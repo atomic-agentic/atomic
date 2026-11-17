@@ -20,6 +20,8 @@
 #   ATOMIC_DEV_CACHE      host directory for cargo's registry and git cache
 #                         (default ${XDG_CACHE_HOME:-~/.cache}/atomic/dev)
 #   ATOMIC_DEV_DB=off     do not start the test Postgres
+#   ATOMIC_DEV_MOUNTS     colon-separated host directories to mount at the same path, for
+#                         checkouts outside this repository (a fork being worked on, say)
 #   ATOMIC_DEV_WAIT_LOCK  a file; while it exists, refuse to start (for hosts shared with
 #                         benchmarks that must not be disturbed)
 #   ATOMIC_TEST_*, RUST_LOG, RUST_BACKTRACE are passed through when set.
@@ -79,6 +81,20 @@ for name in "${!ATOMIC_TEST_@}" RUST_LOG RUST_BACKTRACE; do
     fi
 done
 
+mount_flags=()
+if [ -n "${ATOMIC_DEV_MOUNTS:-}" ]; then
+    IFS=: read -r -a extra_mounts <<<"${ATOMIC_DEV_MOUNTS}"
+    for dir in "${extra_mounts[@]}"; do
+        [ -n "${dir}" ] || continue
+        if [ ! -d "${dir}" ]; then
+            echo "scripts/dev.sh: ATOMIC_DEV_MOUNTS names '${dir}', which is not a directory" >&2
+            exit 2
+        fi
+        dir="$(cd "${dir}" && pwd)"
+        mount_flags+=(-v "${dir}:${dir}")
+    done
+fi
+
 tty_flags=()
 if [ -t 0 ] && [ -t 1 ]; then
     tty_flags=(-it)
@@ -113,6 +129,7 @@ exec "${ENGINE}" run --rm --init ${tty_flags[@]+"${tty_flags[@]}"} \
     -e "CARGO_BUILD_JOBS=${CPUS}" \
     -v "${CACHE}:/cache" \
     -v "${ROOT}:${ROOT}" \
+    ${mount_flags[@]+"${mount_flags[@]}"} \
     -w "${ROOT}" \
     "${IMAGE}" \
     timeout --foreground --kill-after=30s "${LIMIT}" "$@"

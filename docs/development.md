@@ -47,6 +47,7 @@ change them:
 | `ATOMIC_DEV_CPUS` | `16` | CPU limit, also used as cargo's job count |
 | `ATOMIC_DEV_TIMEOUT` | `60m` | Time limit for the command |
 | `ATOMIC_DEV_CACHE` | `~/.cache/atomic/dev` | Host directory for cargo's caches |
+| `ATOMIC_DEV_MOUNTS` | unset | Colon-separated host directories to mount at the same path, for checkouts outside this repository |
 | `ATOMIC_DEV_WAIT_LOCK` | unset | A file; while it exists, `scripts/dev.sh` refuses to start (exit 75) |
 | `ATOMIC_CONTAINER` | `docker` | The engine; `podman` is supported but less tested |
 
