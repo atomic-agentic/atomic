@@ -512,6 +512,8 @@ dependencies = [
  "atomic-agentic-graph",
  "atomic-agentic-schema",
  "clap",
+ "serde",
+ "serde_json",
  "sqlx",
  "tokio",
 ]

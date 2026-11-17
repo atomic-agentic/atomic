@@ -18,6 +18,9 @@ name = "atomic_durable"
 workspace = true
 
 [features]
+# Named failpoints (failpoint()) abort the process when ATOMIC_FAILPOINT
+# names them; for crash tests only. Without the feature they do nothing.
+failpoints = []
 # Run the Postgres variants of the tests against ATOMIC_TEST_DATABASE_URL.
 # With this on, a missing database fails the tests instead of skipping them.
 postgres-tests = []
