@@ -110,3 +110,29 @@ To check that an SBOM describes the binary you have, compare the hash on its
 python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print([c["hashes"][0]["content"] for c in d["metadata"]["component"]["components"] if c["name"]=="atomic"][0])' atomic-<version>-<target>.cdx.json
 sha256sum atomic-<version>-<target>/atomic
 ```
+
+## Bumping Codex
+
+atomic depends on Codex's internal crates, which have no stability promise,
+so the pin in `deps/codex.toml` moves on a schedule, one release at a time:
+
+```bash
+git switch -c codex-bump/rust-v0.170.0
+scripts/codex-bump.sh rust-v0.170.0   # rewrites the pins and reseeds Cargo.lock
+git commit -am "Bump Codex to rust-v0.170.0" && git push -u origin HEAD
+```
+
+Pushing a `codex-bump/*` branch runs the Codex bump workflow. It rebuilds and
+tests the durare fork against the candidate's sqlx and toolchain, then builds
+atomic and runs `scripts/milestone-tests.sh`, whose table in the job summary
+shows which milestone suites pass at the candidate. The same workflow runs on
+the first of each month against Codex's latest release, and by hand with any
+tag. To finish a bump, commit the `Cargo.lock` the workflow uploads, account
+for what `scripts/lock-check.sh` reports, and follow the other steps the
+script prints.
+
+`scripts/milestone-tests.sh` also runs locally:
+
+```bash
+scripts/dev.sh scripts/milestone-tests.sh
+```
