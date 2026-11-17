@@ -14,4 +14,6 @@ pub mod project;
 pub mod render;
 pub mod state;
 pub mod tags;
+#[cfg(any(test, feature = "fake-model"))]
+pub mod testing;
 pub mod workflow;

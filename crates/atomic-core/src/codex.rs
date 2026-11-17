@@ -101,6 +101,17 @@ pub struct ModelEndpoint {
 #[derive(Clone, Debug)]
 pub struct CodexPaths(Arg0DispatchPaths);
 
+impl CodexPaths {
+    /// Paths for a process that did not start through [`dispatch`], such as
+    /// a test: Codex can re-run this executable, but has no sandbox helper.
+    pub fn without_helpers() -> Self {
+        Self(Arg0DispatchPaths {
+            codex_self_exe: std::env::current_exe().ok(),
+            ..Arg0DispatchPaths::default()
+        })
+    }
+}
+
 /// The process entry point.
 ///
 /// The same executable re-runs itself as Codex's helpers (the Linux sandbox,
@@ -482,5 +493,92 @@ async fn run_turn(thread: &CodexThread, prompt: String) -> anyhow::Result<String
             EventMsg::DynamicToolCallRequest(_) => bail!("turn requested a dynamic tool call"),
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::{FakeModel, Reply};
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("atomic-codex-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&d).expect("mkdir");
+        d
+    }
+
+    /// Codex runs on threads with large stacks, as its entry point sets up.
+    fn on_codex_runtime<F: std::future::Future<Output = ()> + Send + 'static>(f: F) {
+        const STACK: usize = 16 * 1024 * 1024;
+        std::thread::Builder::new()
+            .stack_size(STACK)
+            .spawn(move || {
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .thread_stack_size(STACK)
+                    .enable_all()
+                    .build()
+                    .expect("runtime")
+                    .block_on(f)
+            })
+            .expect("thread")
+            .join()
+            .expect("the test thread panicked");
+    }
+
+    #[test]
+    fn a_scripted_model_drives_a_real_codex_thread_with_an_exact_call_count() {
+        on_codex_runtime(async {
+            let model = FakeModel::start(vec![Reply::Text("pong".into())])
+                .await
+                .expect("fake model");
+            let (home, cwd) = (scratch("home"), scratch("cwd"));
+            let endpoint = ModelEndpoint {
+                base_url: model.base_url(),
+                model: "synthetic".into(),
+                api_key_env: None,
+            };
+            let answer = one_turn(
+                &CodexPaths::without_helpers(),
+                &home,
+                &cwd,
+                &endpoint,
+                "ping",
+            )
+            .await
+            .expect("one turn");
+            assert_eq!(answer, "pong");
+            assert_eq!(model.calls(), 1, "requests: {:#?}", model.requests());
+            // The prompt reached the model.
+            assert!(model.requests()[0].to_string().contains("ping"));
+        });
+    }
+
+    #[test]
+    fn a_tool_call_costs_one_more_model_call() {
+        on_codex_runtime(async {
+            let model = FakeModel::start(vec![
+                Reply::Tool {
+                    name: "no_such_tool".into(),
+                    arguments: serde_json::json!({}),
+                },
+                Reply::Text("done".into()),
+            ])
+            .await
+            .expect("fake model");
+            let (home, cwd) = (scratch("home2"), scratch("cwd2"));
+            let endpoint = ModelEndpoint {
+                base_url: model.base_url(),
+                model: "synthetic".into(),
+                api_key_env: None,
+            };
+            let answer = one_turn(&CodexPaths::without_helpers(), &home, &cwd, &endpoint, "go")
+                .await
+                .expect("one turn");
+            assert_eq!(answer, "done");
+            assert_eq!(model.calls(), 2);
+            // The second call carries the failed tool call's result.
+            assert!(model.requests()[1].to_string().contains("call_synthetic"));
+        });
     }
 }
