@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+
+static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 use serde_json::json;
 
 fn dir(files: &[(&str, &str)]) -> PathBuf {
     let d = std::env::temp_dir().join(format!(
-        "atomic-schemas-{}-{}",
+        "atomic-schemas-{}-{}-{}",
         std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())

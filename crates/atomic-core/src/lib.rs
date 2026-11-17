@@ -5,6 +5,7 @@
 //! This is the only atomic crate that depends on Codex.
 
 pub mod artifact;
+pub mod atom;
 pub mod codex;
 pub mod collections;
 pub mod config;

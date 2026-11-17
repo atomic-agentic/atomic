@@ -3,6 +3,8 @@
 //! Ported from errai's configuration tests, extended to atomic's layers.
 
 use super::*;
+
+static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 use serde::Deserialize;
 use std::collections::HashMap;
 
@@ -39,8 +41,9 @@ impl Default for TestConfig {
 
 fn dir(files: &[(&str, &str)]) -> PathBuf {
     let d = std::env::temp_dir().join(format!(
-        "atomic-config-{}-{}",
+        "atomic-config-{}-{}-{}",
         std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
