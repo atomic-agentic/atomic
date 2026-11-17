@@ -520,6 +520,8 @@ dependencies = [
  "codex-core-api",
  "codex-extension-api",
  "dirs",
+ "globset",
+ "ignore",
  "serde",
  "serde_json",
  "sha2 0.10.9",
