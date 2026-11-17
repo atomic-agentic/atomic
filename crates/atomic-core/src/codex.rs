@@ -97,6 +97,19 @@ pub struct ModelEndpoint {
     pub api_key_env: Option<String>,
 }
 
+/// One turn to run on a fresh thread.
+#[derive(Clone, Debug, Default)]
+pub struct TurnSpec {
+    /// Instructions for the developer role; never holds input data.
+    pub developer_instructions: Option<String>,
+    /// The user turn.
+    pub prompt: String,
+    /// A JSON Schema the final answer must follow (structured output).
+    pub output_schema: Option<serde_json::Value>,
+    /// A model name that overrides the endpoint's.
+    pub model: Option<String>,
+}
+
 /// Paths Codex needs to re-run this executable as one of its helpers.
 #[derive(Clone, Debug)]
 pub struct CodexPaths(Arg0DispatchPaths);
@@ -143,7 +156,28 @@ pub async fn one_turn(
     endpoint: &ModelEndpoint,
     prompt: &str,
 ) -> anyhow::Result<String> {
-    let config = new_config(endpoint, codex_home, cwd, paths.0.clone()).await?;
+    let spec = TurnSpec {
+        prompt: prompt.to_owned(),
+        ..TurnSpec::default()
+    };
+    run(paths, codex_home, cwd, endpoint, &spec).await
+}
+
+/// Run `spec` as one turn on a fresh, ephemeral thread and return the final
+/// message.
+pub async fn run(
+    paths: &CodexPaths,
+    codex_home: &Path,
+    cwd: &Path,
+    endpoint: &ModelEndpoint,
+    spec: &TurnSpec,
+) -> anyhow::Result<String> {
+    let mut endpoint = endpoint.clone();
+    if let Some(m) = &spec.model {
+        endpoint.model = m.clone();
+    }
+    let mut config = new_config(&endpoint, codex_home, cwd, paths.0.clone()).await?;
+    config.developer_instructions = spec.developer_instructions.clone();
     let state_db = init_state_db(&config).await;
 
     let auth_manager =
@@ -198,7 +232,7 @@ pub async fn one_turn(
         .await
         .context("start Codex thread")?;
 
-    let answer = run_turn(&thread, prompt.to_owned()).await;
+    let answer = run_turn(&thread, spec).await;
     let shutdown_result = thread.shutdown_and_wait().await;
     let _ = thread_manager.remove_thread(&thread_id).await;
 
@@ -464,12 +498,14 @@ async fn new_config(
     Ok(config)
 }
 
-async fn run_turn(thread: &CodexThread, prompt: String) -> anyhow::Result<String> {
+async fn run_turn(thread: &CodexThread, spec: &TurnSpec) -> anyhow::Result<String> {
+    let mut request = TurnInputRequest::user_input(vec![UserInput::Text {
+        text: spec.prompt.clone(),
+        text_elements: Vec::new(),
+    }]);
+    request.start.final_output_json_schema = spec.output_schema.clone();
     let submission = thread
-        .start_turn_if_idle(TurnInputRequest::user_input(vec![UserInput::Text {
-            text: prompt,
-            text_elements: Vec::new(),
-        }]))
+        .start_turn_if_idle(request)
         .await
         .context("submit user input")?;
     if let StartIfIdleSubmission::NotSubmitted { reason } = submission {

@@ -186,3 +186,26 @@ fn stream(request: &Value, reply: &Reply) -> String {
         .map(|(name, data)| format!("event: {name}\ndata: {data}\n\n"))
         .collect()
 }
+
+/// Run `f` on a runtime like the one Codex's entry point builds: worker
+/// threads with 16 MiB stacks, which Codex's turn needs.
+pub fn on_codex_runtime<F: std::future::Future<Output = ()> + Send + 'static>(f: F) {
+    const STACK: usize = 16 * 1024 * 1024;
+    let result = std::thread::Builder::new()
+        .stack_size(STACK)
+        .spawn(move || {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_stack_size(STACK)
+                .enable_all()
+                .build()
+                .map(|rt| rt.block_on(f))
+        })
+        .map(|t| t.join());
+    match result {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(e))) => panic!("could not build the runtime: {e}"),
+        Ok(Err(panic)) => std::panic::resume_unwind(panic),
+        Err(e) => panic!("could not start the thread: {e}"),
+    }
+}

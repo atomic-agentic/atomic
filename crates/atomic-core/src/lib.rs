@@ -12,6 +12,7 @@ pub mod compile;
 pub mod config;
 pub mod project;
 pub mod render;
+pub mod runtime;
 pub mod state;
 pub mod tags;
 #[cfg(any(test, feature = "fake-model"))]
