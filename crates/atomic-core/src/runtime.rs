@@ -9,8 +9,12 @@
 //! 1. the output contract is lowered to the generation profile, which becomes
 //!    the turn's structured-output schema;
 //! 2. the instructions are the developer instructions and the input is the
-//!    user turn;
-//! 3. the final message is parsed, the nulls lowering introduced are removed,
+//!    user turn; a Codex atom on an endpoint other than OpenAI's API also gets
+//!    the lowered schema written into its instructions, since Codex sends the
+//!    schema on the Responses API, which such servers may accept and ignore;
+//! 3. the final message is parsed (an answer that is exactly one fenced code
+//!    block, as models that are not held to the schema often write, is read
+//!    as its contents), the nulls lowering introduced are removed,
 //!    and the result is validated against the **full** contract (strict mode
 //!    drops constraints such as `maxLength`, so this is where they are
 //!    enforced), every artifact it references is looked up in the runtime's
@@ -182,8 +186,14 @@ async fn run_contract(
             request.name
         ))
     })?;
+    let developer = match backend {
+        Backend::Codex(rt) if !lite::is_openai_api(&rt.endpoint.base_url) => {
+            schema_in_instructions(&request.developer, &lowered.schema)
+        }
+        _ => request.developer,
+    };
     let spec = TurnSpec {
-        developer_instructions: Some(request.developer),
+        developer_instructions: Some(developer),
         prompt: request.prompt,
         output_schema: Some(lowered.schema.clone()),
         model: request.model,
@@ -473,6 +483,37 @@ where
     }
 }
 
+/// `developer` with the output schema stated, for an endpoint that may not
+/// enforce it.
+fn schema_in_instructions(developer: &str, schema: &Value) -> String {
+    let schema = serde_json::to_string_pretty(schema).unwrap_or_default();
+    format!(
+        "{developer}\n\nYour final answer is only a JSON object, with no other text and \
+         no code fence, that follows this JSON Schema:\n\n{schema}"
+    )
+}
+
+/// The contents of `answer` when it is exactly one fenced code block (with or
+/// without a language tag), else `answer` trimmed. Anything outside the block
+/// keeps the answer as it is, so it fails to parse and gets the repair turn.
+fn unfence(answer: &str) -> &str {
+    let trimmed = answer.trim();
+    let Some(rest) = trimmed.strip_prefix("```") else {
+        return trimmed;
+    };
+    let Some((tag, body)) = rest.split_once('\n') else {
+        return trimmed;
+    };
+    let Some(inner) = body.trim_end().strip_suffix("```") else {
+        return trimmed;
+    };
+    let tag_ok = tag.trim().is_empty() || tag.trim().eq_ignore_ascii_case("json");
+    if !tag_ok || inner.contains("```") {
+        return trimmed;
+    }
+    inner.trim()
+}
+
 /// Check an input against its full contract, naming every place it fails.
 fn check_input(validator: &jsonschema::Validator, input: &Value) -> Result<(), AtomError> {
     let errors: Vec<String> = validator
@@ -503,7 +544,7 @@ fn accept(
         message,
         answer: answer.to_owned(),
     };
-    let mut value: Value = serde_json::from_str(answer.trim())
+    let mut value: Value = serde_json::from_str(unfence(answer))
         .map_err(|e| schema_error(format!("the answer is not JSON: {e}")))?;
     lower::normalize(&mut value, lowered);
     let errors: Vec<String> = validator

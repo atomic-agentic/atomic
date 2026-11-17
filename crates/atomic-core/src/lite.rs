@@ -48,19 +48,26 @@ impl Wire {
     /// OpenAI's own API, Chat Completions everywhere else, since that is the
     /// wire on which OpenAI-compatible servers enforce a schema.
     pub fn for_base_url(base_url: &str) -> Self {
-        let host = base_url
-            .split_once("://")
-            .map_or(base_url, |(_, rest)| rest)
-            .split(['/', ':'])
-            .next()
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        if host == "api.openai.com" {
+        if is_openai_api(base_url) {
             Self::Responses
         } else {
             Self::ChatCompletions
         }
     }
+}
+
+/// Whether `base_url` is OpenAI's own API, the one endpoint known to enforce
+/// a Responses API structured-output schema in decoding. Other servers may
+/// accept the schema on that API and ignore it.
+pub fn is_openai_api(base_url: &str) -> bool {
+    let host = base_url
+        .split_once("://")
+        .map_or(base_url, |(_, rest)| rest)
+        .split(['/', ':'])
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    host == "api.openai.com"
 }
 
 /// Where and with what model lite atoms run.

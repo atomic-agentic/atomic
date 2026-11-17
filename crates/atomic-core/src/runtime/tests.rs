@@ -624,3 +624,62 @@ fn a_declarative_output_keeps_its_artifact_references_for_the_check() {
         assert_eq!(model.calls(), 2);
     });
 }
+
+#[test]
+fn an_answer_that_is_one_fenced_json_block_is_read_as_its_contents() {
+    assert_eq!(unfence("```json\n{\"a\": 1}\n```"), "{\"a\": 1}");
+    assert_eq!(unfence("  ```\n{\"a\": 1}\n```\n"), "{\"a\": 1}");
+    assert_eq!(unfence("```JSON\n[1]\n```"), "[1]");
+    assert_eq!(unfence("{\"a\": 1}"), "{\"a\": 1}");
+    // Anything else stays as it is, and fails to parse.
+    for kept in [
+        "Here it is:\n```json\n{}\n```",
+        "```json\n{}\n```\nDone.",
+        "```python\n{}\n```",
+        "```json\n{}\n```\n```json\n{}\n```",
+        "```json {}```",
+    ] {
+        assert_eq!(unfence(kept), kept.trim(), "{kept:?}");
+    }
+
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(
+            "```json\n{\"category\": \"bug\", \"summary\": \"Export crashes.\", \"line\": null}\n```".into(),
+        )])
+        .await
+        .expect("fake model");
+        let rt = runtime(&model, "fenced");
+        let (out, meta) = run_codex_atom(&Classify, &Note { text: "n".into() }, &rt)
+            .await
+            .expect("accepted");
+        assert_eq!(out.category, "bug");
+        assert_eq!((model.calls(), meta.turns), (1, 1), "no repair turn");
+    });
+}
+
+#[test]
+fn a_codex_atom_off_openai_states_its_schema_in_its_instructions() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(
+            r#"{"category": "bug", "summary": "Export crashes.", "line": null}"#.into(),
+        )])
+        .await
+        .expect("fake model");
+        let rt = runtime(&model, "schema-in-prompt");
+        run_codex_atom(&Classify, &Note { text: "n".into() }, &rt)
+            .await
+            .expect("runs");
+        let request = model.requests()[0].to_string();
+        assert!(
+            request.contains("follows this JSON Schema"),
+            "the fake model is not OpenAI's API, so the schema is stated: {request}"
+        );
+        // The lowered schema, which lists the optional `line` as required.
+        assert!(
+            request.contains(r#"\"required\": [\n    \"category\",\n    \"line\""#),
+            "{request}"
+        );
+    });
+    assert!(crate::lite::is_openai_api("https://api.openai.com/v1"));
+    assert!(!crate::lite::is_openai_api("http://127.0.0.1:13305/api/v1"));
+}
