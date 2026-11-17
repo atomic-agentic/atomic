@@ -220,12 +220,17 @@ async fn child_main(dir: &Path, role: &str, round: u32) -> Result<()> {
             .await?;
     }
 
-    // Start this round's pipelines; their ids make the start idempotent.
-    for p in 0..PIPELINES_PER_ROUND {
-        let id = pipeline_id(round, p);
-        engine
-            .start::<_, Nonces>("pipeline", (), WorkflowOptions::with_id(&id))
-            .await?;
+    // Start the pipelines of every round so far; their ids make the start
+    // idempotent. A slow machine can kill every child of a round before any
+    // of them starts its pipelines, and the gates below must not be sent to
+    // workflows that were never created.
+    for r in 0..=round {
+        for p in 0..PIPELINES_PER_ROUND {
+            let id = pipeline_id(r, p);
+            engine
+                .start::<_, Nonces>("pipeline", (), WorkflowOptions::with_id(&id))
+                .await?;
+        }
     }
 
     // Open the gate of every pipeline so far, a little later, so kills land
