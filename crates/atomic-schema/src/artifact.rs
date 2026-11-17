@@ -110,6 +110,88 @@ mod tests {
             assert!(bad.parse::<ArtifactRef>().is_err(), "{bad}");
         }
     }
+
+    /// A store holding one diff, `a…`, and one text note, `b…`.
+    struct Store;
+
+    impl ArtifactLookup for Store {
+        fn media_types(&self, artifact: &ArtifactRef) -> Option<Vec<String>> {
+            match artifact.digest().as_bytes().first() {
+                Some(b'a') => Some(vec!["text/x-diff".into()]),
+                Some(b'b') => Some(vec!["text/plain".into()]),
+                _ => None,
+            }
+        }
+    }
+
+    fn reference(c: char) -> serde_json::Value {
+        serde_json::json!(format!("artifact://sha256/{}", c.to_string().repeat(64)))
+    }
+
+    fn file(alternatives: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"type": "object", "required": ["file"],
+                           "properties": {"file": {"anyOf": alternatives}}})
+    }
+
+    #[test]
+    fn one_alternative_that_accepts_the_reference_is_enough() {
+        let either = file(serde_json::json!([
+            {"$ref": "atomic:artifact", "mediaType": "text/x-diff"},
+            {"$ref": "atomic:artifact", "mediaType": "text/plain"}
+        ]));
+        for c in ['a', 'b'] {
+            let value = serde_json::json!({"file": reference(c)});
+            assert_eq!(check_refs(&either, &value, &Store), Ok(()), "{c}");
+        }
+        // Neither alternative holds a missing artifact.
+        let missing = serde_json::json!({"file": reference('c')});
+        assert!(matches!(
+            check_refs(&either, &missing, &Store),
+            Err(ArtifactCheckError::Missing { .. })
+        ));
+    }
+
+    #[test]
+    fn an_alternative_without_references_counts_only_if_the_value_fits_it() {
+        // `null` does not excuse a missing artifact: a string is not null.
+        let or_null = file(serde_json::json!([
+            {"$ref": "atomic:artifact", "mediaType": "text/x-diff"},
+            {"type": "null"}
+        ]));
+        assert!(matches!(
+            check_refs(
+                &or_null,
+                &serde_json::json!({"file": reference('c')}),
+                &Store
+            ),
+            Err(ArtifactCheckError::Missing { .. })
+        ));
+        assert_eq!(
+            check_refs(&or_null, &serde_json::json!({"file": null}), &Store),
+            Ok(())
+        );
+        // A plain-string alternative accepts text that is no reference at all.
+        let or_text = file(serde_json::json!([
+            {"$ref": "atomic:artifact", "mediaType": "text/x-diff"},
+            {"type": "string", "maxLength": 20}
+        ]));
+        assert_eq!(
+            check_refs(&or_text, &serde_json::json!({"file": "hello"}), &Store),
+            Ok(())
+        );
+        // A wrong type with no other alternative to fall back on still fails.
+        let diff_only = file(serde_json::json!([
+            {"$ref": "atomic:artifact", "mediaType": "text/x-diff"}
+        ]));
+        assert!(matches!(
+            check_refs(
+                &diff_only,
+                &serde_json::json!({"file": reference('b')}),
+                &Store
+            ),
+            Err(ArtifactCheckError::WrongMediaType { .. })
+        ));
+    }
 }
 
 /// The `$id` of the built-in artifact reference schema.
@@ -244,36 +326,129 @@ pub enum ArtifactCheckError {
 }
 
 /// Check every artifact reference `value` holds against the store: it must
-/// exist and, where its schema says, have the right media type.
+/// exist and, where its schema says, have the right media type. Alternatives
+/// (`anyOf`) mean what they mean in JSON Schema: the value is fine if one of
+/// them accepts it. An alternative that holds artifact references accepts the
+/// value when those references hold; one with none accepts it only if the
+/// value fits it.
 pub fn check_refs(
     schema: &serde_json::Value,
     value: &serde_json::Value,
     store: &dyn ArtifactLookup,
 ) -> Result<(), ArtifactCheckError> {
-    for found in find_refs(schema, value) {
-        let artifact: ArtifactRef =
-            found
-                .text
-                .parse()
-                .map_err(|source| ArtifactCheckError::Malformed {
-                    at: found.at.clone(),
-                    source,
-                })?;
-        let types = store
-            .media_types(&artifact)
-            .ok_or_else(|| ArtifactCheckError::Missing {
-                at: found.at.clone(),
-                text: found.text.clone(),
-            })?;
-        if let Some(expected) = found.media_type
-            && !types.contains(&expected)
-        {
-            return Err(ArtifactCheckError::WrongMediaType {
-                at: found.at,
-                text: found.text,
-                expected,
-                found: types,
-            });
+    check_at(schema, schema, value, "", store, 0)
+}
+
+fn check_one(
+    text: &str,
+    at: &str,
+    media_type: Option<&str>,
+    store: &dyn ArtifactLookup,
+) -> Result<(), ArtifactCheckError> {
+    let artifact: ArtifactRef = text
+        .parse()
+        .map_err(|source| ArtifactCheckError::Malformed {
+            at: at.to_owned(),
+            source,
+        })?;
+    let types = store
+        .media_types(&artifact)
+        .ok_or_else(|| ArtifactCheckError::Missing {
+            at: at.to_owned(),
+            text: text.to_owned(),
+        })?;
+    if let Some(expected) = media_type
+        && !types.iter().any(|t| t == expected)
+    {
+        return Err(ArtifactCheckError::WrongMediaType {
+            at: at.to_owned(),
+            text: text.to_owned(),
+            expected: expected.to_owned(),
+            found: types,
+        });
+    }
+    Ok(())
+}
+
+/// Whether `value` fits `branch` as JSON Schema, with the root's
+/// definitions in reach.
+fn fits(root: &serde_json::Value, branch: &serde_json::Value, value: &serde_json::Value) -> bool {
+    let mut schema = branch.clone();
+    if let (Some(obj), Some(defs)) = (schema.as_object_mut(), root.get("$defs")) {
+        obj.entry("$defs").or_insert_with(|| defs.clone());
+    }
+    crate::registry::Registry::new()
+        .validator_for(&schema)
+        .is_ok_and(|v| v.is_valid(value))
+}
+
+fn check_at(
+    root: &serde_json::Value,
+    schema: &serde_json::Value,
+    value: &serde_json::Value,
+    at: &str,
+    store: &dyn ArtifactLookup,
+    depth: usize,
+) -> Result<(), ArtifactCheckError> {
+    use serde_json::Value;
+    if depth > 64 {
+        return Ok(());
+    }
+    match schema.get("$ref").and_then(Value::as_str) {
+        Some(ARTIFACT_SCHEMA_ID) => {
+            return match value.as_str() {
+                Some(text) => check_one(
+                    text,
+                    at,
+                    schema.get("mediaType").and_then(Value::as_str),
+                    store,
+                ),
+                None => Ok(()),
+            };
+        }
+        Some(local) if local.starts_with("#/") => {
+            if let Some(target) = root.pointer(&local[1..]) {
+                check_at(root, target, value, at, store, depth + 1)?;
+            }
+        }
+        _ => {}
+    }
+    if let (Some(props), Some(obj)) = (
+        schema.get("properties").and_then(Value::as_object),
+        value.as_object(),
+    ) {
+        for (k, s) in props {
+            if let Some(v) = obj.get(k) {
+                let child = format!("{at}/{}", k.replace('~', "~0").replace('/', "~1"));
+                check_at(root, s, v, &child, store, depth + 1)?;
+            }
+        }
+    }
+    if let (Some(items), Some(arr)) = (schema.get("items"), value.as_array()) {
+        for (i, v) in arr.iter().enumerate() {
+            check_at(root, items, v, &format!("{at}/{i}"), store, depth + 1)?;
+        }
+    }
+    if let Some(Value::Array(branches)) = schema.get("anyOf") {
+        let mut first_error = None;
+        for b in branches {
+            let mut refs = Vec::new();
+            walk(root, b, value, at, &mut refs, depth + 1);
+            if refs.is_empty() {
+                if fits(root, b, value) {
+                    return Ok(());
+                }
+                continue;
+            }
+            match check_at(root, b, value, at, store, depth + 1) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    first_error.get_or_insert(e);
+                }
+            }
+        }
+        if let Some(e) = first_error {
+            return Err(e);
         }
     }
     Ok(())
