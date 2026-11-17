@@ -45,15 +45,19 @@ pub enum Approvals {
     Attended,
 }
 
-/// The model tiers an atom may name instead of a model. A project maps each
-/// tier to an ordered list of models, so atoms never name a provider:
+/// The model tiers an atom may name instead of a model, from least to most
+/// capable. A project maps each tier to an ordered list of models, so atoms
+/// never name a provider. A tier is independent of an atom's kind: a lite
+/// atom may run on any tier.
 ///
-/// - `fast`: small, cheap models, local ones included, for executors and
-///   for classify, extract and route steps;
+/// - `basic`: the smallest, cheapest models, often local, for classify,
+///   extract and route steps;
+/// - `fast`: quick, low-cost general models, for executors and routine
+///   steps;
 /// - `advanced`: capable general models, for reviewers and harder steps;
 /// - `frontier`: the most capable models available, for planning and the
 ///   reviews that decide the most.
-pub const MODEL_TIERS: &[&str] = &["fast", "advanced", "frontier"];
+pub const MODEL_TIERS: &[&str] = &["basic", "fast", "advanced", "frontier"];
 
 /// Run settings an atom may adjust in [`Atom::configure`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -225,7 +229,7 @@ mod tests {
         let mut config = AtomConfig::default();
         atom.configure(&mut config);
         assert_eq!(config.model.as_deref(), Some("advanced"));
-        assert!(MODEL_TIERS.contains(&"advanced") && MODEL_TIERS.contains(&"frontier"));
+        assert_eq!(MODEL_TIERS, ["basic", "fast", "advanced", "frontier"]);
         assert_eq!(config.sandbox, Sandbox::ReadOnly);
         let out: Verdict = serde_json::from_value(json!({"verdict": "approve"})).expect("parses");
         assert!(matches!(atom.validate(&out), Err(AtomError::Validation(_))));
