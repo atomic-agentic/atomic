@@ -14,3 +14,8 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+durare = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

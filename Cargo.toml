@@ -29,6 +29,29 @@ atomic-exec = { path = "crates/atomic-exec" }
 atomic-graph = { path = "crates/atomic-graph" }
 atomic-schema = { path = "crates/atomic-schema" }
 
+# atomic's fork of durare, at the revision in deps/durare.toml. Only
+# atomic-durable may depend on it.
+durare = { git = "https://github.com/atomic-agentic/durare", rev = "9c93328ded1e68447afa622c85b8144196cd41b6", default-features = false, features = ["sqlite", "postgres"] }
+
+# Third-party crates.
+serde_json = "1"
+tokio = { version = "1", default-features = false }
+
+# Codex, at the revision in deps/codex.toml (scripts/codex-pin.sh checks it).
+# Only atomic-core may depend on these.
+codex-app-server = { git = "https://github.com/openai/codex", rev = "d32063f96c2dff1dc96af839b3952abb6acfeda4" }
+codex-core-api = { git = "https://github.com/openai/codex", rev = "d32063f96c2dff1dc96af839b3952abb6acfeda4" }
+codex-extension-api = { git = "https://github.com/openai/codex", rev = "d32063f96c2dff1dc96af839b3952abb6acfeda4" }
+
+# Codex is a large dependency; full debug info for every crate makes a debug
+# build tens of gigabytes. Keep line tables for atomic's own crates (enough for
+# backtraces) and drop debug info for dependencies.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 [workspace.lints.rust]
 unsafe_code = "deny"
 missing_docs = "warn"

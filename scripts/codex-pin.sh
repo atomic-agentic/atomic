@@ -15,6 +15,7 @@
 #    crates.io sqlx-postgres does not build against the patched core.
 # 2. rust-toolchain.toml names the toolchain Codex's rust-toolchain.toml names.
 # 3. deps/codex.toml records that same toolchain.
+# 4. Every git dependency on openai/codex uses the pinned revision.
 #
 # Codex's files are read from CODEX_SRC (a local clone of openai/codex) when set, otherwise
 # downloaded from GitHub at the pinned revision.
@@ -114,6 +115,13 @@ case "${1:-}" in
         status=0
         if ! current_block | diff -u --label "Cargo.toml (committed)" --label "codex ${REV} (expected)" - "${WORK}/expected"; then
             echo "scripts/codex-pin.sh: the patch block in Cargo.toml differs from Codex ${REV}; run scripts/codex-pin.sh write" >&2
+            status=1
+        fi
+        # Every git dependency on Codex must use the pinned revision.
+        stale="$(grep -n 'git = "https://github.com/openai/codex"' "${MANIFEST}" ${ROOT}/crates/*/Cargo.toml | grep -v "rev = \"${REV}\"" || true)"
+        if [ -n "${stale}" ]; then
+            echo "scripts/codex-pin.sh: Codex dependencies not at ${REV}:" >&2
+            echo "${stale}" >&2
             status=1
         fi
         if [ "${our_toolchain}" != "${codex_toolchain}" ]; then

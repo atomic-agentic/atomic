@@ -16,3 +16,6 @@ workspace = true
 [dependencies]
 atomic-schema = { workspace = true }
 atomic-exec = { workspace = true }
+codex-app-server = { workspace = true }
+codex-core-api = { workspace = true }
+codex-extension-api = { workspace = true }

@@ -1,0 +1,9 @@
+# atomic's fork of durare. Cargo.toml's durare dependency must use this rev.
+
+[durare]
+repository = "https://github.com/atomic-agentic/durare"
+branch = "atomic"
+rev = "9c93328ded1e68447afa622c85b8144196cd41b6"
+upstream = "https://github.com/SamuelXing/durare"
+# The upstream commit the fork's branch starts from.
+upstream_base = "0994da0d6425c575ad4192353399c0eb8085b68a"

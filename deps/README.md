@@ -7,6 +7,7 @@ against it.
 | File | Upstream |
 | --- | --- |
 | [`codex.toml`](codex.toml) | [openai/codex](https://github.com/openai/codex), the `codex-rs` workspace |
+| [`durare.toml`](durare.toml) | [atomic-agentic/durare](https://github.com/atomic-agentic/durare), atomic's fork of [durare](https://github.com/SamuelXing/durare), branch `atomic` |
 
 ## Codex
 
@@ -30,3 +31,12 @@ when the pin moves.
 | V8 stays out of the core path | Only `code-mode-runtime` depends on `v8`, and only `code-mode-host` depends on it. `core`, `app-server` and `tools` depend on `codex-code-mode`, which does not | the crates' `Cargo.toml` files |
 | Crates atomic uses exist | `core-api`, `ext/extension-api`, `app-server`, `arg0`, `thread-manager-sample` | directory listing |
 | The sample uses one Codex crate | `thread-manager-sample` depends only on `codex-core-api` | `thread-manager-sample/Cargo.toml` |
+
+## durare
+
+atomic uses a fork of durare, ported to sqlx 0.9 so that it shares Codex's
+sqlx and `libsqlite3-sys` versions. The fork's changes live on its `atomic`
+branch and are kept small enough to rebase on upstream. A durare dependency
+only resolves inside a workspace whose `[patch.crates-io]` patches
+`sqlx-core`, `sqlx-sqlite` and `sqlx-postgres` to the same sqlx fork revision,
+which atomic's Codex patch block does.
