@@ -3,24 +3,23 @@
 # A version tag (v<version>, equal to the atomic-agentic package's version)
 # builds the atomic binary for Linux and macOS, packages each with its licences
 # and its CycloneDX SBOM, and attaches them to a draft GitHub release for a
-# maintainer to publish. A pull request that changes this pipeline runs the
-# same build and packaging and keeps the results as workflow artifacts, with no
-# release. Actions are pinned by commit SHA.
+# maintainer to publish. A push to a release-check/* branch, or a manual run,
+# does the same build and packaging and keeps the results as workflow
+# artifacts, with no release. (Not on pull requests: a path filter there sees
+# the whole pull request, so it would build both platforms on every push.)
+# Actions are pinned by commit SHA.
 
 name: Release
 
 on:
   push:
     tags: ["v*"]
-  pull_request:
-    paths:
-      - .github/workflows/release.yml
-      - scripts/release-package.sh
-      - scripts/sbom.sh
+    branches: ["release-check/**"]
+  workflow_dispatch:
 
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 permissions:
   contents: read

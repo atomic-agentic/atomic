@@ -95,8 +95,9 @@ A release starts from a tag `v<version>` whose version equals the
 4. attaches the archives, the SBOMs and a `SHA256SUMS` file to a draft GitHub
    release, which a maintainer reviews and publishes.
 
-A pull request that changes the pipeline runs steps 1 to 3 and keeps the
-results as workflow artifacts. To package a build locally:
+A push to a `release-check/*` branch, or a manual run of the workflow, does
+steps 1 to 3 and keeps the results as workflow artifacts. To package a build
+locally:
 
 ```bash
 scripts/dev.sh cargo build --release --locked -p atomic-agentic --target x86_64-unknown-linux-gnu
