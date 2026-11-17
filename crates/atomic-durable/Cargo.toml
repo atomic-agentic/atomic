@@ -30,7 +30,8 @@ durare = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
-sqlx = { workspace = true }
+# Postgres for the adapter's own reads of atomic's tables (durare brings the driver).
+sqlx = { workspace = true, features = ["postgres"] }
 thiserror = { workspace = true }
 
 [dev-dependencies]

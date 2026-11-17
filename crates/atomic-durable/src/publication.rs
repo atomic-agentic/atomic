@@ -192,10 +192,12 @@ pub async fn publish_candidate<C: WorkflowContext>(
     }
     let candidate = Arc::new(candidate.clone());
     let preconditions = Arc::new(preconditions);
+    let step = Arc::new(name.to_owned());
     ctx.transaction(name, move |tx| {
         let candidate = candidate.clone();
         let preconditions = preconditions.clone();
-        Box::pin(async move { publish_in(tx, &candidate, &preconditions).await })
+        let step = step.clone();
+        Box::pin(async move { publish_in(tx, &candidate, &step, &preconditions).await })
     })
     .await
 }
@@ -234,6 +236,7 @@ where
 async fn publish_in(
     mut tx: Tx<'_, '_>,
     candidate: &Candidate,
+    step: &str,
     preconditions: &[Precondition],
 ) -> Result<Value> {
     for p in preconditions {
@@ -316,6 +319,31 @@ async fn publish_in(
         ],
     )
     .await?;
+    // The thread the candidate's turn ran on, indexed both ways, in the same
+    // transaction as the publication.
+    if let Some(thread) = candidate
+        .proposal
+        .metadata
+        .get("thread_id")
+        .and_then(Value::as_str)
+        .filter(|t| !t.is_empty())
+    {
+        let run = candidate
+            .id
+            .rsplit_once(':')
+            .map_or(candidate.id.as_str(), |(run, _)| run);
+        tx.execute(crate::runtime::THREADS_TABLE, &[]).await?;
+        tx.execute(
+            "INSERT INTO atomic_threads (candidate, run, step, thread_id) VALUES (?, ?, ?, ?)",
+            &[
+                Param::Text(candidate.id.clone()),
+                Param::Text(run.to_owned()),
+                Param::Text(step.to_owned()),
+                Param::Text(thread.to_owned()),
+            ],
+        )
+        .await?;
+    }
     Ok(candidate.proposal.output.clone())
 }
 

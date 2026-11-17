@@ -664,6 +664,26 @@ async fn run_atom_records_sibling_steps_in_a_stable_order(mut engine: Durare) ->
     assert_eq!(authors.load(Ordering::SeqCst), 2, "each author ran once");
     assert_eq!(review.output, json!({"reviewed": ["one"]}));
     assert_eq!(plan.metadata["thread_id"], "t-plan");
+    // The thread each step ran on, from the run and back.
+    let threads = engine.threads("two-atoms-1").await?;
+    let pairs: Vec<(&str, &str)> = threads
+        .iter()
+        .map(|t| (t.step.as_str(), t.thread_id.as_str()))
+        .collect();
+    assert_eq!(
+        pairs,
+        [("plan.publish", "t-plan"), ("review.publish", "t-review")]
+    );
+    let back = engine.thread("t-review").await?.expect("indexed");
+    assert_eq!(
+        (
+            back.run.as_str(),
+            back.step.as_str(),
+            back.candidate.as_str()
+        ),
+        ("two-atoms-1", "review.publish", review.candidate.as_str())
+    );
+    assert_eq!(engine.thread("t-unknown").await?, None);
     assert_eq!(counts(&engine).await?, (1, 2));
     engine.shutdown(Duration::from_secs(5)).await
 }

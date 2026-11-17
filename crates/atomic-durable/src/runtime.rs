@@ -65,6 +65,27 @@ pub struct StepRecord {
     pub error: Option<String>,
 }
 
+/// Which model thread a published step ran on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreadRecord {
+    /// The run (workflow id).
+    pub run: String,
+    /// The step that published the result.
+    pub step: String,
+    /// The candidate, `<run>:<position of its turn>`.
+    pub candidate: String,
+    /// The model thread its turn ran on.
+    pub thread_id: String,
+}
+
+/// atomic's index of threads by run and step, written with each publication.
+pub(crate) const THREADS_TABLE: &str = "CREATE TABLE IF NOT EXISTS atomic_threads (
+    candidate TEXT PRIMARY KEY,
+    run TEXT NOT NULL,
+    step TEXT NOT NULL,
+    thread_id TEXT NOT NULL
+)";
+
 /// Where a workflow is.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RunStatus {
@@ -242,6 +263,12 @@ pub trait DurableRuntime: Send + Sync + Sized {
     /// The operations workflow `id` has recorded, in order.
     fn steps(&self, id: &str) -> impl Future<Output = Result<Vec<StepRecord>>> + Send;
 
+    /// The threads a run's published steps ran on, in publication order.
+    fn threads(&self, run: &str) -> impl Future<Output = Result<Vec<ThreadRecord>>> + Send;
+
+    /// The run and step a thread belongs to, if a published step ran on it.
+    fn thread(&self, thread_id: &str) -> impl Future<Output = Result<Option<ThreadRecord>>> + Send;
+
     /// Run again every unfinished workflow this process may recover.
     /// Returns how many it started.
     fn recover(&self) -> impl Future<Output = Result<usize>> + Send;
@@ -252,6 +279,10 @@ pub trait DurableRuntime: Send + Sync + Sized {
 
 // ---------------------------------------------------------------------------
 // The durare adapter.
+
+fn db(e: impl std::fmt::Display) -> DurableError {
+    DurableError::Engine(format!("atomic's tables: {e}"))
+}
 
 fn engine(e: durare::Error) -> DurableError {
     from_durare(e)
@@ -327,9 +358,17 @@ impl WorkflowContext for DurareContext {
     }
 }
 
+/// The adapter's own connection for reading atomic's tables outside a
+/// workflow: the same database, and on PostgreSQL the same schema.
+enum Reads {
+    Sqlite(sqlx::SqlitePool),
+    Postgres(sqlx::PgPool),
+}
+
 /// [`DurableRuntime`] on the durare fork, over SQLite or PostgreSQL.
 pub struct Durare {
     engine: durare::DurableEngine,
+    reads: Reads,
     /// Handles of workflows this process started, by id: waiting on one
     /// follows that execution, including a crash, which a lookup by id would
     /// not see.
@@ -343,7 +382,8 @@ impl Durare {
         let provider = durare::SqliteProvider::connect(&url)
             .await
             .map_err(from_durare)?;
-        Self::over(Arc::new(provider)).await
+        let reads = sqlx::SqlitePool::connect(&url).await.map_err(db)?;
+        Self::over(Arc::new(provider), Reads::Sqlite(reads)).await
     }
 
     /// An engine on PostgreSQL at `url`, in `schema`.
@@ -351,16 +391,90 @@ impl Durare {
         let provider = durare::PostgresProvider::connect_with_schema(url, schema)
             .await
             .map_err(from_durare)?;
-        Self::over(Arc::new(provider)).await
+        let options = <sqlx::postgres::PgConnectOptions as std::str::FromStr>::from_str(url)
+            .map_err(db)?
+            .options([("search_path", schema)]);
+        let reads = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect_with(options)
+            .await
+            .map_err(db)?;
+        Self::over(Arc::new(provider), Reads::Postgres(reads)).await
     }
 
-    async fn over(provider: Arc<dyn durare::StateProvider>) -> Result<Self> {
+    async fn over(provider: Arc<dyn durare::StateProvider>, reads: Reads) -> Result<Self> {
+        let engine = durare::DurableEngine::new(provider)
+            .await
+            .map_err(from_durare)?;
+        let index =
+            "CREATE INDEX IF NOT EXISTS atomic_threads_by_thread ON atomic_threads (thread_id)";
+        match &reads {
+            Reads::Sqlite(pool) => {
+                for sql in [THREADS_TABLE, index] {
+                    sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
+                        .execute(pool)
+                        .await
+                        .map_err(db)?;
+                }
+            }
+            Reads::Postgres(pool) => {
+                for sql in [THREADS_TABLE, index] {
+                    sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
+                        .execute(pool)
+                        .await
+                        .map_err(db)?;
+                }
+            }
+        }
         Ok(Self {
-            engine: durare::DurableEngine::new(provider)
-                .await
-                .map_err(from_durare)?,
+            engine,
+            reads,
             started: std::sync::Mutex::default(),
         })
+    }
+
+    /// Thread records matching `column = value`, in publication order.
+    async fn thread_rows(&self, column: &str, value: &str) -> Result<Vec<ThreadRecord>> {
+        let rows: Vec<(String, String, String, String)> = match &self.reads {
+            Reads::Sqlite(pool) => {
+                let sql = format!(
+                    "SELECT run, step, candidate, thread_id FROM atomic_threads WHERE {column} = ?"
+                );
+                sqlx::query_as(sqlx::AssertSqlSafe(sql))
+                    .bind(value)
+                    .fetch_all(pool)
+                    .await
+                    .map_err(db)?
+            }
+            Reads::Postgres(pool) => {
+                let sql = format!(
+                    "SELECT run, step, candidate, thread_id FROM atomic_threads WHERE {column} = $1"
+                );
+                sqlx::query_as(sqlx::AssertSqlSafe(sql))
+                    .bind(value)
+                    .fetch_all(pool)
+                    .await
+                    .map_err(db)?
+            }
+        };
+        let mut records: Vec<ThreadRecord> = rows
+            .into_iter()
+            .map(|(run, step, candidate, thread_id)| ThreadRecord {
+                run,
+                step,
+                candidate,
+                thread_id,
+            })
+            .collect();
+        // Publication order is the order of the turns' positions.
+        let position = |r: &ThreadRecord| {
+            r.candidate
+                .rsplit_once(':')
+                .and_then(|(_, p)| p.parse::<i64>().ok())
+                .unwrap_or(i64::MAX)
+        };
+        records.sort_by_key(|r| (r.run.clone(), position(r)));
+        Ok(records)
     }
 }
 
@@ -460,6 +574,18 @@ impl DurableRuntime for Durare {
                 })
                 .collect())
         }
+    }
+
+    async fn threads(&self, run: &str) -> Result<Vec<ThreadRecord>> {
+        self.thread_rows("run", run).await
+    }
+
+    async fn thread(&self, thread_id: &str) -> Result<Option<ThreadRecord>> {
+        Ok(self
+            .thread_rows("thread_id", thread_id)
+            .await?
+            .into_iter()
+            .next())
     }
 
     async fn recover(&self) -> Result<usize> {

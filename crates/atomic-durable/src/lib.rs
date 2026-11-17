@@ -29,7 +29,7 @@ pub use publication::{
 };
 pub use runtime::{
     DurableError, DurableRuntime, Durare, DurareContext, Param, Result, Row, RunStatus, StepInfo,
-    StepRecord, Tx, TxFuture, WorkflowContext,
+    StepRecord, ThreadRecord, Tx, TxFuture, WorkflowContext,
 };
 
 use std::path::Path;
