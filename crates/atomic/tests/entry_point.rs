@@ -12,9 +12,11 @@ use std::process::{Command, Output};
 const ATOMIC: &str = env!("CARGO_BIN_EXE_atomic");
 
 fn scratch(tag: &str) -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let dir = std::env::temp_dir().join(format!(
-        "atomic-entry-{tag}-{}-{}",
+        "atomic-entry-{tag}-{}-{}-{}",
         std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())

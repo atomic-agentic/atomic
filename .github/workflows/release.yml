@@ -75,7 +75,10 @@ jobs:
           curl -fsSLo "${RUNNER_TEMP}/cdx.tar.xz" \
             "https://github.com/CycloneDX/cyclonedx-rust-cargo/releases/download/cargo-cyclonedx-0.5.10/${cdx}.tar.xz"
           echo "${{ matrix.cyclonedx_sha256 }}  ${RUNNER_TEMP}/cdx.tar.xz" | shasum -a 256 -c -
-          tar -xJf "${RUNNER_TEMP}/cdx.tar.xz" -C "${HOME}/.cargo/bin" --strip-components=1 "${cdx}/cargo-cyclonedx"
+          # Not ~/.cargo/bin: the macOS runners keep cargo elsewhere.
+          mkdir -p "${RUNNER_TEMP}/bin"
+          tar -xJf "${RUNNER_TEMP}/cdx.tar.xz" -C "${RUNNER_TEMP}/bin" --strip-components=1 "${cdx}/cargo-cyclonedx"
+          echo "${RUNNER_TEMP}/bin" >>"${GITHUB_PATH}"
 
       # Release builds start from a clean target directory; only cargo's
       # download caches are kept, for the large Codex git sources.

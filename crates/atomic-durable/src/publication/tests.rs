@@ -16,12 +16,16 @@ use serde_json::json;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+/// A name no other test in this process uses. The clock alone is not enough:
+/// macOS reports it in microseconds, and parallel tests start together.
 fn unique(tag: &str) -> String {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    format!("{tag}_{}_{nanos}", std::process::id())
+    format!("{tag}_{}_{n}_{nanos}", std::process::id())
 }
 
 async fn sqlite() -> Result<Arc<dyn StateProvider>> {

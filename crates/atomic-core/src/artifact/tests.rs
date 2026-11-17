@@ -4,13 +4,13 @@ use super::*;
 
 fn store() -> (LocalStore, PathBuf) {
     let dir = std::env::temp_dir().join(format!(
-        "atomic-artifacts-{}-{}",
+        "atomic-artifacts-{}-{}-{}",
         std::process::id(),
-        STAGING_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            + std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0)
+        STAGING_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
     ));
     (LocalStore::open(&dir).expect("open store"), dir)
 }

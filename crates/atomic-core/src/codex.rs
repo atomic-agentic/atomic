@@ -42,6 +42,7 @@ use codex_core_api::ModelAvailabilityNuxConfig;
 use codex_core_api::ModelCatalogSettings;
 use codex_core_api::MultiAgentV2Config;
 use codex_core_api::NewThread;
+use codex_core_api::NotSubmittedReason;
 use codex_core_api::Notice;
 use codex_core_api::OPENAI_PROVIDER_ID;
 use codex_core_api::OtelConfig;
@@ -572,23 +573,40 @@ async fn new_config(
     Ok(config)
 }
 
+/// How long a turn waits for the thread to finish settling the previous one.
+const NOT_IDLE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Run one turn; return its final message and the thread's token totals
 /// (input, output, total) as last reported.
 async fn run_turn(
     thread: &CodexThread,
     spec: &TurnSpec,
 ) -> anyhow::Result<(String, Option<(i64, i64, i64)>)> {
-    let mut request = TurnInputRequest::user_input(vec![UserInput::Text {
-        text: spec.prompt.clone(),
-        text_elements: Vec::new(),
-    }]);
-    request.start.final_output_json_schema = spec.output_schema.clone();
-    let submission = thread
-        .start_turn_if_idle(request)
-        .await
-        .context("submit user input")?;
-    if let StartIfIdleSubmission::NotSubmitted { reason } = submission {
-        bail!("turn input was not submitted: {reason:?}");
+    // Codex sends TurnComplete before it marks the thread idle, so a follow-up
+    // turn submitted straight after one can be declined as NotIdle. That
+    // window is short: retry for a bounded time, and only for that reason.
+    let until = std::time::Instant::now() + NOT_IDLE_PATIENCE;
+    loop {
+        let mut request = TurnInputRequest::user_input(vec![UserInput::Text {
+            text: spec.prompt.clone(),
+            text_elements: Vec::new(),
+        }]);
+        request.start.final_output_json_schema = spec.output_schema.clone();
+        match thread
+            .start_turn_if_idle(request)
+            .await
+            .context("submit user input")?
+        {
+            StartIfIdleSubmission::Started { .. } => break,
+            StartIfIdleSubmission::NotSubmitted {
+                reason: NotSubmittedReason::NotIdle,
+            } if std::time::Instant::now() < until => {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            StartIfIdleSubmission::NotSubmitted { reason } => {
+                bail!("turn input was not submitted: {reason:?}")
+            }
+        }
     }
 
     let mut usage = None;
@@ -674,6 +692,47 @@ mod tests {
             assert_eq!(model.calls(), 1, "requests: {:#?}", model.requests());
             // The prompt reached the model.
             assert!(model.requests()[0].to_string().contains("ping"));
+        });
+    }
+
+    /// Codex sends TurnComplete before it marks the thread idle; a follow-up
+    /// submitted in that window must wait, not fail as NotIdle.
+    #[test]
+    fn follow_up_turns_submitted_back_to_back_all_run() {
+        const TURNS: usize = 100;
+        on_codex_runtime(async {
+            let replies = (0..TURNS).map(|i| Reply::Text(format!("r{i}"))).collect();
+            let model = FakeModel::start(replies).await.expect("fake model");
+            let (home, cwd) = (scratch("home3"), scratch("cwd3"));
+            let endpoint = ModelEndpoint {
+                base_url: model.base_url(),
+                model: "synthetic".into(),
+                api_key_env: None,
+            };
+            let first = TurnSpec {
+                prompt: "t0".into(),
+                ..TurnSpec::default()
+            };
+            let mut seen = Vec::new();
+            let (last, report) = converse(
+                &CodexPaths::without_helpers(),
+                &home,
+                &cwd,
+                &endpoint,
+                &first,
+                |answer| {
+                    seen.push(answer.to_owned());
+                    (seen.len() < TURNS).then(|| TurnSpec {
+                        prompt: format!("t{}", seen.len()),
+                        ..TurnSpec::default()
+                    })
+                },
+            )
+            .await
+            .expect("every follow-up turn runs");
+            assert_eq!(last, format!("r{}", TURNS - 1));
+            assert_eq!(report.turns as usize, TURNS);
+            assert_eq!(model.calls(), TURNS);
         });
     }
 

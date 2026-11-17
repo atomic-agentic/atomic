@@ -136,9 +136,11 @@ mod tests {
     use super::*;
 
     fn db(tag: &str) -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         std::env::temp_dir().join(format!(
-            "atomic-store-{tag}-{}-{}.db",
+            "atomic-store-{tag}-{}-{}-{}.db",
             std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
