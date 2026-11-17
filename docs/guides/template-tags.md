@@ -264,7 +264,9 @@ What to know about this form:
   `atomic check --fix` escapes every loose `<` and `{` in a file and changes
   nothing else. Comments are `{/* like this */}`, not `<!-- -->`.
 - **The file stays valid MDX.** Formatters, editor extensions and other MDX
-  tools read an `.atom.mdx` file as they read any MDX file.
+  tools read an `.atom.mdx` file as they read any MDX file. See
+  [set up VS Code](vs-code.md#edit-atom-files) for the one setting the MDX
+  extension needs.
 - **One form per file.** An atom cannot exist as both `review.atom.md` and
   `review.atom.mdx`, and the two tag styles cannot be mixed in one file. A partial
   follows its own extension, so an `.atom.mdx` atom can include a `.md` partial.

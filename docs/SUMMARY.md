@@ -17,6 +17,7 @@
   - [Code and build apps](guides/coding-with-atomic.md)
   - [Watch, steer and approve agents](guides/controlling-agents.md)
   - [Project structure](guides/project-structure.md)
+  - [Set up VS Code](guides/vs-code.md)
   - [Test and improve an atom](guides/testing-and-evals.md)
   - [Template tags and the JSX-style form](guides/template-tags.md)
   - [Diagrams with Mermaid](guides/diagrams.md)
