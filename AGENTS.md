@@ -109,10 +109,10 @@ scripts/dev.sh cargo clippy --workspace --all-targets --locked -- -D warnings
 scripts/dev.sh cargo test -p atomic-agentic-core --lib --features fake-model   # one crate
 ```
 
-CI runs the same build, fmt, clippy and tests, plus these checks, but only
-when started by hand: run everything locally first and spend a CI run only
-when a hosted result is needed (macOS minutes cost ten times Linux's, so it
-is opt-in). These checks also run locally:
+CI runs the same build, fmt, clippy and tests, plus these checks, on Linux
+for every push to main and every pull request; macOS runs only when the
+workflow is started by hand with its `macos` input. Run everything locally
+first. These checks also run locally:
 
 ```bash
 scripts/codex-pin.sh check     # the [patch] block and toolchain match deps/codex.toml
