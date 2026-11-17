@@ -522,6 +522,9 @@ version = "0.0.0"
 dependencies = [
  "atomic-agentic-core",
  "atomic-agentic-schema",
+ "jsonschema",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
