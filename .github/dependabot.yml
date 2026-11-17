@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Dependabot keeps the SHA-pinned GitHub Actions current. Cargo is left out on
+# purpose: crates shared with Codex must keep Codex's locked versions
+# (scripts/lock-check.sh), so Rust dependencies move with the Codex pin
+# (scripts/codex-bump.sh), and RustSec advisories are reported by cargo-deny in
+# CI. Dependabot alerts still cover Cargo.lock.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "CI:"
