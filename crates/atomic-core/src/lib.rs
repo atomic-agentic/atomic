@@ -10,6 +10,7 @@ pub mod codex;
 pub mod collections;
 pub mod compile;
 pub mod config;
+pub mod failure;
 pub mod lite;
 pub mod project;
 pub mod render;
