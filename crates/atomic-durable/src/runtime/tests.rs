@@ -436,3 +436,53 @@ async fn a_newer_store_is_refused_untouched() {
     );
     pool.close().await;
 }
+
+/// On PostgreSQL too, a schema written by a newer atomic is refused before
+/// anything is created in it.
+#[cfg(feature = "postgres-tests")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_newer_postgres_store_is_refused_untouched() {
+    let url = std::env::var("ATOMIC_TEST_DATABASE_URL")
+        .expect("the postgres-tests feature needs ATOMIC_TEST_DATABASE_URL");
+    let schema = unique("atomic_newer");
+    let rt = Durare::postgres(&url, &schema)
+        .await
+        .expect("a current store");
+    rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+    let pool = sqlx::PgPool::connect(&url).await.expect("pool");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE {schema}.atomic_store_version SET version = 999"
+    )))
+    .execute(&pool)
+    .await
+    .expect("mark newer");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP TABLE {schema}.atomic_threads"
+    )))
+    .execute(&pool)
+    .await
+    .expect("drop a table the runtime would create");
+    let tables = |pool: sqlx::PgPool, schema: String| async move {
+        let n: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = $1",
+        )
+        .bind(schema)
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+        n.0
+    };
+    let before = tables(pool.clone(), schema.clone()).await;
+    let opened = Durare::postgres(&url, &schema).await;
+    assert!(
+        matches!(&opened, Err(DurableError::Engine(m)) if m.contains("999")),
+        "refused: {:?}",
+        opened.as_ref().err()
+    );
+    assert_eq!(
+        tables(pool.clone(), schema).await,
+        before,
+        "nothing was created"
+    );
+    pool.close().await;
+}

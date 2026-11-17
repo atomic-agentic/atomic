@@ -433,8 +433,13 @@ impl Durare {
         Self::over(Arc::new(provider), Reads::Sqlite(reads)).await
     }
 
-    /// An engine on PostgreSQL at `url`, in `schema`.
+    /// An engine on PostgreSQL at `url`, in `schema`. As on SQLite, the
+    /// store's version is checked first, and a schema written by a newer
+    /// atomic is refused before anything is created in it.
     pub async fn postgres(url: &str, schema: &str) -> Result<Self> {
+        crate::store::open_postgres(url, schema)
+            .await
+            .map_err(|e| DurableError::Engine(e.to_string()))?;
         let provider = durare::PostgresProvider::connect_with_schema(url, schema)
             .await
             .map_err(from_durare)?;
