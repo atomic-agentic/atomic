@@ -11,6 +11,8 @@ members = [
     "crates/atomic-graph",
     "crates/atomic-schema",
 ]
+# Builds upstream durare's own sqlx 0.8 graph to dump its schema; see its manifest.
+exclude = ["crates/atomic-durable/tests/dbos_schema/upstream"]
 
 [workspace.package]
 version = "0.0.0"

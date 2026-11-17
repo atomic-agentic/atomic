@@ -1,0 +1,203 @@
+column application_versions.version_id #1 text null=NO default=
+column application_versions.version_name #2 text null=NO default=
+column application_versions.version_timestamp #3 bigint null=NO default=((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint
+column application_versions.created_at #4 bigint null=NO default=((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint
+column dbos_migrations.version #1 bigint null=NO default=
+column event_dispatch_kv.service_name #1 text null=NO default=
+column event_dispatch_kv.workflow_fn_name #2 text null=NO default=
+column event_dispatch_kv.key #3 text null=NO default=
+column event_dispatch_kv.value #4 text null=YES default=
+column event_dispatch_kv.update_seq #5 numeric null=YES default=
+column event_dispatch_kv.update_time #6 numeric null=YES default=
+column notifications.destination_uuid #1 text null=NO default=
+column notifications.topic #2 text null=YES default=
+column notifications.message #3 text null=NO default=
+column notifications.created_at_epoch_ms #4 bigint null=NO default=((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint
+column notifications.message_uuid #5 text null=NO default=gen_random_uuid()
+column notifications.serialization #6 text null=YES default=
+column notifications.consumed #7 boolean null=NO default=false
+column operation_outputs.workflow_uuid #1 text null=NO default=
+column operation_outputs.function_id #2 integer null=NO default=
+column operation_outputs.function_name #3 text null=NO default=''::text
+column operation_outputs.output #4 text null=YES default=
+column operation_outputs.error #5 text null=YES default=
+column operation_outputs.child_workflow_id #6 text null=YES default=
+column operation_outputs.started_at_epoch_ms #7 bigint null=YES default=
+column operation_outputs.completed_at_epoch_ms #8 bigint null=YES default=
+column operation_outputs.serialization #9 text null=YES default=
+column queues.queue_id #1 text null=NO default=(gen_random_uuid())::text
+column queues.name #2 text null=NO default=
+column queues.concurrency #3 integer null=YES default=
+column queues.worker_concurrency #4 integer null=YES default=
+column queues.rate_limit_max #5 integer null=YES default=
+column queues.rate_limit_period_sec #6 double precision null=YES default=
+column queues.priority_enabled #7 boolean null=NO default=false
+column queues.partition_queue #8 boolean null=NO default=false
+column queues.polling_interval_sec #9 double precision null=NO default=1.0
+column queues.created_at #10 bigint null=NO default=((EXTRACT(epoch FROM now()) * 1000.0))::bigint
+column queues.updated_at #11 bigint null=NO default=((EXTRACT(epoch FROM now()) * 1000.0))::bigint
+column streams.workflow_uuid #1 text null=NO default=
+column streams.key #2 text null=NO default=
+column streams.value #3 text null=NO default=
+column streams.offset #4 integer null=NO default=
+column streams.function_id #5 integer null=NO default=0
+column streams.serialization #6 text null=YES default=
+column workflow_events.workflow_uuid #1 text null=NO default=
+column workflow_events.key #2 text null=NO default=
+column workflow_events.value #3 text null=NO default=
+column workflow_events.serialization #4 text null=YES default=
+column workflow_events_history.workflow_uuid #1 text null=NO default=
+column workflow_events_history.function_id #2 integer null=NO default=
+column workflow_events_history.key #3 text null=NO default=
+column workflow_events_history.value #4 text null=NO default=
+column workflow_events_history.serialization #5 text null=YES default=
+column workflow_schedules.schedule_id #1 text null=NO default=
+column workflow_schedules.schedule_name #2 text null=NO default=
+column workflow_schedules.workflow_name #3 text null=NO default=
+column workflow_schedules.workflow_class_name #4 text null=YES default=
+column workflow_schedules.schedule #5 text null=NO default=
+column workflow_schedules.status #6 text null=NO default='ACTIVE'::text
+column workflow_schedules.context #7 text null=NO default=
+column workflow_schedules.last_fired_at #8 text null=YES default=
+column workflow_schedules.automatic_backfill #9 boolean null=NO default=false
+column workflow_schedules.cron_timezone #10 text null=YES default=
+column workflow_schedules.queue_name #11 text null=YES default=
+column workflow_status.workflow_uuid #1 text null=NO default=
+column workflow_status.status #2 text null=YES default=
+column workflow_status.name #3 text null=YES default=
+column workflow_status.authenticated_user #4 text null=YES default=
+column workflow_status.assumed_role #5 text null=YES default=
+column workflow_status.authenticated_roles #6 text null=YES default=
+column workflow_status.request #7 text null=YES default=
+column workflow_status.output #8 text null=YES default=
+column workflow_status.error #9 text null=YES default=
+column workflow_status.executor_id #10 text null=YES default=
+column workflow_status.created_at #11 bigint null=NO default=((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint
+column workflow_status.updated_at #12 bigint null=NO default=((EXTRACT(epoch FROM now()) * (1000)::numeric))::bigint
+column workflow_status.application_version #13 text null=YES default=
+column workflow_status.application_id #14 text null=YES default=
+column workflow_status.class_name #15 character varying null=YES default=NULL::character varying
+column workflow_status.config_name #16 character varying null=YES default=NULL::character varying
+column workflow_status.recovery_attempts #17 bigint null=YES default=0
+column workflow_status.queue_name #18 text null=YES default=
+column workflow_status.workflow_timeout_ms #19 bigint null=YES default=
+column workflow_status.workflow_deadline_epoch_ms #20 bigint null=YES default=
+column workflow_status.inputs #21 text null=YES default=
+column workflow_status.started_at_epoch_ms #22 bigint null=YES default=
+column workflow_status.deduplication_id #23 text null=YES default=
+column workflow_status.priority #24 integer null=NO default=0
+column workflow_status.queue_partition_key #25 text null=YES default=
+column workflow_status.forked_from #26 text null=YES default=
+column workflow_status.owner_xid #27 text null=YES default=
+column workflow_status.parent_workflow_id #28 text null=YES default=
+column workflow_status.serialization #29 text null=YES default=
+column workflow_status.delay_until_epoch_ms #30 bigint null=YES default=
+column workflow_status.was_forked_from #31 boolean null=NO default=false
+column workflow_status.rate_limited #32 boolean null=NO default=false
+column workflow_status.completed_at #33 bigint null=YES default=
+column workflow_status.attributes #34 jsonb null=YES default=
+column workflow_status.schedule_name #35 text null=YES default=
+column workflow_status.debounce_deadline_epoch_ms #36 bigint null=YES default=
+column workflow_status.is_debounced #37 boolean null=NO default=false
+index application_versions application_versions_pkey: CREATE UNIQUE INDEX application_versions_pkey ON <schema>.application_versions USING btree (version_id)
+index application_versions application_versions_version_name_key: CREATE UNIQUE INDEX application_versions_version_name_key ON <schema>.application_versions USING btree (version_name)
+index dbos_migrations dbos_migrations_pkey: CREATE UNIQUE INDEX dbos_migrations_pkey ON <schema>.dbos_migrations USING btree (version)
+index event_dispatch_kv event_dispatch_kv_pkey: CREATE UNIQUE INDEX event_dispatch_kv_pkey ON <schema>.event_dispatch_kv USING btree (service_name, workflow_fn_name, key)
+index notifications idx_notifications: CREATE INDEX idx_notifications ON <schema>.notifications USING btree (destination_uuid, topic)
+index notifications idx_workflow_topic: CREATE INDEX idx_workflow_topic ON <schema>.notifications USING btree (destination_uuid, topic)
+index notifications notifications_pkey: CREATE UNIQUE INDEX notifications_pkey ON <schema>.notifications USING btree (message_uuid)
+index operation_outputs idx_operation_outputs_completed_at_function_name: CREATE INDEX idx_operation_outputs_completed_at_function_name ON <schema>.operation_outputs USING btree (completed_at_epoch_ms, function_name)
+index operation_outputs operation_outputs_pkey: CREATE UNIQUE INDEX operation_outputs_pkey ON <schema>.operation_outputs USING btree (workflow_uuid, function_id)
+index queues queues_name_key: CREATE UNIQUE INDEX queues_name_key ON <schema>.queues USING btree (name)
+index queues queues_pkey: CREATE UNIQUE INDEX queues_pkey ON <schema>.queues USING btree (queue_id)
+index streams streams_pkey: CREATE UNIQUE INDEX streams_pkey ON <schema>.streams USING btree (workflow_uuid, key, "offset")
+index workflow_events workflow_events_pkey: CREATE UNIQUE INDEX workflow_events_pkey ON <schema>.workflow_events USING btree (workflow_uuid, key)
+index workflow_events_history workflow_events_history_pkey: CREATE UNIQUE INDEX workflow_events_history_pkey ON <schema>.workflow_events_history USING btree (workflow_uuid, function_id, key)
+index workflow_schedules workflow_schedules_pkey: CREATE UNIQUE INDEX workflow_schedules_pkey ON <schema>.workflow_schedules USING btree (schedule_id)
+index workflow_schedules workflow_schedules_schedule_name_key: CREATE UNIQUE INDEX workflow_schedules_schedule_name_key ON <schema>.workflow_schedules USING btree (schedule_name)
+index workflow_status idx_workflow_status_attributes: CREATE INDEX idx_workflow_status_attributes ON <schema>.workflow_status USING gin (attributes) WHERE (attributes IS NOT NULL)
+index workflow_status idx_workflow_status_completed_at: CREATE INDEX idx_workflow_status_completed_at ON <schema>.workflow_status USING btree (completed_at) WHERE (completed_at IS NOT NULL)
+index workflow_status idx_workflow_status_delayed: CREATE INDEX idx_workflow_status_delayed ON <schema>.workflow_status USING btree (delay_until_epoch_ms) WHERE (status = 'DELAYED'::text)
+index workflow_status idx_workflow_status_failed: CREATE INDEX idx_workflow_status_failed ON <schema>.workflow_status USING btree (status, created_at) WHERE (status = ANY (ARRAY['ERROR'::text, 'CANCELLED'::text, 'MAX_RECOVERY_ATTEMPTS_EXCEEDED'::text]))
+index workflow_status idx_workflow_status_forked_from: CREATE INDEX idx_workflow_status_forked_from ON <schema>.workflow_status USING btree (forked_from) WHERE (forked_from IS NOT NULL)
+index workflow_status idx_workflow_status_in_flight: CREATE INDEX idx_workflow_status_in_flight ON <schema>.workflow_status USING btree (queue_name, status, priority, created_at) WHERE (status = ANY (ARRAY['ENQUEUED'::text, 'PENDING'::text]))
+index workflow_status idx_workflow_status_parent_workflow_id: CREATE INDEX idx_workflow_status_parent_workflow_id ON <schema>.workflow_status USING btree (parent_workflow_id) WHERE (parent_workflow_id IS NOT NULL)
+index workflow_status idx_workflow_status_pending: CREATE INDEX idx_workflow_status_pending ON <schema>.workflow_status USING btree (created_at) WHERE (status = 'PENDING'::text)
+index workflow_status idx_workflow_status_rate_limited: CREATE INDEX idx_workflow_status_rate_limited ON <schema>.workflow_status USING btree (queue_name, started_at_epoch_ms) WHERE (rate_limited = true)
+index workflow_status idx_workflow_status_schedule_name: CREATE INDEX idx_workflow_status_schedule_name ON <schema>.workflow_status USING btree (schedule_name) WHERE (schedule_name IS NOT NULL)
+index workflow_status idx_workflow_status_started_at: CREATE INDEX idx_workflow_status_started_at ON <schema>.workflow_status USING btree (started_at_epoch_ms) WHERE (started_at_epoch_ms IS NOT NULL)
+index workflow_status uq_workflow_status_dedup_id: CREATE UNIQUE INDEX uq_workflow_status_dedup_id ON <schema>.workflow_status USING btree (queue_name, deduplication_id) WHERE (deduplication_id IS NOT NULL)
+index workflow_status workflow_status_created_at_index: CREATE INDEX workflow_status_created_at_index ON <schema>.workflow_status USING btree (created_at)
+index workflow_status workflow_status_pkey: CREATE UNIQUE INDEX workflow_status_pkey ON <schema>.workflow_status USING btree (workflow_uuid)
+constraint application_versions application_versions_created_at_not_null: NOT NULL created_at
+constraint application_versions application_versions_pkey: PRIMARY KEY (version_id)
+constraint application_versions application_versions_version_id_not_null: NOT NULL version_id
+constraint application_versions application_versions_version_name_key: UNIQUE (version_name)
+constraint application_versions application_versions_version_name_not_null: NOT NULL version_name
+constraint application_versions application_versions_version_timestamp_not_null: NOT NULL version_timestamp
+constraint dbos_migrations dbos_migrations_pkey: PRIMARY KEY (version)
+constraint dbos_migrations dbos_migrations_version_not_null: NOT NULL version
+constraint event_dispatch_kv event_dispatch_kv_key_not_null: NOT NULL key
+constraint event_dispatch_kv event_dispatch_kv_pkey: PRIMARY KEY (service_name, workflow_fn_name, key)
+constraint event_dispatch_kv event_dispatch_kv_service_name_not_null: NOT NULL service_name
+constraint event_dispatch_kv event_dispatch_kv_workflow_fn_name_not_null: NOT NULL workflow_fn_name
+constraint notifications notifications_consumed_not_null: NOT NULL consumed
+constraint notifications notifications_created_at_epoch_ms_not_null: NOT NULL created_at_epoch_ms
+constraint notifications notifications_destination_uuid_fkey: FOREIGN KEY (destination_uuid) REFERENCES workflow_status(workflow_uuid) ON UPDATE CASCADE ON DELETE CASCADE
+constraint notifications notifications_destination_uuid_not_null: NOT NULL destination_uuid
+constraint notifications notifications_message_not_null: NOT NULL message
+constraint notifications notifications_message_uuid_not_null: NOT NULL message_uuid
+constraint notifications notifications_pkey: PRIMARY KEY (message_uuid)
+constraint operation_outputs operation_outputs_function_id_not_null: NOT NULL function_id
+constraint operation_outputs operation_outputs_function_name_not_null: NOT NULL function_name
+constraint operation_outputs operation_outputs_pkey: PRIMARY KEY (workflow_uuid, function_id)
+constraint operation_outputs operation_outputs_workflow_uuid_fkey: FOREIGN KEY (workflow_uuid) REFERENCES workflow_status(workflow_uuid) ON UPDATE CASCADE ON DELETE CASCADE
+constraint operation_outputs operation_outputs_workflow_uuid_not_null: NOT NULL workflow_uuid
+constraint queues queues_created_at_not_null: NOT NULL created_at
+constraint queues queues_name_key: UNIQUE (name)
+constraint queues queues_name_not_null: NOT NULL name
+constraint queues queues_partition_queue_not_null: NOT NULL partition_queue
+constraint queues queues_pkey: PRIMARY KEY (queue_id)
+constraint queues queues_polling_interval_sec_not_null: NOT NULL polling_interval_sec
+constraint queues queues_priority_enabled_not_null: NOT NULL priority_enabled
+constraint queues queues_queue_id_not_null: NOT NULL queue_id
+constraint queues queues_updated_at_not_null: NOT NULL updated_at
+constraint streams streams_function_id_not_null: NOT NULL function_id
+constraint streams streams_key_not_null: NOT NULL key
+constraint streams streams_offset_not_null: NOT NULL "offset"
+constraint streams streams_pkey: PRIMARY KEY (workflow_uuid, key, "offset")
+constraint streams streams_value_not_null: NOT NULL value
+constraint streams streams_workflow_uuid_fkey: FOREIGN KEY (workflow_uuid) REFERENCES workflow_status(workflow_uuid) ON UPDATE CASCADE ON DELETE CASCADE
+constraint streams streams_workflow_uuid_not_null: NOT NULL workflow_uuid
+constraint workflow_events workflow_events_key_not_null: NOT NULL key
+constraint workflow_events workflow_events_pkey: PRIMARY KEY (workflow_uuid, key)
+constraint workflow_events workflow_events_value_not_null: NOT NULL value
+constraint workflow_events workflow_events_workflow_uuid_fkey: FOREIGN KEY (workflow_uuid) REFERENCES workflow_status(workflow_uuid) ON UPDATE CASCADE ON DELETE CASCADE
+constraint workflow_events workflow_events_workflow_uuid_not_null: NOT NULL workflow_uuid
+constraint workflow_events_history workflow_events_history_function_id_not_null: NOT NULL function_id
+constraint workflow_events_history workflow_events_history_key_not_null: NOT NULL key
+constraint workflow_events_history workflow_events_history_pkey: PRIMARY KEY (workflow_uuid, function_id, key)
+constraint workflow_events_history workflow_events_history_value_not_null: NOT NULL value
+constraint workflow_events_history workflow_events_history_workflow_uuid_fkey: FOREIGN KEY (workflow_uuid) REFERENCES workflow_status(workflow_uuid) ON UPDATE CASCADE ON DELETE CASCADE
+constraint workflow_events_history workflow_events_history_workflow_uuid_not_null: NOT NULL workflow_uuid
+constraint workflow_schedules workflow_schedules_automatic_backfill_not_null: NOT NULL automatic_backfill
+constraint workflow_schedules workflow_schedules_context_not_null: NOT NULL context
+constraint workflow_schedules workflow_schedules_pkey: PRIMARY KEY (schedule_id)
+constraint workflow_schedules workflow_schedules_schedule_id_not_null: NOT NULL schedule_id
+constraint workflow_schedules workflow_schedules_schedule_name_key: UNIQUE (schedule_name)
+constraint workflow_schedules workflow_schedules_schedule_name_not_null: NOT NULL schedule_name
+constraint workflow_schedules workflow_schedules_schedule_not_null: NOT NULL schedule
+constraint workflow_schedules workflow_schedules_status_not_null: NOT NULL status
+constraint workflow_schedules workflow_schedules_workflow_name_not_null: NOT NULL workflow_name
+constraint workflow_status workflow_status_created_at_not_null: NOT NULL created_at
+constraint workflow_status workflow_status_is_debounced_not_null: NOT NULL is_debounced
+constraint workflow_status workflow_status_pkey: PRIMARY KEY (workflow_uuid)
+constraint workflow_status workflow_status_priority_not_null: NOT NULL priority
+constraint workflow_status workflow_status_rate_limited_not_null: NOT NULL rate_limited
+constraint workflow_status workflow_status_updated_at_not_null: NOT NULL updated_at
+constraint workflow_status workflow_status_was_forked_from_not_null: NOT NULL was_forked_from
+constraint workflow_status workflow_status_workflow_uuid_not_null: NOT NULL workflow_uuid
+function enqueue_workflow(workflow_name text, queue_name text, positional_args json[], named_args json, class_name text, config_name text, workflow_id text, app_version text, timeout_ms bigint, deadline_epoch_ms bigint, deduplication_id text, priority integer, queue_partition_key text, authenticated_user text, authenticated_roles text, delay_until_epoch_ms bigint) returns text md5=87161ada6ed04c4d4049ce47a1a6b53d
+function notifications_function() returns trigger md5=ca9dc75730b02a8c0cc113a07cae5851
+function send_message(destination_id text, message json, topic text, message_id text) returns void md5=3331a477bb88f0092f6dbea87209debf
+trigger notifications dbos_notifications_trigger: CREATE TRIGGER dbos_notifications_trigger AFTER INSERT ON <schema>.notifications FOR EACH ROW EXECUTE FUNCTION notifications_function()
