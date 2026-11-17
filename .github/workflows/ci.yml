@@ -85,7 +85,7 @@ jobs:
       # missing database fails them rather than skipping.
       - name: Test (Linux, with Postgres)
         if: runner.os == 'Linux'
-        run: cargo test --workspace --locked --features atomic-durable/postgres-tests
+        run: cargo test --workspace --locked --features atomic-agentic-durable/postgres-tests
       - name: Test (macOS)
         if: runner.os == 'macOS'
         run: cargo test --workspace --locked

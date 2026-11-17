@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 [package]
-name = "atomic-atoms"
+name = "atomic-agentic-atoms"
 description = "Built-in atoms for atomic."
 version.workspace = true
 edition.workspace = true

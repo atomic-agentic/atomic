@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 [package]
-name = "atomic-graph"
+name = "atomic-agentic-graph"
 description = "atomic's work graph: items, edges, claims and messages."
 version.workspace = true
 edition.workspace = true

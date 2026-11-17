@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 [package]
-name = "atomic-schema"
+name = "atomic-agentic-schema"
 description = "Schema registry, lowering to generation profiles, and full-contract validation for atomic."
 version.workspace = true
 edition.workspace = true

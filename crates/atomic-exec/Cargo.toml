@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 [package]
-name = "atomic-exec"
+name = "atomic-agentic-exec"
 description = "The ExecutionBackend trait between atomic's control plane and its runners, with the local backend."
 version.workspace = true
 edition.workspace = true

@@ -64,7 +64,9 @@ These are the rules that are easiest to break:
 
 - **One Cargo workspace, one binary.** Crates: `atomic-core`, `atomic-durable`,
   `atomic-atoms`, `atomic-graph`, `atomic-schema`, `atomic-exec` and the
-  `atomic` binary.
+  `atomic` binary. Their packages are named `atomic-agentic-*` (the binary's is
+  `atomic-agentic`); the workspace aliases them to the short names used in
+  code, so pass the package name to `cargo -p`.
 - **Codex only behind `atomic-core`.** Depend on the Codex crates at one pinned
   git rev and never fork Codex core. The workspace copies Codex's
   `[patch.crates-io]` block verbatim.

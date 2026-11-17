@@ -22,12 +22,14 @@ repository = "https://github.com/atomic-agentic/atomic"
 publish = false
 
 [workspace.dependencies]
-atomic-atoms = { path = "crates/atomic-atoms" }
-atomic-core = { path = "crates/atomic-core" }
-atomic-durable = { path = "crates/atomic-durable" }
-atomic-exec = { path = "crates/atomic-exec" }
-atomic-graph = { path = "crates/atomic-graph" }
-atomic-schema = { path = "crates/atomic-schema" }
+# Packages are named atomic-agentic-*, the project's name on crates.io; these
+# aliases keep the short names in code (`use atomic_core::...`).
+atomic-atoms = { path = "crates/atomic-atoms", package = "atomic-agentic-atoms" }
+atomic-core = { path = "crates/atomic-core", package = "atomic-agentic-core" }
+atomic-durable = { path = "crates/atomic-durable", package = "atomic-agentic-durable" }
+atomic-exec = { path = "crates/atomic-exec", package = "atomic-agentic-exec" }
+atomic-graph = { path = "crates/atomic-graph", package = "atomic-agentic-graph" }
+atomic-schema = { path = "crates/atomic-schema", package = "atomic-agentic-schema" }
 
 # atomic's fork of durare, at the revision in deps/durare.toml. Only
 # atomic-durable may depend on it.

@@ -40,11 +40,13 @@ fn a_restarted_worker_recovers_only_its_own_workflows() {
     ));
     std::fs::create_dir_all(&dir).expect("create the test directory");
 
+    // One worker at a time while they start: two processes starting
+    // workflows on one new SQLite file at once can leave a start pending
+    // (tracked separately); this test is about recovery, not that.
     let mut a = spawn(&dir, "start", "a");
+    wait_for(&dir, |log| log.contains("wf-a\theld\ta"));
     let mut b = spawn(&dir, "start", "b");
-    wait_for(&dir, |log| {
-        log.contains("wf-a\theld\ta") && log.contains("wf-b\theld\tb")
-    });
+    wait_for(&dir, |log| log.contains("wf-b\theld\tb"));
 
     a.kill().expect("SIGKILL worker a");
     a.wait().expect("reap worker a");

@@ -474,43 +474,43 @@ dependencies = [
 
 [[package]]
 name = "atomic"
-version = "0.0.0"
-dependencies = [
- "atomic-atoms",
- "atomic-core",
- "atomic-durable",
- "atomic-exec",
- "atomic-graph",
- "atomic-schema",
-]
-
-[[package]]
-name = "atomic"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c59bdb34bc650a32731b31bd8f0829cc15d24a708ee31559e0bb34f2bc320cba"
 
 [[package]]
-name = "atomic-atoms"
+name = "atomic-agentic"
 version = "0.0.0"
 dependencies = [
- "atomic-core",
- "atomic-schema",
+ "atomic-agentic-atoms",
+ "atomic-agentic-core",
+ "atomic-agentic-durable",
+ "atomic-agentic-exec",
+ "atomic-agentic-graph",
+ "atomic-agentic-schema",
 ]
 
 [[package]]
-name = "atomic-core"
+name = "atomic-agentic-atoms"
 version = "0.0.0"
 dependencies = [
- "atomic-exec",
- "atomic-schema",
+ "atomic-agentic-core",
+ "atomic-agentic-schema",
+]
+
+[[package]]
+name = "atomic-agentic-core"
+version = "0.0.0"
+dependencies = [
+ "atomic-agentic-exec",
+ "atomic-agentic-schema",
  "codex-app-server",
  "codex-core-api",
  "codex-extension-api",
 ]
 
 [[package]]
-name = "atomic-durable"
+name = "atomic-agentic-durable"
 version = "0.0.0"
 dependencies = [
  "durare",
@@ -521,11 +521,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "atomic-exec"
+name = "atomic-agentic-exec"
 version = "0.0.0"
 
 [[package]]
-name = "atomic-graph"
+name = "atomic-agentic-graph"
+version = "0.0.0"
+
+[[package]]
+name = "atomic-agentic-schema"
 version = "0.0.0"
 
 [[package]]
@@ -536,10 +540,6 @@ checksum = "8cf2bce30dfe09ef0bfaef228b9d414faaf7e563035494d7fe092dba54b300f4"
 dependencies = [
  "critical-section",
 ]
-
-[[package]]
-name = "atomic-schema"
-version = "0.0.0"
 
 [[package]]
 name = "atomic-waker"
@@ -8007,7 +8007,7 @@ version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ebf3631712f5b790675292ff827af269f5d9f920c920b77dc41d0485e3719612"
 dependencies = [
- "atomic 0.5.3",
+ "atomic",
  "parking_lot",
 ]
 

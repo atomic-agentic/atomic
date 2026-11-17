@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 [package]
-name = "atomic"
+name = "atomic-agentic"
 description = "The atomic command-line program: workflows, the operator CLI and the server."
 version.workspace = true
 edition.workspace = true
