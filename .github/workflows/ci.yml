@@ -1,14 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 #
-# Linux and macOS are first-class platforms, so every check runs on both.
-# Actions are pinned by commit SHA.
+# Linux and macOS are first-class platforms. While atomic is built out, CI
+# runs only when started by hand (Actions > CI > Run workflow): checks run
+# locally through scripts/dev.sh first, and a run is spent only when a hosted
+# result is needed. A run covers Linux; tick "macos" to add macOS, whose
+# minutes cost ten times as much. Actions are pinned by commit SHA.
 
 name: CI
 
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_dispatch:
+    inputs:
+      macos:
+        description: Also run the Rust job on macOS
+        type: boolean
+        default: false
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -86,7 +92,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-15]
+        os: ${{ fromJSON(inputs.macos && '["ubuntu-24.04", "macos-15"]' || '["ubuntu-24.04"]') }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

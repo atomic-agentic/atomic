@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Move atomic's Codex pin to another Codex release tag, as the first step of a
-# bump. Run it on a branch named codex-bump/<tag> and push: the Codex bump
-# workflow then rebuilds the durare fork against the candidate's sqlx and
-# reports which milestone suites pass.
+# bump. Run it on a branch named codex-bump/<tag>, push, and start the Codex
+# bump workflow on that branch by hand: it rebuilds the durare fork against
+# the candidate's sqlx and reports which milestone suites pass.
 #
 #   scripts/codex-bump.sh rust-v0.170.0
 #
@@ -76,9 +76,9 @@ toolchain ${OLD_TOOLCHAIN} -> ${TOOLCHAIN}
 sqlx fork ${OLD_SQLX:0:9} -> ${SQLX:0:9}$([ "${OLD_SQLX}" = "${SQLX}" ] && echo " (unchanged)")
 
 Next:
-  - commit on a branch named codex-bump/${TAG} and push it; the Codex bump
-    workflow rebuilds the durare fork at sqlx ${SQLX:0:9} and runs the
-    milestone suites;
+  - commit on a branch named codex-bump/${TAG}, push it and start the Codex
+    bump workflow on it by hand (no tag); it rebuilds the durare fork at
+    sqlx ${SQLX:0:9} and runs the milestone suites;
   - commit the Cargo.lock that workflow uploads, then fix what lock-check
     reports in deps/lock-exceptions.toml;
 EOF

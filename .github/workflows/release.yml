@@ -3,10 +3,9 @@
 # A version tag (v<version>, equal to the atomic-agentic package's version)
 # builds the atomic binary for Linux and macOS, packages each with its licences
 # and its CycloneDX SBOM, and attaches them to a draft GitHub release for a
-# maintainer to publish. A push to a release-check/* branch, or a manual run,
-# does the same build and packaging and keeps the results as workflow
-# artifacts, with no release. (Not on pull requests: a path filter there sees
-# the whole pull request, so it would build both platforms on every push.)
+# maintainer to publish. A manual run on any branch does the same build and
+# packaging and keeps the results as workflow artifacts, with no release.
+# Nothing else starts it: each run builds both platforms in release mode.
 # Actions are pinned by commit SHA.
 
 name: Release
@@ -14,7 +13,6 @@ name: Release
 on:
   push:
     tags: ["v*"]
-    branches: ["release-check/**"]
   workflow_dispatch:
 
 concurrency:

@@ -95,7 +95,7 @@ A release starts from a tag `v<version>` whose version equals the
 4. attaches the archives, the SBOMs and a `SHA256SUMS` file to a draft GitHub
    release, which a maintainer reviews and publishes.
 
-A push to a `release-check/*` branch, or a manual run of the workflow, does
+A manual run of the workflow on any branch does
 steps 1 to 3 and keeps the results as workflow artifacts. To package a build
 locally:
 
@@ -123,14 +123,14 @@ scripts/codex-bump.sh rust-v0.170.0   # rewrites the pins and reseeds Cargo.lock
 git commit -am "Bump Codex to rust-v0.170.0" && git push -u origin HEAD
 ```
 
-Pushing a `codex-bump/*` branch runs the Codex bump workflow. It rebuilds and
-tests the durare fork against the candidate's sqlx and toolchain, then builds
-atomic and runs `scripts/milestone-tests.sh`, whose table in the job summary
-shows which milestone suites pass at the candidate. The same workflow runs on
-the first of each month against Codex's latest release, and by hand with any
-tag. To finish a bump, commit the `Cargo.lock` the workflow uploads, account
-for what `scripts/lock-check.sh` reports, and follow the other steps the
-script prints.
+Then start the Codex bump workflow by hand on that branch (Actions > Codex
+bump > Run workflow, with no tag). It rebuilds and tests the durare fork
+against the candidate's sqlx and toolchain, then builds atomic and runs
+`scripts/milestone-tests.sh`, whose table in the job summary shows which
+milestone suites pass at the candidate. Given a tag, or `latest` for Codex's
+latest release, it applies that candidate itself on any branch. To finish a
+bump, commit the `Cargo.lock` the workflow uploads, account for what
+`scripts/lock-check.sh` reports, and follow the other steps the script prints.
 
 `scripts/milestone-tests.sh` also runs locally:
 
