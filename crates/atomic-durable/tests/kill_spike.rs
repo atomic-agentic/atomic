@@ -103,7 +103,11 @@ fn a_hundred_random_kills_on_sqlite() {
         }
         match exited {
             Some(status) => {
-                assert!(status.success(), "a work child failed on its own: {status}");
+                let errors = std::fs::read_to_string(dir.join("errors.log")).unwrap_or_default();
+                assert!(
+                    status.success(),
+                    "a work child failed on its own: {status}\n{errors}"
+                );
                 finished_early += 1;
             }
             None => {
@@ -179,6 +183,14 @@ fn spike_child() {
     let result = runtime.block_on(child_main(&dir, &role, round));
     if let Err(e) = result {
         eprintln!("child error: {e}");
+        // Work children's output is discarded; keep their errors for the parent.
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("errors.log"))
+        {
+            let _ = f.write_all(format!("{role} child (round {round}): {e:?}\n").as_bytes());
+        }
         std::process::exit(1);
     }
 }

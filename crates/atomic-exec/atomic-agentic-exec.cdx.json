@@ -1,0 +1,62 @@
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.5",
+  "version": 1,
+  "serialNumber": "urn:uuid:58703b51-be87-445b-b2f7-3c8b4d204f35",
+  "metadata": {
+    "timestamp": "2026-11-17T09:33:35.484783158Z",
+    "tools": [
+      {
+        "vendor": "CycloneDX",
+        "name": "cargo-cyclonedx",
+        "version": "0.5.10"
+      }
+    ],
+    "component": {
+      "type": "library",
+      "bom-ref": "path+file:///home/eric/GitHub/atomic/crates/atomic-exec#atomic-agentic-exec@0.0.0",
+      "name": "atomic-agentic-exec",
+      "version": "0.0.0",
+      "description": "The ExecutionBackend trait between atomic's control plane and its runners, with the local backend.",
+      "scope": "required",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "purl": "pkg:cargo/atomic-agentic-exec@0.0.0?download_url=file://.",
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/atomic-agentic/atomic"
+        }
+      ],
+      "components": [
+        {
+          "type": "library",
+          "bom-ref": "path+file:///home/eric/GitHub/atomic/crates/atomic-exec#atomic-agentic-exec@0.0.0 bin-target-0",
+          "name": "atomic_exec",
+          "version": "0.0.0",
+          "licenses": [
+            {
+              "expression": "Apache-2.0"
+            }
+          ],
+          "purl": "pkg:cargo/atomic-agentic-exec@0.0.0?download_url=file://.#src/lib.rs"
+        }
+      ]
+    },
+    "properties": [
+      {
+        "name": "cdx:rustc:sbom:target:triple",
+        "value": "x86_64-unknown-linux-gnu"
+      }
+    ]
+  },
+  "components": [],
+  "dependencies": [
+    {
+      "ref": "path+file:///home/eric/GitHub/atomic/crates/atomic-exec#atomic-agentic-exec@0.0.0"
+    }
+  ]
+}
