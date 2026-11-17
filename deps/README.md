@@ -7,6 +7,7 @@ against it.
 | File | Upstream |
 | --- | --- |
 | [`codex.toml`](codex.toml) | [openai/codex](https://github.com/openai/codex), the `codex-rs` workspace |
+| [`lock-exceptions.toml`](lock-exceptions.toml) | Where `Cargo.lock` differs from Codex's lockfile at the pinned revision, each with its reason. `Cargo.lock` starts from Codex's, and `scripts/lock-check.sh` fails on any unlisted difference |
 | [`forks.toml`](forks.toml) | Every fork the build uses, with its pinned revision: the durare fork and the sqlx fork. `scripts/forks-check.sh` checks it against `Cargo.lock` |
 
 ## Codex

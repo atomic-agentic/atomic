@@ -1,0 +1,80 @@
+# Crates where atomic's Cargo.lock differs from Codex's Cargo.lock at the pinned
+# revision, each with the reason. Cargo.lock starts from Codex's lockfile, so
+# everything Codex builds resolves to the versions Codex tested; these are the
+# differences atomic's own dependencies force. scripts/lock-check.sh fails on
+# any difference not listed here, and on a listed one that no longer occurs.
+
+[[exception]]
+crate = "thiserror"
+version = "2.0.21"
+reason = "saphyr-parser 0.3.4 requires ^2.0.20"
+
+[[exception]]
+crate = "thiserror-impl"
+version = "2.0.21"
+reason = "thiserror 2.0.21 requires =2.0.21"
+
+[[exception]]
+crate = "uuid"
+version = "1.29.3"
+reason = "antlr4rust 0.6.0 (cel's parser) requires ^1.26.1"
+
+[[exception]]
+crate = "zmij"
+version = "1.0.23"
+reason = "jsonschema-value 0.61.2 requires ^1.0.23"
+
+[[exception]]
+crate = "regex-syntax"
+version = "0.8.11"
+reason = "jsonschema-regex 0.61.2 requires ^0.8.9"
+
+[[exception]]
+crate = "regex-automata"
+version = "0.4.18"
+reason = "fancy-regex 0.20.2 (jsonschema) requires ^0.4.16"
+
+[[exception]]
+crate = "num-bigint"
+version = "0.4.8"
+reason = "fraction 0.17.0 (jsonschema) requires ^0.4.8"
+
+[[exception]]
+crate = "borsh"
+version = "1.8.1"
+reason = "an optional dependency's lockfile entry with a ^1.7.0 floor; no atomic build uses it (cargo tree finds no user)"
+
+[[exception]]
+crate = "libredox"
+version = "0.1.25"
+reason = "Redox-only (filetime, redox_users); never built on Linux or macOS; requires ^0.1.16"
+
+[[exception]]
+crate = "redox_syscall"
+version = "0.9.5"
+reason = "Redox-only, beside Codex's versions, through libredox 0.1.25"
+
+[[exception]]
+crate = "base64"
+version = "0.21.7"
+reason = "an extra version beside Codex's, for durare"
+
+[[exception]]
+crate = "bit-set"
+version = "0.11.1"
+reason = "an extra version beside Codex's, for antlr4rust (cel's parser)"
+
+[[exception]]
+crate = "bit-vec"
+version = "0.10.2"
+reason = "an extra version beside Codex's, for bit-set 0.11.1"
+
+[[exception]]
+crate = "fancy-regex"
+version = "0.20.2"
+reason = "an extra version beside Codex's, for jsonschema 0.61.2"
+
+[[exception]]
+crate = "fluent-uri"
+version = "0.4.1"
+reason = "an extra version beside Codex's, for referencing 0.61.2 (jsonschema)"

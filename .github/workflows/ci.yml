@@ -37,6 +37,9 @@ jobs:
       - run: scripts/codex-pin.sh check
       # Fails when a fork in deps/forks.toml resolves from another revision.
       - run: scripts/forks-check.sh
+      # Fails when a crate shared with Codex leaves Codex's locked version
+      # without a reason in deps/lock-exceptions.toml.
+      - run: scripts/lock-check.sh
 
   rust:
     name: Rust (${{ matrix.os }})
