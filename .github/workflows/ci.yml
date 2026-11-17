@@ -20,6 +20,11 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
+  # Codex's patch block pulls rusty_v8 and its Chromium submodules; cargo's
+  # built-in git client has failed on those fetches on macOS runners, and the
+  # git command line is sturdier.
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  CARGO_NET_RETRY: "10"
 
 jobs:
   codex-pin:
