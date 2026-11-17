@@ -108,7 +108,7 @@ pub struct AtomError {
 
 /// Split `text` into frontmatter (with the line its first line is on) and body
 /// (with the line it starts on).
-fn split(text: &str) -> Option<(&str, &str, usize)> {
+pub(crate) fn split(text: &str) -> Option<(&str, &str, usize)> {
     let rest = text
         .strip_prefix("---\n")
         .or_else(|| text.strip_prefix("---\r\n"))?;

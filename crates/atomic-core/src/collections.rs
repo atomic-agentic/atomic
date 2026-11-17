@@ -8,10 +8,12 @@
 //! honouring `.gitignore`, the manifest's `ignore` globs and the generated
 //! directory, and stopping at any subdirectory that holds its own manifest.
 //! A file matched by several globs is found once. Two atoms, or two workflows,
-//! with one name are an error.
+//! with one name are an error, where a file's name is the `name` it declares,
+//! or else its file name.
 
 use crate::project::Project;
 use globset::{Glob, GlobSet, GlobSetBuilder};
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -86,6 +88,23 @@ fn default_name(collection: &str, relative: &Path) -> String {
         .map_or(rel.to_string(), |(stem, _)| stem.to_owned())
 }
 
+/// The name a file declares for itself, if any: `name` in an atom's
+/// frontmatter, or at a workflow's top level. A file that cannot be read or
+/// parsed declares none here; its loader reports what is wrong with it.
+fn declared_name(collection: &str, path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let yaml = match collection {
+        "atoms" => crate::atom::split(&text)?.0,
+        "workflows" => text.as_str(),
+        _ => return None,
+    };
+    let doc = atomic_schema::yaml::load(path, yaml).ok()?;
+    match doc.value.get("name")? {
+        Value::String(n) if !n.is_empty() => Some(n.clone()),
+        _ => None,
+    }
+}
+
 fn globset(collection: &str, globs: &[String]) -> Result<GlobSet, CollectError> {
     let mut b = GlobSetBuilder::new();
     for g in globs {
@@ -156,13 +175,15 @@ pub fn collect(project: &Project) -> Result<BTreeMap<String, Vec<SourceFile>>, C
         for (collection, set) in &sets {
             if set.is_match(relative) {
                 let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+                let name = declared_name(collection, &canonical)
+                    .unwrap_or_else(|| default_name(collection, relative));
                 found
                     .get_mut(collection)
                     .expect("every collection has a map")
                     .insert(
                         canonical.clone(),
                         SourceFile {
-                            name: default_name(collection, relative),
+                            name,
                             path: canonical,
                         },
                     );
