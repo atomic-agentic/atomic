@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[workspace]
+resolver = "3"
+members = [
+    "crates/atomic",
+    "crates/atomic-atoms",
+    "crates/atomic-core",
+    "crates/atomic-durable",
+    "crates/atomic-exec",
+    "crates/atomic-graph",
+    "crates/atomic-schema",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+# The toolchain Codex pins at the revision in deps/codex.toml.
+rust-version = "1.95.0"
+license = "Apache-2.0"
+repository = "https://github.com/atomic-agentic/atomic"
+publish = false
+
+[workspace.dependencies]
+atomic-atoms = { path = "crates/atomic-atoms" }
+atomic-core = { path = "crates/atomic-core" }
+atomic-durable = { path = "crates/atomic-durable" }
+atomic-exec = { path = "crates/atomic-exec" }
+atomic-graph = { path = "crates/atomic-graph" }
+atomic-schema = { path = "crates/atomic-schema" }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unwrap_used = "deny"

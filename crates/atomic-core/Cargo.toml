@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "atomic-core"
+description = "The Atom trait and the runtime that runs atoms on Codex. The only crate in atomic that depends on Codex."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+atomic-schema = { workspace = true }
+atomic-exec = { workspace = true }
