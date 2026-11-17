@@ -367,11 +367,16 @@ pub async fn run_declarative(
         }
         Ok(())
     };
+    // As for a typed atom: the atom's own model, then the project's default,
+    // then the endpoint's.
     let model = atom
         .frontmatter
         .get("model")
         .and_then(Value::as_str)
-        .map(str::to_owned);
+        .map(str::to_owned)
+        .or_else(|| backend.defaults().model.clone());
+    // A declarative atom is read-only unless it says otherwise; a project
+    // default never widens it.
     let sandbox = match atom.frontmatter.get("sandbox").and_then(Value::as_str) {
         Some("workspace-write") => crate::typed::Sandbox::WorkspaceWrite,
         _ => crate::typed::Sandbox::ReadOnly,

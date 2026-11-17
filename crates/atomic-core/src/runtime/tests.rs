@@ -405,3 +405,67 @@ fn a_declarative_atom_rejects_an_input_that_breaks_its_contract() {
         }
     });
 }
+
+/// The model resolves as the atom's own, then the runtime default, then the
+/// endpoint's, for lite and Codex declarative atoms alike.
+#[test]
+fn a_declarative_atom_takes_its_model_from_itself_then_the_defaults_then_the_endpoint() {
+    use crate::{atom, compile};
+    on_codex_runtime(async {
+        let dir = scratch("decl-model");
+        std::fs::create_dir_all(dir.join("atoms")).expect("mkdir");
+        std::fs::write(
+            dir.join("atoms/echo.input.schema.yaml"),
+            "type: object\nrequired: [text]\nproperties:\n  text: {type: string}\n",
+        )
+        .expect("input");
+        std::fs::write(
+            dir.join("atoms/echo.output.schema.yaml"),
+            "type: object\nadditionalProperties: false\nrequired: [text]\nproperties:\n  text: {type: string}\n",
+        )
+        .expect("output");
+        for kind in ["lite", "codex"] {
+            for (own, default, expected) in [
+                (Some("own-model"), Some("default-model"), "own-model"),
+                (None, Some("default-model"), "default-model"),
+                (None, None, "synthetic"),
+            ] {
+                let model_line = own.map(|m| format!("model: {m}\n")).unwrap_or_default();
+                std::fs::write(
+                    dir.join("atoms/echo.atom.md"),
+                    format!(
+                        "---\natomic: 1\ndescription: Echo.\nkind: {kind}\n{model_line}---\nSay {{% $input.text %}}\n"
+                    ),
+                )
+                .expect("atom");
+                let mut registry = Registry::new();
+                let a = atom::load(&dir.join("atoms/echo.atom.md"), &mut registry).expect("loads");
+                let compiled = compile::compile(&a, &registry).expect("compiles");
+                let model = FakeModel::start(vec![Reply::Text(r#"{"text": "hi"}"#.into())])
+                    .await
+                    .expect("fake model");
+                let mut rt = runtimes(&model, "decl-model");
+                rt.codex.defaults.model = default.map(str::to_owned);
+                rt.lite.defaults.model = default.map(str::to_owned);
+                let (_, meta) = run_declarative(
+                    &a,
+                    &compiled,
+                    &mut registry,
+                    &json!({"text": "hi"}),
+                    "run-1",
+                    "external",
+                    &rt,
+                )
+                .await
+                .expect("runs");
+                let case = format!("{kind}, own {own:?}, default {default:?}");
+                assert_eq!(meta.model, expected, "{case}: metadata");
+                assert_eq!(
+                    model.requests()[0]["model"],
+                    json!(expected),
+                    "{case}: the request"
+                );
+            }
+        }
+    });
+}
