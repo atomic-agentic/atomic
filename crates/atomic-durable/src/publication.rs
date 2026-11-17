@@ -19,6 +19,14 @@
 //! A failed precondition means this execution no longer owns the run. It is
 //! not an outcome: the transaction rolls back, nothing is recorded, and the
 //! execution is interrupted, so a stale owner can never publish.
+//!
+//! A precondition is a *fence*: a conditional no-op write on the ownership
+//! row, not a read. The write locks the row until the publication commits, so
+//! a takeover that changes the epoch waits for the publication, and a
+//! publication that meets a takeover in progress waits for it and then finds
+//! the new epoch. A plain read would not: under PostgreSQL's READ COMMITTED,
+//! another execution could change the epoch and commit between the read and
+//! this commit. (On SQLite every write transaction already runs alone.)
 
 // The adapter is used by the workflow runtime, which lands in a later
 // milestone; until then only its tests call it.
@@ -37,11 +45,20 @@ pub(crate) struct Write {
     pub(crate) params: Vec<Value>,
 }
 
-/// A condition the publication transaction checks before it writes anything.
+/// A condition the publication transaction checks before it writes anything,
+/// and holds until it commits.
 ///
-/// `sql` is a query with `?` placeholders that returns one row whose first
-/// column, named `ok`, is 1 when the condition holds. No row, or any other
-/// value, fails the condition.
+/// `sql` is a statement with `?` placeholders that changes nothing and
+/// affects exactly one row when the condition holds, such as
+///
+/// ```sql
+/// UPDATE run_epochs SET epoch = epoch WHERE run = ? AND epoch = ?
+/// ```
+///
+/// Affecting the row is what locks it, so the statement must be an `UPDATE`:
+/// anything else fails the condition, as does any row count but one. (A
+/// query would not do even when it returns one row: PostgreSQL reports the
+/// rows a `SELECT` returns as its count, and the read locks nothing.)
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Precondition {
     pub(crate) what: String,
@@ -137,18 +154,28 @@ async fn publish_in(
                 candidate.id, p.what
             ))))
         };
-        let row = tx
-            .query_opt(&p.sql, &params_of(&p.params)?)
+        let is_update = p
+            .sql
+            .trim_start()
+            .get(..7)
+            .is_some_and(|head| head.eq_ignore_ascii_case("update "));
+        if !is_update {
+            return Err(refuse(
+                "a fence must be an UPDATE that locks the row".into(),
+            ));
+        }
+        let rows = tx
+            .execute(&p.sql, &params_of(&p.params)?)
             .await
             .map_err(|e| refuse(format!("could not evaluate the precondition: {e}")))?;
-        let holds = match row {
-            Some(row) => is_one(&row),
-            None => false,
-        };
-        if !holds {
-            return Err(refuse("precondition failed".into()));
+        if rows != 1 {
+            return Err(refuse(format!(
+                "precondition failed ({rows} rows matched, not 1)"
+            )));
         }
     }
+    #[cfg(test)]
+    tests::after_fences(&candidate.id).await;
 
     if digest(&candidate.proposal)? != candidate.digest {
         return Err(Error::app(format!(
@@ -200,16 +227,6 @@ async fn publish_in(
     )
     .await?;
     Ok(candidate.proposal.output.clone())
-}
-
-/// Whether the row's `ok` column is 1 or true, whatever integer or boolean
-/// type the database returns it as.
-fn is_one(row: &durare::Row) -> bool {
-    row.try_get::<i64>("ok")
-        .map(|v| v == 1)
-        .or_else(|_| row.try_get::<i32>("ok").map(|v| v == 1))
-        .or_else(|_| row.try_get::<bool>("ok"))
-        .unwrap_or(false)
 }
 
 fn params_of(values: &[Value]) -> Result<Vec<Param>> {
