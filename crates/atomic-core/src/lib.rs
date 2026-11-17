@@ -8,6 +8,7 @@ pub mod artifact;
 pub mod atom;
 pub mod codex;
 pub mod collections;
+pub mod compile;
 pub mod config;
 pub mod project;
 pub mod state;

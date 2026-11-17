@@ -18,6 +18,8 @@ anyhow = { workspace = true }
 dirs = { workspace = true }
 globset = { workspace = true }
 ignore = { workspace = true }
+jsonschema = { workspace = true }
+markdown = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

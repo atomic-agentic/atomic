@@ -46,6 +46,8 @@ globset = "0.4"
 ignore = "0.4"
 # No default features: schemas never come from the network.
 jsonschema = { version = "0.61", default-features = false }
+# atomic's one Markdown parser (markdown-rs).
+markdown = "1"
 saphyr-parser = "0.3.4"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }

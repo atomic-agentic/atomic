@@ -86,6 +86,10 @@ pub struct Atom {
     pub frontmatter: Value,
     /// The body, split into text and tags.
     pub body: Vec<Piece>,
+    /// The body as written.
+    pub body_text: String,
+    /// The file line the body starts on.
+    pub body_line: usize,
 }
 
 /// Why an atom file failed to load.
@@ -380,6 +384,8 @@ pub fn load(file: &Path, registry: &mut Registry) -> Result<Atom, AtomError> {
         output,
         frontmatter: doc.value.clone(),
         body,
+        body_text: body_text.to_owned(),
+        body_line,
     })
 }
 
