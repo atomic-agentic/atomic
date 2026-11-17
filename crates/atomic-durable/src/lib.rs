@@ -6,19 +6,20 @@
 //! only through this crate.
 
 mod publication;
+pub mod runtime;
 pub mod store;
+
+pub use runtime::{
+    DurableError, DurableRuntime, Durare, DurareContext, Param, Result, Row, RunStatus, StepInfo,
+    StepRecord, Tx, TxFuture, WorkflowContext,
+};
 
 use std::path::Path;
 use std::sync::Arc;
 
-/// A failure reported by the durable-execution engine.
-#[derive(Debug, thiserror::Error)]
-#[error("durable store: {0}")]
-pub struct DurableError(String);
-
 impl From<durare::Error> for DurableError {
     fn from(e: durare::Error) -> Self {
-        Self(e.to_string())
+        runtime::from_durare(e)
     }
 }
 
@@ -26,10 +27,10 @@ impl From<durare::Error> for DurableError {
 /// workflow through it. Returns how many probe workflows the store has run,
 /// this one included. A diagnostic: it proves the engine links and works in
 /// this process.
-pub async fn probe(database: &Path) -> Result<usize, DurableError> {
+pub async fn probe(database: &Path) -> std::result::Result<usize, DurableError> {
     store::open_sqlite(database)
         .await
-        .map_err(|e| DurableError(e.to_string()))?;
+        .map_err(|e| DurableError::Engine(e.to_string()))?;
     let url = format!("sqlite://{}?mode=rwc", database.display());
     let provider = Arc::new(durare::SqliteProvider::connect(&url).await?);
     let mut engine = durare::DurableEngine::new(provider).await?;
