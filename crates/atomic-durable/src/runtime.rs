@@ -35,10 +35,51 @@ pub enum DurableError {
     /// workflow code only.
     #[error("a step cannot run inside another step: {0}")]
     Nested(String),
+    /// The database failed. The engine's own error travels with it, so a
+    /// failure the engine knows how to handle, such as a serialization
+    /// conflict it retries, is still handled when it passes back through
+    /// workflow code.
+    #[error("{message}")]
+    Database {
+        /// What failed.
+        message: String,
+        /// The engine's error, as it reported it.
+        origin: Origin,
+    },
     /// The engine or its store failed.
     #[error("durable engine: {0}")]
     Engine(String),
 }
+
+/// The engine's own error behind a [`DurableError::Database`]: opaque, and
+/// ignored by equality, which compares the message.
+#[derive(Clone)]
+pub struct Origin(Option<Arc<std::sync::Mutex<Option<durare::Error>>>>);
+
+impl Origin {
+    fn of(e: durare::Error) -> Self {
+        Self(Some(Arc::new(std::sync::Mutex::new(Some(e)))))
+    }
+
+    /// The engine's error, once: the first conversion back takes it.
+    fn take(&self) -> Option<durare::Error> {
+        self.0.as_ref()?.lock().ok()?.take()
+    }
+}
+
+impl std::fmt::Debug for Origin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Origin(..)")
+    }
+}
+
+impl PartialEq for Origin {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for Origin {}
 
 /// A result in workflow code.
 pub type Result<T> = std::result::Result<T, DurableError>;
@@ -294,6 +335,10 @@ pub(crate) fn from_durare(e: durare::Error) -> DurableError {
         durare::Error::RecoveryRequired(inner) => DurableError::Interrupted(inner.to_string()),
         durare::Error::App { message, .. } => DurableError::Failed(message),
         e @ durare::Error::NestedDurableCall { .. } => DurableError::Nested(e.to_string()),
+        e @ durare::Error::Db(_) => DurableError::Database {
+            message: e.to_string(),
+            origin: Origin::of(e),
+        },
         e => DurableError::Engine(e.to_string()),
     }
 }
@@ -303,6 +348,9 @@ pub(crate) fn to_durare(e: DurableError) -> durare::Error {
     match e {
         DurableError::Interrupted(m) => {
             durare::Error::RecoveryRequired(Arc::new(durare::Error::app(m)))
+        }
+        DurableError::Database { message, origin } => {
+            origin.take().unwrap_or_else(|| durare::Error::app(message))
         }
         DurableError::Failed(m) | DurableError::Nested(m) | DurableError::Engine(m) => {
             durare::Error::app(m)
@@ -325,19 +373,17 @@ impl WorkflowContext for DurareContext {
         F: FnOnce(StepInfo) -> Fut + Send + 'static,
         Fut: Future<Output = Result<T>> + Send + 'static,
     {
-        let ctx = self.0.clone();
-        let name = name.to_owned();
-        async move {
-            ctx.step(&name, move |s: durare::StepCtx| async move {
-                let info = StepInfo {
-                    workflow_id: s.workflow_id().to_owned(),
-                    step_id: s.step_id(),
-                };
-                body(info).await.map_err(to_durare)
-            })
-            .await
-            .map_err(from_durare)
-        }
+        // Called now, not when first polled: durare claims the step's
+        // position here, so positions follow construction order whatever
+        // order the futures are awaited in.
+        let pending = self.0.step(name, move |s: durare::StepCtx| async move {
+            let info = StepInfo {
+                workflow_id: s.workflow_id().to_owned(),
+                step_id: s.step_id(),
+            };
+            body(info).await.map_err(to_durare)
+        });
+        async move { pending.await.map_err(from_durare) }
     }
 
     fn transaction<T, F>(&self, name: &str, body: F) -> impl Future<Output = Result<T>> + Send
@@ -345,16 +391,12 @@ impl WorkflowContext for DurareContext {
         T: Serialize + DeserializeOwned + Send + 'static,
         F: for<'t, 'c> Fn(Tx<'t, 'c>) -> TxFuture<'t, T> + Send + Sync + 'static,
     {
-        let ctx = self.0.clone();
-        let name = name.to_owned();
-        async move {
-            ctx.transaction(&name, move |tx| {
-                let fut = body(Tx(tx));
-                Box::pin(async move { fut.await.map_err(to_durare) })
-            })
-            .await
-            .map_err(from_durare)
-        }
+        // As for a step, the position is claimed now.
+        let pending = self.0.transaction(name, move |tx| {
+            let fut = body(Tx(tx));
+            Box::pin(async move { fut.await.map_err(to_durare) })
+        });
+        async move { pending.await.map_err(from_durare) }
     }
 }
 
@@ -376,8 +418,13 @@ pub struct Durare {
 }
 
 impl Durare {
-    /// An engine on the SQLite database at `path`, created if missing.
+    /// An engine on the SQLite database at `path`, created if missing. The
+    /// store is opened through atomic's version check first, so a store
+    /// written by a newer atomic is refused before anything touches it.
     pub async fn sqlite(path: &Path) -> Result<Self> {
+        crate::store::open_sqlite(path)
+            .await
+            .map_err(|e| DurableError::Engine(e.to_string()))?;
         let url = format!("sqlite://{}?mode=rwc", path.display());
         let provider = durare::SqliteProvider::connect(&url)
             .await

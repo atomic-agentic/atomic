@@ -286,6 +286,40 @@ async fn a_workflow_id_started_twice_runs_once<R: DurableRuntime>(mut rt: R) {
     rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
 }
 
+async fn positions_follow_construction_not_polling_order<R: DurableRuntime>(mut rt: R) {
+    rt.register("positions", |ctx: R::Context, (): ()| async move {
+        let a = ctx.step("a", |s| async move { Ok(s.step_id) });
+        let b = ctx.step("b", |s| async move { Ok(s.step_id) });
+        let t = ctx.transaction("t", |_tx| Box::pin(async { Ok(0_i32) }));
+        // Awaited in the other order: positions must not follow.
+        let t_done = t.await?;
+        let b = b.await?;
+        let a = a.await?;
+        Ok((a, b, t_done))
+    });
+    rt.launch().await.expect("launch");
+    let id = unique("positions");
+    rt.start("positions", &id, ()).await.expect("start");
+    let (a, b, _): (i32, i32, i32) = rt.result(&id).await.expect("runs");
+    assert!(a < b, "constructed a before b, but a={a}, b={b}");
+    let steps: Vec<(i32, String)> = rt
+        .steps(&id)
+        .await
+        .expect("steps")
+        .into_iter()
+        .map(|s| (s.step_id, s.name))
+        .collect();
+    let mut by_position = steps.clone();
+    by_position.sort();
+    let names: Vec<&str> = by_position.iter().map(|(_, n)| n.as_str()).collect();
+    assert_eq!(
+        names,
+        ["a", "b", "t"],
+        "positions in construction order: {steps:?}"
+    );
+    rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+}
+
 macro_rules! on_backend {
     ($backend:ident, $($name:ident),+ $(,)?) => {
         mod $backend {
@@ -301,6 +335,7 @@ macro_rules! on_backend {
 
 on_backend!(
     sqlite,
+    positions_follow_construction_not_polling_order,
     a_step_runs_once_and_is_replayed_after_a_crash,
     a_transaction_commits_its_writes_with_its_checkpoint_or_nothing,
     an_interrupted_execution_records_nothing_and_stays_pending,
@@ -312,6 +347,7 @@ on_backend!(
 #[cfg(feature = "postgres-tests")]
 on_backend!(
     postgres,
+    positions_follow_construction_not_polling_order,
     a_step_runs_once_and_is_replayed_after_a_crash,
     a_transaction_commits_its_writes_with_its_checkpoint_or_nothing,
     an_interrupted_execution_records_nothing_and_stays_pending,
@@ -319,3 +355,84 @@ on_backend!(
     steps_are_siblings_in_order_and_cannot_nest,
     a_workflow_id_started_twice_runs_once,
 );
+
+/// A serialization conflict raised once in a transaction step is retried by
+/// the engine, not recorded as the step's failure.
+#[cfg(feature = "postgres-tests")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_postgres_serialization_conflict_is_retried() {
+    let mut rt = postgres().await;
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let a = attempts.clone();
+    rt.register("conflict", move |ctx: DurareContext, (): ()| {
+        let a = a.clone();
+        async move {
+            ctx.transaction("setup", |mut tx| {
+                Box::pin(async move {
+                    tx.execute("CREATE SEQUENCE IF NOT EXISTS conflict_attempt", &[])
+                        .await?;
+                    Ok(())
+                })
+            })
+            .await?;
+            ctx.transaction("retried", move |mut tx| {
+                a.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    tx.execute(
+                        "DO $$ BEGIN IF nextval('conflict_attempt') = 1 THEN \
+                         RAISE EXCEPTION 'synthetic conflict' USING ERRCODE = '40001'; END IF; END $$",
+                        &[],
+                    )
+                    .await?;
+                    Ok(42_i64)
+                })
+            })
+            .await
+        }
+    });
+    rt.launch().await.expect("launch");
+    let id = unique("conflict");
+    rt.start("conflict", &id, ()).await.expect("start");
+    assert_eq!(rt.result::<i64>(&id).await, Ok(42));
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        2,
+        "one conflict, one retry"
+    );
+    rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+}
+
+/// A store written by a newer atomic is refused before the engine opens it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_newer_store_is_refused_untouched() {
+    let path = std::env::temp_dir().join(format!("{}.db", unique("newer")));
+    crate::store::open_sqlite(&path)
+        .await
+        .expect("a current store");
+    let url = format!("sqlite://{}", path.display());
+    let pool = sqlx::SqlitePool::connect(&url).await.expect("pool");
+    sqlx::query("UPDATE atomic_store_version SET version = 999")
+        .execute(&pool)
+        .await
+        .expect("mark newer");
+    let tables = |pool: sqlx::SqlitePool| async move {
+        let n: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+        n.0
+    };
+    let before = tables(pool.clone()).await;
+    let opened = Durare::sqlite(&path).await;
+    assert!(
+        matches!(&opened, Err(DurableError::Engine(m)) if m.contains("999")),
+        "refused: {:?}",
+        opened.as_ref().err()
+    );
+    assert_eq!(
+        tables(pool.clone()).await,
+        before,
+        "nothing was created in it"
+    );
+    pool.close().await;
+}
