@@ -78,6 +78,7 @@ struct Request<'a> {
     developer: String,
     prompt: String,
     model: Option<String>,
+    sandbox: crate::typed::Sandbox,
     contract: &'a Value,
     validator: &'a jsonschema::Validator,
     name: &'a str,
@@ -100,6 +101,7 @@ async fn run_contract(
         prompt: request.prompt,
         output_schema: Some(lowered.schema.clone()),
         model: request.model,
+        sandbox: request.sandbox,
     };
     let model = spec
         .model
@@ -200,6 +202,7 @@ pub async fn run_codex_atom<A: Atom>(
         developer: atom.instructions().into_owned(),
         prompt,
         model: config.model.clone(),
+        sandbox: config.sandbox,
         contract: &contract,
         validator: &validator,
         name: A::NAME,
@@ -276,10 +279,15 @@ pub async fn run_declarative(
         .get("model")
         .and_then(Value::as_str)
         .map(str::to_owned);
+    let sandbox = match atom.frontmatter.get("sandbox").and_then(Value::as_str) {
+        Some("workspace-write") => crate::typed::Sandbox::WorkspaceWrite,
+        _ => crate::typed::Sandbox::ReadOnly,
+    };
     let request = Request {
         developer: rendered.developer,
         prompt: rendered.user,
         model,
+        sandbox,
         contract: &contract,
         validator: &validator,
         name: &atom.name,

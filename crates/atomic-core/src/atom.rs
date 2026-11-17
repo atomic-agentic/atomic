@@ -253,6 +253,51 @@ pub fn load(file: &Path, registry: &mut Registry) -> Result<Atom, AtomError> {
         }
     };
 
+    // Run settings: read-only, no network and no optional tools unless the
+    // atom says otherwise, and only what this version can enforce.
+    match fm.get("sandbox") {
+        None => {}
+        Some(Value::String(s)) if s == "read-only" || s == "workspace-write" => {}
+        Some(other) => {
+            return Err(fail(
+                line_of("/sandbox"),
+                "/sandbox",
+                format!("`sandbox` is read-only or workspace-write, not {other}"),
+            ));
+        }
+    }
+    let allows_network = match fm.get("network") {
+        None | Some(Value::Bool(false)) => false,
+        Some(Value::Object(n)) => n
+            .get("allow")
+            .and_then(Value::as_array)
+            .is_some_and(|a| !a.is_empty()),
+        Some(_) => true,
+    };
+    if allows_network {
+        return Err(fail(
+            line_of("/network"),
+            "/network",
+            "network access for atoms is not supported by this version of atomic yet; atoms run with no network"
+                .into(),
+        ));
+    }
+    let has_tools = match fm.get("tools") {
+        None | Some(Value::Null) => false,
+        Some(Value::Object(o)) => o
+            .values()
+            .any(|v| v.as_array().is_none_or(|a| !a.is_empty())),
+        Some(Value::Array(a)) => !a.is_empty(),
+        Some(_) => true,
+    };
+    if has_tools {
+        return Err(fail(
+            line_of("/tools"),
+            "/tools",
+            "atomic, OpenAPI and MCP tools for atoms are not supported by this version of atomic yet".into(),
+        ));
+    }
+
     let mut ids = Vec::new();
     for role in ["input", "output"] {
         let pointer = format!("/{role}");

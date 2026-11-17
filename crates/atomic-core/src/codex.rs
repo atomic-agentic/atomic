@@ -108,6 +108,17 @@ pub struct TurnSpec {
     pub output_schema: Option<serde_json::Value>,
     /// A model name that overrides the endpoint's.
     pub model: Option<String>,
+    /// The sandbox the thread runs in. The network is always restricted.
+    pub sandbox: crate::typed::Sandbox,
+}
+
+/// Codex's permission profile for a sandbox: read-only, or writes confined
+/// to the workspace; the network is restricted either way.
+pub(crate) fn permission_profile(sandbox: crate::typed::Sandbox) -> PermissionProfile {
+    match sandbox {
+        crate::typed::Sandbox::ReadOnly => PermissionProfile::read_only(),
+        crate::typed::Sandbox::WorkspaceWrite => PermissionProfile::workspace_write(),
+    }
 }
 
 /// What a thread did: its id, how many turns it ran and the tokens it used,
@@ -215,6 +226,10 @@ where
     }
     let mut config = new_config(&endpoint, codex_home, cwd, paths.0.clone()).await?;
     config.developer_instructions = spec.developer_instructions.clone();
+    config.permissions = Permissions::from_approval_and_profile(
+        Constrained::allow_any(AskForApproval::Never),
+        Constrained::allow_any(permission_profile(spec.sandbox)),
+    )?;
     let state_db = init_state_db(&config).await;
 
     let auth_manager =
@@ -660,6 +675,23 @@ mod tests {
             // The prompt reached the model.
             assert!(model.requests()[0].to_string().contains("ping"));
         });
+    }
+
+    #[test]
+    fn sandboxes_map_to_codex_permission_profiles() {
+        use crate::typed::Sandbox;
+        assert_eq!(
+            permission_profile(Sandbox::ReadOnly),
+            PermissionProfile::read_only()
+        );
+        assert_eq!(
+            permission_profile(Sandbox::WorkspaceWrite),
+            PermissionProfile::workspace_write()
+        );
+        assert_ne!(
+            permission_profile(Sandbox::ReadOnly),
+            permission_profile(Sandbox::WorkspaceWrite)
+        );
     }
 
     #[test]

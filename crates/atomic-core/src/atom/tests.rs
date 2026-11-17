@@ -215,3 +215,26 @@ fn an_unlowerable_output_schema_is_rejected_at_load_with_its_file_and_path() {
     let e = load(&root.join("atoms/y.atom.md"), &mut Registry::new()).expect_err("cannot lower");
     assert_eq!((e.path.as_str(), e.line), ("/output/properties/any", 8));
 }
+
+#[test]
+fn run_settings_default_to_read_only_with_no_network_or_tools() {
+    let (_, result) =
+        classify_with(&CLASSIFY.replace("kind: lite\n", "kind: lite\nsandbox: workspace-write\n"));
+    result.expect("workspace-write is allowed");
+    let (_, result) =
+        classify_with(&CLASSIFY.replace("kind: lite\n", "kind: lite\nsandbox: anything\n"));
+    assert_eq!(result.expect_err("bad sandbox").path, "/sandbox");
+    let (_, result) = classify_with(&CLASSIFY.replace(
+        "kind: lite\n",
+        "kind: lite\nnetwork:\n  allow: [example.com]\n",
+    ));
+    assert!(result.expect_err("network").message.contains("no network"));
+    let (_, result) =
+        classify_with(&CLASSIFY.replace("kind: lite\n", "kind: lite\nnetwork:\n  allow: []\n"));
+    result.expect("an empty allow list is no network");
+    let (_, result) = classify_with(&CLASSIFY.replace(
+        "kind: lite\n",
+        "kind: lite\ntools:\n  atomic: [graph_show]\n",
+    ));
+    assert_eq!(result.expect_err("tools").path, "/tools");
+}
