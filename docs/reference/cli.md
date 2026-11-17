@@ -133,6 +133,8 @@ replay as a live model result.
 | Command | Purpose | Planned stage |
 | --- | --- | --- |
 | `atomic check --write-lock` | Write `atomic.policy.lock`, the resolved permissions and limits of every atom and workflow | v1.0 |
+| `atomic check --fix` | Escape every loose `<` and `{` in the prose of `.atom.mdx` files, and change nothing else | v0.5 |
+| `atomic atoms convert <atom> --to md\|mdx` | Rewrite an atom in the other template form, adding or removing escapes so it compiles to the same atom | v0.5 |
 | `atomic stale [--as-of <date>]` | List [recorded decisions](manifest.md#recorded-decisions) that need another look: the review date has passed, or the evidence is too old, was produced on a different model or prompt version, or no longer holds | v0.7 |
 | `atomic runtimes install [--from <archive>]` | Fetch and verify the Deno version this Atomic release pins, ahead of time; `--from` installs from a file on a machine with no network | v0.7 |
 | `atomic runtimes lock` | Write `deno.lock` from the packages that atom code and scripts import | v0.7 |

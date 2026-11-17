@@ -147,7 +147,7 @@ A file named `*.atom.mdx` has the same frontmatter and writes the tags as
 elements: `{input.text}`, `<If cond={…}>` with `<Else />`,
 `<For each={…} as="c">`, `<Partial file="…">`, `<Slot />`, `<Render value={…} />`,
 `<File path="…" />` and `<Example>`. Braces
-hold CEL; the body is parsed and never executed. A `<` or `{` in prose must sit in a code span.
+hold CEL; the body is parsed and never executed. The file is strict MDX: a `<` or `{` in prose must be escaped as `\<` or `\{`, which `atomic check --fix` does for you.
 An atom exists in one form only. Planned for v0.5.
 
 The [template tags guide](../guides/template-tags.md) explains every tag in both

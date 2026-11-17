@@ -257,9 +257,14 @@ What to know about this form:
 - **Capitalized tags are Atomic's fixed set.** An unknown one fails the load.
 - **Lowercase tags are literal text,** as in `.atom.md`. See
   [mark sections with XML-style tags](#mark-sections-with-xml-style-tags).
-- **`<` and `{` in prose must be in a code span or escaped.** `OUT_DIR/<stage>.log`
-  written as plain text fails at load with its line and column. Write it as
-  `` `OUT_DIR/<stage>.log` ``. Comments are `{/* like this */}`, not `<!-- -->`.
+- **`<` and `{` in prose must be escaped.** The file is strict MDX, so a loose
+  `<` or `{` fails at load with its line and column, and the error shows the
+  line with the escape applied. Write `\<` and `\{`: the model sees a plain `<`
+  and `{`. A code span works too, but the model then sees the backticks as well.
+  `atomic check --fix` escapes every loose `<` and `{` in a file and changes
+  nothing else. Comments are `{/* like this */}`, not `<!-- -->`.
+- **The file stays valid MDX.** Formatters, editor extensions and other MDX
+  tools read an `.atom.mdx` file as they read any MDX file.
 - **One form per file.** An atom cannot exist as both `review.atom.md` and
   `review.atom.mdx`, and the two tag styles cannot be mixed in one file. A partial
   follows its own extension, so an `.atom.mdx` atom can include a `.md` partial.
@@ -267,9 +272,12 @@ What to know about this form:
 ## Which form to use
 
 Use `.atom.md` unless you have a reason not to. Its tags almost never collide
-with prompt text, which matters for instructions full of code, generics and
-placeholders. Choose `.atom.mdx` when your team already writes JSX, wants editor
-support for it, or structures prompts with XML-style sections.
+with prompt text, which matters for instructions full of code, generics,
+placeholders and email addresses: in `.atom.md`, a line such as
+`From: {% $input.name %} <{% $input.from %}>` needs no escaping. Choose
+`.atom.mdx` when your team already writes JSX, wants its MDX tools to work on
+atom files, or structures prompts with XML-style sections. To switch an
+existing atom, `atomic atoms convert` rewrites it in the other form.
 
 ## See the prompt before spending tokens
 

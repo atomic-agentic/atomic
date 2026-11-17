@@ -43,9 +43,12 @@ needs a corrected contract, task or model choice.
 ## An `.atom.mdx` file fails to parse
 
 In the JSX-style form, `<` and `{` are syntax. Text such as `Vec<String>` or
-`OUT_DIR/<stage>.log` in prose fails at load with its line and column. Put it in
-a code span, or write the atom as `.atom.md`, where angle brackets inside a line
-of prose are plain text. Comments are `{/* like this */}`, not `<!-- -->`. See
+`OUT_DIR/<stage>.log` in prose fails at load with its line and column, and the
+error shows the line escaped. Write `\<` and `\{`, or run `atomic check --fix`
+to escape the whole file. If a prompt is full of angle brackets, write the atom
+as `.atom.md` instead, where angle brackets inside a line of prose are plain
+text; `atomic atoms convert <atom> --to md` does it for you. Comments are
+`{/* like this */}`, not `<!-- -->`. See
 [the JSX-style form](../guides/template-tags.md#the-same-atom-with-jsx-style-tags).
 
 ## A section tag is reported as unclosed
