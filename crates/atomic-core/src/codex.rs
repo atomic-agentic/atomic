@@ -110,6 +110,22 @@ pub struct TurnSpec {
     pub model: Option<String>,
 }
 
+/// What a thread did: its id, how many turns it ran and the tokens it used,
+/// as the provider reported them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ThreadReport {
+    /// Codex's id for the thread.
+    pub thread_id: String,
+    /// Turns run on it.
+    pub turns: u32,
+    /// Input tokens, over all turns.
+    pub input_tokens: i64,
+    /// Output tokens, over all turns.
+    pub output_tokens: i64,
+    /// Total tokens, over all turns.
+    pub total_tokens: i64,
+}
+
 /// Paths Codex needs to re-run this executable as one of its helpers.
 #[derive(Clone, Debug)]
 pub struct CodexPaths(Arg0DispatchPaths);
@@ -188,7 +204,7 @@ pub async fn converse<F>(
     endpoint: &ModelEndpoint,
     first: &TurnSpec,
     mut next: F,
-) -> anyhow::Result<(String, u32)>
+) -> anyhow::Result<(String, ThreadReport)>
 where
     F: FnMut(&str) -> Option<TurnSpec>,
 {
@@ -254,15 +270,26 @@ where
         .context("start Codex thread")?;
 
     let mut current = spec.clone();
-    let mut turns = 0u32;
+    let mut report = ThreadReport {
+        thread_id: thread_id.to_string(),
+        ..ThreadReport::default()
+    };
     let outcome = loop {
-        turns += 1;
+        report.turns += 1;
         match run_turn(&thread, &current).await {
             Err(e) => break Err(e),
-            Ok(answer) => match next(&answer) {
-                Some(follow_up) => current = follow_up,
-                None => break Ok((answer, turns)),
-            },
+            Ok((answer, usage)) => {
+                // The provider reports the thread's running totals.
+                if let Some((input, output, total)) = usage {
+                    report.input_tokens = input;
+                    report.output_tokens = output;
+                    report.total_tokens = total;
+                }
+                match next(&answer) {
+                    Some(follow_up) => current = follow_up,
+                    None => break Ok((answer, report.clone())),
+                }
+            }
         }
     };
     let shutdown_result = thread.shutdown_and_wait().await;
@@ -530,7 +557,12 @@ async fn new_config(
     Ok(config)
 }
 
-async fn run_turn(thread: &CodexThread, spec: &TurnSpec) -> anyhow::Result<String> {
+/// Run one turn; return its final message and the thread's token totals
+/// (input, output, total) as last reported.
+async fn run_turn(
+    thread: &CodexThread,
+    spec: &TurnSpec,
+) -> anyhow::Result<(String, Option<(i64, i64, i64)>)> {
     let mut request = TurnInputRequest::user_input(vec![UserInput::Text {
         text: spec.prompt.clone(),
         text_elements: Vec::new(),
@@ -544,13 +576,21 @@ async fn run_turn(thread: &CodexThread, spec: &TurnSpec) -> anyhow::Result<Strin
         bail!("turn input was not submitted: {reason:?}");
     }
 
+    let mut usage = None;
     loop {
         let event = thread.next_event().await.context("read Codex event")?;
         match event.msg {
+            EventMsg::TokenCount(count) => {
+                if let Some(info) = count.info {
+                    let t = info.total_token_usage;
+                    usage = Some((t.input_tokens, t.output_tokens, t.total_tokens));
+                }
+            }
             EventMsg::TurnComplete(done) => {
-                return done
+                let message = done
                     .last_agent_message
-                    .context("the turn completed without a message");
+                    .context("the turn completed without a message")?;
+                return Ok((message, usage));
             }
             EventMsg::Error(event) => bail!(event.message),
             EventMsg::TurnAborted(_) => bail!("turn aborted"),

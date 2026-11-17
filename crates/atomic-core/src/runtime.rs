@@ -44,8 +44,19 @@ pub struct CodexRuntime {
 /// What a run records beside its output.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunMetadata {
+    /// Codex's id for the thread the atom ran on.
+    pub thread_id: String,
     /// The model the turn used.
     pub model: String,
+    /// Tokens used, over every turn, as the provider reported them.
+    pub input_tokens: i64,
+    /// Output tokens, over every turn.
+    pub output_tokens: i64,
+    /// Total tokens, over every turn.
+    pub total_tokens: i64,
+    /// Human actions taken during the turn, such as approvals. Unattended
+    /// atoms decline every in-turn approval, so in v0.1 this is empty.
+    pub human_actions: Vec<String>,
     /// SHA-256 over the developer instructions, the user turn and the output
     /// schema, so a run can be matched to exactly what was asked.
     pub prompt_hash: String,
@@ -102,7 +113,7 @@ pub async fn run_codex_atom<A: Atom>(
     let mut out = None;
     let mut failure = None;
     let mut repairs_left = 1;
-    let (_, turns) = codex::converse(
+    let (_, report) = codex::converse(
         &runtime.paths,
         &runtime.codex_home,
         &runtime.cwd,
@@ -137,9 +148,14 @@ pub async fn run_codex_atom<A: Atom>(
     .await
     .map_err(|e| AtomError::Model(format!("{e:#}")))?;
     let metadata = RunMetadata {
+        thread_id: report.thread_id,
         model,
+        input_tokens: report.input_tokens,
+        output_tokens: report.output_tokens,
+        total_tokens: report.total_tokens,
+        human_actions: Vec::new(),
         prompt_hash,
-        turns,
+        turns: report.turns,
     };
     match (out, failure) {
         (Some(o), _) => Ok((o, metadata)),
@@ -147,6 +163,30 @@ pub async fn run_codex_atom<A: Atom>(
         (None, None) => Err(AtomError::Runtime(
             "the turn ended without an answer".into(),
         )),
+    }
+}
+
+/// Run an atom's future on its own task, so a panic inside it fails that
+/// atom's run with [`AtomError::Panicked`] instead of taking the process down.
+pub async fn contained<T, F>(run: F) -> Result<T, AtomError>
+where
+    T: Send + 'static,
+    F: std::future::Future<Output = Result<T, AtomError>> + Send + 'static,
+{
+    match tokio::spawn(run).await {
+        Ok(result) => result,
+        Err(e) if e.is_panic() => {
+            let payload = e.into_panic();
+            let message = payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_owned())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "a panic with no message".to_owned());
+            Err(AtomError::Panicked(message))
+        }
+        Err(e) => Err(AtomError::Runtime(format!(
+            "the atom's task was cancelled: {e}"
+        ))),
     }
 }
 

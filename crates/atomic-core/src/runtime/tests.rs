@@ -97,6 +97,14 @@ fn a_codex_atom_returns_a_valid_out_against_the_fake_model() {
         );
         assert_eq!(model.calls(), 1);
         assert_eq!((meta.model.as_str(), meta.turns), ("synthetic", 1));
+        // The fake model reports 1 input, 1 output and 2 total tokens a call.
+        assert_eq!(
+            (meta.input_tokens, meta.output_tokens, meta.total_tokens),
+            (1, 1, 2)
+        );
+        assert!(!meta.thread_id.is_empty());
+        assert_eq!(meta.prompt_hash.len(), 64);
+        assert!(meta.human_actions.is_empty());
 
         let request = model.requests()[0].to_string();
         assert!(
@@ -166,6 +174,7 @@ fn a_bad_output_gets_one_repair_turn_then_fails_with_a_schema_error() {
             .expect("repaired");
         assert_eq!(out.category, "question");
         assert_eq!((model.calls(), meta.turns), (2, 2));
+        assert_eq!(meta.total_tokens, 4, "two calls of 2 tokens each");
         let repair = model.requests()[1].to_string();
         assert!(
             repair.contains("did not fit the required output"),
@@ -190,5 +199,18 @@ fn a_bad_output_gets_one_repair_turn_then_fails_with_a_schema_error() {
             other => panic!("expected a schema error, got {other:?}"),
         }
         assert_eq!(model.calls(), 2, "one repair, no more");
+    });
+}
+
+#[test]
+fn an_atom_that_panics_fails_its_run_and_the_process_keeps_going() {
+    on_codex_runtime(async {
+        let r: Result<u32, AtomError> = contained(async { panic!("the atom blew up") }).await;
+        assert_eq!(r, Err(AtomError::Panicked("the atom blew up".into())));
+        let r: Result<u32, AtomError> =
+            contained(async { panic!("{}", String::from("formatted")) }).await;
+        assert_eq!(r, Err(AtomError::Panicked("formatted".into())));
+        // The runtime, and the process, carry on.
+        assert_eq!(contained(async { Ok::<_, AtomError>(7) }).await, Ok(7));
     });
 }
