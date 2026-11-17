@@ -532,6 +532,13 @@ fn inline_in(
     }
     match schema {
         Value::Object(map) => {
+            // An artifact reference stays as it is: lowering inlines it with
+            // its media type, and the runtime checks the store against it.
+            if map.get("$ref").and_then(Value::as_str)
+                == Some(atomic_schema::artifact::ARTIFACT_SCHEMA_ID)
+            {
+                return Ok(schema.clone());
+            }
             if let Some(Value::String(r)) = map.get("$ref") {
                 let (base, fragment) = r.split_once('#').map_or((r.as_str(), ""), |(b, f)| (b, f));
                 let (doc, doc_dir) = if base.is_empty() {

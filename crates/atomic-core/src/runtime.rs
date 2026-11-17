@@ -13,7 +13,9 @@
 //! 3. the final message is parsed, the nulls lowering introduced are removed,
 //!    and the result is validated against the **full** contract (strict mode
 //!    drops constraints such as `maxLength`, so this is where they are
-//!    enforced), then against the atom's own checks;
+//!    enforced), every artifact it references is looked up in the runtime's
+//!    store (it must exist, with the media type its schema names), and then
+//!    the atom's own checks run;
 //! 4. an answer that does not fit gets one repair turn on the same thread,
 //!    quoting exactly what was wrong; if the repaired answer does not fit
 //!    either, the atom fails with [`AtomError::Schema`] (or
@@ -30,11 +32,46 @@ use crate::compile::Compiled;
 use crate::lite::{self, LiteRuntime};
 use crate::render::{self, RunInput};
 use crate::typed::{Atom, AtomConfig, AtomError, AtomKind};
+use atomic_schema::artifact::{ArtifactLookup, ArtifactRef};
 use atomic_schema::lower::{self, OPENAI_STRICT};
 use atomic_schema::registry::Registry;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+/// Where a runtime looks up the artifacts an output references.
+#[derive(Clone)]
+pub struct Artifacts(Arc<dyn ArtifactLookup + Send + Sync>);
+
+impl Artifacts {
+    /// Look artifacts up in `lookup`, such as a [`crate::artifact::LocalStore`].
+    pub fn new(lookup: impl ArtifactLookup + Send + Sync + 'static) -> Self {
+        Self(Arc::new(lookup))
+    }
+
+    /// No store: every reference fails (see [`NoArtifacts`]).
+    pub fn none() -> Self {
+        Self::new(NoArtifacts)
+    }
+}
+
+impl std::fmt::Debug for Artifacts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Artifacts(..)")
+    }
+}
+
+/// A lookup that knows no artifacts: an output that references one fails, so
+/// a runtime with no store can never accept a reference it cannot check.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoArtifacts;
+
+impl ArtifactLookup for NoArtifacts {
+    fn media_types(&self, _: &ArtifactRef) -> Option<Vec<String>> {
+        None
+    }
+}
 
 /// Where and with what model atoms run.
 #[derive(Clone, Debug)]
@@ -49,6 +86,8 @@ pub struct CodexRuntime {
     pub endpoint: ModelEndpoint,
     /// The project's default run settings.
     pub defaults: AtomConfig,
+    /// The artifact store outputs' references are checked against.
+    pub artifacts: Artifacts,
 }
 
 /// The runtimes atoms run on, one for each kind of atom that calls a model.
@@ -108,6 +147,13 @@ impl Backend<'_> {
             Self::Lite(rt) => &rt.defaults,
         }
     }
+
+    fn artifacts(&self) -> &(dyn ArtifactLookup + Send + Sync) {
+        match self {
+            Self::Codex(rt) => rt.artifacts.0.as_ref(),
+            Self::Lite(rt) => rt.artifacts.0.as_ref(),
+        }
+    }
 }
 
 /// The atom's own check on a value that already fits the contract.
@@ -161,7 +207,15 @@ async fn run_contract(
     let mut accepted = None;
     let mut failure = None;
     let mut repairs_left = 1;
-    let next = |answer: &str| match accept(answer, &lowered, request.validator, check) {
+    let artifacts = backend.artifacts();
+    let next = |answer: &str| match accept(
+        answer,
+        &lowered,
+        request.validator,
+        request.contract,
+        artifacts,
+        check,
+    ) {
         Ok(v) => {
             accepted = Some(v);
             None
@@ -254,14 +308,16 @@ async fn run_typed<A: Atom>(
     }
     let input_value = serde_json::to_value(input)
         .map_err(|e| AtomError::Runtime(format!("serialize the input: {e}")))?;
-    let input_validator = jsonschema::validator_for(&atom.input_schema()).map_err(|e| {
-        AtomError::Runtime(format!("the input schema of {} is not valid: {e}", A::NAME))
-    })?;
+    let input_validator = Registry::new()
+        .validator_for(&atom.input_schema())
+        .map_err(|e| {
+            AtomError::Runtime(format!("the input schema of {} is not valid: {e}", A::NAME))
+        })?;
     check_input(&input_validator, &input_value)?;
     let mut config = backend.defaults().clone();
     atom.configure(&mut config);
     let contract = atom.output_schema();
-    let validator = jsonschema::validator_for(&contract).map_err(|e| {
+    let validator = Registry::new().validator_for(&contract).map_err(|e| {
         AtomError::Runtime(format!(
             "the output schema of {} is not valid: {e}",
             A::NAME
@@ -439,6 +495,8 @@ fn accept(
     answer: &str,
     lowered: &lower::Lowered,
     validator: &jsonschema::Validator,
+    contract: &Value,
+    artifacts: &(dyn ArtifactLookup + Send + Sync),
     check: &Check<'_>,
 ) -> Result<Value, AtomError> {
     let schema_error = |message: String| AtomError::Schema {
@@ -458,6 +516,10 @@ fn accept(
     if !errors.is_empty() {
         return Err(schema_error(errors.join("; ")));
     }
+    // A reference must name an artifact that exists, of the right type: the
+    // schema can only check its spelling.
+    atomic_schema::artifact::check_refs(contract, &value, artifacts)
+        .map_err(|e| schema_error(e.to_string()))?;
     match check(&value) {
         // A deserialization failure in the typed check is about this answer.
         Err(AtomError::Schema { message, .. }) => Err(schema_error(message)),

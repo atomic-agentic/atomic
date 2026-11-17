@@ -75,17 +75,20 @@ pub struct LiteRuntime {
     pub defaults: AtomConfig,
     /// How long one call may take.
     pub timeout: Duration,
+    /// The artifact store outputs' references are checked against.
+    pub artifacts: crate::runtime::Artifacts,
 }
 
 impl LiteRuntime {
-    /// A runtime on `endpoint`, with the wire [`Wire::for_base_url`] picks and
-    /// the default timeout.
+    /// A runtime on `endpoint`, with the wire [`Wire::for_base_url`] picks,
+    /// the default timeout and no artifact store.
     pub fn new(endpoint: ModelEndpoint, defaults: AtomConfig) -> Self {
         Self {
             wire: Wire::for_base_url(&endpoint.base_url),
             endpoint,
             defaults,
             timeout: DEFAULT_TIMEOUT,
+            artifacts: crate::runtime::Artifacts::none(),
         }
     }
 }

@@ -81,6 +81,7 @@ async fn run_on<A: Atom>(
                 cwd: dir.join("cwd"),
                 endpoint: endpoint(&model),
                 defaults: AtomConfig::default(),
+                artifacts: atomic_core::runtime::Artifacts::none(),
             };
             run_codex_atom(atom, input, &rt).await
         }

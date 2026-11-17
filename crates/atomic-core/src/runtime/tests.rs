@@ -73,6 +73,7 @@ fn runtime(model: &FakeModel, tag: &str) -> CodexRuntime {
             api_key_env: None,
         },
         defaults: AtomConfig::default(),
+        artifacts: Artifacts::none(),
     }
 }
 
@@ -467,5 +468,159 @@ fn a_declarative_atom_takes_its_model_from_itself_then_the_defaults_then_the_end
                 );
             }
         }
+    });
+}
+
+/// An atom that returns a patch and supporting notes, all stored artifacts.
+struct Patch;
+
+impl Atom for Patch {
+    type In = Note;
+    type Out = Value;
+    const NAME: &'static str = "write-patch";
+    fn input_schema(&self) -> Value {
+        Classify.input_schema()
+    }
+    fn output_schema(&self) -> Value {
+        json!({
+            "type": "object", "additionalProperties": false, "required": ["patch", "notes"],
+            "properties": {
+                "patch": {"$ref": "atomic:artifact", "mediaType": "text/x-diff"},
+                "notes": {"type": "array", "items": {"$ref": "#/$defs/note"}}
+            },
+            "$defs": {"note": {"$ref": "atomic:artifact"}}
+        })
+    }
+    fn instructions(&self) -> Cow<'static, str> {
+        "Write the patch.".into()
+    }
+    fn kind(&self) -> crate::typed::AtomKind {
+        crate::typed::AtomKind::Lite
+    }
+}
+
+#[test]
+fn an_output_must_reference_artifacts_that_exist_with_the_right_type() {
+    use crate::artifact::{ArtifactStore, LocalStore, Provenance};
+    on_codex_runtime(async {
+        let store = LocalStore::open(scratch("artifacts")).expect("store");
+        let put = |content: &[u8], media_type: &str| {
+            store
+                .put(
+                    &mut &content[..],
+                    Provenance {
+                        media_type: media_type.into(),
+                        ..Provenance::default()
+                    },
+                )
+                .expect("put")
+                .artifact
+                .uri()
+        };
+        let diff = put(b"--- a\n+++ b\n", "text/x-diff");
+        let text = put(b"a note", "text/plain");
+        let missing = format!("artifact://sha256/{}", "0".repeat(64));
+        let answer = |patch: &str, notes: &[&str]| {
+            Reply::Text(json!({"patch": patch, "notes": notes}).to_string())
+        };
+        let run = |script: Vec<Reply>, store: Option<LocalStore>| async move {
+            let model = FakeModel::start(script).await.expect("fake model");
+            let mut rt = crate::lite::LiteRuntime::new(
+                ModelEndpoint {
+                    base_url: model.base_url(),
+                    model: "synthetic".into(),
+                    api_key_env: None,
+                },
+                AtomConfig::default(),
+            );
+            if let Some(store) = store {
+                rt.artifacts = Artifacts::new(store);
+            }
+            let r = crate::runtime::run_lite_atom(&Patch, &Note { text: "n".into() }, &rt).await;
+            (model.calls(), r)
+        };
+
+        // Every reference holds: accepted in one call.
+        let (calls, r) = run(vec![answer(&diff, &[&text, &diff])], Some(store.clone())).await;
+        assert_eq!(calls, 1);
+        assert!(r.is_ok(), "{r:?}");
+
+        // A well-formed reference to nothing, at the top or nested in a list:
+        // repaired once, then a schema error naming the place.
+        for (bad, at) in [
+            (answer(&missing, &[&text]), "/patch"),
+            (answer(&diff, &[&text, &missing]), "/notes/1"),
+            (answer(&text, &[]), "/patch"),
+        ] {
+            let (calls, r) = run(vec![bad.clone(), bad], Some(store.clone())).await;
+            assert_eq!(calls, 2, "{at}: one repair");
+            match r {
+                Err(AtomError::Schema { message, .. }) => {
+                    assert!(message.starts_with(at), "{at}: {message}");
+                }
+                other => panic!("{at}: expected a schema error, got {other:?}"),
+            }
+        }
+
+        // The repair turn can fix it.
+        let (calls, r) = run(
+            vec![answer(&missing, &[]), answer(&diff, &[])],
+            Some(store.clone()),
+        )
+        .await;
+        assert_eq!(calls, 2);
+        assert!(r.is_ok(), "{r:?}");
+
+        // A runtime with no store accepts no reference at all.
+        let (_, r) = run(vec![answer(&diff, &[]), answer(&diff, &[])], None).await;
+        assert!(matches!(r, Err(AtomError::Schema { .. })), "{r:?}");
+    });
+}
+
+#[test]
+fn a_declarative_output_keeps_its_artifact_references_for_the_check() {
+    use crate::{atom, compile};
+    on_codex_runtime(async {
+        let dir = scratch("decl-artifact");
+        std::fs::create_dir_all(dir.join("atoms")).expect("mkdir");
+        std::fs::write(
+            dir.join("atoms/patch.atom.md"),
+            "---\natomic: 1\ndescription: Write a patch.\nkind: lite\n---\nPatch {% $input.text %}\n",
+        )
+        .expect("atom");
+        std::fs::write(
+            dir.join("atoms/patch.input.schema.yaml"),
+            "type: object\nrequired: [text]\nproperties:\n  text: {type: string}\n",
+        )
+        .expect("input");
+        std::fs::write(
+            dir.join("atoms/patch.output.schema.yaml"),
+            "type: object\nadditionalProperties: false\nrequired: [patch]\nproperties:\n  patch: {$ref: \"atomic:artifact\", mediaType: text/x-diff}\n",
+        )
+        .expect("output");
+        let mut registry = Registry::new();
+        let a = atom::load(&dir.join("atoms/patch.atom.md"), &mut registry).expect("loads");
+        let compiled = compile::compile(&a, &registry).expect("compiles");
+        let missing = format!("artifact://sha256/{}", "0".repeat(64));
+        let bad = Reply::Text(json!({"patch": missing}).to_string());
+        let model = FakeModel::start(vec![bad.clone(), bad])
+            .await
+            .expect("fake model");
+        let rt = runtimes(&model, "decl-artifact");
+        let r = run_declarative(
+            &a,
+            &compiled,
+            &mut registry,
+            &json!({"text": "x"}),
+            "run-1",
+            "external",
+            &rt,
+        )
+        .await;
+        assert!(
+            matches!(&r, Err(AtomError::Schema { message, .. }) if message.contains("no artifact")),
+            "{r:?}"
+        );
+        assert_eq!(model.calls(), 2);
     });
 }
