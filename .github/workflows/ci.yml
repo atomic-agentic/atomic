@@ -1,0 +1,84 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Linux and macOS are first-class platforms, so every check runs on both.
+# Actions are pinned by commit SHA.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  codex-pin:
+    name: Codex pin
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Fails when the [patch] block in Cargo.toml or rust-toolchain.toml drifts from the
+      # Codex revision in deps/codex.toml.
+      - run: scripts/codex-pin.sh check
+
+  rust:
+    name: Rust (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: System packages (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential pkg-config libcap-dev
+
+      # Postgres-backed suites read ATOMIC_TEST_DATABASE_URL and fail without it, so the
+      # database runs where the container service is available.
+      - name: Test Postgres (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          docker run -d --name atomic-test-postgres -p 127.0.0.1:5432:5432 \
+            -e POSTGRES_USER=atomic -e POSTGRES_PASSWORD=atomic -e POSTGRES_DB=atomic \
+            postgres:18.7-trixie@sha256:2ea8630df176ad090ec92136dee850397c5af8781e4bcf2e4162593691c61bbc
+          for _ in $(seq 1 60); do
+            docker exec atomic-test-postgres pg_isready -q -h 127.0.0.1 -U atomic && break
+            sleep 1
+          done
+          echo "ATOMIC_TEST_DATABASE_URL=postgres://atomic:atomic@127.0.0.1:5432/atomic" >>"$GITHUB_ENV"
+
+      # rustup installs the toolchain and components rust-toolchain.toml names.
+      - name: Toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      # The Codex patch block pulls large git sources (rusty_v8 and its submodules),
+      # so cargo's git and registry caches are kept between runs.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo build --workspace --locked
+      - run: cargo test --workspace --locked
