@@ -185,3 +185,33 @@ fn later_fields_and_missing_basics_are_refused() {
     let (_, result) = classify_with(&CLASSIFY.replace("kind: lite", "kind: wizard"));
     assert_eq!(result.expect_err("bad kind").path, "/kind");
 }
+
+#[test]
+fn an_unlowerable_output_schema_is_rejected_at_load_with_its_file_and_path() {
+    let root = project(&[
+        (
+            "atoms/x.atom.md",
+            "---\natomic: 1\ndescription: x.\nkind: lite\n---\nGo.\n",
+        ),
+        ("atoms/x.input.schema.yaml", INPUT),
+        (
+            "atoms/x.output.schema.yaml",
+            "type: object\nproperties:\n  tags:\n    type: object\n    additionalProperties: {type: string}\n",
+        ),
+    ]);
+    let e = load(&root.join("atoms/x.atom.md"), &mut Registry::new()).expect_err("cannot lower");
+    assert_eq!(e.file, root.join("atoms/x.output.schema.yaml"));
+    assert_eq!(e.path, "/properties/tags");
+    assert!(e.message.contains("cannot be lowered"), "{}", e.message);
+
+    // Inline, the path is under /output in the atom file.
+    let root = project(&[
+        (
+            "atoms/y.atom.md",
+            "---\natomic: 1\ndescription: y.\nkind: lite\noutput:\n  type: object\n  properties:\n    any: true\n---\nGo.\n",
+        ),
+        ("atoms/y.input.schema.yaml", INPUT),
+    ]);
+    let e = load(&root.join("atoms/y.atom.md"), &mut Registry::new()).expect_err("cannot lower");
+    assert_eq!((e.path.as_str(), e.line), ("/output/properties/any", 8));
+}

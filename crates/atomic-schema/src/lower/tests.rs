@@ -163,3 +163,14 @@ fn an_artifact_reference_is_inlined_for_generation() {
     );
     assert_eq!(check(&l.schema, &OPENAI_STRICT), Vec::<String>::new());
 }
+
+#[test]
+fn an_optional_anyof_with_a_null_branch_is_ambiguous() {
+    let contract = json!({
+        "type": "object",
+        "properties": {"owner": {"anyOf": [{"type": "string"}, {"type": "null"}]}}
+    });
+    let e = lower(&contract, &OPENAI_STRICT).expect_err("ambiguous");
+    assert_eq!(e.path, "/properties/owner");
+    assert!(e.message.contains("ambiguous"), "{e}");
+}

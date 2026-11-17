@@ -309,6 +309,17 @@ fn node(
             let child_instance = format!("{instance}/{}", escape(name));
             let mut p = node(prop, &child_path, &child_instance, profile, out, err)?;
             if !required.contains(name) {
+                if prop.get("anyOf").is_some() && allows_null(prop) {
+                    // A null could be "omitted" or the value of the branch
+                    // that allows null: normalization could not tell which.
+                    return Err(err(
+                        &child_path,
+                        format!(
+                            "`{name}` is optional and one of its anyOf branches allows null, so a null from the \
+                             model is ambiguous; make `{name}` required, or drop null from its branches"
+                        ),
+                    ));
+                }
                 if allows_null(prop) {
                     out.warnings.push(child_instance.clone());
                 } else {

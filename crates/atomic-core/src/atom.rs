@@ -295,6 +295,41 @@ pub fn load(file: &Path, registry: &mut Registry) -> Result<Atom, AtomError> {
         .map(|e| e.schema.clone())
         .unwrap_or(Value::Null);
 
+    // Lint: the output must lower to the generation profile, so a schema the
+    // model cannot be constrained by fails now, before any tokens are spent.
+    if kind != "exec" {
+        let output_file = registry
+            .get(&output)
+            .map(|e| e.file.clone())
+            .unwrap_or_else(|| file.clone());
+        let in_atom = output_file
+            .to_string_lossy()
+            .starts_with(&*file.to_string_lossy());
+        atomic_schema::lower::lower(&output_schema, &atomic_schema::lower::OPENAI_STRICT).map_err(
+            |e| AtomError {
+                file: if in_atom {
+                    file.clone()
+                } else {
+                    output_file.clone()
+                },
+                line: if in_atom {
+                    line_of(&format!("/output{}", e.path.trim_end_matches('/')))
+                } else {
+                    1
+                },
+                path: if in_atom {
+                    format!("/output{}", e.path.trim_end_matches('/'))
+                } else {
+                    e.path.clone()
+                },
+                message: format!(
+                    "the output schema cannot be lowered for generation: {}",
+                    e.message
+                ),
+            },
+        )?;
+    }
+
     if let Some(rules) = fm.get("validate") {
         let Value::Array(rules) = rules else {
             return Err(fail(
