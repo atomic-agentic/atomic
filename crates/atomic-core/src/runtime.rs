@@ -159,7 +159,7 @@ async fn run_contract(
     let mut accepted = None;
     let mut failure = None;
     let mut repairs_left = 1;
-    let next = |answer: &str| match accept(answer, &lowered.nulls_added, request.validator, check) {
+    let next = |answer: &str| match accept(answer, &lowered, request.validator, check) {
         Ok(v) => {
             accepted = Some(v);
             None
@@ -404,7 +404,7 @@ where
 /// why it does not.
 fn accept(
     answer: &str,
-    nulls_added: &[String],
+    lowered: &lower::Lowered,
     validator: &jsonschema::Validator,
     check: &Check<'_>,
 ) -> Result<Value, AtomError> {
@@ -414,7 +414,7 @@ fn accept(
     };
     let mut value: Value = serde_json::from_str(answer.trim())
         .map_err(|e| schema_error(format!("the answer is not JSON: {e}")))?;
-    lower::normalize(&mut value, nulls_added);
+    lower::normalize(&mut value, lowered);
     let errors: Vec<String> = validator
         .iter_errors(&value)
         .map(|e| {
