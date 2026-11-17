@@ -36,7 +36,10 @@ fn a_restarted_worker_recovers_only_its_own_workflows() {
     let dir = std::env::temp_dir().join(format!(
         "atomic-executor-identity-{}-{}",
         std::process::id(),
-        Instant::now().elapsed().as_nanos()
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
     ));
     std::fs::create_dir_all(&dir).expect("create the test directory");
 
@@ -214,8 +217,10 @@ async fn worker(dir: &Path, role: &str, executor: &str) -> Result<()> {
         .append(true)
         .open(dir.join("owners"))
         .map_err(|e| Error::app(e.to_string()))?;
+    // Both workers append here: one write call per line, so their lines
+    // cannot interleave (writeln! on a File may split a line across calls).
     for w in all.iter().filter(|w| w.id == id) {
-        writeln!(f, "{} {} {}", w.id, w.status, w.executor_id)
+        f.write_all(format!("{} {} {}\n", w.id, w.status, w.executor_id).as_bytes())
             .map_err(|e| Error::app(e.to_string()))?;
     }
     engine.shutdown(Duration::from_secs(5)).await
