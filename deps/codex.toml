@@ -4,7 +4,7 @@
 
 [codex]
 repository = "https://github.com/openai/codex"
-tag = "rust-v0.169.0"
-rev = "d32063f96c2dff1dc96af839b3952abb6acfeda4"
+tag = "rust-v0.171.0-alpha.11"
+rev = "57da98c18f84311dc23abfe1cda8f2c0dbd41cb9"
 # Codex's own codex-rs/rust-toolchain.toml at this rev.
-toolchain = "1.95.0"
+toolchain = "1.99.1"

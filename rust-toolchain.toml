@@ -2,5 +2,5 @@
 #
 # Must equal codex-rs/rust-toolchain.toml at the revision in deps/codex.toml.
 [toolchain]
-channel = "1.95.0"
+channel = "1.99.1"
 components = ["clippy", "rustfmt", "rust-src"]
