@@ -21,7 +21,7 @@ The container has:
 | Tool | Version | Why |
 | --- | --- | --- |
 | Rust | 1.95.0, with clippy, rustfmt and rust-src | The toolchain Codex pins at the revision in [`deps/codex.toml`](../deps/codex.toml) |
-| C toolchain, pkg-config, libcap, bubblewrap | Debian 13 packages | Codex's Linux build and sandbox |
+| C toolchain, pkg-config, libcap, OpenSSL, D-Bus, bubblewrap | Debian 13 packages | Codex's Linux build and sandbox |
 | git, psql | Debian 13 packages | Tests that make commits; inspecting the test database |
 | cargo-deny | 0.21.0 | Licence and advisory checks |
 | cosign | 3.1.4 | Verifying release signatures |
@@ -48,7 +48,11 @@ change them:
 | `ATOMIC_DEV_TIMEOUT` | `60m` | Time limit for the command |
 | `ATOMIC_DEV_CACHE` | `~/.cache/atomic/dev` | Host directory for cargo's caches |
 | `ATOMIC_DEV_MOUNTS` | unset | Colon-separated host directories to mount at the same path, for checkouts outside this repository |
+| `ATOMIC_DEV_MIN_FREE_GB` | `10` | Refuse to start when the disk holding the repository or the cargo cache has less free space than this, in GiB (`0` turns the check off) |
 | `ATOMIC_DEV_WAIT_LOCK` | unset | A file; while it exists, `scripts/dev.sh` refuses to start (exit 75) |
+
+A debug build that includes Codex takes several gigabytes even with
+dependency debug info turned off, so keep that much space free.
 | `ATOMIC_CONTAINER` | `docker` | The engine; `podman` is supported but less tested |
 
 Exit code 124 means the command hit the time limit, and 137 usually means it

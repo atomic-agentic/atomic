@@ -46,7 +46,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            build-essential pkg-config libcap-dev
+            build-essential pkg-config libcap-dev libssl-dev libdbus-1-dev
 
       # Postgres-backed suites read ATOMIC_TEST_DATABASE_URL and fail without it, so the
       # database runs where the container service is available.

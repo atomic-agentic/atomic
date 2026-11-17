@@ -24,11 +24,13 @@
 #                         checkouts outside this repository (a fork being worked on, say)
 #   ATOMIC_DEV_WAIT_LOCK  a file; while it exists, refuse to start (for hosts shared with
 #                         benchmarks that must not be disturbed)
+#   ATOMIC_DEV_MIN_FREE_GB  refuse to start when the disk holding the repository or the cargo
+#                         cache has less than this many GiB free (default 10; 0 turns it off)
 #   ATOMIC_TEST_*, RUST_LOG, RUST_BACKTRACE are passed through when set.
 #
 # Exit codes: the command's own, or
 #   2    bad usage
-#   75   ATOMIC_DEV_WAIT_LOCK exists, so nothing was started
+#   75   ATOMIC_DEV_WAIT_LOCK exists, or the disk is too full, so nothing was started
 #   124  the command hit ATOMIC_DEV_TIMEOUT
 #   137  the command was killed, usually by the memory limit
 set -euo pipefail
@@ -62,6 +64,23 @@ if [ -n "${ATOMIC_DEV_WAIT_LOCK:-}" ] && [ -e "${ATOMIC_DEV_WAIT_LOCK}" ]; then
 fi
 
 mkdir -p "${CACHE}/cargo"
+
+MIN_FREE_GB="${ATOMIC_DEV_MIN_FREE_GB:-10}"
+case "${MIN_FREE_GB}" in
+    '' | *[!0-9]*)
+        echo "scripts/dev.sh: ATOMIC_DEV_MIN_FREE_GB must be a whole number, not '${MIN_FREE_GB}'" >&2
+        exit 2
+        ;;
+esac
+if [ "${MIN_FREE_GB}" -gt 0 ]; then
+    for dir in "${ROOT}" "${CACHE}"; do
+        free_kb="$(df -Pk "${dir}" | awk 'NR == 2 { print $4 }')"
+        if [ "${free_kb}" -lt $((MIN_FREE_GB * 1024 * 1024)) ]; then
+            echo "scripts/dev.sh: only $((free_kb / 1024 / 1024)) GiB free on the disk holding ${dir}; ${MIN_FREE_GB} GiB required (ATOMIC_DEV_MIN_FREE_GB). Nothing was started." >&2
+            exit 75
+        fi
+    done
+fi
 
 if ! "${ENGINE}" image inspect "${IMAGE}" >/dev/null 2>&1; then
     echo "scripts/dev.sh: building ${IMAGE}" >&2

@@ -11,12 +11,12 @@ FROM rust:1.95.0-slim-trixie@sha256:e14e87345b4d5964ddcc3491d27ee046a0f23820f340
 # every component rust-toolchain.toml asks for must already be installed.
 RUN rustup component add clippy rustfmt rust-src
 
-# Codex's Linux build needs libcap and a C toolchain; its sandbox uses
-# bubblewrap. git is needed by tests that make real commits; psql is for
-# inspecting the test database.
+# Codex's Linux build needs a C toolchain and the libcap, OpenSSL and D-Bus
+# (keyring) headers; its sandbox uses bubblewrap. git is needed by tests that
+# make real commits; psql is for inspecting the test database.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        build-essential pkg-config libcap-dev bubblewrap git ca-certificates curl \
+        build-essential pkg-config libcap-dev libssl-dev libdbus-1-dev bubblewrap git ca-certificates curl \
         postgresql-client \
     && rm -rf /var/lib/apt/lists/*
 
