@@ -7,7 +7,7 @@ against it.
 | File | Upstream |
 | --- | --- |
 | [`codex.toml`](codex.toml) | [openai/codex](https://github.com/openai/codex), the `codex-rs` workspace |
-| [`durare.toml`](durare.toml) | [atomic-agentic/durare](https://github.com/atomic-agentic/durare), atomic's fork of [durare](https://github.com/SamuelXing/durare), branch `atomic` |
+| [`forks.toml`](forks.toml) | Every fork the build uses, with its pinned revision: the durare fork and the sqlx fork. `scripts/forks-check.sh` checks it against `Cargo.lock` |
 
 ## Codex
 

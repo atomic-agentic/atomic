@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Dumps the DBOS system schema that *upstream* durare creates, at the commit
-# atomic's fork starts from (deps/durare.toml, upstream_base). Not part of the
+# atomic's fork starts from (deps/forks.toml, upstream_base). Not part of the
 # workspace: it builds upstream's own sqlx 0.8 graph, without atomic's patches.
 #
 #   cargo run --manifest-path crates/atomic-durable/tests/dbos_schema/upstream/Cargo.toml -- \

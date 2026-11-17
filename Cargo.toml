@@ -33,7 +33,7 @@ atomic-exec = { path = "crates/atomic-exec", package = "atomic-agentic-exec" }
 atomic-graph = { path = "crates/atomic-graph", package = "atomic-agentic-graph" }
 atomic-schema = { path = "crates/atomic-schema", package = "atomic-agentic-schema" }
 
-# atomic's fork of durare, at the revision in deps/durare.toml. Only
+# atomic's fork of durare, at the revision in deps/forks.toml. Only
 # atomic-durable may depend on it.
 durare = { git = "https://github.com/atomic-agentic/durare", rev = "9c93328ded1e68447afa622c85b8144196cd41b6", default-features = false, features = ["sqlite", "postgres"] }
 

@@ -28,13 +28,15 @@ env:
 
 jobs:
   codex-pin:
-    name: Codex pin
+    name: Pins
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Fails when the [patch] block in Cargo.toml or rust-toolchain.toml drifts from the
       # Codex revision in deps/codex.toml.
       - run: scripts/codex-pin.sh check
+      # Fails when a fork in deps/forks.toml resolves from another revision.
+      - run: scripts/forks-check.sh
 
   rust:
     name: Rust (${{ matrix.os }})
