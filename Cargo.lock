@@ -532,6 +532,7 @@ dependencies = [
  "anyhow",
  "atomic-agentic-exec",
  "atomic-agentic-schema",
+ "cel",
  "codex-app-server",
  "codex-core-api",
  "codex-extension-api",
@@ -1483,6 +1484,7 @@ dependencies = [
  "lazy_static",
  "nom 7.1.3",
  "pastey",
+ "regex",
  "serde",
  "thiserror 2.0.21",
 ]

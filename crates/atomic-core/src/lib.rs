@@ -11,6 +11,7 @@ pub mod collections;
 pub mod compile;
 pub mod config;
 pub mod project;
+pub mod render;
 pub mod state;
 pub mod tags;
 pub mod workflow;
