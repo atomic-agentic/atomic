@@ -50,8 +50,17 @@ impl Atom for Classify {
     }
 }
 
+/// A fresh directory for one test's files, never shared with another test.
+fn scratch(tag: &str) -> std::path::PathBuf {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("atomic-runtime-{tag}-{}-{n}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
 fn runtime(model: &FakeModel, tag: &str) -> CodexRuntime {
-    let dir = std::env::temp_dir().join(format!("atomic-runtime-{tag}-{}", std::process::id()));
+    let dir = scratch(tag);
     std::fs::create_dir_all(dir.join("home")).expect("home");
     std::fs::create_dir_all(dir.join("cwd")).expect("cwd");
     CodexRuntime {
@@ -143,7 +152,10 @@ fn answers_that_do_not_fit_fail_with_a_schema_error() {
                     assert!(message.contains(needle), "{answer}: {message}");
                     assert_eq!(got, answer);
                 }
-                other => panic!("{answer}: expected a schema error, got {other:?}"),
+                other => panic!(
+                    "{answer}: expected a schema error after {} model calls, got {other:?}",
+                    model.calls()
+                ),
             }
         }
         let blank = r#"{"category": "bug", "summary": "  "}"#;
@@ -151,10 +163,13 @@ fn answers_that_do_not_fit_fail_with_a_schema_error() {
             .await
             .expect("fake model");
         let rt = runtime(&model, "invalid");
-        assert!(matches!(
-            run_codex_atom(&Classify, &Note { text: "n".into() }, &rt).await,
-            Err(AtomError::Validation(_))
-        ));
+        match run_codex_atom(&Classify, &Note { text: "n".into() }, &rt).await {
+            Err(AtomError::Validation(_)) => {}
+            other => panic!(
+                "expected a validation error after {} model calls, got {other:?}",
+                model.calls()
+            ),
+        }
     });
 }
 
@@ -219,7 +234,7 @@ fn an_atom_that_panics_fails_its_run_and_the_process_keeps_going() {
 fn a_declarative_atom_breaking_a_contract_only_constraint_gets_exactly_one_repair() {
     use crate::{atom, compile};
     on_codex_runtime(async {
-        let dir = std::env::temp_dir().join(format!("atomic-runtime-decl-{}", std::process::id()));
+        let dir = scratch("decl-project");
         std::fs::create_dir_all(dir.join("atoms")).expect("mkdir");
         std::fs::write(
             dir.join("atoms/ticket.atom.md"),
