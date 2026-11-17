@@ -95,15 +95,34 @@ These are the rules that are easiest to break:
 
 ## Build and test
 
-There is no workspace yet, so there is nothing to build. The first beads set
-it up: a development environment (`atomic-1a1`), the pinned Codex rev
-(`atomic-90c`), the workspace (`atomic-wl9`), the toolchain pin (`atomic-a5c`)
-and CI (`atomic-4yj`). The toolchain must match the one Codex pins at the
-chosen rev.
+Build and test inside the development container, through `scripts/dev.sh`. It
+runs any command in a pinned image with the toolchain Codex pins (Rust 1.95.0),
+under memory, CPU and time limits, and starts a throwaway Postgres for tests.
+[docs/development.md](docs/development.md) covers its settings.
 
-When those land, replace this section with the real commands. Bead
-`atomic-dxw` tracks that; do not document a command here that you have not
-run.
+```bash
+scripts/dev.sh cargo build --workspace --locked
+scripts/dev.sh cargo test --workspace --locked --no-fail-fast
+scripts/dev.sh cargo test --workspace --locked --features atomic-agentic-durable/postgres-tests
+scripts/dev.sh cargo fmt --all --check
+scripts/dev.sh cargo clippy --workspace --all-targets --locked -- -D warnings
+scripts/dev.sh cargo test -p atomic-agentic-core --lib --features fake-model   # one crate
+```
+
+CI runs the same build, fmt, clippy and tests on Linux and macOS, plus these
+checks, which also run locally:
+
+```bash
+scripts/codex-pin.sh check     # the [patch] block and toolchain match deps/codex.toml
+scripts/forks-check.sh         # each fork in deps/forks.toml resolves at its pinned rev
+scripts/lock-check.sh          # crates shared with Codex keep Codex's locked versions
+scripts/dev.sh cargo deny --locked check bans licenses sources   # deny.toml
+scripts/dev.sh scripts/sbom.sh # the SBOM lists every fork at its pin
+```
+
+The Codex pin, the forks and the lockfile exceptions are recorded under
+`deps/`; change them there and let the checks tell you what else must move.
+Release builds and packaging are described in docs/development.md.
 
 ## Testing rules
 
