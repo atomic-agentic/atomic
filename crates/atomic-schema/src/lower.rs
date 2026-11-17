@@ -122,6 +122,8 @@ pub struct Lowered {
     plan: Plan,
     /// The plans of definitions, by schema path (`/$defs/name`).
     defs: BTreeMap<String, Plan>,
+    /// The contract it was lowered from, for following its references.
+    contract: Value,
 }
 
 /// How to normalize the values one schema node describes; it mirrors the
@@ -178,6 +180,7 @@ pub fn lower(contract: &Value, profile: &Profile) -> Result<Lowered, LowerError>
         return Err(err("", "the root must be an object schema".into()));
     }
     let mut out = Lowered {
+        contract: contract.clone(),
         schema: Value::Null,
         nulls_added: Vec::new(),
         hints: Vec::new(),
@@ -205,6 +208,32 @@ pub fn lower(contract: &Value, profile: &Profile) -> Result<Lowered, LowerError>
 
 fn is_object_schema(s: &Value) -> bool {
     s.get("type").and_then(Value::as_str) == Some("object") || s.get("properties").is_some()
+}
+
+/// `s` with local references followed to their target, within `root`.
+fn resolved<'a>(s: &'a Value, root: &'a Value) -> &'a Value {
+    let mut s = s;
+    for _ in 0..16 {
+        match s
+            .get("$ref")
+            .and_then(Value::as_str)
+            .and_then(|r| r.strip_prefix('#'))
+            .and_then(|pointer| root.pointer(pointer))
+        {
+            Some(target) => s = target,
+            None => break,
+        }
+    }
+    s
+}
+
+/// Whether `s` admits null, following local references within `root`.
+fn allows_null_in(s: &Value, root: &Value) -> bool {
+    let s = resolved(s, root);
+    allows_null(s)
+        || s.get("anyOf")
+            .and_then(Value::as_array)
+            .is_some_and(|bs| bs.iter().any(|b| allows_null_in(b, root)))
 }
 
 fn allows_null(s: &Value) -> bool {
@@ -364,9 +393,13 @@ fn node(
         for (name, prop) in &props {
             let child_path = format!("{path}/properties/{}", escape(name));
             let child_instance = format!("{instance}/{}", escape(name));
+            // Through any local reference: a property that refers to a
+            // nullable definition admits null as surely as one that says so.
+            let null_ok = allows_null_in(prop, &out.contract);
+            let any_of = resolved(prop, &out.contract).get("anyOf").is_some();
             let (mut p, child) = node(prop, &child_path, &child_instance, profile, out, err)?;
             plan.props.push((name.clone(), child));
-            if allows_null(prop) {
+            if null_ok {
                 plan.null_ok.push(name.clone());
             }
             if required.contains(name) {
@@ -380,7 +413,7 @@ fn node(
                 }
             }
             if !required.contains(name) {
-                if prop.get("anyOf").is_some() && allows_null(prop) {
+                if any_of && null_ok {
                     // A null could be "omitted" or the value of the branch
                     // that allows null: normalization could not tell which.
                     return Err(err(
@@ -391,7 +424,7 @@ fn node(
                         ),
                     ));
                 }
-                if allows_null(prop) {
+                if null_ok {
                     out.warnings.push(child_instance.clone());
                 } else {
                     p = nullable(&p);
