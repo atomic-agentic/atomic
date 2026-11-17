@@ -5,10 +5,14 @@
 //! No other atomic crate names the durable-execution engine; workflows reach it
 //! only through this crate.
 
-mod publication;
+pub mod publication;
 pub mod runtime;
 pub mod store;
 
+pub use publication::{
+    Acceptance, Candidate, Precondition, Proposal, Published, Write, execute_candidate,
+    publish_candidate, review_candidate, run_atom,
+};
 pub use runtime::{
     DurableError, DurableRuntime, Durare, DurareContext, Param, Result, Row, RunStatus, StepInfo,
     StepRecord, Tx, TxFuture, WorkflowContext,
