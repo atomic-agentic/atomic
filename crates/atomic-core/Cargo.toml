@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "atomic-agentic-core"
+description = "The Atom trait and the runtime that runs atoms on Codex. The only crate in atomic that depends on Codex."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+# The short name code uses; the package name is the published one.
+name = "atomic_core"
+
+[lints]
+workspace = true
+
+[features]
+# The scripted fake model (atomic_core::testing), for other crates' tests.
+fake-model = []
+
+[dependencies]
+anyhow = { workspace = true }
+cel = { workspace = true }
+dirs = { workspace = true }
+globset = { workspace = true }
+ignore = { workspace = true }
+jsonschema = { workspace = true }
+markdown = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["net", "io-util", "rt", "rt-multi-thread", "sync"] }
+atomic-schema = { workspace = true }
+atomic-exec = { workspace = true }
+codex-app-server = { workspace = true }
+codex-core-api = { workspace = true }
+codex-extension-api = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["net", "io-util", "rt-multi-thread", "macros", "sync"] }

@@ -5,22 +5,19 @@ It builds on OpenAI's open-source Codex crates and gets durable execution from
 a fork of durare. A workflow of atoms survives a crash without redoing finished
 work, and a person signs off at durable gates.
 
-**Status: no code yet.** The design is complete and the whole build is
-recorded as beads in this repository. The current phase is v0.1.
+**Status: early development.** The build is recorded as beads. The current
+phase is v0.1.
 
 ## Where things are
 
 | What | Where |
 | --- | --- |
-| The work to do | Beads in this repository (`bd ready`) |
-| The plan | `../atomic-planning/atomic-scaffold-plan.md`, in the sibling repository |
-| Draft user docs, 11 examples and their offline checker | `../atomic-planning/docs/`, `examples/` and `tools/` |
-| The prototype atomic replaces | `../errai`: a reference for tests and small pure modules, not a base |
+| The work to do | Beads (`bd ready`) |
+| Design notes and private references | `AGENTS.local.md`, if present (not in git) |
 
-Beads cite the plan as `atomic-planning/atomic-scaffold-plan.md § <section>`.
-Bead `atomic-mum` decides whether the plan moves into this repository. Until
-then, read it from the sibling checkout, and say so if it is missing instead of
-working from memory.
+Read `AGENTS.local.md` when it exists: it holds maintainer-local pointers to
+design material that is not part of this repository. If a bead cites a document
+you cannot find, say so instead of working from memory.
 
 ## Work tracking
 
@@ -42,17 +39,17 @@ How the beads are organized:
   milestone epics (`M0` to `M56`, some split into `a` and `b` parts), which hold
   tasks.
 - **Labels.** The phase and the milestone, plus `spike`, `decision`, `test`,
-  `security`, `docs`, `benchmark` and `from-errai`.
-- **Every milestone ends in an acceptance bead** whose criteria quote the
-  plan's acceptance test. A milestone is done when that bead closes, not when
+  `security`, `docs` and `benchmark`.
+- **Every milestone ends in an acceptance bead** whose criteria state the
+  milestone's acceptance test. A milestone is done when that bead closes, not when
   its tasks do.
 - **Later phases are blocked by the phase gate before them.** Do not work
   around a blocker; if a dependency is wrong, fix the dependency and say why.
 
 Rules for working a bead:
 
-1. Read its acceptance criteria and the plan section it cites before writing
-   anything.
+1. Read its acceptance criteria and the design section it cites before
+   writing anything.
 2. Close it only when the acceptance criteria hold and you have run the check
    that shows it.
 3. File what you discover as a new bead under the same parent, linked with
@@ -63,12 +60,13 @@ Rules for working a bead:
 
 ## Architecture rules
 
-The plan's Architecture and Durability sections are the authority. These are
-the rules that are easiest to break:
+These are the rules that are easiest to break:
 
 - **One Cargo workspace, one binary.** Crates: `atomic-core`, `atomic-durable`,
   `atomic-atoms`, `atomic-graph`, `atomic-schema`, `atomic-exec` and the
-  `atomic` binary.
+  `atomic` binary. Their packages are named `atomic-agentic-*` (the binary's is
+  `atomic-agentic`); the workspace aliases them to the short names used in
+  code, so pass the package name to `cargo -p`.
 - **Codex only behind `atomic-core`.** Depend on the Codex crates at one pinned
   git rev and never fork Codex core. The workspace copies Codex's
   `[patch.crates-io]` block verbatim.
@@ -97,15 +95,36 @@ the rules that are easiest to break:
 
 ## Build and test
 
-There is no workspace yet, so there is nothing to build. The first beads set
-it up: a development environment (`atomic-1a1`), the pinned Codex rev
-(`atomic-90c`), the workspace (`atomic-wl9`), the toolchain pin (`atomic-a5c`)
-and CI (`atomic-4yj`). The toolchain must match the one Codex pins at the
-chosen rev.
+Build and test inside the development container, through `scripts/dev.sh`. It
+runs any command in a pinned image with the toolchain Codex pins (Rust 1.95.0),
+under memory, CPU and time limits, and starts a throwaway Postgres for tests.
+[docs/development.md](docs/development.md) covers its settings.
 
-When those land, replace this section with the real commands. Bead
-`atomic-dxw` tracks that; do not document a command here that you have not
-run.
+```bash
+scripts/dev.sh cargo build --workspace --locked
+scripts/dev.sh cargo test --workspace --locked --no-fail-fast
+scripts/dev.sh cargo test --workspace --locked --features atomic-agentic-durable/postgres-tests
+scripts/dev.sh cargo fmt --all --check
+scripts/dev.sh cargo clippy --workspace --all-targets --locked -- -D warnings
+scripts/dev.sh cargo test -p atomic-agentic-core --lib --features fake-model   # one crate
+```
+
+CI runs the same build, fmt, clippy and tests, plus these checks, but only
+when started by hand: run everything locally first and spend a CI run only
+when a hosted result is needed (macOS minutes cost ten times Linux's, so it
+is opt-in). These checks also run locally:
+
+```bash
+scripts/codex-pin.sh check     # the [patch] block and toolchain match deps/codex.toml
+scripts/forks-check.sh         # each fork in deps/forks.toml resolves at its pinned rev
+scripts/lock-check.sh          # crates shared with Codex keep Codex's locked versions
+scripts/dev.sh cargo deny --locked check bans licenses sources   # deny.toml
+scripts/dev.sh scripts/sbom.sh # the SBOM lists every fork at its pin
+```
+
+The Codex pin, the forks and the lockfile exceptions are recorded under
+`deps/`; change them there and let the checks tell you what else must move.
+Release builds and packaging are described in docs/development.md.
 
 ## Testing rules
 
@@ -114,8 +133,8 @@ run.
   calls. Tests need no provider and no network.
 - **A control is tested by removing it:** switch the control off once and see
   its test fail.
-- **Port errai's behavioural tests before the code they describe,** and run
-  errai's own suite first to confirm it passes (`atomic-0yw`).
+- **Port a behavioural test before the code it describes,** and confirm it
+  passes against the implementation it came from first.
 - **Crash tests kill the process** at named failpoints and assert that no
   completed step repeats.
 
@@ -135,5 +154,8 @@ run.
   credited in the third-party notices. Do not ship a binary named `bd`.
 - **Never read or copy code from `beads_rust`.** Its licence rider excludes
   OpenAI, Anthropic and anyone acting on their behalf.
-- Code copied from errai is under the same owner. Its redaction module calls
-  `rig-core` (MIT), which must be vendored with attribution or rewritten.
+- Third-party code that is vendored or adapted keeps its licence and is
+  credited in the third-party notices.
+- **Repository content is about atomic only.** No business plans, roadmaps
+  with dates, competitor analysis or personal details in tracked files or
+  commit messages.

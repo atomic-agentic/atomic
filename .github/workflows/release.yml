@@ -1,0 +1,136 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# A version tag (v<version>, equal to the atomic-agentic package's version)
+# builds the atomic binary for Linux and macOS, packages each with its licences
+# and its CycloneDX SBOM, and attaches them to a draft GitHub release for a
+# maintainer to publish. A manual run on any branch does the same build and
+# packaging and keeps the results as workflow artifacts, with no release.
+# Nothing else starts it: each run builds both platforms in release mode.
+# Actions are pinned by commit SHA.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            cyclonedx_sha256: 2e4ef64a53c0a38d4b7d805c593b5f47ecd29821e98d81e484d03abaa0edb95f
+          - os: macos-15
+            target: aarch64-apple-darwin
+            cyclonedx_sha256: 4c39e13494d51c9d7f63e2923e7afdb5648a7a806a9ed7684dbe3786d2e2d1da
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: System packages (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential pkg-config libcap-dev libssl-dev libdbus-1-dev
+
+      - name: Toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: The tag names the package version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version="$(cargo pkgid -p atomic-agentic)"
+          version="${version##*@}"
+          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match atomic-agentic ${version}" >&2
+            exit 1
+          fi
+
+      - name: cargo-cyclonedx
+        run: |
+          cdx="cargo-cyclonedx-${{ matrix.target }}"
+          curl -fsSLo "${RUNNER_TEMP}/cdx.tar.xz" \
+            "https://github.com/CycloneDX/cyclonedx-rust-cargo/releases/download/cargo-cyclonedx-0.5.10/${cdx}.tar.xz"
+          echo "${{ matrix.cyclonedx_sha256 }}  ${RUNNER_TEMP}/cdx.tar.xz" | shasum -a 256 -c -
+          # Not ~/.cargo/bin: the macOS runners keep cargo elsewhere.
+          mkdir -p "${RUNNER_TEMP}/bin"
+          tar -xJf "${RUNNER_TEMP}/cdx.tar.xz" -C "${RUNNER_TEMP}/bin" --strip-components=1 "${cdx}/cargo-cyclonedx"
+          echo "${RUNNER_TEMP}/bin" >>"${GITHUB_PATH}"
+
+      # Release builds start from a clean target directory; only cargo's
+      # download caches are kept, for the large Codex git sources.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-release-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: cargo-release-${{ runner.os }}-
+
+      # The checkout and cargo-home paths are remapped so the binary does not
+      # carry this runner's directory layout.
+      - name: Build
+        run: |
+          export RUSTFLAGS="--remap-path-prefix=${GITHUB_WORKSPACE}=/atomic --remap-path-prefix=${CARGO_HOME:-${HOME}/.cargo}=/cargo"
+          cargo build --release --locked -p atomic-agentic --target ${{ matrix.target }}
+
+      - name: The binary runs
+        run: target/${{ matrix.target }}/release/atomic --version
+
+      - name: Package
+        run: scripts/release-package.sh ${{ matrix.target }}
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: atomic-${{ matrix.target }}
+          path: target/dist/*
+          if-no-files-found: error
+
+  release:
+    name: Draft release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Check the checksums
+        working-directory: dist
+        run: |
+          for f in *.sha256; do sha256sum -c "$f"; done
+          cat *.sha256 | sort -k2 > SHA256SUMS
+
+      - name: Draft the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" --draft --verify-tag \
+            --title "atomic ${GITHUB_REF_NAME}" --notes "" \
+            dist/*.tar.gz dist/*.cdx.json dist/SHA256SUMS

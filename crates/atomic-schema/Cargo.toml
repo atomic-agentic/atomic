@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "atomic-agentic-schema"
+description = "Schema registry, lowering to generation profiles, and full-contract validation for atomic."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+# The short name code uses; the package name is the published one.
+name = "atomic_schema"
+
+[lints]
+workspace = true
+
+[dependencies]
+cel = { workspace = true }
+jsonschema = { workspace = true }
+saphyr-parser = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

@@ -1,0 +1,167 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Linux and macOS are first-class platforms. While atomic is built out, CI
+# runs only when started by hand (Actions > CI > Run workflow): checks run
+# locally through scripts/dev.sh first, and a run is spent only when a hosted
+# result is needed. A run covers Linux; tick "macos" to add macOS, whose
+# minutes cost ten times as much. Actions are pinned by commit SHA.
+
+name: CI
+
+on:
+  workflow_dispatch:
+    inputs:
+      macos:
+        description: Also run the Rust job on macOS
+        type: boolean
+        default: false
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Codex's patch block pulls rusty_v8 and its Chromium submodules; cargo's
+  # built-in git client has failed on those fetches on macOS runners, and the
+  # git command line is sturdier.
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  codex-pin:
+    name: Pins
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Fails when the [patch] block in Cargo.toml or rust-toolchain.toml drifts from the
+      # Codex revision in deps/codex.toml.
+      - run: scripts/codex-pin.sh check
+      # Fails when a fork in deps/forks.toml resolves from another revision.
+      - run: scripts/forks-check.sh
+      # Fails when a crate shared with Codex leaves Codex's locked version
+      # without a reason in deps/lock-exceptions.toml.
+      - run: scripts/lock-check.sh
+
+  # deny.toml: a dependency with a disallowed licence, a banned crate or an
+  # unlisted source fails CI.
+  deny:
+    name: Dependency policy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: cargo-deny
+        run: |
+          deny=cargo-deny-0.21.0-x86_64-unknown-linux-musl
+          curl -fsSLo "${RUNNER_TEMP}/deny.tar.gz" "https://github.com/EmbarkStudios/cargo-deny/releases/download/0.21.0/${deny}.tar.gz"
+          echo "a2170b854ff697e79e39c4c538981c9c1bdd803addbae6719a4cb66b4585a903  ${RUNNER_TEMP}/deny.tar.gz" | sha256sum -c -
+          mkdir -p "${RUNNER_TEMP}/bin"
+          tar -xzf "${RUNNER_TEMP}/deny.tar.gz" -C "${RUNNER_TEMP}/bin" --strip-components=1 "${deny}/cargo-deny"
+          echo "${RUNNER_TEMP}/bin" >>"${GITHUB_PATH}"
+      - name: Toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Licences, bans and sources
+        run: cargo deny --locked check bans licenses sources
+
+  # Advisories reach atomic through Codex's dependency tree and change daily,
+  # so they are reported in a job of their own rather than mixed into the
+  # policy check above.
+  advisories:
+    name: Advisories
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: cargo-deny
+        run: |
+          deny=cargo-deny-0.21.0-x86_64-unknown-linux-musl
+          curl -fsSLo "${RUNNER_TEMP}/deny.tar.gz" "https://github.com/EmbarkStudios/cargo-deny/releases/download/0.21.0/${deny}.tar.gz"
+          echo "a2170b854ff697e79e39c4c538981c9c1bdd803addbae6719a4cb66b4585a903  ${RUNNER_TEMP}/deny.tar.gz" | sha256sum -c -
+          mkdir -p "${RUNNER_TEMP}/bin"
+          tar -xzf "${RUNNER_TEMP}/deny.tar.gz" -C "${RUNNER_TEMP}/bin" --strip-components=1 "${deny}/cargo-deny"
+          echo "${RUNNER_TEMP}/bin" >>"${GITHUB_PATH}"
+      - name: Toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - run: cargo deny --locked check advisories
+
+  rust:
+    name: Rust (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(inputs.macos && '["ubuntu-24.04", "macos-15"]' || '["ubuntu-24.04"]') }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The Codex graph's target directory, restored from the cache and saved
+      # again, outgrows the runner's free disk; drop toolchains this job never
+      # uses (.NET, Android, GHC, CodeQL).
+      - name: Free disk space (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: System packages (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential pkg-config libcap-dev libssl-dev libdbus-1-dev
+
+      # Postgres-backed suites read ATOMIC_TEST_DATABASE_URL and fail without it, so the
+      # database runs where the container service is available.
+      - name: Test Postgres (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          docker run -d --name atomic-test-postgres -p 127.0.0.1:5432:5432 \
+            -e POSTGRES_USER=atomic -e POSTGRES_PASSWORD=atomic -e POSTGRES_DB=atomic \
+            postgres:18.7-trixie@sha256:2ea8630df176ad090ec92136dee850397c5af8781e4bcf2e4162593691c61bbc
+          for _ in $(seq 1 60); do
+            docker exec atomic-test-postgres pg_isready -q -h 127.0.0.1 -U atomic && break
+            sleep 1
+          done
+          echo "ATOMIC_TEST_DATABASE_URL=postgres://atomic:atomic@127.0.0.1:5432/atomic" >>"$GITHUB_ENV"
+
+      # rustup installs the toolchain and components rust-toolchain.toml names.
+      - name: Toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      # The Codex patch block pulls large git sources (rusty_v8 and its submodules),
+      # so cargo's git and registry caches are kept between runs.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo build --workspace --locked
+      # Postgres variants run where the test database is; with the feature on, a
+      # missing database fails them rather than skipping.
+      - name: Test (Linux, with Postgres)
+        if: runner.os == 'Linux'
+        run: cargo test --workspace --locked --no-fail-fast --features atomic-agentic-durable/postgres-tests
+      - name: Test (macOS)
+        if: runner.os == 'macOS'
+        run: cargo test --workspace --locked --no-fail-fast
+
+      # The release SBOM must list every fork at its pinned revision.
+      - name: SBOM (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cdx=cargo-cyclonedx-x86_64-unknown-linux-gnu
+          curl -fsSLo /tmp/cdx.tar.xz "https://github.com/CycloneDX/cyclonedx-rust-cargo/releases/download/cargo-cyclonedx-0.5.10/${cdx}.tar.xz"
+          echo "2e4ef64a53c0a38d4b7d805c593b5f47ecd29821e98d81e484d03abaa0edb95f  /tmp/cdx.tar.xz" | sha256sum -c -
+          tar -xJf /tmp/cdx.tar.xz -C "$HOME/.cargo/bin" --strip-components=1 "${cdx}/cargo-cyclonedx"
+          scripts/sbom.sh

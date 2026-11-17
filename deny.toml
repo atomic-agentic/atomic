@@ -1,0 +1,77 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# cargo-deny policy: licences, advisories, bans and sources. CI runs
+# `cargo deny --locked check`; a dependency that breaks this policy fails CI.
+#
+# atomic ships Codex's crates, so the licence allow-list and the advisory
+# exceptions start from Codex's own deny.toml at the revision in
+# deps/codex.toml. An exception for an advisory names why it does not apply or
+# what must change before it can be removed.
+
+[graph]
+# The targets atomic is released for.
+targets = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
+all-features = false
+no-default-features = false
+
+[output]
+feature-depth = 1
+
+[advisories]
+ignore = [
+]
+
+[licenses]
+# Permissive licences, plus the file-level copyleft MPL-2.0, which Codex also
+# accepts. Strong copyleft (GPL, AGPL, LGPL) and unlicensed crates fail.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.8
+exceptions = []
+
+# atomic's own crates are checked like everyone else's.
+[licenses.private]
+ignore = false
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+allow-wildcard-paths = true
+deny = [
+    # Its licence excludes the people who build atomic (AGENTS.md).
+    { crate = "beads_rust", reason = "excluded from atomic by its licence rider" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# Every git dependency is pinned to a commit.
+required-git-spec = "rev"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# The git sources atomic's dependency graph resolves: Codex, the forks it
+# patches in and its git dependencies (see Codex's deny.toml), and the durare
+# fork (deps/forks.toml). A source the graph stops using is removed here.
+allow-git = [
+    "https://github.com/atomic-agentic/durare",
+    "https://github.com/helix-editor/nucleo.git",
+    "https://github.com/microsoft/mxc",
+    "https://github.com/modelcontextprotocol/rust-sdk",
+    "https://github.com/openai/codex",
+    "https://github.com/openai-oss-forks/tokio-tungstenite",
+    "https://github.com/openai-oss-forks/tungstenite-rs",
+    "https://github.com/transact-rs/sqlx",
+]

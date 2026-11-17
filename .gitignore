@@ -5,3 +5,14 @@
 .beads-credential-key
 .beads/proxieddb/
 *.gate.lock*
+
+# Maintainer-local agent notes
+AGENTS.local.md
+CLAUDE.local.md
+
+# Build output
+/target/
+
+# cargo-cyclonedx writes an SBOM beside every workspace crate; scripts/sbom.sh
+# keeps only the binary's, under target/sbom.
+*.cdx.json

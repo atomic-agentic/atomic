@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "atomic-agentic"
+description = "The atomic command-line program: workflows, the operator CLI and the server."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+atomic-atoms = { workspace = true }
+atomic-core = { workspace = true }
+atomic-durable = { workspace = true }
+atomic-exec = { workspace = true }
+atomic-graph = { workspace = true }
+atomic-schema = { workspace = true }
+
+[dev-dependencies]
+sqlx = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros"] }
+
+[[bin]]
+name = "atomic"
+path = "src/main.rs"

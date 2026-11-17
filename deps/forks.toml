@@ -1,0 +1,26 @@
+# Every fork atomic's build uses, with its pinned revision. This file is the
+# source for the third-party notices and the release SBOM, and
+# scripts/forks-check.sh checks it against Cargo.lock.
+#
+# Each [[fork]] lists the crates that must resolve from `repository` at `rev`.
+
+[[fork]]
+name = "durare"
+repository = "https://github.com/atomic-agentic/durare"
+upstream = "https://github.com/SamuelXing/durare"
+# The upstream commit the fork's `atomic` branch starts from.
+upstream_base = "0994da0d6425c575ad4192353399c0eb8085b68a"
+branch = "atomic"
+rev = "cbfc49374f5312f9ef176e0dffe512ba3c160b71"
+licence = "MIT OR Apache-2.0"
+why = "ported to sqlx 0.9 so it links with Codex's SQLite stack"
+crates = ["durare", "durare-macros"]
+
+[[fork]]
+name = "sqlx"
+repository = "https://github.com/transact-rs/sqlx"
+upstream = "https://github.com/launchbadge/sqlx"
+rev = "10462fa4414c6c7f1ed1d39bb31678e3b726878c"
+licence = "MIT OR Apache-2.0"
+why = "accepts libsqlite3-sys 0.39; Codex patches sqlx-core and sqlx-sqlite to it, atomic adds sqlx-postgres"
+crates = ["sqlx-core", "sqlx-sqlite", "sqlx-postgres"]

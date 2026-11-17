@@ -1,0 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Must equal codex-rs/rust-toolchain.toml at the revision in deps/codex.toml.
+[toolchain]
+channel = "1.95.0"
+components = ["clippy", "rustfmt", "rust-src"]

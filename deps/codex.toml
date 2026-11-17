@@ -1,0 +1,10 @@
+# The single source of truth for the Codex revision atomic builds against.
+# Cargo.toml, rust-toolchain.toml and the [patch.crates-io] block are checked
+# against this file; change it only through the Codex bump procedure.
+
+[codex]
+repository = "https://github.com/openai/codex"
+tag = "rust-v0.169.0"
+rev = "d32063f96c2dff1dc96af839b3952abb6acfeda4"
+# Codex's own codex-rs/rust-toolchain.toml at this rev.
+toolchain = "1.95.0"
