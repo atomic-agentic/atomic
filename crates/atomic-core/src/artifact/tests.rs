@@ -91,3 +91,65 @@ fn a_missing_artifact_is_reported_as_missing() {
     assert!(s.manifests(&missing).expect("manifests").is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_reference_to_a_missing_artifact_fails_validation() {
+    use atomic_schema::artifact::{ArtifactCheckError, check_refs};
+    use atomic_schema::registry::Registry;
+    use serde_json::json;
+
+    let (s, dir) = store();
+    let patch = s
+        .put(&mut &b"--- a\n+++ b\n"[..], provenance("implement"))
+        .expect("put");
+    let schema = json!({
+        "type": "object",
+        "required": ["patch"],
+        "properties": {
+            "patch": {"$ref": "atomic:artifact", "mediaType": "text/x-diff"},
+            "logs": {"type": "array", "items": {"$ref": "atomic:artifact"}}
+        }
+    });
+    let mut registry = Registry::new();
+    let id = registry
+        .register(dir.join("review.output.schema.json"), schema.clone())
+        .expect("register");
+    let validator = registry.validator(&id).expect("atomic:artifact resolves");
+
+    let good = json!({"patch": patch.artifact.uri(), "logs": [patch.artifact.uri()]});
+    assert!(validator.is_valid(&good));
+    check_refs(&schema, &good, &s).expect("present, and a diff");
+
+    // Not a reference at all: the schema itself rejects it.
+    assert!(!validator.is_valid(&json!({"patch": "patch.diff"})));
+
+    let missing = format!("artifact://sha256/{}", "1".repeat(64));
+    let bad = json!({"patch": patch.artifact.uri(), "logs": [missing.clone()]});
+    assert!(
+        validator.is_valid(&bad),
+        "well-formed, so only the store can tell"
+    );
+    assert_eq!(
+        check_refs(&schema, &bad, &s),
+        Err(ArtifactCheckError::Missing {
+            at: "/logs/0".into(),
+            text: missing
+        })
+    );
+
+    let report = s
+        .put(
+            &mut &b"# Report\n"[..],
+            Provenance {
+                media_type: "text/markdown".into(),
+                ..provenance("x")
+            },
+        )
+        .expect("put");
+    let wrong = json!({"patch": report.artifact.uri()});
+    assert!(matches!(
+        check_refs(&schema, &wrong, &s),
+        Err(ArtifactCheckError::WrongMediaType { ref expected, .. }) if expected == "text/x-diff"
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+}

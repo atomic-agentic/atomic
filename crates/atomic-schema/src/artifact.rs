@@ -111,3 +111,170 @@ mod tests {
         }
     }
 }
+
+/// The `$id` of the built-in artifact reference schema.
+pub const ARTIFACT_SCHEMA_ID: &str = "atomic:artifact";
+
+/// The built-in schema `{ "$ref": "atomic:artifact" }` names: a string holding
+/// an artifact reference. A `mediaType` beside the `$ref` says what the
+/// artifact must be.
+pub fn artifact_schema() -> serde_json::Value {
+    serde_json::json!({
+        "$id": ARTIFACT_SCHEMA_ID,
+        "type": "string",
+        "pattern": "^artifact://sha256/[0-9a-f]{64}$",
+        "description": "A reference to a stored artifact: artifact://sha256/<digest>."
+    })
+}
+
+/// Lets validation ask the artifact store about a reference.
+pub trait ArtifactLookup {
+    /// The media types recorded for the artifact, or `None` if it is not in
+    /// the store.
+    fn media_types(&self, artifact: &ArtifactRef) -> Option<Vec<String>>;
+}
+
+/// An artifact reference in a value, where it is, and the media type its
+/// schema requires.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FoundRef {
+    /// JSON Pointer into the value.
+    pub at: String,
+    /// The reference as written.
+    pub text: String,
+    /// The `mediaType` the schema requires, if any.
+    pub media_type: Option<String>,
+}
+
+/// Every artifact reference `value` holds where `schema` expects one,
+/// following `properties`, `items` and local `$defs` references.
+pub fn find_refs(schema: &serde_json::Value, value: &serde_json::Value) -> Vec<FoundRef> {
+    let mut out = Vec::new();
+    walk(schema, schema, value, "", &mut out, 0);
+    out
+}
+
+fn walk(
+    root: &serde_json::Value,
+    schema: &serde_json::Value,
+    value: &serde_json::Value,
+    at: &str,
+    out: &mut Vec<FoundRef>,
+    depth: usize,
+) {
+    use serde_json::Value;
+    if depth > 64 {
+        return;
+    }
+    match schema.get("$ref").and_then(Value::as_str) {
+        Some(ARTIFACT_SCHEMA_ID) => {
+            if let Some(text) = value.as_str() {
+                out.push(FoundRef {
+                    at: at.to_owned(),
+                    text: text.to_owned(),
+                    media_type: schema
+                        .get("mediaType")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                });
+            }
+            return;
+        }
+        Some(local) if local.starts_with("#/") => {
+            if let Some(target) = root.pointer(&local[1..]) {
+                walk(root, target, value, at, out, depth + 1);
+            }
+        }
+        _ => {}
+    }
+    if let (Some(props), Some(obj)) = (
+        schema.get("properties").and_then(Value::as_object),
+        value.as_object(),
+    ) {
+        for (k, s) in props {
+            if let Some(v) = obj.get(k) {
+                let child = format!("{at}/{}", k.replace('~', "~0").replace('/', "~1"));
+                walk(root, s, v, &child, out, depth + 1);
+            }
+        }
+    }
+    if let (Some(items), Some(arr)) = (schema.get("items"), value.as_array()) {
+        for (i, v) in arr.iter().enumerate() {
+            walk(root, items, v, &format!("{at}/{i}"), out, depth + 1);
+        }
+    }
+    if let Some(Value::Array(branches)) = schema.get("anyOf") {
+        for b in branches {
+            walk(root, b, value, at, out, depth + 1);
+        }
+    }
+}
+
+/// Why a value's artifact references do not hold.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ArtifactCheckError {
+    /// The referenced artifact is not in the store.
+    #[error("{at}: no artifact {text} in the store")]
+    Missing {
+        /// Where in the value.
+        at: String,
+        /// The reference.
+        text: String,
+    },
+    /// The artifact exists but is not of the required media type.
+    #[error("{at}: {text} is {found:?}, not {expected}")]
+    WrongMediaType {
+        /// Where in the value.
+        at: String,
+        /// The reference.
+        text: String,
+        /// What the schema requires.
+        expected: String,
+        /// What the store records.
+        found: Vec<String>,
+    },
+    /// The text is not a reference at all.
+    #[error("{at}: {source}")]
+    Malformed {
+        /// Where in the value.
+        at: String,
+        /// Why.
+        source: ArtifactRefError,
+    },
+}
+
+/// Check every artifact reference `value` holds against the store: it must
+/// exist and, where its schema says, have the right media type.
+pub fn check_refs(
+    schema: &serde_json::Value,
+    value: &serde_json::Value,
+    store: &dyn ArtifactLookup,
+) -> Result<(), ArtifactCheckError> {
+    for found in find_refs(schema, value) {
+        let artifact: ArtifactRef =
+            found
+                .text
+                .parse()
+                .map_err(|source| ArtifactCheckError::Malformed {
+                    at: found.at.clone(),
+                    source,
+                })?;
+        let types = store
+            .media_types(&artifact)
+            .ok_or_else(|| ArtifactCheckError::Missing {
+                at: found.at.clone(),
+                text: found.text.clone(),
+            })?;
+        if let Some(expected) = found.media_type
+            && !types.contains(&expected)
+        {
+            return Err(ArtifactCheckError::WrongMediaType {
+                at: found.at,
+                text: found.text,
+                expected,
+                found: types,
+            });
+        }
+    }
+    Ok(())
+}

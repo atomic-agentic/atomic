@@ -87,7 +87,7 @@ pub enum SchemaError {
 }
 
 /// Schemas by id.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Registry {
     entries: BTreeMap<String, Entry>,
 }
@@ -109,10 +109,30 @@ fn twin(path: &Path) -> Option<PathBuf> {
     Some(path.with_file_name(other))
 }
 
+impl Default for Registry {
+    /// The same as [`Registry::new`]: built-in schemas included.
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Registry {
-    /// An empty registry.
+    /// A registry holding only atomic's built-in schemas
+    /// (`atomic:artifact`).
     pub fn new() -> Self {
-        Self::default()
+        let mut r = Self {
+            entries: BTreeMap::new(),
+        };
+        let id = crate::artifact::ARTIFACT_SCHEMA_ID.to_owned();
+        r.entries.insert(
+            id.clone(),
+            Entry {
+                id,
+                file: PathBuf::from("<built-in>"),
+                schema: crate::artifact::artifact_schema(),
+            },
+        );
+        r
     }
 
     /// Read, parse and register the schema at `path`. Returns its id.

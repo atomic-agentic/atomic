@@ -302,5 +302,22 @@ impl ArtifactStore for LocalStore {
     }
 }
 
+impl atomic_schema::artifact::ArtifactLookup for LocalStore {
+    fn media_types(&self, artifact: &ArtifactRef) -> Option<Vec<String>> {
+        if !self.contains(artifact).ok()? {
+            return None;
+        }
+        let mut types: Vec<String> = self
+            .manifests(artifact)
+            .ok()?
+            .into_iter()
+            .map(|m| m.media_type)
+            .collect();
+        types.sort();
+        types.dedup();
+        Some(types)
+    }
+}
+
 #[cfg(test)]
 mod tests;

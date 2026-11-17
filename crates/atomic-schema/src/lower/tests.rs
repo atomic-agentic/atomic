@@ -145,3 +145,21 @@ fn an_optional_reference_becomes_a_nullable_anyof() {
     assert_eq!(check(&l.schema, &OPENAI_STRICT), Vec::<String>::new());
     assert_eq!(l.nulls_added, ["/owner"]);
 }
+
+#[test]
+fn an_artifact_reference_is_inlined_for_generation() {
+    let contract = json!({
+        "type": "object",
+        "required": ["patch"],
+        "properties": {"patch": {"$ref": "atomic:artifact", "mediaType": "text/x-diff"}}
+    });
+    let l = lower(&contract, &OPENAI_STRICT).expect("lowers");
+    let patch = &l.schema["properties"]["patch"];
+    assert_eq!(patch["type"], json!("string"));
+    assert!(
+        patch["description"]
+            .as_str()
+            .is_some_and(|d| d.contains("text/x-diff"))
+    );
+    assert_eq!(check(&l.schema, &OPENAI_STRICT), Vec::<String>::new());
+}

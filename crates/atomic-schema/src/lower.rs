@@ -209,6 +209,23 @@ fn node(
     out: &mut Lowered,
     err: &dyn Fn(&str, String) -> LowerError,
 ) -> Result<Value, LowerError> {
+    // atomic's own artifact reference cannot be resolved by a provider:
+    // inline it, keeping any mediaType as a hint.
+    if s.get("$ref").and_then(Value::as_str) == Some(crate::artifact::ARTIFACT_SCHEMA_ID) {
+        let mut inlined = crate::artifact::artifact_schema();
+        if let Some(obj) = inlined.as_object_mut() {
+            obj.remove("$id");
+            if let Some(m) = s.get("mediaType").and_then(Value::as_str) {
+                obj.insert(
+                    "description".into(),
+                    Value::String(format!(
+                        "A reference to a stored {m} artifact: artifact://sha256/<digest>."
+                    )),
+                );
+            }
+        }
+        return Ok(inlined);
+    }
     let Value::Object(map) = s else {
         return match s {
             Value::Bool(true) => Err(err(
