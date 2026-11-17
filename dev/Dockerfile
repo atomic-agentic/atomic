@@ -13,11 +13,12 @@ RUN rustup component add clippy rustfmt rust-src
 
 # Codex's Linux build needs a C toolchain and the libcap, OpenSSL and D-Bus
 # (keyring) headers; its sandbox uses bubblewrap. git is needed by tests that
-# make real commits; psql is for inspecting the test database.
+# make real commits; psql is for inspecting the test database; python3 is for
+# the release packaging scripts.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         build-essential pkg-config libcap-dev libssl-dev libdbus-1-dev bubblewrap git ca-certificates curl xz-utils \
-        postgresql-client \
+        postgresql-client python3 \
     && rm -rf /var/lib/apt/lists/*
 
 ARG TARGETARCH

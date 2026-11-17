@@ -79,3 +79,34 @@ Set `ATOMIC_DEV_DB=off` to run a command without starting the database.
 
 A test suite that needs Postgres fails when `ATOMIC_TEST_DATABASE_URL` is not
 set. It never skips silently.
+
+## Releases
+
+A release starts from a tag `v<version>` whose version equals the
+`atomic-agentic` package's. The Release workflow then:
+
+1. builds `atomic` in release mode for `x86_64-unknown-linux-gnu` and
+   `aarch64-apple-darwin`, with the checkout and cargo paths remapped out of
+   the binary;
+2. packages each binary with `LICENSE`, `NOTICE` and
+   `THIRD-PARTY-NOTICES.md` into a deterministic `.tar.gz`;
+3. writes each binary's CycloneDX SBOM, which records the binary's SHA-256 and
+   lists every fork at its pinned revision;
+4. attaches the archives, the SBOMs and a `SHA256SUMS` file to a draft GitHub
+   release, which a maintainer reviews and publishes.
+
+A pull request that changes the pipeline runs steps 1 to 3 and keeps the
+results as workflow artifacts. To package a build locally:
+
+```bash
+scripts/dev.sh cargo build --release --locked -p atomic-agentic --target x86_64-unknown-linux-gnu
+scripts/dev.sh scripts/release-package.sh x86_64-unknown-linux-gnu   # writes target/dist/
+```
+
+To check that an SBOM describes the binary you have, compare the hash on its
+`atomic` component with the binary's own:
+
+```bash
+python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print([c["hashes"][0]["content"] for c in d["metadata"]["component"]["components"] if c["name"]=="atomic"][0])' atomic-<version>-<target>.cdx.json
+sha256sum atomic-<version>-<target>/atomic
+```

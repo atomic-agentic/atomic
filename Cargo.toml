@@ -72,6 +72,14 @@ debug = "line-tables-only"
 [profile.dev.package."*"]
 debug = false
 
+# Release binaries, as Codex builds its own, but stripped: the release
+# pipeline does not yet archive separate debug symbols.
+[profile.release]
+lto = "thin"
+codegen-units = 4
+debug = false
+strip = "symbols"
+
 [workspace.lints.rust]
 unsafe_code = "deny"
 missing_docs = "warn"
