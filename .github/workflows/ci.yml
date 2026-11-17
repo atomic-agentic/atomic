@@ -41,6 +41,46 @@ jobs:
       # without a reason in deps/lock-exceptions.toml.
       - run: scripts/lock-check.sh
 
+  # deny.toml: a dependency with a disallowed licence, a banned crate or an
+  # unlisted source fails CI.
+  deny:
+    name: Dependency policy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: cargo-deny
+        run: |
+          deny=cargo-deny-0.21.0-x86_64-unknown-linux-musl
+          curl -fsSLo "${RUNNER_TEMP}/deny.tar.gz" "https://github.com/EmbarkStudios/cargo-deny/releases/download/0.21.0/${deny}.tar.gz"
+          echo "a2170b854ff697e79e39c4c538981c9c1bdd803addbae6719a4cb66b4585a903  ${RUNNER_TEMP}/deny.tar.gz" | sha256sum -c -
+          mkdir -p "${RUNNER_TEMP}/bin"
+          tar -xzf "${RUNNER_TEMP}/deny.tar.gz" -C "${RUNNER_TEMP}/bin" --strip-components=1 "${deny}/cargo-deny"
+          echo "${RUNNER_TEMP}/bin" >>"${GITHUB_PATH}"
+      - name: Toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Licences, bans and sources
+        run: cargo deny --locked check bans licenses sources
+
+  # Advisories reach atomic through Codex's dependency tree and change daily,
+  # so they are reported in a job of their own rather than mixed into the
+  # policy check above.
+  advisories:
+    name: Advisories
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: cargo-deny
+        run: |
+          deny=cargo-deny-0.21.0-x86_64-unknown-linux-musl
+          curl -fsSLo "${RUNNER_TEMP}/deny.tar.gz" "https://github.com/EmbarkStudios/cargo-deny/releases/download/0.21.0/${deny}.tar.gz"
+          echo "a2170b854ff697e79e39c4c538981c9c1bdd803addbae6719a4cb66b4585a903  ${RUNNER_TEMP}/deny.tar.gz" | sha256sum -c -
+          mkdir -p "${RUNNER_TEMP}/bin"
+          tar -xzf "${RUNNER_TEMP}/deny.tar.gz" -C "${RUNNER_TEMP}/bin" --strip-components=1 "${deny}/cargo-deny"
+          echo "${RUNNER_TEMP}/bin" >>"${GITHUB_PATH}"
+      - name: Toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - run: cargo deny --locked check advisories
+
   rust:
     name: Rust (${{ matrix.os }})
     strategy:
