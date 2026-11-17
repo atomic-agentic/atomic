@@ -16,4 +16,7 @@ pub mod state;
 pub mod tags;
 #[cfg(any(test, feature = "fake-model"))]
 pub mod testing;
+pub mod typed;
 pub mod workflow;
+
+pub use typed::{Approvals, Atom, AtomConfig, AtomError, AtomKind, Sandbox};
