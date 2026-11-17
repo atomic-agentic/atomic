@@ -517,6 +517,8 @@ dependencies = [
  "codex-core-api",
  "codex-extension-api",
  "dirs",
+ "serde",
+ "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.21",
 ]
@@ -546,6 +548,7 @@ name = "atomic-agentic-schema"
 version = "0.0.0"
 dependencies = [
  "saphyr-parser",
+ "serde",
  "serde_json",
  "thiserror 2.0.21",
 ]

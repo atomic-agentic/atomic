@@ -5,4 +5,5 @@
 //! JSON Schema is atomic's contract: every model output and tool argument is
 //! validated here against the full schema, whatever subset a provider enforces.
 
+pub mod artifact;
 pub mod yaml;
