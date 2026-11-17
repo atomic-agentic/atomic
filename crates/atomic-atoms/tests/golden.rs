@@ -8,7 +8,7 @@
 //! generation profile asks for, nulls included), and the `output.json` the
 //! atom must return.
 
-use atomic_atoms::{DraftTask, ReviewPatch};
+use atomic_atoms::{ChangeRequest, DraftTask, ReviewPatch, ReviewRequest};
 use atomic_core::codex::{CodexPaths, ModelEndpoint};
 use atomic_core::lite::LiteRuntime;
 use atomic_core::runtime::{CodexRuntime, run_codex_atom, run_lite_atom};
@@ -58,11 +58,20 @@ where
     A::In: DeserializeOwned,
 {
     let input: A::In = serde_json::from_str(&golden(A::NAME, "input.json")).expect("input");
+    run_on(atom, &input, script).await
+}
+
+/// Run `atom` on `input` against `script`, on its kind's runtime.
+async fn run_on<A: Atom>(
+    atom: &A,
+    input: &A::In,
+    script: Vec<Reply>,
+) -> (FakeModel, Result<A::Out, AtomError>) {
     let model = FakeModel::start(script).await.expect("fake model");
     let result = match atom.kind() {
         AtomKind::Lite => {
             let rt = LiteRuntime::new(endpoint(&model), AtomConfig::default());
-            run_lite_atom(atom, &input, &rt).await
+            run_lite_atom(atom, input, &rt).await
         }
         AtomKind::Codex => {
             let dir = scratch(A::NAME);
@@ -73,7 +82,7 @@ where
                 endpoint: endpoint(&model),
                 defaults: AtomConfig::default(),
             };
-            run_codex_atom(atom, &input, &rt).await
+            run_codex_atom(atom, input, &rt).await
         }
         AtomKind::Exec => panic!("{} calls no model", A::NAME),
     };
@@ -183,5 +192,48 @@ fn an_approval_with_a_blocker_fails_the_reviewers_check() {
             "{result:?}"
         );
         assert_eq!(model.calls(), 2);
+    });
+}
+
+/// An input that breaks its contract fails before anything reaches the model.
+#[test]
+fn invalid_inputs_never_reach_the_model() {
+    on_codex_runtime(async {
+        let good = || Reply::Text(golden(DraftTask::NAME, "answer.json"));
+        // minLength.
+        let request = ChangeRequest {
+            request: String::new(),
+        };
+        let (model, result) = run_on(&DraftTask, &request, vec![good()]).await;
+        assert!(
+            matches!(&result, Err(AtomError::Input(m)) if m.contains("/request")),
+            "{result:?}"
+        );
+        assert_eq!(model.calls(), 0);
+
+        let review: ReviewRequest =
+            serde_json::from_str(&golden(ReviewPatch::NAME, "input.json")).expect("input");
+        let good = || Reply::Text(golden(ReviewPatch::NAME, "answer.json"));
+        // pattern: a branch name is not a commit.
+        let mut by_name = review.clone();
+        by_name.commit = "HEAD".into();
+        // maximum.
+        let mut urgent = review.clone();
+        urgent.item.priority = 9;
+        // minItems.
+        let mut uncheckable = review;
+        uncheckable.item.criteria.clear();
+        for (input, at) in [
+            (by_name, "/commit"),
+            (urgent, "/item/priority"),
+            (uncheckable, "/item/criteria"),
+        ] {
+            let (model, result) = run_on(&ReviewPatch, &input, vec![good()]).await;
+            assert!(
+                matches!(&result, Err(AtomError::Input(m)) if m.contains(at)),
+                "{at}: {result:?}"
+            );
+            assert_eq!(model.calls(), 0, "{at}: no model call");
+        }
     });
 }

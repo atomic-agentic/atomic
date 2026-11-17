@@ -350,3 +350,58 @@ fn a_declarative_atom_breaking_a_contract_only_constraint_gets_exactly_one_repai
         assert_eq!(model.paths(), ["/v1/responses"]);
     });
 }
+
+#[test]
+fn a_declarative_atom_rejects_an_input_that_breaks_its_contract() {
+    use crate::{atom, compile};
+    on_codex_runtime(async {
+        let dir = scratch("decl-input");
+        std::fs::create_dir_all(dir.join("atoms")).expect("mkdir");
+        std::fs::write(
+            dir.join("atoms/count.atom.md"),
+            "---\natomic: 1\ndescription: Count the words in a note.\nkind: lite\n---\nNote: {% $input.text %}\n",
+        )
+        .expect("atom");
+        std::fs::write(
+            dir.join("atoms/count.input.schema.yaml"),
+            "type: object\nrequired: [text, limit]\nproperties:\n  text: {type: string, maxLength: 10}\n  limit: {type: integer, minimum: 1}\n",
+        )
+        .expect("input");
+        std::fs::write(
+            dir.join("atoms/count.output.schema.yaml"),
+            "type: object\nadditionalProperties: false\nrequired: [words]\nproperties:\n  words: {type: integer}\n",
+        )
+        .expect("output");
+        let mut registry = Registry::new();
+        let a = atom::load(&dir.join("atoms/count.atom.md"), &mut registry).expect("loads");
+        let compiled = compile::compile(&a, &registry).expect("compiles");
+        for (input, at) in [
+            (json!({"text": "two words"}), "limit"),
+            (
+                json!({"text": "far more than ten characters", "limit": 3}),
+                "/text",
+            ),
+            (json!({"text": "short", "limit": 0}), "/limit"),
+        ] {
+            let model = FakeModel::start(vec![Reply::Text(r#"{"words": 2}"#.into())])
+                .await
+                .expect("fake model");
+            let rt = runtimes(&model, "decl-input");
+            let r = run_declarative(
+                &a,
+                &compiled,
+                &mut registry,
+                &input,
+                "run-1",
+                "external",
+                &rt,
+            )
+            .await;
+            assert!(
+                matches!(&r, Err(AtomError::Input(m)) if m.contains(at)),
+                "{at}: {r:?}"
+            );
+            assert_eq!(model.calls(), 0, "{at}: no model call");
+        }
+    });
+}

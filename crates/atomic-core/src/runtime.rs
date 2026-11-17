@@ -4,6 +4,8 @@
 //!
 //! Every atom run follows the same contract:
 //!
+//! 0. the input is checked against its full contract; an input that does not
+//!    fit fails with [`AtomError::Input`] before anything is rendered or sent;
 //! 1. the output contract is lowered to the generation profile, which becomes
 //!    the turn's structured-output schema;
 //! 2. the instructions are the developer instructions and the input is the
@@ -250,6 +252,12 @@ async fn run_typed<A: Atom>(
             atom.kind()
         )));
     }
+    let input_value = serde_json::to_value(input)
+        .map_err(|e| AtomError::Runtime(format!("serialize the input: {e}")))?;
+    let input_validator = jsonschema::validator_for(&atom.input_schema()).map_err(|e| {
+        AtomError::Runtime(format!("the input schema of {} is not valid: {e}", A::NAME))
+    })?;
+    check_input(&input_validator, &input_value)?;
     let mut config = backend.defaults().clone();
     atom.configure(&mut config);
     let contract = atom.output_schema();
@@ -305,6 +313,10 @@ pub async fn run_declarative(
             )));
         }
     };
+    let input_validator = registry
+        .validator(&atom.input)
+        .map_err(|e| AtomError::Runtime(e.to_string()))?;
+    check_input(&input_validator, input)?;
     let rendered = render::render(
         compiled,
         &RunInput {
@@ -397,6 +409,22 @@ where
         Err(e) => Err(AtomError::Runtime(format!(
             "the atom's task was cancelled: {e}"
         ))),
+    }
+}
+
+/// Check an input against its full contract, naming every place it fails.
+fn check_input(validator: &jsonschema::Validator, input: &Value) -> Result<(), AtomError> {
+    let errors: Vec<String> = validator
+        .iter_errors(input)
+        .map(|e| {
+            let at = e.instance_path().to_string();
+            format!("{}: {e}", if at.is_empty() { "/".to_owned() } else { at })
+        })
+        .collect();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(AtomError::Input(errors.join("; ")))
     }
 }
 

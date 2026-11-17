@@ -72,6 +72,10 @@ pub struct AtomConfig {
 /// Why an atom failed.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum AtomError {
+    /// The input does not fit the atom's input contract; the model was not
+    /// called.
+    #[error("the input does not fit the input schema: {0}")]
+    Input(String),
     /// The final answer did not fit the output contract, even after the
     /// repair turn.
     #[error("the output does not fit the schema: {message}")]
