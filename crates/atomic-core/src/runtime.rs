@@ -18,14 +18,16 @@
 //!    [`AtomError::Validation`] when only its own check failed).
 //!
 //! The normalized, validated value is what a durable step checkpoints.
-//! [`run_codex_atom`] runs a typed Rust atom; [`run_declarative`] runs a
-//! loaded `.atom.md`.
+//! [`run_codex_atom`] runs a typed Rust atom on a Codex thread,
+//! [`run_lite_atom`] runs one as a single model call (see [`crate::lite`]),
+//! and [`run_declarative`] runs a loaded `.atom.md`.
 
 use crate::atom::Atom as AtomFile;
 use crate::codex::{self, CodexPaths, ModelEndpoint, TurnSpec};
 use crate::compile::Compiled;
+use crate::lite::{self, LiteRuntime};
 use crate::render::{self, RunInput};
-use crate::typed::{Atom, AtomConfig, AtomError};
+use crate::typed::{Atom, AtomConfig, AtomError, AtomKind};
 use atomic_schema::lower::{self, OPENAI_STRICT};
 use atomic_schema::registry::Registry;
 use serde_json::Value;
@@ -47,10 +49,21 @@ pub struct CodexRuntime {
     pub defaults: AtomConfig,
 }
 
+/// The runtimes atoms run on, one for each kind of atom that calls a model.
+/// A declarative atom runs on the one its `kind` names.
+#[derive(Clone, Debug)]
+pub struct Runtimes {
+    /// For `kind: codex`.
+    pub codex: CodexRuntime,
+    /// For `kind: lite`.
+    pub lite: LiteRuntime,
+}
+
 /// What a run records beside its output.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunMetadata {
-    /// Codex's id for the thread the atom ran on.
+    /// Codex's id for the thread the atom ran on; for a lite atom, the
+    /// provider's id for its last response.
     pub thread_id: String,
     /// The model the turn used.
     pub model: String,
@@ -70,6 +83,31 @@ pub struct RunMetadata {
     pub turns: u32,
 }
 
+/// What runs an atom's turns.
+#[derive(Clone, Copy)]
+enum Backend<'a> {
+    /// A Codex thread.
+    Codex(&'a CodexRuntime),
+    /// One model call per turn.
+    Lite(&'a LiteRuntime),
+}
+
+impl Backend<'_> {
+    fn endpoint(&self) -> &ModelEndpoint {
+        match self {
+            Self::Codex(rt) => &rt.endpoint,
+            Self::Lite(rt) => &rt.endpoint,
+        }
+    }
+
+    fn defaults(&self) -> &AtomConfig {
+        match self {
+            Self::Codex(rt) => &rt.defaults,
+            Self::Lite(rt) => &rt.defaults,
+        }
+    }
+}
+
 /// The atom's own check on a value that already fits the contract.
 type Check<'a> = dyn Fn(&Value) -> Result<(), AtomError> + Send + Sync + 'a;
 
@@ -86,7 +124,7 @@ struct Request<'a> {
 
 /// Run `request`, with one repair turn.
 async fn run_contract(
-    runtime: &CodexRuntime,
+    backend: Backend<'_>,
     request: Request<'_>,
     check: &Check<'_>,
 ) -> Result<(Value, RunMetadata), AtomError> {
@@ -106,7 +144,7 @@ async fn run_contract(
     let model = spec
         .model
         .clone()
-        .unwrap_or_else(|| runtime.endpoint.model.clone());
+        .unwrap_or_else(|| backend.endpoint().model.clone());
     let mut h = Sha256::new();
     for part in [
         spec.developer_instructions.as_deref().unwrap_or_default(),
@@ -121,39 +159,45 @@ async fn run_contract(
     let mut accepted = None;
     let mut failure = None;
     let mut repairs_left = 1;
-    let (_, report) = codex::converse(
-        &runtime.paths,
-        &runtime.codex_home,
-        &runtime.cwd,
-        &runtime.endpoint,
-        &spec,
-        |answer| match accept(answer, &lowered.nulls_added, request.validator, check) {
-            Ok(v) => {
-                accepted = Some(v);
-                None
-            }
-            Err(e @ (AtomError::Schema { .. } | AtomError::Validation(_))) if repairs_left > 0 => {
-                repairs_left -= 1;
-                let problem = match &e {
-                    AtomError::Schema { message, .. } => message.clone(),
-                    other => other.to_string(),
-                };
-                Some(TurnSpec {
-                    prompt: format!(
-                        "Your answer did not fit the required output: {problem}\n\
+    let next = |answer: &str| match accept(answer, &lowered.nulls_added, request.validator, check) {
+        Ok(v) => {
+            accepted = Some(v);
+            None
+        }
+        Err(e @ (AtomError::Schema { .. } | AtomError::Validation(_))) if repairs_left > 0 => {
+            repairs_left -= 1;
+            let problem = match &e {
+                AtomError::Schema { message, .. } => message.clone(),
+                other => other.to_string(),
+            };
+            Some(TurnSpec {
+                prompt: format!(
+                    "Your answer did not fit the required output: {problem}\n\
                          Reply again with only the corrected JSON, following the same schema."
-                    ),
-                    output_schema: Some(lowered.schema.clone()),
-                    ..TurnSpec::default()
-                })
-            }
-            Err(e) => {
-                failure = Some(e);
-                None
-            }
-        },
-    )
-    .await
+                ),
+                output_schema: Some(lowered.schema.clone()),
+                ..TurnSpec::default()
+            })
+        }
+        Err(e) => {
+            failure = Some(e);
+            None
+        }
+    };
+    let (_, report) = match backend {
+        Backend::Codex(rt) => {
+            codex::converse(
+                &rt.paths,
+                &rt.codex_home,
+                &rt.cwd,
+                &rt.endpoint,
+                &spec,
+                next,
+            )
+            .await
+        }
+        Backend::Lite(rt) => lite::converse(rt, &spec, next).await,
+    }
     .map_err(|e| AtomError::Model(format!("{e:#}")))?;
     let metadata = RunMetadata {
         thread_id: report.thread_id,
@@ -174,13 +218,39 @@ async fn run_contract(
     }
 }
 
-/// Run a typed atom on `input`.
+/// Run a typed Codex atom on `input`, on a fresh Codex thread.
 pub async fn run_codex_atom<A: Atom>(
     atom: &A,
     input: &A::In,
     runtime: &CodexRuntime,
 ) -> Result<(A::Out, RunMetadata), AtomError> {
-    let mut config = runtime.defaults.clone();
+    run_typed(atom, input, AtomKind::Codex, Backend::Codex(runtime)).await
+}
+
+/// Run a typed lite atom on `input`: one schema-constrained model call, and
+/// one more for the repair turn when the first answer does not fit.
+pub async fn run_lite_atom<A: Atom>(
+    atom: &A,
+    input: &A::In,
+    runtime: &LiteRuntime,
+) -> Result<(A::Out, RunMetadata), AtomError> {
+    run_typed(atom, input, AtomKind::Lite, Backend::Lite(runtime)).await
+}
+
+async fn run_typed<A: Atom>(
+    atom: &A,
+    input: &A::In,
+    kind: AtomKind,
+    backend: Backend<'_>,
+) -> Result<(A::Out, RunMetadata), AtomError> {
+    if atom.kind() != kind {
+        return Err(AtomError::Runtime(format!(
+            "{} is a {:?} atom and cannot run as a {kind:?} atom",
+            A::NAME,
+            atom.kind()
+        )));
+    }
+    let mut config = backend.defaults().clone();
     atom.configure(&mut config);
     let contract = atom.output_schema();
     let validator = jsonschema::validator_for(&contract).map_err(|e| {
@@ -207,14 +277,15 @@ pub async fn run_codex_atom<A: Atom>(
         validator: &validator,
         name: A::NAME,
     };
-    let (value, metadata) = run_contract(runtime, request, &check).await?;
+    let (value, metadata) = run_contract(backend, request, &check).await?;
     let out = serde_json::from_value(value)
         .map_err(|e| AtomError::Runtime(format!("deserialize the accepted output: {e}")))?;
     Ok((out, metadata))
 }
 
-/// Run a loaded `.atom.md` on `input`. Returns the normalized, validated
-/// output, which is what a durable step checkpoints.
+/// Run a loaded `.atom.md` on `input`, on the runtime its `kind` names.
+/// Returns the normalized, validated output, which is what a durable step
+/// checkpoints.
 pub async fn run_declarative(
     atom: &AtomFile,
     compiled: &Compiled,
@@ -222,8 +293,18 @@ pub async fn run_declarative(
     input: &Value,
     run_id: &str,
     origin: &str,
-    runtime: &CodexRuntime,
+    runtimes: &Runtimes,
 ) -> Result<(Value, RunMetadata), AtomError> {
+    let backend = match atom.kind.as_str() {
+        "codex" => Backend::Codex(&runtimes.codex),
+        "lite" => Backend::Lite(&runtimes.lite),
+        other => {
+            return Err(AtomError::Runtime(format!(
+                "{} is a {other} atom, which calls no model",
+                atom.name
+            )));
+        }
+    };
     let rendered = render::render(
         compiled,
         &RunInput {
@@ -292,7 +373,7 @@ pub async fn run_declarative(
         validator: &validator,
         name: &atom.name,
     };
-    run_contract(runtime, request, &check).await
+    run_contract(backend, request, &check).await
 }
 
 /// Run an atom's future on its own task, so a panic inside it fails that

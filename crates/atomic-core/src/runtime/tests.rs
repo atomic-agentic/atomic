@@ -76,6 +76,13 @@ fn runtime(model: &FakeModel, tag: &str) -> CodexRuntime {
     }
 }
 
+/// Both runtimes, on the same fake model.
+fn runtimes(model: &FakeModel, tag: &str) -> Runtimes {
+    let codex = runtime(model, tag);
+    let lite = crate::lite::LiteRuntime::new(codex.endpoint.clone(), AtomConfig::default());
+    Runtimes { codex, lite }
+}
+
 #[test]
 fn a_codex_atom_returns_a_valid_out_against_the_fake_model() {
     on_codex_runtime(async {
@@ -266,7 +273,7 @@ fn a_declarative_atom_breaking_a_contract_only_constraint_gets_exactly_one_repai
         ])
         .await
         .expect("fake model");
-        let rt = runtime(&model, "decl");
+        let rt = runtimes(&model, "decl");
         let input = json!({"text": "Export crashes, see ABC-12."});
         let (out, meta) = run_declarative(
             &a,
@@ -281,6 +288,11 @@ fn a_declarative_atom_breaking_a_contract_only_constraint_gets_exactly_one_repai
         .expect("repaired");
         assert_eq!(out, json!({"ticket": "ABC-12"}));
         assert_eq!((model.calls(), meta.turns), (2, 2));
+        assert_eq!(
+            model.paths(),
+            ["/v1/chat/completions", "/v1/chat/completions"],
+            "a lite atom runs as plain model calls, not on a Codex thread"
+        );
         let first = model.requests()[0].to_string();
         assert!(
             first.contains("origin=\\\"external\\\""),
@@ -298,7 +310,7 @@ fn a_declarative_atom_breaking_a_contract_only_constraint_gets_exactly_one_repai
         ])
         .await
         .expect("fake model");
-        let rt = runtime(&model, "decl-rule");
+        let rt = runtimes(&model, "decl-rule");
         let r = run_declarative(
             &a,
             &compiled,
@@ -311,5 +323,30 @@ fn a_declarative_atom_breaking_a_contract_only_constraint_gets_exactly_one_repai
         .await;
         assert!(matches!(r, Err(AtomError::Validation(_))), "{r:?}");
         assert_eq!(model.calls(), 2);
+
+        // The same atom declared `kind: codex` runs on a Codex thread.
+        let file = dir.join("atoms/ticket.atom.md");
+        let text = std::fs::read_to_string(&file).expect("read");
+        std::fs::write(&file, text.replace("kind: lite", "kind: codex")).expect("write");
+        let mut registry = Registry::new();
+        let a = atom::load(&file, &mut registry).expect("loads");
+        let compiled = compile::compile(&a, &registry).expect("compiles");
+        let model = FakeModel::start(vec![Reply::Text(r#"{"ticket": "ABC-12"}"#.into())])
+            .await
+            .expect("fake model");
+        let rt = runtimes(&model, "decl-codex");
+        let (out, _) = run_declarative(
+            &a,
+            &compiled,
+            &mut registry,
+            &input,
+            "run-3",
+            "external",
+            &rt,
+        )
+        .await
+        .expect("runs");
+        assert_eq!(out, json!({"ticket": "ABC-12"}));
+        assert_eq!(model.paths(), ["/v1/responses"]);
     });
 }
