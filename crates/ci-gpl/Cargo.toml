@@ -1,0 +1,7 @@
+[package]
+name = "ci-gpl"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-only"
+publish = false
+description = "CI check: a GPL-licensed dependency must fail the licence policy (do not merge)."
