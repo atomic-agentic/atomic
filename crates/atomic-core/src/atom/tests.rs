@@ -238,3 +238,82 @@ fn run_settings_default_to_read_only_with_no_network_or_tools() {
     ));
     assert_eq!(result.expect_err("tools").path, "/tools");
 }
+
+/// A schema file that holds only definitions, one per role.
+const COMMON: &str = "$defs:\n  Request:\n    type: object\n    additionalProperties: false\n    required: [text]\n    properties:\n      text: {type: string, minLength: 1}\n  Answer:\n    type: object\n    additionalProperties: false\n    required: [category]\n    properties:\n      category: {enum: [bug, feature]}\n";
+
+fn with_common(atom: &str) -> (PathBuf, Registry, Result<Atom, AtomError>) {
+    let root = project(&[
+        ("atoms/classify-note.atom.md", atom),
+        ("schemas/common.schema.yaml", COMMON),
+    ]);
+    let file = root.join("atoms/classify-note.atom.md");
+    let mut registry = Registry::new();
+    let result = load(&file, &mut registry);
+    (file, registry, result)
+}
+
+#[test]
+fn a_reference_to_a_place_in_a_file_keeps_that_exact_target() {
+    let atom = CLASSIFY
+        .replace(
+            "kind: lite\n",
+            "kind: lite\ninput:\n  $ref: ../schemas/common.schema.yaml#/$defs/Request\noutput:\n  $ref: ../schemas/common.schema.yaml#/$defs/Answer\n",
+        )
+        .replace(
+            "{\"category\": \"bug\", \"summary\": \"Export crashes on accented file names.\"}",
+            "{\"category\": \"bug\"}",
+        );
+    let (_, mut registry, result) = with_common(&atom);
+    let a = result.expect("loads");
+
+    // Validation uses Request itself: its required field and its minLength.
+    let input = registry.validator(&a.input).expect("input validator");
+    assert!(input.is_valid(&serde_json::json!({"text": "x"})));
+    assert!(
+        !input.is_valid(&serde_json::json!({"text": ""})),
+        "minLength kept"
+    );
+    assert!(!input.is_valid(&serde_json::json!({})), "required kept");
+    let output = registry.validator(&a.output).expect("output validator");
+    assert!(output.is_valid(&serde_json::json!({"category": "bug"})));
+    assert!(!output.is_valid(&serde_json::json!({"category": "spam"})));
+
+    // Lowering and workflow mapping inline the schema with no base directory,
+    // and reach Answer, an object root, not the file's bare $defs.
+    for id in [&a.input, &a.output] {
+        let schema = registry.get(id).expect("registered").schema.clone();
+        let inlined =
+            crate::workflow::inline(&schema, Path::new(""), &mut registry, 0).expect("inlines");
+        assert_eq!(inlined["type"], "object", "{id}: {inlined}");
+        assert!(inlined.get("$defs").is_none(), "{id}: {inlined}");
+    }
+    let answer = registry.get(&a.output).expect("registered").schema.clone();
+    let answer =
+        crate::workflow::inline(&answer, Path::new(""), &mut registry, 0).expect("inlines");
+    let lowered =
+        atomic_schema::lower::lower(&answer, &atomic_schema::lower::OPENAI_STRICT).expect("lowers");
+    assert_eq!(lowered.schema["required"], serde_json::json!(["category"]));
+}
+
+#[test]
+fn a_reference_to_a_missing_place_in_a_file_fails_the_load() {
+    for (role, other) in [("input", "output"), ("output", "input")] {
+        let other_def = if other == "input" {
+            "Request"
+        } else {
+            "Answer"
+        };
+        let atom = CLASSIFY.replace(
+            "kind: lite\n",
+            &format!(
+                "kind: lite\n{role}:\n  $ref: ../schemas/common.schema.yaml#/$defs/Nope\n\
+                 {other}:\n  $ref: ../schemas/common.schema.yaml#/$defs/{other_def}\n"
+            ),
+        );
+        let (file, _, result) = with_common(&atom);
+        let e = result.expect_err("missing fragment");
+        assert_eq!((e.file, e.path), (file, format!("/{role}/$ref")));
+        assert!(e.message.contains("#/$defs/Nope"), "{}", e.message);
+    }
+}
