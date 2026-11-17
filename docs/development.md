@@ -25,6 +25,7 @@ The container has:
 | git, psql | Debian 13 packages | Tests that make commits; inspecting the test database |
 | cargo-deny | 0.21.0 | Licence and advisory checks |
 | cosign | 3.1.4 | Verifying release signatures |
+| cargo-cyclonedx | 0.5.10 | The CycloneDX SBOM for a release |
 | bd | 1.3.2 | Bead tracking |
 
 Every downloaded binary is checked against a pinned SHA-256, and the base
