@@ -482,12 +482,14 @@ checksum = "c59bdb34bc650a32731b31bd8f0829cc15d24a708ee31559e0bb34f2bc320cba"
 name = "atomic-agentic"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
  "atomic-agentic-atoms",
  "atomic-agentic-core",
  "atomic-agentic-durable",
  "atomic-agentic-exec",
  "atomic-agentic-graph",
  "atomic-agentic-schema",
+ "clap",
 ]
 
 [[package]]
@@ -502,11 +504,15 @@ dependencies = [
 name = "atomic-agentic-core"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
  "atomic-agentic-exec",
  "atomic-agentic-schema",
  "codex-app-server",
  "codex-core-api",
  "codex-extension-api",
+ "dirs",
+ "sha2 0.10.9",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -517,6 +523,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "thiserror 2.0.21",
  "tokio",
 ]
 

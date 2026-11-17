@@ -36,6 +36,10 @@ atomic-schema = { path = "crates/atomic-schema", package = "atomic-agentic-schem
 durare = { git = "https://github.com/atomic-agentic/durare", rev = "9c93328ded1e68447afa622c85b8144196cd41b6", default-features = false, features = ["sqlite", "postgres"] }
 
 # Third-party crates.
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+dirs = "6"
+thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
