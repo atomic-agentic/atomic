@@ -21,4 +21,4 @@ pub mod testing;
 pub mod typed;
 pub mod workflow;
 
-pub use typed::{Approvals, Atom, AtomConfig, AtomError, AtomKind, Sandbox};
+pub use typed::{Approvals, Atom, AtomConfig, AtomError, AtomKind, MODEL_TIERS, Sandbox};
