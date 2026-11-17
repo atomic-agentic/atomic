@@ -9,3 +9,6 @@
 # Maintainer-local agent notes
 AGENTS.local.md
 CLAUDE.local.md
+
+# Build output
+/target/
