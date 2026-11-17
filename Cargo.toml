@@ -34,7 +34,9 @@ atomic-schema = { path = "crates/atomic-schema" }
 durare = { git = "https://github.com/atomic-agentic/durare", rev = "9c93328ded1e68447afa622c85b8144196cd41b6", default-features = false, features = ["sqlite", "postgres"] }
 
 # Third-party crates.
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 tokio = { version = "1", default-features = false }
 
 # Codex, at the revision in deps/codex.toml (scripts/codex-pin.sh checks it).

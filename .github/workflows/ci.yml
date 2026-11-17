@@ -81,4 +81,11 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo build --workspace --locked
-      - run: cargo test --workspace --locked
+      # Postgres variants run where the test database is; with the feature on, a
+      # missing database fails them rather than skipping.
+      - name: Test (Linux, with Postgres)
+        if: runner.os == 'Linux'
+        run: cargo test --workspace --locked --features atomic-durable/postgres-tests
+      - name: Test (macOS)
+        if: runner.os == 'macOS'
+        run: cargo test --workspace --locked

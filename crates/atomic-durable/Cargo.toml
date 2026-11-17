@@ -13,9 +13,16 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Run the Postgres variants of the tests against ATOMIC_TEST_DATABASE_URL.
+# With this on, a missing database fails the tests instead of skipping them.
+postgres-tests = []
+
 [dependencies]
 durare = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
 
 [dev-dependencies]
-serde_json = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
