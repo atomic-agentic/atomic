@@ -18,7 +18,47 @@ no-default-features = false
 feature-depth = 1
 
 [advisories]
+# Every RustSec advisory fails CI unless it is listed here, with why it does
+# not apply to atomic and when to remove it. Nearly all arrive through Codex's
+# dependency graph, which atomic's lockfile follows (scripts/lock-check.sh), so
+# they leave with a Codex bump; re-check this list at each one.
 ignore = [
+    { id = "RUSTSEC-2024-0388", reason = "derivative: unmaintained, no known vulnerability; via starlark in codex-execpolicy; remove when Codex drops it" },
+    { id = "RUSTSEC-2024-0436", reason = "paste: unmaintained, no known vulnerability; via starlark and v8; remove when Codex drops it" },
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml: unmaintained, no known vulnerability; via serde_yaml in Codex's skills and plugins; atomic reads YAML with its own restricted loader; remove when Codex drops serde_yaml" },
+    { id = "RUSTSEC-2025-0057", reason = "fxhash: unmaintained, no known vulnerability; via starlark and bm25 in Codex; remove when Codex drops it" },
+    { id = "RUSTSEC-2026-0118", reason = "hickory-proto: reached only through Codex's network proxy (codex-network-proxy, rama-dns); atomic builds Codex's permissions with no managed network, so the proxy never starts; remove when Codex's rama moves to a fixed hickory" },
+    { id = "RUSTSEC-2026-0119", reason = "hickory-proto: reached only through Codex's network proxy (codex-network-proxy, rama-dns); atomic builds Codex's permissions with no managed network, so the proxy never starts; remove when Codex's rama moves to a fixed hickory" },
+    { id = "RUSTSEC-2026-0370", reason = "zvariant: unmaintained, no known vulnerability; via zbus in keyring/secret-service; remove when Codex moves off zbus 4" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names: unmaintained, no known vulnerability; via zbus in keyring/secret-service; remove when Codex moves off zbus 4" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive: unmaintained, no known vulnerability; via zbus in keyring/secret-service; remove when Codex moves off zbus 4" },
+    { id = "RUSTSEC-2026-0374", reason = "basic-toml: unmaintained, no known vulnerability; via i18n-config under age in codex-secrets; remove when Codex drops it" },
+    { id = "RUSTSEC-2026-0386", reason = "tokio: AsyncFd::new accepts a descriptor it does not own; atomic never calls it, and Codex's PTY and mount watcher pass files they own; remove when Codex's lockfile has tokio >=1.53.3, which atomic follows" },
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint: timing variation in elliptic-curve operations used by Codex's secrets (age), AWS login, user verification and WebRTC; atomic uses none of them and authenticates with an API key; remove when those paths use crypto-bigint >=0.7.6" },
+    { id = "RUSTSEC-2026-0391", reason = "zstd: Codex's rollout, thread store and HTTP client, tonic and zip do not reuse a borrowed context across streams; remove when the lockfile has zstd >=0.14.3 (it follows Codex's)" },
+    { id = "RUSTSEC-2026-0398", reason = "zstd-safe: Seekable::decompress is behind zstd's seekable feature, which nothing enables; remove when the lockfile has zstd-safe >=8.2.0" },
+    { id = "RUSTSEC-2026-0403", reason = "zstd-safe: legacy-format streaming decompression; Codex's users read with decoders into initialized buffers and drop output on error; remove when the lockfile has zstd-safe >=8.2.0" },
+    { id = "RUSTSEC-2026-0410", reason = "zstd-sys: the allocator shim bug is wasm32-only, and atomic ships native binaries; remove when the lockfile has zstd-sys >=2.1.2" },
+    { id = "RUSTSEC-2026-0441", reason = "pin-utils: unmaintained, no known vulnerability; via aws-smithy crates in codex-aws-auth; remove when Codex drops it" },
+    { id = "RUSTSEC-2026-0487", reason = "hickory-proto: reached only through Codex's network proxy (codex-network-proxy, rama-dns); atomic builds Codex's permissions with no managed network, so the proxy never starts; remove when Codex's rama moves to a fixed hickory" },
+    { id = "RUSTSEC-2026-0489", reason = "hickory-proto: reached only through Codex's network proxy (codex-network-proxy, rama-dns); atomic builds Codex's permissions with no managed network, so the proxy never starts; remove when Codex's rama moves to a fixed hickory" },
+    { id = "RUSTSEC-2026-0490", reason = "hickory-proto: reached only through Codex's network proxy (codex-network-proxy, rama-dns); atomic builds Codex's permissions with no managed network, so the proxy never starts; remove when Codex's rama moves to a fixed hickory" },
+    { id = "RUSTSEC-2026-0491", reason = "hickory-proto: reached only through Codex's network proxy (codex-network-proxy, rama-dns); atomic builds Codex's permissions with no managed network, so the proxy never starts; remove when Codex's rama moves to a fixed hickory" },
+    { id = "RUSTSEC-2026-0504", reason = "hickory-proto: reached only through Codex's network proxy (codex-network-proxy, rama-dns); atomic builds Codex's permissions with no managed network, so the proxy never starts; remove when Codex's rama moves to a fixed hickory" },
+    { id = "RUSTSEC-2026-0505", reason = "hickory-proto: reached only through Codex's network proxy (codex-network-proxy, rama-dns); atomic builds Codex's permissions with no managed network, so the proxy never starts; remove when Codex's rama moves to a fixed hickory" },
+    { id = "RUSTSEC-2026-0511", reason = "hickory-proto: reached only through Codex's network proxy (codex-network-proxy, rama-dns); atomic builds Codex's permissions with no managed network, so the proxy never starts; remove when Codex's rama moves to a fixed hickory" },
+    { id = "RUSTSEC-2026-0512", reason = "hickory-proto: reached only through Codex's network proxy (codex-network-proxy, rama-dns); atomic builds Codex's permissions with no managed network, so the proxy never starts; remove when Codex's rama moves to a fixed hickory" },
+    { id = "RUSTSEC-2026-0514", reason = "hickory-resolver: reached only through Codex's network proxy (codex-network-proxy, rama-dns); atomic builds Codex's permissions with no managed network, so the proxy never starts; remove when Codex's rama moves to a fixed hickory" },
+    { id = "RUSTSEC-2026-0530", reason = "hickory-proto: reached only through Codex's network proxy (codex-network-proxy, rama-dns); atomic builds Codex's permissions with no managed network, so the proxy never starts; remove when Codex's rama moves to a fixed hickory" },
+    { id = "RUSTSEC-2026-0531", reason = "hickory-proto: reached only through Codex's network proxy (codex-network-proxy, rama-dns); atomic builds Codex's permissions with no managed network, so the proxy never starts; remove when Codex's rama moves to a fixed hickory" },
+    { id = "RUSTSEC-2026-0532", reason = "hickory-proto: reached only through Codex's network proxy (codex-network-proxy, rama-dns); atomic builds Codex's permissions with no managed network, so the proxy never starts; remove when Codex's rama moves to a fixed hickory" },
+    { id = "RUSTSEC-2026-0543", reason = "chrono: unmaintained, no known vulnerability; used for timestamps throughout Codex and by the durare fork; remove when both move to a maintained time crate" },
+    { id = "RUSTSEC-2026-0548", reason = "zip: ZipStreamReader is used by Codex's plugin installer and feedback upload; atomic configures Codex with no plugins and feedback off; remove when Codex moves to a fixed zip" },
+    { id = "RUSTSEC-2026-0549", reason = "hickory-proto: reached only through Codex's network proxy (codex-network-proxy, rama-dns); atomic builds Codex's permissions with no managed network, so the proxy never starts; remove when Codex's rama moves to a fixed hickory" },
+    { id = "RUSTSEC-2026-0550", reason = "hickory-proto: reached only through Codex's network proxy (codex-network-proxy, rama-dns); atomic builds Codex's permissions with no managed network, so the proxy never starts; remove when Codex's rama moves to a fixed hickory" },
+    { id = "RUSTSEC-2026-0551", reason = "hickory-proto: reached only through Codex's network proxy (codex-network-proxy, rama-dns); atomic builds Codex's permissions with no managed network, so the proxy never starts; remove when Codex's rama moves to a fixed hickory" },
+    { id = "RUSTSEC-2026-0555", reason = "chrono-tz: unmaintained, no known vulnerability; only the durare fork uses it, for cron time zones; remove when the fork replaces it" },
+    { id = "RUSTSEC-2026-0559", reason = "chrono-tz-build: unmaintained, no known vulnerability; build dependency of chrono-tz in the durare fork; remove with chrono-tz" },
 ]
 
 [licenses]
