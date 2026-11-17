@@ -151,3 +151,15 @@ fn a_store_written_by_a_newer_atomic_stops_it_from_starting() {
     assert!(t.contains("newer than this atomic understands"), "{t}");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn a_broken_manifest_stops_atomic_with_its_error() {
+    let home = scratch("manifest");
+    std::fs::write(home.join("atomic.yaml"), "atomic: 1\n").expect("write");
+    std::fs::create_dir_all(home.join(".atomic")).expect("mkdir");
+    std::fs::write(home.join(".atomic/atomic.yaml"), "atomic: 1\n").expect("write");
+    let out = run(Path::new(ATOMIC), &[], &home);
+    assert!(!out.status.success());
+    assert!(text(&out).contains("keep one"), "{}", text(&out));
+    let _ = std::fs::remove_dir_all(&home);
+}

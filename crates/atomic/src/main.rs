@@ -4,6 +4,7 @@
 
 use anyhow::Context;
 use atomic_core::codex::{self, CodexPaths, ModelEndpoint};
+use atomic_core::project;
 use atomic_core::state::ProjectState;
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
@@ -68,7 +69,13 @@ fn main() -> anyhow::Result<()> {
     // point runs; Codex's helper invocations never need it.
     let state = std::env::current_dir()
         .context("read the working directory")
-        .and_then(|cwd| ProjectState::resolve(&cwd).map_err(anyhow::Error::from))
+        .and_then(|cwd| match project::discover(&cwd) {
+            Ok(p) => Ok(p.root().to_owned()),
+            // Outside any project, state is keyed by the working directory.
+            Err(project::ProjectError::NotFound(_)) => Ok(cwd),
+            Err(e) => Err(e.into()),
+        })
+        .and_then(|root| ProjectState::resolve(&root).map_err(anyhow::Error::from))
         .and_then(|s| s.create().map(|()| s).map_err(anyhow::Error::from));
     let codex_home = match &state {
         Ok(s) => s.codex_home(),
