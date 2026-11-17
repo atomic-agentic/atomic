@@ -1,0 +1,119 @@
+# Local observability and telemetry
+
+Atomic is designed to explain its work locally before you configure an external
+backend. Its binary includes run inspection and OpenTelemetry instrumentation
+and exporters. Collectors, dashboards and services such as Datadog are optional
+consumers of that telemetry.
+
+These capabilities are planned; no Atomic runtime is implemented in this repository.
+See [availability](../reference/availability.md) for the delivery stages.
+
+## Start with built-in run inspection
+
+Use the run identity reported by the CLI:
+
+```sh
+atomic runs show <run-id>
+```
+
+The planned local record shows: which steps completed, what they returned, where
+work failed or waited, which attempts spent tokens, and where a person intervened.
+Associated thread transcripts and artifact links provide the supporting detail.
+The terminal can expose running state while the saved run remains inspectable
+after a restart.
+
+This is application-level inspection from durable records. It does not require
+Docker, a Collector, a Datadog account or a trace viewer, and does not imply that
+Atomic embeds a full APM database or dashboard product.
+
+## Add an optional local trace viewer
+
+The planned developer helper is:
+
+```sh
+atomic dev --otel
+```
+
+It is intended to start a local Jaeger or Langfuse setup, using Docker, and connect
+Atomic's telemetry for development. Jaeger provides trace inspection; Langfuse
+provides agent-quality views. They are separate backend processes, not components
+compiled into the Atomic binary. Ordinary CLI use remains independent of them.
+
+Backend-selection and port flags are not specified in this draft. The helper and
+full observability are planned for **M44/v0.5**. Initial v0.1 coverage is local run inspection, basic
+spans, budgets and evals through M12.
+
+## Follow the telemetry path
+
+```mermaid
+flowchart LR
+  subgraph binary["Inside the Atomic executable"]
+    components["Workflows · graph · durare<br/>Codex model/tool activity · runners"]
+    otel["Shared OpenTelemetry integration<br/>Traces · metrics · structured logs"]
+    components --> otel
+  end
+  collector["Optional OpenTelemetry Collector<br/>Process · sample · route"]
+  local_viewer["Optional local viewer<br/>Jaeger or Langfuse"]
+  remote_backend["Compatible observability backends<br/>Datadog · Grafana / Tempo · SigNoz · others"]
+  otel -->|"OTLP export when enabled"| collector
+  collector --> local_viewer
+  collector --> remote_backend
+```
+
+The protocol boundary is OpenTelemetry/OTLP. Choose a compatible backend and
+configure its receiving pipeline. Different backends support different signals
+and conventions; a trace viewer alone need not store metrics or logs. A deployment
+can route traces, metrics and logs to different destinations.
+
+## Example: Datadog or another compatible provider
+
+Datadog documents receiving traces, metrics and logs through an OpenTelemetry
+Collector. Its agent/LLM observability views also support specified GenAI semantic
+conventions. Use its current setup and mapping guidance for your Datadog site:
+[Collector setup](https://docs.datadoghq.com/opentelemetry/setup/collector_exporter/)
+and [GenAI instrumentation](https://docs.datadoghq.com/llm_observability/instrument/otel_instrumentation/).
+
+Atomic's intended integration exports standard telemetry rather than requiring a
+Datadog-specific agent SDK in every atom. Other OTLP-compatible providers or
+self-hosted stacks can use the same boundary, with the appropriate signal mapping
+and Collector configuration. Backend credentials belong in operator/Collector
+configuration, outside atom definitions and runner environments.
+
+Exact Atomic exporter configuration is still to be specified and tested. This
+guide describes the architecture, not a verified Datadog deployment recipe.
+
+## What to observe
+
+| Area | Planned evidence |
+| --- | --- |
+| Workflow execution | Step/attempt timing, queue delay, failures, retries and parked runs |
+| Model and tool activity | Provider/model, usage, supported cost data, tool duration and errors |
+| Human decisions | Gate wait time, decisions and steering/take-over links |
+| Shared work | Readiness/claim contention, message cursor lag and later sync lag |
+| Quality | Schema repairs, validation failures and eval outcomes |
+| Runtime health | Runner utilization and backend scheduling/resume behavior |
+
+Correlate traces with workflow/run/step/thread identities. Keep run IDs out of
+metric labels to avoid unbounded cardinality. The plan uses a trace per step
+attempt with links across a workflow, so a multi-day gate does not require keeping
+one root span open indefinitely.
+
+Checkpoint replay reuses a saved result without another model call or usage
+charge. An actual retried attempt is new work and will
+remain visible, including spend before a failure. Telemetry is not the budget
+ledger or the source of workflow recovery truth.
+
+## Choose what leaves the machine
+
+Local run inspection works without remote telemetry export. Enabling an exporter
+and enabling prompt/completion/tool-argument capture are separate decisions.
+Content capture is off by default; any enabled content is redacted at its source
+and routed only to approved destinations. Sampling in a Collector does not undo
+data already sent to it.
+
+The audit stream is a separate durable record. Do not sample away approval/admin
+evidence merely because routine operational traces are sampled. Full lifecycle,
+retention and enterprise audit policies arrive in their own milestones.
+
+Next: [architecture](../concepts/architecture.md#built-in-observability-optional-backends)
+or [running Atomic](running-atomic.md).

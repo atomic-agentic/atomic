@@ -1,0 +1,5 @@
+{
+  "decision": "fix_now",
+  "must_fix": ["pricing.py"],
+  "summary": "The quantity bug fails the first criterion and must be fixed; the README note can follow up."
+}

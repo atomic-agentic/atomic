@@ -1,0 +1,31 @@
+$schema: https://json-schema.org/draft/2020-12/schema
+type: object
+additionalProperties: false
+required: [verdict, summary, findings]
+properties:
+  verdict:
+    type: string
+    enum: [approve, request_changes, reject]
+  summary:
+    type: string
+    minLength: 1
+    maxLength: 600
+  findings:
+    type: array
+    items:
+      type: object
+      additionalProperties: false
+      required: [file, severity, message]
+      properties:
+        file:
+          type: string
+          minLength: 1
+        severity:
+          type: string
+          enum: [blocker, major, minor, nit]
+        message:
+          type: string
+          minLength: 1
+        line:
+          type: integer
+          minimum: 1

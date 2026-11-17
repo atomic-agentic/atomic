@@ -13,6 +13,8 @@ phase is v0.1.
 | What | Where |
 | --- | --- |
 | The work to do | Beads (`bd ready`) |
+| User documentation, as designed | `docs/` (`docs/reference/availability.md` says what is built) |
+| The example catalog, the v0.1 authoring contract | `examples/`, checked by `tools/check_examples.py` in CI |
 | Design notes and private references | `AGENTS.local.md`, if present (not in git) |
 
 Read `AGENTS.local.md` when it exists: it holds maintainer-local pointers to

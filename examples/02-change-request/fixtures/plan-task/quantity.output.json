@@ -1,0 +1,6 @@
+{
+  "steps": [
+    "Add a regression test for two units.",
+    "Multiply unit price by quantity and run all pricing tests."
+  ]
+}

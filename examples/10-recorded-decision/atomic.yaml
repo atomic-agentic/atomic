@@ -1,0 +1,11 @@
+atomic: 1
+name: release-notes
+
+# A choice, the evidence it rests on and the date to look again. Planned for v0.7.
+decisions:
+  release-notes-without-repo-access:
+    chose: kind lite for atom write-release-note, so it reads the change description and not the repository
+    rests_on:
+      - "evals['write-release-note'].pass_rate >= 0.9"   # CEL over stored eval results
+    evidence_max_age: 30d
+    review_by: 2027-02-01

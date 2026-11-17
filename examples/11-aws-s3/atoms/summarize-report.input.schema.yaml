@@ -1,0 +1,10 @@
+$schema: https://json-schema.org/draft/2020-12/schema
+type: object
+additionalProperties: false
+required: [key]
+properties:
+  key:
+    type: string
+    description: The object key of the report. The bucket is fixed by the atom.
+    pattern: "^reports/[A-Za-z0-9._-]+$"
+    maxLength: 200

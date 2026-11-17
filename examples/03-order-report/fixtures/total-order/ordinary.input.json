@@ -1,0 +1,15 @@
+{
+  "order_id": "order-1",
+  "lines": [
+    {
+      "sku": "A",
+      "quantity": 2,
+      "unit_cents": 125
+    },
+    {
+      "sku": "B",
+      "quantity": 1,
+      "unit_cents": 50
+    }
+  ]
+}

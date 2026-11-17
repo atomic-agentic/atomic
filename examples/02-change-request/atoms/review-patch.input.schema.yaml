@@ -1,0 +1,34 @@
+$schema: https://json-schema.org/draft/2020-12/schema
+type: object
+additionalProperties: false
+required: [item, commit, base]
+properties:
+  item:
+    type: object
+    additionalProperties: false
+    required: [id, title, priority, criteria]
+    properties:
+      id:
+        type: string
+        minLength: 1
+      title:
+        type: string
+        minLength: 1
+      priority:
+        type: integer
+        minimum: 0
+        maximum: 4
+      criteria:
+        type: array
+        items:
+          type: string
+          minLength: 1
+        minItems: 1
+  commit:
+    type: string
+    pattern: '^[0-9a-f]{40}$'
+    format: git-commit
+  base:
+    type: string
+    pattern: '^[0-9a-f]{40}$'
+    format: git-commit

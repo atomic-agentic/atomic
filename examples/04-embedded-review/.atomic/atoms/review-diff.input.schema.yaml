@@ -1,0 +1,14 @@
+$schema: https://json-schema.org/draft/2020-12/schema
+type: object
+additionalProperties: false
+required: [patch, criteria]
+properties:
+  patch:
+    type: string
+    minLength: 1
+  criteria:
+    type: array
+    items:
+      type: string
+      minLength: 1
+    minItems: 1

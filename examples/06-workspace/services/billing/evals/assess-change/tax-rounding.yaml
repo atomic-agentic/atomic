@@ -1,0 +1,4 @@
+input:
+  change: Change invoice tax rounding from per-line to per-invoice.
+expect:
+- output.needs_human == true

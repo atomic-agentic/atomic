@@ -1,0 +1,16 @@
+$schema: https://json-schema.org/draft/2020-12/schema
+$id: https://atomic.example/schemas/finding-v1
+type: object
+additionalProperties: false
+required: [file, severity, message]
+properties:
+  file:
+    type: string
+    minLength: 1
+  severity:
+    type: string
+    enum: [blocker, major, minor]
+  message:
+    type: string
+    minLength: 1
+    maxLength: 300

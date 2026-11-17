@@ -49,6 +49,21 @@ jobs:
       # without a reason in deps/lock-exceptions.toml.
       - run: scripts/lock-check.sh
 
+  # The example catalog against the proposed authoring contract, offline,
+  # until atomic's own loader checks the same files.
+  examples:
+    name: Examples
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Checker dependencies
+        run: |
+          python3 -m venv "${RUNNER_TEMP}/examples-venv"
+          "${RUNNER_TEMP}/examples-venv/bin/pip" install --no-deps --require-hashes -r tools/requirements.txt
+      - name: Check the examples
+        working-directory: tools
+        run: '"${RUNNER_TEMP}/examples-venv/bin/python" check_examples.py'
+
   # deny.toml: a dependency with a disallowed licence, a banned crate or an
   # unlisted source fails CI.
   deny:

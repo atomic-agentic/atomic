@@ -1,0 +1,7 @@
+input:
+  patch: "--- a/pricing.py\n+++ b/pricing.py\n@@ -1,2 +1,2 @@\n def total_cents(unit_cents, quantity):\n\
+    -    return 0\n+    return unit_cents\n"
+  criteria:
+  - Two units at 125 cents total 250 cents.
+expect:
+- output.verdict == 'request_changes'

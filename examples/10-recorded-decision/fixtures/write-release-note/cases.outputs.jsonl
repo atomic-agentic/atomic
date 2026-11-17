@@ -1,0 +1,3 @@
+{"note": "You can now export orders as a CSV file from the export menu.", "audience": "users"}
+{"note": "Breaking: the QUEUE_URL setting is now BROKER_URL; rename it in your configuration before upgrading.", "audience": "operators"}
+{"note": "The webhook client now makes the full configured number of retries.", "audience": "developers"}

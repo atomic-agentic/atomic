@@ -1,0 +1,44 @@
+atomic: 1
+input:
+  $ref: ../atoms/plan-task.input.schema.yaml#/properties/task
+output:
+  $ref: ../atoms/review-patch.output.schema.yaml
+steps:
+  plan:
+    atom: plan-task
+    with:
+      task: input
+  approve-plan:
+    after:
+    - plan
+    gate:
+      title: '''Approve bounded plan'''
+      show: steps.plan.output
+      timeout: 24h
+      on_timeout: reject
+  implement:
+    after:
+    - approve-plan
+    atom: implement-step
+    with:
+      task: input
+      plan: steps.plan.output
+      base: input.base
+    worktree: true
+  review:
+    after:
+    - implement
+    atom: review-patch
+    with:
+      item: input.item
+      commit: steps.implement.metadata.commit
+      base: input.base
+  accept-change:
+    after:
+    - review
+    gate:
+      title: '''Accept reviewed candidate'''
+      show: '{''commit'': steps.implement.metadata.commit, ''review'': steps.review.output}'
+      timeout: 24h
+      on_timeout: reject
+returns: steps.review.output

@@ -1,0 +1,7 @@
+input:
+  draft:
+    ticket_id: ticket-1
+    body: Your full refund is guaranteed.
+  policy: Never promise a refund. Ask the customer for the order number and have a person review eligibility.
+expect:
+- output.verdict == 'request_changes'

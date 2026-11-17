@@ -1,0 +1,16 @@
+atomic: 1
+name: report-digests
+
+# Named credentials. Atomic assumes the role when a step is dispatched and gives
+# that step short-lived keys. No long-lived AWS key is stored anywhere.
+credentials:
+  aws-reports-reader:
+    aws_role: arn:aws:iam::123456789012:role/reports-reader
+  aws-digest-writer:
+    aws_role: arn:aws:iam::123456789012:role/digest-writer
+
+# Settings for the code these atoms carry. Both tighten a default.
+runtime:
+  deno:
+    minimum_dependency_age: 2d            # default 1d: how old a release must be before it can be locked
+    allow_packages: ["npm:@aws-sdk/*"]    # default: any pinned package

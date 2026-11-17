@@ -1,0 +1,4 @@
+{
+  "summary": "Invoice tax rounding changes from per-line to per-invoice.",
+  "needs_human": true
+}
