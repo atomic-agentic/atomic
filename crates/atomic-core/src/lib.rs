@@ -6,4 +6,5 @@
 
 pub mod artifact;
 pub mod codex;
+pub mod config;
 pub mod state;
