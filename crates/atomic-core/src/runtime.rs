@@ -14,7 +14,10 @@
 //!    and the result is validated against the full contract, deserialized into
 //!    `Out` and checked by the atom's own `validate`.
 //!
-//! A final message that does not fit fails with [`AtomError::Schema`].
+//! A final message that does not fit gets one repair turn on the same thread,
+//! quoting exactly what was wrong; if the repaired answer does not fit
+//! either, the atom fails with [`AtomError::Schema`] (or
+//! [`AtomError::Validation`] when only its own check failed).
 
 use crate::codex::{self, CodexPaths, ModelEndpoint, TurnSpec};
 use crate::typed::{Atom, AtomConfig, AtomError};
@@ -94,23 +97,57 @@ pub async fn run_codex_atom<A: Atom>(
         h.update(part.as_bytes());
         h.update([0]);
     }
-    let metadata = RunMetadata {
-        model,
-        prompt_hash: format!("{:x}", h.finalize()),
-        turns: 1,
-    };
+    let prompt_hash = format!("{:x}", h.finalize());
 
-    let answer = codex::run(
+    let mut out = None;
+    let mut failure = None;
+    let mut repairs_left = 1;
+    let (_, turns) = codex::converse(
         &runtime.paths,
         &runtime.codex_home,
         &runtime.cwd,
         &runtime.endpoint,
         &spec,
+        |answer| match accept::<A>(atom, answer, &lowered.nulls_added, &validator) {
+            Ok(o) => {
+                out = Some(o);
+                None
+            }
+            Err(e @ (AtomError::Schema { .. } | AtomError::Validation(_))) if repairs_left > 0 => {
+                repairs_left -= 1;
+                let problem = match &e {
+                    AtomError::Schema { message, .. } => message.clone(),
+                    other => other.to_string(),
+                };
+                Some(TurnSpec {
+                    prompt: format!(
+                        "Your answer did not fit the required output: {problem}\n\
+                         Reply again with only the corrected JSON, following the same schema."
+                    ),
+                    output_schema: Some(lowered.schema.clone()),
+                    ..TurnSpec::default()
+                })
+            }
+            Err(e) => {
+                failure = Some(e);
+                None
+            }
+        },
     )
     .await
     .map_err(|e| AtomError::Model(format!("{e:#}")))?;
-    let out = accept::<A>(atom, &answer, &lowered.nulls_added, &validator)?;
-    Ok((out, metadata))
+    let metadata = RunMetadata {
+        model,
+        prompt_hash,
+        turns,
+    };
+    match (out, failure) {
+        (Some(o), _) => Ok((o, metadata)),
+        (None, Some(e)) => Err(e),
+        (None, None) => Err(AtomError::Runtime(
+            "the turn ended without an answer".into(),
+        )),
+    }
 }
 
 /// Turn a final message into `Out`, or say exactly why it does not fit.

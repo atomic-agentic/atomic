@@ -122,9 +122,10 @@ fn answers_that_do_not_fit_fail_with_a_schema_error() {
                 "/summary",
             ),
         ] {
-            let model = FakeModel::start(vec![Reply::Text(answer.into())])
-                .await
-                .expect("fake model");
+            let model =
+                FakeModel::start(vec![Reply::Text(answer.into()), Reply::Text(answer.into())])
+                    .await
+                    .expect("fake model");
             let rt = runtime(&model, "bad");
             match run_codex_atom(&Classify, &Note { text: "n".into() }, &rt).await {
                 Err(AtomError::Schema {
@@ -137,15 +138,57 @@ fn answers_that_do_not_fit_fail_with_a_schema_error() {
                 other => panic!("{answer}: expected a schema error, got {other:?}"),
             }
         }
-        let model = FakeModel::start(vec![Reply::Text(
-            r#"{"category": "bug", "summary": "  "}"#.into(),
-        )])
-        .await
-        .expect("fake model");
+        let blank = r#"{"category": "bug", "summary": "  "}"#;
+        let model = FakeModel::start(vec![Reply::Text(blank.into()), Reply::Text(blank.into())])
+            .await
+            .expect("fake model");
         let rt = runtime(&model, "invalid");
         assert!(matches!(
             run_codex_atom(&Classify, &Note { text: "n".into() }, &rt).await,
             Err(AtomError::Validation(_))
         ));
+    });
+}
+
+#[test]
+fn a_bad_output_gets_one_repair_turn_then_fails_with_a_schema_error() {
+    on_codex_runtime(async {
+        // Repaired: a bad answer, then a good one, on the same thread.
+        let model = FakeModel::start(vec![
+            Reply::Text(r#"{"category": "spam", "summary": "x"}"#.into()),
+            Reply::Text(r#"{"category": "question", "summary": "x"}"#.into()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = runtime(&model, "repair-ok");
+        let (out, meta) = run_codex_atom(&Classify, &Note { text: "n".into() }, &rt)
+            .await
+            .expect("repaired");
+        assert_eq!(out.category, "question");
+        assert_eq!((model.calls(), meta.turns), (2, 2));
+        let repair = model.requests()[1].to_string();
+        assert!(
+            repair.contains("did not fit the required output"),
+            "{repair}"
+        );
+        assert!(
+            repair.contains("/category"),
+            "the repair quotes the error: {repair}"
+        );
+
+        // Not repaired: exactly one repair turn, then the schema error.
+        let model = FakeModel::start(vec![
+            Reply::Text("not json".into()),
+            Reply::Text("still not json".into()),
+            Reply::Text(r#"{"category": "bug", "summary": "never asked for"}"#.into()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = runtime(&model, "repair-fails");
+        match run_codex_atom(&Classify, &Note { text: "n".into() }, &rt).await {
+            Err(AtomError::Schema { answer, .. }) => assert_eq!(answer, "still not json"),
+            other => panic!("expected a schema error, got {other:?}"),
+        }
+        assert_eq!(model.calls(), 2, "one repair, no more");
     });
 }

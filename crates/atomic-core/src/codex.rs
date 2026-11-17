@@ -172,6 +172,27 @@ pub async fn run(
     endpoint: &ModelEndpoint,
     spec: &TurnSpec,
 ) -> anyhow::Result<String> {
+    converse(paths, codex_home, cwd, endpoint, spec, |_| None)
+        .await
+        .map(|(answer, _)| answer)
+}
+
+/// Run `first` on a fresh, ephemeral thread, then, after each answer, the
+/// follow-up turn `next` returns on the same thread, until it returns `None`.
+/// Returns the last answer and how many turns ran. Follow-up turns use the
+/// thread's instructions and model; their own are ignored.
+pub async fn converse<F>(
+    paths: &CodexPaths,
+    codex_home: &Path,
+    cwd: &Path,
+    endpoint: &ModelEndpoint,
+    first: &TurnSpec,
+    mut next: F,
+) -> anyhow::Result<(String, u32)>
+where
+    F: FnMut(&str) -> Option<TurnSpec>,
+{
+    let spec = first;
     let mut endpoint = endpoint.clone();
     if let Some(m) = &spec.model {
         endpoint.model = m.clone();
@@ -232,13 +253,24 @@ pub async fn run(
         .await
         .context("start Codex thread")?;
 
-    let answer = run_turn(&thread, spec).await;
+    let mut current = spec.clone();
+    let mut turns = 0u32;
+    let outcome = loop {
+        turns += 1;
+        match run_turn(&thread, &current).await {
+            Err(e) => break Err(e),
+            Ok(answer) => match next(&answer) {
+                Some(follow_up) => current = follow_up,
+                None => break Ok((answer, turns)),
+            },
+        }
+    };
     let shutdown_result = thread.shutdown_and_wait().await;
     let _ = thread_manager.remove_thread(&thread_id).await;
 
-    let answer = answer?;
+    let outcome = outcome?;
     shutdown_result.context("shut down Codex thread")?;
-    Ok(answer)
+    Ok(outcome)
 }
 
 async fn new_config(
