@@ -1,0 +1,132 @@
+// SPDX-License-Identifier: Apache-2.0
+
+use super::*;
+use serde_json::json;
+
+fn ok(text: &str) -> Document {
+    load(Path::new("t.yaml"), text).unwrap_or_else(|e| panic!("expected to load: {e}"))
+}
+
+fn err(text: &str) -> YamlError {
+    match load(Path::new("t.yaml"), text) {
+        Ok(d) => panic!("expected an error, loaded {}", d.value),
+        Err(e) => e,
+    }
+}
+
+fn at(line: usize, column: usize) -> Position {
+    Position { line, column }
+}
+
+#[test]
+fn a_workflow_loads_as_json_with_positions() {
+    let d = ok("name: review\nsteps:\n  - atom: plan\n  - atom: implement\n    retries: 2\n");
+    assert_eq!(
+        d.value,
+        json!({"name": "review", "steps": [{"atom": "plan"}, {"atom": "implement", "retries": 2}]})
+    );
+    assert_eq!(d.position("/steps/1/atom"), Some(at(4, 11)));
+    assert_eq!(d.position("/steps/1/retries"), Some(at(5, 14)));
+}
+
+#[test]
+fn core_schema_scalars() {
+    let d = ok(
+        "a: true\nb: False\nc: ~\nd:\ne: 12\nf: -3\ng: 0x1F\nh: 0o17\ni: 1.5\nj: 1e3\nk: .5\nl: '12'\nm: 1.2.3\n",
+    );
+    assert_eq!(
+        d.value,
+        json!({"a": true, "b": false, "c": null, "d": null, "e": 12, "f": -3, "g": 31, "h": 15,
+               "i": 1.5, "j": 1000.0, "k": 0.5, "l": "12", "m": "1.2.3"})
+    );
+}
+
+#[test]
+fn an_empty_file_is_null() {
+    assert_eq!(ok("").value, Value::Null);
+}
+
+#[test]
+fn a_duplicate_key_is_refused_with_its_line() {
+    let e = err("name: a\nsteps: []\nname: b\n");
+    assert_eq!(e.at, at(3, 1));
+    assert!(
+        e.message
+            .contains("duplicate key \"name\" (first at line 1)"),
+        "{e}"
+    );
+    assert_eq!(e.to_string().split(": ").next(), Some("t.yaml:3:1"));
+}
+
+#[test]
+fn an_unquoted_yes_in_an_enum_is_refused_with_its_line() {
+    let e = err("type: string\nenum: [maybe, yes, no]\n");
+    assert_eq!(e.at, at(2, 15));
+    assert!(e.message.contains("quote it"), "{e}");
+    for word in ["no", "On", "OFF", "YES"] {
+        let e = err(&format!("flag: {word}\n"));
+        assert_eq!(e.at, at(1, 7), "{word}");
+    }
+    // Quoted, they are just strings.
+    assert_eq!(
+        ok("enum: ['yes', \"no\"]\n").value,
+        json!({"enum": ["yes", "no"]})
+    );
+}
+
+#[test]
+fn keys_must_be_strings() {
+    for (text, column) in [
+        ("1: a\n", 1),
+        ("x: 1\ntrue: b\n", 1),
+        ("null: c\n", 1),
+        ("? [a]\n: d\n", 3),
+    ] {
+        let e = err(text);
+        assert!(e.message.contains("keys must be strings"), "{text:?}: {e}");
+        assert_eq!(e.at.column, column, "{text:?}: {e}");
+    }
+    assert_eq!(
+        ok("'1': a\n\"true\": b\n").value,
+        json!({"1": "a", "true": "b"})
+    );
+}
+
+#[test]
+fn tags_anchors_and_aliases_are_refused() {
+    let e = err("a: !!str 5\n");
+    assert!(e.message.contains("tags are not allowed"), "{e}");
+    assert_eq!(e.at.line, 1);
+    let e = err("a: !custom x\n");
+    assert!(e.message.contains("tags are not allowed"), "{e}");
+    let e = err("base: &b {x: 1}\n");
+    assert!(e.message.contains("anchors"), "{e}");
+    let e = err("x: 1\ny: *b\n");
+    // An undefined alias is a parse error in itself; a defined one never
+    // gets that far, because its anchor is refused first.
+    assert_eq!(e.at.line, 2, "{e}");
+}
+
+#[test]
+fn a_second_document_is_refused() {
+    let e = err("a: 1\n---\nb: 2\n");
+    assert_eq!(e.at.line, 2);
+    assert!(e.message.contains("second YAML document"), "{e}");
+}
+
+#[test]
+fn values_json_cannot_hold_are_refused() {
+    for text in ["x: .inf\n", "x: -.Inf\n", "x: .nan\n"] {
+        assert!(
+            err(text).message.contains("cannot be written in JSON"),
+            "{text:?}"
+        );
+    }
+}
+
+#[test]
+fn a_syntax_error_carries_its_position() {
+    let e = err("a: [1, 2\nb: 3\n");
+    assert!(e.at.line >= 1);
+    assert!(!e.message.is_empty());
+}
