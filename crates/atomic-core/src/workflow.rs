@@ -511,7 +511,7 @@ fn close(a: &str, b: &str) -> bool {
 /// Replace `$ref`s with what they point at, so a schema can be embedded
 /// elsewhere. File references resolve relative to `dir`; registered ids
 /// through the registry. Recursion past a depth becomes an open schema.
-fn inline(
+pub(crate) fn inline(
     schema: &Value,
     dir: &Path,
     registry: &mut Registry,

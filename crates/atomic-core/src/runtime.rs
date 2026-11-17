@@ -1,30 +1,36 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Running a typed atom on Codex.
+//! Running atoms on Codex.
 //!
-//! [`run_codex_atom`] runs one atom as one Codex turn:
+//! Every atom run follows the same contract:
 //!
-//! 1. the run settings start from the project's defaults and the atom
-//!    adjusts them in `configure`;
-//! 2. the output contract is lowered to the generation profile, which becomes
+//! 1. the output contract is lowered to the generation profile, which becomes
 //!    the turn's structured-output schema;
-//! 3. the atom's instructions are the developer instructions and the
-//!    serialized input is the user turn;
-//! 4. the final message is parsed, the nulls lowering introduced are removed,
-//!    and the result is validated against the full contract, deserialized into
-//!    `Out` and checked by the atom's own `validate`.
+//! 2. the instructions are the developer instructions and the input is the
+//!    user turn;
+//! 3. the final message is parsed, the nulls lowering introduced are removed,
+//!    and the result is validated against the **full** contract (strict mode
+//!    drops constraints such as `maxLength`, so this is where they are
+//!    enforced), then against the atom's own checks;
+//! 4. an answer that does not fit gets one repair turn on the same thread,
+//!    quoting exactly what was wrong; if the repaired answer does not fit
+//!    either, the atom fails with [`AtomError::Schema`] (or
+//!    [`AtomError::Validation`] when only its own check failed).
 //!
-//! A final message that does not fit gets one repair turn on the same thread,
-//! quoting exactly what was wrong; if the repaired answer does not fit
-//! either, the atom fails with [`AtomError::Schema`] (or
-//! [`AtomError::Validation`] when only its own check failed).
+//! The normalized, validated value is what a durable step checkpoints.
+//! [`run_codex_atom`] runs a typed Rust atom; [`run_declarative`] runs a
+//! loaded `.atom.md`.
 
+use crate::atom::Atom as AtomFile;
 use crate::codex::{self, CodexPaths, ModelEndpoint, TurnSpec};
+use crate::compile::Compiled;
+use crate::render::{self, RunInput};
 use crate::typed::{Atom, AtomConfig, AtomError};
 use atomic_schema::lower::{self, OPENAI_STRICT};
+use atomic_schema::registry::Registry;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Where and with what model atoms run.
 #[derive(Clone, Debug)]
@@ -64,36 +70,36 @@ pub struct RunMetadata {
     pub turns: u32,
 }
 
-/// Run `atom` on `input` as one Codex turn.
-pub async fn run_codex_atom<A: Atom>(
-    atom: &A,
-    input: &A::In,
-    runtime: &CodexRuntime,
-) -> Result<(A::Out, RunMetadata), AtomError> {
-    let mut config = runtime.defaults.clone();
-    atom.configure(&mut config);
+/// The atom's own check on a value that already fits the contract.
+type Check<'a> = dyn Fn(&Value) -> Result<(), AtomError> + Send + Sync + 'a;
 
-    let contract = atom.output_schema();
-    let lowered = lower::lower(&contract, &OPENAI_STRICT).map_err(|e| {
+/// One run of the contract: what to ask, and how to check the answer.
+struct Request<'a> {
+    developer: String,
+    prompt: String,
+    model: Option<String>,
+    contract: &'a Value,
+    validator: &'a jsonschema::Validator,
+    name: &'a str,
+}
+
+/// Run `request`, with one repair turn.
+async fn run_contract(
+    runtime: &CodexRuntime,
+    request: Request<'_>,
+    check: &Check<'_>,
+) -> Result<(Value, RunMetadata), AtomError> {
+    let lowered = lower::lower(request.contract, &OPENAI_STRICT).map_err(|e| {
         AtomError::Runtime(format!(
             "the output schema of {} cannot be lowered: {e}",
-            A::NAME
+            request.name
         ))
     })?;
-    let validator = jsonschema::validator_for(&contract).map_err(|e| {
-        AtomError::Runtime(format!(
-            "the output schema of {} is not valid: {e}",
-            A::NAME
-        ))
-    })?;
-
-    let prompt = serde_json::to_string_pretty(input)
-        .map_err(|e| AtomError::Runtime(format!("serialize the input: {e}")))?;
     let spec = TurnSpec {
-        developer_instructions: Some(atom.instructions().into_owned()),
-        prompt,
+        developer_instructions: Some(request.developer),
+        prompt: request.prompt,
         output_schema: Some(lowered.schema.clone()),
-        model: config.model.clone(),
+        model: request.model,
     };
     let model = spec
         .model
@@ -110,7 +116,7 @@ pub async fn run_codex_atom<A: Atom>(
     }
     let prompt_hash = format!("{:x}", h.finalize());
 
-    let mut out = None;
+    let mut accepted = None;
     let mut failure = None;
     let mut repairs_left = 1;
     let (_, report) = codex::converse(
@@ -119,9 +125,9 @@ pub async fn run_codex_atom<A: Atom>(
         &runtime.cwd,
         &runtime.endpoint,
         &spec,
-        |answer| match accept::<A>(atom, answer, &lowered.nulls_added, &validator) {
-            Ok(o) => {
-                out = Some(o);
+        |answer| match accept(answer, &lowered.nulls_added, request.validator, check) {
+            Ok(v) => {
+                accepted = Some(v);
                 None
             }
             Err(e @ (AtomError::Schema { .. } | AtomError::Validation(_))) if repairs_left > 0 => {
@@ -157,13 +163,128 @@ pub async fn run_codex_atom<A: Atom>(
         prompt_hash,
         turns: report.turns,
     };
-    match (out, failure) {
-        (Some(o), _) => Ok((o, metadata)),
+    match (accepted, failure) {
+        (Some(v), _) => Ok((v, metadata)),
         (None, Some(e)) => Err(e),
         (None, None) => Err(AtomError::Runtime(
             "the turn ended without an answer".into(),
         )),
     }
+}
+
+/// Run a typed atom on `input`.
+pub async fn run_codex_atom<A: Atom>(
+    atom: &A,
+    input: &A::In,
+    runtime: &CodexRuntime,
+) -> Result<(A::Out, RunMetadata), AtomError> {
+    let mut config = runtime.defaults.clone();
+    atom.configure(&mut config);
+    let contract = atom.output_schema();
+    let validator = jsonschema::validator_for(&contract).map_err(|e| {
+        AtomError::Runtime(format!(
+            "the output schema of {} is not valid: {e}",
+            A::NAME
+        ))
+    })?;
+    let prompt = serde_json::to_string_pretty(input)
+        .map_err(|e| AtomError::Runtime(format!("serialize the input: {e}")))?;
+    let check = |v: &Value| -> Result<(), AtomError> {
+        let out: A::Out = serde_json::from_value(v.clone()).map_err(|e| AtomError::Schema {
+            message: format!("the answer does not deserialize: {e}"),
+            answer: v.to_string(),
+        })?;
+        atom.validate(&out)
+    };
+    let request = Request {
+        developer: atom.instructions().into_owned(),
+        prompt,
+        model: config.model.clone(),
+        contract: &contract,
+        validator: &validator,
+        name: A::NAME,
+    };
+    let (value, metadata) = run_contract(runtime, request, &check).await?;
+    let out = serde_json::from_value(value)
+        .map_err(|e| AtomError::Runtime(format!("deserialize the accepted output: {e}")))?;
+    Ok((out, metadata))
+}
+
+/// Run a loaded `.atom.md` on `input`. Returns the normalized, validated
+/// output, which is what a durable step checkpoints.
+pub async fn run_declarative(
+    atom: &AtomFile,
+    compiled: &Compiled,
+    registry: &mut Registry,
+    input: &Value,
+    run_id: &str,
+    origin: &str,
+    runtime: &CodexRuntime,
+) -> Result<(Value, RunMetadata), AtomError> {
+    let rendered = render::render(
+        compiled,
+        &RunInput {
+            run_id,
+            input,
+            frontmatter: &atom.frontmatter,
+            origin,
+        },
+    )
+    .map_err(|e| AtomError::Runtime(e.to_string()))?;
+    let registered = registry
+        .get(&atom.output)
+        .map(|e| e.schema.clone())
+        .ok_or_else(|| AtomError::Runtime(format!("{}: no output schema registered", atom.name)))?;
+    let validator = registry
+        .validator(&atom.output)
+        .map_err(|e| AtomError::Runtime(e.to_string()))?;
+    // The generation profile cannot follow file references: inline them.
+    let dir = atom.file.parent().unwrap_or(Path::new("")).to_owned();
+    let contract =
+        crate::workflow::inline(&registered, &dir, registry, 0).map_err(AtomError::Runtime)?;
+
+    let rules: Vec<String> = atom
+        .frontmatter
+        .get("validate")
+        .and_then(Value::as_array)
+        .map(|r| {
+            r.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let check = |output: &Value| -> Result<(), AtomError> {
+        for rule in &rules {
+            let program = cel::Program::compile(rule)
+                .map_err(|e| AtomError::Runtime(format!("validate rule {rule}: {e}")))?;
+            let mut context = cel::Context::default();
+            context
+                .add_variable("input", input)
+                .and_then(|()| context.add_variable("output", output))
+                .map_err(|e| AtomError::Runtime(e.to_string()))?;
+            match program.execute(&context) {
+                Ok(cel::Value::Bool(true)) => {}
+                Ok(other) => return Err(AtomError::Validation(format!("`{rule}` is {other:?}"))),
+                Err(e) => return Err(AtomError::Validation(format!("`{rule}`: {e}"))),
+            }
+        }
+        Ok(())
+    };
+    let model = atom
+        .frontmatter
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let request = Request {
+        developer: rendered.developer,
+        prompt: rendered.user,
+        model,
+        contract: &contract,
+        validator: &validator,
+        name: &atom.name,
+    };
+    run_contract(runtime, request, &check).await
 }
 
 /// Run an atom's future on its own task, so a panic inside it fails that
@@ -190,13 +311,14 @@ where
     }
 }
 
-/// Turn a final message into `Out`, or say exactly why it does not fit.
-pub(crate) fn accept<A: Atom>(
-    atom: &A,
+/// Turn a final message into a value that fits the contract, or say exactly
+/// why it does not.
+fn accept(
     answer: &str,
     nulls_added: &[String],
     validator: &jsonschema::Validator,
-) -> Result<A::Out, AtomError> {
+    check: &Check<'_>,
+) -> Result<Value, AtomError> {
     let schema_error = |message: String| AtomError::Schema {
         message,
         answer: answer.to_owned(),
@@ -207,23 +329,19 @@ pub(crate) fn accept<A: Atom>(
     let errors: Vec<String> = validator
         .iter_errors(&value)
         .map(|e| {
-            format!(
-                "{}: {e}",
-                if e.instance_path().to_string().is_empty() {
-                    "/".to_owned()
-                } else {
-                    e.instance_path().to_string()
-                }
-            )
+            let at = e.instance_path().to_string();
+            format!("{}: {e}", if at.is_empty() { "/".to_owned() } else { at })
         })
         .collect();
     if !errors.is_empty() {
         return Err(schema_error(errors.join("; ")));
     }
-    let out: A::Out = serde_json::from_value(value)
-        .map_err(|e| schema_error(format!("the answer does not deserialize: {e}")))?;
-    atom.validate(&out)?;
-    Ok(out)
+    match check(&value) {
+        // A deserialization failure in the typed check is about this answer.
+        Err(AtomError::Schema { message, .. }) => Err(schema_error(message)),
+        Err(e) => Err(e),
+        Ok(()) => Ok(value),
+    }
 }
 
 #[cfg(test)]

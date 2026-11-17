@@ -214,3 +214,87 @@ fn an_atom_that_panics_fails_its_run_and_the_process_keeps_going() {
         assert_eq!(contained(async { Ok::<_, AtomError>(7) }).await, Ok(7));
     });
 }
+
+#[test]
+fn a_declarative_atom_breaking_a_contract_only_constraint_gets_exactly_one_repair() {
+    use crate::{atom, compile};
+    on_codex_runtime(async {
+        let dir = std::env::temp_dir().join(format!("atomic-runtime-decl-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("atoms")).expect("mkdir");
+        std::fs::write(
+            dir.join("atoms/ticket.atom.md"),
+            "---\natomic: 1\ndescription: Name the ticket a note is about.\nkind: lite\n\
+             validate:\n  - \"output.ticket != 'ABC-0'\"\n---\nNote: {% $input.text %}\n",
+        )
+        .expect("atom");
+        std::fs::write(
+            dir.join("atoms/ticket.input.schema.yaml"),
+            "type: object\nrequired: [text]\nproperties:\n  text: {type: string}\n",
+        )
+        .expect("input");
+        // maxLength is not in the strict profile: only the full contract
+        // enforces it.
+        std::fs::write(
+            dir.join("atoms/ticket.output.schema.yaml"),
+            "type: object\nadditionalProperties: false\nrequired: [ticket]\nproperties:\n  ticket: {type: string, maxLength: 6}\n",
+        )
+        .expect("output");
+        let mut registry = Registry::new();
+        let a = atom::load(&dir.join("atoms/ticket.atom.md"), &mut registry).expect("loads");
+        let compiled = compile::compile(&a, &registry).expect("compiles");
+
+        // The first answer fits strict mode but breaks maxLength; the repaired
+        // one fits.
+        let model = FakeModel::start(vec![
+            Reply::Text(r#"{"ticket": "ABC-123456"}"#.into()),
+            Reply::Text(r#"{"ticket": "ABC-12"}"#.into()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = runtime(&model, "decl");
+        let input = json!({"text": "Export crashes, see ABC-12."});
+        let (out, meta) = run_declarative(
+            &a,
+            &compiled,
+            &mut registry,
+            &input,
+            "run-1",
+            "external",
+            &rt,
+        )
+        .await
+        .expect("repaired");
+        assert_eq!(out, json!({"ticket": "ABC-12"}));
+        assert_eq!((model.calls(), meta.turns), (2, 2));
+        let first = model.requests()[0].to_string();
+        assert!(
+            first.contains("origin=\\\"external\\\""),
+            "the input is wrapped in the user turn: {first}"
+        );
+        assert!(
+            model.requests()[1].to_string().contains("maxLength"),
+            "the repair quotes the broken constraint"
+        );
+
+        // A validate rule failing twice: one repair, then the validation error.
+        let model = FakeModel::start(vec![
+            Reply::Text(r#"{"ticket": "ABC-0"}"#.into()),
+            Reply::Text(r#"{"ticket": "ABC-0"}"#.into()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = runtime(&model, "decl-rule");
+        let r = run_declarative(
+            &a,
+            &compiled,
+            &mut registry,
+            &input,
+            "run-2",
+            "external",
+            &rt,
+        )
+        .await;
+        assert!(matches!(r, Err(AtomError::Validation(_))), "{r:?}");
+        assert_eq!(model.calls(), 2);
+    });
+}
