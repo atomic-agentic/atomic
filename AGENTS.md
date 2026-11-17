@@ -5,22 +5,19 @@ It builds on OpenAI's open-source Codex crates and gets durable execution from
 a fork of durare. A workflow of atoms survives a crash without redoing finished
 work, and a person signs off at durable gates.
 
-**Status: no code yet.** The design is complete and the whole build is
-recorded as beads in this repository. The current phase is v0.1.
+**Status: early development.** The build is recorded as beads. The current
+phase is v0.1.
 
 ## Where things are
 
 | What | Where |
 | --- | --- |
-| The work to do | Beads in this repository (`bd ready`) |
-| The plan | `../atomic-planning/atomic-scaffold-plan.md`, in the sibling repository |
-| Draft user docs, 11 examples and their offline checker | `../atomic-planning/docs/`, `examples/` and `tools/` |
-| The prototype atomic replaces | `../errai`: a reference for tests and small pure modules, not a base |
+| The work to do | Beads (`bd ready`) |
+| Design notes and private references | `AGENTS.local.md`, if present (not in git) |
 
-Beads cite the plan as `atomic-planning/atomic-scaffold-plan.md § <section>`.
-Bead `atomic-mum` decides whether the plan moves into this repository. Until
-then, read it from the sibling checkout, and say so if it is missing instead of
-working from memory.
+Read `AGENTS.local.md` when it exists: it holds maintainer-local pointers to
+design material that is not part of this repository. If a bead cites a document
+you cannot find, say so instead of working from memory.
 
 ## Work tracking
 
@@ -42,17 +39,17 @@ How the beads are organized:
   milestone epics (`M0` to `M56`, some split into `a` and `b` parts), which hold
   tasks.
 - **Labels.** The phase and the milestone, plus `spike`, `decision`, `test`,
-  `security`, `docs`, `benchmark` and `from-errai`.
-- **Every milestone ends in an acceptance bead** whose criteria quote the
-  plan's acceptance test. A milestone is done when that bead closes, not when
+  `security`, `docs` and `benchmark`.
+- **Every milestone ends in an acceptance bead** whose criteria state the
+  milestone's acceptance test. A milestone is done when that bead closes, not when
   its tasks do.
 - **Later phases are blocked by the phase gate before them.** Do not work
   around a blocker; if a dependency is wrong, fix the dependency and say why.
 
 Rules for working a bead:
 
-1. Read its acceptance criteria and the plan section it cites before writing
-   anything.
+1. Read its acceptance criteria and the design section it cites before
+   writing anything.
 2. Close it only when the acceptance criteria hold and you have run the check
    that shows it.
 3. File what you discover as a new bead under the same parent, linked with
@@ -63,8 +60,7 @@ Rules for working a bead:
 
 ## Architecture rules
 
-The plan's Architecture and Durability sections are the authority. These are
-the rules that are easiest to break:
+These are the rules that are easiest to break:
 
 - **One Cargo workspace, one binary.** Crates: `atomic-core`, `atomic-durable`,
   `atomic-atoms`, `atomic-graph`, `atomic-schema`, `atomic-exec` and the
@@ -114,8 +110,8 @@ run.
   calls. Tests need no provider and no network.
 - **A control is tested by removing it:** switch the control off once and see
   its test fail.
-- **Port errai's behavioural tests before the code they describe,** and run
-  errai's own suite first to confirm it passes (`atomic-0yw`).
+- **Port a behavioural test before the code it describes,** and confirm it
+  passes against the implementation it came from first.
 - **Crash tests kill the process** at named failpoints and assert that no
   completed step repeats.
 
@@ -135,5 +131,8 @@ run.
   credited in the third-party notices. Do not ship a binary named `bd`.
 - **Never read or copy code from `beads_rust`.** Its licence rider excludes
   OpenAI, Anthropic and anyone acting on their behalf.
-- Code copied from errai is under the same owner. Its redaction module calls
-  `rig-core` (MIT), which must be vendored with attribution or rewritten.
+- Third-party code that is vendored or adapted keeps its licence and is
+  credited in the third-party notices.
+- **Repository content is about atomic only.** No business plans, roadmaps
+  with dates, competitor analysis or personal details in tracked files or
+  commit messages.
