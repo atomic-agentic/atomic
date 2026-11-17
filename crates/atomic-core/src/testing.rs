@@ -7,9 +7,6 @@
 //! or a tool call. It drives a real Codex thread deterministically, and it
 //! counts and records every request, so durability and repair tests can
 //! assert exactly how many model calls were made.
-//!
-//! Ported from the scripted model the errai prototype used for its client
-//! tests, which spoke the same streaming events.
 
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
