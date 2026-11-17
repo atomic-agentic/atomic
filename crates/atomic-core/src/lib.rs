@@ -12,3 +12,4 @@ pub mod config;
 pub mod project;
 pub mod state;
 pub mod tags;
+pub mod workflow;

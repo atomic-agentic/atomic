@@ -175,6 +175,13 @@ fn later_fields_and_missing_basics_are_refused() {
             .message
             .contains("description")
     );
+    let (_, result) = classify_with(&CLASSIFY.replace("atomic: 1\n", ""));
+    assert!(
+        result
+            .expect_err("no format version")
+            .message
+            .contains("add `atomic: 1`")
+    );
     let (_, result) = classify_with(&CLASSIFY.replace("kind: lite", "kind: wizard"));
     assert_eq!(result.expect_err("bad kind").path, "/kind");
 }
