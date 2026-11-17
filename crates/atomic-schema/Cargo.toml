@@ -14,6 +14,7 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+cel = { workspace = true }
 jsonschema = { workspace = true }
 saphyr-parser = { workspace = true }
 serde = { workspace = true }
