@@ -41,6 +41,8 @@ durare = { git = "https://github.com/atomic-agentic/durare", rev = "9c93328ded1e
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 dirs = "6"
+# No default features: schemas never come from the network.
+jsonschema = { version = "0.61", default-features = false }
 saphyr-parser = "0.3.4"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
