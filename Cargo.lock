@@ -496,6 +496,8 @@ dependencies = [
  "atomic-agentic-graph",
  "atomic-agentic-schema",
  "clap",
+ "sqlx",
+ "tokio",
 ]
 
 [[package]]
@@ -531,6 +533,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "sqlx",
  "thiserror 2.0.21",
  "tokio",
 ]

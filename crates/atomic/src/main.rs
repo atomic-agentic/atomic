@@ -82,6 +82,8 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn run(cli: Cli, paths: CodexPaths, state: ProjectState) -> anyhow::Result<()> {
+    // Before anything else: a store written by a newer atomic is refused.
+    atomic_durable::store::open_sqlite(&state.database()).await?;
     match cli.command {
         None => {
             println!("atomic {}", env!("CARGO_PKG_VERSION"));

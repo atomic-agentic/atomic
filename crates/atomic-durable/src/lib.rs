@@ -6,6 +6,7 @@
 //! only through this crate.
 
 mod publication;
+pub mod store;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -26,6 +27,9 @@ impl From<durare::Error> for DurableError {
 /// this one included. A diagnostic: it proves the engine links and works in
 /// this process.
 pub async fn probe(database: &Path) -> Result<usize, DurableError> {
+    store::open_sqlite(database)
+        .await
+        .map_err(|e| DurableError(e.to_string()))?;
     let url = format!("sqlite://{}?mode=rwc", database.display());
     let provider = Arc::new(durare::SqliteProvider::connect(&url).await?);
     let mut engine = durare::DurableEngine::new(provider).await?;

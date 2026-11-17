@@ -115,3 +115,39 @@ fn under_the_sandbox_helpers_name_it_takes_the_helper_path() {
     );
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn a_store_written_by_a_newer_atomic_stops_it_from_starting() {
+    let home = scratch("newer-store");
+    let first = run(Path::new(ATOMIC), &[], &home);
+    assert!(first.status.success(), "{}", text(&first));
+    let state = std::fs::read_dir(home.join("atomic-home/projects"))
+        .expect("state directories")
+        .next()
+        .expect("one project")
+        .expect("entry")
+        .path();
+    let db = state.join("atomic.db");
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(async {
+            use sqlx::Connection;
+            let mut c = sqlx::SqliteConnection::connect(&format!("sqlite://{}", db.display()))
+                .await
+                .expect("connect");
+            sqlx::query("UPDATE atomic_store_version SET version = version + 1")
+                .execute(&mut c)
+                .await
+                .expect("bump the version");
+        });
+    let out = run(Path::new(ATOMIC), &[], &home);
+    let t = text(&out);
+    assert!(
+        !out.status.success(),
+        "atomic started on a newer store: {t}"
+    );
+    assert!(t.contains("newer than this atomic understands"), "{t}");
+    let _ = std::fs::remove_dir_all(&home);
+}

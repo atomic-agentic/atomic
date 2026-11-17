@@ -46,6 +46,8 @@ thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+# The same sqlx Codex and the durare fork use (the patch block pins its source).
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite-bundled"] }
 tokio = { version = "1", default-features = false }
 
 # Codex, at the revision in deps/codex.toml (scripts/codex-pin.sh checks it).
