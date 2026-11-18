@@ -13,6 +13,8 @@ export function schemaType(schema, depth = 0) {
     const branches = `(${(anyOf ?? oneOf ?? allOf).map(type).join(allOf ? ' & ' : ' | ')})`;
     return base.type || base.properties ? `(${type(base)} & ${branches})` : branches;
   }
+  // atomic's artifact reference is a string naming a stored artifact.
+  if (schema.$ref === 'atomic:artifact') return 'string';
   if (Array.isArray(schema.type)) return schema.type.map((item) => type({ ...schema, type: item })).join(' | ');
   if (schema.$ref) throw new Error('type generation requires resolved schema references');
   if (schema.type === 'object' || schema.properties) {

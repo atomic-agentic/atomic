@@ -297,6 +297,26 @@ impl Registry {
 }
 
 impl Registry {
+    /// A validator for a schema that is not registered, such as a typed
+    /// atom's, that can still reference every registered schema, including
+    /// the built-in `atomic:artifact`.
+    pub fn validator_for(&self, schema: &Value) -> Result<Validator, SchemaError> {
+        let known: Arc<BTreeMap<String, Value>> = Arc::new(
+            self.entries
+                .iter()
+                .map(|(k, e)| (k.clone(), e.schema.clone()))
+                .collect(),
+        );
+        jsonschema::options()
+            .with_draft(Draft::Draft202012)
+            .with_retriever(Registered(known))
+            .build(schema)
+            .map_err(|e| SchemaError::Invalid {
+                id: "(unregistered)".into(),
+                message: e.to_string(),
+            })
+    }
+
     /// Compile every registered schema, so every reference is checked once
     /// all schemas are loaded.
     pub fn check(&self) -> Result<(), SchemaError> {

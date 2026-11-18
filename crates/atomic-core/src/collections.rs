@@ -8,10 +8,12 @@
 //! honouring `.gitignore`, the manifest's `ignore` globs and the generated
 //! directory, and stopping at any subdirectory that holds its own manifest.
 //! A file matched by several globs is found once. Two atoms, or two workflows,
-//! with one name are an error.
+//! with one name are an error. A workflow's name is the `name` it declares,
+//! or else its file name; an atom's is its file name.
 
 use crate::project::Project;
 use globset::{Glob, GlobSet, GlobSetBuilder};
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -92,6 +94,26 @@ fn default_name(collection: &str, relative: &Path) -> String {
         .map_or(rel.to_string(), |(stem, _)| stem.to_owned())
 }
 
+/// The name a workflow declares for itself at its top level, if any. A file
+/// that cannot be read or parsed declares none here; its loader reports what
+/// is wrong with it.
+///
+/// An atom's name in a collection is its file name: its frontmatter is
+/// TypeScript the compiler reads, and its generated declarations are named
+/// after the file, so one project cannot hold two atom files with one name.
+/// A `name` an atom declares is checked once the atom is loaded.
+fn declared_name(collection: &str, path: &Path) -> Option<String> {
+    if collection != "workflows" {
+        return None;
+    }
+    let text = std::fs::read_to_string(path).ok()?;
+    let doc = atomic_schema::yaml::load(path, &text).ok()?;
+    match doc.value.get("name")? {
+        Value::String(n) if !n.is_empty() => Some(n.clone()),
+        _ => None,
+    }
+}
+
 fn globset(collection: &str, globs: &[String]) -> Result<GlobSet, CollectError> {
     let mut b = GlobSetBuilder::new();
     for g in globs {
@@ -170,13 +192,15 @@ pub fn collect(project: &Project) -> Result<BTreeMap<String, Vec<SourceFile>>, C
         for (collection, set) in &sets {
             if set.is_match(relative) {
                 let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+                let name = declared_name(collection, &canonical)
+                    .unwrap_or_else(|| default_name(collection, relative));
                 found
                     .get_mut(collection)
                     .expect("every collection has a map")
                     .insert(
                         canonical.clone(),
                         SourceFile {
-                            name: default_name(collection, relative),
+                            name,
                             path: canonical,
                         },
                     );

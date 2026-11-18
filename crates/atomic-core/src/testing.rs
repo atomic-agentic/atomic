@@ -2,11 +2,13 @@
 
 //! A scripted fake model, for tests that need a model without a provider.
 //!
-//! [`FakeModel`] serves an OpenAI-compatible Responses API on a loopback port
-//! and answers each request with the next entry of its script: a text reply
-//! or a tool call. It drives a real Codex thread deterministically, and it
-//! counts and records every request, so durability and repair tests can
-//! assert exactly how many model calls were made.
+//! [`FakeModel`] serves an OpenAI-compatible API on a loopback port and
+//! answers each model call with the next entry of its script: a text reply, a
+//! tool call or an HTTP error. It speaks the streaming Responses API, which
+//! drives a real Codex thread deterministically, and the non-streaming
+//! Responses and Chat Completions calls a lite atom makes. It counts and
+//! records every call, so durability and repair tests can assert exactly how
+//! many model calls were made.
 
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
@@ -25,12 +27,20 @@ pub enum Reply {
         /// Its arguments.
         arguments: Value,
     },
+    /// An HTTP error with this status and body.
+    Http {
+        /// The status code.
+        status: u16,
+        /// The response body.
+        body: String,
+    },
 }
 
 #[derive(Default)]
 struct State {
     script: Vec<Reply>,
     requests: Vec<Value>,
+    paths: Vec<String>,
 }
 
 /// A running fake model. It stops when dropped.
@@ -49,6 +59,7 @@ impl FakeModel {
         let state = Arc::new(Mutex::new(State {
             script,
             requests: Vec::new(),
+            paths: Vec::new(),
         }));
         let shared = state.clone();
         let task = tokio::spawn(async move {
@@ -67,7 +78,8 @@ impl FakeModel {
         format!("http://127.0.0.1:{}/v1", self.port)
     }
 
-    /// How many model calls (`POST …/responses`) were made.
+    /// How many model calls (`POST …/responses` or `…/chat/completions`)
+    /// were made.
     pub fn calls(&self) -> usize {
         self.state.lock().map(|s| s.requests.len()).unwrap_or(0)
     }
@@ -77,6 +89,14 @@ impl FakeModel {
         self.state
             .lock()
             .map(|s| s.requests.clone())
+            .unwrap_or_default()
+    }
+
+    /// The path of every model call, in order, such as `/v1/responses`.
+    pub fn paths(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .map(|s| s.paths.clone())
             .unwrap_or_default()
     }
 }
@@ -115,21 +135,48 @@ async fn serve(socket: &mut tokio::net::TcpStream, state: &Mutex<State>) -> std:
         );
         let path = path.split('?').next().unwrap_or_default();
 
-        let (status, content_type, text) = if method == "POST" && path.ends_with("/responses") {
-            let request: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-            let reply = match state.lock() {
-                Ok(mut s) => {
-                    let index = s.requests.len();
-                    s.requests.push(request.clone());
-                    s.script.get(index).cloned()
+        let chat = path.ends_with("/chat/completions");
+        let (status, content_type, text) =
+            if method == "POST" && (chat || path.ends_with("/responses")) {
+                let request: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                let reply = match state.lock() {
+                    Ok(mut s) => {
+                        let index = s.requests.len();
+                        s.requests.push(request.clone());
+                        s.paths.push(path.to_owned());
+                        s.script.get(index).cloned()
+                    }
+                    Err(_) => None,
+                };
+                let reply = reply.unwrap_or_else(|| Reply::Text("Synthetic reply.".into()));
+                let streaming = request.get("stream").and_then(Value::as_bool) != Some(false);
+                match &reply {
+                    Reply::Http { status, body } => {
+                        (format!("{status} Error"), "application/json", body.clone())
+                    }
+                    _ if chat => (
+                        "200 OK".to_owned(),
+                        "application/json",
+                        chat_completion(&request, &reply).to_string(),
+                    ),
+                    _ if streaming => (
+                        "200 OK".to_owned(),
+                        "text/event-stream",
+                        stream(&request, &reply),
+                    ),
+                    _ => (
+                        "200 OK".to_owned(),
+                        "application/json",
+                        completed(&request, &reply).to_string(),
+                    ),
                 }
-                Err(_) => None,
+            } else {
+                (
+                    "404 Not Found".to_owned(),
+                    "application/json",
+                    "{}".to_owned(),
+                )
             };
-            let reply = reply.unwrap_or_else(|| Reply::Text("Synthetic reply.".into()));
-            ("200 OK", "text/event-stream", stream(&request, &reply))
-        } else {
-            ("404 Not Found", "application/json", "{}".to_owned())
-        };
         let response = format!(
             "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\r\n{text}",
             text.len()
@@ -139,13 +186,16 @@ async fn serve(socket: &mut tokio::net::TcpStream, state: &Mutex<State>) -> std:
     }
 }
 
-/// The Responses API's server-sent events for one reply.
-fn stream(request: &Value, reply: &Reply) -> String {
-    let model = request
+fn model_of(request: &Value) -> &str {
+    request
         .get("model")
         .and_then(Value::as_str)
-        .unwrap_or("synthetic");
-    let item = match reply {
+        .unwrap_or("synthetic")
+}
+
+/// The Responses API's output item for one reply.
+fn output_item(reply: &Reply) -> Value {
+    match reply {
         Reply::Text(text) => json!({
             "type": "message", "id": "msg_synthetic", "role": "assistant", "status": "completed",
             "content": [{"type": "output_text", "text": text, "annotations": []}]
@@ -154,12 +204,48 @@ fn stream(request: &Value, reply: &Reply) -> String {
             "type": "function_call", "id": "fc_synthetic", "call_id": "call_synthetic",
             "name": name, "arguments": arguments.to_string(), "status": "completed"
         }),
+        Reply::Http { .. } => Value::Null,
+    }
+}
+
+/// A completed Responses API response for one reply, as a non-streaming call
+/// returns it.
+fn completed(request: &Value, reply: &Reply) -> Value {
+    json!({
+        "id": "resp_synthetic", "object": "response", "status": "completed",
+        "model": model_of(request), "output": [output_item(reply)],
+        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+    })
+}
+
+/// A Chat Completions response for one reply.
+fn chat_completion(request: &Value, reply: &Reply) -> Value {
+    let message = match reply {
+        Reply::Tool { name, arguments } => json!({
+            "role": "assistant", "content": null,
+            "tool_calls": [{"id": "call_synthetic", "type": "function",
+                            "function": {"name": name, "arguments": arguments.to_string()}}]
+        }),
+        Reply::Text(text) => json!({"role": "assistant", "content": text}),
+        Reply::Http { .. } => Value::Null,
     };
-    let response = json!({"id": "resp_synthetic", "object": "response", "status": "in_progress", "model": model, "output": []});
-    let mut done = response.clone();
-    done["status"] = json!("completed");
-    done["output"] = json!([item]);
-    done["usage"] = json!({"input_tokens": 1, "output_tokens": 1, "total_tokens": 2});
+    json!({
+        "id": "chatcmpl_synthetic", "object": "chat.completion", "model": model_of(request),
+        "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+    })
+}
+
+/// The Responses API's server-sent events for one reply.
+fn stream(request: &Value, reply: &Reply) -> String {
+    let item = output_item(reply);
+    let done = completed(request, reply);
+    let mut response = done.clone();
+    response["status"] = json!("in_progress");
+    response["output"] = json!([]);
+    if let Some(r) = response.as_object_mut() {
+        r.remove("usage");
+    }
     let events = [
         (
             "response.created",

@@ -186,3 +186,81 @@ fn an_explicit_file_reference_preserves_its_schema_fragment() {
             .is_valid(&json!({"ticket":"too long"}))
     );
 }
+
+/// A schema file that holds only definitions, one per role.
+const COMMON: &str = "$defs:\n  Request:\n    type: object\n    additionalProperties: false\n    required: [text]\n    properties:\n      text: {type: string, minLength: 1}\n  Answer:\n    type: object\n    additionalProperties: false\n    required: [category]\n    properties:\n      category: {enum: [bug, feature]}\n";
+
+fn with_common(input: &str, output: &str) -> (PathBuf, Registry, Result<Atom, AtomError>) {
+    // Explicit references override the sidecars `project` writes.
+    let root = project(
+        "{input.text}",
+        &format!(
+            "{{input:{{$ref:'./common.schema.yaml#/$defs/{input}'}},output:{{$ref:'./common.schema.yaml#/$defs/{output}'}}}}"
+        ),
+        None,
+    );
+    std::fs::write(root.join("common.schema.yaml"), COMMON).expect("schema");
+    let file = std::fs::canonicalize(root.join("test.atom.astro")).expect("atom");
+    let mut registry = Registry::new();
+    let result = load(&file, &mut registry);
+    (file, registry, result)
+}
+
+#[test]
+fn a_reference_to_a_place_in_a_file_keeps_that_exact_target() {
+    let (_, mut registry, result) = with_common("Request", "Answer");
+    let a = result.expect("loads");
+
+    // Validation uses Request itself: its required field and its minLength.
+    let input = registry.validator(&a.input).expect("input validator");
+    assert!(input.is_valid(&serde_json::json!({"text": "x"})));
+    assert!(
+        !input.is_valid(&serde_json::json!({"text": ""})),
+        "minLength kept"
+    );
+    assert!(!input.is_valid(&serde_json::json!({})), "required kept");
+    let output = registry.validator(&a.output).expect("output validator");
+    assert!(output.is_valid(&serde_json::json!({"category": "bug"})));
+    assert!(!output.is_valid(&serde_json::json!({"category": "spam"})));
+
+    // Lowering and workflow mapping inline the schema from where it was
+    // registered, and reach Answer, an object root, not the file's bare $defs.
+    let base = |registry: &Registry, id: &str| {
+        let entry = registry.get(id).expect("registered");
+        (
+            entry.schema.clone(),
+            entry.file.parent().expect("dir").to_owned(),
+        )
+    };
+    for id in [&a.input, &a.output] {
+        let (schema, dir) = base(&registry, id);
+        let inlined = crate::workflow::inline(&schema, &dir, &mut registry, 0).expect("inlines");
+        assert_eq!(inlined["type"], "object", "{id}: {inlined}");
+        assert!(inlined.get("$defs").is_none(), "{id}: {inlined}");
+    }
+    let (answer, dir) = base(&registry, &a.output);
+    let answer = crate::workflow::inline(&answer, &dir, &mut registry, 0).expect("inlines");
+    let lowered =
+        atomic_schema::lower::lower(&answer, &atomic_schema::lower::OPENAI_STRICT).expect("lowers");
+    assert_eq!(lowered.schema["required"], serde_json::json!(["category"]));
+}
+
+#[test]
+fn a_reference_to_a_missing_place_in_a_file_fails_the_load() {
+    for (role, other) in [("input", "output"), ("output", "input")] {
+        let other_def = if other == "input" {
+            "Request"
+        } else {
+            "Answer"
+        };
+        let (input, output) = if role == "input" {
+            ("Nope", other_def)
+        } else {
+            (other_def, "Nope")
+        };
+        let (file, _, result) = with_common(input, output);
+        let e = result.expect_err("missing fragment");
+        assert_eq!((e.file, e.path), (file, format!("/{role}")));
+        assert!(e.message.contains("/$defs/Nope"), "{}", e.message);
+    }
+}

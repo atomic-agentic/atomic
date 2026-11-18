@@ -1,0 +1,3 @@
+{
+  "request": "Checkout charges for one unit no matter how many are in the cart. Two units at 1.25 should cost 2.50. Please don't change single-unit orders."
+}

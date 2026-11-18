@@ -121,6 +121,7 @@ first. These checks also run locally:
 scripts/codex-pin.sh check     # the [patch] block and toolchain match deps/codex.toml
 scripts/forks-check.sh         # each fork in deps/forks.toml resolves at its pinned rev
 scripts/lock-check.sh          # crates shared with Codex keep Codex's locked versions
+scripts/dev.sh scripts/lock-resolves.sh   # a fresh resolution keeps Codex's libsqlite3-sys
 scripts/dev.sh cargo deny --locked check bans licenses sources   # deny.toml
 scripts/dev.sh scripts/sbom.sh # the SBOM lists every fork at its pin
 ```

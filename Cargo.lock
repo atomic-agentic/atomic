@@ -512,6 +512,7 @@ dependencies = [
  "atomic-agentic-graph",
  "atomic-agentic-schema",
  "clap",
+ "serde",
  "serde_json",
  "sqlx",
  "tokio",
@@ -523,6 +524,9 @@ version = "0.0.0"
 dependencies = [
  "atomic-agentic-core",
  "atomic-agentic-schema",
+ "jsonschema",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -542,6 +546,8 @@ dependencies = [
  "hmac 0.12.1",
  "ignore",
  "jsonschema",
+ "regex",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "sha2 0.10.9",

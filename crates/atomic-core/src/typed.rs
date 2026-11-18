@@ -45,10 +45,24 @@ pub enum Approvals {
     Attended,
 }
 
+/// The model tiers an atom may name instead of a model, from least to most
+/// capable. A project maps each tier to an ordered list of models, so atoms
+/// never name a provider. A tier is independent of an atom's kind: a lite
+/// atom may run on any tier.
+///
+/// - `basic`: the smallest, cheapest models, often local, for classify,
+///   extract and route steps;
+/// - `fast`: quick, low-cost general models, for executors and routine
+///   steps;
+/// - `advanced`: capable general models, for reviewers and harder steps;
+/// - `frontier`: the most capable models available, for planning and the
+///   reviews that decide the most.
+pub const MODEL_TIERS: &[&str] = &["basic", "fast", "advanced", "frontier"];
+
 /// Run settings an atom may adjust in [`Atom::configure`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AtomConfig {
-    /// A model name, or a tier (`fast`, `strong`) the project maps; `None`
+    /// A model name, or one of the [`MODEL_TIERS`] the project maps; `None`
     /// takes the project default.
     pub model: Option<String>,
     /// The sandbox.
@@ -62,6 +76,10 @@ pub struct AtomConfig {
 /// Why an atom failed.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum AtomError {
+    /// The input does not fit the atom's input contract; the model was not
+    /// called.
+    #[error("the input does not fit the input schema: {0}")]
+    Input(String),
     /// The final answer did not fit the output contract, even after the
     /// repair turn.
     #[error("the output does not fit the schema: {message}")]
@@ -183,7 +201,7 @@ mod tests {
             "Review the diff.".into()
         }
         fn configure(&self, config: &mut AtomConfig) {
-            config.model = Some("strong".into());
+            config.model = Some("advanced".into());
         }
         fn validate(&self, out: &Verdict) -> Result<(), AtomError> {
             (out.verdict != "approve")
@@ -210,7 +228,8 @@ mod tests {
         );
         let mut config = AtomConfig::default();
         atom.configure(&mut config);
-        assert_eq!(config.model.as_deref(), Some("strong"));
+        assert_eq!(config.model.as_deref(), Some("advanced"));
+        assert_eq!(MODEL_TIERS, ["basic", "fast", "advanced", "frontier"]);
         assert_eq!(config.sandbox, Sandbox::ReadOnly);
         let out: Verdict = serde_json::from_value(json!({"verdict": "approve"})).expect("parses");
         assert!(matches!(atom.validate(&out), Err(AtomError::Validation(_))));

@@ -192,6 +192,11 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo build --workspace --locked
+      # The graph still resolves from scratch onto the libsqlite3-sys Codex
+      # locks, which both Codex and the durare fork link.
+      - name: Lockfile resolves from scratch (Linux)
+        if: runner.os == 'Linux'
+        run: scripts/lock-resolves.sh
       # Postgres variants run where the test database is; with the feature on, a
       # missing database fails them rather than skipping.
       - name: Test (Linux, with Postgres)

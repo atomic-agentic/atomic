@@ -84,7 +84,7 @@ fn a_null_for_a_lowered_optional_is_removed_and_a_permitted_null_is_kept() {
             {"file": "b.rs", "severity": "nit", "message": "n", "line": 7, "note": "x"}
         ]
     });
-    normalize(&mut generated, &l.nulls_added);
+    normalize(&mut generated, &l);
     assert_eq!(
         generated["findings"][0].get("line"),
         None,
@@ -173,4 +173,194 @@ fn an_optional_anyof_with_a_null_branch_is_ambiguous() {
     let e = lower(&contract, &OPENAI_STRICT).expect_err("ambiguous");
     assert_eq!(e.path, "/properties/owner");
     assert!(e.message.contains("ambiguous"), "{e}");
+}
+
+/// Normalize `generated` under `contract`, and check the result against the
+/// full contract.
+fn normalized(contract: &Value, mut generated: Value) -> Value {
+    let l = lower(contract, &OPENAI_STRICT).expect("lowers");
+    normalize(&mut generated, &l);
+    let validator = jsonschema::validator_for(contract).expect("valid contract");
+    let errors: Vec<String> = validator
+        .iter_errors(&generated)
+        .map(|e| format!("{}: {e}", e.instance_path()))
+        .collect();
+    assert!(
+        errors.is_empty(),
+        "{generated} breaks the contract: {errors:?}"
+    );
+    generated
+}
+
+#[test]
+fn optional_fields_in_definitions_normalize_where_they_are_used() {
+    let contract = json!({
+        "type": "object",
+        "required": ["person", "team"],
+        "properties": {
+            "person": {"$ref": "#/$defs/Person"},
+            "team": {"type": "array", "items": {"$ref": "#/$defs/Person"}},
+            "lead": {"$ref": "#/$defs/Person"}
+        },
+        "$defs": {
+            "Person": {
+                "type": "object", "additionalProperties": false, "required": ["name"],
+                "properties": {"name": {"type": "string"}, "age": {"type": "integer"}}
+            }
+        }
+    });
+    let out = normalized(
+        &contract,
+        json!({
+            "person": {"name": "Ada", "age": null},
+            "team": [{"name": "Bo", "age": null}, {"name": "Cy", "age": 3}],
+            "lead": null
+        }),
+    );
+    assert_eq!(
+        out,
+        json!({
+            "person": {"name": "Ada"},
+            "team": [{"name": "Bo"}, {"name": "Cy", "age": 3}]
+        })
+    );
+}
+
+/// `payload` is one of two shapes; in the second, `line` may be null as a
+/// value, whether it is optional or required there.
+fn alternatives(second_line_required: bool, discriminated: bool) -> Value {
+    let mut a = json!({
+        "type": "object", "additionalProperties": false, "required": ["kind"],
+        "properties": {"kind": {"const": "a"}, "line": {"type": "integer"}}
+    });
+    let mut b = json!({
+        "type": "object", "additionalProperties": false, "required": ["kind"],
+        "properties": {"kind": {"enum": ["b", "c"]}, "line": {"type": ["integer", "null"]}}
+    });
+    if second_line_required {
+        b["required"] = json!(["kind", "line"]);
+    }
+    if !discriminated {
+        // Both may say either kind: the tag no longer tells them apart.
+        a["properties"]["kind"] = json!({"enum": ["a", "b"]});
+        b["properties"]["kind"] = json!({"enum": ["a", "b"]});
+    }
+    json!({
+        "type": "object", "required": ["payload"],
+        "properties": {"payload": {"anyOf": [a, b]}}
+    })
+}
+
+#[test]
+fn a_null_one_alternative_permits_survives_where_another_lowered_an_optional() {
+    for required in [false, true] {
+        let contract = alternatives(required, true);
+        // The second alternative's null is a value: kept.
+        let out = normalized(&contract, json!({"payload": {"kind": "b", "line": null}}));
+        assert_eq!(
+            out,
+            json!({"payload": {"kind": "b", "line": null}}),
+            "required: {required}"
+        );
+        // The first alternative's null means omitted: removed.
+        let out = normalized(&contract, json!({"payload": {"kind": "a", "line": null}}));
+        assert_eq!(
+            out,
+            json!({"payload": {"kind": "a"}}),
+            "required: {required}"
+        );
+    }
+}
+
+#[test]
+fn alternatives_that_disagree_about_a_null_with_nothing_to_tell_them_apart_are_refused() {
+    for required in [false, true] {
+        let e = lower(&alternatives(required, false), &OPENAI_STRICT).expect_err("refused");
+        assert_eq!(e.path, "/properties/payload", "required: {required}");
+        assert!(
+            e.message.contains("/line") && e.message.contains("tells the alternatives apart"),
+            "{e}"
+        );
+    }
+}
+
+#[test]
+fn alternatives_that_agree_about_nulls_need_no_tag() {
+    let contract = json!({
+        "type": "object", "required": ["payload"],
+        "properties": {"payload": {"anyOf": [
+            {"type": "object", "additionalProperties": false, "required": ["file"],
+             "properties": {"file": {"type": "string"}, "line": {"type": "integer"}}},
+            {"type": "object", "additionalProperties": false, "required": ["url"],
+             "properties": {"url": {"type": "string"}}}
+        ]}}
+    });
+    let out = normalized(
+        &contract,
+        json!({"payload": {"file": "a.rs", "line": null}}),
+    );
+    assert_eq!(out, json!({"payload": {"file": "a.rs"}}));
+}
+
+#[test]
+fn alternatives_given_as_definitions_are_told_apart_by_their_tags() {
+    let contract = json!({
+        "type": "object", "required": ["events"],
+        "properties": {"events": {"type": "array", "items": {"anyOf": [
+            {"$ref": "#/$defs/Edit"}, {"$ref": "#/$defs/Note"}
+        ]}}},
+        "$defs": {
+            "Edit": {"type": "object", "additionalProperties": false, "required": ["kind", "file"],
+                     "properties": {"kind": {"const": "edit"}, "file": {"type": "string"},
+                                    "line": {"type": "integer"}}},
+            "Note": {"type": "object", "additionalProperties": false, "required": ["kind", "line"],
+                     "properties": {"kind": {"const": "note"}, "line": {"type": ["integer", "null"]}}}
+        }
+    });
+    let out = normalized(
+        &contract,
+        json!({"events": [
+            {"kind": "edit", "file": "a.rs", "line": null},
+            {"kind": "note", "line": null}
+        ]}),
+    );
+    assert_eq!(
+        out,
+        json!({"events": [{"kind": "edit", "file": "a.rs"}, {"kind": "note", "line": null}]})
+    );
+}
+
+#[test]
+fn an_optional_reference_to_a_nullable_definition_keeps_its_null() {
+    for note in [
+        json!({"type": ["string", "null"]}),
+        json!({"anyOf": [{"type": "string"}, {"type": "null"}]}),
+        json!({"$ref": "#/$defs/Inner"}),
+    ] {
+        let contract = json!({
+            "type": "object",
+            "properties": {"note": {"$ref": "#/$defs/Note"}},
+            "$defs": {"Note": note.clone(), "Inner": {"type": ["string", "null"]}}
+        });
+        match lower(&contract, &OPENAI_STRICT) {
+            Ok(l) => {
+                assert_eq!(l.warnings, ["/note"], "{note}: null is a value here");
+                assert!(l.nulls_added.is_empty(), "{note}: {:?}", l.nulls_added);
+                assert_eq!(
+                    normalized(&contract, json!({"note": null})),
+                    json!({"note": null})
+                );
+                assert_eq!(
+                    normalized(&contract, json!({"note": "x"})),
+                    json!({"note": "x"})
+                );
+            }
+            // A null-admitting anyOf behind an optional reference is the
+            // ambiguous case: refused, never silently normalized.
+            Err(e) => assert!(
+                note.get("anyOf").is_some() && e.message.contains("ambiguous"),
+                "{note}: {e}"
+            ),
+        }
+    }
 }

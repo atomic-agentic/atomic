@@ -105,3 +105,56 @@ fn removed_atom_formats_fail_instead_of_silently_disappearing_from_discovery() {
         ));
     }
 }
+
+fn atom(name: Option<&str>) -> String {
+    let name = name
+        .map(|n| format!("export const config = {{ name: '{n}' }};\n"))
+        .unwrap_or_default();
+    format!("---\n{name}---\nReview.\n")
+}
+
+#[test]
+fn workflows_with_one_file_name_and_distinct_declared_names_are_both_collected() {
+    let root = tree(&[
+        ("atomic.yaml", "atomic: 1\n"),
+        (
+            "workflows/a/release.workflow.yaml",
+            "atomic: 1\nname: release-a\n",
+        ),
+        (
+            "workflows/b/release.workflow.yaml",
+            "atomic: 1\nname: release-b\n",
+        ),
+    ]);
+    let c = collect(&project::load(&root.join("atomic.yaml")).expect("project")).expect("collects");
+    assert_eq!(names(&c, "workflows"), ["release-a", "release-b"]);
+}
+
+#[test]
+fn different_workflow_files_declaring_one_name_are_refused() {
+    let root = tree(&[
+        ("atomic.yaml", "atomic: 1\n"),
+        ("workflows/one.workflow.yaml", "atomic: 1\nname: ship\n"),
+        ("workflows/two.workflow.yaml", "atomic: 1\nname: ship\n"),
+    ]);
+    let project = project::load(&root.join("atomic.yaml")).expect("project");
+    match collect(&project) {
+        Err(CollectError::DuplicateName { collection, .. }) => assert_eq!(collection, "workflows"),
+        other => panic!("expected a duplicate, got {other:?}"),
+    }
+}
+
+#[test]
+fn atom_files_with_one_file_name_collide_even_with_distinct_declared_names() {
+    // Their generated declarations would both be .atomic/types/review.d.ts.
+    let root = tree(&[
+        ("atomic.yaml", "atomic: 1\n"),
+        ("atoms/api/review.atom.astro", &atom(Some("review-api"))),
+        ("atoms/web/review.atom.astro", &atom(Some("review-web"))),
+    ]);
+    let project = project::load(&root.join("atomic.yaml")).expect("project");
+    assert!(matches!(
+        collect(&project),
+        Err(CollectError::DuplicateName { name, .. }) if name == "review"
+    ));
+}

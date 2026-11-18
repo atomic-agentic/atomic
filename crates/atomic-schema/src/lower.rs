@@ -11,6 +11,11 @@
 //! - a property the contract leaves optional becomes required and nullable,
 //!   and the place is recorded, so [`normalize`] can turn the model's `null`
 //!   there back into "omitted";
+//! - where `anyOf` alternatives disagree about what a `null` means (omitted in
+//!   one, a value in another), a required `const` or `enum` property must tell
+//!   them apart, and normalization follows the alternative it names; with no
+//!   such property the schema is refused, since normalizing would have to
+//!   guess;
 //! - a keyword the profile does not support is removed and stated in the
 //!   description instead, so the model still reads it;
 //! - a schema the profile cannot express at all is refused, with the path of
@@ -20,6 +25,7 @@
 //! providers change them.
 
 use serde_json::{Map, Value, json};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// A provider's generation profile.
 #[derive(Debug)]
@@ -101,14 +107,47 @@ pub const OPENAI_STRICT: Profile = Profile {
 pub struct Lowered {
     /// The schema to constrain generation with.
     pub schema: Value,
-    /// Instance paths where lowering made an optional property nullable,
-    /// with `*` for any array index: a `null` there means "omitted".
+    /// Where lowering made an optional property nullable, for reports: an
+    /// instance path with `*` for any array index, or, inside a definition,
+    /// `#` and the definition's schema path. [`normalize`] does not read this
+    /// list; it follows the schema, so a definition is normalized wherever it
+    /// is used.
     pub nulls_added: Vec<String>,
     /// Constraints moved into descriptions, by schema path.
     pub hints: Vec<(String, String)>,
     /// Optional properties the contract also allows to be null: the model
     /// cannot express "omitted" there, so its null is kept as a value.
     pub warnings: Vec<String>,
+    /// How to undo lowering on a generated value.
+    plan: Plan,
+    /// The plans of definitions, by schema path (`/$defs/name`).
+    defs: BTreeMap<String, Plan>,
+    /// The contract it was lowered from, for following its references.
+    contract: Value,
+}
+
+/// How to normalize the values one schema node describes; it mirrors the
+/// contract, so definitions and alternatives are followed where they apply.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Plan {
+    /// The node's schema path, for errors.
+    path: String,
+    /// Properties to descend into.
+    props: Vec<(String, Plan)>,
+    /// Optional properties lowering made nullable: a null there is "omitted".
+    drop_null: Vec<String>,
+    /// Properties where the contract itself allows null: a null is a value.
+    null_ok: Vec<String>,
+    /// Required properties with a fixed set of values (`const` or `enum`),
+    /// which can tell `anyOf` alternatives apart.
+    tags: Vec<(String, Vec<Value>)>,
+    items: Option<Box<Plan>>,
+    any_of: Vec<Plan>,
+    /// When the alternatives disagree about a null: the property whose value
+    /// names the alternative, and each alternative's values for it.
+    select: Option<(String, Vec<Vec<Value>>)>,
+    /// A local `$ref`, as the schema path of its target.
+    reference: Option<String>,
 }
 
 /// Why a schema cannot be lowered.
@@ -141,12 +180,26 @@ pub fn lower(contract: &Value, profile: &Profile) -> Result<Lowered, LowerError>
         return Err(err("", "the root must be an object schema".into()));
     }
     let mut out = Lowered {
+        contract: contract.clone(),
         schema: Value::Null,
         nulls_added: Vec::new(),
         hints: Vec::new(),
         warnings: Vec::new(),
+        plan: Plan::default(),
+        defs: BTreeMap::new(),
     };
-    out.schema = node(contract, "", "", profile, &mut out, &err)?;
+    let (schema, plan) = node(contract, "", "", profile, &mut out, &err)?;
+    out.schema = schema;
+    out.plan = plan;
+    // Settle every anyOf now that every definition's plan is known.
+    let defs = out.defs.clone();
+    settle(&mut out.plan, &defs, &err)?;
+    let mut settled = BTreeMap::new();
+    for (k, mut d) in std::mem::take(&mut out.defs) {
+        settle(&mut d, &defs, &err)?;
+        settled.insert(k, d);
+    }
+    out.defs = settled;
     out.nulls_added.sort();
     out.warnings.sort();
     out.hints.sort();
@@ -155,6 +208,32 @@ pub fn lower(contract: &Value, profile: &Profile) -> Result<Lowered, LowerError>
 
 fn is_object_schema(s: &Value) -> bool {
     s.get("type").and_then(Value::as_str) == Some("object") || s.get("properties").is_some()
+}
+
+/// `s` with local references followed to their target, within `root`.
+fn resolved<'a>(s: &'a Value, root: &'a Value) -> &'a Value {
+    let mut s = s;
+    for _ in 0..16 {
+        match s
+            .get("$ref")
+            .and_then(Value::as_str)
+            .and_then(|r| r.strip_prefix('#'))
+            .and_then(|pointer| root.pointer(pointer))
+        {
+            Some(target) => s = target,
+            None => break,
+        }
+    }
+    s
+}
+
+/// Whether `s` admits null, following local references within `root`.
+fn allows_null_in(s: &Value, root: &Value) -> bool {
+    let s = resolved(s, root);
+    allows_null(s)
+        || s.get("anyOf")
+            .and_then(Value::as_array)
+            .is_some_and(|bs| bs.iter().any(|b| allows_null_in(b, root)))
 }
 
 fn allows_null(s: &Value) -> bool {
@@ -208,7 +287,11 @@ fn node(
     profile: &Profile,
     out: &mut Lowered,
     err: &dyn Fn(&str, String) -> LowerError,
-) -> Result<Value, LowerError> {
+) -> Result<(Value, Plan), LowerError> {
+    let mut plan = Plan {
+        path: path_or_root(path),
+        ..Plan::default()
+    };
     // atomic's own artifact reference cannot be resolved by a provider:
     // inline it, keeping any mediaType as a hint.
     if s.get("$ref").and_then(Value::as_str) == Some(crate::artifact::ARTIFACT_SCHEMA_ID) {
@@ -224,7 +307,10 @@ fn node(
                 );
             }
         }
-        return Ok(inlined);
+        return Ok((inlined, plan));
+    }
+    if let Some(target) = s.get("$ref").and_then(Value::as_str) {
+        plan.reference = target.strip_prefix('#').map(str::to_owned);
     }
     let Value::Object(map) = s else {
         return match s {
@@ -307,9 +393,27 @@ fn node(
         for (name, prop) in &props {
             let child_path = format!("{path}/properties/{}", escape(name));
             let child_instance = format!("{instance}/{}", escape(name));
-            let mut p = node(prop, &child_path, &child_instance, profile, out, err)?;
+            // Through any local reference: a property that refers to a
+            // nullable definition admits null as surely as one that says so.
+            let null_ok = allows_null_in(prop, &out.contract);
+            let any_of = resolved(prop, &out.contract).get("anyOf").is_some();
+            let (mut p, child) = node(prop, &child_path, &child_instance, profile, out, err)?;
+            plan.props.push((name.clone(), child));
+            if null_ok {
+                plan.null_ok.push(name.clone());
+            }
+            if required.contains(name) {
+                let values = match (prop.get("const"), prop.get("enum")) {
+                    (Some(c), _) => Some(vec![c.clone()]),
+                    (None, Some(Value::Array(e))) => Some(e.clone()),
+                    _ => None,
+                };
+                if let Some(values) = values {
+                    plan.tags.push((name.clone(), values));
+                }
+            }
             if !required.contains(name) {
-                if prop.get("anyOf").is_some() && allows_null(prop) {
+                if any_of && null_ok {
                     // A null could be "omitted" or the value of the branch
                     // that allows null: normalization could not tell which.
                     return Err(err(
@@ -320,10 +424,11 @@ fn node(
                         ),
                     ));
                 }
-                if allows_null(prop) {
+                if null_ok {
                     out.warnings.push(child_instance.clone());
                 } else {
                     p = nullable(&p);
+                    plan.drop_null.push(name.clone());
                     out.nulls_added.push(child_instance);
                 }
             }
@@ -337,29 +442,23 @@ fn node(
         kept.insert("additionalProperties".into(), json!(false));
     }
     if let Some(items) = map.get("items") {
-        kept.insert(
-            "items".into(),
-            node(
-                items,
-                &format!("{path}/items"),
-                &format!("{instance}/*"),
-                profile,
-                out,
-                err,
-            )?,
-        );
+        let (lowered, child) = node(
+            items,
+            &format!("{path}/items"),
+            &format!("{instance}/*"),
+            profile,
+            out,
+            err,
+        )?;
+        kept.insert("items".into(), lowered);
+        plan.items = Some(Box::new(child));
     }
     if let Some(Value::Array(branches)) = map.get("anyOf") {
         let mut lowered = Vec::new();
         for (i, b) in branches.iter().enumerate() {
-            lowered.push(node(
-                b,
-                &format!("{path}/anyOf/{i}"),
-                instance,
-                profile,
-                out,
-                err,
-            )?);
+            let (l, child) = node(b, &format!("{path}/anyOf/{i}"), instance, profile, out, err)?;
+            lowered.push(l);
+            plan.any_of.push(child);
         }
         kept.insert("anyOf".into(), Value::Array(lowered));
     }
@@ -369,14 +468,178 @@ fn node(
             // Definitions are reached through $ref; their nulls are recorded
             // where the definition sits, not where it is used.
             let def_path = format!("{path}/$defs/{}", escape(name));
-            lowered.insert(
-                name.clone(),
-                node(d, &def_path, &format!("#{def_path}"), profile, out, err)?,
-            );
+            let (l, child) = node(d, &def_path, &format!("#{def_path}"), profile, out, err)?;
+            lowered.insert(name.clone(), l);
+            out.defs.insert(def_path, child);
         }
         kept.insert("$defs".into(), Value::Object(lowered));
     }
-    Ok(Value::Object(kept))
+    Ok((Value::Object(kept), plan))
+}
+
+/// How deep normalization follows references, which may be recursive.
+const MAX_DEPTH: usize = 64;
+
+/// The instance paths, relative to `plan`, where a null means "omitted"
+/// (`null_ok` false) or is a value (`null_ok` true).
+fn null_paths(
+    plan: &Plan,
+    defs: &BTreeMap<String, Plan>,
+    prefix: &str,
+    null_ok: bool,
+    depth: usize,
+    out: &mut BTreeSet<String>,
+) {
+    if depth > 16 {
+        return;
+    }
+    if let Some(target) = plan.reference.as_ref().and_then(|r| defs.get(r)) {
+        null_paths(target, defs, prefix, null_ok, depth + 1, out);
+    }
+    let names = if null_ok {
+        &plan.null_ok
+    } else {
+        &plan.drop_null
+    };
+    for name in names {
+        out.insert(format!("{prefix}/{}", escape(name)));
+    }
+    for (name, child) in &plan.props {
+        let at = format!("{prefix}/{}", escape(name));
+        null_paths(child, defs, &at, null_ok, depth + 1, out);
+    }
+    if let Some(items) = &plan.items {
+        null_paths(items, defs, &format!("{prefix}/*"), null_ok, depth + 1, out);
+    }
+    for branch in &plan.any_of {
+        null_paths(branch, defs, prefix, null_ok, depth + 1, out);
+    }
+}
+
+/// A branch's tags, following a reference to its definition.
+fn tags_of<'a>(plan: &'a Plan, defs: &'a BTreeMap<String, Plan>) -> &'a [(String, Vec<Value>)] {
+    match plan.reference.as_ref().and_then(|r| defs.get(r)) {
+        Some(target) if plan.tags.is_empty() => &target.tags,
+        _ => &plan.tags,
+    }
+}
+
+/// Decide, for every anyOf under `plan`, whether its alternatives can
+/// disagree about a null, and if so which property tells them apart.
+fn settle(
+    plan: &mut Plan,
+    defs: &BTreeMap<String, Plan>,
+    err: &dyn Fn(&str, String) -> LowerError,
+) -> Result<(), LowerError> {
+    for (_, child) in &mut plan.props {
+        settle(child, defs, err)?;
+    }
+    if let Some(items) = &mut plan.items {
+        settle(items, defs, err)?;
+    }
+    for branch in &mut plan.any_of {
+        settle(branch, defs, err)?;
+    }
+    if plan.any_of.len() < 2 {
+        return Ok(());
+    }
+    let paths = |b: &Plan, null_ok: bool| {
+        let mut out = BTreeSet::new();
+        null_paths(b, defs, "", null_ok, 0, &mut out);
+        out
+    };
+    let omitted: Vec<BTreeSet<String>> = plan.any_of.iter().map(|b| paths(b, false)).collect();
+    let values: Vec<BTreeSet<String>> = plan.any_of.iter().map(|b| paths(b, true)).collect();
+    let mut conflict = None;
+    for (i, o) in omitted.iter().enumerate() {
+        for (j, v) in values.iter().enumerate() {
+            if i != j
+                && let Some(at) = o.intersection(v).next()
+            {
+                conflict = Some((i, j, at.clone()));
+            }
+        }
+    }
+    let Some((i, j, at)) = conflict else {
+        return Ok(());
+    };
+    // A required property whose values differ in every pair of alternatives.
+    let first = tags_of(&plan.any_of[0], defs);
+    let discriminator = first.iter().find_map(|(name, _)| {
+        let sets: Option<Vec<Vec<Value>>> = plan
+            .any_of
+            .iter()
+            .map(|b| {
+                tags_of(b, defs)
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .map(|(_, v)| v.clone())
+            })
+            .collect();
+        let sets = sets?;
+        let disjoint = sets.iter().enumerate().all(|(a, x)| {
+            sets.iter()
+                .skip(a + 1)
+                .all(|y| x.iter().all(|v| !y.contains(v)))
+        });
+        disjoint.then(|| (name.clone(), sets))
+    });
+    match discriminator {
+        Some(select) => {
+            plan.select = Some(select);
+            Ok(())
+        }
+        None => Err(err(
+            &plan.path,
+            format!(
+                "a null at {at} means \"omitted\" in alternative {i} but is a value in alternative {j}, \
+                 and no required const or enum property tells the alternatives apart; add one, or make \
+                 the property required in alternative {i}"
+            ),
+        )),
+    }
+}
+
+fn apply(plan: &Plan, defs: &BTreeMap<String, Plan>, value: &mut Value, depth: usize) {
+    if depth > MAX_DEPTH {
+        return;
+    }
+    if let Some(target) = plan.reference.as_ref().and_then(|r| defs.get(r)) {
+        apply(target, defs, value, depth + 1);
+    }
+    if let Value::Object(map) = value {
+        for name in &plan.drop_null {
+            if map.get(name) == Some(&Value::Null) {
+                map.remove(name);
+            }
+        }
+        for (name, child) in &plan.props {
+            if let Some(v) = map.get_mut(name) {
+                apply(child, defs, v, depth + 1);
+            }
+        }
+    }
+    if let (Value::Array(items), Some(item)) = (&mut *value, &plan.items) {
+        for v in items {
+            apply(item, defs, v, depth + 1);
+        }
+    }
+    match &plan.select {
+        // Only the alternative the value names.
+        Some((name, sets)) => {
+            let tag = value.get(name).cloned();
+            let chosen = tag.and_then(|t| sets.iter().position(|s| s.contains(&t)));
+            if let Some(i) = chosen {
+                apply(&plan.any_of[i], defs, value, depth + 1);
+            }
+        }
+        // The alternatives agree about every null, so each may apply.
+        None => {
+            for branch in &plan.any_of {
+                apply(branch, defs, value, depth + 1);
+            }
+        }
+    }
 }
 
 fn escape(s: &str) -> String {
@@ -469,42 +732,14 @@ fn walk_check(s: &Value, path: &str, profile: &Profile, problems: &mut Vec<Strin
     }
 }
 
-/// Undo lowering on a generated value: at each place lowering made an
-/// optional property nullable, a `null` means the property was omitted, so it
-/// is removed. A null anywhere else, including one the contract permits, is
-/// left alone.
-pub fn normalize(value: &mut Value, nulls_added: &[String]) {
-    for path in nulls_added {
-        let segments: Vec<String> = path
-            .trim_start_matches('/')
-            .split('/')
-            .map(|s| s.replace("~1", "/").replace("~0", "~"))
-            .collect();
-        remove_null_at(value, &segments);
-    }
-}
-
-fn remove_null_at(value: &mut Value, segments: &[String]) {
-    let Some((head, rest)) = segments.split_first() else {
-        return;
-    };
-    match value {
-        Value::Array(items) if head == "*" => {
-            for item in items {
-                remove_null_at(item, rest);
-            }
-        }
-        Value::Object(map) => {
-            if rest.is_empty() {
-                if map.get(head) == Some(&Value::Null) {
-                    map.remove(head);
-                }
-            } else if let Some(child) = map.get_mut(head) {
-                remove_null_at(child, rest);
-            }
-        }
-        _ => {}
-    }
+/// Undo lowering on a generated value: where lowering made an optional
+/// property nullable, a `null` means the property was omitted, so it is
+/// removed. The walk follows the contract: a definition is normalized
+/// wherever it is used, and among alternatives that disagree about a null,
+/// only the one the value names applies. A null anywhere else, including one
+/// the contract permits, is left alone.
+pub fn normalize(value: &mut Value, lowered: &Lowered) {
+    apply(&lowered.plan, &lowered.defs, value, 0);
 }
 
 #[cfg(test)]

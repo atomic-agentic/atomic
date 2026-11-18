@@ -480,6 +480,12 @@ fn expand(
         base.into()
     };
     if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        // atomic's artifact reference stays as written, with its mediaType:
+        // lowering inlines it for the model, and the runtime checks the
+        // artifact store against it.
+        if reference == crate::artifact::ARTIFACT_SCHEMA_ID {
+            return Ok(schema.clone());
+        }
         let resolver =
             resources.resolver(jsonschema::uri::from_str(&base).map_err(|e| invalid(&base, e))?);
         let resolved = resolver

@@ -75,6 +75,98 @@ pub async fn open_sqlite(database: &Path) -> Result<i64, StoreError> {
     result
 }
 
+/// Open atomic's store in PostgreSQL schema `schema` at `url`: refuse it if a
+/// newer atomic wrote it, before anything is created; otherwise create the
+/// schema and the version table if needed and migrate forward. Returns the
+/// version it is now at.
+pub async fn open_postgres(url: &str, schema: &str) -> Result<i64, StoreError> {
+    let path = format!("postgres schema {schema}");
+    let db = |source| StoreError::Database {
+        path: path.clone(),
+        source,
+    };
+    let plain = schema
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && schema
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !plain {
+        return Err(db(sqlx::Error::Protocol(format!(
+            "invalid schema name {schema:?}: use letters, digits and underscores"
+        ))));
+    }
+    let mut conn = sqlx::PgConnection::connect(url).await.map_err(db)?;
+    let result = async {
+        let mut tx = conn.begin().await.map_err(db)?;
+        // One opener at a time per schema, across processes.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
+            .bind(format!("atomic-store:{schema}"))
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+        let table = format!("{schema}.atomic_store_version");
+        let exists: bool = sqlx::query("SELECT to_regclass($1) IS NOT NULL AS e")
+            .bind(&table)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(db)?
+            .try_get("e")
+            .map_err(db)?;
+        let found: i64 = if exists {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "SELECT COALESCE(MAX(version), 0)::BIGINT AS v FROM {table}"
+            )))
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(db)?
+            .try_get("v")
+            .map_err(db)?
+        } else {
+            0
+        };
+        if found > STORE_VERSION {
+            return Err(StoreError::Newer {
+                path: path.clone(),
+                found,
+                supported: STORE_VERSION,
+            });
+        }
+        for sql in [
+            format!("CREATE SCHEMA IF NOT EXISTS {schema}"),
+            format!("CREATE TABLE IF NOT EXISTS {table} (version BIGINT NOT NULL)"),
+            format!("SET LOCAL search_path TO {schema}"),
+        ] {
+            sqlx::query(sqlx::AssertSqlSafe(sql))
+                .execute(&mut *tx)
+                .await
+                .map_err(db)?;
+        }
+        for m in MIGRATIONS.iter().filter(|m| m.version > found) {
+            sqlx::query(m.sql).execute(&mut *tx).await.map_err(db)?;
+        }
+        if found < STORE_VERSION {
+            sqlx::query(sqlx::AssertSqlSafe(format!("DELETE FROM {table}")))
+                .execute(&mut *tx)
+                .await
+                .map_err(db)?;
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "INSERT INTO {table} (version) VALUES ($1)"
+            )))
+            .bind(STORE_VERSION)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+        }
+        tx.commit().await.map_err(db)?;
+        Ok(STORE_VERSION)
+    }
+    .await;
+    let _ = conn.close().await;
+    result
+}
+
 async fn migrate(conn: &mut SqliteConnection, path: &str) -> Result<i64, StoreError> {
     let db = |source| StoreError::Database {
         path: path.to_owned(),

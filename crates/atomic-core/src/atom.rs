@@ -306,6 +306,13 @@ pub fn load(file: &Path, registry: &mut Registry) -> Result<Atom, AtomError> {
     // Lint: the output must lower to the generation profile, so a schema the
     // model cannot be constrained by fails now, before any tokens are spent.
     if kind != "exec" {
+        // A reference to a place in a file is lowered as that place.
+        let output_schema = if output_schema.get("$ref").is_some() {
+            crate::workflow::inline(&output_schema, Path::new(""), registry, 0)
+                .map_err(|m| fail(line_of("/output"), "/output", m))?
+        } else {
+            output_schema.clone()
+        };
         let output_file = registry
             .get(&output)
             .map(|e| e.file.clone())

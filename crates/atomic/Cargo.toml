@@ -24,10 +24,18 @@ atomic-durable = { workspace = true }
 atomic-exec = { workspace = true }
 atomic-graph = { workspace = true }
 atomic-schema = { workspace = true }
+serde = { workspace = true }
 
 [dev-dependencies]
+atomic-core = { workspace = true, features = ["fake-model"] }
+atomic-durable = { workspace = true, features = ["failpoints"] }
 sqlx = { workspace = true }
-tokio = { workspace = true, features = ["rt", "macros"] }
+tokio = { workspace = true, features = ["rt", "macros", "time"] }
+
+[lib]
+# Workflows written in Rust, which the binary and its tests share.
+name = "atomic_app"
+path = "src/lib.rs"
 
 [[bin]]
 name = "atomic"

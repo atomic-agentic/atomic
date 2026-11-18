@@ -524,6 +524,14 @@ pub(crate) fn inline(
     registry: &mut Registry,
     _depth: usize,
 ) -> Result<Value, String> {
+    // Relative references resolve against `dir`, which may itself be relative.
+    let dir = if dir.is_absolute() {
+        dir.to_owned()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| e.to_string())?
+            .join(dir)
+    };
     registry
         .inline_value(schema, &dir.join(".atomic-inline.schema.json"))
         .map_err(|e| e.to_string())
