@@ -235,19 +235,30 @@ impl Git {
         self.find_repo(dir)?.without_filters()
     }
 
+    /// The root of the checkout containing `dir`, including a linked
+    /// checkout whose common git directory belongs to another worktree.
+    /// Like discovery, this is for a trusted source directory.
+    pub fn worktree_root(&self, dir: &Path) -> Result<PathBuf, GitError> {
+        self.path_at(dir, "--show-toplevel")
+    }
+
     fn find_repo(&self, dir: &Path) -> Result<Repo, GitError> {
+        Ok(self.repo(self.path_at(dir, "--git-common-dir")?))
+    }
+
+    fn path_at(&self, dir: &Path, query: &str) -> Result<PathBuf, GitError> {
         let mut command = self.base();
         let mut safe = OsString::from("safe.directory=");
         safe.push(dir);
         command.arg("-c").arg(safe).current_dir(dir);
-        command.args(["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+        command.args(["rev-parse", "--path-format=absolute", query]);
         let out = self.run(command, "rev-parse", None, MAX_OUTPUT_BYTES)?;
         let text = String::from_utf8(out).map_err(|_| GitError::Unreadable)?;
         let path = PathBuf::from(text.trim_end_matches('\n'));
         if !path.is_absolute() {
             return Err(GitError::Unreadable);
         }
-        Ok(self.repo(path))
+        Ok(path)
     }
 
     /// git with a cleared environment and the hardening settings, before any
