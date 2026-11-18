@@ -81,7 +81,11 @@ fn runtime(model: &FakeModel, tag: &str) -> CodexRuntime {
 fn runtimes(model: &FakeModel, tag: &str) -> Runtimes {
     let codex = runtime(model, tag);
     let lite = crate::lite::LiteRuntime::new(codex.endpoint.clone(), AtomConfig::default());
-    Runtimes { codex, lite }
+    Runtimes {
+        codex,
+        lite,
+        exec: Default::default(),
+    }
 }
 
 #[test]

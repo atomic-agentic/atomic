@@ -70,6 +70,7 @@ fn runtimes(dir: &Path, base_url: &str) -> Arc<Runtimes> {
             artifacts: Artifacts::none(),
         },
         lite: LiteRuntime::new(endpoint, AtomConfig::default()),
+        exec: Default::default(),
     })
 }
 

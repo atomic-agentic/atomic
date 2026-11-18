@@ -61,6 +61,8 @@ pub struct WorkflowError {
     pub path: String,
     /// What is wrong.
     pub message: String,
+    /// What to change to fix it, when the check knows.
+    pub action: Option<String>,
 }
 
 const TOP: &[&str] = &[
@@ -81,18 +83,21 @@ pub fn load(
         line: 1,
         path: String::new(),
         message: format!("cannot read: {e}"),
+        action: None,
     })?;
     let text = std::fs::read_to_string(&file).map_err(|e| WorkflowError {
         file: file.clone(),
         line: 1,
         path: String::new(),
         message: format!("cannot read: {e}"),
+        action: None,
     })?;
     let doc = yaml::load(&file, &text).map_err(|e| WorkflowError {
         file: file.clone(),
         line: e.at.line,
         path: String::new(),
         message: e.message,
+        action: None,
     })?;
     let line_of = |pointer: &str| {
         // The nearest enclosing node that has a position.
@@ -112,6 +117,7 @@ pub fn load(
         line: line_of(pointer),
         path: pointer.to_owned(),
         message,
+        action: None,
     };
     let Value::Object(top) = &doc.value else {
         return Err(fail(
@@ -336,7 +342,11 @@ pub fn load(
                 ) {
                     Fit::Yes => {}
                     Fit::No(why) => {
-                        return Err(fail(&wp, format!("`{source}` cannot fit `{field}`: {why}")));
+                        let (message, action) = mismatch(id, atom_name, field, source, &why, steps);
+                        return Err(WorkflowError {
+                            action: Some(action),
+                            ..fail(&wp, message)
+                        });
                     }
                     Fit::Unknown => {
                         warnings.push(format!("{wp}: could not prove `{source}` fits `{field}`"))
@@ -643,6 +653,49 @@ fn types_of(s: &Value) -> Option<BTreeSet<String>> {
                 .collect()
         }),
     }
+}
+
+/// What a mapping whose value cannot fit its field says: both ends, named
+/// (the step or workflow input it reads, and the step it feeds), and what to
+/// change.
+fn mismatch(
+    to: &str,
+    to_atom: &str,
+    field: &str,
+    source: &str,
+    why: &str,
+    steps: &Map<String, Value>,
+) -> (String, String) {
+    let mut parts = source.trim().split('.');
+    let from = match (parts.next(), parts.next()) {
+        (Some("steps"), Some(from)) => {
+            let atom = steps
+                .get(from)
+                .and_then(|s| s.get("atom"))
+                .and_then(Value::as_str);
+            Some((from.to_owned(), atom.map(str::to_owned)))
+        }
+        _ => None,
+    };
+    let origin = match &from {
+        Some((from, _)) => format!("step `{from}`'s output"),
+        None => "the workflow's input".to_owned(),
+    };
+    let message = format!(
+        "step `{to}` maps `{source}`, from {origin}, to its input `{field}`, but \
+         `{source}` cannot fit `{field}`: {why}"
+    );
+    let producer = match &from {
+        Some((from, Some(atom))) => format!("the output schema of atom `{atom}` (step `{from}`)"),
+        Some((from, None)) => format!("what step `{from}` returns"),
+        None => "the workflow's input schema".to_owned(),
+    };
+    let action = format!(
+        "make the two agree: change `with.{field}` in step `{to}` to an expression whose \
+         value fits `{field}`, or change {producer} or the input schema of atom `{to_atom}` \
+         (step `{to}`)"
+    );
+    (message, action)
 }
 
 /// Whether a value of schema `from` fits `to`, as far as can be proven.

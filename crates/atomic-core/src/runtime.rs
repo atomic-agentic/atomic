@@ -103,6 +103,8 @@ pub struct Runtimes {
     pub codex: CodexRuntime,
     /// For `kind: lite`.
     pub lite: LiteRuntime,
+    /// Where `kind: exec` commands run.
+    pub exec: atomic_exec::Backend,
 }
 
 /// What a run records beside its output.
@@ -434,7 +436,7 @@ pub async fn run_declarative_with_context(
         return Err(AtomError::Runtime("compiled atom version mismatch".into()));
     }
     if atom.kind == "exec" {
-        return run_exec(atom, compiled, input, Arc::new(atomic_exec::LocalBackend)).await;
+        return run_exec(atom, compiled, input, runtimes.exec.shared()).await;
     }
     let backend = match atom.kind.as_str() {
         "codex" => Backend::Codex(&runtimes.codex),

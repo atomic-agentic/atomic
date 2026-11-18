@@ -155,6 +155,7 @@ async fn engine(dir: &Path, project: &Path, base_url: &str) -> Durare {
             artifacts: Artifacts::none(),
         },
         lite: LiteRuntime::new(endpoint, AtomConfig::default()),
+        exec: Default::default(),
     });
     let repo = Git::find()
         .expect("git")

@@ -50,6 +50,7 @@ pub(crate) fn run(
         }
         ExecError::TooLarge { .. } => "compiler response limit exceeded".into(),
         ExecError::Io { message, .. } => format!("running the Astro compiler: {message}"),
+        other => format!("running the Astro compiler: {other}"),
     })?;
     if !done.success() {
         let stderr = String::from_utf8_lossy(&done.stderr);

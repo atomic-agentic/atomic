@@ -423,7 +423,7 @@ fn the_worked_example_checks_renders_and_its_cases_hold() {
         std::fs::create_dir_all(target.parent().expect("parent")).expect("mkdir");
         std::fs::write(target, contents).expect("write");
     }
-    crate::check(Some(dir.clone())).expect("atomic check passes");
+    crate::check(Some(dir.clone()), false).expect("atomic check passes");
     let (atom_file, _) = files
         .iter()
         .find(|(p, _)| p.ends_with(".atom.astro"))

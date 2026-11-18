@@ -455,9 +455,15 @@ pub trait DurableRuntime: Send + Sync + Sized {
     /// The run and step a thread belongs to, if a published step ran on it.
     fn thread(&self, thread_id: &str) -> impl Future<Output = Result<Option<ThreadRecord>>> + Send;
 
-    /// Run again every unfinished workflow this process may recover.
-    /// Returns how many it started.
+    /// Run again every unfinished workflow this process may recover: those
+    /// owned by its executor identity. Returns how many it started.
     fn recover(&self) -> impl Future<Output = Result<usize>> + Send;
+
+    /// Run unfinished workflow `id` again from its checkpoints, whichever
+    /// executor last owned it, so [`result`](Self::result) can follow it.
+    /// Its previous execution must have stopped. A finished workflow is left
+    /// as it is.
+    fn resume(&self, id: &str) -> impl Future<Output = Result<()>> + Send;
 
     /// Send `message` to workflow `run` on `topic`, from outside any
     /// workflow, for its [`recv`](WorkflowContext::recv). Delivered at most
@@ -590,6 +596,71 @@ enum Reads {
     Postgres(sqlx::PgPool),
 }
 
+/// Where atomic's durable store is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Database {
+    /// A SQLite file, created if missing.
+    Sqlite(std::path::PathBuf),
+    /// A PostgreSQL database, in one schema of its own.
+    Postgres {
+        /// The connection URL.
+        url: String,
+        /// The schema atomic's tables live in.
+        schema: String,
+    },
+}
+
+/// The environment variable the engine would otherwise read its executor
+/// identity from, ahead of anything atomic configures.
+pub const ENGINE_IDENTITY_VARIABLE: &str = "DBOS__VMID";
+
+/// Why an executor identity was refused.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum IdentityError {
+    /// The engine's own variable is set, which would override atomic's
+    /// setting without atomic knowing.
+    #[error(
+        "{variable} is set to {value:?}; atomic takes its executor identity from its own \
+         configuration, never from the engine's variable"
+    )]
+    EngineVariable {
+        /// The variable.
+        variable: &'static str,
+        /// Its value.
+        value: String,
+    },
+    /// The identity is empty, too long or has characters outside
+    /// letters, digits, `.`, `_`, `:` and `-`.
+    #[error("executor identity {0:?} is not 1 to 128 letters, digits, `.`, `_`, `:` or `-`")]
+    Invalid(String),
+}
+
+/// Check the executor identity a process is configured with, and that
+/// nothing outside atomic overrides it. `None` means the store's default
+/// owner, `local`, which is safe only while one process uses the store.
+pub fn executor_identity(
+    configured: Option<&str>,
+) -> std::result::Result<Option<String>, IdentityError> {
+    if let Some(value) = std::env::var_os(ENGINE_IDENTITY_VARIABLE).filter(|v| !v.is_empty()) {
+        return Err(IdentityError::EngineVariable {
+            variable: ENGINE_IDENTITY_VARIABLE,
+            value: value.to_string_lossy().into_owned(),
+        });
+    }
+    let Some(id) = configured else {
+        return Ok(None);
+    };
+    let fine = (1..=128).contains(&id.len())
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-'));
+    if fine {
+        Ok(Some(id.to_owned()))
+    } else {
+        Err(IdentityError::Invalid(id.to_owned()))
+    }
+}
+
 /// [`DurableRuntime`] on the durare fork, over SQLite or PostgreSQL.
 pub struct Durare {
     pub(crate) engine: durare::DurableEngine,
@@ -613,13 +684,46 @@ impl Durare {
             .await
             .map_err(from_durare)?;
         let reads = sqlx::SqlitePool::connect(&url).await.map_err(db)?;
-        Self::over(Arc::new(provider), Reads::Sqlite(reads)).await
+        Self::over(Arc::new(provider), Reads::Sqlite(reads), None).await
+    }
+
+    /// An engine on `database` that owns its runs as `executor`, checked by
+    /// [`executor_identity`]: each process sharing a store needs an identity
+    /// of its own that stays the same across its restarts, so it recovers
+    /// its own unfinished runs and no one else's. `None` is the default
+    /// owner, `local`.
+    pub async fn open(database: &Database, executor: Option<&str>) -> Result<Self> {
+        let executor =
+            executor_identity(executor).map_err(|e| DurableError::Engine(e.to_string()))?;
+        match database {
+            Database::Sqlite(path) => {
+                crate::store::open_sqlite(path)
+                    .await
+                    .map_err(|e| DurableError::Engine(e.to_string()))?;
+                let url = format!("sqlite://{}?mode=rwc", path.display());
+                let provider = durare::SqliteProvider::connect(&url)
+                    .await
+                    .map_err(from_durare)?;
+                let reads = sqlx::SqlitePool::connect(&url).await.map_err(db)?;
+                Self::over(Arc::new(provider), Reads::Sqlite(reads), executor).await
+            }
+            Database::Postgres { url, schema } => Self::postgres_as(url, schema, executor).await,
+        }
+    }
+
+    /// The identity this engine owns its runs as.
+    pub fn executor_id(&self) -> &str {
+        self.engine.executor_id()
     }
 
     /// An engine on PostgreSQL at `url`, in `schema`. As on SQLite, the
     /// store's version is checked first, and a schema written by a newer
     /// atomic is refused before anything is created in it.
     pub async fn postgres(url: &str, schema: &str) -> Result<Self> {
+        Self::postgres_as(url, schema, None).await
+    }
+
+    async fn postgres_as(url: &str, schema: &str, executor: Option<String>) -> Result<Self> {
         crate::store::open_postgres(url, schema)
             .await
             .map_err(|e| DurableError::Engine(e.to_string()))?;
@@ -634,11 +738,19 @@ impl Durare {
             .connect_with(options)
             .await
             .map_err(db)?;
-        Self::over(Arc::new(provider), Reads::Postgres(reads)).await
+        Self::over(Arc::new(provider), Reads::Postgres(reads), executor).await
     }
 
-    async fn over(provider: Arc<dyn durare::StateProvider>, reads: Reads) -> Result<Self> {
-        let engine = durare::DurableEngine::new(provider)
+    async fn over(
+        provider: Arc<dyn durare::StateProvider>,
+        reads: Reads,
+        executor: Option<String>,
+    ) -> Result<Self> {
+        let config = durare::EngineConfig {
+            executor_id: executor,
+            ..durare::EngineConfig::default()
+        };
+        let engine = durare::DurableEngine::with_config(provider, config)
             .await
             .map_err(from_durare)?;
         let index =
@@ -824,7 +936,28 @@ impl DurableRuntime for Durare {
     }
 
     async fn recover(&self) -> Result<usize> {
-        self.engine.recover().await.map_err(from_durare)
+        let own = [self.engine.executor_id().to_owned()];
+        Ok(self
+            .engine
+            .recover_pending_for(&own)
+            .await
+            .map_err(from_durare)?
+            .len())
+    }
+
+    fn resume(&self, id: &str) -> impl Future<Output = Result<()>> + Send {
+        let id = id.to_owned();
+        async move {
+            let handle = self
+                .engine
+                .resume_workflow::<Value>(&id)
+                .await
+                .map_err(from_durare)?;
+            if let Ok(mut started) = self.started.lock() {
+                started.insert(id, handle);
+            }
+            Ok(())
+        }
     }
 
     fn send<T>(
