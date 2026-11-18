@@ -182,9 +182,37 @@ it running under a supervisor for progress after your terminal exits. It recover
 eligible unfinished runs in the selected project store; approve or reject gates
 from a second terminal. It is not a detach command.
 
+`atomic run`, `atomic runs resume` and `atomic serve` each hold the project's
+execution lock while they run. A second one is refused with the process id and
+command of the one that holds it, so two processes never execute the same
+project's runs. `atomic serve` stops on SIGTERM or SIGINT; unfinished work stays
+recorded for the next `serve` or `runs resume`.
+
+| Setting | Meaning |
+| --- | --- |
+| `ATOMIC_MODEL_BASE_URL`, `ATOMIC_MODEL` (`--model-base-url`, `--model`) | The OpenAI-compatible endpoint and model that model atoms use; `ATOMIC_MODEL_API_KEY_ENV` names the variable holding its key |
+| `ATOMIC_DATABASE_URL`, `ATOMIC_DATABASE_SCHEMA` | PostgreSQL instead of the project's local SQLite store; the schema defaults to `atomic` |
+| `ATOMIC_EXECUTOR_ID` (`--executor-id`) | This process's identity as owner of its runs: unique to the process and the same across its restarts, so a restart recovers its own unfinished runs and no one else's. Required on PostgreSQL |
+| `ATOMIC_RUNNER` (`--runner`) | `local` (the default) runs exec atoms' commands as child processes; `process` runs each in an `atomic runner` process of its own, which sees only `PATH` from its parent |
+
 `atomic --remote <url>` and shared/team service access arrive in **v0.5**, with
-identity and transport controls. Use `atomic runner` only when operating
-a separate execution backend, planned for the platform stage.
+identity and transport controls.
+
+`atomic runner` is the same binary in its other role: it reads one command
+request on standard input, runs it, writes the result on standard output and
+exits with a code from a fixed set, separated by what the control plane does
+about it. It creates no state directory.
+
+| Exit code | Meaning | Control plane |
+| --- | --- | --- |
+| 0 | Ran the request | Reads the result |
+| 64 | Usage error | Fails the attempt, no retry |
+| 78 | Configuration or credential error | Fails the attempt, no retry until fixed |
+| 75 | Workspace lease held elsewhere | Waits, then tries again a bounded number of times |
+| Any other, or a signal | Crash | Runs the command again a bounded number of times |
+
+Its stderr is attached to a failure as it is, never parsed. Runners reached over
+the network and other execution backends are planned for the platform stage.
 
 See [local and team operation](../operations/running-atomic.md) for roles and storage.
 

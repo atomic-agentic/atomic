@@ -216,7 +216,19 @@ fn atomic(dir: &Path, cwd: &Path, args: &[&str], env: &[(&str, &str)], stdin: &s
         .expect("start atomic");
     std::io::Write::write_all(&mut child.stdin.take().expect("stdin"), stdin.as_bytes())
         .expect("write stdin");
-    child.wait_with_output().expect("atomic ran")
+    // A command that should finish and does not fails the test, never hangs it.
+    let pid = child.id();
+    let (send, done) = std::sync::mpsc::channel();
+    std::thread::spawn(move || send.send(child.wait_with_output()));
+    match done.recv_timeout(Duration::from_secs(120)) {
+        Ok(out) => out.expect("atomic ran"),
+        Err(_) => {
+            let _ = Command::new("/bin/sh")
+                .args(["-c", &format!("kill -KILL {pid}")])
+                .status();
+            panic!("atomic {args:?} did not finish within two minutes");
+        }
+    }
 }
 
 /// `atomic` in the background, its stderr in `log`.
@@ -933,4 +945,24 @@ fn a_restarted_server_recovers_only_its_own_runs_on_postgres() {
             .expect("child");
         assert!(status.success());
     });
+}
+
+#[test]
+fn help_and_the_version_create_nothing_even_from_a_deleted_directory() {
+    let dir = scratch("quiet");
+    // The shell leaves a directory it then removes, and runs atomic there.
+    let script = format!(
+        "mkdir gone && cd gone && rmdir ../gone && '{ATOMIC}' --version && '{ATOMIC}' --help"
+    );
+    let out = Command::new("/bin/sh")
+        .args(["-c", &script])
+        .current_dir(&dir)
+        .env("HOME", dir.join("home"))
+        .env("ATOMIC_HOME", dir.join("atomic-home"))
+        .env_remove("XDG_DATA_HOME")
+        .output()
+        .expect("run");
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("atomic "));
+    assert!(!dir.join("atomic-home").exists(), "nothing was created");
 }

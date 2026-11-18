@@ -37,9 +37,22 @@ The workflow interpreter is built: a workflow file runs as one durable run, with
 no rebuild, through sequential atom steps (Codex, lite and exec atoms), local
 gates and `worktree: true` steps, which run a Codex atom in its own worktree at
 the step's `base` and record atomic's commit in `steps.<id>.metadata.commit`.
-A run keeps the definitions it started with. Starting a workflow and deciding
-its gates from the command line (`atomic run`, `atomic gates`) are not wired up
-yet.
+A run keeps the definitions it started with.
+
+`atomic run`, `atomic runs resume` and a local foreground `atomic serve` are
+built. `atomic run` takes an atom or workflow by name, by file or with
+`--project`, and input from a file, standard input or `--data`; a run cut short
+continues with `atomic runs resume <run-id>`, or under `atomic serve`, from its
+checkpoints. One process at a time executes a project's runs. Errors carry a
+description and an action, separately in `--json` output. Deciding gates from
+the command line (`atomic gates`) waits on the local human credential and is
+not wired up yet, nor is the terminal prompt for gates in `atomic run`.
+
+`atomic serve` also runs on PostgreSQL (`ATOMIC_DATABASE_URL`) when the process
+has an executor identity (`ATOMIC_EXECUTOR_ID`). `atomic runner` and
+`--runner process` run exec atoms' commands in a separate process with an
+exit-code contract; Codex turns and their shell still run in the control
+plane's process, and a runner reached over the network is not built yet.
 
 Several authoring aids arrive in stages. Eval cases in JSONL files are part of
 v0.1. Compact schemas, variants, the `--plan` cost preview, declared effect caps
