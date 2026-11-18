@@ -10,8 +10,12 @@
 //! input on stdin and bounded output. [`LocalBackend`] runs it as a child
 //! process on this machine. Workspaces and a model turn's shell and file work
 //! join the trait as they move behind it.
+//!
+//! [`quiescence`] is the runner's side of a sandbox backend that suspends:
+//! whether its sandbox is safe to suspend.
 
 pub mod process;
+pub mod quiescence;
 
 use std::path::PathBuf;
 use std::time::Duration;
