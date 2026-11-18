@@ -63,9 +63,9 @@ tokio = { version = "1", default-features = false }
 
 # Codex, at the revision in deps/codex.toml (scripts/codex-pin.sh checks it).
 # Only atomic-core may depend on these.
-codex-app-server = { git = "https://github.com/atomic-agentic/codex", rev = "a4b0cac70d89a168616d5cb3b99e5b162e91ce5d" }
-codex-core-api = { git = "https://github.com/atomic-agentic/codex", rev = "a4b0cac70d89a168616d5cb3b99e5b162e91ce5d" }
-codex-extension-api = { git = "https://github.com/atomic-agentic/codex", rev = "a4b0cac70d89a168616d5cb3b99e5b162e91ce5d" }
+codex-app-server = { git = "https://github.com/atomic-agentic/codex", rev = "f8e52f30a7d56b045b93068c156aae8a4a312ba6" }
+codex-core-api = { git = "https://github.com/atomic-agentic/codex", rev = "f8e52f30a7d56b045b93068c156aae8a4a312ba6" }
+codex-extension-api = { git = "https://github.com/atomic-agentic/codex", rev = "f8e52f30a7d56b045b93068c156aae8a4a312ba6" }
 
 # Codex is a large dependency; full debug info for every crate makes a debug
 # build tens of gigabytes. Keep line tables for atomic's own crates (enough for

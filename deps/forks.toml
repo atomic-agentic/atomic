@@ -32,7 +32,7 @@ upstream = "https://github.com/openai/codex"
 # The upstream release commit the fork's `atomic` branch starts from (deps/codex.toml's tag).
 upstream_base = "d32063f96c2dff1dc96af839b3952abb6acfeda4"
 branch = "atomic"
-rev = "a4b0cac70d89a168616d5cb3b99e5b162e91ce5d"
+rev = "f8e52f30a7d56b045b93068c156aae8a4a312ba6"
 licence = "Apache-2.0"
-why = "makes the parent-death signal best effort where prctl is refused, so commands start in AWS Lambda"
+why = "makes the parent-death signal best effort where prctl is refused or unsupported, so commands start in AWS Lambda (and on iSH)"
 crates = ["codex-app-server", "codex-core-api", "codex-extension-api", "codex-utils-pty"]
