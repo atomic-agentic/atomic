@@ -596,6 +596,10 @@ fn pipeline_child() {
                     pipeline: load(&project, "triage.workflow.yaml", TRIAGE),
                     input: json!({"text": "Exporting a file named café.txt crashes the app."}),
                 },
+                "start-sent" => PipelineRun {
+                    pipeline: load(&project, "sent.workflow.yaml", &sent()),
+                    input: json!({"text": "Exporting a file named café.txt crashes the app."}),
+                },
                 "start-gated" => PipelineRun {
                     pipeline: load(&project, "gated.workflow.yaml", &gated()),
                     input: json!({"text": "Exporting a file named café.txt crashes the app."}),
@@ -611,8 +615,14 @@ fn pipeline_child() {
             rt.recover().await.expect("recover");
         }
         let id = std::env::var(ENV_RUN).expect("run id");
-        let out: Value = rt.result(&id).await.expect("finishes");
-        std::fs::write(dir.join("result.json"), out.to_string()).expect("write the result");
+        match rt.result::<Value>(&id).await {
+            Ok(out) => {
+                std::fs::write(dir.join("result.json"), out.to_string()).expect("write the result")
+            }
+            Err(e) => {
+                std::fs::write(dir.join("error.txt"), e.to_string()).expect("write the error")
+            }
+        }
         rt.shutdown(std::time::Duration::from_secs(5))
             .await
             .expect("shutdown");
@@ -958,6 +968,135 @@ fn a_worktree_step_killed_after_its_commit_commits_again_and_keeps_one() {
             refs, "refs/atomic/fix-killed/steps/fix/2",
             "{orphan} was dropped"
         );
+    });
+}
+
+/// An exec atom whose command reaches outside atomic: each run appends a
+/// line to `sent.log` in the scratch directory, then reports on the note.
+/// `external` is its `effects.external` declaration, if any.
+fn write_send_note(dir: &Path, external: Option<&str>) {
+    let project = dir.join("project");
+    std::fs::create_dir_all(project.join("tools")).expect("tools");
+    std::fs::write(
+        project.join("tools/send.py"),
+        "import json, os, sys\nnote = json.load(sys.stdin)\nwith open(os.environ['SENT_LOG'], 'a') as log:\n    log.write('sent\\n')\njson.dump({'title': 'Export crashes on accents', 'words': len(note['text'].split())}, sys.stdout)\n",
+    )
+    .expect("script");
+    let effects = external
+        .map(|e| format!(", effects: {{ external: '{e}' }}"))
+        .unwrap_or_default();
+    let atoms = project.join("atoms");
+    std::fs::write(
+        atoms.join("send-note.atom.astro"),
+        format!(
+            "---\nimport type {{ Props, Input, Output }} from '../.atomic/types/send-note';\n\
+             import type {{ AtomConfig }} from '../.atomic/types/authoring';\n\
+             const {{ input }}: Props = Astro.props;\n\
+             export const config: AtomConfig<Input, Output> = {{ description: 'Send the note.', kind: 'exec', exec: {{ command: ['python3', 'tools/send.py'] }}, env: {{ SENT_LOG: '{}' }}{effects} }};\n---\n",
+            dir.join("sent.log").display()
+        ),
+    )
+    .expect("atom");
+    for role in ["input", "output"] {
+        std::fs::copy(
+            atoms.join(format!("read-note.{role}.schema.json")),
+            atoms.join(format!("send-note.{role}.schema.json")),
+        )
+        .expect("schema");
+    }
+}
+
+fn sent() -> String {
+    TRIAGE
+        .replace("name: triage-note", "name: sent-triage")
+        .replace("atom: read-note", "atom: send-note")
+}
+
+fn sends(dir: &Path) -> usize {
+    std::fs::read_to_string(dir.join("sent.log"))
+        .map(|log| log.lines().count())
+        .unwrap_or(0)
+}
+
+/// Kill a run of the sent-triage workflow just after its exec command ran
+/// and before the step's checkpoint, then recover it in a new process.
+async fn kill_after_the_command_and_recover(dir: &Path, url: &str, run: &'static str) {
+    let (d, u) = (dir.to_owned(), url.to_owned());
+    let status = tokio::task::spawn_blocking(move || {
+        child(&d, &u, "start-sent", run, Some("pipeline:ran:read"))
+    })
+    .await
+    .expect("child");
+    assert!(!status.success(), "the first process was killed: {status}");
+    assert_eq!(sends(dir), 1, "the command ran once before the kill");
+    let (d, u) = (dir.to_owned(), url.to_owned());
+    let status = tokio::task::spawn_blocking(move || child(&d, &u, "recover", run, None))
+        .await
+        .expect("child");
+    assert!(status.success(), "the second process ended: {status}");
+}
+
+#[test]
+fn an_interrupted_exec_step_with_no_effects_declaration_parks() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
+            .await
+            .expect("fake model");
+        let dir = scratch("parked");
+        project(&dir);
+        write_send_note(&dir, None);
+        kill_after_the_command_and_recover(&dir, &model.base_url(), "parked-1").await;
+
+        let error = std::fs::read_to_string(dir.join("error.txt")).expect("the run failed");
+        assert!(error.contains("step `read`: outcome_unknown"), "{error}");
+        assert_eq!(sends(&dir), 1, "the command did not run again");
+        assert_eq!(model.calls(), 0, "no step after it ran");
+    });
+}
+
+#[test]
+fn an_interrupted_exec_step_declared_idempotent_runs_again() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
+            .await
+            .expect("fake model");
+        let dir = scratch("idempotent");
+        project(&dir);
+        write_send_note(&dir, Some("idempotent"));
+        kill_after_the_command_and_recover(&dir, &model.base_url(), "idempotent-1").await;
+
+        assert!(!dir.join("error.txt").exists());
+        let out: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("result.json")).expect("result"),
+        )
+        .expect("decode");
+        assert_eq!(out, json!({"line": "P1: Export crashes on accents"}));
+        assert_eq!(sends(&dir), 2, "the command ran again after the crash");
+        assert_eq!(model.calls(), 2);
+    });
+}
+
+#[test]
+fn an_exec_step_that_was_not_interrupted_runs_once_whatever_it_declares() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
+            .await
+            .expect("fake model");
+        let dir = scratch("uninterrupted");
+        let project = project(&dir);
+        write_send_note(&dir, None);
+        let rt = engine(&dir, &model.base_url()).await;
+        let run = PipelineRun {
+            pipeline: load(&project, "sent.workflow.yaml", &sent()),
+            input: json!({"text": "Exporting a file named café.txt crashes the app."}),
+        };
+        rt.start(PIPELINE, "once-1", run).await.expect("start");
+        let out: Value = rt.result("once-1").await.expect("finishes");
+        assert_eq!(out, json!({"line": "P1: Export crashes on accents"}));
+        assert_eq!(sends(&dir), 1);
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
     });
 }
 

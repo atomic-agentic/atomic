@@ -38,6 +38,14 @@
 //! `base` and `commit_ref`, for later steps to review. A finished run's
 //! worktrees are removed; its accepted commits keep their refs.
 //!
+//! An exec atom's command may reach systems atomic cannot observe, so a
+//! step that runs one is guarded ([`atomic_durable::attempt`]): if a process
+//! stopped after the command began and before the step's checkpoint, whether
+//! its effects happened is unknown. A command declared `effects.external:
+//! read-only` or `idempotent` then runs again. One with neither is parked as
+//! `outcome_unknown`: the step fails without running the command again, and
+//! nothing retries it automatically.
+//!
 //! v0.1 runs its steps in order: model atoms, exec atoms, which run a
 //! command with no model, and gates.
 
@@ -49,6 +57,7 @@ use atomic_core::runtime::{Runtimes, contained, run_declarative};
 use atomic_core::workflow::Workflow;
 use atomic_core::worktree::{StepError, StepRequest, Worktrees};
 use atomic_core::{AtomError, compile};
+use atomic_durable::attempt;
 use atomic_durable::gate::{self, Deployment, GateSpec, Resolution, Tier};
 use atomic_durable::{
     DurableError, DurableRuntime, Proposal, Result, WorkflowContext, failpoint, run_atom,
@@ -408,11 +417,31 @@ async fn run_pipeline<C: WorkflowContext>(
         } else {
             None
         };
+        let guard = if atom.kind == "exec" {
+            let begun = attempt::begin(&ctx, &format!("{}.attempt", step.id)).await?;
+            Some((begun, atom.external().is_some()))
+        } else {
+            None
+        };
+        let (id, ran) = (step.id.clone(), format!("pipeline:ran:{}", step.id));
         let published = run_atom(
             &ctx,
             &step.id,
             move || async move {
-                match tree {
+                if let Some((begun, declared)) = guard
+                    && begun.interrupted()
+                    && !declared
+                {
+                    return Err(failed(format!(
+                        "step `{id}`: outcome_unknown: an earlier attempt of `{}` was interrupted \
+                         before its result was saved, so whether its command's effects happened \
+                         is unknown. The step is parked and its command does not run again. If \
+                         repeating it is safe, declare `effects: {{ external: 'idempotent' }}` \
+                         (or `'read-only'` if it only reads)",
+                        atom.name
+                    )));
+                }
+                let proposal = match tree {
                     None => {
                         propose(async move { run_in(&atom, &atom_input, &run_id, &runtimes).await })
                             .await
@@ -420,7 +449,9 @@ async fn run_pipeline<C: WorkflowContext>(
                     Some((worktrees, request)) => {
                         in_worktree(worktrees, request, atom, atom_input, run_id, runtimes).await
                     }
-                }
+                }?;
+                failpoint(&ran);
+                Ok(proposal)
             },
             Vec::new(),
         )
