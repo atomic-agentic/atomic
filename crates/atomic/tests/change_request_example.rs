@@ -85,8 +85,13 @@ fn plain_git(dir: &Path, args: &[&str]) -> String {
 /// The example and its seed code in one new repository, outside the system
 /// temporary directory (which `workspace-write` leaves writable), with one
 /// commit: the run's base.
-fn repository(dir: &Path) -> (PathBuf, String) {
-    let project = dir.join("project");
+fn repository(dir: &Path, layout: &str) -> (PathBuf, String) {
+    let root = dir.join("project");
+    let project = if layout == "member" {
+        root.join("member")
+    } else {
+        root.clone()
+    };
     copy_tree(&example(), &project);
     copy_tree(&example().join("fixtures/repo"), &project);
     let check = std::process::Command::new(env!("CARGO_BIN_EXE_atomic"))
@@ -100,10 +105,33 @@ fn repository(dir: &Path) -> (PathBuf, String) {
         "atomic check: {}",
         String::from_utf8_lossy(&check.stderr)
     );
-    plain_git(&project, &["init", "-q"]);
-    plain_git(&project, &["add", "."]);
-    plain_git(&project, &["commit", "-q", "-m", "baseline"]);
-    let base = plain_git(&project, &["rev-parse", "HEAD"]);
+    plain_git(&root, &["init", "-q"]);
+    plain_git(&root, &["add", "."]);
+    plain_git(&root, &["commit", "-q", "-m", "baseline"]);
+    let base = plain_git(&root, &["rev-parse", "HEAD"]);
+    if layout == "primary" {
+        return (project, base);
+    }
+    let linked = if layout == "nested" {
+        root.join(".worktrees/source")
+    } else {
+        dir.join("linked")
+    };
+    plain_git(
+        &root,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            linked.to_str().expect("path"),
+            &base,
+        ],
+    );
+    let project = if layout == "member" {
+        linked.join("member")
+    } else {
+        linked
+    };
     (project, base)
 }
 
@@ -223,92 +251,111 @@ fn read(path: &Path) -> Value {
 
 const RUN: &str = "change-1";
 
+async fn run_example(layout: &str) {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "atomic-change-request-{layout}-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    for sub in ["bin", "codex-home", "state"] {
+        std::fs::create_dir_all(dir.join(sub)).expect("scratch");
+    }
+    let dir = std::fs::canonicalize(&dir).expect("canonical");
+    let (project, base) = repository(&dir, layout);
+    let fixtures = example().join("fixtures");
+    let mut task = read(&fixtures.join("plan-task/quantity.input.json"))["task"].clone();
+    task["base"] = json!(base);
+    let plan = read(&fixtures.join("plan-task/quantity.output.json"));
+    let implemented = read(&fixtures.join("implement-step/quantity.output.json"));
+    let review = json!({
+        "verdict": "approve",
+        "summary": "Two units now total 250 cents; one unit is unchanged.",
+        "findings": []
+    });
+    let model = FakeModel::start(vec![
+        Reply::Text(plan.to_string()),
+        // The implementing model fixes the bug with a command in its
+        // working directory, the step's worktree.
+        Reply::Tool {
+            name: "exec_command".into(),
+            arguments: json!({
+                "cmd": "sed -i 's/return unit_cents$/return unit_cents * quantity/' pricing.py",
+                "yield_time_ms": 10000
+            }),
+        },
+        Reply::Text(implemented.to_string()),
+        Reply::Text(review.to_string()),
+    ])
+    .await
+    .expect("fake model");
+    let rt = engine(&dir, &project, &model.base_url()).await;
+    rt.start(
+        PIPELINE,
+        RUN,
+        PipelineRun {
+            pipeline: pipeline(&project),
+            input: task,
+        },
+    )
+    .await
+    .expect("start");
+
+    // Planned, then stopped at the first gate.
+    let g = open_gate(&rt, RUN).await;
+    assert_eq!(g.step, "approve-plan");
+    assert_eq!(g.title, "Approve bounded plan");
+    assert_eq!(g.show, plan);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(model.calls(), 1, "nothing after the gate has run");
+    approve(&rt, &g).await;
+
+    // Implemented in a worktree, reviewed, then stopped at the second.
+    let g = open_gate(&rt, RUN).await;
+    assert_eq!(g.step, "accept-change");
+    assert_eq!(model.calls(), 4);
+    let commit = g.show["commit"].as_str().expect("the candidate").to_owned();
+    assert_eq!(g.show["review"], review);
+    assert_eq!(
+        plain_git(&project, &["rev-parse", &format!("{commit}^")]),
+        base
+    );
+    let path = if layout == "member" {
+        "member/pricing.py"
+    } else {
+        "pricing.py"
+    };
+    let fixed = plain_git(&project, &["show", &format!("{commit}:{path}")]);
+    assert!(
+        fixed.contains("return unit_cents * quantity"),
+        "the commit holds the model's edit: {fixed}"
+    );
+    // The project's own checkout is untouched.
+    let own = std::fs::read_to_string(project.join("pricing.py")).expect("pricing.py");
+    assert!(own.contains("return unit_cents\n"), "{own}");
+    // The reviewer was given atomic's commit, not one a model wrote.
+    assert!(model.requests()[3].to_string().contains(&commit));
+    approve(&rt, &g).await;
+
+    let out: Value = rt.result(RUN).await.expect("finishes");
+    assert_eq!(out, review);
+    assert_eq!(model.calls(), 4);
+    rt.shutdown(std::time::Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn the_change_request_example_stops_at_its_gates_and_continues_after_approval() {
-    on_codex_runtime(async {
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-            .join(format!("atomic-change-request-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        for sub in ["bin", "codex-home", "state"] {
-            std::fs::create_dir_all(dir.join(sub)).expect("scratch");
-        }
-        let dir = std::fs::canonicalize(&dir).expect("canonical");
-        let (project, base) = repository(&dir);
-        let fixtures = example().join("fixtures");
-        let mut task = read(&fixtures.join("plan-task/quantity.input.json"))["task"].clone();
-        task["base"] = json!(base);
-        let plan = read(&fixtures.join("plan-task/quantity.output.json"));
-        let implemented = read(&fixtures.join("implement-step/quantity.output.json"));
-        let review = json!({
-            "verdict": "approve",
-            "summary": "Two units now total 250 cents; one unit is unchanged.",
-            "findings": []
-        });
-        let model = FakeModel::start(vec![
-            Reply::Text(plan.to_string()),
-            // The implementing model fixes the bug with a command in its
-            // working directory, the step's worktree.
-            Reply::Tool {
-                name: "exec_command".into(),
-                arguments: json!({
-                    "cmd": "sed -i 's/return unit_cents$/return unit_cents * quantity/' pricing.py",
-                    "yield_time_ms": 10000
-                }),
-            },
-            Reply::Text(implemented.to_string()),
-            Reply::Text(review.to_string()),
-        ])
-        .await
-        .expect("fake model");
-        let rt = engine(&dir, &project, &model.base_url()).await;
-        rt.start(
-            PIPELINE,
-            RUN,
-            PipelineRun {
-                pipeline: pipeline(&project),
-                input: task,
-            },
-        )
-        .await
-        .expect("start");
+    on_codex_runtime(run_example("primary"));
+}
 
-        // Planned, then stopped at the first gate.
-        let g = open_gate(&rt, RUN).await;
-        assert_eq!(g.step, "approve-plan");
-        assert_eq!(g.title, "Approve bounded plan");
-        assert_eq!(g.show, plan);
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        assert_eq!(model.calls(), 1, "nothing after the gate has run");
-        approve(&rt, &g).await;
+#[test]
+fn a_nested_linked_checkout_runs_in_its_attempt_root() {
+    on_codex_runtime(run_example("nested"));
+}
 
-        // Implemented in a worktree, reviewed, then stopped at the second.
-        let g = open_gate(&rt, RUN).await;
-        assert_eq!(g.step, "accept-change");
-        assert_eq!(model.calls(), 4);
-        let commit = g.show["commit"].as_str().expect("the candidate").to_owned();
-        assert_eq!(g.show["review"], review);
-        assert_eq!(
-            plain_git(&project, &["rev-parse", &format!("{commit}^")]),
-            base
-        );
-        let fixed = plain_git(&project, &["show", &format!("{commit}:pricing.py")]);
-        assert!(
-            fixed.contains("return unit_cents * quantity"),
-            "the commit holds the model's edit: {fixed}"
-        );
-        // The project's own checkout is untouched.
-        let own = std::fs::read_to_string(project.join("pricing.py")).expect("pricing.py");
-        assert!(own.contains("return unit_cents\n"), "{own}");
-        // The reviewer was given atomic's commit, not one a model wrote.
-        assert!(model.requests()[3].to_string().contains(&commit));
-        approve(&rt, &g).await;
-
-        let out: Value = rt.result(RUN).await.expect("finishes");
-        assert_eq!(out, review);
-        assert_eq!(model.calls(), 4);
-        rt.shutdown(std::time::Duration::from_secs(5))
-            .await
-            .expect("shutdown");
-        let _ = std::fs::remove_dir_all(&dir);
-    });
+#[test]
+fn a_member_project_in_a_linked_checkout_runs_in_its_attempt_subdirectory() {
+    on_codex_runtime(run_example("member"));
 }
