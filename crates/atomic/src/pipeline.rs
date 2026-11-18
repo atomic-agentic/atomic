@@ -17,10 +17,17 @@
 //! crash is never run again. CEL has no side effects, so mappings evaluated
 //! again on replay give the same values.
 //!
+//! A run is pinned to what it started with. The pipeline records the
+//! SHA-256 of the workflow file and of every source of every atom it uses,
+//! and the run's first durable step stores the whole pipeline in the artifact
+//! store. Editing a file afterwards changes new runs only: a run in flight,
+//! or one recovered after a crash, uses the definitions in its own record.
+//!
 //! v0.1 runs sequential atom steps. Gate steps and worktree steps are refused
 //! by [`prepare`] until the interpreter supports them.
 
 use crate::workflows::propose;
+use atomic_core::artifact::{ArtifactStore, LocalStore, Provenance};
 use atomic_core::atom::Atom;
 use atomic_core::runtime::{Runtimes, run_declarative};
 use atomic_core::workflow::Workflow;
@@ -61,6 +68,23 @@ pub struct Pipeline {
     pub output: Value,
     /// Every atom a step names, by name.
     pub atoms: BTreeMap<String, Atom>,
+    /// The SHA-256 of each file the run uses, by path: the workflow file and
+    /// every source of every atom, as they were read when the run was
+    /// prepared.
+    pub pins: BTreeMap<String, String>,
+}
+
+/// The media type a pipeline snapshot is stored under.
+pub const SNAPSHOT_MEDIA_TYPE: &str = "application/vnd.atomic.pipeline+json";
+
+/// What a run's first step records: where its definitions were stored, and
+/// the hash of every file they came from.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pinned {
+    /// The artifact holding the pipeline, as JSON.
+    pub snapshot: String,
+    /// The SHA-256 of each file, by path.
+    pub files: BTreeMap<String, String>,
 }
 
 /// One run of a pipeline.
@@ -95,6 +119,8 @@ pub fn prepare(
     let definition = &workflow.definition;
     let mut steps = Vec::new();
     let mut used = BTreeMap::new();
+    let mut pins = BTreeMap::new();
+    pins.insert(workflow.file.display().to_string(), workflow.hash.clone());
     for id in &workflow.order {
         let step = &definition["steps"][id];
         if step.get("gate").is_some() {
@@ -131,6 +157,9 @@ pub fn prepare(
                 with.insert(field.clone(), source.to_owned());
             }
         }
+        for (source, text) in &atom.program.sources {
+            pins.insert(source.clone(), sha256(text.as_bytes()));
+        }
         used.insert(name.to_owned(), atom.clone());
         steps.push(AtomStep {
             id: id.clone(),
@@ -150,7 +179,13 @@ pub fn prepare(
         input: workflow.input.clone(),
         output: workflow.output.clone(),
         atoms: used,
+        pins,
     })
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    format!("{:x}", sha2::Sha256::digest(bytes))
 }
 
 fn failed(message: String) -> DurableError {
@@ -185,9 +220,39 @@ async fn run_pipeline<C: WorkflowContext>(
     ctx: C,
     run: PipelineRun,
     runtimes: Arc<Runtimes>,
+    store: LocalStore,
 ) -> Result<Value> {
     let PipelineRun { pipeline, input } = run;
     fits("the workflow's input", &pipeline.input, &input)?;
+    // Store the definitions the run uses before anything runs. The snapshot
+    // is content-addressed, so a retried step stores the same artifact.
+    let snapshot =
+        serde_json::to_vec(&pipeline).map_err(|e| failed(format!("encode the pipeline: {e}")))?;
+    let files = pipeline.pins.clone();
+    let run_id = ctx.workflow_id().to_owned();
+    let _pinned: Pinned = ctx
+        .step("pin", move |_| async move {
+            let manifest = tokio::task::spawn_blocking(move || {
+                store.put(
+                    &mut snapshot.as_slice(),
+                    Provenance {
+                        media_type: SNAPSHOT_MEDIA_TYPE.into(),
+                        workflow: Some(run_id),
+                        step: Some("pin".into()),
+                        origin: Some("run_pipeline".into()),
+                        labels: Default::default(),
+                    },
+                )
+            })
+            .await
+            .map_err(|e| failed(format!("store the pipeline: {e}")))?
+            .map_err(|e| failed(format!("store the pipeline: {e}")))?;
+            Ok(Pinned {
+                snapshot: manifest.artifact.to_string(),
+                files,
+            })
+        })
+        .await?;
     let mut steps = Map::new();
     for step in &pipeline.steps {
         let scope = json!(steps);
@@ -245,9 +310,14 @@ async fn run_pipeline<C: WorkflowContext>(
     Ok(result)
 }
 
-/// Register `run_pipeline` on `rt`, running atoms on `runtimes`.
-pub fn register_pipeline<R: DurableRuntime>(rt: &mut R, runtimes: Arc<Runtimes>) {
+/// Register `run_pipeline` on `rt`, running atoms on `runtimes` and storing
+/// each run's definitions in `store`.
+pub fn register_pipeline<R: DurableRuntime>(
+    rt: &mut R,
+    runtimes: Arc<Runtimes>,
+    store: LocalStore,
+) {
     rt.register(PIPELINE, move |ctx: R::Context, run: PipelineRun| {
-        run_pipeline(ctx, run, runtimes.clone())
+        run_pipeline(ctx, run, runtimes.clone(), store.clone())
     });
 }

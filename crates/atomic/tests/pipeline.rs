@@ -16,7 +16,10 @@
 // needs more than the default query depth.
 #![recursion_limit = "512"]
 
-use atomic_app::pipeline::{PIPELINE, Pipeline, PipelineRun, prepare, register_pipeline};
+use atomic_app::pipeline::{
+    PIPELINE, Pinned, Pipeline, PipelineRun, SNAPSHOT_MEDIA_TYPE, prepare, register_pipeline,
+};
+use atomic_core::artifact::{ArtifactRef, ArtifactStore, LocalStore};
 use atomic_core::codex::{CodexPaths, ModelEndpoint};
 use atomic_core::lite::LiteRuntime;
 use atomic_core::runtime::{Artifacts, CodexRuntime, Runtimes};
@@ -163,7 +166,8 @@ async fn engine(dir: &Path, base_url: &str) -> Durare {
     let mut rt = Durare::sqlite(&dir.join("atomic.db"))
         .await
         .expect("engine");
-    register_pipeline(&mut rt, runtimes(dir, base_url));
+    let store = LocalStore::open(dir.join("artifacts")).expect("artifact store");
+    register_pipeline(&mut rt, runtimes(dir, base_url), store);
     rt.launch().await.expect("launch");
     rt
 }
@@ -398,6 +402,7 @@ fn a_worktree_step_is_refused_before_it_starts() {
 const ENV_ROLE: &str = "ATOMIC_PIPELINE_ROLE";
 const ENV_DIR: &str = "ATOMIC_PIPELINE_DIR";
 const ENV_URL: &str = "ATOMIC_PIPELINE_URL";
+const ENV_RUN: &str = "ATOMIC_PIPELINE_RUN";
 
 /// Not a test on its own: the parent runs it in a child process.
 #[test]
@@ -419,11 +424,13 @@ fn pipeline_child() {
                 pipeline,
                 input: json!({"text": "Exporting a file named café.txt crashes the app."}),
             };
-            rt.start(PIPELINE, "killed-1", run).await.expect("start");
+            let id = std::env::var(ENV_RUN).expect("run id");
+            rt.start(PIPELINE, &id, run).await.expect("start");
         } else {
             rt.recover().await.expect("recover");
         }
-        let out: Value = rt.result("killed-1").await.expect("finishes");
+        let id = std::env::var(ENV_RUN).expect("run id");
+        let out: Value = rt.result(&id).await.expect("finishes");
         std::fs::write(dir.join("result.json"), out.to_string()).expect("write the result");
         rt.shutdown(std::time::Duration::from_secs(5))
             .await
@@ -431,10 +438,17 @@ fn pipeline_child() {
     });
 }
 
-fn child(dir: &Path, url: &str, role: &str, failpoint: Option<&str>) -> std::process::ExitStatus {
+fn child(
+    dir: &Path,
+    url: &str,
+    role: &str,
+    run: &str,
+    failpoint: Option<&str>,
+) -> std::process::ExitStatus {
     let mut cmd = std::process::Command::new(std::env::current_exe().expect("this test binary"));
     cmd.args(["--exact", "pipeline_child", "--ignored", "--nocapture"])
         .env(ENV_ROLE, role)
+        .env(ENV_RUN, run)
         .env(ENV_DIR, dir)
         .env(ENV_URL, url)
         .stdin(std::process::Stdio::null())
@@ -464,7 +478,7 @@ fn a_killed_process_does_not_rerun_a_finished_step() {
         // The first process dies right after the second step is published.
         let (d, u) = (dir.clone(), url.clone());
         let status = tokio::task::spawn_blocking(move || {
-            child(&d, &u, "start", Some("pipeline:after:rank"))
+            child(&d, &u, "start", "killed-1", Some("pipeline:after:rank"))
         })
         .await
         .expect("child");
@@ -474,9 +488,10 @@ fn a_killed_process_does_not_rerun_a_finished_step() {
 
         // A new process recovers the run and runs only the last step.
         let (d, u) = (dir.clone(), url.clone());
-        let status = tokio::task::spawn_blocking(move || child(&d, &u, "recover", None))
-            .await
-            .expect("child");
+        let status =
+            tokio::task::spawn_blocking(move || child(&d, &u, "recover", "killed-1", None))
+                .await
+                .expect("child");
         assert!(status.success(), "the second process finished: {status}");
         assert_eq!(model.calls(), 3, "read and rank were not run again");
         let out: Value = serde_json::from_str(
@@ -484,5 +499,102 @@ fn a_killed_process_does_not_rerun_a_finished_step() {
         )
         .expect("decode");
         assert_eq!(out, json!({"line": "P1: Export crashes on accents"}));
+    });
+}
+
+#[test]
+fn an_atom_edited_mid_run_does_not_change_the_run_in_flight() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![
+            Reply::Text(READ.into()),
+            Reply::Text(RANK.into()),
+            Reply::Text(SUMMARY.into()),
+        ])
+        .await
+        .expect("fake model");
+        let dir = scratch("pinned");
+        let project = project(&dir);
+        let url = model.base_url();
+
+        // The first process dies right after the first step is published.
+        let (d, u) = (dir.clone(), url.clone());
+        let status = tokio::task::spawn_blocking(move || {
+            child(&d, &u, "start", "pinned-1", Some("pipeline:after:read"))
+        })
+        .await
+        .expect("child");
+        assert!(!status.success(), "the first process was killed: {status}");
+        assert_eq!(model.calls(), 1);
+
+        // Someone edits the next atom while the run waits for recovery.
+        let rank = project.join("atoms/rank-note.atom.astro");
+        let original = std::fs::read_to_string(&rank).expect("read");
+        std::fs::write(
+            &rank,
+            original.replace("Rank the note", "EDITED: rank the note"),
+        )
+        .expect("edit");
+
+        // Recovery runs the rank step as it was when the run started.
+        let (d, u) = (dir.clone(), url.clone());
+        let status =
+            tokio::task::spawn_blocking(move || child(&d, &u, "recover", "pinned-1", None))
+                .await
+                .expect("child");
+        assert!(status.success(), "the second process finished: {status}");
+        assert_eq!(model.calls(), 3);
+        let asked = model.requests()[1].to_string();
+        assert!(
+            asked.contains("Rank the note") && !asked.contains("EDITED"),
+            "the run in flight used its pinned atom: {asked}"
+        );
+
+        // The run recorded where its definitions are, and the snapshot holds
+        // the atom as it was, with the hash of each file it came from.
+        let rt = engine(&dir, &url).await;
+        let pin = rt
+            .steps("pinned-1")
+            .await
+            .expect("steps")
+            .into_iter()
+            .find(|s| s.name == "pin")
+            .and_then(|s| s.output)
+            .expect("a pin step");
+        let pinned: Pinned = serde_json::from_value(pin).expect("pinned");
+        let store = LocalStore::open(dir.join("artifacts")).expect("store");
+        let snapshot: ArtifactRef = pinned.snapshot.parse().expect("reference");
+        assert_eq!(
+            store.manifests(&snapshot).expect("manifests")[0].media_type,
+            SNAPSHOT_MEDIA_TYPE
+        );
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut store.open(&snapshot).expect("open"), &mut bytes)
+            .expect("read");
+        let stored: Pipeline = serde_json::from_slice(&bytes).expect("a pipeline");
+        let source = stored.atoms["rank-note"]
+            .program
+            .sources
+            .iter()
+            .find(|(path, _)| path.ends_with("rank-note.atom.astro"))
+            .map(|(path, text)| (path.clone(), text.clone()))
+            .expect("the rank atom's source");
+        assert!(!source.1.contains("EDITED"));
+        assert_eq!(pinned.files[&source.0], {
+            use sha2::Digest;
+            format!("{:x}", sha2::Sha256::digest(original.as_bytes()))
+        });
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+
+        // A run prepared now gets the edited atom.
+        let edited = load(&project, "triage.workflow.yaml", TRIAGE);
+        assert!(
+            edited.atoms["rank-note"]
+                .program
+                .sources
+                .values()
+                .any(|text| text.contains("EDITED"))
+        );
     });
 }
