@@ -424,6 +424,21 @@ pub fn load(
                     }
                 }
             }
+            if let Some(t) = g.get("timeout") {
+                t.as_str()
+                    .ok_or_else(|| "a duration in a string, such as `24h`".to_owned())
+                    .and_then(parse_timeout)
+                    .map_err(|e| fail(&format!("{gp}/timeout"), e))?;
+            }
+            if let Some(a) = g.get("approvers") {
+                let groups = a.as_array().filter(|a| a.iter().all(Value::is_string));
+                if groups.is_none() {
+                    return Err(fail(
+                        &format!("{gp}/approvers"),
+                        "`approvers` is a list of group names".into(),
+                    ));
+                }
+            }
             if let Some(t) = g.get("on_timeout")
                 && !matches!(t.as_str(), Some("reject"))
             {
@@ -491,6 +506,32 @@ pub fn load(
 }
 
 /// Steps in an order respecting `after`, or a step on a cycle.
+/// A gate's `timeout`: a whole number and a unit, `s`, `m`, `h` or `d`,
+/// such as `90s`, `30m`, `24h` or `7d`.
+pub fn parse_timeout(text: &str) -> Result<std::time::Duration, String> {
+    let bad = || format!("`{text}` is not a duration such as `30m`, `24h` or `7d`");
+    let unit = text.chars().last().ok_or_else(bad)?;
+    let scale: u64 = match unit {
+        's' => 1,
+        'm' => 60,
+        'h' => 3_600,
+        'd' => 86_400,
+        _ => return Err(bad()),
+    };
+    let digits = &text[..text.len() - 1];
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(bad());
+    }
+    let count: u64 = digits.parse().map_err(|_| bad())?;
+    let seconds = count.checked_mul(scale).ok_or_else(bad)?;
+    if seconds == 0 {
+        return Err(format!(
+            "`{text}` is no time at all; omit `timeout` for no deadline"
+        ));
+    }
+    Ok(std::time::Duration::from_secs(seconds))
+}
+
 fn topo(after: &BTreeMap<String, Vec<String>>) -> Result<Vec<String>, String> {
     let mut done: Vec<String> = Vec::new();
     let mut left: BTreeSet<&String> = after.keys().collect();

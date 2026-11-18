@@ -25,6 +25,38 @@ The filename supplies the name, `atomic: 1`, version `1`, and kind `lite`.
 Declare `kind: 'codex'` for repository work, or `kind: 'exec'` for a model-free
 script. Explicit names preserve identity across renames.
 
+## Exec atoms
+
+```astro
+---
+export const config = {
+  description: 'Post the summary to the team channel.',
+  kind: 'exec',
+  exec: {command: ['python3', 'tools/post.py']},
+  env: {CHANNEL: 'triage'},
+  effects: {external: 'idempotent'},
+};
+---
+```
+
+`exec.command` is the program and its arguments, run with no shell from the
+project root. The command reads its input as JSON on stdin and writes its output
+as JSON on stdout; a nonzero exit fails the step. It receives only the variables
+in `env`, plus its own `HOME` and `TMPDIR`.
+
+A step runs at least once, and Atomic cannot see what a command does to other
+systems. If the process stops after the command started and before its result
+was saved, `effects.external` decides what recovery does:
+
+| `effects.external` | Meaning | After an interrupted attempt |
+| --- | --- | --- |
+| `read-only` | The command only reads | It runs again |
+| `idempotent` | It writes, and running it again is safe | It runs again |
+| omitted | Neither is known | The step is parked as `outcome_unknown`: it fails without running the command again, and nothing retries it |
+
+A command that writes is safe to repeat when it uses a stable key, a
+create-only write or a check for its own earlier write.
+
 ## Schema locations
 
 Schemas default to
@@ -52,7 +84,7 @@ checking. Stock Astro VS Code support checks the generated `Props` binding.
 | `case`, `judges` | Full evaluation-case and judge input/output schema declarations |
 | `scorers` | Interpreted judge bindings, numeric scores and mean thresholds |
 | `context` | Optional public execution-context schema; a context sidecar is also accepted. See [context schemas](#context-schemas) |
-| `exec`, `effects`, `env` | Execution declarations, subject to runtime availability |
+| `exec`, `effects`, `env` | An exec atom's command, what it does outside Atomic, and its environment. See [exec atoms](#exec-atoms) |
 
 Some integrations shown in the catalog remain staged. Unavailable permissions,
 remote atoms, credentials, skills and runtime declarations fail explicitly in the
