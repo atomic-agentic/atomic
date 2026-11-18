@@ -71,3 +71,24 @@ fn a_syntax_error_fails_at_parse() {
     assert!(parse("input.risk ==").is_err());
     assert!(parse("input.risk == \"high\"").is_ok());
 }
+
+#[test]
+fn an_expression_evaluates_to_json() {
+    let input = json!({"order_id": "A-1", "lines": [{"cents": 125, "units": 2}]});
+    let steps = json!({"total": {"output": {"total_cents": 250}}});
+    let values = [("input", &input), ("steps", &steps)];
+    assert_eq!(evaluate("input.order_id", &values), Ok(json!("A-1")));
+    assert_eq!(
+        evaluate("steps.total.output", &values),
+        Ok(json!({"total_cents": 250}))
+    );
+    assert_eq!(
+        evaluate("'Accept ' + input.order_id", &values),
+        Ok(json!("Accept A-1"))
+    );
+    assert_eq!(
+        evaluate("input.lines.map(l, l.cents * l.units)", &values),
+        Ok(json!([250]))
+    );
+    assert!(evaluate("input.missing", &values).is_err());
+}

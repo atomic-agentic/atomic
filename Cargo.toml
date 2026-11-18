@@ -39,7 +39,7 @@ durare = { git = "https://github.com/atomic-agentic/durare", rev = "cbfc49374f53
 
 # Third-party crates.
 anyhow = "1"
-cel = { version = "0.16", default-features = false, features = ["regex"] }
+cel = { version = "0.16", default-features = false, features = ["regex", "json"] }
 clap = { version = "4", features = ["derive", "env"] }
 dirs = "6"
 globset = "0.4"

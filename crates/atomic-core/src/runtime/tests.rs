@@ -971,3 +971,204 @@ fn a_codex_atom_off_openai_states_its_schema_in_its_instructions() {
     assert!(crate::lite::is_openai_api("https://api.openai.com/v1"));
     assert!(!crate::lite::is_openai_api("http://127.0.0.1:13305/api/v1"));
 }
+
+/// A project with one exec atom whose command runs `script` with python3.
+fn exec_project(
+    tag: &str,
+    script: &str,
+    extra: &str,
+) -> (std::path::PathBuf, crate::atom::Atom, Compiled) {
+    use crate::{atom, compile};
+    let dir = scratch(tag);
+    std::fs::create_dir_all(dir.join("atoms")).expect("atoms");
+    std::fs::create_dir_all(dir.join("tools")).expect("tools");
+    std::fs::write(dir.join("atomic.yaml"), "atomic: 1\nname: exec-test\n").expect("manifest");
+    std::fs::write(dir.join("tools/total.py"), script).expect("script");
+    std::fs::write(
+        dir.join("atoms/total.atom.astro"),
+        format!(
+            "---\nimport type {{ Props, Input, Output }} from '../.atomic/types/total';\n\
+             import type {{ AtomConfig }} from '../.atomic/types/authoring';\n\
+             const {{ input }}: Props = Astro.props;\n\
+             export const config: AtomConfig<Input, Output> = {{ description: 'Total an order.', kind: 'exec', exec: {{ command: ['python3', 'tools/total.py'] }}{extra} }};\n---\n"
+        ),
+    )
+    .expect("atom");
+    std::fs::write(
+        dir.join("atoms/total.input.schema.yaml"),
+        "type: object\nadditionalProperties: false\nrequired: [cents]\nproperties:\n  cents: {type: array, items: {type: integer}}\n",
+    )
+    .expect("input");
+    std::fs::write(
+        dir.join("atoms/total.output.schema.yaml"),
+        "type: object\nadditionalProperties: false\nrequired: [total]\nproperties:\n  total: {type: integer, minimum: 0}\n",
+    )
+    .expect("output");
+    let mut registry = Registry::new();
+    let a = atom::load(&dir.join("atoms/total.atom.astro"), &mut registry).expect("loads");
+    let compiled = compile::compile(&a, &registry).expect("compiles");
+    (dir, a, compiled)
+}
+
+const TOTAL: &str = "import json, sys\norder = json.load(sys.stdin)\njson.dump({'total': sum(order['cents'])}, sys.stdout)\n";
+
+#[test]
+fn an_exec_atom_runs_its_command_with_typed_json_and_no_model() {
+    on_codex_runtime(async {
+        let (_, a, compiled) = exec_project("exec-ok", TOTAL, "");
+        let model = FakeModel::start(Vec::new()).await.expect("fake model");
+        let rt = runtimes(&model, "exec-ok");
+        let (out, meta) = run_declarative(
+            &a,
+            &compiled,
+            &mut Registry::new(),
+            &json!({"cents": [125, 125, 50]}),
+            "run-1",
+            "external",
+            &rt,
+        )
+        .await
+        .expect("runs");
+        assert_eq!(out, json!({"total": 300}));
+        assert_eq!((meta.model.as_str(), meta.turns), ("exec", 0));
+        assert_eq!(model.calls(), 0, "no model call");
+
+        // Input that breaks the contract never reaches the command.
+        let r = run_declarative(
+            &a,
+            &compiled,
+            &mut Registry::new(),
+            &json!({"cents": "a lot"}),
+            "run-2",
+            "external",
+            &rt,
+        )
+        .await;
+        assert!(matches!(r, Err(AtomError::Input(_))), "{r:?}");
+    });
+}
+
+#[test]
+fn exec_output_that_breaks_its_schema_fails_the_step() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(Vec::new()).await.expect("fake model");
+        let rt = runtimes(&model, "exec-bad");
+        for (script, expected) in [
+            ("print('{\"total\": -5}')\n", "minimum"),
+            ("print('not json')\n", "not one JSON value"),
+        ] {
+            let (_, a, compiled) = exec_project("exec-bad", script, "");
+            let r = run_declarative(
+                &a,
+                &compiled,
+                &mut Registry::new(),
+                &json!({"cents": [1]}),
+                "run-1",
+                "external",
+                &rt,
+            )
+            .await;
+            assert!(
+                matches!(&r, Err(AtomError::Schema { message, .. }) if message.contains(expected)),
+                "{expected}: {r:?}"
+            );
+        }
+        assert_eq!(model.calls(), 0);
+    });
+}
+
+#[test]
+fn a_failing_exec_command_fails_the_step_with_its_stderr() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(Vec::new()).await.expect("fake model");
+        let rt = runtimes(&model, "exec-fail");
+        let (_, a, compiled) = exec_project(
+            "exec-fail",
+            "import sys\nprint('the order has no lines', file=sys.stderr)\nsys.exit(4)\n",
+            "",
+        );
+        let r = run_declarative(
+            &a,
+            &compiled,
+            &mut Registry::new(),
+            &json!({"cents": []}),
+            "run-1",
+            "external",
+            &rt,
+        )
+        .await;
+        assert!(
+            matches!(&r, Err(AtomError::Runtime(m)) if m.contains("exited with code 4") && m.contains("the order has no lines")),
+            "{r:?}"
+        );
+    });
+}
+
+#[test]
+fn an_exec_command_sees_only_its_declared_environment_from_the_project_root() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(Vec::new()).await.expect("fake model");
+        let rt = runtimes(&model, "exec-env");
+        let script = "import json, os, sys\njson.load(sys.stdin)\n\
+            names = sorted(n for n in os.environ if n != 'LC_CTYPE')  # Python's own locale coercion\n\
+            assert names == ['HOME', 'REGION', 'TMPDIR'], names\n\
+            assert os.environ['REGION'] == 'eu'\n\
+            assert os.path.isfile('atomic.yaml'), os.getcwd()\n\
+            assert os.environ['HOME'] == os.environ['TMPDIR'] and os.path.isdir(os.environ['HOME'])\n\
+            json.dump({'total': 1}, sys.stdout)\n";
+        let (_, a, compiled) = exec_project("exec-env", script, ", env: { REGION: 'eu' }");
+        let (out, _) = run_declarative(
+            &a,
+            &compiled,
+            &mut Registry::new(),
+            &json!({"cents": [1]}),
+            "run-1",
+            "external",
+            &rt,
+        )
+        .await
+        .expect("the environment is exactly the declared one");
+        assert_eq!(out, json!({"total": 1}));
+    });
+}
+
+#[test]
+fn exec_declarations_are_checked_at_load() {
+    use crate::atom;
+    for (config, problem) in [
+        ("kind: 'exec'", "needs `exec"),
+        ("kind: 'exec', exec: { command: [] }", "nonempty list"),
+        (
+            "kind: 'exec', exec: { script: './x.ts' }",
+            "managed runtime",
+        ),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, env: { 'BAD-NAME': 'x' }",
+            "variable name",
+        ),
+        ("kind: 'lite', env: { REGION: 'eu' }", "for `kind: 'exec'`"),
+    ] {
+        let dir = scratch("exec-load");
+        std::fs::create_dir_all(dir.join("atoms")).expect("atoms");
+        std::fs::write(
+            dir.join("atoms/x.atom.astro"),
+            format!(
+                "---\nimport type {{ Props, Input, Output }} from './.atomic/types/x';\n\
+                 import type {{ AtomConfig }} from './.atomic/types/authoring';\n\
+                 const {{ input }}: Props = Astro.props;\n\
+                 export const config: AtomConfig<Input, Output> = {{ description: 'x', {config} }};\n---\nX {{input.text}}\n"
+            ),
+        )
+        .expect("atom");
+        for role in ["input", "output"] {
+            std::fs::write(
+                dir.join(format!("atoms/x.{role}.schema.yaml")),
+                "type: object\nadditionalProperties: false\nrequired: [text]\nproperties:\n  text: {type: string}\n",
+            )
+            .expect("schema");
+        }
+        let error =
+            atom::load(&dir.join("atoms/x.atom.astro"), &mut Registry::new()).expect_err(problem);
+        assert!(error.message.contains(problem), "{config}: {error}");
+    }
+}

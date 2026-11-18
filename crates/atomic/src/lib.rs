@@ -4,4 +4,5 @@
 //! [`atomic_durable::DurableRuntime`] trait.
 
 pub mod metering;
+pub mod pipeline;
 pub mod workflows;

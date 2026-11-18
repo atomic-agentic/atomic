@@ -43,6 +43,12 @@ pub struct Workflow {
     pub budget: Budget,
     /// The workflow as written, as JSON.
     pub definition: Value,
+    /// Its input contract, with every reference inlined.
+    pub input: Value,
+    /// Its output contract, with every reference inlined.
+    pub output: Value,
+    /// SHA-256 of the file's text, as it was read and parsed.
+    pub hash: String,
     /// Fits the check could not prove, each with its path.
     pub warnings: Vec<String>,
 }
@@ -474,6 +480,12 @@ pub fn load(
         order,
         budget,
         definition: doc.value.clone(),
+        input,
+        output,
+        hash: format!(
+            "{:x}",
+            <sha2::Sha256 as sha2::Digest>::digest(text.as_bytes())
+        ),
         warnings,
     })
 }

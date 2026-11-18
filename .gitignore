@@ -24,3 +24,6 @@ CLAUDE.local.md
 
 # The embedded-Deno host experiment is a second Cargo workspace; atomic has one.
 authoring/embedded/
+
+# Worktrees that coding agents create for parallel work.
+.claude/worktrees/

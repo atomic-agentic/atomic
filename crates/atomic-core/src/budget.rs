@@ -29,7 +29,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 /// The limits a `budget` block wrote; `None` inherits the default.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Budget {
     /// Cumulative input and output tokens.
     pub tokens: Option<u64>,
