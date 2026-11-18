@@ -10,6 +10,7 @@ pub mod codex;
 pub mod collections;
 pub mod compile;
 pub mod config;
+pub mod lite;
 pub mod project;
 pub mod render;
 pub mod runtime;
@@ -20,4 +21,4 @@ pub mod testing;
 pub mod typed;
 pub mod workflow;
 
-pub use typed::{Approvals, Atom, AtomConfig, AtomError, AtomKind, Sandbox};
+pub use typed::{Approvals, Atom, AtomConfig, AtomError, AtomKind, MODEL_TIERS, Sandbox};

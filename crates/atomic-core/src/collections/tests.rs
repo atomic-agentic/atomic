@@ -93,3 +93,80 @@ fn a_supplied_entry_replaces_the_default_globs() {
     let c = collect(&project::discover(&root).expect("project")).expect("collect");
     assert_eq!(names(&c, "atoms"), ["a"]);
 }
+
+fn atom(name: Option<&str>) -> String {
+    let name = name.map(|n| format!("name: {n}\n")).unwrap_or_default();
+    format!("---\natomic: 1\n{name}description: Review.\n---\nReview.\n")
+}
+
+#[test]
+fn files_with_one_file_name_and_distinct_declared_names_are_both_collected() {
+    let root = tree(&[
+        ("atomic.yaml", "atomic: 1\n"),
+        ("atoms/api/review.atom.md", &atom(Some("review-api"))),
+        ("atoms/web/review.atom.md", &atom(Some("review-web"))),
+        (
+            "workflows/a/release.workflow.yaml",
+            "atomic: 1\nname: release-a\n",
+        ),
+        (
+            "workflows/b/release.workflow.yaml",
+            "atomic: 1\nname: release-b\n",
+        ),
+    ]);
+    let c = collect(&project::load(&root.join("atomic.yaml")).expect("project")).expect("collects");
+    assert_eq!(names(&c, "atoms"), ["review-api", "review-web"]);
+    assert_eq!(names(&c, "workflows"), ["release-a", "release-b"]);
+}
+
+#[test]
+fn different_files_declaring_one_name_are_refused() {
+    for (first, second, collection) in [
+        (
+            ("atoms/review.atom.md", atom(Some("check"))),
+            ("atoms/check.atom.md", atom(None)),
+            "atoms",
+        ),
+        (
+            ("atoms/one.atom.md", atom(Some("check"))),
+            ("atoms/two.atom.md", atom(Some("check"))),
+            "atoms",
+        ),
+        (
+            (
+                "workflows/one.workflow.yaml",
+                "atomic: 1\nname: ship\n".to_owned(),
+            ),
+            (
+                "workflows/two.workflow.yaml",
+                "atomic: 1\nname: ship\n".to_owned(),
+            ),
+            "workflows",
+        ),
+    ] {
+        let root = tree(&[
+            ("atomic.yaml", "atomic: 1\n"),
+            (first.0, &first.1),
+            (second.0, &second.1),
+        ]);
+        let project = project::load(&root.join("atomic.yaml")).expect("project");
+        match collect(&project) {
+            Err(CollectError::DuplicateName { collection: c, .. }) => assert_eq!(c, collection),
+            other => panic!("{first:?} and {second:?}: expected a duplicate, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn files_with_one_file_name_and_no_declared_name_collide() {
+    let root = tree(&[
+        ("atomic.yaml", "atomic: 1\n"),
+        ("atoms/api/review.atom.md", &atom(None)),
+        ("atoms/web/review.atom.md", &atom(None)),
+    ]);
+    let project = project::load(&root.join("atomic.yaml")).expect("project");
+    assert!(matches!(
+        collect(&project),
+        Err(CollectError::DuplicateName { name, .. }) if name == "review"
+    ));
+}

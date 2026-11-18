@@ -1,0 +1,17 @@
+{
+  "verdict": "request_changes",
+  "summary": "The two-unit criterion still fails.",
+  "findings": [
+    {
+      "file": "pricing.py",
+      "line": 2,
+      "severity": "blocker",
+      "message": "total_cents(125, 2) returns 125 instead of 250."
+    },
+    {
+      "file": "pricing.py",
+      "severity": "nit",
+      "message": "The function has no docstring."
+    }
+  ]
+}

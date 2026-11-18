@@ -108,7 +108,7 @@ pub struct AtomError {
 
 /// Split `text` into frontmatter (with the line its first line is on) and body
 /// (with the line it starts on).
-fn split(text: &str) -> Option<(&str, &str, usize)> {
+pub(crate) fn split(text: &str) -> Option<(&str, &str, usize)> {
     let rest = text
         .strip_prefix("---\n")
         .or_else(|| text.strip_prefix("---\r\n"))?;
@@ -343,6 +343,13 @@ pub fn load(file: &Path, registry: &mut Registry) -> Result<Atom, AtomError> {
     // Lint: the output must lower to the generation profile, so a schema the
     // model cannot be constrained by fails now, before any tokens are spent.
     if kind != "exec" {
+        // A reference to a place in a file is lowered as that place.
+        let output_schema = if output_schema.get("$ref").is_some() {
+            crate::workflow::inline(&output_schema, Path::new(""), registry, 0)
+                .map_err(|m| fail(line_of("/output"), "/output", m))?
+        } else {
+            output_schema.clone()
+        };
         let output_file = registry
             .get(&output)
             .map(|e| e.file.clone())
@@ -494,8 +501,35 @@ fn schema_id(
                 ),
             ));
         }
-        return registry
+        let id = registry
             .load_file(&target)
+            .map_err(|e| ("/$ref".into(), e.to_string()))?;
+        let fragment = r.split_once('#').map_or("", |(_, f)| f);
+        if fragment.is_empty() {
+            return Ok(id);
+        }
+        // A place inside the file: check it exists, then register a schema
+        // that is exactly that place, by the file's absolute id, so the
+        // registry, lowering and workflow mapping all reach the same target.
+        let found = registry
+            .get(&id)
+            .is_some_and(|e| e.schema.pointer(fragment).is_some());
+        if !found {
+            return Err((
+                "/$ref".into(),
+                format!(
+                    "dangling reference: {r}: {} has no #{fragment}",
+                    target.display()
+                ),
+            ));
+        }
+        let uri_file = PathBuf::from(format!("{}?{role}", atom.display()));
+        let wrapper = serde_json::json!({
+            "$id": format!("file://{}", uri_file.display()),
+            "$ref": format!("{id}#{fragment}"),
+        });
+        return registry
+            .register(uri_file, wrapper)
             .map_err(|e| ("/$ref".into(), e.to_string()));
     }
     // An inline schema: registered under the atom's own URI, so relative

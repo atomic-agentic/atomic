@@ -8,13 +8,63 @@
 //! - publication commits the result and every write together, or nothing;
 //! - publishing the same candidate twice writes once;
 //! - a publication whose precondition fails commits nothing, records no
-//!   checkpoint and interrupts the execution.
+//!   checkpoint and interrupts the execution;
+//! - a publication and a takeover that race are ordered by the fence's row
+//!   lock: a takeover waits for a publication already past its fence, and a
+//!   publication that meets a takeover in progress is refused once the
+//!   takeover commits.
+//!
+//! The races interleave on PostgreSQL only. On SQLite every write
+//! transaction begins IMMEDIATE and so runs alone: a publication and a
+//! takeover cannot interleave, and holding one open to stage the race makes
+//! durare's own reads fail with SQLITE_BUSY instead of waiting. SQLite runs
+//! the same two orderings one after the other, with the same assertions.
 
 use super::*;
 use durare::{DurableEngine, SqliteProvider, StateProvider, WorkflowOptions};
 use serde_json::json;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::Notify;
+
+/// Where a test holds a publication inside its transaction, just after its
+/// fences: (signalled when it gets there, waited on before it goes on).
+type Pause = Arc<(Notify, Notify)>;
+
+/// Pause points by workflow id; a candidate's id starts with its workflow's.
+static PAUSES: LazyLock<Mutex<HashMap<String, Pause>>> = LazyLock::new(Mutex::default);
+
+fn pause_after_fences(workflow_id: &str) -> Pause {
+    let pause: Pause = Arc::default();
+    PAUSES
+        .lock()
+        .expect("pauses")
+        .insert(format!("{workflow_id}:"), pause.clone());
+    pause
+}
+
+/// Called by the publication transaction after its fences hold.
+pub(super) async fn after_fences(candidate_id: &str) {
+    let pause = PAUSES.lock().ok().and_then(|p| {
+        p.iter()
+            .find(|(prefix, _)| candidate_id.starts_with(prefix.as_str()))
+            .map(|(_, pause)| pause.clone())
+    });
+    if let Some(pause) = pause {
+        pause.0.notify_one();
+        pause.1.notified().await;
+    }
+}
+
+/// The fence an execution that owns run-1 at epoch 1 publishes behind.
+const FENCE: &str = "UPDATE run_epochs SET epoch = epoch WHERE epoch = ? AND run = ?";
+/// A fence that cannot run at all.
+const BROKEN: &str = "UPDATE no_such_table SET x = 1 WHERE ? = ?";
+/// A read of the same condition: true, but it locks nothing.
+const READ: &str =
+    "SELECT CASE WHEN epoch = ? THEN 1 ELSE 0 END AS ok FROM run_epochs WHERE run = ?";
 
 /// A name no other test in this process uses. The clock alone is not enough:
 /// macOS reports it in microseconds, and parallel tests start together.
@@ -100,6 +150,34 @@ fn register_common(engine: &mut DurableEngine) {
         })
         .await
     });
+}
+
+/// Wait until execution `id` has checkpointed its candidate and had its
+/// publication refused: interrupted, not finished, with no publish checkpoint.
+async fn assert_refused(engine: &DurableEngine, id: &str) -> Result<()> {
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        let steps = engine.get_workflow_steps(id).await?;
+        if steps.iter().any(|s| s.name == "turn") || Instant::now() > until {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let infos = engine.get_workflow_steps(id).await?;
+    let steps: Vec<String> = infos.into_iter().map(|s| s.name).collect();
+    assert_eq!(steps, ["turn"], "no checkpoint for the refused publication");
+    let status = engine
+        .list_workflows(&durare::ListFilter {
+            workflow_ids: vec![id.to_owned()],
+            ..durare::ListFilter::default()
+        })
+        .await?;
+    assert_eq!(
+        status[0].status, "PENDING",
+        "interrupted, not finished: {status:?}"
+    );
+    Ok(())
 }
 
 async fn setup(engine: &DurableEngine, epoch: i64) -> Result<()> {
@@ -227,11 +305,11 @@ async fn publication_is_all_or_nothing(provider: Arc<dyn StateProvider>) -> Resu
 }
 
 /// `epoch_now` is the run's epoch when publication happens; the execution
-/// expects 1. `broken` makes the precondition's query fail to run at all.
+/// expects 1 and publishes behind `fence`.
 async fn a_failed_precondition_commits_nothing(
     provider: Arc<dyn StateProvider>,
     epoch_now: i64,
-    broken: bool,
+    fence: &'static str,
 ) -> Result<bool> {
     let mut engine = DurableEngine::new(provider).await?;
     register_common(&mut engine);
@@ -246,12 +324,7 @@ async fn a_failed_precondition_commits_nothing(
         // This execution believes it owns run-1 at epoch 1.
         let fence = Precondition {
             what: "run-1 is still at epoch 1".into(),
-            sql: if broken {
-                "SELECT 1 AS ok FROM no_such_table WHERE ? = ?".into()
-            } else {
-                "SELECT CASE WHEN epoch = ? THEN 1 ELSE 0 END AS ok FROM run_epochs WHERE run = ?"
-                    .into()
-            },
+            sql: fence.into(),
             params: vec![json!(1), json!("run-1")],
         };
         publish_candidate(&ctx, "publish", &candidate, vec![fence]).await
@@ -264,34 +337,12 @@ async fn a_failed_precondition_commits_nothing(
     let handle = engine
         .start::<_, Value>("atom", (), WorkflowOptions::with_id(&id))
         .await?;
-    let published = if epoch_now == 1 && !broken {
+    let published = if epoch_now == 1 && fence == FENCE {
         assert_eq!(handle.result().await?, json!("published"));
         true
     } else {
-        // The execution is interrupted, not failed: wait until the candidate
-        // is checkpointed and the publish attempt has been refused.
-        let until = Instant::now() + Duration::from_secs(10);
-        loop {
-            let steps = engine.get_workflow_steps(&id).await?;
-            if steps.iter().any(|s| s.name == "turn") || Instant::now() > until {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        let infos = engine.get_workflow_steps(&id).await?;
-        let steps: Vec<String> = infos.into_iter().map(|s| s.name).collect();
-        assert_eq!(steps, ["turn"], "no checkpoint for the refused publication");
-        let status = engine
-            .list_workflows(&durare::ListFilter {
-                workflow_ids: vec![id.clone()],
-                ..durare::ListFilter::default()
-            })
-            .await?;
-        assert_eq!(
-            status[0].status, "PENDING",
-            "interrupted, not finished: {status:?}"
-        );
+        // The execution is interrupted, not failed.
+        assert_refused(&engine, &id).await?;
         false
     };
     let rows = counts(&engine).await?;
@@ -302,6 +353,159 @@ async fn a_failed_precondition_commits_nothing(
         assert_eq!(rows, (0, 0), "a refused publication writes nothing");
     }
     Ok(published)
+}
+
+/// Register the racing publication and the takeover. The takeover moves run-1
+/// to epoch 2 and returns how many publications it then sees; with `hold` it
+/// signals `taken` after its update and commits only once `release` fires.
+fn register_race(engine: &mut DurableEngine, taken: Arc<Notify>, release: Arc<Notify>) {
+    engine.register("racer", |ctx: DurableContext, (): ()| async move {
+        let candidate = execute_candidate(&ctx, "turn", || async {
+            Ok(Proposal {
+                output: json!("published"),
+                writes: vec![insert(Some("a"))],
+            })
+        })
+        .await?;
+        let fence = Precondition {
+            what: "run-1 is still at epoch 1".into(),
+            sql: FENCE.into(),
+            params: vec![json!(1), json!("run-1")],
+        };
+        publish_candidate(&ctx, "publish", &candidate, vec![fence]).await
+    });
+    engine.register("takeover", move |ctx: DurableContext, hold: bool| {
+        let (taken, release) = (taken.clone(), release.clone());
+        async move {
+            ctx.transaction("take", move |tx| {
+                let (taken, release) = (taken.clone(), release.clone());
+                Box::pin(async move {
+                    tx.execute("UPDATE run_epochs SET epoch = 2 WHERE run = 'run-1'", &[])
+                        .await?;
+                    if hold {
+                        taken.notify_one();
+                        release.notified().await;
+                    }
+                    let n = tx
+                        .query_one("SELECT COUNT(*) AS n FROM atomic_publications", &[])
+                        .await?;
+                    n.try_get::<i64>("n")
+                })
+            })
+            .await
+        }
+    });
+}
+
+async fn within<T>(what: &str, f: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(Duration::from_secs(10), f)
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
+}
+
+/// A publication already past its fence holds the ownership row: a takeover
+/// waits for it to commit, and then sees the publication. Without
+/// `interleave`, the takeover simply runs after the publication.
+async fn a_takeover_waits_for_a_fenced_publication(
+    provider: Arc<dyn StateProvider>,
+    interleave: bool,
+) -> Result<()> {
+    let mut engine = DurableEngine::new(provider).await?;
+    register_common(&mut engine);
+    register_race(&mut engine, Arc::default(), Arc::default());
+    engine.launch().await?;
+    setup(&engine, 1).await?;
+
+    let id = unique("race_publish_first");
+    let pause = interleave.then(|| pause_after_fences(&id));
+    let publication = engine
+        .start::<_, Value>("racer", (), WorkflowOptions::with_id(&id))
+        .await?;
+    let publication = match &pause {
+        Some(pause) => {
+            within("the publication to pass its fence", pause.0.notified()).await;
+            Some(publication)
+        }
+        None => {
+            let out = within("the publication", publication.result()).await?;
+            assert_eq!(out, json!("published"));
+            None
+        }
+    };
+
+    let takeover = engine
+        .start::<_, i64>(
+            "takeover",
+            false,
+            WorkflowOptions::with_id(unique("takeover")),
+        )
+        .await?;
+    let takeover = tokio::spawn(async move { takeover.result().await });
+    if let (Some(pause), Some(publication)) = (pause, publication) {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !takeover.is_finished(),
+            "the takeover must wait while a fenced publication is open"
+        );
+        pause.1.notify_one();
+        let out = within("the publication", publication.result()).await?;
+        assert_eq!(out, json!("published"));
+    }
+    let seen = within("the takeover", takeover)
+        .await
+        .map_err(|e| Error::app(e.to_string()))??;
+    assert_eq!(seen, 1, "the takeover is ordered after the publication");
+    assert_eq!(counts(&engine).await?, (1, 1));
+    engine.shutdown(Duration::from_secs(5)).await
+}
+
+/// A takeover that has moved the epoch but not yet committed holds the row: a
+/// publication waits at its fence, finds the new epoch once the takeover
+/// commits, and is refused with nothing written. Without `interleave`, the
+/// publication simply runs after the takeover.
+async fn a_publication_meeting_a_takeover_is_refused(
+    provider: Arc<dyn StateProvider>,
+    interleave: bool,
+) -> Result<()> {
+    let (taken, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    let mut engine = DurableEngine::new(provider).await?;
+    register_common(&mut engine);
+    register_race(&mut engine, taken.clone(), release.clone());
+    engine.launch().await?;
+    setup(&engine, 1).await?;
+
+    let takeover = engine
+        .start::<_, i64>(
+            "takeover",
+            interleave,
+            WorkflowOptions::with_id(unique("takeover")),
+        )
+        .await?;
+    let id = unique("race_takeover_first");
+    if interleave {
+        within("the takeover to update the epoch", taken.notified()).await;
+        let publication = engine
+            .start::<_, Value>("racer", (), WorkflowOptions::with_id(&id))
+            .await?;
+        // Let the publication reach its fence and wait there.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        release.notify_one();
+        assert_eq!(within("the takeover", takeover.result()).await?, 0);
+        drop(publication);
+    } else {
+        assert_eq!(within("the takeover", takeover.result()).await?, 0);
+        let publication = engine
+            .start::<_, Value>("racer", (), WorkflowOptions::with_id(&id))
+            .await?;
+        drop(publication);
+    }
+    assert_refused(&engine, &id).await?;
+    assert_eq!(
+        counts(&engine).await?,
+        (0, 0),
+        "the stale owner wrote nothing"
+    );
+    engine.shutdown(Duration::from_secs(5)).await
 }
 
 // ---------------------------------------------------------------------------
@@ -318,12 +522,24 @@ async fn publication_is_all_or_nothing_on_sqlite() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_precondition_commits_nothing_on_sqlite() -> Result<()> {
-    assert!(!a_failed_precondition_commits_nothing(sqlite().await?, 2, false).await?);
+    assert!(!a_failed_precondition_commits_nothing(sqlite().await?, 2, FENCE).await?);
     // A precondition that cannot be evaluated refuses too.
-    assert!(!a_failed_precondition_commits_nothing(sqlite().await?, 1, true).await?);
+    assert!(!a_failed_precondition_commits_nothing(sqlite().await?, 1, BROKEN).await?);
+    // A plain read locks nothing, so it never counts as a fence.
+    assert!(!a_failed_precondition_commits_nothing(sqlite().await?, 1, READ).await?);
     // The control: the same publication with the precondition holding.
-    assert!(a_failed_precondition_commits_nothing(sqlite().await?, 1, false).await?);
+    assert!(a_failed_precondition_commits_nothing(sqlite().await?, 1, FENCE).await?);
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_takeover_waits_for_a_fenced_publication_on_sqlite() -> Result<()> {
+    a_takeover_waits_for_a_fenced_publication(sqlite().await?, false).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_publication_meeting_a_takeover_is_refused_on_sqlite() -> Result<()> {
+    a_publication_meeting_a_takeover_is_refused(sqlite().await?, false).await
 }
 
 #[cfg(feature = "postgres-tests")]
@@ -341,8 +557,21 @@ async fn publication_is_all_or_nothing_on_postgres() -> Result<()> {
 #[cfg(feature = "postgres-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_precondition_commits_nothing_on_postgres() -> Result<()> {
-    assert!(!a_failed_precondition_commits_nothing(postgres().await?, 2, false).await?);
-    assert!(!a_failed_precondition_commits_nothing(postgres().await?, 1, true).await?);
-    assert!(a_failed_precondition_commits_nothing(postgres().await?, 1, false).await?);
+    assert!(!a_failed_precondition_commits_nothing(postgres().await?, 2, FENCE).await?);
+    assert!(!a_failed_precondition_commits_nothing(postgres().await?, 1, BROKEN).await?);
+    assert!(!a_failed_precondition_commits_nothing(postgres().await?, 1, READ).await?);
+    assert!(a_failed_precondition_commits_nothing(postgres().await?, 1, FENCE).await?);
     Ok(())
+}
+
+#[cfg(feature = "postgres-tests")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_takeover_waits_for_a_fenced_publication_on_postgres() -> Result<()> {
+    a_takeover_waits_for_a_fenced_publication(postgres().await?, true).await
+}
+
+#[cfg(feature = "postgres-tests")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_publication_meeting_a_takeover_is_refused_on_postgres() -> Result<()> {
+    a_publication_meeting_a_takeover_is_refused(postgres().await?, true).await
 }
