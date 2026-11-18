@@ -48,7 +48,8 @@ pub struct Inputs {
     pub require_pushed: bool,
     /// The sandbox's durable directory.
     pub durable: PathBuf,
-    /// Codex's state directory, when Codex runs in this sandbox.
+    /// Codex's state directory, when Codex runs in this sandbox. It must
+    /// exist, and its resolved path must lie on the durable directory.
     pub codex_home: Option<PathBuf>,
     /// The port exec-server listens on, when the runner serves one.
     pub exec_server_port: Option<u16>,
@@ -127,7 +128,7 @@ pub enum Reason {
         /// How many.
         ahead: u32,
     },
-    /// Pushes are required, but the worktree's branch has no upstream.
+    /// Pushes are required, but the worktree's branch has no existing upstream.
     NoUpstream,
     /// `CODEX_HOME` is not on the durable directory, so a snapshot that keeps
     /// only volumes would lose Codex's state.
@@ -291,14 +292,14 @@ pub fn check(inputs: &Inputs) -> Report {
         }
     }
 
-    if let Some(home) = inputs
-        .codex_home
-        .as_ref()
-        .filter(|home| !home.starts_with(&inputs.durable))
-    {
-        reasons.push(Reason::CodexHomeNotDurable {
-            codex_home: home.clone(),
-        });
+    if let Some(home) = &inputs.codex_home {
+        match durable_home(home, &inputs.durable) {
+            Ok(true) => {}
+            Ok(false) => reasons.push(Reason::CodexHomeNotDurable {
+                codex_home: home.clone(),
+            }),
+            Err(e) => reasons.push(failed("CODEX_HOME durability", e)),
+        }
     }
 
     // Lost needs both facts: the log says a turn is running, and the process
@@ -323,6 +324,18 @@ pub fn check(inputs: &Inputs) -> Report {
         exec_sessions,
         quiescent_for_ms: 0,
     }
+}
+
+fn durable_home(home: &Path, durable: &Path) -> Result<bool, String> {
+    let resolve = |path: &Path| {
+        let resolved = std::fs::canonicalize(path)
+            .map_err(|e| format!("resolving {}: {e}", path.display()))?;
+        if !resolved.is_dir() {
+            return Err(format!("{} is not a directory", path.display()));
+        }
+        Ok(resolved)
+    };
+    Ok(resolve(home)?.starts_with(resolve(durable)?))
 }
 
 /// How long a sandbox has been quiescent, from successive reports.
@@ -414,7 +427,8 @@ pub fn attempt_processes(
     let entries = std::fs::read_dir(proc_root)
         .map_err(|e| format!("reading {}: {e}", proc_root.display()))?;
     let mut out = Vec::new();
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("listing {}: {e}", proc_root.display()))?;
         let Some(pid) = entry
             .file_name()
             .to_str()
@@ -425,12 +439,17 @@ pub fn attempt_processes(
         if pid == 1 || exclude.contains(&pid) {
             continue;
         }
-        // A process can end between listing and reading; skip it.
-        let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else {
-            continue;
+        // Only disappearance proves the process ended. Permission and I/O
+        // errors leave its liveness unknown and must fail the whole scan.
+        let cmdline = match std::fs::read(entry.path().join("cmdline")) {
+            Ok(cmdline) => cmdline,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("reading PID {pid} cmdline: {e}")),
         };
-        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
-            continue;
+        let stat = match std::fs::read_to_string(entry.path().join("stat")) {
+            Ok(stat) => stat,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("reading PID {pid} stat: {e}")),
         };
         if cmdline.is_empty() || process_state(&stat) == Some('Z') {
             continue;
@@ -482,8 +501,12 @@ pub fn established_connections(table: &str, port: u16) -> usize {
 fn exec_server_connections(proc_root: &Path, port: u16) -> Result<usize, String> {
     let mut found = None;
     for table in ["net/tcp", "net/tcp6"] {
-        if let Ok(text) = std::fs::read_to_string(proc_root.join(table)) {
-            *found.get_or_insert(0) += established_connections(&text, port);
+        let path = proc_root.join(table);
+        match std::fs::read_to_string(&path) {
+            Ok(text) => *found.get_or_insert(0) += established_connections(&text, port),
+            // Kernels without an address family omit its table entirely.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("reading {}: {e}", path.display())),
         }
     }
     found.ok_or_else(|| format!("no TCP table under {}", proc_root.display()))
@@ -494,7 +517,7 @@ fn exec_server_connections(proc_root: &Path, port: u16) -> Result<usize, String>
 pub struct Worktree {
     /// Paths with uncommitted changes, untracked files included.
     pub changes: usize,
-    /// Whether the branch has an upstream.
+    /// Whether the branch's upstream ref exists.
     pub upstream: bool,
     /// Commits the upstream does not have.
     pub ahead: u32,
@@ -504,12 +527,109 @@ pub struct Worktree {
 ///
 /// The worktree is the attempt's output and untrusted, so nothing in it may
 /// run: system and global configuration are not read, and the repository's
-/// own settings that could execute a program (fsmonitor, hooks, pager) are
-/// overridden. `git` refuses a repository another user owns, which counts as
-/// a failed check.
+/// own settings that could execute a program (fsmonitor, hooks, pager and
+/// filters) are overridden. Filter discovery includes conditional config and
+/// initialized submodules, whose status inherits those overrides. `git`
+/// refuses a repository another user owns, which counts as a failed check.
+/// Files that need a content filter to match the index are conservatively
+/// reported as changed: the check cannot safely run that filter.
 pub fn worktree(git: &str, path: &Path) -> Result<Worktree, String> {
     let program = process::resolve(git)?;
-    let args = [
+    let mut filters = BTreeSet::new();
+    collect_filters(&program, path, &mut filters, 0)?;
+    let done = git_command(
+        &program,
+        path,
+        &filters,
+        &[
+            "status",
+            "--porcelain=v1",
+            "--branch",
+            "--untracked-files=normal",
+        ],
+    )?;
+    let out = git_output(done)?;
+    Ok(parse_status(&String::from_utf8_lossy(&out)))
+}
+
+/// Read config and the index without querying file contents or running a
+/// submodule's status. Drivers can exist only in a submodule or an includeIf
+/// file, so discover them in each actual repository context before status.
+fn collect_filters(
+    program: &Path,
+    path: &Path,
+    filters: &mut BTreeSet<String>,
+    depth: usize,
+) -> Result<(), String> {
+    if depth > 32 {
+        return Err("submodule nesting exceeds 32 repositories".into());
+    }
+    let done = git_command(
+        program,
+        path,
+        filters,
+        &[
+            "config",
+            "--includes",
+            "--null",
+            "--name-only",
+            "--get-regexp",
+            r"^filter\..*\.(clean|smudge|process|required)$",
+        ],
+    )?;
+    // git config exits 1 when no key matches, rather than emitting an error.
+    if done.code != Some(1) {
+        let out = git_output(done)?;
+        let keys = std::str::from_utf8(&out).map_err(|e| format!("filter config: {e}"))?;
+        for key in keys.split('\0').filter(|key| !key.is_empty()) {
+            let (driver, _) = key.rsplit_once('.').ok_or("invalid filter config key")?;
+            for setting in ["clean=", "smudge=", "process=", "required=false"] {
+                filters.insert(format!("{driver}.{setting}"));
+            }
+        }
+    }
+    let out = git_output(git_command(
+        program,
+        path,
+        filters,
+        &["ls-files", "--stage", "-z"],
+    )?)?;
+    for entry in out
+        .split(|b| *b == 0)
+        .filter(|entry| entry.starts_with(b"160000 "))
+    {
+        let tab = entry
+            .iter()
+            .position(|b| *b == b'\t')
+            .ok_or("invalid gitlink index entry")?;
+        let name = &entry[tab + 1..];
+        let name = std::str::from_utf8(name).map_err(|e| format!("submodule path: {e}"))?;
+        let relative = Path::new(name);
+        if relative
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            return Err("invalid submodule path".into());
+        }
+        let module = path.join(relative);
+        if module
+            .join(".git")
+            .try_exists()
+            .map_err(|e| format!("inspecting {}: {e}", module.display()))?
+        {
+            collect_filters(program, &module, filters, depth + 1)?;
+        }
+    }
+    Ok(())
+}
+
+fn git_command(
+    program: &Path,
+    path: &Path,
+    filters: &BTreeSet<String>,
+    command: &[&str],
+) -> Result<crate::Completed, String> {
+    let mut args = [
         "-c",
         "core.fsmonitor=false",
         "-c",
@@ -517,12 +637,13 @@ pub fn worktree(git: &str, path: &Path) -> Result<Worktree, String> {
         "-c",
         "core.pager=cat",
         "--no-optional-locks",
-        "status",
-        "--porcelain=v1",
-        "--branch",
-        "--untracked-files=normal",
     ]
-    .map(String::from);
+    .map(String::from)
+    .to_vec();
+    for setting in filters {
+        args.extend(["-c".into(), setting.clone()]);
+    }
+    args.extend(command.iter().map(|arg| (*arg).to_owned()));
     let env = [
         ("GIT_CONFIG_NOSYSTEM", "1"),
         ("GIT_CONFIG_GLOBAL", "/dev/null"),
@@ -531,8 +652,8 @@ pub fn worktree(git: &str, path: &Path) -> Result<Worktree, String> {
         ("LC_ALL", "C"),
     ]
     .map(|(k, v)| (k.to_owned(), v.to_owned()));
-    let done = process::run(
-        &program,
+    process::run(
+        program,
         &args,
         Some(path),
         &env,
@@ -543,15 +664,18 @@ pub fn worktree(git: &str, path: &Path) -> Result<Worktree, String> {
             stderr: process::STDERR_LIMIT,
         },
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| e.to_string())
+}
+
+fn git_output(done: crate::Completed) -> Result<Vec<u8>, String> {
     if !done.success() {
         return Err(format!(
-            "git status exited with {:?}: {}",
+            "git exited with {:?}: {}",
             done.code,
             String::from_utf8_lossy(&done.stderr).trim()
         ));
     }
-    Ok(parse_status(&String::from_utf8_lossy(&done.stdout)))
+    Ok(done.stdout)
 }
 
 /// `git status --porcelain=v1 --branch` output, as a [`Worktree`].
@@ -561,7 +685,8 @@ fn parse_status(out: &str) -> Worktree {
     let changes = lines.filter(|l| !l.is_empty()).count();
     // `## main...origin/main [ahead 2, behind 1]`, `## main`, or
     // `## No commits yet on main`.
-    let upstream = branch.starts_with("## ") && branch.contains("...");
+    let upstream =
+        branch.starts_with("## ") && branch.contains("...") && !branch.ends_with(" [gone]");
     let ahead = branch
         .split_once("[ahead ")
         .and_then(|(_, rest)| rest.split(|c: char| !c.is_ascii_digit()).next())

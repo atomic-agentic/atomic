@@ -15,6 +15,7 @@ pub mod config;
 pub mod context;
 pub mod evaluation;
 pub mod failure;
+pub mod git;
 pub mod lite;
 pub mod project;
 pub mod render;
@@ -24,5 +25,6 @@ pub mod state;
 pub mod testing;
 pub mod typed;
 pub mod workflow;
+pub mod worktree;
 
 pub use typed::{Approvals, Atom, AtomConfig, AtomError, AtomKind, MODEL_TIERS, Sandbox};

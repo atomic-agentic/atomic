@@ -78,6 +78,7 @@ impl Fixture {
         );
         f.tcp(&[(8080, "0A")]);
         f.write("work/run/events.jsonl", FINISHED.as_bytes());
+        std::fs::create_dir_all(f.path("work/codex-home")).expect("Codex home");
         let mut inputs = Inputs::new(f.path("work"));
         inputs.proc_root = f.path("proc");
         inputs.events = Some(f.path("work/run/events.jsonl"));
@@ -257,6 +258,7 @@ fn an_open_exec_server_session_is_busy() {
 fn codex_home_off_the_durable_directory_is_busy() {
     let (f, mut inputs) = Fixture::quiescent("codex-home");
     // A sibling whose name only starts with the durable directory's.
+    std::fs::create_dir_all(f.path("work2/codex-home")).expect("ephemeral home");
     inputs.codex_home = Some(f.path("work2/codex-home"));
     assert!(matches!(
         check(&inputs).reasons.as_slice(),
@@ -485,4 +487,258 @@ fn the_report_round_trips_as_json() {
         report.reasons[0].to_string(),
         "a Codex turn is open (command_execution in progress)"
     );
+}
+
+// Regressions for checks that used to report quiescence without proving it.
+#[test]
+fn unreadable_process_files_prevent_quiescence_and_lost_turns() {
+    use std::os::unix::fs::PermissionsExt;
+    for file in ["cmdline", "stat"] {
+        let (f, inputs) = Fixture::quiescent(&format!("denied-{file}"));
+        f.process(40, &["codex", "exec", "--json"], "codex", 'S');
+        let path = f.path(&format!("proc/40/{file}"));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("deny");
+        assert_eq!(
+            std::fs::read(&path)
+                .expect_err("file must be unreadable")
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        for log in [FINISHED, IN_PROGRESS] {
+            f.write("work/run/events.jsonl", log.as_bytes());
+            let report = check(&inputs);
+            assert_eq!(report.state, State::Busy, "{file}: {report:?}");
+            assert!(report.reasons.iter().any(|r| matches!(
+                r, Reason::CheckFailed { check, .. } if check == "processes"
+            )));
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("restore");
+        assert_eq!(
+            attempt_processes(&inputs.proc_root, &inputs.runner_pids)
+                .expect("scan")
+                .len(),
+            1
+        );
+    }
+}
+
+#[test]
+fn processes_that_disappear_during_the_scan_are_ignored() {
+    let f = Fixture::new("exited-processes");
+    std::fs::create_dir_all(f.path("proc/40")).expect("pid dir");
+    f.write("proc/41/cmdline", b"codex\0");
+    assert!(
+        attempt_processes(&f.path("proc"), &BTreeSet::new())
+            .expect("scan")
+            .is_empty()
+    );
+}
+
+#[test]
+fn either_unreadable_tcp_table_prevents_quiescence() {
+    use std::os::unix::fs::PermissionsExt;
+    for table in ["tcp", "tcp6"] {
+        let (f, inputs) = Fixture::quiescent(&format!("denied-{table}"));
+        f.write("proc/net/tcp6", b"sl local_address remote_address st\n");
+        let path = f.path(&format!("proc/net/{table}"));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("deny");
+        assert_eq!(
+            std::fs::read(&path).expect_err("unreadable table").kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let report = check(&inputs);
+        assert_eq!(report.state, State::Busy, "{table}: {report:?}");
+        assert!(report.reasons.iter().any(|r| matches!(
+            r, Reason::CheckFailed { check, .. } if check == "exec-server sessions"
+        )));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("restore");
+        assert!(check(&inputs).quiescent());
+    }
+}
+
+#[test]
+fn tcp_families_that_are_not_available_and_sessions_are_distinguished() {
+    let (f, inputs) = Fixture::quiescent("tcp-families");
+    // The fixture has no IPv6 table, as on a kernel without IPv6 support.
+    assert!(check(&inputs).quiescent());
+    let connected = b"sl local_address remote_address st\n0: 00000000000000000000000000000000:1F90 00000000000000000000000001000000:C350 01 0\n";
+    f.write("proc/net/tcp6", connected);
+    assert_eq!(check(&inputs).exec_sessions, 1);
+    std::fs::remove_file(f.path("proc/net/tcp")).expect("remove IPv4");
+    assert_eq!(check(&inputs).exec_sessions, 1);
+    std::fs::remove_file(f.path("proc/net/tcp6")).expect("remove IPv6");
+    assert_eq!(check(&inputs).state, State::Busy);
+}
+
+#[test]
+fn codex_home_symlinks_and_parent_components_cannot_escape_durability() {
+    let (f, mut inputs) = Fixture::quiescent("resolved-home");
+    std::fs::create_dir_all(f.path("ephemeral/home")).expect("ephemeral home");
+    std::os::unix::fs::symlink(f.path("ephemeral/home"), f.path("work/escape")).expect("symlink");
+    for home in ["work/escape", "work/../ephemeral/home"] {
+        inputs.codex_home = Some(f.path(home));
+        assert!(matches!(
+            check(&inputs).reasons.as_slice(),
+            [Reason::CodexHomeNotDurable { .. }]
+        ));
+    }
+    std::fs::create_dir_all(f.path("work/real-home")).expect("durable home");
+    std::os::unix::fs::symlink(f.path("work/real-home"), f.path("home-alias")).expect("home alias");
+    inputs.codex_home = Some(f.path("home-alias"));
+    assert!(check(&inputs).quiescent());
+    std::os::unix::fs::symlink(f.path("work"), f.path("volume-alias")).expect("volume alias");
+    inputs.durable = f.path("volume-alias");
+    assert!(check(&inputs).quiescent());
+}
+
+#[test]
+fn unverifiable_codex_home_durability_fails_closed() {
+    let (f, mut inputs) = Fixture::quiescent("unknown-home");
+    for home in ["work/missing", "work/not-a-directory"] {
+        if home.ends_with("not-a-directory") {
+            f.write(home, b"file");
+        }
+        inputs.codex_home = Some(f.path(home));
+        assert_eq!(check(&inputs).state, State::Busy);
+    }
+    std::fs::create_dir_all(f.path("work/existing-home")).expect("home");
+    inputs.codex_home = Some(f.path("work/existing-home"));
+    inputs.durable = f.path("missing-volume");
+    assert_eq!(check(&inputs).state, State::Busy);
+}
+
+#[test]
+fn a_gone_upstream_does_not_prove_local_commits_were_pushed() {
+    let (f, mut inputs) = Fixture::quiescent("gone-upstream");
+    let dir = repo(&f);
+    inputs.worktree = Some(dir.clone());
+    git(&dir, &["remote", "add", "origin", "unused"]);
+    git(&dir, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    git(&dir, &["branch", "--set-upstream-to=origin/main"]);
+    assert!(check(&inputs).quiescent());
+    std::fs::write(dir.join("a.txt"), "unpublished\n").expect("edit");
+    git(&dir, &["commit", "-qam", "unpublished"]);
+    assert_eq!(check(&inputs).reasons, vec![Reason::Unpushed { ahead: 1 }]);
+    git(&dir, &["update-ref", "-d", "refs/remotes/origin/main"]);
+    assert_eq!(check(&inputs).reasons, vec![Reason::NoUpstream]);
+    inputs.require_pushed = false;
+    assert!(check(&inputs).quiescent());
+}
+
+fn configure_filter(f: &Fixture, dir: &Path, field: &str, conditional: bool) -> PathBuf {
+    let marker = f.path("filter.ran");
+    let command = if field == "process" {
+        format!("touch '{}'; exit 1", marker.display())
+    } else {
+        format!("touch '{}'; cat", marker.display())
+    };
+    if conditional {
+        let config = f.path("conditional.config");
+        std::fs::write(
+            &config,
+            format!("[filter \"hostile.Driver\"]\n{field} = {command}\n"),
+        )
+        .expect("config");
+        let gitdir = std::process::Command::new("git")
+            .args(["rev-parse", "--absolute-git-dir"])
+            .current_dir(dir)
+            .output()
+            .expect("git dir");
+        assert!(gitdir.status.success());
+        let gitdir = String::from_utf8(gitdir.stdout).expect("git dir path");
+        git(
+            dir,
+            &[
+                "config",
+                &format!("includeIf.gitdir:{}.path", gitdir.trim()),
+                config.to_str().expect("path"),
+            ],
+        );
+    } else {
+        git(
+            dir,
+            &[
+                "config",
+                &format!("filter.hostile.Driver.{field}"),
+                &command,
+            ],
+        );
+    }
+    git(dir, &["config", "filter.hostile.Driver.required", "true"]);
+    marker
+}
+
+#[test]
+fn clean_and_process_filters_from_local_and_conditional_config_never_run() {
+    for field in ["clean", "process"] {
+        for conditional in [false, true] {
+            let f = Fixture::new(&format!("filter-{field}-{conditional}"));
+            let dir = repo(&f);
+            std::fs::write(dir.join(".gitattributes"), "a.txt filter=hostile.Driver\n")
+                .expect("attributes");
+            git(&dir, &["add", ".gitattributes"]);
+            git(&dir, &["commit", "-qm", "attributes"]);
+            let marker = configure_filter(&f, &dir, field, conditional);
+            std::fs::write(dir.join("a.txt"), "b\n").expect("same-size edit");
+            // A process filter that exits before its handshake can make Git
+            // fail; execution, rather than the exit status, is the control.
+            let control = std::process::Command::new("git")
+                .args(["status", "--porcelain"])
+                .current_dir(&dir)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .expect("plain status");
+            assert!(
+                marker.exists(),
+                "plain status must execute {field}, conditional={conditional}: {control:?}"
+            );
+            std::fs::remove_file(&marker).expect("reset marker");
+            assert_eq!(worktree("git", &dir).expect("safe status").changes, 1);
+            assert!(
+                !marker.exists(),
+                "status executed {field}, conditional={conditional}"
+            );
+        }
+    }
+}
+
+#[test]
+fn filters_defined_only_in_submodules_never_run() {
+    let f = Fixture::new("submodule-filter");
+    let source = repo(&f);
+    std::fs::write(
+        source.join(".gitattributes"),
+        "a.txt filter=hostile.Driver\n",
+    )
+    .expect("attributes");
+    git(&source, &["add", ".gitattributes"]);
+    git(&source, &["commit", "-qm", "attributes"]);
+    let parent = f.path("parent");
+    std::fs::create_dir_all(&parent).expect("parent");
+    git(&parent, &["init", "-q"]);
+    git(
+        &parent,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            source.to_str().expect("source"),
+            "module",
+        ],
+    );
+    git(&parent, &["commit", "-qam", "submodule"]);
+    let module = parent.join("module");
+    let marker = configure_filter(&f, &module, "clean", false);
+    std::fs::write(module.join("a.txt"), "b\n").expect("same-size edit");
+    git(&parent, &["status", "--porcelain"]);
+    assert!(
+        marker.exists(),
+        "plain parent status must execute the module filter"
+    );
+    std::fs::remove_file(&marker).expect("reset marker");
+    assert_eq!(worktree("git", &parent).expect("safe status").changes, 1);
+    assert!(!marker.exists(), "submodule filter ran");
 }

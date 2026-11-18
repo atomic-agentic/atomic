@@ -175,69 +175,199 @@ fn params(ps: &[Param]) -> Vec<durare::Param> {
     ps.iter().cloned().map(Into::into).collect()
 }
 
-/// A row a transaction step's query returned.
-pub struct Row(durare::Row);
+/// A row a transaction's query returned.
+pub struct Row(RowInner);
+
+enum RowInner {
+    Engine(durare::Row),
+    Sqlite(sqlx::sqlite::SqliteRow),
+    Postgres(sqlx::postgres::PgRow),
+}
 
 impl Row {
     /// An integer column.
     pub fn int(&self, column: &str) -> Result<i64> {
-        self.0
-            .try_get::<i64>(column)
-            .or_else(|_| self.0.try_get::<i32>(column).map(i64::from))
-            .map_err(engine)
+        self.int_opt(column)?
+            .ok_or_else(|| DurableError::Engine(format!("column {column} is NULL")))
+    }
+
+    /// An integer column that may be `NULL`.
+    pub fn int_opt(&self, column: &str) -> Result<Option<i64>> {
+        use sqlx::Row as _;
+        match &self.0 {
+            RowInner::Engine(r) => r
+                .try_get::<Option<i64>>(column)
+                .or_else(|_| r.try_get::<Option<i32>>(column).map(|v| v.map(i64::from)))
+                .map_err(engine),
+            RowInner::Sqlite(r) => r.try_get::<Option<i64>, _>(column).map_err(db),
+            RowInner::Postgres(r) => r
+                .try_get::<Option<i64>, _>(column)
+                .or_else(|_| {
+                    r.try_get::<Option<i32>, _>(column)
+                        .map(|v| v.map(i64::from))
+                })
+                .map_err(db),
+        }
     }
 
     /// A text column.
     pub fn text(&self, column: &str) -> Result<String> {
-        self.0.try_get::<String>(column).map_err(engine)
+        self.text_opt(column)?
+            .ok_or_else(|| DurableError::Engine(format!("column {column} is NULL")))
     }
 
     /// A text column that may be `NULL`.
     pub fn text_opt(&self, column: &str) -> Result<Option<String>> {
-        self.0.try_get::<Option<String>>(column).map_err(engine)
+        use sqlx::Row as _;
+        match &self.0 {
+            RowInner::Engine(r) => r.try_get::<Option<String>>(column).map_err(engine),
+            RowInner::Sqlite(r) => r.try_get::<Option<String>, _>(column).map_err(db),
+            RowInner::Postgres(r) => r.try_get::<Option<String>, _>(column).map_err(db),
+        }
     }
 }
 
-/// The open transaction of a transaction step. Its writes commit together
-/// with the step's checkpoint, or not at all. SQL uses `?` placeholders on
-/// every backend.
-pub struct Tx<'t, 'c>(&'t mut durare::Tx<'c>);
+/// An open transaction: a transaction step's, whose writes commit together
+/// with the step's checkpoint, or a short control transaction outside any
+/// workflow (see [`DurableRuntime::control_transaction`]). Either way its writes
+/// commit together or not at all. SQL uses `?` placeholders on every backend.
+pub struct Tx<'t, 'c>(TxInner<'t, 'c>);
+
+enum TxInner<'t, 'c> {
+    Engine(&'t mut durare::Tx<'c>),
+    Sqlite(&'t mut sqlx::SqliteConnection),
+    Postgres(&'t mut sqlx::PgConnection),
+}
+
+/// `sql` with each `?` outside a quoted string turned into `$1`, `$2`, ...
+fn to_pg(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len() + 8);
+    let (mut n, mut quoted) = (0, false);
+    for c in sql.chars() {
+        match c {
+            '\'' => {
+                quoted = !quoted;
+                out.push(c);
+            }
+            '?' if !quoted => {
+                n += 1;
+                out.push('$');
+                out.push_str(&n.to_string());
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+type SqliteQuery<'q> = sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments>;
+type PgQuery<'q> = sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>;
+
+fn bind_sqlite<'q>(mut q: SqliteQuery<'q>, ps: &[Param]) -> SqliteQuery<'q> {
+    for p in ps {
+        q = match p.clone() {
+            Param::Null => q.bind(None::<String>),
+            Param::Int(v) => q.bind(v),
+            Param::Float(v) => q.bind(v),
+            Param::Text(v) => q.bind(v),
+            Param::Bool(v) => q.bind(v),
+            Param::Bytes(v) => q.bind(v),
+        };
+    }
+    q
+}
+
+fn bind_pg<'q>(mut q: PgQuery<'q>, ps: &[Param]) -> PgQuery<'q> {
+    for p in ps {
+        q = match p.clone() {
+            Param::Null => q.bind(None::<String>),
+            Param::Int(v) => q.bind(v),
+            Param::Float(v) => q.bind(v),
+            Param::Text(v) => q.bind(v),
+            Param::Bool(v) => q.bind(v),
+            Param::Bytes(v) => q.bind(v),
+        };
+    }
+    q
+}
 
 impl Tx<'_, '_> {
     /// Run a statement; returns the rows it affected.
     pub async fn execute(&mut self, sql: &str, ps: &[Param]) -> Result<u64> {
-        self.0.execute(sql, &params(ps)).await.map_err(engine)
+        match &mut self.0 {
+            TxInner::Engine(tx) => tx.execute(sql, &params(ps)).await.map_err(engine),
+            TxInner::Sqlite(c) => {
+                let q = bind_sqlite(sqlx::query(sqlx::AssertSqlSafe(sql.to_owned())), ps);
+                Ok(q.execute(&mut **c).await.map_err(db)?.rows_affected())
+            }
+            TxInner::Postgres(c) => {
+                let q = bind_pg(sqlx::query(sqlx::AssertSqlSafe(to_pg(sql))), ps);
+                Ok(q.execute(&mut **c).await.map_err(db)?.rows_affected())
+            }
+        }
     }
 
     /// Run a query that returns at most one row.
     pub async fn query_opt(&mut self, sql: &str, ps: &[Param]) -> Result<Option<Row>> {
-        Ok(self
-            .0
-            .query_opt(sql, &params(ps))
-            .await
-            .map_err(engine)?
-            .map(Row))
+        Ok(match &mut self.0 {
+            TxInner::Engine(tx) => tx
+                .query_opt(sql, &params(ps))
+                .await
+                .map_err(engine)?
+                .map(|r| Row(RowInner::Engine(r))),
+            TxInner::Sqlite(c) => {
+                let q = bind_sqlite(sqlx::query(sqlx::AssertSqlSafe(sql.to_owned())), ps);
+                q.fetch_optional(&mut **c)
+                    .await
+                    .map_err(db)?
+                    .map(|r| Row(RowInner::Sqlite(r)))
+            }
+            TxInner::Postgres(c) => {
+                let q = bind_pg(sqlx::query(sqlx::AssertSqlSafe(to_pg(sql))), ps);
+                q.fetch_optional(&mut **c)
+                    .await
+                    .map_err(db)?
+                    .map(|r| Row(RowInner::Postgres(r)))
+            }
+        })
     }
 
     /// Run a query that returns exactly one row.
     pub async fn query_one(&mut self, sql: &str, ps: &[Param]) -> Result<Row> {
-        self.0
-            .query_one(sql, &params(ps))
-            .await
-            .map(Row)
-            .map_err(engine)
+        self.query_opt(sql, ps)
+            .await?
+            .ok_or_else(|| DurableError::Engine("query_one: no rows returned".into()))
     }
 
     /// Run a query and return every row.
     pub async fn query_all(&mut self, sql: &str, ps: &[Param]) -> Result<Vec<Row>> {
-        Ok(self
-            .0
-            .query_all(sql, &params(ps))
-            .await
-            .map_err(engine)?
-            .into_iter()
-            .map(Row)
-            .collect())
+        Ok(match &mut self.0 {
+            TxInner::Engine(tx) => tx
+                .query_all(sql, &params(ps))
+                .await
+                .map_err(engine)?
+                .into_iter()
+                .map(|r| Row(RowInner::Engine(r)))
+                .collect(),
+            TxInner::Sqlite(c) => {
+                let q = bind_sqlite(sqlx::query(sqlx::AssertSqlSafe(sql.to_owned())), ps);
+                q.fetch_all(&mut **c)
+                    .await
+                    .map_err(db)?
+                    .into_iter()
+                    .map(|r| Row(RowInner::Sqlite(r)))
+                    .collect()
+            }
+            TxInner::Postgres(c) => {
+                let q = bind_pg(sqlx::query(sqlx::AssertSqlSafe(to_pg(sql))), ps);
+                q.fetch_all(&mut **c)
+                    .await
+                    .map_err(db)?
+                    .into_iter()
+                    .map(|r| Row(RowInner::Postgres(r)))
+                    .collect()
+            }
+        })
     }
 }
 
@@ -267,6 +397,21 @@ pub trait WorkflowContext: Clone + Send + Sync + 'static {
     where
         T: Serialize + DeserializeOwned + Send + 'static,
         F: for<'t, 'c> Fn(Tx<'t, 'c>) -> TxFuture<'t, T> + Send + Sync + 'static;
+
+    /// Wait up to `timeout` for the oldest message sent to this workflow on
+    /// `topic` (see [`DurableRuntime::send`]) and take it. The message taken,
+    /// or `None` for a timeout, is recorded as this operation's output, so a
+    /// replay returns it without taking another. The deadline is durable: it
+    /// is fixed the first time the wait finds no message, and a wait resumed
+    /// after a crash waits only for what remains of it, however long the
+    /// process was down.
+    fn recv<T>(
+        &self,
+        topic: &str,
+        timeout: Duration,
+    ) -> impl Future<Output = Result<Option<T>>> + Send
+    where
+        T: DeserializeOwned + Send + 'static;
 }
 
 /// A durable-execution engine: atomic's only way to one.
@@ -313,6 +458,31 @@ pub trait DurableRuntime: Send + Sync + Sized {
     /// Run again every unfinished workflow this process may recover.
     /// Returns how many it started.
     fn recover(&self) -> impl Future<Output = Result<usize>> + Send;
+
+    /// Send `message` to workflow `run` on `topic`, from outside any
+    /// workflow, for its [`recv`](WorkflowContext::recv). Delivered at most
+    /// once per `key`: a second send with the same key and destination does
+    /// nothing, so a caller that is unsure whether a send arrived can send
+    /// again. A message whose JSON is `null` reads as a timeout, so send
+    /// something else.
+    fn send<T>(
+        &self,
+        run: &str,
+        topic: &str,
+        message: T,
+        key: &str,
+    ) -> impl Future<Output = Result<()>> + Send
+    where
+        T: Serialize + Send;
+
+    /// Run `body` in one short transaction on atomic's tables, outside any
+    /// workflow, and commit it: for control records, such as a gate decision,
+    /// that a person's command writes. Its writes commit together or not at
+    /// all; an error rolls them back. The body runs once and should be short.
+    fn control_transaction<T, F>(&self, body: F) -> impl Future<Output = Result<T>> + Send
+    where
+        T: Send + 'static,
+        F: for<'t, 'c> Fn(Tx<'t, 'c>) -> TxFuture<'t, T> + Send + Sync + 'static;
 
     /// Stop, giving running work up to `timeout` to finish.
     fn shutdown(&self, timeout: Duration) -> impl Future<Output = Result<()>> + Send;
@@ -393,9 +563,22 @@ impl WorkflowContext for DurareContext {
     {
         // As for a step, the position is claimed now.
         let pending = self.0.transaction(name, move |tx| {
-            let fut = body(Tx(tx));
+            let fut = body(Tx(TxInner::Engine(tx)));
             Box::pin(async move { fut.await.map_err(to_durare) })
         });
+        async move { pending.await.map_err(from_durare) }
+    }
+
+    fn recv<T>(
+        &self,
+        topic: &str,
+        timeout: Duration,
+    ) -> impl Future<Output = Result<Option<T>>> + Send
+    where
+        T: DeserializeOwned + Send + 'static,
+    {
+        // As for a step, the position is claimed now.
+        let pending = self.0.recv::<T>(topic, timeout);
         async move { pending.await.map_err(from_durare) }
     }
 }
@@ -409,7 +592,7 @@ enum Reads {
 
 /// [`DurableRuntime`] on the durare fork, over SQLite or PostgreSQL.
 pub struct Durare {
-    engine: durare::DurableEngine,
+    pub(crate) engine: durare::DurableEngine,
     reads: Reads,
     /// Handles of workflows this process started, by id: waiting on one
     /// follows that execution, including a crash, which a lookup by id would
@@ -642,6 +825,49 @@ impl DurableRuntime for Durare {
 
     async fn recover(&self) -> Result<usize> {
         self.engine.recover().await.map_err(from_durare)
+    }
+
+    fn send<T>(
+        &self,
+        run: &str,
+        topic: &str,
+        message: T,
+        key: &str,
+    ) -> impl Future<Output = Result<()>> + Send
+    where
+        T: Serialize + Send,
+    {
+        let (run, topic, key) = (run.to_owned(), topic.to_owned(), key.to_owned());
+        async move {
+            self.engine
+                .send_with_idempotency_key(&run, message, &topic, &key)
+                .await
+                .map_err(from_durare)
+        }
+    }
+
+    async fn control_transaction<T, F>(&self, body: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: for<'t, 'c> Fn(Tx<'t, 'c>) -> TxFuture<'t, T> + Send + Sync + 'static,
+    {
+        match &self.reads {
+            Reads::Sqlite(pool) => {
+                // IMMEDIATE takes the write lock up front, so a read
+                // followed by a write in the body cannot lose a race to
+                // another writer between the two.
+                let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.map_err(db)?;
+                let out = body(Tx(TxInner::Sqlite(&mut tx))).await?;
+                tx.commit().await.map_err(db)?;
+                Ok(out)
+            }
+            Reads::Postgres(pool) => {
+                let mut tx = pool.begin().await.map_err(db)?;
+                let out = body(Tx(TxInner::Postgres(&mut tx))).await?;
+                tx.commit().await.map_err(db)?;
+                Ok(out)
+            }
+        }
     }
 
     async fn shutdown(&self, timeout: Duration) -> Result<()> {

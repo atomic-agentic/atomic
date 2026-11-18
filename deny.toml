@@ -106,15 +106,16 @@ unknown-git = "deny"
 # Every git dependency is pinned to a commit.
 required-git-spec = "rev"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-# The git sources atomic's dependency graph resolves: Codex, the forks it
-# patches in and its git dependencies (see Codex's deny.toml), and the durare
-# fork (deps/forks.toml). A source the graph stops using is removed here.
+# The git sources atomic's dependency graph resolves: Codex (from atomic's
+# fork), the forks it patches in and its git dependencies (see Codex's
+# deny.toml), and the durare fork (deps/forks.toml). A source the graph stops
+# using is removed here.
 allow-git = [
+    "https://github.com/atomic-agentic/codex",
     "https://github.com/atomic-agentic/durare",
     "https://github.com/helix-editor/nucleo.git",
     "https://github.com/microsoft/mxc",
     "https://github.com/modelcontextprotocol/rust-sdk",
-    "https://github.com/openai/codex",
     "https://github.com/openai-oss-forks/tokio-tungstenite",
     "https://github.com/openai-oss-forks/tungstenite-rs",
     "https://github.com/transact-rs/sqlx",

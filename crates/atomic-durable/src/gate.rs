@@ -1,0 +1,835 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! Gates: a person's sign-off between steps, durable across crashes.
+//!
+//! A gate is two things:
+//!
+//! - **A row in the gate store**, `atomic_gates` in atomic's database: the run
+//!   and step it belongs to, its title, what it shows, the digests of its
+//!   evidence, a proposal digest binding all three, its approvers, risk tier
+//!   and deadline, and, once there is one, its resolution and who made it.
+//!   The store needs no work graph.
+//! - **A durable receive** in the workflow, which the decision completes.
+//!
+//! [`gate`] is the workflow side, three kinds of sibling operation and never
+//! one inside another: a transaction step opens the row (once), a receive
+//! waits for a wake-up, and a transaction step reads the resolution back
+//! from the store. The receive is only a wake-up. What passes the gate is
+//! the store row, read by this run's own gate id and checked against this
+//! run and the proposal digest the workflow computes from what it shows, so
+//! a recorded receive (forged, imported or copied from another run) cannot
+//! approve anything.
+//!
+//! [`decide`] is the person's side: an idempotent command with a client-made
+//! command id, committed in one short transaction before it is
+//! acknowledged. The first durable resolution wins; a replayed command gets
+//! its original result back, and any other command on a resolved gate gets a
+//! [`DecideError::Conflict`] carrying the resolution that won. Only after the
+//! commit does it send the wake-up, keyed by the gate id so a repeat sends
+//! nothing new; [`redeliver`] sends again for resolved gates whose runs are
+//! still waiting, for a decider that stopped between the two.
+//!
+//! A deadline is a wall-clock time fixed when the gate opens. It runs on
+//! while atomic is offline: a gate whose deadline has passed resolves as
+//! expired the next time anything looks at it, before the workflow goes on,
+//! and a decision that arrives after it gets the expiry as its conflict.
+
+pub mod approvers;
+
+pub use approvers::{ApproverError, Approvers, Deployment, Principal, resolve};
+
+use crate::failpoint;
+use crate::runtime::{
+    DurableError, DurableRuntime, Param, Result, Row, RunStatus, Tx, WorkflowContext,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// A gate's risk tier. On a high-tier gate only a person can approve.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Tier {
+    /// A reviewer's verdict may approve.
+    Low,
+    /// Approval needs a person.
+    #[default]
+    High,
+}
+
+impl Tier {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::High => "high",
+        }
+    }
+
+    fn parse(s: &str) -> Result<Self> {
+        match s {
+            "low" => Ok(Self::Low),
+            "high" => Ok(Self::High),
+            other => Err(corrupt(format!("unknown tier {other:?}"))),
+        }
+    }
+}
+
+/// What a gate's deadline does when it passes undecided.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OnTimeout {
+    /// The gate expires, which authorizes nothing: the run does not pass it.
+    #[default]
+    Reject,
+}
+
+impl OnTimeout {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Reject => "reject",
+        }
+    }
+
+    fn parse(s: &str) -> Result<Self> {
+        match s {
+            "reject" => Ok(Self::Reject),
+            other => Err(corrupt(format!("unknown on_timeout {other:?}"))),
+        }
+    }
+}
+
+/// A person's verdict on a gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Verdict {
+    /// The run may pass the gate.
+    Approve,
+    /// It may not.
+    Reject,
+}
+
+impl Verdict {
+    fn state(self) -> &'static str {
+        match self {
+            Self::Approve => "approved",
+            Self::Reject => "rejected",
+        }
+    }
+}
+
+/// A recorded decision.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Decision {
+    /// Approve or reject.
+    pub verdict: Verdict,
+    /// Who decided.
+    pub by: Principal,
+    /// What they said, if anything.
+    pub comment: Option<String>,
+    /// The command that recorded it.
+    pub command: String,
+    /// When, in milliseconds since the Unix epoch.
+    pub at: i64,
+}
+
+/// How a gate was resolved: the first durable resolution, which never
+/// changes afterwards.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Resolution {
+    /// A person decided.
+    Decided(Decision),
+    /// The deadline passed first.
+    Expired {
+        /// When the expiry was recorded, in milliseconds since the Unix epoch.
+        at: i64,
+        /// What the deadline did.
+        on_timeout: OnTimeout,
+    },
+}
+
+impl Resolution {
+    /// Whether it lets the run pass the gate.
+    pub fn approved(&self) -> bool {
+        matches!(
+            self,
+            Self::Decided(Decision {
+                verdict: Verdict::Approve,
+                ..
+            })
+        )
+    }
+}
+
+/// What a workflow asks for when it opens a gate. Built by workflow code
+/// from the workflow's definition; it cannot be deserialized, so a model's
+/// output cannot become one, and its [`Approvers`] come only from
+/// [`resolve`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct GateSpec {
+    /// The workflow's name.
+    pub workflow: String,
+    /// What the person is asked.
+    pub title: String,
+    /// What they are shown.
+    pub show: Value,
+    /// Content digests (`sha256:<hex>`) of the artifacts the gate shows as
+    /// evidence.
+    pub evidence: Vec<String>,
+    /// Who may decide.
+    pub approvers: Approvers,
+    /// The risk tier.
+    pub tier: Tier,
+    /// How long the gate waits from when it opens, or `None` for no deadline.
+    pub timeout: Option<Duration>,
+    /// What the deadline does.
+    pub on_timeout: OnTimeout,
+}
+
+/// A gate as the store records it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Gate {
+    /// Its id, `<run>:<step>`.
+    pub id: String,
+    /// The run (workflow id) it belongs to.
+    pub run: String,
+    /// The workflow's name.
+    pub workflow: String,
+    /// The gate's step name in the workflow.
+    pub step: String,
+    /// What the person is asked.
+    pub title: String,
+    /// What they are shown.
+    pub show: Value,
+    /// Evidence digests.
+    pub evidence: Vec<String>,
+    /// The proposal digest: SHA-256 over the title, what is shown and the
+    /// evidence digests. A decision names the digest it was made on.
+    pub proposal: String,
+    /// Who may decide.
+    pub approvers: Vec<Principal>,
+    /// The risk tier.
+    pub tier: Tier,
+    /// When it opened, in milliseconds since the Unix epoch.
+    pub opened_at: i64,
+    /// Its deadline, in milliseconds since the Unix epoch.
+    pub deadline: Option<i64>,
+    /// What the deadline does.
+    pub on_timeout: OnTimeout,
+    /// How it was resolved, once it has been.
+    pub resolution: Option<Resolution>,
+}
+
+/// A person's decision on a gate, sent as an idempotent command.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecisionCommand {
+    /// A command id the client made, unique per decision it means to send.
+    /// Sending the same command again returns the same result; reusing the
+    /// id for a different command is refused.
+    pub command_id: String,
+    /// The gate.
+    pub gate: String,
+    /// Approve or reject.
+    pub verdict: Verdict,
+    /// A comment, passed on with the decision.
+    pub comment: Option<String>,
+    /// The proposal digest of what the person was shown. A decision on
+    /// anything else is refused.
+    pub proposal: String,
+}
+
+/// Why a decision was not recorded.
+#[derive(Clone, Debug, PartialEq, thiserror::Error)]
+pub enum DecideError {
+    /// There is no such gate.
+    #[error("no gate {0}")]
+    NoSuchGate(String),
+    /// The person is not one of the gate's approvers.
+    #[error("{who} is not an approver of gate {gate}")]
+    NotAnApprover {
+        /// The gate.
+        gate: String,
+        /// Who tried.
+        who: Principal,
+    },
+    /// The command id was already used for a different command.
+    #[error("command {0} was already used for a different decision")]
+    CommandReused(String),
+    /// The decision was made on a proposal the gate does not show.
+    #[error("gate {gate} shows proposal {current}, not {shown}; look at it again")]
+    ProposalChanged {
+        /// The gate.
+        gate: String,
+        /// The proposal digest the command named.
+        shown: String,
+        /// The gate's.
+        current: String,
+    },
+    /// The gate was already resolved, and not by this command.
+    #[error("gate {gate} was already resolved")]
+    Conflict {
+        /// The gate.
+        gate: String,
+        /// The resolution that won.
+        winning: Resolution,
+    },
+    /// The store failed; nothing was recorded.
+    #[error(transparent)]
+    Store(#[from] DurableError),
+}
+
+/// Which gates [`gates`] lists.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GateFilter {
+    /// Only gates that are still open.
+    pub open_only: bool,
+    /// Only the gates of this run.
+    pub run: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Ids, digests and time.
+
+/// The id of gate `step` in run `run`.
+pub fn gate_id(run: &str, step: &str) -> String {
+    format!("{run}:{step}")
+}
+
+/// The topic a gate's wake-up is sent on.
+fn topic(gate: &str) -> String {
+    format!("atomic.gate:{gate}")
+}
+
+/// The proposal digest of a gate showing `show` with `evidence` under
+/// `title`: SHA-256 over their canonical JSON, keys sorted.
+pub fn proposal_digest(title: &str, show: &Value, evidence: &[String]) -> String {
+    let mut bytes = Vec::new();
+    canonical(
+        &json!({"title": title, "show": show, "evidence": evidence}),
+        &mut bytes,
+    );
+    format!("sha256:{:x}", Sha256::digest(&bytes))
+}
+
+/// `value` as JSON with object keys in sorted order, whatever order the map
+/// keeps them in.
+fn canonical(value: &Value, out: &mut Vec<u8>) {
+    match value {
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            out.push(b'{');
+            for (i, k) in keys.into_iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                out.extend(Value::String(k.clone()).to_string().into_bytes());
+                out.push(b':');
+                canonical(&map[k], out);
+            }
+            out.push(b'}');
+        }
+        Value::Array(items) => {
+            out.push(b'[');
+            for (i, v) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                canonical(v, out);
+            }
+            out.push(b']');
+        }
+        other => out.extend(other.to_string().into_bytes()),
+    }
+}
+
+fn is_digest(s: &str) -> bool {
+    s.strip_prefix("sha256:")
+        .is_some_and(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// Milliseconds since the Unix epoch, now.
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+/// How long a wait with no deadline waits for: long enough to be forever.
+const NO_DEADLINE: Duration = Duration::from_secs(10 * 365 * 24 * 3600);
+
+fn corrupt(what: impl std::fmt::Display) -> DurableError {
+    DurableError::Engine(format!("the gate store: {what}"))
+}
+
+fn encode(v: &impl Serialize) -> Result<String> {
+    serde_json::to_string(v).map_err(corrupt)
+}
+
+fn decode<T: serde::de::DeserializeOwned>(s: &str) -> Result<T> {
+    serde_json::from_str(s).map_err(corrupt)
+}
+
+// ---------------------------------------------------------------------------
+// Rows.
+
+const COLUMNS: &str = "gate_id, run, workflow, step, title, show, evidence, proposal, \
+                       approvers, tier, opened_at, deadline, on_timeout, state, decided_by, \
+                       decided_at, comment, command_id";
+
+fn gate_from_row(row: &Row) -> Result<Gate> {
+    let state = row.text("state")?;
+    let on_timeout = OnTimeout::parse(&row.text("on_timeout")?)?;
+    let resolution = match state.as_str() {
+        "open" => None,
+        "expired" => Some(Resolution::Expired {
+            at: row.int("decided_at")?,
+            on_timeout,
+        }),
+        "approved" | "rejected" => Some(Resolution::Decided(Decision {
+            verdict: if state == "approved" {
+                Verdict::Approve
+            } else {
+                Verdict::Reject
+            },
+            by: Principal::stored(row.text("decided_by")?),
+            comment: row.text_opt("comment")?,
+            command: row.text("command_id")?,
+            at: row.int("decided_at")?,
+        })),
+        other => return Err(corrupt(format!("unknown gate state {other:?}"))),
+    };
+    Ok(Gate {
+        id: row.text("gate_id")?,
+        run: row.text("run")?,
+        workflow: row.text("workflow")?,
+        step: row.text("step")?,
+        title: row.text("title")?,
+        show: decode(&row.text("show")?)?,
+        evidence: decode(&row.text("evidence")?)?,
+        proposal: row.text("proposal")?,
+        approvers: decode(&row.text("approvers")?)?,
+        tier: Tier::parse(&row.text("tier")?)?,
+        opened_at: row.int("opened_at")?,
+        deadline: row.int_opt("deadline")?,
+        on_timeout,
+        resolution,
+    })
+}
+
+async fn read_gate(tx: &mut Tx<'_, '_>, id: &str) -> Result<Option<Gate>> {
+    let sql = format!("SELECT {COLUMNS} FROM atomic_gates WHERE gate_id = ?");
+    match tx.query_opt(&sql, &[Param::Text(id.to_owned())]).await? {
+        Some(row) => Ok(Some(gate_from_row(&row)?)),
+        None => Ok(None),
+    }
+}
+
+/// Record that `gate` expired at `now`, if it is still open. Returns the
+/// gate as the store now has it.
+async fn expire(tx: &mut Tx<'_, '_>, gate: &Gate, now: i64) -> Result<Gate> {
+    tx.execute(
+        "UPDATE atomic_gates SET state = 'expired', decided_at = ? \
+         WHERE gate_id = ? AND state = 'open'",
+        &[Param::Int(now), Param::Text(gate.id.clone())],
+    )
+    .await?;
+    read_gate(tx, &gate.id)
+        .await?
+        .ok_or_else(|| corrupt(format!("gate {} vanished", gate.id)))
+}
+
+fn past_deadline(gate: &Gate, now: i64) -> bool {
+    gate.resolution.is_none() && gate.deadline.is_some_and(|d| now >= d)
+}
+
+// ---------------------------------------------------------------------------
+// The workflow side.
+
+/// What the check after a wake-up found.
+#[derive(Serialize, Deserialize)]
+enum Check {
+    /// Still open and not past its deadline: wait again.
+    Open { deadline: Option<i64> },
+    /// Resolved.
+    Resolved(Resolution),
+}
+
+/// Open gate `step` in this run with `spec`, wait for it to be resolved, and
+/// return the resolution. Only [`Resolution::approved`] lets the run pass;
+/// a rejection, an expiry or a failure stops it.
+///
+/// Its operations, all siblings: `<step>.gate` opens the store row,
+/// `<step>.wait` waits for the wake-up, `<step>.decision` reads the
+/// resolution from the store; the last two repeat if a wake-up finds the gate
+/// still open. A step name must be unique among the run's gates.
+pub async fn gate<C: WorkflowContext>(ctx: &C, step: &str, spec: GateSpec) -> Result<Resolution> {
+    if let Some(bad) = spec.evidence.iter().find(|e| !is_digest(e)) {
+        return Err(DurableError::Failed(format!(
+            "gate {step}: evidence {bad:?} is not a content digest (sha256:<hex>)"
+        )));
+    }
+    let run = ctx.workflow_id().to_owned();
+    let id = gate_id(&run, step);
+    let proposal = proposal_digest(&spec.title, &spec.show, &spec.evidence);
+
+    let (open_id, open_run, open_step, open_proposal) =
+        (id.clone(), run.clone(), step.to_owned(), proposal.clone());
+    let opened: Gate = ctx
+        .transaction(&format!("{step}.gate"), move |mut tx| {
+            let (id, run, step, proposal, spec) = (
+                open_id.clone(),
+                open_run.clone(),
+                open_step.clone(),
+                open_proposal.clone(),
+                spec.clone(),
+            );
+            Box::pin(async move {
+                if read_gate(&mut tx, &id).await?.is_some() {
+                    return Err(DurableError::Failed(format!(
+                        "gate {id} is already in the gate store: a gate's step name must be \
+                         unique within its run"
+                    )));
+                }
+                let now = now_ms();
+                let deadline = spec
+                    .timeout
+                    .map(|t| now.saturating_add(i64::try_from(t.as_millis()).unwrap_or(i64::MAX)));
+                // A NULL binds as text on PostgreSQL, hence the cast.
+                tx.execute(
+                    "INSERT INTO atomic_gates (gate_id, run, workflow, step, title, show, \
+                     evidence, proposal, approvers, tier, opened_at, deadline, on_timeout, state) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CAST(? AS BIGINT), ?, 'open')",
+                    &[
+                        Param::Text(id.clone()),
+                        Param::Text(run),
+                        Param::Text(spec.workflow.clone()),
+                        Param::Text(step),
+                        Param::Text(spec.title.clone()),
+                        Param::Text(encode(&spec.show)?),
+                        Param::Text(encode(&spec.evidence)?),
+                        Param::Text(proposal),
+                        Param::Text(encode(&spec.approvers)?),
+                        Param::Text(spec.tier.as_str().to_owned()),
+                        Param::Int(now),
+                        deadline.map_or(Param::Null, Param::Int),
+                        Param::Text(spec.on_timeout.as_str().to_owned()),
+                    ],
+                )
+                .await?;
+                read_gate(&mut tx, &id)
+                    .await?
+                    .ok_or_else(|| corrupt(format!("gate {id} was not written")))
+            })
+        })
+        .await?;
+    failpoint("gate:after-open");
+
+    let mut deadline = opened.deadline;
+    loop {
+        let wait = match deadline {
+            Some(d) => Duration::from_millis(u64::try_from(d - now_ms()).unwrap_or(0)),
+            None => NO_DEADLINE,
+        };
+        // Only a wake-up: what it carries is never read.
+        let _: Option<Value> = ctx.recv(&topic(&id), wait).await?;
+        failpoint("gate:after-wait");
+
+        let (check_id, check_run, check_proposal) = (id.clone(), run.clone(), proposal.clone());
+        let check: Check = ctx
+            .transaction(&format!("{step}.decision"), move |mut tx| {
+                let (id, run, proposal) =
+                    (check_id.clone(), check_run.clone(), check_proposal.clone());
+                Box::pin(async move {
+                    let Some(gate) = read_gate(&mut tx, &id).await? else {
+                        return Err(DurableError::Failed(format!(
+                            "gate {id} is not in the gate store, so nothing approved it"
+                        )));
+                    };
+                    if gate.run != run {
+                        return Err(DurableError::Failed(format!(
+                            "gate {id} in the gate store belongs to run {}, not {run}",
+                            gate.run
+                        )));
+                    }
+                    if gate.proposal != proposal {
+                        return Err(DurableError::Failed(format!(
+                            "gate {id} was opened on proposal {}, but this run now shows \
+                             {proposal}: changed content needs a new gate",
+                            gate.proposal
+                        )));
+                    }
+                    let now = now_ms();
+                    let gate = if past_deadline(&gate, now) {
+                        expire(&mut tx, &gate, now).await?
+                    } else {
+                        gate
+                    };
+                    Ok(match gate.resolution {
+                        Some(r) => Check::Resolved(r),
+                        None => Check::Open {
+                            deadline: gate.deadline,
+                        },
+                    })
+                })
+            })
+            .await?;
+        match check {
+            Check::Resolved(resolution) => return Ok(resolution),
+            Check::Open { deadline: d } => deadline = d,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The person's side.
+
+/// What a command's journal entry records.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum Recorded {
+    Decided(Decision),
+    Conflict(Resolution),
+}
+
+impl Recorded {
+    fn into_result(self, gate: &str) -> std::result::Result<Decision, DecideError> {
+        match self {
+            Self::Decided(d) => Ok(d),
+            Self::Conflict(winning) => Err(DecideError::Conflict {
+                gate: gate.to_owned(),
+                winning,
+            }),
+        }
+    }
+}
+
+/// The digest that identifies what a command asks for, so a reused id with
+/// a different request is told apart from a replay.
+fn request_digest(by: &Principal, cmd: &DecisionCommand) -> String {
+    let mut bytes = Vec::new();
+    canonical(
+        &json!({
+            "by": by,
+            "gate": cmd.gate,
+            "verdict": cmd.verdict,
+            "comment": cmd.comment,
+            "proposal": cmd.proposal,
+        }),
+        &mut bytes,
+    );
+    format!("sha256:{:x}", Sha256::digest(&bytes))
+}
+
+async fn journaled(
+    tx: &mut Tx<'_, '_>,
+    command: &str,
+    request: &str,
+) -> Result<Option<std::result::Result<Recorded, DecideError>>> {
+    let Some(row) = tx
+        .query_opt(
+            "SELECT request, result FROM atomic_gate_commands WHERE command_id = ?",
+            &[Param::Text(command.to_owned())],
+        )
+        .await?
+    else {
+        return Ok(None);
+    };
+    if row.text("request")? != request {
+        return Ok(Some(Err(DecideError::CommandReused(command.to_owned()))));
+    }
+    Ok(Some(Ok(decode(&row.text("result")?)?)))
+}
+
+/// Record `by`'s decision `cmd`, durably, and wake the gate's run.
+///
+/// `by` must be the authenticated person making the decision; nothing in
+/// the command names them. Returns the recorded decision, the same one for a
+/// replayed command, or why it was not recorded.
+pub async fn decide<R: DurableRuntime>(
+    rt: &R,
+    by: &Principal,
+    cmd: DecisionCommand,
+) -> std::result::Result<Decision, DecideError> {
+    let request = request_digest(by, &cmd);
+    let gate_id = cmd.gate.clone();
+    let by = by.clone();
+    let (recorded, run) = rt
+        .control_transaction(move |mut tx| {
+            let (cmd, by, request) = (cmd.clone(), by.clone(), request.clone());
+            Box::pin(async move {
+                if let Some(found) = journaled(&mut tx, &cmd.command_id, &request).await? {
+                    // A replay: wake the run again, in case the first time
+                    // stopped before it did.
+                    let run = read_gate(&mut tx, &cmd.gate).await?.map(|g| g.run);
+                    return Ok((found, run));
+                }
+                let Some(gate) = read_gate(&mut tx, &cmd.gate).await? else {
+                    return Ok((Err(DecideError::NoSuchGate(cmd.gate.clone())), None));
+                };
+                if !gate.approvers.contains(&by) {
+                    return Ok((
+                        Err(DecideError::NotAnApprover {
+                            gate: gate.id.clone(),
+                            who: by.clone(),
+                        }),
+                        None,
+                    ));
+                }
+                let now = now_ms();
+                let gate = if past_deadline(&gate, now) {
+                    expire(&mut tx, &gate, now).await?
+                } else {
+                    gate
+                };
+                let recorded = match gate.resolution {
+                    Some(winning) => Recorded::Conflict(winning),
+                    None if gate.proposal != cmd.proposal => {
+                        return Ok((
+                            Err(DecideError::ProposalChanged {
+                                gate: gate.id.clone(),
+                                shown: cmd.proposal.clone(),
+                                current: gate.proposal.clone(),
+                            }),
+                            None,
+                        ));
+                    }
+                    None => {
+                        let won = tx
+                            .execute(
+                                "UPDATE atomic_gates SET state = ?, decided_by = ?, \
+                                 decided_at = ?, comment = ?, command_id = ? \
+                                 WHERE gate_id = ? AND state = 'open'",
+                                &[
+                                    Param::Text(cmd.verdict.state().to_owned()),
+                                    Param::Text(by.as_str().to_owned()),
+                                    Param::Int(now),
+                                    cmd.comment.clone().map_or(Param::Null, Param::Text),
+                                    Param::Text(cmd.command_id.clone()),
+                                    Param::Text(gate.id.clone()),
+                                ],
+                            )
+                            .await?;
+                        let now_stored = read_gate(&mut tx, &gate.id)
+                            .await?
+                            .ok_or_else(|| corrupt(format!("gate {} vanished", gate.id)))?;
+                        match now_stored.resolution {
+                            Some(Resolution::Decided(d)) if won == 1 => Recorded::Decided(d),
+                            Some(winning) => Recorded::Conflict(winning),
+                            None => return Err(corrupt(format!("gate {} stayed open", gate.id))),
+                        }
+                    }
+                };
+                let inserted = tx
+                    .execute(
+                        "INSERT INTO atomic_gate_commands \
+                         (command_id, gate_id, request, result, recorded_at) \
+                         VALUES (?, ?, ?, ?, ?) ON CONFLICT (command_id) DO NOTHING",
+                        &[
+                            Param::Text(cmd.command_id.clone()),
+                            Param::Text(gate.id.clone()),
+                            Param::Text(request.clone()),
+                            Param::Text(encode(&recorded)?),
+                            Param::Int(now),
+                        ],
+                    )
+                    .await?;
+                if inserted == 0 {
+                    // The same id raced in from another client and won.
+                    if let Some(found) = journaled(&mut tx, &cmd.command_id, &request).await? {
+                        return Ok((found, Some(gate.run)));
+                    }
+                }
+                Ok((Ok(recorded), Some(gate.run)))
+            })
+        })
+        .await?;
+    let recorded = recorded?;
+    if let Some(run) = run {
+        // The decision is durable; the wake-up is not part of it. If it
+        // fails, `redeliver`, or the waiting run's own deadline, catches up.
+        let _ = wake(rt, &run, &gate_id).await;
+    }
+    recorded.into_result(&gate_id)
+}
+
+async fn wake<R: DurableRuntime>(rt: &R, run: &str, gate: &str) -> Result<()> {
+    failpoint("gate:before-wake");
+    rt.send(run, &topic(gate), json!({ "gate": gate }), gate)
+        .await
+}
+
+/// Every gate the filter selects, oldest first.
+pub async fn gates<R: DurableRuntime>(rt: &R, filter: GateFilter) -> Result<Vec<Gate>> {
+    rt.control_transaction(move |mut tx| {
+        let filter = filter.clone();
+        Box::pin(async move {
+            let mut sql = format!("SELECT {COLUMNS} FROM atomic_gates WHERE 1 = 1");
+            let mut ps = Vec::new();
+            if filter.open_only {
+                sql.push_str(" AND state = 'open'");
+            }
+            if let Some(run) = filter.run {
+                sql.push_str(" AND run = ?");
+                ps.push(Param::Text(run));
+            }
+            sql.push_str(" ORDER BY opened_at, gate_id");
+            tx.query_all(&sql, &ps)
+                .await?
+                .iter()
+                .map(gate_from_row)
+                .collect()
+        })
+    })
+    .await
+}
+
+/// One gate, if it exists.
+pub async fn find<R: DurableRuntime>(rt: &R, id: &str) -> Result<Option<Gate>> {
+    let id = id.to_owned();
+    rt.control_transaction(move |mut tx| {
+        let id = id.clone();
+        Box::pin(async move { read_gate(&mut tx, &id).await })
+    })
+    .await
+}
+
+/// Send the wake-up again for every resolved gate whose run is still
+/// unfinished. Run it when a runtime starts or resumes runs: a decider that
+/// stopped after committing its decision but before waking the run leaves
+/// that run waiting until this, or its own deadline. Returns how many it
+/// sent; a repeat for a run that already woke changes nothing.
+pub async fn redeliver<R: DurableRuntime>(rt: &R) -> Result<usize> {
+    let resolved: Vec<Gate> = gates(rt, GateFilter::default())
+        .await?
+        .into_iter()
+        .filter(|g| g.resolution.is_some())
+        .collect();
+    let mut sent = 0;
+    for g in resolved {
+        if rt.status(&g.run).await? == Some(RunStatus::Pending) {
+            wake(rt, &g.run, &g.id).await?;
+            sent += 1;
+        }
+    }
+    Ok(sent)
+}
+
+/// Every evidence digest a gate in the store refers to. Retention keeps
+/// this content for as long as the gate's decision and its run's recovery
+/// may need it.
+pub async fn pinned_evidence<R: DurableRuntime>(rt: &R) -> Result<Vec<String>> {
+    let mut all: Vec<String> = gates(rt, GateFilter::default())
+        .await?
+        .into_iter()
+        .flat_map(|g| g.evidence)
+        .collect();
+    all.sort();
+    all.dedup();
+    Ok(all)
+}
+
+#[cfg(test)]
+mod tests;

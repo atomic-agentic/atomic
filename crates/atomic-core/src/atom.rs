@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 /// The kinds of atom this version runs.
 pub const KINDS: &[&str] = &["codex", "lite", "exec"];
 
-const FIELDS: &[&str] = &[
+/// The configuration fields this version reads; any other field is refused.
+pub const FIELDS: &[&str] = &[
     "atomic",
     "description",
     "name",
@@ -39,8 +40,9 @@ const FIELDS: &[&str] = &[
     "judges",
 ];
 
-/// Fields of the published format that later versions read.
-const LATER: &[&str] = &[
+/// Fields of the published format that later versions read; this version
+/// refuses them by name.
+pub const LATER: &[&str] = &[
     "extends",
     "review",
     "credentials",
@@ -50,6 +52,10 @@ const LATER: &[&str] = &[
     "remote",
     "auth",
 ];
+
+/// The typed `AtomConfig` declaration the compiler checks configuration
+/// against, generated into each project as `.atomic/types/authoring.d.ts`.
+pub const AUTHORING_DECLARATIONS: &str = include_str!("../../../authoring/authoring.d.ts");
 
 /// A loaded, schema-checked Astro atom and its immutable source graph. It
 /// serializes whole, sources and contracts included, so a run can carry the
@@ -525,7 +531,7 @@ pub fn load(file: &Path, registry: &mut Registry) -> Result<Atom, AtomError> {
     let declarations = program
         .invoke_located(
             "check",
-            json!({"schemas": schemas, "authoring": include_str!("../../../authoring/authoring.d.ts")}),
+            json!({"schemas": schemas, "authoring": AUTHORING_DECLARATIONS}),
         )
         .map_err(|e| located("types", e))?;
     if let Some(files) = declarations.as_object() {
