@@ -13,6 +13,6 @@ upstream = "https://github.com/openai/codex"
 branch = "atomic"
 tag = "rust-v0.169.0"
 upstream_rev = "d32063f96c2dff1dc96af839b3952abb6acfeda4"
-rev = "a4b0cac70d89a168616d5cb3b99e5b162e91ce5d"
+rev = "f8e52f30a7d56b045b93068c156aae8a4a312ba6"
 # Codex's own codex-rs/rust-toolchain.toml at this rev.
 toolchain = "1.95.0"

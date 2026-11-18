@@ -27,6 +27,7 @@ Codex's files from the fork at that commit.
 | Commit | Change | Why | Upstream |
 | --- | --- | --- | --- |
 | `a4b0cac` | `utils/pty`: the parent-death signal is best effort where `prctl` is refused (`EPERM`, `EACCES`, `ENOSYS`) | AWS Lambda's seccomp policy refuses every `prctl` call, so no command could start there in any sandbox mode. Found in atomic-deploy's AWS spikes | To offer |
+| `f8e52f3` | `utils/pty`: skip the parent-PID check when no parent-death signal was armed; `EINVAL` is also "unavailable" | On iSH (openai/codex#40454) `prctl` answers `EINVAL` and the check then kills every child; the check only closes the race for an armed signal | To offer, with the commit above |
 
 Keep the branch small and each commit something upstream could take: when a
 release includes a commit's change, drop the commit at the next bump, and when
