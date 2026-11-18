@@ -51,3 +51,7 @@ whitespace is prompt content.
 If a declaration import cannot be found, run `atomic check`, confirm the relative
 path and reload the Astro language server. Schema/field mistakes require changing
 the source; suppressing TypeScript diagnostics does not bypass Atomic's loader.
+
+To have the Codex or Claude Code extension write atoms for you, install the
+authoring skill with `atomic setup codex` or `atomic setup claude`; see
+[coding agents](coding-agents.md).

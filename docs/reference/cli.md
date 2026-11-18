@@ -123,7 +123,7 @@ remain unspecified. Run recovery uses the v0.1 command above. The
 | `atomic schemas expand <atom>` | Print the JSON Schema that a compact schema compiles to | v0.5 |
 | `atomic runs replay <run-id> [--from <step>]` | Inspect recorded execution from a chosen point | v0.5 |
 | `atomic types`, `atomic schemas` | Generate editor types and schemas | v0.5 |
-| `atomic setup <agent>` | Install Atomic authoring skills for an external coding agent | v0.1 initial pack |
+| `atomic setup claude`, `atomic setup codex` | Install the `atomic-create-atom` authoring skill for Claude Code or Codex; see [coding agents](../guides/coding-agents.md) | Implemented; more agents and skills later |
 
 Read [testing and evals](../guides/testing-and-evals.md) before treating recording
 replay as a live model result.
