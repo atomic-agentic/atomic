@@ -9,6 +9,9 @@ use atomic_core::state::ProjectState;
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
+mod setup;
+mod skills;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "atomic",
@@ -29,6 +32,8 @@ enum Command {
     },
     /// Render an Astro prompt without calling a model or running scripts.
     Render(RenderArgs),
+    /// Install atomic's authoring skills for a coding agent.
+    Setup(setup::SetupArgs),
     /// Developer diagnostics.
     #[command(subcommand, hide = true)]
     Debug(Debug),
@@ -122,6 +127,7 @@ async fn run(cli: Cli, paths: CodexPaths, state: ProjectState) -> anyhow::Result
     match cli.command {
         Some(Command::Check { path }) => tokio::task::spawn_blocking(move || check(path)).await?,
         Some(Command::Render(args)) => tokio::task::spawn_blocking(move || render(args)).await?,
+        Some(Command::Setup(args)) => setup::run(args),
         None => {
             println!("atomic {}", env!("CARGO_PKG_VERSION"));
             Ok(())

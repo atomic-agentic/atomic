@@ -21,7 +21,8 @@ configuration and policy integration remain planned; native web search does not
 depend on the later RAG milestone. Slack MCP access, inbound Slack triggers and
 Slack gate approvals are separate integrations, with Atomic adapters still planned.
 
-The initial authoring-skills pack is targeted at v0.1; the rest of the pack and
+The first authoring skill, `atomic-create-atom`, is installed today by
+`atomic setup claude` and `atomic setup codex`; the rest of the pack and
 higher-level project generation follow later. Workspace member discovery and
 shared-schema resolution belong to M11b/M39b in v0.5.
 
