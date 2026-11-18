@@ -62,6 +62,8 @@ pub struct SetupArgs {
 const BEGIN: &str =
     "<!-- BEGIN atomic: written by `atomic setup`; edits between these lines are replaced -->";
 const END: &str = "<!-- END atomic -->";
+/// How a section written by any version of atomic starts.
+const BEGIN_PREFIX: &str = "<!-- BEGIN atomic";
 
 /// The section added to the agent's instructions file.
 fn section() -> String {
@@ -136,7 +138,7 @@ fn with_section(text: Option<&str>, section: &str) -> anyhow::Result<String> {
     let Some(text) = text else {
         return Ok(section.to_owned());
     };
-    match (text.find(BEGIN), text.find(END)) {
+    match (text.find(BEGIN_PREFIX), text.find(END)) {
         (Some(begin), Some(end)) if begin < end => {
             let mut end = end + END.len();
             if text[end..].starts_with('\n') {
@@ -269,8 +271,12 @@ mod tests {
         let once = std::fs::read_to_string(root.join("AGENTS.md")).expect("read");
         assert!(once.starts_with(mine), "{once}");
         assert_eq!(once.matches(BEGIN).count(), 1);
-        // A stale section is replaced, and text after it is kept.
-        let stale = once.replace("is the", "was the") + "\nMore of mine.\n";
+        // A stale section, even one an older atomic marked differently, is
+        // replaced, and text after it is kept.
+        let stale = once
+            .replace("is the", "was the")
+            .replace(BEGIN, "<!-- BEGIN atomic, an older version -->")
+            + "\nMore of mine.\n";
         std::fs::write(root.join("AGENTS.md"), &stale).expect("write");
         let written = install(Agent::Codex, &root).expect("second");
         let twice = std::fs::read_to_string(root.join("AGENTS.md")).expect("read");
