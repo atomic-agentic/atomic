@@ -181,6 +181,7 @@ async fn engine(dir: &Path, project: &Path, base_url: &str) -> Durare {
             endpoint: endpoint.clone(),
             defaults: AtomConfig::default(),
             artifacts: Artifacts::none(),
+            meter: atomic_core::usage::Metering::none(),
         },
         lite: LiteRuntime::new(endpoint, AtomConfig::default()),
     });
@@ -198,6 +199,7 @@ async fn engine(dir: &Path, project: &Path, base_url: &str) -> Durare {
             store: LocalStore::open(dir.join("state/artifacts")).expect("artifact store"),
             deployment: local(),
             worktrees: Some(Arc::new(Worktrees::new(repo, dir.join("state/worktrees")))),
+            budgets: Arc::default(),
         },
     );
     rt.launch().await.expect("launch");

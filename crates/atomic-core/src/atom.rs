@@ -4,6 +4,7 @@
 //! Frontmatter is an interpreted literal configuration; atom modules never execute.
 
 use crate::astro::{self, Program};
+use crate::budget::Budget;
 use atomic_schema::registry::{self, Registry};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -76,6 +77,10 @@ pub struct Atom {
     pub input: String,
     /// Registered full output schema.
     pub output: String,
+    /// The limits its `budget` block writes; the rest inherit defaults (see
+    /// [`crate::budget`]).
+    #[serde(default)]
+    pub budget: Budget,
     /// Parsed literal configuration and interpreted contract descriptors.
     pub frontmatter: Value,
     /// Immutable entry and component sources.
@@ -375,6 +380,16 @@ pub fn load(file: &Path, registry: &mut Registry) -> Result<Atom, AtomError> {
     check_exec(&kind, fm)
         .map_err(|(pointer, message)| fail(line_of(&pointer), &pointer, message))?;
 
+    // A budget limit that is not written inherits the configured default
+    // when the atom runs; what is written must be well formed now.
+    let budget = match fm.get("budget") {
+        None => Budget::default(),
+        Some(b) => Budget::parse(b).map_err(|(sub, message)| {
+            let pointer = format!("/budget{sub}");
+            fail(line_of(&pointer), &pointer, message)
+        })?,
+    };
+
     let mut ids = Vec::new();
     for role in ["input", "output"] {
         let pointer = format!("/{role}");
@@ -600,6 +615,7 @@ pub fn load(file: &Path, registry: &mut Registry) -> Result<Atom, AtomError> {
         description,
         input,
         output,
+        budget,
         frontmatter: config,
         program,
         context,

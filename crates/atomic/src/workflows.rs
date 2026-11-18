@@ -2,19 +2,27 @@
 
 //! Workflows written in Rust.
 //!
-//! Each atom runs through [`run_atom`]: its turn and its publication are
+//! Each atom runs through [`run_atom_at`]: its turn and its publication are
 //! sibling durable steps, so a crash after an atom has finished never runs it
 //! again, and a later atom consumes the earlier one's typed, published
 //! output. Each atom's run is [`contained`] in its own task, so a panic fails
 //! that atom's step instead of the process.
+//!
+//! Every model call an atom makes is metered against the run's usage ledger
+//! (see [`crate::metering`]): admitted against the atom's and the run's caps
+//! before it is dispatched, and settled once after. A call a cap has no room
+//! for is not made, and the run parks.
 
+use crate::metering::RunBudget;
 use atomic_atoms::{
     ChangeRequest, DraftTask, DraftedTask, ReviewPatch, ReviewRequest, Verdict, WorkItem,
 };
-use atomic_core::AtomError;
+use atomic_core::budget::{Budget, BudgetError, BudgetSettings};
 use atomic_core::runtime::{RunMetadata, Runtimes, contained, run_codex_atom, run_lite_atom};
+use atomic_core::{Atom, AtomConfig, AtomError};
 use atomic_durable::{
-    DurableError, DurableRuntime, Proposal, Published, Result, WorkflowContext, failpoint, run_atom,
+    DurableError, DurableRuntime, Proposal, Published, Result, WorkflowContext, failpoint,
+    run_atom_at,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -46,9 +54,20 @@ pub struct ChangeRequestResult {
     pub steps: Vec<Published>,
 }
 
-/// Turn an atom's failure into its step's failure, recorded as the outcome.
+/// Turn an atom's failure into its step's failure, recorded as the outcome;
+/// a cap that left no room for its next call parks the run instead.
 fn failed(e: AtomError) -> DurableError {
-    DurableError::Failed(e.to_string())
+    match e {
+        AtomError::Budget(why) => DurableError::Parked(why),
+        e => DurableError::Failed(e.to_string()),
+    }
+}
+
+/// The run settings `atom` asks for over `defaults`.
+fn configured(atom: &impl Atom, defaults: &AtomConfig) -> AtomConfig {
+    let mut config = defaults.clone();
+    atom.configure(&mut config);
+    config
 }
 
 /// The candidate an atom's run proposes: its output and its run metadata,
@@ -79,21 +98,49 @@ fn decode<T: DeserializeOwned>(published: &Published) -> Result<T> {
 }
 
 /// Register the change-request workflow on `rt`, running its atoms on
-/// `runtimes`.
-pub fn register_change_request<R: DurableRuntime>(rt: &mut R, runtimes: Arc<Runtimes>) {
+/// `runtimes` and metering their calls under `budgets`. Fails, before
+/// anything is registered, when a budget cannot be resolved, such as a
+/// dollar cap on a model the price table does not price.
+pub fn register_change_request<R: DurableRuntime>(
+    rt: &mut R,
+    runtimes: Arc<Runtimes>,
+    budgets: Arc<BudgetSettings>,
+) -> std::result::Result<(), BudgetError> {
+    let draft_config = configured(&DraftTask, &runtimes.lite.defaults);
+    let review_config = configured(&ReviewPatch, &runtimes.codex.defaults);
+    let draft_model = draft_config
+        .model
+        .clone()
+        .unwrap_or_else(|| runtimes.lite.endpoint.model.clone());
+    let review_model = review_config
+        .model
+        .clone()
+        .unwrap_or_else(|| runtimes.codex.endpoint.model.clone());
+    let budget = RunBudget::new(
+        rt.ledger(),
+        budgets,
+        &Budget::default(),
+        &[&draft_model, &review_model],
+    )?;
+    let draft_caps = budget.atom(&draft_config.budget, &draft_model)?;
+    let review_caps = budget.atom(&review_config.budget, &review_model)?;
     rt.register(
         CHANGE_REQUEST,
         move |ctx: R::Context, input: ChangeRequestRun| {
             let runtimes = runtimes.clone();
+            let (budget, draft_caps, review_caps) =
+                (budget.clone(), draft_caps.clone(), review_caps.clone());
             async move {
-                let lite = runtimes.lite.clone();
+                let mut lite = runtimes.lite.clone();
                 let request = ChangeRequest {
                     request: input.request.clone(),
                 };
-                let draft = run_atom(
+                let meter = budget.clone();
+                let draft = run_atom_at(
                     &ctx,
                     "draft",
-                    move || {
+                    move |step| {
+                        lite.meter = meter.meter(&step, &draft_caps);
                         propose(async move { run_lite_atom(&DraftTask, &request, &lite).await })
                     },
                     Vec::new(),
@@ -102,7 +149,7 @@ pub fn register_change_request<R: DurableRuntime>(rt: &mut R, runtimes: Arc<Runt
                 failpoint("change-request:after-draft");
                 let task: DraftedTask = decode(&draft)?;
 
-                let codex = runtimes.codex.clone();
+                let mut codex = runtimes.codex.clone();
                 let review_request = ReviewRequest {
                     item: WorkItem {
                         id: format!("{}:draft", ctx.workflow_id()),
@@ -113,10 +160,11 @@ pub fn register_change_request<R: DurableRuntime>(rt: &mut R, runtimes: Arc<Runt
                     commit: input.commit.clone(),
                     base: input.base.clone(),
                 };
-                let review = run_atom(
+                let review = run_atom_at(
                     &ctx,
                     "review",
-                    move || {
+                    move |step| {
+                        codex.meter = budget.meter(&step, &review_caps);
                         propose(async move {
                             run_codex_atom(&ReviewPatch, &review_request, &codex).await
                         })
@@ -133,4 +181,5 @@ pub fn register_change_request<R: DurableRuntime>(rt: &mut R, runtimes: Arc<Runt
             }
         },
     );
+    Ok(())
 }

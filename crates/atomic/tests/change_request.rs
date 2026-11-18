@@ -68,6 +68,7 @@ fn runtimes(dir: &Path, base_url: &str) -> Arc<Runtimes> {
             endpoint: endpoint.clone(),
             defaults: AtomConfig::default(),
             artifacts: Artifacts::none(),
+            meter: atomic_core::usage::Metering::none(),
         },
         lite: LiteRuntime::new(endpoint, AtomConfig::default()),
     })
@@ -77,7 +78,8 @@ async fn engine(dir: &Path, base_url: &str) -> Durare {
     let mut rt = Durare::sqlite(&dir.join("atomic.db"))
         .await
         .expect("engine");
-    register_change_request(&mut rt, runtimes(dir, base_url));
+    register_change_request(&mut rt, runtimes(dir, base_url), Arc::default())
+        .expect("the default budgets resolve");
     rt
 }
 

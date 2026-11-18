@@ -7,6 +7,7 @@
 pub mod artifact;
 pub mod astro;
 pub mod atom;
+pub mod budget;
 pub mod codex;
 pub mod collections;
 pub mod compile;
@@ -24,6 +25,7 @@ pub mod state;
 #[cfg(any(test, feature = "fake-model"))]
 pub mod testing;
 pub mod typed;
+pub mod usage;
 pub mod workflow;
 pub mod worktree;
 

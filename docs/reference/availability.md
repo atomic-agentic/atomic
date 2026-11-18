@@ -66,6 +66,11 @@ and manages for them. A plain
 `exec.command` is v0.1.
 TypeScript workflows follow in v1.0.
 
+Budgets are partly built: the `budget` field on atoms and workflows, its
+configured defaults and price table, and the durable usage ledger that reserves
+each model call before it is dispatched, settles it once, and parks a run that
+reaches a cap. The commands that show budgets and spend come with run inspection.
+
 ## Observability stages
 
 The local baseline is saved run inspection and basic spans in v0.1 (M12).

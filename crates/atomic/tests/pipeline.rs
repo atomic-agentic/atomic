@@ -11,6 +11,9 @@
 //!   no atom runs again;
 //! - an input that breaks the workflow's contract fails before any model call;
 //! - a workflow the interpreter cannot run yet is refused before it starts;
+//! - every model call is metered: one settled ledger attempt per call, a
+//!   workflow budget with no room parks the run before any call, and a dollar
+//!   cap on an unpriced model fails the run before any call;
 //! - a gate stops the run until the local operator decides: an approval lets
 //!   the steps after it run, a rejection fails the run before any of them,
 //!   and a process killed while waiting leaves the gate waiting.
@@ -175,6 +178,7 @@ fn runtimes_in(dir: &Path, cwd: &Path, base_url: &str) -> Arc<Runtimes> {
             endpoint: endpoint.clone(),
             defaults: AtomConfig::default(),
             artifacts: Artifacts::none(),
+            meter: atomic_core::usage::Metering::none(),
         },
         lite: LiteRuntime::new(endpoint, AtomConfig::default()),
     })
@@ -206,6 +210,7 @@ async fn engine(dir: &Path, base_url: &str) -> Durare {
             store,
             deployment: local(),
             worktrees,
+            budgets: Arc::default(),
         },
     );
     rt.launch().await.expect("launch");
@@ -243,6 +248,15 @@ fn a_three_step_workflow_of_file_defined_atoms_runs() {
 
         assert_eq!(out, json!({"line": "P1: Export crashes on accents"}));
         assert_eq!(model.calls(), 3, "one model call per step");
+        // Each call was admitted and settled once in the usage ledger.
+        let attempts = rt.ledger().attempts("triage-1").await.expect("attempts");
+        assert_eq!(attempts.len(), 3, "{attempts:?}");
+        assert!(
+            attempts
+                .iter()
+                .all(|a| a.state == "settled" && a.usage == Some((1, 1))),
+            "{attempts:?}"
+        );
         let requests = model.requests();
         // Each step got what the steps before it published.
         assert!(requests[0].to_string().contains("café.txt"));
@@ -871,7 +885,8 @@ fn a_worktree_step_runs_at_its_base_and_atomic_commits_what_it_left() {
             .find(|s| s.name == "fix.turn")
             .expect("fix's turn");
         let candidate = fix.output.expect("the turn's candidate");
-        let metadata = &candidate["proposal"]["metadata"];
+        // The turn records either the candidate or that it parked.
+        let metadata = &candidate["Candidate"]["proposal"]["metadata"];
         let commit = metadata["commit"].as_str().expect("a commit").to_owned();
         assert_eq!(metadata["base"], json!(base));
         assert_eq!(
@@ -1246,6 +1261,73 @@ fn an_exec_step_runs_its_command_and_only_model_steps_call_the_model() {
             rank.contains("Export crashes on ac") && rank.contains('5'),
             "{rank}"
         );
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[test]
+fn a_workflow_budget_parks_or_fails_the_run_before_any_model_call() {
+    on_codex_runtime(async {
+        let dir = scratch("budget");
+        let project = project(&dir);
+        let model = FakeModel::start(vec![Reply::Text(READ.into())])
+            .await
+            .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        let input = json!({"text": "Exporting a file named café.txt crashes the app."});
+
+        // Ten tokens leave no room for one call's bound: the run parks.
+        let tight = load(
+            &project,
+            "tight.workflow.yaml",
+            &format!("{TRIAGE}budget:\n  tokens: 10\n"),
+        );
+        let run = PipelineRun {
+            pipeline: tight,
+            input: input.clone(),
+        };
+        rt.start(PIPELINE, "tight", run).await.expect("start");
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let park = loop {
+            if let Some(p) = atomic_durable::parks(&rt, "tight")
+                .await
+                .expect("parks")
+                .into_iter()
+                .next()
+            {
+                break p;
+            }
+            assert!(std::time::Instant::now() < until, "the run parked");
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        };
+        assert!(park.reason.contains("run:tight"), "{}", park.reason);
+        assert_eq!(park.step, "read.park");
+        assert_eq!(model.calls(), 0);
+        assert_eq!(
+            rt.status("tight").await.expect("status"),
+            Some(RunStatus::Pending)
+        );
+
+        // A dollar cap on a model the price table does not price fails the
+        // run before anything is called.
+        let priced = load(
+            &project,
+            "priced.workflow.yaml",
+            &format!("{TRIAGE}budget:\n  cost_usd: 1\n"),
+        );
+        let run = PipelineRun {
+            pipeline: priced,
+            input,
+        };
+        rt.start(PIPELINE, "priced", run).await.expect("start");
+        let failed = rt.result::<Value>("priced").await;
+        assert!(
+            matches!(&failed, Err(atomic_durable::DurableError::Failed(m)) if m.contains("cost_usd needs reliable pricing")),
+            "{failed:?}"
+        );
+        assert_eq!(model.calls(), 0);
         rt.shutdown(std::time::Duration::from_secs(5))
             .await
             .expect("shutdown");

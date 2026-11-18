@@ -19,6 +19,7 @@
 //!   the fit cannot be proven either way, it is a warning.
 
 use crate::atom::Atom;
+use crate::budget::Budget;
 use atomic_schema::expr::{self, Scope};
 use atomic_schema::registry::Registry;
 use atomic_schema::yaml;
@@ -37,6 +38,9 @@ pub struct Workflow {
     pub version: u64,
     /// The steps in an order that respects `after`.
     pub order: Vec<String>,
+    /// The limits its `budget` block writes for the whole run, children
+    /// included; the rest inherit defaults (see [`crate::budget`]).
+    pub budget: Budget,
     /// The workflow as written, as JSON.
     pub definition: Value,
     /// Its input contract, with every reference inlined.
@@ -157,6 +161,14 @@ pub fn load(
             .as_u64()
             .filter(|v| *v >= 1)
             .ok_or_else(|| fail("/version", "`version` is a whole number from 1".into()))?,
+    };
+
+    // The run's own limits; the rest inherit the configured defaults.
+    let budget = match top.get("budget") {
+        None => Budget::default(),
+        Some(b) => {
+            Budget::parse(b).map_err(|(sub, message)| fail(&format!("/budget{sub}"), message))?
+        }
     };
 
     let dir = file.parent().unwrap_or(Path::new("")).to_owned();
@@ -481,6 +493,7 @@ pub fn load(
         name,
         version,
         order,
+        budget,
         definition: doc.value.clone(),
         input,
         output,

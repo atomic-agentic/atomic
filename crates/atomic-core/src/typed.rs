@@ -71,6 +71,9 @@ pub struct AtomConfig {
     pub network_allow: Vec<String>,
     /// In-turn approvals.
     pub approvals: Approvals,
+    /// The atom's own budget limits; the rest inherit the configured
+    /// defaults (see [`crate::budget`]).
+    pub budget: crate::budget::Budget,
 }
 
 /// Why an atom failed.
@@ -98,6 +101,10 @@ pub enum AtomError {
     /// The atom's task panicked; the step fails, the process does not.
     #[error("the atom panicked: {0}")]
     Panicked(String),
+    /// A budget cap left no room for the next model call, so it was not
+    /// made. Not a failure of the atom: a durable run parks on it.
+    #[error("budget: {0}")]
+    Budget(String),
     /// Anything else in running the atom.
     #[error("{0}")]
     Runtime(String),

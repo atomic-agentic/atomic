@@ -1,12 +1,15 @@
 # Budgets
 
 Budgets bound the work an atom or workflow can attempt. They are part of the
-**v0.1 target**. The fields below are the proposed format-v1 contract, shared with
-the scaffold plan; they have not been exercised against an Atomic runtime.
+**v0.1 target**. The `budget` field, its defaults, the price table and the usage
+ledger described below are implemented and tested against the scripted fake
+model; the `atomic config --explain` and `atomic runs show` commands that display
+them are not yet.
 
-You can start with detected model access and finite runtime defaults. Inspect
-those defaults with `atomic config --explain`; override a cap when the task needs
-it. No particular numeric default is promised by this draft.
+You can start with finite runtime defaults. Inspect them with
+`atomic config --explain` once it ships; override a cap when the task needs it.
+The current defaults are provisional and may change as they are tested against
+real providers.
 
 ## Set a cap
 
@@ -43,6 +46,39 @@ A cap stops a run that is already spending. To see the expected spend first, the
 planned `--plan` option on `atomic eval` and `atomic run` prints the model calls
 and an estimated cost range, beside the cap, without calling a model.
 
+## Defaults and prices
+
+Omitted limits come from the `budget` section of the configuration, which layers
+like every other setting (`atomic.yaml`, `atomic.local.yaml`, a profile, then
+`ATOMIC_*` variables such as `ATOMIC_BUDGET_ATOM_TOKENS`):
+
+```yaml
+budget:
+  atom:            # what each atom invocation inherits
+    tokens: 500000
+    minutes: 30
+    cost_usd: null # no dollar cap unless you set one
+  workflow:        # what a whole run inherits, children included
+    tokens: 2000000
+    minutes: 120
+    cost_usd: null
+  call:            # the most one model call may use, when the model has no entry below
+    input_tokens: 64000
+    output_tokens: 16000
+    minutes: 10
+  pricing:         # US dollars per million tokens, by model name
+    gpt-example:
+      input_usd_per_mtok: 2.5
+      output_usd_per_mtok: 10
+      max_input_tokens: 128000   # optional: this model's own maximum per call
+      max_output_tokens: 16000
+```
+
+Token and time caps always resolve to finite values. A dollar cap, written on an
+atom or workflow or set as a default, needs every model it covers in `pricing`;
+otherwise configuration fails before the run starts, with a hint to cap tokens or
+minutes instead.
+
 ## Bound a whole workflow
 
 A workflow can set the same top-level block:
@@ -77,8 +113,14 @@ per in-flight request, where `B` is the provider maximum and `R` the reservation
 parallel bounds sum. Unknown bounds cannot support a hard dollar cap. Provider
 billing deviations still require reconciliation, so this is not an invoice ceiling.
 
+Admission reserves the call's whole bound: the model's `max_input_tokens` and
+`max_output_tokens` from `pricing`, else the `call` defaults, priced at the model's
+rate, and the `call` time. A Codex turn can make several provider requests, so its
+reported usage can exceed that bound; the ledger records any such overshoot.
+
 When a cap prevents more work, the run parks for inspection rather than silently
-starting another attempt. Already-started work and uncertain provider usage can
+starting another attempt. The call is not made, the park is recorded with its
+reason, and the run waits; resuming it finds it parked again. Already-started work and uncertain provider usage can
 require reconciliation; a configured cap is not a promise of a perfectly bounded
 provider bill. Pending usage is not treated as free after a crash.
 
