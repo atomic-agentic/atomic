@@ -598,3 +598,57 @@ fn an_atom_edited_mid_run_does_not_change_the_run_in_flight() {
         );
     });
 }
+
+#[test]
+fn an_exec_step_runs_its_command_and_only_model_steps_call_the_model() {
+    on_codex_runtime(async {
+        let dir = scratch("exec");
+        let project = project(&dir);
+        std::fs::create_dir_all(project.join("tools")).expect("tools");
+        std::fs::write(
+            project.join("tools/count.py"),
+            "import json, sys\nnote = json.load(sys.stdin)\njson.dump({'title': note['text'][:20], 'words': len(note['text'].split())}, sys.stdout)\n",
+        )
+        .expect("script");
+        let atoms = project.join("atoms");
+        std::fs::write(
+            atoms.join("count-note.atom.astro"),
+            "---\nimport type { Props, Input, Output } from '../.atomic/types/count-note';\n\
+             import type { AtomConfig } from '../.atomic/types/authoring';\n\
+             const { input }: Props = Astro.props;\n\
+             export const config: AtomConfig<Input, Output> = { description: 'Count words.', kind: 'exec', exec: { command: ['python3', 'tools/count.py'] } };\n---\n",
+        )
+        .expect("atom");
+        for role in ["input", "output"] {
+            std::fs::copy(
+                atoms.join(format!("read-note.{role}.schema.json")),
+                atoms.join(format!("count-note.{role}.schema.json")),
+            )
+            .expect("schema");
+        }
+        let workflow = TRIAGE
+            .replace("name: triage-note", "name: counted-triage")
+            .replace("atom: read-note", "atom: count-note");
+        let pipeline = load(&project, "counted.workflow.yaml", &workflow);
+        let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
+            .await
+            .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        let run = PipelineRun {
+            pipeline,
+            input: json!({"text": "Export crashes on accented names"}),
+        };
+        rt.start(PIPELINE, "counted-1", run).await.expect("start");
+        let out: Value = rt.result("counted-1").await.expect("finishes");
+        assert_eq!(out, json!({"line": "P1: Export crashes on accents"}));
+        assert_eq!(model.calls(), 2, "the exec step made no model call");
+        let rank = model.requests()[0].to_string();
+        assert!(
+            rank.contains("Export crashes on ac") && rank.contains('5'),
+            "{rank}"
+        );
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}

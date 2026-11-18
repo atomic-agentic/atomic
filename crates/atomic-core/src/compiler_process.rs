@@ -3,19 +3,19 @@
 //! The bounded child process that runs the bundled Astro compiler.
 //!
 //! This is not an execution backend. Runners sit behind `atomic_exec::ExecutionBackend`;
-//! the compiler is trusted host code that atomic starts itself, with a cleared
-//! environment, a time limit and bounded input and output.
+//! the compiler is trusted host code that atomic starts itself, with the same
+//! bounded process the local backend uses: a cleared environment, a time limit
+//! and bounded input and output.
 
-use std::io::{Read, Write};
+use atomic_exec::ExecError;
+use atomic_exec::process::{self, Limits};
 use std::path::Path;
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// The longest a compiler call may run.
 pub(crate) const TIME_LIMIT: Duration = Duration::from_secs(30);
 /// The largest request or response, in bytes.
 pub(crate) const MESSAGE_LIMIT: usize = 8_388_608;
-const STDERR_LIMIT: usize = 65_536;
 
 /// Run `program` with `request` on stdin and return its stdout.
 ///
@@ -29,87 +29,47 @@ pub(crate) fn run(
     request: &[u8],
     time_limit: Duration,
 ) -> Result<Vec<u8>, String> {
-    let mut child = Command::new(program)
-        .args(args)
-        .env_clear()
-        .envs(environment.iter().map(|(key, value)| (key, value)))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| {
-            format!(
-                "cannot start the Astro compiler with {}: {e}; install Deno 2.9.8 or set ATOMIC_DENO",
-                program.display()
-            )
-        })?;
-    let mut stdin = child.stdin.take().ok_or("compiler stdin unavailable")?;
-    let stdout = child.stdout.take().ok_or("compiler stdout unavailable")?;
-    let stderr = child.stderr.take().ok_or("compiler stderr unavailable")?;
-    let request = request.to_vec();
-    let writer = std::thread::spawn(move || stdin.write_all(&request));
-    let reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stdout
-            .take(MESSAGE_LIMIT as u64 + 1)
-            .read_to_end(&mut bytes)
-            .map(|_| bytes)
-    });
-    let errors = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stderr
-            .take(STDERR_LIMIT as u64 + 1)
-            .read_to_end(&mut bytes)
-            .map(|_| bytes)
-    });
-    let started = Instant::now();
-    let status = loop {
-        match child.try_wait().map_err(|e| e.to_string())? {
-            Some(status) => break status,
-            None if started.elapsed() > time_limit => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!(
-                    "the Astro compiler exceeded {} seconds",
-                    time_limit.as_secs()
-                ));
-            }
-            None => std::thread::sleep(Duration::from_millis(10)),
+    let done = process::run(
+        program,
+        args,
+        None,
+        environment,
+        request,
+        Limits {
+            time: time_limit,
+            stdout: MESSAGE_LIMIT,
+            stderr: process::STDERR_LIMIT,
+        },
+    )
+    .map_err(|e| match e {
+        ExecError::Start { program, message } => format!(
+            "cannot start the Astro compiler with {program}: {message}; install Deno 2.9.8 or set ATOMIC_DENO"
+        ),
+        ExecError::TimedOut { seconds, .. } => {
+            format!("the Astro compiler exceeded {seconds} seconds")
         }
-    };
-    let output = reader
-        .join()
-        .map_err(|_| "compiler reader panicked")?
-        .map_err(|e| e.to_string())?;
-    let error = errors
-        .join()
-        .map_err(|_| "compiler stderr reader panicked")?
-        .map_err(|e| e.to_string())?;
-    let written = writer.join().map_err(|_| "compiler writer panicked")?;
-    if output.len() > MESSAGE_LIMIT || error.len() > STDERR_LIMIT {
-        return Err("compiler response limit exceeded".into());
-    }
-    if !status.success() {
-        let stderr = String::from_utf8_lossy(&error);
-        let mut message = format!("the Astro compiler crashed ({status})");
+        ExecError::TooLarge { .. } => "compiler response limit exceeded".into(),
+        ExecError::Io { message, .. } => format!("running the Astro compiler: {message}"),
+    })?;
+    if !done.success() {
+        let stderr = String::from_utf8_lossy(&done.stderr);
+        let mut message = match done.code {
+            Some(code) => format!("the Astro compiler crashed (exit status: {code})"),
+            None => "the Astro compiler was stopped by a signal".to_owned(),
+        };
         if !stderr.trim().is_empty() {
             message.push_str(": ");
             message.push_str(stderr.trim());
         }
-        // A broken pipe only says the worker stopped reading; stderr says why.
-        if let Err(write) = written
-            && write.kind() != std::io::ErrorKind::BrokenPipe
-        {
-            message.push_str(&format!("; writing its request failed: {write}"));
-        }
         return Err(message);
     }
-    Ok(output)
+    Ok(done.stdout)
 }
 
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     fn shell(script: &str, request: &[u8], limit: Duration) -> Result<Vec<u8>, String> {
         run(

@@ -573,6 +573,9 @@ dependencies = [
 [[package]]
 name = "atomic-agentic-exec"
 version = "0.0.0"
+dependencies = [
+ "thiserror 2.0.21",
+]
 
 [[package]]
 name = "atomic-agentic-graph"

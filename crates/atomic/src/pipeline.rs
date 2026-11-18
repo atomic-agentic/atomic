@@ -23,8 +23,9 @@
 //! store. Editing a file afterwards changes new runs only: a run in flight,
 //! or one recovered after a crash, uses the definitions in its own record.
 //!
-//! v0.1 runs sequential atom steps. Gate steps and worktree steps are refused
-//! by [`prepare`] until the interpreter supports them.
+//! v0.1 runs sequential atom steps: model atoms, and exec atoms, which run a
+//! command with no model. Gate steps and worktree steps are refused by
+//! [`prepare`] until the interpreter supports them.
 
 use crate::workflows::propose;
 use atomic_core::artifact::{ArtifactStore, LocalStore, Provenance};
@@ -140,9 +141,9 @@ pub fn prepare(
         let atom = atoms
             .get(name)
             .ok_or_else(|| fail(format!("step `{id}` names `{name}`, which is not loaded")))?;
-        if !matches!(atom.kind.as_str(), "lite" | "codex") {
+        if !matches!(atom.kind.as_str(), "lite" | "codex" | "exec") {
             return Err(fail(format!(
-                "step `{id}` runs `{name}`, a {} atom; run_pipeline runs atoms that call a model",
+                "step `{id}` runs `{name}`, a {} atom, which run_pipeline cannot run",
                 atom.kind
             )));
         }

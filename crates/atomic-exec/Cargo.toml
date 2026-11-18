@@ -18,3 +18,4 @@ name = "atomic_exec"
 workspace = true
 
 [dependencies]
+thiserror = { workspace = true }

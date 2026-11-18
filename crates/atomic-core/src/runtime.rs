@@ -432,12 +432,15 @@ pub async fn run_declarative_with_context(
     if compiled.hash != atom.program.hash() {
         return Err(AtomError::Runtime("compiled atom version mismatch".into()));
     }
+    if atom.kind == "exec" {
+        return run_exec(atom, compiled, input, Arc::new(atomic_exec::LocalBackend)).await;
+    }
     let backend = match atom.kind.as_str() {
         "codex" => Backend::Codex(&runtimes.codex),
         "lite" => Backend::Lite(&runtimes.lite),
         other => {
             return Err(AtomError::Runtime(format!(
-                "{} is a {other} atom, which calls no model",
+                "{} is a {other} atom, which this version cannot run",
                 atom.name
             )));
         }
@@ -519,6 +522,162 @@ pub async fn run_declarative_with_context(
         name: &atom.name,
     };
     run_contract(backend, request, &check).await
+}
+
+/// How long an exec atom's command may run before it is stopped.
+pub const EXEC_TIME_LIMIT: std::time::Duration = std::time::Duration::from_secs(300);
+/// The most an exec atom's command may write to stdout, in bytes.
+pub const EXEC_OUTPUT_LIMIT: usize = 8_388_608;
+
+/// Run an exec atom: its command, with no model and no shell, on `backend`.
+///
+/// The command runs in the project's directory with exactly the environment
+/// the atom declares, plus `HOME` and `TMPDIR` pointing at a scratch
+/// directory of its own. It reads the input as one JSON value on stdin and
+/// writes one JSON value to stdout; stderr is for diagnostics. A nonzero
+/// exit fails the step, and so does output that breaks the contract or the
+/// atom's validators: there is no model to repair it.
+pub async fn run_exec(
+    atom: &AtomFile,
+    compiled: &Compiled,
+    input: &Value,
+    backend: Arc<dyn atomic_exec::ExecutionBackend>,
+) -> Result<(Value, RunMetadata), AtomError> {
+    let contract = |key: &str| {
+        compiled.program.contracts.get(key).ok_or_else(|| {
+            AtomError::Runtime(format!("{} has no compiled {key} contract", atom.name))
+        })
+    };
+    let input_validator = Registry::new()
+        .validator_for(contract("Input")?)
+        .map_err(|e| AtomError::Runtime(e.to_string()))?;
+    check_input(&input_validator, input)?;
+    let strings = |value: &Value| -> Vec<String> {
+        value
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect()
+    };
+    let mut command = strings(&atom.frontmatter["exec"]["command"]).into_iter();
+    let program = command
+        .next()
+        .ok_or_else(|| AtomError::Runtime(format!("{} has no exec.command", atom.name)))?;
+    let args: Vec<String> = command.collect();
+    let scratch =
+        scratch_dir().map_err(|e| AtomError::Runtime(format!("scratch directory: {e}")))?;
+    let mut env: Vec<(String, String)> = atom.frontmatter["env"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_owned())))
+        .collect();
+    let scratch_text = scratch.display().to_string();
+    env.retain(|(k, _)| k != "HOME" && k != "TMPDIR");
+    env.push(("HOME".into(), scratch_text.clone()));
+    env.push(("TMPDIR".into(), scratch_text));
+    let stdin = serde_json::to_vec(input).map_err(|e| AtomError::Runtime(e.to_string()))?;
+    let mut h = Sha256::new();
+    for part in std::iter::once(&program).chain(&args) {
+        h.update(part.as_bytes());
+        h.update([0]);
+    }
+    h.update(&stdin);
+    let prompt_hash = format!("{:x}", h.finalize());
+    let request = atomic_exec::Command {
+        program: program.clone(),
+        args,
+        cwd: atom.program.root.clone(),
+        env,
+        stdin,
+        time_limit: EXEC_TIME_LIMIT,
+        output_limit: EXEC_OUTPUT_LIMIT,
+    };
+    // The command runs on the blocking pool, never on an executor thread.
+    let done = tokio::task::spawn_blocking(move || backend.run(&request))
+        .await
+        .map_err(|e| AtomError::Runtime(format!("{}: {e}", atom.name)));
+    let _ = std::fs::remove_dir_all(&scratch);
+    let done = done?.map_err(|e| AtomError::Runtime(format!("{}: {e}", atom.name)))?;
+    if !done.success() {
+        let stderr = String::from_utf8_lossy(&done.stderr);
+        let tail: String = stderr
+            .trim()
+            .chars()
+            .rev()
+            .take(2000)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        return Err(AtomError::Runtime(format!(
+            "{}: {program} {}{}",
+            atom.name,
+            done.code.map_or_else(
+                || "was stopped by a signal".to_owned(),
+                |c| format!("exited with code {c}")
+            ),
+            if tail.is_empty() {
+                String::new()
+            } else {
+                format!(": {tail}")
+            }
+        )));
+    }
+    let text = String::from_utf8_lossy(&done.stdout).into_owned();
+    let schema_error = |message: String| AtomError::Schema {
+        message,
+        answer: text.chars().take(2000).collect(),
+    };
+    let output: Value = serde_json::from_str(text.trim())
+        .map_err(|e| schema_error(format!("stdout is not one JSON value: {e}")))?;
+    let validator = Registry::new()
+        .validator_for(contract("Output")?)
+        .map_err(|e| AtomError::Runtime(e.to_string()))?;
+    let errors: Vec<String> = validator
+        .iter_errors(&output)
+        .map(|e| {
+            let at = e.instance_path().to_string();
+            format!("{}: {e}", if at.is_empty() { "/".to_owned() } else { at })
+        })
+        .collect();
+    if !errors.is_empty() {
+        return Err(schema_error(errors.join("; ")));
+    }
+    let has_checks = atom
+        .frontmatter
+        .get("validate")
+        .and_then(Value::as_array)
+        .is_some_and(|checks| !checks.is_empty());
+    let values = serde_json::json!({"values":{"input":input,"output":output}});
+    validate_output(&compiled.program, has_checks, values).await?;
+    Ok((
+        output,
+        RunMetadata {
+            thread_id: String::new(),
+            model: "exec".into(),
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
+            human_actions: Vec::new(),
+            prompt_hash,
+            turns: 0,
+        },
+    ))
+}
+
+/// A new, empty scratch directory for one exec attempt.
+fn scratch_dir() -> std::io::Result<PathBuf> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "atomic-exec-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::create_dir(&dir)?;
+    Ok(dir)
 }
 
 async fn validate_output(
