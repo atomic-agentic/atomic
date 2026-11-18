@@ -11,19 +11,20 @@
 #
 # It works in a copy of the committed tree and changes nothing here. It needs
 # cargo and the network (crates.io and the pinned git sources). Codex's
-# lockfile is read from CODEX_SRC (a clone of openai/codex) when set,
+# lockfile is read from CODEX_SRC (a clone of the Codex repository deps/codex.toml names) when set,
 # otherwise downloaded at the pinned revision.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REV="$(sed -n 's/^rev = "\(.*\)"$/\1/p' "${ROOT}/deps/codex.toml" | head -n1)"
+REPOSITORY="$(sed -n 's/^repository = "\(.*\)"$/\1/p' "${ROOT}/deps/codex.toml" | head -n1)"
 WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK}"' EXIT
 
 if [ -n "${CODEX_SRC:-}" ]; then
     git -C "${CODEX_SRC}" show "${REV}:codex-rs/Cargo.lock" >"${WORK}/codex.lock"
 else
-    curl -fsSL --retry 3 -o "${WORK}/codex.lock" "https://raw.githubusercontent.com/openai/codex/${REV}/codex-rs/Cargo.lock"
+    curl -fsSL --retry 3 -o "${WORK}/codex.lock" "https://raw.githubusercontent.com/${REPOSITORY#https://github.com/}/${REV}/codex-rs/Cargo.lock"
 fi
 
 # The versions of a package a lockfile holds, one per line.

@@ -24,3 +24,15 @@ rev = "10462fa4414c6c7f1ed1d39bb31678e3b726878c"
 licence = "MIT OR Apache-2.0"
 why = "accepts libsqlite3-sys 0.39; Codex patches sqlx-core and sqlx-sqlite to it, atomic adds sqlx-postgres"
 crates = ["sqlx-core", "sqlx-sqlite", "sqlx-postgres"]
+
+[[fork]]
+name = "codex"
+repository = "https://github.com/atomic-agentic/codex"
+upstream = "https://github.com/openai/codex"
+# The upstream release commit the fork's `atomic` branch starts from (deps/codex.toml's tag).
+upstream_base = "d32063f96c2dff1dc96af839b3952abb6acfeda4"
+branch = "atomic"
+rev = "a4b0cac70d89a168616d5cb3b99e5b162e91ce5d"
+licence = "Apache-2.0"
+why = "makes the parent-death signal best effort where prctl is refused, so commands start in AWS Lambda"
+crates = ["codex-app-server", "codex-core-api", "codex-extension-api", "codex-utils-pty"]

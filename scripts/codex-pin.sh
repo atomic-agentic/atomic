@@ -15,10 +15,11 @@
 #    crates.io sqlx-postgres does not build against the patched core.
 # 2. rust-toolchain.toml names the toolchain Codex's rust-toolchain.toml names.
 # 3. deps/codex.toml records that same toolchain.
-# 4. Every git dependency on openai/codex uses the pinned revision.
+# 4. Every git dependency on Codex uses the pinned repository and revision.
 #
-# Codex's files are read from CODEX_SRC (a local clone of openai/codex) when set, otherwise
-# downloaded from GitHub at the pinned revision.
+# Codex's files are read from CODEX_SRC (a local clone of the Codex repository
+# deps/codex.toml names) when set, otherwise downloaded from GitHub at the pinned
+# revision.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -32,20 +33,26 @@ pin_value() {
 }
 
 REV="$(pin_value rev)"
+REPOSITORY="$(pin_value repository)"
 TOOLCHAIN_PIN="$(pin_value toolchain)"
-if [ -z "${REV}" ] || [ -z "${TOOLCHAIN_PIN}" ]; then
-    echo "scripts/codex-pin.sh: deps/codex.toml must set rev and toolchain" >&2
+if [ -z "${REV}" ] || [ -z "${TOOLCHAIN_PIN}" ] || [ -z "${REPOSITORY}" ]; then
+    echo "scripts/codex-pin.sh: deps/codex.toml must set repository, rev and toolchain" >&2
     exit 2
 fi
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK}"' EXIT
 
+# Raw files from the Codex repository deps/codex.toml names, at a revision.
+raw_url() { # revision, codex-rs relative path
+    echo "https://raw.githubusercontent.com/${REPOSITORY#https://github.com/}/$1/codex-rs/$2"
+}
+
 fetch() { # codex-rs relative path, destination
     if [ -n "${CODEX_SRC:-}" ]; then
         git -C "${CODEX_SRC}" show "${REV}:codex-rs/$1" >"$2"
     else
-        curl -fsSL --retry 3 -o "$2" "https://raw.githubusercontent.com/openai/codex/${REV}/codex-rs/$1"
+        curl -fsSL --retry 3 -o "$2" "$(raw_url "${REV}" "$1")"
     fi
 }
 
@@ -117,10 +124,10 @@ case "${1:-}" in
             echo "scripts/codex-pin.sh: the patch block in Cargo.toml differs from Codex ${REV}; run scripts/codex-pin.sh write" >&2
             status=1
         fi
-        # Every git dependency on Codex must use the pinned revision.
-        stale="$(grep -n 'git = "https://github.com/openai/codex"' "${MANIFEST}" ${ROOT}/crates/*/Cargo.toml | grep -v "rev = \"${REV}\"" || true)"
+        # Every git dependency on Codex must use the pinned repository and revision.
+        stale="$(grep -n -E 'git = "https://github.com/[^/"]+/codex"' "${MANIFEST}" ${ROOT}/crates/*/Cargo.toml | grep -v -F "git = \"${REPOSITORY}\", rev = \"${REV}\"" || true)"
         if [ -n "${stale}" ]; then
-            echo "scripts/codex-pin.sh: Codex dependencies not at ${REV}:" >&2
+            echo "scripts/codex-pin.sh: Codex dependencies not at ${REPOSITORY} ${REV}:" >&2
             echo "${stale}" >&2
             status=1
         fi
