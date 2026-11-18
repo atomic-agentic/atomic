@@ -4,9 +4,9 @@ The manifest and atom live under [.atomic/](.atomic/atomic.yaml). Run discovery
 from this directory or below it; the application repository need not become an
 agent-only project. Runtime state remains outside the source tree.
 
-[The atom](.atomic/atoms/review-diff.atom.md) discovers adjacent schema files and
-includes `_review-rules.md` relative to itself. The manifest does not repeat the
-default collections. The atom uses the default Codex kind, read-only sandbox and
+[The atom](.atomic/atoms/review-diff.atom.astro) discovers adjacent schema files and
+includes `ReviewRules.astro` relative to itself. The manifest does not repeat the
+default collections. The atom explicitly selects the Codex kind, with a read-only sandbox and
 no optional tools.
 
 The fixture supplies patch text and acceptance criteria. It deliberately does

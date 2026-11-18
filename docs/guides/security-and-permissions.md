@@ -35,7 +35,7 @@ from permitted capabilities; it cannot grant access that managed policy denies.
 | Telemetry | Approved export destination; content capture separately enabled |
 | Runtime and package downloads | One pinned Deno, verified against a checksum built into Atomic; packages only from the registry, verified against the lockfile; both can be forbidden or mirrored by managed policy |
 
-[Code that an atom carries](scripts-and-cloud-sdks.md), in a `---ts` block or a
+[Executable script code](scripts-and-cloud-sdks.md), in a separate
 script, runs on Deno in its own process. It reaches only the hosts in its atom's
 `network.allow` and receives only the environment its atom declares, with
 short-lived credentials that never reach a model. Atomic reads those
@@ -45,7 +45,7 @@ Packages from npm get no more than that. A run uses only versions recorded in
 the lockfile, runs no install scripts, loads nothing from a URL and cannot
 start a process. A project can go further in its manifest, for example by
 limiting which packages atom code may import; see
-[security defaults and settings](atom-code-runtime.md#security-defaults-and-settings).
+[security defaults and settings](atom-code-runtime.md).
 
 There is no single shell-network switch that covers all these paths. Cached
 [web search](web-search.md) still sends a query to a hosted service. Subscription
@@ -76,7 +76,7 @@ values remain untrusted input. Keep private data out of public search queries an
 unapproved model/provider fallbacks.
 
 The v0.1 tutorials use team-curated inputs. From v0.1, each value inserted into
-a prompt is [wrapped and labelled with its origin](template-tags.md#insert-a-value).
+a prompt is [wrapped and labelled with its origin](template-tags.md).
 Tracking an origin through atom outputs, stored text and the work graph, and
 stronger external input controls, arrive in v0.5; sensitivity-based routing and broader enterprise
 controls follow later. Do not treat the early local release as a production
@@ -102,7 +102,7 @@ for operations that might have succeeded before a crash.
 
 Use login storage, environment variables or approved secret references. Atom
 code that calls a cloud service names a
-[credential](scripts-and-cloud-sdks.md#give-code-short-lived-credentials): Atomic
+[credential](scripts-and-cloud-sdks.md): Atomic
 assumes a role for each step and hands the code keys that expire in minutes, so
 no long-lived key is stored. Do not
 commit credentials to atom files, manifests, fixtures or transcripts. Keep runtime

@@ -220,6 +220,25 @@ pub async fn converse<F>(
 where
     F: FnMut(&str) -> Option<TurnSpec>,
 {
+    converse_async(paths, codex_home, cwd, endpoint, first, |answer| {
+        std::future::ready(next(&answer))
+    })
+    .await
+}
+
+/// Conversation with asynchronous checks between turns.
+pub async fn converse_async<F, Fut>(
+    paths: &CodexPaths,
+    codex_home: &Path,
+    cwd: &Path,
+    endpoint: &ModelEndpoint,
+    first: &TurnSpec,
+    mut next: F,
+) -> anyhow::Result<(String, ThreadReport)>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Option<TurnSpec>>,
+{
     let spec = first;
     let mut endpoint = endpoint.clone();
     if let Some(m) = &spec.model {
@@ -301,7 +320,7 @@ where
                     report.output_tokens = output;
                     report.total_tokens = total;
                 }
-                match next(&answer) {
+                match next(answer.clone()).await {
                     Some(follow_up) => current = follow_up,
                     None => break Ok((answer, report.clone())),
                 }

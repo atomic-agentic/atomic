@@ -12,15 +12,20 @@ input:
 output:
   $ref: ../atoms/put-digest.output.schema.yaml
 steps:
-  summarize:
-    atom: summarize-report
+  fetch:
+    atom: fetch-report
     with:
       key: "'reports/' + input.name"
+  summarize:
+    after: [fetch]
+    atom: summarize-report
+    with:
+      report: steps.fetch.output.report
   approve:
     after: [summarize]
     gate:
       title: "'Store this digest in S3'"
-      show: "{'report': 'reports/' + input.name, 'report_sha256': steps.summarize.prepared.report.sha256, 'digest': steps.summarize.output.summary}"
+      show: "{'report': 'reports/' + input.name, 'report_sha256': steps.fetch.output.report.sha256, 'digest': steps.summarize.output.summary}"
       timeout: 24h
       on_timeout: reject
   store:

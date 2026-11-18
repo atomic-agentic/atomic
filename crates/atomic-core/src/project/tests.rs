@@ -33,7 +33,7 @@ fn a_project_is_found_from_a_subdirectory() {
     assert_eq!(p.manifest, root.join("atomic.yaml"));
     assert_eq!(p.dir, root);
     assert_eq!(p.name, "billing");
-    assert_eq!(p.collections["atoms"][0], "atoms/**/*.atom.md");
+    assert_eq!(p.collections["atoms"][0], "atoms/**/*.atom.astro");
     assert_eq!(p.generated, PathBuf::from(".atomic/cache"));
 }
 
@@ -67,7 +67,7 @@ fn a_nested_manifest_bounds_discovery() {
     let root = tree(&[
         ("atomic.yaml", "atomic: 1\nname: outer\n"),
         ("tools/inner/atomic.yaml", "atomic: 1\nname: inner\n"),
-        ("tools/inner/atoms/x.atom.md", ""),
+        ("tools/inner/atoms/x.atom.astro", ""),
     ]);
     assert_eq!(
         discover(&root.join("tools/inner/atoms"))
@@ -128,10 +128,10 @@ fn unknown_and_unsupported_keys_are_refused_with_their_line() {
 fn a_collection_override_replaces_only_that_collection() {
     let root = tree(&[(
         "atomic.yaml",
-        "atomic: 1\ncollections:\n  atoms: [\"agents/*.atom.md\"]\n",
+        "atomic: 1\ncollections:\n  atoms: [\"agents/*.atom.astro\"]\n",
     )]);
     let p = discover(&root).expect("discover");
-    assert_eq!(p.collections["atoms"], ["agents/*.atom.md"]);
+    assert_eq!(p.collections["atoms"], ["agents/*.atom.astro"]);
     assert_eq!(
         p.collections["workflows"][0],
         "workflows/**/*.workflow.yaml"

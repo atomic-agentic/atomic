@@ -1,0 +1,16 @@
+---
+import type { Props, Input, Output } from '../types/review-diff';
+import type { AtomConfig } from '../types/authoring';
+import ReviewRules from './ReviewRules.astro';
+const { input }: Props = Astro.props;
+export const config: AtomConfig<Input, Output> = {
+  "description": "Review supplied patch text without changing the repository.",
+  "kind": "codex",
+  "validate": [({input, output}) => output.verdict !== 'approve' || output.findings.length === 0]
+};
+---
+
+<ReviewRules />
+
+     Criteria: {input.criteria}
+     Patch: {input.patch}

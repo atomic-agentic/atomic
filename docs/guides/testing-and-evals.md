@@ -46,7 +46,7 @@ any other code. `atomic test` runs the project's tests on the managed Deno with
 network access limited to your own machine, so a test cannot reach a real
 service. An atom whose code writes to an outside system has tests and no eval
 cases: Atomic never runs such code in an eval. Planned for v0.7; see
-[call AWS and other services with an SDK](scripts-and-cloud-sdks.md#check-render-and-evaluate-without-calling-the-service).
+[call AWS and other services with an SDK](scripts-and-cloud-sdks.md).
 
 ## Use deterministic checks for deterministic requirements
 
@@ -82,17 +82,15 @@ of what a model returned.
 
 ## Preview the prompt and the cost
 
-Before a live run, `atomic render <atom> --input <file.json>` prints the exact
-prompt for an input without calling a model. `atomic check` keeps a snapshot of
-the rendered prompt for each typed example and fails when it changes without the
-snapshot being updated, so an edit to instructions or to a shared partial is
-visible in review. See
-[template tags](template-tags.md#see-the-prompt-before-spending-tokens).
+Before a live run, `atomic render <file.atom.astro> --input <file.json>` prints the exact
+prompt for an input without calling a model. Review its separate developer/user
+parts when changing instructions or shared components. Persisted prompt snapshots
+and regression comparison remain planned; the current check command validates
+source, types, schemas and declared examples. See [prompt components](template-tags.md).
 
-An atom with a `---ts` block fetches values before the model call. `atomic check`
-and its snapshots never run that code; `render` and evals run it unless you
-supply the values. See
-[check, render and evaluate without calling the service](scripts-and-cloud-sdks.md#check-render-and-evaluate-without-calling-the-service).
+A script atom fetches values as a separate workflow step. Its output becomes the
+Astro model atom's ordinary typed input. Evals use committed input/output fixtures
+and never run a script that writes to an external system.
 
 `atomic eval <atom> --plan` shows what a run would cost before it spends anything:
 the number of model calls, the size of each prompt and an estimated cost range,
@@ -107,8 +105,8 @@ versions of an atom and reports the difference in results and cost.
 
 To try a different wording without losing the current one, add a
 [variant](../reference/atom-files.md#variants) such as
-`summarize-note.short.atom.md`. It shares the atom's schemas and cases, so the
-comparison is like for like.
+`summarize-note.short.atom.astro`. Point it at the atom's own schemas with `$ref`,
+since a variant inherits nothing, so the comparison is like for like.
 
 `--compare` is also how you decide whether an addition to an atom's instructions
 earns its tokens. A [diagram in the instructions](diagrams.md#put-a-diagram-in-an-atoms-instructions-only-when-it-earns-its-place),
@@ -123,8 +121,10 @@ a tolerated drop against a baseline revision, so a regression fails CI even
 while the result is above the minimum. A scorer is a check that gives each case
 a number, where an `expect` assertion gives only pass or fail.
 
-Thresholds are part of the v0.1 target. The syntax for declaring them, and for
-scorers other than `expect` assertions, is not specified yet.
+Astro config declares typed scorer `with` and `score` callbacks and `min_mean`.
+Production helpers check full candidate/case/judge schemas and enforce numeric
+score bounds and mean thresholds. Live judge orchestration and regression CLI
+commands remain separate work. See [atom files](../reference/atom-files.md).
 
 ## Record a decision with its evidence
 

@@ -1,0 +1,31 @@
+---
+export const config = {
+  "description": "Fetch an operations report from S3.",
+  "kind": "exec",
+  "exec": {
+    "script": "../tools/fetch_report.ts"
+  },
+  "env": {
+    "AWS_REGION": "us-east-1",
+    "REPORTS_BUCKET": "acme-reports"
+  },
+  "credentials": [
+    "aws-reports-reader"
+  ],
+  "runtime": {
+    "deno": {
+      "sys": [
+        "osRelease"
+      ]
+    }
+  },
+  "network": {
+    "allow": [
+      "acme-reports.s3.us-east-1.amazonaws.com"
+    ]
+  },
+  "effects": {
+    "external": "read-only"
+  }
+};
+---

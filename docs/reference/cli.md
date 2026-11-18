@@ -47,12 +47,12 @@ itself, which is the quickest way to try an atom.
 From anywhere else, point at the atom's file, or name the project:
 
 ```sh
-atomic run ~/work/note-tools/atoms/classify-note.atom.md --data '{"text": "…"}'
+atomic run ~/work/note-tools/atoms/classify-note.atom.astro --data '{"text": "…"}'
 atomic --project ~/work/note-tools run classify-note --input note.json
 atomic --project ~/work/note-tools/atomic.yaml run classify-note --input note.json
 ```
 
-A path to an `.atom.md`, `.atom.mdx` or `.workflow.yaml` file runs that
+A path to an `.atom.astro` or `.workflow.yaml` file runs that
 definition; Atomic finds its project by walking up from the file. `--project`
 takes the manifest's directory or the `atomic.yaml` file itself.
 
@@ -117,7 +117,7 @@ remain unspecified. Run recovery uses the v0.1 command above. The
 | `atomic dev --otel` | Start the optional local observability setup with Jaeger or Langfuse | v0.5 / M44 |
 | `atomic eval <atom> --live` | Evaluate with live calls and record applicable responses | v0.5 development loop |
 | `atomic eval <atom> --compare <revision>` | Compare behavior, cost and output across definitions | v0.5 |
-| `atomic render <atom> --input <file.json>` | Print the exact prompt an atom would send, without calling a model. For an atom with code, add `--prepared <file.json>` to supply the prepared values and not run its code | v0.5; `--prepared` v0.7 |
+| `atomic render <file.atom.astro> --input <file.json>` | Print developer/user prompt parts without a model; optional `--context-settings`, `--profile`, `--run-id`, `--step-id` | Implemented direct invocation |
 | `atomic eval <atom> --plan`, `atomic run <workflow> --plan` | Print the expected model calls and a cost range, then exit without calling a model | v0.5 |
 | `atomic run <workflow> --effects preview` | Run a workflow in staged mode: external effects are recorded and shown, none is applied | v0.5 |
 | `atomic schemas expand <atom>` | Print the JSON Schema that a compact schema compiles to | v0.5 |
@@ -133,8 +133,7 @@ replay as a live model result.
 | Command | Purpose | Planned stage |
 | --- | --- | --- |
 | `atomic check --write-lock` | Write `atomic.policy.lock`, the resolved permissions and limits of every atom and workflow | v1.0 |
-| `atomic check --fix` | Escape every loose `<` and `{` in the prose of `.atom.mdx` files, and change nothing else | v0.5 |
-| `atomic atoms convert <atom> --to md\|mdx` | Rewrite an atom in the other template form, adding or removing escapes so it compiles to the same atom | v0.5 |
+| `atomic check --fix` | Planned Astro-aware escaping assistance; literal syntax currently uses entities | v0.5 |
 | `atomic stale [--as-of <date>]` | List [recorded decisions](manifest.md#recorded-decisions) that need another look: the review date has passed, or the evidence is too old, was produced on a different model or prompt version, or no longer holds | v0.7 |
 | `atomic runtimes install [--from <archive>]` | Fetch and verify the Deno version this Atomic release pins, ahead of time; `--from` installs from a file on a machine with no network | v0.7 |
 | `atomic runtimes lock` | Write `deno.lock` from the packages that atom code and scripts import | v0.7 |
@@ -148,7 +147,7 @@ as an argument and is meant to run on a schedule; `atomic check` never reads
 the clock. A local run downloads the managed Deno by itself the first time a
 project needs it, so `atomic runtimes install` matters for CI, images and
 offline machines; see
-[you do not install Deno](../guides/atom-code-runtime.md#you-do-not-install-deno).
+[you do not install Deno](../guides/atom-code-runtime.md).
 
 ## Diagrams
 
@@ -188,3 +187,13 @@ identity and transport controls. Use `atomic runner` only when operating
 a separate execution backend, planned for the platform stage.
 
 See [local and team operation](../operations/running-atomic.md) for roles and storage.
+
+`atomic render` without `--run-id` is an ephemeral preview: each invocation uses
+current atom sources, settings and declared environment values. Supply
+`--context-settings` for each contextual preview. With an explicit `--run-id`,
+Atomic checkpoints public context and restores it on subsequent invocations;
+changing the compiled atom requires a new run identity. Checkpoints carry a
+keyed authentication tag, checked using a private key in the host state directory.
+Unsigned checkpoints from earlier implementations are refused; use a new run id.
+The key and checkpoints must remain outside model-accessible paths. Their public
+SHA-256 digest alone is a consistency check, not proof of host authorization.

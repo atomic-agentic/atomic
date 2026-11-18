@@ -271,16 +271,17 @@ pub fn load(
                 };
                 return Err(fail(&ap, format!("no atom named `{atom_name}`{hint}")));
             };
-            let target = registry
-                .get(&atom.input)
-                .map(|e| e.schema.clone())
+            let target = atom
+                .program
+                .contracts
+                .get("Input")
+                .cloned()
                 .ok_or_else(|| {
                     fail(
                         &ap,
-                        format!("atom `{atom_name}` has no registered input schema"),
+                        format!("atom `{atom_name}` has no compiled input contract"),
                     )
                 })?;
-            let target = inline(&target, Path::new(""), registry, 0).map_err(|m| fail(&ap, m))?;
             let fields = target
                 .get("properties")
                 .and_then(Value::as_object)
@@ -354,11 +355,17 @@ pub fn load(
                     "`worktree` is true or false".into(),
                 ));
             }
-            let out = registry
-                .get(&atom.output)
-                .map(|e| e.schema.clone())
-                .unwrap_or(json!({}));
-            let out = inline(&out, Path::new(""), registry, 0).map_err(|m| fail(&ap, m))?;
+            let out = atom
+                .program
+                .contracts
+                .get("Output")
+                .cloned()
+                .ok_or_else(|| {
+                    fail(
+                        &ap,
+                        format!("atom `{atom_name}` has no compiled output contract"),
+                    )
+                })?;
             step_schemas.insert(
                 id.clone(),
                 json!({"type": "object", "properties": {"output": out, "metadata": {"type": "object"}}, "additionalProperties": false}),
@@ -515,77 +522,11 @@ pub(crate) fn inline(
     schema: &Value,
     dir: &Path,
     registry: &mut Registry,
-    depth: usize,
+    _depth: usize,
 ) -> Result<Value, String> {
-    inline_in(schema, schema, dir, registry, depth)
-}
-
-fn inline_in(
-    root: &Value,
-    schema: &Value,
-    dir: &Path,
-    registry: &mut Registry,
-    depth: usize,
-) -> Result<Value, String> {
-    if depth > 16 {
-        return Ok(json!({}));
-    }
-    match schema {
-        Value::Object(map) => {
-            if let Some(Value::String(r)) = map.get("$ref") {
-                let (base, fragment) = r.split_once('#').map_or((r.as_str(), ""), |(b, f)| (b, f));
-                let (doc, doc_dir) = if base.is_empty() {
-                    (root.clone(), dir.to_owned())
-                } else if base.contains(':') {
-                    let e = registry
-                        .get(base)
-                        .ok_or_else(|| format!("no schema registered as {base}"))?;
-                    (
-                        e.schema.clone(),
-                        e.file.parent().map(Path::to_owned).unwrap_or_default(),
-                    )
-                } else {
-                    let path = dir.join(base);
-                    if !path.is_file() {
-                        return Err(format!(
-                            "dangling reference: {r} does not exist ({})",
-                            path.display()
-                        ));
-                    }
-                    let id = registry.load_file(&path).map_err(|e| e.to_string())?;
-                    let e = registry
-                        .get(&id)
-                        .ok_or_else(|| format!("no schema registered as {id}"))?;
-                    (
-                        e.schema.clone(),
-                        path.parent().map(Path::to_owned).unwrap_or_default(),
-                    )
-                };
-                let target = if fragment.is_empty() {
-                    doc.clone()
-                } else {
-                    doc.pointer(fragment)
-                        .cloned()
-                        .ok_or_else(|| format!("{r}: no such place in the schema"))?
-                };
-                return inline_in(&doc, &target, &doc_dir, registry, depth + 1);
-            }
-            let mut out = Map::new();
-            for (k, v) in map {
-                if k == "$defs" || k == "$id" || k == "$schema" {
-                    continue;
-                }
-                out.insert(k.clone(), inline_in(root, v, dir, registry, depth)?);
-            }
-            Ok(Value::Object(out))
-        }
-        Value::Array(items) => items
-            .iter()
-            .map(|v| inline_in(root, v, dir, registry, depth))
-            .collect::<Result<Vec<_>, _>>()
-            .map(Value::Array),
-        other => Ok(other.clone()),
-    }
+    registry
+        .inline_value(schema, &dir.join(".atomic-inline.schema.json"))
+        .map_err(|e| e.to_string())
 }
 
 /// The schema of `source` when it is a plain path from `input` or `steps`.

@@ -1,0 +1,17 @@
+---
+import type { Props, Input, Output } from '../.atomic/types/plan-task';
+import type { AtomConfig } from '../.atomic/types/authoring';
+const { input }: Props = Astro.props;
+export const config: AtomConfig<Input, Output> = {
+  "description": "Plan one bounded change against its acceptance criteria.",
+  "kind": "codex"
+};
+---
+
+Inspect the repository at the supplied base. Produce at most five steps for this
+     one task, with tests that demonstrate each acceptance criterion. Return a plan;
+     do not edit files or create graph items.
+
+     Task: {input.task.item.title}
+     Criteria: {input.task.item.criteria}
+     Base: {input.task.base}

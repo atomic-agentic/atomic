@@ -85,5 +85,5 @@ provider bill. Pending usage is not treated as free after a crash.
 Inspect the run with `atomic runs show <run-id>`. This draft does not define a
 budget-increase command; resuming alone cannot bypass a cap.
 
-See [atom fields](atom-files.md#fields), [workflow fields](workflow-files.md#top-level-fields)
+See [atom fields](atom-files.md), [workflow fields](workflow-files.md#top-level-fields)
 and [observability](../operations/observability.md).

@@ -1,6 +1,6 @@
 // A stand-in for the `atomic:types` module that `atomic types` is planned to
 // generate from the project's schemas. This mirrors
-// atoms/summarize-report.input.schema.yaml.
+// atoms/fetch-report.input.schema.yaml.
 export interface SummarizeReportInput {
   key: string;
 }

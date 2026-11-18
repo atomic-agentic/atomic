@@ -1,11 +1,11 @@
-// Runs the TypeScript block of atoms/summarize-report.atom.md the way Atomic
+// Runs the TypeScript block of atoms/summarize-report.atom.astro the way Atomic
 // is planned to run it. S3 is a local stand-in; nothing leaves this machine.
 //
 //   deno test -A --lock=deno.lock --frozen test/
 import { check, runPrepare } from "./atom_host.ts";
 import { FakeS3 } from "./fake_s3.ts";
 
-const ATOM = "atoms/summarize-report.atom.md";
+const ATOM = "atoms/summarize-report.atom.astro";
 const BUCKET = "acme-reports";
 const root = new URL("../", import.meta.url);
 const readJson = async (path: string) =>
@@ -29,7 +29,7 @@ async function withReport(test: (s3: FakeS3, host: string) => Promise<void>) {
   }
 }
 
-Deno.test("the atom's code type-checks, and its instructions read only what prepare returns", async () => {
+Deno.test("the fetch script type-checks, and the Astro prompt reads only its output", async () => {
   // The committed sample must also have the shape prepare returns.
   const sample = await readJson(
     "fixtures/summarize-report/october.prepared.json",
@@ -38,37 +38,37 @@ Deno.test("the atom's code type-checks, and its instructions read only what prep
   if (result.code !== 0) throw new Error(result.stderr);
 });
 
-Deno.test("a path that prepare does not return is a type error", async () => {
+Deno.test("a path the fetch script does not return is a type error", async () => {
   const result = await check(ATOM, { extraPaths: ["report.body"] });
   if (result.code === 0) throw new Error("expected a type error");
   if (!result.stderr.includes("body")) throw new Error(result.stderr);
 });
 
-Deno.test("the workflow reads only prepared values the atom returns", async () => {
+Deno.test("the workflow binds and displays only fields returned by the fetch step", async () => {
   // A workflow may read steps.<id>.prepared.<path>, for example to show a gate
   // the hash of what the model saw. Those paths are checked the same way.
   const workflow = await Deno.readTextFile(
     new URL("workflows/digest-report.workflow.yaml", root),
   );
   const paths = [
-    ...workflow.matchAll(/steps\.summarize\.prepared((?:\.\w+)+)/g),
+    ...workflow.matchAll(/steps\.fetch\.output((?:\.\w+)+)/g),
   ].map((m) => m[1].slice(1));
-  equal(paths, ["report.sha256"], "prepared paths the workflow reads");
+  equal(paths, ["report", "report.sha256"], "prepared paths the workflow reads");
   const result = await check(ATOM, { extraPaths: paths });
   if (result.code !== 0) throw new Error(result.stderr);
 });
 
-Deno.test("a sample that does not match what prepare returns is a type error", async () => {
+Deno.test("a sample that does not match the fetch output is a type error", async () => {
   const result = await check(ATOM, {
     sample: { report: { text: "x", bytes: "one" } },
   });
   if (result.code === 0) throw new Error("expected a type error");
 });
 
-Deno.test("prepare reads the report and returns the fixture", () =>
+Deno.test("the fetch script reads the report and returns the fixture", () =>
   withReport(async (s3, host) => {
     const input = await readJson(
-      "fixtures/summarize-report/october.input.json",
+      "fixtures/fetch-report/october.input.json",
     );
     const expected = await readJson(
       "fixtures/summarize-report/october.prepared.json",
@@ -86,7 +86,7 @@ Deno.test("prepare reads the report and returns the fixture", () =>
 Deno.test("a replay uses the saved step and needs no network", () =>
   withReport(async (s3, host) => {
     const input = await readJson(
-      "fixtures/summarize-report/october.input.json",
+      "fixtures/fetch-report/october.input.json",
     );
     const first = await runPrepare(ATOM, input, {
       allowNet: host,
@@ -108,7 +108,7 @@ Deno.test("a replay uses the saved step and needs no network", () =>
 Deno.test("the atom's code cannot reach a host the atom did not declare", () =>
   withReport(async (s3) => {
     const input = await readJson(
-      "fixtures/summarize-report/october.input.json",
+      "fixtures/fetch-report/october.input.json",
     );
     const result = await runPrepare(ATOM, input, {
       allowNet: "127.0.0.1:1",
@@ -124,7 +124,7 @@ Deno.test("the atom's code cannot reach a host the atom did not declare", () =>
 Deno.test("with no endpoint override, the SDK asks for the bucket's own host", async () => {
   // Nothing is sent: the only allowed host is unreachable, and Deno names the
   // host the SDK wanted. That name is what the atom's network.allow holds.
-  const input = await readJson("fixtures/summarize-report/october.input.json");
+  const input = await readJson("fixtures/fetch-report/october.input.json");
   const result = await runPrepare(ATOM, input, { allowNet: "127.0.0.1:1" });
   if (result.code === 0) throw new Error("expected a failure");
   if (!result.stderr.includes(`${BUCKET}.s3.us-east-1.amazonaws.com`)) {

@@ -37,15 +37,14 @@ or run the beads CLI to use Atomic.
 bring schemas and references to content files. Atomic applies that idea to atoms,
 workflows, schemas, toolsets and evals.
 
-A Markdown atom keeps the instructions readable while frontmatter declares the
-contract. Filename conventions and schema checks make those files discoverable
-and checkable. Errors belong at load time, with a useful file location, whenever
-the loader can detect them before a model call.
+An Astro atom keeps instructions readable while literal configuration declares the
+contract. Filename conventions and schema-derived types make files discoverable
+and checkable. The bundled Astro parser and bounded TypeScript-shaped interpreter
+check supported syntax before a model turn; they never execute the source module.
 
-The Astro influence also guides progressive authoring: declarative content first;
-code when the logic needs it. Planned mixed Markdown/TypeScript atoms put prepared
-context next to instructions. Atomic's declarative tags are a constrained prompt
-language; they are not arbitrary JavaScript embedded in Markdown.
+Executable SDK calls and I/O belong in separate script atoms. Workflows compose
+scripts and model atoms as sibling steps. Public configuration is explicit, typed
+and frozen for a run; secret credentials remain in their separate channel.
 
 ## Spring Boot: sensible defaults that back off
 

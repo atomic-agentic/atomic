@@ -40,24 +40,21 @@ input mappings and tag paths. A model output can pass provider generation checks
 and still fail Atomic's full contract. Bounded repair may help; persistent failure
 needs a corrected contract, task or model choice.
 
-## An `.atom.mdx` file fails to parse
+## An `.atom.astro` file fails to parse
 
-In the JSX-style form, `<` and `{` are syntax. Text such as `Vec<String>` or
-`OUT_DIR/<stage>.log` in prose fails at load with its line and column, and the
-error shows the line escaped. Write `\<` and `\{`, or run `atomic check --fix`
-to escape the whole file. If a prompt is full of angle brackets, write the atom
-as `.atom.md` instead, where angle brackets inside a line of prose are plain
-text; `atomic atoms convert <atom> --to md` does it for you. Comments are
-`{/* like this */}`, not `<!-- -->`. See
-[the JSX-style form](../guides/template-tags.md#the-same-atom-with-jsx-style-tags).
+Astro treats `<` and `{` as syntax. Escape literal prose with entities such as
+`&lt;name>` and `&#123;value&#125;`, including inside displayed code fences.
+Use local `.astro` components and generated Props imports. The compiler rejects
+unsupported executable syntax before a model call; changing the extension to a
+removed format does not bypass the check. See [the expression guide](../guides/template-tags.md).
 
 ## A section tag is reported as unclosed
 
-A lowercase tag alone on its line, such as `<rubric>`, opens a section and needs
-a matching `</rubric>` on its own line. Check for a misspelled closing tag and
-for sections closed in the wrong order. Tags that start with `data-` are
+An Astro section such as `<rubric>` needs a matching `</rubric>`. Opening
+and closing tags may share a line with their content. Check for a misspelled
+closing tag and for sections closed in the wrong order. Tags that start with `data-` are
 reserved and are rejected wherever you write them. See
-[section tags](../guides/template-tags.md#mark-sections-with-xml-style-tags).
+[section tags](../guides/template-tags.md).
 
 ## `atomic check` says a diagram is stale
 
@@ -74,22 +71,20 @@ step gained write or network access. See
 
 ## `atomic check` says a prompt snapshot changed
 
-An edit to an atom's instructions, or to a partial it includes, changed the
+An edit to an atom's instructions, or to a component it imports, changed the
 prompt for one of its typed examples. Print the new prompt with
 `atomic render <atom> --input <file.json>`, confirm the change is the one you
 meant, then update the snapshot. The update command is not specified yet.
 
 ## A compact schema is rejected
 
-The compact form covers names, types, descriptions, optional fields, lists,
-nested objects and enums. A constraint such as `minLength` or `pattern` needs
-full JSON Schema. Print what the compact form compiles to with
-`atomic schemas expand <atom>`. See
-[the compact form](atom-files.md#the-compact-form).
+Production Astro atoms use full JSON Schema declarations or sidecars. The compact
+form and its expansion command remain planned. Convert a compact declaration to
+full JSON Schema before loading it. See [schema locations](atom-files.md#schema-locations).
 
 ## Code is refused network access
 
-An atom's code, in a `---ts` block or a script, fails with
+An exec atom's separate script fails with
 `Requires net access to "<host>"` when it tries a host that is not in its atom's
 `network.allow`. The message names
 the host. Add it to the list if the script should reach it. An AWS SDK
@@ -98,10 +93,20 @@ addresses an S3 bucket by the bucket's own host name, such as
 endpoint. See
 [call AWS and other services with an SDK](../guides/scripts-and-cloud-sdks.md).
 
+## The Astro compiler needs Deno 2.9.8
+
+`atomic check` and `atomic render` run atomic's bundled Astro compiler on Deno
+2.9.8, and say so when they find no Deno or another version. Install that
+version and put it on your `PATH`, or set `ATOMIC_DENO` to its executable. In a
+checkout of this repository, `python3 scripts/setup-deno.py <dir>` downloads it
+and checks it against the checksum in `deps/deno.json`. The compiler unpacks
+itself under `ATOMIC_HOME` when that is set, and otherwise in your cache
+directory; set `ATOMIC_HOME` when there is no writable home directory.
+
 ## Deno cannot be downloaded
 
-Atomic fetches its own Deno the first time a project with atom code is checked
-or run. If the machine has no network, or your organization forbids the
+From v0.7, Atomic fetches its own Deno the first time a project with atom code
+is checked or run. If the machine has no network, or your organization forbids the
 download, install it from a file:
 
 ```sh
@@ -112,7 +117,7 @@ Use the archive for the version your Atomic release pins; a different or
 altered archive fails the checksum and is not installed. A team-mode server
 never downloads while running: build the runtime into its image. To use a Deno
 you manage yourself, set `runtime.deno.binary` in the manifest. See
-[you do not install Deno](../guides/atom-code-runtime.md#you-do-not-install-deno).
+[you do not install Deno](../guides/atom-code-runtime.md).
 
 ## A package is not in the lockfile
 

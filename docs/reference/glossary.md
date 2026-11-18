@@ -18,8 +18,8 @@
 | **Effect ledger** | Durable intent/outcome records for external mutations, used with idempotency and reconciliation. |
 | **outcome_unknown** | A parked operation whose external outcome is uncertain. Resume alone cannot authorize resending it. |
 | **Replay** | Reuse of saved execution/results for recovery or inspection. Recording-based checks are distinct from new live model calls. |
-| **Variant** | A second version of an atom in `<name>.<variant>.atom.md`. It shares the base atom's schemas and eval cases and changes only instructions and settings. |
-| **Partial** | A shared piece of instructions in a file whose name starts with `_`, included by atoms. It can take parameters or render one schema. |
+| **Variant** | A second version of an atom in `<name>.<variant>.atom.astro`. It references the base atom's schemas explicitly, since nothing is inherited, and changes only instructions and settings. |
+| **Component** | A local `.astro` file of shared prompt text that an atom imports. It takes typed props and can wrap the caller's content in a slot. |
 | **Eval case** | An input and a list of CEL assertions for one atom, in a YAML or JSONL file. |
 | **Fixture** | A prepared input, expected output or seed repository used by checks and evals. A golden fixture is written or reviewed by a person; it is not a model result. |
 | **Recording** | A stored model call and result under its effective execution identity, reusable for regression checks without a live call. The plan also calls it a cassette. |
@@ -28,10 +28,10 @@
 | **Policy lock** | `atomic.policy.lock`, the committed record of every atom's and workflow's resolved permissions and limits, so a change to authority shows up in review. |
 | **Decision** | A recorded choice in the manifest with the evidence it rests on and a review date. `atomic stale` reports the ones that need another look. |
 | **View** | One way of drawing the same workflow or run: structure by default, authority with `--view risk`, budgets and spend with `--view cost`. |
-| **Code block** | TypeScript at the top of an atom file that starts with `---ts`. Its `prepare` function runs before the model call, on Deno, with only the hosts and environment the atom declares. |
+| **Script atom** | An exec atom whose separate script performs executable work. Astro frontmatter is interpreted configuration, never a module that runs. |
 | **Credential** | A named way for an atom's code to sign in to an outside service, defined in the manifest. For an AWS role, Atomic issues keys per step that expire in minutes. |
-| **Prepared values** | What an atom's code returned before its model call. The instructions read them as `$prepared`, and a workflow as `steps.<id>.prepared`. |
-| **Managed Deno** | The Deno that Atomic downloads, verifies against a built-in checksum and keeps in its own data directory to run atom code. Nobody installs it, and a project with no atom code never fetches it. |
+| **Fetched values** | A script step's typed output, passed to a subsequent Astro atom as ordinary input and referenced in a workflow as `steps.<id>.output`. |
+| **Managed Deno** | A pinned runtime host outside project source. The compiler uses Deno 2.9.8; the development image supplies it and the setup script verifies platform archives. Broader automatic runtime management is staged. |
 | **Codex** | [OpenAI's open-source coding-agent foundation](../README.md#open-source-openai-codex-underneath-atomic-on-top) embedded by Atomic; hosted inference/search remain services. |
 | **durare** | The embedded durable execution engine used to checkpoint and recover workflows. |
 | **OpenTelemetry / OTEL** | Instrumentation and export conventions for traces, metrics and logs; compatible backends such as Datadog are optional. |

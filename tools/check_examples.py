@@ -16,8 +16,7 @@ import tempfile
 import yaml
 from jsonschema import Draft202012Validator
 
-import atom_templates
-import compact_schema
+import astro_atoms
 import decisions
 import deno_exec
 import workflow_diagram
@@ -126,15 +125,8 @@ def require(condition, message):
 
 
 def frontmatter(path):
-    text = path.read_text()
-    if text.startswith("---ts\n"):
-        # A TypeScript block in place of YAML. Its `config` literal carries the
-        # same fields; the code is kept for the Deno checks and never run here.
-        code, body = deno_exec.split_block(text, path)
-        return {**deno_exec.read_config(code, path), deno_exec.CODE: code}, body
-    match = re.fullmatch(r"---\n(.*?)\n---\n(.*)", text, re.S)
-    require(match is not None, f"{path}: missing YAML frontmatter")
-    return read_yaml(match[1]), match[2]
+    _, config = astro_atoms.load(path)
+    return config, path.read_text().split("\n---\n", 1)[-1]
 
 
 def validator(uri, registry):
@@ -190,20 +182,8 @@ def check_markdown_links(path):
         require((path.parent / target).exists(), f"{path}: broken local link {target}")
 
 
-ATOM_SUFFIXES = (".atom.md", ".atom.mdx")
+ATOM_SUFFIXES = (".atom.astro",)
 
-# Atoms that are the same task written in both template syntaxes. The checker
-# requires the two bodies to reduce to the same operations.
-TEMPLATE_TWINS = {"08-templating": [("triage-findings", "triage-findings-jsx")]}
-
-# Compact schemas with a committed long form: what `atomic schemas expand` would
-# print. The checker requires the compiled compact schema to equal that file.
-COMPACT_EXPANSIONS = {
-    "09-compact-and-variants": [
-        ("label-ticket", "input", "expanded/label-ticket.input.schema.yaml"),
-        ("label-ticket", "output", "expanded/label-ticket.output.schema.yaml"),
-    ]
-}
 
 
 def atom_stem(path):
@@ -229,113 +209,13 @@ def atom_schema(path, stem, role, fm, schemas, registry):
         target = (path.parent / declared["$ref"]).resolve()
         require(target in schemas, f"{path}: {role} $ref does not name a schema file in this example")
         return target, registry
-    if compact_schema.is_compact(declared):
-        schema = compact_schema.compile_compact(declared, f"{path}: {role}")
-    else:
-        schema = declared
+    schema = declared
     json_model(schema, path)
     Draft202012Validator.check_schema(schema)
     key = path.with_name(f"{stem}.{role}.inline")
     schemas[key] = schema
     registry = registry.with_resource(key.as_uri(), Resource.from_contents(schema, default_specification=DRAFT202012))
     return key, registry
-
-
-def read_partial(path):
-    text, body = atom_templates.split_frontmatter(path.read_text())
-    return (read_yaml(text) or {}) if text else {}, atom_templates.ops_for(path, body)
-
-
-class TemplateChecker:
-    """Checks one project's template operations against its schemas and partials."""
-
-    def __init__(self, project, registry, base_uri, renderers):
-        self.project = project.resolve()
-        self.registry = registry
-        self.base_uri = base_uri
-        self.renderers = renderers  # schema $id -> [partial paths]
-
-    def schema_at(self, path, scope, where):
-        root, *rest = path.split(".")
-        require(root in scope, f"{where}: {path} does not start from a value that is in scope")
-        current = scope[root]
-        for part in rest:
-            current = resolve_root(current, self.base_uri, self.registry)
-            require(part in current.get("properties", {}), f"{where}: unknown path {path}")
-            current = current["properties"][part]
-        return resolve_root(current, self.base_uri, self.registry)
-
-    def check(self, ops, scope, where, directory, validators=None, slot_allowed=False, including=()):
-        scope = dict(scope)
-        open_blocks = []
-        for op in ops:
-            kind = op[0]
-            if kind == "val":
-                self.schema_at(op[1], scope, where)
-            elif kind == "if":
-                require(op[1], f"{where}: empty condition")
-                open_blocks.append(("if", None, None))
-            elif kind == "else":
-                require(open_blocks and open_blocks[-1][0] == "if", f"{where}: else outside if")
-            elif kind == "for":
-                _, variable, source = op
-                array = self.schema_at(source, scope, where)
-                require(array.get("type") == "array" and "items" in array, f"{where}: {source} is not a list")
-                open_blocks.append(("for", variable, scope.get(variable)))
-                scope[variable] = resolve_root(array["items"], self.base_uri, self.registry)
-            elif kind in ("endif", "endfor", "partial_close"):
-                expected = {"endif": "if", "endfor": "for", "partial_close": "partial"}[kind]
-                require(open_blocks and open_blocks[-1][0] == expected, f"{where}: unbalanced {expected} block")
-                _, variable, previous = open_blocks.pop()
-                if variable is not None:
-                    if previous is None:
-                        del scope[variable]
-                    else:
-                        scope[variable] = previous
-            elif kind in ("partial", "partial_open"):
-                self.check_partial(op[1], op[2], kind == "partial_open", where, directory, including)
-                if kind == "partial_open":
-                    open_blocks.append(("partial", None, None))
-            elif kind == "render":
-                schema = self.schema_at(op[1], scope, where)
-                schema_id = schema.get("$id")
-                require(schema_id, f"{where}: {op[1]} has no schema $id to pick a renderer by")
-                bound = self.renderers.get(schema_id, [])
-                require(len(bound) == 1, f"{where}: {len(bound)} partials render {schema_id}; exactly one is needed")
-                _, partial_ops = read_partial(bound[0])
-                self.check(partial_ops, {"value": schema}, bound[0], bound[0].parent, including=including)
-            elif kind == "slot":
-                require(slot_allowed, f"{where}: slot outside a partial")
-            elif kind == "example":
-                require(validators is not None, f"{where}: typed examples belong in an atom")
-                # In an atom with code, an example also says what prepare() returned
-                # for it, so a check never has to run the code.
-                wanted = {"input", "output", "prepared"} if "prepared" in scope else {"input", "output"}
-                require(set(op[2]) == wanted, f"{where}: a typed example here needs exactly the blocks {sorted(wanted)}")
-                validators[0].validate(json.loads(op[2]["input"]))
-                validators[1].validate(json.loads(op[2]["output"]))
-        require(not open_blocks, f"{where}: a {open_blocks[-1][0] if open_blocks else ''} block is never closed")
-
-    def check_partial(self, file, given, has_content, where, directory, including):
-        target = (directory / file).resolve()
-        require(
-            target.is_relative_to(self.project) and target.is_file() and target.name.startswith("_"),
-            f"{where}: invalid partial {file}",
-        )
-        require(target not in including, f"{where}: partial {file} includes itself")
-        fm, ops = read_partial(target)
-        declared = fm.get("params", {})
-        require(set(given) == set(declared), f"{where}: partial {file} takes {sorted(declared)}, was given {sorted(given)}")
-        for name, value in given.items():
-            kind = declared[name].get("type")
-            if kind == "boolean":
-                require(value in {"true", "false"}, f"{where}: parameter {name} must be true or false")
-            elif kind == "string":
-                require(value.startswith('"'), f"{where}: parameter {name} must be a quoted string")
-        if has_content:
-            require(any(op[0] == "slot" for op in ops), f"{where}: partial {file} has no slot for the content it was given")
-        params_schema = {"type": "object", "properties": declared}
-        self.check(ops, {"params": params_schema}, target, target.parent, slot_allowed=True, including=including + (target,))
 
 
 def check_project(top):
@@ -378,13 +258,6 @@ def check_project(top):
                 if parent.is_relative_to(project)
             )
 
-        renderers = {}
-        for partial_path in sorted(p for pattern in ("_*.md", "_*.mdx") for p in project.rglob(pattern)):
-            if belongs(partial_path):
-                partial_fm, _ = read_partial(partial_path)
-                if "renders" in partial_fm:
-                    renderers.setdefault(partial_fm["renders"], []).append(partial_path)
-
         atoms = {}
         templates = {}
         variants = {}
@@ -395,19 +268,14 @@ def check_project(top):
             fm, body = frontmatter(path)
             stem = atom_stem(path)
             if "." in stem:
-                # `<name>.<variant>.atom.md`: same schemas and evals as the base atom,
+                # `<name>.<variant>.atom.astro`: same schemas and evals as the base atom,
                 # different instructions and settings.
                 base, variant = stem.split(".", 1)
                 require(base in atoms, f"{path}: variant of {base}, which is not an atom in this project")
                 require(re.fullmatch(r"[a-z][a-z0-9-]*", variant), f"{path}: invalid variant name {variant!r}")
                 require(fm.get("atomic") == 1, f"{path}: wrong format")
-                shared = {"input", "output", "evals", "name"} & fm.keys()
-                require(not shared, f"{path}: a variant shares its base atom's {sorted(shared)}")
                 _, inp, out, inputs, outputs = atoms[base]
-                require(body.strip(), f"{path}: missing instructions")
-                TemplateChecker(project, registry, inputs.as_uri(), renderers).check(
-                    atom_templates.ops_for(path, body), {"input": schemas[inputs]}, path, path.parent, validators=(inp, out)
-                )
+                astro_atoms.check(path, schemas[inputs], schemas[outputs], registry, inputs.as_uri(), outputs.as_uri())
                 require(variant not in variants.setdefault(base, set()), f"{path}: duplicate variant {variant}")
                 variants[base].add(variant)
                 continue
@@ -415,9 +283,7 @@ def check_project(top):
             require(name not in atoms, f"{path}: duplicate atom name")
             require(fm.get("atomic") == 1, f"{path}: wrong format")
             require(isinstance(fm.get("description"), str), f"{path}: no description")
-            require("name" not in fm or fm["name"] != stem, f"{path}: redundant name")
             require(fm.get("version") != 1, f"{path}: redundant default version")
-            require(fm.get("kind") != "codex", f"{path}: redundant default kind")
             require(fm.get("sandbox") != "read-only", f"{path}: redundant sandbox default")
             require("evals" not in fm, f"{path}: catalog should demonstrate default eval discovery")
             require("tools" not in fm, f"{path}: no catalog atom needs optional tools")
@@ -440,20 +306,11 @@ def check_project(top):
                 require(command and command[0] == "python3", f"{path}: unsupported catalog command")
                 require(len(command) == 2 and (project / command[1]).is_file(), f"{path}: missing exec script")
                 ast.parse((project / command[1]).read_text())
-            ops = atom_templates.ops_for(path, body)
-            scope = {"input": schemas[inputs]}
-            if deno_exec.CODE in fm:
-                deno_exec.check_block(path, fm, project)
-                # `$prepared` holds what the block's prepare() returned. A committed
-                # sample of that value says which paths the instructions may use.
-                samples = sorted((project / "fixtures" / name).glob("*.prepared.json"))
-                require(samples, f"{path}: a ---ts atom needs a fixtures/{name}/<case>.prepared.json sample")
-                scope["prepared"] = deno_exec.infer_schema(read_json(samples[0]))
-                prepared_schemas[name] = scope["prepared"]
-            TemplateChecker(project, registry, inputs.as_uri(), renderers).check(
-                ops, scope, path, path.parent, validators=(inp, out)
-            )
-            templates[name] = atom_templates.normalize(ops)
+            astro_atoms.check(path, schemas[inputs], schemas[outputs], registry, inputs.as_uri(), outputs.as_uri())
+            for example in fm.get("examples", []):
+                inp.validate(example["input"])
+                out.validate(example["output"])
+                astro_atoms.fixture(path, example["input"], example["output"])
             evals = project / "evals" / name
             cases = sorted(evals.glob("*.yaml"))
             case_files = sorted(evals.glob("*.jsonl"))
@@ -484,6 +341,7 @@ def check_project(top):
                     require(isinstance(row["expect"], list) and row["expect"] and all(isinstance(x, str) for x in row["expect"]), f"{case_file}:{number}: missing CEL assertions")
                     inp.validate(row["input"])
                     out.validate(expected)
+                    astro_atoms.fixture(path, row["input"], expected)
                     fixture_count += 1
             for eval_path in cases:
                 ev = read_yaml(eval_path.read_text())
@@ -502,6 +360,7 @@ def check_project(top):
                 require(fixture_input == ev["input"], f"{eval_path}: eval and fixture input drift")
                 inp.validate(fixture_input)
                 out.validate(fixture_output)
+                astro_atoms.fixture(path, fixture_input, fixture_output)
                 fixture_count += 1
                 if fm.get("kind") == "exec" and "command" in fm["exec"]:
                     result = subprocess.run(fm["exec"]["command"], cwd=project, input=json.dumps(fixture_input), text=True, capture_output=True, timeout=5)
@@ -510,26 +369,6 @@ def check_project(top):
                     out.validate(actual)
                     require(actual == fixture_output, f"{eval_path}: exec result differs from golden")
                     exec_count += 1
-
-        for atom_name, role, expected_file in COMPACT_EXPANSIONS.get(top.name, []):
-            require(atom_name in atoms, f"{project}: {atom_name} is missing")
-            key = atoms[atom_name][3 if role == "input" else 4]
-            require(key.name.endswith(".inline"), f"{project}: {atom_name} {role} is not an inline schema")
-            expected = {k: v for k, v in read_schema(project / expected_file).items() if k != "$schema"}
-            require(schemas[key] == expected, f"{project}: compact {role} of {atom_name} does not compile to {expected_file}")
-
-        for first, second in TEMPLATE_TWINS.get(top.name, []):
-            require(first in templates and second in templates, f"{project}: template twins {first} and {second} are missing")
-            a, b = templates[first], templates[second]
-            differs = next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), None)
-            if differs is None and len(a) != len(b):
-                differs = min(len(a), len(b))
-            require(
-                differs is None,
-                f"{project}: {first} and {second} differ at operation {differs}: "
-                f"{a[differs] if differs is not None and differs < len(a) else None!r} vs "
-                f"{b[differs] if differs is not None and differs < len(b) else None!r}",
-            )
 
         if "decisions" in config:
             # Every catalog atom has eval cases, so any atom can be named as evidence.
@@ -593,7 +432,7 @@ def check_project(top):
         # A diagram committed under an `atomic:diagram` marker is generated output.
         # Regenerate it from the workflow and fail when the committed copy differs.
         for path in sorted(project.rglob("*.md")):
-            if not belongs(path) or path.name.endswith(".atom.md"):
+            if not belongs(path) or path.name.endswith(".atom.astro"):
                 continue
             text = path.read_text()
             blocks = list(workflow_diagram.marked_blocks(text))
@@ -724,7 +563,7 @@ def main():
     check_markdown_links(EXAMPLES / "README.md")
     check_markdown_links(EXAMPLES / "recipes.md")
     print(f"PASS {len(projects)} examples; {total[0]} atoms; {total[1]} fixture pairs; {total[3]} workflows; {total[4]} generated diagrams; {total[2]} exec fixtures + {edge_count} exec edge cases")
-    print("Scope: offline contracts and Python execution; atomic runtime, CEL, models and recovery were not executed.")
+    print("Scope: offline contracts and Python execution; shipped Astro parsing, TypeScript checks, rendering and typed validators executed; workflow CEL, models and workflow recovery were not executed.")
 
 
 if __name__ == "__main__":

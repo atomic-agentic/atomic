@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Static checks for atom code that runs on the proposed Deno runtime.
 
-Two places hold such code: a script named by an exec atom (`exec.script`), and
-the TypeScript block at the top of an atom file that starts with `---ts`.
+Executable code lives in a separate script named by an exec atom (`exec.script`).
+Astro frontmatter and expressions are parsed by the shipped compiler.
 
 Not an implementation of atomic, and it does not run Deno. It checks what can be
 checked from the files: the code stays inside the project, every package import
@@ -21,7 +21,7 @@ import re
 import yaml
 
 CHECKED = []
-CODE = "(code)"  # key under which the checker keeps an atom's TypeScript block
+CODE = "(code)"  # reserved; declarative Astro atoms never contain executable code
 
 DENO_KEYS = {"lock", "sys"}
 # Deno's `--allow-sys` kinds that only describe the machine. Nothing here reads
@@ -95,51 +95,6 @@ def _allowed(target, patterns):
     name = PINNED.fullmatch(target)
     package = f"{name[1]}:{name[2]}"
     return any(package == pattern or (pattern.endswith("/*") and package.startswith(pattern[:-1])) for pattern in patterns)
-
-
-# --- atoms that start with ---ts ----------------------------------------------------
-
-def split_block(text, where):
-    """Returns (code, body) for an atom file that starts with a `---ts` block."""
-    match = re.fullmatch(r"---ts\n(.*?)\n---\n(.*)", text, re.S)
-    _require(match is not None, f"{where}: the ---ts block is not closed")
-    return match[1], match[2]
-
-
-def read_config(code, where):
-    """Reads `export const config = { ... };` without running anything.
-
-    The settings that decide what an atom's code may do must be readable before
-    that code runs, so `config` has to be a plain literal: no calls, no
-    variables, no comments. A literal of that kind is also a YAML flow mapping.
-    """
-    start = re.search(r"^export const config = \{", code, re.M)
-    _require(start is not None, f"{where}: the ---ts block must export a config literal")
-    depth = 0
-    for index in range(start.end() - 1, len(code)):
-        depth += {"{": 1, "}": -1}.get(code[index], 0)
-        if depth == 0:
-            literal = code[start.end() - 1:index + 1]
-            break
-    else:
-        raise ValueError(f"{where}: config is not closed")
-    _require("//" not in literal and "/*" not in literal and "`" not in literal and "(" not in literal,
-             f"{where}: config must be a plain literal, with no comments, calls or template strings")
-    try:
-        config = yaml.safe_load(literal)
-    except yaml.YAMLError as exc:
-        raise ValueError(f"{where}: config is not a plain literal: {exc}") from exc
-    _require(isinstance(config, dict), f"{where}: config must be an object")
-    return config
-
-
-def infer_schema(value):
-    """A schema that admits the paths present in a sample value, for checking `$prepared` tags."""
-    if isinstance(value, dict):
-        return {"type": "object", "properties": {key: infer_schema(item) for key, item in value.items()}}
-    if isinstance(value, list):
-        return {"type": "array", "items": infer_schema(value[0]) if value else {}}
-    return {}
 
 
 # --- shared checks ------------------------------------------------------------------
@@ -229,18 +184,3 @@ def check_script(path, fm, project):
     _require(specifiers, f"{path}: {fm['exec']['script']} imports no package; a plain exec command would do")
     _require("network" in fm, f"{path}: declare the hosts the script may reach in network.allow")
     CHECKED.append((path, "script", *_declaration(path, fm, project, specifiers)))
-
-
-def check_block(path, fm, project):
-    """An atom whose file starts with a `---ts` block."""
-    project = project.resolve()
-    code = fm[CODE]
-    _require(fm.get("kind", "codex") in ("codex", "lite"), f"{path}: a ---ts block belongs to a model-backed atom; use exec.script for an exec atom")
-    exports = set(re.findall(r"^export (?:async )?function (\w+)", code, re.M))
-    _require(exports & {"prepare", "validate"}, f"{path}: the ---ts block exports neither prepare nor validate")
-    _require(exports <= {"prepare", "validate"}, f"{path}: unknown exported function {sorted(exports - {'prepare', 'validate'})}")
-    # prepare() runs before the model and before any gate, so it only reads.
-    _require((fm.get("effects") or {}).get("external") != "idempotent",
-             f"{path}: a ---ts block is for reading; declare effects.external: read-only, and write in a separate step")
-    specifiers = _specifiers(code, path, project, {path.resolve()})
-    CHECKED.append((path, "block", *_declaration(path, fm, project, specifiers)))

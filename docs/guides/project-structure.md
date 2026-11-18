@@ -28,7 +28,7 @@ Use top-level source directories:
 note-tools/
   atomic.yaml
   atoms/
-    summarize-note.atom.md
+    summarize-note.atom.astro
   workflows/
     summarize-and-review.workflow.yaml
   evals/
@@ -47,16 +47,16 @@ name: note-tools
 
 | Source | Convention |
 | --- | --- |
-| Atom | `*.atom.md`, or `*.atom.mdx` for the JSX-style form; the stem supplies its default name |
+| Atom | `*.atom.astro`; the stem supplies its default name and the name of its generated types, so it is unique in a project |
 | Workflow | `*.workflow.yaml`; the stem supplies its default name |
 | Atom schemas | Inline, or adjacent `<name>.input.schema.yaml` and `<name>.output.schema.yaml`; `.schema.json` is also accepted |
-| Variant | `<name>.<variant>.atom.md`, sharing the atom's schemas and evals · v0.5 |
+| Variant | `<name>.<variant>.atom.astro`, naming the same schemas as the atom explicitly · v0.5 |
 | Evals | `evals/<resolved-atom-name>/` under the manifest directory; one case per `.yaml` file, or many per `.jsonl` file |
 | Shared schemas | `schemas/**/*.schema.yaml`, or `.json` |
 | OpenAPI toolsets | `toolsets/**/*.openapi.yaml` or `.json` |
-| Shared prompt fragment | A partial such as `_review-rules.md`, referenced from an atom |
+| Shared prompt fragment | A component such as `ReviewRules.astro`, imported by an atom |
 | Code tests | `test/*_test.ts` under the manifest directory, run by `atomic test` · v0.7 |
-| Atom with code | A `---ts` block at the top of the atom file, or a script named by an exec atom; packages are pinned in `deno.lock` beside the manifest · v0.7 |
+| Atom with code | A separate script named by an exec atom; packages are pinned in `deno.lock` beside the manifest · v0.7 |
 
 A default name changes when its file is renamed. Set `name` explicitly when you
 want identity to remain stable across that move. Names are unique within a scope;
@@ -66,7 +66,7 @@ package names are namespaced.
 
 CLI file arguments are relative to the directory where you run the command.
 Manifest globs and paths are relative to the manifest. Atom/workflow file
-references such as partials are relative to their source file. JSON Schema `$ref`
+references such as component imports are relative to their source file. JSON Schema `$ref`
 resolution follows the schema's base URI and any `$id`.
 
 Atomic finds the nearest `atomic.yaml` or `.atomic/atomic.yaml` while walking up
@@ -77,7 +77,8 @@ A nested project is a discovery boundary; workspace members are loaded explicitl
 
 Commit the definitions, evals, fixtures, package lockfile, `deno.lock` when
 atoms carry code and, once it exists, the generated `atomic.policy.lock`. Generated editor
-schemas/types belong in the generated cache directory. Checkpoints, transcripts,
+types currently live under project-root `.atomic/types`; other generated editor
+artifacts use the configured cache exclusion. Checkpoints, transcripts,
 artifacts and worktrees live in Atomic's user-data directory rather than beside
 your application source.
 

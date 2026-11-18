@@ -1,0 +1,7 @@
+node_modules/
+.astro/
+results/
+.atomic/
+.typed-test-*/
+embedded/target/
+src/typescript-libs.json

@@ -16,3 +16,11 @@ CLAUDE.local.md
 # cargo-cyclonedx writes an SBOM beside every workspace crate; scripts/sbom.sh
 # keeps only the binary's, under target/sbom.
 *.cdx.json
+
+# Generated Astro declarations are authoring artifacts.
+**/.atomic/types/
+**/node_modules/
+**/__pycache__/
+
+# The embedded-Deno host experiment is a second Cargo workspace; atomic has one.
+authoring/embedded/

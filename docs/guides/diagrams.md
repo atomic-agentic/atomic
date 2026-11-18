@@ -176,7 +176,7 @@ color-blind reader.
 A diagram in a README is useful only while it matches the workflow. Put a marker
 comment above a generated block to name its source:
 
-````markdown
+````astro
 ## How a note is reviewed
 
 <!-- atomic:diagram workflow=summarize-and-review -->
@@ -211,16 +211,19 @@ check that they are still true.
 
 ## Put a diagram in an atom's instructions only when it earns its place
 
-A `mermaid` fence is allowed anywhere in an atom's Markdown body and reaches the
+A `mermaid` fence can be written as literal text in an Astro atom body and reaches the
 model as text. It suits structure that prose states badly, such as the allowed
 transitions of a state machine:
 
-````markdown
+````astro
 ---
-atomic: 1
-description: Propose the next status for a support ticket.
-kind: lite
-# input and output schemas are in sidecar files beside this atom
+import type { Props, Input, Output } from '../.atomic/types/example';
+import type { AtomConfig } from '../.atomic/types/authoring';
+const { input }: Props = Astro.props;
+export const config: AtomConfig<Input, Output> = {
+  "description": "Propose the next status for a support ticket.",
+  "kind": "lite"
+};
 ---
 Choose the next status for the ticket. Only the transitions in this diagram are
 allowed. Return the current status when none applies.
@@ -236,13 +239,14 @@ stateDiagram-v2
   rejected --> [*]
 ```
 
-Ticket: {% $input.ticket %}
+Ticket: {input.ticket}
 ````
 
 Three things to know:
 
-- **Tags are not expanded inside the fence.** A `{% $input… %}` value placed
-  there stays literal, so input data cannot rewrite the diagram.
+- **Astro still parses expressions inside a fence.** Escape literal braces and
+  angle brackets. Input interpolation remains tagged user data; it is never
+  reparsed as diagram syntax or developer instructions.
 - **The diagram costs tokens on every run.** It counts toward the atom's size
   estimate like any other instruction text.
 - **Its value is unproven until you measure it.** A plain list may work as well,

@@ -14,10 +14,11 @@ do not establish that an atomic runtime accepts or executes the projects.
 | [05 · Support draft](05-support-draft/README.md) | v0.5 | External input, independent reviewer, explicit SSO approvers, draft approval without a send side effect |
 | [06 · Workspace contracts](06-workspace/README.md) | v0.5 | A shared schema by `$id`, workspace discovery, member manifests |
 | [07 · A2A translation](07-a2a-translation/README.md) | v1.0 | Typed remote handoff, secret reference, bounded wait, mocked contract fixtures |
-| [08 · Template tags in both forms](08-templating/README.md) | v0.5 | A loop, a partial with a parameter and a slot, a renderer bound to a schema; the same atom as `.atom.md` and `.atom.mdx` |
-| [09 · Compact schemas, a variant and JSONL cases](09-compact-and-variants/README.md) | v0.5 | Inline compact schemas with their expanded form, a `strict` variant sharing schemas and evals, eval cases in one JSONL file |
+| [08 · Astro prompt components](08-templating/README.md) | v0.5 | Typed loops, conditions, imported components, props and a slot |
+| [09 · Shared schemas, a variant and JSONL cases](09-compact-and-variants/README.md) | v0.5 | A `strict` variant that references the base atom's schemas explicitly, eval cases in one JSONL file |
 | [10 · A decision recorded with its evidence](10-recorded-decision/README.md) | v0.7 | A `decisions` block in the manifest: a choice, the eval condition it rests on, an age limit for that evidence and a review date for `atomic stale` |
-| [11 · Read from and write to S3 with the AWS SDK](11-aws-s3/README.md) | v0.7 | TypeScript in an atom's `---ts` block that reads S3 before the model call, and an exec script that writes after the gate; `npm:` imports on Deno with a lockfile; hosts, environment and a named short-lived credential declared in the atom; a gate that shows the hash of what the model read; local tests with a stand-in for S3 |
+| [11 · Read from and write to S3 with the AWS SDK](11-aws-s3/README.md) | v0.7 | Separate fetch and write script atoms around an Astro summarizer and a human gate; `npm:` imports on Deno with a lockfile; hosts, environment and a named short-lived credential declared in the atom; a gate that shows the hash of what the model read; local tests with a stand-in for S3 |
+| [12 · Public execution context](12-execution-context/README.md) | Implemented compiler/direct invocation | Typed readonly profiles, public env, project/run/step metadata and external checkpoint reuse |
 
 Workspace discovery/shared-schema resolution belong to M11b/M39b in v0.5.
 Later-phase examples are not v0.1 quickstarts. [Further recipes](recipes.md) explain OpenAPI, database, retrieval,
@@ -27,15 +28,15 @@ multimodal, TypeScript and parallel-code extensions without inventing missing AP
 
 - Start with `atomic: 1` and a project `name`. Default collections, generated paths,
   ignores and detected providers do not need to be repeated.
-- A filename supplies the atom/workflow name and version defaults to 1. Only
-  `kind: lite`, `exec` and `a2a` need to override the default Codex kind here.
+- A filename supplies the atom/workflow name and version defaults to 1. The default kind is `lite`;
+  repository workers declare `codex`, scripts declare `exec`, and remote examples
+  retain their staged `a2a` integration.
 - Each atom has adjacent `<name>.input.schema.yaml` and
   `<name>.output.schema.yaml`. YAML is the default schema format; a `.schema.json`
   file is accepted too, but not both for one schema. Explicit references are
   reserved for actual reuse. Fixtures and typed examples stay JSON, because they
   are data, not definitions.
-- Atom bodies use `{% … %}` tags in `.atom.md`, the default form. Example 08 also
-  shows the optional JSX-style `.atom.mdx` form; a file is one form or the other.
+- Atom bodies use typed Astro expressions and explicit local components in `.atom.astro`.
 - A workflow has explicit input/output contracts and uses names to call atoms.
   Every `with` value is CEL, not a template or a string literal by default. A CEL
   string literal inside YAML needs its own quotes, e.g. `title: "'Review draft'"`.
@@ -60,29 +61,27 @@ From the repository root, with Python 3, PyYAML, jsonschema and referencing:
 python3 tools/check_examples.py
 ```
 
-The checker rejects duplicate YAML keys, validates JSON Schemas and all fixture
-pairs, resolves schema references offline, checks source-relative partials and
-input tags, checks workflow names/dependencies/bindings, and runs exec fixtures.
-For template tags it checks value paths, loop sources, partial parameters and
-slots, and schema-bound renderers in both forms, and that example 08's two
-forms of one atom are equivalent. It compiles example 09's compact schemas and
-requires them to equal their committed expanded form, checks that a variant
-shares its base atom's schemas, and validates JSONL eval cases line by line. Its `.atom.mdx` reader is a small approximation
-of an MDX parser, not the parser atomic will use.
+The checker rejects duplicate YAML keys, validates complete JSON Schemas and fixture
+pairs, resolves schema references offline, checks workflow names/dependencies/bindings,
+and runs Python exec fixtures. It invokes the shipped Astro compiler for parsing,
+mandatory schema-derived TypeScript checks, prompt rendering and typed output
+validators. Generated direct declaration imports resolve in VS Code. Example 08
+uses local components and slots; example 09 reuses full schemas explicitly across
+variants. JSONL cases are checked line by line. Pinned Deno 2.9.8 must be on PATH
+or selected with `ATOMIC_DENO`; runtime Node/npm is not required.
 It regenerates the workflow diagrams committed under an `atomic:diagram` marker in
 examples 02 and 05, in the default and risk views, and fails when a committed
 copy differs. It validates example 10's `decisions` block and compares its review
 date only with dates it is given; it does not evaluate the conditions.
-For example 11's atom code block and Deno script it checks, without running
-Deno, that the block's `config` is a plain literal, that every package import
-is pinned and recorded in the lockfile, that the atoms declare their hosts and
-effects, that credentials are secret references, and that the instructions use
-only `$prepared` paths present in a committed sample. The code is run by the
-example's own `deno test`.
+For example 11's standalone Deno scripts it checks pinned imports and lockfile
+entries, declared hosts/effects and secret references without running SDK code.
+The example's own tests exercise the scripts against a local fake service.
+Example 12 exercises schema-typed public context using synthetic host values.
 It also exercises failure cases for invalid quantities and mismatched orders,
 and verifies reproducible coding-fixture preparation from unrelated directories
 without source modifications or unsafe destination reuse.
-It is not an atomic loader, a CEL interpreter, a model eval or a crash-test harness.
+The compiler is shared with the production loader. This checker does not execute
+workflow CEL, model evals or workflow crash recovery.
 
 `evals/<atom>/<case>.yaml` is the proposed atomic eval case. The matching
 `fixtures/<atom>/<case>.input.json` and `.output.json` are an illustrative golden

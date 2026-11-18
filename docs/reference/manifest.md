@@ -21,13 +21,13 @@ This is a proposed schema, not a manifest verified against a released loader.
 | --- | --- | --- |
 | `atomic` | Required format version, currently `1` | v0.1 |
 | `name` | Project identity | v0.1 |
-| `collections.atoms` | Atom globs; conventional `atoms/` files and colocated `*.atom.md` or `*.atom.mdx` | v0.1 Markdown; `.atom.mdx` v0.5; `---ts` blocks and `.atom.ts` v0.7 |
+| `collections.atoms` | Atom globs; conventional `atoms/` files and colocated `*.atom.astro` | Astro declarative atoms; executable script and TypeScript integrations are staged separately |
 | `collections.workflows` | Workflow globs; conventional `workflows/` and colocated `*.workflow.yaml` | v0.1 YAML; TypeScript v1.0 |
 | `collections.schemas` | Shared schema globs, normally `schemas/**/*.schema.{yaml,json}`, with YAML the default; adjacent atom sidecars are discovered separately | v0.1 |
 | `collections.evals` | Case globs, normally `evals/**/*.{yaml,jsonl}`; atom-specific case directories still bind cases to atoms | v0.1 |
 | `collections.toolsets` | Imported OpenAPI specs, normally `toolsets/**/*.openapi.{yaml,json}` | v0.5 |
 | `ignore` | Additional ignored paths; `.gitignore` is also respected | v0.1 |
-| `generated` | Editor/type cache directory, normally `.atomic/cache`; not the runtime database | Cache setting; editor/type generators v0.5 |
+| `generated` | Collection exclusion for generated cache artifacts; current Astro declarations use fixed project-root `.atomic/types` | Relocating Astro declarations is tracked separately; runtime state is external |
 | `workspace.members` | Member-project directory globs | v0.5 · M11b/M39b |
 | `packages` | Namespaced dependencies with `git`, pinned `rev` and accepted `trust`; resolved hashes go in `atomic.lock` | Later package/trust support |
 | `models` | Named model tiers mapped to ordered provider/model candidates | Full routing v0.7 |
@@ -50,7 +50,7 @@ For example, when the repository has a dedicated automation subtree:
 atomic: 1
 name: release-tools
 collections:
-  atoms: [automation/**/*.atom.md]
+  atoms: [automation/**/*.atom.astro]
   workflows: [automation/**/*.workflow.yaml]
   schemas: ["automation/**/*.schema.{yaml,json}"]
   evals: ["automation/evals/**/*.{yaml,jsonl}"]
@@ -115,7 +115,7 @@ credentials:
 
 The keys go to that step's code and nowhere else. A role ARN is not a secret,
 but it differs between environments; define it in a profile overlay when it
-does. See [give code short-lived credentials](../guides/scripts-and-cloud-sdks.md#give-code-short-lived-credentials).
+does. See [give code short-lived credentials](../guides/scripts-and-cloud-sdks.md).
 
 ## Settings for atom code
 
@@ -142,7 +142,7 @@ runtime:
 | `audit_permissions` | `false` | Record each permission the code uses in the step's trace |
 
 No key here can widen what an atom's code may do beyond its own declaration.
-See [security defaults and settings](../guides/atom-code-runtime.md#security-defaults-and-settings)
+See [security defaults and settings](../guides/atom-code-runtime.md)
 and [the S3 example](../../examples/11-aws-s3/README.md).
 
 ## Workspace example

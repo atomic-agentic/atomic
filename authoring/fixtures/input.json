@@ -1,0 +1,5 @@
+{
+  "email": {"name":"Avery","from":"avery@example.test","subject":"Meeting","body":"Can we meet Tuesday?"},
+  "free_slots":[{"start":"2026-11-17T10:00:00Z","end":"2026-11-17T10:30:00Z"}],
+  "feedback":["Keep it short."]
+}

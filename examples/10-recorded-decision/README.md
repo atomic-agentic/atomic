@@ -1,6 +1,6 @@
 # A decision recorded with its evidence · v0.7
 
-A release-note writer with one recorded decision. [The atom](atoms/write-release-note.atom.md)
+A release-note writer with one recorded decision. [The atom](atoms/write-release-note.atom.astro)
 is `kind: lite`: it reads the change's title and description and has no access to
 the repository. That is a choice, and it holds only while the atom keeps passing
 its evals. [The manifest](atomic.yaml) says so:

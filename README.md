@@ -14,6 +14,11 @@ crates for running agents, and gets durable execution from a fork of
 designed, not built yet; [availability](docs/reference/availability.md) says
 what works today.
 
+Declarative atoms use `.atom.astro`, with schema-generated types, local prompt
+components and bounded interpreted expressions. `atomic check` validates them and
+`atomic render` previews their developer/user prompt parts without a model call.
+See [Astro authoring](docs/reference/atom-files.md).
+
 - [Documentation](docs/README.md), starting with
   [the mental model](docs/concepts/mental-model.md)
 - [Examples](examples/README.md), checked offline by `tools/check_examples.py`

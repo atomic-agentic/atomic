@@ -1,10 +1,7 @@
 // A stand-in for the part of Atomic that runs the code in an atom file.
 //
-// An atom that starts with `---ts` has a TypeScript block above its
-// instructions. Atomic is planned to split the block off, generate a small
-// entry module beside it, and run that on Deno with the permissions the
-// atom's `config` declares. This file does the same, for the tests.
-
+// The Astro prompt reads the output of tools/fetch_report.ts as ordinary input.
+// This test-only harness simulates checkpoint reuse around that standalone script.
 const root = new URL("../", import.meta.url);
 
 export interface PrepareResult {
@@ -29,33 +26,24 @@ const ctx = {
     return (saved[name] = await run()) as T;
   },
 };
-const prepared = await atom.prepare(input, ctx);
+const prepared = await ctx.step("fetch", () => atom.fetchReport(input));
 console.log(JSON.stringify({ prepared, checkpoints: saved, ran }));
 `;
 
-/** Splits an atom file into its code block and its instructions. */
-export function split(text: string): { code: string; body: string } {
-  const match = text.match(/^---ts\n([\s\S]*?)\n---\n([\s\S]*)$/);
-  if (!match) throw new Error("the atom has no ---ts block");
-  return { code: match[1], body: match[2] };
-}
-
-/** The paths the instructions read from what prepare returned, such as "report.text". */
+/** Paths read by the Astro prompt from the fetched report. */
 export function preparedPaths(body: string): string[] {
-  return [...body.matchAll(/\{%\s*\$prepared((?:\.\w+)+)\s*%\}/g)].map((m) =>
-    m[1].slice(1)
-  );
+  return [...body.matchAll(/\{input((?:\.\w+)+)\}/g)].map((m) => m[1].slice(1));
 }
 
 /**
- * A module that only type-checks. Each `$prepared` path in the instructions
- * becomes a property access on the type prepare() returns, so a misspelled
+ * A module that only type-checks. Each report path in the Astro instructions
+ * becomes a property access on the type fetchReport() returns, so a misspelled
  * path is a TypeScript error. A sample value is checked against the same type.
  */
 function pathsModule(paths: string[], sample?: unknown): string {
   return [
     'import type * as atom from "./atom.ts";',
-    "type Prepared = Awaited<ReturnType<typeof atom.prepare>>;",
+    "type Prepared = Awaited<ReturnType<typeof atom.fetchReport>>;",
     "declare const prepared: Prepared;",
     ...paths.map((path) => `void prepared.${path};`),
     ...(sample === undefined ? [] : [
@@ -66,9 +54,9 @@ function pathsModule(paths: string[], sample?: unknown): string {
 }
 
 export interface GenerateOptions {
-  /** Extra `$prepared` paths to check, beyond those in the instructions. */
+  /** Extra fetched-report paths to check, beyond those in the instructions. */
   extraPaths?: string[];
-  /** A value to check against the type prepare() returns. */
+  /** A value to check against the type fetchReport() returns. */
   sample?: unknown;
 }
 
@@ -77,9 +65,8 @@ export async function generate(
   atomPath: string,
   options: GenerateOptions = {},
 ): Promise<string> {
-  const { code, body } = split(
-    await Deno.readTextFile(new URL(atomPath, root)),
-  );
+  const code = await Deno.readTextFile(new URL("tools/fetch_report.ts", root));
+  const body = await Deno.readTextFile(new URL(atomPath, root));
   const dir = await Deno.makeTempDir({ prefix: "atomic-atom-" });
   await Deno.writeTextFile(`${dir}/atom.ts`, code + "\n");
   await Deno.writeTextFile(`${dir}/entry.ts`, ENTRY);

@@ -1,0 +1,5 @@
+---
+interface Props { finding: { severity: string; file: string; message: string } }
+const { finding }: Props = Astro.props;
+---
+- {finding.severity} in {finding.file}: {finding.message}

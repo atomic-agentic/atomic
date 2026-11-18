@@ -25,10 +25,12 @@ The initial authoring-skills pack is targeted at v0.1; the rest of the pack and
 higher-level project generation follow later. Workspace member discovery and
 shared-schema resolution belong to M11b/M39b in v0.5.
 
-The first [template tags](../guides/template-tags.md) (`$input` values, `if`, a
-plain `partial` and `example`) are part of v0.1. Loops, partials with
-parameters, schema-bound `render`, the JSX-style `.atom.mdx` form, `atomic render`
-and prompt snapshots are planned for v0.5.
+Declarative atoms now use Astro exclusively. The production loader supports local
+components, slots, bounded TypeScript-shaped expressions and typed validators.
+`atomic check` checks source and generates editor types; `atomic render` previews
+prompts without a model. Markdown and MDX atom frontends have been removed.
+The Astro compiler and full JSON Schema gates execute in this repository; broader
+workflow scheduling, interactive commands and integrations retain their staged status.
 
 Several authoring aids arrive in stages. Eval cases in JSONL files are part of
 v0.1. Compact schemas, variants, the `--plan` cost preview, declared effect caps
@@ -48,7 +50,7 @@ console follows at v1.0.
 Running an atom by the path to its file, and passing input with `--data` or on
 standard input, are part of the v0.1 `atomic run`. `atomic curl` arrives with
 the HTTP API in v0.5. [Code on the Deno runtime](../guides/scripts-and-cloud-sdks.md) is planned
-for v0.7: the `---ts` block in an atom file, `.atom.ts` code atoms and
+for v0.7: separate SDK scripts, `.atom.ts` code atoms and
 `exec.script`, with `env` and `runtime.deno`, the manifest's `runtime.deno`
 settings, named credentials, `atomic test`, and the Deno that Atomic downloads
 and manages for them. A plain

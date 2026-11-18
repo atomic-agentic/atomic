@@ -5,7 +5,7 @@ are part of the **v0.1 target**. They are distinct from model-response recording
 
 ## Location and format
 
-For `atoms/summarize-note.atom.md`, the default directory is
+For `atoms/summarize-note.atom.astro`, the default directory is
 `<manifest-dir>/evals/summarize-note/`. The atom's `evals` field can override it
 with a path relative to that atom file. Each YAML file holds one case; its relative
 filename identifies it in results. A `.jsonl` file holds
@@ -23,7 +23,6 @@ expect:
 | --- | --- |
 | `input` | Required JSON-compatible value matching the atom's input schema; an object when the schema requires one |
 | `expect` | Required nonempty list of CEL expressions; every expression must evaluate to `true` |
-| `prepared` | Optional, and only for an atom with a `---ts` block: the values its `prepare` would return. The eval then does not run `prepare` · v0.7 |
 
 An atom whose code declares a write to an outside system has no eval cases:
 Atomic never runs such code in an eval. Cover it with code tests and
@@ -60,7 +59,7 @@ each case's `expect` expression against `input` and `output`. A false assertion 
 an evaluation error fails the case. These illustrative string checks catch known
 regressions; they do not establish the factual quality of arbitrary summaries.
 
-Inline `{% example %}` blocks supply typed example inputs and outputs. Schema
+Literal `config.examples` declarations supply typed example inputs and outputs. Schema
 checks establish their shape; handwritten example outputs do not establish model
 performance. Use case assertions for the behavior you need to evaluate.
 

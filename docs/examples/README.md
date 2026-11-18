@@ -15,10 +15,11 @@ and add reusable definitions as needed.
 | [Draft a support response](../../examples/05-support-draft/README.md) | External text, independent review and team approval | v0.5 |
 | [Share workspace contracts](../../examples/06-workspace/README.md) | Shared schema IDs across member projects | v0.5 · M11b/M39b |
 | [Delegate translation over A2A](../../examples/07-a2a-translation/README.md) | Typed remote handoff and secret references | v1.0 |
-| [Write one atom in both template forms](../../examples/08-templating/README.md) | Loops, partials with parameters, schema-bound rendering, and the JSX-style `.atom.mdx` form | v0.5 |
-| [Use compact schemas, a variant and JSONL cases](../../examples/09-compact-and-variants/README.md) | Short inline schemas, two versions of one atom side by side, many eval cases in one file | v0.5 |
+| [Compose an Astro prompt](../../examples/08-templating/README.md) | Typed loops, local components, props and slots | v0.5 |
+| [Share schemas across a variant and JSONL cases](../../examples/09-compact-and-variants/README.md) | Full inline/referenced schemas, two versions of one atom side by side, many eval cases in one file | v0.5 |
 | [Record a decision with its evidence](../../examples/10-recorded-decision/README.md) | A choice in the manifest, the eval result it rests on and the date to review it | v0.7 |
-| [Read from and write to S3 with the AWS SDK](../../examples/11-aws-s3/README.md) | TypeScript in an atom that imports an SDK from npm, declared hosts and short-lived credentials, a gate that shows what the model read, and a write that is safe to repeat | v0.7 |
+| [Read from and write to S3 with the AWS SDK](../../examples/11-aws-s3/README.md) | Separate script atoms that import an SDK from npm, declared hosts and short-lived credentials, a gate that shows what the model read, and a write that is safe to repeat | v0.7 |
+| [Inject public execution context](../../examples/12-execution-context/README.md) | Readonly profiles, public env and frozen run metadata | Implemented direct invocation |
 
 The [source catalog](../../examples/README.md) includes complete project files,
 schemas and fixtures. Its Python checker can validate those artifacts now; there

@@ -1,0 +1,20 @@
+{
+  "profile": "test",
+  "environment": {
+    "SUPPORT_REGION": "eu-test",
+    "SUPPORT_DOCS_SITE": "https://docs.example.test",
+    "UNDECLARED_SECRET": "not-for-the-prompt"
+  },
+  "metadata": {
+    "run": {
+      "id": "context-demo-run"
+    },
+    "step": {
+      "id": "draft"
+    },
+    "project": {
+      "id": "email-assistant",
+      "name": "Email Assistant"
+    }
+  }
+}

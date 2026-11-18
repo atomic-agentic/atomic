@@ -1,6 +1,6 @@
 # Typed A2A translation · v1.0
 
-[The atom](atoms/translate.atom.md) delegates a translation through a pinned and
+[The atom](atoms/translate.atom.astro) delegates a translation through a pinned and
 approved remote Agent Card, validates the typed result and checks that the target
 language is unchanged. Its name, version and schema locations follow convention.
 It overrides kind and bounds the remote wait to five minutes.

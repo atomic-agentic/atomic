@@ -1,0 +1,8 @@
+---
+interface Props { tone: 'brief' | 'formal' }
+const { tone }: Props = Astro.props;
+---
+<reply_style>
+{tone === 'brief' ? 'Keep the reply brief and direct.' : 'Use a formal tone.'}
+<slot />
+</reply_style>

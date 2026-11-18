@@ -137,3 +137,40 @@ bump, commit the `Cargo.lock` the workflow uploads, account for what
 ```bash
 scripts/dev.sh scripts/milestone-tests.sh
 ```
+
+## Astro compiler
+
+Declarative atoms use `.atom.astro`. The production compiler assets are bundled
+under `crates/atomic-core/assets` and included in the binary. Running atoms needs
+no npm install or project `node_modules`. The development image supplies pinned
+Deno 2.9.8; other builds can provision that host outside the source tree:
+
+```sh
+python3 scripts/setup-deno.py /tmp/atomic-deno
+export ATOMIC_DENO=/tmp/atomic-deno/deno
+```
+
+The setup script verifies the platform archive against `deps/deno.json`. The worker
+checks its runtime version, clears inherited environment, and has no network, npm,
+write, FFI or subprocess grant, and reads only the compiler assets: atomic reads
+atom sources itself and sends them in the request, for loading as for rendering.
+Compiler cache and direct-run context checkpoints live outside the source tree.
+
+Contributors changing the interpreter or type checker rebuild the shipped assets:
+
+```sh
+cd authoring
+npm ci --ignore-scripts
+npm run build
+npm test
+npm run probe:lsp
+npm run probe:controls
+```
+
+Use the Node version in `authoring/.node-version`. npm dependencies are contributor
+tooling only. Parser/compiler licenses accompany the assets and release notices.
+The `authoring/embedded` experiment is kept out of the repository, because it is a
+second Cargo workspace; the combined
+Atomic/Codex/Deno native dependency and release-packaging decision is still open.
+Workflow-level durable execution context integration remains separate from the
+direct-invocation file checkpoint; do not substitute it for a durable transaction.

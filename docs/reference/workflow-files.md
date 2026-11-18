@@ -109,7 +109,7 @@ including a coding candidate's `commit`. Pass that runtime-owned SHA to review;
 do not ask the author model to invent it.
 
 From v0.7, `steps.<id>.prepared` holds what the step's atom
-[computed in code](atom-files.md#code-in-an-atom) before its model call. Like
+[computed in code](atom-files.md) before its model call. Like
 metadata, it is not written by a model, so a gate can show it as evidence.
 
 The later workflow language adds `foreach`, concurrency, merge queues and richer

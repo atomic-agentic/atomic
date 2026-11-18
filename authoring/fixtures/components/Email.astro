@@ -1,0 +1,9 @@
+---
+import type { Email } from '../../.atomic/types/schemas';
+interface Props { email: Email }
+const { email }: Props = Astro.props;
+---
+From: {email.name} &lt;{email.from}>
+Subject: {email.subject}
+
+{email.body}

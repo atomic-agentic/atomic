@@ -29,12 +29,12 @@ fn names(c: &BTreeMap<String, Vec<SourceFile>>, collection: &str) -> Vec<String>
 
 #[test]
 fn overlapping_globs_load_an_atom_once() {
-    // atoms/review.atom.md matches both default globs: atoms/**/*.atom.md and
-    // **/*.atom.md.
+    // atoms/review.atom.astro matches both default globs: atoms/**/*.atom.astro and
+    // **/*.atom.astro.
     let root = tree(&[
         ("atomic.yaml", "atomic: 1\n"),
-        ("atoms/review.atom.md", ""),
-        ("src/billing/plan.atom.md", ""),
+        ("atoms/review.atom.astro", ""),
+        ("src/billing/plan.atom.astro", ""),
         ("workflows/release.workflow.yaml", ""),
         ("schemas/task.schema.yaml", ""),
         ("evals/review/missing-tests.yaml", ""),
@@ -51,8 +51,8 @@ fn overlapping_globs_load_an_atom_once() {
 fn duplicate_names_in_one_scope_fail_the_load() {
     let root = tree(&[
         ("atomic.yaml", "atomic: 1\n"),
-        ("atoms/review.atom.md", ""),
-        ("src/review.atom.md", ""),
+        ("atoms/review.atom.astro", ""),
+        ("src/review.atom.astro", ""),
     ]);
     match collect(&project::discover(&root).expect("project")) {
         Err(CollectError::DuplicateName {
@@ -69,12 +69,12 @@ fn gitignore_ignore_globs_generated_files_and_nested_projects_are_skipped() {
     let root = tree(&[
         ("atomic.yaml", "atomic: 1\nignore: [\"vendor/**\"]\n"),
         (".gitignore", "build/\n"),
-        ("atoms/keep.atom.md", ""),
-        ("build/out.atom.md", ""),
-        ("vendor/lib/x.atom.md", ""),
-        (".atomic/cache/gen.atom.md", ""),
+        ("atoms/keep.atom.astro", ""),
+        ("build/out.atom.astro", ""),
+        ("vendor/lib/x.atom.astro", ""),
+        (".atomic/cache/gen.atom.astro", ""),
         ("tools/other/atomic.yaml", "atomic: 1\n"),
-        ("tools/other/theirs.atom.md", ""),
+        ("tools/other/theirs.atom.astro", ""),
     ]);
     let c = collect(&project::discover(&root).expect("project")).expect("collect");
     assert_eq!(names(&c, "atoms"), ["keep"]);
@@ -85,11 +85,23 @@ fn a_supplied_entry_replaces_the_default_globs() {
     let root = tree(&[
         (
             "atomic.yaml",
-            "atomic: 1\ncollections:\n  atoms: [\"agents/*.atom.md\"]\n",
+            "atomic: 1\ncollections:\n  atoms: [\"agents/*.atom.astro\"]\n",
         ),
-        ("agents/a.atom.md", ""),
-        ("atoms/b.atom.md", ""),
+        ("agents/a.atom.astro", ""),
+        ("atoms/b.atom.astro", ""),
     ]);
     let c = collect(&project::discover(&root).expect("project")).expect("collect");
     assert_eq!(names(&c, "atoms"), ["a"]);
+}
+
+#[test]
+fn removed_atom_formats_fail_instead_of_silently_disappearing_from_discovery() {
+    for suffix in ["md", "mdx"] {
+        let file = format!("atoms/old.atom.{suffix}");
+        let root = tree(&[("atomic.yaml", "atomic: 1\n"), (&file, "old source")]);
+        assert!(matches!(
+            collect(&project::discover(&root).expect("project")),
+            Err(CollectError::LegacyAtom { .. })
+        ));
+    }
 }

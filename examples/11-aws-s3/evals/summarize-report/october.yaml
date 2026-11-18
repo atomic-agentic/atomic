@@ -1,18 +1,22 @@
-# `prepared` holds what the atom's prepare() would return, so this eval reads nothing from S3.
 input:
-  key: reports/2026-10.md
-prepared:
   report:
-    text: |
-      # October 2026 operations report
+    text: '# October 2026 operations report
+
 
       Orders shipped: 41,280, up 6% on September.
+
       Late shipments: 2.1% of orders, against a target of 1.5%. Most were in the last
+
       week, when the Leeds warehouse ran one shift short.
+
       Support tickets: 1,930. Median first reply was 3 hours 10 minutes.
+
       Refunds: 312, in line with September.
 
+
       Open question: whether to add a temporary shift in Leeds for November.
+
+      '
     bytes: 387
     sha256: 3cba0bac9c3b768a120ebda66a56760594bc3975352be8211d76003bfcd57419
 expect:

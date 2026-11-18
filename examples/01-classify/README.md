@@ -4,7 +4,7 @@ A lite atom classifies team-curated engineering notes. It has no tools, a new
 thread per input, and a bounded schema. Use Codex atoms when repository access is
 needed; this task only needs a model call.
 
-Read [atomic.yaml](atomic.yaml), [the atom](atoms/classify-note.atom.md), and its
+Read [atomic.yaml](atomic.yaml), [the atom](atoms/classify-note.atom.astro), and its
 [input](atoms/classify-note.input.schema.yaml) and
 [output](atoms/classify-note.output.schema.yaml) contracts. The frontmatter only
 declares the format, description and non-default kind. The typed example is also

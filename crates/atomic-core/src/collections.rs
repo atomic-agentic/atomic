@@ -28,6 +28,12 @@ pub struct SourceFile {
 /// Why the collections could not be gathered.
 #[derive(Debug, thiserror::Error)]
 pub enum CollectError {
+    /// A removed atom frontend remains in the project.
+    #[error("{}: Markdown/MDX atoms have been replaced; migrate this file to .atom.astro", .path.display())]
+    LegacyAtom {
+        /// Legacy source file.
+        path: PathBuf,
+    },
     /// A glob is not valid.
     #[error("collection {collection}: bad glob {glob:?}: {message}")]
     Glob {
@@ -70,7 +76,7 @@ fn default_name(collection: &str, relative: &Path) -> String {
         .map(|f| f.to_string_lossy().into_owned())
         .unwrap_or_default();
     let suffixes: &[&str] = match collection {
-        "atoms" => &[".atom.md"],
+        "atoms" => &[".atom.astro"],
         "workflows" => &[".workflow.yaml"],
         "schemas" => &[".schema.yaml", ".schema.json"],
         _ => &[],
@@ -152,6 +158,14 @@ pub fn collect(project: &Project) -> Result<BTreeMap<String, Vec<SourceFile>>, C
         };
         if ignored.is_match(relative) {
             continue;
+        }
+        if path
+            .to_str()
+            .is_some_and(|name| name.ends_with(".atom.md") || name.ends_with(".atom.mdx"))
+        {
+            return Err(CollectError::LegacyAtom {
+                path: path.to_owned(),
+            });
         }
         for (collection, set) in &sets {
             if set.is_match(relative) {

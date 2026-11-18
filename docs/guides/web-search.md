@@ -41,7 +41,7 @@ codex:
 ```
 
 This is a fragment, not a complete atom. See the
-[`codex` field](../reference/atom-files.md#fields). Managed policy constrains the
+[`codex` field](../reference/atom-files.md). Managed policy constrains the
 selection. Durable-atom search defaults remain unspecified; inspect the resolved
 setting before relying on remote retrieval.
 

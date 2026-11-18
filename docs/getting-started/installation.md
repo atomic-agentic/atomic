@@ -25,9 +25,13 @@ See [availability](../reference/availability.md) before trying a feature.
   API key, or a supported local provider. Subscription sign-in exists upstream;
   Atomic still needs to expose it. The API-key path detects `OPENAI_API_KEY`.
 - Git and your usual build tools for repository work.
-- Nothing extra for TypeScript in atoms. From v0.7, Atomic downloads and
-  verifies its own pinned [Deno](../guides/atom-code-runtime.md#you-do-not-install-deno)
-  the first time a project needs it.
+- Deno 2.9.8, for now. Atomic's Astro compiler runs on it, and `atomic check`
+  and `atomic render` refuse any other version. Put it on your `PATH`, or set
+  `ATOMIC_DENO` to its executable; in a checkout of this repository,
+  `python3 scripts/setup-deno.py <dir>` downloads it and verifies its checksum.
+  From v0.7, Atomic downloads and verifies its own pinned
+  [Deno](../guides/atom-code-runtime.md) the first time a project needs it,
+  and this step goes away.
 
 Read [subscriptions and authentication](authentication.md) for the verified
 upstream login paths and the planned Atomic integration. Keep credentials out of
