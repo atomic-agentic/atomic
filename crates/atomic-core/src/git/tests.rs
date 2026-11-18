@@ -134,5 +134,5 @@ fn every_command_is_hardened() {
 #[test]
 fn printable_error_text_has_no_control_characters() {
     assert_eq!(printable(b"fatal: a\x1b[31mb\n\n"), "fatal: a?[31mb");
-    assert_eq!(printable(b"one\ntwo\r"), "one\ntwo?");
+    assert_eq!(printable(b"one\ntwo\rthree\r"), "one\ntwo?three");
 }
