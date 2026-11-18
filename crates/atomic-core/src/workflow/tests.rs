@@ -220,3 +220,42 @@ fn reference_sibling_unevaluated_properties_see_target_annotations() {
     assert!(validator.is_valid(&serde_json::json!({"name":"value"})));
     assert!(!validator.is_valid(&serde_json::json!({"name":"value","extra":true})));
 }
+
+#[test]
+fn a_gate_timeout_is_a_duration() {
+    assert_eq!(
+        parse_timeout("24h"),
+        Ok(std::time::Duration::from_secs(86_400))
+    );
+    assert_eq!(parse_timeout("90s"), Ok(std::time::Duration::from_secs(90)));
+    assert_eq!(
+        parse_timeout("7d"),
+        Ok(std::time::Duration::from_secs(604_800))
+    );
+    for bad in [
+        "",
+        "h",
+        "24",
+        "1.5h",
+        "-1h",
+        "0m",
+        "24 h",
+        "99999999999999999999d",
+    ] {
+        assert!(parse_timeout(bad).is_err(), "{bad:?}");
+    }
+    let e = err(&WORKFLOW.replace("timeout: 24h", "timeout: a day"));
+    assert_eq!(e.path, "/steps/accept/gate/timeout");
+    assert!(e.message.contains("not a duration"), "{}", e.message);
+}
+
+#[test]
+fn gate_approvers_are_group_names() {
+    check(&WORKFLOW.replace(
+        "timeout: 24h",
+        "timeout: 24h\n      approvers: [maintainers]",
+    ))
+    .expect("a list of groups loads");
+    let e = err(&WORKFLOW.replace("timeout: 24h", "timeout: 24h\n      approvers: maintainers"));
+    assert_eq!(e.path, "/steps/accept/gate/approvers");
+}
