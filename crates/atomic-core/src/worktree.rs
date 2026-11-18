@@ -389,6 +389,59 @@ impl Worktrees {
     }
 }
 
+/// Build and package caches shared by every worktree of a project, kept
+/// outside all of them under `<state>/cache`, so a fresh worktree does not
+/// build cold and resetting a worktree never discards them.
+///
+/// An atom's commands find them through [`env`](Self::env), and a
+/// `workspace-write` thread is given [`dir`](Self::dir) as a writable root
+/// (`TurnSpec::env` and `TurnSpec::writable_roots` in [`crate::codex`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Caches {
+    dir: PathBuf,
+}
+
+impl Caches {
+    /// The caches of the project at `state`.
+    pub fn for_state(state: &ProjectState) -> Self {
+        Self::new(state.dir().join("cache"))
+    }
+
+    /// Caches kept under `dir`.
+    pub fn new(dir: PathBuf) -> Self {
+        Self { dir }
+    }
+
+    /// Where they are.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Create the cache directory.
+    pub fn create(&self) -> Result<()> {
+        std::fs::create_dir_all(&self.dir).map_err(io("create", &self.dir))
+    }
+
+    /// The environment that points common build tools at the caches: the
+    /// XDG cache home, Cargo's target directory, and npm's, pip's and Go's
+    /// caches, plus `ATOMIC_CACHE_DIR` for anything else.
+    pub fn env(&self) -> std::collections::BTreeMap<String, String> {
+        let at = |sub: &str| self.dir.join(sub).to_string_lossy().into_owned();
+        [
+            ("ATOMIC_CACHE_DIR", self.dir.to_string_lossy().into_owned()),
+            ("XDG_CACHE_HOME", at("xdg")),
+            ("CARGO_TARGET_DIR", at("cargo-target")),
+            ("npm_config_cache", at("npm")),
+            ("PIP_CACHE_DIR", at("pip")),
+            ("GOCACHE", at("go-build")),
+            ("GOMODCACHE", at("go-mod")),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v))
+        .collect()
+    }
+}
+
 /// Run blocking git work off the async workers.
 async fn blocking<T: Send + 'static>(
     work: impl FnOnce() -> Result<T> + Send + 'static,

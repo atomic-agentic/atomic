@@ -81,7 +81,7 @@ use codex_core_api::resolve_installation_id;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::future::Future;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// The provider id atomic registers for its model endpoint.
@@ -111,6 +111,12 @@ pub struct TurnSpec {
     pub model: Option<String>,
     /// The sandbox the thread runs in. The network is always restricted.
     pub sandbox: crate::typed::Sandbox,
+    /// Environment variables set for every command the thread runs, such as
+    /// the project's shared caches (see [`crate::worktree::Caches`]).
+    pub env: BTreeMap<String, String>,
+    /// Directories a `workspace-write` thread may write besides its working
+    /// directory, such as the project's shared caches. Absolute paths.
+    pub writable_roots: Vec<PathBuf>,
 }
 
 /// Codex's permission profile for a sandbox: read-only, or writes confined
@@ -148,6 +154,18 @@ impl CodexPaths {
     pub fn without_helpers() -> Self {
         Self(Arg0DispatchPaths {
             codex_self_exe: std::env::current_exe().ok(),
+            ..Arg0DispatchPaths::default()
+        })
+    }
+
+    /// Paths for a process that did not start through [`dispatch`] but has
+    /// atomic's binary at hand, such as a test: Codex re-runs `atomic` for
+    /// its helpers, and runs `linux_sandbox`, a link to `atomic` named
+    /// `codex-linux-sandbox`, as its Linux sandbox.
+    pub fn with_helpers(atomic: PathBuf, linux_sandbox: PathBuf) -> Self {
+        Self(Arg0DispatchPaths {
+            codex_self_exe: Some(atomic),
+            codex_linux_sandbox_exe: Some(linux_sandbox),
             ..Arg0DispatchPaths::default()
         })
     }
@@ -250,6 +268,26 @@ where
         Constrained::allow_any(AskForApproval::Never),
         Constrained::allow_any(permission_profile(spec.sandbox)),
     )?;
+    if !spec.writable_roots.is_empty() {
+        let mut roots = vec![config.cwd.clone()];
+        for root in &spec.writable_roots {
+            let root = AbsolutePathBuf::from_absolute_path(root)
+                .with_context(|| format!("resolve the writable root {}", root.display()))?;
+            if !roots.contains(&root) {
+                roots.push(root);
+            }
+        }
+        config.permissions.set_workspace_roots(roots.clone());
+        config.workspace_roots = roots;
+        config.workspace_roots_explicit = true;
+    }
+    for (name, value) in &spec.env {
+        config
+            .permissions
+            .shell_environment_policy
+            .r#set
+            .insert(name.clone(), value.clone());
+    }
     let state_db = init_state_db(&config).await;
 
     let auth_manager =

@@ -80,6 +80,22 @@ Set `ATOMIC_DEV_DB=off` to run a command without starting the database.
 A test suite that needs Postgres fails when `ATOMIC_TEST_DATABASE_URL` is not
 set. It never skips silently.
 
+## The sandbox tests
+
+Tests that run Codex's Linux sandbox are behind the `atomic-agentic` package's
+`sandbox-tests` feature. The sandbox uses bubblewrap, which needs unprivileged
+user namespaces and a fresh `/proc`; the container engine's default seccomp
+profile and masked `/proc` paths forbid both. `ATOMIC_DEV_SANDBOX=on` lifts
+those two restrictions for one command, and leaves capabilities dropped and
+`no-new-privileges` on:
+
+```bash
+ATOMIC_DEV_SANDBOX=on scripts/dev.sh cargo test --workspace --locked \
+  --features atomic-agentic-durable/postgres-tests,atomic-agentic/sandbox-tests
+```
+
+With the feature on, a sandbox that cannot start fails the tests.
+
 ## Releases
 
 A release starts from a tag `v<version>` whose version equals the
