@@ -5,6 +5,7 @@
 //! No other atomic crate names the durable-execution engine; workflows reach it
 //! only through this crate.
 
+pub mod gate;
 pub mod publication;
 pub mod runtime;
 

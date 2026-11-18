@@ -15,22 +15,62 @@ use std::str::FromStr;
 /// One forward migration of atomic's tables.
 struct Migration {
     version: i64,
-    sql: &'static str,
+    /// Its statements, run in order in one transaction. Each is valid on
+    /// SQLite and PostgreSQL alike.
+    sql: &'static [&'static str],
 }
 
 /// Every migration, in order. Append only: a released migration never changes.
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    // Published candidates (see `publication`).
-    sql: "CREATE TABLE IF NOT EXISTS atomic_publications (
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        // Published candidates (see `publication`).
+        sql: &["CREATE TABLE IF NOT EXISTS atomic_publications (
               publication_key TEXT PRIMARY KEY,
               digest TEXT NOT NULL,
               output TEXT NOT NULL
-          )",
-}];
+          )"],
+    },
+    Migration {
+        version: 2,
+        // The gate store (see `gate`): one row per gate, and the journal of
+        // decision commands. Times are milliseconds since the Unix epoch.
+        sql: &[
+            "CREATE TABLE IF NOT EXISTS atomic_gates (
+                gate_id TEXT PRIMARY KEY,
+                run TEXT NOT NULL,
+                workflow TEXT NOT NULL,
+                step TEXT NOT NULL,
+                title TEXT NOT NULL,
+                show TEXT NOT NULL,
+                evidence TEXT NOT NULL,
+                proposal TEXT NOT NULL,
+                approvers TEXT NOT NULL,
+                tier TEXT NOT NULL,
+                opened_at BIGINT NOT NULL,
+                deadline BIGINT,
+                on_timeout TEXT NOT NULL,
+                state TEXT NOT NULL,
+                decided_by TEXT,
+                decided_at BIGINT,
+                comment TEXT,
+                command_id TEXT
+            )",
+            "CREATE INDEX IF NOT EXISTS atomic_gates_by_state ON atomic_gates (state, opened_at)",
+            "CREATE INDEX IF NOT EXISTS atomic_gates_by_run ON atomic_gates (run)",
+            "CREATE TABLE IF NOT EXISTS atomic_gate_commands (
+                command_id TEXT PRIMARY KEY,
+                gate_id TEXT NOT NULL,
+                request TEXT NOT NULL,
+                result TEXT NOT NULL,
+                recorded_at BIGINT NOT NULL
+            )",
+        ],
+    },
+];
 
 /// The store version this binary writes and understands.
-pub const STORE_VERSION: i64 = 1;
+pub const STORE_VERSION: i64 = 2;
 
 /// Why the store could not be opened.
 #[derive(Debug, thiserror::Error)]
@@ -144,7 +184,9 @@ pub async fn open_postgres(url: &str, schema: &str) -> Result<i64, StoreError> {
                 .map_err(db)?;
         }
         for m in MIGRATIONS.iter().filter(|m| m.version > found) {
-            sqlx::query(m.sql).execute(&mut *tx).await.map_err(db)?;
+            for sql in m.sql {
+                sqlx::query(*sql).execute(&mut *tx).await.map_err(db)?;
+            }
         }
         if found < STORE_VERSION {
             sqlx::query(sqlx::AssertSqlSafe(format!("DELETE FROM {table}")))
@@ -198,7 +240,9 @@ async fn migrate(conn: &mut SqliteConnection, path: &str) -> Result<i64, StoreEr
             });
         }
         for m in MIGRATIONS.iter().filter(|m| m.version > found) {
-            sqlx::query(m.sql).execute(&mut *conn).await.map_err(db)?;
+            for sql in m.sql {
+                sqlx::query(*sql).execute(&mut *conn).await.map_err(db)?;
+            }
         }
         if found < STORE_VERSION {
             sqlx::query("DELETE FROM atomic_store_version")
