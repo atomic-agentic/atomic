@@ -94,6 +94,10 @@ allow-wildcard-paths = true
 deny = [
     # Its licence excludes the people who build atomic (AGENTS.md).
     { crate = "beads_rust", reason = "excluded from atomic by its licence rider" },
+    # Only atomic-durable may depend on the durable-execution engine: every
+    # other crate reaches it through the DurableRuntime trait, so the engine
+    # can be replaced behind it.
+    { crate = "durare", wrappers = ["atomic-agentic-durable"], reason = "reached only through atomic-durable's DurableRuntime" },
 ]
 
 [sources]

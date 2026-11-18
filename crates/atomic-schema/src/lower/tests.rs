@@ -329,3 +329,38 @@ fn alternatives_given_as_definitions_are_told_apart_by_their_tags() {
         json!({"events": [{"kind": "edit", "file": "a.rs"}, {"kind": "note", "line": null}]})
     );
 }
+
+#[test]
+fn an_optional_reference_to_a_nullable_definition_keeps_its_null() {
+    for note in [
+        json!({"type": ["string", "null"]}),
+        json!({"anyOf": [{"type": "string"}, {"type": "null"}]}),
+        json!({"$ref": "#/$defs/Inner"}),
+    ] {
+        let contract = json!({
+            "type": "object",
+            "properties": {"note": {"$ref": "#/$defs/Note"}},
+            "$defs": {"Note": note.clone(), "Inner": {"type": ["string", "null"]}}
+        });
+        match lower(&contract, &OPENAI_STRICT) {
+            Ok(l) => {
+                assert_eq!(l.warnings, ["/note"], "{note}: null is a value here");
+                assert!(l.nulls_added.is_empty(), "{note}: {:?}", l.nulls_added);
+                assert_eq!(
+                    normalized(&contract, json!({"note": null})),
+                    json!({"note": null})
+                );
+                assert_eq!(
+                    normalized(&contract, json!({"note": "x"})),
+                    json!({"note": "x"})
+                );
+            }
+            // A null-admitting anyOf behind an optional reference is the
+            // ambiguous case: refused, never silently normalized.
+            Err(e) => assert!(
+                note.get("anyOf").is_some() && e.message.contains("ambiguous"),
+                "{note}: {e}"
+            ),
+        }
+    }
+}

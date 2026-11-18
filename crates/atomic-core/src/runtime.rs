@@ -105,7 +105,7 @@ pub struct Runtimes {
 }
 
 /// What a run records beside its output.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RunMetadata {
     /// Codex's id for the thread the atom ran on; for a lite atom, the
     /// provider's id for its last response.

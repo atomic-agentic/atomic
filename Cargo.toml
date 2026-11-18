@@ -48,6 +48,7 @@ ignore = "0.4"
 jsonschema = { version = "0.61", default-features = false }
 # atomic's one Markdown parser (markdown-rs).
 markdown = "1"
+regex = "1"
 # Lite atoms' model client: the version and TLS stack Codex's own client uses.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "rustls-tls-native-roots"] }
 saphyr-parser = "0.3.4"
