@@ -1,0 +1,35 @@
+atomic: 1
+input:
+  $ref: ../atoms/total-order.input.schema.yaml
+output:
+  $ref: ../atoms/render-report.output.schema.yaml
+steps:
+  total:
+    atom: total-order
+    with:
+      order_id: input.order_id
+      lines: input.lines
+  assess:
+    after:
+    - total
+    atom: assess-order
+    with:
+      order_id: steps.total.output.order_id
+      total_cents: steps.total.output.total_cents
+      item_count: steps.total.output.item_count
+  accept-report:
+    after:
+    - assess
+    gate:
+      title: '''Accept order report'''
+      show: steps.assess.output
+      timeout: 24h
+      on_timeout: reject
+  render:
+    after:
+    - accept-report
+    atom: render-report
+    with:
+      total: steps.total.output
+      assessment: steps.assess.output
+returns: steps.render.output

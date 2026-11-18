@@ -1,0 +1,8 @@
+---
+interface Props { strict: boolean }
+const { strict }: Props = Astro.props;
+---
+Sort the findings into what must be fixed now and what can follow up.
+{strict ? <Fragment>A missing test for new behaviour counts as a blocker.</Fragment> : null}
+Name each file that must change by its path, such as src/&lt;module>.py.
+<slot />

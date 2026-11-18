@@ -41,6 +41,33 @@ mv "${ROOT}/crates/atomic/atomic-agentic.cdx.json" "${OUT}/atomic-agentic.cdx.js
 rm -f "${ROOT}"/crates/*/atomic-agentic-*.cdx.json
 SBOM="${OUT}/atomic-agentic.cdx.json"
 
+# Include the non-Cargo libraries and compiler payloads shipped in the binary.
+python3 -I - "${SBOM}" "${ROOT}" <<'PY_ASTRO'
+import json, pathlib, sys
+file, root = sys.argv[1:]
+manifest = json.loads((pathlib.Path(root) / "crates/atomic-core/assets/manifest.json").read_text())
+doc = json.loads(pathlib.Path(file).read_text())
+refs = []
+licenses = {"@astrojs/compiler":"MIT", "typescript":"Apache-2.0", "source-map-js":"BSD-3-Clause"}
+for name, version in manifest["dependencies"].items():
+    purl = f"pkg:npm/{name.replace('@', '%40')}@{version}"
+    component = {"type":"library", "name":name, "version":version, "bom-ref":purl, "purl":purl, "licenses":[{"license":{"id":licenses[name]}}]}
+    doc.setdefault("components", []).append(component)
+    refs.append(purl)
+for name in ("worker.mjs", "astro.wasm"):
+    ref = "atomic:astro:" + name
+    doc["components"].append({"type":"file", "name":name, "bom-ref":ref, "hashes":[{"alg":"SHA-256","content":manifest["assets"][name]}]})
+    refs.append(ref)
+owner = doc["metadata"]["component"]["bom-ref"]
+dependency = next((item for item in doc.setdefault("dependencies", []) if item["ref"] == owner), None)
+if dependency is None:
+    dependency = {"ref":owner,"dependsOn":[]}
+    doc["dependencies"].append(dependency)
+dependency.setdefault("dependsOn", []).extend(refs)
+pathlib.Path(file).write_text(json.dumps(doc, indent=2) + "\n")
+print("SBOM includes pinned Astro/TypeScript libraries and bundled payload hashes")
+PY_ASTRO
+
 if [ -n "${BINARY}" ]; then
     python3 -I - "${SBOM}" "${BINARY}" "${ROOT}" <<'PY'
 import hashlib, json, sys

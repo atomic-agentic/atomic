@@ -42,12 +42,51 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # Fails when the [patch] block in Cargo.toml or rust-toolchain.toml drifts from the
       # Codex revision in deps/codex.toml.
+      - run: python3 scripts/check-authoring-assets.py
       - run: scripts/codex-pin.sh check
       # Fails when a fork in deps/forks.toml resolves from another revision.
       - run: scripts/forks-check.sh
       # Fails when a crate shared with Codex leaves Codex's locked version
       # without a reason in deps/lock-exceptions.toml.
       - run: scripts/lock-check.sh
+
+  # The Astro interpreter's own tests, and a rebuild of the bundled compiler
+  # from its sources: the committed assets must be exactly what the sources
+  # build, not only what the manifest says they are.
+  authoring:
+    name: Astro compiler
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Test and rebuild in the pinned Node
+        run: |
+          docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp \
+            -v "${GITHUB_WORKSPACE}:/work" -w /work/authoring \
+            node:24.21.0-trixie-slim@sha256:173f125896c3b47ddf056734c7ea789d04595a6a08769a8f78e0df642781fb66 \
+            sh -c 'npm ci --ignore-scripts --no-audit --no-fund && node src/generate.mjs >/dev/null && node --test test/*.test.mjs && node src/build-worker.mjs'
+      - name: The committed assets match the rebuild
+        run: |
+          git diff --exit-code -- crates/atomic-core/assets
+          python3 scripts/check-authoring-assets.py
+
+  # The example catalog against the proposed authoring contract, offline,
+  # until atomic's own loader checks the same files.
+  examples:
+    name: Examples
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Checker dependencies
+        run: |
+          python3 -m venv "${RUNNER_TEMP}/examples-venv"
+          "${RUNNER_TEMP}/examples-venv/bin/pip" install --no-deps --require-hashes -r tools/requirements.txt
+      - name: Pinned Astro compiler host
+        run: |
+          python3 scripts/setup-deno.py "${RUNNER_TEMP}/atomic-deno"
+          echo "${RUNNER_TEMP}/atomic-deno" >>"${GITHUB_PATH}"
+      - name: Check the examples
+        working-directory: tools
+        run: '"${RUNNER_TEMP}/examples-venv/bin/python" check_examples.py'
 
   # deny.toml: a dependency with a disallowed licence, a banned crate or an
   # unlisted source fails CI.
@@ -131,6 +170,10 @@ jobs:
           echo "ATOMIC_TEST_DATABASE_URL=postgres://atomic:atomic@127.0.0.1:5432/atomic" >>"$GITHUB_ENV"
 
       # rustup installs the toolchain and components rust-toolchain.toml names.
+      - name: Pinned Astro compiler host
+        run: |
+          python3 scripts/setup-deno.py "${RUNNER_TEMP}/atomic-deno"
+          echo "${RUNNER_TEMP}/atomic-deno" >>"${GITHUB_PATH}"
       - name: Toolchain
         run: rustup show active-toolchain || rustup toolchain install
 

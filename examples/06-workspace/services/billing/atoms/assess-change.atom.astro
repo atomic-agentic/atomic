@@ -1,0 +1,13 @@
+---
+import type { Props, Input, Output } from '../.atomic/types/assess-change';
+import type { AtomConfig } from '../.atomic/types/authoring';
+const { input }: Props = Astro.props;
+export const config: AtomConfig<Input, Output> = {
+  "description": "Summarize the supplied billing change and flag uncertainty."
+};
+---
+
+Summarize the billing change in one sentence. Set needs_human to true when
+     the change affects money or policy, or when its effect is uncertain.
+
+     Change: {input.change}

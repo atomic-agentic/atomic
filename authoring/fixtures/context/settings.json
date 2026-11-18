@@ -1,0 +1,36 @@
+{
+  "schema": "RuntimeContext",
+  "defaultProfile": "dev",
+  "base": {
+    "organizationName": "Example Support",
+    "replyLocale": "en",
+    "maxReplyCharacters": 600,
+    "features": {
+      "calendar": true,
+      "drafts": true
+    }
+  },
+  "profiles": {
+    "dev": {
+      "maxReplyCharacters": 1000
+    },
+    "test": {
+      "replyLocale": "en-GB",
+      "maxReplyCharacters": 200,
+      "features": {
+        "calendar": false
+      }
+    },
+    "prod": {}
+  },
+  "environment": {
+    "SUPPORT_REGION": {
+      "name": "SUPPORT_REGION",
+      "required": true
+    },
+    "DOCS_SITE": {
+      "name": "SUPPORT_DOCS_SITE",
+      "required": false
+    }
+  }
+}

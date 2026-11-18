@@ -1,0 +1,323 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "Email": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "from": {
+          "type": "string"
+        },
+        "subject": {
+          "type": "string"
+        },
+        "body": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "from",
+        "subject",
+        "body"
+      ],
+      "additionalProperties": false
+    },
+    "TimeSlot": {
+      "type": "object",
+      "properties": {
+        "start": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "end": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "start",
+        "end"
+      ],
+      "additionalProperties": false
+    },
+    "Meeting": {
+      "type": "object",
+      "properties": {
+        "title": {
+          "type": "string"
+        },
+        "start": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "minutes": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "title",
+        "start",
+        "minutes"
+      ],
+      "additionalProperties": false
+    },
+    "DraftInput": {
+      "type": "object",
+      "properties": {
+        "email": {
+          "$ref": "#/$defs/Email"
+        },
+        "free_slots": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TimeSlot"
+          }
+        },
+        "feedback": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "email",
+        "free_slots"
+      ],
+      "additionalProperties": false
+    },
+    "TriageInput": {
+      "type": "object",
+      "properties": {
+        "email": {
+          "$ref": "#/$defs/Email"
+        }
+      },
+      "required": [
+        "email"
+      ],
+      "additionalProperties": false
+    },
+    "Reply": {
+      "type": "object",
+      "properties": {
+        "subject": {
+          "type": "string"
+        },
+        "body": {
+          "type": "string"
+        },
+        "meeting": {
+          "$ref": "#/$defs/Meeting"
+        }
+      },
+      "required": [
+        "subject",
+        "body"
+      ],
+      "additionalProperties": false
+    },
+    "TriageOutput": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": [
+            "ignore",
+            "notify",
+            "respond"
+          ]
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "additionalProperties": false
+    },
+    "EvalCase": {
+      "type": "object",
+      "properties": {
+        "criteria": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "criteria"
+      ],
+      "additionalProperties": false
+    },
+    "JudgeInput": {
+      "type": "object",
+      "properties": {
+        "email": {
+          "$ref": "#/$defs/Email"
+        },
+        "reply": {
+          "$ref": "#/$defs/Reply"
+        },
+        "criteria": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "email",
+        "reply",
+        "criteria"
+      ],
+      "additionalProperties": false
+    },
+    "JudgeOutput": {
+      "type": "object",
+      "properties": {
+        "verdicts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "met": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "met"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": [
+        "verdicts"
+      ],
+      "additionalProperties": false
+    },
+    "ProjectConfig": {
+      "type": "object",
+      "properties": {
+        "organizationName": {
+          "type": "string"
+        },
+        "replyLocale": {
+          "type": "string"
+        },
+        "maxReplyCharacters": {
+          "type": "integer"
+        },
+        "features": {
+          "type": "object",
+          "properties": {
+            "calendar": {
+              "type": "boolean"
+            },
+            "drafts": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "calendar",
+            "drafts"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "organizationName",
+        "replyLocale",
+        "maxReplyCharacters",
+        "features"
+      ],
+      "additionalProperties": false
+    },
+    "PublicEnvironment": {
+      "type": "object",
+      "properties": {
+        "SUPPORT_REGION": {
+          "type": "string"
+        },
+        "DOCS_SITE": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "SUPPORT_REGION"
+      ],
+      "additionalProperties": false
+    },
+    "RuntimeContext": {
+      "type": "object",
+      "properties": {
+        "profile": {
+          "type": "string",
+          "enum": [
+            "dev",
+            "test",
+            "prod"
+          ]
+        },
+        "config": {
+          "$ref": "#/$defs/ProjectConfig"
+        },
+        "env": {
+          "$ref": "#/$defs/PublicEnvironment"
+        },
+        "run": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id"
+          ],
+          "additionalProperties": false
+        },
+        "step": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id"
+          ],
+          "additionalProperties": false
+        },
+        "project": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "name"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "profile",
+        "config",
+        "env",
+        "run",
+        "step",
+        "project"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

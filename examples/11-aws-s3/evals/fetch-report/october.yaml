@@ -1,0 +1,4 @@
+input:
+  key: reports/2026-10.md
+expect:
+- output.report.bytes > 0

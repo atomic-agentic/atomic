@@ -1,0 +1,13 @@
+{
+  "item": {
+    "id": "local-1",
+    "title": "Fix quantity handling",
+    "priority": 1,
+    "criteria": [
+      "Two units at 125 cents total 250 cents.",
+      "Existing one-unit behavior remains unchanged."
+    ]
+  },
+  "commit": "2222222222222222222222222222222222222222",
+  "base": "1111111111111111111111111111111111111111"
+}

@@ -5,48 +5,22 @@ use crate::atom;
 
 static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-const SUMMARIZE: &str = "---
-atomic: 1
-description: Summarize one note.
-kind: lite
-input:
-  type: object
-  additionalProperties: false
-  required: [text]
-  properties:
-    text: {type: string}
-output:
-  type: object
-  additionalProperties: false
-  required: [summary]
-  properties:
-    summary: {type: string}
+const SUMMARIZE: &str = r#"---
+import type { Props } from "./.atomic/types/summarize-note";
+const { input }: Props = Astro.props;
+export const config = {"atomic": 1, "description": "Summarize one note.", "kind": "lite", "input": {"type": "object", "additionalProperties": false, "required": ["text"], "properties": {"text": {"type": "string"}}}, "output": {"type": "object", "additionalProperties": false, "required": ["summary"], "properties": {"summary": {"type": "string"}}}};
 ---
-Summarize: {% $input.text %}
-";
+Summarize: {input.text}
+"#;
 
-const REVIEW: &str = "---
-atomic: 1
-description: Review a summary against its source.
-kind: lite
-input:
-  type: object
-  additionalProperties: false
-  required: [source, draft]
-  properties:
-    source: {type: string}
-    draft: {type: string}
-output:
-  type: object
-  additionalProperties: false
-  required: [verdict]
-  properties:
-    verdict: {enum: [ok, revise]}
-    notes: {type: string}
+const REVIEW: &str = r#"---
+import type { Props } from "./.atomic/types/review-summary";
+const { input }: Props = Astro.props;
+export const config = {"atomic": 1, "description": "Review a summary against its source.", "kind": "lite", "input": {"type": "object", "additionalProperties": false, "required": ["source", "draft"], "properties": {"source": {"type": "string"}, "draft": {"type": "string"}}}, "output": {"type": "object", "additionalProperties": false, "required": ["verdict"], "properties": {"verdict": {"enum": ["ok", "revise"]}, "notes": {"type": "string"}}}};
 ---
-Source: {% $input.source %}
-Draft: {% $input.draft %}
-";
+Source: {input.source}
+Draft: {input.draft}
+"#;
 
 const WORKFLOW: &str = "atomic: 1
 input:
@@ -87,8 +61,8 @@ fn check(workflow: &str) -> Result<Workflow, WorkflowError> {
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     for (p, t) in [
-        ("atoms/summarize-note.atom.md", SUMMARIZE),
-        ("atoms/review-summary.atom.md", REVIEW),
+        ("atoms/summarize-note.atom.astro", SUMMARIZE),
+        ("atoms/review-summary.atom.astro", REVIEW),
         ("workflows/summarize-and-review.workflow.yaml", workflow),
     ] {
         let p = root.join(p);
@@ -98,8 +72,11 @@ fn check(workflow: &str) -> Result<Workflow, WorkflowError> {
     let mut registry = Registry::new();
     let mut atoms = BTreeMap::new();
     for name in ["summarize-note", "review-summary"] {
-        let a = atom::load(&root.join(format!("atoms/{name}.atom.md")), &mut registry)
-            .expect("atom loads");
+        let a = atom::load(
+            &root.join(format!("atoms/{name}.atom.astro")),
+            &mut registry,
+        )
+        .expect("atom loads");
         atoms.insert(a.name.clone(), a);
     }
     load(
@@ -206,4 +183,40 @@ fn cycles_unknown_dependencies_and_bad_results_fail() {
     );
     let e = err(&WORKFLOW.replace("atomic: 1\n", ""));
     assert!(e.message.contains("format version"), "{}", e.message);
+}
+
+#[test]
+fn schema_inlining_preserves_reference_sibling_constraints() {
+    let schema =
+        serde_json::json!({"$defs":{"text":{"type":"string"}},"$ref":"#/$defs/text","maxLength":3});
+    let result = inline(&schema, Path::new("/tmp"), &mut Registry::new(), 0).expect("inline");
+    assert!(
+        !jsonschema::validator_for(&result)
+            .expect("validator")
+            .is_valid(&serde_json::json!("too long"))
+    );
+}
+
+#[test]
+fn schema_inlining_rejects_recursion_instead_of_weakening_the_contract() {
+    let schema = serde_json::json!({"type":"object","properties":{"child":{"$ref":"#"}}});
+    assert!(inline(&schema, Path::new("/tmp"), &mut Registry::new(), 0).is_err());
+}
+
+#[test]
+fn schema_inlining_leaves_literal_reference_shaped_data_unchanged() {
+    let schema = serde_json::json!({"const":{"$ref":"not-a-schema.json"}});
+    assert_eq!(
+        inline(&schema, Path::new("/tmp"), &mut Registry::new(), 0).expect("literal data"),
+        schema
+    );
+}
+
+#[test]
+fn reference_sibling_unevaluated_properties_see_target_annotations() {
+    let schema = serde_json::json!({"$defs":{"object":{"type":"object","properties":{"name":{"type":"string"}}}},"$ref":"#/$defs/object","unevaluatedProperties":false});
+    let expanded = inline(&schema, Path::new("/tmp"), &mut Registry::new(), 0).expect("inline");
+    let validator = jsonschema::validator_for(&expanded).expect("validator");
+    assert!(validator.is_valid(&serde_json::json!({"name":"value"})));
+    assert!(!validator.is_valid(&serde_json::json!({"name":"value","extra":true})));
 }

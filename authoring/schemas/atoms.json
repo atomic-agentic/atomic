@@ -1,0 +1,20 @@
+{
+  "draft-reply": {
+    "input": "DraftInput",
+    "output": "Reply",
+    "case": "EvalCase",
+    "judges": {
+      "judge-reply": {
+        "input": "JudgeInput",
+        "output": "JudgeOutput"
+      }
+    },
+    "context": "RuntimeContext"
+  },
+  "triage-email": {
+    "input": "TriageInput",
+    "output": "TriageOutput",
+    "case": "EvalCase",
+    "judges": {}
+  }
+}

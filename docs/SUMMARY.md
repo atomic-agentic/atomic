@@ -1,0 +1,48 @@
+# Documentation contents
+
+- [Atomic](README.md)
+- Get started
+  - [Installation](getting-started/installation.md)
+  - [Subscriptions and authentication](getting-started/authentication.md)
+  - [Start coding with Atomic](getting-started/quickstart.md)
+  - [Your first atom](getting-started/first-atom.md)
+  - [Your first workflow](getting-started/first-workflow.md)
+- Concepts
+  - [The Atomic mental model](concepts/mental-model.md)
+  - [Architecture: Atomic on Codex](concepts/architecture.md)
+  - [Atoms and workflows](concepts/atoms-and-workflows.md)
+  - [Durable execution](concepts/durable-execution.md)
+  - [Design principles and inspirations](concepts/design-principles.md)
+- Guides
+  - [Code and build apps](guides/coding-with-atomic.md)
+  - [Watch, steer and approve agents](guides/controlling-agents.md)
+  - [Project structure](guides/project-structure.md)
+  - [Set up VS Code](guides/vs-code.md)
+  - [Test and improve an atom](guides/testing-and-evals.md)
+  - [Template tags and the JSX-style form](guides/template-tags.md)
+  - [Diagrams with Mermaid](guides/diagrams.md)
+  - [Tools and integrations](guides/tools-and-integrations.md)
+  - [Call AWS and other services with an SDK](guides/scripts-and-cloud-sdks.md)
+  - [How Atomic runs and confines atom code](guides/atom-code-runtime.md)
+  - [Slack](guides/slack.md)
+  - [Web search](guides/web-search.md)
+  - [Security and permissions](guides/security-and-permissions.md)
+- [Examples](examples/README.md)
+- Operations
+  - [Run locally or with a team](operations/running-atomic.md)
+  - [Local observability and telemetry](operations/observability.md)
+- Reference
+  - [CLI reference](reference/cli.md)
+  - [Atom files](reference/atom-files.md)
+  - [Workflow files](reference/workflow-files.md)
+  - [Configuration](reference/configuration.md)
+  - [Project manifest: atomic.yaml](reference/manifest.md)
+  - [Budgets](reference/budgets.md)
+  - [Eval case files](reference/eval-cases.md)
+  - [Glossary](reference/glossary.md)
+  - [Troubleshooting](reference/troubleshooting.md)
+  - [Availability and delivery stages](reference/availability.md)
+  - [Atom tags (as implemented)](reference/atom-tags.md)
+  - [Configuration layers (as implemented)](configuration.md)
+- For contributors
+  - [Developing atomic](development.md)

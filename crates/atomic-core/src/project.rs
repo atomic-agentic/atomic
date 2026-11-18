@@ -27,7 +27,7 @@ pub const FORMAT_VERSION: u64 = 1;
 /// The default glob lists, per collection. A manifest's `collections` entry
 /// replaces the default for that collection only.
 pub const DEFAULT_COLLECTIONS: &[(&str, &[&str])] = &[
-    ("atoms", &["atoms/**/*.atom.md", "**/*.atom.md"]),
+    ("atoms", &["atoms/**/*.atom.astro", "**/*.atom.astro"]),
     (
         "workflows",
         &["workflows/**/*.workflow.yaml", "**/*.workflow.yaml"],

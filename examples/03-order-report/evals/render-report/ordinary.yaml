@@ -1,0 +1,11 @@
+input:
+  total:
+    order_id: order-1
+    total_cents: 300
+    item_count: 3
+  assessment:
+    order_id: order-1
+    total_cents: 300
+    note: Three items total 300 cents.
+expect:
+- output.order_id == input.total.order_id

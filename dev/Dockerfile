@@ -5,6 +5,8 @@
 # scripts/dev.sh builds it when missing and tags it with a hash of this file,
 # so any change here builds a new image.
 
+FROM denoland/deno@sha256:a0d88a7fcbd44f062cba2748e19df67d30290ad12aa203c7c1e0b12462c483f0 AS compiler-deno
+
 FROM rust:1.95.0-slim-trixie@sha256:e14e87345b4d5964ddcc3491d27ee046a0f23820f340c3c1e24da6880141f7c0
 
 # The container runs as the invoking user, who cannot write to RUSTUP_HOME, so
@@ -63,3 +65,6 @@ RUN set -eu; \
     tar -xJf cdx.tar.xz -C /usr/local/bin --strip-components=1 "${cdx}/cargo-cyclonedx"; \
     rm -rf /tmp/*; \
     cargo-deny --version && cosign version >/dev/null && bd version && cargo-cyclonedx cyclonedx --version
+
+# Trusted Astro compiler host; atom source never executes in this runtime.
+COPY --from=compiler-deno /usr/bin/deno /usr/local/bin/deno

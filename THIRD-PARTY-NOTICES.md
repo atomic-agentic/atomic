@@ -71,3 +71,23 @@ The MIT License, as it applies to the projects above that use it:
 > LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 > OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 > SOFTWARE.
+
+
+## Bundled Astro authoring compiler
+
+The binary embeds a trusted compiler worker and Astro WASM, built from pinned npm
+packages. Atom source itself is never executed. Runtime npm installation is not
+required. The bundled libraries are:
+
+| Package | Version | License | Upstream |
+| --- | --- | --- | --- |
+| @astrojs/compiler | 4.0.0 | MIT and included Go BSD notices | https://github.com/withastro/compiler |
+| TypeScript | 5.9.3 | Apache-2.0 | https://github.com/microsoft/TypeScript |
+| source-map-js | 1.2.2 | BSD-3-Clause | https://github.com/7rulnik/source-map-js |
+
+Original licenses and generated bundle notices are retained under
+`crates/atomic-core/assets` and included in release archives under `licenses/`.
+Compiler dependency versions and payload hashes are included in the SBOM.
+Deno 2.9.8 is a separately provisioned host, pinned in `deps/deno.json`; it is not
+linked into this binary. Contributor-only npm dependencies are pinned in the
+authoring package lockfile.

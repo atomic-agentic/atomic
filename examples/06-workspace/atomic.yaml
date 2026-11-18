@@ -1,0 +1,6 @@
+atomic: 1
+name: engineering
+workspace:
+  members:
+  - shared
+  - services/*

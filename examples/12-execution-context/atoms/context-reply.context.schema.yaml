@@ -1,0 +1,80 @@
+$schema: https://json-schema.org/draft/2020-12/schema
+type: object
+properties:
+  profile:
+    type: string
+    enum:
+    - dev
+    - test
+    - prod
+  config:
+    type: object
+    properties:
+      organizationName:
+        type: string
+      replyLocale:
+        type: string
+      maxReplyCharacters:
+        type: integer
+      features:
+        type: object
+        properties:
+          calendar:
+            type: boolean
+          drafts:
+            type: boolean
+        required:
+        - calendar
+        - drafts
+        additionalProperties: false
+    required:
+    - organizationName
+    - replyLocale
+    - maxReplyCharacters
+    - features
+    additionalProperties: false
+  env:
+    type: object
+    properties:
+      SUPPORT_REGION:
+        type: string
+      DOCS_SITE:
+        type: string
+    required:
+    - SUPPORT_REGION
+    additionalProperties: false
+  run:
+    type: object
+    properties:
+      id:
+        type: string
+    required:
+    - id
+    additionalProperties: false
+  step:
+    type: object
+    properties:
+      id:
+        type: string
+    required:
+    - id
+    additionalProperties: false
+  project:
+    type: object
+    properties:
+      id:
+        type: string
+      name:
+        type: string
+    required:
+    - id
+    - name
+    additionalProperties: false
+required:
+- profile
+- config
+- env
+- run
+- step
+- project
+additionalProperties: false

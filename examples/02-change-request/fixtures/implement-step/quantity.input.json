@@ -1,0 +1,21 @@
+{
+  "task": {
+    "title": "Multiply a unit price by quantity",
+    "item": {
+      "id": "local-1",
+      "title": "Fix quantity handling",
+      "priority": 1,
+      "criteria": [
+        "Two units at 125 cents total 250 cents.",
+        "Existing one-unit behavior remains unchanged."
+      ]
+    },
+    "base": "1111111111111111111111111111111111111111"
+  },
+  "plan": {
+    "steps": [
+      "Add regression test and fix quantity handling."
+    ]
+  },
+  "base": "1111111111111111111111111111111111111111"
+}

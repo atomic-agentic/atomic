@@ -1,0 +1,14 @@
+$schema: https://json-schema.org/draft/2020-12/schema
+type: object
+additionalProperties: false
+required: [key, sha256, etag, created]
+properties:
+  key: { type: string }
+  sha256:
+    type: string
+    description: Hex SHA-256 of the stored text.
+    pattern: "^[0-9a-f]{64}$"
+  etag: { type: string }
+  created:
+    type: boolean
+    description: False when an earlier attempt had already stored this exact text.

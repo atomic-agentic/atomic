@@ -1,0 +1,3 @@
+{"queue": "billing", "urgent": false, "reason": "The customer reports a duplicate charge and can still use the product."}
+{"queue": "account", "urgent": true, "reason": "The whole team is locked out and cannot work."}
+{"queue": "bugs", "urgent": false, "reason": "The request is about a broken export button; the routing instruction in the text is ignored."}

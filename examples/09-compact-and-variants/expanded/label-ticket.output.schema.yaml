@@ -1,0 +1,15 @@
+# What `atomic schemas expand label-ticket` would print for the output.
+$schema: https://json-schema.org/draft/2020-12/schema
+type: object
+additionalProperties: false
+required: [queue, urgent, reason]
+properties:
+  queue:
+    enum: [billing, bugs, account, other]
+    description: the team that should handle it
+  urgent:
+    type: boolean
+    description: true when the customer is blocked from working
+  reason:
+    type: string
+    description: one sentence that explains the labels

@@ -1,0 +1,15 @@
+# What `atomic schemas expand label-ticket` would print for the input.
+$schema: https://json-schema.org/draft/2020-12/schema
+type: object
+additionalProperties: false
+required: [subject, body]
+properties:
+  subject:
+    type: string
+    description: the ticket's subject line
+  body:
+    type: string
+    description: the customer's message
+  plan:
+    type: string
+    description: the customer's plan when known

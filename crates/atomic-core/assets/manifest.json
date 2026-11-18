@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "sources": {
+    "authoring/src/build-worker.mjs": "9024a98bb4a2893d9b8ea3a109187ad86dc697ba4ac8c0089792ce3207357a86",
+    "authoring/src/worker.mjs": "a7510c1a50f8c2c119f6b51678345ba678cc66940ae4d54c7812cf215a42255d",
+    "authoring/src/renderer.mjs": "59f628614637867b45a501e0a6c8149d0b6ac8312f2b84718c4e08b557071e4c",
+    "authoring/src/typecheck.mjs": "6dc8d2673fe226ce4099b2c7ad8ed199aeebc236f19db1c8109d2ebd01ece0c4",
+    "authoring/src/schema-types.mjs": "bebee7eb6a89a793055ecebb6bd81a397c3cc3a93f81e13e7a42490936ac84f2",
+    "authoring/src/platform.mjs": "fb8e01afb7067a1a3c5a552f83f394d7b6c0403cfc3cd6796bf671259fb13de0",
+    "authoring/src/context.mjs": "f778318f9b86c07e7fd799306d2bcc8de51ac4e13065cedcb92986c93d9b0eec",
+    "authoring/src/generate.mjs": "acccd4e317b0e1edf1fcc6683a5e170233df73c4b488f3cb46026d8705608618",
+    "authoring/src/intrinsics.mjs": "1998f7bcfb276501618e48635e9f26731197a29fab362727eb0682e60f3b6995",
+    "authoring/authoring.d.ts": "b98358f5ae04af50272f0ff39b71b6dd4f13403de89590a3e8935262153ccf5d",
+    "authoring/package.json": "6e093c23679caafc5c476e18c2b903a64eaecbf0437d4fe01d38ed74989b6036",
+    "authoring/package-lock.json": "9aa4288a0c0f6c7d44c63d081d5eb8d510cf54c41c337e147d0cf60265f67346"
+  },
+  "assets": {
+    "worker.mjs": "c64d79391e5259449848b82011d4f36e6254f368919c05649bdb3e9c3253210b",
+    "worker.mjs.LEGAL.txt": "ab1fbb4a8cd93f8da2ecaf67e418c748cd6c2ef00609e7d60923fc46aa5745da",
+    "astro.wasm": "a4ed5ef260d401dba6f172d52a3c27dbd933bfcd9b1698e91b430214c9701313",
+    "TYPESCRIPT-LICENSE.txt": "a7d00bfd54525bc694b6e32f64c7ebcf5e6b7ae3657be5cc12767bce74654a47",
+    "ASTRO-LICENSE": "41bf89dd8dffe96c4d833b7dabef397194a24f3c15c2ef4b050f875c6e9b7d29",
+    "SOURCE-MAP-LICENSE": "6cb0631f71c7749763fd3dd1d5bee52dd1070ec17f2edc1710079ad070bd2fbd"
+  },
+  "dependencies": {
+    "@astrojs/compiler": "4.0.0",
+    "typescript": "5.9.3",
+    "source-map-js": "1.2.2"
+  }
+}

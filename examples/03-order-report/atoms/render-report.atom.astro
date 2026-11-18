@@ -1,0 +1,17 @@
+---
+import type { Props, Input, Output } from '../.atomic/types/render-report';
+import type { AtomConfig } from '../.atomic/types/authoring';
+const { input }: Props = Astro.props;
+export const config: AtomConfig<Input, Output> = {
+  "description": "Render an accepted order assessment as a text result.",
+  "kind": "exec",
+  "exec": {
+    "command": [
+      "python3",
+      "tools/render_report.py"
+    ]
+  }
+};
+---
+
+

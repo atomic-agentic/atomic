@@ -1,0 +1,6 @@
+{
+  "verdict": "request_changes",
+  "findings": [
+    "The function still ignores quantity; two units at 125 cents return 125 cents."
+  ]
+}

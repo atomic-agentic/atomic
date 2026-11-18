@@ -1,0 +1,4 @@
+{
+  "category": "bug",
+  "summary": "Export crashes for file names containing accented characters."
+}

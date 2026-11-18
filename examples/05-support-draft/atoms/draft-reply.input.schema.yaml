@@ -1,0 +1,22 @@
+$schema: https://json-schema.org/draft/2020-12/schema
+type: object
+additionalProperties: false
+required: [ticket, policy]
+properties:
+  ticket:
+    type: object
+    additionalProperties: false
+    required: [id, body]
+    properties:
+      id:
+        type: string
+        minLength: 1
+      body:
+        type: string
+        minLength: 1
+        maxLength: 5000
+  policy:
+    type: string
+    minLength: 1
+    maxLength: 3000
+$id: https://atomic.example/schemas/support-request-v1

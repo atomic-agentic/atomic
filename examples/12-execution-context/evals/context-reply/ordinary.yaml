@@ -1,0 +1,4 @@
+input:
+  text: When does support open?
+expect:
+- size(output.reply) > 0

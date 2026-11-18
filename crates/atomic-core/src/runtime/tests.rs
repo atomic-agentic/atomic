@@ -245,9 +245,18 @@ fn a_declarative_atom_breaking_a_contract_only_constraint_gets_exactly_one_repai
         let dir = scratch("decl-project");
         std::fs::create_dir_all(dir.join("atoms")).expect("mkdir");
         std::fs::write(
-            dir.join("atoms/ticket.atom.md"),
-            "---\natomic: 1\ndescription: Name the ticket a note is about.\nkind: lite\n\
-             validate:\n  - \"output.ticket != 'ABC-0'\"\n---\nNote: {% $input.text %}\n",
+            dir.join("atoms/ticket.atom.astro"),
+            r#"---
+import type { Props, Input, Output } from './.atomic/types/ticket';
+import type { AtomConfig } from './.atomic/types/authoring';
+const { input }: Props = Astro.props;
+export const config: AtomConfig<Input, Output> = {
+  description: 'Name the ticket a note is about.',
+  validate: [({output}) => output.ticket !== 'ABC-0'],
+};
+---
+Note: {input.text}
+"#,
         )
         .expect("atom");
         std::fs::write(
@@ -263,7 +272,7 @@ fn a_declarative_atom_breaking_a_contract_only_constraint_gets_exactly_one_repai
         )
         .expect("output");
         let mut registry = Registry::new();
-        let a = atom::load(&dir.join("atoms/ticket.atom.md"), &mut registry).expect("loads");
+        let a = atom::load(&dir.join("atoms/ticket.atom.astro"), &mut registry).expect("loads");
         let compiled = compile::compile(&a, &registry).expect("compiles");
 
         // The first answer fits strict mode but breaks maxLength; the repaired
@@ -299,9 +308,13 @@ fn a_declarative_atom_breaking_a_contract_only_constraint_gets_exactly_one_repai
             first.contains("origin=\\\"external\\\""),
             "the input is wrapped in the user turn: {first}"
         );
+        // Every request's schema mentions maxLength; only the repair turn
+        // quotes the validator's complaint about this answer.
+        let repair = model.requests()[1].to_string();
         assert!(
-            model.requests()[1].to_string().contains("maxLength"),
-            "the repair quotes the broken constraint"
+            repair.contains("did not fit the required output")
+                && repair.contains("is longer than 6 characters"),
+            "the repair quotes the broken constraint: {repair}"
         );
 
         // A validate rule failing twice: one repair, then the validation error.
@@ -326,9 +339,13 @@ fn a_declarative_atom_breaking_a_contract_only_constraint_gets_exactly_one_repai
         assert_eq!(model.calls(), 2);
 
         // The same atom declared `kind: codex` runs on a Codex thread.
-        let file = dir.join("atoms/ticket.atom.md");
+        let file = dir.join("atoms/ticket.atom.astro");
         let text = std::fs::read_to_string(&file).expect("read");
-        std::fs::write(&file, text.replace("kind: lite", "kind: codex")).expect("write");
+        std::fs::write(
+            &file,
+            text.replace("description: 'Name", "kind: 'codex',\n  description: 'Name"),
+        )
+        .expect("write");
         let mut registry = Registry::new();
         let a = atom::load(&file, &mut registry).expect("loads");
         let compiled = compile::compile(&a, &registry).expect("compiles");
@@ -353,14 +370,283 @@ fn a_declarative_atom_breaking_a_contract_only_constraint_gets_exactly_one_repai
 }
 
 #[test]
+fn an_astro_typed_validator_gets_exactly_one_repair() {
+    use crate::{atom, compile};
+    on_codex_runtime(async {
+        let dir = scratch("decl-project");
+        std::fs::create_dir_all(dir.join("atoms")).expect("mkdir");
+        std::fs::write(
+            dir.join("atoms/ticket.atom.astro"),
+            r#"---
+import type { Props, Input, Output } from './.atomic/types/ticket';
+import type { AtomConfig } from './.atomic/types/authoring';
+const { input }: Props = Astro.props;
+export const config: AtomConfig<Input, Output> = {
+  description: 'Name the ticket a note is about.',
+  validate: [({output}) => output.ticket !== 'ABC-0'],
+};
+---
+Note: {input.text}
+"#,
+        )
+        .expect("atom");
+        std::fs::write(
+            dir.join("atoms/ticket.input.schema.yaml"),
+            "type: object\nrequired: [text]\nproperties:\n  text: {type: string}\n",
+        )
+        .expect("input");
+        // maxLength is not in the strict profile: only the full contract
+        // enforces it.
+        std::fs::write(
+            dir.join("atoms/ticket.output.schema.yaml"),
+            "type: object\nadditionalProperties: false\nrequired: [ticket]\nproperties:\n  ticket: {type: string, maxLength: 6}\n",
+        )
+        .expect("output");
+        let mut registry = Registry::new();
+        let a = atom::load(&dir.join("atoms/ticket.atom.astro"), &mut registry).expect("loads");
+        let compiled = compile::compile(&a, &registry).expect("compiles");
+
+        // The first answer fits the schema but breaks the validator; the
+        // repaired one fits.
+        let model = FakeModel::start(vec![
+            Reply::Text(r#"{"ticket": "ABC-0"}"#.into()),
+            Reply::Text(r#"{"ticket": "ABC-12"}"#.into()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = runtimes(&model, "decl");
+        let input = json!({"text": "Export crashes, see ABC-12."});
+        let (out, meta) = run_declarative(
+            &a,
+            &compiled,
+            &mut registry,
+            &input,
+            "run-1",
+            "external",
+            &rt,
+        )
+        .await
+        .expect("repaired");
+        assert_eq!(out, json!({"ticket": "ABC-12"}));
+        assert_eq!((model.calls(), meta.turns), (2, 2));
+        let first = model.requests()[0].to_string();
+        assert!(
+            first.contains("origin=\\\"external\\\""),
+            "the input is wrapped in the user turn: {first}"
+        );
+        let repair = model.requests()[1].to_string();
+        assert!(
+            repair.contains("did not fit the required output")
+                && repair.contains("output.ticket !== 'ABC-0'")
+                && repair.contains("returned false"),
+            "the repair quotes the broken rule: {repair}"
+        );
+
+        // A validate rule failing twice: one repair, then the validation error.
+        let model = FakeModel::start(vec![
+            Reply::Text(r#"{"ticket": "ABC-0"}"#.into()),
+            Reply::Text(r#"{"ticket": "ABC-0"}"#.into()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = runtimes(&model, "decl-rule");
+        let r = run_declarative(
+            &a,
+            &compiled,
+            &mut registry,
+            &input,
+            "run-2",
+            "external",
+            &rt,
+        )
+        .await;
+        assert!(matches!(r, Err(AtomError::Validation(_))), "{r:?}");
+        assert_eq!(model.calls(), 2);
+    });
+}
+
+#[test]
+fn a_registry_reload_cannot_change_a_compiled_atoms_contract() {
+    use crate::{atom, compile};
+    on_codex_runtime(async {
+        let dir = scratch("decl-project");
+        std::fs::create_dir_all(dir.join("atoms")).expect("mkdir");
+        std::fs::write(
+            dir.join("atoms/ticket.atom.astro"),
+            r#"---
+import type { Props, Input, Output } from './.atomic/types/ticket';
+import type { AtomConfig } from './.atomic/types/authoring';
+const { input }: Props = Astro.props;
+export const config: AtomConfig<Input, Output> = {
+  description: 'Name the ticket a note is about.',
+  validate: [({output}) => output.ticket !== 'ABC-0'],
+};
+---
+Note: {input.text}
+"#,
+        )
+        .expect("atom");
+        std::fs::write(
+            dir.join("atoms/ticket.input.schema.yaml"),
+            "type: object\nrequired: [text]\nproperties:\n  text: {type: string}\n",
+        )
+        .expect("input");
+        // maxLength is not in the strict profile: only the full contract
+        // enforces it.
+        std::fs::write(
+            dir.join("atoms/ticket.output.schema.yaml"),
+            "type: object\nadditionalProperties: false\nrequired: [ticket]\nproperties:\n  ticket: {type: string, maxLength: 6}\n",
+        )
+        .expect("output");
+        let mut registry = Registry::new();
+        let a = atom::load(&dir.join("atoms/ticket.atom.astro"), &mut registry).expect("loads");
+        let compiled = compile::compile(&a, &registry).expect("compiles");
+        let entry = registry.get(&a.output).expect("entry").clone();
+        let mut changed = entry.schema;
+        changed["properties"]["ticket"]["maxLength"] = json!(100);
+        registry
+            .register(entry.file, changed)
+            .expect("simulated reload");
+
+        // The first answer fits strict mode but breaks maxLength; the repaired
+        // one fits.
+        let model = FakeModel::start(vec![
+            Reply::Text(r#"{"ticket": "ABC-123456"}"#.into()),
+            Reply::Text(r#"{"ticket": "ABC-12"}"#.into()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = runtimes(&model, "decl");
+        let input = json!({"text": "Export crashes, see ABC-12."});
+        let (out, meta) = run_declarative(
+            &a,
+            &compiled,
+            &mut registry,
+            &input,
+            "run-1",
+            "external",
+            &rt,
+        )
+        .await
+        .expect("repaired");
+        assert_eq!(out, json!({"ticket": "ABC-12"}));
+        assert_eq!((model.calls(), meta.turns), (2, 2));
+        let first = model.requests()[0].to_string();
+        assert!(
+            first.contains("origin=\\\"external\\\""),
+            "the input is wrapped in the user turn: {first}"
+        );
+        // Every request's schema mentions maxLength; only the repair turn
+        // quotes the validator's complaint about this answer.
+        let repair = model.requests()[1].to_string();
+        assert!(
+            repair.contains("did not fit the required output")
+                && repair.contains("is longer than 6 characters"),
+            "the repair quotes the broken constraint: {repair}"
+        );
+
+        // A validate rule failing twice: one repair, then the validation error.
+        let model = FakeModel::start(vec![
+            Reply::Text(r#"{"ticket": "ABC-0"}"#.into()),
+            Reply::Text(r#"{"ticket": "ABC-0"}"#.into()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = runtimes(&model, "decl-rule");
+        let r = run_declarative(
+            &a,
+            &compiled,
+            &mut registry,
+            &input,
+            "run-2",
+            "external",
+            &rt,
+        )
+        .await;
+        assert!(matches!(r, Err(AtomError::Validation(_))), "{r:?}");
+        assert_eq!(model.calls(), 2);
+    });
+}
+
+#[test]
+fn compiler_failures_never_spend_a_repair_call() {
+    on_codex_runtime(async {
+        for failure in [
+            "Deno missing",
+            "compiler worker exceeded 30 seconds",
+            "Broken pipe",
+        ] {
+            let model = FakeModel::start(vec![Reply::Text(r#"{"ok":true}"#.into())])
+                .await
+                .expect("fake model");
+            let rt = runtime(&model, "compiler-infrastructure");
+            let backend = Backend::Codex(&rt);
+            let contract = json!({"type":"object","additionalProperties":false,"required":["ok"],"properties":{"ok":{"type":"boolean"}}});
+            let validator = jsonschema::validator_for(&contract).expect("schema");
+            let check = |_: Value| -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<(), AtomError>> + Send>,
+            > {
+                Box::pin(std::future::ready(validation_result(Err(failure.into()))))
+            };
+            let error = run_contract(
+                backend,
+                Request {
+                    developer: "Test".into(),
+                    prompt: "Test".into(),
+                    model: None,
+                    sandbox: crate::typed::Sandbox::ReadOnly,
+                    contract: &contract,
+                    validator: &validator,
+                    name: "infrastructure-test",
+                },
+                &check,
+            )
+            .await
+            .expect_err("infrastructure failure");
+            assert!(
+                matches!(error, AtomError::Runtime(ref message) if message == failure),
+                "{error}"
+            );
+            assert_eq!(model.calls(), 1, "{failure}");
+        }
+        assert!(matches!(
+            validation_result(Ok(json!({}))),
+            Err(AtomError::Runtime(_))
+        ));
+        assert!(matches!(
+            validation_result(Ok(json!({"valid":false}))),
+            Err(AtomError::Validation(_))
+        ));
+    });
+}
+
+#[tokio::test]
+async fn no_declared_validators_need_no_compiler_process() {
+    let program = crate::astro::Program {
+        file: "/missing/atom.atom.astro".into(),
+        root: "/missing".into(),
+        sources: Default::default(),
+        source_paths: Default::default(),
+        contracts: Value::Null,
+    };
+    validate_output(&program, false, json!({}))
+        .await
+        .expect("no worker needed");
+    assert!(matches!(
+        validate_output(&program, true, json!({})).await,
+        Err(AtomError::Runtime(_))
+    ));
+}
+
+#[test]
 fn a_declarative_atom_rejects_an_input_that_breaks_its_contract() {
     use crate::{atom, compile};
     on_codex_runtime(async {
         let dir = scratch("decl-input");
         std::fs::create_dir_all(dir.join("atoms")).expect("mkdir");
         std::fs::write(
-            dir.join("atoms/count.atom.md"),
-            "---\natomic: 1\ndescription: Count the words in a note.\nkind: lite\n---\nNote: {% $input.text %}\n",
+            dir.join("atoms/count.atom.astro"),
+            "---\nimport type { Props, Input, Output } from './.atomic/types/count';\nimport type { AtomConfig } from './.atomic/types/authoring';\nconst { input }: Props = Astro.props;\nexport const config: AtomConfig<Input, Output> = { description: 'Count the words in a note.', kind: 'lite' };\n---\nNote: {input.text}\n",
         )
         .expect("atom");
         std::fs::write(
@@ -374,7 +660,7 @@ fn a_declarative_atom_rejects_an_input_that_breaks_its_contract() {
         )
         .expect("output");
         let mut registry = Registry::new();
-        let a = atom::load(&dir.join("atoms/count.atom.md"), &mut registry).expect("loads");
+        let a = atom::load(&dir.join("atoms/count.atom.astro"), &mut registry).expect("loads");
         let compiled = compile::compile(&a, &registry).expect("compiles");
         for (input, at) in [
             (json!({"text": "two words"}), "limit"),
@@ -431,16 +717,17 @@ fn a_declarative_atom_takes_its_model_from_itself_then_the_defaults_then_the_end
                 (None, Some("default-model"), "default-model"),
                 (None, None, "synthetic"),
             ] {
-                let model_line = own.map(|m| format!("model: {m}\n")).unwrap_or_default();
+                let model_field = own.map(|m| format!(", model: '{m}'")).unwrap_or_default();
                 std::fs::write(
-                    dir.join("atoms/echo.atom.md"),
+                    dir.join("atoms/echo.atom.astro"),
                     format!(
-                        "---\natomic: 1\ndescription: Echo.\nkind: {kind}\n{model_line}---\nSay {{% $input.text %}}\n"
+                        "---\nimport type {{ Props, Input, Output }} from './.atomic/types/echo';\nimport type {{ AtomConfig }} from './.atomic/types/authoring';\nconst {{ input }}: Props = Astro.props;\nexport const config: AtomConfig<Input, Output> = {{ description: 'Echo.', kind: '{kind}'{model_field} }};\n---\nSay {{input.text}}\n"
                     ),
                 )
                 .expect("atom");
                 let mut registry = Registry::new();
-                let a = atom::load(&dir.join("atoms/echo.atom.md"), &mut registry).expect("loads");
+                let a =
+                    atom::load(&dir.join("atoms/echo.atom.astro"), &mut registry).expect("loads");
                 let compiled = compile::compile(&a, &registry).expect("compiles");
                 let model = FakeModel::start(vec![Reply::Text(r#"{"text": "hi"}"#.into())])
                     .await
@@ -584,8 +871,8 @@ fn a_declarative_output_keeps_its_artifact_references_for_the_check() {
         let dir = scratch("decl-artifact");
         std::fs::create_dir_all(dir.join("atoms")).expect("mkdir");
         std::fs::write(
-            dir.join("atoms/patch.atom.md"),
-            "---\natomic: 1\ndescription: Write a patch.\nkind: lite\n---\nPatch {% $input.text %}\n",
+            dir.join("atoms/patch.atom.astro"),
+            "---\nimport type { Props, Input, Output } from './.atomic/types/patch';\nimport type { AtomConfig } from './.atomic/types/authoring';\nconst { input }: Props = Astro.props;\nexport const config: AtomConfig<Input, Output> = { description: 'Write a patch.', kind: 'lite' };\n---\nPatch {input.text}\n",
         )
         .expect("atom");
         std::fs::write(
@@ -599,7 +886,7 @@ fn a_declarative_output_keeps_its_artifact_references_for_the_check() {
         )
         .expect("output");
         let mut registry = Registry::new();
-        let a = atom::load(&dir.join("atoms/patch.atom.md"), &mut registry).expect("loads");
+        let a = atom::load(&dir.join("atoms/patch.atom.astro"), &mut registry).expect("loads");
         let compiled = compile::compile(&a, &registry).expect("compiles");
         let missing = format!("artifact://sha256/{}", "0".repeat(64));
         let bad = Reply::Text(json!({"patch": missing}).to_string());

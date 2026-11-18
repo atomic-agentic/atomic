@@ -1,0 +1,11 @@
+{
+  "extends": "astro/tsconfigs/strict",
+  "include": [
+    "fixtures/**/*.astro",
+    ".atomic/types/**/*.d.ts",
+    "authoring.d.ts"
+  ],
+  "exclude": [
+    "node_modules"
+  ]
+}

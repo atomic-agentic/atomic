@@ -28,12 +28,13 @@ dirs = { workspace = true }
 globset = { workspace = true }
 ignore = { workspace = true }
 jsonschema = { workspace = true }
-markdown = { workspace = true }
 regex = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+hmac = { workspace = true }
+getrandom = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["net", "io-util", "rt", "rt-multi-thread", "sync"] }
 atomic-schema = { workspace = true }

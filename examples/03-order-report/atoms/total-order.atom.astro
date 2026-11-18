@@ -1,0 +1,17 @@
+---
+import type { Props, Input, Output } from '../.atomic/types/total-order';
+import type { AtomConfig } from '../.atomic/types/authoring';
+const { input }: Props = Astro.props;
+export const config: AtomConfig<Input, Output> = {
+  "description": "Compute an order total in integer cents.",
+  "kind": "exec",
+  "exec": {
+    "command": [
+      "python3",
+      "tools/total_order.py"
+    ]
+  }
+};
+---
+
+

@@ -1,0 +1,4 @@
+input:
+  text: Export crashes when the file name contains an accent.
+expect:
+- output.category == 'bug'

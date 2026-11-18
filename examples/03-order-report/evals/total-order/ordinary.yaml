@@ -1,0 +1,12 @@
+input:
+  order_id: order-1
+  lines:
+  - sku: A
+    quantity: 2
+    unit_cents: 125
+  - sku: B
+    quantity: 1
+    unit_cents: 50
+expect:
+- output.total_cents == 300
+- output.item_count == 3

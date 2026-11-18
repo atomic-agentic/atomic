@@ -13,6 +13,8 @@ phase is v0.1.
 | What | Where |
 | --- | --- |
 | The work to do | Beads (`bd ready`) |
+| User documentation, as designed | `docs/` (`docs/reference/availability.md` says what is built) |
+| The example catalog, the v0.1 authoring contract | `examples/`, checked by `tools/check_examples.py` in CI |
 | Design notes and private references | `AGENTS.local.md`, if present (not in git) |
 
 Read `AGENTS.local.md` when it exists: it holds maintainer-local pointers to
@@ -84,8 +86,9 @@ These are the rules that are easiest to break:
 - **atomic makes git commits, outside the sandbox.** A worktree an atom wrote
   to is untrusted input: run git there with hooks, drivers, signing and pagers
   off.
-- **Declarative files never run code.** Expressions are CEL. Atom bodies are
-  parsed with the `markdown` crate and nothing else.
+- **Declarative atoms never execute modules.** `.atom.astro` files use the
+  bundled Astro parser and a bounded TypeScript-shaped AST interpreter.
+  Workflow mappings remain CEL. JSON Schema stays the runtime contract.
 - **JSON Schema is the contract.** atomic validates every model output and
   tool argument against the full schema itself.
 - **Runtime state never lives in the source tree.** It goes in the per-project

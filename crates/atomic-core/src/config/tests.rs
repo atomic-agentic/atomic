@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Ported from errai's configuration tests, extended to atomic's layers.
+//! The configuration layers: precedence, file and environment parsing, and
+//! the errors a bad setting gives.
 
 use super::*;
 

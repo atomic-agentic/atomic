@@ -1,0 +1,6 @@
+{
+  "summary": "Multiplied unit price by quantity and added a regression test.",
+  "tests_run": [
+    "python3 -m unittest discover -s tests"
+  ]
+}

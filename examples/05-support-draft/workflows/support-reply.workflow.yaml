@@ -1,0 +1,29 @@
+atomic: 1
+input:
+  $ref: ../atoms/draft-reply.input.schema.yaml
+output:
+  $ref: ../atoms/draft-reply.output.schema.yaml
+steps:
+  draft:
+    atom: draft-reply
+    with:
+      ticket: input.ticket
+      policy: input.policy
+  review:
+    after:
+    - draft
+    atom: review-reply
+    with:
+      draft: steps.draft.output
+      policy: input.policy
+  approve-draft:
+    after:
+    - review
+    gate:
+      title: '''Approve support draft'''
+      show: '{''draft'': steps.draft.output, ''review'': steps.review.output}'
+      approvers:
+      - group:support-leads
+      timeout: 24h
+      on_timeout: reject
+returns: steps.draft.output

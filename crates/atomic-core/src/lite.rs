@@ -138,6 +138,20 @@ pub async fn converse<F>(
 where
     F: FnMut(&str) -> Option<TurnSpec>,
 {
+    converse_async(runtime, first, |answer| std::future::ready(next(&answer))).await
+}
+
+/// As [`converse`], with an asynchronous check between turns, such as an
+/// atom's validators running in the compiler worker.
+pub async fn converse_async<F, Fut>(
+    runtime: &LiteRuntime,
+    first: &TurnSpec,
+    mut next: F,
+) -> anyhow::Result<(String, ThreadReport)>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Option<TurnSpec>>,
+{
     let model = first
         .model
         .clone()
@@ -179,7 +193,7 @@ where
         report.input_tokens += answer.input_tokens;
         report.output_tokens += answer.output_tokens;
         report.total_tokens += answer.total_tokens;
-        match next(&answer.text) {
+        match next(answer.text.clone()).await {
             Some(follow_up) => {
                 exchange.push((Role::Assistant, answer.text));
                 exchange.push((Role::User, follow_up.prompt));

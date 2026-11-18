@@ -8,8 +8,8 @@
 //! honouring `.gitignore`, the manifest's `ignore` globs and the generated
 //! directory, and stopping at any subdirectory that holds its own manifest.
 //! A file matched by several globs is found once. Two atoms, or two workflows,
-//! with one name are an error, where a file's name is the `name` it declares,
-//! or else its file name.
+//! with one name are an error. A workflow's name is the `name` it declares,
+//! or else its file name; an atom's is its file name.
 
 use crate::project::Project;
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -30,6 +30,12 @@ pub struct SourceFile {
 /// Why the collections could not be gathered.
 #[derive(Debug, thiserror::Error)]
 pub enum CollectError {
+    /// A removed atom frontend remains in the project.
+    #[error("{}: Markdown/MDX atoms have been replaced; migrate this file to .atom.astro", .path.display())]
+    LegacyAtom {
+        /// Legacy source file.
+        path: PathBuf,
+    },
     /// A glob is not valid.
     #[error("collection {collection}: bad glob {glob:?}: {message}")]
     Glob {
@@ -72,7 +78,7 @@ fn default_name(collection: &str, relative: &Path) -> String {
         .map(|f| f.to_string_lossy().into_owned())
         .unwrap_or_default();
     let suffixes: &[&str] = match collection {
-        "atoms" => &[".atom.md"],
+        "atoms" => &[".atom.astro"],
         "workflows" => &[".workflow.yaml"],
         "schemas" => &[".schema.yaml", ".schema.json"],
         _ => &[],
@@ -88,17 +94,20 @@ fn default_name(collection: &str, relative: &Path) -> String {
         .map_or(rel.to_string(), |(stem, _)| stem.to_owned())
 }
 
-/// The name a file declares for itself, if any: `name` in an atom's
-/// frontmatter, or at a workflow's top level. A file that cannot be read or
-/// parsed declares none here; its loader reports what is wrong with it.
+/// The name a workflow declares for itself at its top level, if any. A file
+/// that cannot be read or parsed declares none here; its loader reports what
+/// is wrong with it.
+///
+/// An atom's name in a collection is its file name: its frontmatter is
+/// TypeScript the compiler reads, and its generated declarations are named
+/// after the file, so one project cannot hold two atom files with one name.
+/// A `name` an atom declares is checked once the atom is loaded.
 fn declared_name(collection: &str, path: &Path) -> Option<String> {
+    if collection != "workflows" {
+        return None;
+    }
     let text = std::fs::read_to_string(path).ok()?;
-    let yaml = match collection {
-        "atoms" => crate::atom::split(&text)?.0,
-        "workflows" => text.as_str(),
-        _ => return None,
-    };
-    let doc = atomic_schema::yaml::load(path, yaml).ok()?;
+    let doc = atomic_schema::yaml::load(path, &text).ok()?;
     match doc.value.get("name")? {
         Value::String(n) if !n.is_empty() => Some(n.clone()),
         _ => None,
@@ -171,6 +180,14 @@ pub fn collect(project: &Project) -> Result<BTreeMap<String, Vec<SourceFile>>, C
         };
         if ignored.is_match(relative) {
             continue;
+        }
+        if path
+            .to_str()
+            .is_some_and(|name| name.ends_with(".atom.md") || name.ends_with(".atom.mdx"))
+        {
+            return Err(CollectError::LegacyAtom {
+                path: path.to_owned(),
+            });
         }
         for (collection, set) in &sets {
             if set.is_match(relative) {

@@ -1,0 +1,37 @@
+atomic: 1
+input:
+  type: object
+  additionalProperties: false
+  required: [name]
+  properties:
+    name:
+      type: string
+      description: The report's file name, such as 2026-10.md.
+      pattern: "^[A-Za-z0-9._-]+$"
+      maxLength: 150
+output:
+  $ref: ../atoms/put-digest.output.schema.yaml
+steps:
+  fetch:
+    atom: fetch-report
+    with:
+      key: "'reports/' + input.name"
+  summarize:
+    after: [fetch]
+    atom: summarize-report
+    with:
+      report: steps.fetch.output.report
+  approve:
+    after: [summarize]
+    gate:
+      title: "'Store this digest in S3'"
+      show: "{'report': 'reports/' + input.name, 'report_sha256': steps.fetch.output.report.sha256, 'digest': steps.summarize.output.summary}"
+      timeout: 24h
+      on_timeout: reject
+  store:
+    after: [approve]
+    atom: put-digest
+    with:
+      key: "'digests/' + input.name"
+      text: steps.summarize.output.summary
+returns: steps.store.output

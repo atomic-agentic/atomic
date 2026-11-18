@@ -49,6 +49,10 @@ members = [("atomic", binary, 0o755)] + [
     (f, os.path.join(root, f), 0o644)
     for f in ("LICENSE", "NOTICE", "THIRD-PARTY-NOTICES.md")
 ]
+license_dir = os.path.join(root, "crates", "atomic-core", "assets")
+for filename in sorted(os.listdir(license_dir)):
+    if "LICENSE" in filename or filename.endswith("LEGAL.txt"):
+        members.append(("licenses/" + filename, os.path.join(license_dir, filename), 0o644))
 buf = io.BytesIO()
 with tarfile.open(fileobj=buf, mode="w", format=tarfile.PAX_FORMAT) as tar:
     top = tarfile.TarInfo(name)

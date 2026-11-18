@@ -1,0 +1,11 @@
+$schema: https://json-schema.org/draft/2020-12/schema
+type: object
+additionalProperties: false
+required: [draft, policy]
+properties:
+  draft:
+    $ref: draft-reply.output.schema.yaml
+  policy:
+    type: string
+    minLength: 1
+    maxLength: 3000

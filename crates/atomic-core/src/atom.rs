@@ -1,35 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Loading an atom file (`*.atom.md`).
-//!
-//! An atom file is YAML frontmatter between `---` lines, then a Markdown body
-//! with `{% … %}` tags. Loading parses and checks everything that can be
-//! checked without running it:
-//!
-//! - the frontmatter, against the atom field reference: unknown fields, fields
-//!   of later versions and wrong types fail with their line;
-//! - `input` and `output`: an inline schema, a `$ref` to a schema file
-//!   (relative to the atom), or a sidecar beside the atom
-//!   (`<name>.input.schema.yaml`); an explicit declaration wins over a sidecar,
-//!   and a reference to a missing file fails;
-//! - the body's tags: value paths and `if` conditions against the input
-//!   schema, and partial files on disk;
-//! - `validate` rules, as CEL over `input` and `output`.
-//!
-//! Every error names the file, the line and the path (a JSON Pointer into the
-//! frontmatter, or the tag in the body).
+//! Loading the sole declarative atom format, `*.atom.astro`.
+//! Frontmatter is an interpreted literal configuration; atom modules never execute.
 
-use crate::tags::{self, Piece, Tag};
-use atomic_schema::expr::{self, Scope};
+use crate::astro::{self, Program};
 use atomic_schema::registry::{self, Registry};
-use atomic_schema::yaml;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
 /// The kinds of atom this version runs.
 pub const KINDS: &[&str] = &["codex", "lite", "exec"];
 
-/// Frontmatter fields this version reads.
 const FIELDS: &[&str] = &[
     "atomic",
     "description",
@@ -51,6 +32,11 @@ const FIELDS: &[&str] = &[
     "exec",
     "effects",
     "env",
+    "scorers",
+    "examples",
+    "context",
+    "case",
+    "judges",
 ];
 
 /// Fields of the published format that later versions read.
@@ -65,194 +51,161 @@ const LATER: &[&str] = &[
     "auth",
 ];
 
-/// A loaded atom.
+/// A loaded, schema-checked Astro atom and its immutable source graph.
 #[derive(Clone, Debug)]
 pub struct Atom {
-    /// The file.
+    /// The source file.
     pub file: PathBuf,
-    /// Its name: `name`, else the file name without `.atom.md`.
+    /// Explicit name or filename-derived identity.
     pub name: String,
-    /// Its version, default 1.
+    /// Declaration version, defaulting to one.
     pub version: u64,
-    /// `codex`, `lite` or `exec`.
+    /// Model or execution kind.
     pub kind: String,
-    /// One sentence on what it does.
+    /// Human-readable purpose.
     pub description: String,
-    /// The registry id of its input schema.
+    /// Registered full input schema.
     pub input: String,
-    /// The registry id of its output schema.
+    /// Registered full output schema.
     pub output: String,
-    /// The whole frontmatter, as JSON.
+    /// Parsed literal configuration and interpreted contract descriptors.
     pub frontmatter: Value,
-    /// The body, split into text and tags.
-    pub body: Vec<Piece>,
-    /// The body as written.
-    pub body_text: String,
-    /// The file line the body starts on.
-    pub body_line: usize,
+    /// Immutable entry and component sources.
+    pub program: Program,
+    /// Full optional runtime context contract.
+    pub context: Option<Value>,
+    /// Full evaluation case schema.
+    pub case: Value,
+    /// Full judge input/output contracts keyed by the declared judge.
+    pub judges: std::collections::BTreeMap<String, Value>,
+    /// Generated declarations checked before model dispatch.
+    pub declarations: Value,
 }
 
-/// Why an atom file failed to load.
+/// A file-local loading diagnostic.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[error("{}:{line}: {path}: {message}", file.display())]
 pub struct AtomError {
-    /// The atom file, or the schema file the problem is in.
+    /// Source file.
     pub file: PathBuf,
-    /// The line, from 1.
+    /// One-based source line.
     pub line: usize,
-    /// A JSON Pointer into the frontmatter, or `body` for the body.
+    /// Configuration or body path.
     pub path: String,
-    /// What is wrong.
+    /// Diagnostic message.
     pub message: String,
 }
 
-/// Split `text` into frontmatter (with the line its first line is on) and body
-/// (with the line it starts on).
-pub(crate) fn split(text: &str) -> Option<(&str, &str, usize)> {
-    let rest = text
-        .strip_prefix("---\n")
-        .or_else(|| text.strip_prefix("---\r\n"))?;
-    let mut offset = 0;
-    for (i, line) in rest.split_inclusive('\n').enumerate() {
-        if line.trim_end() == "---" {
-            let fm = &rest[..offset];
-            let body = &rest[offset + line.len()..];
-            return Some((fm, body, i + 3));
-        }
-        offset += line.len();
-    }
-    None
-}
-
-/// Load the atom at `file`, registering its schemas in `registry`.
+/// Load and type-check an Astro atom, registering its full schemas.
 pub fn load(file: &Path, registry: &mut Registry) -> Result<Atom, AtomError> {
-    let file = std::fs::canonicalize(file).map_err(|e| AtomError {
+    let fail = |line, path: &str, message: String| AtomError {
         file: file.to_owned(),
-        line: 1,
-        path: String::new(),
-        message: format!("cannot read: {e}"),
-    })?;
-    let text = std::fs::read_to_string(&file).map_err(|e| AtomError {
-        file: file.clone(),
-        line: 1,
-        path: String::new(),
-        message: format!("cannot read: {e}"),
-    })?;
-    let fail = |line: usize, path: &str, message: String| AtomError {
+        line,
+        path: path.to_owned(),
+        message,
+    };
+    if !file.to_string_lossy().ends_with(".atom.astro") {
+        return Err(fail(
+            1,
+            "",
+            "declarative atoms use .atom.astro; Markdown and MDX atom files have been replaced"
+                .into(),
+        ));
+    }
+    let file = std::fs::canonicalize(file).map_err(|e| fail(1, "", e.to_string()))?;
+    let fail = |line, path: &str, message: String| AtomError {
         file: file.clone(),
         line,
         path: path.to_owned(),
         message,
     };
-    let (fm_text, body_text, body_line) = split(&text).ok_or_else(|| {
-        fail(
-            1,
-            "",
-            "an atom file starts with frontmatter between --- lines".into(),
-        )
-    })?;
-
-    let doc = yaml::load(&file, fm_text).map_err(|e| fail(e.at.line + 1, "", e.message))?;
-    let line_of = |pointer: &str| doc.position(pointer).map_or(2, |p| p.line + 1);
-    let Value::Object(fm) = &doc.value else {
-        return Err(fail(
-            2,
-            "",
-            "the frontmatter is a mapping, starting with `atomic: 1`".into(),
-        ));
+    // A compiler diagnostic keeps the file and line the compiler found.
+    let located = |path: &str, error: astro::Diagnostic| {
+        let mut message = error.message;
+        for detail in error.details.iter().skip(1) {
+            message.push('\n');
+            message.push_str(detail);
+        }
+        AtomError {
+            file: error.file.map_or_else(|| file.clone(), PathBuf::from),
+            line: error.line.unwrap_or(1),
+            path: path.to_owned(),
+            message,
+        }
     };
-
+    let root = astro::project_root(&file).map_err(|e| fail(1, "project", e))?;
+    let request = json!({
+        "action": "load",
+        "file": astro::path_text(&file).map_err(|e| fail(1, "", e))?,
+        "root": astro::path_text(&root).map_err(|e| fail(1, "project", e))?,
+    });
+    let parsed = astro::worker_located(request).map_err(|e| located("body", e))?;
+    let config = parsed["config"].clone();
+    let fm = config
+        .as_object()
+        .ok_or_else(|| fail(1, "config", "config must be an object".into()))?;
+    let source = std::fs::read_to_string(&file).map_err(|e| fail(1, "", e.to_string()))?;
+    let line_of = |pointer: &str| {
+        let key = pointer
+            .trim_start_matches('/')
+            .split('/')
+            .next()
+            .unwrap_or("");
+        source
+            .lines()
+            .position(|line| {
+                line.contains(&format!("{key}:")) || line.contains(&format!("\"{key}\":"))
+            })
+            .map_or(1, |line| line + 1)
+    };
     for key in fm.keys() {
-        let pointer = format!("/{key}");
         if LATER.contains(&key.as_str()) {
             return Err(fail(
-                line_of(&pointer),
-                &pointer,
+                line_of(key),
+                &format!("/{key}"),
                 format!("`{key}` is not supported by this version of atomic yet"),
             ));
         }
         if !FIELDS.contains(&key.as_str()) {
             return Err(fail(
-                line_of(&pointer),
-                &pointer,
+                line_of(key),
+                &format!("/{key}"),
                 format!("unknown field `{key}`"),
             ));
         }
     }
-    match fm.get("atomic") {
-        Some(Value::Number(n)) if n.as_u64() == Some(crate::project::FORMAT_VERSION) => {}
-        Some(other) => {
-            return Err(fail(
-                line_of("/atomic"),
-                "/atomic",
-                format!("format version {other} is not one this atomic reads"),
-            ));
-        }
-        None => {
-            return Err(fail(
-                2,
-                "",
-                "missing the format version: add `atomic: 1`".into(),
-            ));
-        }
+    if fm.get("atomic").and_then(Value::as_u64) != Some(crate::project::FORMAT_VERSION) {
+        return Err(fail(1, "/atomic", "unsupported atom format version".into()));
     }
-    let description = match fm.get("description") {
-        Some(Value::String(d)) if !d.trim().is_empty() => d.clone(),
-        Some(_) => {
-            return Err(fail(
-                line_of("/description"),
-                "/description",
-                "`description` is one sentence of text".into(),
-            ));
-        }
-        None => {
-            return Err(fail(
-                2,
-                "",
-                "missing `description`: say in one sentence what the atom does".into(),
-            ));
-        }
-    };
-    let file_name = file
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let name = match fm.get("name") {
-        None => file_name
-            .strip_suffix(".atom.md")
-            .unwrap_or(&file_name)
-            .to_owned(),
-        Some(Value::String(n)) if !n.is_empty() => n.clone(),
-        Some(_) => {
-            return Err(fail(
-                line_of("/name"),
-                "/name",
-                "`name` is a non-empty string".into(),
-            ));
-        }
-    };
-    let version = match fm.get("version") {
-        None => 1,
-        Some(v) => v.as_u64().filter(|v| *v >= 1).ok_or_else(|| {
-            fail(
-                line_of("/version"),
-                "/version",
-                "`version` is a whole number from 1".into(),
-            )
-        })?,
-    };
-    let kind = match fm.get("kind") {
-        None => "codex".to_owned(),
-        Some(Value::String(k)) if KINDS.contains(&k.as_str()) => k.clone(),
-        Some(other) => {
-            return Err(fail(
-                line_of("/kind"),
-                "/kind",
-                format!("`kind` is one of {}, not {other}", KINDS.join(", ")),
-            ));
-        }
-    };
-
+    let name = fm
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| fail(1, "/name", "name must be nonempty".into()))?
+        .to_owned();
+    let version = fm
+        .get("version")
+        .map_or(Some(1), Value::as_u64)
+        .filter(|n| *n > 0)
+        .ok_or_else(|| fail(1, "/version", "version must be a positive integer".into()))?;
+    let kind = fm
+        .get("kind")
+        .and_then(Value::as_str)
+        .filter(|s| KINDS.contains(s))
+        .ok_or_else(|| {
+            let message = if fm.get("kind").and_then(Value::as_str) == Some("a2a") {
+                "kind a2a (remote atoms) is not available yet; kind must be codex, lite or exec"
+            } else {
+                "kind must be codex, lite or exec"
+            };
+            fail(line_of("/kind"), "/kind", message.into())
+        })?
+        .to_owned();
+    let description = fm
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or(&name)
+        .to_owned();
     // Run settings: read-only, no network and no optional tools unless the
     // atom says otherwise, and only what this version can enforce.
     match fm.get("sandbox") {
@@ -331,15 +284,25 @@ pub fn load(file: &Path, registry: &mut Registry) -> Result<Atom, AtomError> {
     }
     let (input, output) = (ids.remove(0), ids.remove(0));
     registry.check().map_err(|e| fail(1, "", e.to_string()))?;
-    let input_schema = registry
-        .get(&input)
-        .map(|e| e.schema.clone())
-        .unwrap_or(Value::Null);
-    let output_schema = registry
-        .get(&output)
-        .map(|e| e.schema.clone())
-        .unwrap_or(Value::Null);
-
+    let mut program = Program {
+        file: file.clone(),
+        root,
+        contracts: Value::Null,
+        source_paths: serde_json::from_value(parsed["sourcePaths"].clone())
+            .map_err(|e| fail(1, "body", e.to_string()))?,
+        sources: serde_json::from_value(parsed["sources"].clone())
+            .map_err(|e| fail(1, "body", e.to_string()))?,
+    };
+    let mut schemas = serde_json::Map::new();
+    for (key, id) in [("Input", &input), ("Output", &output)] {
+        schemas.insert(
+            key.into(),
+            registry
+                .inline(id)
+                .map_err(|e| fail(1, key, e.to_string()))?,
+        );
+    }
+    let output_schema = schemas["Output"].clone();
     // Lint: the output must lower to the generation profile, so a schema the
     // model cannot be constrained by fails now, before any tokens are spent.
     if kind != "exec" {
@@ -382,85 +345,129 @@ pub fn load(file: &Path, registry: &mut Registry) -> Result<Atom, AtomError> {
         )?;
     }
 
-    if let Some(rules) = fm.get("validate") {
-        let Value::Array(rules) = rules else {
-            return Err(fail(
-                line_of("/validate"),
-                "/validate",
-                "`validate` is a list of CEL expressions".into(),
-            ));
-        };
-        let scope = Scope::new()
-            .with("input", &input_schema)
-            .with("output", &output_schema);
-        for (i, rule) in rules.iter().enumerate() {
-            let pointer = format!("/validate/{i}");
-            let source = rule.as_str().ok_or_else(|| {
-                fail(
-                    line_of(&pointer),
-                    &pointer,
-                    "a rule is a CEL expression in a string".into(),
-                )
-            })?;
-            expr::parse(source)
-                .and_then(|e| e.check(&scope))
-                .map_err(|e| fail(line_of(&pointer), &pointer, e.to_string()))?;
+    let context = match fm.get("context").cloned() {
+        Some(schema) => Some(schema),
+        None => registry::sidecar(&file, "context")
+            .map_err(|e| fail(1, "/context", e.to_string()))?
+            .map(|path| {
+                registry
+                    .load_file(&path)
+                    .map_err(|e| fail(1, "/context", e.to_string()))
+            })
+            .transpose()?
+            .and_then(|id| registry.get(&id).map(|entry| entry.schema.clone())),
+    };
+    let context = context
+        .map(|schema| {
+            crate::workflow::inline(
+                &schema,
+                file.parent().unwrap_or(Path::new("/")),
+                registry,
+                0,
+            )
+            .map_err(|e| fail(1, "/context", e))
+        })
+        .transpose()?;
+    if parsed["needsContext"].as_bool() == Some(true) && context.is_none() {
+        return Err(fail(
+            1,
+            "/context",
+            "context binding requires a declared context schema".into(),
+        ));
+    }
+    schemas.insert(
+        "Context".into(),
+        context
+            .clone()
+            .unwrap_or(json!({"type":"object","additionalProperties":false})),
+    );
+    let mut schema_number = 0;
+    let mut resolve_schema = |schema: &Value| -> Result<Value, AtomError> {
+        schema_number += 1;
+        let id = schema_id(
+            &file,
+            &format!("evaluation-{schema_number}"),
+            schema,
+            registry,
+        )
+        .map_err(|(path, message)| fail(1, &path, message))?;
+        registry
+            .inline(&id)
+            .map_err(|e| fail(1, "/case", e.to_string()))
+    };
+    let case = fm
+        .get("case")
+        .map(&mut resolve_schema)
+        .transpose()?
+        .unwrap_or(json!(true));
+    let mut judges = std::collections::BTreeMap::new();
+    let mut judge_properties = serde_json::Map::new();
+    if let Some(declared) = fm.get("judges") {
+        for (name, judge) in declared
+            .as_object()
+            .ok_or_else(|| fail(1, "/judges", "judges must be a mapping".into()))?
+        {
+            let input = resolve_schema(
+                judge
+                    .get("input")
+                    .ok_or_else(|| fail(1, "/judges", "judge needs input".into()))?,
+            )?;
+            let output = resolve_schema(
+                judge
+                    .get("output")
+                    .ok_or_else(|| fail(1, "/judges", "judge needs output".into()))?,
+            )?;
+            judges.insert(name.clone(), json!({"input":input,"output":output}));
+            judge_properties.insert(name.clone(), json!({"type":"object","additionalProperties":false,"required":["input","output"],"properties":{"input":input,"output":output}}));
         }
     }
-
-    let body = tags::recognize(body_text).map_err(|e| {
-        fail(
-            body_line + e.at.line - 1,
-            "body",
-            format!("column {}: {}", e.at.column, e.message),
-        )
-    })?;
-    let scope = Scope::new()
-        .with("input", &input_schema)
-        .with_any("frontmatter");
-    for piece in &body {
-        let Piece::Tag(tag, at) = piece else { continue };
-        let line = body_line + at.line - 1;
-        let checked = match tag {
-            Tag::Value { root, path } if root == "input" => {
-                let source = std::iter::once("input".to_owned())
-                    .chain(path.iter().map(|p| {
-                        if p.bytes().all(|b| b.is_ascii_digit()) {
-                            format!("[{p}]")
-                        } else {
-                            format!(".{p}")
-                        }
-                    }))
-                    .collect::<String>()
-                    .replace(".[", "[");
-                expr::parse(&source)
-                    .and_then(|e| e.check(&scope))
-                    .map_err(|e| e.message)
+    if let Some(scorers) = fm.get("scorers") {
+        for scorer in scorers
+            .as_object()
+            .ok_or_else(|| fail(1, "/scorers", "scorers must be a mapping".into()))?
+            .values()
+        {
+            let judge = scorer
+                .get("judge")
+                .and_then(Value::as_str)
+                .ok_or_else(|| fail(1, "/scorers", "scorer needs a declared judge".into()))?;
+            if !judges.contains_key(judge) {
+                return Err(fail(1, "/scorers", format!("undeclared judge {judge}")));
             }
-            Tag::Value { root, .. } if root == "frontmatter" => Ok(()),
-            Tag::Value { root, .. } => Err(format!(
-                "`${root}` is not a value an atom body can read; use $input or $frontmatter"
-            )),
-            Tag::If { condition } => expr::parse(condition)
-                .and_then(|e| e.check(&scope))
-                .map_err(|e| e.to_string()),
-            Tag::Partial { file: partial } => {
-                let p = file.parent().unwrap_or(Path::new("")).join(partial);
-                if p.is_file() {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "partial {partial} does not exist ({})",
-                        p.display()
-                    ))
-                }
+            if scorer
+                .get("min_mean")
+                .and_then(Value::as_f64)
+                .is_none_or(|value| !(0.0..=1.0).contains(&value))
+            {
+                return Err(fail(
+                    1,
+                    "/scorers",
+                    "min_mean must be between zero and one".into(),
+                ));
             }
-            Tag::Else | Tag::EndIf | Tag::Example { .. } | Tag::EndExample => Ok(()),
-        };
-        checked
-            .map_err(|message| fail(line, "body", format!("column {}: {message}", at.column)))?;
+        }
     }
-
+    schemas.insert("Case".into(), case.clone());
+    let required: Vec<_> = judge_properties.keys().cloned().collect();
+    schemas.insert("Judges".into(), json!({"type":"object","additionalProperties":false,"required":required,"properties":judge_properties}));
+    program.contracts = Value::Object(schemas.clone());
+    let declarations = program
+        .invoke_located(
+            "check",
+            json!({"schemas": schemas, "authoring": include_str!("../../../authoring/authoring.d.ts")}),
+        )
+        .map_err(|e| located("types", e))?;
+    if let Some(files) = declarations.as_object() {
+        for (name, source) in files {
+            program.sources.insert(
+                name.clone(),
+                source
+                    .as_str()
+                    .ok_or_else(|| fail(1, "types", "invalid declaration".into()))?
+                    .to_owned(),
+            );
+        }
+    }
     Ok(Atom {
         file,
         name,
@@ -469,10 +476,12 @@ pub fn load(file: &Path, registry: &mut Registry) -> Result<Atom, AtomError> {
         description,
         input,
         output,
-        frontmatter: doc.value.clone(),
-        body,
-        body_text: body_text.to_owned(),
-        body_line,
+        frontmatter: config,
+        program,
+        context,
+        case,
+        judges,
+        declarations,
     })
 }
 
@@ -504,87 +513,17 @@ fn schema_id(
         let id = registry
             .load_file(&target)
             .map_err(|e| ("/$ref".into(), e.to_string()))?;
-        let fragment = r.split_once('#').map_or("", |(_, f)| f);
-        if fragment.is_empty() {
+        if !r.contains('#') || r.ends_with('#') {
             return Ok(id);
         }
-        // A place inside the file: check it exists, then register a schema
-        // that is exactly that place, by the file's absolute id, so the
-        // registry, lowering and workflow mapping all reach the same target.
-        let found = registry
-            .get(&id)
-            .is_some_and(|e| e.schema.pointer(fragment).is_some());
-        if !found {
-            return Err((
-                "/$ref".into(),
-                format!(
-                    "dangling reference: {r}: {} has no #{fragment}",
-                    target.display()
-                ),
-            ));
-        }
-        let uri_file = PathBuf::from(format!("{}?{role}", atom.display()));
-        let wrapper = serde_json::json!({
-            "$id": format!("file://{}", uri_file.display()),
-            "$ref": format!("{id}#{fragment}"),
-        });
-        return registry
-            .register(uri_file, wrapper)
-            .map_err(|e| ("/$ref".into(), e.to_string()));
     }
     // An inline schema: registered under the atom's own URI, so relative
     // references resolve beside the atom.
     let uri_file = PathBuf::from(format!("{}?{role}", atom.display()));
-    let mut schema = schema.clone();
-    if schema.get("$id").is_none()
-        && let Some(o) = schema.as_object_mut()
-    {
-        o.insert(
-            "$id".into(),
-            Value::String(format!("file://{}", uri_file.display())),
-        );
-    }
-    for target in relative_refs(&schema) {
-        let path = dir.join(&target);
-        if !path.is_file() {
-            return Err((
-                String::new(),
-                format!(
-                    "dangling reference: {target} does not exist ({})",
-                    path.display()
-                ),
-            ));
-        }
-        registry
-            .load_file(&path)
-            .map_err(|e| (String::new(), e.to_string()))?;
-    }
     registry
-        .register(uri_file, schema)
+        .register(uri_file, schema.clone())
         .map_err(|e| (String::new(), e.to_string()))
 }
 
-/// File paths named by `$ref`s anywhere in `schema` (not URIs or fragments).
-fn relative_refs(schema: &Value) -> Vec<String> {
-    let mut out = Vec::new();
-    fn walk(v: &Value, out: &mut Vec<String>) {
-        match v {
-            Value::Object(m) => {
-                if let Some(Value::String(r)) = m.get("$ref")
-                    && !r.contains(':')
-                    && !r.starts_with('#')
-                {
-                    out.push(r.split('#').next().unwrap_or(r).to_owned());
-                }
-                m.values().for_each(|c| walk(c, out));
-            }
-            Value::Array(a) => a.iter().for_each(|c| walk(c, out)),
-            _ => {}
-        }
-    }
-    walk(schema, &mut out);
-    out
-}
-
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
