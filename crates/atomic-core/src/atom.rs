@@ -57,8 +57,10 @@ pub const LATER: &[&str] = &[
 /// against, generated into each project as `.atomic/types/authoring.d.ts`.
 pub const AUTHORING_DECLARATIONS: &str = include_str!("../../../authoring/authoring.d.ts");
 
-/// A loaded, schema-checked Astro atom and its immutable source graph.
-#[derive(Clone, Debug)]
+/// A loaded, schema-checked Astro atom and its immutable source graph. It
+/// serializes whole, sources and contracts included, so a run can carry the
+/// atom it started with.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Atom {
     /// The source file.
     pub file: PathBuf,
@@ -100,6 +102,73 @@ pub struct AtomError {
     pub path: String,
     /// Diagnostic message.
     pub message: String,
+}
+
+/// Check an exec atom's command and environment, and that no other atom
+/// declares them. `exec.command` is a literal argument array, run with no
+/// shell; `env` is the whole environment the command receives.
+fn check_exec(kind: &str, fm: &serde_json::Map<String, Value>) -> Result<(), (String, String)> {
+    let refuse = |pointer: &str, message: &str| Err((pointer.to_owned(), message.to_owned()));
+    if kind != "exec" {
+        for key in ["exec", "env", "effects"] {
+            if fm.contains_key(key) {
+                return refuse(
+                    &format!("/{key}"),
+                    &format!("`{key}` is for `kind: 'exec'` atoms"),
+                );
+            }
+        }
+        return Ok(());
+    }
+    let Some(Value::Object(exec)) = fm.get("exec") else {
+        return refuse(
+            "/exec",
+            "an exec atom needs `exec: { command: [program, ...args] }`",
+        );
+    };
+    if exec.contains_key("script") {
+        return refuse(
+            "/exec/script",
+            "`exec.script` runs on a managed runtime, which this version of atomic does not provide yet; use `exec.command`",
+        );
+    }
+    if let Some(key) = exec.keys().find(|key| *key != "command") {
+        return refuse(&format!("/exec/{key}"), &format!("unknown field `{key}`"));
+    }
+    match exec.get("command") {
+        Some(Value::Array(args))
+            if !args.is_empty()
+                && args
+                    .iter()
+                    .all(|a| a.as_str().is_some_and(|a| !a.is_empty())) => {}
+        _ => {
+            return refuse(
+                "/exec/command",
+                "`exec.command` is a nonempty list of nonempty strings: the program, then its arguments; no shell runs it",
+            );
+        }
+    }
+    match fm.get("env") {
+        None => {}
+        Some(Value::Object(env)) => {
+            for (name, value) in env {
+                let valid = !name.is_empty()
+                    && !name.starts_with(|c: char| c.is_ascii_digit())
+                    && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+                if !valid {
+                    return refuse(
+                        &format!("/env/{name}"),
+                        "an environment variable name is letters, digits and `_`",
+                    );
+                }
+                if !value.is_string() {
+                    return refuse(&format!("/env/{name}"), "an environment value is a string");
+                }
+            }
+        }
+        Some(_) => return refuse("/env", "`env` maps variable names to string values"),
+    }
+    Ok(())
 }
 
 /// Load and type-check an Astro atom, registering its full schemas.
@@ -256,6 +325,8 @@ pub fn load(file: &Path, registry: &mut Registry) -> Result<Atom, AtomError> {
             "atomic, OpenAPI and MCP tools for atoms are not supported by this version of atomic yet".into(),
         ));
     }
+    check_exec(&kind, fm)
+        .map_err(|(pointer, message)| fail(line_of(&pointer), &pointer, message))?;
 
     let mut ids = Vec::new();
     for role in ["input", "output"] {

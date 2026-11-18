@@ -366,5 +366,47 @@ fn known_fields(doc: &Value, s: &Value) -> Vec<String> {
     out
 }
 
+/// Evaluate `source` with each name in `values` bound to its JSON value, and
+/// return the result as JSON. Evaluation reads only those values: CEL has no
+/// side effects, so a workflow mapping can be evaluated again on replay and
+/// give the same answer.
+pub fn evaluate(source: &str, values: &[(&str, &Value)]) -> Result<Value, String> {
+    let program = cel::Program::compile(source).map_err(|e| e.to_string())?;
+    let mut context = cel::Context::default();
+    for (name, value) in values {
+        context.add_variable_from_value(*name, cel_value(value));
+    }
+    let result = program
+        .execute(&context)
+        .map_err(|e| format!("`{source}`: {e}"))?;
+    result
+        .json()
+        .map_err(|e| format!("`{source}` does not give a JSON value: {e}"))
+}
+
+/// `value` as a CEL value. Built by hand rather than through serde, which
+/// would turn a number into serde_json's private wrapper when its
+/// arbitrary-precision feature is on, as it is in this workspace.
+fn cel_value(value: &Value) -> cel::Value {
+    match value {
+        Value::Null => cel::Value::Null,
+        Value::Bool(b) => cel::Value::Bool(*b),
+        Value::Number(n) => n
+            .as_i64()
+            .map(cel::Value::Int)
+            .or_else(|| n.as_u64().map(cel::Value::UInt))
+            .unwrap_or_else(|| cel::Value::Float(n.as_f64().unwrap_or(f64::NAN))),
+        Value::String(s) => cel::Value::String(std::sync::Arc::new(s.clone())),
+        Value::Array(items) => {
+            cel::Value::List(std::sync::Arc::new(items.iter().map(cel_value).collect()))
+        }
+        Value::Object(map) => map
+            .iter()
+            .map(|(key, item)| (key.clone(), cel_value(item)))
+            .collect::<std::collections::HashMap<String, cel::Value>>()
+            .into(),
+    }
+}
+
 #[cfg(test)]
 mod tests;
