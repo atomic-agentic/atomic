@@ -281,3 +281,49 @@ fn two_atoms_with_one_file_name_are_refused() {
     assert!(!output.status.success(), "{stderr}");
     assert!(stderr.contains("are named \"classify-note\""), "{stderr}");
 }
+
+#[test]
+fn a_misspelled_atom_reference_fails_atomic_check() {
+    let fixture = Fixture::new("misspelled-atom");
+    let project = fixture.0.join("project");
+    copy_tree(&repository().join("examples/02-change-request"), &project);
+    let file = project.join("workflows/change-request.workflow.yaml");
+    let text = std::fs::read_to_string(&file).expect("workflow");
+    std::fs::write(&file, text.replace("atom: plan-task", "atom: plan-taks")).expect("write");
+    let output = fixture.run(&project, &["check"], "");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("change-request.workflow.yaml")
+            && stderr.contains("/steps/plan/atom")
+            && stderr.contains("did you mean plan-task?"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn an_unlowerable_schema_fails_atomic_check_with_its_file_and_path() {
+    let fixture = Fixture::new("unlowerable");
+    let project = fixture.0.join("project");
+    copy_tree(&repository().join("examples/01-classify"), &project);
+    // A map with free-form keys has no strict-mode form.
+    let file = project.join("atoms/classify-note.output.schema.yaml");
+    let text = std::fs::read_to_string(&file).expect("schema");
+    std::fs::write(
+        &file,
+        text.replace(
+            "properties:\n",
+            "properties:\n  labels:\n    type: object\n    additionalProperties: {type: string}\n",
+        ),
+    )
+    .expect("write");
+    let output = fixture.run(&project, &["check"], "");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("atoms/classify-note.output.schema.yaml")
+            && stderr.contains("/properties/labels")
+            && stderr.contains("cannot be lowered"),
+        "{stderr}"
+    );
+}

@@ -1146,6 +1146,18 @@ fn exec_declarations_are_checked_at_load() {
             "variable name",
         ),
         ("kind: 'lite', env: { REGION: 'eu' }", "for `kind: 'exec'`"),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, effects: { external: 'sometimes' }",
+            "`read-only` (the command only reads) or `idempotent`",
+        ),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, effects: { caps: {} }",
+            "`effects.caps` is not supported yet",
+        ),
+        (
+            "kind: 'lite', effects: { external: 'read-only' }",
+            "for `kind: 'exec'`",
+        ),
     ] {
         let dir = scratch("exec-load");
         std::fs::create_dir_all(dir.join("atoms")).expect("atoms");

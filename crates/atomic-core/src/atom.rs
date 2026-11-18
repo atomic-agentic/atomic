@@ -90,6 +90,26 @@ pub struct Atom {
     pub declarations: Value,
 }
 
+/// What an exec atom declares about effects atomic cannot observe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum External {
+    /// The command only reads.
+    ReadOnly,
+    /// It writes, and repeating it is safe.
+    Idempotent,
+}
+
+impl Atom {
+    /// Its `effects.external` declaration, if it makes one.
+    pub fn external(&self) -> Option<External> {
+        match self.frontmatter.pointer("/effects/external")?.as_str()? {
+            "read-only" => Some(External::ReadOnly),
+            "idempotent" => Some(External::Idempotent),
+            _ => None,
+        }
+    }
+}
+
 /// A file-local loading diagnostic.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[error("{}:{line}: {path}: {message}", file.display())]
@@ -167,6 +187,33 @@ fn check_exec(kind: &str, fm: &serde_json::Map<String, Value>) -> Result<(), (St
             }
         }
         Some(_) => return refuse("/env", "`env` maps variable names to string values"),
+    }
+    match fm.get("effects") {
+        None => {}
+        Some(Value::Object(effects)) => {
+            if let Some(key) = effects.keys().find(|key| *key != "external") {
+                return refuse(
+                    &format!("/effects/{key}"),
+                    &format!(
+                        "`effects.{key}` is not supported yet; this version reads only `effects.external`"
+                    ),
+                );
+            }
+            if let Some(external) = effects.get("external")
+                && !matches!(external.as_str(), Some("read-only" | "idempotent"))
+            {
+                return refuse(
+                    "/effects/external",
+                    "`effects.external` is `read-only` (the command only reads) or `idempotent` (it writes, and repeating it is safe)",
+                );
+            }
+        }
+        Some(_) => {
+            return refuse(
+                "/effects",
+                "`effects` is a mapping, such as `{ external: 'idempotent' }`",
+            );
+        }
     }
     Ok(())
 }

@@ -33,6 +33,14 @@ prompts without a model. Markdown and MDX atom frontends have been removed.
 The Astro compiler and full JSON Schema gates execute in this repository; broader
 workflow scheduling, interactive commands and integrations retain their staged status.
 
+The workflow interpreter is built: a workflow file runs as one durable run, with
+no rebuild, through sequential atom steps (Codex, lite and exec atoms), local
+gates and `worktree: true` steps, which run a Codex atom in its own worktree at
+the step's `base` and record atomic's commit in `steps.<id>.metadata.commit`.
+A run keeps the definitions it started with. Starting a workflow and deciding
+its gates from the command line (`atomic run`, `atomic gates`) are not wired up
+yet.
+
 Several authoring aids arrive in stages. Eval cases in JSONL files are part of
 v0.1. Compact schemas, variants, the `--plan` cost preview, declared effect caps
 and the staged `--effects preview` mode are planned for v0.5. The `file` tag

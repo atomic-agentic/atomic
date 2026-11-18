@@ -41,6 +41,23 @@ expressions. `after` establishes dependencies; do not depend on YAML key order.
 The loader checks required bindings and structural compatibility to the extent
 it can prove them.
 
+```yaml
+implement:
+  after: [approve-plan]
+  atom: implement-step
+  with:
+    plan: steps.plan.output
+    base: input.base
+  worktree: true
+```
+
+`worktree: true` runs a Codex atom in a worktree of its own, checked out at the
+commit its mapped `base` names; the step must map `base`. Every attempt starts
+again from that commit. When the atom's turn ends, Atomic commits what it left,
+outside the sandbox, and records the commit in `steps.<id>.metadata.commit`,
+beside `base` and `commit_ref`. The worktrees are removed when the run finishes;
+accepted commits keep their refs.
+
 ## CEL values and string literals
 
 An expression such as `input.text` evaluates a value. To produce a literal string,
@@ -64,6 +81,10 @@ accept:
     timeout: 24h
     on_timeout: reject
 ```
+
+`title` and `show` are CEL over the steps the gate runs after. `timeout` is a
+whole number and a unit, `s`, `m`, `h` or `d`; omit it for no deadline.
+`approvers` is a list of group names.
 
 An omitted `approvers` resolves to the authenticated local operator in local mode.
 Shared/team deployments require an approved group from project policy or an explicit
