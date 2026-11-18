@@ -67,10 +67,58 @@ const MIGRATIONS: &[Migration] = &[
             )",
         ],
     },
+    Migration {
+        version: 3,
+        // The usage ledger (see `usage`): allowances with their caps and what
+        // is charged against them, and the journal of call attempts; and the
+        // runs parked on a cap. Times are milliseconds since the Unix epoch.
+        sql: &[
+            "CREATE TABLE IF NOT EXISTS atomic_usage_allowances (
+                scope TEXT PRIMARY KEY,
+                parent TEXT,
+                tokens_cap BIGINT NOT NULL,
+                millis_cap BIGINT NOT NULL,
+                micro_usd_cap BIGINT,
+                tokens_charged BIGINT NOT NULL,
+                millis_charged BIGINT NOT NULL,
+                micro_usd_charged BIGINT NOT NULL
+            )",
+            "CREATE TABLE IF NOT EXISTS atomic_usage_attempts (
+                request_id TEXT NOT NULL,
+                attempt BIGINT NOT NULL,
+                run TEXT NOT NULL,
+                model TEXT NOT NULL,
+                scopes TEXT NOT NULL,
+                state TEXT NOT NULL,
+                reserved_tokens BIGINT NOT NULL,
+                reserved_millis BIGINT NOT NULL,
+                reserved_micro_usd BIGINT NOT NULL,
+                maximum_tokens BIGINT NOT NULL,
+                maximum_micro_usd BIGINT NOT NULL,
+                input_tokens BIGINT,
+                output_tokens BIGINT,
+                charged_tokens BIGINT NOT NULL,
+                charged_millis BIGINT NOT NULL,
+                charged_micro_usd BIGINT NOT NULL,
+                admitted_at BIGINT NOT NULL,
+                settled_at BIGINT,
+                PRIMARY KEY (request_id, attempt)
+            )",
+            "CREATE INDEX IF NOT EXISTS atomic_usage_attempts_by_run ON atomic_usage_attempts (run)",
+            "CREATE TABLE IF NOT EXISTS atomic_parks (
+                park_id TEXT PRIMARY KEY,
+                run TEXT NOT NULL,
+                step TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                parked_at BIGINT NOT NULL
+            )",
+            "CREATE INDEX IF NOT EXISTS atomic_parks_by_run ON atomic_parks (run)",
+        ],
+    },
 ];
 
 /// The store version this binary writes and understands.
-pub const STORE_VERSION: i64 = 2;
+pub const STORE_VERSION: i64 = 3;
 
 /// Why the store could not be opened.
 #[derive(Debug, thiserror::Error)]

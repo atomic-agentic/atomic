@@ -74,6 +74,7 @@ fn runtime(model: &FakeModel, tag: &str) -> CodexRuntime {
         },
         defaults: AtomConfig::default(),
         artifacts: Artifacts::none(),
+        meter: crate::usage::Metering::none(),
     }
 }
 
