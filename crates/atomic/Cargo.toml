@@ -13,6 +13,11 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Run the tests that need Codex's Linux sandbox (bubblewrap and unprivileged
+# user namespaces). With this on, a sandbox that cannot start fails them.
+sandbox-tests = []
+
 [dependencies]
 tokio = { workspace = true, features = ["rt"] }
 anyhow = { workspace = true }

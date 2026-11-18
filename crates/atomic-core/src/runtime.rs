@@ -206,6 +206,7 @@ async fn run_contract(
         output_schema: Some(lowered.schema.clone()),
         model: request.model,
         sandbox: request.sandbox,
+        ..TurnSpec::default()
     };
     let model = spec
         .model

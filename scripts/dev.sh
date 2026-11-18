@@ -20,6 +20,9 @@
 #   ATOMIC_DEV_CACHE      host directory for cargo's registry and git cache
 #                         (default ${XDG_CACHE_HOME:-~/.cache}/atomic/dev)
 #   ATOMIC_DEV_DB=off     do not start the test Postgres
+#   ATOMIC_DEV_SANDBOX=on let processes in the container create user namespaces and mount
+#                         /proc (seccomp and system paths unconfined), so Codex's Linux
+#                         sandbox can run, for the sandbox-tests feature
 #   ATOMIC_DEV_MOUNTS     colon-separated host directories to mount at the same path, for
 #                         checkouts outside this repository (a fork being worked on, say)
 #   ATOMIC_DEV_WAIT_LOCK  a file; while it exists, refuse to start (for hosts shared with
@@ -119,6 +122,19 @@ if [ -t 0 ] && [ -t 1 ]; then
     tty_flags=(-it)
 fi
 
+sandbox_flags=()
+if [ "${ATOMIC_DEV_SANDBOX:-off}" = "on" ]; then
+    # bubblewrap needs unshare(CLONE_NEWUSER), which the engine's default seccomp profile
+    # refuses, and mounts a fresh /proc, which the engine's masked /proc paths forbid.
+    # Capabilities stay dropped and no-new-privileges stays on.
+    sandbox_flags=(--security-opt seccomp=unconfined)
+    if [ "${ENGINE}" = "podman" ]; then
+        sandbox_flags+=(--security-opt unmask=ALL)
+    else
+        sandbox_flags+=(--security-opt systempaths=unconfined)
+    fi
+fi
+
 user_flags=(--user "$(id -u):$(id -g)")
 if [ "${ENGINE}" = "podman" ]; then
     user_flags+=(--userns=keep-id)
@@ -143,6 +159,7 @@ exec "${ENGINE}" run --rm --init ${tty_flags[@]+"${tty_flags[@]}"} \
     --cap-drop ALL \
     --security-opt no-new-privileges \
     --security-opt label=disable \
+    ${sandbox_flags[@]+"${sandbox_flags[@]}"} \
     -e HOME=/cache \
     -e CARGO_HOME=/cache/cargo \
     -e "CARGO_BUILD_JOBS=${CPUS}" \
