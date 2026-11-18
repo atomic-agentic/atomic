@@ -592,7 +592,7 @@ enum Reads {
 
 /// [`DurableRuntime`] on the durare fork, over SQLite or PostgreSQL.
 pub struct Durare {
-    engine: durare::DurableEngine,
+    pub(crate) engine: durare::DurableEngine,
     reads: Reads,
     /// Handles of workflows this process started, by id: waiting on one
     /// follows that execution, including a crash, which a lookup by id would

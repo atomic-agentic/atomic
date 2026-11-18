@@ -12,7 +12,10 @@
 //! - a wake-up the store does not back passes nothing;
 //! - a deadline that passes expires the gate, which authorizes nothing, and
 //!   a later decision gets the expiry as its conflict;
-//! - changed content cannot reuse an earlier approval.
+//! - changed content cannot reuse an earlier approval;
+//! - a run forked from, or imported as, an approved run does not pass its
+//!   gate on the copied checkpoints: the store has no approval for it, and
+//!   an approval copied in from another run names that run.
 
 use super::*;
 use crate::runtime::{Durare, RunStatus};
@@ -523,6 +526,131 @@ fn the_proposal_digest_ignores_key_order_and_sees_every_change() {
     );
 }
 
+/// Run the test workflow through an approval. Returns the run, its gate and
+/// the position of the step that read the decision.
+async fn approved_run(rt: &Durare) -> (String, Gate, i32) {
+    let (run, opened) = start_gated(rt, input(None)).await;
+    decide(
+        rt,
+        &operator(),
+        command(&opened, &unique("c"), Verdict::Approve),
+    )
+    .await
+    .expect("decided");
+    assert!(outcome(rt, &run).await.expect("finishes").approved());
+    let decision = rt
+        .steps(&run)
+        .await
+        .expect("steps")
+        .into_iter()
+        .rfind(|s| s.name == "accept.decision")
+        .expect("a decision step")
+        .step_id;
+    (run, opened, decision)
+}
+
+/// A copy of gate `from`'s row under gate id `id`, still naming `from`'s run:
+/// an approval someone wrote for another run.
+async fn copy_gate_row(rt: &Durare, from: &str, id: &str) {
+    let (from, id) = (from.to_owned(), id.to_owned());
+    rt.control_transaction(move |mut tx| {
+        let (from, id) = (from.clone(), id.clone());
+        Box::pin(async move {
+            let rest = COLUMNS.trim_start_matches("gate_id, ");
+            tx.execute(
+                &format!(
+                    "INSERT INTO atomic_gates (gate_id, {rest}) \
+                     SELECT ?, {rest} FROM atomic_gates WHERE gate_id = ?"
+                ),
+                &[Param::Text(id), Param::Text(from)],
+            )
+            .await
+            .map(|_| ())
+        })
+    })
+    .await
+    .expect("copy the row");
+}
+
+async fn a_forked_run_does_not_reuse_the_original_approval(mut rt: Durare) {
+    register(&mut rt);
+    rt.launch().await.expect("launch");
+    let (run, opened, decision) = approved_run(&rt).await;
+
+    // A fork from the decision step copies the gate's opening and its
+    // recorded wake-up, and reads the decision again, in the fork's name.
+    let fork = unique("fork");
+    rt.engine
+        .fork_workflow::<Value>(&run, decision, durare::WorkflowOptions::with_id(&fork))
+        .await
+        .expect("fork");
+    let refused = outcome(&rt, &fork).await;
+    assert!(
+        matches!(&refused, Err(DurableError::Failed(m)) if m.contains("is not in the gate store")),
+        "{refused:?}"
+    );
+
+    // And an approval copied into the fork's gate id still names the
+    // original run, so it does not pass either.
+    let copied = unique("fork");
+    copy_gate_row(&rt, &opened.id, &gate_id(&copied, "accept")).await;
+    rt.engine
+        .fork_workflow::<Value>(&run, decision, durare::WorkflowOptions::with_id(&copied))
+        .await
+        .expect("fork");
+    let refused = outcome(&rt, &copied).await;
+    assert!(
+        matches!(&refused, Err(DurableError::Failed(m)) if m.contains(&format!("belongs to run {run}"))),
+        "{refused:?}"
+    );
+    rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+}
+
+async fn an_imported_run_does_not_reuse_an_exported_approval(mut rt: Durare) {
+    register(&mut rt);
+    rt.launch().await.expect("launch");
+    let (run, _, decision) = approved_run(&rt).await;
+
+    // Export the approved run and import it under a new id, unfinished, with
+    // its checkpoints up to the decision: everything a forged import could
+    // say, including a recorded wake-up.
+    let forged = unique("imported");
+    let mut exported = rt
+        .engine
+        .export_workflow(&run, false)
+        .await
+        .expect("export");
+    for w in &mut exported {
+        w.workflow_status
+            .insert("workflow_uuid".into(), json!(forged.clone()));
+        w.workflow_status.insert("status".into(), json!("PENDING"));
+        w.workflow_status.insert("output".into(), Value::Null);
+        w.operation_outputs.retain(|o| {
+            o.get("function_id")
+                .and_then(Value::as_i64)
+                .is_some_and(|f| f < i64::from(decision))
+        });
+        for o in &mut w.operation_outputs {
+            o.insert("workflow_uuid".into(), json!(forged.clone()));
+        }
+        for table in [
+            &mut w.workflow_events,
+            &mut w.workflow_events_history,
+            &mut w.streams,
+        ] {
+            table.clear();
+        }
+    }
+    rt.engine.import_workflow(&exported).await.expect("import");
+    rt.recover().await.expect("recover");
+    let refused = outcome(&rt, &forged).await;
+    assert!(
+        matches!(&refused, Err(DurableError::Failed(m)) if m.contains("is not in the gate store")),
+        "{refused:?}"
+    );
+    rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+}
+
 macro_rules! on_backend {
     ($backend:ident, $($name:ident),+ $(,)?) => {
         mod $backend {
@@ -546,6 +674,8 @@ on_backend!(
     a_decision_after_the_deadline_records_the_expiry,
     changed_content_cannot_reuse_an_approval,
     redelivery_wakes_a_run_whose_decider_stopped_early,
+    a_forked_run_does_not_reuse_the_original_approval,
+    an_imported_run_does_not_reuse_an_exported_approval,
 );
 
 #[cfg(feature = "postgres-tests")]
@@ -559,4 +689,6 @@ on_backend!(
     a_decision_after_the_deadline_records_the_expiry,
     changed_content_cannot_reuse_an_approval,
     redelivery_wakes_a_run_whose_decider_stopped_early,
+    a_forked_run_does_not_reuse_the_original_approval,
+    an_imported_run_does_not_reuse_an_exported_approval,
 );
