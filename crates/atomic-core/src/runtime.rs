@@ -423,7 +423,7 @@ pub struct DispatchContext<'a> {
 pub async fn run_declarative_with_context(
     atom: &AtomFile,
     compiled: &Compiled,
-    registry: &mut Registry,
+    _registry: &mut Registry,
     run: &RunInput<'_>,
     context: Option<DispatchContext<'_>>,
     runtimes: &Runtimes,
@@ -442,8 +442,13 @@ pub async fn run_declarative_with_context(
             )));
         }
     };
-    let input_validator = registry
-        .validator(&atom.input)
+    // The compiled contract, not the registry: a run carries its atoms with
+    // their contracts, and checks against what it started with.
+    let input_contract = compiled.program.contracts.get("Input").ok_or_else(|| {
+        AtomError::Runtime(format!("{} has no compiled input contract", atom.name))
+    })?;
+    let input_validator = Registry::new()
+        .validator_for(input_contract)
         .map_err(|e| AtomError::Runtime(e.to_string()))?;
     check_input(&input_validator, input)?;
     let snapshot = context.as_ref().map(|context| context.snapshot);

@@ -51,8 +51,10 @@ const LATER: &[&str] = &[
     "auth",
 ];
 
-/// A loaded, schema-checked Astro atom and its immutable source graph.
-#[derive(Clone, Debug)]
+/// A loaded, schema-checked Astro atom and its immutable source graph. It
+/// serializes whole, sources and contracts included, so a run can carry the
+/// atom it started with.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Atom {
     /// The source file.
     pub file: PathBuf,
