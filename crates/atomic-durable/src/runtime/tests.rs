@@ -10,7 +10,12 @@
 //! - a failure is recorded as the workflow's outcome;
 //! - steps are recorded as siblings, in order, and a step inside a step is
 //!   refused;
-//! - starting a workflow id twice runs it once.
+//! - starting a workflow id twice runs it once;
+//! - a message sent to a workflow is received once, replayed after a crash,
+//!   and a second send with the same key delivers nothing; a receive with
+//!   nothing to take times out;
+//! - a control transaction outside any workflow commits its writes, or
+//!   nothing.
 
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -320,6 +325,105 @@ async fn positions_follow_construction_not_polling_order<R: DurableRuntime>(mut 
     rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
 }
 
+async fn a_message_is_received_once_and_replayed_after_a_crash<R: DurableRuntime>(mut rt: R) {
+    let executions = Arc::new(AtomicUsize::new(0));
+    let e = executions.clone();
+    rt.register("receive", move |ctx: R::Context, (): ()| {
+        let e = e.clone();
+        async move {
+            let first: Option<String> = ctx.recv("topic", Duration::from_secs(30)).await?;
+            if e.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("crash after the receive's checkpoint");
+            }
+            // The second send carried the same key, so nothing else waits.
+            let second: Option<String> = ctx.recv("topic", Duration::from_millis(300)).await?;
+            Ok((first, second))
+        }
+    });
+    rt.launch().await.expect("launch");
+    let id = unique("receive");
+    rt.start("receive", &id, ()).await.expect("start");
+    for _ in 0..2 {
+        rt.send(&id, "topic", "hello", "key-1").await.expect("send");
+    }
+    assert!(
+        rt.result::<(Option<String>, Option<String>)>(&id)
+            .await
+            .is_err(),
+        "the first execution crashed"
+    );
+    rt.recover().await.expect("recover");
+    assert_eq!(
+        rt.result::<(Option<String>, Option<String>)>(&id).await,
+        Ok((Some("hello".to_owned()), None)),
+        "the message taken before the crash is replayed, and taken once"
+    );
+    assert_eq!(executions.load(Ordering::SeqCst), 2);
+    rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+}
+
+async fn a_receive_times_out_at_its_deadline<R: DurableRuntime>(mut rt: R) {
+    rt.register("timeout", |ctx: R::Context, (): ()| async move {
+        let got: Option<String> = ctx.recv("nothing", Duration::from_millis(500)).await?;
+        Ok(got)
+    });
+    rt.launch().await.expect("launch");
+    let id = unique("timeout");
+    let started = Instant::now();
+    rt.start("timeout", &id, ()).await.expect("start");
+    assert_eq!(rt.result::<Option<String>>(&id).await, Ok(None));
+    assert!(started.elapsed() >= Duration::from_millis(500));
+    rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+}
+
+async fn a_control_transaction_commits_its_writes_or_nothing<R: DurableRuntime>(rt: R) {
+    let table = unique("c");
+    let write = |fail: bool| {
+        let t = table.clone();
+        rt.control_transaction(move |mut tx| {
+            let t = t.clone();
+            Box::pin(async move {
+                tx.execute(
+                    &format!("CREATE TABLE IF NOT EXISTS {t} (v TEXT NOT NULL)"),
+                    &[],
+                )
+                .await?;
+                tx.execute(
+                    &format!("INSERT INTO {t} (v) VALUES (?)"),
+                    &[Param::Text("a".into())],
+                )
+                .await?;
+                if fail {
+                    return Err(DurableError::Failed("after the write".into()));
+                }
+                Ok(())
+            })
+        })
+    };
+    write(false).await.expect("commits");
+    assert_eq!(
+        write(true).await,
+        Err(DurableError::Failed("after the write".into()))
+    );
+    let t = table.clone();
+    let n = rt
+        .control_transaction(move |mut tx| {
+            let t = t.clone();
+            Box::pin(async move {
+                tx.query_one(
+                    &format!("SELECT COUNT(*) AS n FROM {t} WHERE v = ?"),
+                    &[Param::Text("a".into())],
+                )
+                .await?
+                .int("n")
+            })
+        })
+        .await
+        .expect("count");
+    assert_eq!(n, 1, "the failed transaction wrote nothing");
+    rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+}
+
 macro_rules! on_backend {
     ($backend:ident, $($name:ident),+ $(,)?) => {
         mod $backend {
@@ -342,6 +446,9 @@ on_backend!(
     a_failure_is_recorded_as_the_outcome,
     steps_are_siblings_in_order_and_cannot_nest,
     a_workflow_id_started_twice_runs_once,
+    a_message_is_received_once_and_replayed_after_a_crash,
+    a_receive_times_out_at_its_deadline,
+    a_control_transaction_commits_its_writes_or_nothing,
 );
 
 #[cfg(feature = "postgres-tests")]
@@ -354,6 +461,9 @@ on_backend!(
     a_failure_is_recorded_as_the_outcome,
     steps_are_siblings_in_order_and_cannot_nest,
     a_workflow_id_started_twice_runs_once,
+    a_message_is_received_once_and_replayed_after_a_crash,
+    a_receive_times_out_at_its_deadline,
+    a_control_transaction_commits_its_writes_or_nothing,
 );
 
 /// A serialization conflict raised once in a transaction step is retried by
