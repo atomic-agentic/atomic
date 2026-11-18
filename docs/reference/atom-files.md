@@ -45,8 +45,9 @@ as JSON on stdout; a nonzero exit fails the step. It receives only the variables
 in `env`, plus its own `HOME` and `TMPDIR`.
 
 A step runs at least once, and Atomic cannot see what a command does to other
-systems. If the process stops after the command started and before its result
-was saved, `effects.external` decides what recovery does:
+systems. If execution is interrupted after the command started and before its
+result was saved, `effects.external` decides what recovery does. This includes
+checkpoint failures that trigger recovery without restarting the process:
 
 | `effects.external` | Meaning | After an interrupted attempt |
 | --- | --- | --- |

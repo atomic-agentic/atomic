@@ -39,7 +39,7 @@
 //! worktrees are removed; its accepted commits keep their refs.
 //!
 //! An exec atom's command may reach systems atomic cannot observe, so a
-//! step that runs one is guarded ([`atomic_durable::attempt`]): if a process
+//! step that runs one is guarded ([`atomic_durable::attempt`]): if execution
 //! stopped after the command began and before the step's checkpoint, whether
 //! its effects happened is unknown. A command declared `effects.external:
 //! read-only` or `idempotent` then runs again. One with neither is parked as
@@ -52,7 +52,7 @@
 use crate::workflows::propose;
 use atomic_core::artifact::{ArtifactStore, LocalStore, Provenance};
 use atomic_core::atom::Atom;
-use atomic_core::git::Signature;
+use atomic_core::git::{Git, Signature};
 use atomic_core::runtime::{Runtimes, contained, run_declarative};
 use atomic_core::workflow::Workflow;
 use atomic_core::worktree::{StepError, StepRequest, Worktrees};
@@ -66,7 +66,7 @@ use atomic_schema::registry::Registry;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// The name `run_pipeline` is registered under.
@@ -525,11 +525,11 @@ async fn in_worktree(
     runtimes: Arc<Runtimes>,
 ) -> Result<Proposal> {
     let ((output, metadata), commit) = contained(async move {
-        let top = worktrees.repo().git_dir().parent().map(Path::to_owned);
+        let subdirectory = source_subdirectory(runtimes.codex.cwd.clone()).await?;
         worktrees
             .run_step(request, |tree| async move {
                 let mut here = (*runtimes).clone();
-                here.codex.cwd = cwd_in(&tree, top.as_deref(), &runtimes.codex.cwd);
+                here.codex.cwd = tree.join(subdirectory);
                 run_in(&atom, &input, &run_id, &here).await
             })
             .await
@@ -551,13 +551,21 @@ async fn in_worktree(
     })
 }
 
-/// Where the atom works inside `tree`: the same place relative to the
-/// repository's top as the project's own working directory, or the top of
-/// the worktree when that is not inside the repository.
-fn cwd_in(tree: &Path, top: Option<&Path>, cwd: &Path) -> PathBuf {
-    top.and_then(|top| cwd.strip_prefix(top).ok())
-        .map(|sub| tree.join(sub))
-        .unwrap_or_else(|| tree.to_owned())
+/// Resolve the project's position within its actual source checkout. Git's
+/// common metadata directory cannot identify the root of a linked checkout.
+async fn source_subdirectory(cwd: PathBuf) -> std::result::Result<PathBuf, AtomError> {
+    tokio::task::spawn_blocking(move || {
+        let error = |e| AtomError::Runtime(format!("the source checkout: {e}"));
+        let cwd = std::fs::canonicalize(cwd).map_err(|e| error(e.to_string()))?;
+        let top = Git::find()
+            .and_then(|git| git.worktree_root(&cwd))
+            .map_err(|e| error(e.to_string()))?;
+        cwd.strip_prefix(top)
+            .map(PathBuf::from)
+            .map_err(|e| error(e.to_string()))
+    })
+    .await
+    .map_err(|e| AtomError::Runtime(format!("the source checkout: {e}")))?
 }
 
 /// Open gate `step`, wait for its resolution, and return the decision that

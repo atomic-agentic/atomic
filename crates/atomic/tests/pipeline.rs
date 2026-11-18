@@ -1049,26 +1049,32 @@ fn an_interrupted_exec_step_with_no_effects_declaration_parks() {
     });
 }
 
+async fn interrupted_declared_exec_runs_again(external: &str) {
+    let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
+        .await
+        .expect("fake model");
+    let dir = scratch(external);
+    project(&dir);
+    write_send_note(&dir, Some(external));
+    kill_after_the_command_and_recover(&dir, &model.base_url(), "declared-1").await;
+
+    assert!(!dir.join("error.txt").exists());
+    let out: Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("result.json")).expect("result"))
+            .expect("decode");
+    assert_eq!(out, json!({"line": "P1: Export crashes on accents"}));
+    assert_eq!(sends(&dir), 2, "the command ran again after the crash");
+    assert_eq!(model.calls(), 2);
+}
+
 #[test]
 fn an_interrupted_exec_step_declared_idempotent_runs_again() {
-    on_codex_runtime(async {
-        let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
-            .await
-            .expect("fake model");
-        let dir = scratch("idempotent");
-        project(&dir);
-        write_send_note(&dir, Some("idempotent"));
-        kill_after_the_command_and_recover(&dir, &model.base_url(), "idempotent-1").await;
+    on_codex_runtime(interrupted_declared_exec_runs_again("idempotent"));
+}
 
-        assert!(!dir.join("error.txt").exists());
-        let out: Value = serde_json::from_str(
-            &std::fs::read_to_string(dir.join("result.json")).expect("result"),
-        )
-        .expect("decode");
-        assert_eq!(out, json!({"line": "P1: Export crashes on accents"}));
-        assert_eq!(sends(&dir), 2, "the command ran again after the crash");
-        assert_eq!(model.calls(), 2);
-    });
+#[test]
+fn an_interrupted_exec_step_declared_read_only_runs_again() {
+    on_codex_runtime(interrupted_declared_exec_runs_again("read-only"));
 }
 
 #[test]
@@ -1244,4 +1250,114 @@ fn an_exec_step_runs_its_command_and_only_model_steps_call_the_model() {
             .await
             .expect("shutdown");
     });
+}
+
+/// A failed candidate checkpoint must not resend an unknown external effect,
+/// even when the engine recovers it without restarting the process.
+async fn failed_exec_checkpoint(reopen: bool) {
+    let dir = scratch(if reopen {
+        "checkpoint-reopen"
+    } else {
+        "checkpoint-effect"
+    });
+    let project = project(&dir);
+    write_send_note(&dir, None);
+    let model = FakeModel::start(Vec::new()).await.expect("fake model");
+    let mut rt = engine(&dir, &model.base_url()).await;
+    rt.control_transaction(|mut tx| {
+        Box::pin(async move {
+            tx.execute(
+                "CREATE TRIGGER reject_candidate BEFORE INSERT ON operation_outputs \
+                 WHEN NEW.function_name = 'read.turn' \
+                 BEGIN SELECT RAISE(FAIL, 'candidate checkpoint unavailable'); END",
+                &[],
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await
+    .expect("checkpoint fault");
+    let run = PipelineRun {
+        pipeline: load(&project, "sent.workflow.yaml", &sent()),
+        input: json!({"text": "A command with an unknown external effect."}),
+    };
+    rt.start(PIPELINE, "checkpoint-effect", run)
+        .await
+        .expect("start");
+    // Wait for an automatic recovery claim, proving the first command
+    // returned and its checkpoint failed, rather than racing its dispatch.
+    let mut recovered = false;
+    for _ in 0..500 {
+        let attempts: i64 = rt
+            .control_transaction(|mut tx| {
+                Box::pin(async move {
+                    tx.query_one(
+                        "SELECT recovery_attempts AS attempts FROM workflow_status \
+                         WHERE workflow_uuid = ?",
+                        &[atomic_durable::Param::Text("checkpoint-effect".into())],
+                    )
+                    .await?
+                    .int("attempts")
+                })
+            })
+            .await
+            .expect("recovery count");
+        if attempts > 0 {
+            recovered = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(recovered, "the failed checkpoint must trigger recovery");
+    if reopen {
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("stop the first engine");
+        drop(rt);
+        rt = engine(&dir, &model.base_url()).await;
+    }
+    rt.control_transaction(|mut tx| {
+        Box::pin(async move {
+            tx.execute("DROP TRIGGER reject_candidate", &[]).await?;
+            Ok(())
+        })
+    })
+    .await
+    .expect("restore checkpoint writes");
+    if reopen {
+        rt.recover().await.expect("recover in the new engine");
+    }
+    let mut terminal = None;
+    for _ in 0..500 {
+        let status = rt.status("checkpoint-effect").await.expect("status");
+        if !matches!(status, Some(RunStatus::Pending)) {
+            terminal = status;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    rt.shutdown(std::time::Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+    assert_eq!(
+        sends(&dir),
+        1,
+        "automatic recovery must not resend the command"
+    );
+    assert!(
+        matches!(terminal, Some(RunStatus::Failed(ref message)) if message.contains("outcome_unknown")),
+        "{terminal:?}"
+    );
+    assert_eq!(model.calls(), 0, "nothing downstream may run");
+}
+
+#[test]
+fn a_failed_exec_checkpoint_parks_in_the_same_process() {
+    on_codex_runtime(failed_exec_checkpoint(false));
+}
+
+#[test]
+fn a_reopened_engine_in_the_same_process_does_not_repeat_an_exec_effect() {
+    on_codex_runtime(failed_exec_checkpoint(true));
 }
