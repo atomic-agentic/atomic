@@ -22,6 +22,7 @@
 
 use crate::codex::{ModelEndpoint, ThreadReport, TurnSpec};
 use crate::typed::AtomConfig;
+use crate::usage::{Call, Outcome, Usage, meter_error};
 use anyhow::{Context, anyhow, bail};
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -84,6 +85,8 @@ pub struct LiteRuntime {
     pub timeout: Duration,
     /// The artifact store outputs' references are checked against.
     pub artifacts: crate::runtime::Artifacts,
+    /// What admits and settles each call (see [`crate::usage`]).
+    pub meter: crate::usage::Metering,
 }
 
 impl LiteRuntime {
@@ -96,6 +99,7 @@ impl LiteRuntime {
             defaults,
             timeout: DEFAULT_TIMEOUT,
             artifacts: crate::runtime::Artifacts::none(),
+            meter: crate::usage::Metering::none(),
         }
     }
 }
@@ -177,7 +181,18 @@ where
         output_tokens: 0,
         total_tokens: 0,
     };
+    let mut index = 0;
     loop {
+        // Admitted before it is dispatched, settled once after.
+        let ticket = runtime
+            .meter
+            .admit(Call {
+                index,
+                model: model.clone(),
+            })
+            .await
+            .map_err(meter_error)?;
+        index += 1;
         let answer = call(
             &client,
             runtime,
@@ -187,7 +202,22 @@ where
             &exchange,
             schema.as_ref(),
         )
-        .await?;
+        .await;
+        let outcome = match &answer {
+            Ok(a) => Outcome::Reported(Usage {
+                input_tokens: a.input_tokens,
+                output_tokens: a.output_tokens,
+            }),
+            // A connection that was never made sent nothing.
+            Err(e) if never_sent(e) => Outcome::NotDispatched,
+            Err(_) => Outcome::Unknown,
+        };
+        runtime
+            .meter
+            .settle(ticket, outcome)
+            .await
+            .map_err(meter_error)?;
+        let answer = answer?;
         report.thread_id = answer.id;
         report.turns += 1;
         report.input_tokens += answer.input_tokens;
@@ -202,6 +232,14 @@ where
             None => return Ok((answer.text, report)),
         }
     }
+}
+
+/// Whether `e` shows the request never left this process: the connection
+/// to the provider was never made.
+fn never_sent(e: &anyhow::Error) -> bool {
+    e.chain()
+        .filter_map(|c| c.downcast_ref::<reqwest::Error>())
+        .any(reqwest::Error::is_connect)
 }
 
 /// Make one call on the runtime's wire.

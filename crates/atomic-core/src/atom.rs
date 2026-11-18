@@ -4,6 +4,7 @@
 //! Frontmatter is an interpreted literal configuration; atom modules never execute.
 
 use crate::astro::{self, Program};
+use crate::budget::Budget;
 use atomic_schema::registry::{self, Registry};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -76,6 +77,10 @@ pub struct Atom {
     pub input: String,
     /// Registered full output schema.
     pub output: String,
+    /// The limits its `budget` block writes; the rest inherit defaults (see
+    /// [`crate::budget`]).
+    #[serde(default)]
+    pub budget: Budget,
     /// Parsed literal configuration and interpreted contract descriptors.
     pub frontmatter: Value,
     /// Immutable entry and component sources.
@@ -88,6 +93,26 @@ pub struct Atom {
     pub judges: std::collections::BTreeMap<String, Value>,
     /// Generated declarations checked before model dispatch.
     pub declarations: Value,
+}
+
+/// What an exec atom declares about effects atomic cannot observe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum External {
+    /// The command only reads.
+    ReadOnly,
+    /// It writes, and repeating it is safe.
+    Idempotent,
+}
+
+impl Atom {
+    /// Its `effects.external` declaration, if it makes one.
+    pub fn external(&self) -> Option<External> {
+        match self.frontmatter.pointer("/effects/external")?.as_str()? {
+            "read-only" => Some(External::ReadOnly),
+            "idempotent" => Some(External::Idempotent),
+            _ => None,
+        }
+    }
 }
 
 /// A file-local loading diagnostic.
@@ -167,6 +192,33 @@ fn check_exec(kind: &str, fm: &serde_json::Map<String, Value>) -> Result<(), (St
             }
         }
         Some(_) => return refuse("/env", "`env` maps variable names to string values"),
+    }
+    match fm.get("effects") {
+        None => {}
+        Some(Value::Object(effects)) => {
+            if let Some(key) = effects.keys().find(|key| *key != "external") {
+                return refuse(
+                    &format!("/effects/{key}"),
+                    &format!(
+                        "`effects.{key}` is not supported yet; this version reads only `effects.external`"
+                    ),
+                );
+            }
+            if let Some(external) = effects.get("external")
+                && !matches!(external.as_str(), Some("read-only" | "idempotent"))
+            {
+                return refuse(
+                    "/effects/external",
+                    "`effects.external` is `read-only` (the command only reads) or `idempotent` (it writes, and repeating it is safe)",
+                );
+            }
+        }
+        Some(_) => {
+            return refuse(
+                "/effects",
+                "`effects` is a mapping, such as `{ external: 'idempotent' }`",
+            );
+        }
     }
     Ok(())
 }
@@ -327,6 +379,16 @@ pub fn load(file: &Path, registry: &mut Registry) -> Result<Atom, AtomError> {
     }
     check_exec(&kind, fm)
         .map_err(|(pointer, message)| fail(line_of(&pointer), &pointer, message))?;
+
+    // A budget limit that is not written inherits the configured default
+    // when the atom runs; what is written must be well formed now.
+    let budget = match fm.get("budget") {
+        None => Budget::default(),
+        Some(b) => Budget::parse(b).map_err(|(sub, message)| {
+            let pointer = format!("/budget{sub}");
+            fail(line_of(&pointer), &pointer, message)
+        })?,
+    };
 
     let mut ids = Vec::new();
     for role in ["input", "output"] {
@@ -553,6 +615,7 @@ pub fn load(file: &Path, registry: &mut Registry) -> Result<Atom, AtomError> {
         description,
         input,
         output,
+        budget,
         frontmatter: config,
         program,
         context,

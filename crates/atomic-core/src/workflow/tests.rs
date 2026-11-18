@@ -236,6 +236,22 @@ fn reference_sibling_unevaluated_properties_see_target_annotations() {
 }
 
 #[test]
+fn a_budget_is_read_and_a_bad_one_fails_where_it_is_written() {
+    let w = check(&format!(
+        "{WORKFLOW}budget:\n  tokens: 60000\n  minutes: 15\n"
+    ))
+    .expect("loads");
+    assert_eq!(w.budget.tokens, Some(60_000));
+    assert_eq!(w.budget.millis, Some(900_000));
+    assert_eq!(w.budget.micro_usd, None);
+    assert_eq!(check(WORKFLOW).expect("loads").budget, Budget::default());
+
+    let e = err(&format!("{WORKFLOW}budget:\n  tokens: 0\n"));
+    assert_eq!((e.path.as_str(), e.line), ("/budget/tokens", 32));
+    assert!(e.message.contains("positive integer"), "{}", e.message);
+}
+
+#[test]
 fn a_gate_timeout_is_a_duration() {
     assert_eq!(
         parse_timeout("24h"),

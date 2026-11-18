@@ -12,6 +12,7 @@
 //! output is recorded once and returned on replay, and a transaction step's
 //! writes commit exactly once, together with its checkpoint.
 
+use crate::usage::Ledger;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -49,6 +50,12 @@ pub enum DurableError {
     /// The engine or its store failed.
     #[error("durable engine: {0}")]
     Engine(String),
+    /// The run cannot go on until a person acts: a budget cap left no room
+    /// for the next model call. An atom's author returns it, and the atom's
+    /// turn parks the run instead of recording a failure (see
+    /// [`crate::publication::execute_candidate`]).
+    #[error("parked: {0}")]
+    Parked(String),
 }
 
 /// The engine's own error behind a [`DurableError::Database`]: opaque, and
@@ -490,6 +497,10 @@ pub trait DurableRuntime: Send + Sync + Sized {
         T: Send + 'static,
         F: for<'t, 'c> Fn(Tx<'t, 'c>) -> TxFuture<'t, T> + Send + Sync + 'static;
 
+    /// The usage ledger in this runtime's database (see [`crate::usage`]):
+    /// budget accounting, apart from step outputs and telemetry.
+    fn ledger(&self) -> Ledger;
+
     /// Stop, giving running work up to `timeout` to finish.
     fn shutdown(&self, timeout: Duration) -> impl Future<Output = Result<()>> + Send;
 }
@@ -528,9 +539,10 @@ pub(crate) fn to_durare(e: DurableError) -> durare::Error {
         DurableError::Database { message, origin } => {
             origin.take().unwrap_or_else(|| durare::Error::app(message))
         }
-        DurableError::Failed(m) | DurableError::Nested(m) | DurableError::Engine(m) => {
-            durare::Error::app(m)
-        }
+        DurableError::Failed(m)
+        | DurableError::Nested(m)
+        | DurableError::Engine(m)
+        | DurableError::Parked(m) => durare::Error::app(m),
     }
 }
 
@@ -591,7 +603,8 @@ impl WorkflowContext for DurareContext {
 
 /// The adapter's own connection for reading atomic's tables outside a
 /// workflow: the same database, and on PostgreSQL the same schema.
-enum Reads {
+#[derive(Clone)]
+pub(crate) enum Reads {
     Sqlite(sqlx::SqlitePool),
     Postgres(sqlx::PgPool),
 }
@@ -658,6 +671,47 @@ pub fn executor_identity(
         Ok(Some(id.to_owned()))
     } else {
         Err(IdentityError::Invalid(id.to_owned()))
+    }
+}
+
+/// Whether a short transaction on atomic's tables commits.
+pub(crate) enum End<T> {
+    /// Commit its writes and return this.
+    Commit(T),
+    /// Roll its writes back and return this.
+    Rollback(T),
+}
+
+impl Reads {
+    /// Run `body` in one short transaction on atomic's tables, committing or
+    /// rolling back as it says; an error rolls back. On SQLite the write lock
+    /// is taken up front, so a read followed by a write in the body cannot
+    /// lose a race to another writer between the two.
+    pub(crate) async fn transaction<T, F>(&self, body: F) -> Result<End<T>>
+    where
+        T: Send + 'static,
+        F: for<'t, 'c> Fn(Tx<'t, 'c>) -> TxFuture<'t, End<T>> + Send + Sync + 'static,
+    {
+        match self {
+            Reads::Sqlite(pool) => {
+                let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.map_err(db)?;
+                let out = body(Tx(TxInner::Sqlite(&mut tx))).await?;
+                match &out {
+                    End::Commit(_) => tx.commit().await.map_err(db)?,
+                    End::Rollback(_) => tx.rollback().await.map_err(db)?,
+                }
+                Ok(out)
+            }
+            Reads::Postgres(pool) => {
+                let mut tx = pool.begin().await.map_err(db)?;
+                let out = body(Tx(TxInner::Postgres(&mut tx))).await?;
+                match &out {
+                    End::Commit(_) => tx.commit().await.map_err(db)?,
+                    End::Rollback(_) => tx.rollback().await.map_err(db)?,
+                }
+                Ok(out)
+            }
+        }
     }
 }
 
@@ -984,23 +1038,21 @@ impl DurableRuntime for Durare {
         T: Send + 'static,
         F: for<'t, 'c> Fn(Tx<'t, 'c>) -> TxFuture<'t, T> + Send + Sync + 'static,
     {
-        match &self.reads {
-            Reads::Sqlite(pool) => {
-                // IMMEDIATE takes the write lock up front, so a read
-                // followed by a write in the body cannot lose a race to
-                // another writer between the two.
-                let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.map_err(db)?;
-                let out = body(Tx(TxInner::Sqlite(&mut tx))).await?;
-                tx.commit().await.map_err(db)?;
-                Ok(out)
-            }
-            Reads::Postgres(pool) => {
-                let mut tx = pool.begin().await.map_err(db)?;
-                let out = body(Tx(TxInner::Postgres(&mut tx))).await?;
-                tx.commit().await.map_err(db)?;
-                Ok(out)
-            }
+        let body = Arc::new(body);
+        let out = self
+            .reads
+            .transaction(move |tx| {
+                let body = body.clone();
+                Box::pin(async move { body(tx).await.map(End::Commit) })
+            })
+            .await?;
+        match out {
+            End::Commit(v) | End::Rollback(v) => Ok(v),
         }
+    }
+
+    fn ledger(&self) -> Ledger {
+        Ledger::new(self.reads.clone())
     }
 
     async fn shutdown(&self, timeout: Duration) -> Result<()> {

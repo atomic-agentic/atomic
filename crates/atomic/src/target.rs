@@ -268,6 +268,9 @@ fn atom_pipeline(atom: Atom, input: &Value) -> anyhow::Result<Pipeline> {
         output: output_contract,
         atoms: BTreeMap::from([(atom.name.clone(), atom)]),
         pins,
+        // A single atom's own budget block applies through the atom; the
+        // run itself has the workflow defaults.
+        budget: Default::default(),
     })
 }
 

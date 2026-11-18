@@ -12,7 +12,7 @@
 //!
 //! The interpreter walks the steps in order. Each atom step evaluates its
 //! mapping against the workflow's `input` and the published outputs of the
-//! steps before it, then runs the atom through [`run_atom`]: its turn and its
+//! steps before it, then runs the atom through [`run_atom_at`]: its turn and its
 //! publication are sibling durable steps, so a step that finished before a
 //! crash is never run again. CEL has no side effects, so mappings evaluated
 //! again on replay give the same values.
@@ -38,26 +38,38 @@
 //! `base` and `commit_ref`, for later steps to review. A finished run's
 //! worktrees are removed; its accepted commits keep their refs.
 //!
+//! An exec atom's command may reach systems atomic cannot observe, so a
+//! step that runs one is guarded ([`atomic_durable::attempt`]): if execution
+//! stopped after the command began and before the step's checkpoint, whether
+//! its effects happened is unknown. A command declared `effects.external:
+//! read-only` or `idempotent` then runs again. One with neither is parked as
+//! `outcome_unknown`: the step fails without running the command again, and
+//! nothing retries it automatically.
+//!
 //! v0.1 runs its steps in order: model atoms, exec atoms, which run a
 //! command with no model, and gates.
 
+use crate::metering::RunBudget;
 use crate::workflows::propose;
 use atomic_core::artifact::{ArtifactStore, LocalStore, Provenance};
 use atomic_core::atom::Atom;
-use atomic_core::git::Signature;
+use atomic_core::budget::{Budget, BudgetSettings, Resolved};
+use atomic_core::git::{Git, Signature};
 use atomic_core::runtime::{Runtimes, contained, run_declarative};
 use atomic_core::workflow::Workflow;
 use atomic_core::worktree::{StepError, StepRequest, Worktrees};
 use atomic_core::{AtomError, compile};
+use atomic_durable::attempt;
 use atomic_durable::gate::{self, Deployment, GateSpec, Resolution, Tier};
+use atomic_durable::usage::Ledger;
 use atomic_durable::{
-    DurableError, DurableRuntime, Proposal, Result, WorkflowContext, failpoint, run_atom,
+    DurableError, DurableRuntime, Proposal, Result, WorkflowContext, failpoint, run_atom_at,
 };
 use atomic_schema::registry::Registry;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// The name `run_pipeline` is registered under.
@@ -127,6 +139,9 @@ pub struct Pipeline {
     pub output: Value,
     /// Every atom a step names, by name.
     pub atoms: BTreeMap<String, Atom>,
+    /// The limits the workflow's `budget` block writes for the whole run.
+    #[serde(default)]
+    pub budget: Budget,
     /// The SHA-256 of each file the run uses, by path: the workflow file and
     /// every source of every atom, as they were read when the run was
     /// prepared.
@@ -248,6 +263,7 @@ pub fn prepare(
         input: workflow.input.clone(),
         output: workflow.output.clone(),
         atoms: used,
+        budget: workflow.budget,
         pins,
     })
 }
@@ -314,16 +330,71 @@ fn fits(what: &str, contract: &Value, value: &Value) -> Result<()> {
     }
 }
 
+/// The model a declarative atom's calls go to, as its runtime picks it: the
+/// atom's own, then the project default, then the endpoint's. `None` for an
+/// atom that calls no model.
+fn model_of(atom: &Atom, runtimes: &Runtimes) -> Option<String> {
+    let (defaults, endpoint) = match atom.kind.as_str() {
+        "codex" => (&runtimes.codex.defaults, &runtimes.codex.endpoint),
+        "lite" => (&runtimes.lite.defaults, &runtimes.lite.endpoint),
+        _ => return None,
+    };
+    Some(
+        atom.frontmatter
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| defaults.model.clone())
+            .unwrap_or_else(|| endpoint.model.clone()),
+    )
+}
+
+/// The run's caps and each model atom's, resolved before anything runs: a
+/// budget that cannot be resolved, such as a dollar cap on an unpriced model,
+/// fails the run here.
+fn budgets(
+    pipeline: &Pipeline,
+    runtimes: &Runtimes,
+    ledger: Ledger,
+    settings: Arc<BudgetSettings>,
+) -> Result<(RunBudget, BTreeMap<String, Resolved>)> {
+    let models: BTreeMap<&str, String> = pipeline
+        .atoms
+        .iter()
+        .filter_map(|(name, atom)| Some((name.as_str(), model_of(atom, runtimes)?)))
+        .collect();
+    let all: Vec<&str> = models.values().map(String::as_str).collect();
+    let budget = RunBudget::new(ledger, settings, &pipeline.budget, &all)
+        .map_err(|e| failed(format!("workflow {}: budget: {e}", pipeline.name)))?;
+    let mut caps = BTreeMap::new();
+    for (name, model) in &models {
+        let atom = &pipeline.atoms[*name];
+        let resolved = budget
+            .atom(&atom.budget, model)
+            .map_err(|e| failed(format!("atom {name}: budget: {e}")))?;
+        caps.insert((*name).to_owned(), resolved);
+    }
+    Ok((budget, caps))
+}
+
 /// Run one pipeline. Workflow code: everything that touches a model or the
-/// store goes through durable steps.
+/// store goes through durable steps. Every model call is metered against
+/// the run's and its atom's budget (see [`crate::metering`]).
 async fn run_pipeline<C: WorkflowContext>(
     ctx: C,
     run: PipelineRun,
     services: Arc<Services>,
+    ledger: Ledger,
 ) -> Result<Value> {
     let PipelineRun { pipeline, input } = run;
     let store = services.store.clone();
     fits("the workflow's input", &pipeline.input, &input)?;
+    let (budget, caps) = budgets(
+        &pipeline,
+        &services.runtimes,
+        ledger,
+        services.budgets.clone(),
+    )?;
     // Store the definitions the run uses before anything runs. The snapshot
     // is content-addressed, so a retried step stores the same artifact.
     let snapshot =
@@ -380,9 +451,10 @@ async fn run_pipeline<C: WorkflowContext>(
             .get(&step.atom)
             .cloned()
             .ok_or_else(|| failed(format!("step `{}`: no atom `{}`", step.id, step.atom)))?;
-        let runtimes = services.runtimes.clone();
+        let mut runtimes = (*services.runtimes).clone();
         let run_id = ctx.workflow_id().to_owned();
         let atom_input = Value::Object(mapped);
+        let (budget, atom_caps) = (budget.clone(), caps.get(&step.atom).cloned());
         let tree = if step.worktree {
             let worktrees = services.worktrees.clone().ok_or_else(|| {
                 failed(format!(
@@ -408,18 +480,49 @@ async fn run_pipeline<C: WorkflowContext>(
         } else {
             None
         };
-        let published = run_atom(
+        let guard = if atom.kind == "exec" {
+            let begun = attempt::begin(&ctx, &format!("{}.attempt", step.id)).await?;
+            Some((begun, atom.external().is_some()))
+        } else {
+            None
+        };
+        let (id, ran) = (step.id.clone(), format!("pipeline:ran:{}", step.id));
+        let published = run_atom_at(
             &ctx,
             &step.id,
-            move || async move {
-                match tree {
+            move |position| {
+                // An exec atom calls no model and has no caps to meter.
+                if let Some(atom_caps) = &atom_caps {
+                    let meter = budget.meter(&position, atom_caps);
+                    runtimes.codex.meter = meter.clone();
+                    runtimes.lite.meter = meter;
+                }
+                async move {
+                if let Some((begun, declared)) = guard
+                    && begun.interrupted()
+                    && !declared
+                {
+                    return Err(failed(format!(
+                        "step `{id}`: outcome_unknown: an earlier attempt of `{}` was interrupted \
+                         before its result was saved, so whether its command's effects happened \
+                         is unknown. The step is parked and its command does not run again. If \
+                         repeating it is safe, declare `effects: {{ external: 'idempotent' }}` \
+                         (or `'read-only'` if it only reads)",
+                        atom.name
+                    )));
+                }
+                let proposal = match tree {
                     None => {
                         propose(async move { run_in(&atom, &atom_input, &run_id, &runtimes).await })
                             .await
                     }
                     Some((worktrees, request)) => {
+                        let runtimes = Arc::new(runtimes);
                         in_worktree(worktrees, request, atom, atom_input, run_id, runtimes).await
                     }
+                }?;
+                failpoint(&ran);
+                Ok(proposal)
                 }
             },
             Vec::new(),
@@ -494,11 +597,11 @@ async fn in_worktree(
     runtimes: Arc<Runtimes>,
 ) -> Result<Proposal> {
     let ((output, metadata), commit) = contained(async move {
-        let top = worktrees.repo().git_dir().parent().map(Path::to_owned);
+        let subdirectory = source_subdirectory(runtimes.codex.cwd.clone()).await?;
         worktrees
             .run_step(request, |tree| async move {
                 let mut here = (*runtimes).clone();
-                here.codex.cwd = cwd_in(&tree, top.as_deref(), &runtimes.codex.cwd);
+                here.codex.cwd = tree.join(subdirectory);
                 run_in(&atom, &input, &run_id, &here).await
             })
             .await
@@ -520,13 +623,21 @@ async fn in_worktree(
     })
 }
 
-/// Where the atom works inside `tree`: the same place relative to the
-/// repository's top as the project's own working directory, or the top of
-/// the worktree when that is not inside the repository.
-fn cwd_in(tree: &Path, top: Option<&Path>, cwd: &Path) -> PathBuf {
-    top.and_then(|top| cwd.strip_prefix(top).ok())
-        .map(|sub| tree.join(sub))
-        .unwrap_or_else(|| tree.to_owned())
+/// Resolve the project's position within its actual source checkout. Git's
+/// common metadata directory cannot identify the root of a linked checkout.
+async fn source_subdirectory(cwd: PathBuf) -> std::result::Result<PathBuf, AtomError> {
+    tokio::task::spawn_blocking(move || {
+        let error = |e| AtomError::Runtime(format!("the source checkout: {e}"));
+        let cwd = std::fs::canonicalize(cwd).map_err(|e| error(e.to_string()))?;
+        let top = Git::find()
+            .and_then(|git| git.worktree_root(&cwd))
+            .map_err(|e| error(e.to_string()))?;
+        cwd.strip_prefix(top)
+            .map(PathBuf::from)
+            .map_err(|e| error(e.to_string()))
+    })
+    .await
+    .map_err(|e| AtomError::Runtime(format!("the source checkout: {e}")))?
 }
 
 /// Open gate `step`, wait for its resolution, and return the decision that
@@ -596,12 +707,16 @@ pub struct Services {
     /// The project repository's worktrees, for `worktree: true` steps, or
     /// `None` when the project is not in a git repository.
     pub worktrees: Option<Arc<Worktrees>>,
+    /// The budget settings every run's model calls are metered under.
+    pub budgets: Arc<BudgetSettings>,
 }
 
-/// Register `run_pipeline` on `rt`.
+/// Register `run_pipeline` on `rt`, metering model calls against `rt`'s
+/// usage ledger.
 pub fn register_pipeline<R: DurableRuntime>(rt: &mut R, services: Services) {
     let services = Arc::new(services);
+    let ledger = rt.ledger();
     rt.register(PIPELINE, move |ctx: R::Context, run: PipelineRun| {
-        run_pipeline(ctx, run, services.clone())
+        run_pipeline(ctx, run, services.clone(), ledger.clone())
     });
 }

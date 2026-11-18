@@ -10,6 +10,7 @@
 //! read from the user's Codex configuration: Codex's home is the project's
 //! state directory (see [`crate::state`]).
 
+use crate::usage::{Call, Metering, Outcome, Usage, meter_error};
 use anyhow::Context;
 use anyhow::bail;
 use codex_core_api::AbsolutePathBuf;
@@ -238,18 +239,26 @@ pub async fn converse<F>(
 where
     F: FnMut(&str) -> Option<TurnSpec>,
 {
-    converse_async(paths, codex_home, cwd, endpoint, first, |answer| {
-        std::future::ready(next(&answer))
-    })
+    converse_async(
+        paths,
+        codex_home,
+        cwd,
+        endpoint,
+        &Metering::none(),
+        first,
+        |answer| std::future::ready(next(&answer)),
+    )
     .await
 }
 
-/// Conversation with asynchronous checks between turns.
+/// Conversation with asynchronous checks between turns. Each turn is
+/// admitted by `meter` before it is submitted and settled once after it.
 pub async fn converse_async<F, Fut>(
     paths: &CodexPaths,
     codex_home: &Path,
     cwd: &Path,
     endpoint: &ModelEndpoint,
+    meter: &Metering,
     first: &TurnSpec,
     mut next: F,
 ) -> anyhow::Result<(String, ThreadReport)>
@@ -348,11 +357,34 @@ where
         ..ThreadReport::default()
     };
     let outcome = loop {
+        // Admitted before the turn is submitted, settled once after it.
+        let ticket = match meter
+            .admit(Call {
+                index: report.turns,
+                model: endpoint.model.clone(),
+            })
+            .await
+        {
+            Ok(ticket) => ticket,
+            Err(e) => break Err(meter_error(e)),
+        };
         report.turns += 1;
-        match run_turn(&thread, &current).await {
+        let turn = run_turn(&thread, &current).await;
+        // The provider reports the thread's running totals; the turn's own
+        // usage is what they grew by.
+        let outcome = match &turn {
+            Ok((_, Some((input, output, _)))) => Outcome::Reported(Usage {
+                input_tokens: input - report.input_tokens,
+                output_tokens: output - report.output_tokens,
+            }),
+            _ => Outcome::Unknown,
+        };
+        if let Err(e) = meter.settle(ticket, outcome).await {
+            break Err(meter_error(e));
+        }
+        match turn {
             Err(e) => break Err(e),
             Ok((answer, usage)) => {
-                // The provider reports the thread's running totals.
                 if let Some((input, output, total)) = usage {
                     report.input_tokens = input;
                     report.output_tokens = output;

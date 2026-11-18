@@ -37,6 +37,7 @@ use crate::compile::Compiled;
 use crate::lite::{self, LiteRuntime};
 use crate::render::{self, RunInput};
 use crate::typed::{Atom, AtomConfig, AtomError, AtomKind};
+use crate::usage::{MeterError, Metering};
 use atomic_schema::artifact::{ArtifactLookup, ArtifactRef};
 use atomic_schema::lower::{self, OPENAI_STRICT};
 use atomic_schema::registry::Registry;
@@ -93,6 +94,8 @@ pub struct CodexRuntime {
     pub defaults: AtomConfig,
     /// The artifact store outputs' references are checked against.
     pub artifacts: Artifacts,
+    /// What admits and settles each turn (see [`crate::usage`]).
+    pub meter: Metering,
 }
 
 /// The runtimes atoms run on, one for each kind of atom that calls a model.
@@ -281,6 +284,7 @@ async fn run_contract(
                 &rt.codex_home,
                 &rt.cwd,
                 &rt.endpoint,
+                &rt.meter,
                 &spec,
                 next,
             )
@@ -288,7 +292,12 @@ async fn run_contract(
         }
         Backend::Lite(rt) => lite::converse_async(rt, &spec, next).await,
     }
-    .map_err(|e| AtomError::Model(format!("{e:#}")))?;
+    .map_err(|e| match crate::usage::meter_failure(&e) {
+        // The meter refused the next call: nothing was sent for it.
+        Some(MeterError::Exhausted(refusal)) => AtomError::Budget(refusal.to_string()),
+        Some(failure @ MeterError::Store(_)) => AtomError::Runtime(failure.to_string()),
+        None => AtomError::Model(format!("{e:#}")),
+    })?;
     let metadata = RunMetadata {
         thread_id: report.thread_id,
         model,

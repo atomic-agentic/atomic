@@ -101,6 +101,7 @@ fn main() {
                         endpoint: endpoint.clone(),
                         defaults: AtomConfig::default(),
                         artifacts: Artifacts::none(),
+                        meter: atomic_core::usage::Metering::none(),
                     };
                     let input = ChangeRequest {
                         request: (*request).to_owned(),

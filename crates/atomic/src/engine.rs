@@ -177,6 +177,7 @@ pub async fn open(
             endpoint: endpoint.clone(),
             defaults: AtomConfig::default(),
             artifacts: Artifacts::new(store.clone()),
+            meter: atomic_core::usage::Metering::none(),
         },
         lite: LiteRuntime::new(endpoint, AtomConfig::default()),
         exec,
@@ -193,6 +194,9 @@ pub async fn open(
             store,
             deployment: deployment(),
             worktrees,
+            // The CLI reads no configuration files yet, so every run is
+            // metered under the built-in budget defaults.
+            budgets: Arc::default(),
         },
     );
     rt.launch().await.context("launch the durable runtime")?;
