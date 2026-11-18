@@ -7,15 +7,21 @@
 # the candidate's sqlx and reports which milestone suites pass.
 #
 #   scripts/codex-bump.sh rust-v0.170.0
+#   scripts/codex-bump.sh rust-v0.170.0 <fork commit>
+#
+# When deps/codex.toml names a fork (a `branch`), rebase the fork's branch onto
+# the new tag first, push it, and pass that commit as the second argument: the
+# pin moves to the fork commit, and `upstream_rev` records the tag's commit.
 #
 # It rewrites, from Codex's files at the tag's commit:
 #
-#   deps/codex.toml        tag, rev and toolchain
+#   deps/codex.toml        tag, rev, upstream_rev and toolchain
 #   rust-toolchain.toml    the toolchain channel
 #   Cargo.toml and crates/*/Cargo.toml
-#                          the rev of every git dependency on openai/codex
+#                          the rev of every git dependency on Codex
 #   Cargo.toml             the [patch] block (through scripts/codex-pin.sh write)
 #   deps/forks.toml        the sqlx fork's rev, when Codex moved it
+#   deps/forks.toml        the Codex fork's rev and upstream_base, with a fork
 #   Cargo.lock             reseeded from Codex's lockfile; the next cargo
 #                          command adds atomic's own packages to it
 #
@@ -24,28 +30,38 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TAG="${1:?usage: scripts/codex-bump.sh <codex release tag>}"
+TAG="${1:?usage: scripts/codex-bump.sh <codex release tag> [fork commit]}"
 PIN="${ROOT}/deps/codex.toml"
-REPO="https://github.com/openai/codex"
 
 pin_value() { sed -n "s/^$1 = \"\\(.*\\)\"\$/\\1/p" "${PIN}" | head -n1; }
+REPOSITORY="$(pin_value repository)"
+UPSTREAM="$(pin_value upstream)"
+[ -n "${UPSTREAM}" ] || UPSTREAM="${REPOSITORY}"
+BRANCH="$(pin_value branch)"
 OLD_TAG="$(pin_value tag)"
 OLD_REV="$(pin_value rev)"
 OLD_TOOLCHAIN="$(pin_value toolchain)"
+OLD_UPSTREAM_REV="$(pin_value upstream_rev)"
 
 # The commit the tag names (an annotated tag is peeled to its commit).
-refs="$(git ls-remote "${REPO}" "refs/tags/${TAG}" "refs/tags/${TAG}^{}")"
-REV="$(awk '/\^\{\}$/ { print $1 }' <<<"${refs}")"
-[ -n "${REV}" ] || REV="$(awk '{ print $1; exit }' <<<"${refs}")"
-if [ -z "${REV}" ]; then
-    echo "scripts/codex-bump.sh: ${REPO} has no tag ${TAG}" >&2
+refs="$(git ls-remote "${UPSTREAM}" "refs/tags/${TAG}" "refs/tags/${TAG}^{}")"
+TAG_REV="$(awk '/\^\{\}$/ { print $1 }' <<<"${refs}")"
+[ -n "${TAG_REV}" ] || TAG_REV="$(awk '{ print $1; exit }' <<<"${refs}")"
+if [ -z "${TAG_REV}" ]; then
+    echo "scripts/codex-bump.sh: ${UPSTREAM} has no tag ${TAG}" >&2
     exit 1
+fi
+# With a fork, atomic builds the fork's commit on top of the tag.
+if [ -n "${BRANCH}" ]; then
+    REV="${2:?deps/codex.toml names a fork: rebase its ${BRANCH} branch onto ${TAG}, push it, and pass that commit as the second argument}"
+else
+    REV="${TAG_REV}"
 fi
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK}"' EXIT
 for f in rust-toolchain.toml Cargo.lock Cargo.toml; do
-    curl -fsSL --retry 3 -o "${WORK}/${f}" "https://raw.githubusercontent.com/openai/codex/${REV}/codex-rs/${f}"
+    curl -fsSL --retry 3 -o "${WORK}/${f}" "https://raw.githubusercontent.com/${REPOSITORY#https://github.com/}/${REV}/codex-rs/${f}"
 done
 TOOLCHAIN="$(sed -n 's/^channel = "\(.*\)"$/\1/p' "${WORK}/rust-toolchain.toml")"
 [ -n "${TOOLCHAIN}" ] || { echo "scripts/codex-bump.sh: no toolchain channel at ${REV}" >&2; exit 1; }
@@ -56,14 +72,20 @@ SQLX="$(sqlx_rev "${WORK}/Cargo.toml")"
 sed -i.bak \
     -e "s/^tag = \".*\"\$/tag = \"${TAG}\"/" \
     -e "s/^rev = \".*\"\$/rev = \"${REV}\"/" \
+    -e "s/^upstream_rev = \".*\"\$/upstream_rev = \"${TAG_REV}\"/" \
     -e "s/^toolchain = \".*\"\$/toolchain = \"${TOOLCHAIN}\"/" "${PIN}"
 sed -i.bak "s/^channel = \".*\"\$/channel = \"${TOOLCHAIN}\"/" "${ROOT}/rust-toolchain.toml"
 for manifest in "${ROOT}/Cargo.toml" "${ROOT}"/crates/*/Cargo.toml; do
-    sed -i.bak "/git = \"https:\/\/github.com\/openai\/codex\"/s/rev = \"${OLD_REV}\"/rev = \"${REV}\"/" "${manifest}"
+    sed -i.bak "\\|git = \"${REPOSITORY}\"|s/rev = \"${OLD_REV}\"/rev = \"${REV}\"/" "${manifest}"
 done
 # The sqlx fork atomic records follows Codex's.
 if [ -n "${OLD_SQLX}" ] && [ -n "${SQLX}" ] && [ "${OLD_SQLX}" != "${SQLX}" ]; then
     sed -i.bak "s/${OLD_SQLX}/${SQLX}/" "${ROOT}/deps/forks.toml"
+    rm -f "${ROOT}/deps/forks.toml.bak"
+fi
+# The Codex fork's entry follows the pin.
+if [ -n "${BRANCH}" ]; then
+    sed -i.bak -e "s/${OLD_REV}/${REV}/" -e "s/^upstream_base = \"${OLD_UPSTREAM_REV}\"/upstream_base = \"${TAG_REV}\"/" "${ROOT}/deps/forks.toml"
     rm -f "${ROOT}/deps/forks.toml.bak"
 fi
 rm -f "${PIN}.bak" "${ROOT}/rust-toolchain.toml.bak" "${ROOT}/Cargo.toml.bak" "${ROOT}"/crates/*/Cargo.toml.bak

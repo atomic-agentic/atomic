@@ -1,10 +1,18 @@
 # The single source of truth for the Codex revision atomic builds against.
 # Cargo.toml, rust-toolchain.toml and the [patch.crates-io] block are checked
 # against this file; change it only through the Codex bump procedure.
+#
+# atomic builds Codex from its fork (see deps/forks.toml and deps/README.md):
+# every Codex git dependency points at `repository`, at `rev`, a commit on the
+# fork's `branch`. `tag` and `upstream_rev` are the upstream release that
+# branch is based on.
 
 [codex]
-repository = "https://github.com/openai/codex"
+repository = "https://github.com/atomic-agentic/codex"
+upstream = "https://github.com/openai/codex"
+branch = "atomic"
 tag = "rust-v0.169.0"
-rev = "d32063f96c2dff1dc96af839b3952abb6acfeda4"
+upstream_rev = "d32063f96c2dff1dc96af839b3952abb6acfeda4"
+rev = "a4b0cac70d89a168616d5cb3b99e5b162e91ce5d"
 # Codex's own codex-rs/rust-toolchain.toml at this rev.
 toolchain = "1.95.0"
