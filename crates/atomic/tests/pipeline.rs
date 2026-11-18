@@ -856,16 +856,11 @@ fn a_worktree_step_runs_at_its_base_and_atomic_commits_what_it_left() {
         assert_eq!(out, json!({"ok": true}));
         assert_eq!(model.calls(), 2);
 
-        // The atom's turn ran in the step's worktree, not the project.
+        // Where the turn ran is not in the model's request at this Codex
+        // revision; the sandboxed change-request test shows the model's edit
+        // landing in the worktree and not in the project.
         let worktrees = dir.join("state/worktrees");
         let requests = model.requests();
-        assert!(
-            requests[0]
-                .to_string()
-                .contains(&worktrees.display().to_string()),
-            "the turn's working directory is under {}",
-            worktrees.display()
-        );
         // atomic committed on the base, recorded it in the step's metadata,
         // and the next step received that commit.
         let fix = rt
