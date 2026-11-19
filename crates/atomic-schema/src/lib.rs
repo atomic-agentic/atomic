@@ -9,4 +9,5 @@ pub mod artifact;
 pub mod expr;
 pub mod lower;
 pub mod registry;
+pub mod typescript;
 pub mod yaml;
