@@ -25,6 +25,12 @@
 //!    either, the atom fails with [`AtomError::Schema`] (or
 //!    [`AtomError::Validation`] when only its own check failed).
 //!
+//! Every run goes through the execution backend its runtime names (see
+//! [`atomic_exec`]): it opens a workspace there before anything is sent, a
+//! Codex turn runs its shell and file work where the workspace says, an exec
+//! atom's command runs through the backend, and the workspace is closed when
+//! the run ends, whether it succeeded or not.
+//!
 //! The normalized, validated value is what a durable step checkpoints.
 //! [`run_codex_atom`] runs a typed Rust atom on a Codex thread,
 //! [`run_lite_atom`] runs one as a single model call (see [`crate::lite`]),
@@ -45,6 +51,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::Arc;
+
+use atomic_exec::{ExecutionBackend, Open, Shell, Workspace};
 
 /// Where a runtime looks up the artifacts an output references.
 #[derive(Clone)]
@@ -96,6 +104,9 @@ pub struct CodexRuntime {
     pub artifacts: Artifacts,
     /// What admits and settles each turn (see [`crate::usage`]).
     pub meter: Metering,
+    /// The execution backend each run opens its workspace on, from
+    /// [`cwd`](Self::cwd), and runs its turn's shell and file work through.
+    pub backend: atomic_exec::Backend,
 }
 
 /// The runtimes atoms run on, one for each kind of atom that calls a model.
@@ -164,6 +175,50 @@ impl Backend<'_> {
             Self::Lite(rt) => rt.artifacts.0.as_ref(),
         }
     }
+
+    fn execution(&self) -> &atomic_exec::Backend {
+        match self {
+            Self::Codex(rt) => &rt.backend,
+            Self::Lite(rt) => &rt.backend,
+        }
+    }
+
+    /// What a run asks its backend for: a Codex atom's workspace starts
+    /// from the runtime's directory, and a lite atom's has no files.
+    fn open(&self, label: &str, sandbox: crate::typed::Sandbox) -> Open {
+        match self {
+            Self::Codex(rt) => Open {
+                label: label.to_owned(),
+                source: Some(rt.cwd.clone()),
+                sandbox,
+                ..Open::default()
+            },
+            Self::Lite(_) => Open {
+                label: label.to_owned(),
+                ..Open::default()
+            },
+        }
+    }
+}
+
+/// Open a workspace on `backend`, on the blocking pool.
+pub(crate) async fn open_workspace(
+    backend: Arc<dyn ExecutionBackend>,
+    request: Open,
+) -> Result<Workspace, AtomError> {
+    let label = request.label.clone();
+    tokio::task::spawn_blocking(move || backend.open(&request))
+        .await
+        .map_err(|e| AtomError::Runtime(format!("{label}: open its workspace: {e}")))?
+        .map_err(|e| AtomError::Runtime(format!("{label}: {e}")))
+}
+
+/// Close `workspace` on `backend`, on the blocking pool. A run's outcome is
+/// settled before its workspace is closed, so a close that fails changes
+/// nothing about the run: what it would have released is only scratch
+/// space, and a backend that keeps workspaces reclaims its own.
+pub(crate) async fn close_workspace(backend: Arc<dyn ExecutionBackend>, workspace: Workspace) {
+    let _ = tokio::task::spawn_blocking(move || backend.close(&workspace)).await;
 }
 
 /// The atom's own check on a value that already fits the contract.
@@ -205,7 +260,7 @@ async fn run_contract(
         }
         _ => request.developer,
     };
-    let spec = TurnSpec {
+    let mut spec = TurnSpec {
         developer_instructions: Some(developer),
         prompt: request.prompt,
         output_schema: Some(lowered.schema.clone()),
@@ -277,22 +332,37 @@ async fn run_contract(
             }
         }
     };
-    let (_, report) = match backend {
-        Backend::Codex(rt) => {
-            codex::converse_async(
-                &rt.paths,
-                &rt.codex_home,
-                &rt.cwd,
-                &rt.endpoint,
-                &rt.meter,
-                &spec,
-                next,
-            )
-            .await
-        }
+    // Nothing is sent before the backend has opened the run's workspace,
+    // and the workspace is closed however the run ends.
+    let execution = backend.execution().shared();
+    let workspace = open_workspace(
+        execution.clone(),
+        backend.open(request.name, request.sandbox),
+    )
+    .await?;
+    let conversation = match backend {
+        Backend::Codex(rt) => match turn_in(&workspace, &mut spec) {
+            Ok(cwd) => {
+                codex::converse_async(
+                    &rt.paths,
+                    &rt.codex_home,
+                    &cwd,
+                    &rt.endpoint,
+                    &rt.meter,
+                    &spec,
+                    next,
+                )
+                .await
+            }
+            Err(e) => {
+                close_workspace(execution, workspace).await;
+                return Err(e);
+            }
+        },
         Backend::Lite(rt) => lite::converse_async(rt, &spec, next).await,
-    }
-    .map_err(|e| match crate::usage::meter_failure(&e) {
+    };
+    close_workspace(execution, workspace).await;
+    let (_, report) = conversation.map_err(|e| match crate::usage::meter_failure(&e) {
         // The meter refused the next call: nothing was sent for it.
         Some(MeterError::Exhausted(refusal)) => AtomError::Budget(refusal.to_string()),
         Some(failure @ MeterError::Store(_)) => AtomError::Runtime(failure.to_string()),
@@ -317,6 +387,29 @@ async fn run_contract(
             "the turn ended without an answer".into(),
         )),
     }
+}
+
+/// Set `spec` up to run in `workspace` and return the directory its thread
+/// runs in: the sandbox, the writable roots and the environment are the
+/// workspace's, and its shell must be one this process can drive.
+fn turn_in(workspace: &Workspace, spec: &mut TurnSpec) -> Result<PathBuf, AtomError> {
+    let cwd = workspace
+        .require_root()
+        .map_err(|e| AtomError::Runtime(e.to_string()))?
+        .clone();
+    match workspace.shell {
+        Shell::Local => {}
+        Shell::None => {
+            return Err(AtomError::Runtime(format!(
+                "the backend gave {}'s turn no shell, and a codex atom's turn needs one",
+                workspace.label
+            )));
+        }
+    }
+    spec.sandbox = workspace.sandbox;
+    spec.writable_roots = workspace.writable_roots.clone();
+    spec.env = workspace.env.clone();
+    Ok(cwd)
 }
 
 /// Run a typed Codex atom on `input`, on a fresh Codex thread.
@@ -543,9 +636,10 @@ pub const EXEC_OUTPUT_LIMIT: usize = 8_388_608;
 
 /// Run an exec atom: its command, with no model and no shell, on `backend`.
 ///
-/// The command runs in the project's directory with exactly the environment
-/// the atom declares, plus `HOME` and `TMPDIR` pointing at a scratch
-/// directory of its own. It reads the input as one JSON value on stdin and
+/// The command runs in a workspace the backend opens from the project's
+/// directory, with exactly the environment the atom declares, plus `HOME`
+/// and `TMPDIR` pointing at the workspace's scratch directory, which is the
+/// attempt's own. It reads the input as one JSON value on stdin and
 /// writes one JSON value to stdout; stderr is for diagnostics. A nonzero
 /// exit fails the step, and so does output that breaks the contract or the
 /// atom's validators: there is no model to repair it.
@@ -578,18 +672,12 @@ pub async fn run_exec(
         .next()
         .ok_or_else(|| AtomError::Runtime(format!("{} has no exec.command", atom.name)))?;
     let args: Vec<String> = command.collect();
-    let scratch =
-        scratch_dir().map_err(|e| AtomError::Runtime(format!("scratch directory: {e}")))?;
-    let mut env: Vec<(String, String)> = atom.frontmatter["env"]
+    let declared: std::collections::BTreeMap<String, String> = atom.frontmatter["env"]
         .as_object()
         .into_iter()
         .flatten()
         .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_owned())))
         .collect();
-    let scratch_text = scratch.display().to_string();
-    env.retain(|(k, _)| k != "HOME" && k != "TMPDIR");
-    env.push(("HOME".into(), scratch_text.clone()));
-    env.push(("TMPDIR".into(), scratch_text));
     let stdin = serde_json::to_vec(input).map_err(|e| AtomError::Runtime(e.to_string()))?;
     let mut h = Sha256::new();
     for part in std::iter::once(&program).chain(&args) {
@@ -598,21 +686,19 @@ pub async fn run_exec(
     }
     h.update(&stdin);
     let prompt_hash = format!("{:x}", h.finalize());
-    let request = atomic_exec::Command {
-        program: program.clone(),
-        args,
-        cwd: atom.program.root.clone(),
-        env,
-        stdin,
-        time_limit: EXEC_TIME_LIMIT,
-        output_limit: EXEC_OUTPUT_LIMIT,
-    };
-    // The command runs on the blocking pool, never on an executor thread.
-    let done = tokio::task::spawn_blocking(move || backend.run(&request))
-        .await
-        .map_err(|e| AtomError::Runtime(format!("{}: {e}", atom.name)));
-    let _ = std::fs::remove_dir_all(&scratch);
-    let done = done?.map_err(|e| AtomError::Runtime(format!("{}: {e}", atom.name)))?;
+    let workspace = open_workspace(
+        backend.clone(),
+        Open {
+            label: atom.name.clone(),
+            source: Some(atom.program.root.clone()),
+            env: declared,
+            ..Open::default()
+        },
+    )
+    .await?;
+    let done = run_command(backend.clone(), &workspace, program.clone(), args, stdin).await;
+    close_workspace(backend, workspace).await;
+    let done = done.map_err(|e| AtomError::Runtime(format!("{}: {e}", atom.name)))?;
     if !done.success() {
         let stderr = String::from_utf8_lossy(&done.stderr);
         let tail: String = stderr
@@ -680,16 +766,43 @@ pub async fn run_exec(
     ))
 }
 
-/// A new, empty scratch directory for one exec attempt.
-fn scratch_dir() -> std::io::Result<PathBuf> {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let dir = std::env::temp_dir().join(format!(
-        "atomic-exec-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    std::fs::create_dir(&dir)?;
-    Ok(dir)
+/// Run an exec atom's command in `workspace`: in its root, with its
+/// environment and `HOME` and `TMPDIR` at its scratch directory. The command
+/// runs on the blocking pool, never on an executor thread.
+async fn run_command(
+    backend: Arc<dyn ExecutionBackend>,
+    workspace: &Workspace,
+    program: String,
+    args: Vec<String>,
+    stdin: Vec<u8>,
+) -> Result<atomic_exec::Completed, String> {
+    let cwd = workspace.require_root().map_err(|e| e.to_string())?.clone();
+    let scratch = workspace
+        .require_scratch()
+        .map_err(|e| e.to_string())?
+        .display()
+        .to_string();
+    let mut env: Vec<(String, String)> = workspace
+        .env
+        .iter()
+        .filter(|(k, _)| *k != "HOME" && *k != "TMPDIR")
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    env.push(("HOME".into(), scratch.clone()));
+    env.push(("TMPDIR".into(), scratch));
+    let request = atomic_exec::Command {
+        program,
+        args,
+        cwd,
+        env,
+        stdin,
+        time_limit: EXEC_TIME_LIMIT,
+        output_limit: EXEC_OUTPUT_LIMIT,
+    };
+    tokio::task::spawn_blocking(move || backend.run(&request))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
 }
 
 async fn validate_output(

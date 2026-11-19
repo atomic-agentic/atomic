@@ -75,6 +75,7 @@ fn runtime(model: &FakeModel, tag: &str) -> CodexRuntime {
         defaults: AtomConfig::default(),
         artifacts: Artifacts::none(),
         meter: crate::usage::Metering::none(),
+        backend: Default::default(),
     }
 }
 
@@ -1187,4 +1188,257 @@ fn exec_declarations_are_checked_at_load() {
             atom::load(&dir.join("atoms/x.atom.astro"), &mut Registry::new()).expect_err(problem);
         assert!(error.message.contains(problem), "{config}: {error}");
     }
+}
+
+/// A lite atom with [`Classify`]'s contract.
+struct LiteClassify;
+
+impl Atom for LiteClassify {
+    type In = Note;
+    type Out = Classified;
+    const NAME: &'static str = "classify-note-lite";
+    fn input_schema(&self) -> Value {
+        Classify.input_schema()
+    }
+    fn output_schema(&self) -> Value {
+        Classify.output_schema()
+    }
+    fn instructions(&self) -> Cow<'static, str> {
+        Classify.instructions()
+    }
+    fn kind(&self) -> crate::typed::AtomKind {
+        crate::typed::AtomKind::Lite
+    }
+}
+
+/// An execution backend that records every call before passing it to the
+/// local backend, and can refuse to open a workspace.
+#[derive(Clone, Default)]
+struct Recording {
+    calls: Arc<std::sync::Mutex<Vec<String>>>,
+    opened: Arc<std::sync::Mutex<Vec<(atomic_exec::Open, Workspace)>>>,
+    refuse: bool,
+}
+
+impl Recording {
+    fn calls(&self) -> Vec<String> {
+        self.calls.lock().expect("calls").clone()
+    }
+
+    fn opened(&self) -> Vec<(atomic_exec::Open, Workspace)> {
+        self.opened.lock().expect("opened").clone()
+    }
+
+    fn backend(&self) -> atomic_exec::Backend {
+        atomic_exec::Backend::new(self.clone())
+    }
+}
+
+impl ExecutionBackend for Recording {
+    fn open(&self, request: &atomic_exec::Open) -> Result<Workspace, atomic_exec::ExecError> {
+        self.calls
+            .lock()
+            .expect("calls")
+            .push(format!("open {}", request.label));
+        if self.refuse {
+            return Err(atomic_exec::ExecError::Workspace {
+                label: request.label.clone(),
+                message: "no room on this backend".into(),
+            });
+        }
+        let ws = atomic_exec::LocalBackend.open(request)?;
+        self.opened
+            .lock()
+            .expect("opened")
+            .push((request.clone(), ws.clone()));
+        Ok(ws)
+    }
+
+    fn run(
+        &self,
+        command: &atomic_exec::Command,
+    ) -> Result<atomic_exec::Completed, atomic_exec::ExecError> {
+        self.calls
+            .lock()
+            .expect("calls")
+            .push(format!("run {}", command.program));
+        atomic_exec::LocalBackend.run(command)
+    }
+
+    fn close(&self, workspace: &Workspace) -> Result<(), atomic_exec::ExecError> {
+        self.calls
+            .lock()
+            .expect("calls")
+            .push(format!("close {}", workspace.label));
+        atomic_exec::LocalBackend.close(workspace)
+    }
+}
+
+const CLASSIFIED: &str = r#"{"category": "bug", "summary": "Export crashes.", "line": null}"#;
+
+/// Every kind of atom opens its workspace on its runtime's backend before
+/// anything runs, and closes it after: a codex atom's in the runtime's
+/// directory with a local shell, a lite atom's with no files or shell, and
+/// an exec atom's in its project, where its command runs through the
+/// backend with the workspace's scratch directory as its home.
+#[test]
+fn every_kind_of_atom_runs_through_its_execution_backend() {
+    on_codex_runtime(async {
+        let note = Note {
+            text: "Export crashes on é.".into(),
+        };
+        let model = FakeModel::start(vec![
+            Reply::Text(CLASSIFIED.into()),
+            Reply::Text(CLASSIFIED.into()),
+        ])
+        .await
+        .expect("fake model");
+
+        let codex = Recording::default();
+        let mut rt = runtime(&model, "seam-codex");
+        rt.backend = codex.backend();
+        run_codex_atom(&Classify, &note, &rt).await.expect("runs");
+        assert_eq!(codex.calls(), ["open classify-note", "close classify-note"]);
+        let (asked, given) = &codex.opened()[0];
+        assert_eq!(asked.source.as_ref(), Some(&rt.cwd));
+        assert_eq!(asked.sandbox, crate::typed::Sandbox::ReadOnly);
+        assert_eq!(given.shell, atomic_exec::Shell::Local);
+        assert!(
+            !given.scratch.as_ref().expect("scratch").exists(),
+            "closed when the run ended"
+        );
+
+        let lite = Recording::default();
+        let mut lrt = crate::lite::LiteRuntime::new(rt.endpoint.clone(), AtomConfig::default());
+        lrt.backend = lite.backend();
+        run_lite_atom(&LiteClassify, &note, &lrt)
+            .await
+            .expect("runs");
+        assert_eq!(
+            lite.calls(),
+            ["open classify-note-lite", "close classify-note-lite"]
+        );
+        let (asked, given) = &lite.opened()[0];
+        assert_eq!(asked.source, None);
+        assert_eq!(given.shell, atomic_exec::Shell::None);
+        assert_eq!(model.calls(), 2);
+
+        let exec = Recording::default();
+        let mut all = runtimes(&model, "seam-exec");
+        all.exec = exec.backend();
+        let script = "import json, os, sys\norder = json.load(sys.stdin)\n\
+            json.dump({'total': len(os.listdir(os.environ['HOME']))}, sys.stdout)\n";
+        let (dir, a, compiled) = exec_project("seam-exec", script, "");
+        let (out, _) = run_declarative(
+            &a,
+            &compiled,
+            &mut Registry::new(),
+            &json!({"cents": [1]}),
+            "run-1",
+            "external",
+            &all,
+        )
+        .await
+        .expect("runs");
+        assert_eq!(out, json!({"total": 0}), "the scratch home starts empty");
+        assert_eq!(exec.calls(), ["open total", "run python3", "close total"]);
+        let (asked, given) = &exec.opened()[0];
+        assert_eq!(asked.source.as_ref(), Some(&a.program.root));
+        assert!(dir.join("atomic.yaml").is_file());
+        assert!(!given.scratch.as_ref().expect("scratch").exists());
+        assert_eq!(model.calls(), 2, "an exec atom calls no model");
+    });
+}
+
+/// A backend that cannot open a workspace fails the run before anything is
+/// sent to a model or run: no atom gets around the backend.
+#[test]
+fn a_run_whose_workspace_cannot_be_opened_sends_and_runs_nothing() {
+    on_codex_runtime(async {
+        let note = Note { text: "n".into() };
+        let model = FakeModel::start(vec![Reply::Text(CLASSIFIED.into())])
+            .await
+            .expect("fake model");
+        let refusing = Recording {
+            refuse: true,
+            ..Recording::default()
+        };
+
+        let mut rt = runtime(&model, "seam-refuse");
+        rt.backend = refusing.backend();
+        let r = run_codex_atom(&Classify, &note, &rt).await;
+        assert!(
+            matches!(&r, Err(AtomError::Runtime(m)) if m.contains("no room on this backend")),
+            "{r:?}"
+        );
+
+        let mut lrt = crate::lite::LiteRuntime::new(rt.endpoint.clone(), AtomConfig::default());
+        lrt.backend = refusing.backend();
+        let r = run_lite_atom(&LiteClassify, &note, &lrt).await;
+        assert!(matches!(&r, Err(AtomError::Runtime(_))), "{r:?}");
+
+        let mut all = runtimes(&model, "seam-refuse-exec");
+        all.exec = refusing.backend();
+        let (_, a, compiled) = exec_project("seam-refuse", TOTAL, "");
+        let r = run_declarative(
+            &a,
+            &compiled,
+            &mut Registry::new(),
+            &json!({"cents": [1]}),
+            "run-1",
+            "external",
+            &all,
+        )
+        .await;
+        assert!(matches!(&r, Err(AtomError::Runtime(_))), "{r:?}");
+
+        assert_eq!(model.calls(), 0, "nothing reached the model");
+        assert_eq!(
+            refusing.calls(),
+            [
+                "open classify-note",
+                "open classify-note-lite",
+                "open total"
+            ],
+            "nothing ran and nothing was left open"
+        );
+    });
+}
+
+/// A run that fails still closes its workspace.
+#[test]
+fn a_failed_run_closes_its_workspace() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![
+            Reply::Text("not json".into()),
+            Reply::Text("still not json".into()),
+        ])
+        .await
+        .expect("fake model");
+        let codex = Recording::default();
+        let mut rt = runtime(&model, "seam-fail");
+        rt.backend = codex.backend();
+        let r = run_codex_atom(&Classify, &Note { text: "n".into() }, &rt).await;
+        assert!(matches!(&r, Err(AtomError::Schema { .. })), "{r:?}");
+        assert_eq!(codex.calls(), ["open classify-note", "close classify-note"]);
+
+        let exec = Recording::default();
+        let mut all = runtimes(&model, "seam-fail-exec");
+        all.exec = exec.backend();
+        let (_, a, compiled) = exec_project("seam-fail", "import sys\nsys.exit(3)\n", "");
+        let r = run_declarative(
+            &a,
+            &compiled,
+            &mut Registry::new(),
+            &json!({"cents": [1]}),
+            "run-1",
+            "external",
+            &all,
+        )
+        .await;
+        assert!(matches!(&r, Err(AtomError::Runtime(_))), "{r:?}");
+        assert_eq!(exec.calls(), ["open total", "run python3", "close total"]);
+        let (_, given) = &exec.opened()[0];
+        assert!(!given.scratch.as_ref().expect("scratch").exists());
+    });
 }

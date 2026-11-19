@@ -178,8 +178,12 @@ pub async fn open(
             defaults: AtomConfig::default(),
             artifacts: Artifacts::new(store.clone()),
             meter: atomic_core::usage::Metering::none(),
+            backend: exec.clone(),
         },
-        lite: LiteRuntime::new(endpoint, AtomConfig::default()),
+        lite: LiteRuntime {
+            backend: exec.clone(),
+            ..LiteRuntime::new(endpoint, AtomConfig::default())
+        },
         exec,
     });
     // A project in a git repository gets worktrees for its worktree steps.

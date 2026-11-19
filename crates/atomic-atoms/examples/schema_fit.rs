@@ -102,6 +102,7 @@ fn main() {
                         defaults: AtomConfig::default(),
                         artifacts: Artifacts::none(),
                         meter: atomic_core::usage::Metering::none(),
+                        backend: Default::default(),
                     };
                     let input = ChangeRequest {
                         request: (*request).to_owned(),

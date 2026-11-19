@@ -25,15 +25,9 @@ pub enum AtomKind {
     Exec,
 }
 
-/// The sandbox an atom's thread runs in.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Sandbox {
-    /// Read the workspace, write nothing.
-    #[default]
-    ReadOnly,
-    /// Write only inside the step's own worktree or scratch workspace.
-    WorkspaceWrite,
-}
+/// The sandbox an atom's thread runs in: the one its workspace is opened
+/// with on the execution backend.
+pub use atomic_exec::Sandbox;
 
 /// What happens to an approval the model asks for in the middle of a turn.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
