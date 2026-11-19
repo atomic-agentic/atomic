@@ -431,6 +431,10 @@ fn known_fields(doc: &Value, s: &Value) -> Vec<String> {
 /// return the result as JSON. Evaluation reads only those values: CEL has no
 /// side effects, so a workflow mapping can be evaluated again on replay and
 /// give the same answer.
+///
+/// This is the one place atomic evaluates CEL over JSON. Every caller, from
+/// workflow mappings to eval assertions, goes through it, so each sees the
+/// same conversion from JSON to CEL values ([`cel_value`]).
 pub fn evaluate(source: &str, values: &[(&str, &Value)]) -> Result<Value, String> {
     let program = cel::Program::compile(source).map_err(|e| e.to_string())?;
     let mut context = cel::Context::default();
@@ -445,10 +449,17 @@ pub fn evaluate(source: &str, values: &[(&str, &Value)]) -> Result<Value, String
         .map_err(|e| format!("`{source}` does not give a JSON value: {e}"))
 }
 
-/// `value` as a CEL value. Built by hand rather than through serde, which
-/// would turn a number into serde_json's private wrapper when its
-/// arbitrary-precision feature is on, as it is in this workspace.
-fn cel_value(value: &Value) -> cel::Value {
+/// `value` as a CEL value.
+///
+/// Built by hand rather than through serde (`Context::add_variable`):
+/// serde_json's `arbitrary_precision` feature is on in this workspace, and
+/// under it a number serializes as a private one-entry map, so `output.n >= 1`
+/// would fail to find an overload for a map and an int.
+///
+/// A number becomes an `int` when it fits in `i64`, else a `uint` when it fits
+/// in `u64`, else a `double`; an integer too large for both is a `double`,
+/// as it is in JavaScript.
+pub fn cel_value(value: &Value) -> cel::Value {
     match value {
         Value::Null => cel::Value::Null,
         Value::Bool(b) => cel::Value::Bool(*b),

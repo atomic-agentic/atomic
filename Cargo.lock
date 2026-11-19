@@ -511,7 +511,6 @@ dependencies = [
  "atomic-agentic-exec",
  "atomic-agentic-graph",
  "atomic-agentic-schema",
- "cel",
  "clap",
  "serde",
  "serde_json",
