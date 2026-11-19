@@ -579,6 +579,44 @@ impl Program {
         blocking(move || program.invoke(&action, args)).await
     }
 
+    /// Checks that every captured helper still has the digest it is recorded
+    /// under, so a damaged stored program fails instead of running code the
+    /// atom never captured.
+    pub fn verify_helpers(&self) -> Result<(), String> {
+        for (digest, captured) in &self.helpers {
+            if captured.digest() != *digest {
+                return Err(format!(
+                    "a captured helper of {} does not match its digest {digest}: the stored atom is damaged",
+                    self.file.display()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// What this program's helpers depend on besides their code: the helper
+    /// runtime and the compiler that interprets the atom. A run records it
+    /// when it starts; see [`crate::helper_runtime::identity`].
+    pub fn helper_runtime(&self) -> String {
+        Self::current_helper_runtime()
+    }
+
+    /// [`Program::helper_runtime`] for this build. Debug builds honour
+    /// `ATOMIC_TEST_HELPER_RUNTIME`, so tests can stand in for another
+    /// release; release builds ignore it.
+    pub fn current_helper_runtime() -> String {
+        if cfg!(debug_assertions)
+            && let Some(identity) = std::env::var_os("ATOMIC_TEST_HELPER_RUNTIME")
+        {
+            return identity.to_string_lossy().into_owned();
+        }
+        let mut digest = Sha256::new();
+        digest.update(crate::helper_runtime::identity().as_bytes());
+        digest.update([0]);
+        digest.update(COMPILER_HASH.as_bytes());
+        format!("{:x}", digest.finalize())
+    }
+
     /// A stable fingerprint of the entry and all component bytes.
     pub fn hash(&self) -> String {
         let mut digest = Sha256::new();

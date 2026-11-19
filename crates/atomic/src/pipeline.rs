@@ -160,6 +160,11 @@ pub struct Pinned {
     pub snapshot: String,
     /// The SHA-256 of each file, by path.
     pub files: BTreeMap<String, String>,
+    /// The helper runtime the run started on (see
+    /// `atomic_core::astro::Program::helper_runtime`). A step whose atom
+    /// captures helpers runs only on the same one.
+    #[serde(default)]
+    pub helper_runtime: Option<String>,
 }
 
 /// One run of a pipeline.
@@ -402,7 +407,8 @@ async fn run_pipeline<C: WorkflowContext>(
         serde_json::to_vec(&pipeline).map_err(|e| failed(format!("encode the pipeline: {e}")))?;
     let files = pipeline.pins.clone();
     let run_id = ctx.workflow_id().to_owned();
-    let _pinned: Pinned = ctx
+    let helper_runtime = atomic_core::astro::Program::current_helper_runtime();
+    let pinned: Pinned = ctx
         .step("pin", move |_| async move {
             let manifest = tokio::task::spawn_blocking(move || {
                 store.put(
@@ -422,6 +428,7 @@ async fn run_pipeline<C: WorkflowContext>(
             Ok(Pinned {
                 snapshot: manifest.artifact.to_string(),
                 files,
+                helper_runtime: Some(helper_runtime),
             })
         })
         .await?;
@@ -458,6 +465,21 @@ async fn run_pipeline<C: WorkflowContext>(
         // so its helpers render the same prompt and reach the same validator
         // decisions after a crash.
         if !atom.program.helpers.is_empty() {
+            // The run's helpers run only as recorded, on the runtime the run
+            // started on; anything else is refused rather than recaptured.
+            atom.program
+                .verify_helpers()
+                .map_err(|e| failed(format!("step `{}`: {e}", step.id)))?;
+            let now = atomic_core::astro::Program::current_helper_runtime();
+            if pinned.helper_runtime.as_deref() != Some(now.as_str()) {
+                return Err(failed(format!(
+                    "step `{}`: this run started on another helper runtime ({}), and its helpers \
+                     cannot resume on this one ({now}); their behaviour could differ from what the \
+                     run already recorded. Start a new run",
+                    step.id,
+                    pinned.helper_runtime.as_deref().unwrap_or("not recorded"),
+                )));
+            }
             let clock: StepClock = ctx
                 .step(&format!("{}.clock", step.id), |_| async {
                     StepClock::fresh().map_err(|e| failed(format!("the step's clock: {e}")))

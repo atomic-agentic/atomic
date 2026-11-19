@@ -104,7 +104,9 @@ export async function captureHelper(root, entry, from, state) {
     modules[url] = output.outputText.replace(/\n\/\/# sourceMappingURL=.*$/, '\n');
     maps[url] = { file, map: output.sourceMapText };
   }
-  const artifact = { entry: urlOf(root, first), modules };
+  // Modules in URL order, as the host's digest check orders them.
+  const ordered = Object.fromEntries(Object.entries(modules).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
+  const artifact = { entry: urlOf(root, first), modules: ordered };
   const digest = createHash('sha256').update(JSON.stringify(artifact)).digest('hex');
   const captured = { digest, artifact, maps, typeImports: [...typeImports] };
   state.cache.set(first, captured);

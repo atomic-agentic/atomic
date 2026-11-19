@@ -35,6 +35,31 @@ use std::time::Duration;
 /// The URL scheme captured modules are keyed by.
 pub const SCHEME: &str = "atomic-helper";
 
+/// The version of the helper-call semantics: the wrapper, JSON marshalling
+/// and failure kinds. Changing what a helper observes changes this.
+const SEMANTICS: &str = "atomic-helper-call-1";
+
+/// What a helper's behaviour depends on besides its own code: the engine
+/// (deno_core and V8), the prelude (host functions, stripped globals, the
+/// virtual clock) and the call semantics. A run that recorded another
+/// identity cannot resume its helper steps on this runtime.
+pub fn identity() -> String {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    for part in [
+        SEMANTICS,
+        "deno_core 0.413.0",
+        deno_core::v8::VERSION_STRING,
+        HOST,
+        STRIP,
+        CLOCK,
+    ] {
+        digest.update(part.as_bytes());
+        digest.update([0]);
+    }
+    format!("{:x}", digest.finalize())
+}
+
 /// A captured helper module graph, already transpiled to JavaScript.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Captured {
@@ -42,6 +67,25 @@ pub struct Captured {
     pub modules: BTreeMap<String, String>,
     /// The URL of the module whose exports are called.
     pub entry: String,
+}
+
+impl Captured {
+    /// The capture's digest, as the compiler computes it: SHA-256 of
+    /// `{"entry":…,"modules":{…}}` with the modules in key order.
+    pub fn digest(&self) -> String {
+        use sha2::{Digest, Sha256};
+        #[derive(serde::Serialize)]
+        struct Canonical<'a> {
+            entry: &'a str,
+            modules: &'a BTreeMap<String, String>,
+        }
+        let text = serde_json::to_string(&Canonical {
+            entry: &self.entry,
+            modules: &self.modules,
+        })
+        .unwrap_or_default();
+        format!("{:x}", Sha256::digest(text.as_bytes()))
+    }
 }
 
 /// The limits on one helper call.

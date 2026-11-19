@@ -404,3 +404,15 @@ fn a_local_template_literal_around_a_helper_keeps_provenance() {
         "{error}"
     );
 }
+
+#[test]
+fn a_damaged_capture_is_refused() {
+    let dir = helper_project("{label(input.text)}", "{}", REVIEW);
+    let mut atom = loaded(&dir).expect("loads");
+    atom.program.verify_helpers().expect("as captured");
+    let captured = atom.program.helpers.values_mut().next().expect("capture");
+    let module = captured.modules.values_mut().next().expect("module");
+    module.push_str("\nexport const injected = 1;\n");
+    let error = atom.program.verify_helpers().expect_err("damaged");
+    assert!(error.contains("does not match its digest"), "{error}");
+}

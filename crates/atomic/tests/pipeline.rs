@@ -615,6 +615,10 @@ fn pipeline_child() {
                     pipeline: load(&project, "sent.workflow.yaml", &sent()),
                     input: json!({"text": "Exporting a file named café.txt crashes the app."}),
                 },
+                "start-marked" => PipelineRun {
+                    pipeline: load(&project, "marked.workflow.yaml", MARKED),
+                    input: json!({"text": "Exporting a file named café.txt crashes the app."}),
+                },
                 "start-stamped" => PipelineRun {
                     pipeline: load(&project, "stamped.workflow.yaml", STAMPED),
                     input: json!({"text": "Exporting a file named café.txt crashes the app."}),
@@ -655,7 +659,7 @@ fn child(
     run: &str,
     failpoint: Option<&str>,
 ) -> std::process::ExitStatus {
-    child_in(dir, url, role, run, failpoint, "UTC")
+    child_in(dir, url, role, run, failpoint, "UTC", &[])
 }
 
 /// As [`child`], with the child process's timezone set to `zone`.
@@ -666,9 +670,13 @@ fn child_in(
     run: &str,
     failpoint: Option<&str>,
     zone: &str,
+    env: &[(&str, &str)],
 ) -> std::process::ExitStatus {
     let mut cmd = std::process::Command::new(std::env::current_exe().expect("this test binary"));
-    cmd.env("TZ", zone);
+    cmd.env("TZ", zone).env_remove("ATOMIC_TEST_HELPER_RUNTIME");
+    for (name, value) in env {
+        cmd.env(name, value);
+    }
     cmd.args(["--exact", "pipeline_child", "--ignored", "--nocapture"])
         .env(ENV_ROLE, role)
         .env(ENV_RUN, run)
@@ -1538,6 +1546,7 @@ fn a_retried_step_gives_its_helpers_the_clock_it_recorded() {
                 "stamped-1",
                 Some("pipeline:ran:stamp"),
                 "Asia/Kolkata",
+                &[],
             )
         })
         .await
@@ -1552,7 +1561,15 @@ fn a_retried_step_gives_its_helpers_the_clock_it_recorded() {
             .expect("fake model");
         let (d, u) = (dir.clone(), second.base_url());
         let status = tokio::task::spawn_blocking(move || {
-            child_in(&d, &u, "recover", "stamped-1", None, "America/Los_Angeles")
+            child_in(
+                &d,
+                &u,
+                "recover",
+                "stamped-1",
+                None,
+                "America/Los_Angeles",
+                &[],
+            )
         })
         .await
         .expect("child");
@@ -1590,5 +1607,155 @@ fn a_retried_step_gives_its_helpers_the_clock_it_recorded() {
         rt.shutdown(std::time::Duration::from_secs(5))
             .await
             .expect("shutdown");
+    });
+}
+
+/// Two atoms that share one helper: the first labels the note, the second
+/// labels the first's title.
+fn marked(project: &Path, version: &str) {
+    let atoms = project.join("atoms");
+    std::fs::create_dir_all(atoms.join("helpers")).expect("helpers");
+    std::fs::write(
+        atoms.join("helpers/mark.ts"),
+        format!("export const mark = (text: string): string => `MARK-{version} ${{text}}`;\n"),
+    )
+    .expect("helper");
+    for (name, field) in [("mark-note", "text"), ("mark-title", "title")] {
+        std::fs::write(
+            atoms.join(format!("{name}.atom.astro")),
+            format!(
+                "---\nimport type {{ Props, Input, Output }} from '../.atomic/types/{name}';\n\
+                 import type {{ AtomConfig }} from '../.atomic/types/authoring';\n\
+                 import {{ mark }} from './helpers/mark';\n\
+                 const {{ input }}: Props = Astro.props;\n\
+                 export const config: AtomConfig<Input, Output> = {{ description: '{name}' }};\n\
+                 ---\nLabel: {{mark('literal')}}\nTitle the note.\nNote: {{input.{field}}}\n"
+            ),
+        )
+        .expect("atom");
+        for (role, schema) in [
+            ("input", object(json!({ field: {"type": "string"} }))),
+            ("output", object(json!({"title": {"type": "string"}}))),
+        ] {
+            std::fs::write(
+                atoms.join(format!("{name}.{role}.schema.json")),
+                schema.to_string(),
+            )
+            .expect("schema");
+        }
+    }
+}
+
+const MARKED: &str = "\
+atomic: 1
+name: marked
+input: { $ref: ../atoms/mark-note.input.schema.json }
+output: { $ref: ../atoms/mark-title.output.schema.json }
+steps:
+  first:
+    atom: mark-note
+    with: { text: input.text }
+  second:
+    after: [first]
+    atom: mark-title
+    with: { title: steps.first.output.title }
+returns: steps.second.output
+";
+
+// A helper edited while a run waits for recovery changes neither the step
+// that was running nor a later one: both run the helpers the run captured.
+#[test]
+fn a_helper_edited_mid_run_does_not_change_the_run_in_flight() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![
+            Reply::Text(r#"{"title": "one"}"#.into()),
+            Reply::Text(r#"{"title": "one"}"#.into()),
+            Reply::Text(r#"{"title": "two"}"#.into()),
+        ])
+        .await
+        .expect("fake model");
+        let dir = scratch("marked");
+        let project = project(&dir);
+        marked(&project, "v1");
+        let url = model.base_url();
+        let (d, u) = (dir.clone(), url.clone());
+        let status = tokio::task::spawn_blocking(move || {
+            child(
+                &d,
+                &u,
+                "start-marked",
+                "marked-1",
+                Some("pipeline:ran:first"),
+            )
+        })
+        .await
+        .expect("child");
+        assert!(!status.success(), "the first process was killed: {status}");
+        assert_eq!(model.calls(), 1);
+
+        marked(&project, "v2");
+        let (d, u) = (dir.clone(), url.clone());
+        let status =
+            tokio::task::spawn_blocking(move || child(&d, &u, "recover", "marked-1", None))
+                .await
+                .expect("child");
+        assert!(status.success(), "the second process finished: {status}");
+        assert_eq!(
+            model.calls(),
+            3,
+            "the first step's turn ran again, then the second"
+        );
+        for (i, request) in model.requests().iter().enumerate() {
+            let text = request.to_string();
+            assert!(
+                text.contains("MARK-v1 literal") && !text.contains("MARK-v2"),
+                "request {i}: {text}"
+            );
+        }
+    });
+}
+
+// A run that started on another helper runtime does not resume its helper
+// steps on this one: they could behave differently from what it recorded.
+#[test]
+fn a_run_started_on_another_helper_runtime_is_refused() {
+    on_codex_runtime(async {
+        let dir = scratch("runtime");
+        let project = project(&dir);
+        stamped(&project);
+        let first = FakeModel::start(stamped_replies())
+            .await
+            .expect("fake model");
+        let (d, u) = (dir.clone(), first.base_url());
+        let status = tokio::task::spawn_blocking(move || {
+            child_in(
+                &d,
+                &u,
+                "start-stamped",
+                "runtime-1",
+                Some("pipeline:ran:stamp"),
+                "UTC",
+                &[("ATOMIC_TEST_HELPER_RUNTIME", "an-earlier-release")],
+            )
+        })
+        .await
+        .expect("child");
+        assert!(!status.success(), "the first process was killed: {status}");
+
+        let second = FakeModel::start(stamped_replies())
+            .await
+            .expect("fake model");
+        let (d, u) = (dir.clone(), second.base_url());
+        let status =
+            tokio::task::spawn_blocking(move || child(&d, &u, "recover", "runtime-1", None))
+                .await
+                .expect("child");
+        assert!(status.success(), "the recovering process ended: {status}");
+        let error = std::fs::read_to_string(dir.join("error.txt")).expect("the run failed");
+        assert!(
+            error.contains("another helper runtime (an-earlier-release)"),
+            "{error}"
+        );
+        assert_eq!(second.calls(), 0, "the step did not run on this runtime");
     });
 }

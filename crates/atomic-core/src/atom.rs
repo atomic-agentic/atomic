@@ -438,6 +438,7 @@ pub fn load(file: &Path, registry: &mut Registry) -> Result<Atom, AtomError> {
                 .map_err(|e| fail(1, "body", e.to_string()))?,
         },
     };
+    program.verify_helpers().map_err(|e| fail(1, "body", e))?;
     let mut schemas = serde_json::Map::new();
     for (key, id) in [("Input", &input), ("Output", &output)] {
         schemas.insert(
