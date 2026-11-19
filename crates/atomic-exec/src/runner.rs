@@ -334,6 +334,16 @@ impl ProcessRunner {
 }
 
 impl ExecutionBackend for ProcessRunner {
+    /// Its runners run on this machine, so a workspace is opened here, as
+    /// [`LocalBackend`] opens one, and each command a runner runs finds it.
+    fn open(&self, request: &crate::Open) -> Result<crate::Workspace, ExecError> {
+        LocalBackend.open(request)
+    }
+
+    fn close(&self, workspace: &crate::Workspace) -> Result<(), ExecError> {
+        LocalBackend.close(workspace)
+    }
+
     fn run(&self, command: &Command) -> Result<Completed, ExecError> {
         let request = serde_json::to_vec(&Request::new(command)).map_err(|e| ExecError::Io {
             program: command.program.clone(),
