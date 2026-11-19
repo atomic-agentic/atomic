@@ -42,9 +42,15 @@ fn copy_tree(source: &Path, destination: &Path) {
 }
 
 /// A copy of `example` outside the repository, so `atomic check` writes its
-/// generated declarations there.
+/// generated declarations there. Each call gets its own directory: tests
+/// that copy the same example run in parallel in one process.
 fn copy(example: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("atomic-example-{example}-{}", std::process::id()));
+    static COPIES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "atomic-example-{example}-{}-{n}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&dir);
     copy_tree(&repository().join("examples").join(example), &dir);
     dir
