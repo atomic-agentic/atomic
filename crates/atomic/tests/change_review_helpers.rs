@@ -240,6 +240,7 @@ fn the_workflow_runs_and_a_helper_validator_asks_for_one_repair() {
                 deployment,
                 worktrees: None,
                 budgets: Arc::default(),
+                context: None,
             },
         );
         rt.launch().await.expect("launch");

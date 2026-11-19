@@ -233,6 +233,17 @@ async fn engine(dir: &Path, base_url: &str) -> Durare {
             deployment: local(),
             worktrees,
             budgets: Arc::default(),
+            // A child process started for a contextual run gets its settings here.
+            context: std::env::var_os("ATOMIC_TEST_CONTEXT_SETTINGS").map(|path| {
+                atomic_core::context::DispatchSettings {
+                    settings: serde_json::from_str(
+                        &std::fs::read_to_string(path).expect("settings"),
+                    )
+                    .expect("settings JSON"),
+                    profile: Some("test".into()),
+                    project: json!({"id": "notes-1", "name": "notes"}),
+                }
+            }),
         },
     );
     rt.launch().await.expect("launch");
@@ -635,6 +646,10 @@ fn pipeline_child() {
                 "start-sent" => PipelineRun {
                     pipeline: load(&project, "sent.workflow.yaml", &sent()),
                     input: json!({"text": "Exporting a file named café.txt crashes the app."}),
+                },
+                "start-context" => PipelineRun {
+                    pipeline: load(&project, "context.workflow.yaml", CONTEXT),
+                    input: json!({"text": "When does support open?"}),
                 },
                 "start-marked" => PipelineRun {
                     pipeline: load(&project, "marked.workflow.yaml", MARKED),
@@ -1986,5 +2001,156 @@ fn another_run_gets_another_effect_key_and_atoms_cannot_set_it() {
         .expect("atom");
         let error = atomic_core::atom::load(&atom, &mut Registry::new()).expect_err("refused");
         assert!(error.message.contains("set by atomic"), "{error}");
+    });
+}
+
+/// Example 12's contextual atom, in the project.
+fn context_atom(project: &Path) {
+    let example =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/12-execution-context/atoms");
+    for name in [
+        "context-reply.atom.astro",
+        "context-reply.input.schema.yaml",
+        "context-reply.output.schema.yaml",
+        "context-reply.context.schema.yaml",
+    ] {
+        std::fs::copy(example.join(name), project.join("atoms").join(name)).expect("copy");
+    }
+}
+
+const CONTEXT: &str = "\
+atomic: 1
+name: contextual
+input: { $ref: ../atoms/context-reply.input.schema.yaml }
+output: { $ref: ../atoms/context-reply.output.schema.yaml }
+steps:
+  reply:
+    atom: context-reply
+    with: { text: input.text }
+returns: steps.reply.output
+";
+
+fn settings_file(dir: &Path, organization: &str) -> PathBuf {
+    let example = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/12-execution-context/context.settings.json");
+    let text = std::fs::read_to_string(example)
+        .expect("settings")
+        .replace("Example Support", organization);
+    let file = dir.join("context.settings.json");
+    std::fs::write(&file, text).expect("settings");
+    file
+}
+
+// A step's public context is resolved once and recorded: after a crash, with
+// the settings and the environment changed, the retried step renders the
+// context it recorded, bound to its own step.
+#[test]
+fn a_retried_step_keeps_the_context_it_recorded() {
+    on_codex_runtime(async {
+        let reply = || Reply::Text(r#"{"reply": "Support opens at 9am."}"#.into());
+        let first = FakeModel::start(vec![reply()]).await.expect("fake model");
+        let dir = scratch("context");
+        let project = project(&dir);
+        context_atom(&project);
+        let settings = settings_file(&dir, "Example Support");
+        let (d, u, s) = (
+            dir.clone(),
+            first.base_url(),
+            settings.display().to_string(),
+        );
+        let status = tokio::task::spawn_blocking(move || {
+            child_in(
+                &d,
+                &u,
+                "start-context",
+                "context-1",
+                Some("pipeline:ran:reply"),
+                "UTC",
+                &[
+                    ("ATOMIC_TEST_CONTEXT_SETTINGS", &s),
+                    ("SUPPORT_REGION", "eu-west"),
+                ],
+            )
+        })
+        .await
+        .expect("child");
+        assert!(!status.success(), "the first process was killed: {status}");
+        let asked = first.requests()[0].to_string();
+        for seen in ["Example Support", "eu-west", "en-GB", "context-1", "reply"] {
+            assert!(asked.contains(seen), "{seen}: {asked}");
+        }
+
+        // The settings and the environment change before recovery.
+        let settings = settings_file(&dir, "Renamed Support");
+        let second = FakeModel::start(vec![reply()]).await.expect("fake model");
+        let (d, u, s) = (
+            dir.clone(),
+            second.base_url(),
+            settings.display().to_string(),
+        );
+        let status = tokio::task::spawn_blocking(move || {
+            child_in(
+                &d,
+                &u,
+                "recover",
+                "context-1",
+                None,
+                "UTC",
+                &[
+                    ("ATOMIC_TEST_CONTEXT_SETTINGS", &s),
+                    ("SUPPORT_REGION", "us-east"),
+                ],
+            )
+        })
+        .await
+        .expect("child");
+        assert!(status.success(), "the second process finished: {status}");
+        assert!(
+            dir.join("result.json").exists(),
+            "{:?}",
+            std::fs::read_to_string(dir.join("error.txt"))
+        );
+        assert_eq!(
+            second.requests()[0].to_string(),
+            asked,
+            "the retry rendered the recorded context"
+        );
+    });
+}
+
+// A contextual atom in a run without context settings is refused before its
+// model is called.
+#[test]
+fn a_contextual_step_without_settings_is_refused() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(Vec::new()).await.expect("fake model");
+        let dir = scratch("no-context");
+        let project = project(&dir);
+        context_atom(&project);
+        let pipeline = load(&project, "context.workflow.yaml", CONTEXT);
+        let rt = engine(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "no-context-1",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "hi"}),
+            },
+        )
+        .await
+        .expect("start");
+        let error = rt
+            .result::<Value>("no-context-1")
+            .await
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            error.contains("reads a public context") && error.contains("no context settings"),
+            "{error}"
+        );
+        assert_eq!(model.calls(), 0);
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
     });
 }

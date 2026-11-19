@@ -551,6 +551,36 @@ async fn run_pipeline<C: WorkflowContext>(
             runtimes.clock = Some(clock);
         }
         let run_id = ctx.workflow_id().to_owned();
+        // An atom with a public context gets it from a step of its own,
+        // resolved once from the run's settings and read back on every retry.
+        let snapshot = if atom.context.is_some() {
+            let settings = services.context.clone().ok_or_else(|| {
+                failed(format!(
+                    "step `{}` runs `{}`, which reads a public context, and this run has no \
+                     context settings",
+                    step.id, atom.name
+                ))
+            })?;
+            let (resolving, run, id) = (atom.clone(), run_id.clone(), step.id.clone());
+            let recorded: Value = ctx
+                .step(&format!("{}.context", step.id), move |_| async move {
+                    tokio::task::spawn_blocking(move || {
+                        atomic_core::context::resolve_for_step(&resolving, &run, &id, &settings)
+                            .map(|snapshot| snapshot.as_value().clone())
+                    })
+                    .await
+                    .map_err(|e| failed(format!("resolve the context: {e}")))?
+                    .map_err(|e| failed(format!("resolve the context: {e}")))
+                })
+                .await?;
+            Some(
+                atomic_core::context::ContextSnapshot::restore(&atom, &run_id, recorded).map_err(
+                    |e| failed(format!("step `{}`: its recorded context: {e}", step.id)),
+                )?,
+            )
+        } else {
+            None
+        };
         let atom_input = Value::Object(mapped);
         let (budget, atom_caps) = (budget.clone(), caps.get(&step.atom).cloned());
         let tree = if step.worktree {
@@ -613,14 +643,21 @@ async fn run_pipeline<C: WorkflowContext>(
                 let proposal = match tree {
                     None => {
                         propose(async move {
-                            run_in(&atom, &atom_input, &origins, &run_id, &id, &runtimes).await
+                            run_in(&atom, &atom_input, &origins, &run_id, &id, snapshot.as_ref(), &runtimes)
+                                .await
                         })
                             .await
                     }
                     Some((worktrees, request)) => {
                         let runtimes = Arc::new(runtimes);
-                        in_worktree(worktrees, request, atom, atom_input, origins, run_id, runtimes)
-                            .await
+                        let call = StepCall {
+                            atom,
+                            input: atom_input,
+                            origins,
+                            snapshot,
+                            run_id,
+                        };
+                        in_worktree(worktrees, request, call, runtimes).await
                     }
                 }?;
                 failpoint(&ran);
@@ -670,6 +707,7 @@ async fn run_in(
     origins: &BTreeMap<String, String>,
     run_id: &str,
     step: &str,
+    snapshot: Option<&atomic_core::context::ContextSnapshot>,
     runtimes: &Runtimes,
 ) -> std::result::Result<(Value, atomic_core::runtime::RunMetadata), AtomError> {
     let mut registry = Registry::new();
@@ -689,24 +727,41 @@ async fn run_in(
             origins: Some(origins),
             step: Some(step),
         },
-        None,
+        snapshot.map(|snapshot| atomic_core::runtime::DispatchContext {
+            snapshot,
+            step_id: step,
+        }),
         runtimes,
     )
     .await
 }
 
-/// Run `atom` in its step's worktree, reset to the step's base, and commit
+/// What one step dispatches: its atom, its mapped input with each field's
+/// origin, its recorded public context, and its run.
+struct StepCall {
+    atom: Atom,
+    input: Value,
+    origins: BTreeMap<String, String>,
+    snapshot: Option<atomic_core::context::ContextSnapshot>,
+    run_id: String,
+}
+
+/// Run a step's atom in its worktree, reset to the step's base, and commit
 /// what it left. The commit is recorded in the step's metadata by atomic,
 /// over anything the atom reported.
 async fn in_worktree(
     worktrees: Arc<Worktrees>,
     request: StepRequest,
-    atom: Atom,
-    input: Value,
-    origins: BTreeMap<String, String>,
-    run_id: String,
+    call: StepCall,
     runtimes: Arc<Runtimes>,
 ) -> Result<Proposal> {
+    let StepCall {
+        atom,
+        input,
+        origins,
+        snapshot,
+        run_id,
+    } = call;
     let step = request.step.clone();
     let ((output, metadata), commit) = contained(async move {
         let subdirectory = source_subdirectory(runtimes.codex.cwd.clone()).await?;
@@ -714,7 +769,16 @@ async fn in_worktree(
             .run_step(request, |tree| async move {
                 let mut here = (*runtimes).clone();
                 here.codex.cwd = tree.join(subdirectory);
-                run_in(&atom, &input, &origins, &run_id, &step, &here).await
+                run_in(
+                    &atom,
+                    &input,
+                    &origins,
+                    &run_id,
+                    &step,
+                    snapshot.as_ref(),
+                    &here,
+                )
+                .await
             })
             .await
             .map_err(|e| match e {
@@ -821,6 +885,9 @@ pub struct Services {
     pub worktrees: Option<Arc<Worktrees>>,
     /// The budget settings every run's model calls are metered under.
     pub budgets: Arc<BudgetSettings>,
+    /// The public context settings a step whose atom declares a context is
+    /// resolved from, once per run and step; `None` refuses such a step.
+    pub context: Option<atomic_core::context::DispatchSettings>,
 }
 
 /// Register `run_pipeline` on `rt`, metering model calls against `rt`'s

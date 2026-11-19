@@ -201,6 +201,7 @@ async fn engine(dir: &Path, project: &Path, base_url: &str) -> Durare {
             deployment: local(),
             worktrees: Some(Arc::new(Worktrees::new(repo, dir.join("state/worktrees")))),
             budgets: Arc::default(),
+            context: None,
         },
     );
     rt.launch().await.expect("launch");

@@ -277,9 +277,13 @@ content, so formatting on save is disabled in the repository's Astro settings.
 Public context separates `profile`, `config`, `env`, `run`, `step` and `project`.
 Only declared public environment names are read; secret-marked declarations fail.
 Context is readonly in generated types and verified on restore. Direct invocation
-can checkpoint it outside the source tree and rebind the current step. Integration
-with workflow-level durable dispatch is tracked separately; a file checkpoint is
-not a workflow transaction.
+can checkpoint it outside the source tree and rebind the current step. In a
+workflow, a step whose atom declares a context resolves it once, from the
+context settings the workflow runs with, in a durable step of its own; a
+retried step restores that record, checked against the atom's compiled version,
+the run and the context contract, and never reads settings or environment again.
+A contextual step in a run without context settings is refused before its model
+is called.
 
 ### Context schemas
 
