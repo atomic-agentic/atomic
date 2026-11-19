@@ -71,6 +71,7 @@ fn runtimes(dir: &Path, base_url: &str) -> Arc<Runtimes> {
             meter: atomic_core::usage::Metering::none(),
         },
         lite: LiteRuntime::new(endpoint, AtomConfig::default()),
+        clock: None,
     })
 }
 

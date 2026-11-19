@@ -268,7 +268,7 @@ fn a_reference_to_a_missing_place_in_a_file_fails_the_load() {
 /// An atom and a component that import the shared `Change` type from
 /// `schemas/change.schema.json`, which references `schemas/tier.schema.json`.
 /// The input schema is inline, so the shared schemas supply types only.
-fn shared_types_project(component_body: &str) -> PathBuf {
+pub(crate) fn shared_types_project(component_body: &str) -> PathBuf {
     let dir = project("", "{}", None);
     std::fs::write(
         dir.join("test.atom.astro"),
@@ -391,4 +391,66 @@ fn a_schema_cannot_replace_the_atom_declarations() {
     .expect("schema");
     let error = load(&dir.join("test.atom.astro"), &mut Registry::new()).expect_err("collision");
     assert!(error.message.contains("rename the schema file"), "{error}");
+}
+
+// A mermaid fence's braces and tags are diagram text: they pass the type
+// check and reach the prompt unchanged.
+#[test]
+fn a_mermaid_fence_checks_and_renders_as_text() {
+    let (atom, registry) = checked(
+        "Route it as drawn.\n```mermaid\nflowchart TD\n  A[Ticket] --> B{Urgent?}\n  B --> C<page>\n```\nNote: {input.text}",
+    );
+    let compiled = crate::compile::compile(&atom, &registry).expect("compiles");
+    let out = crate::render::render(
+        &compiled,
+        &crate::render::RunInput {
+            run_id: "run-1",
+            input: &json!({"text": "hello"}),
+            frontmatter: &atom.frontmatter,
+            origin: "external",
+            origins: None,
+            step: None,
+        },
+    )
+    .expect("renders");
+    assert!(
+        out.developer
+            .contains("A[Ticket] --> B{Urgent?}\n  B --> C<page>"),
+        "{}",
+        out.developer
+    );
+}
+
+// Loops are `map` over a list and partials are components with declared
+// props: a loop over a value that is not a list, and a component given a
+// prop it does not declare, both fail the check before any model call.
+#[test]
+fn a_loop_over_a_non_list_and_an_undeclared_component_prop_fail_the_check() {
+    let root = project(
+        "{input.text.map((x) => <Fragment>{x}</Fragment>)}",
+        "{}",
+        None,
+    );
+    let error = load(&root.join("test.atom.astro"), &mut Registry::new()).expect_err("not a list");
+    assert!(error.message.contains("TS2339"), "{error}");
+    let component = "---\ninterface Props { strict: boolean }\nconst { strict }: Props = Astro.props;\n---\n{strict ? <Fragment>Follow every rule.</Fragment> : null}\n<slot />\n";
+    let root = project(
+        "<Style strict={true} tone=\"warm\">Be brief.</Style>",
+        "{}",
+        Some(component),
+    );
+    let error =
+        load(&root.join("test.atom.astro"), &mut Registry::new()).expect_err("undeclared prop");
+    assert!(
+        error.message.contains("TS2322") && error.message.contains("tone"),
+        "{error}"
+    );
+    // Declared props and a list loop check, and the loop renders one block
+    // per element.
+    let root = project(
+        "<Style strict={true}>Be brief.</Style>\n{input.text}",
+        "{}",
+        Some(component),
+    );
+    load(&root.join("test.atom.astro"), &mut Registry::new()).expect("declared props");
 }

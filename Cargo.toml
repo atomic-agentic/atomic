@@ -57,9 +57,13 @@ serde_json = "1"
 sha2 = "0.10"
 hmac = "0.12.1"
 getrandom = "0.3.4"
+libc = "0.2.186"
 # The same sqlx Codex and the durare fork use (the patch block pins its source).
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite-bundled"] }
 tokio = { version = "1", default-features = false }
+# The embedded V8 isolate captured TypeScript helpers run in: deno_core alone,
+# without deno_runtime's I/O extensions (deps/README.md, "One V8").
+deno_core = { version = "=0.413.0", features = ["v8", "v8_use_custom_libcxx"] }
 
 # Codex, at the revision in deps/codex.toml (scripts/codex-pin.sh checks it).
 # Only atomic-core may depend on these.

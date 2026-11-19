@@ -2,7 +2,7 @@
 
 # Prompt syntax
 
-The body of an `.atom.astro` file is the prompt. atomic parses it with the Astro parser and interprets a small, TypeScript-shaped subset; it never runs it as JavaScript. Whitespace is prompt text. Examples show only the frontmatter lines they add to the standard imports and `Props` binding in fields.md. Every example below compiles with `atomic check`, against an input with `text` (string), `items` (string list), `urgent` (boolean) and an optional `extra.note` (string), and an output with `summary` (string) and `labels` (string list).
+The body of an `.atom.astro` file is the prompt. atomic parses it with the Astro parser and interprets a small, TypeScript-shaped subset; it never runs it as JavaScript. Only the TypeScript helpers an atom imports run, in an isolated runtime. Whitespace is prompt text. Examples show only the frontmatter lines they add to the standard imports and `Props` binding in fields.md. Every example below compiles with `atomic check`, against an input with `text` (string), `items` (string list), `urgent` (boolean) and an optional `extra.note` (string), and an output with `summary` (string) and `labels` (string list).
 
 ## Interpolate a value
 
@@ -98,6 +98,60 @@ const { strict }: Props = Astro.props;
 <slot />
 ```
 
+## Compute a value in the frontmatter
+
+A `const` binds an interpreted expression, evaluated when the prompt renders; a template literal builds a string. A value computed from input is still data, never instructions.
+
+```astro
+---
+const count = input.items.length;
+const heading = `${count} items to summarize`;
+---
+{heading}
+Note: {input.text}
+```
+
+## Fill a named slot
+
+A component renders `<slot name="rules">` with fallback text; the caller fills it with a direct child that names it. `Astro.slots.has('rules')` tells the component whether the caller did.
+
+```astro
+---
+import Layout from './Layout.astro';
+---
+<Layout>
+<Fragment slot="rules">Keep the summary short.</Fragment>
+Summarize: {input.text}
+</Layout>
+```
+
+`Layout.astro`:
+
+```astro
+---
+---
+<rules><slot name="rules">Use the team's default rules.</slot></rules>
+<slot />
+```
+
+## Call a TypeScript helper
+
+A named import of a local `.ts` module, written without the extension, is a helper. Each call runs in an isolate that sees only its arguments: no network, files, environment or host clock. Its result is as trusted as its least trusted argument; one computed from literals alone may be instructions.
+
+```astro
+---
+import { shorten } from './text';
+---
+Start from: {shorten(input.text, 40)}
+```
+
+`text.ts`:
+
+```ts
+export const shorten = (text: string, limit: number): string =>
+  text.length > limit ? `${text.slice(0, limit)}...` : text;
+```
+
 ## Check the answer with a validator
 
 `validate` holds arrow functions over `{input, output}` returning a boolean.
@@ -138,9 +192,10 @@ Summarize: {input.text}
 - Calling a method that is not `map`, `filter`, `some` or `every`, as in `{input.text.toUpperCase()}`. `atomic check` reports "unsupported expression: CallExpression". Write the instruction in prose ("in capitals"), or compute the value in an `exec` atom.
 - A block-bodied callback, as in `{input.items.map(item => { return item; })}`. `atomic check` reports "callback requires one plain parameter and a synchronous expression body". Use an expression body: `item => <Fragment>{item}</Fragment>`.
 - Literal braces in prose, as in `Reply with {placeholder} filled in.`. `atomic check` reports "Cannot find name 'placeholder'". Escape them: `&#123;placeholder&#125;`.
-- A `<script>` or `<style>` element, as in `<script>console.log(1)</script>`. `atomic check` reports "unsupported/reserved element script". Atoms never run code in the prompt. Move logic to an `exec` atom.
+- A `<script>` or `<style>` element, as in `<script>console.log(1)</script>`. `atomic check` reports "unsupported/reserved element script". Atoms never run code in the prompt. Put pure logic in a TypeScript helper, and anything that reads or changes the world in an `exec` atom.
 - A runtime global, as in `{JSON.stringify(input)}`. `atomic check` reports "unsupported expression: CallExpression". Interpolate the fields you need, `{input.text}`.
 - A continued optional chain, as in `{input.extra?.note.length}`. `atomic check` reports "continued optional chains are unsupported". Read the optional value last and fall back: `{input.extra?.note ?? ''}`.
-- A statement in the frontmatter, as in `const today = new Date();`. `atomic check` reports "script values must be config or destructured Astro.props". The frontmatter holds imports, the `Props` binding and `config` only.
+- Reading the clock in the frontmatter, as in `const today = new Date();`. `atomic check` reports "unsupported expression: NewExpression". Frontmatter is interpreted, not run. Pass the date as input, or compute it in a helper, which sees the step's recorded time.
+- A package import, as in `import { z } from 'zod';`. `atomic check` reports "named imports of local .ts helpers are supported". Import local `.astro` components and `.ts` helpers only; packages are not available yet.
 - A validator written as a CEL string, as in `export const config = { validate: ['output.summary.size() > 0'] };`. `atomic check` reports "validate requires interpreted typed callbacks, not CEL strings". Write an arrow function: `({output}) => output.summary.length > 0`. CEL is for eval-case `expect` lines.
 - A field the input schema does not declare, as in `Title: {input.title}`. `atomic check` reports "Property 'title' does not exist on type 'Input'". Read only declared fields, or add the field to the input schema.

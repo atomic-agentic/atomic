@@ -1,0 +1,52 @@
+# V8 builds in Cargo.lock. Two V8 builds cannot be linked into one binary, so
+# Cargo.lock may hold at most one V8 binding crate version that is built. scripts/lock-check.sh fails on a second version unless it is
+# listed here as locked but never built, with the reason;
+# `scripts/lock-check.sh v8-built` (it needs cargo, so run it through
+# scripts/dev.sh) proves each listed version stays out of the build graph.
+#
+# Codex's patch block points `v8` at its own fork for Codex's code-mode
+# runtime, which atomic does not build; Cargo.lock records that patch as
+# unused. Before atomic enables Codex code-mode, its V8 and Codex's must
+# converge on one version (deps/README.md).
+
+[[unbuilt]]
+crate = "v8x"
+version = "149.4.0-rc.4"
+reason = "deno_v8 0.5.0's alternative V8 backend, behind its v8x feature, which nothing enables; deno_core builds deno_v8's v8 backend (v8 150.4.0)"
+
+# The prebuilt V8 archives atomic links, and the generated bindings that go
+# with them. rusty_v8's build script downloads these from GitHub releases and
+# records only the URL, so atomic verifies them instead:
+# scripts/v8-archive.sh fetches each file once, checks its SHA-256 every time
+# and lays the files out as a local mirror; the workspace's
+# .cargo/config.toml points RUSTY_V8_MIRROR there, so a build reads only
+# verified files and works offline once they are cached. A V8 version or
+# target with no entry here cannot be built. Hashes were checked against the
+# release's published digests.
+
+[[archive]]
+crate = "v8"
+version = "150.4.0"
+target = "x86_64-unknown-linux-gnu"
+file = "librusty_v8_simdutf_release_x86_64-unknown-linux-gnu.a.gz"
+sha256 = "f48762ca10d1f1fc605a441c5ae430ec8ce1e9e80f14d78fbc42cb878c30b476"
+binding = "src_binding_simdutf_release_x86_64-unknown-linux-gnu.rs"
+binding_sha256 = "7727826ae479bdb645e807239fb12d1f8e2e23de7a6cf16f5ee592690d1d8506"
+
+[[archive]]
+crate = "v8"
+version = "150.4.0"
+target = "aarch64-unknown-linux-gnu"
+file = "librusty_v8_simdutf_release_aarch64-unknown-linux-gnu.a.gz"
+sha256 = "539e283815a396a5796f32858b42e517b858ebaaeaaad05d03290ee8c864a527"
+binding = "src_binding_simdutf_release_aarch64-unknown-linux-gnu.rs"
+binding_sha256 = "7727826ae479bdb645e807239fb12d1f8e2e23de7a6cf16f5ee592690d1d8506"
+
+[[archive]]
+crate = "v8"
+version = "150.4.0"
+target = "aarch64-apple-darwin"
+file = "librusty_v8_simdutf_release_aarch64-apple-darwin.a.gz"
+sha256 = "5aeffd8d5a0c1b79ac1d70af83d5b19099655fd9c645a794dc43f101f779838c"
+binding = "src_binding_simdutf_release_aarch64-apple-darwin.rs"
+binding_sha256 = "ca5adf0cf89c9a70ad460ae73648b2fe89b74aa113b3cb7f757b6a02b758394f"

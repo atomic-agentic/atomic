@@ -185,4 +185,65 @@ export const config: AtomConfig<Input, Output, Case, Judges> = {
         assert!(aggregate(&atom, "quality", &[]).is_err());
         assert!(aggregate(&atom, "quality", &[f64::NAN]).is_err());
     }
+
+    // A judge binding and a score that call captured helpers keep their
+    // return contracts: structured judge input and a number in [0, 1].
+    #[test]
+    fn scorers_call_helpers_with_their_existing_contracts() {
+        let root = crate::atom::tests::project("{input.text}", "{}", None);
+        std::fs::create_dir_all(root.join("helpers")).expect("helpers");
+        std::fs::write(
+            root.join("helpers/judging.ts"),
+            "export const brief = (text: string): string => text.slice(0, 3);
+export const grade = (ok: boolean, weight: number): number => (ok ? weight : 0);
+",
+        )
+        .expect("helper");
+        std::fs::write(root.join("test.atom.astro"), r#"---
+import type { Props, Input, Output, Case, Judges } from './.atomic/types/test';
+import type { AtomConfig } from './.atomic/types/authoring';
+import { brief, grade } from './helpers/judging';
+const { input }: Props = Astro.props;
+export const config: AtomConfig<Input, Output, Case, Judges> = {
+  case: {type:'object',additionalProperties:false,required:['ok'],properties:{ok:{type:'boolean'}}},
+  judges: {reviewer: {
+    input: {type:'object',additionalProperties:false,required:['text'],properties:{text:{type:'string',maxLength:3}}},
+    output: {type:'object',additionalProperties:false,required:['ok'],properties:{ok:{type:'boolean'}}},
+  }},
+  scorers: {quality: {judge:'reviewer',with:({input}) => ({text:brief(input.text)}),score:({judge}) => grade(judge.ok, 0.5),min_mean:0.25}},
+};
+---
+{input.text}
+"#).expect("source");
+        let mut registry = Registry::new();
+        let atom = crate::atom::load(&root.join("test.atom.astro"), &mut registry).expect("types");
+        let input = json!({"text":"a longer note"});
+        let output = json!({"ticket":"ABC-1"});
+        let case = json!({"ok":true});
+        let values = Evaluation {
+            run_id: "evaluation-test",
+            input: &input,
+            output: &output,
+            case: &case,
+            snapshot: None,
+            step_id: None,
+        };
+        // Without the helper the binding would break the judge's maxLength.
+        assert_eq!(
+            judge_input(&atom, &registry, "quality", &values).expect("binding"),
+            json!({"text":"a l"})
+        );
+        assert_eq!(
+            judge_score(
+                &atom,
+                "quality",
+                &json!({"ok":true}),
+                None,
+                None,
+                "evaluation-test"
+            )
+            .expect("score"),
+            0.5
+        );
+    }
 }

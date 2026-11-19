@@ -24,6 +24,7 @@ restores its original public context without reading settings or environment;
 `--step-id review` binds a new trusted dispatch step. Use another run ID to choose
 new settings. A changed compiled source/schema version is refused on restore.
 
-This exercises production direct invocation. Workflow-level durable snapshot and
-step scheduling integration is separate tracked work; the file store is not a
-replacement for a workflow transaction.
+This exercises production direct invocation. Inside a workflow the same atom's
+context is resolved once per run and step and recorded by the durable runtime,
+not the file store, so a step retried after a crash renders the context it
+recorded even if settings or the environment changed.

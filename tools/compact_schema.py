@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Compiles the proposed compact schema form to JSON Schema, for the example checker.
+"""Compiles the compact schema form to JSON Schema, for the example checker.
 
-Not an implementation of atomic. The syntax follows Dotprompt's Picoschema, with the
-difference the scaffold plan states: a `?` field is optional and is not also nullable.
+A mirror of atomic's own compiler (atomic_schema::compact), kept for the
+offline catalog checks. The syntax follows Dotprompt's Picoschema, with one
+difference: a `?` field is optional and is not also nullable.
 
     name: type, description          a required scalar (string, integer, number, boolean, any)
     name?: type                      an optional one
@@ -19,18 +20,32 @@ from __future__ import annotations
 
 import re
 
-SCALARS = {"string", "integer", "number", "boolean", "any"}
-JSON_SCHEMA_TYPES = {"object", "array", "string", "integer", "number", "boolean", "null"}
+SCALARS = {"string", "integer", "number", "boolean", "null", "any"}
+# A root with any of these is full JSON Schema, as atomic decides.
+JSON_SCHEMA_KEYWORDS = {"$ref", "$schema", "$id", "$defs", "$anchor", "$comment", "$dynamicRef",
+    "$dynamicAnchor", "$vocabulary", "type", "properties", "patternProperties", "additionalProperties",
+    "unevaluatedProperties", "propertyNames", "required", "enum", "const", "anyOf", "oneOf", "allOf",
+    "not", "if", "then", "else", "items", "prefixItems", "unevaluatedItems", "contains",
+    "dependentSchemas"}
+# Constraints and annotations: full JSON Schema unless the value is a compact field.
+VALUE_KEYWORDS = {"multipleOf", "maximum", "exclusiveMaximum", "minimum", "exclusiveMinimum",
+    "maxLength", "minLength", "pattern", "maxItems", "minItems", "uniqueItems", "maxContains",
+    "minContains", "maxProperties", "minProperties", "dependentRequired", "format", "contentEncoding",
+    "contentMediaType", "contentSchema", "title", "description", "default", "deprecated", "readOnly",
+    "writeOnly", "examples", "definitions", "dependencies"}
 KEY = re.compile(r"(\(\*\)|[A-Za-z_][\w-]*)(\?)?(?:\((\w+)(?:,\s*(.*))?\))?")
 
 
+def _is_field(value):
+    return isinstance(value, str) and value.partition(",")[0].strip() in SCALARS
+
+
 def is_compact(schema):
-    """Detects the form the way Dotprompt does: a JSON Schema names its own type."""
-    if not isinstance(schema, dict):
-        return False
-    if "$ref" in schema or "$schema" in schema or "properties" in schema:
-        return False
-    return schema.get("type") not in JSON_SCHEMA_TYPES
+    """A non-empty mapping with no JSON Schema keyword at its root, counting a
+    constraint or annotation keyword only when its value is not a compact field."""
+    return isinstance(schema, dict) and bool(schema) and not any(
+        key in JSON_SCHEMA_KEYWORDS or (key in VALUE_KEYWORDS and not _is_field(value))
+        for key, value in schema.items())
 
 
 def _fail(where, message):
@@ -84,3 +99,18 @@ def compile_compact(mapping, where):
         compiled["required"] = required
     compiled["properties"] = properties
     return compiled
+
+
+def to_json_schema(schema, where="schema"):
+    """The schema as JSON Schema: compiled when compact. A root that mixes a
+    structural keyword with a key that only reads as a compact field is refused."""
+    if is_compact(schema):
+        return compile_compact(schema, where)
+    if isinstance(schema, dict):
+        keyword = next((k for k in schema if k in JSON_SCHEMA_KEYWORDS), None)
+        if keyword is not None:
+            for key, value in schema.items():
+                known = key in JSON_SCHEMA_KEYWORDS or key in VALUE_KEYWORDS or key.startswith("x-")
+                if not known and (key.endswith("?") or "(" in key or _is_field(value)):
+                    _fail(where, f"{key!r} reads as a compact field beside the JSON Schema keyword {keyword!r}")
+    return schema

@@ -78,9 +78,17 @@ meant, then update the snapshot. The update command is not specified yet.
 
 ## A compact schema is rejected
 
-Production Astro atoms use full JSON Schema declarations or sidecars. The compact
-form and its expansion command remain planned. Convert a compact declaration to
-full JSON Schema before loading it. See [schema locations](atom-files.md#schema-locations).
+The compact form has no constraints: a field such as `when: date-time` or
+`name: string(minLength 3)` fails with its file and path. Write that schema as
+full JSON Schema, which can say `format: date-time` or `minLength: 3`. A compact
+schema also cannot name a top-level field after a structural JSON Schema
+keyword, such as `type`, `enum` or `items`: a schema with one is read as full
+JSON Schema, and atomic refuses it if its other fields read as compact ones
+(`type: string` beside `message: string`), rather than ignore them. A field
+named after a constraint or annotation keyword, such as `description` or
+`format`, stays a field while its value is `type, description`.
+`atomic schemas expand <atom>` prints what a compact schema compiles to. See
+[compact schemas](atom-files.md#compact-schemas).
 
 ## Code is refused network access
 
