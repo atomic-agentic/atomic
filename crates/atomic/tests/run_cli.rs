@@ -178,9 +178,16 @@ fn count_log(dir: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// `atomic` with a throwaway home and state, as the local operator `dev`.
-fn command(dir: &Path, cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Command {
-    let mut cmd = Command::new(ATOMIC);
+/// `atomic`, from the executable at `program`, with a throwaway home and
+/// state, as the local operator `dev`.
+fn command_as(
+    program: &Path,
+    dir: &Path,
+    cwd: &Path,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> Command {
+    let mut cmd = Command::new(program);
     cmd.args(args)
         .current_dir(cwd)
         .env("HOME", dir.join("home"))
@@ -193,6 +200,7 @@ fn command(dir: &Path, cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Comma
         "ATOMIC_DATABASE_SCHEMA",
         "ATOMIC_EXECUTOR_ID",
         "DBOS__VMID",
+        "DBOS__APPVERSION",
         "ATOMIC_FAILPOINT",
         "ATOMIC_MODEL_BASE_URL",
         "ATOMIC_MODEL",
@@ -208,7 +216,19 @@ fn command(dir: &Path, cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Comma
 }
 
 fn atomic(dir: &Path, cwd: &Path, args: &[&str], env: &[(&str, &str)], stdin: &str) -> Output {
-    let mut child = command(dir, cwd, args, env)
+    atomic_as(Path::new(ATOMIC), dir, cwd, args, env, stdin)
+}
+
+/// [`atomic`], from the executable at `program`.
+fn atomic_as(
+    program: &Path,
+    dir: &Path,
+    cwd: &Path,
+    args: &[&str],
+    env: &[(&str, &str)],
+    stdin: &str,
+) -> Output {
+    let mut child = command_as(program, dir, cwd, args, env)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -233,7 +253,19 @@ fn atomic(dir: &Path, cwd: &Path, args: &[&str], env: &[(&str, &str)], stdin: &s
 
 /// `atomic` in the background, its stderr in `log`.
 fn spawn(dir: &Path, cwd: &Path, args: &[&str], env: &[(&str, &str)], log: &Path) -> Child {
-    command(dir, cwd, args, env)
+    spawn_as(Path::new(ATOMIC), dir, cwd, args, env, log)
+}
+
+/// [`spawn`], from the executable at `program`.
+fn spawn_as(
+    program: &Path,
+    dir: &Path,
+    cwd: &Path,
+    args: &[&str],
+    env: &[(&str, &str)],
+    log: &Path,
+) -> Child {
+    command_as(program, dir, cwd, args, env)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(std::fs::File::create(log).expect("log"))
@@ -752,6 +784,188 @@ fn serve_started_after_a_kill_recovers_the_run_and_finishes_it() {
     });
 }
 
+/// A copy of the atomic executable that differs from it by one byte, as a
+/// rebuild of the same source would.
+fn rebuilt(dir: &Path) -> PathBuf {
+    let copy = dir.join("bin/atomic");
+    std::fs::create_dir_all(dir.join("bin")).expect("bin");
+    let mut bytes = std::fs::read(ATOMIC).expect("read atomic");
+    bytes.push(0);
+    std::fs::write(&copy, bytes).expect("copy atomic");
+    let mut permissions = std::fs::metadata(&copy).expect("copy").permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+    std::fs::set_permissions(&copy, permissions).expect("make the copy executable");
+    copy
+}
+
+/// Run the triage workflow as `id` until the failpoint after `rank` kills it.
+fn killed_after_rank(dir: &Path, project: &Path, env: &[(&'static str, String)], id: &str) {
+    let out = atomic(
+        dir,
+        project,
+        &["run", "triage", "--run-id", id, "--data", NOTE],
+        &with(env, &[("ATOMIC_FAILPOINT", "pipeline:after:rank")]),
+        "",
+    );
+    assert!(
+        !out.status.success(),
+        "killed at the failpoint: {}",
+        text(&out)
+    );
+}
+
+#[test]
+fn a_run_started_by_one_build_resumes_and_recovers_under_another() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![
+            Reply::Text(RANK.into()),
+            Reply::Text(SUMMARY.into()),
+            Reply::Text(RANK.into()),
+            Reply::Text(SUMMARY.into()),
+        ])
+        .await
+        .expect("fake model");
+        let dir = scratch("rebuilt");
+        let project = project(&dir);
+        let state = state_dir(&dir, &project);
+        let env = model_env(&model.base_url());
+        let other = rebuilt(&dir);
+
+        // Resumed by the other build.
+        let (d, p, e) = (dir.clone(), project.clone(), env.clone());
+        tokio::task::spawn_blocking(move || killed_after_rank(&d, &p, &e, "built-1"))
+            .await
+            .expect("child");
+        let (d, p, e, o) = (dir.clone(), project.clone(), env.clone(), other.clone());
+        let out = tokio::task::spawn_blocking(move || {
+            atomic_as(
+                &o,
+                &d,
+                &p,
+                &["--json", "runs", "resume", "built-1"],
+                &with(&e, &[]),
+                "",
+            )
+        })
+        .await
+        .expect("child");
+        assert!(out.status.success(), "{}", text(&out));
+        assert_eq!(
+            stdout_json(&out)["output"],
+            json!({"line": "P1: Export crashes on accents"})
+        );
+        assert_eq!(model.calls(), 2, "only summarize ran again");
+
+        // Recovered by the other build's server.
+        let (d, p, e) = (dir.clone(), project.clone(), env.clone());
+        tokio::task::spawn_blocking(move || killed_after_rank(&d, &p, &e, "built-2"))
+            .await
+            .expect("child");
+        let mut serve = spawn_as(
+            &other,
+            &dir,
+            &project,
+            &["serve"],
+            &with(&env, &[]),
+            &dir.join("serve.log"),
+        );
+        let rt = Durare::sqlite(&state.join("atomic.db"))
+            .await
+            .expect("store");
+        let started = Instant::now();
+        while rt.status("built-2").await.expect("status") != Some(RunStatus::Succeeded) {
+            assert!(
+                started.elapsed() < Duration::from_secs(120),
+                "the other build's server never finished the run: {}",
+                std::fs::read_to_string(dir.join("serve.log")).unwrap_or_default()
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(model.calls(), 4);
+        assert_eq!(count_log(&dir).len(), 2, "each run counted once");
+        terminate(&serve);
+        let status = tokio::task::spawn_blocking(move || wait_child(&mut serve, "serve"))
+            .await
+            .expect("child");
+        assert!(status.success());
+    });
+}
+
+#[test]
+fn a_run_of_another_durable_layout_is_reported_not_resumed() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(RANK.into())])
+            .await
+            .expect("fake model");
+        let dir = scratch("layout");
+        let project = project(&dir);
+        let state = state_dir(&dir, &project);
+        let env = model_env(&model.base_url());
+        let (d, p, e) = (dir.clone(), project.clone(), env.clone());
+        tokio::task::spawn_blocking(move || killed_after_rank(&d, &p, &e, "old-1"))
+            .await
+            .expect("child");
+        // As if an atomic of an earlier layout had started it.
+        let db =
+            sqlx::SqlitePool::connect(&format!("sqlite://{}", state.join("atomic.db").display()))
+                .await
+                .expect("store");
+        sqlx::query(
+            "UPDATE workflow_status SET application_version = 'atomic.pipeline.0' \
+             WHERE workflow_uuid = 'old-1'",
+        )
+        .execute(&db)
+        .await
+        .expect("restamp");
+
+        let (d, p, e) = (dir.clone(), project.clone(), env.clone());
+        let out = tokio::task::spawn_blocking(move || {
+            atomic(
+                &d,
+                &p,
+                &["--json", "runs", "resume", "old-1"],
+                &with(&e, &[]),
+                "",
+            )
+        })
+        .await
+        .expect("child");
+        assert!(!out.status.success(), "{}", text(&out));
+        let error = &stdout_json(&out)["error"];
+        assert_eq!(error["kind"], "run.other_layout", "{error}");
+        assert!(
+            error["description"]
+                .as_str()
+                .is_some_and(|d| d.contains("atomic.pipeline.0")),
+            "{error}"
+        );
+
+        let mut serve = spawn(
+            &dir,
+            &project,
+            &["serve"],
+            &with(&env, &[]),
+            &dir.join("serve.log"),
+        );
+        wait_until("serve to recover", || {
+            std::fs::read_to_string(dir.join("serve.log")).is_ok_and(|l| l.contains("recovered"))
+        });
+        let log = std::fs::read_to_string(dir.join("serve.log")).expect("log");
+        assert!(
+            log.contains("old-1 (layout atomic.pipeline.0)")
+                && log.contains("recovered 0 unfinished run(s)"),
+            "{log}"
+        );
+        terminate(&serve);
+        let status = tokio::task::spawn_blocking(move || wait_child(&mut serve, "serve"))
+            .await
+            .expect("child");
+        assert!(status.success());
+        assert_eq!(model.calls(), 1, "nothing ran again");
+        assert_eq!(count_log(&dir).len(), 1);
+    });
+}
+
 #[test]
 fn exec_commands_run_in_a_runner_process_when_asked() {
     let dir = scratch("runner");
@@ -839,6 +1053,18 @@ fn the_executor_identity_is_atomics_own_and_required_on_postgres() {
         error["action"].as_str().is_some_and(
             |a| a.contains("unset DBOS__VMID") && a.contains("ATOMIC_EXECUTOR_ID=worker-7")
         ),
+        "{error}"
+    );
+    // So is its version variable: atomic stamps runs with its own layout.
+    let mut env = model.to_vec();
+    env.push(("DBOS__APPVERSION", "v9"));
+    let out = atomic(&dir, &project, &["--json", "serve"], &env, "");
+    let error = &stdout_json(&out)["error"];
+    assert_eq!(error["kind"], "config.engine_version", "{error}");
+    assert!(
+        error["action"]
+            .as_str()
+            .is_some_and(|a| a.contains("unset DBOS__APPVERSION")),
         "{error}"
     );
 }

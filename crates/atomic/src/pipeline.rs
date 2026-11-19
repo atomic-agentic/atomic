@@ -77,6 +77,15 @@ use std::sync::Arc;
 /// The name `run_pipeline` is registered under.
 pub const PIPELINE: &str = "atomic.pipeline";
 
+/// The layout of the durable steps `run_pipeline` records, stamped on every
+/// run as its version. The engine recovers and dequeues only runs of its own
+/// version, so any build of atomic with the same layout continues the same
+/// runs, and one with another layout leaves them alone. Change it exactly
+/// when a run started under the old layout would replay differently under
+/// the new one: a step added, removed, renamed or moved, or a checkpoint's
+/// shape changed.
+pub const LAYOUT_VERSION: &str = "atomic.pipeline.1";
+
 /// One atom step, as the interpreter runs it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AtomStep {

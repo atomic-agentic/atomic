@@ -148,6 +148,40 @@ pub enum RunStatus {
     Other(String),
 }
 
+/// What the store records about a run beside its steps.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunRecord {
+    /// Its id.
+    pub id: String,
+    /// Where it is.
+    pub status: RunStatus,
+    /// The executor identity that last owned it.
+    pub executor: String,
+    /// The version it was stamped with, which only an engine of the same
+    /// version recovers.
+    pub version: String,
+}
+
+impl From<durare::WorkflowStatus> for RunRecord {
+    fn from(w: durare::WorkflowStatus) -> Self {
+        Self {
+            id: w.id,
+            status: run_status(&w.status, w.error),
+            executor: w.executor_id,
+            version: w.app_version,
+        }
+    }
+}
+
+fn run_status(status: &str, error: Option<String>) -> RunStatus {
+    match status {
+        "PENDING" | "ENQUEUED" => RunStatus::Pending,
+        "SUCCESS" => RunStatus::Succeeded,
+        "ERROR" => RunStatus::Failed(error.unwrap_or_default()),
+        other => RunStatus::Other(other.to_owned()),
+    }
+}
+
 /// A value bound to a `?` placeholder in a transaction step's SQL.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Param {
@@ -627,6 +661,17 @@ pub enum Database {
 /// identity from, ahead of anything atomic configures.
 pub const ENGINE_IDENTITY_VARIABLE: &str = "DBOS__VMID";
 
+/// The environment variable the engine would otherwise read the version it
+/// stamps on runs from, ahead of anything atomic configures.
+pub const ENGINE_VERSION_VARIABLE: &str = "DBOS__APPVERSION";
+
+/// The version stamped on runs by an engine whose caller names none, as the
+/// plain [`Durare::sqlite`] and [`Durare::postgres`] constructors do. The
+/// engine recovers and dequeues only runs of its own version, so a version
+/// that followed the executable would strand every unfinished run at each
+/// rebuild; atomic always names one.
+pub const DEFAULT_VERSION: &str = "atomic-durable.1";
+
 /// Why an executor identity was refused.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum IdentityError {
@@ -646,20 +691,48 @@ pub enum IdentityError {
     /// letters, digits, `.`, `_`, `:` and `-`.
     #[error("executor identity {0:?} is not 1 to 128 letters, digits, `.`, `_`, `:` or `-`")]
     Invalid(String),
+    /// The engine's version variable is set, which would stamp runs with a
+    /// version atomic does not choose, and strand them for any atomic that
+    /// does.
+    #[error(
+        "{variable} is set to {value:?}; atomic stamps runs with the version of its own durable \
+         step layout, never with the engine's variable"
+    )]
+    VersionVariable {
+        /// The variable.
+        variable: &'static str,
+        /// Its value.
+        value: String,
+    },
 }
 
-/// Check the executor identity a process is configured with, and that
-/// nothing outside atomic overrides it. `None` means the store's default
-/// owner, `local`, which is safe only while one process uses the store.
-pub fn executor_identity(
-    configured: Option<&str>,
-) -> std::result::Result<Option<String>, IdentityError> {
-    if let Some(value) = std::env::var_os(ENGINE_IDENTITY_VARIABLE).filter(|v| !v.is_empty()) {
+/// Refuse the engine's own identity and version variables, which would
+/// override atomic's settings without atomic knowing.
+fn engine_variables() -> std::result::Result<(), IdentityError> {
+    let set = |name| std::env::var_os(name).filter(|v| !v.is_empty());
+    if let Some(value) = set(ENGINE_IDENTITY_VARIABLE) {
         return Err(IdentityError::EngineVariable {
             variable: ENGINE_IDENTITY_VARIABLE,
             value: value.to_string_lossy().into_owned(),
         });
     }
+    if let Some(value) = set(ENGINE_VERSION_VARIABLE) {
+        return Err(IdentityError::VersionVariable {
+            variable: ENGINE_VERSION_VARIABLE,
+            value: value.to_string_lossy().into_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Check the executor identity a process is configured with, and that
+/// nothing outside atomic overrides it or the version runs are stamped with.
+/// `None` means the store's default owner, `local`, which is safe only while
+/// one process uses the store.
+pub fn executor_identity(
+    configured: Option<&str>,
+) -> std::result::Result<Option<String>, IdentityError> {
+    engine_variables()?;
     let Some(id) = configured else {
         return Ok(None);
     };
@@ -738,7 +811,13 @@ impl Durare {
             .await
             .map_err(from_durare)?;
         let reads = sqlx::SqlitePool::connect(&url).await.map_err(db)?;
-        Self::over(Arc::new(provider), Reads::Sqlite(reads), None).await
+        Self::over(
+            Arc::new(provider),
+            Reads::Sqlite(reads),
+            None,
+            DEFAULT_VERSION,
+        )
+        .await
     }
 
     /// An engine on `database` that owns its runs as `executor`, checked by
@@ -746,7 +825,13 @@ impl Durare {
     /// of its own that stays the same across its restarts, so it recovers
     /// its own unfinished runs and no one else's. `None` is the default
     /// owner, `local`.
-    pub async fn open(database: &Database, executor: Option<&str>) -> Result<Self> {
+    ///
+    /// Runs it starts are stamped with `version`, and it recovers and
+    /// dequeues only runs of that version. Name the layout of the durable
+    /// steps the registered workflows record, changed exactly when a run
+    /// started under the old layout could not replay under the new one, so
+    /// any build of the same layout continues the same runs.
+    pub async fn open(database: &Database, executor: Option<&str>, version: &str) -> Result<Self> {
         let executor =
             executor_identity(executor).map_err(|e| DurableError::Engine(e.to_string()))?;
         match database {
@@ -759,9 +844,11 @@ impl Durare {
                     .await
                     .map_err(from_durare)?;
                 let reads = sqlx::SqlitePool::connect(&url).await.map_err(db)?;
-                Self::over(Arc::new(provider), Reads::Sqlite(reads), executor).await
+                Self::over(Arc::new(provider), Reads::Sqlite(reads), executor, version).await
             }
-            Database::Postgres { url, schema } => Self::postgres_as(url, schema, executor).await,
+            Database::Postgres { url, schema } => {
+                Self::postgres_as(url, schema, executor, version).await
+            }
         }
     }
 
@@ -770,14 +857,51 @@ impl Durare {
         self.engine.executor_id()
     }
 
+    /// The version this engine stamps on runs, and the only one it recovers.
+    pub fn version(&self) -> &str {
+        self.engine.app_version()
+    }
+
+    /// Run `id`'s status, owner and version, or `None` if there is no such run.
+    pub async fn run_record(&self, id: &str) -> Result<Option<RunRecord>> {
+        let found = self
+            .engine
+            .list_workflows(&durare::ListFilter {
+                workflow_ids: vec![id.to_owned()],
+                ..durare::ListFilter::default()
+            })
+            .await
+            .map_err(from_durare)?;
+        Ok(found.into_iter().next().map(RunRecord::from))
+    }
+
+    /// Every unfinished run in the store, whoever owns it and whatever its
+    /// version.
+    pub async fn unfinished(&self) -> Result<Vec<RunRecord>> {
+        let found = self
+            .engine
+            .list_workflows(&durare::ListFilter {
+                status: vec!["PENDING".into(), "ENQUEUED".into()],
+                ..durare::ListFilter::default()
+            })
+            .await
+            .map_err(from_durare)?;
+        Ok(found.into_iter().map(RunRecord::from).collect())
+    }
+
     /// An engine on PostgreSQL at `url`, in `schema`. As on SQLite, the
     /// store's version is checked first, and a schema written by a newer
     /// atomic is refused before anything is created in it.
     pub async fn postgres(url: &str, schema: &str) -> Result<Self> {
-        Self::postgres_as(url, schema, None).await
+        Self::postgres_as(url, schema, None, DEFAULT_VERSION).await
     }
 
-    async fn postgres_as(url: &str, schema: &str, executor: Option<String>) -> Result<Self> {
+    async fn postgres_as(
+        url: &str,
+        schema: &str,
+        executor: Option<String>,
+        version: &str,
+    ) -> Result<Self> {
         crate::store::open_postgres(url, schema)
             .await
             .map_err(|e| DurableError::Engine(e.to_string()))?;
@@ -792,16 +916,26 @@ impl Durare {
             .connect_with(options)
             .await
             .map_err(db)?;
-        Self::over(Arc::new(provider), Reads::Postgres(reads), executor).await
+        Self::over(
+            Arc::new(provider),
+            Reads::Postgres(reads),
+            executor,
+            version,
+        )
+        .await
     }
 
     async fn over(
         provider: Arc<dyn durare::StateProvider>,
         reads: Reads,
         executor: Option<String>,
+        version: &str,
     ) -> Result<Self> {
+        // The engine would let its variables override both settings.
+        engine_variables().map_err(|e| DurableError::Engine(e.to_string()))?;
         let config = durare::EngineConfig {
             executor_id: executor,
+            app_version: Some(version.to_owned()),
             ..durare::EngineConfig::default()
         };
         let engine = durare::DurableEngine::with_config(provider, config)
@@ -949,12 +1083,10 @@ impl DurableRuntime for Durare {
                 })
                 .await
                 .map_err(from_durare)?;
-            Ok(found.into_iter().next().map(|w| match w.status.as_str() {
-                "PENDING" | "ENQUEUED" => RunStatus::Pending,
-                "SUCCESS" => RunStatus::Succeeded,
-                "ERROR" => RunStatus::Failed(w.error.unwrap_or_default()),
-                other => RunStatus::Other(other.to_owned()),
-            }))
+            Ok(found
+                .into_iter()
+                .next()
+                .map(|w| run_status(&w.status, w.error)))
         }
     }
 

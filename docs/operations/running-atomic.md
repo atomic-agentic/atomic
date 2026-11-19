@@ -63,7 +63,7 @@ host or StatefulSet member name, never a random container or pod name. On
 PostgreSQL `atomic serve` refuses to start without one. A restarted process
 recovers the unfinished runs it owns and leaves other processes' runs alone.
 Atomic takes the identity only from its own setting and refuses to start when
-the durable engine's own variable (`DBOS__VMID`) is set.
+the durable engine's own variables (`DBOS__VMID`, `DBOS__APPVERSION`) are set.
 
 Atomic currently plans API keys, approved enterprise providers or workload identity
 as its defaults for unattended model access. Eligible documented account-auth

@@ -159,7 +159,8 @@ pub async fn resume(
     let state = state(project)?;
     let engine = engine::open(&state, paths, &args.engine, "atomic runs resume", true).await?;
     let id = &args.run_id;
-    match engine.rt.status(id).await? {
+    let record = engine.rt.run_record(id).await?;
+    match record.as_ref().map(|r| &r.status) {
         None => {
             let _ = engine.rt.shutdown(SHUTDOWN).await;
             Err(Failure::new(
@@ -180,7 +181,33 @@ pub async fn resume(
             .into())
         }
         Some(RunStatus::Succeeded) => finish(&engine, id, json).await,
-        Some(RunStatus::Pending | RunStatus::Other(_)) => {
+        Some(RunStatus::Other(state)) => {
+            let _ = engine.rt.shutdown(SHUTDOWN).await;
+            Err(Failure::new(
+                "run.not_resumable",
+                format!("run {id} is {state}, so it cannot be resumed"),
+                "start a new run",
+            )
+            .into())
+        }
+        Some(RunStatus::Pending) => {
+            let record = record.as_ref().expect("a status has a record");
+            // The engine runs only runs of its own layout: resuming another
+            // would wait for ever.
+            if record.version != engine.rt.version() {
+                let _ = engine.rt.shutdown(SHUTDOWN).await;
+                return Err(Failure::new(
+                    "run.other_layout",
+                    format!(
+                        "run {id} was started by an atomic whose durable step layout is {}, and \
+                         this atomic's is {}, so it cannot continue the run",
+                        record.version,
+                        engine.rt.version()
+                    ),
+                    "continue it with an atomic of the layout that started it, or start a new run",
+                )
+                .into());
+            }
             eprintln!("run {id}: resuming");
             engine.rt.resume(id).await?;
             finish(&engine, id, json).await
@@ -222,6 +249,26 @@ pub async fn serve(
         engine.rt.executor_id()
     );
     let recovered = engine.rt.recover().await?;
+    // Runs of another layout are this executor's too, but only an atomic of
+    // their layout can continue them.
+    let stranded: Vec<String> = engine
+        .rt
+        .unfinished()
+        .await?
+        .into_iter()
+        .filter(|r| r.executor == engine.rt.executor_id() && r.version != engine.rt.version())
+        .map(|r| format!("{} (layout {})", r.id, r.version))
+        .collect();
+    if !stranded.is_empty() {
+        eprintln!(
+            "atomic serve: left {} unfinished run(s) started by an atomic of another durable step \
+             layout, which this one ({}) cannot continue: {}; continue them with an atomic of \
+             their layout",
+            stranded.len(),
+            engine.rt.version(),
+            stranded.join(", ")
+        );
+    }
     eprintln!("atomic serve: recovered {recovered} unfinished run(s); serving until stopped");
     let signal = stopped().await?;
     eprintln!("atomic serve: {signal}: stopping");

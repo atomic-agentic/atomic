@@ -167,11 +167,18 @@ fn known(cause: &(dyn std::error::Error + 'static)) -> Option<Failure> {
     }
     if let Some(e) = cause.downcast_ref::<atomic_durable::IdentityError>() {
         return f(
-            "config.executor_id",
+            match e {
+                atomic_durable::IdentityError::VersionVariable { .. } => "config.engine_version",
+                _ => "config.executor_id",
+            },
             match e {
                 atomic_durable::IdentityError::EngineVariable { variable, value } => format!(
                     "unset {variable} and set ATOMIC_EXECUTOR_ID={value} (or pass \
                      --executor-id) instead"
+                ),
+                atomic_durable::IdentityError::VersionVariable { variable, .. } => format!(
+                    "unset {variable}: atomic stamps each run with its own durable step layout, \
+                     so any atomic of that layout continues the run"
                 ),
                 atomic_durable::IdentityError::Invalid(_) => {
                     "set ATOMIC_EXECUTOR_ID to a name of letters, digits, `.`, `_`, `:` and \

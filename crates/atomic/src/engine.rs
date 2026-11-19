@@ -13,7 +13,7 @@
 
 use crate::failure::Failure;
 use anyhow::Context;
-use atomic_app::pipeline::{Services, register_pipeline};
+use atomic_app::pipeline::{LAYOUT_VERSION, Services, register_pipeline};
 use atomic_core::AtomConfig;
 use atomic_core::artifact::LocalStore;
 use atomic_core::codex::{CodexPaths, ModelEndpoint};
@@ -185,7 +185,7 @@ pub async fn open(
     });
     // A project in a git repository gets worktrees for its worktree steps.
     let worktrees = Worktrees::open(state).ok().map(Arc::new);
-    let mut rt = Durare::open(&database, executor.as_deref())
+    let mut rt = Durare::open(&database, executor.as_deref(), LAYOUT_VERSION)
         .await
         .with_context(|| format!("open the durable store at {}", describe(&database)))?;
     register_pipeline(

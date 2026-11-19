@@ -31,9 +31,10 @@ pub use publication::{
     execute_candidate_at, parks, publish_candidate, review_candidate, run_atom, run_atom_at,
 };
 pub use runtime::{
-    Database, DurableError, DurableRuntime, Durare, DurareContext, ENGINE_IDENTITY_VARIABLE,
-    IdentityError, Param, Result, Row, RunStatus, StepInfo, StepRecord, ThreadRecord, Tx, TxFuture,
-    WorkflowContext, executor_identity,
+    DEFAULT_VERSION, Database, DurableError, DurableRuntime, Durare, DurareContext,
+    ENGINE_IDENTITY_VARIABLE, ENGINE_VERSION_VARIABLE, IdentityError, Param, Result, Row,
+    RunRecord, RunStatus, StepInfo, StepRecord, ThreadRecord, Tx, TxFuture, WorkflowContext,
+    executor_identity,
 };
 
 /// Whether this build runs the PostgreSQL variants of the tests (the

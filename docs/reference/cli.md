@@ -189,6 +189,13 @@ command of the one that holds it, so two processes never execute the same
 project's runs. `atomic serve` stops on SIGTERM or SIGINT; unfinished work stays
 recorded for the next `serve` or `runs resume`.
 
+Each run is stamped with the layout of the durable steps atomic records, not
+with the build that started it, so a rebuilt or upgraded atomic with the same
+layout resumes and recovers it. A run of another layout is refused by
+`atomic runs resume` and listed by `atomic serve`, which leaves it as it is.
+Atomic refuses to start when the durable engine's own version variable
+(`DBOS__APPVERSION`) is set.
+
 | Setting | Meaning |
 | --- | --- |
 | `ATOMIC_MODEL_BASE_URL`, `ATOMIC_MODEL` (`--model-base-url`, `--model`) | The OpenAI-compatible endpoint and model that model atoms use; `ATOMIC_MODEL_API_KEY_ENV` names the variable holding its key |
