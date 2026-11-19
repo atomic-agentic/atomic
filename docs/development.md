@@ -119,6 +119,24 @@ With the feature on, a sandbox that cannot start fails the tests, each with a
 message saying what the sandbox needs. Run without `ATOMIC_DEV_SANDBOX=on`,
 `scripts/dev.sh scripts/backends-check.sh sandbox` requires exactly that.
 
+## Controls are tested by removing them
+
+Each security control has a test that fails when the control is switched off.
+`scripts/controls-check.sh` proves it: for each v0.1 control (the hardened git
+command's settings, its neutralized filter drivers and its explicit git
+directory; the sandbox's confinement of writes, which keeps the state
+directory and a worktree's git directory out of a turn's reach), it switches
+the control off in the source, requires the control's test to fail, puts the
+source back and requires the test to pass. Each control costs a rebuild, so it
+runs by hand rather than in CI:
+
+```bash
+ATOMIC_DEV_SANDBOX=on scripts/dev.sh scripts/controls-check.sh
+```
+
+A control added later gets a row in the script. A row whose code has moved
+fails until it is updated.
+
 ## The crash suite
 
 atomic's crash tests kill the process at named failpoints. A failpoint is
