@@ -1,0 +1,29 @@
+---
+import type { Props, Input, Output } from '../.atomic/types/assess-change';
+import type { AtomConfig } from '../.atomic/types/authoring';
+import ChangeReviewLayout from './components/ChangeReviewLayout.astro';
+import RegionalPolicy from './components/RegionalPolicy.astro';
+import EvidenceList from './components/EvidenceList.astro';
+import { missingEvidence, evidenceInPolicyOrder, reviewLabel, stageBanner } from '../lib/review';
+const { input }: Props = Astro.props;
+const { change, policy } = input;
+const evidence = evidenceInPolicyOrder(input);
+const missing = missingEvidence(input);
+const label = reviewLabel(change);
+const banner = stageBanner('risk assessment');
+export const config: AtomConfig<Input, Output> = {
+  description: 'Assess a production change against the team policy.',
+  validate: [({ input, output }) => output.verdict === 'hold' || missingEvidence(input).length === 0],
+};
+---
+<ChangeReviewLayout stage="risk assessment" change={change}>
+{banner}
+<RegionalPolicy policy={policy} change={change} />
+Assess {label}. Return review only when required evidence has passed and no freeze applies.
+{missing.length > 0 && <Fragment>
+Missing or unsuccessful evidence categories:
+{missing.map((kind) => <Fragment>- {kind}
+</Fragment>)}
+</Fragment>}
+<EvidenceList evidence={evidence} />
+</ChangeReviewLayout>

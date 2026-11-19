@@ -1,0 +1,11 @@
+---
+import PolicyRules from './PolicyRules.astro';
+import { effectivePolicy } from '../../lib/review';
+import type { Change } from '../../.atomic/types/schemas/change';
+import type { Policy } from '../../.atomic/types/schemas/policy';
+interface Props { policy: Policy; change: Change }
+const { policy, change }: Props = Astro.props;
+const resolved = effectivePolicy(change, policy);
+---
+<PolicyRules policy={resolved} />
+Regional reviewers supplement baseline reviewers. They never replace them.

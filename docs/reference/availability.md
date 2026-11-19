@@ -27,7 +27,10 @@ higher-level project generation follow later. Workspace member discovery and
 shared-schema resolution belong to M11b/M39b in v0.5.
 
 Declarative atoms now use Astro exclusively. The production loader supports local
-components, slots, bounded TypeScript-shaped expressions and typed validators.
+components, named slots with fallback content, frontmatter locals, template
+literals, bounded TypeScript-shaped expressions, typed validators and
+[TypeScript helpers](atom-files.md#typescript-helpers), which run in an
+embedded, capability-free isolate per call with the step's recorded clock.
 `atomic check` checks source and generates editor types, including
 [types from shared schema files](atom-files.md#types-from-shared-schema-files); `atomic render` previews
 prompts without a model. Markdown and MDX atom frontends have been removed.

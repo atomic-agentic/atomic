@@ -4,7 +4,9 @@
 have been replaced. The body contains prompt text, typed expressions and local
 Astro components. Frontmatter declares literal configuration and typed contracts.
 Atomic parses and interprets the allowed syntax; it never imports an atom as a
-JavaScript module or runs Astro's page renderer.
+JavaScript module or runs Astro's page renderer. The one code that runs is a
+[TypeScript helper](#typescript-helpers) the atom imports, one call at a time in
+an isolate that can read nothing but its arguments.
 
 ```astro
 ---
@@ -141,22 +143,93 @@ eval assertions; Astro braces contain the supported TypeScript-shaped expression
 
 ## Supported syntax and limits
 
-Use property access, optional access, literals, comparisons, arithmetic, logical
-operators, conditionals, object construction, and `map`, `filter`, `some`, `every`
-with one expression-bodied callback. Destructured callback parameters are supported.
-Local default imports ending in `.astro` compose prompts; type-only imports have
-no runtime effect. Registered compiler intrinsics such as `fitsWithin` have typed
-declarations and a fixed implementation.
+Use property access, optional access, literals, template literals, comparisons,
+arithmetic, logical operators, conditionals, object construction, and `map`,
+`filter`, `some`, `every` with one expression-bodied callback. Destructured
+callback parameters are supported. Frontmatter `const` locals bind supported
+expressions, with plain or nested destructuring, and evaluate in order when the
+component renders. Local default imports ending in `.astro` compose prompts;
+named imports of local TypeScript modules are [helpers](#typescript-helpers);
+type-only imports have no runtime effect. Registered compiler intrinsics such as
+`fitsWithin` have typed declarations and a fixed implementation.
 
-Arbitrary imports and function calls, assignments, executable script statements,
-async/block callbacks, directives, spreads, runtime globals, `<script>`, `<style>`
-and the reserved `<data-…>` elements are rejected. The editor understands a larger
+Components render `<slot />` and named slots such as
+`<slot name="policy">fallback</slot>`; a caller fills one with a direct child
+that names it, such as `<Fragment slot="policy">`. As in Astro, explicit
+content, even an empty Fragment, is present and suppresses the fallback;
+whitespace and comments are not content; and a slot forwarded through a layout
+(`<slot name="policy" slot="policy" />`) is present only when the caller filled
+it. `Astro.slots.has('policy')` reads that without rendering the slot.
+
+Package and other non-helper imports, calls of anything but helpers and
+intrinsics, assignments, `let` and `var`, executable script statements,
+async/block callbacks, tagged templates, directives, spreads, runtime globals,
+`<script>`, `<style>` and the reserved `<data-…>` elements are rejected. The editor understands a larger
 language than the interpreter; `atomic check` is authoritative. Escape literal
 angle brackets and braces in prose, for example `&lt;name>` and `&#123;value&#125;`.
 
 The compiler bounds source size and component depth. Rendering and contracts have
 operation, collection and output budgets, and the worker has a time limit.
 Unsupported syntax fails; it is never evaluated as JavaScript.
+
+## TypeScript helpers
+
+Business rules that are awkward as template expressions can be ordinary
+TypeScript, imported by name without an extension:
+
+```astro
+---
+import type { Props, Input, Output } from '../.atomic/types/assess-change';
+import type { AtomConfig } from '../.atomic/types/authoring';
+import { missingEvidence, reviewLabel } from '../lib/review';
+const { input }: Props = Astro.props;
+const missing = missingEvidence(input);
+export const config: AtomConfig<Input, Output> = {
+  validate: [({ input, output }) => output.verdict === 'hold' || missingEvidence(input).length === 0],
+};
+---
+Assess {reviewLabel(input.change)}.
+{missing.length > 0 && <Fragment>Required evidence is missing.</Fragment>}
+```
+
+```ts
+// lib/review.ts
+import type { Change } from '../.atomic/types/schemas/change';
+export const reviewLabel = (change: Change): string => `${change.id} (${change.service.tier})`;
+```
+
+- **What runs.** `atomic check` type-checks a helper with the atoms and
+  components that import it, then captures its runtime imports (local `.ts`
+  modules only) with the compiled atom. Type-only imports, such as generated
+  schema types, are checked and never captured. Each call runs in a fresh V8
+  isolate with ECMAScript built-ins and the JSON arguments it is given: no
+  network, files, environment, process, timers, WebAssembly or shared memory,
+  and no state survives between calls. Anything that reads or changes the
+  world belongs in an [exec step](#exec-atoms).
+- **Provenance.** A helper's result is as trusted as its least trusted
+  argument, so a helper over a ticket's text returns external data. A result
+  computed from literals alone, such as `stageBanner('risk assessment')`, is
+  authored text and may be part of the instructions.
+- **Time and randomness.** `Date`, `Temporal.Now` and `Math.random` follow a
+  logical time and seed the step records when it first starts, so a step
+  retried after a crash renders the same prompt and reaches the same validator
+  decisions. Local time is UTC and an unspecified locale is `en-US`, whatever
+  the host's.
+- **Durability.** A run keeps the helpers it captured when it started; editing
+  a helper affects new runs only. A run cannot resume a helper step on a
+  different helper runtime (a newer atomic whose engine, prelude or compiler
+  differs); start a new run instead.
+- **Contracts.** Validators, `scorers.with` and `scorers.score` may call
+  helpers and keep their return types. A helper that throws or hits a limit
+  fails the operation; in a validator that is an error, not a rejection that
+  starts a repair turn. A thrown error is reported at the helper line that threw.
+- **Limits.** Per call: 1 second, a 128 MiB heap, 64 MiB of ArrayBuffers, a
+  1 MiB result and 16 KiB of error text. Per render, validation or judge
+  binding: 256 calls, 10 seconds and 4 MiB of results. A helper graph holds at
+  most 64 modules of 256 KiB, 1 MiB in all.
+- **Editors.** Write helper imports without `.ts`: stock editors resolve them
+  with no tsconfig, while an explicit `.ts` extension needs
+  `allowImportingTsExtensions`. Packages are not available to helpers yet.
 
 ## Prompt and execution context
 

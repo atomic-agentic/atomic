@@ -51,6 +51,24 @@ Sort the findings into immediate fixes and follow-up work.
 <slot />
 ```
 
+Named slots take the caller's content for one part of a layout, with fallback
+text for when the caller supplies none:
+
+```astro
+<policy><slot name="policy">Follow the team's default change policy.</slot></policy>
+<slot />
+```
+
+```astro
+<ReviewFrame>
+  <Fragment slot="policy">Hold every change to the payments database.</Fragment>
+  Review the attached change.
+</ReviewFrame>
+```
+
+`Astro.slots.has('policy')` tells a component whether its caller filled the slot,
+as Astro defines it; see [supported syntax](../reference/atom-files.md#supported-syntax-and-limits).
+
 Import components explicitly by their local filename. They share the atom's source
 containment rules and are captured in its compiled source graph. Cycles and imports
 that escape the project fail. There is no npm component execution, implicit

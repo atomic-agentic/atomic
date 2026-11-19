@@ -40,7 +40,9 @@ workflows, schemas, toolsets and evals.
 An Astro atom keeps instructions readable while literal configuration declares the
 contract. Filename conventions and schema-derived types make files discoverable
 and checkable. The bundled Astro parser and bounded TypeScript-shaped interpreter
-check supported syntax before a model turn; they never execute the source module.
+check supported syntax before a model turn; they never execute the atom itself.
+Business rules can live in ordinary TypeScript helpers, which run one call at a
+time in an isolate that can read nothing but its arguments.
 
 Executable SDK calls and I/O belong in separate script atoms. Workflows compose
 scripts and model atoms as sibling steps. Public configuration is explicit, typed

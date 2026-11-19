@@ -86,9 +86,14 @@ These are the rules that are easiest to break:
 - **atomic makes git commits, outside the sandbox.** A worktree an atom wrote
   to is untrusted input: run git there with hooks, drivers, signing and pagers
   off.
-- **Declarative atoms never execute modules.** `.atom.astro` files use the
-  bundled Astro parser and a bounded TypeScript-shaped AST interpreter.
-  Workflow mappings remain CEL. JSON Schema stays the runtime contract.
+- **Declarative atoms interpret frontmatter and templates; only captured
+  helper modules execute, one fresh capability-free isolate per call.**
+  `.atom.astro` files use the bundled Astro parser and a bounded
+  TypeScript-shaped AST interpreter. Helper calls run in `deno_core` behind
+  `atomic_core::helper_runtime`, with no host operations, Rust-enforced limits,
+  the step's recorded clock and a result as trusted as its least trusted
+  argument. Workflow mappings remain CEL. JSON Schema stays the runtime
+  contract.
 - **JSON Schema is the contract.** atomic validates every model output and
   tool argument against the full schema itself.
 - **Runtime state never lives in the source tree.** It goes in the per-project
