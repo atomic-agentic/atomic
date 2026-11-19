@@ -6,9 +6,12 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
-// Every outcome is one JSON response on stdout and exit code 0: `ok` with a
-// result, or `error` with a message and, when known, the authored file and
-// line. A non-zero exit means the worker crashed before it could answer.
+// The request is one line of JSON on stdin. Every outcome is one JSON line on
+// stdout and exit code 0: `ok` with a result, or `error` with a message and,
+// when known, the authored file and line. A non-zero exit means the worker
+// crashed before it could answer. While it works, the worker may ask the host
+// to run a captured helper: it writes a `call` line and reads the host's
+// one-line reply from stdin.
 function respond(body) { console.log(JSON.stringify(body)); }
 function failure(error) {
   const body = { message: String(error?.message ?? error) };
@@ -22,16 +25,32 @@ if (Deno.version.deno !== PINNED_DENO) {
   respond(failure(`the Astro compiler requires Deno ${PINNED_DENO}, but found Deno ${Deno.version.deno}; set ATOMIC_DENO to a Deno ${PINNED_DENO} executable`));
   Deno.exit(0);
 }
+// One line from stdin, read synchronously (the interpreter is synchronous and
+// waits for each helper result). Bytes after the newline are kept for the next.
+let pending = new Uint8Array(0);
+function readLine(limit) {
+  const chunk = new Uint8Array(65536);
+  for (;;) {
+    const newline = pending.indexOf(10);
+    if (newline >= 0) {
+      const line = new TextDecoder().decode(pending.subarray(0, newline));
+      pending = pending.slice(newline + 1);
+      return line;
+    }
+    if (pending.length > limit) throw new Error('compiler request limit exceeded');
+    const read = Deno.stdin.readSync(chunk);
+    if (read === null) {
+      if (!pending.length) return null;
+      const line = new TextDecoder().decode(pending); pending = new Uint8Array(0); return line;
+    }
+    const next = new Uint8Array(pending.length + read); next.set(pending); next.set(chunk.subarray(0, read), pending.length); pending = next;
+  }
+}
 let request;
 try {
-  let requestText = '';
-  const decoder = new TextDecoder();
-  for await (const chunk of Deno.stdin.readable) {
-    requestText += decoder.decode(chunk, { stream: true });
-    if (requestText.length > 8_388_608) throw new Error('compiler request limit exceeded');
-  }
-  requestText += decoder.decode();
-  request = JSON.parse(requestText);
+  const line = readLine(8_388_608);
+  if (line === null) throw new Error('missing compiler request');
+  request = JSON.parse(line);
 } catch (error) {
   respond(failure(error));
   Deno.exit(0);
@@ -40,7 +59,11 @@ if (request.options) for (const key of ['contextSnapshot', 'stepId']) if (reques
 const sources = new Map(Object.entries(request.sources ?? {}));
 const frozen = request.sources !== undefined;
 const sourcePaths = request.sourcePaths ?? {};
+// Files the host looked for and found absent: an import of one is an
+// authored error, reported where the import is.
+const absent = new Set(request.absent ?? []);
 function missing(file) {
+  if (absent.has(file)) throw Object.assign(new Error(`no such file: ${file}`), { code: 'ENOENT' });
   if (request.action === 'load' && frozen) {
     const error = new Error('missing source'); error.sources = [file]; throw error;
   }
@@ -67,6 +90,22 @@ try {
   const { compile, render, validateOutput, judgeInput, judgeScore, aggregateScores } = await import('./renderer.mjs');
   if (!frozen) throw new Error('the compiler reads atom sources only from the request');
   const unit = await compile(request.file, { root: request.root, authoringFile: `${request.root}/.atomic/types/authoring.d.ts`, production: true });
+  // Helper calls go to the host, which runs each in a fresh isolate from the
+  // capture it recorded when the atom loaded.
+  const { locateThrow } = await import('./capture.mjs');
+  const { setHelperExecutor, HelperFailure } = await import('./renderer.mjs');
+  setHelperExecutor((capture, name, args) => {
+    respond({ call: { capture, export: name, args } });
+    const line = readLine(8_388_608);
+    if (line === null) throw new HelperFailure('host', 'the host closed the helper channel');
+    const reply = JSON.parse(line);
+    if (Object.hasOwn(reply, 'ok')) return reply.ok;
+    const failure = reply.error ?? {};
+    const text = String(failure.message ?? 'failed');
+    const at = failure.kind === 'threw' ? locateThrow(text, unit.captures.values()) : undefined;
+    // A thrown error's stack locates it; the message is its first line.
+    throw new HelperFailure(failure.kind ?? 'host', `helper ${name}: ${text.split('\n')[0]}`, at?.file, at?.line);
+  });
   if (Object.hasOwn(unit.config, 'validate') && !Array.isArray(unit.config.validate)) throw new Error('validate must be an array of interpreted callbacks');
   for (const descriptor of unit.config.validate ?? []) if (descriptor?.kind !== 'interpreted' || !unit.contracts.has(descriptor.id)) throw new Error('validate requires interpreted typed callbacks, not CEL strings');
   for (const scorer of Object.values(unit.config.scorers ?? {})) {
@@ -81,12 +120,20 @@ try {
     const { verifySnapshot } = await import('./context.mjs');
     result = verifySnapshot(request.snapshot, request.runId);
     if (result.programHash !== request.programHash) throw new Error('context compiled atom version mismatch');
-  } else if (request.action === 'load') result = { config: unit.config, needsContext: unit.requiresContext || unit.bindings.some(binding => binding.prop === 'context'), sources: Object.fromEntries(sources), sourcePaths };
-  else if (request.action === 'check') {
+  } else if (request.action === 'load') {
+    // Type-only imports across the component graph, which the host resolves to declarations.
+    const typeImports = new Set(), seen = new Set();
+    const visit = (item) => { if (seen.has(item)) return; seen.add(item); item.typeImports.forEach((file) => typeImports.add(file)); item.imports.forEach(visit); };
+    visit(unit);
+    const helpers = Object.fromEntries([...unit.captures].sort(([a], [b]) => (a < b ? -1 : 1)).map(([digest, captured]) => [digest, captured.artifact]));
+    result = { config: unit.config, needsContext: unit.requiresContext || unit.bindings.some(binding => binding.prop === 'context'), sources: Object.fromEntries(sources), sourcePaths, typeImports: [...typeImports].sort(), helpers };
+  } else if (request.action === 'check') {
+    // The host generates every declaration from the full schemas; the worker only checks.
     const { typecheck } = await import('./typecheck.mjs');
-    const { atomDeclarations } = await import('./schema-types.mjs');
-    const stem = path.basename(request.file, '.atom.astro');
-    const declarations = { [`${request.root}/.atomic/types/${stem}.d.ts`]: atomDeclarations(request.schemas), [`${request.root}/.atomic/types/authoring.d.ts`]: request.authoring };
+    const declarations = request.declarations ?? {};
+    for (const [name, text] of Object.entries(declarations)) {
+      if (!name.startsWith(`${request.root}/.atomic/types/`) || !name.endsWith('.d.ts') || typeof text !== 'string') throw new Error('declarations must be .d.ts text under .atomic/types');
+    }
     await typecheck(Object.fromEntries(sources), declarations, sourcePaths);
     result = declarations;
   } else if (request.action === 'render') result = render(unit, request.input, request.options);

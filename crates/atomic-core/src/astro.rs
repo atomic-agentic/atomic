@@ -35,6 +35,10 @@ pub struct Program {
     /// Canonical paths for explicitly imported source aliases.
     #[serde(default)]
     pub source_paths: BTreeMap<String, String>,
+    /// The captured helper module graphs the sources import, keyed by digest.
+    /// Helper calls run only these, so a run keeps the helpers it started with.
+    #[serde(default)]
+    pub helpers: BTreeMap<String, crate::helper_runtime::Captured>,
 }
 
 /// A compiler failure, located in the authored source when the compiler knows where.
@@ -254,7 +258,151 @@ pub fn worker(request: Value) -> Result<Value, String> {
 }
 
 /// As [`worker`], keeping where in the authored source a failure is.
-pub fn worker_located(mut request: Value) -> Result<Value, Diagnostic> {
+pub fn worker_located(request: Value) -> Result<Value, Diagnostic> {
+    worker_with(request, &BTreeMap::new(), None)
+}
+
+/// The logical time and seed of one durable step, recorded when the step
+/// first starts and reused on every retry of it, so the step's helper calls
+/// see the same clock and randomness each time. Each call's
+/// [`crate::helper_runtime::Clock`] is derived from it, the operation (a
+/// render, a validation round) and the call's position in that operation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepClock {
+    /// Milliseconds since the epoch.
+    pub now_ms: i64,
+    /// 32 random bytes, in hex.
+    pub seed: String,
+}
+
+impl StepClock {
+    /// The current time and a fresh seed: what a step records, and what an
+    /// operation outside a durable step (a preview, a check) uses.
+    pub fn fresh() -> Result<Self, String> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_millis();
+        let mut seed = [0u8; 32];
+        getrandom::fill(&mut seed).map_err(|e| e.to_string())?;
+        Ok(Self {
+            now_ms: i64::try_from(now_ms).map_err(|e| e.to_string())?,
+            seed: seed.iter().map(|b| format!("{b:02x}")).collect(),
+        })
+    }
+
+    /// The clock of call `index` within `operation`.
+    pub(crate) fn call(&self, operation: &str, index: usize) -> crate::helper_runtime::Clock {
+        let mut digest = Sha256::new();
+        digest.update(b"atomic-helper-clock-v1\0");
+        digest.update(self.seed.as_bytes());
+        digest.update([0]);
+        digest.update(operation.as_bytes());
+        digest.update([0]);
+        digest.update((index as u64).to_le_bytes());
+        let bytes = digest.finalize();
+        let word =
+            |i: usize| u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
+        crate::helper_runtime::Clock {
+            now_ms: self.now_ms as f64,
+            seed: [word(0), word(4), word(8), word(12)],
+        }
+    }
+}
+
+/// The helper calls one compiler operation may make, together: a render, a
+/// validation or a judge binding. Each call has its own limits as well
+/// ([`crate::helper_runtime::Limits`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HelperBudget {
+    /// Calls.
+    pub calls: usize,
+    /// Time spent in helpers.
+    pub time: std::time::Duration,
+    /// JSON result bytes.
+    pub bytes: usize,
+}
+
+impl Default for HelperBudget {
+    fn default() -> Self {
+        Self {
+            calls: 256,
+            time: std::time::Duration::from_secs(10),
+            bytes: 4 * 1024 * 1024,
+        }
+    }
+}
+
+/// Runs one helper call the worker asked for, against the captures the atom
+/// recorded when it loaded, and spends it from `left`.
+pub(crate) fn helper_call(
+    helpers: &BTreeMap<String, crate::helper_runtime::Captured>,
+    left: &mut HelperBudget,
+    call: &Value,
+    clock: crate::helper_runtime::Clock,
+) -> Value {
+    use crate::helper_runtime::{Failure, Limits, invoke};
+    let failure =
+        |kind: &str, message: String| json!({ "error": { "kind": kind, "message": message } });
+    let Some(captured) = call["capture"]
+        .as_str()
+        .and_then(|digest| helpers.get(digest))
+    else {
+        return failure(
+            "refused",
+            "the helper is not in the atom's captured helpers".into(),
+        );
+    };
+    let Some(export) = call["export"].as_str() else {
+        return failure("refused", "a helper call names its export".into());
+    };
+    if left.calls == 0 {
+        return failure("budget", "helper call limit exceeded".into());
+    }
+    left.calls -= 1;
+    if left.time.is_zero() {
+        return failure("budget", "helper time limit exceeded".into());
+    }
+    let limits = Limits {
+        deadline: left.time.min(Limits::default().deadline),
+        ..Limits::default()
+    };
+    let started = std::time::Instant::now();
+    let result = invoke(captured, export, &call["args"], limits, clock);
+    left.time = left.time.saturating_sub(started.elapsed());
+    match result {
+        Ok(value) => {
+            let size = value.to_string().len();
+            if size > left.bytes {
+                left.bytes = 0;
+                return failure("budget", "helper result limit exceeded".into());
+            }
+            left.bytes -= size;
+            json!({ "ok": value })
+        }
+        Err(Failure::Threw(text)) => failure("threw", text),
+        Err(other) => {
+            let kind = match other {
+                Failure::Deadline => "deadline",
+                Failure::Heap | Failure::ArrayBufferLimit => "memory",
+                Failure::OutputLimit | Failure::ErrorLimit => "size",
+                Failure::NotJson(_) => "not-json",
+                Failure::Refused(_) => "refused",
+                Failure::Threw(_) | Failure::Host(_) => "host",
+            };
+            failure(kind, other.to_string())
+        }
+    }
+}
+
+/// As [`worker_located`], answering the worker's helper calls from `helpers`
+/// with clocks derived from `clock` and the operation; without one, the
+/// operation's calls share the current time and a fresh seed.
+pub(crate) fn worker_with(
+    mut request: Value,
+    helpers: &BTreeMap<String, crate::helper_runtime::Captured>,
+    clock: Option<(&StepClock, &str)>,
+) -> Result<Value, Diagnostic> {
     safe_json(&request, 0, &mut 100_000)?;
     let dir = assets()?;
     let root = request
@@ -278,17 +426,26 @@ pub fn worker_located(mut request: Value) -> Result<Value, Diagnostic> {
                 .to_owned(),
         ];
         let mut total = 0;
+        // Requested files that do not exist; the compiler reports an import of
+        // one where the import is.
+        let mut absent = std::collections::BTreeSet::<String>::new();
         // Capture all missing siblings together; one worker per import depth.
         for _ in 0..33 {
             for target in targets {
-                let canonical = std::fs::canonicalize(&target)
-                    .map_err(|e| format!("read component {target}: {e}"))?;
+                let canonical = match std::fs::canonicalize(&target) {
+                    Ok(canonical) => canonical,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound && !sources.is_empty() => {
+                        absent.insert(target);
+                        continue;
+                    }
+                    Err(e) => return Err(format!("read component {target}: {e}").into()),
+                };
+                let helper = canonical.extension().is_some_and(|e| e == "ts")
+                    && !canonical.to_string_lossy().ends_with(".d.ts");
                 if !canonical.starts_with(&root)
-                    || canonical
-                        .extension()
-                        .is_none_or(|extension| extension != "astro")
+                    || !(helper || canonical.extension().is_some_and(|e| e == "astro"))
                 {
-                    return Err("component must be an Astro source inside the project root".into());
+                    return Err("an imported source must be an Astro component or a .ts helper inside the project root".into());
                 }
                 let canonical_name = canonical
                     .to_str()
@@ -311,13 +468,14 @@ pub fn worker_located(mut request: Value) -> Result<Value, Diagnostic> {
                     }
                     entry.insert(source);
                 }
-                if sources.len() > 128 || source_paths.len() > 512 {
+                if sources.len() > 128 || source_paths.len() > 512 || absent.len() > 128 {
                     return Err("component graph limit exceeded".into());
                 }
             }
             request["sources"] = json!(sources);
             request["sourcePaths"] = json!(source_paths);
-            let result = worker_located(request.clone())?;
+            request["absent"] = json!(absent);
+            let result = worker_with(request.clone(), helpers, clock)?;
             if let Some(next) = result.get("needsSources") {
                 targets = serde_json::from_value::<Vec<String>>(next.clone())
                     .map_err(|_| "invalid source discovery response")?;
@@ -335,7 +493,18 @@ pub fn worker_located(mut request: Value) -> Result<Value, Diagnostic> {
     if bytes.len() > crate::compiler_process::MESSAGE_LIMIT {
         return Err("compiler request limit exceeded".into());
     }
-    let output = crate::compiler_process::run(
+    let mut left = HelperBudget::default();
+    let fresh;
+    let (step_clock, operation) = match clock {
+        Some(clock) => clock,
+        None => {
+            fresh = StepClock::fresh()?;
+            (&fresh, request["action"].as_str().unwrap_or("operation"))
+        }
+    };
+    let operation = operation.to_owned();
+    let mut index = 0usize;
+    let output = crate::compiler_process::run_interactive(
         &deno(),
         &deno_args(&dir),
         &[
@@ -347,6 +516,15 @@ pub fn worker_located(mut request: Value) -> Result<Value, Diagnostic> {
         ],
         &bytes,
         crate::compiler_process::TIME_LIMIT,
+        &mut |call: &Value| {
+            index += 1;
+            helper_call(
+                helpers,
+                &mut left,
+                call,
+                step_clock.call(&operation, index - 1),
+            )
+        },
     )?;
     let response: Value =
         serde_json::from_slice(&output).map_err(|e| format!("invalid compiler response: {e}"))?;
@@ -373,13 +551,25 @@ impl Program {
     }
 
     /// As [`Program::invoke`], keeping where in the authored source a failure is.
-    pub fn invoke_located(&self, action: &str, mut args: Value) -> Result<Value, Diagnostic> {
+    pub fn invoke_located(&self, action: &str, args: Value) -> Result<Value, Diagnostic> {
+        self.invoke_clocked(action, args, None)
+    }
+
+    /// As [`Program::invoke_located`], with helper calls clocked by a durable
+    /// step's record and named `operation` within it (a render, one round of
+    /// validation), so a retried step sees the same values.
+    pub fn invoke_clocked(
+        &self,
+        action: &str,
+        mut args: Value,
+        clock: Option<(&StepClock, &str)>,
+    ) -> Result<Value, Diagnostic> {
         args["action"] = json!(action);
         args["file"] = json!(path_text(&self.file)?);
         args["root"] = json!(path_text(&self.root)?);
         args["sources"] = json!(self.sources);
         args["sourcePaths"] = json!(self.source_paths);
-        worker_located(args)
+        worker_with(args, &self.helpers, clock)
     }
 
     /// Invoke on the bounded blocking pool rather than an executor thread.
@@ -389,12 +579,51 @@ impl Program {
         blocking(move || program.invoke(&action, args)).await
     }
 
+    /// Checks that every captured helper still has the digest it is recorded
+    /// under, so a damaged stored program fails instead of running code the
+    /// atom never captured.
+    pub fn verify_helpers(&self) -> Result<(), String> {
+        for (digest, captured) in &self.helpers {
+            if captured.digest() != *digest {
+                return Err(format!(
+                    "a captured helper of {} does not match its digest {digest}: the stored atom is damaged",
+                    self.file.display()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// What this program's helpers depend on besides their code: the helper
+    /// runtime and the compiler that interprets the atom. A run records it
+    /// when it starts; see [`crate::helper_runtime::identity`].
+    pub fn helper_runtime(&self) -> String {
+        Self::current_helper_runtime()
+    }
+
+    /// [`Program::helper_runtime`] for this build. Debug builds honour
+    /// `ATOMIC_TEST_HELPER_RUNTIME`, so tests can stand in for another
+    /// release; release builds ignore it.
+    pub fn current_helper_runtime() -> String {
+        if cfg!(debug_assertions)
+            && let Some(identity) = std::env::var_os("ATOMIC_TEST_HELPER_RUNTIME")
+        {
+            return identity.to_string_lossy().into_owned();
+        }
+        let mut digest = Sha256::new();
+        digest.update(crate::helper_runtime::identity().as_bytes());
+        digest.update([0]);
+        digest.update(COMPILER_HASH.as_bytes());
+        format!("{:x}", digest.finalize())
+    }
+
     /// A stable fingerprint of the entry and all component bytes.
     pub fn hash(&self) -> String {
         let mut digest = Sha256::new();
         digest.update(COMPILER_HASH.as_bytes());
         digest.update(self.contracts.to_string().as_bytes());
         digest.update(serde_json::to_vec(&self.source_paths).unwrap_or_default());
+        digest.update(serde_json::to_vec(&self.helpers).unwrap_or_default());
         for (name, source) in &self.sources {
             digest.update(name.as_bytes());
             digest.update([0]);

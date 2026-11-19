@@ -55,6 +55,15 @@ enum Command {
     /// Run commands for a control plane: one request on stdin, one response
     /// on stdout, and an exit code from a fixed set.
     Runner,
+    /// Write JSON Schemas for editors: workflow files and the manifest, with
+    /// the project's atom names and schema IDs.
+    #[command(args_conflicts_with_subcommands = true)]
+    Schemas {
+        /// A project directory; defaults to the current project.
+        path: Option<PathBuf>,
+        #[command(subcommand)]
+        command: Option<SchemasCommand>,
+    },
     /// Install atomic's authoring skills for a coding agent.
     Setup(setup::SetupArgs),
     /// Developer diagnostics.
@@ -67,6 +76,16 @@ enum Runs {
     /// Continue an unfinished run in the foreground, from its checkpoints,
     /// with the definitions and input it started with.
     Resume(runs::ResumeArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum SchemasCommand {
+    /// Print the JSON Schemas an atom's input and output compile to, as
+    /// atomic enforces them, compact forms expanded.
+    Expand {
+        /// The atom, by name in the current project or by file.
+        atom: String,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -127,6 +146,13 @@ impl PromptArgs {
 }
 
 fn main() -> anyhow::Result<()> {
+    // A helper child serves one call and exits, before anything else starts:
+    // no state directory, no Codex dispatch.
+    if std::env::args_os().nth(1).as_deref()
+        == Some(atomic_core::helper_runtime::CHILD_ARG.as_ref())
+    {
+        std::process::exit(atomic_core::helper_runtime::serve());
+    }
     // The runner role needs no state directory and no Codex: it runs one
     // command for a control plane and exits with a code from its contract.
     if std::env::args_os().nth(1).is_some_and(|a| a == "runner") {
@@ -239,6 +265,12 @@ async fn run(cli: Cli, paths: CodexPaths, state: ProjectState) -> anyhow::Result
         Some(Command::Serve(args)) => runs::serve(args, project, &paths).await,
         Some(Command::Runner) => Ok(()),
         Some(Command::Render(args)) => tokio::task::spawn_blocking(move || render(args)).await?,
+        Some(Command::Schemas { path, command }) => match command {
+            Some(SchemasCommand::Expand { atom }) => {
+                tokio::task::spawn_blocking(move || expand(&atom)).await?
+            }
+            None => tokio::task::spawn_blocking(move || schemas(path)).await?,
+        },
         Some(Command::Setup(args)) => setup::run(args),
         None => {
             println!("atomic {}", env!("CARGO_PKG_VERSION"));
@@ -317,11 +349,7 @@ fn load_project_schemas(
     };
     match project::discover(path) {
         Ok(project) => {
-            let files = atomic_core::collections::collect(&project)?;
-            for schema in &files["schemas"] {
-                registry.load_file(&schema.path)?;
-            }
-            Ok(())
+            atomic_core::collections::load_schemas(&project, registry).map_err(anyhow::Error::msg)
         }
         Err(project::ProjectError::NotFound(_)) => Ok(()),
         Err(error) => Err(error.into()),
@@ -352,9 +380,7 @@ fn check(path: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
     }
     let project = project::discover(&path)?;
     let files = collections::collect(&project)?;
-    for schema in &files["schemas"] {
-        registry.load_file(&schema.path)?;
-    }
+    collections::load_schemas(&project, &mut registry).map_err(anyhow::Error::msg)?;
     let mut atoms = std::collections::BTreeMap::new();
     for source in &files["atoms"] {
         let atom = atom::load(&source.path, &mut registry)?;
@@ -373,11 +399,37 @@ fn check(path: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
             warnings.push(format!("{}: {w}", loaded.file.display()));
         }
     }
+    // Each OpenAPI toolset must give tools whose schemas compile.
+    let mut operations = 0;
+    for source in &files["toolsets"] {
+        let text = std::fs::read_to_string(&source.path)?;
+        let spec = if source.path.extension().is_some_and(|e| e == "json") {
+            serde_json::from_str(&text)?
+        } else {
+            atomic_schema::yaml::load(&source.path, &text)?.value
+        };
+        let tools = atomic_schema::openapi::operations(&spec)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", source.path.display()))?;
+        for tool in &tools {
+            for schema in std::iter::once(&tool.input).chain(tool.output.as_ref()) {
+                atomic_schema::registry::Registry::new()
+                    .validator_for(schema)
+                    .map_err(|e| {
+                        anyhow::anyhow!("{}: operation `{}`: {e}", source.path.display(), tool.name)
+                    })?;
+            }
+        }
+        operations += tools.len();
+    }
     if json {
         println!(
             "{}",
             serde_json::json!({
-                "checked": {"atoms": atoms.len(), "workflows": files["workflows"].len()},
+                "checked": {
+                    "atoms": atoms.len(),
+                    "workflows": files["workflows"].len(),
+                    "toolset_operations": operations,
+                },
                 "warnings": warnings,
             })
         );
@@ -386,11 +438,101 @@ fn check(path: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
             eprintln!("warning: {w}");
         }
         println!(
-            "checked {} Astro atoms and {} workflows",
+            "checked {} Astro atoms, {} workflows and {} toolset operations",
             atoms.len(),
-            files["workflows"].len()
+            files["workflows"].len(),
+            operations
         );
     }
+    Ok(())
+}
+
+fn schemas(path: Option<PathBuf>) -> anyhow::Result<()> {
+    use atomic_core::{atom, collections, editor};
+    let path = path.unwrap_or(std::env::current_dir()?);
+    let project = project::discover(&path)?;
+    let files = collections::collect(&project)?;
+    let mut registry = atomic_schema::registry::Registry::new();
+    collections::load_schemas(&project, &mut registry).map_err(anyhow::Error::msg)?;
+    let mut atoms = std::collections::BTreeMap::new();
+    for source in &files["atoms"] {
+        let atom = atom::load(&source.path, &mut registry)?;
+        atoms.insert(atom.name.clone(), atom);
+    }
+    // Schema IDs a contract can reference by name; a file's own URI is not one.
+    let mut ids: Vec<String> = registry
+        .entries()
+        .map(|entry| entry.id.clone())
+        .filter(|id| !id.starts_with("file:") && !id.starts_with("atomic:"))
+        .collect();
+    ids.sort();
+    ids.dedup();
+    let dir = project.dir.join(&project.generated).join("schemas");
+    std::fs::create_dir_all(&dir)?;
+    for (name, schema) in [
+        (
+            "workflow.schema.json",
+            editor::workflow_schema(&atoms, &ids),
+        ),
+        ("manifest.schema.json", editor::manifest_schema()),
+    ] {
+        let file = dir.join(name);
+        std::fs::write(&file, serde_json::to_string_pretty(&schema)? + "\n")?;
+        println!("wrote {}", file.display());
+    }
+    let relative = project.generated.join("schemas");
+    println!(
+        "Point an editor at them with a first line, the path relative to the file; for \
+         workflows/x.workflow.yaml:\n  # yaml-language-server: $schema=../{}/workflow.schema.json\n\
+         and for atomic.yaml:\n  # yaml-language-server: $schema={}/manifest.schema.json",
+        relative.display(),
+        relative.display()
+    );
+    Ok(())
+}
+
+fn expand(name: &str) -> anyhow::Result<()> {
+    use atomic_core::{atom, collections};
+    let file = std::path::Path::new(name);
+    let file = if file.is_file() {
+        file.to_owned()
+    } else {
+        let project = project::discover(&std::env::current_dir()?)?;
+        let files = collections::collect(&project)?;
+        files["atoms"]
+            .iter()
+            .find(|source| source.name == name)
+            .map(|source| source.path.clone())
+            .ok_or_else(|| anyhow::anyhow!("no atom named `{name}` in {}", project.name))?
+    };
+    let mut registry = atomic_schema::registry::Registry::new();
+    load_project_schemas(
+        file.parent().unwrap_or(std::path::Path::new(".")),
+        &mut registry,
+    )?;
+    let atom = atom::load(&file, &mut registry)?;
+    // Each contract as a standalone JSON Schema 2020-12 document.
+    let standalone = |contract: &serde_json::Value| {
+        let mut out = serde_json::Map::new();
+        out.insert(
+            "$schema".into(),
+            serde_json::json!("https://json-schema.org/draft/2020-12/schema"),
+        );
+        if let Some(fields) = contract.as_object() {
+            for (key, value) in fields {
+                out.entry(key.clone()).or_insert_with(|| value.clone());
+            }
+        }
+        serde_json::Value::Object(out)
+    };
+    let contracts = &atom.program.contracts;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "input": standalone(&contracts["Input"]),
+            "output": standalone(&contracts["Output"]),
+        }))?
+    );
     Ok(())
 }
 
@@ -463,6 +605,8 @@ fn render(args: RenderArgs) -> anyhow::Result<()> {
             input: &input,
             frontmatter: &atom.frontmatter,
             origin: "external",
+            origins: None,
+            step: None,
         },
         snapshot.as_ref(),
         Some(&args.step_id),

@@ -32,6 +32,7 @@ Paths are relative to the manifest's directory. atomic finds files by these defa
 - workflows: `workflows/**/*.workflow.yaml`, `**/*.workflow.yaml`
 - schemas: `schemas/**/*.schema.yaml`, `schemas/**/*.schema.json`
 - evals: `evals/**/*.yaml`, `evals/**/*.jsonl`
+- toolsets: `toolsets/**/*.openapi.yaml`, `toolsets/**/*.openapi.json`
 
 An atom's schemas default to sidecars named after its file: for `atoms/<stem>.atom.astro`, `atoms/<stem>.input.schema.yaml` and `atoms/<stem>.output.schema.yaml` (`.json` also works; both forms of one sidecar is an error). Eval cases for atom `<name>` go in `evals/<name>/`, one case per `.yaml` file or one per line of a `.jsonl` file. `.atomic/types/` is generated: never edit it, and keep it out of version control.
 

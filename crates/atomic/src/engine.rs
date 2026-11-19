@@ -181,6 +181,7 @@ pub async fn open(
         },
         lite: LiteRuntime::new(endpoint, AtomConfig::default()),
         exec,
+        clock: None,
     });
     // A project in a git repository gets worktrees for its worktree steps.
     let worktrees = Worktrees::open(state).ok().map(Arc::new);
@@ -197,6 +198,9 @@ pub async fn open(
             // The CLI reads no configuration files yet, so every run is
             // metered under the built-in budget defaults.
             budgets: Arc::default(),
+            // No context settings yet: a step whose atom declares a public
+            // context is refused rather than resolved from nothing.
+            context: None,
         },
     );
     rt.launch().await.context("launch the durable runtime")?;

@@ -120,9 +120,10 @@ remain unspecified. Run recovery uses the v0.1 command above. The
 | `atomic render <file.atom.astro> --input <file.json>` | Print developer/user prompt parts without a model; optional `--context-settings`, `--profile`, `--run-id`, `--step-id` | Implemented direct invocation |
 | `atomic eval <atom> --plan`, `atomic run <workflow> --plan` | Print the expected model calls and a cost range, then exit without calling a model | v0.5 |
 | `atomic run <workflow> --effects preview` | Run a workflow in staged mode: external effects are recorded and shown, none is applied | v0.5 |
-| `atomic schemas expand <atom>` | Print the JSON Schema that a compact schema compiles to | v0.5 |
+| `atomic schemas expand <atom>` | Print an atom's input and output contracts as atomic enforces them, compact forms expanded | Implemented |
 | `atomic runs replay <run-id> [--from <step>]` | Inspect recorded execution from a chosen point | v0.5 |
-| `atomic types`, `atomic schemas` | Generate editor types and schemas | v0.5 |
+| `atomic schemas` | Write JSON Schemas for workflow files and the manifest into the generated directory, with the project's atom names, their input fields and its schema IDs, for editors; see [VS Code](../guides/vs-code.md#workflow-and-manifest-files) | Implemented |
+| `atomic types` | Generate editor types without a full check (`atomic check` writes them today) | v0.5 |
 | `atomic setup claude`, `atomic setup codex` | Install the `atomic-create-atom` authoring skill for Claude Code or Codex; see [coding agents](../guides/coding-agents.md) | Implemented; more agents and skills later |
 
 Read [testing and evals](../guides/testing-and-evals.md) before treating recording

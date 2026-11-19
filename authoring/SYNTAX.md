@@ -1,7 +1,9 @@
 # Astro expression contract
 
 Atomic uses Astro syntax and its real parser, with a deliberately bounded
-TypeScript-shaped interpreter. Source modules never execute. TypeScript checks
+TypeScript-shaped interpreter. Atom and component modules never execute; named
+imports of local TypeScript helpers run in the host's embedded runtime, one
+fresh isolate per call (see Helpers below). TypeScript checks
 against fresh schema-derived declarations before a model call. Suppression
 comments and explicit `any` in production frontmatter cannot disable that gate.
 Diagnostics use Astro's source map to point back to the authored file.
@@ -38,9 +40,34 @@ fail rather than silently disappearing from a prompt.
 
 Import only local default `.astro` components at runtime. Type-only imports
 supply generated declarations. The fixed authoring intrinsics have explicit
-implementations, such as `fitsWithin`; arbitrary helper modules never execute.
-Components must remain under the project root, have no import cycles, and use
-supported props, literal sections, fragments and an unnamed slot.
+implementations, such as `fitsWithin`. Components must remain under the project
+root, have no import cycles, and use supported props, literal sections,
+fragments and slots.
+
+Frontmatter may declare `const` locals bound to supported expressions, with
+plain or nested object destructuring; they evaluate in order when the component
+renders. Template literals interpolate strings, numbers, booleans and null and
+carry the least trusted origin of their parts. Named slots (`<slot name="x">`
+with fallback content, filled by a direct child with `slot="x"`) follow Astro:
+explicit content, even an empty Fragment, is present; whitespace and comments
+are not; and a forwarded slot is present only when the slot it forwards is.
+`Astro.slots.has('x')` reads presence without rendering.
+
+## Helpers
+
+A named import of a local `.ts` module, written without the extension
+(`import { label } from '../lib/review'`), imports helpers. The compiler
+captures the helper graph's runtime imports, type-checks it with the atom and
+records it with the compiled atom; type-only imports are never captured. Each
+call runs in a fresh V8 isolate with ECMAScript built-ins only: no network,
+files, environment, timers, WebAssembly or shared memory. Arguments and
+results are JSON. A result is as trusted as its least trusted argument; one
+computed from literals alone is authored and may be instructions. Date,
+Temporal.Now and Math.random follow the step's recorded clock and seed, and
+local time is UTC with an en-US default locale. Limits: 1 s per call, 128 MiB
+heap, 64 MiB of ArrayBuffers, 1 MiB result, 16 KiB error text, and per operation
+256 calls, 10 s and 4 MiB of results. A helper failure fails the operation; in a
+validator it is an error, not a rejection.
 
 Frontmatter permits literal `config`, prop destructuring and type declarations.
 Executable statements, arbitrary calls/globals, assignment, spreads, directives,

@@ -108,6 +108,10 @@ pub struct Runtimes {
     pub lite: LiteRuntime,
     /// Where `kind: exec` commands run.
     pub exec: atomic_exec::Backend,
+    /// The durable step's recorded clock, for the atom's helper calls (see
+    /// [`crate::astro::StepClock`]). Without one, each operation's helpers
+    /// see the current time and a fresh seed.
+    pub clock: Option<crate::astro::StepClock>,
 }
 
 /// What a run records beside its output.
@@ -416,6 +420,8 @@ pub async fn run_declarative(
             input,
             frontmatter: &atom.frontmatter,
             origin,
+            origins: None,
+            step: None,
         },
         None,
         runtimes,
@@ -445,7 +451,20 @@ pub async fn run_declarative_with_context(
         return Err(AtomError::Runtime("compiled atom version mismatch".into()));
     }
     if atom.kind == "exec" {
-        return run_exec(atom, compiled, input, runtimes.exec.shared()).await;
+        // Outside a workflow, the atom's own name stands in for the step.
+        let identity = EffectIdentity {
+            run_id: run.run_id.to_owned(),
+            step_id: run.step.unwrap_or(&atom.name).to_owned(),
+        };
+        return run_exec(
+            atom,
+            compiled,
+            input,
+            &identity,
+            runtimes.exec.shared(),
+            runtimes.clock.as_ref(),
+        )
+        .await;
     }
     let backend = match atom.kind.as_str() {
         "codex" => Backend::Codex(&runtimes.codex),
@@ -473,19 +492,24 @@ pub async fn run_declarative_with_context(
     let render_frontmatter = run.frontmatter.clone();
     let render_run_id = run.run_id.to_owned();
     let render_origin = run.origin.to_owned();
+    let render_origins = run.origins.cloned();
     let render_snapshot = snapshot.cloned();
     let render_step = step_id.map(str::to_owned);
+    let render_clock = runtimes.clock.clone();
     let rendered = crate::astro::blocking(move || {
-        render::render_with_context(
+        render::render_clocked(
             &render_program,
             &RunInput {
                 run_id: &render_run_id,
                 input: &render_input,
                 frontmatter: &render_frontmatter,
                 origin: &render_origin,
+                origins: render_origins.as_ref(),
+                step: None,
             },
             render_snapshot.as_ref(),
             render_step.as_deref(),
+            render_clock.as_ref(),
         )
         .map_err(|e| e.to_string())
     })
@@ -498,17 +522,24 @@ pub async fn run_declarative_with_context(
         .validator_for(&contract)
         .map_err(|e| AtomError::Runtime(e.to_string()))?;
 
+    // Each validation round is its own operation within the step's clock.
+    let rounds = std::sync::atomic::AtomicUsize::new(0);
     let check = |output: Value| -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<(), AtomError>> + Send>,
     > {
         let program = compiled.program.clone();
+        let round = rounds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let clock = runtimes
+            .clock
+            .clone()
+            .map(|clock| (clock, format!("validate:{round}")));
         let values = serde_json::json!({"values":{"input":input,"output":output},"options":{"contextSnapshot":snapshot,"stepId":step_id}});
         let has_checks = atom
             .frontmatter
             .get("validate")
             .and_then(Value::as_array)
             .is_some_and(|checks| !checks.is_empty());
-        Box::pin(async move { validate_output(&program, has_checks, values).await })
+        Box::pin(async move { validate_output(&program, has_checks, values, clock).await })
     };
     // As for a typed atom: the atom's own model, then the project's default,
     // then the endpoint's.
@@ -536,6 +567,42 @@ pub async fn run_declarative_with_context(
     run_contract(backend, request, &check).await
 }
 
+/// The names atomic sets in an exec command's environment, which an atom's
+/// `env` may not declare.
+pub const EFFECT_VARIABLES: [&str; 3] = ["ATOMIC_RUN_ID", "ATOMIC_STEP_ID", "ATOMIC_EFFECT_KEY"];
+
+/// Who an exec command acts for: its run and step. The effect key is the
+/// same on every attempt of that step and differs for any other step or run,
+/// so a command that writes can make a retried write recognisable, by
+/// sending it as an idempotency key or putting it in what it writes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EffectIdentity {
+    /// The run.
+    pub run_id: String,
+    /// The step within it.
+    pub step_id: String,
+}
+
+impl EffectIdentity {
+    /// SHA-256 of the run and step, in hex.
+    pub fn key(&self) -> String {
+        let mut digest = Sha256::new();
+        digest.update(b"atomic-effect-v1\0");
+        digest.update(self.run_id.as_bytes());
+        digest.update([0]);
+        digest.update(self.step_id.as_bytes());
+        format!("{:x}", digest.finalize())
+    }
+
+    fn environment(&self) -> [(String, String); 3] {
+        [
+            ("ATOMIC_RUN_ID".into(), self.run_id.clone()),
+            ("ATOMIC_STEP_ID".into(), self.step_id.clone()),
+            ("ATOMIC_EFFECT_KEY".into(), self.key()),
+        ]
+    }
+}
+
 /// How long an exec atom's command may run before it is stopped.
 pub const EXEC_TIME_LIMIT: std::time::Duration = std::time::Duration::from_secs(300);
 /// The most an exec atom's command may write to stdout, in bytes.
@@ -548,12 +615,15 @@ pub const EXEC_OUTPUT_LIMIT: usize = 8_388_608;
 /// directory of its own. It reads the input as one JSON value on stdin and
 /// writes one JSON value to stdout; stderr is for diagnostics. A nonzero
 /// exit fails the step, and so does output that breaks the contract or the
-/// atom's validators: there is no model to repair it.
+/// atom's validators: there is no model to repair it. The validators' helpers
+/// follow `clock`, the step's recorded clock, when there is one.
 pub async fn run_exec(
     atom: &AtomFile,
     compiled: &Compiled,
     input: &Value,
+    identity: &EffectIdentity,
     backend: Arc<dyn atomic_exec::ExecutionBackend>,
+    clock: Option<&crate::astro::StepClock>,
 ) -> Result<(Value, RunMetadata), AtomError> {
     let contract = |key: &str| {
         compiled.program.contracts.get(key).ok_or_else(|| {
@@ -587,9 +657,10 @@ pub async fn run_exec(
         .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_owned())))
         .collect();
     let scratch_text = scratch.display().to_string();
-    env.retain(|(k, _)| k != "HOME" && k != "TMPDIR");
+    env.retain(|(k, _)| k != "HOME" && k != "TMPDIR" && !EFFECT_VARIABLES.contains(&k.as_str()));
     env.push(("HOME".into(), scratch_text.clone()));
     env.push(("TMPDIR".into(), scratch_text));
+    env.extend(identity.environment());
     let stdin = serde_json::to_vec(input).map_err(|e| AtomError::Runtime(e.to_string()))?;
     let mut h = Sha256::new();
     for part in std::iter::once(&program).chain(&args) {
@@ -664,7 +735,9 @@ pub async fn run_exec(
         .and_then(Value::as_array)
         .is_some_and(|checks| !checks.is_empty());
     let values = serde_json::json!({"values":{"input":input,"output":output}});
-    validate_output(&compiled.program, has_checks, values).await?;
+    // One validation round, the same operation on every attempt.
+    let clock = clock.map(|clock| (clock.clone(), "validate:0".to_owned()));
+    validate_output(&compiled.program, has_checks, values, clock).await?;
     Ok((
         output,
         RunMetadata {
@@ -696,11 +769,25 @@ async fn validate_output(
     program: &crate::astro::Program,
     has_checks: bool,
     values: Value,
+    clock: Option<(crate::astro::StepClock, String)>,
 ) -> Result<(), AtomError> {
     if !has_checks {
         return Ok(());
     }
-    validation_result(program.invoke_async("validate", values).await)
+    let program = program.clone();
+    let result = crate::astro::blocking(move || {
+        program
+            .invoke_clocked(
+                "validate",
+                values,
+                clock
+                    .as_ref()
+                    .map(|(clock, operation)| (clock, operation.as_str())),
+            )
+            .map_err(|e| e.to_string())
+    })
+    .await;
+    validation_result(result)
 }
 
 // Only an explicit predicate rejection is repairable. Transport failures and

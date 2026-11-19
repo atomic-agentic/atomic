@@ -1,0 +1,8 @@
+---
+import ReviewFrame from './ReviewFrame.astro';
+import type { Change } from '../../.atomic/types/schemas/change';
+interface Props { stage: string; change: Change }
+const { stage, change }: Props = Astro.props;
+const label = `${change.id}: ${change.service.name}`;
+---
+<ReviewFrame stage={stage} label={label}><slot /><slot name="footer" slot="footer" /></ReviewFrame>

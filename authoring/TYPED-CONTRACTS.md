@@ -149,8 +149,8 @@ fails explicitly. Compiled fingerprints include full constraints, even those era
 from TypeScript. The current semantics and limits are documented in [SYNTAX.md](SYNTAX.md).
 
 The stock editor still accepts a larger language than Atomic's interpreter.
-Config type aliases, `satisfies`, arbitrary helpers and executable modules remain
-outside the subset. Astro formatting can change prompt whitespace. Workflow-level
-durable context dispatch, registry-backed notes and live judge orchestration remain
-separate work. The owner selected Astro as the sole declarative frontend; the
-combined embedded-runtime decision remains open.
+Config type aliases, `satisfies` and executable frontmatter remain outside the
+subset; named imports of local TypeScript helpers run in the embedded helper
+runtime, one isolate per call. Astro formatting can change prompt whitespace.
+Workflow-level durable context dispatch, registry-backed notes and live judge
+orchestration remain separate work.

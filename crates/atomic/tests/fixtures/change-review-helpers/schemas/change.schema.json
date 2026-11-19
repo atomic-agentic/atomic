@@ -1,0 +1,23 @@
+{
+  "title": "Change",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "title", "description", "rollback_owner", "service"],
+  "properties": {
+    "id": { "type": "string", "description": "The change ID." },
+    "title": { "type": "string" },
+    "description": { "type": "string" },
+    "rollback_owner": { "type": "string" },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "owner", "tier", "regions"],
+      "properties": {
+        "name": { "type": "string" },
+        "owner": { "type": "string" },
+        "tier": { "enum": ["tier-1", "tier-2", "tier-3"] },
+        "regions": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  }
+}

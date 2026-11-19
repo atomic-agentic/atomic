@@ -1,0 +1,8 @@
+---
+interface Props { approvers: string[] }
+const { approvers }: Props = Astro.props;
+---
+Required human reviewers:
+{approvers.map((approver) => <Fragment>
+- {approver}
+</Fragment>)}

@@ -86,6 +86,7 @@ fn runtimes(model: &FakeModel, tag: &str) -> Runtimes {
         codex,
         lite,
         exec: Default::default(),
+        clock: None,
     }
 }
 
@@ -633,12 +634,13 @@ async fn no_declared_validators_need_no_compiler_process() {
         sources: Default::default(),
         source_paths: Default::default(),
         contracts: Value::Null,
+        helpers: Default::default(),
     };
-    validate_output(&program, false, json!({}))
+    validate_output(&program, false, json!({}), None)
         .await
         .expect("no worker needed");
     assert!(matches!(
-        validate_output(&program, true, json!({})).await,
+        validate_output(&program, true, json!({}), None).await,
         Err(AtomError::Runtime(_))
     ));
 }
@@ -1052,6 +1054,66 @@ fn an_exec_atom_runs_its_command_with_typed_json_and_no_model() {
     });
 }
 
+// An exec atom's validators follow the step's recorded clock, as a model
+// atom's do, so a retried step reaches the same decision.
+#[test]
+fn exec_validators_follow_the_steps_clock() {
+    use crate::{atom, compile};
+    on_codex_runtime(async {
+        let (dir, _, _) = exec_project("exec-clock", TOTAL, "");
+        std::fs::create_dir_all(dir.join("atoms/helpers")).expect("helpers");
+        std::fs::write(
+            dir.join("atoms/helpers/clock.ts"),
+            "export const recorded = (total: number): boolean => total > 0 && Date.now() === 1700000000000;\n",
+        )
+        .expect("helper");
+        std::fs::write(
+            dir.join("atoms/total.atom.astro"),
+            "---\nimport type { Props, Input, Output } from '../.atomic/types/total';\n\
+             import type { AtomConfig } from '../.atomic/types/authoring';\n\
+             import { recorded } from './helpers/clock';\n\
+             const { input }: Props = Astro.props;\n\
+             export const config: AtomConfig<Input, Output> = { description: 'Total an order.', kind: 'exec', exec: { command: ['python3', 'tools/total.py'] }, validate: [({ output }) => recorded(output.total)] };\n---\n",
+        )
+        .expect("atom");
+        let mut registry = Registry::new();
+        let a = atom::load(&dir.join("atoms/total.atom.astro"), &mut registry).expect("loads");
+        let compiled = compile::compile(&a, &registry).expect("compiles");
+        let identity = EffectIdentity {
+            run_id: "run-1".into(),
+            step_id: "total".into(),
+        };
+        let clock = crate::astro::StepClock {
+            now_ms: 1_700_000_000_000,
+            seed: "00".repeat(32),
+        };
+        let input = json!({"cents": [1, 2]});
+        for _ in 0..2 {
+            let (out, _) = run_exec(
+                &a,
+                &compiled,
+                &input,
+                &identity,
+                Arc::new(atomic_exec::LocalBackend),
+                Some(&clock),
+            )
+            .await
+            .expect("the recorded clock passes");
+            assert_eq!(out, json!({"total": 3}));
+        }
+        let fresh = run_exec(
+            &a,
+            &compiled,
+            &input,
+            &identity,
+            Arc::new(atomic_exec::LocalBackend),
+            None,
+        )
+        .await;
+        assert!(matches!(fresh, Err(AtomError::Validation(_))), "{fresh:?}");
+    });
+}
+
 #[test]
 fn exec_output_that_breaks_its_schema_fails_the_step() {
     on_codex_runtime(async {
@@ -1115,8 +1177,10 @@ fn an_exec_command_sees_only_its_declared_environment_from_the_project_root() {
         let rt = runtimes(&model, "exec-env");
         let script = "import json, os, sys\njson.load(sys.stdin)\n\
             names = sorted(n for n in os.environ if n != 'LC_CTYPE')  # Python's own locale coercion\n\
-            assert names == ['HOME', 'REGION', 'TMPDIR'], names\n\
+            assert names == ['ATOMIC_EFFECT_KEY', 'ATOMIC_RUN_ID', 'ATOMIC_STEP_ID', 'HOME', 'REGION', 'TMPDIR'], names\n\
             assert os.environ['REGION'] == 'eu'\n\
+            assert os.environ['ATOMIC_RUN_ID'] == 'run-1' and os.environ['ATOMIC_STEP_ID'] == 'total', dict(os.environ)\n\
+            assert len(os.environ['ATOMIC_EFFECT_KEY']) == 64\n\
             assert os.path.isfile('atomic.yaml'), os.getcwd()\n\
             assert os.environ['HOME'] == os.environ['TMPDIR'] and os.path.isdir(os.environ['HOME'])\n\
             json.dump({'total': 1}, sys.stdout)\n";

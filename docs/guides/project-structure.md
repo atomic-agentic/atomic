@@ -77,7 +77,8 @@ A nested project is a discovery boundary; workspace members are loaded explicitl
 
 Commit the definitions, evals, fixtures, package lockfile, `deno.lock` when
 atoms carry code and, once it exists, the generated `atomic.policy.lock`. Generated editor
-types currently live under project-root `.atomic/types`; other generated editor
+types currently live under project-root `.atomic/types`, including the
+[types of shared schema files](../reference/atom-files.md#types-from-shared-schema-files); other generated editor
 artifacts use the configured cache exclusion. Checkpoints, transcripts,
 artifacts and worktrees live in Atomic's user-data directory rather than beside
 your application source.

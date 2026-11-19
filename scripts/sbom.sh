@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Write the CycloneDX SBOM for the atomic binary and check that it lists every
-# fork in deps/forks.toml at its pinned revision.
+# fork in deps/forks.toml at its pinned revision. It also lists the bundled
+# Astro compiler payloads and the prebuilt V8 archive deps/v8.toml pins.
 #
 #   scripts/sbom.sh                       # writes target/sbom/atomic-agentic.cdx.json
 #   scripts/sbom.sh --target <triple> --binary <path>
@@ -67,6 +68,39 @@ dependency.setdefault("dependsOn", []).extend(refs)
 pathlib.Path(file).write_text(json.dumps(doc, indent=2) + "\n")
 print("SBOM includes pinned Astro/TypeScript libraries and bundled payload hashes")
 PY_ASTRO
+
+# The prebuilt V8 archive linked into the binary, which cargo metadata does not
+# see: one file component per archive, with the hash deps/v8.toml pins.
+V8_TARGET="${TARGET:-$(rustc -vV | sed -n 's/^host: //p')}"
+python3 -I - "${SBOM}" "${ROOT}" "${V8_TARGET}" <<'PY_V8'
+import json, pathlib, re, sys
+file, root, target = sys.argv[1:]
+lock = pathlib.Path(root, "Cargo.lock").read_text()
+versions = {m.group(1) for m in re.finditer(r'\[\[package\]\]\nname = "v8"\nversion = "([^"]+)"', lock)}
+if not versions:
+    sys.exit(0)
+archives = []
+for block in pathlib.Path(root, "deps/v8.toml").read_text().split("[[archive]]")[1:]:
+    fields = dict(re.findall(r'^(\w+) = "([^"]*)"', block, re.M))
+    if fields.get("crate") == "v8" and fields.get("version") in versions and fields.get("target") == target:
+        archives.append(fields)
+if len(archives) != len(versions):
+    sys.exit(f"scripts/sbom.sh: deps/v8.toml pins no V8 {sorted(versions)} archive for {target}")
+doc = json.loads(pathlib.Path(file).read_text())
+owner = doc["metadata"]["component"]["bom-ref"]
+dependency = next(item for item in doc.setdefault("dependencies", []) if item["ref"] == owner)
+for archive in archives:
+    ref = f"atomic:v8:{archive['file']}"
+    url = f"https://github.com/denoland/rusty_v8/releases/download/v{archive['version']}/{archive['file']}"
+    doc.setdefault("components", []).append({"type": "file", "name": archive["file"], "version": archive["version"],
+        "bom-ref": ref, "description": "prebuilt V8 static library linked by the v8 crate",
+        "licenses": [{"license": {"id": "BSD-3-Clause"}}],
+        "hashes": [{"alg": "SHA-256", "content": archive["sha256"]}],
+        "externalReferences": [{"type": "distribution", "url": url}]})
+    dependency.setdefault("dependsOn", []).append(ref)
+    print(f"SBOM includes the V8 {archive['version']} archive for {target} (sha256 {archive['sha256']})")
+pathlib.Path(file).write_text(json.dumps(doc, indent=2) + "\n")
+PY_V8
 
 if [ -n "${BINARY}" ]; then
     python3 -I - "${SBOM}" "${BINARY}" "${ROOT}" <<'PY'

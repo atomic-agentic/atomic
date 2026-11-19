@@ -25,10 +25,10 @@ This is a proposed schema, not a manifest verified against a released loader.
 | `collections.workflows` | Workflow globs; conventional `workflows/` and colocated `*.workflow.yaml` | v0.1 YAML; TypeScript v1.0 |
 | `collections.schemas` | Shared schema globs, normally `schemas/**/*.schema.{yaml,json}`, with YAML the default; adjacent atom sidecars are discovered separately | v0.1 |
 | `collections.evals` | Case globs, normally `evals/**/*.{yaml,jsonl}`; atom-specific case directories still bind cases to atoms | v0.1 |
-| `collections.toolsets` | Imported OpenAPI specs, normally `toolsets/**/*.openapi.{yaml,json}` | v0.5 |
+| `collections.toolsets` | Imported OpenAPI 3.0 and 3.1 specs, normally `toolsets/**/*.openapi.{yaml,json}`; `atomic check` turns each operation into a tool and checks its schemas | Checked; calling operations is v0.5 |
 | `ignore` | Additional ignored paths; `.gitignore` is also respected | v0.1 |
 | `generated` | Collection exclusion for generated cache artifacts; current Astro declarations use fixed project-root `.atomic/types` | Relocating Astro declarations is tracked separately; runtime state is external |
-| `workspace.members` | Member-project directory globs | v0.5 · M11b/M39b |
+| `workspace.members` | Member-project directory globs; members share their schemas | Built; shared atoms v0.5 |
 | `packages` | Namespaced dependencies with `git`, pinned `rev` and accepted `trust`; resolved hashes go in `atomic.lock` | Later package/trust support |
 | `models` | Named model tiers mapped to ordered provider/model candidates | Full routing v0.7 |
 | `datasources` | Named application database capabilities; separate from Atomic state | v0.7 |
@@ -147,7 +147,7 @@ and [the S3 example](../../examples/11-aws-s3/README.md).
 
 ## Workspace example
 
-This later-stage fragment discovers member projects:
+A workspace manifest lists its member projects:
 
 ```yaml
 atomic: 1
@@ -156,9 +156,12 @@ workspace:
   members: [services/*, shared]
 ```
 
-Each member has its own manifest and namespace. See
-[the workspace example](../../examples/06-workspace/README.md) for complete files
-and its current availability limitation.
+Each member has its own manifest and namespace and is discovered on its own. A
+member, found from any directory, also loads the schemas its fellow members
+share, so it can reference them by `$id` offline; its own schemas take
+precedence, and two members sharing an ID is an error. Atoms are not shared
+between members yet. See [the workspace example](../../examples/06-workspace/README.md)
+for complete files.
 
 Keep secrets and runtime databases out of the manifest. Configuration overlays
 and managed requirements are described in [configuration](configuration.md);

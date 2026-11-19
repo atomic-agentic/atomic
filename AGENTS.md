@@ -86,9 +86,14 @@ These are the rules that are easiest to break:
 - **atomic makes git commits, outside the sandbox.** A worktree an atom wrote
   to is untrusted input: run git there with hooks, drivers, signing and pagers
   off.
-- **Declarative atoms never execute modules.** `.atom.astro` files use the
-  bundled Astro parser and a bounded TypeScript-shaped AST interpreter.
-  Workflow mappings remain CEL. JSON Schema stays the runtime contract.
+- **Declarative atoms interpret frontmatter and templates; only captured
+  helper modules execute, one fresh capability-free isolate per call.**
+  `.atom.astro` files use the bundled Astro parser and a bounded
+  TypeScript-shaped AST interpreter. Helper calls run in `deno_core` behind
+  `atomic_core::helper_runtime`, with no host operations, Rust-enforced limits,
+  the step's recorded clock and a result as trusted as its least trusted
+  argument. Workflow mappings remain CEL. JSON Schema stays the runtime
+  contract.
 - **JSON Schema is the contract.** atomic validates every model output and
   tool argument against the full schema itself.
 - **Runtime state never lives in the source tree.** It goes in the per-project
@@ -120,7 +125,10 @@ first. These checks also run locally:
 ```bash
 scripts/codex-pin.sh check     # the [patch] block and toolchain match deps/codex.toml
 scripts/forks-check.sh         # each fork in deps/forks.toml resolves at its pinned rev
-scripts/lock-check.sh          # crates shared with Codex keep Codex's locked versions
+scripts/lock-check.sh          # crates shared with Codex keep Codex's locked versions; one V8
+scripts/lock-check-test.sh     # the V8 rule against small lockfiles
+scripts/dev.sh scripts/lock-check.sh v8-built   # V8s deps/v8.toml calls unbuilt stay unbuilt
+scripts/v8-archive-test.sh     # the V8 archive check refuses tampered files
 scripts/dev.sh scripts/lock-resolves.sh   # a fresh resolution keeps Codex's libsqlite3-sys
 scripts/dev.sh cargo deny --locked check bans licenses sources   # deny.toml
 scripts/dev.sh scripts/sbom.sh # the SBOM lists every fork at its pin
