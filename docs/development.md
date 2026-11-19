@@ -125,7 +125,8 @@ Each security control has a test that fails when the control is switched off.
 `scripts/controls-check.sh` proves it: for each v0.1 control (the hardened git
 command's settings, its neutralized filter drivers and its explicit git
 directory; the sandbox's confinement of writes, which keeps the state
-directory and a worktree's git directory out of a turn's reach), it switches
+directory and a worktree's git directory out of a turn's reach, its exclusion
+of `/tmp`, and its denial of atomic's private state), it switches
 the control off in the source, requires the control's test to fail, puts the
 source back and requires the test to pass. Each control costs a rebuild, so it
 runs by hand rather than in CI:
@@ -133,6 +134,11 @@ runs by hand rather than in CI:
 ```bash
 ATOMIC_DEV_SANDBOX=on scripts/dev.sh scripts/controls-check.sh
 ```
+
+In a linked worktree, also mount the main checkout's `.git` with
+`ATOMIC_DEV_MOUNTS`, since the script hashes files with git. It puts every
+file it edits back, even when interrupted, and `scripts/controls-check-test.sh`
+(in CI) tests that.
 
 A control added later gets a row in the script. A row whose code has moved
 fails until it is updated.

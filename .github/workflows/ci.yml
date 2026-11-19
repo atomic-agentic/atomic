@@ -51,6 +51,9 @@ jobs:
       - run: scripts/lock-check.sh
       # The V8 rule in lock-check against small lockfiles.
       - run: scripts/lock-check-test.sh
+      # controls-check.sh restores the source it edits, and refuses what it
+      # cannot do safely; tested with a stand-in for cargo.
+      - run: scripts/controls-check-test.sh
 
   # The Astro interpreter's own tests, and a rebuild of the bundled compiler
   # from its sources: the committed assets must be exactly what the sources
