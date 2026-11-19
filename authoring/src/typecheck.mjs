@@ -14,9 +14,11 @@ export async function typecheck(sources, declarations, sourcePaths = {}) {
   }
   for (const [name, text] of Object.entries(libs)) files.set(`/__lib/${name}`, text);
   files.set('/__lib/atomic.d.ts', `
-declare module 'astro' { export type AstroGlobal<P, C = unknown, R = unknown> = { readonly props: P }; }
-declare namespace JSX { interface Element {} interface IntrinsicElements { [name: string]: any } }
-declare function Fragment(props: {children?: unknown}): JSX.Element;
+declare module 'astro' { export type AstroGlobal<P, C = unknown, R = unknown> = { readonly props: P; readonly slots: { has(name: string): boolean } }; }
+declare namespace JSX { interface Element {} interface IntrinsicElements { [name: string]: any } interface IntrinsicAttributes { slot?: string } }
+declare function Fragment(props: {children?: unknown; slot?: string}): JSX.Element;
+// A component with no Props sees the ambient Astro global, as in Astro.
+declare const Astro: Readonly<import('astro').AstroGlobal<Record<string, unknown>>>;
 `);
   for (const [name, text] of Object.entries(declarations)) files.set(name, text);
   const options = { strict: true, noEmit: true, target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext, moduleResolution: ts.ModuleResolutionKind.Bundler, jsx: ts.JsxEmit.Preserve, skipLibCheck: true, allowImportingTsExtensions: true };

@@ -134,6 +134,11 @@ function validateExpression(node, unit, locals = null) {
     if (node.arguments.length !== intrinsic.arity) error(unit, node, 'incorrect intrinsic argument count');
     node.arguments.forEach(check); return;
   }
+  if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression) && node.expression.getText() === 'Astro.slots.has') {
+    if (locals) error(unit, node, 'Astro.slots is for templates, not contracts');
+    if (node.arguments.length !== 1 || !ts.isStringLiteral(node.arguments[0])) error(unit, node, 'Astro.slots.has takes one slot name as a string literal');
+    return;
+  }
   if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression) && collections.has(node.expression.name.text)
     && node.arguments.length === 1 && ts.isArrowFunction(node.arguments[0])) {
     if (ts.isOptionalChain(node) || node.questionDotToken || node.expression.questionDotToken) error(unit, node, 'optional collection calls are unsupported; use an explicit condition');
@@ -336,7 +341,9 @@ export async function compile(file, options = {}) {
     // Astro starts an expression's position at the text before its brace; its
     // first child holds the brace's line.
     const authoredLine = (node) => (node.type === 'expression' ? node.children?.find((child) => child.position)?.position.start.line : undefined) ?? node.position?.start?.line;
-    const lowerNodes = (nodes) => nodes.filter((n) => n.type !== 'frontmatter').map((node) => located(unit, { position: { start: { line: authoredLine(node) } } }, () => {
+    // `slotted` nodes are a component's direct children, which may name the
+    // slot they fill with a literal `slot` attribute.
+    const lowerNodes = (nodes, slotted = false) => nodes.filter((n) => n.type !== 'frontmatter').map((node) => located(unit, { position: { start: { line: authoredLine(node) } } }, () => {
       const line = authoredLine(node);
       if (node.type === 'text') return { op: 'text', text: decode(node.value, unit) };
       if (node.type === 'comment') return { op: 'comment' };
@@ -357,13 +364,25 @@ export async function compile(file, options = {}) {
       if (!['element', 'component', 'fragment'].includes(node.type)) error(unit, node, `unsupported template node ${node.type}`);
       if (node.type === 'component' && name !== 'Fragment' && !unit.imports.has(name)) error(unit, node, `unknown component ${name}`);
       if (node.attributes?.some((a) => a.name.includes(':') || !['quoted', 'expression'].includes(a.kind))) error(unit, node, 'directives, spread and shorthand attributes are unsupported');
-      if (node.type === 'element' && name !== 'slot' && node.attributes?.length) error(unit, node, 'literal section attributes are unsupported');
-      if (['slot', 'Fragment'].includes(name) && node.attributes?.length) error(unit, node, 'named slots and Fragment attributes are unsupported');
-      if (name === 'slot' && node.children?.length) error(unit, node, 'slot fallback content is unsupported');
+      const attributes = node.attributes ?? [];
+      const slotAttribute = attributes.find((a) => a.name === 'slot');
+      if (slotAttribute && !slotted) error(unit, node, "the slot attribute names a slot of the enclosing component; use it on a component's direct children");
+      if (slotAttribute && slotAttribute.kind !== 'quoted') error(unit, node, 'slot names are literal strings');
+      const rest = attributes.filter((a) => a !== slotAttribute);
+      let slotName;
+      if (name === 'slot') {
+        // <slot name="x">fallback</slot>; the fallback renders when the slot is absent.
+        const named = rest.find((a) => a.name === 'name');
+        if (rest.some((a) => a.name !== 'name') || (named && named.kind !== 'quoted')) error(unit, node, 'a slot takes a literal name and nothing else');
+        slotName = named ? decode(named.value, unit) : 'default';
+      } else if (node.type === 'element' && rest.length) error(unit, node, 'literal section attributes are unsupported');
+      else if (name === 'Fragment' && rest.length) error(unit, node, 'Fragment takes only a slot attribute');
       return {
         op: name === 'Fragment' ? 'fragment' : name === 'slot' ? 'slot' : node.type === 'component' ? 'component' : 'section',
-        name, children: lowerNodes(node.children ?? []),
-        attrs: (node.attributes ?? []).map((a) => ({ name: a.name, literal: a.kind === 'quoted', value: a.kind === 'quoted' ? decode(a.value, unit) : expression(a.value, unit, a.position?.start?.line ?? line) })),
+        name: name === 'slot' ? slotName : name,
+        fills: slotAttribute ? decode(slotAttribute.value, unit) : undefined,
+        children: lowerNodes(node.children ?? [], node.type === 'component' && name !== 'Fragment'),
+        attrs: (node.type === 'component' ? rest : []).map((a) => ({ name: a.name, literal: a.kind === 'quoted', value: a.kind === 'quoted' ? decode(a.value, unit) : expression(a.value, unit, a.position?.start?.line ?? line) })),
       };
     }));
     unit.nodes = lowerNodes(parsed.ast.children);
@@ -408,6 +427,27 @@ function labelHelperResult(result, args, node, helper) {
   const identity = JSON.stringify([helper.module, helper.name, node.getText(), args.map((v) => isData(v) ? { path: v.at } : { literal: materialize(v) })]);
   const suffix = createHash('sha256').update(identity).digest('hex').slice(0, 16);
   return data(result, `helpers.${helper.name}_${suffix}`, origin.origin);
+}
+// The slots a component call supplies, as Astro defines them. A slot is
+// present when the caller supplied it: a child with `slot="x"`, even an empty
+// Fragment, is explicit content. Default content of only whitespace and
+// comments is absent, and a forwarded slot (`<slot name="y" slot="x" />`, or
+// a bare `<slot />` as default content) is present only when the slot it
+// forwards is, or its fallback has content. Presence is decided from the
+// tree, so `Astro.slots.has` renders nothing and spends no helper budget.
+function slotSet(children, scope, callerSlots, unit) {
+  const nodes = new Map([['default', []]]);
+  for (const child of children) {
+    const name = child.fills ?? 'default';
+    if (!nodes.has(name)) nodes.set(name, []);
+    nodes.get(name).push(child);
+  }
+  const occupied = (list) => list.some((node) => {
+    if (node.op === 'comment' || (node.op === 'text' && !node.text.trim())) return false;
+    if (node.op === 'slot') return Boolean(callerSlots?.has(node.name)) || occupied(node.children);
+    return true;
+  });
+  return { nodes, scope, slots: callerSlots, unit, has: (name) => nodes.has(name) && occupied(nodes.get(name)) };
 }
 function property(parent, key) {
   const value = raw(parent);
@@ -488,6 +528,10 @@ function evaluate(node, scope, unit, slots, budget) {
   if (ts.isObjectLiteralExpression(node)) {
     const values = fields(node).map(([key, child]) => [key, evaluate(child, scope, unit, slots, budget)]);
     return derive(Object.fromEntries(values.map(([key, value]) => [key, materialize(value)])), values.map(([, value]) => value), node);
+  }
+  if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression) && node.expression.getText() === 'Astro.slots.has') {
+    // Structural: whether the caller supplied the slot, never its rendering.
+    return Boolean(slots?.has(node.arguments[0].text));
   }
   if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && unit.helpers.has(node.expression.text)) {
     const helper = unit.helpers.get(node.expression.text);
@@ -651,13 +695,16 @@ export function render(unit, input, { runId, origin = 'external', contextSnapsho
       if (node.op === 'text') emit(node.text);
       else if (node.op === 'expression') emit(located(component, node.ast, () => evaluate(node.ast, scope, component, slots, budget)));
       else if (node.op === 'fragment') walk(node.children, scope, component, slots);
-      else if (node.op === 'slot') { if (slots) emit(slots); }
+      else if (node.op === 'slot') {
+        if (slots?.has(node.name)) walk(slots.nodes.get(node.name), slots.scope, slots.unit, slots.slots);
+        else walk(node.children, scope, component, slots);
+      }
       else if (node.op === 'section') {
         emit(`<${node.name}>`); walk(node.children, scope, component, slots); emit(`</${node.name}>`);
       } else if (node.op === 'component') {
         const props = Object.create(null);
         for (const a of node.attrs) props[a.name] = a.literal ? a.value : located(component, a.value, () => evaluate(a.value, scope, component, slots, budget));
-        run(component.imports.get(node.name), props, fragments(node.children, scope, slots, component));
+        run(component.imports.get(node.name), props, slotSet(node.children, scope, slots, component));
       }
     }
   }

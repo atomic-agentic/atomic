@@ -3,8 +3,8 @@
   "sources": {
     "authoring/src/build-worker.mjs": "d7b1f328a86b56f38e4dc9ad01c2954e259c8bf2f0520b938756a316548a2db2",
     "authoring/src/worker.mjs": "386449f01893d8afb0911e975cc9762a7d583890b761e46f1aef827351198657",
-    "authoring/src/renderer.mjs": "44989581ec442a2ce8e527a52fe349dbea84b67c8d7d6939af46bce945483e35",
-    "authoring/src/typecheck.mjs": "2ea2484a28ca597ff56273916f124d64f360d89773342dceb3ed22dd8be3087f",
+    "authoring/src/renderer.mjs": "783475bf8644fff83827658bc63cf0ece72e52d0f2fdcd8a3a681e7af1ad8f67",
+    "authoring/src/typecheck.mjs": "e12ba7919cfe6e600b5fdb55d423ff5d16e21bf735fe28b9f3dbe4dfd440f48f",
     "authoring/src/platform.mjs": "fb8e01afb7067a1a3c5a552f83f394d7b6c0403cfc3cd6796bf671259fb13de0",
     "authoring/src/context.mjs": "f778318f9b86c07e7fd799306d2bcc8de51ac4e13065cedcb92986c93d9b0eec",
     "authoring/src/generate.mjs": "acccd4e317b0e1edf1fcc6683a5e170233df73c4b488f3cb46026d8705608618",
@@ -15,7 +15,7 @@
     "authoring/package-lock.json": "9aa4288a0c0f6c7d44c63d081d5eb8d510cf54c41c337e147d0cf60265f67346"
   },
   "assets": {
-    "worker.mjs": "9118852745a410628109265151d7763e2410c64406f8324f912fd10591f346c9",
+    "worker.mjs": "7053c559b29d87394933f8d52cd993b9dfd0288beda72b0d90d5fffccef588ab",
     "worker.mjs.LEGAL.txt": "ab1fbb4a8cd93f8da2ecaf67e418c748cd6c2ef00609e7d60923fc46aa5745da",
     "astro.wasm": "a4ed5ef260d401dba6f172d52a3c27dbd933bfcd9b1698e91b430214c9701313",
     "TYPESCRIPT-LICENSE.txt": "a7d00bfd54525bc694b6e32f64c7ebcf5e6b7ae3657be5cc12767bce74654a47",
