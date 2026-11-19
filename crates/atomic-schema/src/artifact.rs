@@ -192,6 +192,131 @@ mod tests {
             Err(ArtifactCheckError::WrongMediaType { .. })
         ));
     }
+
+    fn expected_type(result: Result<(), ArtifactCheckError>) -> Option<String> {
+        match result {
+            Err(ArtifactCheckError::WrongMediaType { expected, .. }) => Some(expected),
+            other => panic!("expected a wrong media type, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn artifact_alternatives_accept_one_matching_media_type() {
+        let either = file(serde_json::json!([
+            {"$ref": "atomic:artifact", "mediaType": "text/x-diff"},
+            {"$ref": "atomic:artifact", "mediaType": "text/plain"}
+        ]));
+        let diff = serde_json::json!({"file": reference('a')});
+        assert_eq!(check_refs(&either, &diff, &Store), Ok(()));
+        // When every alternative fails, the first one's reason is reported.
+        let neither = file(serde_json::json!([
+            {"$ref": "atomic:artifact", "mediaType": "text/markdown"},
+            {"$ref": "atomic:artifact", "mediaType": "application/json"}
+        ]));
+        assert_eq!(
+            expected_type(check_refs(&neither, &diff, &Store)).as_deref(),
+            Some("text/markdown")
+        );
+    }
+
+    /// `payload` is a diff or a text note, told apart by `kind`.
+    fn tagged(keyword: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {"payload": {keyword: [
+                {"type": "object", "required": ["kind", "file"],
+                 "properties": {"kind": {"const": "diff"},
+                                "file": {"$ref": "atomic:artifact", "mediaType": "text/x-diff"}}},
+                {"$ref": "#/$defs/note"}
+            ]}},
+            "$defs": {"note": {"type": "object", "required": ["kind", "file"],
+                               "properties": {"kind": {"const": "text"},
+                                              "file": {"$ref": "atomic:artifact", "mediaType": "text/plain"}}}}
+        })
+    }
+
+    fn payload(kind: &str, c: char) -> serde_json::Value {
+        serde_json::json!({"payload": {"kind": kind, "file": reference(c)}})
+    }
+
+    #[test]
+    fn artifact_alternative_must_match_the_object_tag() {
+        for keyword in ["anyOf", "oneOf"] {
+            let schema = tagged(keyword);
+            assert_eq!(check_refs(&schema, &payload("diff", 'a'), &Store), Ok(()));
+            assert_eq!(check_refs(&schema, &payload("text", 'b'), &Store), Ok(()));
+            // The branch the tag selects decides; the other adds nothing.
+            assert_eq!(
+                expected_type(check_refs(&schema, &payload("diff", 'b'), &Store)).as_deref(),
+                Some("text/x-diff"),
+                "{keyword}"
+            );
+            assert_eq!(
+                expected_type(check_refs(&schema, &payload("text", 'a'), &Store)).as_deref(),
+                Some("text/plain"),
+                "{keyword}"
+            );
+            assert!(
+                matches!(
+                    check_refs(&schema, &payload("diff", 'c'), &Store),
+                    Err(ArtifactCheckError::Missing { .. })
+                ),
+                "{keyword}"
+            );
+        }
+    }
+
+    #[test]
+    fn tagged_alternatives_inside_a_list_are_checked_per_item() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"items": {"type": "array", "items": tagged("anyOf")["properties"]["payload"]}},
+            "$defs": tagged("anyOf")["$defs"]
+        });
+        let good = serde_json::json!({"items": [
+            {"kind": "diff", "file": reference('a')},
+            {"kind": "text", "file": reference('b')}
+        ]});
+        assert_eq!(check_refs(&schema, &good, &Store), Ok(()));
+        let bad = serde_json::json!({"items": [
+            {"kind": "text", "file": reference('b')},
+            {"kind": "diff", "file": reference('b')}
+        ]});
+        match check_refs(&schema, &bad, &Store) {
+            Err(ArtifactCheckError::WrongMediaType { at, expected, .. }) => {
+                assert_eq!(
+                    (at.as_str(), expected.as_str()),
+                    ("/items/1/file", "text/x-diff")
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_all_of_branch_must_hold() {
+        let schema = serde_json::json!({"allOf": [
+            {"type": "object", "properties": {"file": {"$ref": "atomic:artifact"}}},
+            {"properties": {"file": {"$ref": "atomic:artifact", "mediaType": "text/x-diff"}}}
+        ]});
+        assert_eq!(
+            check_refs(
+                &schema,
+                &serde_json::json!({"file": reference('a')}),
+                &Store
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            expected_type(check_refs(
+                &schema,
+                &serde_json::json!({"file": reference('b')}),
+                &Store
+            ))
+            .as_deref(),
+            Some("text/x-diff")
+        );
+    }
 }
 
 /// The `$id` of the built-in artifact reference schema.
@@ -229,7 +354,9 @@ pub struct FoundRef {
 }
 
 /// Every artifact reference `value` holds where `schema` expects one,
-/// following `properties`, `items` and local `$defs` references.
+/// following `properties`, `items`, local `$defs` references and the branches
+/// of `anyOf`, `oneOf` and `allOf`. Every branch contributes, so a reference
+/// under alternatives can appear once for each branch that expects one.
 pub fn find_refs(schema: &serde_json::Value, value: &serde_json::Value) -> Vec<FoundRef> {
     let mut out = Vec::new();
     walk(schema, schema, value, "", &mut out, 0);
@@ -285,9 +412,11 @@ fn walk(
             walk(root, items, v, &format!("{at}/{i}"), out, depth + 1);
         }
     }
-    if let Some(Value::Array(branches)) = schema.get("anyOf") {
-        for b in branches {
-            walk(root, b, value, at, out, depth + 1);
+    for keyword in ["anyOf", "oneOf", "allOf"] {
+        if let Some(Value::Array(branches)) = schema.get(keyword) {
+            for b in branches {
+                walk(root, b, value, at, out, depth + 1);
+            }
         }
     }
 }
@@ -326,11 +455,13 @@ pub enum ArtifactCheckError {
 }
 
 /// Check every artifact reference `value` holds against the store: it must
-/// exist and, where its schema says, have the right media type. Alternatives
-/// (`anyOf`) mean what they mean in JSON Schema: the value is fine if one of
-/// them accepts it. An alternative that holds artifact references accepts the
-/// value when those references hold; one with none accepts it only if the
-/// value fits it.
+/// exist and, where its schema says, have the right media type. Combinators
+/// mean what they mean in JSON Schema. Every `allOf` branch's references must
+/// hold. `anyOf` and `oneOf` are alternatives: the value is fine if one branch
+/// accepts it, and a branch accepts it when the value fits the branch and the
+/// branch's own references hold. A branch the value does not fit adds no
+/// requirement, so `{kind: "diff", file}` is held to the diff branch's media
+/// type and not to a text branch's.
 pub fn check_refs(
     schema: &serde_json::Value,
     value: &serde_json::Value,
@@ -371,15 +502,27 @@ fn check_one(
 }
 
 /// Whether `value` fits `branch` as JSON Schema, with the root's
-/// definitions in reach.
-fn fits(root: &serde_json::Value, branch: &serde_json::Value, value: &serde_json::Value) -> bool {
+/// definitions in reach, or `None` when the branch cannot be compiled on its
+/// own (a reference into the root outside its definitions, say). A branch
+/// whose fit is unknown is treated as one the value fits, so its artifact
+/// requirements still apply.
+fn fits(
+    root: &serde_json::Value,
+    branch: &serde_json::Value,
+    value: &serde_json::Value,
+) -> Option<bool> {
     let mut schema = branch.clone();
-    if let (Some(obj), Some(defs)) = (schema.as_object_mut(), root.get("$defs")) {
-        obj.entry("$defs").or_insert_with(|| defs.clone());
+    if let Some(obj) = schema.as_object_mut() {
+        for defs in ["$defs", "definitions"] {
+            if let Some(found) = root.get(defs) {
+                obj.entry(defs).or_insert_with(|| found.clone());
+            }
+        }
     }
     crate::registry::Registry::new()
         .validator_for(&schema)
-        .is_ok_and(|v| v.is_valid(value))
+        .ok()
+        .map(|v| v.is_valid(value))
 }
 
 fn check_at(
@@ -429,19 +572,30 @@ fn check_at(
             check_at(root, items, v, &format!("{at}/{i}"), store, depth + 1)?;
         }
     }
-    if let Some(Value::Array(branches)) = schema.get("anyOf") {
+    // Every `allOf` branch applies, so every branch's references must hold.
+    if let Some(Value::Array(branches)) = schema.get("allOf") {
+        for b in branches {
+            check_at(root, b, value, at, store, depth + 1)?;
+        }
+    }
+    // `anyOf` and `oneOf` are alternatives. Only a branch the value fits can
+    // accept it, and a branch that fits accepts it when its own references
+    // hold. Whether exactly one `oneOf` branch fits is the schema validator's
+    // question, already answered; here a fitting branch that holds is enough.
+    for keyword in ["anyOf", "oneOf"] {
+        let Some(Value::Array(branches)) = schema.get(keyword) else {
+            continue;
+        };
         let mut first_error = None;
         for b in branches {
-            let mut refs = Vec::new();
-            walk(root, b, value, at, &mut refs, depth + 1);
-            if refs.is_empty() {
-                if fits(root, b, value) {
-                    return Ok(());
-                }
+            if fits(root, b, value) == Some(false) {
                 continue;
             }
             match check_at(root, b, value, at, store, depth + 1) {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    first_error = None;
+                    break;
+                }
                 Err(e) => {
                     first_error.get_or_insert(e);
                 }
@@ -450,6 +604,7 @@ fn check_at(
         if let Some(e) = first_error {
             return Err(e);
         }
+        // No branch fits: the schema validator rejects the value itself.
     }
     Ok(())
 }
