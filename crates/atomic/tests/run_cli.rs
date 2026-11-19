@@ -967,6 +967,80 @@ fn a_run_of_another_durable_layout_is_reported_not_resumed() {
 }
 
 #[test]
+fn a_run_id_that_already_exists_is_refused() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(RANK.into())])
+            .await
+            .expect("fake model");
+        let dir = scratch("reused");
+        let project = project(&dir);
+        let env = model_env(&model.base_url());
+        let refused = |args: Vec<String>, env: Vec<(&'static str, String)>| {
+            let (d, p) = (dir.clone(), project.clone());
+            tokio::task::spawn_blocking(move || {
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                atomic(&d, &p, &args, &with(&env, &[]), "")
+            })
+        };
+        // A finished run's id, for the same atom or another workflow.
+        let out = atomic(
+            &dir,
+            &project,
+            &["run", "count-note", "--run-id", "done-1", "--data", NOTE],
+            &[],
+            "",
+        );
+        assert!(out.status.success(), "{}", text(&out));
+        for target in ["count-note", "count-only"] {
+            let args = [
+                "--json", "run", target, "--run-id", "done-1", "--data", NOTE,
+            ];
+            let out = refused(args.map(str::to_owned).to_vec(), env.to_vec())
+                .await
+                .expect("child");
+            assert!(!out.status.success(), "{}", text(&out));
+            let error = &stdout_json(&out)["error"];
+            assert_eq!(error["kind"], "run.exists", "{target}: {error}");
+            assert!(
+                error["action"]
+                    .as_str()
+                    .is_some_and(|a| a.contains("atomic runs resume done-1")),
+                "{error}"
+            );
+        }
+        assert_eq!(count_log(&dir).len(), 1, "nothing ran again");
+
+        // An unfinished one's: refused, not waited on.
+        let (d, p, e) = (dir.clone(), project.clone(), env.clone());
+        tokio::task::spawn_blocking(move || killed_after_rank(&d, &p, &e, "pending-1"))
+            .await
+            .expect("child");
+        let args = [
+            "--json",
+            "run",
+            "triage",
+            "--run-id",
+            "pending-1",
+            "--data",
+            NOTE,
+        ];
+        let out = refused(args.map(str::to_owned).to_vec(), env.to_vec())
+            .await
+            .expect("child");
+        let error = &stdout_json(&out)["error"];
+        assert_eq!(error["kind"], "run.exists", "{error}");
+        assert!(
+            error["description"]
+                .as_str()
+                .is_some_and(|d| d.contains("pending-1") && d.contains("unfinished")),
+            "{error}"
+        );
+        assert_eq!(model.calls(), 1, "nothing ran again");
+        assert_eq!(count_log(&dir).len(), 2);
+    });
+}
+
+#[test]
 fn exec_commands_run_in_a_runner_process_when_asked() {
     let dir = scratch("runner");
     let project = project(&dir);

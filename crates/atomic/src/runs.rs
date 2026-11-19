@@ -139,6 +139,27 @@ pub async fn run(
         Some(id) => id,
         None => new_run_id()?,
     };
+    // The engine treats a run id as an idempotency key: starting one that
+    // exists would wait for that run, whatever it runs, instead of this one.
+    // Checked under the lock, so no other local process starts it meanwhile.
+    if let Some(existing) = engine.rt.run_record(&run_id).await? {
+        let _ = engine.rt.shutdown(SHUTDOWN).await;
+        let state = match existing.status {
+            RunStatus::Pending => "unfinished".to_owned(),
+            RunStatus::Succeeded => "finished".to_owned(),
+            RunStatus::Failed(_) => "failed".to_owned(),
+            RunStatus::Other(state) => state.to_lowercase(),
+        };
+        return Err(Failure::new(
+            "run.exists",
+            format!("there is already a run {run_id} in this project's store, and it is {state}"),
+            format!(
+                "give a new id, or leave out --run-id for one; to continue or read that run, use \
+                 `atomic runs resume {run_id}`"
+            ),
+        )
+        .into());
+    }
     // Before anything runs, so a run cut short can be resumed by its id.
     eprintln!(
         "run {run_id}: {} in project {}",

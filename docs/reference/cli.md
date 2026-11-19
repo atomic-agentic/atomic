@@ -24,7 +24,8 @@ interactive coding, the target entry experience also works in an ordinary
 directory without a project manifest.
 
 `atomic run` returns a typed result when successful and provides a run identity
-for inspection. Local workflow gates can wait for your decision in the terminal.
+for inspection. `--run-id` names the new run; an id that is already in the store
+is refused, since that run continues only with `atomic runs resume`. Local workflow gates can wait for your decision in the terminal.
 Use `atomic runs resume <run-id>` after an interruption, from the same project
 and state store. It uses saved inputs and definitions; there is no replacement
 `--input`. If another local runtime owns the project, it reports that owner
