@@ -244,9 +244,13 @@ Ticket: {input.ticket}
 
 Three things to know:
 
-- **Astro still parses expressions inside a fence.** Escape literal braces and
-  angle brackets. Input interpolation remains tagged user data; it is never
-  reparsed as diagram syntax or developer instructions.
+- **A `mermaid` fence is literal.** atomic reads everything between
+  ```` ```mermaid ```` and the closing ```` ``` ```` as text, so `B{Urgent?}` and
+  `C<page>` are diagram syntax, never expressions or tags, and nothing inside is
+  interpolated. Only `mermaid` fences work this way; another fence is ordinary
+  prompt text, where braces start expressions. A stock Astro editor does not
+  know the rule and may underline braces in a diagram; `atomic check` is
+  authoritative.
 - **The diagram costs tokens on every run.** It counts toward the atom's size
   estimate like any other instruction text.
 - **Its value is unproven until you measure it.** A plain list may work as well,

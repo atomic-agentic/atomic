@@ -185,6 +185,10 @@ named imports of local TypeScript modules are [helpers](#typescript-helpers);
 type-only imports have no runtime effect. Registered compiler intrinsics such as
 `fitsWithin` have typed declarations and a fixed implementation.
 
+A ```` ```mermaid ```` fence in the body is read literally: its braces and angle
+brackets are diagram syntax, never expressions or tags. See
+[diagrams](../guides/diagrams.md#put-a-diagram-in-an-atoms-instructions-only-when-it-earns-its-place).
+
 Components render `<slot />` and named slots such as
 `<slot name="policy">fallback</slot>`; a caller fills one with a direct child
 that names it, such as `<Fragment slot="policy">`. As in Astro, explicit

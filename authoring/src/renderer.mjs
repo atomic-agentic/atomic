@@ -9,6 +9,7 @@ import { readFile, realpath, path, createHash, fileURLToPath } from './platform.
 import { intrinsics } from './intrinsics.mjs';
 import { contextForStep } from './context.mjs';
 import { captureHelper } from './capture.mjs';
+import { literalFences } from './fences.mjs';
 
 const denied = new Set(['__proto__', 'prototype', 'constructor']);
 const dataBrand = Symbol('data');
@@ -229,7 +230,7 @@ export async function compile(file, options = {}) {
     sourceBytes += text.length;
     if (text.length > 262144 || sourceBytes > 1048576) throw new Error('source size limit exceeded');
     if (options.production && /@ts-(?:ignore|nocheck|expect-error)/.test(text)) throw new Error('TypeScript diagnostic suppression is not allowed in atom sources');
-    const parsed = await parse(text, { position: true });
+    const parsed = await parse(literalFences(text), { position: true });
     const parseError = parsed.diagnostics?.find((d) => d.severity === 1);
     if (parseError) throw new AtomDiagnostic(parseError.text ?? 'Astro parse error', canonical, parseError.location?.line);
     const defaults = canonical.endsWith('.atom.astro')

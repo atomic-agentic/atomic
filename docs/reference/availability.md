@@ -54,8 +54,8 @@ follows with code context in v0.7. The committed `atomic.policy.lock`, and
 
 Mermaid diagrams written by hand in docs need nothing from Atomic. The
 [diagram exporters](../guides/diagrams.md) for workflows, the work graph and
-runs, their `--view risk` and `--view cost` views, the stale-diagram check and
-`mermaid` fences in atom instructions are planned for v0.5. Rendering in the web
+runs, their `--view risk` and `--view cost` views and the stale-diagram check are
+planned for v0.5; literal `mermaid` fences in atom instructions are built. Rendering in the web
 console follows at v1.0.
 
 [Recorded decisions](manifest.md#recorded-decisions) in the manifest and the

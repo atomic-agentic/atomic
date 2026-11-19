@@ -392,3 +392,31 @@ fn a_schema_cannot_replace_the_atom_declarations() {
     let error = load(&dir.join("test.atom.astro"), &mut Registry::new()).expect_err("collision");
     assert!(error.message.contains("rename the schema file"), "{error}");
 }
+
+// A mermaid fence's braces and tags are diagram text: they pass the type
+// check and reach the prompt unchanged.
+#[test]
+fn a_mermaid_fence_checks_and_renders_as_text() {
+    let (atom, registry) = checked(
+        "Route it as drawn.\n```mermaid\nflowchart TD\n  A[Ticket] --> B{Urgent?}\n  B --> C<page>\n```\nNote: {input.text}",
+    );
+    let compiled = crate::compile::compile(&atom, &registry).expect("compiles");
+    let out = crate::render::render(
+        &compiled,
+        &crate::render::RunInput {
+            run_id: "run-1",
+            input: &json!({"text": "hello"}),
+            frontmatter: &atom.frontmatter,
+            origin: "external",
+            origins: None,
+            step: None,
+        },
+    )
+    .expect("renders");
+    assert!(
+        out.developer
+            .contains("A[Ticket] --> B{Urgent?}\n  B --> C<page>"),
+        "{}",
+        out.developer
+    );
+}
