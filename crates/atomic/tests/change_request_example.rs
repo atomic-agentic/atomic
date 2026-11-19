@@ -21,7 +21,7 @@
 
 use atomic_app::pipeline::{PIPELINE, PipelineRun, Services, prepare, register_pipeline};
 use atomic_core::artifact::LocalStore;
-use atomic_core::codex::{CodexPaths, ModelEndpoint};
+use atomic_core::codex::{CodexPaths, ModelEndpoint, StateGuard};
 use atomic_core::git::Git;
 use atomic_core::lite::LiteRuntime;
 use atomic_core::runtime::{Artifacts, CodexRuntime, Runtimes};
@@ -177,7 +177,7 @@ async fn engine(dir: &Path, project: &Path, base_url: &str) -> Durare {
                 dir.join("bin/codex-linux-sandbox"),
             ),
             codex_home: dir.join("codex-home"),
-            state_dir: Some(dir.join("state")),
+            guard: StateGuard::deny_state_dir(dir.join("state")).expect("guard"),
             cwd: project.to_owned(),
             endpoint: endpoint.clone(),
             defaults: AtomConfig::default(),

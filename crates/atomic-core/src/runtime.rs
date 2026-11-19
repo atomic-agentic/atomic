@@ -86,11 +86,9 @@ pub struct CodexRuntime {
     pub paths: CodexPaths,
     /// Codex's home for atom threads, inside the project's state directory.
     pub codex_home: PathBuf,
-    /// The project's state directory, which atoms' commands may not read or
-    /// write (see [`TurnSpec::state_dir`]). Always set where atoms run;
-    /// `None` only for runtimes with no sandbox helper, such as tests, since
-    /// Codex enforces the denial through the helper.
-    pub state_dir: Option<PathBuf>,
+    /// What atoms' commands are kept out of: atomic's private state, for
+    /// every runtime atoms run on (see [`codex::StateGuard`]).
+    pub guard: codex::StateGuard,
     /// The working directory threads run in.
     pub cwd: PathBuf,
     /// The model endpoint.
@@ -218,10 +216,6 @@ async fn run_contract(
         output_schema: Some(lowered.schema.clone()),
         model: request.model,
         sandbox: request.sandbox,
-        state_dir: match backend {
-            Backend::Codex(rt) => rt.state_dir.clone(),
-            Backend::Lite(_) => None,
-        },
         ..TurnSpec::default()
     };
     let model = spec
@@ -296,6 +290,7 @@ async fn run_contract(
                 &rt.cwd,
                 &rt.endpoint,
                 &rt.meter,
+                &rt.guard,
                 &spec,
                 next,
             )

@@ -97,7 +97,8 @@ fn main() {
                     let rt = CodexRuntime {
                         paths: paths.clone(),
                         codex_home: dir.join("home"),
-                        state_dir: Some(dir.clone()),
+                        guard: atomic_core::codex::StateGuard::deny_state_dir(dir.clone())
+                            .expect("guard"),
                         cwd: dir.join("cwd"),
                         endpoint: endpoint.clone(),
                         defaults: AtomConfig::default(),
