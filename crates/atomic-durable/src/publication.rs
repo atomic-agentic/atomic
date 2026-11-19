@@ -128,16 +128,41 @@ fn digest(proposal: &Proposal) -> Result<String> {
 
 /// What an atom's turn records: the candidate, or that the run parked before
 /// the turn could finish.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize)]
 enum Turn {
     Candidate(Candidate),
     Parked { position: i32, reason: String },
 }
 
+/// A turn checkpoint as stored. A store written before turns could park
+/// holds the bare candidate; it decodes as [`Turn::Candidate`], so a run
+/// checkpointed then resumes now.
+impl<'de> Deserialize<'de> for Turn {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        enum Tagged {
+            Candidate(Candidate),
+            Parked { position: i32, reason: String },
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Stored {
+            Tagged(Tagged),
+            Bare(Candidate),
+        }
+        Ok(match Stored::deserialize(d)? {
+            Stored::Tagged(Tagged::Candidate(c)) | Stored::Bare(c) => Turn::Candidate(c),
+            Stored::Tagged(Tagged::Parked { position, reason }) => {
+                Turn::Parked { position, reason }
+            }
+        })
+    }
+}
+
 /// A parked run's row in `atomic_parks`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Park {
-    /// `<run>:<position of the parked turn>`.
+    /// `<run>:<position of the parked turn>`: each park has its own.
     pub id: String,
     /// The run.
     pub run: String,
@@ -149,7 +174,18 @@ pub struct Park {
     pub parked_at: i64,
 }
 
-/// How long a park waits for: long enough to be forever.
+impl Park {
+    /// The topic the parked run waits on: a message on it releases the park.
+    pub fn topic(&self) -> String {
+        topic(&self.id)
+    }
+}
+
+fn topic(park: &str) -> String {
+    format!("atomic.park:{park}")
+}
+
+/// How long a park waits before it waits again: long enough to be forever.
 const PARKED: std::time::Duration = std::time::Duration::from_secs(10 * 365 * 24 * 3600);
 
 /// Run `author` as a durable step and checkpoint what it proposes as a private
@@ -159,13 +195,16 @@ const PARKED: std::time::Duration = std::time::Duration::from_secs(10 * 365 * 24
 ///
 /// An author that returns [`DurableError::Parked`], because a budget cap left
 /// no room for its next model call, parks the run: the turn records that it
-/// parked, `<name>.park` records the park in `atomic_parks`, and the run then
-/// waits durably and never goes on to later steps. A recovered run replays
-/// both and waits again: resuming does not unpark it.
+/// parked, `<name>.park` records the park in `atomic_parks`, and the run waits
+/// durably on the park's [topic](Park::topic), going on to no later step. A
+/// recovered run replays all three and waits again: resuming does not unpark
+/// it. When the park is [released](release), the author runs again as a new
+/// turn, and its calls are admitted afresh against the caps as they stand
+/// then: if they still leave no room, it parks again.
 pub async fn execute_candidate<C, F, Fut>(ctx: &C, name: &str, author: F) -> Result<Candidate>
 where
     C: WorkflowContext,
-    F: FnOnce() -> Fut + Send + 'static,
+    F: Fn() -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = Result<Proposal>> + Send + 'static,
 {
     execute_candidate_at(ctx, name, move |_| author()).await
@@ -174,46 +213,59 @@ where
 /// As [`execute_candidate`], with the author told which step it runs as, so
 /// it can key what it does outside the step, such as its model calls'
 /// ledger requests, by the step's stable position.
+///
+/// The position it is told is its first turn's, on every turn: a turn run
+/// again after a park makes new attempts at the same ledger requests,
+/// against the same atom allowance, rather than new ones.
 pub async fn execute_candidate_at<C, F, Fut>(ctx: &C, name: &str, author: F) -> Result<Candidate>
 where
     C: WorkflowContext,
-    F: FnOnce(StepInfo) -> Fut + Send + 'static,
+    F: Fn(StepInfo) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = Result<Proposal>> + Send + 'static,
 {
-    let turn: Turn = ctx
-        .step(name, move |step| async move {
-            let (id, position) = (
-                format!("{}:{}", step.workflow_id, step.step_id),
-                step.step_id,
-            );
-            match author(step).await {
-                Ok(proposal) => {
-                    let digest = digest(&proposal)?;
-                    Ok(Turn::Candidate(Candidate {
-                        id,
-                        proposal,
-                        digest,
-                    }))
+    let author = Arc::new(author);
+    let mut first: Option<i32> = None;
+    loop {
+        let author = author.clone();
+        let turn: Turn = ctx
+            .step(name, move |step| async move {
+                let position = step.step_id;
+                let id = format!("{}:{position}", step.workflow_id);
+                let told = StepInfo {
+                    workflow_id: step.workflow_id,
+                    step_id: first.unwrap_or(position),
+                };
+                match author(told).await {
+                    Ok(proposal) => {
+                        let digest = digest(&proposal)?;
+                        Ok(Turn::Candidate(Candidate {
+                            id,
+                            proposal,
+                            digest,
+                        }))
+                    }
+                    Err(DurableError::Parked(reason)) => Ok(Turn::Parked { position, reason }),
+                    Err(e) => Err(e),
                 }
-                Err(DurableError::Parked(reason)) => Ok(Turn::Parked { position, reason }),
-                Err(e) => Err(e),
+            })
+            .await?;
+        match turn {
+            Turn::Candidate(candidate) => return Ok(candidate),
+            Turn::Parked { position, reason } => {
+                first.get_or_insert(position);
+                park(ctx, name, position, reason).await?;
             }
-        })
-        .await?;
-    match turn {
-        Turn::Candidate(candidate) => Ok(candidate),
-        Turn::Parked { position, reason } => park(ctx, name, position, reason).await,
+        }
     }
 }
 
-/// Record the park, then wait. Nothing in this version raises a cap, so the
-/// wait never ends; a wake-up on the park's topic is ignored.
+/// Record the park, then wait on its topic until it is released.
 async fn park<C: WorkflowContext>(
     ctx: &C,
     turn: &str,
     position: i32,
     reason: String,
-) -> Result<Candidate> {
+) -> Result<()> {
     let run = ctx.workflow_id().to_owned();
     let id = format!("{run}:{position}");
     let step = format!("{}.park", turn.strip_suffix(".turn").unwrap_or(turn));
@@ -231,7 +283,8 @@ async fn park<C: WorkflowContext>(
         let row = row.clone();
         Box::pin(async move {
             tx.execute(
-                "INSERT INTO atomic_parks (park_id, run, step, reason, parked_at)                  VALUES (?, ?, ?, ?, ?) ON CONFLICT (park_id) DO NOTHING",
+                "INSERT INTO atomic_parks (park_id, run, step, reason, parked_at) \
+                 VALUES (?, ?, ?, ?, ?) ON CONFLICT (park_id) DO NOTHING",
                 &[
                     Param::Text(row.id.clone()),
                     Param::Text(row.run.clone()),
@@ -247,8 +300,26 @@ async fn park<C: WorkflowContext>(
     .await?;
     crate::failpoint("usage:after-park");
     loop {
-        let _: Option<Value> = ctx.recv(&format!("atomic.park:{id}"), PARKED).await?;
+        let woken: Option<Value> = ctx.recv(&topic(&id), PARKED).await?;
+        if woken.is_some() {
+            return Ok(());
+        }
     }
+}
+
+/// Release `park`: its run runs the parked turn again, admitting its calls
+/// afresh. Releasing does not raise a cap; a release with no more room than
+/// before parks the run again. A person's action, such as raising the cap in
+/// the usage ledger, comes first, from a human credential only. Releasing
+/// the same park twice delivers one wake-up.
+pub async fn release<R: DurableRuntime>(rt: &R, park: &Park) -> Result<()> {
+    rt.send(
+        &park.run,
+        &park.topic(),
+        serde_json::json!({"released": park.id}),
+        &format!("release:{}", park.id),
+    )
+    .await
 }
 
 /// The parks recorded for run `run`, oldest first.
@@ -259,7 +330,8 @@ pub async fn parks<R: DurableRuntime>(rt: &R, run: &str) -> Result<Vec<Park>> {
         Box::pin(async move {
             let rows = tx
                 .query_all(
-                    "SELECT park_id, run, step, reason, parked_at FROM atomic_parks                      WHERE run = ? ORDER BY parked_at, park_id",
+                    "SELECT park_id, run, step, reason, parked_at FROM atomic_parks \
+                     WHERE run = ? ORDER BY parked_at, park_id",
                     &[Param::Text(run)],
                 )
                 .await?;
@@ -344,7 +416,7 @@ pub async fn run_atom<C, F, Fut>(
 ) -> Result<Published>
 where
     C: WorkflowContext,
-    F: FnOnce() -> Fut + Send + 'static,
+    F: Fn() -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = Result<Proposal>> + Send + 'static,
 {
     run_atom_at(ctx, name, move |_| author(), preconditions).await
@@ -360,7 +432,7 @@ pub async fn run_atom_at<C, F, Fut>(
 ) -> Result<Published>
 where
     C: WorkflowContext,
-    F: FnOnce(StepInfo) -> Fut + Send + 'static,
+    F: Fn(StepInfo) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = Result<Proposal>> + Send + 'static,
 {
     let candidate = execute_candidate_at(ctx, &format!("{name}.turn"), author).await?;

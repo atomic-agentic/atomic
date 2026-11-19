@@ -10,7 +10,12 @@
 //!   hold however a later admission states them;
 //! - parallel children cannot both take their parent's last reservation;
 //! - only a call that was never dispatched is released;
-//! - usage past the reservation is recorded, against its declared bound.
+//! - usage past the reservation is recorded, against its declared bound;
+//! - admission refuses on active time and on dollars as it does on tokens;
+//! - an attempt left reserved can be reconciled or released once, and a
+//!   person can raise a cap, never lower one;
+//! - a refusal's reason comes from the state it refused, however many
+//!   admissions and settlements race it.
 
 use super::*;
 use crate::runtime::{DurableRuntime, Durare};
@@ -329,6 +334,205 @@ async fn usage_past_the_reservation_is_recorded_against_its_bound<R: DurableRunt
     assert_eq!(second.overshoot(), 0);
 }
 
+async fn admission_refuses_on_time_and_on_dollars<R: DurableRuntime>(rt: R) {
+    let ledger = rt.ledger();
+    // Room for any number of tokens, but for one call's time.
+    let run = unique("millis");
+    let mut timed = request(&run, 1, 0, 1_000_000, 1_000_000);
+    for scope in &mut timed.chain {
+        scope.caps.millis = 1_500;
+    }
+    admitted(&ledger.admit(timed.clone()).await.expect("admit"));
+    timed.id = format!("{run}:1:1");
+    match ledger.admit(timed).await.expect("admit") {
+        Admission::Refused { reason, .. } => {
+            assert!(reason.contains("1000 of 1500 ms"), "{reason}");
+            assert!(!reason.contains("tokens charged"), "{reason}");
+        }
+        other => panic!("refused on time: {other:?}"),
+    }
+    // Room for any number of tokens and any time, but for one call's cost.
+    let run = unique("micro");
+    let mut priced = request(&run, 1, 0, 1_000_000, 1_000_000);
+    for scope in &mut priced.chain {
+        scope.caps.micro_usd = Some(80);
+    }
+    admitted(&ledger.admit(priced.clone()).await.expect("admit"));
+    priced.id = format!("{run}:1:1");
+    match ledger.admit(priced.clone()).await.expect("admit") {
+        Admission::Refused { reason, .. } => {
+            assert!(reason.contains("50 of 80 micro-dollars"), "{reason}");
+        }
+        other => panic!("refused on cost: {other:?}"),
+    }
+    // Settled at its real cost, the first call leaves room for the second.
+    ledger
+        .settle(
+            &format!("{run}:1:0"),
+            1,
+            Settlement::Reported {
+                input_tokens: 1,
+                output_tokens: 1,
+                millis: 1,
+                micro_usd: 3,
+            },
+        )
+        .await
+        .expect("settle");
+    assert_eq!(charged(&ledger, &format!("run:{run}")).await.micro_usd, 3);
+    admitted(&ledger.admit(priced).await.expect("admit"));
+}
+
+async fn a_reserved_attempt_is_reconciled_or_released_once<R: DurableRuntime>(rt: R) {
+    let ledger = rt.ledger();
+    let run = unique("reconcile");
+    for call in 0..2 {
+        admitted(
+            &ledger
+                .admit(request(&run, 1, call, 1_000, 1_000))
+                .await
+                .expect("admit"),
+        );
+    }
+    assert_eq!(ledger.unsettled(&run).await.expect("unsettled").len(), 2);
+    // Its usage learned later: charged as used, its time as reserved.
+    let learned = Settlement::Reconciled {
+        input_tokens: 7,
+        output_tokens: 3,
+        micro_usd: 2,
+    };
+    let first = format!("{run}:1:0");
+    assert_eq!(
+        ledger.settle(&first, 1, learned).await.expect("reconcile"),
+        Settled::Now
+    );
+    assert_eq!(
+        ledger.settle(&first, 1, learned).await.expect("again"),
+        Settled::Already
+    );
+    // Confirmed unused: released.
+    let second = format!("{run}:1:1");
+    assert_eq!(
+        ledger.release(&second, 1).await.expect("release"),
+        Settled::Now
+    );
+    assert_eq!(
+        ledger.release(&second, 1).await.expect("again"),
+        Settled::Already
+    );
+    assert!(ledger.unsettled(&run).await.expect("unsettled").is_empty());
+    assert_eq!(
+        charged(&ledger, &format!("atom:{run}:1")).await,
+        Charge {
+            tokens: 10,
+            millis: BOUND.millis,
+            micro_usd: 2,
+        }
+    );
+}
+
+async fn a_person_raises_a_cap_and_never_lowers_one<R: DurableRuntime>(rt: R) {
+    let ledger = rt.ledger();
+    let run = unique("raise");
+    admitted(
+        &ledger
+            .admit(request(&run, 1, 0, 100, 10_000))
+            .await
+            .expect("admit"),
+    );
+    let scope = format!("run:{run}");
+    assert!(matches!(
+        ledger
+            .admit(request(&run, 1, 1, 100, 10_000))
+            .await
+            .expect("admit"),
+        Admission::Refused { .. }
+    ));
+    let raised = ledger
+        .raise(
+            &scope,
+            Caps {
+                tokens: 250,
+                millis: 10,
+                micro_usd: Some(1),
+            },
+        )
+        .await
+        .expect("raise")
+        .expect("exists");
+    // Tokens rose; time is not lowered; no dollar cap is added.
+    assert_eq!(
+        raised.caps,
+        Caps {
+            tokens: 250,
+            millis: 1_000_000,
+            micro_usd: None,
+        }
+    );
+    admitted(
+        &ledger
+            .admit(request(&run, 1, 1, 100, 10_000))
+            .await
+            .expect("admit"),
+    );
+    assert_eq!(
+        ledger
+            .raise(&format!("run:{run}-none"), caps(1))
+            .await
+            .expect("raise"),
+        None
+    );
+}
+
+async fn a_refusal_is_explained_by_the_state_it_refused<R: DurableRuntime>(rt: R) {
+    let ledger = rt.ledger();
+    for round in 0..5 {
+        let run = unique(&format!("reason{round}"));
+        // Room for three bounds at once. Children admit and settle at once,
+        // so the room changes all the time; every refusal must still say
+        // which cap had no room and how much was charged.
+        let children: Vec<_> = (1..=8)
+            .map(|step| {
+                let ledger = ledger.clone();
+                let req = request(&run, step, 0, 300, 10_000);
+                tokio::spawn(async move {
+                    match ledger.admit(req).await.expect("admit") {
+                        Admission::Admitted { request, attempt } => {
+                            ledger
+                                .settle(
+                                    &request,
+                                    attempt,
+                                    Settlement::Reported {
+                                        input_tokens: 1,
+                                        output_tokens: 1,
+                                        millis: 1,
+                                        micro_usd: 1,
+                                    },
+                                )
+                                .await
+                                .expect("settle");
+                            None
+                        }
+                        Admission::Refused { reason, .. } => Some(reason),
+                    }
+                })
+            })
+            .collect();
+        for child in children {
+            if let Some(reason) = child.await.expect("task") {
+                let explained = reason
+                    .split_once(": ")
+                    .map(|(_, why)| why)
+                    .unwrap_or_default();
+                assert!(
+                    explained.contains("tokens charged, and the call reserves 100"),
+                    "a refusal with its reason: {reason:?}"
+                );
+            }
+        }
+    }
+}
+
 macro_rules! on_sqlite {
     ($($name:ident),* $(,)?) => {
         mod on_sqlite {
@@ -358,6 +562,10 @@ macro_rules! on_postgres {
 
 on_sqlite!(
     a_call_is_reserved_before_dispatch_and_settled_once,
+    admission_refuses_on_time_and_on_dollars,
+    a_reserved_attempt_is_reconciled_or_released_once,
+    a_person_raises_a_cap_and_never_lowers_one,
+    a_refusal_is_explained_by_the_state_it_refused,
     an_unsettled_attempt_stays_charged_until_admission_refuses,
     caps_hold_as_first_created,
     parallel_children_cannot_both_take_the_last_reservation,
@@ -368,6 +576,10 @@ on_sqlite!(
 #[cfg(feature = "postgres-tests")]
 on_postgres!(
     a_call_is_reserved_before_dispatch_and_settled_once,
+    admission_refuses_on_time_and_on_dollars,
+    a_reserved_attempt_is_reconciled_or_released_once,
+    a_person_raises_a_cap_and_never_lowers_one,
+    a_refusal_is_explained_by_the_state_it_refused,
     an_unsettled_attempt_stays_charged_until_admission_refuses,
     caps_hold_as_first_created,
     parallel_children_cannot_both_take_the_last_reservation,

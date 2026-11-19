@@ -34,15 +34,31 @@
 //!
 //! Caps are fixed when an allowance is first created. Admitting again with
 //! larger caps, as a resumed run with an edited budget would, changes
-//! nothing, so resuming alone never raises a cap.
+//! nothing, so resuming alone never raises a cap. Only [`Ledger::raise`],
+//! a person's action, raises one.
+//!
+//! An attempt left `reserved` can be reconciled later, once its real usage
+//! is known from a usage query or a person ([`Settlement::Reconciled`]), or
+//! released once it is confirmed unused ([`Ledger::release`]);
+//! [`Ledger::unsettled`] lists them.
 //!
 //! Charges are integers: tokens, milliseconds of active execution and
-//! micro-dollars (millionths of a US dollar).
+//! micro-dollars (millionths of a US dollar), each at most [`MOST`], so no
+//! sum the ledger keeps can overflow.
 
 use crate::failpoint;
 use crate::runtime::{DurableError, End, Param, Reads, Result, Row, Tx, TxFuture};
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// The most any cap, reservation or reported amount may be: 2^53. Larger
+/// reported usage is held to it.
+pub const MOST: i64 = 1 << 53;
+
+/// How an absent amount is bound, for `NULLIF(?, -1)`: binding NULL instead
+/// would type the parameter as text on PostgreSQL, and a statement prepared
+/// that way then misreads a number bound to it later.
+const NONE: i64 = -1;
 
 /// The caps of one allowance.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,6 +168,18 @@ pub enum Settlement {
     Unknown,
     /// The call was never dispatched: the reservation is released.
     NotDispatched,
+    /// Its usage, learned after the fact from a usage query or a person,
+    /// for an attempt that was never settled: it replaces the reservation,
+    /// and the active time stays charged as reserved, since how long the
+    /// call took is not known.
+    Reconciled {
+        /// Input tokens.
+        input_tokens: i64,
+        /// Output tokens.
+        output_tokens: i64,
+        /// What it cost, in micro-dollars.
+        micro_usd: i64,
+    },
 }
 
 /// What a settlement did.
@@ -325,6 +353,35 @@ async fn add_charge(tx: &mut Tx<'_, '_>, scopes: &[String], delta: Charge) -> Re
     Ok(())
 }
 
+/// Why `a` has no room for `r`, one reason per cap it would pass; empty
+/// when it has room.
+fn shortfall(a: &Allowance, r: Charge) -> Vec<String> {
+    let over =
+        |charged: i64, cap: i64, reserve: i64| charged.checked_add(reserve).is_none_or(|n| n > cap);
+    let mut short = Vec::new();
+    if over(a.charged.tokens, a.caps.tokens, r.tokens) {
+        short.push(format!(
+            "{} of {} tokens charged, and the call reserves {}",
+            a.charged.tokens, a.caps.tokens, r.tokens
+        ));
+    }
+    if over(a.charged.millis, a.caps.millis, r.millis) {
+        short.push(format!(
+            "{} of {} ms of active time charged, and the call reserves {}",
+            a.charged.millis, a.caps.millis, r.millis
+        ));
+    }
+    if let Some(cap) = a.caps.micro_usd
+        && over(a.charged.micro_usd, cap, r.micro_usd)
+    {
+        short.push(format!(
+            "{} of {} micro-dollars charged, and the call reserves {}",
+            a.charged.micro_usd, cap, r.micro_usd
+        ));
+    }
+    short
+}
+
 async fn admit_in(tx: &mut Tx<'_, '_>, request: &Request) -> Result<End<Admission>> {
     let refuse = |scope: &str, reason: String| {
         Ok(End::Rollback(Admission::Refused {
@@ -339,9 +396,17 @@ async fn admit_in(tx: &mut Tx<'_, '_>, request: &Request) -> Result<End<Admissio
         )));
     }
     let r = request.reserve;
-    if r.tokens < 0 || r.millis < 0 || r.micro_usd < 0 {
+    let amounts =
+        [r.tokens, r.millis, r.micro_usd]
+            .into_iter()
+            .chain(request.chain.iter().flat_map(|s| {
+                [s.caps.tokens, s.caps.millis]
+                    .into_iter()
+                    .chain(s.caps.micro_usd)
+            }));
+    if amounts.into_iter().any(|n| !(0..=MOST).contains(&n)) {
         return Err(corrupt(format!(
-            "request {} reserves less than nothing",
+            "request {} reserves or caps an amount below zero or past {MOST}",
             request.id
         )));
     }
@@ -349,26 +414,49 @@ async fn admit_in(tx: &mut Tx<'_, '_>, request: &Request) -> Result<End<Admissio
     // allowance that exists keeps the caps it was created with.
     let mut parent: Option<&str> = None;
     for scope in &request.chain {
-        // A NULL binds as text on PostgreSQL, hence the casts.
+        // A NULL binds as text on PostgreSQL, hence the cast for the parent;
+        // an absent dollar cap is bound as NONE.
         tx.execute(
             "INSERT INTO atomic_usage_allowances (scope, parent, tokens_cap, millis_cap, \
              micro_usd_cap, tokens_charged, millis_charged, micro_usd_charged) \
-             VALUES (?, CAST(? AS TEXT), ?, ?, CAST(? AS BIGINT), 0, 0, 0) \
+             VALUES (?, CAST(? AS TEXT), ?, ?, NULLIF(?, -1), 0, 0, 0) \
              ON CONFLICT (scope) DO NOTHING",
             &[
                 Param::Text(scope.id.clone()),
                 parent.map_or(Param::Null, |p| Param::Text(p.to_owned())),
                 Param::Int(scope.caps.tokens),
                 Param::Int(scope.caps.millis),
-                scope.caps.micro_usd.map_or(Param::Null, Param::Int),
+                Param::Int(scope.caps.micro_usd.unwrap_or(NONE)),
             ],
         )
         .await?;
         parent = Some(&scope.id);
     }
-    // Reserve against each, root first. The conditional update both checks
-    // the room and takes it, under the row's lock.
+    // Reserve against each, root first. Each row is locked before it is
+    // read (a write that changes nothing), so the room the read finds is
+    // the room the reservation takes, and a refusal's reason comes from the
+    // same state as the refusal itself.
     for scope in &request.chain {
+        tx.execute(
+            "UPDATE atomic_usage_allowances SET tokens_cap = tokens_cap WHERE scope = ?",
+            &[Param::Text(scope.id.clone())],
+        )
+        .await?;
+        let Some(a) = read_allowance(tx, &scope.id).await? else {
+            return Err(corrupt(format!("allowance {} vanished", scope.id)));
+        };
+        let short = shortfall(&a, r);
+        if !short.is_empty() {
+            return refuse(
+                &scope.id,
+                format!(
+                    "the allowance {} has no room for request {}: {}",
+                    scope.id,
+                    request.id,
+                    short.join("; ")
+                ),
+            );
+        }
         let rows = tx
             .execute(
                 "UPDATE atomic_usage_allowances SET tokens_charged = tokens_charged + ?, \
@@ -388,39 +476,10 @@ async fn admit_in(tx: &mut Tx<'_, '_>, request: &Request) -> Result<End<Admissio
             )
             .await?;
         if rows != 1 {
-            let Some(a) = read_allowance(tx, &scope.id).await? else {
-                return Err(corrupt(format!("allowance {} vanished", scope.id)));
-            };
-            let mut short = Vec::new();
-            if a.charged.tokens + r.tokens > a.caps.tokens {
-                short.push(format!(
-                    "{} of {} tokens charged, and the call reserves {}",
-                    a.charged.tokens, a.caps.tokens, r.tokens
-                ));
-            }
-            if a.charged.millis + r.millis > a.caps.millis {
-                short.push(format!(
-                    "{} of {} ms of active time charged, and the call reserves {}",
-                    a.charged.millis, a.caps.millis, r.millis
-                ));
-            }
-            if let Some(cap) = a.caps.micro_usd
-                && a.charged.micro_usd + r.micro_usd > cap
-            {
-                short.push(format!(
-                    "{} of {} micro-dollars charged, and the call reserves {}",
-                    a.charged.micro_usd, cap, r.micro_usd
-                ));
-            }
-            return refuse(
-                &scope.id,
-                format!(
-                    "the allowance {} has no room for request {}: {}",
-                    scope.id,
-                    request.id,
-                    short.join("; ")
-                ),
-            );
+            return Err(corrupt(format!(
+                "allowance {} changed under its lock",
+                scope.id
+            )));
         }
     }
     let attempt = tx
@@ -489,6 +548,9 @@ async fn settle_in(
         millis: row.int("charged_millis")?,
         micro_usd: row.int("charged_micro_usd")?,
     };
+    // Reported amounts are held to [0, MOST], so the sums below cannot
+    // overflow.
+    let held = |n: i64| n.clamp(0, MOST);
     let (state, actual, usage) = match how {
         Settlement::Unknown => return Ok(End::Rollback(Settled::Uncertain)),
         Settlement::NotDispatched => ("released", Charge::default(), None),
@@ -500,24 +562,37 @@ async fn settle_in(
         } => (
             "settled",
             Charge {
-                tokens: input_tokens.max(0).saturating_add(output_tokens.max(0)),
-                millis: millis.max(0),
-                micro_usd: micro_usd.max(0),
+                tokens: held(input_tokens) + held(output_tokens),
+                millis: held(millis),
+                micro_usd: held(micro_usd),
             },
-            Some((input_tokens.max(0), output_tokens.max(0))),
+            Some((held(input_tokens), held(output_tokens))),
+        ),
+        Settlement::Reconciled {
+            input_tokens,
+            output_tokens,
+            micro_usd,
+        } => (
+            "settled",
+            Charge {
+                tokens: held(input_tokens) + held(output_tokens),
+                millis: charged.millis,
+                micro_usd: held(micro_usd),
+            },
+            Some((held(input_tokens), held(output_tokens))),
         ),
     };
     // Only a reserved attempt changes, so two settlements cannot both apply.
     let changed = tx
         .execute(
-            "UPDATE atomic_usage_attempts SET state = ?, input_tokens = CAST(? AS BIGINT), \
-             output_tokens = CAST(? AS BIGINT), charged_tokens = ?, charged_millis = ?, \
+            "UPDATE atomic_usage_attempts SET state = ?, input_tokens = NULLIF(?, -1), \
+             output_tokens = NULLIF(?, -1), charged_tokens = ?, charged_millis = ?, \
              charged_micro_usd = ?, settled_at = ? \
              WHERE request_id = ? AND attempt = ? AND state = 'reserved'",
             &[
                 Param::Text(state.to_owned()),
-                usage.map_or(Param::Null, |(i, _)| Param::Int(i)),
-                usage.map_or(Param::Null, |(_, o)| Param::Int(o)),
+                Param::Int(usage.map_or(NONE, |(i, _)| i)),
+                Param::Int(usage.map_or(NONE, |(_, o)| o)),
                 Param::Int(actual.tokens),
                 Param::Int(actual.millis),
                 Param::Int(actual.micro_usd),
@@ -578,6 +653,83 @@ impl Ledger {
         // Where a crash test kills the process: after the provider was
         // called, before its usage is recorded.
         failpoint("usage:before-settle");
+        self.settle_once(request, attempt, how).await
+    }
+
+    /// Release attempt `attempt` at `request`, left `reserved`, once it is
+    /// confirmed that it spent nothing: its reservation is no longer
+    /// charged. Releasing a settled or released attempt changes nothing.
+    pub async fn release(&self, request: &str, attempt: i64) -> Result<Settled> {
+        self.settle_once(request, attempt, Settlement::NotDispatched)
+            .await
+    }
+
+    /// The attempts journaled for run `run` that are still `reserved`: each
+    /// charged at its bound until it is settled, reconciled or released.
+    pub async fn unsettled(&self, run: &str) -> Result<Vec<Attempt>> {
+        Ok(self
+            .attempts(run)
+            .await?
+            .into_iter()
+            .filter(|a| a.state == "reserved")
+            .collect())
+    }
+
+    /// Raise allowance `scope`'s caps to `caps`, each only where it is
+    /// larger: a cap is never lowered here, and a `micro_usd` of `None`
+    /// leaves the dollar cap as it is. A person's action, from a human
+    /// credential only; resuming a run never calls it. Returns the
+    /// allowance as it stands after, or `None` if there is no such one.
+    pub async fn raise(&self, scope: &str, caps: Caps) -> Result<Option<Allowance>> {
+        if [caps.tokens, caps.millis]
+            .into_iter()
+            .chain(caps.micro_usd)
+            .any(|n| !(0..=MOST).contains(&n))
+        {
+            return Err(corrupt(format!(
+                "a cap for {scope} is below zero or past {MOST}"
+            )));
+        }
+        let scope = scope.to_owned();
+        self.transact(move |mut tx| {
+            let scope = scope.clone();
+            Box::pin(async move {
+                // Locked before it is read, so a concurrent raise cannot be
+                // undone by this one.
+                tx.execute(
+                    "UPDATE atomic_usage_allowances SET tokens_cap = tokens_cap WHERE scope = ?",
+                    &[Param::Text(scope.clone())],
+                )
+                .await?;
+                let Some(a) = read_allowance(&mut tx, &scope).await? else {
+                    return Ok(End::Rollback(None));
+                };
+                let raised = Caps {
+                    tokens: a.caps.tokens.max(caps.tokens),
+                    millis: a.caps.millis.max(caps.millis),
+                    micro_usd: match (a.caps.micro_usd, caps.micro_usd) {
+                        (Some(old), Some(new)) => Some(old.max(new)),
+                        (old, _) => old,
+                    },
+                };
+                tx.execute(
+                    "UPDATE atomic_usage_allowances SET tokens_cap = ?, millis_cap = ?, \
+                     micro_usd_cap = NULLIF(?, -1) WHERE scope = ?",
+                    &[
+                        Param::Int(raised.tokens),
+                        Param::Int(raised.millis),
+                        Param::Int(raised.micro_usd.unwrap_or(NONE)),
+                        Param::Text(scope.clone()),
+                    ],
+                )
+                .await?;
+                Ok(End::Commit(read_allowance(&mut tx, &scope).await?))
+            })
+        })
+        .await
+    }
+
+    async fn settle_once(&self, request: &str, attempt: i64, how: Settlement) -> Result<Settled> {
         let request = request.to_owned();
         self.transact(move |mut tx| {
             let request = request.clone();
