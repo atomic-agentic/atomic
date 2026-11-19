@@ -11,9 +11,11 @@
 //!   no atom runs again;
 //! - an input that breaks the workflow's contract fails before any model call;
 //! - a workflow the interpreter cannot run yet is refused before it starts;
-//! - every model call is metered: one settled ledger attempt per call, a
-//!   workflow budget with no room parks the run before any call, and a dollar
-//!   cap on an unpriced model fails the run before any call;
+//! - every model call is metered: one settled ledger attempt per call; a
+//!   workflow budget with no room for the next call parks the run before it,
+//!   and so does one in a worktree step; a budget smaller than one call, or a
+//!   dollar cap on an unpriced model, fails before any call; a run keeps the
+//!   budgets it started with, whatever the settings say when it resumes;
 //! - a gate stops the run until the local operator decides: an approval lets
 //!   the steps after it run, a rejection fails the run before any of them,
 //!   and a process killed while waiting leaves the gate waiting.
@@ -23,10 +25,11 @@
 #![recursion_limit = "512"]
 
 use atomic_app::pipeline::{
-    PIPELINE, Pinned, Pipeline, PipelineRun, SNAPSHOT_MEDIA_TYPE, Services, Step, prepare,
-    register_pipeline,
+    PIPELINE, Pinned, Pipeline, PipelineRun, SNAPSHOT_MEDIA_TYPE, Services, Step, pin_budgets,
+    prepare, register_pipeline,
 };
 use atomic_core::artifact::{ArtifactRef, ArtifactStore, LocalStore};
+use atomic_core::budget::{BudgetSettings, CallBound, Price};
 use atomic_core::codex::{CodexPaths, ModelEndpoint};
 use atomic_core::git::Git;
 use atomic_core::lite::LiteRuntime;
@@ -35,6 +38,7 @@ use atomic_core::testing::{FakeModel, Reply, on_codex_runtime};
 use atomic_core::worktree::Worktrees;
 use atomic_core::{AtomConfig, atom, workflow};
 use atomic_durable::gate::{self, DecisionCommand, Deployment, GateFilter, Principal, Verdict};
+use atomic_durable::usage::Caps;
 use atomic_durable::{DurableRuntime, Durare, RunStatus};
 use atomic_schema::registry::Registry;
 use serde_json::{Value, json};
@@ -218,6 +222,11 @@ fn runtimes_in(dir: &Path, cwd: &Path, base_url: &str) -> Arc<Runtimes> {
 }
 
 async fn engine(dir: &Path, base_url: &str) -> Durare {
+    engine_with(dir, base_url, BudgetSettings::default()).await
+}
+
+/// As [`engine`], metering model calls under `budgets`.
+async fn engine_with(dir: &Path, base_url: &str, budgets: BudgetSettings) -> Durare {
     let mut rt = Durare::sqlite(&dir.join("atomic.db"))
         .await
         .expect("engine");
@@ -243,7 +252,7 @@ async fn engine(dir: &Path, base_url: &str) -> Durare {
             store,
             deployment: local(),
             worktrees,
-            budgets: Arc::default(),
+            budgets: Arc::new(budgets),
             // A child process started for a contextual run gets its settings here.
             context: std::env::var_os("ATOMIC_TEST_CONTEXT_SETTINGS").map(|path| {
                 atomic_core::context::DispatchSettings {
@@ -1348,55 +1357,124 @@ fn an_exec_step_runs_its_command_and_only_model_steps_call_the_model() {
     });
 }
 
+/// Budget settings whose every call reserves 100 input and 50 output tokens
+/// and a minute.
+fn small_calls() -> BudgetSettings {
+    let mut s = BudgetSettings {
+        call: CallBound {
+            input_tokens: 100,
+            output_tokens: 50,
+            minutes: 1.0,
+        },
+        ..BudgetSettings::default()
+    };
+    s.atom.tokens = 10_000;
+    s
+}
+
+/// Wait for run `run`'s `n`th park.
+async fn nth_park(rt: &Durare, run: &str, n: usize) -> atomic_durable::Park {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        if let Some(RunStatus::Failed(e)) = rt.status(run).await.expect("status") {
+            panic!("run {run} failed: {e}");
+        }
+        if let Some(p) = atomic_durable::parks(rt, run)
+            .await
+            .expect("parks")
+            .into_iter()
+            .nth(n - 1)
+        {
+            return p;
+        }
+        assert!(std::time::Instant::now() < until, "the run parked");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 #[test]
-fn a_workflow_budget_parks_or_fails_the_run_before_any_model_call() {
+fn a_workflow_budget_parks_the_run_before_the_call_it_has_no_room_for() {
     on_codex_runtime(async {
         let dir = scratch("budget");
         let project = project(&dir);
         let model = FakeModel::start(vec![Reply::Text(READ.into())])
             .await
             .expect("fake model");
-        let rt = engine(&dir, &model.base_url()).await;
+        let rt = engine_with(&dir, &model.base_url(), small_calls()).await;
         let input = json!({"text": "Exporting a file named café.txt crashes the app."});
 
-        // Ten tokens leave no room for one call's bound: the run parks.
+        // Room for one call's bound: the first step runs and settles at its
+        // two tokens, and the second finds no room. The run parks.
         let tight = load(
             &project,
             "tight.workflow.yaml",
-            &format!("{TRIAGE}budget:\n  tokens: 10\n"),
+            &format!("{TRIAGE}budget:\n  tokens: 150\n"),
         );
         let run = PipelineRun {
             pipeline: tight,
             input: input.clone(),
         };
         rt.start(PIPELINE, "tight", run).await.expect("start");
-        let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        let park = loop {
-            if let Some(p) = atomic_durable::parks(&rt, "tight")
-                .await
-                .expect("parks")
-                .into_iter()
-                .next()
-            {
-                break p;
-            }
-            assert!(std::time::Instant::now() < until, "the run parked");
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        };
+        let park = nth_park(&rt, "tight", 1).await;
         assert!(park.reason.contains("run:tight"), "{}", park.reason);
-        assert_eq!(park.step, "read.park");
-        assert_eq!(model.calls(), 0);
+        assert_eq!(park.step, "rank.park");
+        assert_eq!(model.calls(), 1);
         assert_eq!(
             rt.status("tight").await.expect("status"),
             Some(RunStatus::Pending)
         );
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
 
-        // A dollar cap on a model the price table does not price fails the
-        // run before anything is called.
-        let priced = load(
+#[test]
+fn a_budget_that_cannot_hold_fails_before_any_model_call() {
+    on_codex_runtime(async {
+        let dir = scratch("budget-fails");
+        let project = project(&dir);
+        let model = FakeModel::start(vec![Reply::Text(READ.into())])
+            .await
+            .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        let input = json!({"text": "Exporting a file named café.txt crashes the app."});
+        let settings = BudgetSettings::default();
+
+        // Ten tokens could never admit a call: refused when the budgets are
+        // pinned, before the run starts, and naming what one call reserves.
+        let mut tiny = load(
+            &project,
+            "tiny.workflow.yaml",
+            &format!("{TRIAGE}budget:\n  tokens: 10\n"),
+        );
+        let refused = pin_budgets(&mut tiny, &runtimes(&dir, &model.base_url()), &settings)
+            .expect_err("no room for one call");
+        assert!(refused.message.contains("budget.call"), "{refused}");
+        // Unpinned, the run fails in its first step, still before any call.
+        let run = PipelineRun {
+            pipeline: tiny,
+            input: input.clone(),
+        };
+        rt.start(PIPELINE, "tiny", run).await.expect("start");
+        let failed = rt.result::<Value>("tiny").await;
+        assert!(
+            matches!(&failed, Err(atomic_durable::DurableError::Failed(m)) if m.contains("smaller than one call")),
+            "{failed:?}"
+        );
+
+        // A dollar cap on a model the price table does not price is refused
+        // the same way.
+        let mut priced = load(
             &project,
             "priced.workflow.yaml",
             &format!("{TRIAGE}budget:\n  cost_usd: 1\n"),
+        );
+        let refused = pin_budgets(&mut priced, &runtimes(&dir, &model.base_url()), &settings)
+            .expect_err("unpriced");
+        assert!(
+            refused.message.contains("cost_usd needs reliable pricing"),
+            "{refused}"
         );
         let run = PipelineRun {
             pipeline: priced,
@@ -1409,6 +1487,119 @@ fn a_workflow_budget_parks_or_fails_the_run_before_any_model_call() {
             "{failed:?}"
         );
         assert_eq!(model.calls(), 0);
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[test]
+fn a_resumed_run_keeps_the_budgets_it_started_with() {
+    let dir = scratch("budget-pinned");
+    let project = project(&dir);
+    // The first process: started with a dollar cap on a priced model, room
+    // for one call, it parks at its second step. Its runtime, and every
+    // task on it, ends with it.
+    {
+        let (dir, project) = (dir.clone(), project.clone());
+        on_codex_runtime(async move {
+            let model = FakeModel::start(vec![Reply::Text(READ.into())])
+                .await
+                .expect("fake model");
+            let url = model.base_url();
+            let mut first = small_calls();
+            first.pricing.insert(
+                "synthetic".into(),
+                Price {
+                    input_usd_per_mtok: 1.0,
+                    output_usd_per_mtok: 1.0,
+                    max_input_tokens: None,
+                    max_output_tokens: None,
+                },
+            );
+            let mut pipeline = load(
+                &project,
+                "pinned.workflow.yaml",
+                &format!("{TRIAGE}budget:\n  tokens: 150\n  cost_usd: 1\n"),
+            );
+            pin_budgets(&mut pipeline, &runtimes(&dir, &url), &first).expect("pinned");
+            let rt = engine_with(&dir, &url, first).await;
+            let run = PipelineRun {
+                pipeline,
+                input: json!({"text": "Exporting a file named café.txt crashes the app."}),
+            };
+            rt.start(PIPELINE, "pinned", run).await.expect("start");
+            assert_eq!(nth_park(&rt, "pinned", 1).await.step, "rank.park");
+            assert_eq!(model.calls(), 1);
+        });
+    }
+    // The next process resumes it where the settings now price nothing and
+    // make every call ten times larger: resolved afresh, the run's dollar
+    // cap and its 150 tokens could not hold. It keeps what it began with.
+    on_codex_runtime(async move {
+        let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
+            .await
+            .expect("fake model");
+        let mut later = BudgetSettings::default();
+        later.call.input_tokens = 1_000;
+        let rt = engine_with(&dir, &model.base_url(), later).await;
+        rt.recover().await.expect("recover");
+        let park = nth_park(&rt, "pinned", 1).await;
+        rt.ledger()
+            .raise(
+                "run:pinned",
+                Caps {
+                    tokens: 10_000,
+                    millis: 0,
+                    micro_usd: None,
+                },
+            )
+            .await
+            .expect("raise")
+            .expect("exists");
+        atomic_durable::release(&rt, &park).await.expect("release");
+        let out: Value = rt.result("pinned").await.expect("finishes");
+        assert_eq!(out, json!({"line": "P1: Export crashes on accents"}));
+        let attempts = rt.ledger().attempts("pinned").await.expect("attempts");
+        assert_eq!(attempts.len(), 3);
+        for a in &attempts {
+            assert_eq!(a.reserved.tokens, 150, "the bound it started with: {a:?}");
+            assert_eq!(a.reserved.micro_usd, 150, "priced as it started: {a:?}");
+            assert_eq!(a.charged.micro_usd, 2, "{a:?}");
+        }
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[test]
+fn a_budget_refusal_in_a_worktree_step_parks_the_run() {
+    on_codex_runtime(async {
+        let dir = scratch("worktree-park");
+        let (project, base) = repository_project(&dir);
+        let pipeline = load(&project, "fix.workflow.yaml", FIX);
+        // The fix's first answer does not fit, and its atom has room for
+        // that one call only: the repair turn is refused.
+        let model = FakeModel::start(vec![Reply::Text("not json".into())])
+            .await
+            .expect("fake model");
+        let mut budgets = small_calls();
+        budgets.atom.tokens = 150;
+        let rt = engine_with(&dir, &model.base_url(), budgets).await;
+        let run = PipelineRun {
+            pipeline,
+            input: json!({"title": "Export crashes on accents", "base": base}),
+        };
+        rt.start(PIPELINE, "fix-park", run).await.expect("start");
+        let park = nth_park(&rt, "fix-park", 1).await;
+        assert_eq!(park.step, "fix.park");
+        assert!(park.reason.contains("atom:fix-park:"), "{}", park.reason);
+        assert_eq!(model.calls(), 1, "the repair turn was not dispatched");
+        assert_eq!(
+            rt.status("fix-park").await.expect("status"),
+            Some(RunStatus::Pending)
+        );
         rt.shutdown(std::time::Duration::from_secs(5))
             .await
             .expect("shutdown");

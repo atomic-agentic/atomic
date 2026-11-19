@@ -8,17 +8,67 @@
 //! from the run, the step's stable position and the call's index, so a
 //! re-run of the step after a crash makes new attempts at the same requests
 //! instead of new requests. Each admission reserves the call's whole bound
-//! from the price table and call bound in [`BudgetSettings`]; each
-//! settlement records what the provider reported, priced the same way.
+//! from the price table and call bound in [`BudgetSettings`], and the call
+//! is held to it: it is sent with the bound's output tokens as its output
+//! limit and cut off when the bound's time runs out. Each settlement records
+//! what the provider reported, priced the same way.
+//!
+//! A run's caps, prices and call bounds are resolved once, before it starts,
+//! into a [`BudgetPlan`] the run keeps: a resumed run is metered as it began,
+//! whatever the settings say by then.
 
 use atomic_core::budget::{Budget, BudgetError, BudgetSettings, Level, Resolved, resolve};
 use atomic_core::usage::{
-    Call, Exhausted, Meter, MeterError, MeterFuture, Metering, Outcome, Ticket,
+    Call, Exhausted, Limit, Meter, MeterError, MeterFuture, Metering, Outcome, Ticket,
 };
 use atomic_durable::StepInfo;
 use atomic_durable::usage::{Admission, Caps, Charge, Ledger, Request, Scope, Settlement};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// A run's budgets, resolved once: the run's caps, each model atom's by
+/// name, and the call bounds and prices of the models the run calls. A run
+/// keeps the plan it started with.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BudgetPlan {
+    /// The run's caps, children included.
+    pub run: Resolved,
+    /// Each model atom's caps, by atom name.
+    pub atoms: BTreeMap<String, Resolved>,
+    /// The call bound and the price table, cut to the models the run calls.
+    pub settings: BudgetSettings,
+}
+
+impl BudgetPlan {
+    /// Resolve the plan of a run with its own limits `declared` whose model
+    /// atoms are `atoms`, each by name with its limits and model, against
+    /// `settings`. Fails on a budget that cannot be resolved, such as a
+    /// dollar cap on an unpriced model or a cap with no room for one call.
+    pub fn resolve(
+        settings: &BudgetSettings,
+        declared: &Budget,
+        atoms: &[(&str, &Budget, &str)],
+    ) -> Result<Self, (Option<String>, BudgetError)> {
+        let models: Vec<&str> = atoms.iter().map(|(_, _, model)| *model).collect();
+        let run = resolve(declared, Level::Workflow, settings, &models).map_err(|e| (None, e))?;
+        let mut resolved = BTreeMap::new();
+        for (name, budget, model) in atoms {
+            let caps = resolve(budget, Level::Atom, settings, &[model])
+                .map_err(|e| (Some((*name).to_owned()), e))?;
+            resolved.insert((*name).to_owned(), caps);
+        }
+        let mut kept = settings.clone();
+        kept.pricing
+            .retain(|model, _| models.contains(&model.as_str()));
+        Ok(Self {
+            run,
+            atoms: resolved,
+            settings: kept,
+        })
+    }
+}
 
 /// A run's caps, for metering its atoms.
 #[derive(Clone, Debug)]
@@ -28,9 +78,11 @@ pub struct RunBudget {
     run: Resolved,
 }
 
-/// A count as the ledger holds it.
+/// A count as the ledger holds it: at most its largest amount.
 fn int(v: u64) -> i64 {
-    i64::try_from(v).unwrap_or(i64::MAX)
+    i64::try_from(v).map_or(atomic_durable::usage::MOST, |n| {
+        n.min(atomic_durable::usage::MOST)
+    })
 }
 
 /// Caps as the ledger holds them.
@@ -63,6 +115,15 @@ impl RunBudget {
     /// The run's resolved caps.
     pub fn caps(&self) -> &Resolved {
         &self.run
+    }
+
+    /// The caps of a run metered under `plan`, as it was resolved.
+    pub fn pinned(ledger: Ledger, plan: &BudgetPlan) -> Self {
+        Self {
+            ledger,
+            settings: Arc::new(plan.settings.clone()),
+            run: plan.run.clone(),
+        }
     }
 
     /// The caps of an atom calling `model` with its own limits `declared`.
@@ -103,12 +164,23 @@ impl Meter for LedgerMeter {
     fn admit(&self, call: Call) -> MeterFuture<'_, Ticket> {
         Box::pin(async move {
             let bound = self.settings.reservation(&call.model);
-            // The whole bound is reserved, so the reservation is also the
-            // documented maximum: no excess is left unreserved.
+            // The whole bound is reserved, and the call is held to it: its
+            // output limit and its time are the bound's. Its input is what
+            // the caller sends; where the caller can bound it, a request
+            // larger than the bound's input is declared in the maximum, so
+            // the excess the ledger records as possible is true.
             let whole = Charge {
                 tokens: int(bound.tokens),
                 millis: int(bound.millis),
                 micro_usd: int(bound.micro_usd),
+            };
+            let input = call
+                .input_bound
+                .map_or(bound.input_tokens, |b| b.max(bound.input_tokens));
+            let maximum = Charge {
+                tokens: int(input.saturating_add(bound.output_tokens)),
+                millis: whole.millis,
+                micro_usd: int(self.settings.cost(&call.model, input, bound.output_tokens)),
             };
             let request = Request {
                 id: format!("{}:{}:{}", self.run, self.step, call.index),
@@ -116,7 +188,7 @@ impl Meter for LedgerMeter {
                 model: call.model.clone(),
                 chain: self.chain.clone(),
                 reserve: whole,
-                maximum: whole,
+                maximum,
             };
             match self.ledger.admit(request).await.map_err(store)? {
                 Admission::Admitted { request, attempt } => Ok(Ticket {
@@ -124,6 +196,10 @@ impl Meter for LedgerMeter {
                     attempt,
                     model: call.model,
                     admitted: Instant::now(),
+                    limit: Limit {
+                        output_tokens: Some(bound.output_tokens),
+                        time: Some(Duration::from_millis(bound.millis)),
+                    },
                 }),
                 Admission::Refused { reason, .. } => Err(Exhausted(reason).into()),
             }

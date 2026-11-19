@@ -251,6 +251,7 @@ fn a_panicking_atom_fails_its_step_and_spares_the_other_workflows() {
                     &ctx,
                     "boom",
                     move || {
+                        let workflow = workflow.clone();
                         propose::<Value, _>(async move {
                             if !workflow.is_empty() {
                                 panic!("the atom exploded");

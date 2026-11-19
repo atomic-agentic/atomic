@@ -124,49 +124,54 @@ fn register(rt: &mut Durare, dir: &Path, base_url: &str) {
                 run_atom(
                     &ctx,
                     "implement",
-                    move || async move {
-                        let step = worktrees.run_step(request, |tree| async move {
-                            let started_clean = !tree.join("half-edit.txt").exists()
-                                && std::fs::read_to_string(tree.join("lib.rs")).ok().as_deref()
-                                    == Some(BASE_TEXT);
-                            std::fs::write(tree.join("half-edit.txt"), "half").map_err(failed)?;
-                            std::fs::write(tree.join("lib.rs"), "broken").map_err(failed)?;
-                            let ask = ChangeRequest {
-                                request: "Two units at 1.25 should cost 2.50.".into(),
-                            };
-                            let (task, metadata) = run_lite_atom(&DraftTask, &ask, &lite)
-                                .await
+                    move || {
+                        let (worktrees, lite, request) =
+                            (worktrees.clone(), lite.clone(), request.clone());
+                        async move {
+                            let step = worktrees.run_step(request, |tree| async move {
+                                let started_clean = !tree.join("half-edit.txt").exists()
+                                    && std::fs::read_to_string(tree.join("lib.rs")).ok().as_deref()
+                                        == Some(BASE_TEXT);
+                                std::fs::write(tree.join("half-edit.txt"), "half")
+                                    .map_err(failed)?;
+                                std::fs::write(tree.join("lib.rs"), "broken").map_err(failed)?;
+                                let ask = ChangeRequest {
+                                    request: "Two units at 1.25 should cost 2.50.".into(),
+                                };
+                                let (task, metadata) = run_lite_atom(&DraftTask, &ask, &lite)
+                                    .await
+                                    .map_err(failed)?;
+                                failpoint("worktree-step:mid-atom");
+                                std::fs::remove_file(tree.join("half-edit.txt")).map_err(failed)?;
+                                std::fs::write(
+                                    tree.join("lib.rs"),
+                                    format!(
+                                        "// {}\nfn total(n: u32) -> u32 {{ 125 * n }}\n",
+                                        task.title
+                                    ),
+                                )
                                 .map_err(failed)?;
-                            failpoint("worktree-step:mid-atom");
-                            std::fs::remove_file(tree.join("half-edit.txt")).map_err(failed)?;
-                            std::fs::write(
-                                tree.join("lib.rs"),
-                                format!(
-                                    "// {}\nfn total(n: u32) -> u32 {{ 125 * n }}\n",
-                                    task.title
-                                ),
-                            )
-                            .map_err(failed)?;
-                            Ok::<_, DurableError>((
-                                Implemented {
-                                    started_clean,
-                                    title: task.title,
-                                },
+                                Ok::<_, DurableError>((
+                                    Implemented {
+                                        started_clean,
+                                        title: task.title,
+                                    },
+                                    metadata,
+                                ))
+                            });
+                            let ((out, metadata), commit) = step.await.map_err(|e| match e {
+                                StepError::Body(e) => e,
+                                StepError::Worktree(e) => failed(e),
+                            })?;
+                            failpoint("worktree-step:after-commit");
+                            let mut metadata = serde_json::to_value(metadata).map_err(failed)?;
+                            commit.record(&mut metadata);
+                            Ok(Proposal {
+                                output: serde_json::to_value(out).map_err(failed)?,
                                 metadata,
-                            ))
-                        });
-                        let ((out, metadata), commit) = step.await.map_err(|e| match e {
-                            StepError::Body(e) => e,
-                            StepError::Worktree(e) => failed(e),
-                        })?;
-                        failpoint("worktree-step:after-commit");
-                        let mut metadata = serde_json::to_value(metadata).map_err(failed)?;
-                        commit.record(&mut metadata);
-                        Ok(Proposal {
-                            output: serde_json::to_value(out).map_err(failed)?,
-                            metadata,
-                            writes: Vec::new(),
-                        })
+                                writes: Vec::new(),
+                            })
+                        }
                     },
                     Vec::new(),
                 )
