@@ -67,11 +67,11 @@ pub struct WorkflowError {
     pub message: String,
 }
 
-const TOP: &[&str] = &[
+pub(crate) const TOP: &[&str] = &[
     "atomic", "name", "version", "input", "output", "steps", "returns", "budget",
 ];
-const STEP: &[&str] = &["atom", "gate", "after", "with", "origins", "worktree"];
-const GATE: &[&str] = &["title", "show", "timeout", "on_timeout", "approvers"];
+pub(crate) const STEP: &[&str] = &["atom", "gate", "after", "with", "origins", "worktree"];
+pub(crate) const GATE: &[&str] = &["title", "show", "timeout", "on_timeout", "approvers"];
 const LATER_STEP: &[&str] = &["foreach", "concurrency", "merge_queue", "review", "retry"];
 
 /// Load the workflow at `file`, checking it against `atoms` (by name).

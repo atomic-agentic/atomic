@@ -32,6 +32,12 @@ enum Command {
     },
     /// Render an Astro prompt without calling a model or running scripts.
     Render(RenderArgs),
+    /// Write JSON Schemas for editors: workflow files and the manifest, with
+    /// the project's atom names and schema IDs.
+    Schemas {
+        /// A project directory; defaults to the current project.
+        path: Option<PathBuf>,
+    },
     /// Install atomic's authoring skills for a coding agent.
     Setup(setup::SetupArgs),
     /// Developer diagnostics.
@@ -127,6 +133,9 @@ async fn run(cli: Cli, paths: CodexPaths, state: ProjectState) -> anyhow::Result
     match cli.command {
         Some(Command::Check { path }) => tokio::task::spawn_blocking(move || check(path)).await?,
         Some(Command::Render(args)) => tokio::task::spawn_blocking(move || render(args)).await?,
+        Some(Command::Schemas { path }) => {
+            tokio::task::spawn_blocking(move || schemas(path)).await?
+        }
         Some(Command::Setup(args)) => setup::run(args),
         None => {
             println!("atomic {}", env!("CARGO_PKG_VERSION"));
@@ -248,6 +257,50 @@ fn check(path: Option<PathBuf>) -> anyhow::Result<()> {
         "checked {} Astro atoms and {} workflows",
         atoms.len(),
         files["workflows"].len()
+    );
+    Ok(())
+}
+
+fn schemas(path: Option<PathBuf>) -> anyhow::Result<()> {
+    use atomic_core::{atom, collections, editor};
+    let path = path.unwrap_or(std::env::current_dir()?);
+    let project = project::discover(&path)?;
+    let files = collections::collect(&project)?;
+    let mut registry = atomic_schema::registry::Registry::new();
+    collections::load_schemas(&project, &mut registry).map_err(anyhow::Error::msg)?;
+    let mut atoms = std::collections::BTreeMap::new();
+    for source in &files["atoms"] {
+        let atom = atom::load(&source.path, &mut registry)?;
+        atoms.insert(atom.name.clone(), atom);
+    }
+    // Schema IDs a contract can reference by name; a file's own URI is not one.
+    let mut ids: Vec<String> = registry
+        .entries()
+        .map(|entry| entry.id.clone())
+        .filter(|id| !id.starts_with("file:") && !id.starts_with("atomic:"))
+        .collect();
+    ids.sort();
+    ids.dedup();
+    let dir = project.dir.join(&project.generated).join("schemas");
+    std::fs::create_dir_all(&dir)?;
+    for (name, schema) in [
+        (
+            "workflow.schema.json",
+            editor::workflow_schema(&atoms, &ids),
+        ),
+        ("manifest.schema.json", editor::manifest_schema()),
+    ] {
+        let file = dir.join(name);
+        std::fs::write(&file, serde_json::to_string_pretty(&schema)? + "\n")?;
+        println!("wrote {}", file.display());
+    }
+    let relative = project.generated.join("schemas");
+    println!(
+        "Point an editor at them with a first line, the path relative to the file; for \
+         workflows/x.workflow.yaml:\n  # yaml-language-server: $schema=../{}/workflow.schema.json\n\
+         and for atomic.yaml:\n  # yaml-language-server: $schema={}/manifest.schema.json",
+        relative.display(),
+        relative.display()
     );
     Ok(())
 }

@@ -14,6 +14,7 @@ pub mod compile;
 mod compiler_process;
 pub mod config;
 pub mod context;
+pub mod editor;
 pub mod evaluation;
 pub mod failure;
 pub mod git;
