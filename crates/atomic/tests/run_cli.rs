@@ -1041,6 +1041,58 @@ fn a_run_id_that_already_exists_is_refused() {
 }
 
 #[test]
+fn a_cancelled_or_parked_run_is_not_resumed() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(RANK.into())])
+            .await
+            .expect("fake model");
+        let dir = scratch("cancelled");
+        let project = project(&dir);
+        let state = state_dir(&dir, &project);
+        let env = model_env(&model.base_url());
+        let db_url = format!("sqlite://{}", state.join("atomic.db").display());
+        for (id, status) in [
+            ("cancelled-1", "CANCELLED"),
+            ("parked-1", "MAX_RECOVERY_ATTEMPTS_EXCEEDED"),
+        ] {
+            let (d, p, e) = (dir.clone(), project.clone(), env.clone());
+            tokio::task::spawn_blocking(move || killed_after_rank(&d, &p, &e, id))
+                .await
+                .expect("child");
+            let db = sqlx::SqlitePool::connect(&db_url).await.expect("store");
+            sqlx::query("UPDATE workflow_status SET status = ? WHERE workflow_uuid = ?")
+                .bind(status)
+                .bind(id)
+                .execute(&db)
+                .await
+                .expect("set the status");
+            let (d, p, e) = (dir.clone(), project.clone(), env.clone());
+            let out = tokio::task::spawn_blocking(move || {
+                atomic(
+                    &d,
+                    &p,
+                    &["--json", "runs", "resume", id],
+                    &with(&e, &[]),
+                    "",
+                )
+            })
+            .await
+            .expect("child");
+            assert!(!out.status.success(), "{}", text(&out));
+            let error = &stdout_json(&out)["error"];
+            assert_eq!(error["kind"], "run.not_resumable", "{id}: {error}");
+            assert!(
+                error["description"]
+                    .as_str()
+                    .is_some_and(|d| d.contains(status)),
+                "{error}"
+            );
+        }
+        assert_eq!(model.calls(), 2, "nothing ran again");
+    });
+}
+
+#[test]
 fn exec_commands_run_in_a_runner_process_when_asked() {
     let dir = scratch("runner");
     let project = project(&dir);
@@ -1070,6 +1122,34 @@ fn exec_commands_run_in_a_runner_process_when_asked() {
         "the runner started it: {}",
         log[1]
     );
+
+    // The runner process itself has only PATH from atomic's environment,
+    // which has HOME, USER and ATOMIC_HOME too.
+    std::fs::write(
+        project.join("tools/parent-env.py"),
+        "import json, os, sys\n\
+         json.load(sys.stdin)\n\
+         names = [e.split(b'=')[0].decode() for e in open(f'/proc/{os.getppid()}/environ', 'rb').read().split(b'\\0') if e]\n\
+         json.dump({'names': sorted(names)}, sys.stdout)\n",
+    )
+    .expect("script");
+    write_atom(
+        &project,
+        "parent-env",
+        "description: 'Name the parent environment.', kind: 'exec', exec: { command: ['python3', 'tools/parent-env.py'] }",
+        "",
+        object(json!({"text": {"type": "string"}})),
+        object(json!({"names": {"type": "array", "items": {"type": "string"}}})),
+    );
+    let out = atomic(
+        &dir,
+        &project,
+        &["run", "parent-env", "--runner", "process", "--data", NOTE],
+        &[],
+        "",
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(stdout_json(&out), json!({"names": ["PATH"]}));
 }
 
 /// An exec atom whose command logs that it ran, then, the first time,
@@ -1375,6 +1455,10 @@ fn the_runner_role_keeps_its_exit_code_contract() {
         stdout_json(&out),
         json!({"outcome": "completed", "code": 3, "stdout": "6869", "stderr": ""})
     );
+    // Nor after a global flag.
+    let out = atomic(&dir, &dir, &["--json", "runner"], &[], &request.to_string());
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out));
+    assert_eq!(stdout_json(&out)["code"], 3);
     // The runner never makes a state directory.
     assert!(!dir.join("atomic-home").exists());
 }
@@ -1655,5 +1739,6 @@ fn help_and_the_version_create_nothing_even_from_a_deleted_directory() {
         .expect("run");
     assert!(out.status.success(), "{}", text(&out));
     assert!(String::from_utf8_lossy(&out.stdout).contains("atomic "));
+    assert!(out.stderr.is_empty(), "no warnings: {}", text(&out));
     assert!(!dir.join("atomic-home").exists(), "nothing was created");
 }

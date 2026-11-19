@@ -115,6 +115,10 @@ pub fn describe(database: &Database) -> String {
 }
 
 /// One developer on one machine: the local operator decides gates.
+///
+/// `$USER` only names that operator in gate records. It is not a
+/// credential: anyone who can set it can set it to anything, so it must never
+/// be what proves a decision came from a person.
 pub fn deployment() -> Deployment {
     let user = std::env::var("USER")
         .ok()

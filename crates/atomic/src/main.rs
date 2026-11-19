@@ -7,7 +7,7 @@ use atomic_core::codex::{self, CodexPaths, ModelEndpoint};
 use atomic_core::project;
 use atomic_core::state::ProjectState;
 use clap::{Args, Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 mod engine;
 mod failure;
@@ -159,7 +159,9 @@ fn main() -> anyhow::Result<()> {
         std::process::exit(runner());
     }
     let parsed = Cli::try_parse();
-    // Help and the version create nothing on disk.
+    // Help and the version create nothing on disk, and print only themselves:
+    // they need no Codex either, unless this process was started as one of
+    // Codex's helpers, which read their own arguments.
     let quiet = parsed.as_ref().err().is_some_and(|e| {
         use clap::error::ErrorKind;
         matches!(
@@ -169,6 +171,28 @@ fn main() -> anyhow::Result<()> {
                 | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
         )
     });
+    let as_atomic = std::env::args_os()
+        .next()
+        .and_then(|arg0| {
+            Path::new(&arg0)
+                .file_name()
+                .map(|name| name.to_string_lossy().starts_with("atomic"))
+        })
+        .unwrap_or(false);
+    if quiet
+        && as_atomic
+        && let Err(e) = &parsed
+    {
+        e.exit();
+    }
+    // The runner role after global flags, such as `atomic --json runner`.
+    if let Ok(Cli {
+        command: Some(Command::Runner),
+        ..
+    }) = &parsed
+    {
+        std::process::exit(atomic_exec::runner::serve_stdio());
+    }
     // Resolve and create the state directory before Codex starts, so its home
     // is never the user's own. A failure here is reported once the normal entry
     // point runs; Codex's helper invocations never need it.
@@ -249,9 +273,6 @@ fn runner() -> i32 {
 }
 
 async fn run(cli: Cli, paths: CodexPaths, state: ProjectState) -> anyhow::Result<()> {
-    if let Some(Command::Runner) = cli.command {
-        std::process::exit(atomic_exec::runner::serve_stdio());
-    }
     // Before anything else: a store written by a newer atomic is refused.
     atomic_durable::store::open_sqlite(&state.database()).await?;
     let (json, project) = (cli.json, cli.project);

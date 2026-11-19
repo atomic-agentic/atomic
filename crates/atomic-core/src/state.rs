@@ -127,11 +127,9 @@ impl ProjectState {
         match file.try_lock() {
             Ok(()) => {}
             Err(std::fs::TryLockError::WouldBlock) => {
-                let mut owner = String::new();
-                let _ = std::io::Read::read_to_string(&mut file, &mut owner);
                 return Err(LockError::Held {
+                    owner: holder(&path),
                     path,
-                    owner: owner.trim().to_owned(),
                 });
             }
             Err(std::fs::TryLockError::Error(e)) => return Err(io(e)),
@@ -142,6 +140,30 @@ impl ProjectState {
         std::io::Write::write_all(&mut file, owner.as_bytes()).map_err(io)?;
         Ok(ExecutionLock { _file: file, owner })
     }
+}
+
+/// Who holds the lock at `path`, as it wrote: `pid <n> (<command>)`. A
+/// holder writes only after it has the lock, so the file can be empty, or
+/// still say who held it last; words whose process is gone are not
+/// reported as the holder's.
+fn holder(path: &Path) -> String {
+    for _ in 0..10 {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        let text = text.trim();
+        let pid = text
+            .strip_prefix("pid ")
+            .and_then(|rest| rest.split_whitespace().next());
+        let current = match pid {
+            Some(pid) if cfg!(target_os = "linux") => Path::new("/proc").join(pid).exists(),
+            Some(_) => true,
+            None => false,
+        };
+        if current {
+            return text.to_owned();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    "another process, which has not yet said which".into()
 }
 
 /// The project's execution lock, held until it is dropped or the process
@@ -237,6 +259,46 @@ mod tests {
             .lock_execution("atomic runs resume")
             .expect("released");
         assert!(again.owner().contains("resume"));
+    }
+
+    #[test]
+    fn a_holder_that_has_not_yet_said_who_it_is_is_not_misnamed() {
+        let dir = std::env::temp_dir().join(format!("atomic-lock-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let state = ProjectState {
+            root: dir.clone(),
+            dir: dir.join("state"),
+        };
+        state.create().expect("state");
+        // A previous holder's words, left in the file, and a new holder that
+        // has the lock but has not written yet.
+        std::fs::write(state.lock_file(), "pid 4194304999 (atomic serve)").expect("stale");
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(state.lock_file())
+            .expect("open");
+        holder.try_lock().expect("hold");
+        match state.lock_execution("atomic runs resume") {
+            Err(LockError::Held { owner, .. }) => {
+                assert!(!owner.contains("4194304999"), "{owner}");
+                assert!(owner.contains("has not yet said"), "{owner}");
+            }
+            other => panic!("{other:?}"),
+        }
+        // Once it has, its own words are reported.
+        std::fs::write(
+            state.lock_file(),
+            format!("pid {} (atomic serve)", std::process::id()),
+        )
+        .expect("owner");
+        match state.lock_execution("atomic runs resume") {
+            Err(LockError::Held { owner, .. }) => {
+                assert_eq!(owner, format!("pid {} (atomic serve)", std::process::id()));
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
