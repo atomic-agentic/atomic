@@ -54,6 +54,7 @@ use codex_core_api::RealtimeAudioConfig;
 use codex_core_api::RealtimeConfig;
 use codex_core_api::SessionPickerViewMode;
 use codex_core_api::SessionSource;
+use codex_core_api::ShellEnvironmentPolicy;
 use codex_core_api::SqliteConfig;
 use codex_core_api::StartIfIdleSubmission;
 use codex_core_api::StartThreadOptions;
@@ -126,6 +127,34 @@ pub(crate) fn permission_profile(sandbox: crate::typed::Sandbox) -> PermissionPr
     match sandbox {
         crate::typed::Sandbox::ReadOnly => PermissionProfile::read_only(),
         crate::typed::Sandbox::WorkspaceWrite => PermissionProfile::workspace_write(),
+    }
+}
+
+/// atomic's own variables: its configuration and the credentials it holds,
+/// such as its database URL, project secrets and telemetry headers.
+const ATOMIC_OWN: [&str; 3] = ["ATOMIC_*", "DBOS__*", "OTEL_EXPORTER_OTLP_HEADERS"];
+
+/// The environment of every command a thread runs: the platform's core
+/// variables from this process (`PATH`, `HOME`, `USER` and the like),
+/// except any whose name holds `KEY`, `SECRET` or `TOKEN` and any of
+/// atomic's own, and then exactly what the atom declares (`declared`).
+/// Nothing else of atomic's environment reaches the command, and through
+/// its output, the model.
+pub(crate) fn command_environment(declared: &BTreeMap<String, String>) -> ShellEnvironmentPolicy {
+    use codex_protocol::config_types::{EnvironmentVariablePattern, ShellEnvironmentPolicyInherit};
+    ShellEnvironmentPolicy {
+        inherit: ShellEnvironmentPolicyInherit::Core,
+        ignore_default_excludes: false,
+        exclude: ATOMIC_OWN
+            .iter()
+            .map(|pattern| EnvironmentVariablePattern::new_case_insensitive(pattern))
+            .collect(),
+        r#set: declared
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect(),
+        include_only: Vec::new(),
+        use_profile: false,
     }
 }
 
@@ -290,13 +319,7 @@ where
         config.workspace_roots = roots;
         config.workspace_roots_explicit = true;
     }
-    for (name, value) in &spec.env {
-        config
-            .permissions
-            .shell_environment_policy
-            .r#set
-            .insert(name.clone(), value.clone());
-    }
+    config.permissions.shell_environment_policy = command_environment(&spec.env);
     let state_db = init_state_db(&config).await;
 
     let auth_manager =
@@ -823,6 +846,47 @@ mod tests {
             assert_eq!(report.turns as usize, TURNS);
             assert_eq!(model.calls(), TURNS);
         });
+    }
+
+    #[test]
+    fn commands_get_only_core_and_declared_variables() {
+        let inherited = [
+            ("PATH", "/usr/bin"),
+            ("HOME", "/home/dev"),
+            ("USER", "dev"),
+            ("ATOMIC_DATABASE_URL", "postgres://atomic:pw@db/atomic"),
+            ("ATOMIC_SECRET_DEPLOY", "s3cret"),
+            ("GITHUB_TOKEN", "ghp_x"),
+            ("AWS_SECRET_ACCESS_KEY", "aws"),
+            ("OPENAI_API_KEY", "sk"),
+            ("DBOS__APPVERSION", "1"),
+            ("OTEL_EXPORTER_OTLP_HEADERS", "authorization=Bearer x"),
+            ("SOME_TOOL_SETTING", "x"),
+        ]
+        .map(|(k, v)| (k.to_owned(), v.to_owned()));
+        let declared = BTreeMap::from([
+            ("ATOMIC_CACHE_DIR".to_owned(), "/cache".to_owned()),
+            ("CARGO_TARGET_DIR".to_owned(), "/cache/target".to_owned()),
+        ]);
+        let env = codex_protocol::shell_environment::create_env_from_vars(
+            inherited,
+            &command_environment(&declared),
+            None,
+        );
+        let names: std::collections::BTreeSet<&str> = env.keys().map(String::as_str).collect();
+        assert_eq!(
+            names,
+            [
+                "ATOMIC_CACHE_DIR",
+                "CARGO_TARGET_DIR",
+                "HOME",
+                "PATH",
+                "USER"
+            ]
+            .into(),
+            "{env:?}"
+        );
+        assert_eq!(env["CARGO_TARGET_DIR"], "/cache/target");
     }
 
     #[test]
