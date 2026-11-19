@@ -78,3 +78,13 @@ reason = "an extra version beside Codex's, for jsonschema 0.61.2"
 crate = "fluent-uri"
 version = "0.4.1"
 reason = "an extra version beside Codex's, for referencing 0.61.2 (jsonschema)"
+
+[[exception]]
+crate = "bindgen"
+version = "0.70.1"
+reason = "v8x 149.4.0-rc.4 (deno_v8's alternative backend, locked but never built; deps/v8.toml) requires ^0.70"
+
+[[exception]]
+crate = "rustc-hash"
+version = "1.1.0"
+reason = "bindgen 0.70.1 requires ^1"

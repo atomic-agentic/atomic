@@ -197,6 +197,13 @@ jobs:
           key: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
           restore-keys: cargo-${{ runner.os }}-
 
+      # The prebuilt V8 archive deps/v8.toml pins, checked against its SHA-256
+      # into target/v8-mirror, which .cargo/config.toml points rusty_v8 at.
+      - name: V8 archive
+        run: |
+          scripts/v8-archive.sh
+          scripts/v8-archive-test.sh
+
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo build --workspace --locked

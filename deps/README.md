@@ -8,7 +8,7 @@ against it.
 | --- | --- |
 | [`codex.toml`](codex.toml) | [openai/codex](https://github.com/openai/codex), the `codex-rs` workspace, built from atomic's fork [atomic-agentic/codex](https://github.com/atomic-agentic/codex) |
 | [`lock-exceptions.toml`](lock-exceptions.toml) | Where `Cargo.lock` differs from Codex's lockfile at the pinned revision, each with its reason. `Cargo.lock` starts from Codex's, and `scripts/lock-check.sh` fails on any unlisted difference |
-| [`v8.toml`](v8.toml) | V8 versions `Cargo.lock` holds but never builds, each with its reason. `scripts/lock-check.sh` fails when more than one other V8 version is locked; see [one V8](#one-v8) |
+| [`v8.toml`](v8.toml) | The prebuilt V8 archives atomic links, pinned by SHA-256 per target (`scripts/v8-archive.sh` verifies them), and V8 versions `Cargo.lock` holds but never builds, each with its reason. `scripts/lock-check.sh` fails when more than one other V8 version is locked; see [one V8](#one-v8) |
 | [`forks.toml`](forks.toml) | Every fork the build uses, with its pinned revision: the Codex fork, the durare fork and the sqlx fork. `scripts/forks-check.sh` checks it against `Cargo.lock` |
 
 ## Codex
@@ -75,6 +75,13 @@ that fork while Codex code-mode stays off; before atomic enables Codex
 code-mode, the two must converge on one version, either through a deno_core
 release on Codex's V8 line or by building deno_core against the same fork.
 A Codex bump that brings a second V8 into the graph fails the check.
+
+The V8 that is built comes as a prebuilt static library from rusty_v8's
+releases. Each target's archive and generated bindings are pinned in
+[`v8.toml`](v8.toml); moving `deno_core` to a release on another V8 means
+pinning that version's archives here, for every release target and for the
+development container's Linux targets. [Developing atomic](../docs/development.md#the-prebuilt-v8)
+describes how builds read them.
 
 ## durare
 

@@ -42,6 +42,7 @@ atomic-exec = { workspace = true }
 codex-app-server = { workspace = true }
 codex-core-api = { workspace = true }
 codex-extension-api = { workspace = true }
+deno_core = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["net", "io-util", "rt-multi-thread", "macros", "sync"] }

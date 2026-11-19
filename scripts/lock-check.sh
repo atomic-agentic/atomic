@@ -23,9 +23,9 @@ V8_TOML="${LOCK_CHECK_V8_TOML:-${ROOT}/deps/v8.toml}"
 # "crate version" for each [[unbuilt]] entry in deps/v8.toml.
 v8_unbuilt() {
     awk '
-        /^\[\[unbuilt\]\]/ { crate = "" }
-        /^crate = / { gsub(/"/, "", $3); crate = $3 }
-        /^version = / && crate != "" { gsub(/"/, "", $3); print crate, $3 }
+        /^\[/ { unbuilt = ($0 == "[[unbuilt]]"); crate = "" }
+        unbuilt && /^crate = / { gsub(/"/, "", $3); crate = $3 }
+        unbuilt && /^version = / && crate != "" { gsub(/"/, "", $3); print crate, $3 }
     ' "${V8_TOML}" | sort -u
 }
 
@@ -65,11 +65,15 @@ v8_built() {
     local status=0 output
     while read -r name version; do
         [ -n "${name}" ] || continue
+        # A locked package outside the graph prints nothing (or, on older
+        # cargo, matches no package); one in the graph prints its tree.
         if output="$(cargo tree --manifest-path "${ROOT}/Cargo.toml" --locked --workspace --all-features --target all \
             -e normal,build,dev -i "${name}@${version}" 2>&1)"; then
-            echo "scripts/lock-check.sh: deps/v8.toml lists ${name} ${version} as unbuilt, but the build graph includes it:" >&2
-            printf '%s\n' "${output}" | sed 's/^/    /' >&2
-            status=1
+            if ! grep -q "nothing to print" <<<"${output}"; then
+                echo "scripts/lock-check.sh: deps/v8.toml lists ${name} ${version} as unbuilt, but the build graph includes it:" >&2
+                grep -v '^warning: patch\|^help:\|^ \{6\}' <<<"${output}" | sed 's/^/    /' >&2
+                status=1
+            fi
         elif ! grep -q "did not match any packages" <<<"${output}"; then
             echo "scripts/lock-check.sh: cargo tree failed for ${name} ${version}:" >&2
             printf '%s\n' "${output}" | sed 's/^/    /' >&2
