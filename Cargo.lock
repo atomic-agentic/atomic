@@ -538,7 +538,6 @@ dependencies = [
  "anyhow",
  "atomic-agentic-exec",
  "atomic-agentic-schema",
- "cel",
  "codex-app-server",
  "codex-core-api",
  "codex-extension-api",
