@@ -420,3 +420,37 @@ fn a_mermaid_fence_checks_and_renders_as_text() {
         out.developer
     );
 }
+
+// Loops are `map` over a list and partials are components with declared
+// props: a loop over a value that is not a list, and a component given a
+// prop it does not declare, both fail the check before any model call.
+#[test]
+fn a_loop_over_a_non_list_and_an_undeclared_component_prop_fail_the_check() {
+    let root = project(
+        "{input.text.map((x) => <Fragment>{x}</Fragment>)}",
+        "{}",
+        None,
+    );
+    let error = load(&root.join("test.atom.astro"), &mut Registry::new()).expect_err("not a list");
+    assert!(error.message.contains("TS2339"), "{error}");
+    let component = "---\ninterface Props { strict: boolean }\nconst { strict }: Props = Astro.props;\n---\n{strict ? <Fragment>Follow every rule.</Fragment> : null}\n<slot />\n";
+    let root = project(
+        "<Style strict={true} tone=\"warm\">Be brief.</Style>",
+        "{}",
+        Some(component),
+    );
+    let error =
+        load(&root.join("test.atom.astro"), &mut Registry::new()).expect_err("undeclared prop");
+    assert!(
+        error.message.contains("TS2322") && error.message.contains("tone"),
+        "{error}"
+    );
+    // Declared props and a list loop check, and the loop renders one block
+    // per element.
+    let root = project(
+        "<Style strict={true}>Be brief.</Style>\n{input.text}",
+        "{}",
+        Some(component),
+    );
+    load(&root.join("test.atom.astro"), &mut Registry::new()).expect("declared props");
+}
