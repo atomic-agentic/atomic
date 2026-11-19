@@ -116,6 +116,31 @@ pub enum ExecError {
         /// What the runner wrote to stderr, as it was: captured, never parsed.
         stderr: String,
     },
+    /// The runner process it was sent to ended without saying how the
+    /// command ended. The command may have run, in part or in full, so what
+    /// it did is unknown, and the backend never runs it again on its own.
+    #[error("the runner for {program} ended without its result{}: {message}{}; the command may have run",
+        code.map(|c| format!(" (exit code {c})")).unwrap_or_default(),
+        if stderr.is_empty() { String::new() } else { format!("; its stderr: {stderr}") })]
+    Lost {
+        /// The program.
+        program: String,
+        /// The runner's exit code, or `None` if a signal ended it.
+        code: Option<i32>,
+        /// What the control plane concluded.
+        message: String,
+        /// What the runner wrote to stderr, as it was: captured, never parsed.
+        stderr: String,
+    },
+}
+
+impl ExecError {
+    /// Whether the command may have run although no result came back, so
+    /// running it again could repeat what it did. Only the caller, which
+    /// knows what the command declares about its effects, may decide to.
+    pub fn outcome_unknown(&self) -> bool {
+        matches!(self, Self::Lost { .. })
+    }
 }
 
 /// Where commands run. The control plane reaches runners only through this.

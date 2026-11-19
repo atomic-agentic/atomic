@@ -89,7 +89,13 @@ fn print_result(run_id: &str, output: &Value, json: bool) -> anyhow::Result<()> 
 
 /// Wait for run `run_id` and turn its outcome into the command's.
 async fn finish(engine: &engine::Engine, run_id: &str, json: bool) -> anyhow::Result<()> {
-    let outcome = engine.rt.result::<Value>(run_id).await;
+    let mut outcome = engine.rt.result::<Value>(run_id).await;
+    if matches!(outcome, Err(DurableError::Interrupted(_))) {
+        // This execution stopped without an outcome, as one whose exec
+        // command's result was lost does, and the engine recovers it in this
+        // process; follow the run by its id to the outcome recovery reaches.
+        outcome = engine.rt.result::<Value>(run_id).await;
+    }
     let _ = engine.rt.shutdown(SHUTDOWN).await;
     match outcome {
         Ok(output) => print_result(run_id, &output, json),

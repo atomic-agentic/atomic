@@ -998,6 +998,98 @@ fn exec_commands_run_in_a_runner_process_when_asked() {
     );
 }
 
+/// An exec atom whose command logs that it ran, then, the first time,
+/// SIGKILLs the process that started it: with `--runner process`, its runner.
+fn write_runner_killer(project: &Path, dir: &Path, name: &str, effects: &str) {
+    std::fs::write(
+        project.join("tools/kill-runner.py"),
+        "import json, os, signal, sys\n\
+         note = json.load(sys.stdin)\n\
+         log = os.environ['KILL_LOG']\n\
+         open(log, 'a').write('ran\\n')\n\
+         if not os.path.exists(log + '.killed'):\n\
+         \x20   open(log + '.killed', 'w').close()\n\
+         \x20   os.kill(os.getppid(), signal.SIGKILL)\n\
+         json.dump({'title': note['text'][:25], 'words': len(note['text'].split())}, sys.stdout)\n",
+    )
+    .expect("script");
+    write_atom(
+        project,
+        name,
+        &format!(
+            "description: 'Kill the runner.', kind: 'exec', exec: {{ command: ['python3', 'tools/kill-runner.py'] }}, env: {{ KILL_LOG: '{}' }}{effects}",
+            dir.join(format!("{name}.log")).display()
+        ),
+        "",
+        object(json!({"text": {"type": "string"}})),
+        object(json!({"title": {"type": "string"}, "words": {"type": "integer"}})),
+    );
+}
+
+fn lines(file: &Path) -> usize {
+    std::fs::read_to_string(file)
+        .map(|s| s.lines().count())
+        .unwrap_or(0)
+}
+
+#[test]
+fn a_command_that_kills_its_runner_is_never_run_again_unless_it_may_be() {
+    let dir = scratch("runner-killed");
+    let project = project(&dir);
+    write_runner_killer(&project, &dir, "undeclared", "");
+    write_runner_killer(
+        &project,
+        &dir,
+        "idempotent",
+        ", effects: { external: 'idempotent' }",
+    );
+    // Undeclared: it may have done what it does, so it parks after one run.
+    let out = atomic(
+        &dir,
+        &project,
+        &[
+            "--json",
+            "run",
+            "undeclared",
+            "--runner",
+            "process",
+            "--data",
+            NOTE,
+        ],
+        &[],
+        "",
+    );
+    assert!(!out.status.success(), "{}", text(&out));
+    let error = &stdout_json(&out)["error"];
+    assert_eq!(error["kind"], "run.failed", "{error}");
+    assert!(
+        error["description"]
+            .as_str()
+            .is_some_and(|d| d.contains("outcome_unknown")),
+        "{error}"
+    );
+    assert_eq!(lines(&dir.join("undeclared.log")), 1, "it ran once");
+
+    // Declared idempotent: the step is retried, and the second run finishes.
+    let out = atomic(
+        &dir,
+        &project,
+        &["run", "idempotent", "--runner", "process", "--data", NOTE],
+        &[],
+        "",
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(
+        stdout_json(&out),
+        json!({"title": "Exporting a file named ca", "words": 8})
+    );
+    assert_eq!(
+        lines(&dir.join("idempotent.log")),
+        2,
+        "once more, as declared"
+    );
+}
+
 #[test]
 fn the_runner_role_keeps_its_exit_code_contract() {
     let dir = scratch("runner-codes");

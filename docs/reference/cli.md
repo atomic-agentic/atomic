@@ -217,7 +217,7 @@ about it. It creates no state directory.
 | 64 | Usage error | Fails the attempt, no retry |
 | 78 | Configuration or credential error | Fails the attempt, no retry until fixed |
 | 75 | Workspace lease held elsewhere | Waits, then tries again a bounded number of times |
-| Any other, or a signal | Crash | Runs the command again a bounded number of times |
+| Any other, or a signal | Crash | Never runs the command again: it may have run, so the step's attempt is interrupted, and only a command declared `read-only` or `idempotent` runs again; any other is parked as `outcome_unknown` |
 
 Its stderr is attached to a failure as it is, never parsed. Runners reached over
 the network and other execution backends are planned for the platform stage.

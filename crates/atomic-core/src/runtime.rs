@@ -683,7 +683,14 @@ pub async fn run_exec(
         .await
         .map_err(|e| AtomError::Runtime(format!("{}: {e}", atom.name)));
     let _ = std::fs::remove_dir_all(&scratch);
-    let done = done?.map_err(|e| AtomError::Runtime(format!("{}: {e}", atom.name)))?;
+    let done = done?.map_err(|e| {
+        let message = format!("{}: {e}", atom.name);
+        if e.outcome_unknown() {
+            AtomError::OutcomeUnknown(message)
+        } else {
+            AtomError::Runtime(message)
+        }
+    })?;
     if !done.success() {
         let stderr = String::from_utf8_lossy(&done.stderr);
         let tail: String = stderr
