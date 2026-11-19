@@ -424,6 +424,56 @@ async fn a_control_transaction_commits_its_writes_or_nothing<R: DurableRuntime>(
     rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
 }
 
+async fn control_authorization_is_rechecked_on_workflow_replay<R: DurableRuntime>(mut rt: R) {
+    let executions = Arc::new(AtomicUsize::new(0));
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (counter, fresh) = (executions.clone(), reads.clone());
+    rt.register("control-replay", move |ctx: R::Context, (): ()| {
+        let (counter, fresh) = (counter.clone(), fresh.clone());
+        async move {
+            let current = ctx
+                .control_transaction(move |mut tx| {
+                    let fresh = fresh.clone();
+                    Box::pin(async move {
+                        assert_eq!(
+                            tx.query_one("SELECT 42 AS value", &[])
+                                .await?
+                                .int("value")?,
+                            42
+                        );
+                        Ok(fresh.fetch_add(1, Ordering::SeqCst))
+                    })
+                })
+                .await?;
+            let saved = ctx
+                .step("checkpoint", move |_| async move { Ok(current) })
+                .await?;
+            if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(DurableError::Interrupted("replay authorization".into()));
+            }
+            Ok((current, saved))
+        }
+    });
+    rt.launch().await.expect("launch");
+    let run = unique("control-replay");
+    rt.start("control-replay", &run, ()).await.expect("start");
+    assert!(matches!(
+        rt.result::<(usize, usize)>(&run).await,
+        Err(DurableError::Interrupted(_))
+    ));
+    rt.recover().await.expect("recover");
+    assert_eq!(
+        rt.result::<(usize, usize)>(&run).await.expect("replayed"),
+        (1, 0)
+    );
+    assert_eq!(
+        rt.steps(&run).await.expect("steps").len(),
+        1,
+        "control reads do not consume durable operation positions"
+    );
+    rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+}
+
 macro_rules! on_backend {
     ($backend:ident, $($name:ident),+ $(,)?) => {
         mod $backend {
@@ -439,6 +489,7 @@ macro_rules! on_backend {
 
 on_backend!(
     sqlite,
+    control_authorization_is_rechecked_on_workflow_replay,
     positions_follow_construction_not_polling_order,
     a_step_runs_once_and_is_replayed_after_a_crash,
     a_transaction_commits_its_writes_with_its_checkpoint_or_nothing,
@@ -454,6 +505,7 @@ on_backend!(
 #[cfg(feature = "postgres-tests")]
 on_backend!(
     postgres,
+    control_authorization_is_rechecked_on_workflow_replay,
     positions_follow_construction_not_polling_order,
     a_step_runs_once_and_is_replayed_after_a_crash,
     a_transaction_commits_its_writes_with_its_checkpoint_or_nothing,

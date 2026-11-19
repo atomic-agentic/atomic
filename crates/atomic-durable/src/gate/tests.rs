@@ -754,6 +754,10 @@ on_backend!(
     redelivery_wakes_a_run_whose_decider_stopped_early,
     a_forked_run_does_not_reuse_the_original_approval,
     an_imported_run_does_not_reuse_an_exported_approval,
+    importing_a_decision_checkpoint_does_not_authorize_another_run,
+    a_fork_after_the_decision_still_requires_its_own_approval,
+    an_approved_gate_replays_in_its_original_run,
+    concurrent_replays_return_one_recorded_decision,
 );
 
 #[cfg(feature = "postgres-tests")]
@@ -770,4 +774,228 @@ on_backend!(
     redelivery_wakes_a_run_whose_decider_stopped_early,
     a_forked_run_does_not_reuse_the_original_approval,
     an_imported_run_does_not_reuse_an_exported_approval,
+    importing_a_decision_checkpoint_does_not_authorize_another_run,
+    a_fork_after_the_decision_still_requires_its_own_approval,
+    an_approved_gate_replays_in_its_original_run,
+    concurrent_replays_return_one_recorded_decision,
 );
+
+async fn importing_a_decision_checkpoint_does_not_authorize_another_run(mut rt: Durare) {
+    register(&mut rt);
+    rt.launch().await.expect("launch");
+    let (run, opened, _) = approved_run(&rt).await;
+    for rejected_row in [false, true] {
+        let forged = unique("complete_import");
+        if rejected_row {
+            let id = gate_id(&forged, "accept");
+            copy_gate_row(&rt, &opened.id, &id).await;
+            let current_run = forged.clone();
+            rt.control_transaction(move |mut tx| {
+                let (id, run) = (id.clone(), current_run.clone());
+                Box::pin(async move {
+                    tx.execute(
+                        "UPDATE atomic_gates SET run = ?, state = 'rejected' WHERE gate_id = ?",
+                        &[Param::Text(run), Param::Text(id)],
+                    )
+                    .await
+                    .map(|_| ())
+                })
+            })
+            .await
+            .expect("a rejection for the imported run");
+        }
+        let mut exported = rt
+            .engine
+            .export_workflow(&run, false)
+            .await
+            .expect("export");
+        for workflow in &mut exported {
+            workflow
+                .workflow_status
+                .insert("workflow_uuid".into(), json!(forged.clone()));
+            workflow
+                .workflow_status
+                .insert("status".into(), json!("PENDING"));
+            workflow
+                .workflow_status
+                .insert("output".into(), Value::Null);
+            // Keep all checkpoints, including the transaction that checked the gate store.
+            for operation in &mut workflow.operation_outputs {
+                operation.insert("workflow_uuid".into(), json!(forged.clone()));
+            }
+            workflow.workflow_events.clear();
+            workflow.workflow_events_history.clear();
+            workflow.streams.clear();
+        }
+        rt.engine.import_workflow(&exported).await.expect("import");
+        rt.recover().await.expect("recover");
+        let result = outcome(&rt, &forged).await;
+        if rejected_row {
+            assert!(
+                matches!(
+                    result,
+                    Ok(Resolution::Decided(Decision {
+                        verdict: Verdict::Reject,
+                        ..
+                    }))
+                ),
+                "the checkpoint overrode the store's rejection: {result:?}"
+            );
+        } else {
+            assert!(
+                matches!(result, Err(DurableError::Failed(_))),
+                "new run reused an approval without its own gate-store row: {result:?}"
+            );
+        }
+    }
+    rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+}
+
+async fn a_fork_after_the_decision_still_requires_its_own_approval(mut rt: Durare) {
+    rt.register(
+        "gated",
+        |ctx: crate::runtime::DurareContext, input: Gated| async move {
+            let resolution = gate(&ctx, "accept", spec(&input)).await?;
+            ctx.step("after-gate", |_| async { Ok(()) }).await?;
+            Ok(resolution)
+        },
+    );
+    rt.launch().await.expect("launch");
+    let (run, _, decision) = approved_run(&rt).await;
+    let fork = unique("fork_after_decision");
+    rt.engine
+        .fork_workflow::<Value>(&run, decision + 1, durare::WorkflowOptions::with_id(&fork))
+        .await
+        .expect("fork after decision");
+    let result = outcome(&rt, &fork).await;
+    assert!(
+        matches!(result, Err(DurableError::Failed(_))),
+        "fork reused the cached approval: {result:?}"
+    );
+    rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+}
+
+async fn an_approved_gate_replays_in_its_original_run(mut rt: Durare) {
+    let executions = std::sync::Arc::new(AtomicUsize::new(0));
+    let counter = executions.clone();
+    rt.register(
+        "gated",
+        move |ctx: crate::runtime::DurareContext, input: Gated| {
+            let counter = counter.clone();
+            async move {
+                let resolution = gate(&ctx, "accept", spec(&input)).await?;
+                if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err(DurableError::Interrupted(
+                        "resume after authorization".into(),
+                    ));
+                }
+                Ok(resolution)
+            }
+        },
+    );
+    rt.launch().await.expect("launch");
+    let (run, opened) = start_gated(&rt, input(None)).await;
+    decide(
+        &rt,
+        &me(&rt).await,
+        command(&opened, &unique("decision"), Verdict::Approve),
+    )
+    .await
+    .expect("decide");
+    assert!(matches!(
+        outcome(&rt, &run).await,
+        Err(DurableError::Interrupted(_))
+    ));
+    let steps = rt.steps(&run).await.expect("steps");
+    rt.recover().await.expect("recover");
+    assert!(outcome(&rt, &run).await.expect("recovered gate").approved());
+    assert_eq!(executions.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        rt.steps(&run).await.expect("steps").len(),
+        steps.len(),
+        "revalidation must not add durable operations"
+    );
+    rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+}
+
+async fn concurrent_replays_return_one_recorded_decision<R: DurableRuntime>(mut rt: R) {
+    register(&mut rt);
+    rt.launch().await.expect("launch");
+    let (_, opened) = start_gated(&rt, input(None)).await;
+    let cmd = command(&opened, &unique("same_command"), Verdict::Approve);
+    let person = me(&rt).await;
+    let (a, b) = tokio::join!(decide(&rt, &person, cmd.clone()), decide(&rt, &person, cmd));
+    assert_eq!(a.expect("first caller"), b.expect("replayed caller"));
+    rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+}
+
+#[cfg(feature = "postgres-tests")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_raced_command_id_cannot_decide_another_gate() {
+    use sqlx::Connection;
+    let url = std::env::var("ATOMIC_TEST_DATABASE_URL").expect("test Postgres");
+    let schema = unique("command_race");
+    let separator = if url.contains('?') { '&' } else { '?' };
+    let url = format!("{url}{separator}application_name={schema}");
+    let mut rt = Durare::postgres(&url, &schema).await.expect("engine");
+    register(&mut rt);
+    rt.launch().await.expect("launch");
+    let (_, gate_a) = start_gated(&rt, input(None)).await;
+    let (_, gate_b) = start_gated(&rt, input(None)).await;
+    let rt = std::sync::Arc::new(rt);
+    let mut connection = sqlx::PgConnection::connect(&url).await.expect("connection");
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!("SET search_path TO {schema}")))
+        .execute(&mut connection)
+        .await
+        .expect("schema");
+    let mut monitor = sqlx::PgConnection::connect(&url).await.expect("monitor");
+    let mut lock = connection.begin().await.expect("lock transaction");
+    sqlx::query("SELECT gate_id FROM atomic_gates WHERE gate_id = $1 FOR UPDATE")
+        .bind(&gate_a.id)
+        .fetch_one(&mut *lock)
+        .await
+        .expect("lock gate A");
+    let command_id = unique("same_command");
+    let request_a = command(&gate_a, &command_id, Verdict::Approve);
+    let person = me(rt.as_ref()).await;
+    let raced_rt = rt.clone();
+    let raced_person = person.clone();
+    let first =
+        tokio::spawn(async move { decide(raced_rt.as_ref(), &raced_person, request_a).await });
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        let blocked: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE application_name = $1 AND wait_event_type = 'Lock' AND query LIKE 'UPDATE atomic_gates SET state = %'")
+            .bind(&schema).fetch_one(&mut monitor).await.expect("waiting queries");
+        if blocked > 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < until,
+            "decide A never blocked on its gate update"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    decide(
+        rt.as_ref(),
+        &person,
+        command(&gate_b, &command_id, Verdict::Approve),
+    )
+    .await
+    .expect("B wins command id");
+    lock.commit().await.expect("unlock gate A");
+    let rejected = first.await.expect("decider task");
+    assert!(
+        matches!(rejected, Err(DecideError::CommandReused(_))),
+        "{rejected:?}"
+    );
+    let stored = find(rt.as_ref(), &gate_a.id)
+        .await
+        .expect("find")
+        .expect("gate A");
+    rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+    assert!(
+        stored.resolution.is_none(),
+        "command reuse returned an error but durably decided gate A: {:?}",
+        stored.resolution
+    );
+}

@@ -18,7 +18,8 @@
 //! the store row, read by this run's own gate id and checked against this
 //! run and the proposal digest the workflow computes from what it shows, so
 //! a recorded receive (forged, imported or copied from another run) cannot
-//! approve anything.
+//! approve anything. A completed decision checkpoint is revalidated against
+//! the store outside checkpoint replay before the workflow can proceed.
 //!
 //! [`decide`] is the person's side: an idempotent command with a client-made
 //! command id, committed in one short transaction before it is
@@ -438,6 +439,29 @@ async fn read_gate(tx: &mut Tx<'_, '_>, id: &str) -> Result<Option<Gate>> {
     }
 }
 
+// The same identity/proposal fence applies inside the durable decision step
+// and after replay. Never infer authorization from a copied step output.
+async fn checked_gate(tx: &mut Tx<'_, '_>, id: &str, run: &str, proposal: &str) -> Result<Gate> {
+    let gate = read_gate(tx, id).await?.ok_or_else(|| {
+        DurableError::Failed(format!(
+            "gate {id} is not in the gate store, so nothing approved it"
+        ))
+    })?;
+    if gate.run != run {
+        return Err(DurableError::Failed(format!(
+            "gate {id} in the gate store belongs to run {}, not {run}",
+            gate.run
+        )));
+    }
+    if gate.proposal != proposal {
+        return Err(DurableError::Failed(format!(
+            "gate {id} was opened on proposal {}, but this run now shows {proposal}: changed content needs a new gate",
+            gate.proposal
+        )));
+    }
+    Ok(gate)
+}
+
 /// Record that `gate` expired at `now`, if it is still open. Returns the
 /// gate as the store now has it.
 async fn expire(tx: &mut Tx<'_, '_>, gate: &Gate, now: i64) -> Result<Gate> {
@@ -554,24 +578,7 @@ pub async fn gate<C: WorkflowContext>(ctx: &C, step: &str, spec: GateSpec) -> Re
                 let (id, run, proposal) =
                     (check_id.clone(), check_run.clone(), check_proposal.clone());
                 Box::pin(async move {
-                    let Some(gate) = read_gate(&mut tx, &id).await? else {
-                        return Err(DurableError::Failed(format!(
-                            "gate {id} is not in the gate store, so nothing approved it"
-                        )));
-                    };
-                    if gate.run != run {
-                        return Err(DurableError::Failed(format!(
-                            "gate {id} in the gate store belongs to run {}, not {run}",
-                            gate.run
-                        )));
-                    }
-                    if gate.proposal != proposal {
-                        return Err(DurableError::Failed(format!(
-                            "gate {id} was opened on proposal {}, but this run now shows \
-                             {proposal}: changed content needs a new gate",
-                            gate.proposal
-                        )));
-                    }
+                    let gate = checked_gate(&mut tx, &id, &run, &proposal).await?;
                     let now = now_ms();
                     let gate = if past_deadline(&gate, now) {
                         expire(&mut tx, &gate, now).await?
@@ -588,7 +595,27 @@ pub async fn gate<C: WorkflowContext>(ctx: &C, step: &str, spec: GateSpec) -> Re
             })
             .await?;
         match check {
-            Check::Resolved(resolution) => return Ok(resolution),
+            Check::Resolved(_) => {
+                // A transaction checkpoint can be copied or forged just like a
+                // receive checkpoint. Recheck the authoritative row outside
+                // every replayed operation, and return its actual resolution.
+                let (id, run, proposal) = (id.clone(), run.clone(), proposal.clone());
+                return ctx
+                    .control_transaction(move |mut tx| {
+                        let (id, run, proposal) = (id.clone(), run.clone(), proposal.clone());
+                        Box::pin(async move {
+                            checked_gate(&mut tx, &id, &run, &proposal)
+                                .await?
+                                .resolution
+                                .ok_or_else(|| {
+                                    DurableError::Failed(format!(
+                                        "gate {id} is not resolved in the gate store"
+                                    ))
+                                })
+                        })
+                    })
+                    .await;
+            }
             Check::Open { deadline: d } => deadline = d,
         }
     }
@@ -703,6 +730,10 @@ pub async fn decide<R: DurableRuntime>(
                         None,
                     ));
                 }
+                // A competing command may win its journal key after we have
+                // updated this gate. Keep those writes reversible until the
+                // command identity has also been admitted.
+                tx.execute("SAVEPOINT atomic_gate_decision", &[]).await?;
                 let now = now_ms();
                 let gate = if past_deadline(&gate, now) {
                     expire(&mut tx, &gate, now).await?
@@ -762,10 +793,14 @@ pub async fn decide<R: DurableRuntime>(
                     )
                     .await?;
                 if inserted == 0 {
-                    // The same id raced in from another client and won.
-                    if let Some(found) = journaled(&mut tx, &cmd.command_id, &request).await? {
-                        return Ok((found, Some(gate.run)));
-                    }
+                    // Undo this transaction's gate changes before returning
+                    // the winner (or refusing a different request on its key).
+                    tx.execute("ROLLBACK TO SAVEPOINT atomic_gate_decision", &[])
+                        .await?;
+                    let found = journaled(&mut tx, &cmd.command_id, &request)
+                        .await?
+                        .ok_or_else(|| corrupt("a conflicting command journal entry vanished"))?;
+                    return Ok((found, Some(gate.run)));
                 }
                 Ok((Ok(recorded), Some(gate.run)))
             })
