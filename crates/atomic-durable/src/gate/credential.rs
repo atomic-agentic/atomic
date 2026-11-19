@@ -66,6 +66,8 @@ pub enum Enrollment {
     Enrolled,
     /// The principal already had this credential.
     AlreadyEnrolled,
+    /// The principal's earlier credential was replaced by this one.
+    Replaced,
 }
 
 /// Why a credential was not enrolled.
@@ -156,6 +158,45 @@ pub async fn enroll<R: DurableRuntime>(
         })
         .await?;
     outcome.map_err(EnrollError::Different)
+}
+
+/// Enroll `credential` for its principal in place of any credential it had,
+/// as a person does who rotates theirs or lost it. Only a person's own
+/// command does this: the gate store is out of every atom's reach.
+pub async fn replace_enrollment<R: DurableRuntime>(
+    rt: &R,
+    credential: &HumanCredential,
+) -> Result<Enrollment> {
+    let credential = credential.clone();
+    rt.control_transaction(move |mut tx| {
+        let credential = credential.clone();
+        Box::pin(async move {
+            let before = verify(&mut tx, &credential).await?;
+            if before == Verified::Yes {
+                return Ok(Enrollment::AlreadyEnrolled);
+            }
+            let principal = credential.principal.as_str().to_owned();
+            tx.execute(
+                "DELETE FROM atomic_operators WHERE principal = ?",
+                &[Param::Text(principal.clone())],
+            )
+            .await?;
+            tx.execute(
+                "INSERT INTO atomic_operators (principal, verifier, enrolled_at) VALUES (?, ?, ?)",
+                &[
+                    Param::Text(principal),
+                    Param::Text(credential.verifier()),
+                    Param::Int(super::now_ms()),
+                ],
+            )
+            .await?;
+            Ok(match before {
+                Verified::Mismatch => Enrollment::Replaced,
+                _ => Enrollment::Enrolled,
+            })
+        })
+    })
+    .await
 }
 
 /// Whether `principal` has a credential enrolled.

@@ -44,10 +44,22 @@ gates and `worktree: true` steps, which run a Codex atom in its own worktree at
 the step's `base` and record atomic's commit in `steps.<id>.metadata.commit`.
 A run keeps the definitions it started with. Starting a workflow and deciding
 its gates from the command line (`atomic run`, `atomic gates`) are not wired up
-yet. A gate decision already counts only with the credential its person
-enrolled, and an atom's sandbox cannot reach the gate store or the credential:
-atomic's state directory is denied to its commands, which also cannot read the
-session keyring or connect to a socket.
+yet; `atomic gates enroll`, `list`, `approve` and `reject` are. A gate decision
+counts only with the credential its person enrolled.
+
+On Linux, atomic has verified that an atom's sandbox cannot reach the gate store
+or the credential: the private part of the state directory, Codex's own records
+and the credential and key directories are denied to its commands, which also
+cannot use the kernel keyrings or connect to a socket. On macOS and Windows this
+has not been verified, so atomic keeps no operator credential there and refuses
+credentialed gate decisions.
+
+A `workspace-write` atom cannot write `/tmp`, `/var/tmp` or `$TMPDIR`: each turn
+gets a temporary directory of its own, named by `TMPDIR` and removed when the
+turn ends (a killed atomic's are removed at its next start). A tool that ignores
+`TMPDIR` and writes to `/tmp` directly, such as a JVM's default
+`java.io.tmpdir`, fails there; point it at `$TMPDIR` (for the JVM,
+`-Djava.io.tmpdir=$TMPDIR`).
 
 Several authoring aids arrive in stages. Eval cases in JSONL files are part of
 v0.1. Compact schemas, variants, the `--plan` cost preview, declared effect caps

@@ -41,7 +41,9 @@ pub mod approvers;
 pub mod credential;
 
 pub use approvers::{ApproverError, Approvers, Deployment, Principal, resolve};
-pub use credential::{EnrollError, Enrollment, HumanCredential, enroll, enrolled};
+pub use credential::{
+    EnrollError, Enrollment, HumanCredential, enroll, enrolled, replace_enrollment,
+};
 
 use crate::failpoint;
 use crate::runtime::{

@@ -330,6 +330,22 @@ async fn only_the_enrolled_credential_decides<R: DurableRuntime>(mut rt: R) {
     let still = find(&rt, &opened.id).await.expect("find").expect("stored");
     assert_eq!(still.resolution, None, "neither decided anything");
 
+    // Rotating replaces the credential: the old one no longer decides.
+    let rotated = HumanCredential::new(operator(), "the rotated secret");
+    assert_eq!(
+        replace_enrollment(&rt, &rotated).await.expect("rotate"),
+        Enrollment::Replaced
+    );
+    assert_eq!(
+        replace_enrollment(&rt, &rotated).await.expect("again"),
+        Enrollment::AlreadyEnrolled
+    );
+    assert_eq!(
+        decide(&rt, &mine, command(&opened, "c1", Verdict::Approve)).await,
+        Err(DecideError::BadCredential(operator()))
+    );
+    replace_enrollment(&rt, &mine).await.expect("back");
+
     // The refused commands recorded nothing, so their id is still free.
     let decision = decide(&rt, &mine, command(&opened, "c1", Verdict::Approve))
         .await

@@ -9,6 +9,7 @@ use atomic_core::state::ProjectState;
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
+mod gates;
 mod setup;
 mod skills;
 
@@ -41,6 +42,9 @@ enum Command {
         #[command(subcommand)]
         command: Option<SchemasCommand>,
     },
+    /// Enroll your operator credential, list gates and decide them.
+    #[command(subcommand)]
+    Gates(gates::GatesCommand),
     /// Install atomic's authoring skills for a coding agent.
     Setup(setup::SetupArgs),
     /// Developer diagnostics.
@@ -153,6 +157,7 @@ async fn run(cli: Cli, paths: CodexPaths, state: ProjectState) -> anyhow::Result
     // Turn directories a killed atomic left behind.
     codex::sweep_turn_temps(state.dir())?;
     match cli.command {
+        Some(Command::Gates(command)) => gates::run(command, &state).await,
         Some(Command::Check { path }) => tokio::task::spawn_blocking(move || check(path)).await?,
         Some(Command::Render(args)) => tokio::task::spawn_blocking(move || render(args)).await?,
         Some(Command::Schemas { path, command }) => match command {
