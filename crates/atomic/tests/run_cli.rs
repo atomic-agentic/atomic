@@ -12,10 +12,19 @@
 //! - a run killed after a step is resumed by its id, and nothing that
 //!   finished runs again; a run killed at a gate keeps the gate and its
 //!   deadline, and a second resume is refused while one runs;
+//! - a resumed run keeps the budget it already spent, and an exec command
+//!   whose outcome is unknown stays parked however often it is resumed;
 //! - `atomic serve` started after a kill recovers the run and finishes it;
-//! - exec commands run in an `atomic runner` process when asked to;
+//!   stopped mid-command, it holds the lock until it exits and kills the
+//!   command, at once on a second signal;
+//! - a run started by one build resumes and recovers under a byte-different
+//!   one, and one of another durable layout is reported, not resumed;
+//! - a run id that exists is refused, and so is resuming a cancelled run;
+//! - exec commands run in an `atomic runner` process when asked to, and one
+//!   that kills its runner never runs again unless it says it may;
 //! - the executor identity comes from atomic's own setting, is required on
-//!   PostgreSQL, and a restarted server recovers only its own runs.
+//!   PostgreSQL, a restarted server recovers only its own runs, and a run
+//!   another executor owns is resumed only once it has stopped.
 //!
 //! Model atoms call the scripted fake model, which counts calls; the exec
 //! atom logs each time its command runs.
@@ -622,6 +631,113 @@ fn a_run_killed_after_a_step_resumes_by_its_id_and_reruns_nothing_finished() {
         assert_eq!(model.calls(), 2, "only summarize ran again");
         assert_eq!(count_log(&dir).len(), 1, "count did not run again");
     });
+}
+
+#[test]
+fn a_resumed_run_keeps_the_budget_it_already_spent() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
+            .await
+            .expect("fake model");
+        let dir = scratch("budget");
+        let project = project(&dir);
+        let state = state_dir(&dir, &project);
+        // One call's whole bound (80,000 tokens by default) and one token
+        // more: rank fits, and summarize fits only if rank's spend is forgotten.
+        std::fs::write(
+            project.join("workflows/budgeted.workflow.yaml"),
+            format!(
+                "{}budget:\n  tokens: 80001\n",
+                TRIAGE.replace("name: triage", "name: budgeted")
+            ),
+        )
+        .expect("workflow");
+        let env = model_env(&model.base_url());
+        let (d, p, e) = (dir.clone(), project.clone(), env.clone());
+        let out = tokio::task::spawn_blocking(move || {
+            atomic(
+                &d,
+                &p,
+                &["run", "budgeted", "--run-id", "budget-1", "--data", NOTE],
+                &with(&e, &[("ATOMIC_FAILPOINT", "pipeline:after:rank")]),
+                "",
+            )
+        })
+        .await
+        .expect("child");
+        assert!(!out.status.success(), "killed: {}", text(&out));
+        assert_eq!(model.calls(), 1, "rank ran");
+
+        let mut resumed = spawn(
+            &dir,
+            &project,
+            &["runs", "resume", "budget-1"],
+            &with(&env, &[]),
+            &dir.join("resumed.log"),
+        );
+        let rt = Durare::sqlite(&state.join("atomic.db"))
+            .await
+            .expect("store");
+        let started = Instant::now();
+        let park = loop {
+            if let Some(p) = atomic_durable::parks(&rt, "budget-1")
+                .await
+                .expect("parks")
+                .into_iter()
+                .next()
+            {
+                break p;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "the resumed run did not park on its budget: {} model calls; {}",
+                model.calls(),
+                std::fs::read_to_string(dir.join("resumed.log")).unwrap_or_default()
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert!(park.reason.contains("run:budget-1"), "{}", park.reason);
+        assert_eq!(model.calls(), 1, "summarize was not called");
+        resumed.kill().expect("stop the resume");
+        resumed.wait().expect("reap");
+    });
+}
+
+#[test]
+fn an_unresolved_effect_stays_parked_across_resumes() {
+    let dir = scratch("parked-effect");
+    let project = project(&dir);
+    // Killed after its command ran and before its step's checkpoint.
+    let out = atomic(
+        &dir,
+        &project,
+        &["run", "count-only", "--run-id", "effect-1", "--data", NOTE],
+        &[("ATOMIC_FAILPOINT", "pipeline:ran:count")],
+        "",
+    );
+    assert!(!out.status.success(), "killed: {}", text(&out));
+    assert_eq!(count_log(&dir).len(), 1);
+    // The command declares no effects, so resuming parks it instead of
+    // running it again, and later resumes leave it parked.
+    for expected in ["run.failed", "run.failed"] {
+        let out = atomic(
+            &dir,
+            &project,
+            &["--json", "runs", "resume", "effect-1"],
+            &UNUSED_MODEL,
+            "",
+        );
+        assert!(!out.status.success(), "{}", text(&out));
+        let error = &stdout_json(&out)["error"];
+        assert_eq!(error["kind"], expected, "{error}");
+        assert!(
+            error["description"]
+                .as_str()
+                .is_some_and(|d| d.contains("outcome_unknown")),
+            "{error}"
+        );
+        assert_eq!(count_log(&dir).len(), 1, "the command did not run again");
+    }
 }
 
 #[test]
