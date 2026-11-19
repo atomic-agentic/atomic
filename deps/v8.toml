@@ -1,0 +1,15 @@
+# V8 builds in Cargo.lock. Two V8 builds cannot be linked into one binary, so
+# Cargo.lock may hold at most one V8 binding crate version that is built. scripts/lock-check.sh fails on a second version unless it is
+# listed here as locked but never built, with the reason;
+# `scripts/lock-check.sh v8-built` (it needs cargo, so run it through
+# scripts/dev.sh) proves each listed version stays out of the build graph.
+#
+# Codex's patch block points `v8` at its own fork for Codex's code-mode
+# runtime, which atomic does not build; Cargo.lock records that patch as
+# unused. Before atomic enables Codex code-mode, its V8 and Codex's must
+# converge on one version (deps/README.md).
+#
+# [[unbuilt]]
+# crate = "v8x"
+# version = "149.4.0-rc.4"
+# reason = "..."

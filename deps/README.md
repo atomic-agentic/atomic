@@ -8,6 +8,7 @@ against it.
 | --- | --- |
 | [`codex.toml`](codex.toml) | [openai/codex](https://github.com/openai/codex), the `codex-rs` workspace, built from atomic's fork [atomic-agentic/codex](https://github.com/atomic-agentic/codex) |
 | [`lock-exceptions.toml`](lock-exceptions.toml) | Where `Cargo.lock` differs from Codex's lockfile at the pinned revision, each with its reason. `Cargo.lock` starts from Codex's, and `scripts/lock-check.sh` fails on any unlisted difference |
+| [`v8.toml`](v8.toml) | V8 versions `Cargo.lock` holds but never builds, each with its reason. `scripts/lock-check.sh` fails when more than one other V8 version is locked; see [one V8](#one-v8) |
 | [`forks.toml`](forks.toml) | Every fork the build uses, with its pinned revision: the Codex fork, the durare fork and the sqlx fork. `scripts/forks-check.sh` checks it against `Cargo.lock` |
 
 ## Codex
@@ -56,6 +57,24 @@ when the pin moves.
 | V8 stays out of the core path | Only `code-mode-runtime` depends on `v8`, and only `code-mode-host` depends on it. `core`, `app-server` and `tools` depend on `codex-code-mode`, which does not | the crates' `Cargo.toml` files |
 | Crates atomic uses exist | `core-api`, `ext/extension-api`, `app-server`, `arg0`, `thread-manager-sample` | directory listing |
 | The sample uses one Codex crate | `thread-manager-sample` depends only on `codex-core-api` | `thread-manager-sample/Cargo.toml` |
+
+## One V8
+
+Two V8 builds cannot be linked into one binary, so atomic builds at most one
+V8: one version of one V8 binding crate (`v8`, or deno_v8's alternative `v8x`).
+`scripts/lock-check.sh` fails when `Cargo.lock` holds a second version that
+[`v8.toml`](v8.toml) does not list as locked but unbuilt, and
+`scripts/dev.sh scripts/lock-check.sh v8-built` proves with `cargo tree`
+that each listed version stays out of the graph for every workspace feature
+and target.
+
+Codex's patch block points `v8` at Codex's own fork for its code-mode
+runtime. atomic does not build that runtime, so `Cargo.lock` records the
+patch as unused and it does not count. The V8 atomic links need not match
+that fork while Codex code-mode stays off; before atomic enables Codex
+code-mode, the two must converge on one version, either through a deno_core
+release on Codex's V8 line or by building deno_core against the same fork.
+A Codex bump that brings a second V8 into the graph fails the check.
 
 ## durare
 
