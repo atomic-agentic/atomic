@@ -293,6 +293,202 @@ mod tests {
         }
     }
 
+    /// The reproduction: `about` refers to the whole contract with `#`.
+    fn recursive() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {"attachment": {"anyOf": [
+                {"type": "null"},
+                {"type": "object", "required": ["file", "about"],
+                 "properties": {"file": {"$ref": "atomic:artifact", "mediaType": "text/x-diff"},
+                                "about": {"$ref": "#"}}}
+            ]}}
+        })
+    }
+
+    fn attachment(c: char, about: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"attachment": {"file": reference(c), "about": about}})
+    }
+
+    #[test]
+    fn a_root_reference_inside_a_branch_means_the_contract() {
+        let schema = recursive();
+        assert_eq!(
+            check_refs(&schema, &attachment('a', serde_json::json!({})), &Store),
+            Ok(())
+        );
+        assert_eq!(
+            check_refs(&schema, &serde_json::json!({"attachment": null}), &Store),
+            Ok(())
+        );
+        assert!(matches!(
+            check_refs(&schema, &attachment('c', serde_json::json!({})), &Store),
+            Err(ArtifactCheckError::Missing { .. })
+        ));
+        assert_eq!(
+            expected_type(check_refs(
+                &schema,
+                &attachment('b', serde_json::json!({})),
+                &Store
+            ))
+            .as_deref(),
+            Some("text/x-diff")
+        );
+        // Two alternatives that both refer to the contract: the diff branch
+        // fits, so the text branch adds no requirement.
+        let either = serde_json::json!({
+            "type": "object",
+            "properties": {"attachment": {"anyOf": [
+                {"type": "object", "required": ["file", "about"],
+                 "properties": {"file": {"$ref": "atomic:artifact", "mediaType": "text/x-diff"},
+                                "about": {"$ref": "#"}}},
+                {"type": "object", "required": ["file", "about"],
+                 "properties": {"file": {"$ref": "atomic:artifact", "mediaType": "text/plain"},
+                                "about": {"$ref": "#"}}}
+            ]}}
+        });
+        for c in ['a', 'b'] {
+            assert_eq!(
+                check_refs(&either, &attachment(c, serde_json::json!({})), &Store),
+                Ok(()),
+                "{c}"
+            );
+        }
+        // `#` is followed into the nested value too.
+        let nested = attachment('a', attachment('c', serde_json::json!({})));
+        match check_refs(&schema, &nested, &Store) {
+            Err(ArtifactCheckError::Missing { at, .. }) => {
+                assert_eq!(at, "/attachment/about/attachment/file");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_branch_whose_fit_cannot_be_decided_is_still_held() {
+        // The second branch refers to a schema outside the contract, so no
+        // validator can be built for it.
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"attachment": {"anyOf": [
+                {"type": "null"},
+                {"type": "object",
+                 "properties": {"file": {"$ref": "atomic:artifact", "mediaType": "text/x-diff"},
+                                "extra": {"$ref": "https://example.invalid/other.schema.json"}}}
+            ]}}
+        });
+        let value = |c| serde_json::json!({"attachment": {"file": reference(c)}});
+        assert!(matches!(
+            check_refs(&schema, &value('c'), &Store),
+            Err(ArtifactCheckError::Missing { .. })
+        ));
+        assert_eq!(
+            expected_type(check_refs(&schema, &value('b'), &Store)).as_deref(),
+            Some("text/x-diff")
+        );
+        assert_eq!(check_refs(&schema, &value('a'), &Store), Ok(()));
+        assert_eq!(
+            check_refs(&schema, &serde_json::json!({"attachment": null}), &Store),
+            Ok(())
+        );
+        // An undecided branch with no references of its own does not accept a
+        // value that no branch definitely fits.
+        let schema = serde_json::json!({"anyOf": [
+            {"type": "object", "required": ["kind", "file"],
+             "properties": {"kind": {"const": "diff"},
+                            "file": {"$ref": "atomic:artifact", "mediaType": "text/x-diff"}}},
+            {"$ref": "https://example.invalid/other.schema.json"}
+        ]});
+        assert!(matches!(
+            check_refs(
+                &schema,
+                &serde_json::json!({"file": reference('c')}),
+                &Store
+            ),
+            Err(ArtifactCheckError::Missing { .. })
+        ));
+    }
+
+    #[test]
+    fn when_no_branch_fits_every_branch_is_held() {
+        // `kind` matches neither tag, so the value breaks the schema; its
+        // references are still held, to every branch.
+        let schema = tagged("anyOf");
+        assert!(matches!(
+            check_refs(&schema, &payload("other", 'c'), &Store),
+            Err(ArtifactCheckError::Missing { .. })
+        ));
+        assert!(matches!(
+            check_refs(&schema, &payload("other", 'a'), &Store),
+            Err(ArtifactCheckError::WrongMediaType { .. })
+        ));
+    }
+
+    #[test]
+    fn branches_under_definitions_and_root_pointers_are_decided() {
+        let branch = |kind: &str, media: &str| {
+            serde_json::json!({"type": "object", "required": ["kind", "file"],
+                               "properties": {"kind": {"const": kind},
+                                              "file": {"$ref": "atomic:artifact", "mediaType": media}}})
+        };
+        let definitions = serde_json::json!({
+            "type": "object",
+            "properties": {"payload": {"anyOf": [
+                {"$ref": "#/definitions/diff"}, {"$ref": "#/definitions/note"}
+            ]}},
+            "definitions": {"diff": branch("diff", "text/x-diff"), "note": branch("text", "text/plain")}
+        });
+        // The second branch cannot be compiled on its own: it points into the
+        // contract's properties.
+        let pointer = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "payload": {"anyOf": [branch("diff", "text/x-diff"), {"$ref": "#/properties/note"}]},
+                "note": branch("text", "text/plain")
+            }
+        });
+        for schema in [definitions, pointer] {
+            assert_eq!(check_refs(&schema, &payload("diff", 'a'), &Store), Ok(()));
+            assert_eq!(check_refs(&schema, &payload("text", 'b'), &Store), Ok(()));
+            assert_eq!(
+                expected_type(check_refs(&schema, &payload("diff", 'b'), &Store)).as_deref(),
+                Some("text/x-diff"),
+                "{schema}"
+            );
+            assert_eq!(
+                expected_type(check_refs(&schema, &payload("text", 'a'), &Store)).as_deref(),
+                Some("text/plain"),
+                "{schema}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_branch_is_compiled_once_per_check() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"items": {"type": "array", "items": tagged("anyOf")["properties"]["payload"]}},
+            "$defs": tagged("anyOf")["$defs"]
+        });
+        let items: Vec<_> = (0..5000)
+            .map(|i| {
+                if i % 2 == 0 {
+                    serde_json::json!({"kind": "diff", "file": reference('a')})
+                } else {
+                    serde_json::json!({"kind": "text", "file": reference('b')})
+                }
+            })
+            .collect();
+        let value = serde_json::json!({ "items": items });
+        let started = std::time::Instant::now();
+        let (result, compiled) = Checker::new(&schema, &Store).check(&value);
+        let took = started.elapsed();
+        eprintln!("5000 tagged items: {took:?}");
+        assert_eq!(result, Ok(()));
+        assert_eq!(compiled, 2, "one validator per branch");
+        assert!(took < std::time::Duration::from_secs(5), "{took:?}");
+    }
+
     #[test]
     fn every_all_of_branch_must_hold() {
         let schema = serde_json::json!({"allOf": [
@@ -341,86 +537,6 @@ pub trait ArtifactLookup {
     fn media_types(&self, artifact: &ArtifactRef) -> Option<Vec<String>>;
 }
 
-/// An artifact reference in a value, where it is, and the media type its
-/// schema requires.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FoundRef {
-    /// JSON Pointer into the value.
-    pub at: String,
-    /// The reference as written.
-    pub text: String,
-    /// The `mediaType` the schema requires, if any.
-    pub media_type: Option<String>,
-}
-
-/// Every artifact reference `value` holds where `schema` expects one,
-/// following `properties`, `items`, local `$defs` references and the branches
-/// of `anyOf`, `oneOf` and `allOf`. Every branch contributes, so a reference
-/// under alternatives can appear once for each branch that expects one.
-pub fn find_refs(schema: &serde_json::Value, value: &serde_json::Value) -> Vec<FoundRef> {
-    let mut out = Vec::new();
-    walk(schema, schema, value, "", &mut out, 0);
-    out
-}
-
-fn walk(
-    root: &serde_json::Value,
-    schema: &serde_json::Value,
-    value: &serde_json::Value,
-    at: &str,
-    out: &mut Vec<FoundRef>,
-    depth: usize,
-) {
-    use serde_json::Value;
-    if depth > 64 {
-        return;
-    }
-    match schema.get("$ref").and_then(Value::as_str) {
-        Some(ARTIFACT_SCHEMA_ID) => {
-            if let Some(text) = value.as_str() {
-                out.push(FoundRef {
-                    at: at.to_owned(),
-                    text: text.to_owned(),
-                    media_type: schema
-                        .get("mediaType")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned),
-                });
-            }
-            return;
-        }
-        Some(local) if local.starts_with("#/") => {
-            if let Some(target) = root.pointer(&local[1..]) {
-                walk(root, target, value, at, out, depth + 1);
-            }
-        }
-        _ => {}
-    }
-    if let (Some(props), Some(obj)) = (
-        schema.get("properties").and_then(Value::as_object),
-        value.as_object(),
-    ) {
-        for (k, s) in props {
-            if let Some(v) = obj.get(k) {
-                let child = format!("{at}/{}", k.replace('~', "~0").replace('/', "~1"));
-                walk(root, s, v, &child, out, depth + 1);
-            }
-        }
-    }
-    if let (Some(items), Some(arr)) = (schema.get("items"), value.as_array()) {
-        for (i, v) in arr.iter().enumerate() {
-            walk(root, items, v, &format!("{at}/{i}"), out, depth + 1);
-        }
-    }
-    for keyword in ["anyOf", "oneOf", "allOf"] {
-        if let Some(Value::Array(branches)) = schema.get(keyword) {
-            for b in branches {
-                walk(root, b, value, at, out, depth + 1);
-            }
-        }
-    }
-}
-
 /// Why a value's artifact references do not hold.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ArtifactCheckError {
@@ -462,12 +578,17 @@ pub enum ArtifactCheckError {
 /// branch's own references hold. A branch the value does not fit adds no
 /// requirement, so `{kind: "diff", file}` is held to the diff branch's media
 /// type and not to a text branch's.
+///
+/// Whether a value fits a branch is decided against the whole `schema`, so a
+/// `$ref` inside a branch means what it means in the contract. The check fails
+/// closed: when no branch definitely fits (the value breaks the schema, or a
+/// branch's fit cannot be decided), every branch's references must hold.
 pub fn check_refs(
     schema: &serde_json::Value,
     value: &serde_json::Value,
     store: &dyn ArtifactLookup,
 ) -> Result<(), ArtifactCheckError> {
-    check_at(schema, schema, value, "", store, 0)
+    Checker::new(schema, store).check(value).0
 }
 
 fn check_one(
@@ -501,110 +622,202 @@ fn check_one(
     Ok(())
 }
 
-/// Whether `value` fits `branch` as JSON Schema, with the root's
-/// definitions in reach, or `None` when the branch cannot be compiled on its
-/// own (a reference into the root outside its definitions, say). A branch
-/// whose fit is unknown is treated as one the value fits, so its artifact
-/// requirements still apply.
-fn fits(
-    root: &serde_json::Value,
-    branch: &serde_json::Value,
-    value: &serde_json::Value,
-) -> Option<bool> {
-    let mut schema = branch.clone();
-    if let Some(obj) = schema.as_object_mut() {
-        for defs in ["$defs", "definitions"] {
-            if let Some(found) = root.get(defs) {
-                obj.entry(defs).or_insert_with(|| found.clone());
-            }
-        }
-    }
-    crate::registry::Registry::new()
-        .validator_for(&schema)
-        .ok()
-        .map(|v| v.is_valid(value))
+/// The URI the contract is served under while branch fits are decided, when
+/// it has no absolute `$id` of its own.
+const CONTRACT_URI: &str = "urn:atomic:contract";
+
+/// One `check_refs` call: the contract, the store, and each branch's
+/// validator, compiled the first time it is needed.
+struct Checker<'a> {
+    root: &'a serde_json::Value,
+    store: &'a dyn ArtifactLookup,
+    base: String,
+    known: std::sync::Arc<std::collections::BTreeMap<String, serde_json::Value>>,
+    branches: std::collections::HashMap<String, Option<jsonschema::Validator>>,
+    compiled: usize,
 }
 
-fn check_at(
-    root: &serde_json::Value,
-    schema: &serde_json::Value,
-    value: &serde_json::Value,
-    at: &str,
-    store: &dyn ArtifactLookup,
-    depth: usize,
-) -> Result<(), ArtifactCheckError> {
-    use serde_json::Value;
-    if depth > 64 {
-        return Ok(());
+/// Serves the contract and the built-in artifact schema, and nothing else.
+struct Contract(std::sync::Arc<std::collections::BTreeMap<String, serde_json::Value>>);
+
+impl jsonschema::Retrieve for Contract {
+    fn retrieve(
+        &self,
+        uri: &jsonschema::Uri<String>,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        let key = uri.as_str().split('#').next().unwrap_or_default();
+        self.0
+            .get(key)
+            .cloned()
+            .ok_or_else(|| format!("{key} is not part of the contract").into())
     }
-    match schema.get("$ref").and_then(Value::as_str) {
-        Some(ARTIFACT_SCHEMA_ID) => {
-            return match value.as_str() {
-                Some(text) => check_one(
-                    text,
-                    at,
-                    schema.get("mediaType").and_then(Value::as_str),
-                    store,
-                ),
-                None => Ok(()),
-            };
-        }
-        Some(local) if local.starts_with("#/") => {
-            if let Some(target) = root.pointer(&local[1..]) {
-                check_at(root, target, value, at, store, depth + 1)?;
-            }
-        }
-        _ => {}
-    }
-    if let (Some(props), Some(obj)) = (
-        schema.get("properties").and_then(Value::as_object),
-        value.as_object(),
-    ) {
-        for (k, s) in props {
-            if let Some(v) = obj.get(k) {
-                let child = format!("{at}/{}", k.replace('~', "~0").replace('/', "~1"));
-                check_at(root, s, v, &child, store, depth + 1)?;
-            }
+}
+
+/// `pointer` as a URI fragment: every byte outside the fragment's safe set
+/// is percent-encoded, `%` included.
+fn fragment(pointer: &str) -> String {
+    let mut out = String::with_capacity(pointer.len());
+    for byte in pointer.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~/!$&'()*+,;=:@".contains(&byte) {
+            out.push(char::from(byte));
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
         }
     }
-    if let (Some(items), Some(arr)) = (schema.get("items"), value.as_array()) {
-        for (i, v) in arr.iter().enumerate() {
-            check_at(root, items, v, &format!("{at}/{i}"), store, depth + 1)?;
+    out
+}
+
+/// A JSON Pointer token, escaped.
+fn token(key: &str) -> String {
+    key.replace('~', "~0").replace('/', "~1")
+}
+
+impl<'a> Checker<'a> {
+    fn new(root: &'a serde_json::Value, store: &'a dyn ArtifactLookup) -> Self {
+        // The contract keeps its own base URI when it has one, so its
+        // references resolve as they do when the whole answer is validated.
+        let base = root
+            .get("$id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| url::Url::parse(id).is_ok())
+            .map(|id| id.trim_end_matches('#').to_owned())
+            .unwrap_or_else(|| CONTRACT_URI.to_owned());
+        let known = std::sync::Arc::new(std::collections::BTreeMap::from([
+            (base.clone(), root.clone()),
+            (ARTIFACT_SCHEMA_ID.to_owned(), artifact_schema()),
+        ]));
+        Self {
+            root,
+            store,
+            base,
+            known,
+            branches: std::collections::HashMap::new(),
+            compiled: 0,
         }
     }
-    // Every `allOf` branch applies, so every branch's references must hold.
-    if let Some(Value::Array(branches)) = schema.get("allOf") {
-        for b in branches {
-            check_at(root, b, value, at, store, depth + 1)?;
-        }
+
+    /// The result, and how many branch validators were compiled.
+    fn check(mut self, value: &serde_json::Value) -> (Result<(), ArtifactCheckError>, usize) {
+        let result = self.check_at("", value, "", 0);
+        (result, self.compiled)
     }
-    // `anyOf` and `oneOf` are alternatives. Only a branch the value fits can
-    // accept it, and a branch that fits accepts it when its own references
-    // hold. Whether exactly one `oneOf` branch fits is the schema validator's
-    // question, already answered; here a fitting branch that holds is enough.
-    for keyword in ["anyOf", "oneOf"] {
-        let Some(Value::Array(branches)) = schema.get(keyword) else {
-            continue;
+
+    /// Whether `value` fits the subschema at `pointer` in the contract, or
+    /// `None` when that cannot be decided.
+    fn fits(&mut self, pointer: &str, value: &serde_json::Value) -> Option<bool> {
+        if !self.branches.contains_key(pointer) {
+            self.compiled += 1;
+            let wrapper =
+                serde_json::json!({"$ref": format!("{}#{}", self.base, fragment(pointer))});
+            let validator = jsonschema::options()
+                .with_draft(jsonschema::Draft::Draft202012)
+                .with_retriever(Contract(std::sync::Arc::clone(&self.known)))
+                .build(&wrapper)
+                .ok();
+            self.branches.insert(pointer.to_owned(), validator);
+        }
+        self.branches[pointer].as_ref().map(|v| v.is_valid(value))
+    }
+
+    fn check_at(
+        &mut self,
+        pointer: &str,
+        value: &serde_json::Value,
+        at: &str,
+        depth: usize,
+    ) -> Result<(), ArtifactCheckError> {
+        use serde_json::Value;
+        if depth > 64 {
+            return Ok(());
+        }
+        let root = self.root;
+        let Some(schema) = root.pointer(pointer) else {
+            return Ok(());
         };
-        let mut first_error = None;
-        for b in branches {
-            if fits(root, b, value) == Some(false) {
+        match schema.get("$ref").and_then(Value::as_str) {
+            Some(ARTIFACT_SCHEMA_ID) => {
+                return match value.as_str() {
+                    Some(text) => check_one(
+                        text,
+                        at,
+                        schema.get("mediaType").and_then(Value::as_str),
+                        self.store,
+                    ),
+                    None => Ok(()),
+                };
+            }
+            Some(local)
+                if (local == "#" || local.starts_with("#/"))
+                    && root.pointer(&local[1..]).is_some() =>
+            {
+                self.check_at(&local[1..], value, at, depth + 1)?;
+            }
+            _ => {}
+        }
+        if let (Some(props), Some(obj)) = (
+            schema.get("properties").and_then(Value::as_object),
+            value.as_object(),
+        ) {
+            for k in props.keys() {
+                if let Some(v) = obj.get(k) {
+                    let child = format!("{at}/{}", token(k));
+                    let sub = format!("{pointer}/properties/{}", token(k));
+                    self.check_at(&sub, v, &child, depth + 1)?;
+                }
+            }
+        }
+        if let (Some(_), Some(arr)) = (schema.get("items"), value.as_array()) {
+            let sub = format!("{pointer}/items");
+            for (i, v) in arr.iter().enumerate() {
+                self.check_at(&sub, v, &format!("{at}/{i}"), depth + 1)?;
+            }
+        }
+        // Every `allOf` branch applies, so every branch's references must hold.
+        if let Some(Value::Array(branches)) = schema.get("allOf") {
+            for i in 0..branches.len() {
+                self.check_at(&format!("{pointer}/allOf/{i}"), value, at, depth + 1)?;
+            }
+        }
+        // `anyOf` and `oneOf` are alternatives. A branch the value fits
+        // accepts it when the branch's own references hold. Whether exactly
+        // one `oneOf` branch fits is the schema validator's question.
+        for keyword in ["anyOf", "oneOf"] {
+            let Some(Value::Array(branches)) = schema.get(keyword) else {
+                continue;
+            };
+            let mut first_error = None;
+            let mut accepted = false;
+            let mut held = Vec::new();
+            for i in 0..branches.len() {
+                let sub = format!("{pointer}/{keyword}/{i}");
+                match self.fits(&sub, value) {
+                    Some(true) => match self.check_at(&sub, value, at, depth + 1) {
+                        Ok(()) => {
+                            accepted = true;
+                            break;
+                        }
+                        Err(e) => {
+                            first_error.get_or_insert(e);
+                        }
+                    },
+                    Some(false) => held.push(sub),
+                    // Undecided: it cannot accept the value on its own, and
+                    // its references are held if nothing else accepts.
+                    None => held.push(sub),
+                }
+            }
+            if accepted {
                 continue;
             }
-            match check_at(root, b, value, at, store, depth + 1) {
-                Ok(()) => {
-                    first_error = None;
-                    break;
-                }
-                Err(e) => {
-                    first_error.get_or_insert(e);
-                }
+            if let Some(e) = first_error {
+                return Err(e);
+            }
+            // No branch definitely fits: fail closed, holding every branch's
+            // references.
+            for sub in held {
+                self.check_at(&sub, value, at, depth + 1)?;
             }
         }
-        if let Some(e) = first_error {
-            return Err(e);
-        }
-        // No branch fits: the schema validator rejects the value itself.
+        Ok(())
     }
-    Ok(())
 }
