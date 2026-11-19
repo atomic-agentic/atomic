@@ -20,6 +20,7 @@ validators. Live comparison and cost-preview commands remain staged.
 atomic check
 ```
 
-The directory retains its catalog number and historical name. Compact-schema
-syntax and its expansion command remain separate planned work; these Astro atoms
-use the full JSON Schema contract directly.
+These Astro atoms write the full JSON Schema contract. The same contracts in the
+[compact form](../../docs/reference/atom-files.md#compact-schemas) compile to exactly
+the files under [expanded/](expanded/label-ticket.input.schema.yaml), which is what
+`atomic schemas expand label-ticket` prints for either form.

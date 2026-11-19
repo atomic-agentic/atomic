@@ -74,6 +74,33 @@ An explicit full JSON Schema or `{$ref: './file.schema.yaml'}` overrides a sidec
 Schemas resolve offline. The complete schema is enforced at runtime, including
 constraints omitted from the model's generation schema and TypeScript projection.
 
+### Compact schemas
+
+Wherever a schema is written, in a sidecar, a shared schema file, an atom's
+`input` or `output`, or a workflow's contracts, the compact form Dotprompt calls
+Picoschema also works, and atomic compiles it to JSON Schema 2020-12 when it
+loads:
+
+```yaml
+# label-ticket.output.schema.yaml
+queue(enum, the team that should handle it): [billing, bugs, account, other]
+urgent: boolean, true when the customer is blocked from working
+reason: string, one sentence that explains the labels
+findings(array):
+  file: string
+  line?: integer
+```
+
+A field is `name: type, description`, with `string`, `integer`, `number`,
+`boolean`, `null` or `any`. Fields are required unless the name ends in `?`, and
+no other properties are allowed unless `(*): type` says which. `name(array):`,
+`name(object):` and `name(enum): [a, b]` give lists, nested objects and enums.
+One difference from Picoschema: a `?` field may be omitted, and is not also
+nullable. The form has no constraints; a schema that needs `minLength`,
+`pattern` or `format` is full JSON Schema, and a root with any JSON Schema
+keyword (`type`, `properties`, `$ref`, `enum` and the like) is read as one.
+`atomic schemas expand <atom>` prints the contracts as atomic enforces them.
+
 `atomic check` generates direct relative declaration imports under `.atomic/types`.
 These files are disposable editor artifacts, not runtime state. The loader checks
 the source against fresh in-memory declarations, so stale files cannot bypass

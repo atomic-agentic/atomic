@@ -34,15 +34,28 @@ enum Command {
     Render(RenderArgs),
     /// Write JSON Schemas for editors: workflow files and the manifest, with
     /// the project's atom names and schema IDs.
+    #[command(args_conflicts_with_subcommands = true)]
     Schemas {
         /// A project directory; defaults to the current project.
         path: Option<PathBuf>,
+        #[command(subcommand)]
+        command: Option<SchemasCommand>,
     },
     /// Install atomic's authoring skills for a coding agent.
     Setup(setup::SetupArgs),
     /// Developer diagnostics.
     #[command(subcommand, hide = true)]
     Debug(Debug),
+}
+
+#[derive(Debug, Subcommand)]
+enum SchemasCommand {
+    /// Print the JSON Schemas an atom's input and output compile to, as
+    /// atomic enforces them, compact forms expanded.
+    Expand {
+        /// The atom, by name in the current project or by file.
+        atom: String,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -133,9 +146,12 @@ async fn run(cli: Cli, paths: CodexPaths, state: ProjectState) -> anyhow::Result
     match cli.command {
         Some(Command::Check { path }) => tokio::task::spawn_blocking(move || check(path)).await?,
         Some(Command::Render(args)) => tokio::task::spawn_blocking(move || render(args)).await?,
-        Some(Command::Schemas { path }) => {
-            tokio::task::spawn_blocking(move || schemas(path)).await?
-        }
+        Some(Command::Schemas { path, command }) => match command {
+            Some(SchemasCommand::Expand { atom }) => {
+                tokio::task::spawn_blocking(move || expand(&atom)).await?
+            }
+            None => tokio::task::spawn_blocking(move || schemas(path)).await?,
+        },
         Some(Command::Setup(args)) => setup::run(args),
         None => {
             println!("atomic {}", env!("CARGO_PKG_VERSION"));
@@ -301,6 +317,51 @@ fn schemas(path: Option<PathBuf>) -> anyhow::Result<()> {
          and for atomic.yaml:\n  # yaml-language-server: $schema={}/manifest.schema.json",
         relative.display(),
         relative.display()
+    );
+    Ok(())
+}
+
+fn expand(name: &str) -> anyhow::Result<()> {
+    use atomic_core::{atom, collections};
+    let file = std::path::Path::new(name);
+    let file = if file.is_file() {
+        file.to_owned()
+    } else {
+        let project = project::discover(&std::env::current_dir()?)?;
+        let files = collections::collect(&project)?;
+        files["atoms"]
+            .iter()
+            .find(|source| source.name == name)
+            .map(|source| source.path.clone())
+            .ok_or_else(|| anyhow::anyhow!("no atom named `{name}` in {}", project.name))?
+    };
+    let mut registry = atomic_schema::registry::Registry::new();
+    load_project_schemas(
+        file.parent().unwrap_or(std::path::Path::new(".")),
+        &mut registry,
+    )?;
+    let atom = atom::load(&file, &mut registry)?;
+    // Each contract as a standalone JSON Schema 2020-12 document.
+    let standalone = |contract: &serde_json::Value| {
+        let mut out = serde_json::Map::new();
+        out.insert(
+            "$schema".into(),
+            serde_json::json!("https://json-schema.org/draft/2020-12/schema"),
+        );
+        if let Some(fields) = contract.as_object() {
+            for (key, value) in fields {
+                out.entry(key.clone()).or_insert_with(|| value.clone());
+            }
+        }
+        serde_json::Value::Object(out)
+    };
+    let contracts = &atom.program.contracts;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "input": standalone(&contracts["Input"]),
+            "output": standalone(&contracts["Output"]),
+        }))?
     );
     Ok(())
 }

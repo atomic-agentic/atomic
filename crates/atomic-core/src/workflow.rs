@@ -180,8 +180,14 @@ pub fn load(
                 format!("missing `{role}`: a workflow declares its {role} schema"),
             )
         })?;
+        let declared = atomic_schema::compact::to_json_schema(declared).map_err(|e| {
+            fail(
+                &format!("/{role}{}", e.path.trim_end_matches('/')),
+                e.message,
+            )
+        })?;
         let schema =
-            inline(declared, &dir, registry, 0).map_err(|m| fail(&format!("/{role}"), m))?;
+            inline(&declared, &dir, registry, 0).map_err(|m| fail(&format!("/{role}"), m))?;
         contracts.insert(role, schema);
     }
     let (input, output) = (contracts["input"].clone(), contracts["output"].clone());

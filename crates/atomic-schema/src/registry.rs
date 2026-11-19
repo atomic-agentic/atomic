@@ -207,9 +207,15 @@ impl Registry {
     fn register_inner(
         &mut self,
         file: PathBuf,
-        mut schema: Value,
+        schema: Value,
         depth: usize,
     ) -> Result<String, SchemaError> {
+        // A compact schema is compiled to JSON Schema as it loads.
+        let mut schema =
+            crate::compact::to_json_schema(&schema).map_err(|e| SchemaError::Invalid {
+                id: file.display().to_string(),
+                message: e.to_string(),
+            })?;
         let retrieval = file_uri(&file);
         let captured = schema.clone();
         let id = match schema.get("$id").and_then(Value::as_str) {

@@ -233,3 +233,73 @@ fn a_workspace_member_resolves_shared_schemas_from_anywhere() {
     let error = String::from_utf8_lossy(&output.stderr);
     assert!(error.contains("assessment-v1"), "{error}");
 }
+
+// Example 09's contracts written in the compact form check, and `atomic
+// schemas expand` prints exactly the long forms the example writes by hand.
+#[test]
+fn compact_sidecars_expand_to_the_example_long_forms() {
+    let dir = copy("09-compact-and-variants");
+    let atoms = dir.join("atoms");
+    std::fs::write(
+        atoms.join("label-compact.atom.astro"),
+        "---\nimport type { Props, Input, Output } from '../.atomic/types/label-compact';\n\
+         import type { AtomConfig } from '../.atomic/types/authoring';\n\
+         const { input }: Props = Astro.props;\n\
+         export const config: AtomConfig<Input, Output> = { description: 'Label one ticket.', model: 'basic' };\n\
+         ---\nLabel the ticket.\nSubject: {input.subject}\nBody: {input.body}\n",
+    )
+    .expect("atom");
+    std::fs::write(
+        atoms.join("label-compact.input.schema.yaml"),
+        "subject: string, the ticket's subject line\nbody: string, the customer's message\nplan?: string, the customer's plan when known\n",
+    )
+    .expect("input");
+    std::fs::write(
+        atoms.join("label-compact.output.schema.yaml"),
+        "queue(enum, the team that should handle it): [billing, bugs, account, other]\nurgent: boolean, true when the customer is blocked from working\nreason: string, one sentence that explains the labels\n",
+    )
+    .expect("output");
+    let run = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_atomic"))
+            .args(args)
+            .current_dir(&dir)
+            .env("ATOMIC_HOME", dir.join(".state"))
+            .output()
+            .expect("atomic")
+    };
+    let checked = run(&["check"]);
+    assert!(
+        checked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    // The compact atom and the example's full-schema atom print the same.
+    for atom in ["label-compact", "label-ticket"] {
+        let printed = run(&["schemas", "expand", atom]);
+        assert!(
+            printed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&printed.stderr)
+        );
+        let printed: Value = serde_json::from_slice(&printed.stdout).expect("JSON");
+        for role in ["input", "output"] {
+            let file = dir.join(format!("expanded/label-ticket.{role}.schema.yaml"));
+            let text = std::fs::read_to_string(&file).expect("expanded");
+            let expected = atomic_schema::yaml::load(&file, &text).expect("yaml").value;
+            assert_eq!(printed[role], expected, "{atom} {role}");
+        }
+    }
+    // A compact schema that needs a constraint is refused, with its file.
+    std::fs::write(
+        atoms.join("label-compact.input.schema.yaml"),
+        "subject: string\nwhen: date-time\n",
+    )
+    .expect("input");
+    let refused = run(&["check"]);
+    assert!(!refused.status.success());
+    let error = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        error.contains("label-compact.input.schema.yaml") && error.contains("full JSON Schema"),
+        "{error}"
+    );
+}

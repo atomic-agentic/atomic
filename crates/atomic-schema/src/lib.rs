@@ -6,6 +6,7 @@
 //! validated here against the full schema, whatever subset a provider enforces.
 
 pub mod artifact;
+pub mod compact;
 pub mod expr;
 pub mod lower;
 pub mod registry;
