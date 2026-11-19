@@ -426,7 +426,7 @@ mod tests {
         let account = operator_account(&state, "dev");
         assert!(
             account.starts_with("operator:dev@atomic-credential-"),
-            "{account}"
+            "the account names a different user or project"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
