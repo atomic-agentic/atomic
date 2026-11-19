@@ -35,10 +35,18 @@
 //!   atom and then a codex atom;
 //! - `parked`: a workflow file whose budget has no room for its first model
 //!   call, so it parks.
+//!
+//! The codex atom's command runs under Codex's Linux sandbox, as in
+//! production, so the suite needs bubblewrap and unprivileged user
+//! namespaces and runs with the `sandbox-tests` feature; with the feature on,
+//! a sandbox that cannot start fails it.
 
+#![cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 // Codex's turn futures nest deeply inside the workflow's; proving them Send
 // needs more than the default query depth.
 #![recursion_limit = "512"]
+
+mod support;
 
 use atomic_app::pipeline::{PIPELINE, Pipeline, PipelineRun, Services, prepare, register_pipeline};
 use atomic_app::workflows::{CHANGE_REQUEST, ChangeRequestRun, register_change_request};
@@ -147,11 +155,29 @@ impl Scenario {
         Reply::Text(
             match self.caller(request) {
                 Some("read") => r#"{"title": "Export crashes on accents", "words": 7}"#,
-                // The first answer does not parse, so the atom gets its
-                // repair turn on the same thread, which this answers.
+                // The fix changes code: it appends to a file in its worktree,
+                // so a retry that did not start from the base would show.
+                // Its first answer then does not parse, so the atom gets its
+                // repair turn on the same thread, which the last call
+                // answers.
                 Some("fix") if text.contains(UNFIT) => r#"{"done": true}"#,
-                Some("fix") => UNFIT,
-                Some("summarize") => r#"{"line": "P1: Export crashes on accents"}"#,
+                Some("fix") if text.contains("function_call_output") => UNFIT,
+                Some("fix") => {
+                    return Reply::Tool {
+                        name: "exec_command".into(),
+                        arguments: json!({"cmd": FIX_COMMAND, "yield_time_ms": 10000}),
+                    };
+                }
+                // The summary names the commit it was given, so the result
+                // shows which commit the step after the fix saw.
+                Some("summarize") => {
+                    let commit = text
+                        .split("Commit: ")
+                        .nth(1)
+                        .map(|rest| rest.chars().take_while(char::is_ascii_hexdigit).collect::<String>())
+                        .unwrap_or_default();
+                    return Reply::Text(format!(r#"{{"line": "P1: fixed in {commit}"}}"#));
+                }
                 Some("draft") => {
                     r#"{"title": "Charge for every unit in the cart", "priority": 1, "criteria": ["Two units at 125 cents total 250 cents."]}"#
                 }
@@ -168,8 +194,13 @@ impl Scenario {
     /// agree on.
     fn comparable(self, result: &Value) -> Value {
         match self {
-            // The commit's ID depends on when it was made.
-            Self::Pipeline => json!({"line": result["line"]}),
+            // The commit's ID depends on when it was made; the summary must
+            // name the accepted one.
+            Self::Pipeline => {
+                let commit = result["commit"].as_str().unwrap_or("no commit");
+                let line = result["line"].as_str().unwrap_or_default();
+                json!({"line": line.replace(commit, "<the accepted commit>")})
+            }
             // The published steps carry thread IDs.
             Self::ChangeRequest => json!({"task": result["task"], "verdict": result["verdict"]}),
             Self::Parked => result.clone(),
@@ -180,11 +211,18 @@ impl Scenario {
 /// The fix atom's first answer, which is not JSON.
 const UNFIT: &str = "I fixed the note.";
 
+/// What the fix runs in its worktree: it appends, so it is not idempotent,
+/// and only a worktree reset to its base gives the same file every time.
+const FIX_COMMAND: &str = "printf 'fixed\\n' >> fixed.txt";
+
 fn scratch(tag: &str) -> PathBuf {
+    // Outside the system temporary directory, which the workspace-write
+    // sandbox leaves writable.
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("atomic-crash-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     for sub in [
+        "bin",
         "home",
         "cwd",
         "project/atoms",
@@ -193,6 +231,13 @@ fn scratch(tag: &str) -> PathBuf {
     ] {
         std::fs::create_dir_all(dir.join(sub)).expect("scratch");
     }
+    // Codex runs its Linux sandbox as a helper named codex-linux-sandbox:
+    // atomic's binary under that name.
+    std::os::unix::fs::symlink(
+        env!("CARGO_BIN_EXE_atomic"),
+        dir.join("bin/codex-linux-sandbox"),
+    )
+    .expect("the sandbox helper");
     dir
 }
 
@@ -402,7 +447,10 @@ fn runtimes(dir: &Path, cwd: &Path, base_url: &str) -> Arc<Runtimes> {
     };
     Arc::new(Runtimes {
         codex: CodexRuntime {
-            paths: CodexPaths::without_helpers(),
+            paths: CodexPaths::with_helpers(
+                PathBuf::from(env!("CARGO_BIN_EXE_atomic")),
+                dir.join("bin/codex-linux-sandbox"),
+            ),
             codex_home: dir.join("home"),
             cwd: cwd.to_owned(),
             endpoint: endpoint.clone(),
@@ -692,15 +740,37 @@ async fn setup(scenario: Scenario, tag: &str) -> (PathBuf, String, FakeModel) {
 }
 
 /// What an uninterrupted run of `scenario` does.
+#[derive(Clone)]
 struct Reference {
-    /// The failpoints it reaches, each once, in the order first reached.
+    /// The failpoints it reaches, in order; each is reached once.
     failpoints: Vec<String>,
     /// Its result, as far as runs agree on it.
     result: Value,
+    /// Its model calls, by step.
+    calls: BTreeMap<&'static str, usize>,
+    /// Its ledger attempts (a Codex turn is one, however many requests it
+    /// makes).
+    attempts: usize,
+    /// Each code-changing step's accepted commit, as the paths it changed
+    /// and their contents.
+    commits: BTreeMap<&'static str, BTreeMap<String, String>>,
+}
+
+/// What the accepted commit of `step` changed on `base`: each path, with
+/// its content there.
+fn changes(dir: &Path, base: &str, commit: &str) -> BTreeMap<String, String> {
+    let project = dir.join("project");
+    plain_git(&project, &["diff", "--name-only", base, commit])
+        .lines()
+        .map(|path| {
+            let content = plain_git(&project, &["show", &format!("{commit}:{path}")]);
+            (path.to_owned(), content)
+        })
+        .collect()
 }
 
 async fn reference(scenario: Scenario) -> Reference {
-    let (dir, _, model) = setup(scenario, "reference").await;
+    let (dir, base, model) = setup(scenario, "reference").await;
     let url = model.base_url();
     let d = dir.clone();
     let ended =
@@ -716,16 +786,56 @@ async fn reference(scenario: Scenario) -> Reference {
     );
     let result = written_outcome(&dir)
         .unwrap_or_else(|e| panic!("{}: the uninterrupted run: {e}", scenario.name()));
-    let mut failpoints = Vec::new();
+    // ATOMIC_FAILPOINT stops at the first failpoint of its name, so a name
+    // reached twice would leave its later occurrences untested.
+    let mut failpoints: Vec<String> = Vec::new();
     for name in ended.reached {
-        if !failpoints.contains(&name) {
-            failpoints.push(name);
-        }
+        assert!(
+            !failpoints.contains(&name),
+            "{}: the uninterrupted run reaches {name} more than once; name it per occurrence",
+            scenario.name()
+        );
+        failpoints.push(name);
     }
+    let mut commits = BTreeMap::new();
+    for step in scenario.code_changing() {
+        let commit = result["commit"].as_str().expect("the accepted commit");
+        let changed = changes(&dir, &base, commit);
+        // What the fix's command printed, as Codex reported it to the model.
+        let printed: Vec<String> = model
+            .requests()
+            .iter()
+            .flat_map(|r| r["input"].as_array().cloned().unwrap_or_default())
+            .filter(|item| item["type"] == "function_call_output")
+            .map(|item| item["output"].to_string())
+            .collect();
+        assert_eq!(
+            changed.get("fixed.txt").map(String::as_str),
+            Some("fixed"),
+            "{}: the uninterrupted {step} changed {changed:?}; its command printed {printed:?}",
+            scenario.name()
+        );
+        commits.insert(*step, changed);
+    }
+    let calls = calls(scenario, &model);
+    let rt = Durare::sqlite(&dir.join("atomic.db"))
+        .await
+        .expect("engine");
+    let attempts = rt.ledger().attempts(RUN).await.expect("attempts");
+    assert!(
+        attempts.iter().all(|a| a.state == "settled"),
+        "{}: an uninterrupted run left attempts unsettled: {attempts:?}",
+        scenario.name()
+    );
+    let attempts = attempts.len();
+    drop(rt);
     let _ = std::fs::remove_dir_all(&dir);
     Reference {
         failpoints,
         result: scenario.comparable(&result),
+        calls,
+        attempts,
+        commits,
     }
 }
 
@@ -735,8 +845,9 @@ async fn kill_and_recover(
     scenario: Scenario,
     index: usize,
     failpoint: String,
-    expected: Value,
+    reference: Reference,
 ) -> Vec<String> {
+    let expected = reference.result.clone();
     let (dir, base, model) = setup(scenario, &index.to_string()).await;
     let url = model.base_url();
     let at = format!("{} at {failpoint}", scenario.name());
@@ -753,7 +864,7 @@ async fn kill_and_recover(
     if first.clean
         || !first
             .stderr
-            .contains(&format!("failpoint {failpoint}: aborting"))
+            .contains(&format!("failpoint {failpoint}: killing the process"))
     {
         fail!(
             "the first process was not killed there: it ended {}\n{}",
@@ -821,6 +932,13 @@ async fn kill_and_recover(
     if after.contains_key("unknown") {
         fail!("a model call came from no step: {after:?}");
     }
+    // A step that had not committed ran at most once more.
+    for (step, n) in &after {
+        let once = reference.calls.get(step).copied().unwrap_or(0);
+        if *n > 2 * once {
+            fail!("{step} called the model {n} times; one run calls it {once} times");
+        }
+    }
 
     // The exec command ran once if its step committed, and at most once
     // more otherwise.
@@ -836,14 +954,21 @@ async fn kill_and_recover(
         }
     }
 
-    // One accepted candidate commit per code-changing step, on its base.
+    // One accepted candidate commit per code-changing step, on its base,
+    // changing what an uninterrupted run changes; its worktree is gone.
     for step in scenario.code_changing() {
         let refs = attempt_refs(&dir, step);
         let accepted = result["commit"].as_str().unwrap_or_default();
-        let named: BTreeSet<&str> = refs.iter().map(|(_, c)| c.as_str()).collect();
-        if named.len() != 1 || !named.contains(accepted) {
+        if refs.len() != 1 || refs[0].1 != accepted {
             fail!("{step} left attempt refs {refs:?}, not one for {accepted}");
             continue;
+        }
+        let changed = changes(&dir, &base, accepted);
+        if Some(&changed) != reference.commits.get(step) {
+            fail!(
+                "{step}'s accepted commit changed {changed:?}, not {:?}",
+                reference.commits.get(step)
+            );
         }
         let parent = plain_git(
             &dir.join("project"),
@@ -852,13 +977,51 @@ async fn kill_and_recover(
         if parent != base {
             fail!("{step}'s commit {accepted} is on {parent}, not its base {base}");
         }
+        let left: Vec<_> = std::fs::read_dir(dir.join("state/worktrees"))
+            .map(|d| d.filter_map(|e| e.ok().map(|e| e.file_name())).collect())
+            .unwrap_or_default();
+        if !left.is_empty() {
+            fail!("the finished run left worktrees {left:?}");
+        }
+    }
+
+    // The gate was opened once and approved once. Every metered call the
+    // uninterrupted run made was settled, and those of a step that ran again
+    // at most twice; only the one the kill caught between admission and
+    // settlement may be left unsettled.
+    let rt = Durare::sqlite(&dir.join("atomic.db"))
+        .await
+        .expect("engine");
+    if scenario == Scenario::Pipeline {
+        let filter = GateFilter {
+            open_only: false,
+            run: Some(RUN.to_owned()),
+        };
+        let gates = gate::gates(&rt, filter).await.expect("gates");
+        let approved = gates
+            .iter()
+            .filter(|g| g.resolution.as_ref().is_some_and(|r| r.approved()))
+            .count();
+        if gates.len() != 1 || approved != 1 {
+            fail!(
+                "{} gates, {approved} approved, not one of each",
+                gates.len()
+            );
+        }
+    }
+    let attempts = rt.ledger().attempts(RUN).await.expect("attempts");
+    let unsettled = attempts.iter().filter(|a| a.state != "settled").count();
+    let settled = attempts.len() - unsettled;
+    let once = reference.attempts;
+    if unsettled > 1 || settled < once || attempts.len() > 2 * once {
+        fail!(
+            "{} ledger attempts, {unsettled} unsettled; an uninterrupted run settles {once}",
+            attempts.len()
+        );
     }
 
     // A parked run parked once, and made no model call.
     if scenario == Scenario::Parked {
-        let rt = Durare::sqlite(&dir.join("atomic.db"))
-            .await
-            .expect("engine");
         let n = parks(&rt, RUN).await.expect("parks").len();
         if n != 1 {
             fail!("{n} parks recorded, not one");
@@ -875,6 +1038,7 @@ async fn kill_and_recover(
 
 #[test]
 fn every_failpoint_triggered_in_turn_ends_with_the_workflow_complete() {
+    support::require_sandbox();
     on_codex_runtime(async {
         let mut cases = Vec::new();
         let mut reached = BTreeSet::new();
@@ -882,7 +1046,7 @@ fn every_failpoint_triggered_in_turn_ends_with_the_workflow_complete() {
             let r = reference(scenario).await;
             for name in &r.failpoints {
                 reached.insert(name.clone());
-                cases.push((scenario, name.clone(), r.result.clone()));
+                cases.push((scenario, name.clone(), r.clone()));
             }
         }
 
@@ -915,10 +1079,10 @@ fn every_failpoint_triggered_in_turn_ends_with_the_workflow_complete() {
         let mut failures = Vec::new();
         loop {
             while running.len() < width {
-                let Some((i, (scenario, name, expected))) = pending.next() else {
+                let Some((i, (scenario, name, reference))) = pending.next() else {
                     break;
                 };
-                running.spawn(kill_and_recover(scenario, i, name, expected));
+                running.spawn(kill_and_recover(scenario, i, name, reference));
             }
             match running.join_next().await {
                 Some(done) => failures.extend(done.expect("a case")),

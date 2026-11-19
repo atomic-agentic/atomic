@@ -66,7 +66,7 @@ sandbox)
     check "sandbox suites with no sandbox" \
         "the sandbox tests need Codex's Linux sandbox" \
         --workspace --features "${FEATURES}" \
-        --test sandboxed_commit --test change_request_example
+        --test sandboxed_commit --test change_request_example --test crash
     ;;
 *)
     echo "usage: scripts/backends-check.sh postgres|sandbox" >&2

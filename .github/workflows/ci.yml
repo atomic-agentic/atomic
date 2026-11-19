@@ -226,8 +226,9 @@ jobs:
         run: cargo test --workspace --locked --no-fail-fast --features atomic-agentic-durable/postgres-tests,atomic-agentic/sandbox-tests -- --skip every_failpoint_triggered_in_turn
       # The crash suite: every failpoint, triggered in turn, against real
       # workflows and the scripted fake model; each run killed there must
-      # finish when recovered, with no completed step repeated. The same
-      # features as the step above, so nothing rebuilds. Linux only.
+      # finish when recovered, with no completed step repeated. Its codex atom
+      # runs under the sandbox, hence sandbox-tests. The same features as the
+      # step above, so nothing rebuilds. Linux only.
       - name: Crash suite (Linux)
         if: runner.os == 'Linux'
         run: cargo test --workspace --locked --features atomic-agentic-durable/postgres-tests,atomic-agentic/sandbox-tests --test crash

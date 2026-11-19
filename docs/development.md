@@ -144,26 +144,35 @@ compiled in only with the `failpoints` features of `atomic-agentic-durable` and
 `atomic-agentic-core`, which the `atomic-agentic` package's tests turn on; a
 release build has none. Two variables drive them:
 
-- `ATOMIC_FAILPOINT=<name>` aborts the process at the first failpoint of that
-  name, as if it were killed;
+- `ATOMIC_FAILPOINT=<name>` kills the process (SIGKILL, so no core is dumped)
+  at the first failpoint of that name;
 - `ATOMIC_FAILPOINT_LOG=<file>` appends the name of every failpoint the process
   reaches to `<file>`.
 
 `atomic_durable::failpoints::SITES` lists every site: before and after every
-durable checkpoint, after each model call in an atom's turn, between the steps
-of a commit, and around gates and parks.
+durable checkpoint, at each message wait's record, between a model call's
+admission, its answer and its settlement, between the steps of a commit and of
+a finished run's cleanup, and around gates and parks. A site reached more than
+once in a run names each occurrence, such as
+`usage:before-settle:<request>`. A test reads the source to check that every
+failpoint named there is in `SITES`, and every site is named somewhere.
 
 The crash suite, `crates/atomic/tests/crash.rs`, runs each v0.1 workflow once
 to record the failpoints it passes, then, for each of them, kills a fresh run
 there and recovers it in a new process. Every recovered run must finish with
 the result an uninterrupted run gives, repeat no step whose checkpoint had
-committed, and leave one accepted commit for each code-changing step. Across
-the workflows, every site must be reached. It takes a few minutes; while you
-work on one failpoint, `ATOMIC_TEST_CRASH_ONLY` narrows it:
+committed, and leave one accepted commit for each code-changing step, changing
+what an uninterrupted run's commit changes. Across the workflows, every site
+must be reached, and no name twice in one run. Its code-changing atom runs a
+command under Codex's sandbox, so the suite is behind `sandbox-tests`. It
+takes a few minutes; while you work on one failpoint, `ATOMIC_TEST_CRASH_ONLY`
+narrows it:
 
 ```bash
-scripts/dev.sh cargo test -p atomic-agentic --locked --test crash
-ATOMIC_TEST_CRASH_ONLY=pipeline:after-commit scripts/dev.sh cargo test -p atomic-agentic --locked --test crash
+ATOMIC_DEV_SANDBOX=on scripts/dev.sh cargo test -p atomic-agentic --locked \
+  --features sandbox-tests --test crash
+ATOMIC_DEV_SANDBOX=on ATOMIC_TEST_CRASH_ONLY=pipeline:after-commit scripts/dev.sh \
+  cargo test -p atomic-agentic --locked --features sandbox-tests --test crash
 ```
 
 CI runs it on Linux, in a step of its own.

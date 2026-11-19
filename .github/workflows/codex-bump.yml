@@ -124,7 +124,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            build-essential pkg-config libcap-dev libssl-dev libdbus-1-dev
+            build-essential pkg-config libcap-dev libssl-dev libdbus-1-dev bubblewrap
+
+      # The crash suite (the M38a row) runs Codex's Linux sandbox, which needs
+      # unprivileged user namespaces.
+      - name: User namespaces for the sandbox
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
       - name: Test Postgres
         run: |
