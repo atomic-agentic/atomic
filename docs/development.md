@@ -115,6 +115,37 @@ ATOMIC_DEV_SANDBOX=on scripts/dev.sh cargo test --workspace --locked \
 
 With the feature on, a sandbox that cannot start fails the tests.
 
+## The crash suite
+
+atomic's crash tests kill the process at named failpoints. A failpoint is
+compiled in only with the `failpoints` features of `atomic-agentic-durable` and
+`atomic-agentic-core`, which the `atomic-agentic` package's tests turn on; a
+release build has none. Two variables drive them:
+
+- `ATOMIC_FAILPOINT=<name>` aborts the process at the first failpoint of that
+  name, as if it were killed;
+- `ATOMIC_FAILPOINT_LOG=<file>` appends the name of every failpoint the process
+  reaches to `<file>`.
+
+`atomic_durable::failpoints::SITES` lists every site: before and after every
+durable checkpoint, after each model call in an atom's turn, between the steps
+of a commit, and around gates and parks.
+
+The crash suite, `crates/atomic/tests/crash.rs`, runs each v0.1 workflow once
+to record the failpoints it passes, then, for each of them, kills a fresh run
+there and recovers it in a new process. Every recovered run must finish with
+the result an uninterrupted run gives, repeat no step whose checkpoint had
+committed, and leave one accepted commit for each code-changing step. Across
+the workflows, every site must be reached. It takes a few minutes; while you
+work on one failpoint, `ATOMIC_TEST_CRASH_ONLY` narrows it:
+
+```bash
+scripts/dev.sh cargo test -p atomic-agentic --locked --test crash
+ATOMIC_TEST_CRASH_ONLY=pipeline:after-commit scripts/dev.sh cargo test -p atomic-agentic --locked --test crash
+```
+
+CI runs it on Linux, in a step of its own.
+
 ## Releases
 
 A release starts from a tag `v<version>` whose version equals the
