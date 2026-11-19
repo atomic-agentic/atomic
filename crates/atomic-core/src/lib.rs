@@ -17,6 +17,7 @@ pub mod context;
 pub mod evaluation;
 pub mod failure;
 pub mod git;
+pub mod helper_runtime;
 pub mod lite;
 pub mod project;
 pub mod render;
