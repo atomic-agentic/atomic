@@ -7,16 +7,17 @@
 #
 #   scripts/milestone-tests.sh            # table on stdout; exit 1 if any row fails
 #
-# The table is also appended to $GITHUB_STEP_SUMMARY when that is set. When
-# ATOMIC_TEST_DATABASE_URL is set, the rows that include atomic-agentic-durable
-# run its Postgres variants too. Every row runs even when an earlier one fails;
+# The table is also appended to $GITHUB_STEP_SUMMARY when that is set. The
+# rows that include atomic-agentic-durable run its Postgres variants too, so
+# they need the test database in ATOMIC_TEST_DATABASE_URL (scripts/dev.sh
+# starts one); without it those rows fail, naming it, rather than passing with
+# the Postgres variants unrun. Every row runs even when an earlier one fails;
 # the last row runs the whole workspace, so a test no row names still counts.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"
-POSTGRES=""
-[ -n "${ATOMIC_TEST_DATABASE_URL:-}" ] && POSTGRES="--features atomic-agentic-durable/postgres-tests"
+POSTGRES="--features atomic-agentic-durable/postgres-tests"
 
 # milestone | what it covers | cargo test arguments
 ROWS=(

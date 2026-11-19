@@ -231,6 +231,19 @@ jobs:
       - name: Crash suite (Linux)
         if: runner.os == 'Linux'
         run: cargo test --workspace --locked --features atomic-agentic-durable/postgres-tests,atomic-agentic/sandbox-tests --test crash
+      # A suite that cannot reach its backend fails; it never skips. The
+      # Postgres and sandbox suites run once more with their backend missing,
+      # and every one of their tests must fail, naming it. Nothing rebuilds.
+      - name: Suites fail without their backends (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          scripts/backends-check.sh postgres
+          old="$(sysctl -n user.max_user_namespaces)"
+          sudo sysctl -w user.max_user_namespaces=0
+          status=0
+          scripts/backends-check.sh sandbox || status=$?
+          sudo sysctl -w user.max_user_namespaces="${old}"
+          exit "${status}"
       - name: Test (macOS)
         if: runner.os == 'macOS'
         run: cargo test --workspace --locked --no-fail-fast

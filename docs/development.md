@@ -97,7 +97,9 @@ scripts/dev.sh bash -c 'psql "$ATOMIC_TEST_DATABASE_URL"'   # a SQL shell
 Set `ATOMIC_DEV_DB=off` to run a command without starting the database.
 
 A test suite that needs Postgres fails when `ATOMIC_TEST_DATABASE_URL` is not
-set. It never skips silently.
+set, or when the database it names does not answer, with a message naming it.
+It never skips silently. `scripts/backends-check.sh postgres` shows this: it
+runs every Postgres test without the database and requires each to fail so.
 
 ## The sandbox tests
 
@@ -113,7 +115,9 @@ ATOMIC_DEV_SANDBOX=on scripts/dev.sh cargo test --workspace --locked \
   --features atomic-agentic-durable/postgres-tests,atomic-agentic/sandbox-tests
 ```
 
-With the feature on, a sandbox that cannot start fails the tests.
+With the feature on, a sandbox that cannot start fails the tests, each with a
+message saying what the sandbox needs. Run without `ATOMIC_DEV_SANDBOX=on`,
+`scripts/dev.sh scripts/backends-check.sh sandbox` requires exactly that.
 
 ## The crash suite
 

@@ -11,6 +11,8 @@ pub mod gate;
 pub mod publication;
 pub mod runtime;
 pub mod store;
+#[cfg(feature = "postgres-tests")]
+pub mod testing;
 pub mod usage;
 
 pub use failpoints::failpoint;

@@ -25,6 +25,8 @@
 #![recursion_limit = "512"]
 #![allow(clippy::unwrap_used)]
 
+mod support;
+
 use atomic_core::Sandbox;
 use atomic_core::codex::{self, CodexPaths, ModelEndpoint, PrivateState, StateGuard, TurnSpec};
 use atomic_core::git::{Git, Signature};
@@ -75,6 +77,7 @@ fn fixture(tag: &str) -> Fixture {
 }
 
 fn fixture_in(parent: &Path, tag: &str) -> Fixture {
+    support::require_sandbox();
     let dir = parent.join(format!("atomic-sandboxed-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     for sub in ["project", "state", "codex-home", "bin"] {
