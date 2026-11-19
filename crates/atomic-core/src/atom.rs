@@ -6,6 +6,7 @@
 use crate::astro::{self, Program};
 use crate::budget::Budget;
 use atomic_schema::registry::{self, Registry};
+use atomic_schema::typescript;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
@@ -590,11 +591,16 @@ pub fn load(file: &Path, registry: &mut Registry) -> Result<Atom, AtomError> {
     let required: Vec<_> = judge_properties.keys().cloned().collect();
     schemas.insert("Judges".into(), json!({"type":"object","additionalProperties":false,"required":required,"properties":judge_properties}));
     program.contracts = Value::Object(schemas.clone());
+    let generated = declarations_for(
+        &program.root,
+        &file,
+        &parsed["typeImports"],
+        &schemas,
+        registry,
+    )
+    .map_err(|e| fail(1, "types", e))?;
     let declarations = program
-        .invoke_located(
-            "check",
-            json!({"schemas": schemas, "authoring": AUTHORING_DECLARATIONS}),
-        )
+        .invoke_located("check", json!({ "declarations": generated }))
         .map_err(|e| located("types", e))?;
     if let Some(files) = declarations.as_object() {
         for (name, source) in files {
@@ -623,6 +629,81 @@ pub fn load(file: &Path, registry: &mut Registry) -> Result<Atom, AtomError> {
         judges,
         declarations,
     })
+}
+
+/// The declarations an atom's sources are checked against: its own contract
+/// types, the authoring types, and a module for each project schema file its
+/// sources import types from, with the schema files those reference. Sources
+/// import `schemas/change.schema.json`'s types from
+/// `.atomic/types/schemas/change`. Only imported schemas are included, so
+/// editing an unrelated schema leaves the compiled atom unchanged. An import
+/// with no schema file behind it is left for the type checker to report.
+fn declarations_for(
+    root: &Path,
+    file: &Path,
+    type_imports: &Value,
+    schemas: &serde_json::Map<String, Value>,
+    registry: &mut Registry,
+) -> Result<serde_json::Map<String, Value>, String> {
+    let types = root.join(".atomic/types");
+    let stem = file
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_suffix(".atom.astro"))
+        .ok_or("atom file name")?;
+    let mut out = serde_json::Map::new();
+    out.insert(
+        astro::path_text(&types.join(format!("{stem}.d.ts")))?.to_owned(),
+        json!(typescript::atom_declarations(schemas).map_err(|e| e.to_string())?),
+    );
+    out.insert(
+        astro::path_text(&types.join("authoring.d.ts"))?.to_owned(),
+        json!(AUTHORING_DECLARATIONS),
+    );
+    let mut wanted = Vec::new();
+    for import in type_imports
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        let import = import.strip_suffix(".d.ts").unwrap_or(import);
+        let Ok(relative) = Path::new(import).strip_prefix(&types) else {
+            continue;
+        };
+        let Some(name) = relative.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        for extension in ["json", "yaml"] {
+            let schema = root
+                .join(relative)
+                .with_file_name(format!("{name}.schema.{extension}"));
+            if schema.is_file() {
+                registry.load_file(&schema).map_err(|e| e.to_string())?;
+                wanted.push(std::fs::canonicalize(&schema).map_err(|e| e.to_string())?);
+                break;
+            }
+        }
+    }
+    if wanted.is_empty() {
+        return Ok(out);
+    }
+    for (path, text) in
+        typescript::declarations(registry, root, &wanted, true).map_err(|e| e.to_string())?
+    {
+        let key = astro::path_text(&path)?.to_owned();
+        if out.contains_key(&key) {
+            return Err(format!(
+                "{} would replace the atom's generated {}; rename the schema file",
+                path.display(),
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("declarations")
+            ));
+        }
+        out.insert(key, json!(text));
+    }
+    Ok(out)
 }
 
 /// Register an explicitly declared schema and return its id. Errors carry a

@@ -199,7 +199,7 @@ export async function compile(file, options = {}) {
     const defaults = canonical.endsWith('.atom.astro')
       ? { atomic: 1, name: path.basename(canonical, '.atom.astro'), kind: 'lite' }
       : {};
-    const unit = { file: canonical, root, config: { ...defaults }, bindings: [], imports: new Map(), templates: new Map(), nodes: [], intrinsics: new Map(), contracts: new Map() };
+    const unit = { file: canonical, root, config: { ...defaults }, bindings: [], imports: new Map(), templates: new Map(), nodes: [], intrinsics: new Map(), contracts: new Map(), typeImports: [] };
     const missingSources = new Set();
     const contractTypes = new Set();
     const propTypes = new Set();
@@ -230,6 +230,8 @@ export async function compile(file, options = {}) {
           continue;
         }
         if (statement.importClause?.isTypeOnly) {
+          // The host supplies declarations for these, such as generated schema types.
+          if (specifier.startsWith('.')) unit.typeImports.push(path.resolve(path.dirname(canonical), specifier));
           if (path.resolve(path.dirname(canonical), `${specifier}.d.ts`) === `${root}/.atomic/types/${path.basename(canonical, '.atom.astro')}.d.ts`) {
             for (const item of statement.importClause.namedBindings?.elements ?? []) if ((item.propertyName?.text ?? item.name.text) === 'Props') propTypes.add(item.name.text);
           }

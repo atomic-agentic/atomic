@@ -1,0 +1,504 @@
+{
+  "about": "Behaviour of the JSON Schema to TypeScript projection (ported from the authoring compiler's former schemaType in authoring/src/schema-types.mjs, which these cases were confirmed against before it was removed). Each case gives the expected type expression or an error substring. `rust` records a deliberate difference in the Rust generator, with the reason.",
+  "cases": [
+    {
+      "name": "true is unknown",
+      "schema": true,
+      "type": "unknown"
+    },
+    {
+      "name": "false is never",
+      "schema": false,
+      "type": "never"
+    },
+    {
+      "name": "empty schema is unknown",
+      "schema": {},
+      "type": "unknown"
+    },
+    {
+      "name": "string",
+      "schema": {
+        "type": "string"
+      },
+      "type": "string"
+    },
+    {
+      "name": "integer is number",
+      "schema": {
+        "type": "integer"
+      },
+      "type": "number"
+    },
+    {
+      "name": "number",
+      "schema": {
+        "type": "number"
+      },
+      "type": "number"
+    },
+    {
+      "name": "boolean",
+      "schema": {
+        "type": "boolean"
+      },
+      "type": "boolean"
+    },
+    {
+      "name": "null",
+      "schema": {
+        "type": "null"
+      },
+      "type": "null"
+    },
+    {
+      "name": "unknown type name is unknown",
+      "schema": {
+        "type": "decimal"
+      },
+      "type": "unknown"
+    },
+    {
+      "name": "format does not change the type",
+      "schema": {
+        "type": "string",
+        "format": "date-time"
+      },
+      "type": "string"
+    },
+    {
+      "name": "string constraints do not change the type",
+      "schema": {
+        "type": "string",
+        "minLength": 1,
+        "pattern": "^CHG-[0-9]+$"
+      },
+      "type": "string"
+    },
+    {
+      "name": "const string",
+      "schema": {
+        "const": "hold"
+      },
+      "type": "\"hold\""
+    },
+    {
+      "name": "const wins over type",
+      "schema": {
+        "type": "string",
+        "const": "x"
+      },
+      "type": "\"x\""
+    },
+    {
+      "name": "const null",
+      "schema": {
+        "const": null
+      },
+      "type": "null"
+    },
+    {
+      "name": "const object is a literal type",
+      "schema": {
+        "const": {
+          "x": 1
+        }
+      },
+      "type": "{\"x\":1}"
+    },
+    {
+      "name": "enum of strings",
+      "schema": {
+        "enum": [
+          "hold",
+          "review"
+        ]
+      },
+      "type": "\"hold\" | \"review\""
+    },
+    {
+      "name": "enum with a type",
+      "schema": {
+        "type": "string",
+        "enum": [
+          "low",
+          "critical"
+        ]
+      },
+      "type": "\"low\" | \"critical\""
+    },
+    {
+      "name": "mixed enum",
+      "schema": {
+        "enum": [
+          "a",
+          1,
+          true,
+          null
+        ]
+      },
+      "type": "\"a\" | 1 | true | null"
+    },
+    {
+      "name": "empty enum is never",
+      "schema": {
+        "enum": []
+      },
+      "type": "never"
+    },
+    {
+      "name": "closed object with required and optional properties",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "minutes": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "additionalProperties": false
+      },
+      "type": "{ \"id\": string; \"minutes\"?: number; }"
+    },
+    {
+      "name": "open object has an unknown index signature",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        }
+      },
+      "type": "{ \"id\"?: string; [key: string]: unknown; }"
+    },
+    {
+      "name": "additionalProperties schema is still unknown",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": {
+          "type": "string"
+        }
+      },
+      "type": "{ \"id\"?: string; [key: string]: unknown; }"
+    },
+    {
+      "name": "properties without type is an object",
+      "schema": {
+        "properties": {
+          "a": {}
+        },
+        "additionalProperties": false
+      },
+      "type": "{ \"a\"?: unknown; }"
+    },
+    {
+      "name": "object without properties",
+      "schema": {
+        "type": "object"
+      },
+      "type": "{ [key: string]: unknown; }"
+    },
+    {
+      "name": "closed empty object",
+      "schema": {
+        "type": "object",
+        "additionalProperties": false
+      },
+      "type": "{  }"
+    },
+    {
+      "name": "property names are quoted",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "weird key": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "type": "{ \"weird key\"?: string; }"
+    },
+    {
+      "name": "array of strings",
+      "schema": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "type": "Array<string>"
+    },
+    {
+      "name": "array without items",
+      "schema": {
+        "type": "array"
+      },
+      "type": "Array<unknown>"
+    },
+    {
+      "name": "array of closed objects",
+      "schema": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "met": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "met"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "type": "Array<{ \"met\": boolean; }>"
+    },
+    {
+      "name": "nullable primitive through a type array",
+      "schema": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "type": "string | null"
+    },
+    {
+      "name": "nullable object through a type array",
+      "schema": {
+        "type": [
+          "object",
+          "null"
+        ],
+        "properties": {
+          "a": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "type": "{ \"a\"?: string; } | { \"a\"?: string; }",
+      "rust": {
+        "type": "{ \"a\"?: string; } | null",
+        "reason": "JS treats any schema with properties as an object, so the null branch becomes a second object type."
+      }
+    },
+    {
+      "name": "anyOf is a union",
+      "schema": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "integer"
+          }
+        ]
+      },
+      "type": "(string | number)"
+    },
+    {
+      "name": "oneOf is a union",
+      "schema": {
+        "oneOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "type": "(string | null)"
+    },
+    {
+      "name": "allOf is an intersection",
+      "schema": {
+        "allOf": [
+          {
+            "type": "object",
+            "properties": {
+              "a": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "a"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "b": {
+                "type": "string"
+              }
+            }
+          }
+        ]
+      },
+      "type": "({ \"a\": string; [key: string]: unknown; } & { \"b\"?: string; [key: string]: unknown; })"
+    },
+    {
+      "name": "base object with anyOf branches",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "additionalProperties": false,
+        "anyOf": [
+          {
+            "properties": {
+              "a": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "properties": {
+              "b": {
+                "type": "string"
+              }
+            }
+          }
+        ]
+      },
+      "type": "({ \"kind\": string; } & ({ \"a\"?: string; [key: string]: unknown; } | { \"b\"?: string; [key: string]: unknown; }))"
+    },
+    {
+      "name": "anyOf and allOf together",
+      "schema": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "number"
+          }
+        ],
+        "allOf": [
+          {
+            "type": "string"
+          }
+        ]
+      },
+      "type": "(string & number)",
+      "rust": {
+        "type": "((string | number) & (string))",
+        "reason": "JS takes the anyOf branches but joins them with & because allOf is present, and drops allOf's own branches: the union becomes an intersection."
+      }
+    },
+    {
+      "name": "artifact reference is a string",
+      "schema": {
+        "$ref": "atomic:artifact"
+      },
+      "type": "string"
+    },
+    {
+      "name": "other references need resolution",
+      "schema": {
+        "$ref": "#/$defs/Change"
+      },
+      "error": "type generation requires resolved schema references"
+    },
+    {
+      "name": "a non-object schema is invalid",
+      "schema": 3,
+      "error": "invalid schema"
+    },
+    {
+      "name": "deep nesting is bounded",
+      "schema": "DEEP-66",
+      "error": "schema type depth limit exceeded"
+    }
+  ],
+  "atoms": [
+    {
+      "name": "an atom with input, output, empty context, any case and no judges",
+      "schemas": {
+        "Input": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "email"
+          ],
+          "properties": {
+            "email": {
+              "type": "string"
+            },
+            "free_slots": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "start",
+                  "end"
+                ],
+                "properties": {
+                  "start": {
+                    "type": "string",
+                    "format": "date-time"
+                  },
+                  "end": {
+                    "type": "string",
+                    "format": "date-time"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "Output": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "reply"
+          ],
+          "properties": {
+            "reply": {
+              "type": "string"
+            },
+            "tone": {
+              "enum": [
+                "brief",
+                "warm"
+              ]
+            }
+          }
+        },
+        "Context": {
+          "type": "object",
+          "additionalProperties": false
+        },
+        "Case": true,
+        "Judges": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [],
+          "properties": {}
+        }
+      },
+      "declarations": "// Generated from the full runtime contracts. Do not edit.\nexport type Input = { \"email\": string; \"free_slots\"?: Array<{ \"start\": string; \"end\": string; }>; };\nexport type Output = { \"reply\": string; \"tone\"?: \"brief\" | \"warm\"; };\nexport type ContextData = {  };\nexport type Case = unknown;\nexport type Judges = {  };\nexport type Context = Immutable<ContextData>;\nexport type Reply = Output;\nexport type EvalCase = Case;\nexport type Immutable<T> = T extends object ? { readonly [K in keyof T]: Immutable<T[K]> } : T;\nexport interface Props { input: Input; readonly context: Immutable<Context>; }\n"
+    }
+  ]
+}

@@ -544,6 +544,8 @@ def check_decision_dates():
 
 
 def main():
+    # Atom declarations come from this mirror, so it must agree with atomic's.
+    print(f"PASS TypeScript projection mirror: {astro_atoms.check_projection()} cases match atomic's generator")
     total = [0, 0, 0, 0, 0]
     projects = sorted(path for path in EXAMPLES.iterdir() if path.is_dir())
     for project in projects:
