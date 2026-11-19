@@ -327,6 +327,7 @@ fn render(args: RenderArgs) -> anyhow::Result<()> {
             input: &input,
             frontmatter: &atom.frontmatter,
             origin: "external",
+            origins: None,
         },
         snapshot.as_ref(),
         Some(&args.step_id),

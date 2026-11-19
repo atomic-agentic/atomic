@@ -13,7 +13,9 @@ import { captureHelper } from './capture.mjs';
 const denied = new Set(['__proto__', 'prototype', 'constructor']);
 const dataBrand = Symbol('data');
 const isData = (value) => value?.[dataBrand] === true;
-const data = (value, at, origin) => ({ [dataBrand]: true, tag: 'data', value, at, origin });
+// `fields` gives some first-level fields their own origin, such as a
+// workflow's bindings assign; the value as a whole is its least trusted.
+const data = (value, at, origin, fields) => ({ [dataBrand]: true, tag: 'data', value, at, origin, fields });
 const raw = (value) => isData(value) ? value.value : value;
 const fragments = (nodes, scope, slots, unit) => ({ tag: 'fragment', nodes, scope, slots, unit });
 const allowedBinary = new Set(['&&', '||', '??', '===', '!==', '>', '>=', '<', '<=', '+', '-', '*', '/']);
@@ -454,7 +456,7 @@ function property(parent, key) {
   if (denied.has(key)) throw new Error(`forbidden property ${key}`);
   if (value == null) throw new Error(`cannot read property ${key} of missing value`);
   const item = Object.hasOwn(Object(value), key) ? value[key] : undefined;
-  if (isData(parent)) return data(item, `${parent.at}.${key}`, parent.origin);
+  if (isData(parent)) return data(item, `${parent.at}.${key}`, (parent.fields && Object.hasOwn(parent.fields, key)) ? parent.fields[key] : parent.origin);
   if (isData(item) || item === undefined || typeof value !== 'object') return item;
   // For example the length of a mapped list of data.
   const origin = leastTrusted([value]);
@@ -649,9 +651,10 @@ export function aggregateScores(unit, name, scores) {
   return { mean, threshold, passed: mean >= threshold };
 }
 
-export function render(unit, input, { runId, origin = 'external', contextSnapshot, stepId } = {}) {
+export function render(unit, input, { runId, origin = 'external', origins, contextSnapshot, stepId } = {}) {
   assertJson(input);
   if (!['external', 'team', 'agent'].includes(origin)) throw new Error('invalid input origin');
+  if (origins != null && (typeof origins !== 'object' || Array.isArray(origins) || Object.values(origins).some((o) => !Object.hasOwn(trust, o)))) throw new Error('invalid input origins');
   if (contextSnapshot && runId !== undefined && runId !== contextSnapshot.runId) throw new Error('context snapshot run mismatch');
   runId ??= contextSnapshot?.runId ?? 'spike-run';
   const result = { developer: '', user: '', bindings: [] };
@@ -709,7 +712,15 @@ export function render(unit, input, { runId, origin = 'external', contextSnapsho
     }
   }
   if ((unit.requiresContext || unit.bindings.some((binding) => binding.prop === 'context')) && !contextSnapshot) throw new Error('context snapshot required');
-  const props = { input: data(input, 'input', origin) };
+  // Per-field origins, as a workflow's bindings assign them; the input as a
+  // whole is as trusted as its least trusted field.
+  let fields;
+  if (origins && input && typeof input === 'object' && !Array.isArray(input)) {
+    fields = Object.create(null);
+    for (const key of Object.keys(input)) fields[key] = Object.hasOwn(origins, key) ? origins[key] : origin;
+  }
+  const whole = fields ? Object.values(fields).reduce((least, o) => (trust[o] < trust[least] ? o : least), 'team') : origin;
+  const props = { input: data(input, 'input', fields && Object.keys(fields).length ? whole : origin, fields) };
   if (contextSnapshot) props.context = data(contextForStep(contextSnapshot, stepId), 'context', 'team');
   nonce = createHash('sha256').update(JSON.stringify([runId, input, props.context?.value ?? null, unit.config.examples ?? []])).digest('hex');
   run(unit, props, null);

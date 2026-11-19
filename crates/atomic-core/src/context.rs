@@ -425,6 +425,7 @@ Profile: {context.profile}; step: {context.step.id}; input: {input.text}
             input: &input,
             frontmatter: &atom.frontmatter,
             origin: "external",
+            origins: None,
         };
         let result = render::render_with_context(&compiled, &run, Some(&restored), Some("review"))
             .expect("dispatch");

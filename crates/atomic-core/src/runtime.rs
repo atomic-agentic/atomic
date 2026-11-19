@@ -418,6 +418,7 @@ pub async fn run_declarative(
             input,
             frontmatter: &atom.frontmatter,
             origin,
+            origins: None,
         },
         None,
         runtimes,
@@ -475,6 +476,7 @@ pub async fn run_declarative_with_context(
     let render_frontmatter = run.frontmatter.clone();
     let render_run_id = run.run_id.to_owned();
     let render_origin = run.origin.to_owned();
+    let render_origins = run.origins.cloned();
     let render_snapshot = snapshot.cloned();
     let render_step = step_id.map(str::to_owned);
     let render_clock = runtimes.clock.clone();
@@ -486,6 +488,7 @@ pub async fn run_declarative_with_context(
                 input: &render_input,
                 frontmatter: &render_frontmatter,
                 origin: &render_origin,
+                origins: render_origins.as_ref(),
             },
             render_snapshot.as_ref(),
             render_step.as_deref(),

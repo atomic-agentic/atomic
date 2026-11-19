@@ -70,7 +70,7 @@ pub struct WorkflowError {
 const TOP: &[&str] = &[
     "atomic", "name", "version", "input", "output", "steps", "returns", "budget",
 ];
-const STEP: &[&str] = &["atom", "gate", "after", "with", "worktree"];
+const STEP: &[&str] = &["atom", "gate", "after", "with", "origins", "worktree"];
 const GATE: &[&str] = &["title", "show", "timeout", "on_timeout", "approvers"];
 const LATER_STEP: &[&str] = &["foreach", "concurrency", "merge_queue", "review", "retry"];
 
@@ -325,6 +325,34 @@ pub fn load(
                     ));
                 }
             };
+            // Each mapped field's origin, when the workflow lowers it; the
+            // interpreter checks it against the origin its sources allow.
+            match s.get("origins") {
+                None => {}
+                Some(Value::Object(origins)) => {
+                    for (field, origin) in origins {
+                        let op = format!("{sp}/origins/{field}");
+                        if !with.contains_key(field) {
+                            return Err(fail(
+                                &op,
+                                format!("`origins` names `{field}`, which `with` does not map"),
+                            ));
+                        }
+                        if !matches!(origin.as_str(), Some("external" | "agent" | "team")) {
+                            return Err(fail(
+                                &op,
+                                "an origin is `external`, `agent` or `team`".into(),
+                            ));
+                        }
+                    }
+                }
+                Some(_) => {
+                    return Err(fail(
+                        &format!("{sp}/origins"),
+                        "`origins` maps input fields to `external`, `agent` or `team`".into(),
+                    ));
+                }
+            }
             for (field, e) in &with {
                 let wp = format!("{sp}/with/{field}");
                 let Some(field_schema) = fields.get(field) else {

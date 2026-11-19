@@ -104,6 +104,67 @@ impl Expression {
         &self.source
     }
 
+    /// Every name path the expression reads from its roots, such as
+    /// `["steps", "fetch", "output", "city"]`; names bound inside the
+    /// expression (comprehension variables) are left out. A literal reads
+    /// nothing.
+    pub fn references(&self) -> Vec<Vec<String>> {
+        fn visit(e: &IdedExpr, locals: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
+            match &e.expr {
+                Expr::Ident(_) | Expr::Select(_) => {
+                    if let Some((_, root, path)) = path_of(e) {
+                        if !locals.contains(&root) {
+                            let mut names = vec![root];
+                            names.extend(path.into_iter().map(|(_, field)| field));
+                            out.push(names);
+                        }
+                    } else if let Expr::Select(s) = &e.expr {
+                        visit(&s.operand, locals, out);
+                    }
+                }
+                Expr::Call(c) => {
+                    if let Some(t) = &c.target {
+                        visit(t, locals, out);
+                    }
+                    c.args.iter().for_each(|a| visit(a, locals, out));
+                }
+                Expr::Comprehension(c) => {
+                    visit(&c.iter_range, locals, out);
+                    visit(&c.accu_init, locals, out);
+                    let before = locals.len();
+                    locals.push(c.iter_var.clone());
+                    if let Some(v2) = &c.iter_var2 {
+                        locals.push(v2.clone());
+                    }
+                    locals.push(c.accu_var.clone());
+                    visit(&c.loop_cond, locals, out);
+                    visit(&c.loop_step, locals, out);
+                    visit(&c.result, locals, out);
+                    locals.truncate(before);
+                }
+                Expr::List(l) => l.elements.iter().for_each(|x| visit(x, locals, out)),
+                Expr::Map(m) => m.entries.iter().for_each(|entry| match &entry.expr {
+                    EntryExpr::MapEntry(me) => {
+                        visit(&me.key, locals, out);
+                        visit(&me.value, locals, out);
+                    }
+                    EntryExpr::StructField(f) => visit(&f.value, locals, out),
+                }),
+                Expr::Struct(s) => s.entries.iter().for_each(|entry| match &entry.expr {
+                    EntryExpr::MapEntry(me) => {
+                        visit(&me.key, locals, out);
+                        visit(&me.value, locals, out);
+                    }
+                    EntryExpr::StructField(f) => visit(&f.value, locals, out),
+                }),
+                Expr::Literal(_) | Expr::Unspecified => {}
+            }
+        }
+        let mut out = Vec::new();
+        visit(&self.ast, &mut Vec::new(), &mut out);
+        out
+    }
+
     /// Check every name and field path against `scope`.
     pub fn check(&self, scope: &Scope<'_>) -> Result<(), ExprError> {
         let mut locals = Vec::new();

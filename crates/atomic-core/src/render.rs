@@ -31,6 +31,9 @@ pub struct RunInput<'a> {
     pub frontmatter: &'a Value,
     /// Input origin: external, team or agent.
     pub origin: &'a str,
+    /// Origins of individual input fields, overriding `origin` for each, as
+    /// a workflow's bindings assign them.
+    pub origins: Option<&'a std::collections::BTreeMap<String, String>>,
 }
 
 /// Render a checked source graph without reading the source tree.
@@ -74,7 +77,7 @@ pub fn render_clocked(
         .program
         .invoke_clocked(
             "render",
-            json!({"input":run.input,"options":{"runId":run.run_id,"origin":run.origin,"contextSnapshot":snapshot,"stepId":step_id}}),
+            json!({"input":run.input,"options":{"runId":run.run_id,"origin":run.origin,"origins":run.origins,"contextSnapshot":snapshot,"stepId":step_id}}),
             clock.map(|clock| (clock, "render")),
         )
         .map_err(|e| RenderError(e.to_string()))?;

@@ -154,6 +154,7 @@ fn every_v0_1_example_passes_the_real_load_and_check() {
                             input: &input,
                             frontmatter: &atom.frontmatter,
                             origin: "external",
+                            origins: None,
                         },
                     )
                     .unwrap_or_else(|e| panic!("{what}: {e}"));

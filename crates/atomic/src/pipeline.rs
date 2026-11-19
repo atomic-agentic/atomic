@@ -56,7 +56,8 @@ use atomic_core::astro::StepClock;
 use atomic_core::atom::Atom;
 use atomic_core::budget::{Budget, BudgetSettings, Resolved};
 use atomic_core::git::{Git, Signature};
-use atomic_core::runtime::{Runtimes, contained, run_declarative};
+use atomic_core::render::RunInput;
+use atomic_core::runtime::{Runtimes, contained, run_declarative_with_context};
 use atomic_core::workflow::Workflow;
 use atomic_core::worktree::{StepError, StepRequest, Worktrees};
 use atomic_core::{AtomError, compile};
@@ -88,6 +89,46 @@ pub struct AtomStep {
     /// Whether it runs in a worktree of its own, at its mapped `base`.
     #[serde(default)]
     pub worktree: bool,
+    /// Each mapped field's origin: what its sources allow, or lower when the
+    /// workflow says so (see [`origin_of`]).
+    #[serde(default)]
+    pub origins: BTreeMap<String, String>,
+}
+
+/// How far a value may be trusted, least first.
+const TRUST: [&str; 3] = ["external", "agent", "team"];
+
+fn rank(origin: &str) -> usize {
+    TRUST.iter().position(|o| *o == origin).unwrap_or(0)
+}
+
+/// The most a binding's sources allow it to be trusted: the least trusted
+/// of what its CEL expression reads. The workflow's input is external
+/// (nothing yet marks a field of it as coming from trusted configuration); a
+/// model's output is agent; an exec atom's output came from outside code and
+/// is external; a gate's decision came from a person and is team; and a
+/// literal the workflow file writes is team. Every value, team included,
+/// still reaches the model as data, never as instructions.
+fn origin_of(
+    source: &str,
+    kinds: &BTreeMap<String, &str>,
+) -> std::result::Result<&'static str, String> {
+    let parsed = atomic_schema::expr::parse(source).map_err(|e| e.to_string())?;
+    let mut least = "team";
+    for path in parsed.references() {
+        let origin = match (path.first().map(String::as_str), path.get(1)) {
+            (Some("steps"), Some(step)) => match kinds.get(step).copied() {
+                Some("gate") => "team",
+                Some("lite" | "codex") => "agent",
+                _ => "external",
+            },
+            _ => "external",
+        };
+        if rank(origin) < rank(least) {
+            least = origin;
+        }
+    }
+    Ok(least)
 }
 
 /// One gate step, as the interpreter runs it.
@@ -200,6 +241,8 @@ pub fn prepare(
     };
     let definition = &workflow.definition;
     let mut steps = Vec::new();
+    // Each step's kind, for the origin of what it outputs.
+    let mut kinds: BTreeMap<String, &str> = BTreeMap::new();
     let mut used = BTreeMap::new();
     let mut pins = BTreeMap::new();
     pins.insert(workflow.file.display().to_string(), workflow.hash.clone());
@@ -207,6 +250,7 @@ pub fn prepare(
         let step = &definition["steps"][id];
         if let Some(g) = step.get("gate") {
             steps.push(Step::Gate(gate_step(id, g, deployment).map_err(fail)?));
+            kinds.insert(id.clone(), "gate");
             continue;
         }
         let worktree = step.get("worktree").and_then(Value::as_bool) == Some(true);
@@ -241,6 +285,23 @@ pub fn prepare(
                 with.insert(field.clone(), source.to_owned());
             }
         }
+        let mut origins = BTreeMap::new();
+        for (field, source) in &with {
+            let allowed = origin_of(source, &kinds)
+                .map_err(|e| fail(format!("step `{id}`: `with.{field}`: {e}")))?;
+            let declared = step["origins"].get(field).and_then(Value::as_str);
+            let origin = match declared {
+                Some(declared) if rank(declared) > rank(allowed) => {
+                    return Err(fail(format!(
+                        "step `{id}` marks `{field}` as {declared}, but `{source}` is {allowed} \
+                         data at most; a binding may lower an origin, never raise it"
+                    )));
+                }
+                Some(declared) => declared,
+                None => allowed,
+            };
+            origins.insert(field.clone(), origin.to_owned());
+        }
         if worktree && !with.contains_key("base") {
             return Err(fail(format!(
                 "step `{id}` asks for a worktree but maps no `base`, the commit it starts from"
@@ -250,11 +311,13 @@ pub fn prepare(
             pins.insert(source.clone(), sha256(text.as_bytes()));
         }
         used.insert(name.to_owned(), atom.clone());
+        kinds.insert(id.clone(), atom.kind.as_str());
         steps.push(Step::Atom(AtomStep {
             id: id.clone(),
             atom: name.to_owned(),
             with,
             worktree,
+            origins,
         }));
     }
     let returns = definition
@@ -521,6 +584,7 @@ async fn run_pipeline<C: WorkflowContext>(
         } else {
             None
         };
+        let origins = step.origins.clone();
         let (id, ran) = (step.id.clone(), format!("pipeline:ran:{}", step.id));
         let published = run_atom_at(
             &ctx,
@@ -548,12 +612,15 @@ async fn run_pipeline<C: WorkflowContext>(
                 }
                 let proposal = match tree {
                     None => {
-                        propose(async move { run_in(&atom, &atom_input, &run_id, &runtimes).await })
+                        propose(async move {
+                            run_in(&atom, &atom_input, &origins, &run_id, &runtimes).await
+                        })
                             .await
                     }
                     Some((worktrees, request)) => {
                         let runtimes = Arc::new(runtimes);
-                        in_worktree(worktrees, request, atom, atom_input, run_id, runtimes).await
+                        in_worktree(worktrees, request, atom, atom_input, origins, run_id, runtimes)
+                            .await
                     }
                 }?;
                 failpoint(&ran);
@@ -600,21 +667,27 @@ async fn run_pipeline<C: WorkflowContext>(
 async fn run_in(
     atom: &Atom,
     input: &Value,
+    origins: &BTreeMap<String, String>,
     run_id: &str,
     runtimes: &Runtimes,
 ) -> std::result::Result<(Value, atomic_core::runtime::RunMetadata), AtomError> {
     let mut registry = Registry::new();
     let compiled =
         compile::compile(atom, &registry).map_err(|e| AtomError::Runtime(e.to_string()))?;
-    // A workflow's input and every step's output are data the workflow's
-    // caller or a model supplied: untrusted.
-    run_declarative(
+    // Each mapped field carries the origin its binding allows; anything else
+    // is external.
+    run_declarative_with_context(
         atom,
         &compiled,
         &mut registry,
-        input,
-        run_id,
-        "external",
+        &RunInput {
+            run_id,
+            input,
+            frontmatter: &atom.frontmatter,
+            origin: "external",
+            origins: Some(origins),
+        },
+        None,
         runtimes,
     )
     .await
@@ -628,6 +701,7 @@ async fn in_worktree(
     request: StepRequest,
     atom: Atom,
     input: Value,
+    origins: BTreeMap<String, String>,
     run_id: String,
     runtimes: Arc<Runtimes>,
 ) -> Result<Proposal> {
@@ -637,7 +711,7 @@ async fn in_worktree(
             .run_step(request, |tree| async move {
                 let mut here = (*runtimes).clone();
                 here.codex.cwd = tree.join(subdirectory);
-                run_in(&atom, &input, &run_id, &here).await
+                run_in(&atom, &input, &origins, &run_id, &here).await
             })
             .await
             .map_err(|e| match e {
