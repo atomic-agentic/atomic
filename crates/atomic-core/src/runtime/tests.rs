@@ -82,7 +82,11 @@ fn runtime(model: &FakeModel, tag: &str) -> CodexRuntime {
 fn runtimes(model: &FakeModel, tag: &str) -> Runtimes {
     let codex = runtime(model, tag);
     let lite = crate::lite::LiteRuntime::new(codex.endpoint.clone(), AtomConfig::default());
-    Runtimes { codex, lite }
+    Runtimes {
+        codex,
+        lite,
+        clock: None,
+    }
 }
 
 #[test]
@@ -631,11 +635,11 @@ async fn no_declared_validators_need_no_compiler_process() {
         contracts: Value::Null,
         helpers: Default::default(),
     };
-    validate_output(&program, false, json!({}))
+    validate_output(&program, false, json!({}), None)
         .await
         .expect("no worker needed");
     assert!(matches!(
-        validate_output(&program, true, json!({})).await,
+        validate_output(&program, true, json!({}), None).await,
         Err(AtomError::Runtime(_))
     ));
 }

@@ -4,6 +4,11 @@ use serde_json::json;
 use std::time::Instant;
 
 const ENTRY: &str = "atomic-helper:///prepare.js";
+// 2026-11-19T08:30:00.250Z.
+const CLOCK: Clock = Clock {
+    now_ms: 1_795_077_000_250.0,
+    seed: [1, 2, 3, 4],
+};
 const LIB: &str = "atomic-helper:///lib.js";
 
 fn captured(entry: &str, modules: &[(&str, &str)]) -> Captured {
@@ -80,11 +85,11 @@ fn input() -> Value {
 }
 
 fn call(export: &str, args: Value) -> Result<Value, Failure> {
-    invoke(&graph(), export, &args, Limits::default())
+    invoke(&graph(), export, &args, Limits::default(), CLOCK)
 }
 
 fn call_without(export: &str, args: Value, controls: Controls) -> Result<Value, Failure> {
-    invoke_with(&graph(), export, &args, Limits::default(), controls)
+    invoke_with(&graph(), export, &args, Limits::default(), CLOCK, controls)
 }
 
 #[test]
@@ -230,8 +235,8 @@ fn imports_outside_the_capture_and_dynamic_imports_are_refused() {
             r#"import "file:///etc/passwd"; export const prepare = () => 1;"#,
         )],
     );
-    let error =
-        invoke(&escaping, "prepare", &json!([]), Limits::default()).expect_err("the call fails");
+    let error = invoke(&escaping, "prepare", &json!([]), Limits::default(), CLOCK)
+        .expect_err("the call fails");
     assert!(
         matches!(&error, Failure::Refused(text) if text.contains("uncaptured module")),
         "{error:?}"
@@ -298,7 +303,7 @@ fn a_module_that_throws_while_loading_is_reported_and_truncated() {
         )],
     );
     let error =
-        invoke(&loud, "prepare", &json!([]), Limits::default()).expect_err("the call fails");
+        invoke(&loud, "prepare", &json!([]), Limits::default(), CLOCK).expect_err("the call fails");
     let Failure::Threw(text) = &error else {
         panic!("{error:?}");
     };
@@ -317,7 +322,7 @@ fn a_synchronous_loop_is_interrupted_and_the_next_call_succeeds() {
         ..Limits::default()
     };
     assert_eq!(
-        invoke(&graph(), "spin", &json!([]), limits),
+        invoke(&graph(), "spin", &json!([]), limits, CLOCK),
         Err(Failure::Deadline)
     );
     assert!(started.elapsed() < Duration::from_secs(2));
@@ -398,7 +403,7 @@ fn module_state_does_not_survive_between_invocations() {
 #[test]
 fn a_reused_isolate_leaks_module_state() {
     let mut isolate =
-        Isolate::new(&graph(), Limits::default(), Controls::default()).expect("isolate");
+        Isolate::new(&graph(), Limits::default(), CLOCK, Controls::default()).expect("isolate");
     isolate
         .call("remember", &json!(["external secret"]))
         .expect("the call succeeds");
@@ -486,7 +491,7 @@ fn child_process() {
         deadline: Duration::from_millis(250),
         ..Limits::default()
     };
-    let result = invoke_with(&graph(), export, &json!([]), limits, controls);
+    let result = invoke_with(&graph(), export, &json!([]), limits, CLOCK, controls);
     println!("survived: {result:?}");
 }
 
@@ -514,4 +519,183 @@ fn without_the_watchdog_a_loop_never_returns() {
         status.is_none() && !out.contains("survived"),
         "{status:?} {out}"
     );
+}
+
+const CLOCKED: &str = r#"
+export const time = () => ({
+  now: Date.now(), made: new Date().toISOString(), called: Date(),
+  local: new Date(2026, 0, 2, 3, 4, 5).toISOString(), parsed: new Date('2026-01-02T03:04').toISOString(),
+  hours: new Date(0).getHours(), offset: new Date().getTimezoneOffset(), text: new Date(0).toString(),
+});
+export const temporal = () => ({
+  instant: Temporal.Now.instant().epochMilliseconds, zone: Temporal.Now.timeZoneId(),
+  date: Temporal.Now.plainDateISO().toString(),
+});
+export const random = () => [Math.random(), Math.random(), Math.random()];
+export const zone = () => ({
+  format: new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: 'numeric', hour12: false }).format(new Date(0)),
+  resolved: Intl.DateTimeFormat().resolvedOptions().timeZone, locale: Intl.DateTimeFormat().resolvedOptions().locale,
+  local: new Date(0).toLocaleString(), number: (1234567.5).toLocaleString(),
+});
+"#;
+
+fn clocked() -> Captured {
+    captured(ENTRY, &[(ENTRY, CLOCKED)])
+}
+
+fn clocked_call(export: &str, clock: Clock, controls: Controls) -> Value {
+    invoke_with(
+        &clocked(),
+        export,
+        &json!([]),
+        Limits::default(),
+        clock,
+        controls,
+    )
+    .expect("the call succeeds")
+}
+
+#[test]
+fn date_is_the_logical_time_in_utc() {
+    let out = clocked_call("time", CLOCK, Controls::default());
+    assert_eq!(out["now"], 1_795_077_000_250u64);
+    assert_eq!(out["made"], "2026-11-19T08:30:00.250Z");
+    assert_eq!(
+        out["called"],
+        "Thu Nov 19 2026 08:30:00 GMT+0000 (Coordinated Universal Time)"
+    );
+    assert_eq!(out["local"], "2026-01-02T03:04:05.000Z");
+    assert_eq!(out["parsed"], "2026-01-02T03:04:00.000Z");
+    assert_eq!(out["hours"], 0);
+    assert_eq!(out["offset"], 0);
+    assert_eq!(
+        out["text"],
+        "Thu Jan 01 1970 00:00:00 GMT+0000 (Coordinated Universal Time)"
+    );
+}
+
+#[test]
+fn temporal_now_is_the_logical_time_in_utc() {
+    let out = clocked_call("temporal", CLOCK, Controls::default());
+    assert_eq!(
+        out,
+        json!({ "instant": 1_795_077_000_250u64, "zone": "UTC", "date": "2026-11-19" })
+    );
+}
+
+#[test]
+fn math_random_follows_the_seed() {
+    let first = clocked_call("random", CLOCK, Controls::default());
+    assert_eq!(clocked_call("random", CLOCK, Controls::default()), first);
+    let other = Clock {
+        seed: [5, 6, 7, 8],
+        ..CLOCK
+    };
+    assert_ne!(clocked_call("random", other, Controls::default()), first);
+    assert!(
+        first
+            .as_array()
+            .expect("numbers")
+            .iter()
+            .all(|n| (0.0..1.0).contains(&n.as_f64().unwrap_or(-1.0)))
+    );
+}
+
+#[test]
+fn formatting_uses_utc_and_en_us() {
+    let out = clocked_call("zone", CLOCK, Controls::default());
+    assert_eq!(
+        out,
+        json!({ "format": "00:00", "resolved": "UTC", "locale": "en-US", "local": "1/1/1970, 12:00:00 AM", "number": "1,234,567.5" })
+    );
+}
+
+// Control: without the replacement, Date, Temporal.Now and Math.random read
+// the host, so two calls with one clock disagree and the time is not the
+// logical one.
+#[test]
+fn without_the_virtual_clock_helpers_read_the_host() {
+    let controls = Controls {
+        virtual_clock: false,
+        ..Controls::default()
+    };
+    let time = clocked_call("time", CLOCK, controls);
+    assert_ne!(time["now"], 1_795_077_000_250u64);
+    let temporal = clocked_call("temporal", CLOCK, controls);
+    assert_ne!(temporal["instant"], 1_795_077_000_250u64);
+    assert_ne!(
+        clocked_call("random", CLOCK, controls),
+        clocked_call("random", CLOCK, controls)
+    );
+}
+
+// The host's timezone and locale come from the process environment, so they
+// are varied in child processes: with the replacement every zone formats
+// alike; without it, they differ.
+#[test]
+fn the_host_timezone_and_locale_do_not_reach_helpers() {
+    let outputs = |control: &str| -> Vec<String> {
+        ["Asia/Kolkata", "America/Los_Angeles"]
+            .iter()
+            .map(|zone| {
+                let exe = std::env::current_exe().expect("the test binary");
+                let out = std::process::Command::new(exe)
+                    .args([
+                        "--exact",
+                        "helper_runtime::tests::zone_child",
+                        "--include-ignored",
+                        "--nocapture",
+                        "--test-threads=1",
+                    ])
+                    .env(CHILD, control)
+                    .env("TZ", zone)
+                    .env(
+                        "LANG",
+                        if zone.starts_with("Asia") {
+                            "de_DE.UTF-8"
+                        } else {
+                            "en_US.UTF-8"
+                        },
+                    )
+                    .env(
+                        "LC_ALL",
+                        if zone.starts_with("Asia") {
+                            "de_DE.UTF-8"
+                        } else {
+                            "en_US.UTF-8"
+                        },
+                    )
+                    .output()
+                    .expect("the child runs");
+                let text = String::from_utf8_lossy(&out.stdout).into_owned();
+                text.find("zone: ")
+                    .and_then(|at| text[at..].lines().next())
+                    .unwrap_or_default()
+                    .to_owned()
+            })
+            .collect()
+    };
+    let virtual_ = outputs("clock");
+    assert!(virtual_.iter().all(|line| !line.is_empty()), "{virtual_:?}");
+    assert_eq!(virtual_[0], virtual_[1]);
+    let host = outputs("host-clock");
+    assert_ne!(
+        host[0], host[1],
+        "the control shows the host zone reaching helpers"
+    );
+}
+
+#[test]
+#[ignore = "run in a child process by the_host_timezone_and_locale_do_not_reach_helpers"]
+fn zone_child() {
+    let controls = match std::env::var(CHILD).as_deref() {
+        Ok("host-clock") => Controls {
+            virtual_clock: false,
+            ..Controls::default()
+        },
+        _ => Controls::default(),
+    };
+    let zone = clocked_call("zone", CLOCK, controls);
+    let time = clocked_call("time", CLOCK, controls);
+    println!("zone: {zone} {} {}", time["hours"], time["text"]);
 }

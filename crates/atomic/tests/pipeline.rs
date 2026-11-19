@@ -181,6 +181,7 @@ fn runtimes_in(dir: &Path, cwd: &Path, base_url: &str) -> Arc<Runtimes> {
             meter: atomic_core::usage::Metering::none(),
         },
         lite: LiteRuntime::new(endpoint, AtomConfig::default()),
+        clock: None,
     })
 }
 
@@ -614,6 +615,10 @@ fn pipeline_child() {
                     pipeline: load(&project, "sent.workflow.yaml", &sent()),
                     input: json!({"text": "Exporting a file named café.txt crashes the app."}),
                 },
+                "start-stamped" => PipelineRun {
+                    pipeline: load(&project, "stamped.workflow.yaml", STAMPED),
+                    input: json!({"text": "Exporting a file named café.txt crashes the app."}),
+                },
                 "start-gated" => PipelineRun {
                     pipeline: load(&project, "gated.workflow.yaml", &gated()),
                     input: json!({"text": "Exporting a file named café.txt crashes the app."}),
@@ -650,7 +655,20 @@ fn child(
     run: &str,
     failpoint: Option<&str>,
 ) -> std::process::ExitStatus {
+    child_in(dir, url, role, run, failpoint, "UTC")
+}
+
+/// As [`child`], with the child process's timezone set to `zone`.
+fn child_in(
+    dir: &Path,
+    url: &str,
+    role: &str,
+    run: &str,
+    failpoint: Option<&str>,
+    zone: &str,
+) -> std::process::ExitStatus {
     let mut cmd = std::process::Command::new(std::env::current_exe().expect("this test binary"));
+    cmd.env("TZ", zone);
     cmd.args(["--exact", "pipeline_child", "--ignored", "--nocapture"])
         .env(ENV_ROLE, role)
         .env(ENV_RUN, run)
@@ -1442,4 +1460,135 @@ fn a_failed_exec_checkpoint_parks_in_the_same_process() {
 #[test]
 fn a_reopened_engine_in_the_same_process_does_not_repeat_an_exec_effect() {
     on_codex_runtime(failed_exec_checkpoint(true));
+}
+
+/// An atom whose prompt and validator call helpers that read the clock and
+/// randomness: the prompt shows a stamp of both, and the first answer is
+/// accepted only when a seeded coin says so (a later answer always is).
+fn stamped(project: &Path) {
+    let atoms = project.join("atoms");
+    std::fs::create_dir_all(atoms.join("helpers")).expect("helpers");
+    std::fs::write(
+        atoms.join("helpers/clock.ts"),
+        "export const stamp = (label: string): string => `${label} @ ${new Date().toISOString()} #${Math.random()} ${new Date().getHours()}h`;\n\
+         export const coin = (title: string): boolean => title === 'second' || Math.random() < 0.5;\n",
+    )
+    .expect("helper");
+    std::fs::write(
+        atoms.join("stamp-note.atom.astro"),
+        "---\nimport type { Props, Input, Output } from '../.atomic/types/stamp-note';\n\
+         import type { AtomConfig } from '../.atomic/types/authoring';\n\
+         import { stamp, coin } from './helpers/clock';\n\
+         const { input }: Props = Astro.props;\n\
+         export const config: AtomConfig<Input, Output> = { description: 'stamp', validate: [({ output }) => coin(output.title)] };\n\
+         ---\nStamp: {stamp('logical')}\nTitle the note.\nNote: {input.text}\n",
+    )
+    .expect("atom");
+    for (role, schema) in [
+        ("input", object(json!({"text": {"type": "string"}}))),
+        ("output", object(json!({"title": {"type": "string"}}))),
+    ] {
+        std::fs::write(
+            atoms.join(format!("stamp-note.{role}.schema.json")),
+            schema.to_string(),
+        )
+        .expect("schema");
+    }
+}
+
+const STAMPED: &str = "\
+atomic: 1
+name: stamped
+input: { $ref: ../atoms/stamp-note.input.schema.json }
+output: { $ref: ../atoms/stamp-note.output.schema.json }
+steps:
+  stamp:
+    atom: stamp-note
+    with: { text: input.text }
+returns: steps.stamp.output
+";
+
+fn stamped_replies() -> Vec<Reply> {
+    vec![
+        Reply::Text(r#"{"title": "first"}"#.into()),
+        Reply::Text(r#"{"title": "second"}"#.into()),
+    ]
+}
+
+// A step retried after a crash, in another timezone, renders the same prompt
+// and reaches the same validator decisions: its helpers see the clock and
+// seed its own step recorded, not the host's.
+#[test]
+fn a_retried_step_gives_its_helpers_the_clock_it_recorded() {
+    on_codex_runtime(async {
+        let dir = scratch("stamped");
+        let project = project(&dir);
+        stamped(&project);
+
+        // The first process dies after the turn, before its result is saved.
+        let first = FakeModel::start(stamped_replies())
+            .await
+            .expect("fake model");
+        let (d, u) = (dir.clone(), first.base_url());
+        let status = tokio::task::spawn_blocking(move || {
+            child_in(
+                &d,
+                &u,
+                "start-stamped",
+                "stamped-1",
+                Some("pipeline:ran:stamp"),
+                "Asia/Kolkata",
+            )
+        })
+        .await
+        .expect("child");
+        assert!(!status.success(), "the first process was killed: {status}");
+        let asked = first.requests();
+        assert!(!asked.is_empty());
+
+        // A second process, in another timezone, retries the turn.
+        let second = FakeModel::start(stamped_replies())
+            .await
+            .expect("fake model");
+        let (d, u) = (dir.clone(), second.base_url());
+        let status = tokio::task::spawn_blocking(move || {
+            child_in(&d, &u, "recover", "stamped-1", None, "America/Los_Angeles")
+        })
+        .await
+        .expect("child");
+        assert!(status.success(), "the second process finished: {status}");
+        let text = |requests: &[Value]| requests.iter().map(Value::to_string).collect::<Vec<_>>();
+        assert_eq!(
+            text(&second.requests()),
+            text(&asked),
+            "the retry sent the same prompts, and repaired exactly when the first attempt did"
+        );
+        let prompt = asked[0].to_string();
+        assert!(
+            prompt.contains("logical @ 20") && prompt.contains("Z #0."),
+            "{prompt}"
+        );
+
+        // The clock is a step of its own, before the turn.
+        let rt = engine(&dir, &second.base_url()).await;
+        let names: Vec<String> = rt
+            .steps("stamped-1")
+            .await
+            .expect("steps")
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        let clock = names
+            .iter()
+            .position(|n| n == "stamp.clock")
+            .expect("a clock step");
+        let turn = names
+            .iter()
+            .position(|n| n == "stamp.turn")
+            .expect("a turn step");
+        assert!(clock < turn, "{names:?}");
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
 }

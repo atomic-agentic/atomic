@@ -259,7 +259,55 @@ pub fn worker(request: Value) -> Result<Value, String> {
 
 /// As [`worker`], keeping where in the authored source a failure is.
 pub fn worker_located(request: Value) -> Result<Value, Diagnostic> {
-    worker_with(request, &BTreeMap::new())
+    worker_with(request, &BTreeMap::new(), None)
+}
+
+/// The logical time and seed of one durable step, recorded when the step
+/// first starts and reused on every retry of it, so the step's helper calls
+/// see the same clock and randomness each time. Each call's
+/// [`crate::helper_runtime::Clock`] is derived from it, the operation (a
+/// render, a validation round) and the call's position in that operation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepClock {
+    /// Milliseconds since the epoch.
+    pub now_ms: i64,
+    /// 32 random bytes, in hex.
+    pub seed: String,
+}
+
+impl StepClock {
+    /// The current time and a fresh seed: what a step records, and what an
+    /// operation outside a durable step (a preview, a check) uses.
+    pub fn fresh() -> Result<Self, String> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_millis();
+        let mut seed = [0u8; 32];
+        getrandom::fill(&mut seed).map_err(|e| e.to_string())?;
+        Ok(Self {
+            now_ms: i64::try_from(now_ms).map_err(|e| e.to_string())?,
+            seed: seed.iter().map(|b| format!("{b:02x}")).collect(),
+        })
+    }
+
+    /// The clock of call `index` within `operation`.
+    pub(crate) fn call(&self, operation: &str, index: usize) -> crate::helper_runtime::Clock {
+        let mut digest = Sha256::new();
+        digest.update(b"atomic-helper-clock-v1\0");
+        digest.update(self.seed.as_bytes());
+        digest.update([0]);
+        digest.update(operation.as_bytes());
+        digest.update([0]);
+        digest.update((index as u64).to_le_bytes());
+        let bytes = digest.finalize();
+        let word =
+            |i: usize| u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
+        crate::helper_runtime::Clock {
+            now_ms: self.now_ms as f64,
+            seed: [word(0), word(4), word(8), word(12)],
+        }
+    }
 }
 
 /// The helper calls one compiler operation may make, together: a render, a
@@ -291,6 +339,7 @@ pub(crate) fn helper_call(
     helpers: &BTreeMap<String, crate::helper_runtime::Captured>,
     left: &mut HelperBudget,
     call: &Value,
+    clock: crate::helper_runtime::Clock,
 ) -> Value {
     use crate::helper_runtime::{Failure, Limits, invoke};
     let failure =
@@ -319,7 +368,7 @@ pub(crate) fn helper_call(
         ..Limits::default()
     };
     let started = std::time::Instant::now();
-    let result = invoke(captured, export, &call["args"], limits);
+    let result = invoke(captured, export, &call["args"], limits, clock);
     left.time = left.time.saturating_sub(started.elapsed());
     match result {
         Ok(value) => {
@@ -346,10 +395,13 @@ pub(crate) fn helper_call(
     }
 }
 
-/// As [`worker_located`], answering the worker's helper calls from `helpers`.
+/// As [`worker_located`], answering the worker's helper calls from `helpers`
+/// with clocks derived from `clock` and the operation; without one, the
+/// operation's calls share the current time and a fresh seed.
 pub(crate) fn worker_with(
     mut request: Value,
     helpers: &BTreeMap<String, crate::helper_runtime::Captured>,
+    clock: Option<(&StepClock, &str)>,
 ) -> Result<Value, Diagnostic> {
     safe_json(&request, 0, &mut 100_000)?;
     let dir = assets()?;
@@ -423,7 +475,7 @@ pub(crate) fn worker_with(
             request["sources"] = json!(sources);
             request["sourcePaths"] = json!(source_paths);
             request["absent"] = json!(absent);
-            let result = worker_with(request.clone(), helpers)?;
+            let result = worker_with(request.clone(), helpers, clock)?;
             if let Some(next) = result.get("needsSources") {
                 targets = serde_json::from_value::<Vec<String>>(next.clone())
                     .map_err(|_| "invalid source discovery response")?;
@@ -442,6 +494,16 @@ pub(crate) fn worker_with(
         return Err("compiler request limit exceeded".into());
     }
     let mut left = HelperBudget::default();
+    let fresh;
+    let (step_clock, operation) = match clock {
+        Some(clock) => clock,
+        None => {
+            fresh = StepClock::fresh()?;
+            (&fresh, request["action"].as_str().unwrap_or("operation"))
+        }
+    };
+    let operation = operation.to_owned();
+    let mut index = 0usize;
     let output = crate::compiler_process::run_interactive(
         &deno(),
         &deno_args(&dir),
@@ -454,7 +516,15 @@ pub(crate) fn worker_with(
         ],
         &bytes,
         crate::compiler_process::TIME_LIMIT,
-        &mut |call: &Value| helper_call(helpers, &mut left, call),
+        &mut |call: &Value| {
+            index += 1;
+            helper_call(
+                helpers,
+                &mut left,
+                call,
+                step_clock.call(&operation, index - 1),
+            )
+        },
     )?;
     let response: Value =
         serde_json::from_slice(&output).map_err(|e| format!("invalid compiler response: {e}"))?;
@@ -481,13 +551,25 @@ impl Program {
     }
 
     /// As [`Program::invoke`], keeping where in the authored source a failure is.
-    pub fn invoke_located(&self, action: &str, mut args: Value) -> Result<Value, Diagnostic> {
+    pub fn invoke_located(&self, action: &str, args: Value) -> Result<Value, Diagnostic> {
+        self.invoke_clocked(action, args, None)
+    }
+
+    /// As [`Program::invoke_located`], with helper calls clocked by a durable
+    /// step's record and named `operation` within it (a render, one round of
+    /// validation), so a retried step sees the same values.
+    pub fn invoke_clocked(
+        &self,
+        action: &str,
+        mut args: Value,
+        clock: Option<(&StepClock, &str)>,
+    ) -> Result<Value, Diagnostic> {
         args["action"] = json!(action);
         args["file"] = json!(path_text(&self.file)?);
         args["root"] = json!(path_text(&self.root)?);
         args["sources"] = json!(self.sources);
         args["sourcePaths"] = json!(self.source_paths);
-        worker_with(args, &self.helpers)
+        worker_with(args, &self.helpers, clock)
     }
 
     /// Invoke on the bounded blocking pool rather than an executor thread.

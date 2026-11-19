@@ -71,6 +71,19 @@ impl Default for Limits {
     }
 }
 
+/// The time and randomness one helper call sees. A durable step records its
+/// logical time and seed when it first starts, and the host derives each
+/// call's clock from that record, so a retried step's helpers see the same
+/// values (see `astro::StepClock`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Clock {
+    /// What `Date.now()` and `Temporal.Now` return, in milliseconds since the
+    /// epoch.
+    pub now_ms: f64,
+    /// The state `Math.random` starts from.
+    pub seed: [u32; 4],
+}
+
 /// Why a helper call produced no result. Every variant is a failure of the
 /// helper, never a value it returned.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -121,6 +134,9 @@ pub(crate) struct Controls {
     pub text_limits: bool,
     /// Terminate the call at its deadline.
     pub watchdog: bool,
+    /// Replace the clock, randomness, timezone and default locale with the
+    /// call's [`Clock`], UTC and `en-US`.
+    pub virtual_clock: bool,
 }
 
 impl Default for Controls {
@@ -131,6 +147,7 @@ impl Default for Controls {
             bounded_array_buffers: true,
             text_limits: true,
             watchdog: true,
+            virtual_clock: true,
         }
     }
 }
@@ -243,6 +260,110 @@ const STRIP: &str = r#"(() => {
 })();
 "#;
 
+// What a helper could otherwise read from the host: the clock (Date,
+// Temporal.Now), randomness (Math.random), and the host's timezone and
+// locale, which ICU reads per process and V8 cannot set per isolate. Each is
+// replaced: time is the call's logical time, Math.random a seeded generator,
+// local time is UTC, and an unspecified locale is en-US. Called with the
+// call's time and the four words of its seed.
+const CLOCK: &str = r#"((now, a, b, c, d) => {
+  const defineProperty = Object.defineProperty, construct = Reflect.construct, freeze = Object.freeze;
+  const define = (target, name, value) => defineProperty(target, name, { value, writable: true, configurable: true, enumerable: false });
+  const LOCALE = 'en-US';
+  const locales = (value) => (value === undefined ? LOCALE : value);
+  const utc = (options) => (options !== undefined && options !== null && typeof options === 'object' && options.timeZone !== undefined)
+    ? options : Object.assign({}, options, { timeZone: 'UTC' });
+
+  // Math.random: sfc32 from the call's seed.
+  let s0 = a >>> 0, s1 = b >>> 0, s2 = c >>> 0, s3 = d >>> 0;
+  const next = () => {
+    const t = (((s0 + s1) | 0) + s3) | 0;
+    s3 = (s3 + 1) | 0; s0 = s1 ^ (s1 >>> 9); s1 = (s2 + (s2 << 3)) | 0;
+    s2 = (s2 << 21) | (s2 >>> 11); s2 = (s2 + t) | 0;
+    return (t >>> 0) / 4294967296;
+  };
+  for (let i = 0; i < 15; i++) next();
+  define(Math, 'random', function random() { return next(); });
+
+  // Date: the logical time, and local time is UTC.
+  const OriginalDate = Date, proto = OriginalDate.prototype, UTC = OriginalDate.UTC, parse = OriginalDate.parse;
+  const isoLocal = /^[+-]?\d{4,6}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?$/;
+  const asUTC = (value) => (typeof value === 'string' && isoLocal.test(value) ? value + 'Z' : value);
+  const VirtualDate = function Date(...args) {
+    if (new.target === undefined) return new VirtualDate().toString();
+    const fields = args.length === 0 ? [now] : args.length === 1 ? [asUTC(args[0])] : [UTC(...args)];
+    return construct(OriginalDate, fields, new.target === VirtualDate ? OriginalDate : new.target);
+  };
+  VirtualDate.prototype = proto;
+  define(VirtualDate, 'now', function now_() { return now; });
+  define(VirtualDate, 'parse', function parse_(text) { return parse(asUTC(text)); });
+  define(VirtualDate, 'UTC', UTC);
+  define(proto, 'constructor', VirtualDate);
+  define(globalThis, 'Date', VirtualDate);
+  for (const name of ['FullYear', 'Month', 'Date', 'Day', 'Hours', 'Minutes', 'Seconds', 'Milliseconds']) {
+    define(proto, 'get' + name, proto['getUTC' + name]);
+    if (name !== 'Day') define(proto, 'set' + name, proto['setUTC' + name]);
+  }
+  define(proto, 'getTimezoneOffset', function getTimezoneOffset() { return 0; });
+  const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  const pad = (n, w = 2) => String(n).padStart(w, '0');
+  const valid = (date) => !Number.isNaN(proto.getTime.call(date));
+  const dateText = (date) => `${days[proto.getUTCDay.call(date)]} ${months[proto.getUTCMonth.call(date)]} ${pad(proto.getUTCDate.call(date))} ${pad(proto.getUTCFullYear.call(date), 4)}`;
+  const timeText = (date) => `${pad(proto.getUTCHours.call(date))}:${pad(proto.getUTCMinutes.call(date))}:${pad(proto.getUTCSeconds.call(date))} GMT+0000 (Coordinated Universal Time)`;
+  define(proto, 'toString', function toString() { return valid(this) ? `${dateText(this)} ${timeText(this)}` : 'Invalid Date'; });
+  define(proto, 'toDateString', function toDateString() { return valid(this) ? dateText(this) : 'Invalid Date'; });
+  define(proto, 'toTimeString', function toTimeString() { return valid(this) ? timeText(this) : 'Invalid Date'; });
+  for (const name of ['toLocaleString', 'toLocaleDateString', 'toLocaleTimeString']) {
+    const original = proto[name];
+    define(proto, name, { [name](l, options) { return original.call(this, locales(l), utc(options)); } }[name]);
+  }
+
+  // Intl: an unspecified locale is en-US, and dates format in UTC.
+  for (const name of ['Collator', 'DateTimeFormat', 'DisplayNames', 'DurationFormat', 'ListFormat', 'NumberFormat', 'PluralRules', 'RelativeTimeFormat', 'Segmenter']) {
+    const Original = Intl[name];
+    if (typeof Original !== 'function') continue;
+    const dates = name === 'DateTimeFormat';
+    const Wrapped = { [name]: function (l, options) {
+      return construct(Original, [locales(l), dates ? utc(options) : options], new.target === undefined || new.target === Wrapped ? Original : new.target);
+    } }[name];
+    Wrapped.prototype = Original.prototype;
+    define(Wrapped, 'supportedLocalesOf', Original.supportedLocalesOf);
+    define(Original.prototype, 'constructor', Wrapped);
+    define(Intl, name, Wrapped);
+  }
+  for (const [target, name, args] of [[Number.prototype, 'toLocaleString', 0], [BigInt.prototype, 'toLocaleString', 0],
+    [String.prototype, 'localeCompare', 1], [String.prototype, 'toLocaleLowerCase', 0], [String.prototype, 'toLocaleUpperCase', 0]]) {
+    const original = target[name];
+    define(target, name, { [name](...given) { given[args] = locales(given[args]); return original.apply(this, given); } }[name]);
+  }
+
+  // Temporal: Now is the logical time in UTC; formatting follows Intl above.
+  if (typeof Temporal === 'object' && Temporal !== null) {
+    const T = Temporal;
+    const instant = () => T.Instant.fromEpochMilliseconds(now);
+    const zoned = (zone = 'UTC') => instant().toZonedDateTimeISO(zone);
+    define(T, 'Now', freeze({
+      instant, timeZoneId: () => 'UTC', zonedDateTimeISO: zoned,
+      plainDateTimeISO: (zone) => zoned(zone).toPlainDateTime(),
+      plainDateISO: (zone) => zoned(zone).toPlainDate(),
+      plainTimeISO: (zone) => zoned(zone).toPlainTime(),
+      [Symbol.toStringTag]: 'Temporal.Now',
+    }));
+    for (const type of ['Instant', 'PlainDate', 'PlainDateTime', 'PlainMonthDay', 'PlainTime', 'PlainYearMonth', 'Duration']) {
+      const target = T[type]?.prototype;
+      if (!target || typeof target.toLocaleString !== 'function') continue;
+      const original = target.toLocaleString, zone = type === 'Instant';
+      define(target, 'toLocaleString', function toLocaleString(l, options) { return original.call(this, locales(l), zone ? utc(options) : options); });
+    }
+    const ZonedProto = T.ZonedDateTime?.prototype;
+    if (ZonedProto) {
+      const original = ZonedProto.toLocaleString;
+      define(ZonedProto, 'toLocaleString', function toLocaleString(l, options) { return original.call(this, locales(l), options); });
+    }
+  }
+})"#;
+
 /// Flags the watchdog and heap callback raise before they terminate a call,
 /// so the failure is reported as the limit it hit.
 #[derive(Default)]
@@ -271,6 +392,7 @@ impl Isolate {
     pub(crate) fn new(
         captured: &Captured,
         limits: Limits,
+        clock: Clock,
         controls: Controls,
     ) -> Result<Self, Failure> {
         let host = |error: &dyn std::fmt::Display| Failure::Host(error.to_string());
@@ -315,6 +437,18 @@ impl Isolate {
         if controls.strip_globals {
             runtime
                 .execute_script("atomic:strip", STRIP)
+                .map_err(|error| host(&error))?;
+        }
+        if controls.virtual_clock {
+            if !clock.now_ms.is_finite() {
+                return Err(Failure::Host("helper clock is not a finite time".into()));
+            }
+            let [a, b, c, d] = clock.seed;
+            runtime
+                .execute_script(
+                    "atomic:clock",
+                    format!("{CLOCK}({:?}, {a}, {b}, {c}, {d});", clock.now_ms),
+                )
                 .map_err(|error| host(&error))?;
         }
         Ok(Self {
@@ -499,8 +633,9 @@ pub fn invoke(
     export: &str,
     args: &Value,
     limits: Limits,
+    clock: Clock,
 ) -> Result<Value, Failure> {
-    invoke_with(captured, export, args, limits, Controls::default())
+    invoke_with(captured, export, args, limits, clock, Controls::default())
 }
 
 pub(crate) fn invoke_with(
@@ -508,11 +643,12 @@ pub(crate) fn invoke_with(
     export: &str,
     args: &Value,
     limits: Limits,
+    clock: Clock,
     controls: Controls,
 ) -> Result<Value, Failure> {
     std::thread::scope(|scope| {
         scope
-            .spawn(|| Isolate::new(captured, limits, controls)?.call(export, args))
+            .spawn(|| Isolate::new(captured, limits, clock, controls)?.call(export, args))
             .join()
             .unwrap_or_else(|_| Err(Failure::Host("helper thread panicked".into())))
     })

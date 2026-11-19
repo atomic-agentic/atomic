@@ -45,6 +45,18 @@ pub fn render_with_context(
     snapshot: Option<&crate::context::ContextSnapshot>,
     step_id: Option<&str>,
 ) -> Result<Rendered, RenderError> {
+    render_clocked(compiled, run, snapshot, step_id, None)
+}
+
+/// As [`render_with_context`], with helper calls clocked by the durable
+/// step's record, so a retried step renders the same prompt.
+pub fn render_clocked(
+    compiled: &Compiled,
+    run: &RunInput<'_>,
+    snapshot: Option<&crate::context::ContextSnapshot>,
+    step_id: Option<&str>,
+    clock: Option<&crate::astro::StepClock>,
+) -> Result<Rendered, RenderError> {
     jsonschema::validator_for(&compiled.program.contracts["Input"])
         .map_err(|e| RenderError(e.to_string()))?
         .validate(run.input)
@@ -58,7 +70,14 @@ pub fn render_with_context(
             .verify_for(&compiled.hash, run.run_id)
             .map_err(RenderError)?;
     }
-    let result = compiled.program.invoke("render", json!({"input":run.input,"options":{"runId":run.run_id,"origin":run.origin,"contextSnapshot":snapshot,"stepId":step_id}})).map_err(RenderError)?;
+    let result = compiled
+        .program
+        .invoke_clocked(
+            "render",
+            json!({"input":run.input,"options":{"runId":run.run_id,"origin":run.origin,"contextSnapshot":snapshot,"stepId":step_id}}),
+            clock.map(|clock| (clock, "render")),
+        )
+        .map_err(|e| RenderError(e.to_string()))?;
     serde_json::from_value(result).map_err(|e| RenderError(e.to_string()))
 }
 

@@ -252,6 +252,9 @@ fn budget_call(helpers: &Atom, left: &mut HelperBudget, text: &str) -> Value {
         &helpers.program.helpers,
         left,
         &json!({ "capture": digest, "export": "label", "args": [text] }),
+        crate::astro::StepClock::fresh()
+            .expect("clock")
+            .call("test", 0),
     )
 }
 

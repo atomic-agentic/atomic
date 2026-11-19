@@ -52,6 +52,7 @@
 use crate::metering::RunBudget;
 use crate::workflows::propose;
 use atomic_core::artifact::{ArtifactStore, LocalStore, Provenance};
+use atomic_core::astro::StepClock;
 use atomic_core::atom::Atom;
 use atomic_core::budget::{Budget, BudgetSettings, Resolved};
 use atomic_core::git::{Git, Signature};
@@ -452,6 +453,18 @@ async fn run_pipeline<C: WorkflowContext>(
             .cloned()
             .ok_or_else(|| failed(format!("step `{}`: no atom `{}`", step.id, step.atom)))?;
         let mut runtimes = (*services.runtimes).clone();
+        // An atom with captured helpers gets its step's logical time and seed
+        // from a step of its own, recorded once and read back on every retry,
+        // so its helpers render the same prompt and reach the same validator
+        // decisions after a crash.
+        if !atom.program.helpers.is_empty() {
+            let clock: StepClock = ctx
+                .step(&format!("{}.clock", step.id), |_| async {
+                    StepClock::fresh().map_err(|e| failed(format!("the step's clock: {e}")))
+                })
+                .await?;
+            runtimes.clock = Some(clock);
+        }
         let run_id = ctx.workflow_id().to_owned();
         let atom_input = Value::Object(mapped);
         let (budget, atom_caps) = (budget.clone(), caps.get(&step.atom).cloned());

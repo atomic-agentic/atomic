@@ -106,6 +106,10 @@ pub struct Runtimes {
     pub codex: CodexRuntime,
     /// For `kind: lite`.
     pub lite: LiteRuntime,
+    /// The durable step's recorded clock, for the atom's helper calls (see
+    /// [`crate::astro::StepClock`]). Without one, each operation's helpers
+    /// see the current time and a fresh seed.
+    pub clock: Option<crate::astro::StepClock>,
 }
 
 /// What a run records beside its output.
@@ -473,8 +477,9 @@ pub async fn run_declarative_with_context(
     let render_origin = run.origin.to_owned();
     let render_snapshot = snapshot.cloned();
     let render_step = step_id.map(str::to_owned);
+    let render_clock = runtimes.clock.clone();
     let rendered = crate::astro::blocking(move || {
-        render::render_with_context(
+        render::render_clocked(
             &render_program,
             &RunInput {
                 run_id: &render_run_id,
@@ -484,6 +489,7 @@ pub async fn run_declarative_with_context(
             },
             render_snapshot.as_ref(),
             render_step.as_deref(),
+            render_clock.as_ref(),
         )
         .map_err(|e| e.to_string())
     })
@@ -496,17 +502,24 @@ pub async fn run_declarative_with_context(
         .validator_for(&contract)
         .map_err(|e| AtomError::Runtime(e.to_string()))?;
 
+    // Each validation round is its own operation within the step's clock.
+    let rounds = std::sync::atomic::AtomicUsize::new(0);
     let check = |output: Value| -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<(), AtomError>> + Send>,
     > {
         let program = compiled.program.clone();
+        let round = rounds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let clock = runtimes
+            .clock
+            .clone()
+            .map(|clock| (clock, format!("validate:{round}")));
         let values = serde_json::json!({"values":{"input":input,"output":output},"options":{"contextSnapshot":snapshot,"stepId":step_id}});
         let has_checks = atom
             .frontmatter
             .get("validate")
             .and_then(Value::as_array)
             .is_some_and(|checks| !checks.is_empty());
-        Box::pin(async move { validate_output(&program, has_checks, values).await })
+        Box::pin(async move { validate_output(&program, has_checks, values, clock).await })
     };
     // As for a typed atom: the atom's own model, then the project's default,
     // then the endpoint's.
@@ -662,7 +675,7 @@ pub async fn run_exec(
         .and_then(Value::as_array)
         .is_some_and(|checks| !checks.is_empty());
     let values = serde_json::json!({"values":{"input":input,"output":output}});
-    validate_output(&compiled.program, has_checks, values).await?;
+    validate_output(&compiled.program, has_checks, values, None).await?;
     Ok((
         output,
         RunMetadata {
@@ -694,11 +707,25 @@ async fn validate_output(
     program: &crate::astro::Program,
     has_checks: bool,
     values: Value,
+    clock: Option<(crate::astro::StepClock, String)>,
 ) -> Result<(), AtomError> {
     if !has_checks {
         return Ok(());
     }
-    validation_result(program.invoke_async("validate", values).await)
+    let program = program.clone();
+    let result = crate::astro::blocking(move || {
+        program
+            .invoke_clocked(
+                "validate",
+                values,
+                clock
+                    .as_ref()
+                    .map(|(clock, operation)| (clock, operation.as_str())),
+            )
+            .map_err(|e| e.to_string())
+    })
+    .await;
+    validation_result(result)
 }
 
 // Only an explicit predicate rejection is repairable. Transport failures and
