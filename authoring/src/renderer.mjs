@@ -122,6 +122,7 @@ function validateExpression(node, unit, locals = null) {
     return;
   }
   if (ts.isObjectLiteralExpression(node)) { for (const [, value] of fields(node)) check(value); return; }
+  if (ts.isTemplateExpression(node)) { for (const span of node.templateSpans) check(span.expression); return; }
   if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && unit.helpers.has(node.expression.text)) {
     if (node.questionDotToken || node.typeArguments?.length) error(unit, node, 'helper calls take plain arguments');
     if (node.arguments.some((arg) => ts.isSpreadElement(arg))) error(unit, node, 'helper calls take plain arguments');
@@ -227,7 +228,7 @@ export async function compile(file, options = {}) {
     const defaults = canonical.endsWith('.atom.astro')
       ? { atomic: 1, name: path.basename(canonical, '.atom.astro'), kind: 'lite' }
       : {};
-    const unit = { file: canonical, root, config: { ...defaults }, bindings: [], imports: new Map(), templates: new Map(), nodes: [], intrinsics: new Map(), contracts: new Map(), typeImports: [], helpers: new Map() };
+    const unit = { file: canonical, root, config: { ...defaults }, bindings: [], imports: new Map(), templates: new Map(), nodes: [], intrinsics: new Map(), contracts: new Map(), typeImports: [], helpers: new Map(), locals: [] };
     const missingSources = new Set();
     const contractTypes = new Set();
     const propTypes = new Set();
@@ -303,8 +304,15 @@ export async function compile(file, options = {}) {
           if (ts.isObjectBindingPattern(declaration.name) && declaration.initializer?.getText(script) === 'Astro.props') {
             if (options.production && canonical.endsWith('.atom.astro') && (!declaration.type || !propTypes.has(declaration.type.getText(script)))) error(unit, null, 'atom props require an explicit generated Props annotation and direct declaration import');
             for (const binding of declaration.name.elements) {
-              if (!ts.isIdentifier(binding.name) || binding.dotDotDotToken || (binding.propertyName && !ts.isIdentifier(binding.propertyName))) error(unit, null, 'only simple prop destructuring is supported');
-              unit.bindings.push({ local: binding.name.text, prop: binding.propertyName?.text ?? binding.name.text, fallback: binding.initializer ? literal(binding.initializer, unit) : undefined });
+              if (binding.dotDotDotToken || (binding.propertyName && !ts.isIdentifier(binding.propertyName))) error(unit, null, 'only plain prop destructuring is supported');
+              // A nested pattern, such as `const { input: { change } } = Astro.props`.
+              if (ts.isObjectBindingPattern(binding.name)) {
+                if (!binding.propertyName) error(unit, null, 'only plain prop destructuring is supported');
+                located(unit, binding, () => bindingNames(binding.name));
+              } else if (!ts.isIdentifier(binding.name)) error(unit, null, 'only plain prop destructuring is supported');
+              const prop = binding.propertyName?.text ?? binding.name.text;
+              if (denied.has(prop)) error(unit, null, 'forbidden destructured property');
+              unit.bindings.push({ local: ts.isIdentifier(binding.name) ? binding.name.text : null, pattern: ts.isIdentifier(binding.name) ? null : binding.name, prop, fallback: binding.initializer ? literal(binding.initializer, unit) : undefined });
             }
           } else if (ts.isIdentifier(declaration.name) && declaration.name.text === 'config' && declaration.initializer) {
             const typed = options.production || (declaration.type && ts.isTypeReferenceNode(declaration.type) && contractTypes.has(declaration.type.typeName.getText()));
@@ -312,7 +320,13 @@ export async function compile(file, options = {}) {
             const overrides = typed ? contractConfig(declaration.initializer, unit) : literal(declaration.initializer, unit);
             if (overrides === null || Array.isArray(overrides) || typeof overrides !== 'object') error(unit, null, 'config must be a plain object');
             unit.config = Object.assign(Object.create(null), defaults, overrides);
-          } else error(unit, null, 'script values must be config or destructured Astro.props');
+          } else if (declaration.initializer && (ts.isIdentifier(declaration.name) || ts.isObjectBindingPattern(declaration.name))) {
+            // An interpreted local, evaluated in order when the component renders.
+            if (declaration.initializer.getText(script) === 'Astro.props') error(unit, null, 'destructure Astro.props in the declaration');
+            located(unit, declaration, () => bindingNames(declaration.name));
+            validateExpression(declaration.initializer, unit);
+            unit.locals.push({ pattern: declaration.name, ast: declaration.initializer });
+          } else error(unit, null, 'script values must be config, destructured Astro.props or const locals');
         }
       } else error(unit, statement, `unsupported script statement: ${ts.SyntaxKind[statement.kind]}; script code is never executed`);
     } catch (cause) { throw relocate(unit, statement, cause); }
@@ -459,6 +473,18 @@ function evaluate(node, scope, unit, slots, budget) {
     return derive(result, [a, b], node);
   }
   if (ts.isConditionalExpression(node)) return evaluate(raw(evaluate(node.condition, scope, unit, slots, budget)) ? node.whenTrue : node.whenFalse, scope, unit, slots, budget);
+  if (ts.isTemplateExpression(node)) {
+    const values = node.templateSpans.map((span) => evaluate(span.expression, scope, unit, slots, budget));
+    let text = node.head.text;
+    node.templateSpans.forEach((span, i) => {
+      const value = raw(values[i]);
+      if (value === undefined) error(unit, span.expression, 'cannot interpolate a missing value into a template literal');
+      if (value !== null && typeof value === 'object') error(unit, span.expression, 'template literals interpolate strings, numbers, booleans and null');
+      text += String(value) + span.literal.text;
+    });
+    // As trusted as its least trusted part; authored literals alone are instructions.
+    return derive(text, values, node);
+  }
   if (ts.isObjectLiteralExpression(node)) {
     const values = fields(node).map(([key, child]) => [key, evaluate(child, scope, unit, slots, budget)]);
     return derive(Object.fromEntries(values.map(([key, value]) => [key, materialize(value)])), values.map(([, value]) => value), node);
@@ -611,7 +637,11 @@ export function render(unit, input, { runId, origin = 'external', contextSnapsho
   function run(component, props, slots) {
     if (++budget.depth > 32) throw new Error('component depth limit exceeded');
     const scope = Object.create(null);
-    for (const binding of component.bindings) { const value = props[binding.prop]; scope[binding.local] = raw(value) === undefined ? binding.fallback : value; }
+    for (const binding of component.bindings) {
+      const value = raw(props[binding.prop]) === undefined ? binding.fallback : props[binding.prop];
+      if (binding.pattern) bind(binding.pattern, value, scope); else scope[binding.local] = value;
+    }
+    for (const local of component.locals) bind(local.pattern, located(component, local.ast, () => evaluate(local.ast, scope, component, slots, budget)), scope);
     walk(component.nodes, scope, component, slots);
     budget.depth--;
   }
