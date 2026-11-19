@@ -16,7 +16,7 @@ await copyFile(`${root}/node_modules/@astrojs/compiler/LICENSE`, `${out}/ASTRO-L
 await copyFile(`${root}/node_modules/source-map-js/LICENSE`, `${out}/SOURCE-MAP-LICENSE`);
 console.log('Built bundled Astro compiler, TypeScript checker and WASM assets.');
 
-const sourceNames = ['src/build-worker.mjs','src/worker.mjs','src/renderer.mjs','src/typecheck.mjs','src/schema-types.mjs','src/platform.mjs','src/context.mjs','src/generate.mjs','src/intrinsics.mjs','authoring.d.ts','package.json','package-lock.json'];
+const sourceNames = ['src/build-worker.mjs','src/worker.mjs','src/renderer.mjs','src/typecheck.mjs','src/platform.mjs','src/context.mjs','src/generate.mjs','src/intrinsics.mjs','authoring.d.ts','package.json','package-lock.json'];
 const hash = async (file) => createHash('sha256').update(await readFile(file)).digest('hex');
 const manifest = { version: 1, sources: {}, assets: {}, dependencies: { '@astrojs/compiler': '4.0.0', typescript: '5.9.3', 'source-map-js': '1.2.2' } };
 for (const name of sourceNames) manifest.sources[`authoring/${name}`] = await hash(`${root}/${name}`);

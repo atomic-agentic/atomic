@@ -81,12 +81,19 @@ try {
     const { verifySnapshot } = await import('./context.mjs');
     result = verifySnapshot(request.snapshot, request.runId);
     if (result.programHash !== request.programHash) throw new Error('context compiled atom version mismatch');
-  } else if (request.action === 'load') result = { config: unit.config, needsContext: unit.requiresContext || unit.bindings.some(binding => binding.prop === 'context'), sources: Object.fromEntries(sources), sourcePaths };
-  else if (request.action === 'check') {
+  } else if (request.action === 'load') {
+    // Type-only imports across the component graph, which the host resolves to declarations.
+    const typeImports = new Set(), seen = new Set();
+    const visit = (item) => { if (seen.has(item)) return; seen.add(item); item.typeImports.forEach((file) => typeImports.add(file)); item.imports.forEach(visit); };
+    visit(unit);
+    result = { config: unit.config, needsContext: unit.requiresContext || unit.bindings.some(binding => binding.prop === 'context'), sources: Object.fromEntries(sources), sourcePaths, typeImports: [...typeImports].sort() };
+  } else if (request.action === 'check') {
+    // The host generates every declaration from the full schemas; the worker only checks.
     const { typecheck } = await import('./typecheck.mjs');
-    const { atomDeclarations } = await import('./schema-types.mjs');
-    const stem = path.basename(request.file, '.atom.astro');
-    const declarations = { [`${request.root}/.atomic/types/${stem}.d.ts`]: atomDeclarations(request.schemas), [`${request.root}/.atomic/types/authoring.d.ts`]: request.authoring };
+    const declarations = request.declarations ?? {};
+    for (const [name, text] of Object.entries(declarations)) {
+      if (!name.startsWith(`${request.root}/.atomic/types/`) || !name.endsWith('.d.ts') || typeof text !== 'string') throw new Error('declarations must be .d.ts text under .atomic/types');
+    }
     await typecheck(Object.fromEntries(sources), declarations, sourcePaths);
     result = declarations;
   } else if (request.action === 'render') result = render(unit, request.input, request.options);

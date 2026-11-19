@@ -87,6 +87,112 @@ def inline(schema, resolver, depth=0):
     return schema
 
 
+# A mirror of atomic's TypeScript projection (atomic_schema::typescript), so this
+# checker needs no Rust build. It is tested against the same cases as the Rust
+# generator (crates/atomic-schema/tests/typescript/projection.json); atomic's own
+# declarations always come from Rust.
+PROJECTION_CASES = ROOT / 'crates/atomic-schema/tests/typescript/projection.json'
+
+
+def _literal(value):
+    return json.dumps(value, separators=(',', ':'), ensure_ascii=False)
+
+
+def schema_type(schema, depth=0):
+    if depth > 64:
+        raise ValueError('schema type depth limit exceeded')
+    if schema is True:
+        return 'unknown'
+    if schema is False:
+        return 'never'
+    if not isinstance(schema, dict):
+        raise ValueError('invalid schema')
+    if 'const' in schema:
+        return _literal(schema['const'])
+    if 'enum' in schema:
+        if not isinstance(schema['enum'], list):
+            raise ValueError('enum must be an array')
+        return ' | '.join(_literal(value) for value in schema['enum']) or 'never'
+    combinators = [('anyOf', ' | '), ('oneOf', ' | '), ('allOf', ' & ')]
+    if any(key in schema for key, _ in combinators):
+        groups = []
+        for key, separator in combinators:
+            if key not in schema:
+                continue
+            if not isinstance(schema[key], list):
+                raise ValueError(f'{key} must be an array')
+            groups.append('(' + separator.join(schema_type(branch, depth + 1) for branch in schema[key]) + ')')
+        combined = groups[0] if len(groups) == 1 else '(' + ' & '.join(groups) + ')'
+        base = {key: value for key, value in schema.items() if key not in ('anyOf', 'oneOf', 'allOf')}
+        return f'({schema_type(base, depth + 1)} & {combined})' if 'type' in base or 'properties' in base else combined
+    if schema.get('$ref') == 'atomic:artifact':
+        return 'string'
+    if isinstance(schema.get('type'), list):
+        return ' | '.join('null' if item == 'null' else schema_type(schema | {'type': item}, depth + 1) for item in schema['type'])
+    if '$ref' in schema:
+        raise ValueError('type generation requires resolved schema references')
+    kind = schema.get('type')
+    if kind == 'object' or 'properties' in schema:
+        required = {key for key in schema.get('required', []) if isinstance(key, str)}
+        properties = schema.get('properties', {})
+        if not isinstance(properties, dict):
+            raise ValueError('properties must be an object')
+        members = [f"{_literal(key)}{'' if key in required else '?'}: {schema_type(value, depth + 1)};" for key, value in properties.items()]
+        if schema.get('additionalProperties') is not False:
+            members.append('[key: string]: unknown;')
+        return '{ ' + ' '.join(members) + ' }'
+    if kind == 'array':
+        if 'prefixItems' not in schema:
+            return f"Array<{schema_type(schema.get('items', True), depth + 1)}>"
+        if not isinstance(schema['prefixItems'], list):
+            raise ValueError('prefixItems must be an array')
+        members = [schema_type(item, depth + 1) for item in schema['prefixItems']]
+        if 'items' not in schema:
+            members.append('...Array<unknown>')
+        elif schema['items'] is not False:
+            members.append(f"...Array<{schema_type(schema['items'], depth + 1)}>")
+        return '[' + ', '.join(members) + ']'
+    return {'string': 'string', 'number': 'number', 'integer': 'number', 'boolean': 'boolean', 'null': 'null'}.get(kind, 'unknown')
+
+
+def atom_declarations(schemas):
+    types = '\n'.join(f"export type {'ContextData' if key == 'Context' else key} = {schema_type(schema)};" for key, schema in schemas.items())
+    return ('// Generated from the full runtime contracts. Do not edit.\n' + types + '\n'
+            'export type Context = Immutable<ContextData>;\n'
+            'export type Reply = Output;\n'
+            'export type EvalCase = Case;\n'
+            'export type Immutable<T> = T extends object ? { readonly [K in keyof T]: Immutable<T[K]> } : T;\n'
+            'export interface Props { input: Input; readonly context: Immutable<Context>; }\n')
+
+
+def check_projection():
+    """The mirror against the Rust generator's cases. Returns the number checked."""
+    document = json.loads(PROJECTION_CASES.read_text())
+    def expand(schema):
+        if isinstance(schema, str) and schema.startswith('DEEP-'):
+            inner = {'type': 'string'}
+            for _ in range(int(schema[5:])):
+                inner = {'type': 'array', 'items': inner}
+            return inner
+        return schema
+    for case in document['cases']:
+        try:
+            result, error = schema_type(expand(case['schema'])), None
+        except ValueError as raised:
+            result, error = None, str(raised)
+        if 'error' in case:
+            if error is None or case['error'] not in error:
+                raise ValueError(f"projection case {case['name']!r}: expected error {case['error']!r}, got {result or error!r}")
+        else:
+            expected = case.get('rust', {}).get('type', case['type'])
+            if result != expected:
+                raise ValueError(f"projection case {case['name']!r}: expected {expected!r}, got {result or error!r}")
+    for case in document['atoms']:
+        if atom_declarations(case['schemas']) != case['declarations']:
+            raise ValueError(f"atom declarations case {case['name']!r} differs")
+    return len(document['cases']) + len(document['atoms'])
+
+
 def check(path, input_schema, output_schema, registry, input_uri, output_uri):
     request, config = load(path)
     schemas = {'Input':inline(input_schema,registry.resolver(input_uri)), 'Output':inline(output_schema,registry.resolver(output_uri)), 'Context':{'type':'object','additionalProperties':False}, 'Case':{}}
@@ -95,7 +201,9 @@ def check(path, input_schema, output_schema, registry, input_uri, output_uri):
     if sidecars:
         import yaml
         schemas['Context'] = inline(yaml.safe_load(sidecars[0].read_text()), registry.resolver(sidecars[0].as_uri()))
-    declarations = invoke(request | {'action':'check','schemas':schemas,'authoring':(ROOT / 'authoring/authoring.d.ts').read_text()})
+    types = Path(request['root']) / '.atomic/types'
+    supplied = {str(types / (path.name.removesuffix('.atom.astro') + '.d.ts')): atom_declarations(schemas), str(types / 'authoring.d.ts'): (ROOT / 'authoring/authoring.d.ts').read_text()}
+    declarations = invoke(request | {'action':'check','declarations':supplied})
     for name, text in declarations.items():
         target = Path(name)
         target.parent.mkdir(parents=True,exist_ok=True)

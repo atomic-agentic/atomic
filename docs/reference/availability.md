@@ -28,7 +28,8 @@ shared-schema resolution belong to M11b/M39b in v0.5.
 
 Declarative atoms now use Astro exclusively. The production loader supports local
 components, slots, bounded TypeScript-shaped expressions and typed validators.
-`atomic check` checks source and generates editor types; `atomic render` previews
+`atomic check` checks source and generates editor types, including
+[types from shared schema files](atom-files.md#types-from-shared-schema-files); `atomic render` previews
 prompts without a model. Markdown and MDX atom frontends have been removed.
 The Astro compiler and full JSON Schema gates execute in this repository; broader
 workflow scheduling, interactive commands and integrations retain their staged status.

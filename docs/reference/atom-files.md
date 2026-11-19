@@ -72,6 +72,34 @@ These files are disposable editor artifacts, not runtime state. The loader check
 the source against fresh in-memory declarations, so stale files cannot bypass
 checking. Stock Astro VS Code support checks the generated `Props` binding.
 
+### Types from shared schema files
+
+An atom or component can import the type of any schema file in the project.
+The import path is the schema's path under `.atomic/types`, without
+`.schema.json` or `.schema.yaml`:
+
+```astro
+---
+import type { Change } from '../../.atomic/types/schemas/change';
+interface Props { change: Change }
+const { change }: Props = Astro.props;
+---
+Change {change.id} ({change.tier})
+```
+
+The schema's own type is named by its `title`, or else its file name
+(`review-packet.schema.json` declares `ReviewPacket`). Each `$defs` entry
+declares a type of its own. A `$ref` to another schema file, or to one of its
+`$defs`, becomes that type, imported from its module, so recursive schemas
+declare recursive types. Descriptions, and constraints TypeScript cannot express
+such as patterns, lengths and formats, appear as doc comments; atomic still
+validates against the full schema.
+
+Only the schemas an atom's sources import, and the schemas those reference, are
+part of the compiled atom, so editing an unrelated schema does not change it. An
+import whose schema file does not exist fails the check. A schema file whose
+declarations would replace an atom's own `.atomic/types/<atom>.d.ts` is an error.
+
 ## Configuration
 
 | Field | Meaning |
