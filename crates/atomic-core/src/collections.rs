@@ -81,6 +81,7 @@ fn default_name(collection: &str, relative: &Path) -> String {
         "atoms" => &[".atom.astro"],
         "workflows" => &[".workflow.yaml"],
         "schemas" => &[".schema.yaml", ".schema.json"],
+        "toolsets" => &[".openapi.yaml", ".openapi.json"],
         _ => &[],
     };
     for s in suffixes {

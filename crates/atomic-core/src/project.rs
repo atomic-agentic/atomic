@@ -50,6 +50,10 @@ pub const DEFAULT_COLLECTIONS: &[(&str, &[&str])] = &[
         &["schemas/**/*.schema.yaml", "schemas/**/*.schema.json"],
     ),
     ("evals", &["evals/**/*.yaml", "evals/**/*.jsonl"]),
+    (
+        "toolsets",
+        &["toolsets/**/*.openapi.yaml", "toolsets/**/*.openapi.json"],
+    ),
 ];
 
 /// A loaded project.

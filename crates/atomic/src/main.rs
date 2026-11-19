@@ -269,10 +269,33 @@ fn check(path: Option<PathBuf>) -> anyhow::Result<()> {
     for source in &files["workflows"] {
         workflow::load(&source.path, &atoms, &mut registry)?;
     }
+    // Each OpenAPI toolset must give tools whose schemas compile.
+    let mut operations = 0;
+    for source in &files["toolsets"] {
+        let text = std::fs::read_to_string(&source.path)?;
+        let spec = if source.path.extension().is_some_and(|e| e == "json") {
+            serde_json::from_str(&text)?
+        } else {
+            atomic_schema::yaml::load(&source.path, &text)?.value
+        };
+        let tools = atomic_schema::openapi::operations(&spec)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", source.path.display()))?;
+        for tool in &tools {
+            for schema in std::iter::once(&tool.input).chain(tool.output.as_ref()) {
+                atomic_schema::registry::Registry::new()
+                    .validator_for(schema)
+                    .map_err(|e| {
+                        anyhow::anyhow!("{}: operation `{}`: {e}", source.path.display(), tool.name)
+                    })?;
+            }
+        }
+        operations += tools.len();
+    }
     println!(
-        "checked {} Astro atoms and {} workflows",
+        "checked {} Astro atoms, {} workflows and {} toolset operations",
         atoms.len(),
-        files["workflows"].len()
+        files["workflows"].len(),
+        operations
     );
     Ok(())
 }

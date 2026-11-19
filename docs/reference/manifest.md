@@ -25,7 +25,7 @@ This is a proposed schema, not a manifest verified against a released loader.
 | `collections.workflows` | Workflow globs; conventional `workflows/` and colocated `*.workflow.yaml` | v0.1 YAML; TypeScript v1.0 |
 | `collections.schemas` | Shared schema globs, normally `schemas/**/*.schema.{yaml,json}`, with YAML the default; adjacent atom sidecars are discovered separately | v0.1 |
 | `collections.evals` | Case globs, normally `evals/**/*.{yaml,jsonl}`; atom-specific case directories still bind cases to atoms | v0.1 |
-| `collections.toolsets` | Imported OpenAPI specs, normally `toolsets/**/*.openapi.{yaml,json}` | v0.5 |
+| `collections.toolsets` | Imported OpenAPI 3.0 and 3.1 specs, normally `toolsets/**/*.openapi.{yaml,json}`; `atomic check` turns each operation into a tool and checks its schemas | Checked; calling operations is v0.5 |
 | `ignore` | Additional ignored paths; `.gitignore` is also respected | v0.1 |
 | `generated` | Collection exclusion for generated cache artifacts; current Astro declarations use fixed project-root `.atomic/types` | Relocating Astro declarations is tracked separately; runtime state is external |
 | `workspace.members` | Member-project directory globs; members share their schemas | Built; shared atoms v0.5 |

@@ -303,3 +303,44 @@ fn compact_sidecars_expand_to_the_example_long_forms() {
         "{error}"
     );
 }
+
+// OpenAPI toolsets under toolsets/ are checked with the project: each
+// operation's tool schemas must compile, and a spec atomic cannot read fails
+// the check with its file.
+#[test]
+fn atomic_check_reads_openapi_toolsets() {
+    let dir = copy("01-classify");
+    std::fs::create_dir_all(dir.join("toolsets")).expect("toolsets");
+    std::fs::write(
+        dir.join("toolsets/forecast.openapi.yaml"),
+        "openapi: 3.0.3\ninfo: { title: Forecast, version: '1' }\npaths:\n  /v1/forecast:\n    get:\n      operationId: getForecast\n      parameters:\n        - { name: latitude, in: query, required: true, schema: { type: number, nullable: true } }\n      responses:\n        '200':\n          description: ok\n          content:\n            application/json:\n              schema: { type: object, properties: { temperature_2m: { type: number } } }\n",
+    )
+    .expect("spec");
+    let check = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_atomic"))
+            .arg("check")
+            .current_dir(&dir)
+            .env("ATOMIC_HOME", dir.join(".state"))
+            .output()
+            .expect("atomic check")
+    };
+    let output = check();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 toolset operations"));
+    std::fs::write(
+        dir.join("toolsets/broken.openapi.yaml"),
+        "swagger: '2.0'\npaths: {}\n",
+    )
+    .expect("spec");
+    let output = check();
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains("broken.openapi.yaml") && error.contains("Swagger 2.0"),
+        "{error}"
+    );
+}
