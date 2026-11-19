@@ -1,0 +1,10 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["change", "policy", "evidence"],
+  "properties": {
+    "change": { "$ref": "../schemas/change.schema.json" },
+    "policy": { "$ref": "../schemas/policy.schema.json" },
+    "evidence": { "type": "array", "items": { "$ref": "../schemas/evidence.schema.json" } }
+  }
+}

@@ -1,0 +1,11 @@
+---
+import type { Evidence } from '../../.atomic/types/schemas/evidence';
+interface Props { item: Evidence }
+const { item }: Props = Astro.props;
+---
+<report>
+ID: {item.id}; category: {item.kind}; reported status: {item.status}
+Source: {item.source}
+{item.text}
+{item.status !== 'passed' ? <Fragment>This report does not demonstrate a successful check.</Fragment> : null}
+</report>

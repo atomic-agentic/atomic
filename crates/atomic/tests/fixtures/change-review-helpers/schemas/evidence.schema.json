@@ -1,0 +1,16 @@
+{
+  "title": "Evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "kind", "status", "source", "text"],
+  "properties": {
+    "id": { "type": "string" },
+    "kind": { "$ref": "#/$defs/Kind" },
+    "status": { "enum": ["passed", "failed", "unknown"] },
+    "source": { "type": "string" },
+    "text": { "type": "string" }
+  },
+  "$defs": {
+    "Kind": { "enum": ["test", "rollback", "security", "observability"] }
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "title": "Policy",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["revision", "required_approvers", "required_evidence", "freeze_active", "rules"],
+  "properties": {
+    "revision": { "type": "string" },
+    "required_approvers": { "type": "array", "items": { "type": "string" } },
+    "required_evidence": { "type": "array", "items": { "$ref": "evidence.schema.json#/$defs/Kind" } },
+    "freeze_active": { "type": "boolean" },
+    "rules": { "type": "array", "items": { "type": "string" } }
+  }
+}

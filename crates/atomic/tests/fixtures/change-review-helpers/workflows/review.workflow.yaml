@@ -1,0 +1,23 @@
+atomic: 1
+name: review
+input:
+  type: object
+  additionalProperties: false
+  required: [change, evidence]
+  properties:
+    change: { $ref: ../schemas/change.schema.json }
+    evidence: { type: array, items: { $ref: ../schemas/evidence.schema.json } }
+output: { $ref: ../atoms/assess-change-split.output.schema.json }
+steps:
+  assess:
+    atom: assess-change-split
+    with:
+      change: input.change
+      evidence: input.evidence
+      policy: >-
+        {'revision': 'production-change-v3',
+         'required_approvers': ['payments-platform', 'database-oncall', 'security-review'],
+         'required_evidence': ['test', 'rollback', 'security', 'observability'],
+         'freeze_active': false,
+         'rules': ['POLICY-RULE: start in one region with at most five percent of instances.']}
+returns: steps.assess.output

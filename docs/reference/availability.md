@@ -23,12 +23,17 @@ Slack gate approvals are separate integrations, with Atomic adapters still plann
 
 The first authoring skill, `atomic-create-atom`, is installed today by
 `atomic setup claude` and `atomic setup codex`; the rest of the pack and
-higher-level project generation follow later. Workspace member discovery and
-shared-schema resolution belong to M11b/M39b in v0.5.
+higher-level project generation follow later. Workspace member discovery
+and shared-schema resolution are built; sharing atoms between members belongs
+to M11b/M39b in v0.5.
 
 Declarative atoms now use Astro exclusively. The production loader supports local
-components, slots, bounded TypeScript-shaped expressions and typed validators.
-`atomic check` checks source and generates editor types; `atomic render` previews
+components, named slots with fallback content, frontmatter locals, template
+literals, bounded TypeScript-shaped expressions, typed validators and
+[TypeScript helpers](atom-files.md#typescript-helpers), which run in an
+embedded, capability-free isolate per call with the step's recorded clock.
+`atomic check` checks source and generates editor types, including
+[types from shared schema files](atom-files.md#types-from-shared-schema-files); `atomic render` previews
 prompts without a model. Markdown and MDX atom frontends have been removed.
 The Astro compiler and full JSON Schema gates execute in this repository; broader
 workflow scheduling, interactive commands and integrations retain their staged status.
@@ -49,8 +54,8 @@ follows with code context in v0.7. The committed `atomic.policy.lock`, and
 
 Mermaid diagrams written by hand in docs need nothing from Atomic. The
 [diagram exporters](../guides/diagrams.md) for workflows, the work graph and
-runs, their `--view risk` and `--view cost` views, the stale-diagram check and
-`mermaid` fences in atom instructions are planned for v0.5. Rendering in the web
+runs, their `--view risk` and `--view cost` views and the stale-diagram check are
+planned for v0.5; literal `mermaid` fences in atom instructions are built. Rendering in the web
 console follows at v1.0.
 
 [Recorded decisions](manifest.md#recorded-decisions) in the manifest and the

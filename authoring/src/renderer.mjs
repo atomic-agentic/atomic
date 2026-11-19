@@ -1,19 +1,41 @@
 // SPDX-License-Identifier: Apache-2.0
 // Astro atom frontend. It interprets an allowlisted AST; it never evaluates JS.
+// Calls to imported TypeScript helpers are the one exception: they run in the
+// host's embedded runtime, one fresh capability-free isolate per call, and
+// each result is labelled with the least trusted origin among its arguments.
 import { parse } from '@astrojs/compiler';
 import ts from 'typescript';
 import { readFile, realpath, path, createHash, fileURLToPath } from './platform.mjs';
 import { intrinsics } from './intrinsics.mjs';
 import { contextForStep } from './context.mjs';
+import { captureHelper } from './capture.mjs';
+import { FenceError, literalFences } from './fences.mjs';
 
 const denied = new Set(['__proto__', 'prototype', 'constructor']);
 const dataBrand = Symbol('data');
 const isData = (value) => value?.[dataBrand] === true;
-const data = (value, at, origin) => ({ [dataBrand]: true, tag: 'data', value, at, origin });
+// `fields` gives some first-level fields their own origin, such as a
+// workflow's bindings assign; the value as a whole is its least trusted.
+const data = (value, at, origin, fields) => ({ [dataBrand]: true, tag: 'data', value, at, origin, fields });
 const raw = (value) => isData(value) ? value.value : value;
 const fragments = (nodes, scope, slots, unit) => ({ tag: 'fragment', nodes, scope, slots, unit });
 const allowedBinary = new Set(['&&', '||', '??', '===', '!==', '>', '>=', '<', '<=', '+', '-', '*', '/']);
 const collections = new Set(['map', 'some', 'every', 'filter']);
+
+// A helper call that produced no result: a throw, a limit or a refusal. It is
+// an evaluation error, never a value, so a validator that hits one fails the
+// operation instead of returning false (which would start a repair round).
+export class HelperFailure extends Error {
+  constructor(kind, message, file, line) {
+    super(message);
+    this.kind = kind; this.helperFailure = true;
+    if (file) this.file = file;
+    if (line) this.line = line;
+  }
+}
+// The host's helper runtime: (capture digest, export name, JSON args) => JSON.
+let helperExecutor = null;
+export function setHelperExecutor(executor) { helperExecutor = executor; }
 
 function bindingNames(pattern) {
   if (ts.isIdentifier(pattern)) return [pattern.text];
@@ -103,10 +125,22 @@ function validateExpression(node, unit, locals = null) {
     return;
   }
   if (ts.isObjectLiteralExpression(node)) { for (const [, value] of fields(node)) check(value); return; }
+  if (ts.isTemplateExpression(node)) { for (const span of node.templateSpans) check(span.expression); return; }
+  if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && unit.helpers.has(node.expression.text)) {
+    if (node.questionDotToken || node.typeArguments?.length) error(unit, node, 'helper calls take plain arguments');
+    if (node.arguments.some((arg) => ts.isSpreadElement(arg))) error(unit, node, 'helper calls take plain arguments');
+    if (node.arguments.length > 16) error(unit, node, 'helper calls take at most 16 arguments');
+    node.arguments.forEach(check); return;
+  }
   if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && unit.intrinsics.has(node.expression.text)) {
     const intrinsic = intrinsics.get(unit.intrinsics.get(node.expression.text));
     if (node.arguments.length !== intrinsic.arity) error(unit, node, 'incorrect intrinsic argument count');
     node.arguments.forEach(check); return;
+  }
+  if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression) && node.expression.getText() === 'Astro.slots.has') {
+    if (locals) error(unit, node, 'Astro.slots is for templates, not contracts');
+    if (node.arguments.length !== 1 || !ts.isStringLiteral(node.arguments[0])) error(unit, node, 'Astro.slots.has takes one slot name as a string literal');
+    return;
   }
   if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression) && collections.has(node.expression.name.text)
     && node.arguments.length === 1 && ts.isArrowFunction(node.arguments[0])) {
@@ -181,6 +215,9 @@ function decode(text, unit) {
 export async function compile(file, options = {}) {
   const root = await realpath(options.root ?? path.dirname(file));
   const cache = new Map();
+  // Every helper graph the atom's components import, keyed by capture digest.
+  const captures = new Map();
+  const captureState = { cache: new Map(), modules: 0, bytes: 0 };
   let sourceBytes = 0;
   let componentCount = 0;
   async function load(target, stack = []) {
@@ -193,13 +230,18 @@ export async function compile(file, options = {}) {
     sourceBytes += text.length;
     if (text.length > 262144 || sourceBytes > 1048576) throw new Error('source size limit exceeded');
     if (options.production && /@ts-(?:ignore|nocheck|expect-error)/.test(text)) throw new Error('TypeScript diagnostic suppression is not allowed in atom sources');
-    const parsed = await parse(text, { position: true });
+    let fenced;
+    try { fenced = literalFences(text); } catch (cause) {
+      if (cause instanceof FenceError) throw new AtomDiagnostic(cause.message, canonical, cause.line);
+      throw cause;
+    }
+    const parsed = await parse(fenced, { position: true });
     const parseError = parsed.diagnostics?.find((d) => d.severity === 1);
     if (parseError) throw new AtomDiagnostic(parseError.text ?? 'Astro parse error', canonical, parseError.location?.line);
     const defaults = canonical.endsWith('.atom.astro')
       ? { atomic: 1, name: path.basename(canonical, '.atom.astro'), kind: 'lite' }
       : {};
-    const unit = { file: canonical, root, config: { ...defaults }, bindings: [], imports: new Map(), templates: new Map(), nodes: [], intrinsics: new Map(), contracts: new Map() };
+    const unit = { file: canonical, root, config: { ...defaults }, bindings: [], imports: new Map(), templates: new Map(), nodes: [], intrinsics: new Map(), contracts: new Map(), typeImports: [], helpers: new Map(), locals: [] };
     const missingSources = new Set();
     const contractTypes = new Set();
     const propTypes = new Set();
@@ -230,12 +272,37 @@ export async function compile(file, options = {}) {
           continue;
         }
         if (statement.importClause?.isTypeOnly) {
+          // The host supplies declarations for these, such as generated schema types.
+          if (specifier.startsWith('.')) unit.typeImports.push(path.resolve(path.dirname(canonical), specifier));
           if (path.resolve(path.dirname(canonical), `${specifier}.d.ts`) === `${root}/.atomic/types/${path.basename(canonical, '.atom.astro')}.d.ts`) {
             for (const item of statement.importClause.namedBindings?.elements ?? []) if ((item.propertyName?.text ?? item.name.text) === 'Props') propTypes.add(item.name.text);
           }
           continue;
         }
-        if (!statement.importClause?.name || statement.importClause.namedBindings || !specifier.startsWith('.') || !specifier.endsWith('.astro')) error(unit, null, 'only default imports of local .astro components are supported');
+        const clause = statement.importClause;
+        // Named value imports of a local module are helpers: `./helpers/review`
+        // (as editors resolve it without a tsconfig) or `./helpers/review.ts`.
+        if (specifier.startsWith('.') && !specifier.endsWith('.astro') && clause && !clause.name && clause.namedBindings && ts.isNamedImports(clause.namedBindings)
+          && clause.namedBindings.elements.some((item) => !item.isTypeOnly)) {
+          let captured = null;
+          try {
+            captured = await captureHelper(root, path.resolve(path.dirname(canonical), specifier), { file: canonical, line: lineOf(statement), specifier }, captureState);
+            captures.set(captured.digest, captured);
+            for (const file of captured.typeImports) unit.typeImports.push(file);
+          } catch (cause) {
+            if (!cause.sources) throw cause;
+            // Still being discovered: the names are helpers, so the rest of the
+            // script checks; the missing sources are requested below.
+            for (const source of cause.sources) missingSources.add(source);
+          }
+          for (const item of clause.namedBindings.elements) {
+            if (item.isTypeOnly) continue;
+            if (unit.intrinsics.has(item.name.text) || unit.helpers.has(item.name.text)) error(unit, null, `duplicate helper ${item.name.text}`);
+            unit.helpers.set(item.name.text, { capture: captured?.digest ?? null, name: item.propertyName?.text ?? item.name.text, module: specifier });
+          }
+          continue;
+        }
+        if (!statement.importClause?.name || statement.importClause.namedBindings || !specifier.startsWith('.') || !specifier.endsWith('.astro')) error(unit, null, 'only default imports of local .astro components and named imports of local .ts helpers are supported');
         try {
           const imported = await load(path.resolve(path.dirname(canonical), specifier), [...stack, canonical]);
           unit.imports.set(statement.importClause.name.text, imported);
@@ -250,8 +317,15 @@ export async function compile(file, options = {}) {
           if (ts.isObjectBindingPattern(declaration.name) && declaration.initializer?.getText(script) === 'Astro.props') {
             if (options.production && canonical.endsWith('.atom.astro') && (!declaration.type || !propTypes.has(declaration.type.getText(script)))) error(unit, null, 'atom props require an explicit generated Props annotation and direct declaration import');
             for (const binding of declaration.name.elements) {
-              if (!ts.isIdentifier(binding.name) || binding.dotDotDotToken || (binding.propertyName && !ts.isIdentifier(binding.propertyName))) error(unit, null, 'only simple prop destructuring is supported');
-              unit.bindings.push({ local: binding.name.text, prop: binding.propertyName?.text ?? binding.name.text, fallback: binding.initializer ? literal(binding.initializer, unit) : undefined });
+              if (binding.dotDotDotToken || (binding.propertyName && !ts.isIdentifier(binding.propertyName))) error(unit, null, 'only plain prop destructuring is supported');
+              // A nested pattern, such as `const { input: { change } } = Astro.props`.
+              if (ts.isObjectBindingPattern(binding.name)) {
+                if (!binding.propertyName) error(unit, null, 'only plain prop destructuring is supported');
+                located(unit, binding, () => bindingNames(binding.name));
+              } else if (!ts.isIdentifier(binding.name)) error(unit, null, 'only plain prop destructuring is supported');
+              const prop = binding.propertyName?.text ?? binding.name.text;
+              if (denied.has(prop)) error(unit, null, 'forbidden destructured property');
+              unit.bindings.push({ local: ts.isIdentifier(binding.name) ? binding.name.text : null, pattern: ts.isIdentifier(binding.name) ? null : binding.name, prop, fallback: binding.initializer ? literal(binding.initializer, unit) : undefined });
             }
           } else if (ts.isIdentifier(declaration.name) && declaration.name.text === 'config' && declaration.initializer) {
             const typed = options.production || (declaration.type && ts.isTypeReferenceNode(declaration.type) && contractTypes.has(declaration.type.typeName.getText()));
@@ -259,7 +333,13 @@ export async function compile(file, options = {}) {
             const overrides = typed ? contractConfig(declaration.initializer, unit) : literal(declaration.initializer, unit);
             if (overrides === null || Array.isArray(overrides) || typeof overrides !== 'object') error(unit, null, 'config must be a plain object');
             unit.config = Object.assign(Object.create(null), defaults, overrides);
-          } else error(unit, null, 'script values must be config or destructured Astro.props');
+          } else if (declaration.initializer && (ts.isIdentifier(declaration.name) || ts.isObjectBindingPattern(declaration.name))) {
+            // An interpreted local, evaluated in order when the component renders.
+            if (declaration.initializer.getText(script) === 'Astro.props') error(unit, null, 'destructure Astro.props in the declaration');
+            located(unit, declaration, () => bindingNames(declaration.name));
+            validateExpression(declaration.initializer, unit);
+            unit.locals.push({ pattern: declaration.name, ast: declaration.initializer });
+          } else error(unit, null, 'script values must be config, destructured Astro.props or const locals');
         }
       } else error(unit, statement, `unsupported script statement: ${ts.SyntaxKind[statement.kind]}; script code is never executed`);
     } catch (cause) { throw relocate(unit, statement, cause); }
@@ -269,7 +349,9 @@ export async function compile(file, options = {}) {
     // Astro starts an expression's position at the text before its brace; its
     // first child holds the brace's line.
     const authoredLine = (node) => (node.type === 'expression' ? node.children?.find((child) => child.position)?.position.start.line : undefined) ?? node.position?.start?.line;
-    const lowerNodes = (nodes) => nodes.filter((n) => n.type !== 'frontmatter').map((node) => located(unit, { position: { start: { line: authoredLine(node) } } }, () => {
+    // `slotted` nodes are a component's direct children, which may name the
+    // slot they fill with a literal `slot` attribute.
+    const lowerNodes = (nodes, slotted = false) => nodes.filter((n) => n.type !== 'frontmatter').map((node) => located(unit, { position: { start: { line: authoredLine(node) } } }, () => {
       const line = authoredLine(node);
       if (node.type === 'text') return { op: 'text', text: decode(node.value, unit) };
       if (node.type === 'comment') return { op: 'comment' };
@@ -290,20 +372,34 @@ export async function compile(file, options = {}) {
       if (!['element', 'component', 'fragment'].includes(node.type)) error(unit, node, `unsupported template node ${node.type}`);
       if (node.type === 'component' && name !== 'Fragment' && !unit.imports.has(name)) error(unit, node, `unknown component ${name}`);
       if (node.attributes?.some((a) => a.name.includes(':') || !['quoted', 'expression'].includes(a.kind))) error(unit, node, 'directives, spread and shorthand attributes are unsupported');
-      if (node.type === 'element' && name !== 'slot' && node.attributes?.length) error(unit, node, 'literal section attributes are unsupported');
-      if (['slot', 'Fragment'].includes(name) && node.attributes?.length) error(unit, node, 'named slots and Fragment attributes are unsupported');
-      if (name === 'slot' && node.children?.length) error(unit, node, 'slot fallback content is unsupported');
+      const attributes = node.attributes ?? [];
+      const slotAttribute = attributes.find((a) => a.name === 'slot');
+      if (slotAttribute && !slotted) error(unit, node, "the slot attribute names a slot of the enclosing component; use it on a component's direct children");
+      if (slotAttribute && slotAttribute.kind !== 'quoted') error(unit, node, 'slot names are literal strings');
+      const rest = attributes.filter((a) => a !== slotAttribute);
+      let slotName;
+      if (name === 'slot') {
+        // <slot name="x">fallback</slot>; the fallback renders when the slot is absent.
+        const named = rest.find((a) => a.name === 'name');
+        if (rest.some((a) => a.name !== 'name') || (named && named.kind !== 'quoted')) error(unit, node, 'a slot takes a literal name and nothing else');
+        slotName = named ? decode(named.value, unit) : 'default';
+      } else if (node.type === 'element' && rest.length) error(unit, node, 'literal section attributes are unsupported');
+      else if (name === 'Fragment' && rest.length) error(unit, node, 'Fragment takes only a slot attribute');
       return {
         op: name === 'Fragment' ? 'fragment' : name === 'slot' ? 'slot' : node.type === 'component' ? 'component' : 'section',
-        name, children: lowerNodes(node.children ?? []),
-        attrs: (node.attributes ?? []).map((a) => ({ name: a.name, literal: a.kind === 'quoted', value: a.kind === 'quoted' ? decode(a.value, unit) : expression(a.value, unit, a.position?.start?.line ?? line) })),
+        name: name === 'slot' ? slotName : name,
+        fills: slotAttribute ? decode(slotAttribute.value, unit) : undefined,
+        children: lowerNodes(node.children ?? [], node.type === 'component' && name !== 'Fragment'),
+        attrs: (node.type === 'component' ? rest : []).map((a) => ({ name: a.name, literal: a.kind === 'quoted', value: a.kind === 'quoted' ? decode(a.value, unit) : expression(a.value, unit, a.position?.start?.line ?? line) })),
       };
     }));
     unit.nodes = lowerNodes(parsed.ast.children);
     cache.set(canonical, unit);
     return unit;
   }
-  return load(file);
+  const unit = await load(file);
+  unit.captures = captures;
+  return unit;
 }
 
 const trust = { external: 0, agent: 1, team: 2 };
@@ -330,12 +426,45 @@ function derive(result, values, node) {
   const suffix = createHash('sha256').update(identity).digest('hex').slice(0, 16);
   return data(materialize(result), `${origin.at}.expression_${suffix}`, origin.origin);
 }
+// A helper sees only its arguments, so its result is no more trusted than its
+// least trusted argument. A result computed from authored literals alone is
+// authored computation and may supply instructions. The call's position in
+// the render is part of its path: two identical calls can return different
+// values (each call has its own clock and seed), and each keeps its own.
+function labelHelperResult(result, args, node, helper, call) {
+  const origin = leastTrusted(args);
+  if (!origin) return result;
+  const identity = JSON.stringify([helper.module, helper.name, node.getText(), call, args.map((v) => isData(v) ? { path: v.at } : { literal: materialize(v) })]);
+  const suffix = createHash('sha256').update(identity).digest('hex').slice(0, 16);
+  return data(result, `helpers.${helper.name}_${suffix}`, origin.origin);
+}
+// The slots a component call supplies, as Astro defines them. A slot is
+// present when the caller supplied it: a child with `slot="x"`, even an empty
+// Fragment, is explicit content. Default content of only whitespace and
+// comments is absent, and a forwarded slot (`<slot name="y" slot="x" />`, or
+// a bare `<slot />` as default content) is present only when the slot it
+// forwards is, or its fallback has content. Presence is decided from the
+// tree, so `Astro.slots.has` renders nothing and spends no helper budget.
+function slotSet(children, scope, callerSlots, unit) {
+  const nodes = new Map([['default', []]]);
+  for (const child of children) {
+    const name = child.fills ?? 'default';
+    if (!nodes.has(name)) nodes.set(name, []);
+    nodes.get(name).push(child);
+  }
+  const occupied = (list) => list.some((node) => {
+    if (node.op === 'comment' || (node.op === 'text' && !node.text.trim())) return false;
+    if (node.op === 'slot') return Boolean(callerSlots?.has(node.name)) || occupied(node.children);
+    return true;
+  });
+  return { nodes, scope, slots: callerSlots, unit, has: (name) => nodes.has(name) && occupied(nodes.get(name)) };
+}
 function property(parent, key) {
   const value = raw(parent);
   if (denied.has(key)) throw new Error(`forbidden property ${key}`);
   if (value == null) throw new Error(`cannot read property ${key} of missing value`);
   const item = Object.hasOwn(Object(value), key) ? value[key] : undefined;
-  if (isData(parent)) return data(item, `${parent.at}.${key}`, parent.origin);
+  if (isData(parent)) return data(item, `${parent.at}.${key}`, (parent.fields && Object.hasOwn(parent.fields, key)) ? parent.fields[key] : parent.origin);
   if (isData(item) || item === undefined || typeof value !== 'object') return item;
   // For example the length of a mapped list of data.
   const origin = leastTrusted([value]);
@@ -394,9 +523,33 @@ function evaluate(node, scope, unit, slots, budget) {
     return derive(result, [a, b], node);
   }
   if (ts.isConditionalExpression(node)) return evaluate(raw(evaluate(node.condition, scope, unit, slots, budget)) ? node.whenTrue : node.whenFalse, scope, unit, slots, budget);
+  if (ts.isTemplateExpression(node)) {
+    const values = node.templateSpans.map((span) => evaluate(span.expression, scope, unit, slots, budget));
+    let text = node.head.text;
+    node.templateSpans.forEach((span, i) => {
+      const value = raw(values[i]);
+      if (value === undefined) error(unit, span.expression, 'cannot interpolate a missing value into a template literal');
+      if (value !== null && typeof value === 'object') error(unit, span.expression, 'template literals interpolate strings, numbers, booleans and null');
+      text += String(value) + span.literal.text;
+    });
+    // As trusted as its least trusted part; authored literals alone are instructions.
+    return derive(text, values, node);
+  }
   if (ts.isObjectLiteralExpression(node)) {
     const values = fields(node).map(([key, child]) => [key, evaluate(child, scope, unit, slots, budget)]);
     return derive(Object.fromEntries(values.map(([key, value]) => [key, materialize(value)])), values.map(([, value]) => value), node);
+  }
+  if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression) && node.expression.getText() === 'Astro.slots.has') {
+    // Structural: whether the caller supplied the slot, never its rendering.
+    return Boolean(slots?.has(node.arguments[0].text));
+  }
+  if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && unit.helpers.has(node.expression.text)) {
+    const helper = unit.helpers.get(node.expression.text);
+    const args = node.arguments.map((arg) => evaluate(arg, scope, unit, slots, budget));
+    if (!helperExecutor) error(unit, node, 'helper calls need the atomic host');
+    const result = helperExecutor(helper.capture, helper.name, args.map(materialize));
+    budget.helperCalls = (budget.helperCalls ?? 0) + 1;
+    return labelHelperResult(result, args, node, helper, budget.helperCalls);
   }
   if (ts.isCallExpression(node) && ts.isIdentifier(node.expression)) {
     const args = node.arguments.map((arg) => evaluate(arg, scope, unit, slots, budget));
@@ -478,7 +631,10 @@ export function validateOutput(unit, values, options) {
     try {
       passed = invokeContract(unit, contract, values);
       if (typeof passed !== 'boolean') failure = 'validator must return boolean';
-    } catch (cause) { failure = cause.message ?? String(cause); }
+    } catch (cause) {
+      if (cause?.helperFailure) throw cause;
+      failure = cause.message ?? String(cause);
+    }
     return failure === undefined ? { id: contract.id, passed, source: contract.source }
       : { id: contract.id, passed: false, source: contract.source, error: failure };
   });
@@ -504,9 +660,10 @@ export function aggregateScores(unit, name, scores) {
   return { mean, threshold, passed: mean >= threshold };
 }
 
-export function render(unit, input, { runId, origin = 'external', contextSnapshot, stepId } = {}) {
+export function render(unit, input, { runId, origin = 'external', origins, contextSnapshot, stepId } = {}) {
   assertJson(input);
   if (!['external', 'team', 'agent'].includes(origin)) throw new Error('invalid input origin');
+  if (origins != null && (typeof origins !== 'object' || Array.isArray(origins) || Object.values(origins).some((o) => !Object.hasOwn(trust, o)))) throw new Error('invalid input origins');
   if (contextSnapshot && runId !== undefined && runId !== contextSnapshot.runId) throw new Error('context snapshot run mismatch');
   runId ??= contextSnapshot?.runId ?? 'spike-run';
   const result = { developer: '', user: '', bindings: [] };
@@ -536,7 +693,11 @@ export function render(unit, input, { runId, origin = 'external', contextSnapsho
   function run(component, props, slots) {
     if (++budget.depth > 32) throw new Error('component depth limit exceeded');
     const scope = Object.create(null);
-    for (const binding of component.bindings) { const value = props[binding.prop]; scope[binding.local] = raw(value) === undefined ? binding.fallback : value; }
+    for (const binding of component.bindings) {
+      const value = raw(props[binding.prop]) === undefined ? binding.fallback : props[binding.prop];
+      if (binding.pattern) bind(binding.pattern, value, scope); else scope[binding.local] = value;
+    }
+    for (const local of component.locals) bind(local.pattern, located(component, local.ast, () => evaluate(local.ast, scope, component, slots, budget)), scope);
     walk(component.nodes, scope, component, slots);
     budget.depth--;
   }
@@ -546,18 +707,29 @@ export function render(unit, input, { runId, origin = 'external', contextSnapsho
       if (node.op === 'text') emit(node.text);
       else if (node.op === 'expression') emit(located(component, node.ast, () => evaluate(node.ast, scope, component, slots, budget)));
       else if (node.op === 'fragment') walk(node.children, scope, component, slots);
-      else if (node.op === 'slot') { if (slots) emit(slots); }
+      else if (node.op === 'slot') {
+        if (slots?.has(node.name)) walk(slots.nodes.get(node.name), slots.scope, slots.unit, slots.slots);
+        else walk(node.children, scope, component, slots);
+      }
       else if (node.op === 'section') {
         emit(`<${node.name}>`); walk(node.children, scope, component, slots); emit(`</${node.name}>`);
       } else if (node.op === 'component') {
         const props = Object.create(null);
         for (const a of node.attrs) props[a.name] = a.literal ? a.value : located(component, a.value, () => evaluate(a.value, scope, component, slots, budget));
-        run(component.imports.get(node.name), props, fragments(node.children, scope, slots, component));
+        run(component.imports.get(node.name), props, slotSet(node.children, scope, slots, component));
       }
     }
   }
   if ((unit.requiresContext || unit.bindings.some((binding) => binding.prop === 'context')) && !contextSnapshot) throw new Error('context snapshot required');
-  const props = { input: data(input, 'input', origin) };
+  // Per-field origins, as a workflow's bindings assign them; the input as a
+  // whole is as trusted as its least trusted field.
+  let fields;
+  if (origins && input && typeof input === 'object' && !Array.isArray(input)) {
+    fields = Object.create(null);
+    for (const key of Object.keys(input)) fields[key] = Object.hasOwn(origins, key) ? origins[key] : origin;
+  }
+  const whole = fields ? Object.values(fields).reduce((least, o) => (trust[o] < trust[least] ? o : least), 'team') : origin;
+  const props = { input: data(input, 'input', fields && Object.keys(fields).length ? whole : origin, fields) };
   if (contextSnapshot) props.context = data(contextForStep(contextSnapshot, stepId), 'context', 'team');
   nonce = createHash('sha256').update(JSON.stringify([runId, input, props.context?.value ?? null, unit.config.examples ?? []])).digest('hex');
   run(unit, props, null);

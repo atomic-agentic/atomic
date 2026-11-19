@@ -264,3 +264,193 @@ fn a_reference_to_a_missing_place_in_a_file_fails_the_load() {
         assert!(e.message.contains("/$defs/Nope"), "{}", e.message);
     }
 }
+
+/// An atom and a component that import the shared `Change` type from
+/// `schemas/change.schema.json`, which references `schemas/tier.schema.json`.
+/// The input schema is inline, so the shared schemas supply types only.
+pub(crate) fn shared_types_project(component_body: &str) -> PathBuf {
+    let dir = project("", "{}", None);
+    std::fs::write(
+        dir.join("test.atom.astro"),
+        "---\nimport type { Props, Input, Output } from './.atomic/types/test';\nimport type { AtomConfig } from './.atomic/types/authoring';\nimport type { Change } from './.atomic/types/schemas/change';\nimport Summary from './Summary.astro';\ntype Shown = Pick<Change, 'id'>;\nconst { input }: Props = Astro.props;\nexport const config: AtomConfig<Input, Output> = {};\n---\n<Summary change={input.change} />\n",
+    )
+    .expect("atom");
+    std::fs::write(
+        dir.join("Summary.astro"),
+        format!("---\nimport type {{ Change }} from './.atomic/types/schemas/change';\ninterface Props {{ change: Change }}\nconst {{ change }}: Props = Astro.props;\n---\n{component_body}\n"),
+    )
+    .expect("component");
+    let change = json!({"type":"object","additionalProperties":false,"required":["id","tier"],"properties":{"id":{"type":"string"},"tier":{"enum":["tier-1","tier-2"]}}});
+    std::fs::write(
+        dir.join("test.input.schema.json"),
+        json!({"type":"object","additionalProperties":false,"required":["change"],"properties":{"change":change}}).to_string(),
+    )
+    .expect("input");
+    std::fs::create_dir_all(dir.join("schemas")).expect("schemas");
+    std::fs::write(
+        dir.join("schemas/change.schema.json"),
+        json!({"type":"object","additionalProperties":false,"required":["id","tier"],"properties":{"id":{"type":"string","description":"The change ID."},"tier":{"$ref":"tier.schema.json"}}}).to_string(),
+    )
+    .expect("change");
+    std::fs::write(
+        dir.join("schemas/tier.schema.json"),
+        json!({"enum":["tier-1","tier-2"]}).to_string(),
+    )
+    .expect("tier");
+    std::fs::write(
+        dir.join("schemas/unrelated.schema.json"),
+        json!({"type":"string"}).to_string(),
+    )
+    .expect("unrelated");
+    dir
+}
+
+#[test]
+fn an_atom_and_a_component_check_against_a_shared_schema_type() {
+    let dir = shared_types_project("Change {change.id} ({change.tier})");
+    let atom = load(&dir.join("test.atom.astro"), &mut Registry::new()).expect("loads");
+    let types = std::fs::canonicalize(&dir)
+        .expect("root")
+        .join(".atomic/types");
+    let declarations = atom.declarations.as_object().expect("declarations");
+    let change = declarations[&types.join("schemas/change.d.ts").display().to_string()]
+        .as_str()
+        .expect("change module");
+    assert!(
+        change.contains("import type { Tier } from './tier';"),
+        "{change}"
+    );
+    assert!(
+        change.contains("/** The change ID. */ \"id\": string;"),
+        "{change}"
+    );
+    // Referenced schemas come along; unreferenced ones do not.
+    assert!(declarations.contains_key(&types.join("schemas/tier.d.ts").display().to_string()));
+    assert!(
+        !declarations.contains_key(&types.join("schemas/unrelated.d.ts").display().to_string())
+    );
+}
+
+#[test]
+fn a_misspelled_shared_type_field_fails_in_the_component() {
+    let dir = shared_types_project("Change {change.idd}");
+    let error = load(&dir.join("test.atom.astro"), &mut Registry::new()).expect_err("type error");
+    assert!(
+        error.message.contains("TS2339") || error.message.contains("TS2551"),
+        "{error}"
+    );
+    assert!(error.file.ends_with("Summary.astro"), "{error:?}");
+}
+
+#[test]
+fn without_its_schema_file_a_shared_type_import_fails() {
+    // Negative control: the generated declaration is what makes the import resolve.
+    let dir = shared_types_project("Change {change.id}");
+    std::fs::remove_file(dir.join("schemas/change.schema.json")).expect("remove");
+    let error = load(&dir.join("test.atom.astro"), &mut Registry::new()).expect_err("unresolved");
+    assert!(error.message.contains("TS2307"), "{error}");
+}
+
+#[test]
+fn editing_an_unrelated_schema_keeps_the_compiled_atom() {
+    let dir = shared_types_project("Change {change.id}");
+    let hash = || {
+        load(&dir.join("test.atom.astro"), &mut Registry::new())
+            .expect("loads")
+            .program
+            .hash()
+    };
+    let first = hash();
+    std::fs::write(
+        dir.join("schemas/unrelated.schema.json"),
+        json!({"type":"integer"}).to_string(),
+    )
+    .expect("edit");
+    assert_eq!(hash(), first);
+    std::fs::write(
+        dir.join("schemas/tier.schema.json"),
+        json!({"enum":["tier-1","tier-2","tier-3"]}).to_string(),
+    )
+    .expect("edit");
+    assert_ne!(
+        hash(),
+        first,
+        "an imported schema's types are part of the atom"
+    );
+}
+
+#[test]
+fn a_schema_cannot_replace_the_atom_declarations() {
+    // `test.schema.json` would generate `.atomic/types/test.d.ts`, the atom's
+    // own declarations, which the atom imports its Props from.
+    let dir = shared_types_project("Change {change.id}");
+    std::fs::write(
+        dir.join("test.schema.json"),
+        json!({"type":"string"}).to_string(),
+    )
+    .expect("schema");
+    let error = load(&dir.join("test.atom.astro"), &mut Registry::new()).expect_err("collision");
+    assert!(error.message.contains("rename the schema file"), "{error}");
+}
+
+// A mermaid fence's braces and tags are diagram text: they pass the type
+// check and reach the prompt unchanged.
+#[test]
+fn a_mermaid_fence_checks_and_renders_as_text() {
+    let (atom, registry) = checked(
+        "Route it as drawn.\n```mermaid\nflowchart TD\n  A[Ticket] --> B{Urgent?}\n  B --> C<page>\n```\nNote: {input.text}",
+    );
+    let compiled = crate::compile::compile(&atom, &registry).expect("compiles");
+    let out = crate::render::render(
+        &compiled,
+        &crate::render::RunInput {
+            run_id: "run-1",
+            input: &json!({"text": "hello"}),
+            frontmatter: &atom.frontmatter,
+            origin: "external",
+            origins: None,
+            step: None,
+        },
+    )
+    .expect("renders");
+    assert!(
+        out.developer
+            .contains("A[Ticket] --> B{Urgent?}\n  B --> C<page>"),
+        "{}",
+        out.developer
+    );
+}
+
+// Loops are `map` over a list and partials are components with declared
+// props: a loop over a value that is not a list, and a component given a
+// prop it does not declare, both fail the check before any model call.
+#[test]
+fn a_loop_over_a_non_list_and_an_undeclared_component_prop_fail_the_check() {
+    let root = project(
+        "{input.text.map((x) => <Fragment>{x}</Fragment>)}",
+        "{}",
+        None,
+    );
+    let error = load(&root.join("test.atom.astro"), &mut Registry::new()).expect_err("not a list");
+    assert!(error.message.contains("TS2339"), "{error}");
+    let component = "---\ninterface Props { strict: boolean }\nconst { strict }: Props = Astro.props;\n---\n{strict ? <Fragment>Follow every rule.</Fragment> : null}\n<slot />\n";
+    let root = project(
+        "<Style strict={true} tone=\"warm\">Be brief.</Style>",
+        "{}",
+        Some(component),
+    );
+    let error =
+        load(&root.join("test.atom.astro"), &mut Registry::new()).expect_err("undeclared prop");
+    assert!(
+        error.message.contains("TS2322") && error.message.contains("tone"),
+        "{error}"
+    );
+    // Declared props and a list loop check, and the loop renders one block
+    // per element.
+    let root = project(
+        "<Style strict={true}>Be brief.</Style>\n{input.text}",
+        "{}",
+        Some(component),
+    );
+    load(&root.join("test.atom.astro"), &mut Registry::new()).expect("declared props");
+}

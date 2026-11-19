@@ -15,6 +15,19 @@
 //! atomic: 1
 //! name: billing-service
 //! ```
+//!
+//! A workspace manifest lists member projects by glob, relative to it:
+//!
+//! ```yaml
+//! atomic: 1
+//! name: engineering
+//! workspace:
+//!   members: [shared, services/*]
+//! ```
+//!
+//! Each member keeps its own manifest and is still discovered on its own; a
+//! member also sees the schemas its fellow members share (see
+//! [`workspace_of`]).
 
 use atomic_schema::yaml;
 use serde_json::Value;
@@ -37,6 +50,10 @@ pub const DEFAULT_COLLECTIONS: &[(&str, &[&str])] = &[
         &["schemas/**/*.schema.yaml", "schemas/**/*.schema.json"],
     ),
     ("evals", &["evals/**/*.yaml", "evals/**/*.jsonl"]),
+    (
+        "toolsets",
+        &["toolsets/**/*.openapi.yaml", "toolsets/**/*.openapi.json"],
+    ),
 ];
 
 /// A loaded project.
@@ -54,6 +71,17 @@ pub struct Project {
     pub ignore: Vec<String>,
     /// Where generated files go, relative to `dir`.
     pub generated: PathBuf,
+    /// The member globs, when this manifest declares a workspace.
+    pub members: Option<Vec<String>>,
+}
+
+/// A workspace: its manifest's project and its members, by directory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Workspace {
+    /// The workspace manifest's own project.
+    pub root: Project,
+    /// Every member project, in directory order.
+    pub members: Vec<Project>,
 }
 
 /// Why a project could not be found or loaded.
@@ -163,8 +191,8 @@ pub fn load(path: &Path) -> Result<Project, ProjectError> {
     for key in map.keys() {
         let pointer = format!("/{key}");
         match key.as_str() {
-            "atomic" | "name" | "collections" | "ignore" | "generated" => {}
-            "workspace" | "packages" | "exports" | "package" | "models" => {
+            "atomic" | "name" | "collections" | "ignore" | "generated" | "workspace" => {}
+            "packages" | "exports" | "package" | "models" => {
                 return Err(invalid(
                     &pointer,
                     format!("`{key}` is not supported by this version of atomic yet"),
@@ -239,6 +267,43 @@ pub fn load(path: &Path) -> Result<Project, ProjectError> {
         }
     };
 
+    let members = match map.get("workspace") {
+        None => None,
+        Some(Value::Object(workspace)) => {
+            if let Some(key) = workspace.keys().find(|key| *key != "members") {
+                return Err(invalid(
+                    &format!("/workspace/{key}"),
+                    format!("`workspace.{key}` is not supported by this version of atomic yet"),
+                ));
+            }
+            let members = workspace
+                .get("members")
+                .and_then(string_list)
+                .filter(|members| !members.is_empty())
+                .ok_or_else(|| {
+                    invalid(
+                        "/workspace/members",
+                        "`workspace.members` lists member directories, as globs relative to the manifest".into(),
+                    )
+                })?;
+            for member in &members {
+                if Path::new(member).is_absolute() || member.split('/').any(|part| part == "..") {
+                    return Err(invalid(
+                        "/workspace/members",
+                        format!("member `{member}` must be inside the workspace"),
+                    ));
+                }
+            }
+            Some(members)
+        }
+        Some(_) => {
+            return Err(invalid(
+                "/workspace",
+                "`workspace` is a mapping with `members`".into(),
+            ));
+        }
+    };
+
     Ok(Project {
         manifest: path.to_owned(),
         dir,
@@ -246,7 +311,113 @@ pub fn load(path: &Path) -> Result<Project, ProjectError> {
         collections,
         ignore,
         generated,
+        members,
     })
+}
+
+/// The manifest in `dir` itself, if it has one.
+fn manifest_in(dir: &Path) -> Result<Option<PathBuf>, ProjectError> {
+    let dedicated = dir.join("atomic.yaml");
+    let embedded = dir.join(".atomic").join("atomic.yaml");
+    match (dedicated.is_file(), embedded.is_file()) {
+        (true, true) => Err(ProjectError::BothManifests(dir.to_owned())),
+        (true, false) => Ok(Some(dedicated)),
+        (false, true) => Ok(Some(embedded)),
+        (false, false) => Ok(None),
+    }
+}
+
+/// The members of the workspace `root` declares: every directory under it
+/// that holds a manifest and matches one of its member globs. A literal
+/// member with no manifest is an error.
+pub fn members(root: &Project) -> Result<Vec<Project>, ProjectError> {
+    let globs = root.members.clone().unwrap_or_default();
+    let invalid = |message: String| ProjectError::Invalid {
+        path: root.manifest.clone(),
+        line: 1,
+        message,
+    };
+    let mut builder = globset::GlobSetBuilder::new();
+    for glob in &globs {
+        let glob = globset::GlobBuilder::new(glob.trim_end_matches('/'))
+            .literal_separator(true)
+            .build()
+            .map_err(|e| invalid(format!("workspace member `{glob}`: {e}")))?;
+        builder.add(glob);
+    }
+    let set = builder
+        .build()
+        .map_err(|e| invalid(format!("workspace members: {e}")))?;
+    let base = root.root().to_owned();
+    let mut found = Vec::new();
+    let walker = ignore::WalkBuilder::new(&base)
+        .require_git(false)
+        .max_depth(Some(8))
+        .build();
+    for entry in walker {
+        let entry = entry.map_err(|e| invalid(format!("walking the workspace: {e}")))?;
+        if !entry.file_type().is_some_and(|t| t.is_dir()) || entry.path() == base {
+            continue;
+        }
+        let Ok(relative) = entry.path().strip_prefix(&base) else {
+            continue;
+        };
+        if set.is_match(relative)
+            && let Some(manifest) = manifest_in(entry.path())?
+        {
+            found.push(load(&manifest)?);
+        }
+    }
+    for glob in &globs {
+        let literal = !glob.contains(['*', '?', '[', '{']);
+        if literal
+            && !found
+                .iter()
+                .any(|m| m.root() == base.join(glob.trim_end_matches('/')))
+        {
+            return Err(invalid(format!(
+                "workspace member `{glob}` holds no atomic.yaml or .atomic/atomic.yaml"
+            )));
+        }
+    }
+    found.sort_by(|a, b| a.dir.cmp(&b.dir));
+    Ok(found)
+}
+
+/// The workspace `project` belongs to: itself, if it declares one, or the
+/// nearest manifest above it, if that manifest declares a workspace whose
+/// members include `project`. A plain manifest above it bounds the search,
+/// as a nested project bounds discovery.
+pub fn workspace_of(project: &Project) -> Result<Option<Workspace>, ProjectError> {
+    if project.members.is_some() {
+        return Ok(Some(Workspace {
+            root: project.clone(),
+            members: members(project)?,
+        }));
+    }
+    let here = std::fs::canonicalize(project.root()).map_err(|source| ProjectError::Read {
+        path: project.root().to_owned(),
+        source,
+    })?;
+    for dir in here.ancestors().skip(1) {
+        let Some(manifest) = manifest_in(dir)? else {
+            continue;
+        };
+        let root = load(&manifest)?;
+        if root.members.is_none() {
+            return Ok(None);
+        }
+        let members = members(&root)?;
+        let canonical = |p: &Project| std::fs::canonicalize(p.root()).ok();
+        if members
+            .iter()
+            .any(|m| canonical(m).as_deref() == Some(here.as_path()))
+        {
+            return Ok(Some(Workspace { root, members }));
+        }
+        return Ok(None);
+    }
+    Ok(None)
 }
 
 impl Project {

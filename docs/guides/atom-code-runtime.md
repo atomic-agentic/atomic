@@ -1,8 +1,11 @@
 # Atom authoring and executable code
 
 An Astro atom is declarative. Its TypeScript-shaped frontmatter and expressions
-are parsed into a bounded AST and interpreted; the source module never executes.
-Astro's ordinary JavaScript execution model is not enabled.
+are parsed into a bounded AST and interpreted; the atom itself never executes.
+Astro's ordinary JavaScript execution model is not enabled. Pure business rules
+can be [TypeScript helpers](../reference/atom-files.md#typescript-helpers),
+which run in an isolate with no network, files, environment or clock of the
+host; anything that reads or changes the world is a script step.
 
 Use a separate script for SDK calls, I/O and transforms, then compose it with a
 model atom as sibling workflow steps. This keeps external effects and their

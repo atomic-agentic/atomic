@@ -22,6 +22,8 @@ cel = { workspace = true }
 jsonschema = { workspace = true }
 saphyr-parser = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+# Key order follows the document, as in the atomic binary (where other crates
+# enable it too); generated declarations list properties in authored order.
+serde_json = { workspace = true, features = ["preserve_order"] }
 thiserror = { workspace = true }
 url = { workspace = true }
