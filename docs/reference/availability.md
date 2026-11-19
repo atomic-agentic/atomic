@@ -59,6 +59,15 @@ has an executor identity (`ATOMIC_EXECUTOR_ID`). `atomic runner` and
 exit-code contract; Codex turns and their shell still run in the control
 plane's process, and a runner reached over the network is not built yet.
 
+Every atom run goes through the execution backend: it opens a workspace there
+before anything is sent or run and closes it when the run ends. The local
+backend is the only one with a Codex shell, and it states that its workspaces
+are durable. A backend that states anything else, or a value atomic does not
+recognize, is treated as ephemeral, and a workflow with a `worktree: true` step
+is refused on it before anything runs. A command an atom runs, whether an exec
+atom's or one a model runs in a Codex turn, gets the platform's core variables
+and what the atom declares, never atomic's own environment or its credentials.
+
 Several authoring aids arrive in stages. Eval cases in JSONL files are part of
 v0.1. Compact schemas, variants, the `--plan` cost preview, declared effect caps
 and the staged `--effects preview` mode are planned for v0.5. The `file` tag
