@@ -143,7 +143,15 @@ pub(crate) fn permission_profile(
     };
     let base = match sandbox {
         crate::typed::Sandbox::ReadOnly => PermissionProfile::read_only(),
-        crate::typed::Sandbox::WorkspaceWrite => PermissionProfile::workspace_write(),
+        // Not /tmp or $TMPDIR: a repository or state directory there would be
+        // writable from the turn. A thread with a state directory gets a
+        // temporary directory of its own instead (see `TurnTemp`).
+        crate::typed::Sandbox::WorkspaceWrite => PermissionProfile::workspace_write_with(
+            &[],
+            NetworkSandboxPolicy::Restricted,
+            /*exclude_tmpdir_env_var*/ true,
+            /*exclude_slash_tmp*/ true,
+        ),
     };
     let Some(state_dir) = state_dir else {
         return Ok(base);
@@ -269,6 +277,37 @@ where
         std::env::set_var("CODEX_HOME", codex_home);
     }
     arg0_dispatch_or_else(move |paths| main_fn(CodexPaths(paths)))
+}
+
+/// A thread's own temporary directory, `<state>/tmp/turn-…`, writable from
+/// its commands and named by their `TMPDIR`. Removed when dropped.
+struct TurnTemp(PathBuf);
+
+impl TurnTemp {
+    fn create(state: &Path) -> anyhow::Result<Self> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let parent = state.join("tmp");
+        std::fs::create_dir_all(&parent).with_context(|| format!("create {}", parent.display()))?;
+        let dir = parent.join(format!("turn-{}-{n}-{nanos}", std::process::id()));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder
+            .create(&dir)
+            .with_context(|| format!("create the turn's temporary directory {}", dir.display()))?;
+        Ok(Self(dir))
+    }
+}
+
+impl Drop for TurnTemp {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// Whether this process is Codex's Linux sandbox helper: this executable,
@@ -404,9 +443,23 @@ where
             codex_home,
         )?),
     )?;
-    if !spec.writable_roots.is_empty() {
+    // Under workspace-write the system temporary directories are not
+    // writable (see `permission_profile`): the thread gets its own, in the
+    // state directory, removed when the thread ends.
+    let temp = match (spec.sandbox, &spec.state_dir) {
+        (crate::typed::Sandbox::WorkspaceWrite, Some(state)) => Some(TurnTemp::create(state)?),
+        _ => None,
+    };
+    let mut writable_roots = spec.writable_roots.clone();
+    let mut env = spec.env.clone();
+    if let Some(temp) = &temp {
+        writable_roots.push(temp.0.clone());
+        env.entry("TMPDIR".into())
+            .or_insert_with(|| temp.0.display().to_string());
+    }
+    if !writable_roots.is_empty() {
         let mut roots = vec![config.cwd.clone()];
-        for root in &spec.writable_roots {
+        for root in &writable_roots {
             let root = AbsolutePathBuf::from_absolute_path(root)
                 .with_context(|| format!("resolve the writable root {}", root.display()))?;
             if !roots.contains(&root) {
@@ -417,7 +470,7 @@ where
         config.workspace_roots = roots;
         config.workspace_roots_explicit = true;
     }
-    for (name, value) in &spec.env {
+    for (name, value) in &env {
         config
             .permissions
             .shell_environment_policy
@@ -960,7 +1013,17 @@ mod tests {
         assert_eq!(profile(Sandbox::ReadOnly), PermissionProfile::read_only());
         assert_eq!(
             profile(Sandbox::WorkspaceWrite),
-            PermissionProfile::workspace_write()
+            PermissionProfile::workspace_write_with(
+                &[],
+                codex_protocol::permissions::NetworkSandboxPolicy::Restricted,
+                true,
+                true
+            )
+        );
+        assert_ne!(
+            profile(Sandbox::WorkspaceWrite),
+            PermissionProfile::workspace_write(),
+            "the system temporary directories are not writable"
         );
         assert_ne!(profile(Sandbox::ReadOnly), profile(Sandbox::WorkspaceWrite));
     }
@@ -1043,6 +1106,14 @@ mod tests {
             ),
             Write
         );
+        // The system temporary directory is not writable, nor a project in it.
+        for profile in [&write, &read] {
+            assert_eq!(access(profile, worktree, &[cache], "/tmp/x"), Read);
+            assert_eq!(
+                access(profile, worktree, &[cache], "/tmp/project/.git/HEAD"),
+                Read
+            );
+        }
         // A thread working in the project itself, outside the state directory.
         assert_eq!(access(&write, "/work/project", &[], db), Deny);
         assert_eq!(

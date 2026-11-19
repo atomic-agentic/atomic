@@ -10,6 +10,10 @@
 //!   the edit on the base.
 //! - build caches live outside worktrees, shared per project: a second step,
 //!   in a fresh worktree, finds what the first step's build left in them.
+//! - a project and its state under the system temporary directory stay out
+//!   of reach: the turn cannot write `/tmp`, the project's git directory or
+//!   the state directory, and writes its temporary files to a directory of
+//!   its own.
 //!
 //! Needs bubblewrap and unprivileged user namespaces, so it runs with the
 //! `sandbox-tests` feature; with the feature on, a sandbox that cannot start
@@ -50,9 +54,7 @@ fn plain_git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap()
 }
 
-/// A project with one commit, in a scratch directory outside the system
-/// temporary directory (which the workspace-write sandbox leaves writable),
-/// and its worktrees.
+/// A project with one commit, in a scratch directory, and its worktrees.
 struct Fixture {
     dir: PathBuf,
     project: PathBuf,
@@ -67,8 +69,11 @@ impl Drop for Fixture {
 }
 
 fn fixture(tag: &str) -> Fixture {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("atomic-sandboxed-{tag}-{}", std::process::id()));
+    fixture_in(Path::new(env!("CARGO_TARGET_TMPDIR")), tag)
+}
+
+fn fixture_in(parent: &Path, tag: &str) -> Fixture {
+    let dir = parent.join(format!("atomic-sandboxed-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     for sub in ["project", "state", "codex-home", "bin"] {
         std::fs::create_dir_all(dir.join(sub)).unwrap();
@@ -232,5 +237,67 @@ fn a_fresh_worktree_reuses_the_shared_cache() {
         let output = sandboxed(&f, &second.path, build, spec).await;
         assert!(output.contains("build=warm"), "{output}");
         assert!(!second.path.join("target").exists());
+    });
+}
+
+#[test]
+fn a_project_under_the_system_temporary_directory_stays_out_of_reach() {
+    on_codex_runtime(async {
+        let f = fixture_in(&std::env::temp_dir(), "tmp");
+        assert!(
+            f.dir
+                .starts_with(std::env::temp_dir().canonicalize().unwrap())
+        );
+        let state = f.dir.join("state");
+        let wt = f
+            .worktrees
+            .prepare("sandboxed", "implement", &f.base)
+            .unwrap();
+        assert!(wt.path.starts_with(&state));
+        let common = f.project.join(".git");
+        let command = format!(
+            "printf 'changed\\n' > a.txt; echo wrote-exit=$?; \
+             echo x > /tmp/atomic-sandbox-probe-$$; echo tmp-exit=$?; \
+             echo x > {common}/forged; echo common-exit=$?; \
+             git update-ref refs/heads/forged HEAD; echo ref-exit=$?; \
+             echo x > {state}/forged; echo state-exit=$?; \
+             t=$(mktemp) && echo temp=$t; echo mktemp-exit=$?",
+            common = common.display(),
+            state = state.display(),
+        );
+        let spec = TurnSpec {
+            state_dir: Some(state.clone()),
+            ..TurnSpec::default()
+        };
+        let output = sandboxed(&f, &wt.path, &command, spec).await;
+
+        assert!(output.contains("wrote-exit=0"), "{output}");
+        for refused in ["tmp", "common", "ref", "state"] {
+            assert!(output.contains(&format!("{refused}-exit=")), "{output}");
+            assert!(
+                !output.contains(&format!("{refused}-exit=0")),
+                "{refused} was writable: {output}"
+            );
+        }
+        assert!(!common.join("forged").exists());
+        assert!(!state.join("forged").exists());
+        assert_eq!(f.worktrees.repo().refs("refs/heads/").unwrap().len(), 1);
+        // Its temporary files go to a directory of its own, removed after.
+        assert!(output.contains("mktemp-exit=0"), "{output}");
+        // The output is the JSON text of what the command printed.
+        let temp = output
+            .split("temp=")
+            .nth(1)
+            .and_then(|rest| rest.split("\\n").next())
+            .expect("mktemp printed its file")
+            .to_owned();
+        assert!(
+            Path::new(&temp).starts_with(state.join("tmp")),
+            "{temp} is not in the turn's own temporary directory"
+        );
+        assert!(
+            !Path::new(&temp).exists(),
+            "the turn's temporary directory was removed"
+        );
     });
 }
