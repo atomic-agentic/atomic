@@ -9,7 +9,10 @@
 //!   and then `checkpoint:after:<op>` for each operation, in order, and every
 //!   name it reaches belongs to a site in the inventory;
 //! - a replay of the finished run reaches none of them, because no operation
-//!   runs again;
+//!   runs again, and neither does the replay of a killed run's committed
+//!   operations;
+//! - every failpoint named in atomic's source belongs to a site in the
+//!   inventory, and every site is named in the source;
 //! - each of those names, given in `ATOMIC_FAILPOINT`, kills a fresh run
 //!   there, and only there; a new process then recovers the run to the same
 //!   result, and no operation whose checkpoint committed before the kill runs
@@ -203,7 +206,7 @@ fn each_failpoint_kills_the_process_there_and_the_run_recovers() {
         let (status, stderr) = child(&dir, "start", Some(name), "first.log");
         assert!(!status.success(), "{name}: the first process was killed");
         assert!(
-            stderr.contains(&format!("failpoint {name}: aborting")),
+            stderr.contains(&format!("failpoint {name}: killing the process")),
             "{name}: {stderr}"
         );
         let first = lines(&dir.join("first.log"));
@@ -214,14 +217,17 @@ fn each_failpoint_kills_the_process_there_and_the_run_recovers() {
         assert!(status.success(), "{name}: recovered: {status}\n{stderr}");
         assert_eq!(result(&dir), json!([1, 2, 3]), "{name}");
 
-        // No operation whose checkpoint committed before the kill ran again.
+        // No operation whose checkpoint committed before the kill ran again,
+        // and its replay reached neither of its failpoints.
         let second = lines(&dir.join("second.log"));
         for op in OPS {
             if first.contains(&format!("checkpoint:after:{op}")) {
-                assert!(
-                    !second.contains(&format!("checkpoint:before:{op}")),
-                    "{name}: {op} ran again: {second:?}"
-                );
+                for when in ["before", "after"] {
+                    assert!(
+                        !second.contains(&format!("checkpoint:{when}:{op}")),
+                        "{name}: replaying {op} reached checkpoint:{when}: {second:?}"
+                    );
+                }
             }
         }
         // The same, counted by the bodies themselves.
@@ -234,5 +240,87 @@ fn each_failpoint_kills_the_process_there_and_the_run_recovers() {
             assert_eq!(times, expected, "{name}: {body} ran {times} times: {ran:?}");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Every failpoint name or name template in a source file: the string
+/// literal passed to `failpoint(` directly or through `format!(`, with each
+/// `{...}` replaced by `x`.
+fn named_in(source: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for (at, _) in source.match_indices("failpoint(") {
+        let before = &source[..at];
+        if before.ends_with("fn ") || before.ends_with("_") {
+            continue;
+        }
+        let rest = source[at + "failpoint(".len()..].trim_start();
+        let rest = rest.strip_prefix("&format!(").unwrap_or(rest).trim_start();
+        let Some(rest) = rest.strip_prefix('"') else {
+            continue;
+        };
+        let Some(end) = rest.find('"') else {
+            continue;
+        };
+        let mut name = String::new();
+        let mut inside = false;
+        for c in rest[..end].chars() {
+            match c {
+                '{' => {
+                    inside = true;
+                    name.push('x');
+                }
+                '}' => inside = false,
+                c if !inside => name.push(c),
+                _ => {}
+            }
+        }
+        names.push(name);
+    }
+    names
+}
+
+fn sources(dir: &Path, out: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(dir).expect("read the source tree") {
+        let path = entry.expect("entry").path();
+        if path.is_dir() {
+            sources(&path, out);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            out.push(path);
+        }
+    }
+}
+
+#[test]
+fn every_failpoint_in_the_source_is_in_the_inventory_and_back() {
+    use atomic_durable::failpoints::SITES;
+    let crates = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(&crates).expect("crates") {
+        let src = entry.expect("entry").path().join("src");
+        if src.is_dir() {
+            sources(&src, &mut files);
+        }
+    }
+    let (mut found, mut all) = (Vec::new(), String::new());
+    for file in &files {
+        let text = std::fs::read_to_string(file).expect("source");
+        for name in named_in(&text) {
+            found.push((file.display().to_string(), name));
+        }
+        all.push_str(&text);
+    }
+    assert!(found.len() >= 10, "too few failpoints found: {found:?}");
+    for (file, name) in &found {
+        assert!(site_of(name).is_some(), "{file}: {name} is not in SITES");
+    }
+    // A name may be built before it is passed, so the other way round looks
+    // for the site's literal anywhere in the source.
+    for site in SITES {
+        let literal = format!("\"{}", site.name.split('{').next().unwrap_or(site.name));
+        assert!(
+            all.contains(&literal),
+            "{} is in SITES and named nowhere in the source",
+            site.name
+        );
     }
 }

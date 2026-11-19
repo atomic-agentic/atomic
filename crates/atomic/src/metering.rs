@@ -119,12 +119,18 @@ impl Meter for LedgerMeter {
                 maximum: whole,
             };
             match self.ledger.admit(request).await.map_err(store)? {
-                Admission::Admitted { request, attempt } => Ok(Ticket {
-                    request,
-                    attempt,
-                    model: call.model,
-                    admitted: Instant::now(),
-                }),
+                Admission::Admitted { request, attempt } => {
+                    // Admitted and reserved, and not yet dispatched.
+                    if atomic_durable::failpoints::armed() {
+                        atomic_durable::failpoint(&format!("atom:after-admit:{request}"));
+                    }
+                    Ok(Ticket {
+                        request,
+                        attempt,
+                        model: call.model,
+                        admitted: Instant::now(),
+                    })
+                }
                 Admission::Refused { reason, .. } => Err(Exhausted(reason).into()),
             }
         })

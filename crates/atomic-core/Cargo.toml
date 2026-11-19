@@ -18,7 +18,7 @@ name = "atomic_core"
 workspace = true
 
 [features]
-# Named failpoints (failpoint::failpoint()) abort the process when
+# Named failpoints (failpoint::failpoint()) kill the process when
 # ATOMIC_FAILPOINT names them; for crash tests only. Without the feature they
 # do nothing.
 failpoints = []

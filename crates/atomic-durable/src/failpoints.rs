@@ -5,11 +5,13 @@
 //! A failpoint is a named place in atomic's code. With the `failpoints`
 //! feature, two environment variables drive them:
 //!
-//! - `ATOMIC_FAILPOINT=<name>`: the process aborts at the first failpoint of
-//!   that name, as if killed. Nothing is flushed, no destructor runs and the
-//!   engine does not shut down.
+//! - `ATOMIC_FAILPOINT=<name>`: the process kills itself with SIGKILL at the
+//!   first failpoint of that name. Nothing is flushed, no destructor runs, the
+//!   engine does not shut down and no core is dumped.
 //! - `ATOMIC_FAILPOINT_LOG=<file>`: every failpoint the process reaches is
-//!   appended to `<file>`, one name per line, before it is checked. A crash
+//!   appended to `<file>`, one name per line, before it is checked. A log
+//!   that cannot be written kills the process too, saying why, so a test
+//!   never reads a partial log as a whole one. A crash
 //!   test runs a workflow once with the log on, reads which failpoints it
 //!   passed and in what order, and then kills a fresh run at each in turn.
 //!
@@ -58,8 +60,26 @@ pub const SITES: &[Site] = &[
         what: "mid-atom: one model call was made and its usage settled; the atom's turn goes on",
     },
     Site {
-        name: "usage:before-settle",
-        what: "mid-atom: the provider was called and its usage is not yet recorded",
+        name: "atom:after-admit:{request}",
+        what: "mid-atom: a model call is admitted and its bound reserved; it is not dispatched",
+    },
+    Site {
+        name: "usage:before-settle:{request}",
+        what: "mid-atom: the provider answered the call and its usage is not yet recorded",
+    },
+    Site {
+        name: "recv:after:{topic}",
+        what: "a message wait's outcome, the message taken or the timeout, is recorded (a replay \
+               reaches it too)",
+    },
+    Site {
+        name: "worktree:after-prepare:{step}",
+        what: "a code-changing step's worktree is reset to its base and the atom has not started",
+    },
+    Site {
+        name: "cleanup:after-refs:{run}",
+        what: "a finished run's unaccepted attempt refs are deleted and its worktrees are not yet \
+               removed",
     },
     Site {
         name: "usage:after-park",
@@ -124,21 +144,44 @@ pub fn failpoint(name: &str) {
             use std::io::Write;
             // One write of the whole line, appended, so lines from threads of
             // one process do not interleave.
-            if let Ok(mut file) = std::fs::OpenOptions::new()
+            let written = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(log)
-            {
-                let _ = file.write_all(format!("{name}\n").as_bytes());
+                .open(&log)
+                .and_then(|mut file| file.write_all(format!("{name}\n").as_bytes()));
+            // A test that reads the log must not read a partial one as the
+            // whole truth: stop here, loudly.
+            if let Err(e) = written {
+                eprintln!(
+                    "failpoint {name}: cannot write the failpoint log {}: {e}",
+                    std::path::Path::new(&log).display()
+                );
+                kill_self();
             }
         }
         if std::env::var("ATOMIC_FAILPOINT").is_ok_and(|f| f == name) {
-            eprintln!("failpoint {name}: aborting");
-            std::process::abort();
+            eprintln!("failpoint {name}: killing the process");
+            kill_self();
         }
     }
     #[cfg(not(feature = "failpoints"))]
     let _ = name;
+}
+
+/// End the process as a crash would: SIGKILL, which runs nothing on the way
+/// out and leaves no core dump.
+#[cfg(feature = "failpoints")]
+#[allow(unsafe_code)]
+fn kill_self() -> ! {
+    #[cfg(unix)]
+    // SAFETY: kill(2) on this process's own id, with a signal number from
+    // libc; it takes no pointers.
+    unsafe {
+        libc::kill(libc::getpid(), libc::SIGKILL);
+    }
+    // SIGKILL cannot be caught or ignored, so this is not reached; where
+    // there is no SIGKILL, abort ends the process just as abruptly.
+    std::process::abort()
 }
 
 #[cfg(test)]

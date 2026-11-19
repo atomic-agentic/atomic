@@ -18,9 +18,9 @@ name = "atomic_durable"
 workspace = true
 
 [features]
-# Named failpoints (failpoint()) abort the process when ATOMIC_FAILPOINT
+# Named failpoints (failpoint()) kill the process when ATOMIC_FAILPOINT
 # names them; for crash tests only. Without the feature they do nothing.
-failpoints = []
+failpoints = ["dep:libc"]
 # Run the Postgres variants of the tests against ATOMIC_TEST_DATABASE_URL.
 # With this on, a missing database fails the tests instead of skipping them.
 postgres-tests = []
@@ -34,6 +34,8 @@ sha2 = { workspace = true }
 # Postgres for the adapter's own reads of atomic's tables (durare brings the driver).
 sqlx = { workspace = true, features = ["postgres"] }
 thiserror = { workspace = true }
+# How a failpoint kills its process (failpoints only).
+libc = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

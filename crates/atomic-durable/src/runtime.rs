@@ -607,17 +607,19 @@ impl WorkflowContext for DurareContext {
         // position here, so positions follow construction order whatever
         // order the futures are awaited in.
         let (checkpoint, ran) = Checkpoint::new(name);
-        let pending = self.engine.step(name, move |s: durare::StepCtx| async move {
-            let info = StepInfo {
-                workflow_id: s.workflow_id().to_owned(),
-                step_id: s.step_id(),
-            };
-            let out = body(info).await;
-            if out.is_ok() {
-                ran.before();
-            }
-            out.map_err(to_durare)
-        });
+        let pending = self
+            .engine
+            .step(name, move |s: durare::StepCtx| async move {
+                let info = StepInfo {
+                    workflow_id: s.workflow_id().to_owned(),
+                    step_id: s.step_id(),
+                };
+                let out = body(info).await;
+                if out.is_ok() {
+                    ran.before();
+                }
+                out.map_err(to_durare)
+            });
         async move {
             let out = pending.await.map_err(from_durare);
             if out.is_ok() {
@@ -674,7 +676,16 @@ impl WorkflowContext for DurareContext {
     {
         // As for a step, the position is claimed now.
         let pending = self.engine.recv::<T>(topic, timeout);
-        async move { pending.await.map_err(from_durare) }
+        let topic = topic.to_owned();
+        async move {
+            let out = pending.await.map_err(from_durare);
+            // The message taken, or the timeout, is recorded. A replay that
+            // returns the recorded one reaches this too.
+            if out.is_ok() && crate::failpoints::armed() {
+                crate::failpoint(&format!("recv:after:{topic}"));
+            }
+            out
+        }
     }
 }
 
