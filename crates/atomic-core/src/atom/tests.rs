@@ -454,3 +454,48 @@ fn a_loop_over_a_non_list_and_an_undeclared_component_prop_fail_the_check() {
     );
     load(&root.join("test.atom.astro"), &mut Registry::new()).expect("declared props");
 }
+
+#[test]
+fn a_budget_in_the_frontmatter_is_read_and_a_bad_one_fails_where_it_is_written() {
+    let root = project(
+        "{input.text}",
+        "{budget: {tokens: 100000, minutes: 12.5, cost_usd: 0.5}}",
+        None,
+    );
+    let atom = load(&root.join("test.atom.astro"), &mut Registry::new()).expect("loads");
+    assert_eq!(
+        atom.budget,
+        crate::budget::Budget {
+            tokens: Some(100_000),
+            millis: Some(750_000),
+            micro_usd: Some(500_000),
+        }
+    );
+    let _ = std::fs::remove_dir_all(root);
+    // No budget block: every limit inherits its default.
+    let (atom, _) = checked("{input.text}");
+    assert_eq!(atom.budget, crate::budget::Budget::default());
+    for (config, path, says) in [
+        (
+            "{budget: {tokens: 0}}",
+            "/budget/tokens",
+            "positive integer",
+        ),
+        (
+            "{budget: {minutes: -1}}",
+            "/budget/minutes",
+            "positive number",
+        ),
+        (
+            "{budget: {dollars: 1}}",
+            "/budget/dollars",
+            "unknown budget field",
+        ),
+    ] {
+        let root = project("{input.text}", config, None);
+        let error = load(&root.join("test.atom.astro"), &mut Registry::new()).expect_err(config);
+        assert_eq!(error.path, path, "{error}");
+        assert!(error.message.contains(says), "{error}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+}

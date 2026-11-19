@@ -34,6 +34,15 @@ pub enum Reply {
         /// The response body.
         body: String,
     },
+    /// An assistant message with this text, and no usage reported.
+    WithoutUsage(String),
+    /// This reply, sent once this long has passed.
+    Delayed {
+        /// How long to wait before answering.
+        after: std::time::Duration,
+        /// The answer.
+        reply: Box<Reply>,
+    },
 }
 
 #[derive(Default)]
@@ -148,7 +157,11 @@ async fn serve(socket: &mut tokio::net::TcpStream, state: &Mutex<State>) -> std:
                     }
                     Err(_) => None,
                 };
-                let reply = reply.unwrap_or_else(|| Reply::Text("Synthetic reply.".into()));
+                let mut reply = reply.unwrap_or_else(|| Reply::Text("Synthetic reply.".into()));
+                while let Reply::Delayed { after, reply: then } = reply {
+                    tokio::time::sleep(after).await;
+                    reply = *then;
+                }
                 let streaming = request.get("stream").and_then(Value::as_bool) != Some(false);
                 match &reply {
                     Reply::Http { status, body } => {
@@ -196,7 +209,7 @@ fn model_of(request: &Value) -> &str {
 /// The Responses API's output item for one reply.
 fn output_item(reply: &Reply) -> Value {
     match reply {
-        Reply::Text(text) => json!({
+        Reply::Text(text) | Reply::WithoutUsage(text) => json!({
             "type": "message", "id": "msg_synthetic", "role": "assistant", "status": "completed",
             "content": [{"type": "output_text", "text": text, "annotations": []}]
         }),
@@ -204,18 +217,22 @@ fn output_item(reply: &Reply) -> Value {
             "type": "function_call", "id": "fc_synthetic", "call_id": "call_synthetic",
             "name": name, "arguments": arguments.to_string(), "status": "completed"
         }),
-        Reply::Http { .. } => Value::Null,
+        Reply::Http { .. } | Reply::Delayed { .. } => Value::Null,
     }
 }
 
 /// A completed Responses API response for one reply, as a non-streaming call
 /// returns it.
 fn completed(request: &Value, reply: &Reply) -> Value {
-    json!({
+    let mut done = json!({
         "id": "resp_synthetic", "object": "response", "status": "completed",
         "model": model_of(request), "output": [output_item(reply)],
         "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
-    })
+    });
+    if let (Reply::WithoutUsage(_), Some(d)) = (reply, done.as_object_mut()) {
+        d.remove("usage");
+    }
+    done
 }
 
 /// A Chat Completions response for one reply.
@@ -226,14 +243,20 @@ fn chat_completion(request: &Value, reply: &Reply) -> Value {
             "tool_calls": [{"id": "call_synthetic", "type": "function",
                             "function": {"name": name, "arguments": arguments.to_string()}}]
         }),
-        Reply::Text(text) => json!({"role": "assistant", "content": text}),
-        Reply::Http { .. } => Value::Null,
+        Reply::Text(text) | Reply::WithoutUsage(text) => {
+            json!({"role": "assistant", "content": text})
+        }
+        Reply::Http { .. } | Reply::Delayed { .. } => Value::Null,
     };
-    json!({
+    let mut done = json!({
         "id": "chatcmpl_synthetic", "object": "chat.completion", "model": model_of(request),
         "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
         "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
-    })
+    });
+    if let (Reply::WithoutUsage(_), Some(d)) = (reply, done.as_object_mut()) {
+        d.remove("usage");
+    }
+    done
 }
 
 /// The Responses API's server-sent events for one reply.

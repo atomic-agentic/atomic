@@ -7,8 +7,8 @@
 //!
 //! ```yaml
 //! budget:
-//!   tokens: 20000    # cumulative input and output tokens of real calls
-//!   minutes: 5       # cumulative active execution, excluding gate waits
+//!   tokens: 200000   # cumulative input and output tokens of real calls
+//!   minutes: 20      # cumulative active execution, excluding gate waits
 //!   cost_usd: 1.00   # cumulative model-call cost, where pricing is reliable
 //! ```
 //!
@@ -22,7 +22,12 @@
 //!
 //! Caps are held as integers: tokens, milliseconds and micro-dollars
 //! (millionths of a US dollar). A price in US dollars per million tokens is
-//! therefore exactly a price in micro-dollars per token.
+//! therefore exactly a price in micro-dollars per token. Every amount is at
+//! most [`LIMIT`], so the ledger's sums cannot overflow.
+//!
+//! A cap must leave room for at least one call: [`resolve`] refuses a cap
+//! smaller than what one call to a model it covers reserves, since such a
+//! budget could never admit anything.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -42,6 +47,20 @@ pub struct Budget {
 /// The fields a `budget` block may have.
 pub const FIELDS: &[&str] = &["tokens", "minutes", "cost_usd"];
 
+/// The most any one amount may be, in its integer unit (tokens,
+/// milliseconds or micro-dollars): 2^53, the largest integer every JSON
+/// reader keeps exactly. Far past any real budget, and far enough below
+/// the ledger's 64-bit columns that its sums cannot overflow.
+pub const LIMIT: u64 = 1 << 53;
+
+/// `n` as an integer amount, if it is finite, positive and at most
+/// [`LIMIT`] once `scale`d and rounded (at least one).
+fn amount(n: f64, scale: f64) -> Option<u64> {
+    let scaled = (n * scale).round();
+    // In range: finite, positive and at most LIMIT, checked first.
+    (n.is_finite() && n > 0.0 && scaled <= LIMIT as f64).then(|| (scaled as u64).max(1))
+}
+
 impl Budget {
     /// Read a `budget` block: an object with any of [`FIELDS`], each a
     /// positive number, `tokens` an integer. On a bad block, the JSON
@@ -56,22 +75,38 @@ impl Budget {
         let mut budget = Self::default();
         for (key, v) in fields {
             let at = format!("/{key}");
-            let positive = |v: &Value| v.as_f64().filter(|n| n.is_finite() && *n > 0.0);
             match key.as_str() {
                 "tokens" => {
-                    budget.tokens = Some(v.as_u64().filter(|n| *n > 0).ok_or_else(|| {
-                        (at.clone(), "tokens must be a positive integer".to_owned())
-                    })?);
+                    budget.tokens = Some(v.as_u64().filter(|n| *n > 0 && *n <= LIMIT).ok_or_else(
+                        || {
+                            (
+                                at.clone(),
+                                format!("tokens must be a positive integer, at most {LIMIT}"),
+                            )
+                        },
+                    )?);
                 }
                 "minutes" => {
-                    let m = positive(v)
-                        .ok_or_else(|| (at.clone(), "minutes must be a positive number".into()))?;
-                    budget.millis = Some(minutes_to_millis(m));
+                    budget.millis = Some(v.as_f64().and_then(|m| amount(m, 60_000.0)).ok_or_else(
+                        || {
+                            (
+                                at.clone(),
+                                "minutes must be a positive number of a sane size".to_owned(),
+                            )
+                        },
+                    )?);
                 }
                 "cost_usd" => {
-                    let usd = positive(v)
-                        .ok_or_else(|| (at.clone(), "cost_usd must be a positive number".into()))?;
-                    budget.micro_usd = Some(usd_to_micro(usd));
+                    budget.micro_usd = Some(
+                        v.as_f64()
+                            .and_then(|usd| amount(usd, 1_000_000.0))
+                            .ok_or_else(|| {
+                                (
+                                    at.clone(),
+                                    "cost_usd must be a positive number of a sane size".to_owned(),
+                                )
+                            })?,
+                    );
                 }
                 other => {
                     return Err((
@@ -86,17 +121,6 @@ impl Budget {
         }
         Ok(budget)
     }
-}
-
-/// Milliseconds in `minutes`, at least one.
-fn minutes_to_millis(minutes: f64) -> u64 {
-    // In range: a positive, finite number of minutes, saturating.
-    ((minutes * 60_000.0).round() as u64).max(1)
-}
-
-/// Micro-dollars in `usd`, at least one.
-fn usd_to_micro(usd: f64) -> u64 {
-    ((usd * 1_000_000.0).round() as u64).max(1)
 }
 
 /// The limits an atom or workflow inherits when it writes none.
@@ -184,7 +208,7 @@ impl Default for BudgetSettings {
 }
 
 /// Where a resolved cap came from.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Origin {
     /// The atom's or workflow's own `budget` block.
     Declared,
@@ -194,7 +218,7 @@ pub enum Origin {
 }
 
 /// A budget after defaults: every cap that applies, and where each came from.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Resolved {
     /// Cumulative tokens.
     pub tokens: u64,
@@ -237,59 +261,141 @@ pub enum BudgetError {
         /// The model.
         model: String,
     },
-    /// A configured default is not positive and finite.
-    #[error("{setting} must be a positive number")]
+    /// A configured setting is out of range: not finite, not positive where
+    /// it must be, or past [`LIMIT`].
+    #[error("{setting} {message}")]
     Default {
         /// The setting, such as `budget.atom.minutes`.
         setting: String,
+        /// What is wrong with it.
+        message: String,
     },
+    /// A cap smaller than what one call reserves: it could never admit a
+    /// call.
+    #[error("{0}")]
+    BelowCall(Box<BelowCall>),
+}
+
+/// A cap smaller than what one call to a model reserves.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "the {level} {field} cap ({cap}{unit}, {from}) is smaller than one call to model {model:?} \
+     reserves ({need}{unit}, from {bound}); raise the cap, or lower {bound}"
+)]
+pub struct BelowCall {
+    /// `atom` or `workflow`.
+    pub level: String,
+    /// `tokens`, `minutes` or `cost_usd`.
+    pub field: String,
+    /// The cap, in the field's unit.
+    pub cap: String,
+    /// What one call reserves, in the same unit.
+    pub need: String,
+    /// The unit, such as ` tokens`.
+    pub unit: String,
+    /// Where the cap came from: written in the budget block, or the
+    /// default's setting.
+    pub from: String,
+    /// The model.
+    pub model: String,
+    /// The settings that make up one call's reservation, such as
+    /// `budget.call.input_tokens + budget.call.output_tokens`.
+    pub bound: String,
+}
+
+fn out_of_range(setting: String, message: &str) -> BudgetError {
+    BudgetError::Default {
+        setting,
+        message: message.to_owned(),
+    }
+}
+
+impl BudgetSettings {
+    /// Check every setting is in range: caps, the call bound and prices
+    /// finite, positive (a price may be zero) and at most [`LIMIT`] in their
+    /// integer units.
+    pub fn validate(&self) -> Result<(), BudgetError> {
+        let count = |setting: String, n: u64| {
+            if n == 0 || n > LIMIT {
+                Err(out_of_range(
+                    setting,
+                    &format!("must be a positive integer, at most {LIMIT}"),
+                ))
+            } else {
+                Ok(())
+            }
+        };
+        let scaled = |setting: String, n: f64, scale: f64| {
+            amount(n, scale)
+                .map(|_| ())
+                .ok_or_else(|| out_of_range(setting, "must be a positive number of a sane size"))
+        };
+        for (level, limits) in [("atom", &self.atom), ("workflow", &self.workflow)] {
+            count(format!("budget.{level}.tokens"), limits.tokens)?;
+            scaled(format!("budget.{level}.minutes"), limits.minutes, 60_000.0)?;
+            if let Some(usd) = limits.cost_usd {
+                scaled(format!("budget.{level}.cost_usd"), usd, 1_000_000.0)?;
+            }
+        }
+        count("budget.call.input_tokens".into(), self.call.input_tokens)?;
+        count("budget.call.output_tokens".into(), self.call.output_tokens)?;
+        scaled("budget.call.minutes".into(), self.call.minutes, 60_000.0)?;
+        for (model, price) in &self.pricing {
+            let at = |field: &str| format!("budget.pricing.{model}.{field}");
+            for (field, usd) in [
+                ("input_usd_per_mtok", price.input_usd_per_mtok),
+                ("output_usd_per_mtok", price.output_usd_per_mtok),
+            ] {
+                // A price may be zero, never negative, and a million tokens
+                // at it stays under LIMIT micro-dollars.
+                if !(usd.is_finite() && usd >= 0.0 && usd * 1e6 <= LIMIT as f64) {
+                    return Err(out_of_range(
+                        at(field),
+                        "must be a number of US dollars, zero or more, of a sane size",
+                    ));
+                }
+            }
+            if let Some(n) = price.max_input_tokens {
+                count(at("max_input_tokens"), n)?;
+            }
+            if let Some(n) = price.max_output_tokens {
+                count(at("max_output_tokens"), n)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Resolve `declared` for `level` against `settings`, for calls to `models`
 /// (every model the atom or workflow may call). A dollar cap, written or
-/// inherited, needs every one of them priced.
+/// inherited, needs every one of them priced, and every cap must leave room
+/// for one call to each of them.
 pub fn resolve(
     declared: &Budget,
     level: Level,
     settings: &BudgetSettings,
     models: &[&str],
 ) -> Result<Resolved, BudgetError> {
+    settings.validate()?;
     let limits = match level {
         Level::Atom => &settings.atom,
         Level::Workflow => &settings.workflow,
     };
     let path = |field: &str| format!("budget.{}.{field}", level.key());
-    let finite = |n: f64, field: &str| {
-        if n.is_finite() && n > 0.0 {
-            Ok(n)
-        } else {
-            Err(BudgetError::Default {
-                setting: path(field),
-            })
-        }
-    };
+    // In range: validated above.
+    let millis_of = |minutes: f64| amount(minutes, 60_000.0).unwrap_or(LIMIT);
+    let micro_of = |usd: f64| amount(usd, 1_000_000.0).unwrap_or(LIMIT);
     let (tokens, tokens_from) = match declared.tokens {
         Some(t) => (t, Origin::Declared),
-        None if limits.tokens > 0 => (limits.tokens, Origin::Default(path("tokens"))),
-        None => {
-            return Err(BudgetError::Default {
-                setting: path("tokens"),
-            });
-        }
+        None => (limits.tokens, Origin::Default(path("tokens"))),
     };
     let (millis, millis_from) = match declared.millis {
         Some(m) => (m, Origin::Declared),
-        None => (
-            minutes_to_millis(finite(limits.minutes, "minutes")?),
-            Origin::Default(path("minutes")),
-        ),
+        None => (millis_of(limits.minutes), Origin::Default(path("minutes"))),
     };
     let (micro_usd, cost_from) = match (declared.micro_usd, limits.cost_usd) {
         (Some(c), _) => (Some(c), Origin::Declared),
-        (None, Some(usd)) => (
-            Some(usd_to_micro(finite(usd, "cost_usd")?)),
-            Origin::Default(path("cost_usd")),
-        ),
+        (None, Some(usd)) => (Some(micro_of(usd)), Origin::Default(path("cost_usd"))),
         (None, None) => (None, Origin::Default(path("cost_usd"))),
     };
     if micro_usd.is_some()
@@ -299,21 +405,30 @@ pub fn resolve(
             model: (*model).to_owned(),
         });
     }
-    Ok(Resolved {
+    let resolved = Resolved {
         tokens,
         millis,
         micro_usd,
         origins: [tokens_from, millis_from, cost_from],
-    })
+    };
+    for model in models {
+        settings.check_room(&resolved, level, model)?;
+    }
+    Ok(resolved)
 }
 
 /// What one call to a model reserves, and the provider's documented maximum
 /// for it, as tokens, milliseconds and micro-dollars.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Reservation {
-    /// Input and output tokens.
+    /// The input tokens it may take.
+    pub input_tokens: u64,
+    /// The output tokens it may return, reasoning included: a call is sent
+    /// with this as its output limit.
+    pub output_tokens: u64,
+    /// Input and output tokens together.
     pub tokens: u64,
-    /// Active milliseconds.
+    /// Active milliseconds: a call is cut off when they run out.
     pub millis: u64,
     /// Micro-dollars at the model's price; zero when it is unpriced.
     pub micro_usd: u64,
@@ -325,17 +440,17 @@ impl BudgetSettings {
         let price = self.pricing.get(model);
         let input = price
             .and_then(|p| p.max_input_tokens)
-            .unwrap_or(self.call.input_tokens);
+            .unwrap_or(self.call.input_tokens)
+            .min(LIMIT);
         let output = price
             .and_then(|p| p.max_output_tokens)
-            .unwrap_or(self.call.output_tokens);
+            .unwrap_or(self.call.output_tokens)
+            .min(LIMIT);
         Reservation {
+            input_tokens: input,
+            output_tokens: output,
             tokens: input.saturating_add(output),
-            millis: if self.call.minutes.is_finite() && self.call.minutes > 0.0 {
-                minutes_to_millis(self.call.minutes)
-            } else {
-                0
-            },
+            millis: amount(self.call.minutes, 60_000.0).unwrap_or(LIMIT),
             micro_usd: price.map_or(0, |p| cost(p, input, output)),
         }
     }
@@ -347,13 +462,86 @@ impl BudgetSettings {
             .get(model)
             .map_or(0, |p| cost(p, input, output))
     }
+
+    /// Refuse `caps` at `level` if one call to `model` cannot fit in them.
+    fn check_room(&self, caps: &Resolved, level: Level, model: &str) -> Result<(), BudgetError> {
+        let call = self.reservation(model);
+        let priced = self.pricing.get(model);
+        let tokens_from = match (
+            priced.and_then(|p| p.max_input_tokens),
+            priced.and_then(|p| p.max_output_tokens),
+        ) {
+            (None, None) => "budget.call.input_tokens + budget.call.output_tokens".to_owned(),
+            (Some(_), Some(_)) => format!(
+                "budget.pricing.{model}.max_input_tokens + budget.pricing.{model}.max_output_tokens"
+            ),
+            (Some(_), None) => {
+                format!("budget.pricing.{model}.max_input_tokens + budget.call.output_tokens")
+            }
+            (None, Some(_)) => {
+                format!("budget.call.input_tokens + budget.pricing.{model}.max_output_tokens")
+            }
+        };
+        let below = |field: &str, origin: &Origin, cap: String, need: String, unit: &str, bound| {
+            BudgetError::BelowCall(Box::new(BelowCall {
+                level: level.key().to_owned(),
+                field: field.to_owned(),
+                cap,
+                need,
+                unit: unit.to_owned(),
+                from: match origin {
+                    Origin::Declared => "written in its budget block".to_owned(),
+                    Origin::Default(setting) => format!("the default {setting}"),
+                },
+                model: model.to_owned(),
+                bound,
+            }))
+        };
+        if caps.tokens < call.tokens {
+            return Err(below(
+                "tokens",
+                &caps.origins[0],
+                caps.tokens.to_string(),
+                call.tokens.to_string(),
+                " tokens",
+                tokens_from,
+            ));
+        }
+        if caps.millis < call.millis {
+            let minutes = |ms: u64| format!("{}", ms as f64 / 60_000.0);
+            return Err(below(
+                "minutes",
+                &caps.origins[1],
+                minutes(caps.millis),
+                minutes(call.millis),
+                " minutes",
+                "budget.call.minutes".to_owned(),
+            ));
+        }
+        if let Some(cap) = caps.micro_usd
+            && cap < call.micro_usd
+        {
+            let usd = |micro: u64| format!("{:.6}", micro as f64 / 1e6);
+            return Err(below(
+                "cost_usd",
+                &caps.origins[2],
+                usd(cap),
+                usd(call.micro_usd),
+                " US dollars",
+                format!("{tokens_from}, at budget.pricing.{model}"),
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn cost(price: &Price, input: u64, output: u64) -> u64 {
-    // USD per million tokens is micro-dollars per token.
+    // USD per million tokens is micro-dollars per token. Negative prices are
+    // refused by validation; clamped here all the same.
     let micro = input as f64 * price.input_usd_per_mtok.max(0.0)
         + output as f64 * price.output_usd_per_mtok.max(0.0);
-    micro.ceil() as u64
+    // Saturating, and held to LIMIT so a sum of costs cannot overflow.
+    (micro.ceil() as u64).min(LIMIT)
 }
 
 #[cfg(test)]

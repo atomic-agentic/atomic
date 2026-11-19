@@ -19,7 +19,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Tokens one model call used, as the provider reported them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -45,6 +45,27 @@ pub struct Call {
     pub index: u32,
     /// The model it goes to.
     pub model: String,
+    /// An upper bound on its input tokens, when the caller can tell: the
+    /// size of the request in bytes, since no token is shorter than a byte.
+    /// The meter records it in the call's declared maximum.
+    pub input_bound: Option<u64>,
+}
+
+/// What an admitted call may use: the runtime holds the call to it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Limit {
+    /// The output tokens it may return, sent to the provider as the call's
+    /// output limit.
+    pub output_tokens: Option<u64>,
+    /// How long it may take: it is cut off after this.
+    pub time: Option<Duration>,
+}
+
+impl Limit {
+    /// `default`, or this limit's time if it is shorter.
+    pub fn time_within(&self, default: Duration) -> Duration {
+        self.time.map_or(default, |t| t.min(default))
+    }
 }
 
 /// A call the meter admitted, to be settled once.
@@ -58,7 +79,13 @@ pub struct Ticket {
     pub model: String,
     /// When it was admitted, for the active time it took.
     pub admitted: Instant,
+    /// What the call may use: its reservation.
+    pub limit: Limit,
 }
+
+/// An admission: the ticket to settle, if the call is metered, and the
+/// limit to hold it to.
+pub(crate) type Admitted = (Option<Ticket>, Limit);
 
 /// How a call ended, for its settlement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,11 +150,14 @@ impl Metering {
         self.0.is_some()
     }
 
-    /// Admit `call`; with no meter, a ticket that settles to nothing.
-    pub(crate) async fn admit(&self, call: Call) -> Result<Option<Ticket>, MeterError> {
+    /// Admit `call`; with no meter, no ticket and no limit.
+    pub(crate) async fn admit(&self, call: Call) -> Result<Admitted, MeterError> {
         match &self.0 {
-            Some(meter) => meter.admit(call).await.map(Some),
-            None => Ok(None),
+            Some(meter) => meter.admit(call).await.map(|t| {
+                let limit = t.limit;
+                (Some(t), limit)
+            }),
+            None => Ok((None, Limit::default())),
         }
     }
 
