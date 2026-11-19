@@ -1116,8 +1116,10 @@ fn an_exec_command_sees_only_its_declared_environment_from_the_project_root() {
         let rt = runtimes(&model, "exec-env");
         let script = "import json, os, sys\njson.load(sys.stdin)\n\
             names = sorted(n for n in os.environ if n != 'LC_CTYPE')  # Python's own locale coercion\n\
-            assert names == ['HOME', 'REGION', 'TMPDIR'], names\n\
+            assert names == ['ATOMIC_EFFECT_KEY', 'ATOMIC_RUN_ID', 'ATOMIC_STEP_ID', 'HOME', 'REGION', 'TMPDIR'], names\n\
             assert os.environ['REGION'] == 'eu'\n\
+            assert os.environ['ATOMIC_RUN_ID'] == 'run-1' and os.environ['ATOMIC_STEP_ID'] == 'total', dict(os.environ)\n\
+            assert len(os.environ['ATOMIC_EFFECT_KEY']) == 64\n\
             assert os.path.isfile('atomic.yaml'), os.getcwd()\n\
             assert os.environ['HOME'] == os.environ['TMPDIR'] and os.path.isdir(os.environ['HOME'])\n\
             json.dump({'total': 1}, sys.stdout)\n";

@@ -187,6 +187,14 @@ fn check_exec(kind: &str, fm: &serde_json::Map<String, Value>) -> Result<(), (St
                         "an environment variable name is letters, digits and `_`",
                     );
                 }
+                if crate::runtime::EFFECT_VARIABLES.contains(&name.as_str()) {
+                    return refuse(
+                        &format!("/env/{name}"),
+                        &format!(
+                            "`{name}` is set by atomic for every exec step; an atom cannot declare it"
+                        ),
+                    );
+                }
                 if !value.is_string() {
                     return refuse(&format!("/env/{name}"), "an environment value is a string");
                 }

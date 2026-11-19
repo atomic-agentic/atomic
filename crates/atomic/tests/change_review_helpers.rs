@@ -102,6 +102,7 @@ fn rendered(project: &Path, name: &str) -> atomic_core::render::Rendered {
             frontmatter: &atom.frontmatter,
             origin: "external",
             origins: Some(&origins),
+            step: None,
         },
     )
     .expect("renders")

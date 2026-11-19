@@ -419,6 +419,7 @@ pub async fn run_declarative(
             frontmatter: &atom.frontmatter,
             origin,
             origins: None,
+            step: None,
         },
         None,
         runtimes,
@@ -448,7 +449,19 @@ pub async fn run_declarative_with_context(
         return Err(AtomError::Runtime("compiled atom version mismatch".into()));
     }
     if atom.kind == "exec" {
-        return run_exec(atom, compiled, input, Arc::new(atomic_exec::LocalBackend)).await;
+        // Outside a workflow, the atom's own name stands in for the step.
+        let identity = EffectIdentity {
+            run_id: run.run_id.to_owned(),
+            step_id: run.step.unwrap_or(&atom.name).to_owned(),
+        };
+        return run_exec(
+            atom,
+            compiled,
+            input,
+            &identity,
+            Arc::new(atomic_exec::LocalBackend),
+        )
+        .await;
     }
     let backend = match atom.kind.as_str() {
         "codex" => Backend::Codex(&runtimes.codex),
@@ -489,6 +502,7 @@ pub async fn run_declarative_with_context(
                 frontmatter: &render_frontmatter,
                 origin: &render_origin,
                 origins: render_origins.as_ref(),
+                step: None,
             },
             render_snapshot.as_ref(),
             render_step.as_deref(),
@@ -550,6 +564,42 @@ pub async fn run_declarative_with_context(
     run_contract(backend, request, &check).await
 }
 
+/// The names atomic sets in an exec command's environment, which an atom's
+/// `env` may not declare.
+pub const EFFECT_VARIABLES: [&str; 3] = ["ATOMIC_RUN_ID", "ATOMIC_STEP_ID", "ATOMIC_EFFECT_KEY"];
+
+/// Who an exec command acts for: its run and step. The effect key is the
+/// same on every attempt of that step and differs for any other step or run,
+/// so a command that writes can make a retried write recognisable, by
+/// sending it as an idempotency key or putting it in what it writes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EffectIdentity {
+    /// The run.
+    pub run_id: String,
+    /// The step within it.
+    pub step_id: String,
+}
+
+impl EffectIdentity {
+    /// SHA-256 of the run and step, in hex.
+    pub fn key(&self) -> String {
+        let mut digest = Sha256::new();
+        digest.update(b"atomic-effect-v1\0");
+        digest.update(self.run_id.as_bytes());
+        digest.update([0]);
+        digest.update(self.step_id.as_bytes());
+        format!("{:x}", digest.finalize())
+    }
+
+    fn environment(&self) -> [(String, String); 3] {
+        [
+            ("ATOMIC_RUN_ID".into(), self.run_id.clone()),
+            ("ATOMIC_STEP_ID".into(), self.step_id.clone()),
+            ("ATOMIC_EFFECT_KEY".into(), self.key()),
+        ]
+    }
+}
+
 /// How long an exec atom's command may run before it is stopped.
 pub const EXEC_TIME_LIMIT: std::time::Duration = std::time::Duration::from_secs(300);
 /// The most an exec atom's command may write to stdout, in bytes.
@@ -567,6 +617,7 @@ pub async fn run_exec(
     atom: &AtomFile,
     compiled: &Compiled,
     input: &Value,
+    identity: &EffectIdentity,
     backend: Arc<dyn atomic_exec::ExecutionBackend>,
 ) -> Result<(Value, RunMetadata), AtomError> {
     let contract = |key: &str| {
@@ -601,9 +652,10 @@ pub async fn run_exec(
         .filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_owned())))
         .collect();
     let scratch_text = scratch.display().to_string();
-    env.retain(|(k, _)| k != "HOME" && k != "TMPDIR");
+    env.retain(|(k, _)| k != "HOME" && k != "TMPDIR" && !EFFECT_VARIABLES.contains(&k.as_str()));
     env.push(("HOME".into(), scratch_text.clone()));
     env.push(("TMPDIR".into(), scratch_text));
+    env.extend(identity.environment());
     let stdin = serde_json::to_vec(input).map_err(|e| AtomError::Runtime(e.to_string()))?;
     let mut h = Sha256::new();
     for part in std::iter::once(&program).chain(&args) {

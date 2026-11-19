@@ -44,7 +44,7 @@ export const config = {
 `exec.command` is the program and its arguments, run with no shell from the
 project root. The command reads its input as JSON on stdin and writes its output
 as JSON on stdout; a nonzero exit fails the step. It receives only the variables
-in `env`, plus its own `HOME` and `TMPDIR`.
+in `env`, plus its own `HOME` and `TMPDIR` and the effect variables below.
 
 A step runs at least once, and Atomic cannot see what a command does to other
 systems. If execution is interrupted after the command started and before its
@@ -58,7 +58,12 @@ checkpoint failures that trigger recovery without restarting the process:
 | omitted | Neither is known | The step is parked as `outcome_unknown`: it fails without running the command again, and nothing retries it |
 
 A command that writes is safe to repeat when it uses a stable key, a
-create-only write or a check for its own earlier write.
+create-only write or a check for its own earlier write. Atomic gives every exec
+command one in its environment: `ATOMIC_EFFECT_KEY` is the same on every attempt
+of a step and differs for any other step or run, beside `ATOMIC_RUN_ID` and
+`ATOMIC_STEP_ID`. Send it as an idempotency key, or put it in what the command
+writes so a repeated write is recognisable. An atom's `env` cannot set these
+three names.
 
 ## Schema locations
 

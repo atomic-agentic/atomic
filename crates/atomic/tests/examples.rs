@@ -142,6 +142,10 @@ fn every_v0_1_example_passes_the_real_load_and_check() {
                             &atom,
                             &compiled,
                             &input,
+                            &runtime::EffectIdentity {
+                                run_id: "examples".into(),
+                                step_id: atom.name.clone(),
+                            },
                             Arc::new(atomic_exec::LocalBackend),
                         ))
                         .unwrap_or_else(|e| panic!("{what}: {e}"));
@@ -155,6 +159,7 @@ fn every_v0_1_example_passes_the_real_load_and_check() {
                             frontmatter: &atom.frontmatter,
                             origin: "external",
                             origins: None,
+                            step: None,
                         },
                     )
                     .unwrap_or_else(|e| panic!("{what}: {e}"));

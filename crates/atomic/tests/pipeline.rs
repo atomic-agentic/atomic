@@ -1036,7 +1036,7 @@ fn write_send_note(dir: &Path, external: Option<&str>) {
     std::fs::create_dir_all(project.join("tools")).expect("tools");
     std::fs::write(
         project.join("tools/send.py"),
-        "import json, os, sys\nnote = json.load(sys.stdin)\nwith open(os.environ['SENT_LOG'], 'a') as log:\n    log.write('sent\\n')\njson.dump({'title': 'Export crashes on accents', 'words': len(note['text'].split())}, sys.stdout)\n",
+        "import json, os, sys\nnote = json.load(sys.stdin)\nwith open(os.environ['SENT_LOG'], 'a') as log:\n    log.write('sent ' + os.environ.get('ATOMIC_EFFECT_KEY', '-') + ' ' + os.environ.get('ATOMIC_RUN_ID', '-') + ' ' + os.environ.get('ATOMIC_STEP_ID', '-') + '\\n')\njson.dump({'title': 'Export crashes on accents', 'words': len(note['text'].split())}, sys.stdout)\n",
     )
     .expect("script");
     let effects = external
@@ -1127,6 +1127,13 @@ async fn interrupted_declared_exec_runs_again(external: &str) {
     assert_eq!(out, json!({"line": "P1: Export crashes on accents"}));
     assert_eq!(sends(&dir), 2, "the command ran again after the crash");
     assert_eq!(model.calls(), 2);
+    // Both attempts saw one effect key, for this run and step.
+    let log = std::fs::read_to_string(dir.join("sent.log")).expect("log");
+    let lines: Vec<&str> = log.lines().collect();
+    assert_eq!(lines[0], lines[1], "{log}");
+    let fields: Vec<&str> = lines[0].split(' ').collect();
+    assert_eq!(fields[2..], ["declared-1", "read"], "{log}");
+    assert_eq!(fields[1].len(), 64, "{log}");
 }
 
 #[test]
@@ -1923,5 +1930,61 @@ fn a_model_output_bound_to_policy_is_agent_data() {
         rt.shutdown(std::time::Duration::from_secs(5))
             .await
             .expect("shutdown");
+    });
+}
+
+// The effect key differs for another run, and an atom cannot set it itself.
+#[test]
+fn another_run_gets_another_effect_key_and_atoms_cannot_set_it() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![
+            Reply::Text(RANK.into()),
+            Reply::Text(SUMMARY.into()),
+            Reply::Text(RANK.into()),
+            Reply::Text(SUMMARY.into()),
+        ])
+        .await
+        .expect("fake model");
+        let dir = scratch("keys");
+        let project = project(&dir);
+        write_send_note(&dir, Some("idempotent"));
+        let rt = engine(&dir, &model.base_url()).await;
+        for run in ["keys-1", "keys-2"] {
+            let pipeline = load(&project, "sent.workflow.yaml", &sent());
+            rt.start(
+                PIPELINE,
+                run,
+                PipelineRun {
+                    pipeline,
+                    input: json!({"text": "a note"}),
+                },
+            )
+            .await
+            .expect("start");
+            let _: Value = rt.result(run).await.expect("result");
+        }
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+        let log = std::fs::read_to_string(dir.join("sent.log")).expect("log");
+        let keys: Vec<&str> = log
+            .lines()
+            .map(|l| l.split(' ').nth(1).unwrap_or(""))
+            .collect();
+        assert_eq!(keys.len(), 2);
+        assert_ne!(keys[0], keys[1], "{log}");
+
+        let atom = project.join("atoms/send-note.atom.astro");
+        let source = std::fs::read_to_string(&atom).expect("atom");
+        std::fs::write(
+            &atom,
+            source.replace(
+                "env: { SENT_LOG:",
+                "env: { ATOMIC_EFFECT_KEY: 'mine', SENT_LOG:",
+            ),
+        )
+        .expect("atom");
+        let error = atomic_core::atom::load(&atom, &mut Registry::new()).expect_err("refused");
+        assert!(error.message.contains("set by atomic"), "{error}");
     });
 }

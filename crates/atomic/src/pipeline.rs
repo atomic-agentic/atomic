@@ -613,7 +613,7 @@ async fn run_pipeline<C: WorkflowContext>(
                 let proposal = match tree {
                     None => {
                         propose(async move {
-                            run_in(&atom, &atom_input, &origins, &run_id, &runtimes).await
+                            run_in(&atom, &atom_input, &origins, &run_id, &id, &runtimes).await
                         })
                             .await
                     }
@@ -669,6 +669,7 @@ async fn run_in(
     input: &Value,
     origins: &BTreeMap<String, String>,
     run_id: &str,
+    step: &str,
     runtimes: &Runtimes,
 ) -> std::result::Result<(Value, atomic_core::runtime::RunMetadata), AtomError> {
     let mut registry = Registry::new();
@@ -686,6 +687,7 @@ async fn run_in(
             frontmatter: &atom.frontmatter,
             origin: "external",
             origins: Some(origins),
+            step: Some(step),
         },
         None,
         runtimes,
@@ -705,13 +707,14 @@ async fn in_worktree(
     run_id: String,
     runtimes: Arc<Runtimes>,
 ) -> Result<Proposal> {
+    let step = request.step.clone();
     let ((output, metadata), commit) = contained(async move {
         let subdirectory = source_subdirectory(runtimes.codex.cwd.clone()).await?;
         worktrees
             .run_step(request, |tree| async move {
                 let mut here = (*runtimes).clone();
                 here.codex.cwd = tree.join(subdirectory);
-                run_in(&atom, &input, &origins, &run_id, &here).await
+                run_in(&atom, &input, &origins, &run_id, &step, &here).await
             })
             .await
             .map_err(|e| match e {

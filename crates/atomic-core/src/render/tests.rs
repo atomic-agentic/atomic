@@ -14,6 +14,7 @@ fn prompt(body: &str, input: Value, origin: &str) -> Rendered {
             frontmatter: &atom.frontmatter,
             origin,
             origins: None,
+            step: None,
         },
     )
     .expect("render")
@@ -75,6 +76,7 @@ fn curated_examples_are_rendered_as_schema_checked_team_data() {
             frontmatter: &atom.frontmatter,
             origin: "external",
             origins: None,
+            step: None,
         },
     )
     .expect("render");

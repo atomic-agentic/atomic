@@ -34,6 +34,9 @@ pub struct RunInput<'a> {
     /// Origins of individual input fields, overriding `origin` for each, as
     /// a workflow's bindings assign them.
     pub origins: Option<&'a std::collections::BTreeMap<String, String>>,
+    /// The workflow step this dispatch runs, when there is one; an exec
+    /// atom's effect key is derived from it and the run.
+    pub step: Option<&'a str>,
 }
 
 /// Render a checked source graph without reading the source tree.

@@ -47,6 +47,7 @@ fn rendered(atom: &Atom, input: Value, origin: &str) -> Result<Rendered, RenderE
             frontmatter: &atom.frontmatter,
             origin,
             origins: None,
+            step: None,
         },
     )
 }
