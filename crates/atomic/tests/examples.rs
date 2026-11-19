@@ -175,3 +175,61 @@ fn every_v0_1_example_passes_the_real_load_and_check() {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+// The workspace example (`examples/06-workspace`): a member checked from an
+// unrelated directory resolves the shared schema its output references,
+// offline; two members sharing a schema ID fail.
+#[test]
+fn a_workspace_member_resolves_shared_schemas_from_anywhere() {
+    let dir = copy("06-workspace");
+    let check = |cwd: &Path| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_atomic"))
+            .arg("check")
+            .arg(dir.join("services/billing"))
+            .current_dir(cwd)
+            .env("ATOMIC_HOME", dir.join(".state"))
+            .output()
+            .expect("atomic check")
+    };
+    let elsewhere = std::env::temp_dir();
+    let output = check(&elsewhere);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The billing atom's contract is the shared schema.
+    let project = project::discover(&dir.join("services/billing")).expect("member");
+    let mut registry = Registry::new();
+    collections::load_schemas(&project, &mut registry).expect("schemas");
+    let atom = atom::load(
+        &dir.join("services/billing/atoms/assess-change.atom.astro"),
+        &mut registry,
+    )
+    .expect("atom");
+    compile::compile(&atom, &registry).expect("compiles");
+    assert!(
+        registry
+            .get("https://atomic.example/schemas/assessment-v1")
+            .is_some()
+    );
+
+    // Without the workspace, the reference has nothing to resolve to.
+    std::fs::rename(dir.join("atomic.yaml"), dir.join("workspace.yaml.off")).expect("hide");
+    assert!(!check(&elsewhere).status.success());
+    std::fs::rename(dir.join("workspace.yaml.off"), dir.join("atomic.yaml")).expect("restore");
+
+    // A second member declaring the same ID is a duplicate in the shared scope.
+    let other = dir.join("services/payments");
+    std::fs::create_dir_all(other.join("schemas")).expect("member");
+    std::fs::write(other.join("atomic.yaml"), "atomic: 1\nname: payments\n").expect("manifest");
+    std::fs::copy(
+        dir.join("shared/schemas/assessment.schema.yaml"),
+        other.join("schemas/assessment.schema.yaml"),
+    )
+    .expect("duplicate");
+    let output = check(&elsewhere);
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("assessment-v1"), "{error}");
+}

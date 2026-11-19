@@ -23,8 +23,9 @@ Slack gate approvals are separate integrations, with Atomic adapters still plann
 
 The first authoring skill, `atomic-create-atom`, is installed today by
 `atomic setup claude` and `atomic setup codex`; the rest of the pack and
-higher-level project generation follow later. Workspace member discovery and
-shared-schema resolution belong to M11b/M39b in v0.5.
+higher-level project generation follow later. Workspace member discovery
+and shared-schema resolution are built; sharing atoms between members belongs
+to M11b/M39b in v0.5.
 
 Declarative atoms now use Astro exclusively. The production loader supports local
 components, named slots with fallback content, frontmatter locals, template

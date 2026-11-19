@@ -137,3 +137,93 @@ fn a_collection_override_replaces_only_that_collection() {
         "workflows/**/*.workflow.yaml"
     );
 }
+
+const WORKSPACE: &[(&str, &str)] = &[
+    (
+        "atomic.yaml",
+        "atomic: 1\nname: engineering\nworkspace:\n  members: [shared, services/*]\n",
+    ),
+    ("shared/atomic.yaml", "atomic: 1\nname: shared\n"),
+    ("services/billing/atomic.yaml", "atomic: 1\nname: billing\n"),
+    (
+        "services/payments/atomic.yaml",
+        "atomic: 1\nname: payments\n",
+    ),
+    ("services/notes.txt", ""),
+    ("tools/atomic.yaml", "atomic: 1\nname: tools\n"),
+];
+
+#[test]
+fn a_workspace_lists_its_members_by_glob() {
+    let root = tree(WORKSPACE);
+    let workspace = workspace_of(&discover(&root).expect("discover"))
+        .expect("workspace")
+        .expect("a workspace");
+    let mut names: Vec<_> = workspace.members.iter().map(|m| m.name.as_str()).collect();
+    names.sort_unstable();
+    // `services/notes.txt` is not a directory and `tools` is not listed.
+    assert_eq!(names, ["billing", "payments", "shared"]);
+}
+
+#[test]
+fn a_member_finds_its_workspace_and_a_project_outside_it_does_not() {
+    let root = tree(WORKSPACE);
+    let billing = discover(&root.join("services/billing")).expect("discover");
+    assert_eq!(billing.name, "billing");
+    let workspace = workspace_of(&billing)
+        .expect("workspace")
+        .expect("a member");
+    assert_eq!(workspace.root.name, "engineering");
+    let mut names: Vec<_> = workspace.members.iter().map(|m| m.name.clone()).collect();
+    names.sort();
+    assert_eq!(names, ["billing", "payments", "shared"]);
+    // `tools` has a manifest but is not a member.
+    let tools = discover(&root.join("tools")).expect("discover");
+    assert!(workspace_of(&tools).expect("workspace").is_none());
+    // A plain project between a member and the workspace bounds the search.
+    let nested = tree(&[
+        (
+            "atomic.yaml",
+            "atomic: 1\nname: engineering\nworkspace:\n  members: [team/*]\n",
+        ),
+        ("team/atomic.yaml", "atomic: 1\nname: team\n"),
+        ("team/app/atomic.yaml", "atomic: 1\nname: app\n"),
+    ]);
+    let app = discover(&nested.join("team/app")).expect("discover");
+    assert!(workspace_of(&app).expect("workspace").is_none());
+}
+
+#[test]
+fn workspace_mistakes_are_refused() {
+    for (manifest, says) in [
+        (
+            "atomic: 1\nworkspace:\n  members: []\n",
+            "lists member directories",
+        ),
+        (
+            "atomic: 1\nworkspace:\n  members: [../elsewhere]\n",
+            "inside the workspace",
+        ),
+        (
+            "atomic: 1\nworkspace:\n  members: [shared]\n  exports: []\n",
+            "not supported",
+        ),
+        (
+            "atomic: 1\nworkspace: [shared]\n",
+            "a mapping with `members`",
+        ),
+    ] {
+        let root = tree(&[("atomic.yaml", manifest)]);
+        let error = discover(&root).expect_err(manifest).to_string();
+        assert!(error.contains(says), "{manifest}: {error}");
+    }
+    let root = tree(&[(
+        "atomic.yaml",
+        "atomic: 1\nworkspace:\n  members: [shared]\n",
+    )]);
+    let error = workspace_of(&discover(&root).expect("discover")).expect_err("no manifest");
+    assert!(
+        error.to_string().contains("holds no atomic.yaml"),
+        "{error}"
+    );
+}

@@ -205,11 +205,7 @@ fn load_project_schemas(
     };
     match project::discover(path) {
         Ok(project) => {
-            let files = atomic_core::collections::collect(&project)?;
-            for schema in &files["schemas"] {
-                registry.load_file(&schema.path)?;
-            }
-            Ok(())
+            atomic_core::collections::load_schemas(&project, registry).map_err(anyhow::Error::msg)
         }
         Err(project::ProjectError::NotFound(_)) => Ok(()),
         Err(error) => Err(error.into()),
@@ -233,9 +229,7 @@ fn check(path: Option<PathBuf>) -> anyhow::Result<()> {
     }
     let project = project::discover(&path)?;
     let files = collections::collect(&project)?;
-    for schema in &files["schemas"] {
-        registry.load_file(&schema.path)?;
-    }
+    collections::load_schemas(&project, &mut registry).map_err(anyhow::Error::msg)?;
     let mut atoms = std::collections::BTreeMap::new();
     for source in &files["atoms"] {
         let atom = atom::load(&source.path, &mut registry)?;

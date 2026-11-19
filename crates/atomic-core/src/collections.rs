@@ -231,3 +231,43 @@ pub fn collect(project: &Project) -> Result<BTreeMap<String, Vec<SourceFile>>, C
 
 #[cfg(test)]
 mod tests;
+
+/// Load the schemas `project` can reference into `registry`: its own, then
+/// those of its fellow workspace members (see
+/// [`crate::project::workspace_of`]). The project's own schema wins over a
+/// member's with the same ID; two members sharing an ID is an error, as two
+/// schemas sharing one in a project are. Nothing is fetched.
+pub fn load_schemas(
+    project: &Project,
+    registry: &mut atomic_schema::registry::Registry,
+) -> Result<(), String> {
+    use atomic_schema::registry::SchemaError;
+    let own = collect(project).map_err(|e| e.to_string())?;
+    for schema in &own["schemas"] {
+        registry
+            .load_file(&schema.path)
+            .map_err(|e| e.to_string())?;
+    }
+    let Some(workspace) = crate::project::workspace_of(project).map_err(|e| e.to_string())? else {
+        return Ok(());
+    };
+    let here = std::fs::canonicalize(project.root()).map_err(|e| e.to_string())?;
+    for member in &workspace.members {
+        let root = std::fs::canonicalize(member.root()).map_err(|e| e.to_string())?;
+        if root == here {
+            continue;
+        }
+        let files = collect(member).map_err(|e| e.to_string())?;
+        for schema in &files["schemas"] {
+            match registry.load_file(&schema.path) {
+                Ok(_) => {}
+                // The project's own schema takes precedence.
+                Err(SchemaError::DuplicateId { first, .. }) if first.starts_with(&here) => {}
+                Err(e) => {
+                    return Err(format!("workspace member {}: {e}", member.name));
+                }
+            }
+        }
+    }
+    Ok(())
+}
