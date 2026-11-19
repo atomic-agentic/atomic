@@ -36,6 +36,25 @@ repository at the same path as on the host, and keeps cargo's registry and git
 cache in `~/.cache/atomic/dev`. Build output goes to `target/` in the
 repository as usual.
 
+### The prebuilt V8
+
+atomic links one V8, through `deno_core`, for the isolates captured
+TypeScript helpers run in. rusty_v8's build script normally downloads a
+prebuilt static library and checks nothing about it, so atomic pins each
+archive and its generated bindings by SHA-256 in
+[`deps/v8.toml`](../deps/v8.toml). `scripts/v8-archive.sh [TARGET]` fetches
+them once into a local mirror and verifies them on every run;
+[`.cargo/config.toml`](../.cargo/config.toml) points `RUSTY_V8_MIRROR` at
+`target/v8-mirror`, so a plain `cargo build` reads only that mirror and fails
+inside V8's build script, before linking, until the script has filled it.
+`scripts/dev.sh` verifies the archive on the host before the container starts
+and keeps its mirror in `~/.cache/atomic/dev/v8-mirror`, so builds work offline
+once it is cached. A tampered file stops the build; delete it to fetch it again.
+`atomic-core`'s build script checks the mirrored archive against its pin as
+well, and refuses a build with `RUSTY_V8_ARCHIVE` or `V8_FROM_SOURCE` set or
+with `RUSTY_V8_MIRROR` naming a remote mirror, so no environment can link
+another V8.
+
 ### Limits
 
 The container has a memory limit with no swap, a CPU limit and a time limit,

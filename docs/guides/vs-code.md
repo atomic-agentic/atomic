@@ -55,3 +55,19 @@ the source; suppressing TypeScript diagnostics does not bypass Atomic's loader.
 To have the Codex or Claude Code extension write atoms for you, install the
 authoring skill with `atomic setup codex` or `atomic setup claude`; see
 [coding agents](coding-agents.md).
+
+## Workflow and manifest files
+
+`atomic schemas` writes JSON Schemas for workflow files and `atomic.yaml` into
+the generated directory (`.atomic/cache/schemas/` by default). The workflow
+schema is the project's own: a step's `atom` completes from the project's atom
+names, its `with` keys from that atom's input fields, and a contract's `$ref`
+from the schema IDs the project can reference. Point the YAML extension at them
+with a first line, the path relative to the file:
+
+```yaml
+# yaml-language-server: $schema=../.atomic/cache/schemas/workflow.schema.json
+```
+
+Rerun `atomic schemas` after adding or renaming atoms. `atomic check` remains
+authoritative: the schemas cannot check CEL, step references or contracts.

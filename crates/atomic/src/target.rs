@@ -245,7 +245,7 @@ fn atom_pipeline(atom: Atom, input: &Value) -> anyhow::Result<Pipeline> {
     };
     // Each field present, mapped by name: an optional field left out stays
     // out.
-    let with = fields
+    let with: BTreeMap<String, String> = fields
         .keys()
         .map(|k| (k.clone(), format!("input[{}]", Value::String(k.clone()))))
         .collect();
@@ -260,6 +260,7 @@ fn atom_pipeline(atom: Atom, input: &Value) -> anyhow::Result<Pipeline> {
         steps: vec![Step::Atom(AtomStep {
             id: "run".into(),
             atom: atom.name.clone(),
+            origins: with.keys().map(|k| (k.clone(), "external".to_owned())).collect(),
             with,
             worktree: false,
         })],

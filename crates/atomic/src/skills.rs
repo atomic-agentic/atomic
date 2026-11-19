@@ -431,7 +431,8 @@ pub struct Construct {
     pub title: &'static str,
     /// One line of explanation.
     pub note: &'static str,
-    /// Lines added to the frontmatter after the standard imports.
+    /// Lines added to the frontmatter after the standard imports and the
+    /// `Props` binding.
     pub frontmatter: &'static str,
     /// Configuration object literal.
     pub config: &'static str,
@@ -511,6 +512,43 @@ pub const CONSTRUCTS: &[Construct] = &[
         )),
     },
     Construct {
+        title: "Compute a value in the frontmatter",
+        note: "A `const` binds an interpreted expression, evaluated when the prompt \
+               renders; a template literal builds a string. A value computed from input is \
+               still data, never instructions.",
+        frontmatter: "const count = input.items.length;\nconst heading = `${count} items to summarize`;",
+        config: "{}",
+        body: "{heading}\nNote: {input.text}",
+        component: None,
+    },
+    Construct {
+        title: "Fill a named slot",
+        note: "A component renders `<slot name=\"rules\">` with fallback text; the caller \
+               fills it with a direct child that names it. `Astro.slots.has('rules')` tells \
+               the component whether the caller did.",
+        frontmatter: "import Layout from './Layout.astro';",
+        config: "{}",
+        body: "<Layout>\n<Fragment slot=\"rules\">Keep the summary short.</Fragment>\nSummarize: {input.text}\n</Layout>",
+        component: Some((
+            "Layout.astro",
+            "---\n---\n<rules><slot name=\"rules\">Use the team's default rules.</slot></rules>\n<slot />\n",
+        )),
+    },
+    Construct {
+        title: "Call a TypeScript helper",
+        note: "A named import of a local `.ts` module, written without the extension, is a \
+               helper. Each call runs in an isolate that sees only its arguments: no network, \
+               files, environment or host clock. Its result is as trusted as its least trusted \
+               argument; one computed from literals alone may be instructions.",
+        frontmatter: "import { shorten } from './text';",
+        config: "{}",
+        body: "Start from: {shorten(input.text, 40)}",
+        component: Some((
+            "text.ts",
+            "export const shorten = (text: string, limit: number): string =>\n  text.length > limit ? `${text.slice(0, limit)}...` : text;\n",
+        )),
+    },
+    Construct {
         title: "Check the answer with a validator",
         note: "`validate` holds arrow functions over `{input, output}` returning a boolean.",
         frontmatter: "",
@@ -567,7 +605,8 @@ pub const MISTAKES: &[Mistake] = &[
         title: "A `<script>` or `<style>` element",
         wrong: Construct::body("", "", "<script>console.log(1)</script>"),
         says: "unsupported/reserved element script",
-        fix: "Atoms never run code in the prompt. Move logic to an `exec` atom.",
+        fix: "Atoms never run code in the prompt. Put pure logic in a TypeScript helper, and \
+              anything that reads or changes the world in an `exec` atom.",
     },
     Mistake {
         title: "A runtime global",
@@ -582,7 +621,7 @@ pub const MISTAKES: &[Mistake] = &[
         fix: "Read the optional value last and fall back: `{input.extra?.note ?? ''}`.",
     },
     Mistake {
-        title: "A statement in the frontmatter",
+        title: "Reading the clock in the frontmatter",
         wrong: Construct {
             title: "",
             note: "",
@@ -591,8 +630,23 @@ pub const MISTAKES: &[Mistake] = &[
             body: "Note: {input.text}",
             component: None,
         },
-        says: "script values must be config or destructured Astro.props",
-        fix: "The frontmatter holds imports, the `Props` binding and `config` only.",
+        says: "unsupported expression: NewExpression",
+        fix: "Frontmatter is interpreted, not run. Pass the date as input, or compute it in a \
+              helper, which sees the step's recorded time.",
+    },
+    Mistake {
+        title: "A package import",
+        wrong: Construct {
+            title: "",
+            note: "",
+            frontmatter: "import { z } from 'zod';",
+            config: "{}",
+            body: "Note: {input.text}",
+            component: None,
+        },
+        says: "named imports of local .ts helpers are supported",
+        fix: "Import local `.astro` components and `.ts` helpers only; packages are not \
+              available yet.",
     },
     Mistake {
         title: "A validator written as a CEL string",
@@ -624,7 +678,8 @@ pub fn prompt_reference() -> String {
         "# Prompt syntax\n\n\
          The body of an `.atom.astro` file is the prompt. atomic parses it with the Astro \
          parser and interprets a small, TypeScript-shaped subset; it never runs it as \
-         JavaScript. Whitespace is prompt text. Examples show only the frontmatter lines \
+         JavaScript. Only the TypeScript helpers an atom imports run, in an isolated \
+         runtime. Whitespace is prompt text. Examples show only the frontmatter lines \
          they add to the standard imports and `Props` binding in fields.md. Every \
          example below compiles with \
          `atomic check`, against an input with `text` (string), `items` (string list), \
@@ -650,7 +705,8 @@ pub fn prompt_reference() -> String {
         }
         let _ = writeln!(out, "{}\n```\n", c.body);
         if let Some((file, source)) = c.component {
-            let _ = writeln!(out, "`{file}`:\n\n```astro\n{}```\n", source);
+            let fence = if file.ends_with(".ts") { "ts" } else { "astro" };
+            let _ = writeln!(out, "`{file}`:\n\n```{fence}\n{}```\n", source);
         }
     }
     out.push_str("## Mistakes `atomic check` refuses\n\n");

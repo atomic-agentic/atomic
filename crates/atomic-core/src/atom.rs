@@ -187,6 +187,14 @@ fn check_exec(kind: &str, fm: &serde_json::Map<String, Value>) -> Result<(), (St
                         "an environment variable name is letters, digits and `_`",
                     );
                 }
+                if crate::runtime::EFFECT_VARIABLES.contains(&name.as_str()) {
+                    return refuse(
+                        &format!("/env/{name}"),
+                        &format!(
+                            "`{name}` is set by atomic for every exec step; an atom cannot declare it"
+                        ),
+                    );
+                }
                 if !value.is_string() {
                     return refuse(&format!("/env/{name}"), "an environment value is a string");
                 }
@@ -432,7 +440,13 @@ pub fn load(file: &Path, registry: &mut Registry) -> Result<Atom, AtomError> {
             .map_err(|e| fail(1, "body", e.to_string()))?,
         sources: serde_json::from_value(parsed["sources"].clone())
             .map_err(|e| fail(1, "body", e.to_string()))?,
+        helpers: match &parsed["helpers"] {
+            Value::Null => Default::default(),
+            helpers => serde_json::from_value(helpers.clone())
+                .map_err(|e| fail(1, "body", e.to_string()))?,
+        },
     };
+    program.verify_helpers().map_err(|e| fail(1, "body", e))?;
     let mut schemas = serde_json::Map::new();
     for (key, id) in [("Input", &input), ("Output", &output)] {
         schemas.insert(

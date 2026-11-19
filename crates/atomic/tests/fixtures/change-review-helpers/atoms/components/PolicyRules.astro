@@ -1,0 +1,15 @@
+---
+import ApproverList from './ApproverList.astro';
+import type { Policy } from '../../.atomic/types/schemas/policy';
+interface Props { policy: Policy; approvers?: string[] }
+const { policy, approvers }: Props = Astro.props;
+---
+<policy>
+Approved policy revision: {policy.revision}
+{policy.freeze_active ? <Fragment>A change freeze is active. Recommend hold.</Fragment> : null}
+Rules:
+{policy.rules.map((rule) => <Fragment>
+- {rule}
+</Fragment>)}
+<ApproverList approvers={approvers ?? policy.required_approvers} />
+</policy>

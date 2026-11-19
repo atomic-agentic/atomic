@@ -140,6 +140,10 @@ jobs:
       - name: Toolchain
         run: rustup show active-toolchain || rustup toolchain install
 
+      # The prebuilt V8 archive deps/v8.toml pins, for the milestone suites.
+      - name: V8 archive
+        run: scripts/v8-archive.sh
+
       # Codex's lockfile lacks atomic's own packages; resolving adds them at
       # the versions Codex's lockfile allows. The result is kept for the bump
       # commit.

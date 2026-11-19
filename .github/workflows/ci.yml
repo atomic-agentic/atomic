@@ -49,6 +49,8 @@ jobs:
       # Fails when a crate shared with Codex leaves Codex's locked version
       # without a reason in deps/lock-exceptions.toml.
       - run: scripts/lock-check.sh
+      # The V8 rule in lock-check against small lockfiles.
+      - run: scripts/lock-check-test.sh
 
   # The Astro interpreter's own tests, and a rebuild of the bundled compiler
   # from its sources: the committed assets must be exactly what the sources
@@ -195,6 +197,13 @@ jobs:
           key: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
           restore-keys: cargo-${{ runner.os }}-
 
+      # The prebuilt V8 archive deps/v8.toml pins, checked against its SHA-256
+      # into target/v8-mirror, which .cargo/config.toml points rusty_v8 at.
+      - name: V8 archive
+        run: |
+          scripts/v8-archive.sh
+          scripts/v8-archive-test.sh
+
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo build --workspace --locked
@@ -203,6 +212,11 @@ jobs:
       - name: Lockfile resolves from scratch (Linux)
         if: runner.os == 'Linux'
         run: scripts/lock-resolves.sh
+      # Each V8 version deps/v8.toml lists as locked but unbuilt stays out of
+      # the build graph.
+      - name: Unbuilt V8 versions stay unbuilt (Linux)
+        if: runner.os == 'Linux'
+        run: scripts/lock-check.sh v8-built
       # Postgres variants run where the test database is, and the sandbox tests
       # where Codex's Linux sandbox can start; with the features on, a missing
       # database or sandbox fails them rather than skipping.

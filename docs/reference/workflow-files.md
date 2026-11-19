@@ -58,6 +58,40 @@ outside the sandbox, and records the commit in `steps.<id>.metadata.commit`,
 beside `base` and `commit_ref`. The worktrees are removed when the run finishes;
 accepted commits keep their refs.
 
+### Where each input came from
+
+Every mapped value reaches the atom's model as data labelled with its origin,
+never as instructions. Its origin follows what its expression reads, taking the
+least trusted part:
+
+| Source | Origin |
+| --- | --- |
+| The workflow's `input` | `external` |
+| A model step's output (`kind: lite` or `codex`) | `agent` |
+| An exec step's output | `external`, since it brought in outside data |
+| A gate's decision | `team`, since a person made it |
+| A literal the workflow file writes, such as `"'Be brief.'"` | `team` |
+
+`origins` may lower a field's origin, never raise it:
+
+```yaml
+review:
+  after: [draft]
+  atom: review-draft
+  with:
+    draft: steps.draft.output.text
+    rules: "'Cite every claim.'"
+  origins:
+    draft: external
+```
+
+Marking a model's output as `team`, or the workflow's input as `agent`, is an
+error when the workflow loads. So is mapping a value into an atom that does not
+accept its origin: an atom's `trust` is the riskiest origin it accepts, so an
+atom with `trust: 'team'` takes only team data, `'agent'` takes agent or team
+data, and `'external'`, or no `trust` at all, takes any. A helper an atom calls returns data as trusted as
+its least trusted argument.
+
 ## CEL values and string literals
 
 An expression such as `input.text` evaluates a value. To produce a literal string,

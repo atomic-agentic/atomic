@@ -178,7 +178,10 @@ fn standalone_home_atom_works_with_compiler_cache_beneath_home() {
             .expect("symlink");
         let output = fixture.run(&home, &["check", "hello.atom.astro"], "");
         assert!(!output.status.success());
-        assert!(String::from_utf8_lossy(&output.stderr).contains("must be an Astro source"));
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("must be an Astro component or a .ts helper")
+        );
     }
 }
 

@@ -177,7 +177,8 @@ for (const [name, body, script, match] of [
   ['unknown components', '<Missing />', undefined, /unknown component/],
   ['Astro directives', '<div set:html={input.body} />', undefined, /directives/],
   ['literal section attributes', '<rubric name="x">safe</rubric>', undefined, /section attributes/],
-  ['named slots', '<slot name="email" />', undefined, /named slots/],
+  ['dynamic slot names', '<slot name={input.slot} />', undefined, /literal name/],
+  ['a slot attribute outside a component call', '<rubric slot="x">safe</rubric>', undefined, /enclosing component/],
   ['reserved delimiters', '<data-abcd>safe</data-abcd>', undefined, /reserved element/],
 ]) test(`rejects ${name} without executing it`, async (t) => {
   await assert.rejects(() => sample(t, body, script), match);

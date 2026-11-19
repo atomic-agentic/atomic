@@ -281,6 +281,50 @@ fn validate_context(atom: &Atom, snapshot: &Value) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// Where a workflow step's public context comes from: the settings and
+/// profile its run was started with, and the project it belongs to.
+#[derive(Clone, Debug, PartialEq, Serialize, serde::Deserialize)]
+pub struct DispatchSettings {
+    /// Context settings, as `--context-settings` gives them.
+    pub settings: Value,
+    /// The configuration profile, if any.
+    pub profile: Option<String>,
+    /// The project's id and name, for `context.project`.
+    pub project: Value,
+}
+
+/// Resolve a workflow step's public context from its run's settings. The
+/// durable runtime records the result as a step of its own, so a retried
+/// step restores it with [`ContextSnapshot::restore`] instead of reading
+/// settings and environment again.
+pub fn resolve_for_step(
+    atom: &Atom,
+    run_id: &str,
+    step_id: &str,
+    dispatch: &DispatchSettings,
+) -> Result<ContextSnapshot, String> {
+    resolve_fresh(atom, run_id, || {
+        Ok((
+            dispatch.settings.clone(),
+            json!({"run": {"id": run_id}, "step": {"id": step_id}, "project": dispatch.project}),
+            dispatch.profile.clone(),
+            json!({}),
+        ))
+    })
+}
+
+impl ContextSnapshot {
+    /// A snapshot the durable runtime recorded for `run_id`, checked again
+    /// against the atom it was resolved for: the same compiled version, the
+    /// same run, and the atom's full context contract.
+    pub fn restore(atom: &Atom, run_id: &str, recorded: Value) -> Result<Self, String> {
+        let snapshot = Self(recorded);
+        snapshot.verify_for(&atom.program.hash(), run_id)?;
+        validate_context(atom, snapshot.as_value())?;
+        Ok(snapshot)
+    }
+}
+
 /// Resolve an ephemeral preview against current settings without creating a checkpoint.
 pub fn resolve_fresh(
     atom: &Atom,
@@ -425,6 +469,8 @@ Profile: {context.profile}; step: {context.step.id}; input: {input.text}
             input: &input,
             frontmatter: &atom.frontmatter,
             origin: "external",
+            origins: None,
+            step: None,
         };
         let result = render::render_with_context(&compiled, &run, Some(&restored), Some("review"))
             .expect("dispatch");

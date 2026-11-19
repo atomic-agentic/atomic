@@ -181,8 +181,8 @@ fn compile_construct(c: &Construct) -> Result<(), String> {
     let dir = scratch("construct");
     let source = format!(
         "---\nimport type {{ Props, Input, Output }} from './.atomic/types/test';\n\
-         import type {{ AtomConfig }} from './.atomic/types/authoring';\n{}\n\
-         const {{ input }}: Props = Astro.props;\n\
+         import type {{ AtomConfig }} from './.atomic/types/authoring';\n\
+         const {{ input }}: Props = Astro.props;\n{}\n\
          export const config: AtomConfig<Input, Output> = {};\n---\n{}\n",
         c.frontmatter, c.config, c.body
     );

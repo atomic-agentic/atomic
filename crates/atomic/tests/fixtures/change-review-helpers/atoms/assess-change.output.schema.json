@@ -1,0 +1,9 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "cited"],
+  "properties": {
+    "verdict": { "enum": ["review", "hold"] },
+    "cited": { "type": "array", "items": { "type": "string" } }
+  }
+}
