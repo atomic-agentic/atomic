@@ -175,7 +175,21 @@ impl HttpToolset {
         for (field, value) in fields {
             match operation.locations.get(field).and_then(Value::as_str) {
                 Some("path") => {
-                    path = path.replace(&format!("{{{field}}}"), &segment(&text(value)));
+                    let value = text(value);
+                    // `.` and `..` are dot segments: URL parsing removes
+                    // them (and `..` the segment before it), and so would
+                    // their encoded spelling `%2E`, so they are refused
+                    // rather than encoded. An empty value would leave an
+                    // empty segment.
+                    if matches!(value.as_str(), "" | "." | "..") {
+                        return Err(CallError::Arguments {
+                            operation: name.to_owned(),
+                            errors: format!(
+                                "/{field}: {value:?} is not a path segment; it would change the operation's path"
+                            ),
+                        });
+                    }
+                    path = path.replace(&format!("{{{field}}}"), &segment(&value));
                 }
                 Some("query") => query.push((field.clone(), text(value))),
                 Some("header") => headers.push((field.clone(), text(value))),

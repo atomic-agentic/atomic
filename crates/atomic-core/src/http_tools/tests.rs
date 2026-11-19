@@ -213,3 +213,32 @@ async fn safe_methods_are_retried_and_others_are_sent_once() {
     );
     assert_eq!(seen.lock().expect("log").len(), 1);
 }
+
+// URL parsing removes `.` and `..` segments, so a path argument spelled as
+// one would drop part of the operation's path while staying on the allowed
+// host. Such values are refused before any request; ones that only contain
+// dots are encoded into their own segment as usual.
+#[test]
+fn a_path_argument_cannot_change_the_operations_path() {
+    let tools = toolset("api.example.com");
+    for city in [".", "..", ""] {
+        let error = tools
+            .request("getForecast", &json!({ "city": city, "days": 1 }))
+            .expect_err("refused");
+        assert!(
+            matches!(error, CallError::Arguments { .. }),
+            "{city:?}: {error}"
+        );
+    }
+    for (city, path) in [
+        ("...", "/api/v1/forecast/..."),
+        ("St. Ives", "/api/v1/forecast/St.%20Ives"),
+        ("../..", "/api/v1/forecast/..%2F.."),
+        ("%2E%2E", "/api/v1/forecast/%252E%252E"),
+    ] {
+        let request = tools
+            .request("getForecast", &json!({ "city": city, "days": 1 }))
+            .expect("built");
+        assert_eq!(request.url.path(), path, "{city:?}");
+    }
+}

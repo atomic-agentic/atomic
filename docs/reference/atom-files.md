@@ -97,8 +97,12 @@ no other properties are allowed unless `(*): type` says which. `name(array):`,
 `name(object):` and `name(enum): [a, b]` give lists, nested objects and enums.
 One difference from Picoschema: a `?` field may be omitted, and is not also
 nullable. The form has no constraints; a schema that needs `minLength`,
-`pattern` or `format` is full JSON Schema, and a root with any JSON Schema
-keyword (`type`, `properties`, `$ref`, `enum` and the like) is read as one.
+`pattern` or `format` is full JSON Schema. A root with a structural JSON
+Schema keyword (`type`, `properties`, `$ref`, `enum` and the like) is read as
+one, and so is a root with a constraint or annotation keyword (`minLength`,
+`format`, `description` and the like) whose value is not a compact field:
+`description: A city` is JSON Schema, `description: string, what happened` a
+field.
 `atomic schemas expand <atom>` prints the contracts as atomic enforces them.
 
 `atomic check` generates direct relative declaration imports under `.atomic/types`.

@@ -27,7 +27,7 @@
 
 use serde_json::{Map, Value, json};
 
-/// Keywords whose presence at a schema's root mark it as full JSON Schema.
+/// Keywords whose presence at a schema's root marks it as full JSON Schema.
 /// Picoschema itself looks only at `type` and `properties`; atomic also
 /// treats these as JSON Schema, so a full schema such as `{enum: [a, b]}` is
 /// never read as a compact object with a field named `enum`.
@@ -38,11 +38,15 @@ const JSON_SCHEMA_KEYWORDS: &[&str] = &[
     "$defs",
     "$anchor",
     "$comment",
+    "$dynamicRef",
+    "$dynamicAnchor",
+    "$vocabulary",
     "type",
     "properties",
     "patternProperties",
     "additionalProperties",
     "unevaluatedProperties",
+    "propertyNames",
     "required",
     "enum",
     "const",
@@ -55,8 +59,46 @@ const JSON_SCHEMA_KEYWORDS: &[&str] = &[
     "else",
     "items",
     "prefixItems",
+    "unevaluatedItems",
     "contains",
     "dependentSchemas",
+];
+
+/// The other JSON Schema keywords: constraints and annotations. Several are
+/// also natural field names (`title`, `description`, `format`, `default`), so
+/// one marks the root as full JSON Schema only when its value is not a
+/// compact field: `{minLength: 3}` and `{description: A city}` are JSON
+/// Schema, `{description: string, what happened}` a compact field.
+const VALUE_KEYWORDS: &[&str] = &[
+    "multipleOf",
+    "maximum",
+    "exclusiveMaximum",
+    "minimum",
+    "exclusiveMinimum",
+    "maxLength",
+    "minLength",
+    "pattern",
+    "maxItems",
+    "minItems",
+    "uniqueItems",
+    "maxContains",
+    "minContains",
+    "maxProperties",
+    "minProperties",
+    "dependentRequired",
+    "format",
+    "contentEncoding",
+    "contentMediaType",
+    "contentSchema",
+    "title",
+    "description",
+    "default",
+    "deprecated",
+    "readOnly",
+    "writeOnly",
+    "examples",
+    "definitions",
+    "dependencies",
 ];
 
 const SCALARS: &[&str] = &["string", "integer", "number", "boolean", "null", "any"];
@@ -71,14 +113,24 @@ pub struct CompactError {
     pub message: String,
 }
 
-/// Whether `schema` is written in the compact form: a non-empty mapping with
-/// none of the JSON Schema keywords at its root.
+/// Whether `value` reads as a compact scalar field, `type, description`.
+fn is_field(value: &Value) -> bool {
+    value.as_str().is_some_and(|text| {
+        let kind = text.split_once(',').map_or(text, |(kind, _)| kind);
+        SCALARS.contains(&kind.trim())
+    })
+}
+
+/// Whether `schema` is written in the compact form: a non-empty mapping
+/// whose root has no structural JSON Schema keyword, and no constraint or
+/// annotation keyword with a value other than a compact field.
 pub fn is_compact(schema: &Value) -> bool {
     schema.as_object().is_some_and(|object| {
         !object.is_empty()
-            && !object
-                .keys()
-                .any(|key| JSON_SCHEMA_KEYWORDS.contains(&key.as_str()))
+            && !object.iter().any(|(key, value)| {
+                JSON_SCHEMA_KEYWORDS.contains(&key.as_str())
+                    || (VALUE_KEYWORDS.contains(&key.as_str()) && !is_field(value))
+            })
     })
 }
 

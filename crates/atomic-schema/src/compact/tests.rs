@@ -132,3 +132,40 @@ fn full_json_schema_is_never_read_as_compact() {
     assert!(!is_compact(&json!(true)));
     assert!(is_compact(&yaml("name: string\n")));
 }
+
+// A full schema need not say `type`: constraints and annotations alone are
+// valid JSON Schema, and load unchanged. Where such a keyword is also a
+// natural field name, a compact field value keeps it a field.
+#[test]
+fn constraint_and_annotation_schemas_without_a_type_load_unchanged() {
+    for text in [
+        "minLength: 3\n",
+        "minimum: 0\n",
+        "pattern: '^x'\n",
+        "format: date-time\n",
+        "description: A city name\n",
+        "title: Forecast\ndescription: string\n",
+        "examples: [Lisbon]\n",
+        "deprecated: true\n",
+        "default: 3\n",
+        "multipleOf: 5\nexclusiveMaximum: 100\n",
+    ] {
+        let schema = yaml(text);
+        assert!(!is_compact(&schema), "{text}");
+        assert_eq!(to_json_schema(&schema).expect(text), schema, "{text}");
+    }
+    for text in [
+        "title: string\ndescription: string, what happened\n",
+        "format(enum): [json, text]\n",
+        "default?: integer\n",
+    ] {
+        assert!(is_compact(&yaml(text)), "{text}");
+    }
+    let out = to_json_schema(&yaml("title: string\ndescription: string, what happened\n"))
+        .expect("compact");
+    assert_eq!(
+        out["properties"]["description"]["description"],
+        "what happened"
+    );
+    assert_eq!(out["required"], json!(["title", "description"]));
+}

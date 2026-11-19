@@ -537,6 +537,14 @@ export const zone = () => ({
   resolved: Intl.DateTimeFormat().resolvedOptions().timeZone, locale: Intl.DateTimeFormat().resolvedOptions().locale,
   local: new Date(0).toLocaleString(), number: (1234567.5).toLocaleString(),
 });
+export const escapes = () => ({
+  formatted: new Intl.DateTimeFormat('en-US', { dateStyle: 'full', timeStyle: 'long' }).format(),
+  parts: new Intl.DateTimeFormat('en-US', { year: 'numeric' }).formatToParts()[0].value,
+  given: new Intl.DateTimeFormat('en-US', { year: 'numeric' }).format(new Date(0)),
+  legacy: Date.parse('January 1, 2020 00:00:00'), constructed: new Date('January 1, 2020 00:00:00').getTime(),
+  zoned: Date.parse('Tue, 01 Jan 2020 00:00:00 GMT'), own: Date.parse(new Date(0).toString()),
+  year: new Date(0).getYear(),
+});
 "#;
 
 fn clocked() -> Captured {
@@ -598,6 +606,23 @@ fn math_random_follows_the_seed() {
             .expect("numbers")
             .iter()
             .all(|n| (0.0..1.0).contains(&n.as_f64().unwrap_or(-1.0)))
+    );
+}
+
+// Built-ins the prelude does not replace: a DateTimeFormat given no date,
+// and Date's legacy string formats and Annex B accessors, which read ICU's
+// local time.
+#[test]
+fn formatting_the_current_time_and_legacy_dates_use_the_clock_and_utc() {
+    let out = clocked_call("escapes", CLOCK, Controls::default());
+    assert_eq!(
+        out,
+        json!({
+            "formatted": "Thursday, November 19, 2026 at 8:30:00 AM UTC",
+            "parts": "2026", "given": "1970",
+            "legacy": 1_577_836_800_000u64, "constructed": 1_577_836_800_000u64,
+            "zoned": 1_577_836_800_000u64, "own": 0, "year": 70,
+        })
     );
 }
 
@@ -678,6 +703,10 @@ fn the_host_timezone_and_locale_do_not_reach_helpers() {
     let virtual_ = outputs("clock");
     assert!(virtual_.iter().all(|line| !line.is_empty()), "{virtual_:?}");
     assert_eq!(virtual_[0], virtual_[1]);
+    assert!(
+        virtual_[0].contains(r#""legacy":1577836800000"#),
+        "{virtual_:?}"
+    );
     let host = outputs("host-clock");
     assert_ne!(
         host[0], host[1],
@@ -697,5 +726,6 @@ fn zone_child() {
     };
     let zone = clocked_call("zone", CLOCK, controls);
     let time = clocked_call("time", CLOCK, controls);
-    println!("zone: {zone} {} {}", time["hours"], time["text"]);
+    let escapes = clocked_call("escapes", CLOCK, controls);
+    println!("zone: {zone} {} {} {escapes}", time["hours"], time["text"]);
 }

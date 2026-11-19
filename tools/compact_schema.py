@@ -22,16 +22,30 @@ import re
 
 SCALARS = {"string", "integer", "number", "boolean", "null", "any"}
 # A root with any of these is full JSON Schema, as atomic decides.
-JSON_SCHEMA_KEYWORDS = {"$ref", "$schema", "$id", "$defs", "$anchor", "$comment", "type", "properties",
-    "patternProperties", "additionalProperties", "unevaluatedProperties", "required", "enum", "const",
-    "anyOf", "oneOf", "allOf", "not", "if", "then", "else", "items", "prefixItems", "contains",
+JSON_SCHEMA_KEYWORDS = {"$ref", "$schema", "$id", "$defs", "$anchor", "$comment", "$dynamicRef",
+    "$dynamicAnchor", "$vocabulary", "type", "properties", "patternProperties", "additionalProperties",
+    "unevaluatedProperties", "propertyNames", "required", "enum", "const", "anyOf", "oneOf", "allOf",
+    "not", "if", "then", "else", "items", "prefixItems", "unevaluatedItems", "contains",
     "dependentSchemas"}
+# Constraints and annotations: full JSON Schema unless the value is a compact field.
+VALUE_KEYWORDS = {"multipleOf", "maximum", "exclusiveMaximum", "minimum", "exclusiveMinimum",
+    "maxLength", "minLength", "pattern", "maxItems", "minItems", "uniqueItems", "maxContains",
+    "minContains", "maxProperties", "minProperties", "dependentRequired", "format", "contentEncoding",
+    "contentMediaType", "contentSchema", "title", "description", "default", "deprecated", "readOnly",
+    "writeOnly", "examples", "definitions", "dependencies"}
 KEY = re.compile(r"(\(\*\)|[A-Za-z_][\w-]*)(\?)?(?:\((\w+)(?:,\s*(.*))?\))?")
 
 
+def _is_field(value):
+    return isinstance(value, str) and value.partition(",")[0].strip() in SCALARS
+
+
 def is_compact(schema):
-    """A non-empty mapping with no JSON Schema keyword at its root."""
-    return isinstance(schema, dict) and bool(schema) and not (set(schema) & JSON_SCHEMA_KEYWORDS)
+    """A non-empty mapping with no JSON Schema keyword at its root, counting a
+    constraint or annotation keyword only when its value is not a compact field."""
+    return isinstance(schema, dict) and bool(schema) and not any(
+        key in JSON_SCHEMA_KEYWORDS or (key in VALUE_KEYWORDS and not _is_field(value))
+        for key, value in schema.items())
 
 
 def _fail(where, message):

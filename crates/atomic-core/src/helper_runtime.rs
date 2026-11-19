@@ -19,6 +19,7 @@
 mod allocator;
 #[cfg(test)]
 mod tests;
+mod zone;
 
 use deno_core::{
     JsRuntime, ModuleLoadOptions, ModuleLoadReferrer, ModuleLoadResponse, ModuleLoader,
@@ -53,6 +54,8 @@ pub fn identity() -> String {
         HOST,
         STRIP,
         CLOCK,
+        zone::ZONE,
+        zone::LOCALE,
     ] {
         digest.update(part.as_bytes());
         digest.update([0]);
@@ -308,8 +311,9 @@ const STRIP: &str = r#"(() => {
 // Temporal.Now), randomness (Math.random), and the host's timezone and
 // locale, which ICU reads per process and V8 cannot set per isolate. Each is
 // replaced: time is the call's logical time, Math.random a seeded generator,
-// local time is UTC, and an unspecified locale is en-US. Called with the
-// call's time and the four words of its seed.
+// local time is UTC, and an unspecified locale is en-US. ICU's own defaults
+// are also set to UTC and en-US (see `zone`), for the built-ins this cannot
+// reach. Called with the call's time and the four words of its seed.
 const CLOCK: &str = r#"((now, a, b, c, d) => {
   const defineProperty = Object.defineProperty, construct = Reflect.construct, freeze = Object.freeze;
   const define = (target, name, value) => defineProperty(target, name, { value, writable: true, configurable: true, enumerable: false });
@@ -376,6 +380,21 @@ const CLOCK: &str = r#"((now, a, b, c, d) => {
     define(Original.prototype, 'constructor', Wrapped);
     define(Intl, name, Wrapped);
   }
+  // A DateTimeFormat given no date formats the current time, which V8 reads
+  // from the host clock: the logical time is passed instead.
+  const DateTimeProto = Intl.DateTimeFormat.prototype;
+  const formatGetter = Object.getOwnPropertyDescriptor(DateTimeProto, 'format').get, bound = new WeakMap();
+  defineProperty(DateTimeProto, 'format', { configurable: true, enumerable: false, get() {
+    const original = formatGetter.call(this);
+    let format = bound.get(this);
+    if (format === undefined) {
+      format = (date) => original(date === undefined ? now : date);
+      bound.set(this, format);
+    }
+    return format;
+  } });
+  const formatToParts = DateTimeProto.formatToParts;
+  define(DateTimeProto, 'formatToParts', function formatToParts_(date) { return formatToParts.call(this, date === undefined ? now : date); });
   for (const [target, name, args] of [[Number.prototype, 'toLocaleString', 0], [BigInt.prototype, 'toLocaleString', 0],
     [String.prototype, 'localeCompare', 1], [String.prototype, 'toLocaleLowerCase', 0], [String.prototype, 'toLocaleUpperCase', 0]]) {
     const original = target[name];
@@ -461,6 +480,13 @@ impl Isolate {
                 ..Default::default()
             })
         };
+        if controls.virtual_clock {
+            zone::set_defaults().map_err(Failure::Host)?;
+            // The isolate may have cached the zone it started with.
+            runtime
+                .v8_isolate()
+                .date_time_configuration_change_notification(v8::TimeZoneDetection::Skip);
+        }
         let tripped = Arc::new(Tripped::default());
         if controls.heap_callback {
             let handle = runtime.v8_isolate().thread_safe_handle();
