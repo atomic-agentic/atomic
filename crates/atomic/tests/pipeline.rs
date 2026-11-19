@@ -1019,16 +1019,16 @@ impl atomic_exec::ExecutionBackend for Stating {
         &self,
         request: &atomic_exec::Open,
     ) -> Result<atomic_exec::Workspace, atomic_exec::ExecError> {
-        atomic_exec::LocalBackend.open(request)
+        atomic_exec::LocalBackend::default().open(request)
     }
     fn run(
         &self,
         command: &atomic_exec::Command,
     ) -> Result<atomic_exec::Completed, atomic_exec::ExecError> {
-        atomic_exec::LocalBackend.run(command)
+        atomic_exec::LocalBackend::default().run(command)
     }
     fn close(&self, workspace: &atomic_exec::Workspace) -> Result<(), atomic_exec::ExecError> {
-        atomic_exec::LocalBackend.close(workspace)
+        atomic_exec::LocalBackend::default().close(workspace)
     }
 }
 
@@ -1102,6 +1102,83 @@ fn a_worktree_step_is_refused_on_a_backend_that_does_not_state_durable_workspace
         let out: Value = rt.result("fix-1").await.expect("finishes");
         assert_eq!(out, json!({"ok": true}));
         assert_eq!(model.calls(), 2);
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+/// A backend that never has room for another workspace.
+struct Busy;
+
+impl atomic_exec::ExecutionBackend for Busy {
+    fn connect(&self) -> Result<atomic_exec::Statement, atomic_exec::ExecError> {
+        atomic_exec::LocalBackend::default().connect()
+    }
+    fn open(
+        &self,
+        request: &atomic_exec::Open,
+    ) -> Result<atomic_exec::Workspace, atomic_exec::ExecError> {
+        Err(atomic_exec::ExecError::Unavailable {
+            label: request.label.clone(),
+            message: "no runner is free".into(),
+        })
+    }
+    fn run(
+        &self,
+        command: &atomic_exec::Command,
+    ) -> Result<atomic_exec::Completed, atomic_exec::ExecError> {
+        atomic_exec::LocalBackend::default().run(command)
+    }
+    fn close(&self, workspace: &atomic_exec::Workspace) -> Result<(), atomic_exec::ExecError> {
+        atomic_exec::LocalBackend::default().close(workspace)
+    }
+}
+
+/// A backend with no room parks the run, which `atomic runs resume` can
+/// continue later, instead of failing it.
+#[test]
+fn a_run_parks_when_its_backend_has_no_room() {
+    on_codex_runtime(async {
+        let dir = scratch("busy");
+        let project = project(&dir);
+        let pipeline = load(&project, "triage.workflow.yaml", TRIAGE);
+        let model = FakeModel::start(vec![Reply::Text(READ.into())])
+            .await
+            .expect("fake model");
+        let backend = atomic_exec::Backend::connect(Busy).expect("connects");
+        let rt = engine_on(&dir, &model.base_url(), Some(backend)).await;
+        let run = PipelineRun {
+            pipeline,
+            input: json!({"text": "Exporting a file named café.txt crashes the app."}),
+        };
+        rt.start(PIPELINE, "busy-1", run).await.expect("start");
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let parked = loop {
+            if let Some(p) = atomic_durable::parks(&rt, "busy-1")
+                .await
+                .expect("parks")
+                .into_iter()
+                .next()
+            {
+                break p;
+            }
+            assert!(
+                !matches!(
+                    rt.status("busy-1").await.expect("status"),
+                    Some(RunStatus::Failed(_))
+                ),
+                "the run failed instead of parking"
+            );
+            assert!(std::time::Instant::now() < until, "the run never parked");
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        };
+        assert!(
+            parked.reason.contains("no runner is free"),
+            "{}",
+            parked.reason
+        );
+        assert_eq!(model.calls(), 0, "nothing was sent");
         rt.shutdown(std::time::Duration::from_secs(5))
             .await
             .expect("shutdown");

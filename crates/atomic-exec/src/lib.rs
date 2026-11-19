@@ -196,6 +196,16 @@ pub enum ExecError {
         /// What failed.
         message: String,
     },
+    /// The backend cannot open a workspace now, for a reason that may pass,
+    /// such as a full disk or no room for another runner: trying again later
+    /// may succeed, and nothing was started.
+    #[error("the workspace for {label} is not available now: {message}")]
+    Unavailable {
+        /// The workspace's label.
+        label: String,
+        /// Why.
+        message: String,
+    },
 }
 
 /// Where atoms run. The control plane reaches runners only through this.
@@ -258,7 +268,7 @@ impl Backend {
 impl Default for Backend {
     fn default() -> Self {
         Self {
-            inner: Arc::new(LocalBackend),
+            inner: Arc::new(LocalBackend::default()),
             statement: LocalBackend::STATEMENT,
         }
     }
@@ -294,8 +304,15 @@ impl ExecutionBackend for Backend {
 /// The backend on this machine, in the control plane's process: a
 /// workspace is the source directory itself, a model turn's shell and file
 /// work runs under Codex's own sandbox, and commands run as child processes.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct LocalBackend;
+///
+/// Each attempt's scratch directory is a private one under
+/// [`scratch_root`](Self::scratch_root), named by the attempt's run and step
+/// (see [`workspace`]). Give it a directory no sandboxed turn may write, such
+/// as one in the project's state directory: [`LocalBackend::in_dir`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalBackend {
+    scratch_root: PathBuf,
+}
 
 impl LocalBackend {
     /// What it states: a workspace is a directory on this machine's disk,
@@ -303,15 +320,51 @@ impl LocalBackend {
     pub const STATEMENT: Statement = Statement {
         durability: Durability::Durable,
     };
+
+    /// A backend keeping its scratch directories under `scratch_root`,
+    /// which it creates, private, when it first needs it.
+    pub fn in_dir(scratch_root: PathBuf) -> Self {
+        Self { scratch_root }
+    }
+
+    /// Where it keeps its scratch directories.
+    pub fn scratch_root(&self) -> &std::path::Path {
+        &self.scratch_root
+    }
+}
+
+impl Default for LocalBackend {
+    /// Scratch directories under a private directory of this user's in the
+    /// system's temporary directory. Sandboxed turns may write there, so
+    /// atomic itself always uses [`LocalBackend::in_dir`] with a directory
+    /// in the project's state directory; this one is for tests and tools.
+    fn default() -> Self {
+        #[cfg(unix)]
+        // SAFETY: getuid cannot fail and touches no memory.
+        #[allow(unsafe_code)]
+        let user = unsafe { libc::getuid() }.to_string();
+        #[cfg(not(unix))]
+        let user = std::env::var("USERNAME").unwrap_or_default();
+        Self::in_dir(std::env::temp_dir().join(format!("atomic-scratch-{user}")))
+    }
 }
 
 impl ExecutionBackend for LocalBackend {
+    /// States durable workspaces, and removes the scratch directories of
+    /// attempts whose processes no longer run.
     fn connect(&self) -> Result<Statement, ExecError> {
+        workspace::sweep_local(&self.scratch_root).map_err(|e| ExecError::Workspace {
+            label: "connect".into(),
+            message: format!(
+                "remove dead attempts' scratch directories under {}: {e}",
+                self.scratch_root.display()
+            ),
+        })?;
         Ok(Self::STATEMENT)
     }
 
     fn open(&self, request: &Open) -> Result<Workspace, ExecError> {
-        workspace::open_local(request)
+        workspace::open_local(&self.scratch_root, request)
     }
 
     fn close(&self, workspace: &Workspace) -> Result<(), ExecError> {

@@ -163,14 +163,21 @@ pub async fn open(
     }
     let endpoint = args.endpoint(needs_model)?;
     let store = LocalStore::open(state.dir().join("artifacts")).context("the artifact store")?;
-    // Connected once: what the backend states here is what runs plan on.
+    // Scratch directories live in the project's state directory, outside
+    // every directory a sandboxed turn may write. Connected once: what the
+    // backend states here is what runs plan on, and connecting reclaims
+    // what attempts of dead processes left.
+    let local = atomic_exec::LocalBackend::in_dir(state.dir().join("scratch"));
     let exec = match args.runner {
-        RunnerKind::Local => atomic_exec::Backend::default(),
-        RunnerKind::Process => atomic_exec::Backend::connect(ProcessRunner::atomic(
-            std::env::current_exe().context("find atomic's own executable for its runners")?,
-        ))
-        .context("connect to the execution backend")?,
-    };
+        RunnerKind::Local => atomic_exec::Backend::connect(local),
+        RunnerKind::Process => atomic_exec::Backend::connect(ProcessRunner {
+            workspaces: local,
+            ..ProcessRunner::atomic(
+                std::env::current_exe().context("find atomic's own executable for its runners")?,
+            )
+        }),
+    }
+    .context("connect to the execution backend")?;
     let runtimes = Arc::new(Runtimes {
         codex: CodexRuntime {
             paths: paths.clone(),

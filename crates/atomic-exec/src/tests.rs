@@ -4,7 +4,7 @@ use super::*;
 use std::path::Path;
 
 fn shell(script: &str, stdin: &[u8], time: Duration) -> Result<Completed, ExecError> {
-    LocalBackend.run(&Command {
+    LocalBackend::default().run(&Command {
         program: "/bin/sh".into(),
         args: vec!["-c".into(), script.into()],
         cwd: std::env::temp_dir(),
@@ -56,7 +56,7 @@ fn output_past_its_limit_is_refused() {
 
 #[test]
 fn no_shell_expands_the_arguments() {
-    let done = LocalBackend
+    let done = LocalBackend::default()
         .run(&Command {
             program: "printf".into(),
             args: vec!["%s".into(), "$HOME;`id`".into()],
@@ -72,7 +72,7 @@ fn no_shell_expands_the_arguments() {
 
 #[test]
 fn a_missing_program_cannot_start() {
-    let error = LocalBackend
+    let error = LocalBackend::default()
         .run(&Command {
             program: "atomic-no-such-program".into(),
             args: Vec::new(),
@@ -93,41 +93,178 @@ fn source(tag: &str) -> PathBuf {
     dir
 }
 
-#[test]
-fn a_local_workspace_is_its_source_with_a_fresh_scratch_and_a_local_shell() {
-    let src = source("open");
-    let request = Open {
+/// A backend with scratch directories of its own, under the system's
+/// temporary directory, for one test.
+fn backend(tag: &str) -> LocalBackend {
+    let root =
+        std::env::temp_dir().join(format!("atomic-exec-scratch-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    LocalBackend::in_dir(root)
+}
+
+fn opening(src: &Path, step: &str, attempt: &str) -> Open {
+    Open {
         label: "fix tests".into(),
-        source: Some(src.clone()),
+        run: "run-1".into(),
+        step: step.into(),
+        attempt: attempt.into(),
+        source: Some(src.to_owned()),
         sandbox: Sandbox::WorkspaceWrite,
         writable_roots: vec![std::env::temp_dir()],
         env: [("DECLARED".to_owned(), "yes".to_owned())].into(),
-    };
-    let first = LocalBackend.open(&request).expect("opens");
-    let second = LocalBackend.open(&request).expect("opens again");
-    assert_eq!(first.root.as_ref(), Some(&src));
-    assert_eq!(first.shell, Shell::Local);
-    assert_eq!(first.sandbox, Sandbox::WorkspaceWrite);
-    assert_eq!(first.writable_roots, request.writable_roots);
-    assert_eq!(first.env, request.env);
-    let scratch = first.scratch.clone().expect("a scratch directory");
+    }
+}
+
+#[cfg(unix)]
+fn mode(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .expect("metadata")
+        .permissions()
+        .mode()
+        & 0o777
+}
+
+#[test]
+fn a_local_workspace_is_its_source_with_a_private_scratch_and_a_local_shell() {
+    let src = source("open");
+    let local = backend("open");
+    let request = opening(&src, "fix", "a1");
+    let ws = local.open(&request).expect("opens");
+    assert_eq!(ws.root.as_ref(), Some(&src));
+    assert_eq!(ws.shell, Shell::Local);
+    assert_eq!(ws.sandbox, Sandbox::WorkspaceWrite);
+    assert_eq!(ws.writable_roots, request.writable_roots);
+    assert_eq!(ws.env, request.env);
+    let scratch = ws.scratch.clone().expect("a scratch directory");
     assert!(scratch.is_dir());
+    assert!(
+        scratch.starts_with(local.scratch_root()),
+        "{} is under the backend's scratch root",
+        scratch.display()
+    );
+    assert!(
+        !scratch.starts_with(&src),
+        "scratch is outside the workspace"
+    );
     assert_eq!(std::fs::read_dir(&scratch).expect("read").count(), 0);
-    // Each attempt gets a scratch directory of its own.
-    assert_ne!(first.scratch, second.scratch);
+    #[cfg(unix)]
+    {
+        assert_eq!(mode(local.scratch_root()), 0o700);
+        assert_eq!(mode(scratch.parent().expect("step")), 0o700);
+        assert_eq!(mode(&scratch), 0o700);
+    }
+
+    // Another step of the same run gets a directory of its own.
+    let other = local.open(&opening(&src, "review", "b1")).expect("opens");
+    assert_ne!(
+        other.scratch.as_ref().and_then(|s| s.parent()),
+        scratch.parent()
+    );
 
     std::fs::write(scratch.join("left"), "behind").expect("write");
-    LocalBackend.close(&first).expect("closes");
+    local.close(&ws).expect("closes");
     assert!(!scratch.exists(), "the scratch directory goes");
     assert!(src.is_dir(), "the source stays");
-    LocalBackend.close(&first).expect("closing twice succeeds");
-    LocalBackend.close(&second).expect("closes");
+    local.close(&ws).expect("closing twice succeeds");
+    local.close(&other).expect("closes");
+    let _ = std::fs::remove_dir_all(&src);
+    let _ = std::fs::remove_dir_all(local.scratch_root());
+}
+
+/// An attempt that runs again starts with nothing an earlier attempt of
+/// the same step left, finished or not.
+#[test]
+fn opening_an_attempt_removes_what_an_earlier_attempt_of_its_step_left() {
+    let src = source("again");
+    let local = backend("again");
+    let first = local.open(&opening(&src, "fix", "a1")).expect("opens");
+    let first_scratch = first.scratch.clone().expect("scratch");
+    std::fs::write(first_scratch.join("planted"), "x").expect("write");
+    // The first attempt never closed: its process stopped, say.
+    let second = local
+        .open(&opening(&src, "fix", "a2"))
+        .expect("opens again");
+    let second_scratch = second.scratch.clone().expect("scratch");
+    assert_ne!(first_scratch, second_scratch);
+    assert!(
+        !first_scratch.exists(),
+        "the earlier attempt's scratch is gone"
+    );
+    assert_eq!(std::fs::read_dir(&second_scratch).expect("read").count(), 0);
+    // Closing the replaced attempt late leaves the new one alone.
+    local.close(&first).expect("closes");
+    assert!(second_scratch.is_dir());
+    local.close(&second).expect("closes");
+    let _ = std::fs::remove_dir_all(&src);
+    let _ = std::fs::remove_dir_all(local.scratch_root());
+}
+
+/// Connecting removes the scratch of attempts whose process was killed,
+/// and keeps that of attempts whose process still runs.
+#[test]
+fn connecting_sweeps_the_scratch_of_killed_attempts_only() {
+    let local = backend("sweep");
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("a process that will be killed");
+    let step = workspace::step_dir(local.scratch_root(), "run-1", "fix");
+    let theirs = step.join(format!("{}-a1", child.id()));
+    std::fs::create_dir_all(&theirs).expect("its scratch");
+    std::fs::write(theirs.join("left"), "behind").expect("write");
+    let ours = workspace::step_dir(local.scratch_root(), "run-1", "check")
+        .join(format!("{}-b1", std::process::id()));
+    std::fs::create_dir_all(&ours).expect("our scratch");
+
+    local.connect().expect("connects");
+    assert!(theirs.is_dir(), "a live attempt's scratch stays");
+
+    child.kill().expect("kill -9");
+    child.wait().expect("reaped");
+    local.connect().expect("connects");
+    assert!(!theirs.exists(), "a killed attempt's scratch goes");
+    assert!(!step.exists(), "and its step's directory with it");
+    assert!(ours.is_dir(), "this process's own attempts stay");
+    let _ = std::fs::remove_dir_all(local.scratch_root());
+}
+
+#[test]
+fn only_errors_that_may_pass_make_a_workspace_unavailable() {
+    use std::io::{Error, ErrorKind};
+    for kind in [
+        ErrorKind::StorageFull,
+        ErrorKind::QuotaExceeded,
+        ErrorKind::ResourceBusy,
+    ] {
+        assert!(workspace::transient(&Error::from(kind)), "{kind:?}");
+    }
+    assert!(workspace::transient(&Error::from_raw_os_error(
+        libc::EMFILE
+    )));
+    for kind in [
+        ErrorKind::PermissionDenied,
+        ErrorKind::NotADirectory,
+        ErrorKind::AlreadyExists,
+    ] {
+        assert!(!workspace::transient(&Error::from(kind)), "{kind:?}");
+    }
+    // A scratch root that cannot be made because a file is in its way will
+    // not change by trying again: the error is permanent.
+    let src = source("unavailable");
+    let blocker = std::env::temp_dir().join(format!("atomic-exec-blocker-{}", std::process::id()));
+    std::fs::write(&blocker, "a file").expect("file");
+    let error = LocalBackend::in_dir(blocker.join("scratch"))
+        .open(&opening(&src, "fix", "a1"))
+        .expect_err("refused");
+    assert!(matches!(error, ExecError::Workspace { .. }), "{error}");
+    let _ = std::fs::remove_file(&blocker);
     let _ = std::fs::remove_dir_all(&src);
 }
 
 #[test]
 fn a_workspace_with_no_source_has_no_files_and_no_shell() {
-    let ws = LocalBackend
+    let ws = LocalBackend::default()
         .open(&Open {
             label: "classify".into(),
             ..Open::default()
@@ -140,12 +277,12 @@ fn a_workspace_with_no_source_has_no_files_and_no_shell() {
         ws.require_root(),
         Err(ExecError::Workspace { .. })
     ));
-    LocalBackend.close(&ws).expect("closes");
+    LocalBackend::default().close(&ws).expect("closes");
 }
 
 #[test]
 fn a_source_that_is_not_a_directory_is_refused() {
-    let error = LocalBackend
+    let error = LocalBackend::default()
         .open(&Open {
             label: "fix".into(),
             source: Some(std::env::temp_dir().join("atomic-exec-no-such-source")),
@@ -162,7 +299,7 @@ fn a_source_that_is_not_a_directory_is_refused() {
 fn a_command_in_a_local_workspace_runs_as_it_would_directly() {
     let src = source("same");
     std::fs::write(src.join("input.txt"), "from the source").expect("write");
-    let ws = LocalBackend
+    let ws = LocalBackend::default()
         .open(&Open {
             label: "same".into(),
             source: Some(src.clone()),
@@ -182,7 +319,7 @@ fn a_command_in_a_local_workspace_runs_as_it_would_directly() {
         time_limit: Duration::from_secs(10),
         output_limit: 1024,
     };
-    let through = LocalBackend.run(&command).expect("runs");
+    let through = LocalBackend::default().run(&command).expect("runs");
     let direct = process::run(
         Path::new("/bin/sh"),
         &command.args,
@@ -198,7 +335,7 @@ fn a_command_in_a_local_workspace_runs_as_it_would_directly() {
     .expect("runs");
     assert_eq!(through, direct);
     assert_eq!(through.code, Some(4));
-    LocalBackend.close(&ws).expect("closes");
+    LocalBackend::default().close(&ws).expect("closes");
     let _ = std::fs::remove_dir_all(&src);
 }
 
@@ -219,13 +356,13 @@ impl ExecutionBackend for Stating {
         })
     }
     fn open(&self, request: &Open) -> Result<Workspace, ExecError> {
-        LocalBackend.open(request)
+        LocalBackend::default().open(request)
     }
     fn run(&self, command: &Command) -> Result<Completed, ExecError> {
-        LocalBackend.run(command)
+        LocalBackend::default().run(command)
     }
     fn close(&self, workspace: &Workspace) -> Result<(), ExecError> {
-        LocalBackend.close(workspace)
+        LocalBackend::default().close(workspace)
     }
 }
 
@@ -272,12 +409,15 @@ fn only_a_durable_statement_is_durable_and_anything_unrecognized_is_ephemeral() 
 #[test]
 fn the_local_backend_states_that_its_workspaces_are_durable() {
     assert_eq!(
-        LocalBackend.connect().expect("connects").durability,
+        LocalBackend::default()
+            .connect()
+            .expect("connects")
+            .durability,
         Durability::Durable
     );
     assert_eq!(Backend::default().durability(), Durability::Durable);
     assert_eq!(
-        Backend::connect(LocalBackend)
+        Backend::connect(LocalBackend::default())
             .expect("connects")
             .durability(),
         Durability::Durable

@@ -580,8 +580,10 @@ dependencies = [
 name = "atomic-agentic-exec"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.21",
 ]
 

@@ -262,7 +262,7 @@ pub fn serve_stdio() -> i32 {
         &mut std::io::stdin().lock(),
         &mut std::io::stdout().lock(),
         &mut std::io::stderr().lock(),
-        &LocalBackend,
+        &LocalBackend::default(),
     )
 }
 
@@ -280,6 +280,8 @@ pub struct ProcessRunner {
     pub retries: u32,
     /// How long to wait for a held lease before trying again.
     pub lease_wait: Duration,
+    /// Where its workspaces are opened: its runners run on this machine.
+    pub workspaces: LocalBackend,
 }
 
 /// How much longer than its command a runner may take before it is stopped.
@@ -297,6 +299,7 @@ impl ProcessRunner {
                 .unwrap_or_default(),
             retries: 2,
             lease_wait: Duration::from_secs(1),
+            workspaces: LocalBackend::default(),
         }
     }
 
@@ -336,17 +339,17 @@ impl ProcessRunner {
 impl ExecutionBackend for ProcessRunner {
     /// Its workspaces are [`LocalBackend`]'s, so it states what that does.
     fn connect(&self) -> Result<crate::Statement, ExecError> {
-        LocalBackend.connect()
+        self.workspaces.connect()
     }
 
     /// Its runners run on this machine, so a workspace is opened here, as
     /// [`LocalBackend`] opens one, and each command a runner runs finds it.
     fn open(&self, request: &crate::Open) -> Result<crate::Workspace, ExecError> {
-        LocalBackend.open(request)
+        self.workspaces.open(request)
     }
 
     fn close(&self, workspace: &crate::Workspace) -> Result<(), ExecError> {
-        LocalBackend.close(workspace)
+        self.workspaces.close(workspace)
     }
 
     fn run(&self, command: &Command) -> Result<Completed, ExecError> {

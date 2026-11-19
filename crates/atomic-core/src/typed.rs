@@ -99,6 +99,11 @@ pub enum AtomError {
     /// made. Not a failure of the atom: a durable run parks on it.
     #[error("budget: {0}")]
     Budget(String),
+    /// The execution backend could not open the run's workspace now, for a
+    /// reason that may pass; nothing was sent or run. Not a failure of the
+    /// atom: a durable run parks on it.
+    #[error("execution backend: {0}")]
+    Unavailable(String),
     /// Anything else in running the atom.
     #[error("{0}")]
     Runtime(String),

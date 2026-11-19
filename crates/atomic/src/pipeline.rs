@@ -789,7 +789,7 @@ async fn in_worktree(
             })
     })
     .await
-    .map_err(|e| failed(e.to_string()))?;
+    .map_err(crate::workflows::failed)?;
     failpoint("pipeline:after-commit");
     let mut metadata = serde_json::to_value(metadata)
         .map_err(|e| failed(format!("encode the atom's metadata: {e}")))?;

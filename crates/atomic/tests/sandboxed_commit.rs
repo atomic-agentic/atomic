@@ -20,9 +20,11 @@
 #![allow(clippy::unwrap_used)]
 
 use atomic_core::Sandbox;
-use atomic_core::codex::{self, CodexPaths, ModelEndpoint, TurnSpec};
+use atomic_core::codex::{CodexPaths, ModelEndpoint, TurnSpec};
 use atomic_core::git::{Git, Signature};
+use atomic_core::runtime::{Artifacts, CodexRuntime, run_turn};
 use atomic_core::testing::{FakeModel, Reply, on_codex_runtime};
+use atomic_core::usage::Metering;
 use atomic_core::worktree::{Caches, Worktrees};
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -111,15 +113,25 @@ async fn sandboxed(f: &Fixture, cwd: &Path, command: &str, extra: TurnSpec) -> S
         PathBuf::from(env!("CARGO_BIN_EXE_atomic")),
         f.dir.join("bin/codex-linux-sandbox"),
     );
-    let answer = codex::run(
-        &paths,
-        &f.dir.join("codex-home"),
-        cwd,
-        &ModelEndpoint {
+    let runtime = CodexRuntime {
+        paths,
+        codex_home: f.dir.join("codex-home"),
+        cwd: cwd.to_owned(),
+        endpoint: ModelEndpoint {
             base_url: model.base_url(),
             model: "synthetic".into(),
             api_key_env: None,
         },
+        defaults: Default::default(),
+        artifacts: Artifacts::none(),
+        meter: Metering::none(),
+        backend: atomic_exec::Backend::connect(atomic_exec::LocalBackend::in_dir(
+            f.dir.join("state/scratch"),
+        ))
+        .unwrap(),
+    };
+    let answer = run_turn(
+        &runtime,
         &TurnSpec {
             prompt: "Do the work.".into(),
             sandbox: Sandbox::WorkspaceWrite,

@@ -371,7 +371,10 @@ fn check(path: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
         if json {
             println!(
                 "{}",
-                serde_json::json!({"checked": {"atoms": 1, "workflows": 0}, "warnings": []})
+                serde_json::json!({
+                    "checked": {"atoms": 1, "workflows": 0, "toolset_operations": 0},
+                    "warnings": []
+                })
             );
         } else {
             println!("checked {}", atom.file.display());
@@ -625,13 +628,24 @@ async fn prompt(
     state: &ProjectState,
     args: &PromptArgs,
 ) -> anyhow::Result<String> {
-    let cwd: PathBuf = state.root().to_owned();
-    codex::one_turn(
-        paths,
-        &state.codex_home(),
-        &cwd,
-        &args.endpoint(),
-        &args.prompt.join(" "),
-    )
-    .await
+    // The same backend `atomic run` uses: the turn opens a workspace there.
+    let backend = atomic_exec::Backend::connect(atomic_exec::LocalBackend::in_dir(
+        state.dir().join("scratch"),
+    ))
+    .context("connect to the execution backend")?;
+    let runtime = atomic_core::runtime::CodexRuntime {
+        paths: paths.clone(),
+        codex_home: state.codex_home(),
+        cwd: state.root().to_owned(),
+        endpoint: args.endpoint(),
+        defaults: atomic_core::AtomConfig::default(),
+        artifacts: atomic_core::runtime::Artifacts::none(),
+        meter: atomic_core::usage::Metering::none(),
+        backend,
+    };
+    let spec = codex::TurnSpec {
+        prompt: args.prompt.join(" "),
+        ..codex::TurnSpec::default()
+    };
+    Ok(atomic_core::runtime::run_turn(&runtime, &spec).await?)
 }

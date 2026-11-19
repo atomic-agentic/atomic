@@ -158,6 +158,27 @@ pub(crate) fn command_environment(declared: &BTreeMap<String, String>) -> ShellE
     }
 }
 
+/// The environments a thread's shell and file work may run in: this machine,
+/// and nothing else.
+///
+/// Codex's usual constructors read `CODEX_HOME/environments.toml`, then
+/// `CODEX_EXEC_SERVER_URL` and the `CODEX_EXEC_SERVER_NOISE_*` variables
+/// from this process's environment, any of which would move a turn's shell
+/// to an exec-server the execution backend never chose. At the pinned
+/// revision the only public constructor that reads none of them is the one
+/// Codex names for tests: with no URL it builds exactly the local
+/// environment, and it fails only without runtime paths, which are always
+/// given. What it built is checked before any thread uses it.
+async fn local_environment(paths: ExecServerRuntimeOptions) -> anyhow::Result<EnvironmentManager> {
+    let manager = EnvironmentManager::create_for_tests(/*exec_server_url*/ None, Some(paths)).await;
+    let ids = manager.default_environment_ids();
+    let local = manager.default_environment();
+    if ids != ["local"] || local.as_ref().is_none_or(|e| e.is_remote()) {
+        bail!("the turn's shell would not run on this machine: environments {ids:?}");
+    }
+    Ok(manager)
+}
+
 /// What a thread did: its id, how many turns it ran and the tokens it used,
 /// as the provider reported them.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -225,7 +246,12 @@ where
 /// Run one turn on a fresh, ephemeral Codex thread and return the model's
 /// final message. The thread runs with read-only permissions and never asks
 /// for approval.
-pub async fn one_turn(
+///
+/// This and the entry points below take a directory, not a workspace, so
+/// only the runtime calls them, once its backend has opened one (see
+/// [`crate::runtime::run_turn`]).
+#[cfg(test)]
+pub(crate) async fn one_turn(
     paths: &CodexPaths,
     codex_home: &Path,
     cwd: &Path,
@@ -241,7 +267,8 @@ pub async fn one_turn(
 
 /// Run `spec` as one turn on a fresh, ephemeral thread and return the final
 /// message.
-pub async fn run(
+#[cfg(test)]
+pub(crate) async fn run(
     paths: &CodexPaths,
     codex_home: &Path,
     cwd: &Path,
@@ -257,7 +284,8 @@ pub async fn run(
 /// follow-up turn `next` returns on the same thread, until it returns `None`.
 /// Returns the last answer and how many turns ran. Follow-up turns use the
 /// thread's instructions and model; their own are ignored.
-pub async fn converse<F>(
+#[cfg(test)]
+pub(crate) async fn converse<F>(
     paths: &CodexPaths,
     codex_home: &Path,
     cwd: &Path,
@@ -282,7 +310,7 @@ where
 
 /// Conversation with asynchronous checks between turns. Each turn is
 /// admitted by `meter` before it is submitted and settled once after it.
-pub async fn converse_async<F, Fut>(
+pub(crate) async fn converse_async<F, Fut>(
     paths: &CodexPaths,
     codex_home: &Path,
     cwd: &Path,
@@ -320,6 +348,13 @@ where
         config.workspace_roots_explicit = true;
     }
     config.permissions.shell_environment_policy = command_environment(&spec.env);
+    // No login shell, and no snapshot taken from one: a command never runs
+    // the developer's or the system's shell startup files.
+    config.permissions.allow_login_shell = false;
+    config
+        .features
+        .set_enabled(Feature::ShellSnapshot, false)
+        .context("turn shell snapshots off")?;
     let state_db = init_state_db(&config).await;
 
     let auth_manager =
@@ -329,14 +364,7 @@ where
         config.codex_linux_sandbox_exe.clone(),
     )?;
     let thread_store = ThreadStoreBuilder::from_config(&config, state_db.clone()).build();
-    let environment_manager = Arc::new(
-        EnvironmentManager::from_codex_home(
-            config.codex_home.clone(),
-            Some(local_runtime_paths),
-            config.http_client_factory(),
-        )
-        .await?,
-    );
+    let environment_manager = Arc::new(local_environment(local_runtime_paths).await?);
     let installation_id = resolve_installation_id(&config.codex_home).await?;
     let user_instructions_provider = Arc::new(CodexHomeUserInstructionsProvider::new(
         config.codex_home.clone(),

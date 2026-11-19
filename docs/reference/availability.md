@@ -59,14 +59,27 @@ has an executor identity (`ATOMIC_EXECUTOR_ID`). `atomic runner` and
 exit-code contract; Codex turns and their shell still run in the control
 plane's process, and a runner reached over the network is not built yet.
 
-Every atom run goes through the execution backend: it opens a workspace there
-before anything is sent or run and closes it when the run ends. The local
-backend is the only one with a Codex shell, and it states that its workspaces
-are durable. A backend that states anything else, or a value atomic does not
-recognize, is treated as ephemeral, and a workflow with a `worktree: true` step
-is refused on it before anything runs. A command an atom runs, whether an exec
-atom's or one a model runs in a Codex turn, gets the platform's core variables
-and what the atom declares, never atomic's own environment or its credentials.
+Every atom run goes through the execution backend: once its prompt is
+rendered, which runs the atom's helpers, it opens a workspace there before any
+model call or command, and closes it however the run ends, including a panic or
+a cancelled run. A backend with no room for a workspace parks the run, which
+`atomic runs resume` continues. The local backend is the only one with a Codex
+shell, and it states that its workspaces are durable. A backend that states
+anything else, or a value atomic does not recognize, is treated as ephemeral,
+and a workflow with a `worktree: true` step is refused on it before anything
+runs.
+
+A command an atom runs, whether an exec atom's or one a model runs in a Codex
+turn, gets the platform's core variables and what the atom declares, never
+atomic's own environment or its credentials. A turn's commands run with no
+login shell and with `HOME` and `TMPDIR` at a private scratch directory of the
+attempt's own, so no shell startup file runs; an exec atom's command gets its
+own, in the project's state directory, where no sandboxed turn may write. A
+turn's shell always runs on the machine its backend names; `CODEX_EXEC_SERVER_URL`
+and an `environments.toml` in Codex's home have no effect.
+
+`atomic run` and `atomic serve` do not read public context settings yet, so they
+refuse a step whose atom declares a context.
 
 Several authoring aids arrive in stages. Eval cases in JSONL files are part of
 v0.1. Compact schemas, variants, the `--plan` cost preview, declared effect caps

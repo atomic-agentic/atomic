@@ -55,10 +55,11 @@ pub struct ChangeRequestResult {
 }
 
 /// Turn an atom's failure into its step's failure, recorded as the outcome;
-/// a cap that left no room for its next call parks the run instead.
-fn failed(e: AtomError) -> DurableError {
+/// a cap that left no room for its next call, or an execution backend that
+/// could not take the run, parks the run instead.
+pub(crate) fn failed(e: AtomError) -> DurableError {
     match e {
-        AtomError::Budget(why) => DurableError::Parked(why),
+        AtomError::Budget(why) | AtomError::Unavailable(why) => DurableError::Parked(why),
         e => DurableError::Failed(e.to_string()),
     }
 }
