@@ -136,7 +136,10 @@ fn a_workspace_with_no_source_has_no_files_and_no_shell() {
     assert_eq!(ws.root, None);
     assert_eq!(ws.scratch, None);
     assert_eq!(ws.shell, Shell::None);
-    assert!(matches!(ws.require_root(), Err(ExecError::Workspace { .. })));
+    assert!(matches!(
+        ws.require_root(),
+        Err(ExecError::Workspace { .. })
+    ));
     LocalBackend.close(&ws).expect("closes");
 }
 
@@ -197,4 +200,104 @@ fn a_command_in_a_local_workspace_runs_as_it_would_directly() {
     assert_eq!(through.code, Some(4));
     LocalBackend.close(&ws).expect("closes");
     let _ = std::fs::remove_dir_all(&src);
+}
+
+/// A backend that states whatever it is given, as a runner on the wire
+/// would, and counts how often it is asked.
+struct Stating {
+    statement: serde_json::Value,
+    asked: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ExecutionBackend for Stating {
+    fn connect(&self) -> Result<Statement, ExecError> {
+        self.asked
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        serde_json::from_value(self.statement.clone()).map_err(|e| ExecError::Io {
+            program: "connect".into(),
+            message: e.to_string(),
+        })
+    }
+    fn open(&self, request: &Open) -> Result<Workspace, ExecError> {
+        LocalBackend.open(request)
+    }
+    fn run(&self, command: &Command) -> Result<Completed, ExecError> {
+        LocalBackend.run(command)
+    }
+    fn close(&self, workspace: &Workspace) -> Result<(), ExecError> {
+        LocalBackend.close(workspace)
+    }
+}
+
+#[test]
+fn only_a_durable_statement_is_durable_and_anything_unrecognized_is_ephemeral() {
+    use serde_json::json;
+    assert_eq!(Durability::from_statement("durable"), Durability::Durable);
+    for value in ["ephemeral", "snapshot", "Durable", "durable ", ""] {
+        assert_eq!(
+            Durability::from_statement(value),
+            Durability::Ephemeral,
+            "{value:?}"
+        );
+    }
+    let read = |statement: serde_json::Value| -> Durability {
+        serde_json::from_value::<Statement>(statement)
+            .expect("any statement is read")
+            .durability
+    };
+    assert_eq!(read(json!({"durability": "durable"})), Durability::Durable);
+    for statement in [
+        json!({"durability": "ephemeral"}),
+        json!({"durability": "snapshotted"}),
+        json!({"durability": 1}),
+        json!({"durability": null}),
+        json!({"durability": {"kind": "durable"}}),
+        json!({}),
+        json!({"durability": "durable-ish", "other": true}),
+    ] {
+        assert_eq!(
+            read(statement.clone()),
+            Durability::Ephemeral,
+            "{statement}"
+        );
+    }
+    // What a backend states round-trips by name.
+    for durability in [Durability::Durable, Durability::Ephemeral] {
+        let text = serde_json::to_value(Statement { durability }).expect("encodes");
+        assert_eq!(text, json!({"durability": durability.as_str()}));
+        assert_eq!(read(text), durability);
+    }
+}
+
+#[test]
+fn the_local_backend_states_that_its_workspaces_are_durable() {
+    assert_eq!(
+        LocalBackend.connect().expect("connects").durability,
+        Durability::Durable
+    );
+    assert_eq!(Backend::default().durability(), Durability::Durable);
+    assert_eq!(
+        Backend::connect(LocalBackend)
+            .expect("connects")
+            .durability(),
+        Durability::Durable
+    );
+}
+
+#[test]
+fn a_backend_states_its_durability_once_at_connect() {
+    let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let backend = Backend::connect(Stating {
+        statement: serde_json::json!({"durability": "snapshot"}),
+        asked: asked.clone(),
+    })
+    .expect("connects");
+    assert_eq!(backend.durability(), Durability::Ephemeral);
+    assert_eq!(
+        backend.connect().expect("stated").durability,
+        Durability::Ephemeral
+    );
+    let shared = backend.clone();
+    assert_eq!(shared.durability(), Durability::Ephemeral);
+    assert_eq!(asked.load(std::sync::atomic::Ordering::Relaxed), 1);
 }

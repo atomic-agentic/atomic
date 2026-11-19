@@ -163,11 +163,13 @@ pub async fn open(
     }
     let endpoint = args.endpoint(needs_model)?;
     let store = LocalStore::open(state.dir().join("artifacts")).context("the artifact store")?;
+    // Connected once: what the backend states here is what runs plan on.
     let exec = match args.runner {
         RunnerKind::Local => atomic_exec::Backend::default(),
-        RunnerKind::Process => atomic_exec::Backend::new(ProcessRunner::atomic(
+        RunnerKind::Process => atomic_exec::Backend::connect(ProcessRunner::atomic(
             std::env::current_exe().context("find atomic's own executable for its runners")?,
-        )),
+        ))
+        .context("connect to the execution backend")?,
     };
     let runtimes = Arc::new(Runtimes {
         codex: CodexRuntime {

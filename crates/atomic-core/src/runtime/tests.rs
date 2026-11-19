@@ -1294,11 +1294,15 @@ impl Recording {
     }
 
     fn backend(&self) -> atomic_exec::Backend {
-        atomic_exec::Backend::new(self.clone())
+        atomic_exec::Backend::connect(self.clone()).expect("connects")
     }
 }
 
 impl ExecutionBackend for Recording {
+    fn connect(&self) -> Result<atomic_exec::Statement, atomic_exec::ExecError> {
+        atomic_exec::LocalBackend.connect()
+    }
+
     fn open(&self, request: &atomic_exec::Open) -> Result<Workspace, atomic_exec::ExecError> {
         self.calls
             .lock()

@@ -424,6 +424,7 @@ async fn run_pipeline<C: WorkflowContext>(
     let PipelineRun { pipeline, input } = run;
     let store = services.store.clone();
     fits("the workflow's input", &pipeline.input, &input)?;
+    plan(&pipeline, services.runtimes.codex.backend.statement())?;
     let (budget, caps) = budgets(
         &pipeline,
         &services.runtimes,
@@ -671,6 +672,34 @@ async fn run_pipeline<C: WorkflowContext>(
             .await?;
     }
     Ok(result)
+}
+
+/// Refuse, before anything runs, a step the execution backend's statement
+/// cannot carry. The plan follows what the backend stated when it connected,
+/// never which backend it is.
+///
+/// A worktree step's commit is made from its workspace after its turn, so a
+/// backend whose workspaces may not survive its runner (ephemeral, which a
+/// statement it does not recognize also means) could lose the step's work
+/// before atomic commits it.
+fn plan(pipeline: &Pipeline, statement: atomic_exec::Statement) -> Result<()> {
+    if statement.durability == atomic_exec::Durability::Durable {
+        return Ok(());
+    }
+    let worktree = pipeline.steps.iter().find_map(|step| match step {
+        Step::Atom(step) if step.worktree => Some(&step.id),
+        _ => None,
+    });
+    match worktree {
+        Some(id) => Err(failed(format!(
+            "step `{id}` runs in a worktree, and the execution backend states that its \
+             workspaces are {}: they may not survive its runner, and the step's change is \
+             committed from its workspace after its turn. Run this workflow on a backend \
+             whose workspaces are durable, such as the local one",
+            statement.durability.as_str()
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// Run `atom` on `input` with `runtimes`.

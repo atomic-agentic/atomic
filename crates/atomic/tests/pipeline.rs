@@ -220,6 +220,11 @@ fn runtimes_in(dir: &Path, cwd: &Path, base_url: &str) -> Arc<Runtimes> {
 }
 
 async fn engine(dir: &Path, base_url: &str) -> Durare {
+    engine_on(dir, base_url, None).await
+}
+
+/// [`engine`], with every atom running on `backend` when one is given.
+async fn engine_on(dir: &Path, base_url: &str, backend: Option<atomic_exec::Backend>) -> Durare {
     let mut rt = Durare::sqlite(&dir.join("atomic.db"))
         .await
         .expect("engine");
@@ -237,6 +242,16 @@ async fn engine(dir: &Path, base_url: &str) -> Durare {
         )
     } else {
         (runtimes(dir, base_url), None)
+    };
+    let runtimes = match backend {
+        Some(backend) => {
+            let mut on = (*runtimes).clone();
+            on.codex.backend = backend.clone();
+            on.lite.backend = backend.clone();
+            on.exec = backend;
+            Arc::new(on)
+        }
+        None => runtimes,
     };
     register_pipeline(
         &mut rt,
@@ -983,6 +998,110 @@ fn a_worktree_step_runs_at_its_base_and_atomic_commits_what_it_left() {
             plain_git(&project, &["rev-parse", "refs/atomic/fix-1/steps/fix/1"]),
             commit
         );
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+/// A backend on the local machine that states its durability as a runner
+/// on the wire would: as a JSON value it is given.
+struct Stating(Value);
+
+impl atomic_exec::ExecutionBackend for Stating {
+    fn connect(&self) -> Result<atomic_exec::Statement, atomic_exec::ExecError> {
+        serde_json::from_value(self.0.clone()).map_err(|e| atomic_exec::ExecError::Io {
+            program: "connect".into(),
+            message: e.to_string(),
+        })
+    }
+    fn open(
+        &self,
+        request: &atomic_exec::Open,
+    ) -> Result<atomic_exec::Workspace, atomic_exec::ExecError> {
+        atomic_exec::LocalBackend.open(request)
+    }
+    fn run(
+        &self,
+        command: &atomic_exec::Command,
+    ) -> Result<atomic_exec::Completed, atomic_exec::ExecError> {
+        atomic_exec::LocalBackend.run(command)
+    }
+    fn close(&self, workspace: &atomic_exec::Workspace) -> Result<(), atomic_exec::ExecError> {
+        atomic_exec::LocalBackend.close(workspace)
+    }
+}
+
+/// The run plans from what the backend states, not from which backend it
+/// is: the same local machine, stating an ephemeral or an unrecognized
+/// durability, gets a worktree step refused before anything runs, and
+/// stating durable gets it run.
+#[test]
+fn a_worktree_step_is_refused_on_a_backend_that_does_not_state_durable_workspaces() {
+    on_codex_runtime(async {
+        for (tag, statement) in [
+            ("ephemeral", json!({"durability": "ephemeral"})),
+            ("unrecognized", json!({"durability": "snapshot"})),
+            ("unstated", json!({})),
+        ] {
+            let dir = scratch(&format!("worktree-{tag}"));
+            let (project, base) = repository_project(&dir);
+            let pipeline = load(&project, "fix.workflow.yaml", FIX);
+            let model = FakeModel::start(vec![
+                Reply::Text(r#"{"done": true}"#.into()),
+                Reply::Text(r#"{"ok": true}"#.into()),
+            ])
+            .await
+            .expect("fake model");
+            let backend = atomic_exec::Backend::connect(Stating(statement)).expect("connects");
+            assert_eq!(backend.durability(), atomic_exec::Durability::Ephemeral);
+            let rt = engine_on(&dir, &model.base_url(), Some(backend)).await;
+            let run = PipelineRun {
+                pipeline,
+                input: json!({"title": "Export crashes on accents", "base": base}),
+            };
+            rt.start(PIPELINE, "fix-1", run).await.expect("start");
+            let error = rt
+                .result::<Value>("fix-1")
+                .await
+                .expect_err("refused")
+                .to_string();
+            assert!(
+                error.contains("step `fix` runs in a worktree")
+                    && error.contains("workspaces are ephemeral"),
+                "{tag}: {error}"
+            );
+            assert_eq!(model.calls(), 0, "{tag}: nothing ran");
+            let made = std::fs::read_dir(dir.join("state/worktrees"))
+                .map(|d| d.count())
+                .unwrap_or(0);
+            assert_eq!(made, 0, "{tag}: no worktree was made");
+            rt.shutdown(std::time::Duration::from_secs(5))
+                .await
+                .expect("shutdown");
+        }
+
+        // The same machine, stating durable workspaces, runs the step.
+        let dir = scratch("worktree-durable");
+        let (project, base) = repository_project(&dir);
+        let pipeline = load(&project, "fix.workflow.yaml", FIX);
+        let model = FakeModel::start(vec![
+            Reply::Text(r#"{"done": true}"#.into()),
+            Reply::Text(r#"{"ok": true}"#.into()),
+        ])
+        .await
+        .expect("fake model");
+        let backend = atomic_exec::Backend::connect(Stating(json!({"durability": "durable"})))
+            .expect("connects");
+        let rt = engine_on(&dir, &model.base_url(), Some(backend)).await;
+        let run = PipelineRun {
+            pipeline,
+            input: json!({"title": "Export crashes on accents", "base": base}),
+        };
+        rt.start(PIPELINE, "fix-1", run).await.expect("start");
+        let out: Value = rt.result("fix-1").await.expect("finishes");
+        assert_eq!(out, json!({"ok": true}));
+        assert_eq!(model.calls(), 2);
         rt.shutdown(std::time::Duration::from_secs(5))
             .await
             .expect("shutdown");

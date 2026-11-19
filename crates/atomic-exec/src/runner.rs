@@ -334,6 +334,11 @@ impl ProcessRunner {
 }
 
 impl ExecutionBackend for ProcessRunner {
+    /// Its workspaces are [`LocalBackend`]'s, so it states what that does.
+    fn connect(&self) -> Result<crate::Statement, ExecError> {
+        LocalBackend.connect()
+    }
+
     /// Its runners run on this machine, so a workspace is opened here, as
     /// [`LocalBackend`] opens one, and each command a runner runs finds it.
     fn open(&self, request: &crate::Open) -> Result<crate::Workspace, ExecError> {

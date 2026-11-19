@@ -867,9 +867,7 @@ async fn run_command(
     let mut env: Vec<(String, String)> = workspace
         .env
         .iter()
-        .filter(|(k, _)| {
-            *k != "HOME" && *k != "TMPDIR" && !EFFECT_VARIABLES.contains(&k.as_str())
-        })
+        .filter(|(k, _)| *k != "HOME" && *k != "TMPDIR" && !EFFECT_VARIABLES.contains(&k.as_str()))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     env.push(("HOME".into(), scratch.clone()));

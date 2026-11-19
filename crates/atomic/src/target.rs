@@ -260,7 +260,10 @@ fn atom_pipeline(atom: Atom, input: &Value) -> anyhow::Result<Pipeline> {
         steps: vec![Step::Atom(AtomStep {
             id: "run".into(),
             atom: atom.name.clone(),
-            origins: with.keys().map(|k| (k.clone(), "external".to_owned())).collect(),
+            origins: with
+                .keys()
+                .map(|k| (k.clone(), "external".to_owned()))
+                .collect(),
             with,
             worktree: false,
         })],
