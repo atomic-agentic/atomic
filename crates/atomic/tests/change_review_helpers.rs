@@ -197,6 +197,7 @@ fn runtimes(dir: &Path, base_url: &str) -> Arc<Runtimes> {
         codex: CodexRuntime {
             paths: CodexPaths::without_helpers(),
             codex_home: dir.join("home"),
+            state_dir: None,
             cwd: dir.join("cwd"),
             endpoint: endpoint.clone(),
             defaults: AtomConfig::default(),

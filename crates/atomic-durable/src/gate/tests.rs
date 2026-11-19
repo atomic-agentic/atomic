@@ -9,6 +9,7 @@
 //!   on a decided gate gets a typed conflict carrying the winner; a command
 //!   id reused for another decision is refused;
 //! - only an approver, deciding on the proposal the gate shows, decides it;
+//! - only the credential a principal enrolled decides for it;
 //! - a wake-up the store does not back passes nothing;
 //! - a deadline that passes expires the gate, which authorizes nothing, and
 //!   a later decision gets the expiry as its conflict;
@@ -49,6 +50,13 @@ async fn postgres() -> Durare {
 
 fn operator() -> Principal {
     Principal::local("dev")
+}
+
+/// The operator's credential, enrolled.
+async fn me<R: DurableRuntime>(rt: &R) -> HumanCredential {
+    let credential = HumanCredential::new(operator(), "the operator's secret");
+    enroll(rt, &credential).await.expect("enroll");
+    credential
 }
 
 const EVIDENCE: &str = "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
@@ -157,9 +165,13 @@ async fn a_gate_is_opened_listed_and_decided<R: DurableRuntime>(mut rt: R) {
     .expect("list");
     assert_eq!(open, std::slice::from_ref(&opened));
 
-    let decision = decide(&rt, &operator(), command(&opened, "c1", Verdict::Approve))
-        .await
-        .expect("decided");
+    let decision = decide(
+        &rt,
+        &me(&rt).await,
+        command(&opened, "c1", Verdict::Approve),
+    )
+    .await
+    .expect("decided");
     assert_eq!(decision.verdict, Verdict::Approve);
     assert_eq!(decision.by, operator());
     assert_eq!(decision.comment.as_deref(), Some("looks right"));
@@ -201,14 +213,23 @@ async fn a_replayed_decision_returns_the_original_and_another_conflicts<R: Durab
     rt.launch().await.expect("launch");
     let (run, opened) = start_gated(&rt, input(None)).await;
 
-    let first = decide(&rt, &operator(), command(&opened, "c1", Verdict::Approve))
-        .await
-        .expect("decided");
-    let replay = decide(&rt, &operator(), command(&opened, "c1", Verdict::Approve)).await;
+    let first = decide(
+        &rt,
+        &me(&rt).await,
+        command(&opened, "c1", Verdict::Approve),
+    )
+    .await
+    .expect("decided");
+    let replay = decide(
+        &rt,
+        &me(&rt).await,
+        command(&opened, "c1", Verdict::Approve),
+    )
+    .await;
     assert_eq!(replay, Ok(first.clone()), "a replay returns the original");
 
     let winning = Resolution::Decided(first.clone());
-    let other = decide(&rt, &operator(), command(&opened, "c2", Verdict::Reject)).await;
+    let other = decide(&rt, &me(&rt).await, command(&opened, "c2", Verdict::Reject)).await;
     assert_eq!(
         other,
         Err(DecideError::Conflict {
@@ -217,10 +238,10 @@ async fn a_replayed_decision_returns_the_original_and_another_conflicts<R: Durab
         }),
         "a different decision gets the winner"
     );
-    let other_again = decide(&rt, &operator(), command(&opened, "c2", Verdict::Reject)).await;
+    let other_again = decide(&rt, &me(&rt).await, command(&opened, "c2", Verdict::Reject)).await;
     assert_eq!(other_again, other, "and so does its replay");
 
-    let reused = decide(&rt, &operator(), command(&opened, "c1", Verdict::Reject)).await;
+    let reused = decide(&rt, &me(&rt).await, command(&opened, "c1", Verdict::Reject)).await;
     assert_eq!(reused, Err(DecideError::CommandReused("c1".into())));
 
     assert_eq!(outcome(&rt, &run).await, Ok(winning.clone()));
@@ -239,8 +260,10 @@ async fn only_an_approver_on_the_shown_proposal_decides<R: DurableRuntime>(mut r
     let (run, opened) = start_gated(&rt, input(None)).await;
 
     let stranger = Principal::local("someone-else");
+    let theirs = HumanCredential::new(stranger.clone(), "their own secret");
+    enroll(&rt, &theirs).await.expect("enroll");
     assert_eq!(
-        decide(&rt, &stranger, command(&opened, "c1", Verdict::Approve)).await,
+        decide(&rt, &theirs, command(&opened, "c1", Verdict::Approve)).await,
         Err(DecideError::NotAnApprover {
             gate: opened.id.clone(),
             who: stranger
@@ -249,7 +272,7 @@ async fn only_an_approver_on_the_shown_proposal_decides<R: DurableRuntime>(mut r
     let mut stale = command(&opened, "c2", Verdict::Approve);
     stale.proposal = proposal_digest("Accept the reviewed summary", &json!({"draft": "old"}), &[]);
     assert_eq!(
-        decide(&rt, &operator(), stale.clone()).await,
+        decide(&rt, &me(&rt).await, stale.clone()).await,
         Err(DecideError::ProposalChanged {
             gate: opened.id.clone(),
             shown: stale.proposal.clone(),
@@ -259,14 +282,14 @@ async fn only_an_approver_on_the_shown_proposal_decides<R: DurableRuntime>(mut r
     let mut missing = command(&opened, "c3", Verdict::Approve);
     missing.gate = format!("{run}:nowhere");
     assert_eq!(
-        decide(&rt, &operator(), missing.clone()).await,
+        decide(&rt, &me(&rt).await, missing.clone()).await,
         Err(DecideError::NoSuchGate(missing.gate))
     );
     let still = find(&rt, &opened.id).await.expect("find").expect("stored");
     assert_eq!(still.resolution, None, "none of those decided anything");
 
     // The refused commands recorded nothing, so their ids are still free.
-    let decision = decide(&rt, &operator(), command(&opened, "c1", Verdict::Reject))
+    let decision = decide(&rt, &me(&rt).await, command(&opened, "c1", Verdict::Reject))
         .await
         .expect("decided");
     let resolution: Resolution = outcome(&rt, &run).await.expect("finishes");
@@ -276,6 +299,46 @@ async fn only_an_approver_on_the_shown_proposal_decides<R: DurableRuntime>(mut r
 }
 
 /// Wait until `run` has recorded at least `n` operations.
+/// A decision counts only with the credential its principal enrolled: one
+/// with no credential enrolled, or with a guessed one, records nothing, and
+/// enrolling again cannot replace the first credential.
+async fn only_the_enrolled_credential_decides<R: DurableRuntime>(mut rt: R) {
+    register(&mut rt);
+    rt.launch().await.expect("launch");
+    let (run, opened) = start_gated(&rt, input(None)).await;
+
+    let claimed = HumanCredential::new(operator(), "a guess");
+    assert!(!enrolled(&rt, &operator()).await.expect("enrolled"));
+    assert_eq!(
+        decide(&rt, &claimed, command(&opened, "c1", Verdict::Approve)).await,
+        Err(DecideError::NotEnrolled(operator()))
+    );
+    let mine = me(&rt).await;
+    assert!(enrolled(&rt, &operator()).await.expect("enrolled"));
+    assert_eq!(
+        enroll(&rt, &mine).await.expect("again"),
+        Enrollment::AlreadyEnrolled
+    );
+    assert!(matches!(
+        enroll(&rt, &claimed).await,
+        Err(EnrollError::Different(p)) if p == operator()
+    ));
+    assert_eq!(
+        decide(&rt, &claimed, command(&opened, "c1", Verdict::Approve)).await,
+        Err(DecideError::BadCredential(operator()))
+    );
+    let still = find(&rt, &opened.id).await.expect("find").expect("stored");
+    assert_eq!(still.resolution, None, "neither decided anything");
+
+    // The refused commands recorded nothing, so their id is still free.
+    let decision = decide(&rt, &mine, command(&opened, "c1", Verdict::Approve))
+        .await
+        .expect("decided");
+    assert_eq!(decision.by, operator());
+    assert!(outcome(&rt, &run).await.expect("finishes").approved());
+    rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+}
+
 async fn until_steps<R: DurableRuntime>(rt: &R, run: &str, n: usize) {
     let until = Instant::now() + Duration::from_secs(20);
     while rt.steps(run).await.expect("steps").len() < n {
@@ -316,9 +379,13 @@ async fn a_wake_up_the_store_does_not_back_passes_nothing<R: DurableRuntime>(mut
         "one check, which found the gate open: {names:?}"
     );
 
-    let decision = decide(&rt, &operator(), command(&opened, "c1", Verdict::Approve))
-        .await
-        .expect("decided");
+    let decision = decide(
+        &rt,
+        &me(&rt).await,
+        command(&opened, "c1", Verdict::Approve),
+    )
+    .await
+    .expect("decided");
     assert_eq!(outcome(&rt, &run).await, Ok(Resolution::Decided(decision)));
     rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
 }
@@ -345,7 +412,12 @@ async fn a_passed_deadline_expires_the_gate_and_a_later_decision_conflicts<R: Du
     assert!(!resolution.approved(), "an expiry does not pass the gate");
 
     assert_eq!(
-        decide(&rt, &operator(), command(&opened, "late", Verdict::Approve)).await,
+        decide(
+            &rt,
+            &me(&rt).await,
+            command(&opened, "late", Verdict::Approve)
+        )
+        .await,
         Err(DecideError::Conflict {
             gate: opened.id.clone(),
             winning: resolution,
@@ -393,7 +465,12 @@ async fn a_decision_after_the_deadline_records_the_expiry<R: DurableRuntime>(rt:
     .expect("insert");
     rt.launch().await.expect("launch");
     let gate = find(&rt, &id).await.expect("find").expect("stored");
-    let refused = decide(&rt, &operator(), command(&gate, "late", Verdict::Approve)).await;
+    let refused = decide(
+        &rt,
+        &me(&rt).await,
+        command(&gate, "late", Verdict::Approve),
+    )
+    .await;
     let Err(DecideError::Conflict {
         winning: Resolution::Expired { at, .. },
         ..
@@ -417,7 +494,7 @@ async fn changed_content_cannot_reuse_an_approval<R: DurableRuntime>(mut rt: R) 
     register(&mut rt);
     rt.launch().await.expect("launch");
     let (first_run, first) = start_gated(&rt, input(None)).await;
-    let approved = decide(&rt, &operator(), command(&first, "c1", Verdict::Approve))
+    let approved = decide(&rt, &me(&rt).await, command(&first, "c1", Verdict::Approve))
         .await
         .expect("decided");
     assert!(outcome(&rt, &first_run).await.expect("finishes").approved());
@@ -433,7 +510,7 @@ async fn changed_content_cannot_reuse_an_approval<R: DurableRuntime>(mut rt: R) 
     let mut reuse = command(&first, "c9", Verdict::Approve);
     reuse.gate = second.id.clone();
     assert_eq!(
-        decide(&rt, &operator(), reuse).await,
+        decide(&rt, &me(&rt).await, reuse).await,
         Err(DecideError::ProposalChanged {
             gate: second.id.clone(),
             shown: first.proposal.clone(),
@@ -532,7 +609,7 @@ async fn approved_run(rt: &Durare) -> (String, Gate, i32) {
     let (run, opened) = start_gated(rt, input(None)).await;
     decide(
         rt,
-        &operator(),
+        &me(rt).await,
         command(&opened, &unique("c"), Verdict::Approve),
     )
     .await
@@ -669,6 +746,7 @@ on_backend!(
     a_gate_is_opened_listed_and_decided,
     a_replayed_decision_returns_the_original_and_another_conflicts,
     only_an_approver_on_the_shown_proposal_decides,
+    only_the_enrolled_credential_decides,
     a_wake_up_the_store_does_not_back_passes_nothing,
     a_passed_deadline_expires_the_gate_and_a_later_decision_conflicts,
     a_decision_after_the_deadline_records_the_expiry,
@@ -684,6 +762,7 @@ on_backend!(
     a_gate_is_opened_listed_and_decided,
     a_replayed_decision_returns_the_original_and_another_conflicts,
     only_an_approver_on_the_shown_proposal_decides,
+    only_the_enrolled_credential_decides,
     a_wake_up_the_store_does_not_back_passes_nothing,
     a_passed_deadline_expires_the_gate_and_a_later_decision_conflicts,
     a_decision_after_the_deadline_records_the_expiry,

@@ -177,6 +177,7 @@ async fn engine(dir: &Path, project: &Path, base_url: &str) -> Durare {
                 dir.join("bin/codex-linux-sandbox"),
             ),
             codex_home: dir.join("codex-home"),
+            state_dir: Some(dir.join("state")),
             cwd: project.to_owned(),
             endpoint: endpoint.clone(),
             defaults: AtomConfig::default(),
@@ -234,9 +235,11 @@ async fn open_gate(rt: &Durare, run: &str) -> gate::Gate {
 }
 
 async fn approve(rt: &Durare, g: &gate::Gate) {
+    let credential = gate::HumanCredential::new(Principal::local("dev"), "the operator's secret");
+    gate::enroll(rt, &credential).await.expect("enroll");
     gate::decide(
         rt,
-        &Principal::local("dev"),
+        &credential,
         DecisionCommand {
             command_id: format!("{}-approve", g.id),
             gate: g.id.clone(),

@@ -486,12 +486,10 @@ async fn prompt(
     args: &PromptArgs,
 ) -> anyhow::Result<String> {
     let cwd: PathBuf = state.root().to_owned();
-    codex::one_turn(
-        paths,
-        &state.codex_home(),
-        &cwd,
-        &args.endpoint(),
-        &args.prompt.join(" "),
-    )
-    .await
+    let spec = codex::TurnSpec {
+        prompt: args.prompt.join(" "),
+        state_dir: Some(state.dir().to_owned()),
+        ..codex::TurnSpec::default()
+    };
+    codex::run(paths, &state.codex_home(), &cwd, &args.endpoint(), &spec).await
 }

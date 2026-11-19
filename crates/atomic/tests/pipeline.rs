@@ -206,6 +206,7 @@ fn runtimes_in(dir: &Path, cwd: &Path, base_url: &str) -> Arc<Runtimes> {
         codex: CodexRuntime {
             paths: CodexPaths::without_helpers(),
             codex_home: dir.join("home"),
+            state_dir: None,
             cwd: cwd.to_owned(),
             endpoint: endpoint.clone(),
             defaults: AtomConfig::default(),
@@ -430,9 +431,11 @@ async fn open_gate(rt: &Durare, run: &str) -> gate::Gate {
 
 /// The local operator decides `g`.
 async fn decide(rt: &Durare, g: &gate::Gate, verdict: Verdict, comment: &str) {
+    let credential = gate::HumanCredential::new(Principal::local("dev"), "the operator's secret");
+    gate::enroll(rt, &credential).await.expect("enroll");
     gate::decide(
         rt,
-        &Principal::local("dev"),
+        &credential,
         DecisionCommand {
             command_id: format!("{}-{verdict:?}", g.id),
             gate: g.id.clone(),

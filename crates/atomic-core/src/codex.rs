@@ -118,15 +118,84 @@ pub struct TurnSpec {
     /// Directories a `workspace-write` thread may write besides its working
     /// directory, such as the project's shared caches. Absolute paths.
     pub writable_roots: Vec<PathBuf>,
+    /// atomic's state directory (see [`crate::state`]), which the thread's
+    /// commands can neither read nor write: it holds the gate store and the
+    /// rest of atomic's own state. Only the working directory, the writable
+    /// roots and the Codex helper files inside it stay open to them. `None`
+    /// leaves it as the sandbox otherwise has it, for callers with no state
+    /// directory, such as tests.
+    pub state_dir: Option<PathBuf>,
 }
 
 /// Codex's permission profile for a sandbox: read-only, or writes confined
-/// to the workspace; the network is restricted either way.
-pub(crate) fn permission_profile(sandbox: crate::typed::Sandbox) -> PermissionProfile {
-    match sandbox {
+/// to the workspace; the network is restricted either way. With a state
+/// directory, that directory is denied to the thread's commands, apart from
+/// the thread's own roots inside it and the files Codex's shell needs from
+/// its home (`codex_home`): its shell snapshots and helper links.
+pub(crate) fn permission_profile(
+    sandbox: crate::typed::Sandbox,
+    state_dir: Option<&Path>,
+    codex_home: &Path,
+) -> anyhow::Result<PermissionProfile> {
+    use codex_protocol::permissions::{
+        FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry, FileSystemSpecialPath,
+        NetworkSandboxPolicy,
+    };
+    let base = match sandbox {
         crate::typed::Sandbox::ReadOnly => PermissionProfile::read_only(),
         crate::typed::Sandbox::WorkspaceWrite => PermissionProfile::workspace_write(),
+    };
+    let Some(state_dir) = state_dir else {
+        return Ok(base);
+    };
+    let path = |p: &Path| -> anyhow::Result<FileSystemPath> {
+        let p = AbsolutePathBuf::from_absolute_path(p)
+            .with_context(|| format!("resolve the sandbox path {}", p.display()))?;
+        Ok(FileSystemPath::from(p))
+    };
+    let mut policy = base.file_system_sandbox_policy();
+    // The deepest entry that covers a path decides its access, so the denial
+    // covers everything in the state directory that nothing below re-opens.
+    // Both spellings are denied when the directory is reached through a link.
+    let mut denied = vec![state_dir.to_owned()];
+    if let Ok(real) = std::fs::canonicalize(state_dir)
+        && real != state_dir
+    {
+        denied.push(real);
     }
+    for dir in &denied {
+        policy.entries.push(FileSystemSandboxEntry::new(
+            path(dir)?,
+            FileSystemAccessMode::Deny,
+        ));
+    }
+    // The thread's roots (its working directory, and under workspace-write
+    // its writable roots) may be inside it, as worktrees and caches are.
+    if sandbox == crate::typed::Sandbox::ReadOnly {
+        policy.entries.push(FileSystemSandboxEntry::new(
+            FileSystemPath::Special {
+                value: FileSystemSpecialPath::project_roots(None),
+            },
+            FileSystemAccessMode::Read,
+        ));
+    }
+    // Codex's shell sources a snapshot of its startup environment and finds
+    // `apply_patch` through links, both kept in Codex's home.
+    for helper in [
+        codex_home.join("shell_snapshots"),
+        codex_home
+            .join("tmp")
+            .join(format!("arg0-{}", std::env::consts::OS)),
+    ] {
+        policy.entries.push(FileSystemSandboxEntry::new(
+            path(&helper)?,
+            FileSystemAccessMode::Read,
+        ));
+    }
+    Ok(PermissionProfile::from_runtime_permissions(
+        &policy,
+        NetworkSandboxPolicy::Restricted,
+    ))
 }
 
 /// What a thread did: its id, how many turns it ran and the tokens it used,
@@ -184,6 +253,15 @@ where
     F: FnOnce(CodexPaths) -> Fut + Send + 'static,
     Fut: Future<Output = anyhow::Result<()>>,
 {
+    #[cfg(target_os = "linux")]
+    if invoked_as_linux_sandbox()
+        && let Err(e) = leave_session_keyring()
+    {
+        // Running the command with the session keyring would let it read
+        // what the keyring holds: refuse instead.
+        eprintln!("atomic: cannot leave the session keyring before sandboxing a command: {e}");
+        std::process::exit(1);
+    }
     // SAFETY: called at the start of main, while the process has one thread,
     // so no other thread can read the environment concurrently.
     #[allow(unsafe_code)]
@@ -191,6 +269,51 @@ where
         std::env::set_var("CODEX_HOME", codex_home);
     }
     arg0_dispatch_or_else(move |paths| main_fn(CodexPaths(paths)))
+}
+
+/// Whether this process is Codex's Linux sandbox helper: this executable,
+/// run under the helper's name, which [`dispatch`] hands to Codex.
+#[cfg(target_os = "linux")]
+fn invoked_as_linux_sandbox() -> bool {
+    std::env::args_os()
+        .next()
+        .as_deref()
+        .map(Path::new)
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == "codex-linux-sandbox")
+}
+
+/// Join a new, empty session keyring, so the command the helper sandboxes
+/// cannot read the keys of the session that started atomic, such as the
+/// cached operator credential (see [`crate::credential`]).
+///
+/// Codex's sandbox gives a command a new user namespace, and with it a new
+/// user keyring, but the session keyring is inherited, and the user's own
+/// keyring is linked into it. Keys found through a keyring the process holds
+/// are readable to it; an anonymous session keyring holds nothing. Where
+/// `keyctl` itself is refused, as under a container's default seccomp
+/// profile, it is refused to the command too, and there is nothing to leave.
+#[cfg(target_os = "linux")]
+fn leave_session_keyring() -> std::io::Result<()> {
+    const KEYCTL_JOIN_SESSION_KEYRING: libc::c_long = 1;
+    // SAFETY: keyctl(KEYCTL_JOIN_SESSION_KEYRING, NULL) reads no memory: a
+    // null name asks for a new anonymous keyring.
+    #[allow(unsafe_code)]
+    let joined = unsafe {
+        libc::syscall(
+            libc::SYS_keyctl,
+            KEYCTL_JOIN_SESSION_KEYRING,
+            std::ptr::null::<libc::c_char>(),
+        )
+    };
+    if joined >= 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ENOSYS | libc::EPERM) => Ok(()),
+        _ => Err(error),
+    }
 }
 
 /// Run one turn on a fresh, ephemeral Codex thread and return the model's
@@ -275,7 +398,11 @@ where
     config.developer_instructions = spec.developer_instructions.clone();
     config.permissions = Permissions::from_approval_and_profile(
         Constrained::allow_any(AskForApproval::Never),
-        Constrained::allow_any(permission_profile(spec.sandbox)),
+        Constrained::allow_any(permission_profile(
+            spec.sandbox,
+            spec.state_dir.as_deref(),
+            codex_home,
+        )?),
     )?;
     if !spec.writable_roots.is_empty() {
         let mut roots = vec![config.cwd.clone()];
@@ -828,17 +955,99 @@ mod tests {
     #[test]
     fn sandboxes_map_to_codex_permission_profiles() {
         use crate::typed::Sandbox;
+        let home = Path::new("/state/codex");
+        let profile = |sandbox| permission_profile(sandbox, None, home).expect("profile");
+        assert_eq!(profile(Sandbox::ReadOnly), PermissionProfile::read_only());
         assert_eq!(
-            permission_profile(Sandbox::ReadOnly),
-            PermissionProfile::read_only()
-        );
-        assert_eq!(
-            permission_profile(Sandbox::WorkspaceWrite),
+            profile(Sandbox::WorkspaceWrite),
             PermissionProfile::workspace_write()
         );
-        assert_ne!(
-            permission_profile(Sandbox::ReadOnly),
-            permission_profile(Sandbox::WorkspaceWrite)
+        assert_ne!(profile(Sandbox::ReadOnly), profile(Sandbox::WorkspaceWrite));
+    }
+
+    /// What a profile lets a command at `path` do, with `cwd` and `roots` as
+    /// the thread's working directory and writable roots.
+    fn access(
+        profile: &PermissionProfile,
+        cwd: &str,
+        roots: &[&str],
+        path: &str,
+    ) -> codex_protocol::permissions::FileSystemAccessMode {
+        let mut workspace: Vec<AbsolutePathBuf> =
+            vec![AbsolutePathBuf::from_absolute_path(cwd).expect("cwd")];
+        workspace.extend(
+            roots
+                .iter()
+                .map(|r| AbsolutePathBuf::from_absolute_path(r).expect("root")),
+        );
+        let policy = profile
+            .clone()
+            .materialize_project_roots_with_workspace_roots(&workspace)
+            .file_system_sandbox_policy();
+        let can_read = policy.can_read_local_path_with_cwd(Path::new(path), Path::new(cwd));
+        let can_write = policy.can_write_local_path_with_cwd(Path::new(path), Path::new(cwd));
+        use codex_protocol::permissions::FileSystemAccessMode::*;
+        match (can_read, can_write) {
+            (_, true) => Write,
+            (true, false) => Read,
+            (false, false) => Deny,
+        }
+    }
+
+    #[test]
+    fn the_state_directory_is_denied_but_the_threads_own_roots_in_it_are_not() {
+        use crate::typed::Sandbox;
+        use codex_protocol::permissions::FileSystemAccessMode::*;
+        let state = Path::new("/home/u/.local/share/atomic/projects/p-0123");
+        let home = state.join("codex");
+        let worktree = "/home/u/.local/share/atomic/projects/p-0123/worktrees/run/step";
+        let cache = "/home/u/.local/share/atomic/projects/p-0123/cache";
+        let write = permission_profile(Sandbox::WorkspaceWrite, Some(state), &home).expect("rw");
+        let read = permission_profile(Sandbox::ReadOnly, Some(state), &home).expect("ro");
+        let db = "/home/u/.local/share/atomic/projects/p-0123/atomic.db";
+        let codex_db = "/home/u/.local/share/atomic/projects/p-0123/codex/state.sqlite";
+        for (profile, own) in [(&write, Write), (&read, Read)] {
+            assert_eq!(access(profile, worktree, &[cache], db), Deny);
+            assert_eq!(access(profile, worktree, &[cache], codex_db), Deny);
+            assert_eq!(
+                access(profile, worktree, &[cache], state.to_str().expect("utf-8")),
+                Deny
+            );
+            assert_eq!(
+                access(
+                    profile,
+                    worktree,
+                    &[cache],
+                    &format!("{worktree}/src/lib.rs")
+                ),
+                own
+            );
+            assert_eq!(
+                access(
+                    profile,
+                    worktree,
+                    &[cache],
+                    "/home/u/.local/share/atomic/projects/p-0123/codex/shell_snapshots/t.sh"
+                ),
+                Read
+            );
+            // Outside the state directory, nothing changes.
+            assert_eq!(access(profile, worktree, &[cache], "/usr/bin/git"), Read);
+        }
+        assert_eq!(
+            access(
+                &write,
+                worktree,
+                &[cache],
+                &format!("{cache}/cargo-target/x")
+            ),
+            Write
+        );
+        // A thread working in the project itself, outside the state directory.
+        assert_eq!(access(&write, "/work/project", &[], db), Deny);
+        assert_eq!(
+            access(&write, "/work/project", &[], "/work/project/a.txt"),
+            Write
         );
     }
 

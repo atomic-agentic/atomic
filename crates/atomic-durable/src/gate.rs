@@ -22,7 +22,9 @@
 //!
 //! [`decide`] is the person's side: an idempotent command with a client-made
 //! command id, committed in one short transaction before it is
-//! acknowledged. The first durable resolution wins; a replayed command gets
+//! acknowledged. It carries a [`HumanCredential`], checked against the
+//! verifier the person enrolled (see [`credential`]): who decided is who
+//! proved it, never a name the command gives. The first durable resolution wins; a replayed command gets
 //! its original result back, and any other command on a resolved gate gets a
 //! [`DecideError::Conflict`] carrying the resolution that won. Only after the
 //! commit does it send the wake-up, keyed by the gate id so a repeat sends
@@ -35,8 +37,10 @@
 //! and a decision that arrives after it gets the expiry as its conflict.
 
 pub mod approvers;
+pub mod credential;
 
 pub use approvers::{ApproverError, Approvers, Deployment, Principal, resolve};
+pub use credential::{EnrollError, Enrollment, HumanCredential, enroll, enrolled};
 
 use crate::failpoint;
 use crate::runtime::{
@@ -245,6 +249,13 @@ pub enum DecideError {
     /// There is no such gate.
     #[error("no gate {0}")]
     NoSuchGate(String),
+    /// The principal has no credential enrolled, so nothing it sends is a
+    /// decision.
+    #[error("{0} has no operator credential enrolled")]
+    NotEnrolled(Principal),
+    /// The credential is not the one the principal enrolled.
+    #[error("the credential presented for {0} is not the one it enrolled")]
+    BadCredential(Principal),
     /// The person is not one of the gate's approvers.
     #[error("{who} is not an approver of gate {gate}")]
     NotAnApprover {
@@ -643,23 +654,37 @@ async fn journaled(
     Ok(Some(Ok(decode(&row.text("result")?)?)))
 }
 
-/// Record `by`'s decision `cmd`, durably, and wake the gate's run.
+/// Record the decision `cmd` of the person `credential` proves, durably,
+/// and wake the gate's run.
 ///
-/// `by` must be the authenticated person making the decision; nothing in
-/// the command names them. Returns the recorded decision, the same one for a
-/// replayed command, or why it was not recorded.
+/// The credential is checked against the gate store in the same
+/// transaction: a principal with none enrolled, or a credential that does
+/// not match, records nothing. Nothing in the command names who decides.
+/// Returns the recorded decision, the same one for a replayed command, or
+/// why it was not recorded.
 pub async fn decide<R: DurableRuntime>(
     rt: &R,
-    by: &Principal,
+    credential: &HumanCredential,
     cmd: DecisionCommand,
 ) -> std::result::Result<Decision, DecideError> {
-    let request = request_digest(by, &cmd);
+    let by = credential.principal().clone();
+    let request = request_digest(&by, &cmd);
     let gate_id = cmd.gate.clone();
-    let by = by.clone();
+    let credential = credential.clone();
     let (recorded, run) = rt
         .control_transaction(move |mut tx| {
-            let (cmd, by, request) = (cmd.clone(), by.clone(), request.clone());
+            let (cmd, by, request, credential) =
+                (cmd.clone(), by.clone(), request.clone(), credential.clone());
             Box::pin(async move {
+                match credential::verify(&mut tx, &credential).await? {
+                    credential::Verified::Yes => {}
+                    credential::Verified::NotEnrolled => {
+                        return Ok((Err(DecideError::NotEnrolled(by)), None));
+                    }
+                    credential::Verified::Mismatch => {
+                        return Ok((Err(DecideError::BadCredential(by)), None));
+                    }
+                }
                 if let Some(found) = journaled(&mut tx, &cmd.command_id, &request).await? {
                     // A replay: wake the run again, in case the first time
                     // stopped before it did.

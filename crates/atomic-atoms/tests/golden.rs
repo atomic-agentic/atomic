@@ -78,6 +78,7 @@ async fn run_on<A: Atom>(
             let rt = CodexRuntime {
                 paths: CodexPaths::without_helpers(),
                 codex_home: dir.join("home"),
+                state_dir: None,
                 cwd: dir.join("cwd"),
                 endpoint: endpoint(&model),
                 defaults: AtomConfig::default(),

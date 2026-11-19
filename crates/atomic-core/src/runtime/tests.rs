@@ -66,6 +66,7 @@ fn runtime(model: &FakeModel, tag: &str) -> CodexRuntime {
     CodexRuntime {
         paths: CodexPaths::without_helpers(),
         codex_home: dir.join("home"),
+        state_dir: None,
         cwd: dir.join("cwd"),
         endpoint: ModelEndpoint {
             base_url: model.base_url(),

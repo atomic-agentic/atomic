@@ -543,6 +543,8 @@ dependencies = [
  "codex-app-server",
  "codex-core-api",
  "codex-extension-api",
+ "codex-keyring-store",
+ "codex-protocol",
  "deno_core",
  "dirs",
  "getrandom 0.3.4",
