@@ -14,8 +14,8 @@ use std::time::Duration;
 /// The variable that names the test database.
 pub const DATABASE_VAR: &str = "ATOMIC_TEST_DATABASE_URL";
 
-/// How long the database has to accept a connection.
-const REACH: Duration = Duration::from_secs(10);
+/// How long the database has to accept one connection.
+const REACH: Duration = Duration::from_secs(3);
 
 /// The test database's URL, without checking that it answers. Panics when
 /// [`DATABASE_VAR`] is unset or empty.
@@ -29,24 +29,24 @@ pub fn database_url() -> String {
     }
 }
 
-/// The test database's URL, once a connection to it succeeds. Panics, naming
-/// the database, when it does not answer.
+/// The test database's URL, once one connection to it succeeds. Panics,
+/// naming the database, when it does not answer within a few seconds.
 pub async fn database() -> String {
+    use sqlx::Connection;
     let url = database_url();
-    let reached = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(1)
-        .acquire_timeout(REACH)
-        .connect(&url)
-        .await;
-    match reached {
-        Ok(pool) => {
-            pool.close().await;
-            url
-        }
-        Err(e) => panic!(
-            "the PostgreSQL test database {} ({DATABASE_VAR}) cannot be reached: {e}",
+    let fail = |why: String| -> ! {
+        panic!(
+            "the PostgreSQL test database {} ({DATABASE_VAR}) cannot be reached: {why}",
             redacted(&url)
-        ),
+        )
+    };
+    match tokio::time::timeout(REACH, sqlx::PgConnection::connect(&url)).await {
+        Ok(Ok(connection)) => {
+            let _ = connection.close().await;
+            url.clone()
+        }
+        Ok(Err(e)) => fail(e.to_string()),
+        Err(_) => fail(format!("no answer in {} s", REACH.as_secs())),
     }
 }
 

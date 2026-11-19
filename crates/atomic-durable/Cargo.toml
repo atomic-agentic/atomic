@@ -23,7 +23,7 @@ workspace = true
 failpoints = ["dep:libc"]
 # Run the Postgres variants of the tests against ATOMIC_TEST_DATABASE_URL.
 # With this on, a missing database fails the tests instead of skipping them.
-postgres-tests = []
+postgres-tests = ["dep:tokio"]
 
 [dependencies]
 durare = { workspace = true }
@@ -36,6 +36,8 @@ sqlx = { workspace = true, features = ["postgres"] }
 thiserror = { workspace = true }
 # How a failpoint kills its process (failpoints only).
 libc = { workspace = true, optional = true }
+# The test database probe's time limit (postgres-tests only).
+tokio = { workspace = true, features = ["time"], optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

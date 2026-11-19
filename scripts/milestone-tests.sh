@@ -22,7 +22,7 @@ POSTGRES="--features atomic-agentic-durable/postgres-tests"
 # milestone | what it covers | cargo test arguments
 ROWS=(
     "M0|durable core: kill spike, step positions, executor identity, publication, store|-p atomic-agentic-durable"
-    "M1|the atomic binary and its Codex entry point|-p atomic-agentic"
+    "M1|the atomic binary and its Codex entry point|-p atomic-agentic -- --skip every_failpoint_triggered_in_turn"
     "M2|typed atoms on Codex and lite, repair turn, fake model|-p atomic-agentic-core --lib --features fake-model -- codex:: lite:: runtime:: typed:: testing::"
     "M2|golden test: the built-in atoms on the fake model|-p atomic-agentic-atoms"
     "M3|durable runtime, candidates, publication, run_atom|-p atomic-agentic-durable --lib -- runtime:: publication::"
@@ -32,7 +32,8 @@ ROWS=(
     "M35a|artifact store and typed references|-p atomic-agentic-core --lib -- artifact::"
     "M35a|artifact references in schemas|-p atomic-agentic-schema -- artifact::"
     "-|project, configuration and state|-p atomic-agentic-core --lib -- project:: config:: state::"
-    "all|the whole workspace|--workspace"
+    "M38a|failpoints and the crash suite (needs the sandbox)|-p atomic-agentic --features sandbox-tests --test failpoints --test crash"
+    "all|the whole workspace, but the crash suite (M38a)|--workspace -- --skip every_failpoint_triggered_in_turn"
 )
 
 table="| Milestone | Suite | Result | Passed | Failed |
