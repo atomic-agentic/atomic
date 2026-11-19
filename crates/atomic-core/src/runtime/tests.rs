@@ -629,6 +629,7 @@ async fn no_declared_validators_need_no_compiler_process() {
         sources: Default::default(),
         source_paths: Default::default(),
         contracts: Value::Null,
+        helpers: Default::default(),
     };
     validate_output(&program, false, json!({}))
         .await

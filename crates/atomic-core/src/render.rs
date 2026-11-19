@@ -63,4 +63,6 @@ pub fn render_with_context(
 }
 
 #[cfg(test)]
+mod helper_tests;
+#[cfg(test)]
 mod tests;

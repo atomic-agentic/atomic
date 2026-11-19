@@ -432,6 +432,11 @@ pub fn load(file: &Path, registry: &mut Registry) -> Result<Atom, AtomError> {
             .map_err(|e| fail(1, "body", e.to_string()))?,
         sources: serde_json::from_value(parsed["sources"].clone())
             .map_err(|e| fail(1, "body", e.to_string()))?,
+        helpers: match &parsed["helpers"] {
+            Value::Null => Default::default(),
+            helpers => serde_json::from_value(helpers.clone())
+                .map_err(|e| fail(1, "body", e.to_string()))?,
+        },
     };
     let mut schemas = serde_json::Map::new();
     for (key, id) in [("Input", &input), ("Output", &output)] {

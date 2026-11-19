@@ -208,7 +208,7 @@ const HOST: &str = r#"(() => {
   }
   Object.defineProperty(globalThis, '__atomicHost', { configurable: false, writable: false, enumerable: false,
     value: freeze({ input: text => deepFreeze(parse(text)), output: value => stringify(value, jsonOnly),
-      text: value => toText(value) }) });
+      text: value => (value !== null && typeof value === 'object' && typeof value.stack === 'string') ? value.stack : toText(value) }) });
 })();
 "#;
 

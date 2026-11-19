@@ -32,11 +32,14 @@ declare function Fragment(props: {children?: unknown}): JSX.Element;
       for (const part of parts) { if (part === '..') out.pop(); else if (part && part !== '.') out.push(part); }
       const requested = '/' + out.join('/');
       const base = sourcePaths[requested] ?? requested;
-      const resolvedFileName = [base + '.tsx', base + '.d.ts', base].find((name) => files.has(name));
-      return resolvedFileName ? { resolvedFileName, extension: resolvedFileName.endsWith('.tsx') ? ts.Extension.Tsx : ts.Extension.Dts } : undefined;
+      const resolvedFileName = [base + '.tsx', base + '.d.ts', base + '.ts', base].find((name) => files.has(name));
+      if (!resolvedFileName) return undefined;
+      const extension = resolvedFileName.endsWith('.tsx') ? ts.Extension.Tsx : resolvedFileName.endsWith('.d.ts') ? ts.Extension.Dts : resolvedFileName.endsWith('.ts') ? ts.Extension.Ts : undefined;
+      return extension ? { resolvedFileName, extension } : undefined;
     }),
   };
-  const program = ts.createProgram([...files.keys()].filter((name) => name.endsWith('.tsx') || name.endsWith('.d.ts')), options, host);
+  // Helper modules are checked as TypeScript with the atom and its components.
+  const program = ts.createProgram([...files.keys()].filter((name) => name.endsWith('.tsx') || name.endsWith('.ts')), options, host);
   const errors = ts.getPreEmitDiagnostics(program).filter((diagnostic) => diagnostic.category === ts.DiagnosticCategory.Error);
   if (!errors.length) return;
   const diagnostics = errors.slice(0, 12).map((diagnostic) => {

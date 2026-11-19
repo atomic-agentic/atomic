@@ -268,7 +268,7 @@ fn a_reference_to_a_missing_place_in_a_file_fails_the_load() {
 /// An atom and a component that import the shared `Change` type from
 /// `schemas/change.schema.json`, which references `schemas/tier.schema.json`.
 /// The input schema is inline, so the shared schemas supply types only.
-fn shared_types_project(component_body: &str) -> PathBuf {
+pub(crate) fn shared_types_project(component_body: &str) -> PathBuf {
     let dir = project("", "{}", None);
     std::fs::write(
         dir.join("test.atom.astro"),

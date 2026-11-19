@@ -35,6 +35,10 @@ pub struct Program {
     /// Canonical paths for explicitly imported source aliases.
     #[serde(default)]
     pub source_paths: BTreeMap<String, String>,
+    /// The captured helper module graphs the sources import, keyed by digest.
+    /// Helper calls run only these, so a run keeps the helpers it started with.
+    #[serde(default)]
+    pub helpers: BTreeMap<String, crate::helper_runtime::Captured>,
 }
 
 /// A compiler failure, located in the authored source when the compiler knows where.
@@ -254,7 +258,99 @@ pub fn worker(request: Value) -> Result<Value, String> {
 }
 
 /// As [`worker`], keeping where in the authored source a failure is.
-pub fn worker_located(mut request: Value) -> Result<Value, Diagnostic> {
+pub fn worker_located(request: Value) -> Result<Value, Diagnostic> {
+    worker_with(request, &BTreeMap::new())
+}
+
+/// The helper calls one compiler operation may make, together: a render, a
+/// validation or a judge binding. Each call has its own limits as well
+/// ([`crate::helper_runtime::Limits`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HelperBudget {
+    /// Calls.
+    pub calls: usize,
+    /// Time spent in helpers.
+    pub time: std::time::Duration,
+    /// JSON result bytes.
+    pub bytes: usize,
+}
+
+impl Default for HelperBudget {
+    fn default() -> Self {
+        Self {
+            calls: 256,
+            time: std::time::Duration::from_secs(10),
+            bytes: 4 * 1024 * 1024,
+        }
+    }
+}
+
+/// Runs one helper call the worker asked for, against the captures the atom
+/// recorded when it loaded, and spends it from `left`.
+pub(crate) fn helper_call(
+    helpers: &BTreeMap<String, crate::helper_runtime::Captured>,
+    left: &mut HelperBudget,
+    call: &Value,
+) -> Value {
+    use crate::helper_runtime::{Failure, Limits, invoke};
+    let failure =
+        |kind: &str, message: String| json!({ "error": { "kind": kind, "message": message } });
+    let Some(captured) = call["capture"]
+        .as_str()
+        .and_then(|digest| helpers.get(digest))
+    else {
+        return failure(
+            "refused",
+            "the helper is not in the atom's captured helpers".into(),
+        );
+    };
+    let Some(export) = call["export"].as_str() else {
+        return failure("refused", "a helper call names its export".into());
+    };
+    if left.calls == 0 {
+        return failure("budget", "helper call limit exceeded".into());
+    }
+    left.calls -= 1;
+    if left.time.is_zero() {
+        return failure("budget", "helper time limit exceeded".into());
+    }
+    let limits = Limits {
+        deadline: left.time.min(Limits::default().deadline),
+        ..Limits::default()
+    };
+    let started = std::time::Instant::now();
+    let result = invoke(captured, export, &call["args"], limits);
+    left.time = left.time.saturating_sub(started.elapsed());
+    match result {
+        Ok(value) => {
+            let size = value.to_string().len();
+            if size > left.bytes {
+                left.bytes = 0;
+                return failure("budget", "helper result limit exceeded".into());
+            }
+            left.bytes -= size;
+            json!({ "ok": value })
+        }
+        Err(Failure::Threw(text)) => failure("threw", text),
+        Err(other) => {
+            let kind = match other {
+                Failure::Deadline => "deadline",
+                Failure::Heap | Failure::ArrayBufferLimit => "memory",
+                Failure::OutputLimit | Failure::ErrorLimit => "size",
+                Failure::NotJson(_) => "not-json",
+                Failure::Refused(_) => "refused",
+                Failure::Threw(_) | Failure::Host(_) => "host",
+            };
+            failure(kind, other.to_string())
+        }
+    }
+}
+
+/// As [`worker_located`], answering the worker's helper calls from `helpers`.
+pub(crate) fn worker_with(
+    mut request: Value,
+    helpers: &BTreeMap<String, crate::helper_runtime::Captured>,
+) -> Result<Value, Diagnostic> {
     safe_json(&request, 0, &mut 100_000)?;
     let dir = assets()?;
     let root = request
@@ -278,17 +374,26 @@ pub fn worker_located(mut request: Value) -> Result<Value, Diagnostic> {
                 .to_owned(),
         ];
         let mut total = 0;
+        // Requested files that do not exist; the compiler reports an import of
+        // one where the import is.
+        let mut absent = std::collections::BTreeSet::<String>::new();
         // Capture all missing siblings together; one worker per import depth.
         for _ in 0..33 {
             for target in targets {
-                let canonical = std::fs::canonicalize(&target)
-                    .map_err(|e| format!("read component {target}: {e}"))?;
+                let canonical = match std::fs::canonicalize(&target) {
+                    Ok(canonical) => canonical,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound && !sources.is_empty() => {
+                        absent.insert(target);
+                        continue;
+                    }
+                    Err(e) => return Err(format!("read component {target}: {e}").into()),
+                };
+                let helper = canonical.extension().is_some_and(|e| e == "ts")
+                    && !canonical.to_string_lossy().ends_with(".d.ts");
                 if !canonical.starts_with(&root)
-                    || canonical
-                        .extension()
-                        .is_none_or(|extension| extension != "astro")
+                    || !(helper || canonical.extension().is_some_and(|e| e == "astro"))
                 {
-                    return Err("component must be an Astro source inside the project root".into());
+                    return Err("an imported source must be an Astro component or a .ts helper inside the project root".into());
                 }
                 let canonical_name = canonical
                     .to_str()
@@ -311,13 +416,14 @@ pub fn worker_located(mut request: Value) -> Result<Value, Diagnostic> {
                     }
                     entry.insert(source);
                 }
-                if sources.len() > 128 || source_paths.len() > 512 {
+                if sources.len() > 128 || source_paths.len() > 512 || absent.len() > 128 {
                     return Err("component graph limit exceeded".into());
                 }
             }
             request["sources"] = json!(sources);
             request["sourcePaths"] = json!(source_paths);
-            let result = worker_located(request.clone())?;
+            request["absent"] = json!(absent);
+            let result = worker_with(request.clone(), helpers)?;
             if let Some(next) = result.get("needsSources") {
                 targets = serde_json::from_value::<Vec<String>>(next.clone())
                     .map_err(|_| "invalid source discovery response")?;
@@ -335,7 +441,8 @@ pub fn worker_located(mut request: Value) -> Result<Value, Diagnostic> {
     if bytes.len() > crate::compiler_process::MESSAGE_LIMIT {
         return Err("compiler request limit exceeded".into());
     }
-    let output = crate::compiler_process::run(
+    let mut left = HelperBudget::default();
+    let output = crate::compiler_process::run_interactive(
         &deno(),
         &deno_args(&dir),
         &[
@@ -347,6 +454,7 @@ pub fn worker_located(mut request: Value) -> Result<Value, Diagnostic> {
         ],
         &bytes,
         crate::compiler_process::TIME_LIMIT,
+        &mut |call: &Value| helper_call(helpers, &mut left, call),
     )?;
     let response: Value =
         serde_json::from_slice(&output).map_err(|e| format!("invalid compiler response: {e}"))?;
@@ -379,7 +487,7 @@ impl Program {
         args["root"] = json!(path_text(&self.root)?);
         args["sources"] = json!(self.sources);
         args["sourcePaths"] = json!(self.source_paths);
-        worker_located(args)
+        worker_with(args, &self.helpers)
     }
 
     /// Invoke on the bounded blocking pool rather than an executor thread.
@@ -395,6 +503,7 @@ impl Program {
         digest.update(COMPILER_HASH.as_bytes());
         digest.update(self.contracts.to_string().as_bytes());
         digest.update(serde_json::to_vec(&self.source_paths).unwrap_or_default());
+        digest.update(serde_json::to_vec(&self.helpers).unwrap_or_default());
         for (name, source) in &self.sources {
             digest.update(name.as_bytes());
             digest.update([0]);

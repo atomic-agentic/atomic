@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Astro atom frontend. It interprets an allowlisted AST; it never evaluates JS.
+// Calls to imported TypeScript helpers are the one exception: they run in the
+// host's embedded runtime, one fresh capability-free isolate per call, and
+// each result is labelled with the least trusted origin among its arguments.
 import { parse } from '@astrojs/compiler';
 import ts from 'typescript';
 import { readFile, realpath, path, createHash, fileURLToPath } from './platform.mjs';
 import { intrinsics } from './intrinsics.mjs';
 import { contextForStep } from './context.mjs';
+import { captureHelper } from './capture.mjs';
 
 const denied = new Set(['__proto__', 'prototype', 'constructor']);
 const dataBrand = Symbol('data');
@@ -14,6 +18,21 @@ const raw = (value) => isData(value) ? value.value : value;
 const fragments = (nodes, scope, slots, unit) => ({ tag: 'fragment', nodes, scope, slots, unit });
 const allowedBinary = new Set(['&&', '||', '??', '===', '!==', '>', '>=', '<', '<=', '+', '-', '*', '/']);
 const collections = new Set(['map', 'some', 'every', 'filter']);
+
+// A helper call that produced no result: a throw, a limit or a refusal. It is
+// an evaluation error, never a value, so a validator that hits one fails the
+// operation instead of returning false (which would start a repair round).
+export class HelperFailure extends Error {
+  constructor(kind, message, file, line) {
+    super(message);
+    this.kind = kind; this.helperFailure = true;
+    if (file) this.file = file;
+    if (line) this.line = line;
+  }
+}
+// The host's helper runtime: (capture digest, export name, JSON args) => JSON.
+let helperExecutor = null;
+export function setHelperExecutor(executor) { helperExecutor = executor; }
 
 function bindingNames(pattern) {
   if (ts.isIdentifier(pattern)) return [pattern.text];
@@ -103,6 +122,12 @@ function validateExpression(node, unit, locals = null) {
     return;
   }
   if (ts.isObjectLiteralExpression(node)) { for (const [, value] of fields(node)) check(value); return; }
+  if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && unit.helpers.has(node.expression.text)) {
+    if (node.questionDotToken || node.typeArguments?.length) error(unit, node, 'helper calls take plain arguments');
+    if (node.arguments.some((arg) => ts.isSpreadElement(arg))) error(unit, node, 'helper calls take plain arguments');
+    if (node.arguments.length > 16) error(unit, node, 'helper calls take at most 16 arguments');
+    node.arguments.forEach(check); return;
+  }
   if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && unit.intrinsics.has(node.expression.text)) {
     const intrinsic = intrinsics.get(unit.intrinsics.get(node.expression.text));
     if (node.arguments.length !== intrinsic.arity) error(unit, node, 'incorrect intrinsic argument count');
@@ -181,6 +206,9 @@ function decode(text, unit) {
 export async function compile(file, options = {}) {
   const root = await realpath(options.root ?? path.dirname(file));
   const cache = new Map();
+  // Every helper graph the atom's components import, keyed by capture digest.
+  const captures = new Map();
+  const captureState = { cache: new Map(), modules: 0, bytes: 0 };
   let sourceBytes = 0;
   let componentCount = 0;
   async function load(target, stack = []) {
@@ -199,7 +227,7 @@ export async function compile(file, options = {}) {
     const defaults = canonical.endsWith('.atom.astro')
       ? { atomic: 1, name: path.basename(canonical, '.atom.astro'), kind: 'lite' }
       : {};
-    const unit = { file: canonical, root, config: { ...defaults }, bindings: [], imports: new Map(), templates: new Map(), nodes: [], intrinsics: new Map(), contracts: new Map(), typeImports: [] };
+    const unit = { file: canonical, root, config: { ...defaults }, bindings: [], imports: new Map(), templates: new Map(), nodes: [], intrinsics: new Map(), contracts: new Map(), typeImports: [], helpers: new Map() };
     const missingSources = new Set();
     const contractTypes = new Set();
     const propTypes = new Set();
@@ -237,7 +265,30 @@ export async function compile(file, options = {}) {
           }
           continue;
         }
-        if (!statement.importClause?.name || statement.importClause.namedBindings || !specifier.startsWith('.') || !specifier.endsWith('.astro')) error(unit, null, 'only default imports of local .astro components are supported');
+        const clause = statement.importClause;
+        // Named value imports of a local module are helpers: `./helpers/review`
+        // (as editors resolve it without a tsconfig) or `./helpers/review.ts`.
+        if (specifier.startsWith('.') && !specifier.endsWith('.astro') && clause && !clause.name && clause.namedBindings && ts.isNamedImports(clause.namedBindings)
+          && clause.namedBindings.elements.some((item) => !item.isTypeOnly)) {
+          let captured = null;
+          try {
+            captured = await captureHelper(root, path.resolve(path.dirname(canonical), specifier), { file: canonical, line: lineOf(statement), specifier }, captureState);
+            captures.set(captured.digest, captured);
+            for (const file of captured.typeImports) unit.typeImports.push(file);
+          } catch (cause) {
+            if (!cause.sources) throw cause;
+            // Still being discovered: the names are helpers, so the rest of the
+            // script checks; the missing sources are requested below.
+            for (const source of cause.sources) missingSources.add(source);
+          }
+          for (const item of clause.namedBindings.elements) {
+            if (item.isTypeOnly) continue;
+            if (unit.intrinsics.has(item.name.text) || unit.helpers.has(item.name.text)) error(unit, null, `duplicate helper ${item.name.text}`);
+            unit.helpers.set(item.name.text, { capture: captured?.digest ?? null, name: item.propertyName?.text ?? item.name.text, module: specifier });
+          }
+          continue;
+        }
+        if (!statement.importClause?.name || statement.importClause.namedBindings || !specifier.startsWith('.') || !specifier.endsWith('.astro')) error(unit, null, 'only default imports of local .astro components and named imports of local .ts helpers are supported');
         try {
           const imported = await load(path.resolve(path.dirname(canonical), specifier), [...stack, canonical]);
           unit.imports.set(statement.importClause.name.text, imported);
@@ -305,7 +356,9 @@ export async function compile(file, options = {}) {
     cache.set(canonical, unit);
     return unit;
   }
-  return load(file);
+  const unit = await load(file);
+  unit.captures = captures;
+  return unit;
 }
 
 const trust = { external: 0, agent: 1, team: 2 };
@@ -331,6 +384,16 @@ function derive(result, values, node) {
   const identity = JSON.stringify([node.getText(), values.map((v) => isData(v) ? { path: v.at } : { literal: v })]);
   const suffix = createHash('sha256').update(identity).digest('hex').slice(0, 16);
   return data(materialize(result), `${origin.at}.expression_${suffix}`, origin.origin);
+}
+// A helper sees only its arguments, so its result is no more trusted than its
+// least trusted argument. A result computed from authored literals alone is
+// authored computation and may supply instructions.
+function labelHelperResult(result, args, node, helper) {
+  const origin = leastTrusted(args);
+  if (!origin) return result;
+  const identity = JSON.stringify([helper.module, helper.name, node.getText(), args.map((v) => isData(v) ? { path: v.at } : { literal: materialize(v) })]);
+  const suffix = createHash('sha256').update(identity).digest('hex').slice(0, 16);
+  return data(result, `helpers.${helper.name}_${suffix}`, origin.origin);
 }
 function property(parent, key) {
   const value = raw(parent);
@@ -399,6 +462,13 @@ function evaluate(node, scope, unit, slots, budget) {
   if (ts.isObjectLiteralExpression(node)) {
     const values = fields(node).map(([key, child]) => [key, evaluate(child, scope, unit, slots, budget)]);
     return derive(Object.fromEntries(values.map(([key, value]) => [key, materialize(value)])), values.map(([, value]) => value), node);
+  }
+  if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && unit.helpers.has(node.expression.text)) {
+    const helper = unit.helpers.get(node.expression.text);
+    const args = node.arguments.map((arg) => evaluate(arg, scope, unit, slots, budget));
+    if (!helperExecutor) error(unit, node, 'helper calls need the atomic host');
+    const result = helperExecutor(helper.capture, helper.name, args.map(materialize));
+    return labelHelperResult(result, args, node, helper);
   }
   if (ts.isCallExpression(node) && ts.isIdentifier(node.expression)) {
     const args = node.arguments.map((arg) => evaluate(arg, scope, unit, slots, budget));
@@ -480,7 +550,10 @@ export function validateOutput(unit, values, options) {
     try {
       passed = invokeContract(unit, contract, values);
       if (typeof passed !== 'boolean') failure = 'validator must return boolean';
-    } catch (cause) { failure = cause.message ?? String(cause); }
+    } catch (cause) {
+      if (cause?.helperFailure) throw cause;
+      failure = cause.message ?? String(cause);
+    }
     return failure === undefined ? { id: contract.id, passed, source: contract.source }
       : { id: contract.id, passed: false, source: contract.source, error: failure };
   });
