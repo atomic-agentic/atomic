@@ -715,6 +715,7 @@ impl Repo {
         if !is_sha(tree) {
             return Err(GitError::Unreadable);
         }
+        crate::failpoint::failpoint("commit:after-stage");
         let env = [
             ("GIT_AUTHOR_NAME", who.name.as_str()),
             ("GIT_AUTHOR_EMAIL", who.email.as_str()),

@@ -34,7 +34,7 @@ sha2 = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-atomic-core = { workspace = true, features = ["fake-model"] }
+atomic-core = { workspace = true, features = ["fake-model", "failpoints"] }
 atomic-durable = { workspace = true, features = ["failpoints"] }
 sqlx = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "time"] }

@@ -263,6 +263,9 @@ impl Worktrees {
         self.check_admin(&worktree.git_dir, &worktree.path)?;
         let tree = self.repo.linked(&worktree.git_dir, &worktree.path);
         let commit = tree.commit_all(&worktree.base, message, signature)?;
+        if crate::failpoint::armed() {
+            crate::failpoint::failpoint(&format!("commit:before-ref:{}", worktree.step));
+        }
         let prefix = format!(
             "refs/atomic/{}/steps/{}/",
             component(&worktree.run),

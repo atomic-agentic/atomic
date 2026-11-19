@@ -155,6 +155,11 @@ impl Meter for LedgerMeter {
                 .settle(&ticket.request, ticket.attempt, how)
                 .await
                 .map_err(store)?;
+            // Mid-atom: the call is made and settled, and the atom's turn
+            // goes on.
+            if atomic_durable::failpoints::armed() {
+                atomic_durable::failpoint(&format!("atom:after-call:{}", ticket.request));
+            }
             Ok(())
         })
     }
