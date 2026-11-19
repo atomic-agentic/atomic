@@ -86,7 +86,10 @@ review:
 ```
 
 Marking a model's output as `team`, or the workflow's input as `agent`, is an
-error when the workflow loads. A helper an atom calls returns data as trusted as
+error when the workflow loads. So is mapping a value into an atom that does not
+accept its origin: an atom's `trust` is the riskiest origin it accepts, so an
+atom with `trust: 'team'` takes only team data, `'agent'` takes agent or team
+data, and `'external'`, or no `trust` at all, takes any. A helper an atom calls returns data as trusted as
 its least trusted argument.
 
 ## CEL values and string literals

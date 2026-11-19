@@ -2154,3 +2154,99 @@ fn a_contextual_step_without_settings_is_refused() {
             .expect("shutdown");
     });
 }
+
+/// The policy atom, accepting at most `trust` input.
+fn trusting_atom(project: &Path, trust: &str) {
+    policy_atom(project);
+    let atoms = project.join("atoms");
+    let source = std::fs::read_to_string(atoms.join("apply-policy.atom.astro")).expect("atom");
+    std::fs::write(
+        atoms.join("apply-policy.atom.astro"),
+        source.replace(
+            "{ description: 'apply-policy' }",
+            &format!("{{ description: 'apply-policy', trust: '{trust}' }}"),
+        ),
+    )
+    .expect("atom");
+}
+
+// An atom's trust is the riskiest input origin it accepts: binding less
+// trusted data into it fails the check, before any run.
+#[test]
+fn a_binding_less_trusted_than_its_atom_accepts_fails_the_check() {
+    let dir = scratch("trust");
+    let project = project(&dir);
+    policy_atom(&project);
+    // `note` is the workflow's input: external.
+    trusting_atom(&project, "team");
+    let error = try_load(
+        &project,
+        "policy.workflow.yaml",
+        &policy_workflow("'Be brief.'", ""),
+    )
+    .expect_err("external note");
+    assert!(
+        error.contains("/with/note") && error.contains("accepts team input at most"),
+        "{error}"
+    );
+    trusting_atom(&project, "agent");
+    let error = try_load(
+        &project,
+        "policy.workflow.yaml",
+        &policy_workflow("steps.read.output.title", ""),
+    )
+    .expect_err("external note");
+    assert!(error.contains("`input.text` is external data"), "{error}");
+    // An atom built for external input takes all of it, and one that
+    // declares nothing accepts any origin.
+    trusting_atom(&project, "external");
+    try_load(
+        &project,
+        "policy.workflow.yaml",
+        &policy_workflow("steps.read.output.title", ""),
+    )
+    .expect("external accepted");
+    policy_atom(&project);
+    try_load(
+        &project,
+        "policy.workflow.yaml",
+        &policy_workflow("steps.read.output.title", ""),
+    )
+    .expect("no trust declared");
+}
+
+// The check holds field by field: team literals pass a team atom, and a
+// model output passes an agent atom, while external input is refused.
+#[test]
+fn trust_is_checked_per_binding() {
+    let dir = scratch("trust-fields");
+    let project = project(&dir);
+    policy_atom(&project);
+    let workflow = |policy: &str, note: &str| {
+        policy_workflow(policy, "").replace("note: input.text", &format!("note: \"{note}\""))
+    };
+    trusting_atom(&project, "team");
+    try_load(
+        &project,
+        "policy.workflow.yaml",
+        &workflow("'Be brief.'", "'A note.'"),
+    )
+    .expect("team literals");
+    let error = try_load(
+        &project,
+        "policy.workflow.yaml",
+        &workflow("steps.read.output.title", "'A note.'"),
+    )
+    .expect_err("agent policy");
+    assert!(
+        error.contains("/with/policy") && error.contains("is agent data"),
+        "{error}"
+    );
+    trusting_atom(&project, "agent");
+    try_load(
+        &project,
+        "policy.workflow.yaml",
+        &workflow("steps.read.output.title", "'A note.'"),
+    )
+    .expect("agent accepted");
+}

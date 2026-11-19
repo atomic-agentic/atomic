@@ -67,6 +67,44 @@ pub struct WorkflowError {
     pub message: String,
 }
 
+/// How far a value may be trusted, least first.
+pub const TRUST: [&str; 3] = ["external", "agent", "team"];
+
+/// Where `origin` sits in [`TRUST`]; an unknown origin ranks as external.
+pub fn trust_rank(origin: &str) -> usize {
+    TRUST.iter().position(|o| *o == origin).unwrap_or(0)
+}
+
+/// The most a binding's sources allow it to be trusted: the least trusted
+/// of what its CEL expression reads. `kinds` gives each earlier step's kind
+/// (`gate`, `lite`, `codex` or `exec`). The workflow's input is external
+/// (nothing yet marks a field of it as coming from trusted configuration); a
+/// model's output is agent; an exec atom's output came from outside code and
+/// is external; a gate's decision came from a person and is team; and a
+/// literal the workflow file writes is team. Every value, team included,
+/// still reaches the model as data, never as instructions.
+pub fn binding_origin(
+    source: &str,
+    kinds: &BTreeMap<String, String>,
+) -> Result<&'static str, String> {
+    let parsed = expr::parse(source).map_err(|e| e.to_string())?;
+    let mut least = "team";
+    for path in parsed.references() {
+        let origin = match (path.first().map(String::as_str), path.get(1)) {
+            (Some("steps"), Some(step)) => match kinds.get(step).map(String::as_str) {
+                Some("gate") => "team",
+                Some("lite" | "codex") => "agent",
+                _ => "external",
+            },
+            _ => "external",
+        };
+        if trust_rank(origin) < trust_rank(least) {
+            least = origin;
+        }
+    }
+    Ok(least)
+}
+
 pub(crate) const TOP: &[&str] = &[
     "atomic", "name", "version", "input", "output", "steps", "returns", "budget",
 ];
@@ -260,8 +298,10 @@ pub fn load(
         )
     })?;
 
-    // Every step's type, as seen by later steps.
+    // Every step's type, as seen by later steps, and its kind, for the origin
+    // of what it outputs.
     let mut step_schemas: BTreeMap<String, Value> = BTreeMap::new();
+    let mut kinds: BTreeMap<String, String> = BTreeMap::new();
     let mut warnings = Vec::new();
     for id in &order {
         let sp = format!("/steps/{id}");
@@ -389,6 +429,45 @@ pub fn load(
                     }
                 }
             }
+            // Each binding's origin: what its sources allow, lowered if the
+            // step says so, and no less trusted than the atom accepts.
+            let accepts = atom
+                .frontmatter
+                .get("trust")
+                .and_then(Value::as_str)
+                .unwrap_or("external");
+            for (field, e) in &with {
+                let wp = format!("{sp}/with/{field}");
+                let source = e.as_str().unwrap_or_default();
+                let allowed = binding_origin(source, &kinds).map_err(|m| fail(&wp, m))?;
+                let origin = match s
+                    .get("origins")
+                    .and_then(|o| o.get(field))
+                    .and_then(Value::as_str)
+                {
+                    Some(declared) if trust_rank(declared) > trust_rank(allowed) => {
+                        return Err(fail(
+                            &format!("{sp}/origins/{field}"),
+                            format!(
+                                "`origins` marks `{field}` as {declared}, but `{source}` is {allowed} data at most; \
+                                 a binding may lower an origin, never raise it"
+                            ),
+                        ));
+                    }
+                    Some(declared) => declared,
+                    None => allowed,
+                };
+                if trust_rank(origin) < trust_rank(accepts) {
+                    return Err(fail(
+                        &wp,
+                        format!(
+                            "`{source}` is {origin} data, and atom `{atom_name}` accepts {accepts} input at most \
+                             (`trust: '{accepts}'`); pass it through a step that can take it, or declare a lower trust \
+                             on the atom if it is built for {origin} input"
+                        ),
+                    ));
+                }
+            }
             for r in &required {
                 if !with.contains_key(r) {
                     return Err(fail(
@@ -422,7 +501,9 @@ pub fn load(
                 id.clone(),
                 json!({"type": "object", "properties": {"output": out, "metadata": {"type": "object"}}, "additionalProperties": false}),
             );
+            kinds.insert(id.clone(), atom.kind.clone());
         } else if let Some(gate) = s.get("gate") {
+            kinds.insert(id.clone(), "gate".into());
             let gp = format!("{sp}/gate");
             let Value::Object(g) = gate else {
                 return Err(fail(

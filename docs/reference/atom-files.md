@@ -142,6 +142,7 @@ declarations would replace an atom's own `.atomic/types/<atom>.d.ts` is an error
 | `kind` | `lite`, `codex` or `exec` |
 | `input`, `output` | Full JSON Schema or a local schema reference |
 | `model`, `sandbox` | Model selection and effective sandbox request |
+| `trust` | The riskiest input origin the atom accepts: `team`, `agent` or `external` (the default). A workflow that maps less trusted data into it fails to load; see [where each input came from](workflow-files.md#where-each-input-came-from) |
 | `validate` | Expression-bodied typed callbacks over `{input, output}` |
 | `examples` | Named `{input, output}` examples checked against full contracts |
 | `case`, `judges` | Full evaluation-case and judge input/output schema declarations |
