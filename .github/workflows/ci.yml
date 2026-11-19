@@ -222,7 +222,7 @@ jobs:
       # database or sandbox fails them rather than skipping.
       - name: Test (Linux, with Postgres and the sandbox)
         if: runner.os == 'Linux'
-        run: cargo test --workspace --locked --no-fail-fast --features atomic-agentic-durable/postgres-tests,atomic-agentic/sandbox-tests
+        run: cargo test --workspace --locked --no-fail-fast --features atomic-agentic/postgres-tests,atomic-agentic/sandbox-tests
       - name: Test (macOS)
         if: runner.os == 'macOS'
         run: cargo test --workspace --locked --no-fail-fast

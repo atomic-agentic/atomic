@@ -209,6 +209,7 @@ Atomic refuses to start when the durable engine's own version variable
 | --- | --- |
 | `ATOMIC_MODEL_BASE_URL`, `ATOMIC_MODEL` (`--model-base-url`, `--model`) | The OpenAI-compatible endpoint and model that model atoms use; `ATOMIC_MODEL_API_KEY_ENV` names the variable holding its key |
 | `ATOMIC_DATABASE_URL`, `ATOMIC_DATABASE_SCHEMA` | PostgreSQL instead of the project's local SQLite store; the schema defaults to `atomic` |
+| `--owner-stopped` (`runs resume` only) | On PostgreSQL, take over a run another executor owns, asserting that executor has stopped; without it such a resume is refused |
 | `ATOMIC_EXECUTOR_ID` (`--executor-id`) | This process's identity as owner of its runs: unique to the process and the same across its restarts, so a restart recovers its own unfinished runs and no one else's. Required on PostgreSQL |
 | `ATOMIC_RUNNER` (`--runner`) | `local` (the default) runs exec atoms' commands as child processes; `process` runs each in an `atomic runner` process of its own, which sees only `PATH` from its parent |
 

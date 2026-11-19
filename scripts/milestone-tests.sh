@@ -16,7 +16,7 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"
 POSTGRES=""
-[ -n "${ATOMIC_TEST_DATABASE_URL:-}" ] && POSTGRES="--features atomic-agentic-durable/postgres-tests"
+[ -n "${ATOMIC_TEST_DATABASE_URL:-}" ] && POSTGRES="--features atomic-agentic/postgres-tests"
 
 # milestone | what it covers | cargo test arguments
 ROWS=(

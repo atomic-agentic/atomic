@@ -52,6 +52,11 @@ pub struct RunArgs {
 pub struct ResumeArgs {
     /// The id `atomic run` printed.
     pub run_id: String,
+    /// On a shared store, assert that the executor that owns the run has
+    /// stopped, so this process may take the run over. Wrong, it lets two
+    /// processes run the same steps at once.
+    #[arg(long)]
+    pub owner_stopped: bool,
     #[command(flatten)]
     pub engine: EngineArgs,
 }
@@ -232,6 +237,27 @@ pub async fn resume(
                         engine.rt.version()
                     ),
                     "continue it with an atomic of the layout that started it, or start a new run",
+                )
+                .into());
+            }
+            // The execution lock covers this host only. On a shared store
+            // another live process may own the run, and nothing fences it.
+            if engine.shared && record.executor != engine.rt.executor_id() && !args.owner_stopped {
+                let _ = engine.rt.shutdown(SHUTDOWN).await;
+                return Err(Failure::new(
+                    "run.owned",
+                    format!(
+                        "run {id} is owned by executor {}, not this one ({}), and may still be \
+                         running there",
+                        record.executor,
+                        engine.rt.executor_id()
+                    ),
+                    format!(
+                        "let executor {} finish it, or restart its `atomic serve`; if that \
+                         executor has stopped for good, run `atomic runs resume {id} \
+                         --owner-stopped`",
+                        record.executor
+                    ),
                 )
                 .into());
             }

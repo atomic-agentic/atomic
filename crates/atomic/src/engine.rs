@@ -132,6 +132,9 @@ pub struct Engine {
     pub rt: Durare,
     /// Where its store is, for messages.
     pub store: String,
+    /// Whether the store is shared with other hosts' executors, which this
+    /// process's execution lock does not exclude.
+    pub shared: bool,
 }
 
 /// Take the project's execution lock for `command`, open its store and
@@ -209,5 +212,6 @@ pub async fn open(
     Ok(Engine {
         rt,
         store: describe(&database),
+        shared: matches!(database, Database::Postgres { .. }),
     })
 }

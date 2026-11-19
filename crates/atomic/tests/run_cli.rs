@@ -1429,11 +1429,9 @@ fn the_executor_identity_is_atomics_own_and_required_on_postgres() {
 /// Two processes on one PostgreSQL store, each with its own identity, each
 /// with a run waiting at a gate. One is killed; `atomic serve` restarted
 /// under its identity recovers its run and not the live one's.
+#[cfg(feature = "postgres-tests")]
 #[test]
 fn a_restarted_server_recovers_only_its_own_runs_on_postgres() {
-    if !atomic_durable::POSTGRES_TESTS {
-        return;
-    }
     let url = std::env::var("ATOMIC_TEST_DATABASE_URL")
         .expect("postgres-tests needs ATOMIC_TEST_DATABASE_URL");
     on_codex_runtime(async move {
@@ -1527,6 +1525,116 @@ fn a_restarted_server_recovers_only_its_own_runs_on_postgres() {
             .await
             .expect("child");
         assert!(status.success());
+    });
+}
+
+/// The environment of executor `name` on schema `schema`, with a state
+/// directory of its own, as on a host of its own.
+#[cfg(feature = "postgres-tests")]
+fn executor_env(dir: &Path, url: &str, schema: &str, name: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("ATOMIC_DATABASE_URL", url.to_owned()),
+        ("ATOMIC_DATABASE_SCHEMA", schema.to_owned()),
+        ("ATOMIC_EXECUTOR_ID", name.to_owned()),
+        (
+            "ATOMIC_HOME",
+            dir.join(format!("{name}-home"))
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    ]
+}
+
+/// On PostgreSQL the execution lock covers one host only, so resuming a
+/// run another executor owns is refused unless the operator says that
+/// executor has stopped.
+#[cfg(feature = "postgres-tests")]
+#[test]
+fn resuming_a_run_another_executor_owns_needs_its_owner_stopped() {
+    let url = std::env::var("ATOMIC_TEST_DATABASE_URL")
+        .expect("postgres-tests needs ATOMIC_TEST_DATABASE_URL");
+    on_codex_runtime(async move {
+        let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
+            .await
+            .expect("fake model");
+        let dir = scratch("owned");
+        let project = project(&dir);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let schema = format!("atomic_owned_{}_{nanos}", std::process::id());
+        let mut a_env = model_env(&model.base_url()).to_vec();
+        a_env.extend(executor_env(&dir, &url, &schema, "worker-a"));
+        let mut b_env = model_env(&model.base_url()).to_vec();
+        b_env.extend(executor_env(&dir, &url, &schema, "worker-b"));
+        let mut a = spawn(
+            &dir,
+            &project,
+            &["run", "gated", "--run-id", "owned-1", "--data", NOTE],
+            &with(&a_env, &[]),
+            &dir.join("a.log"),
+        );
+        let rt = Durare::postgres(&url, &schema).await.expect("store");
+        let opened = open_gate(&rt, "owned-1").await;
+
+        // worker-a is alive and owns the run: worker-b may not take it.
+        let resume = |extra: &'static [&'static str]| {
+            let (d, p, e) = (dir.clone(), project.clone(), b_env.clone());
+            tokio::task::spawn_blocking(move || {
+                let mut args = vec!["--json", "runs", "resume", "owned-1"];
+                args.extend(extra);
+                atomic(&d, &p, &args, &with(&e, &[]), "")
+            })
+        };
+        let out = resume(&[]).await.expect("child");
+        assert!(!out.status.success(), "{}", text(&out));
+        let error = &stdout_json(&out)["error"];
+        assert_eq!(error["kind"], "run.owned", "{error}");
+        assert!(
+            error["description"]
+                .as_str()
+                .is_some_and(|d| d.contains("worker-a")),
+            "{error}"
+        );
+        assert!(
+            error["action"]
+                .as_str()
+                .is_some_and(|a| a.contains("--owner-stopped")),
+            "{error}"
+        );
+        assert!(
+            a.try_wait().expect("wait").is_none(),
+            "the owner kept its run"
+        );
+
+        // Once it has stopped, the operator says so, and worker-b continues
+        // the run at the gate it opened.
+        a.kill().expect("SIGKILL worker-a");
+        a.wait().expect("reap");
+        let mut b = spawn(
+            &dir,
+            &project,
+            &["runs", "resume", "owned-1", "--owner-stopped"],
+            &with(&b_env, &[]),
+            &dir.join("b.log"),
+        );
+        wait_until("worker-b to resume", || {
+            std::fs::read_to_string(dir.join("b.log")).is_ok_and(|l| l.contains("resuming"))
+        });
+        let again = open_gate(&rt, "owned-1").await;
+        assert_eq!(again.id, opened.id);
+        approve(&rt, &again).await;
+        let status = tokio::task::spawn_blocking(move || wait_child(&mut b, "worker-b"))
+            .await
+            .expect("child");
+        assert!(
+            status.success(),
+            "{}",
+            std::fs::read_to_string(dir.join("b.log")).unwrap_or_default()
+        );
+        assert_eq!(model.calls(), 2, "rank once, summarize once");
+        assert_eq!(count_log(&dir).len(), 1, "count once");
     });
 }
 

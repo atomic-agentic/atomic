@@ -37,11 +37,6 @@ pub use runtime::{
     executor_identity,
 };
 
-/// Whether this build runs the PostgreSQL variants of the tests (the
-/// `postgres-tests` feature), for test suites in other crates, which cannot
-/// see this crate's features. With it on, a missing database fails them.
-pub const POSTGRES_TESTS: bool = cfg!(feature = "postgres-tests");
-
 use std::path::Path;
 use std::sync::Arc;
 
