@@ -9,7 +9,7 @@ import { readFile, realpath, path, createHash, fileURLToPath } from './platform.
 import { intrinsics } from './intrinsics.mjs';
 import { contextForStep } from './context.mjs';
 import { captureHelper } from './capture.mjs';
-import { literalFences } from './fences.mjs';
+import { FenceError, literalFences } from './fences.mjs';
 
 const denied = new Set(['__proto__', 'prototype', 'constructor']);
 const dataBrand = Symbol('data');
@@ -230,7 +230,12 @@ export async function compile(file, options = {}) {
     sourceBytes += text.length;
     if (text.length > 262144 || sourceBytes > 1048576) throw new Error('source size limit exceeded');
     if (options.production && /@ts-(?:ignore|nocheck|expect-error)/.test(text)) throw new Error('TypeScript diagnostic suppression is not allowed in atom sources');
-    const parsed = await parse(literalFences(text), { position: true });
+    let fenced;
+    try { fenced = literalFences(text); } catch (cause) {
+      if (cause instanceof FenceError) throw new AtomDiagnostic(cause.message, canonical, cause.line);
+      throw cause;
+    }
+    const parsed = await parse(fenced, { position: true });
     const parseError = parsed.diagnostics?.find((d) => d.severity === 1);
     if (parseError) throw new AtomDiagnostic(parseError.text ?? 'Astro parse error', canonical, parseError.location?.line);
     const defaults = canonical.endsWith('.atom.astro')
@@ -423,11 +428,13 @@ function derive(result, values, node) {
 }
 // A helper sees only its arguments, so its result is no more trusted than its
 // least trusted argument. A result computed from authored literals alone is
-// authored computation and may supply instructions.
-function labelHelperResult(result, args, node, helper) {
+// authored computation and may supply instructions. The call's position in
+// the render is part of its path: two identical calls can return different
+// values (each call has its own clock and seed), and each keeps its own.
+function labelHelperResult(result, args, node, helper, call) {
   const origin = leastTrusted(args);
   if (!origin) return result;
-  const identity = JSON.stringify([helper.module, helper.name, node.getText(), args.map((v) => isData(v) ? { path: v.at } : { literal: materialize(v) })]);
+  const identity = JSON.stringify([helper.module, helper.name, node.getText(), call, args.map((v) => isData(v) ? { path: v.at } : { literal: materialize(v) })]);
   const suffix = createHash('sha256').update(identity).digest('hex').slice(0, 16);
   return data(result, `helpers.${helper.name}_${suffix}`, origin.origin);
 }
@@ -541,7 +548,8 @@ function evaluate(node, scope, unit, slots, budget) {
     const args = node.arguments.map((arg) => evaluate(arg, scope, unit, slots, budget));
     if (!helperExecutor) error(unit, node, 'helper calls need the atomic host');
     const result = helperExecutor(helper.capture, helper.name, args.map(materialize));
-    return labelHelperResult(result, args, node, helper);
+    budget.helperCalls = (budget.helperCalls ?? 0) + 1;
+    return labelHelperResult(result, args, node, helper, budget.helperCalls);
   }
   if (ts.isCallExpression(node) && ts.isIdentifier(node.expression)) {
     const args = node.arguments.map((arg) => evaluate(arg, scope, unit, slots, budget));

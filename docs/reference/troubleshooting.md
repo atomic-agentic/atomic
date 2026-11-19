@@ -83,9 +83,10 @@ The compact form has no constraints: a field such as `when: date-time` or
 full JSON Schema, which can say `format: date-time` or `minLength: 3`. A compact
 schema also cannot name a top-level field after a structural JSON Schema
 keyword, such as `type`, `enum` or `items`: a schema with one is read as full
-JSON Schema. A field named after a constraint or annotation keyword, such as
-`description` or `format`, stays a field while its value is `type,
-description`.
+JSON Schema, and atomic refuses it if its other fields read as compact ones
+(`type: string` beside `message: string`), rather than ignore them. A field
+named after a constraint or annotation keyword, such as `description` or
+`format`, stays a field while its value is `type, description`.
 `atomic schemas expand <atom>` prints what a compact schema compiles to. See
 [compact schemas](atom-files.md#compact-schemas).
 

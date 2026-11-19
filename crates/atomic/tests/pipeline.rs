@@ -42,7 +42,18 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// Helper calls run in a child process: the atomic binary under test.
+fn helper_host() {
+    use atomic_core::helper_runtime::{CHILD_ARG, HostCommand, set_host_command};
+    set_host_command(HostCommand {
+        program: env!("CARGO_BIN_EXE_atomic").into(),
+        args: vec![CHILD_ARG.to_owned()],
+        env: Vec::new(),
+    });
+}
+
 fn scratch(tag: &str) -> PathBuf {
+    helper_host();
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir =
@@ -626,6 +637,7 @@ const ENV_RUN: &str = "ATOMIC_PIPELINE_RUN";
 #[test]
 #[ignore = "run by a_killed_process_does_not_rerun_a_finished_step in a child process"]
 fn pipeline_child() {
+    helper_host();
     let (Ok(role), Ok(dir), Ok(url)) = (
         std::env::var(ENV_ROLE),
         std::env::var(ENV_DIR),
@@ -1800,6 +1812,52 @@ fn a_run_started_on_another_helper_runtime_is_refused() {
             "{error}"
         );
         assert_eq!(second.calls(), 0, "the step did not run on this runtime");
+    });
+}
+
+// A helper step that already finished replays from its checkpoint on any
+// runtime: the runtime check guards running helpers, not reading results.
+#[test]
+fn a_finished_helper_step_replays_on_another_helper_runtime() {
+    on_codex_runtime(async {
+        let dir = scratch("runtime-done");
+        let project = project(&dir);
+        stamped(&project);
+        let first = FakeModel::start(stamped_replies())
+            .await
+            .expect("fake model");
+        let (d, u) = (dir.clone(), first.base_url());
+        let status = tokio::task::spawn_blocking(move || {
+            child_in(
+                &d,
+                &u,
+                "start-stamped",
+                "runtime-2",
+                Some("pipeline:after:stamp"),
+                "UTC",
+                &[("ATOMIC_TEST_HELPER_RUNTIME", "an-earlier-release")],
+            )
+        })
+        .await
+        .expect("child");
+        assert!(!status.success(), "the first process was killed: {status}");
+
+        let second = FakeModel::start(stamped_replies())
+            .await
+            .expect("fake model");
+        let (d, u) = (dir.clone(), second.base_url());
+        let status =
+            tokio::task::spawn_blocking(move || child(&d, &u, "recover", "runtime-2", None))
+                .await
+                .expect("child");
+        assert!(status.success(), "the recovering process ended: {status}");
+        assert!(
+            !dir.join("error.txt").exists(),
+            "{}",
+            std::fs::read_to_string(dir.join("error.txt")).unwrap_or_default()
+        );
+        assert!(dir.join("result.json").exists(), "the run finished");
+        assert_eq!(second.calls(), 0, "the finished step did not run again");
     });
 }
 

@@ -243,10 +243,12 @@ export const reviewLabel = (change: Change): string => `${change.id} (${change.s
   components that import it, then captures its runtime imports (local `.ts`
   modules only) with the compiled atom. Type-only imports, such as generated
   schema types, are checked and never captured. Each call runs in a fresh V8
-  isolate with ECMAScript built-ins and the JSON arguments it is given: no
-  network, files, environment, process, timers, WebAssembly or shared memory,
-  and no state survives between calls. Anything that reads or changes the
-  world belongs in an [exec step](#exec-atoms).
+  isolate, in a short-lived child process of its own, with ECMAScript
+  built-ins and the JSON arguments it is given: no network, files,
+  environment, process, timers, WebAssembly, shared memory or code built from
+  strings (`eval`, `new Function`), and no state survives between calls. A
+  call that crashes V8 fails; atomic carries on. Anything that reads or
+  changes the world belongs in an [exec step](#exec-atoms).
 - **Provenance.** A helper's result is as trusted as its least trusted
   argument, so a helper over a ticket's text returns external data. A result
   computed from literals alone, such as `stageBanner('risk assessment')`, is
@@ -265,7 +267,11 @@ export const reviewLabel = (change: Change): string => `${change.id} (${change.s
   fails the operation; in a validator that is an error, not a rejection that
   starts a repair turn. A thrown error is reported at the helper line that threw.
 - **Limits.** Per call: 1 second, a 128 MiB heap, 64 MiB of ArrayBuffers, a
-  1 MiB result and 16 KiB of error text. Per render, validation or judge
+  1 MiB result and 16 KiB of error text. The call's process also has a limit
+  on all the memory it writes (about 700 MiB with these limits, on Linux),
+  which covers what V8 allocates outside its heap, such as very long strings
+  and compiled regular expressions, and the host kills it two seconds after
+  its deadline if V8 has not stopped it. Per render, validation or judge
   binding: 256 calls, 10 seconds and 4 MiB of results. A helper graph holds at
   most 64 modules of 256 KiB, 1 MiB in all.
 - **Editors.** Write helper imports without `.ts`: stock editors resolve them

@@ -99,3 +99,18 @@ def compile_compact(mapping, where):
         compiled["required"] = required
     compiled["properties"] = properties
     return compiled
+
+
+def to_json_schema(schema, where="schema"):
+    """The schema as JSON Schema: compiled when compact. A root that mixes a
+    structural keyword with a key that only reads as a compact field is refused."""
+    if is_compact(schema):
+        return compile_compact(schema, where)
+    if isinstance(schema, dict):
+        keyword = next((k for k in schema if k in JSON_SCHEMA_KEYWORDS), None)
+        if keyword is not None:
+            for key, value in schema.items():
+                known = key in JSON_SCHEMA_KEYWORDS or key in VALUE_KEYWORDS or key.startswith("x-")
+                if not known and (key.endswith("?") or "(" in key or _is_field(value)):
+                    _fail(where, f"{key!r} reads as a compact field beside the JSON Schema keyword {keyword!r}")
+    return schema

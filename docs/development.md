@@ -50,6 +50,10 @@ inside V8's build script, before linking, until the script has filled it.
 `scripts/dev.sh` verifies the archive on the host before the container starts
 and keeps its mirror in `~/.cache/atomic/dev/v8-mirror`, so builds work offline
 once it is cached. A tampered file stops the build; delete it to fetch it again.
+`atomic-core`'s build script checks the mirrored archive against its pin as
+well, and refuses a build with `RUSTY_V8_ARCHIVE` or `V8_FROM_SOURCE` set or
+with `RUSTY_V8_MIRROR` naming a remote mirror, so no environment can link
+another V8.
 
 ### Limits
 

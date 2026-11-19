@@ -5,4 +5,6 @@
 # files deps/v8.toml pins, after checking their SHA-256; until it has run the
 # build fails here, before anything unverified is fetched or linked.
 # scripts/dev.sh and CI set RUSTY_V8_MIRROR to their own verified caches.
+# atomic-core's build script checks the archive again, and refuses
+# RUSTY_V8_ARCHIVE, V8_FROM_SOURCE and a remote mirror.
 RUSTY_V8_MIRROR = { value = "target/v8-mirror", relative = true }

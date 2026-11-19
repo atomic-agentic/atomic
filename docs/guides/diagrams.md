@@ -248,7 +248,9 @@ Three things to know:
   ```` ```mermaid ```` and the closing ```` ``` ```` as text, so `B{Urgent?}` and
   `C<page>` are diagram syntax, never expressions or tags, and nothing inside is
   interpolated. Only `mermaid` fences work this way; another fence is ordinary
-  prompt text, where braces start expressions. A stock Astro editor does not
+  prompt text, where braces start expressions. A fence left open is an error
+  at its opening line, since it would make the rest of the body literal. A
+  stock Astro editor does not
   know the rule and may underline braces in a diagram; `atomic check` is
   authoritative.
 - **The diagram costs tokens on every run.** It counts toward the atom's size

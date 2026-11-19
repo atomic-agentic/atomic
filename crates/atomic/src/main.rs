@@ -116,6 +116,13 @@ impl PromptArgs {
 }
 
 fn main() -> anyhow::Result<()> {
+    // A helper child serves one call and exits, before anything else starts:
+    // no state directory, no Codex dispatch.
+    if std::env::args_os().nth(1).as_deref()
+        == Some(atomic_core::helper_runtime::CHILD_ARG.as_ref())
+    {
+        std::process::exit(atomic_core::helper_runtime::serve());
+    }
     // Resolve and create the state directory before Codex starts, so its home
     // is never the user's own. A failure here is reported once the normal entry
     // point runs; Codex's helper invocations never need it.

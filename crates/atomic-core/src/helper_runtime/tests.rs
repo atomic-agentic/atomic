@@ -536,6 +536,8 @@ export const zone = () => ({
   format: new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: 'numeric', hour12: false }).format(new Date(0)),
   resolved: Intl.DateTimeFormat().resolvedOptions().timeZone, locale: Intl.DateTimeFormat().resolvedOptions().locale,
   local: new Date(0).toLocaleString(), number: (1234567.5).toLocaleString(),
+  empty: [(1234.5).toLocaleString([]), new Date(0).toLocaleString([]), 'i'.toLocaleUpperCase([])],
+  unsupported: (1234.5).toLocaleString('tlh'),
 });
 export const escapes = () => ({
   formatted: new Intl.DateTimeFormat('en-US', { dateStyle: 'full', timeStyle: 'long' }).format(),
@@ -631,7 +633,10 @@ fn formatting_uses_utc_and_en_us() {
     let out = clocked_call("zone", CLOCK, Controls::default());
     assert_eq!(
         out,
-        json!({ "format": "00:00", "resolved": "UTC", "locale": "en-US", "local": "1/1/1970, 12:00:00 AM", "number": "1,234,567.5" })
+        json!({
+            "format": "00:00", "resolved": "UTC", "locale": "en-US", "local": "1/1/1970, 12:00:00 AM",
+            "number": "1,234,567.5", "empty": ["1,234.5", "1/1/1970, 12:00:00 AM", "I"], "unsupported": "1,234.5",
+        })
     );
 }
 
@@ -677,7 +682,7 @@ fn the_host_timezone_and_locale_do_not_reach_helpers() {
                     .env(
                         "LANG",
                         if zone.starts_with("Asia") {
-                            "de_DE.UTF-8"
+                            "tr_TR.UTF-8"
                         } else {
                             "en_US.UTF-8"
                         },
@@ -685,7 +690,7 @@ fn the_host_timezone_and_locale_do_not_reach_helpers() {
                     .env(
                         "LC_ALL",
                         if zone.starts_with("Asia") {
-                            "de_DE.UTF-8"
+                            "tr_TR.UTF-8"
                         } else {
                             "en_US.UTF-8"
                         },

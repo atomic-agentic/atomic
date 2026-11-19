@@ -13,13 +13,23 @@
 //! Resource limits are enforced from Rust, so a helper cannot lift them: a
 //! watchdog thread terminates a call at its deadline, a near-heap-limit
 //! callback terminates it before V8's heap is exhausted, a budgeted allocator
-//! bounds ArrayBuffer memory, and the result and error text are measured
-//! before they are copied out of the isolate. A failed isolate is discarded.
+//! bounds ArrayBuffer memory, and the result and the text of an error a call
+//! throws are measured before they are copied out of the isolate. An error a
+//! module throws while it loads is copied by `deno_core` and then truncated,
+//! within the memory limit of the call's process. A failed isolate is
+//! discarded.
+//!
+//! [`invoke`] runs each call in a child process (see `process`), which bounds
+//! the memory V8 allocates outside its heap and contains the failures V8
+//! cannot recover from, such as an invalid string size, by aborting.
 
 mod allocator;
+mod process;
 #[cfg(test)]
 mod tests;
 mod zone;
+
+pub use process::{CHILD_ARG, HostCommand, serve, set_host_command};
 
 use deno_core::{
     JsRuntime, ModuleLoadOptions, ModuleLoadReferrer, ModuleLoadResponse, ModuleLoader,
@@ -38,7 +48,7 @@ pub const SCHEME: &str = "atomic-helper";
 
 /// The version of the helper-call semantics: the wrapper, JSON marshalling
 /// and failure kinds. Changing what a helper observes changes this.
-const SEMANTICS: &str = "atomic-helper-call-1";
+const SEMANTICS: &str = "atomic-helper-call-2";
 
 /// What a helper's behaviour depends on besides its own code: the engine
 /// (deno_core and V8), the prelude (host functions, stripped globals, the
@@ -92,7 +102,7 @@ impl Captured {
 }
 
 /// The limits on one helper call.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Limits {
     /// Wall-clock time for the call, including module evaluation.
     pub deadline: Duration,
@@ -122,7 +132,7 @@ impl Default for Limits {
 /// logical time and seed when it first starts, and the host derives each
 /// call's clock from that record, so a retried step's helpers see the same
 /// values (see `astro::StepClock`).
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Clock {
     /// What `Date.now()` and `Temporal.Now` return, in milliseconds since the
     /// epoch.
@@ -133,7 +143,7 @@ pub struct Clock {
 
 /// Why a helper call produced no result. Every variant is a failure of the
 /// helper, never a value it returned.
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error, serde::Serialize, serde::Deserialize)]
 pub enum Failure {
     /// The helper threw, or a module in its graph failed to evaluate.
     #[error("helper threw: {0}")]
@@ -141,8 +151,9 @@ pub enum Failure {
     /// The call ran past its deadline.
     #[error("helper deadline exceeded")]
     Deadline,
-    /// The call exhausted its V8 heap.
-    #[error("helper heap limit exceeded")]
+    /// The call exhausted its memory: the V8 heap, or the helper
+    /// process's limit on what it may allocate outside the heap.
+    #[error("helper memory limit exceeded")]
     Heap,
     /// The call asked for more ArrayBuffer memory than its budget, and V8
     /// could not recover the space.
@@ -472,6 +483,12 @@ impl Isolate {
             params = params.array_buffer_allocator(allocator);
             budget = Some(shared);
         }
+        if controls.virtual_clock {
+            // ICU's defaults are set once V8 has loaded ICU's data and before
+            // any isolate exists, so no isolate caches the host's.
+            JsRuntime::init_platform(None);
+            zone::set_defaults().map_err(Failure::Host)?;
+        }
         let mut runtime = {
             let _entered = tokio.enter();
             JsRuntime::new(RuntimeOptions {
@@ -480,25 +497,30 @@ impl Isolate {
                 ..Default::default()
             })
         };
-        if controls.virtual_clock {
-            zone::set_defaults().map_err(Failure::Host)?;
-            // The isolate may have cached the zone it started with.
-            runtime
-                .v8_isolate()
-                .date_time_configuration_change_notification(v8::TimeZoneDetection::Skip);
+        if controls.strip_globals {
+            // `eval` and `new Function` compile strings; a helper is its
+            // captured modules and nothing else.
+            let context = runtime.main_context();
+            deno_core::scope!(scope, &mut runtime);
+            v8::Local::new(scope, context).set_allow_generation_from_strings(false);
         }
         let tripped = Arc::new(Tripped::default());
         if controls.heap_callback {
             let handle = runtime.v8_isolate().thread_safe_handle();
             let flag = tripped.clone();
             // Terminating unwinds the call; the raised limit gives V8 room to
-            // do that instead of aborting the process. V8 also calls this from
-            // the last-resort collection after the allocator refuses an
-            // ArrayBuffer, which `call` reports as that limit.
-            runtime.add_near_heap_limit_callback(move |current, _initial| {
+            // do that instead of aborting. V8 also calls this from the
+            // last-resort collection after the allocator refuses an
+            // ArrayBuffer, which `call` reports as that limit. Each call
+            // raises the limit by a quarter of the original, to twice it at
+            // most; past that V8 aborts, which the call's process contains.
+            runtime.add_near_heap_limit_callback(move |current, initial| {
                 flag.heap.store(true, Ordering::Release);
                 handle.terminate_execution();
-                current.saturating_mul(2)
+                current
+                    .saturating_add(initial / 4)
+                    .min(initial.saturating_mul(2))
+                    .max(current)
             });
         }
         runtime
@@ -705,7 +727,7 @@ pub fn invoke(
     limits: Limits,
     clock: Clock,
 ) -> Result<Value, Failure> {
-    invoke_with(captured, export, args, limits, clock, Controls::default())
+    process::invoke(captured, export, args, limits, clock)
 }
 
 pub(crate) fn invoke_with(

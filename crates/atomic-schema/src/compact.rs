@@ -135,12 +135,39 @@ pub fn is_compact(schema: &Value) -> bool {
 }
 
 /// `schema` as JSON Schema: compiled when it is compact, unchanged otherwise.
+///
+/// A root that mixes the two is refused: one with a structural keyword such
+/// as `type` or `const` and a key that only reads as a compact field (`name:
+/// string`, `name?: ...` or `name(array): ...`). Read as JSON Schema, the
+/// field would be an unknown keyword and silently ignored.
 pub fn to_json_schema(schema: &Value) -> Result<Value, CompactError> {
     if is_compact(schema) {
-        expand(schema)
-    } else {
-        Ok(schema.clone())
+        return expand(schema);
     }
+    if let Some(object) = schema.as_object()
+        && let Some(keyword) = object
+            .keys()
+            .find(|key| JSON_SCHEMA_KEYWORDS.contains(&key.as_str()))
+    {
+        for (key, value) in object {
+            let known = JSON_SCHEMA_KEYWORDS.contains(&key.as_str())
+                || VALUE_KEYWORDS.contains(&key.as_str())
+                || key.starts_with("x-");
+            let compact_syntax = key.ends_with('?') || key.contains('(');
+            if !known && (compact_syntax || is_field(value)) {
+                return Err(fail(
+                    &format!("/{key}"),
+                    format!(
+                        "`{key}` reads as a compact field, but the schema's root also has the \
+                         JSON Schema keyword `{keyword}`, so it would be read as full JSON Schema \
+                         and `{key}` ignored; rename the field `{keyword}` or write the whole \
+                         schema as JSON Schema"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(schema.clone())
 }
 
 /// Compile a compact schema to JSON Schema 2020-12.

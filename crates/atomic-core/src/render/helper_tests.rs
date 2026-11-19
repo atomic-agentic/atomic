@@ -418,3 +418,27 @@ fn a_damaged_capture_is_refused() {
     let error = atom.program.verify_helpers().expect_err("damaged");
     assert!(error.contains("does not match its digest"), "{error}");
 }
+
+// Two identical calls run separately, each with its own seed, so each keeps
+// its own result instead of sharing the first call's data block.
+#[test]
+fn identical_helper_calls_each_keep_their_result() {
+    let review = REVIEW.replace(
+        "export const label = (text: string): string => `Ticket: ${upper(text)}`;",
+        "export const label = (text: string): string => `${upper(text)}:${Math.random()}`;",
+    );
+    let dir = helper_project(
+        "A: {label(input.text)}\nB: {label(input.text)}\n",
+        "{}",
+        &review,
+    );
+    let atom = loaded(&dir).expect("loads");
+    let out = rendered(&atom, json!({ "text": "same" }), "external").expect("renders");
+    let values: Vec<&str> = out
+        .user
+        .lines()
+        .filter(|line| line.contains("path=\"helpers.label_"))
+        .collect();
+    assert_eq!(values.len(), 2, "{}", out.user);
+    assert_ne!(values[0], values[1], "{}", out.user);
+}

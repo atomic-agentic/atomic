@@ -50,7 +50,18 @@ fn copy_tree(source: &Path, destination: &Path) {
     }
 }
 
+/// Helper calls run in a child process: the atomic binary under test.
+fn helper_host() {
+    use atomic_core::helper_runtime::{CHILD_ARG, HostCommand, set_host_command};
+    set_host_command(HostCommand {
+        program: env!("CARGO_BIN_EXE_atomic").into(),
+        args: vec![CHILD_ARG.to_owned()],
+        env: Vec::new(),
+    });
+}
+
 fn project(tag: &str) -> PathBuf {
+    helper_host();
     let dir =
         std::env::temp_dir().join(format!("atomic-change-review-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);

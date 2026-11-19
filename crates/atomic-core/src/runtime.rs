@@ -460,6 +460,7 @@ pub async fn run_declarative_with_context(
             input,
             &identity,
             Arc::new(atomic_exec::LocalBackend),
+            runtimes.clock.as_ref(),
         )
         .await;
     }
@@ -612,13 +613,15 @@ pub const EXEC_OUTPUT_LIMIT: usize = 8_388_608;
 /// directory of its own. It reads the input as one JSON value on stdin and
 /// writes one JSON value to stdout; stderr is for diagnostics. A nonzero
 /// exit fails the step, and so does output that breaks the contract or the
-/// atom's validators: there is no model to repair it.
+/// atom's validators: there is no model to repair it. The validators' helpers
+/// follow `clock`, the step's recorded clock, when there is one.
 pub async fn run_exec(
     atom: &AtomFile,
     compiled: &Compiled,
     input: &Value,
     identity: &EffectIdentity,
     backend: Arc<dyn atomic_exec::ExecutionBackend>,
+    clock: Option<&crate::astro::StepClock>,
 ) -> Result<(Value, RunMetadata), AtomError> {
     let contract = |key: &str| {
         compiled.program.contracts.get(key).ok_or_else(|| {
@@ -730,7 +733,9 @@ pub async fn run_exec(
         .and_then(Value::as_array)
         .is_some_and(|checks| !checks.is_empty());
     let values = serde_json::json!({"values":{"input":input,"output":output}});
-    validate_output(&compiled.program, has_checks, values, None).await?;
+    // One validation round, the same operation on every attempt.
+    let clock = clock.map(|clock| (clock.clone(), "validate:0".to_owned()));
+    validate_output(&compiled.program, has_checks, values, clock).await?;
     Ok((
         output,
         RunMetadata {

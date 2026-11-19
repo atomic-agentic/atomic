@@ -494,21 +494,6 @@ async fn run_pipeline<C: WorkflowContext>(
         // so its helpers render the same prompt and reach the same validator
         // decisions after a crash.
         if !atom.program.helpers.is_empty() {
-            // The run's helpers run only as recorded, on the runtime the run
-            // started on; anything else is refused rather than recaptured.
-            atom.program
-                .verify_helpers()
-                .map_err(|e| failed(format!("step `{}`: {e}", step.id)))?;
-            let now = atomic_core::astro::Program::current_helper_runtime();
-            if pinned.helper_runtime.as_deref() != Some(now.as_str()) {
-                return Err(failed(format!(
-                    "step `{}`: this run started on another helper runtime ({}), and its helpers \
-                     cannot resume on this one ({now}); their behaviour could differ from what the \
-                     run already recorded. Start a new run",
-                    step.id,
-                    pinned.helper_runtime.as_deref().unwrap_or("not recorded"),
-                )));
-            }
             let clock: StepClock = ctx
                 .step(&format!("{}.clock", step.id), |_| async {
                     StepClock::fresh().map_err(|e| failed(format!("the step's clock: {e}")))
@@ -520,16 +505,19 @@ async fn run_pipeline<C: WorkflowContext>(
         // An atom with a public context gets it from a step of its own,
         // resolved once from the run's settings and read back on every retry.
         let snapshot = if atom.context.is_some() {
-            let settings = services.context.clone().ok_or_else(|| {
-                failed(format!(
-                    "step `{}` runs `{}`, which reads a public context, and this run has no \
-                     context settings",
-                    step.id, atom.name
-                ))
-            })?;
+            // The settings are needed only to resolve the context; a recorded
+            // one replays without them.
+            let settings = services.context.clone();
             let (resolving, run, id) = (atom.clone(), run_id.clone(), step.id.clone());
             let recorded: Value = ctx
                 .step(&format!("{}.context", step.id), move |_| async move {
+                    let settings = settings.ok_or_else(|| {
+                        failed(format!(
+                            "step `{id}` runs `{}`, which reads a public context, and this run \
+                             has no context settings",
+                            resolving.name
+                        ))
+                    })?;
                     tokio::task::spawn_blocking(move || {
                         atomic_core::context::resolve_for_step(&resolving, &run, &id, &settings)
                             .map(|snapshot| snapshot.as_value().clone())
@@ -581,6 +569,7 @@ async fn run_pipeline<C: WorkflowContext>(
             None
         };
         let origins = step.origins.clone();
+        let pinned_helpers = pinned.helper_runtime.clone();
         let (id, ran) = (step.id.clone(), format!("pipeline:ran:{}", step.id));
         let published = run_atom_at(
             &ctx,
@@ -593,6 +582,24 @@ async fn run_pipeline<C: WorkflowContext>(
                     runtimes.lite.meter = meter;
                 }
                 async move {
+                // The run's helpers run only as recorded, on the runtime the
+                // run started on; anything else is refused rather than
+                // recaptured. Checked only when the turn runs: a finished
+                // turn replays from its checkpoint, whatever the runtime.
+                if !atom.program.helpers.is_empty() {
+                    atom.program
+                        .verify_helpers()
+                        .map_err(|e| failed(format!("step `{id}`: {e}")))?;
+                    let now = atomic_core::astro::Program::current_helper_runtime();
+                    if pinned_helpers.as_deref() != Some(now.as_str()) {
+                        return Err(failed(format!(
+                            "step `{id}`: this run started on another helper runtime ({}), and \
+                             its helpers cannot resume on this one ({now}); their behaviour could \
+                             differ from what the run already recorded. Start a new run",
+                            pinned_helpers.as_deref().unwrap_or("not recorded"),
+                        )));
+                    }
+                }
                 if let Some((begun, declared)) = guard
                     && begun.interrupted()
                     && !declared

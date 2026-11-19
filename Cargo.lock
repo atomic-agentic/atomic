@@ -550,6 +550,7 @@ dependencies = [
  "hmac 0.12.1",
  "ignore",
  "jsonschema",
+ "libc",
  "regex",
  "reqwest 0.12.28",
  "serde",

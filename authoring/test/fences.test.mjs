@@ -41,3 +41,7 @@ test('only mermaid fences in the body are literal, and lines are kept', () => {
   assert(out.includes('A&#123;b&#125;'));
   assert.equal(out.split('\n').length, source.split('\n').length);
 });
+
+test('an unclosed mermaid fence is an error at its line', async (t) => {
+  assert.throws(() => literalFences('---\n---\nIntro\n```mermaid\nA-->B\nSecret rule: {input.text}\n'), (error) => error.line === 4 && /never closed/.test(error.message));
+});

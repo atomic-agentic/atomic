@@ -169,3 +169,35 @@ fn constraint_and_annotation_schemas_without_a_type_load_unchanged() {
     );
     assert_eq!(out["required"], json!(["title", "description"]));
 }
+
+// A compact field beside a structural keyword would be an ignored unknown
+// keyword in JSON Schema, so the mixture is refused rather than misread.
+#[test]
+fn a_root_mixing_compact_fields_and_structural_keywords_is_refused() {
+    for (text, at) in [
+        ("type: string\nmessage: string\n", "/message"),
+        ("id: string\nconst: string\n", "/id"),
+        ("enum: [a, b]\nnote?: string\n", "/note?"),
+        (
+            "items: { type: string }\nlines(array): string\n",
+            "/lines(array)",
+        ),
+    ] {
+        let error = to_json_schema(&yaml(text)).expect_err(text);
+        assert_eq!(error.path, at, "{text}");
+        assert!(
+            error.message.contains("reads as a compact field"),
+            "{text}: {error}"
+        );
+    }
+    // Full schemas keep unknown keywords that are not field-shaped, and
+    // extension keywords.
+    for text in [
+        "type: object\nproperties: {}\nx-order: string\n",
+        "type: string\nnullable: true\n",
+        "type: string\ntitle: string\n",
+    ] {
+        let schema = yaml(text);
+        assert_eq!(to_json_schema(&schema).expect(text), schema, "{text}");
+    }
+}

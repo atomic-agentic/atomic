@@ -210,3 +210,61 @@ fn unsupported_specs_and_ambiguous_operations_are_refused() {
     .expect("spec");
     assert_eq!(ops[0].name, "delete_v1_items__id");
 }
+
+#[test]
+fn reserved_headers_styles_and_media_types_follow_openapi() {
+    let spec = yaml(
+        r#"openapi: 3.1.0
+paths:
+  /a:
+    post:
+      operationId: a
+      parameters:
+        - { name: Authorization, in: header, schema: { type: string } }
+        - { name: accept, in: header, schema: { type: string } }
+        - { name: tags, in: query, schema: { type: array } }
+        - { name: ids, in: query, style: pipeDelimited, explode: false, schema: { type: array } }
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody: { required: true, content: { application/vnd.api+json: { schema: { type: object } } } }
+      responses:
+        "200": { description: ok, content: { "application/json; charset=utf-8": { schema: { type: integer } } } }
+  /b:
+    put:
+      operationId: b
+      requestBody: { required: true, content: { text/plain: { schema: { type: string } } } }
+"#,
+    );
+    let ops = operations(&spec).expect("spec");
+    let a = &ops[0];
+    assert!(a.locations.get("Authorization").is_none() && a.locations.get("accept").is_none());
+    assert_eq!(
+        a.styles["tags"],
+        json!({ "style": "form", "explode": true })
+    );
+    assert_eq!(
+        a.styles["ids"],
+        json!({ "style": "pipeDelimited", "explode": false })
+    );
+    assert_eq!(
+        a.styles["id"],
+        json!({ "style": "simple", "explode": false })
+    );
+    assert_eq!(a.locations["body"], "body");
+    assert_eq!(a.output, Some(json!({ "type": "integer" })));
+    assert_eq!(a.unsupported, None);
+    assert!(
+        ops[1]
+            .unsupported
+            .as_deref()
+            .is_some_and(|r| r.contains("text/plain"))
+    );
+    let bad = yaml(
+        "openapi: 3.1.0\npaths:\n  /a:\n    get:\n      parameters:\n        - { name: n, in: header, style: form }\n",
+    );
+    assert!(
+        operations(&bad)
+            .expect_err("style")
+            .message
+            .contains("cannot have style")
+    );
+}

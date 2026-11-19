@@ -3,13 +3,16 @@ import ts from 'typescript';
 import sourceMap from 'source-map-js';
 import { convertToTSX } from '@astrojs/compiler';
 import libs from './typescript-libs.json' with { type: 'json' };
-import { literalFences } from './fences.mjs';
+import { FenceError, literalFences } from './fences.mjs';
 
 export async function typecheck(sources, declarations, sourcePaths = {}) {
   const files = new Map(Object.entries(sources));
   const maps = new Map();
   for (const [name, text] of [...files]) if (name.endsWith('.astro')) {
-    const result = await convertToTSX(literalFences(text), { filename: name });
+    // An unclosed fence is reported by the renderer, at its line.
+    let fenced;
+    try { fenced = literalFences(text); } catch (cause) { if (!(cause instanceof FenceError)) throw cause; fenced = text; }
+    const result = await convertToTSX(fenced, { filename: name });
     maps.set(`${name}.tsx`, new sourceMap.SourceMapConsumer(result.map));
     files.set(`${name}.tsx`, result.code.replace('/* @jsxImportSource astro */', ''));
   }

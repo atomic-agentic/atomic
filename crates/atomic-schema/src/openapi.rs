@@ -9,6 +9,12 @@
 //! and `example` becomes `examples`. Component schemas become `$defs`, and
 //! references to component parameters, request bodies and responses are
 //! resolved in place, so a 3.0 and a 3.1 spec of one API give the same tools.
+//!
+//! As OpenAPI requires, header parameters named `Accept`, `Content-Type` or
+//! `Authorization` are ignored: the executor sets those itself. Request and
+//! response bodies are read from a JSON media type (`application/json`,
+//! with parameters or not, or a `+json` type). An operation whose required
+//! body has no JSON media type is kept, marked [`Operation::unsupported`].
 
 use serde_json::{Map, Value, json};
 
@@ -26,11 +32,48 @@ pub struct Operation {
     /// Where each input field goes: `path`, `query`, `header`, `cookie` or
     /// `body`.
     pub locations: Map<String, Value>,
+    /// How each parameter is serialized: `{"style": ..., "explode": ...}`,
+    /// with OpenAPI's defaults filled in.
+    pub styles: Map<String, Value>,
     /// The tool's input: one object, a field per parameter and `body` for a
     /// JSON request body.
     pub input: Value,
     /// The JSON schema of its success response, when it declares one.
     pub output: Option<Value>,
+    /// Why atomic cannot call it, when it cannot: a required request body
+    /// with no JSON media type.
+    pub unsupported: Option<String>,
+}
+
+/// The styles OpenAPI allows in each location; the first is the default.
+fn styles_for(place: &str) -> &'static [&'static str] {
+    match place {
+        "path" => &["simple", "label", "matrix"],
+        "query" => &["form", "spaceDelimited", "pipeDelimited", "deepObject"],
+        "header" => &["simple"],
+        _ => &["form"],
+    }
+}
+
+/// Whether `media` is a JSON media type: `application/json`, with or
+/// without parameters, or a structured `+json` type.
+pub fn is_json_media(media: &str) -> bool {
+    let essence = media
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    essence == "application/json"
+        || (essence.starts_with("application/") && essence.ends_with("+json"))
+}
+
+/// The schema under a `content` map's first JSON media type, if any.
+fn json_content(content: &Value) -> Option<&Value> {
+    let content = content.as_object()?;
+    let mut keys: Vec<&String> = content.keys().filter(|k| is_json_media(k)).collect();
+    keys.sort();
+    keys.first().and_then(|k| content[k.as_str()].get("schema"))
 }
 
 /// Why a spec cannot become a toolset.
@@ -134,6 +177,8 @@ pub fn operations(spec: &Value) -> Result<Vec<Operation>, OpenApiError> {
             let mut properties = Map::new();
             let mut required = Vec::new();
             let mut locations = Map::new();
+            let mut styles = Map::new();
+            let mut unsupported = None;
             // Operation parameters override path-level ones of the same name and place.
             let mut parameters: Vec<Value> = Vec::new();
             for parameter in shared
@@ -155,6 +200,27 @@ pub fn operations(spec: &Value) -> Result<Vec<Operation>, OpenApiError> {
                 if !["path", "query", "header", "cookie"].contains(&place) {
                     return Err(fail(&at, format!("parameter `{field}` is in `{place}`")));
                 }
+                if place == "header"
+                    && ["accept", "content-type", "authorization"]
+                        .contains(&field.to_ascii_lowercase().as_str())
+                {
+                    continue;
+                }
+                let allowed = styles_for(place);
+                let style = match parameter.get("style") {
+                    None => allowed[0],
+                    Some(style) => {
+                        let style = style.as_str().unwrap_or_default();
+                        allowed.iter().copied().find(|s| *s == style).ok_or_else(|| {
+                            fail(&at, format!("parameter `{field}` in `{place}` cannot have style `{style}`"))
+                        })?
+                    }
+                };
+                let explode = parameter["explode"].as_bool().unwrap_or(style == "form");
+                styles.insert(
+                    field.to_owned(),
+                    json!({ "style": style, "explode": explode }),
+                );
                 if properties.contains_key(field) {
                     return Err(fail(&at, format!("two parameters are named `{field}`")));
                 }
@@ -175,7 +241,24 @@ pub fn operations(spec: &Value) -> Result<Vec<Operation>, OpenApiError> {
             }
             if let Some(body) = operation.get("requestBody") {
                 let body = resolve(spec, body, &at)?;
-                if let Some(schema) = body.pointer("/content/application~1json/schema") {
+                let json = body.get("content").and_then(json_content);
+                if json.is_none() && body["required"] == true {
+                    let mut types: Vec<&String> = body["content"]
+                        .as_object()
+                        .map(|c| c.keys().collect())
+                        .unwrap_or_default();
+                    types.sort();
+                    let types: Vec<&str> = types.iter().map(|t| t.as_str()).collect();
+                    unsupported = Some(format!(
+                        "its required request body is {}; atomic sends JSON request bodies only",
+                        if types.is_empty() {
+                            "untyped".to_owned()
+                        } else {
+                            types.join(", ")
+                        }
+                    ));
+                }
+                if let Some(schema) = json {
                     if properties.contains_key("body") {
                         return Err(fail(
                             &at,
@@ -212,7 +295,7 @@ pub fn operations(spec: &Value) -> Result<Vec<Operation>, OpenApiError> {
                     .or_else(|| responses.keys().find(|k| *k == "default"))
                 {
                     let response = resolve(spec, &responses[code], &at)?;
-                    if let Some(schema) = response.pointer("/content/application~1json/schema") {
+                    if let Some(schema) = response.get("content").and_then(json_content) {
                         output = Some(convert(schema, &format!("{at}/responses/{code}"))?);
                     }
                 }
@@ -233,8 +316,10 @@ pub fn operations(spec: &Value) -> Result<Vec<Operation>, OpenApiError> {
                 path: path.clone(),
                 description,
                 locations,
+                styles,
                 input,
                 output,
+                unsupported,
             });
         }
     }

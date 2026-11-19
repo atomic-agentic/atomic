@@ -242,3 +242,132 @@ fn a_path_argument_cannot_change_the_operations_path() {
         assert_eq!(request.url.path(), path, "{city:?}");
     }
 }
+
+const EXTRA: &str = r##"openapi: 3.1.0
+info: { title: Extra, version: "1" }
+paths:
+  /{resource}:batch:
+    get:
+      operationId: batch
+      parameters: [ { name: resource, in: path, required: true, schema: { type: string } } ]
+  /v1/search:
+    get:
+      operationId: search
+      parameters:
+        - { name: tags, in: query, schema: { type: array, items: { type: string } } }
+        - { name: ids, in: query, explode: false, schema: { type: array, items: { type: integer } } }
+        - { name: filter, in: query, style: deepObject, schema: { type: object, additionalProperties: { type: string } } }
+        - { name: session, in: cookie, schema: { type: string } }
+        - { name: Authorization, in: header, schema: { type: string } }
+        - { name: X-Trace, in: header, schema: { type: string } }
+      responses:
+        "200":
+          description: ok
+          content:
+            "application/json; charset=utf-8":
+              schema: { type: object, required: [count], properties: { count: { type: integer } } }
+  /v1/upload:
+    post:
+      operationId: upload
+      requestBody: { required: true, content: { multipart/form-data: { schema: { type: object } } } }
+      responses: { "201": { description: created } }
+"##;
+
+fn extra(host: &str, base: &str) -> HttpToolset {
+    let spec = atomic_schema::yaml::load(std::path::Path::new("extra.yaml"), EXTRA)
+        .expect("yaml")
+        .value;
+    let mut tools = toolset(host);
+    tools.base_url = base.parse().expect("url");
+    tools.operations = atomic_schema::openapi::operations(&spec)
+        .expect("spec")
+        .into_iter()
+        .map(|op| (op.name.clone(), op))
+        .collect();
+    tools
+}
+
+// The operation's path follows the base URL's whole path, with or without
+// its trailing slash, and a first segment with a colon is still a path.
+#[test]
+fn the_base_url_path_is_kept() {
+    for base in ["http://api.example.com/api", "http://api.example.com/api/"] {
+        let mut tools = toolset("api.example.com");
+        tools.base_url = base.parse().expect("url");
+        let request = tools
+            .request("getForecast", &json!({ "city": "Paris", "days": 1 }))
+            .expect("built");
+        assert_eq!(request.url.path(), "/api/v1/forecast/Paris", "{base}");
+    }
+    let tools = extra("api.example.com", "http://api.example.com/api/v2");
+    let request = tools
+        .request("batch", &json!({ "resource": "things" }))
+        .expect("built");
+    assert_eq!(
+        request.url.as_str(),
+        "http://api.example.com/api/v2/things:batch"
+    );
+}
+
+// Parameters follow their OpenAPI style; a model cannot add a header the
+// toolset sets, or a cookie of its own.
+#[test]
+fn parameters_are_serialized_by_style_and_cannot_reach_reserved_headers() {
+    let mut tools = extra("api.example.com", "http://api.example.com/");
+    let request = tools
+        .request(
+            "search",
+            &json!({
+                "tags": ["a", "b"], "ids": [1, 2], "filter": { "kind": "x" },
+                "session": "abc; admin=1", "X-Trace": "t1",
+            }),
+        )
+        .expect("built");
+    assert_eq!(
+        request.url.query(),
+        Some("tags=a&tags=b&ids=1%2C2&filter%5Bkind%5D=x")
+    );
+    let cookie = request
+        .headers
+        .iter()
+        .find(|(name, _)| name == "Cookie")
+        .expect("cookie");
+    assert_eq!(cookie.1, "session=abc%3B%20admin=1");
+    // `Authorization` was ignored on import, so the argument breaks the
+    // input schema; a header the toolset sets is refused by name.
+    let error = tools
+        .request("search", &json!({ "Authorization": "Bearer model-chosen" }))
+        .expect_err("refused");
+    assert!(matches!(error, CallError::Arguments { .. }), "{error}");
+    tools.headers.push(("x-trace".into(), "host".into()));
+    let error = tools
+        .request("search", &json!({ "X-Trace": "t1" }))
+        .expect_err("refused");
+    assert!(matches!(error, CallError::Refused(_)), "{error}");
+    // An operation atomic cannot call is refused, and credentials stay out
+    // of debug output.
+    let error = tools.request("upload", &json!({})).expect_err("refused");
+    assert!(error.to_string().contains("multipart/form-data"), "{error}");
+    let shown = format!(
+        "{tools:?} {:?}",
+        tools
+            .request("batch", &json!({ "resource": "r" }))
+            .expect("built")
+    );
+    assert!(
+        !shown.contains("scoped") && !shown.contains("host\""),
+        "{shown}"
+    );
+}
+
+#[tokio::test]
+async fn a_response_that_breaks_its_schema_is_an_error() {
+    let (host, _) = server(vec![(200, r#"{"count": 2}"#), (200, r#"{"count": "two"}"#)]).await;
+    let tools = extra(&host, &format!("http://{host}/"));
+    assert_eq!(
+        tools.call("search", &json!({})).await.expect("fits"),
+        json!({ "count": 2 })
+    );
+    let error = tools.call("search", &json!({})).await.expect_err("breaks");
+    assert!(matches!(error, CallError::Response { .. }), "{error}");
+}

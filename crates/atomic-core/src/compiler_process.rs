@@ -25,7 +25,9 @@ pub(crate) type CallHandler<'a> = dyn FnMut(&serde_json::Value) -> serde_json::V
 /// lines it writes on stdout with `handler`, and return its final line.
 ///
 /// stdin stays open until the final line, so the worker can read each reply;
-/// the time limit covers the whole exchange, helper calls included. Output is
+/// the time limit covers the whole exchange, helper calls and writes to a
+/// worker that stops reading included: writes happen on their own thread,
+/// and the worker is killed at the limit. Output is
 /// bounded per line and in total. A worker that exits successfully has
 /// answered, even if it stopped reading its request early; one that exits
 /// unsuccessfully has crashed, and the error carries its stderr.
@@ -55,7 +57,7 @@ pub(crate) fn run_interactive(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| start(e.to_string()))?;
-    let mut input = child.stdin.take().ok_or("no compiler stdin")?;
+    let input = child.stdin.take().ok_or("no compiler stdin")?;
     let stdout = child.stdout.take().ok_or("no compiler stdout")?;
     let stderr = child.stderr.take().ok_or("no compiler stderr")?;
     let errors = std::thread::spawn(move || {
@@ -106,13 +108,25 @@ pub(crate) fn run_interactive(
         let _ = child.kill();
         let _ = child.wait();
     };
-    let write = |input: &mut std::process::ChildStdin, bytes: &[u8]| {
-        input.write_all(bytes)?;
-        input.write_all(b"\n")?;
-        input.flush()
-    };
+    // Lines to the worker, written in order on their own thread so a worker
+    // that stops reading cannot hold the host past the limit. The thread
+    // ends when a write fails (the worker exited or was killed) or when the
+    // sender is dropped, which closes stdin.
+    let (to_worker, outgoing) = std::sync::mpsc::channel::<Vec<u8>>();
+    std::thread::spawn(move || {
+        let mut input = input;
+        for bytes in outgoing {
+            let written = input
+                .write_all(&bytes)
+                .and_then(|()| input.write_all(b"\n"))
+                .and_then(|()| input.flush());
+            if written.is_err() {
+                return;
+            }
+        }
+    });
     // A worker that exits without reading its request has still answered.
-    let _ = write(&mut input, request);
+    let _ = to_worker.send(request.to_vec());
     let mut answer = None;
     loop {
         let line = match received.recv_timeout(remaining()) {
@@ -136,7 +150,7 @@ pub(crate) fn run_interactive(
         match call {
             Some(call) if answer.is_none() => {
                 let reply = serde_json::to_vec(&handler(&call)).map_err(|e| e.to_string())?;
-                if write(&mut input, &reply).is_err() {
+                if to_worker.send(reply).is_err() {
                     break;
                 }
             }
@@ -146,7 +160,7 @@ pub(crate) fn run_interactive(
             }
         }
     }
-    drop(input);
+    drop(to_worker);
     let status = loop {
         match child.try_wait().map_err(io)? {
             Some(status) => break status,
@@ -276,6 +290,39 @@ mod tests {
         let (result, _) = interactive("read request; sleep 5", Duration::from_millis(200));
         assert!(result.expect_err("killed").contains("exceeded"));
         assert!(started.elapsed() < Duration::from_secs(4));
+    }
+
+    // A worker that stops reading cannot hold the host on a blocked write:
+    // neither a large request nor a large reply outlasts the limit.
+    #[test]
+    fn a_worker_that_stops_reading_is_killed_at_the_time_limit() {
+        let big = vec![b'x'; 4 << 20];
+        let started = Instant::now();
+        let error = shell("sleep 4", &big, Duration::from_millis(200)).expect_err("killed");
+        assert!(error.contains("exceeded"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        let started = Instant::now();
+        let result = run_interactive(
+            Path::new("/bin/sh"),
+            &[
+                "-c".into(),
+                r#"read request; printf '{"call":{}}\n'; sleep 4"#.into(),
+            ],
+            &[],
+            b"{}",
+            Duration::from_millis(300),
+            &mut |_: &Value| json!({ "padding": "x".repeat(1 << 20) }),
+        );
+        assert!(result.expect_err("killed").contains("exceeded"));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
