@@ -4,12 +4,62 @@
 //! and capped output. [`crate::LocalBackend`] runs commands with it, and so
 //! does atomic's own trusted tooling, such as the Astro compiler, which is
 //! not a runner and does not go through the backend trait.
+//!
+//! On Unix each process starts in a process group of its own, so stopping
+//! it stops everything it started, and a terminal's signals reach atomic
+//! alone. On Linux it also gets a parent-death signal, best effort: if the
+//! thread that started it dies with atomic, so does the process. A process
+//! that is stopping calls [`stop_all`] before it exits.
 
 use crate::{Completed, ExecError};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+/// The process groups of the processes running now.
+static RUNNING: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+/// Set by [`stop_all`]: this process is about to exit.
+static STOPPING: AtomicBool = AtomicBool::new(false);
+
+/// Kill the process group `group` started as.
+fn kill_group(group: u32) {
+    #[cfg(unix)]
+    if let Ok(group) = libc::pid_t::try_from(group) {
+        // SAFETY: killpg only sends a signal; a group that is gone is ESRCH.
+        #[allow(unsafe_code)]
+        unsafe {
+            libc::killpg(group, libc::SIGKILL);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = group;
+}
+
+/// For a process that is about to exit, not to recover: kill every process
+/// [`run`] started that has not ended, with everything it started, and
+/// never report how any of them ended, so no step records an outcome its
+/// own process did not reach. Returns how many were running.
+///
+/// Call it, then exit. The steps that were running stay unfinished, and
+/// their attempt guards decide whether their commands may run again.
+pub fn stop_all() -> usize {
+    STOPPING.store(true, Ordering::SeqCst);
+    let running = RUNNING.lock().map(|r| r.clone()).unwrap_or_default();
+    for group in &running {
+        kill_group(*group);
+    }
+    running.len()
+}
+
+/// Wait here for good if the process is stopping: its exit ends the wait.
+fn unless_stopping() {
+    while STOPPING.load(Ordering::SeqCst) {
+        std::thread::park();
+    }
+}
 
 /// The most stderr kept, in bytes; anything beyond it is dropped.
 pub const STDERR_LIMIT: usize = 65_536;
@@ -55,10 +105,6 @@ pub fn run(
     limits: Limits,
 ) -> Result<Completed, ExecError> {
     let name = program.display().to_string();
-    let io = |e: std::io::Error| ExecError::Io {
-        program: name.clone(),
-        message: e.to_string(),
-    };
     let mut command = std::process::Command::new(program);
     command
         .args(args)
@@ -70,10 +116,59 @@ pub fn run(
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
-    let mut child = command.spawn().map_err(|e| ExecError::Start {
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    #[cfg(target_os = "linux")]
+    {
+        let parent = libc::pid_t::try_from(std::process::id()).unwrap_or(0);
+        // SAFETY: between fork and exec the closure makes only
+        // async-signal-safe calls (prctl, getppid, _exit) and allocates
+        // nothing.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::os::unix::process::CommandExt::pre_exec(&mut command, move || {
+                // Best effort: where prctl is refused, the process group
+                // still lets atomic stop it.
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0);
+                // atomic died before the signal was set.
+                if libc::getppid() != parent {
+                    libc::_exit(137);
+                }
+                Ok(())
+            });
+        }
+    }
+    // A process that is stopping starts nothing more.
+    unless_stopping();
+    let child = command.spawn().map_err(|e| ExecError::Start {
         program: name.clone(),
         message: e.to_string(),
     })?;
+    let group = child.id();
+    if let Ok(mut running) = RUNNING.lock() {
+        running.push(group);
+    }
+    let done = finish(child, &name, stdin, limits);
+    if let Ok(mut running) = RUNNING.lock() {
+        running.retain(|g| *g != group);
+    }
+    // A process that is stopping killed it: how it ended is not its result.
+    unless_stopping();
+    done
+}
+
+fn finish(
+    mut child: std::process::Child,
+    name: &str,
+    stdin: &[u8],
+    limits: Limits,
+) -> Result<Completed, ExecError> {
+    let group = child.id();
+    let name = name.to_owned();
+    let io = |e: std::io::Error| ExecError::Io {
+        program: name.clone(),
+        message: e.to_string(),
+    };
     let mut input = child
         .stdin
         .take()
@@ -110,6 +205,8 @@ pub fn run(
         match child.try_wait().map_err(io)? {
             Some(status) => break status,
             None if started.elapsed() > limits.time => {
+                // Everything it started, not only the process itself.
+                kill_group(group);
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(ExecError::TimedOut {

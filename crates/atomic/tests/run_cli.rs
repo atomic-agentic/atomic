@@ -1090,6 +1090,197 @@ fn a_command_that_kills_its_runner_is_never_run_again_unless_it_may_be() {
     );
 }
 
+/// An idempotent exec atom whose command logs `start <pid>`, then sleeps a
+/// minute before it would answer.
+fn write_slow(project: &Path, dir: &Path) {
+    std::fs::write(
+        project.join("tools/slow.py"),
+        "import json, os, sys, time\n\
+         note = json.load(sys.stdin)\n\
+         open(os.environ['SLOW_LOG'], 'a').write(f'start {os.getpid()}\\n')\n\
+         time.sleep(60)\n\
+         open(os.environ['SLOW_LOG'], 'a').write('end\\n')\n\
+         json.dump({'title': note['text'][:25], 'words': len(note['text'].split())}, sys.stdout)\n",
+    )
+    .expect("script");
+    write_atom(
+        project,
+        "slow",
+        &format!(
+            "description: 'Take a minute.', kind: 'exec', exec: {{ command: ['python3', 'tools/slow.py'] }}, env: {{ SLOW_LOG: '{}' }}, effects: {{ external: 'idempotent' }}",
+            dir.join("slow.log").display()
+        ),
+        "",
+        object(json!({"text": {"type": "string"}})),
+        object(json!({"title": {"type": "string"}, "words": {"type": "integer"}})),
+    );
+}
+
+const UNUSED_MODEL: [(&str, &str); 2] = [
+    ("ATOMIC_MODEL_BASE_URL", "http://127.0.0.1:9/v1"),
+    ("ATOMIC_MODEL", "unused"),
+];
+
+/// The pid of each start of the slow command.
+fn slow_starts(dir: &Path) -> Vec<String> {
+    std::fs::read_to_string(dir.join("slow.log"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.strip_prefix("start ").map(str::to_owned))
+        .collect()
+}
+
+/// Whether serve has said it stopped or failed.
+fn serve_ended(dir: &Path) -> bool {
+    std::fs::read_to_string(dir.join("serve.log"))
+        .is_ok_and(|l| l.contains("error") || l.contains("stopping"))
+}
+
+/// Whether process `pid` still runs: a zombie waiting to be reaped does not.
+fn alive(pid: &str) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+        !stat
+            .rsplit(')')
+            .next()
+            .unwrap_or("")
+            .trim_start()
+            .starts_with('Z')
+    })
+}
+
+/// Whether another process holds the project's execution lock.
+fn lock_held(state: &Path) -> bool {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(state.join("runtime.lock"))
+        .expect("the lock file");
+    matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock))
+}
+
+/// Start the slow atom as run `id`, SIGKILL `atomic run` while its command
+/// runs, and check the command died with it. Returns the project's state.
+fn slow_run_killed_mid_command(dir: &Path, project: &Path, id: &str) -> PathBuf {
+    write_slow(project, dir);
+    let state = state_dir(dir, project);
+    let mut run = spawn(
+        dir,
+        project,
+        &["run", "slow", "--run-id", id, "--data", NOTE],
+        &[],
+        &dir.join("run.log"),
+    );
+    wait_until("the command to start", || slow_starts(dir).len() == 1);
+    run.kill().expect("SIGKILL atomic run");
+    run.wait().expect("reap");
+    // Well before it would end by itself.
+    let pid = slow_starts(dir)[0].clone();
+    let killed = Instant::now();
+    while alive(&pid) {
+        assert!(
+            killed.elapsed() < Duration::from_secs(10),
+            "the command outlived atomic"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    state
+}
+
+#[test]
+fn serve_stopped_mid_command_holds_the_lock_until_it_exits_and_runs_nothing_twice() {
+    let dir = scratch("serve-stop");
+    let project = project(&dir);
+    let state = slow_run_killed_mid_command(&dir, &project, "slow-1");
+    // serve needs a model endpoint, though nothing here calls one.
+    let mut serve = spawn(
+        &dir,
+        &project,
+        &["serve"],
+        &UNUSED_MODEL,
+        &dir.join("serve.log"),
+    );
+    wait_until("serve to start the command again", || {
+        slow_starts(&dir).len() == 2 || serve_ended(&dir)
+    });
+    assert_eq!(
+        slow_starts(&dir).len(),
+        2,
+        "{}",
+        std::fs::read_to_string(dir.join("serve.log")).unwrap_or_default()
+    );
+    let pid = slow_starts(&dir)[1].clone();
+    terminate(&serve);
+    // Until serve exits, the lock stays held and the command stays its own.
+    let stopping = Instant::now();
+    let status = loop {
+        let held = lock_held(&state);
+        if let Some(status) = serve.try_wait().expect("wait") {
+            break status;
+        }
+        assert!(held, "the lock was free while serve still ran");
+        assert!(
+            stopping.elapsed() < Duration::from_secs(30),
+            "serve did not stop"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let log = std::fs::read_to_string(dir.join("serve.log")).expect("log");
+    assert!(
+        stopping.elapsed() >= Duration::from_secs(9),
+        "running steps had their time to checkpoint: {log}"
+    );
+    assert!(!status.success(), "a command was stopped: {log}");
+    assert!(log.contains("stopped 1 command(s)"), "{log}");
+    wait_until("the stopped command to be gone", || !alive(&pid));
+    assert!(!lock_held(&state), "the lock went with the process");
+    let ends = std::fs::read_to_string(dir.join("slow.log")).expect("log");
+    assert!(!ends.contains("end"), "no command ran to its end: {ends}");
+    assert_eq!(slow_starts(&dir).len(), 2, "started twice, never at once");
+}
+
+#[test]
+fn a_second_signal_stops_serve_at_once() {
+    let dir = scratch("serve-twice");
+    let project = project(&dir);
+    let state = slow_run_killed_mid_command(&dir, &project, "slow-2");
+    // serve needs a model endpoint, though nothing here calls one.
+    let mut serve = spawn(
+        &dir,
+        &project,
+        &["serve"],
+        &UNUSED_MODEL,
+        &dir.join("serve.log"),
+    );
+    wait_until("serve to start the command again", || {
+        slow_starts(&dir).len() == 2 || serve_ended(&dir)
+    });
+    assert_eq!(
+        slow_starts(&dir).len(),
+        2,
+        "{}",
+        std::fs::read_to_string(dir.join("serve.log")).unwrap_or_default()
+    );
+    let pid = slow_starts(&dir)[1].clone();
+    terminate(&serve);
+    wait_until("serve to begin stopping", || {
+        std::fs::read_to_string(dir.join("serve.log")).is_ok_and(|l| l.contains("stopping;"))
+    });
+    assert!(lock_held(&state));
+    let again = Instant::now();
+    terminate(&serve);
+    let status = wait_child(&mut serve, "serve");
+    let log = std::fs::read_to_string(dir.join("serve.log")).expect("log");
+    assert!(
+        again.elapsed() < Duration::from_secs(5),
+        "the second signal stops it at once: {log}"
+    );
+    assert!(!status.success(), "{log}");
+    assert!(log.contains("stopping now"), "{log}");
+    wait_until("the stopped command to be gone", || !alive(&pid));
+    assert!(!lock_held(&state));
+    assert_eq!(slow_starts(&dir).len(), 2);
+}
+
 #[test]
 fn the_runner_role_keeps_its_exit_code_contract() {
     let dir = scratch("runner-codes");

@@ -221,31 +221,62 @@ pub async fn resume(
     }
 }
 
-/// Wait for the signal that stops a foreground server.
-async fn stopped() -> anyhow::Result<&'static str> {
+/// The signals that stop a foreground server, listened for from the start
+/// so that none is missed between the first and the second.
+struct Signals {
     #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut term = signal(SignalKind::terminate())?;
-        let mut int = signal(SignalKind::interrupt())?;
-        Ok(tokio::select! {
-            _ = term.recv() => "SIGTERM",
-            _ = int.recv() => "SIGINT",
-        })
+    term: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    int: tokio::signal::unix::Signal,
+}
+
+impl Signals {
+    fn new() -> anyhow::Result<Self> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Ok(Self {
+                term: signal(SignalKind::terminate())?,
+                int: signal(SignalKind::interrupt())?,
+            })
+        }
+        #[cfg(not(unix))]
+        Ok(Self {})
     }
-    #[cfg(not(unix))]
-    {
-        tokio::signal::ctrl_c().await?;
-        Ok("Ctrl-C")
+
+    /// The next one.
+    async fn next(&mut self) -> &'static str {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                _ = self.term.recv() => "SIGTERM",
+                _ = self.int.recv() => "SIGINT",
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+            "Ctrl-C"
+        }
     }
 }
 
 /// `atomic serve`.
+///
+/// It runs until a signal stops it. Running steps then have [`SHUTDOWN`] to
+/// reach a checkpoint, or until a second signal. Whatever command is still
+/// running after that is killed, with everything it started, and the
+/// process exits without recording how it ended; only its exit releases the
+/// execution lock, so no other process can recover a run while a command of
+/// this one still runs. Unfinished work stays recorded for the next serve
+/// or resume, and each interrupted command's attempt guard decides whether
+/// it may run again.
 pub async fn serve(
     args: ServeArgs,
     project: Option<&Path>,
     paths: &CodexPaths,
 ) -> anyhow::Result<()> {
+    let mut signals = Signals::new()?;
     let state = state(project)?;
     let engine = engine::open(&state, paths, &args.engine, "atomic serve", true).await?;
     eprintln!(
@@ -276,9 +307,34 @@ pub async fn serve(
         );
     }
     eprintln!("atomic serve: recovered {recovered} unfinished run(s); serving until stopped");
-    let signal = stopped().await?;
-    eprintln!("atomic serve: {signal}: stopping");
-    // Unfinished work stays recorded; a later serve or resume continues it.
-    let _ = engine.rt.shutdown(SHUTDOWN).await;
-    Ok(())
+    let signal = signals.next().await;
+    eprintln!(
+        "atomic serve: {signal}: stopping; running steps have {} seconds to reach a checkpoint \
+         (send another signal to stop now)",
+        SHUTDOWN.as_secs()
+    );
+    let forced = tokio::select! {
+        _ = engine.rt.shutdown(SHUTDOWN) => None,
+        again = signals.next() => Some(again),
+    };
+    if let Some(again) = forced {
+        eprintln!("atomic serve: {again}: stopping now");
+    }
+    // The engine's drain ends at its time limit whether or not its steps
+    // did, so whatever still runs is stopped here, and its end is never
+    // recorded: this process exits first.
+    let stopped = atomic_exec::process::stop_all();
+    if stopped > 0 {
+        eprintln!(
+            "atomic serve: stopped {stopped} command(s) that had not finished; their runs continue \
+             with the next `atomic serve` or `atomic runs resume`"
+        );
+    }
+    // Exit here, not by returning: the runtime would wait for the blocked
+    // threads of the stopped commands, which never return.
+    std::process::exit(if forced.is_some() || stopped > 0 {
+        1
+    } else {
+        0
+    })
 }

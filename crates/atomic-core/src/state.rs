@@ -157,6 +157,14 @@ impl ExecutionLock {
     pub fn owner(&self) -> &str {
         &self.owner
     }
+
+    /// Hold it until this process exits, however it exits: never released
+    /// while anything this process started may still be running, such as a
+    /// command a blocked thread is waiting on as the process stops. The
+    /// file is closed on exec, so no child keeps it.
+    pub fn hold_until_exit(self) {
+        std::mem::forget(self);
+    }
 }
 
 /// Why the execution lock was not taken.

@@ -19,7 +19,7 @@ use atomic_core::artifact::LocalStore;
 use atomic_core::codex::{CodexPaths, ModelEndpoint};
 use atomic_core::lite::LiteRuntime;
 use atomic_core::runtime::{Artifacts, CodexRuntime, Runtimes};
-use atomic_core::state::{ExecutionLock, ProjectState};
+use atomic_core::state::ProjectState;
 use atomic_core::worktree::Worktrees;
 use atomic_durable::gate::{Deployment, Principal};
 use atomic_durable::{Database, DurableRuntime, Durare};
@@ -125,13 +125,13 @@ pub fn deployment() -> Deployment {
     }
 }
 
-/// A control plane for one project, holding its execution lock.
+/// A control plane for one project. Its process holds the project's
+/// execution lock until it exits.
 pub struct Engine {
     /// The durable runtime, launched, with `run_pipeline` registered.
     pub rt: Durare,
     /// Where its store is, for messages.
     pub store: String,
-    _lock: ExecutionLock,
 }
 
 /// Take the project's execution lock for `command`, open its store and
@@ -144,7 +144,9 @@ pub async fn open(
     needs_model: bool,
 ) -> anyhow::Result<Engine> {
     state.create()?;
-    let lock = state.lock_execution(command)?;
+    // Held until the process exits: dropping the engine while a command it
+    // started still runs must not let another process recover that run.
+    state.lock_execution(command)?.hold_until_exit();
     let database = database(state);
     let executor = atomic_durable::executor_identity(args.executor_id.as_deref())?;
     if matches!(database, Database::Postgres { .. }) && executor.is_none() {
@@ -207,6 +209,5 @@ pub async fn open(
     Ok(Engine {
         rt,
         store: describe(&database),
-        _lock: lock,
     })
 }

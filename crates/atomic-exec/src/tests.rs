@@ -84,3 +84,50 @@ fn a_missing_program_cannot_start() {
         .expect_err("missing");
     assert!(matches!(error, ExecError::Start { .. }), "{error}");
 }
+
+#[cfg(unix)]
+#[test]
+fn a_command_runs_in_a_process_group_of_its_own() {
+    // Fields 1 and 5 of /proc/<pid>/stat: the process and its group.
+    let done = shell(
+        "read -r pid _ _ _ group _ < /proc/self/stat; printf '%s %s' \"$pid\" \"$group\"",
+        b"",
+        Duration::from_secs(10),
+    )
+    .expect("runs");
+    let text = String::from_utf8_lossy(&done.stdout).into_owned();
+    let (pid, group) = text.split_once(' ').expect("two fields");
+    assert_eq!(pid, group, "{text}");
+    assert_ne!(
+        group,
+        std::process::id().to_string(),
+        "not this process's group"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_command_past_its_time_limit_is_stopped_with_everything_it_started() {
+    let file = std::env::temp_dir().join(format!("atomic-exec-group-{}", std::process::id()));
+    let script = format!("sleep 30 & printf '%s' \"$!\" > '{}'; wait", file.display());
+    let error = shell(&script, b"", Duration::from_millis(500)).expect_err("times out");
+    assert!(matches!(error, ExecError::TimedOut { .. }), "{error}");
+    let pid = std::fs::read_to_string(&file).expect("the background pid");
+    let _ = std::fs::remove_file(&file);
+    let started = std::time::Instant::now();
+    // Gone, or a zombie waiting for init to reap it.
+    while std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+        !stat
+            .rsplit(')')
+            .next()
+            .unwrap_or("")
+            .trim_start()
+            .starts_with('Z')
+    }) {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the command's own child {pid} outlived it"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
