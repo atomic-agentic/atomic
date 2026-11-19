@@ -1083,6 +1083,89 @@ fn a_run_of_another_durable_layout_is_reported_not_resumed() {
 }
 
 #[test]
+fn a_resumed_run_left_queued_is_taken_by_no_other_command() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
+            .await
+            .expect("fake model");
+        let dir = scratch("left-queued");
+        let project = project(&dir);
+        let state = state_dir(&dir, &project);
+        let env = model_env(&model.base_url());
+        let (d, p, e) = (dir.clone(), project.clone(), env.clone());
+        tokio::task::spawn_blocking(move || killed_after_rank(&d, &p, &e, "left-1"))
+            .await
+            .expect("child");
+        // The resume puts the run on its queue and dies before running it.
+        let (d, p, e) = (dir.clone(), project.clone(), env.clone());
+        let out = tokio::task::spawn_blocking(move || {
+            atomic(
+                &d,
+                &p,
+                &["runs", "resume", "left-1"],
+                &with(&e, &[("ATOMIC_FAILPOINT", "resume:queued")]),
+                "",
+            )
+        })
+        .await
+        .expect("child");
+        assert!(!out.status.success(), "killed: {}", text(&out));
+
+        // An unrelated run starts and finishes, and leaves it alone.
+        let (d, p, e) = (dir.clone(), project.clone(), env.clone());
+        let out = tokio::task::spawn_blocking(move || {
+            atomic(
+                &d,
+                &p,
+                &["run", "count-note", "--data", NOTE],
+                &with(&e, &[]),
+                "",
+            )
+        })
+        .await
+        .expect("child");
+        assert!(out.status.success(), "{}", text(&out));
+        let rt = Durare::sqlite(&state.join("atomic.db"))
+            .await
+            .expect("store");
+        assert_eq!(
+            rt.status("left-1").await.expect("status"),
+            Some(RunStatus::Pending)
+        );
+        assert_eq!(model.calls(), 1, "atomic run did not run it");
+
+        // serve takes it from the queue and finishes it.
+        let mut serve = spawn(
+            &dir,
+            &project,
+            &["serve"],
+            &with(&env, &[]),
+            &dir.join("serve.log"),
+        );
+        let started = Instant::now();
+        while rt.status("left-1").await.expect("status") != Some(RunStatus::Succeeded) {
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "serve never finished the run: {}",
+                std::fs::read_to_string(dir.join("serve.log")).unwrap_or_default()
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(model.calls(), 2);
+        assert_eq!(
+            count_log(&dir).len(),
+            2,
+            "triage's count once, count-note once"
+        );
+        terminate(&serve);
+        let status = tokio::task::spawn_blocking(move || wait_child(&mut serve, "serve"))
+            .await
+            .expect("child");
+        assert!(status.success());
+    });
+}
+
+#[test]
 fn a_run_id_that_already_exists_is_refused() {
     on_codex_runtime(async {
         let model = FakeModel::start(vec![Reply::Text(RANK.into())])
@@ -1835,6 +1918,78 @@ fn resuming_a_run_another_executor_owns_needs_its_owner_stopped() {
         );
         assert_eq!(model.calls(), 2, "rank once, summarize once");
         assert_eq!(count_log(&dir).len(), 1, "count once");
+    });
+}
+
+/// A run resumed by one executor goes on that executor's own queue: an
+/// unrelated `atomic run` on another executor never takes it.
+#[cfg(feature = "postgres-tests")]
+#[test]
+fn a_resumed_run_is_taken_only_by_its_resumer_on_postgres() {
+    let url = std::env::var("ATOMIC_TEST_DATABASE_URL")
+        .expect("postgres-tests needs ATOMIC_TEST_DATABASE_URL");
+    on_codex_runtime(async move {
+        let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
+            .await
+            .expect("fake model");
+        let dir = scratch("private-queue");
+        let project = project(&dir);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let schema = format!("atomic_queue_{}_{nanos}", std::process::id());
+        let env_of = |name: &str| {
+            let mut env = model_env(&model.base_url()).to_vec();
+            env.extend(executor_env(&dir, &url, &schema, name));
+            env
+        };
+        let (a, b, c) = (env_of("worker-a"), env_of("worker-b"), env_of("worker-c"));
+        let (d, p) = (dir.clone(), project.clone());
+        tokio::task::spawn_blocking(move || killed_after_rank(&d, &p, &a, "queued-1"))
+            .await
+            .expect("child");
+        let call = |env: Vec<(&'static str, String)>, args: &'static [&'static str]| {
+            let (d, p) = (dir.clone(), project.clone());
+            tokio::task::spawn_blocking(move || atomic(&d, &p, args, &with(&env, &[]), ""))
+        };
+        // worker-b takes the run over and dies before running it.
+        let mut killed = b.clone();
+        killed.push(("ATOMIC_FAILPOINT", "resume:queued".into()));
+        let out = call(killed, &["runs", "resume", "queued-1", "--owner-stopped"])
+            .await
+            .expect("child");
+        assert!(!out.status.success(), "killed: {}", text(&out));
+
+        // worker-c's unrelated run leaves it alone.
+        let out = call(c, &["run", "count-note", "--data", NOTE])
+            .await
+            .expect("child");
+        assert!(out.status.success(), "{}", text(&out));
+        let rt = Durare::postgres(&url, &schema).await.expect("store");
+        let record = rt
+            .run_record("queued-1")
+            .await
+            .expect("record")
+            .expect("run");
+        assert_eq!(record.status, RunStatus::Pending);
+        assert_ne!(record.executor, "worker-c");
+        assert_eq!(model.calls(), 1, "worker-c did not run it");
+
+        // worker-b again, on the same private queue, finishes it.
+        let out = call(
+            b,
+            &["--json", "runs", "resume", "queued-1", "--owner-stopped"],
+        )
+        .await
+        .expect("child");
+        assert!(out.status.success(), "{}", text(&out));
+        assert_eq!(
+            stdout_json(&out)["output"],
+            json!({"line": "P1: Export crashes on accents"})
+        );
+        assert_eq!(model.calls(), 2);
+        assert_eq!(count_log(&dir).len(), 2);
     });
 }
 

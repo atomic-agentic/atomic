@@ -1024,7 +1024,10 @@ fn a_worktree_step_killed_after_its_commit_commits_again_and_keeps_one() {
         );
 
         // The retry starts from the base again and makes a second commit;
-        // that one is accepted, and cleanup drops the orphan's ref.
+        // that one is accepted, and cleanup drops the orphan's ref. A
+        // commit's time has one-second resolution, so a retry within the
+        // same second would write the very same commit: start it a second on.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
         let (d, u) = (dir.clone(), url.clone());
         let status =
             tokio::task::spawn_blocking(move || child(&d, &u, "recover", "fix-killed", None))

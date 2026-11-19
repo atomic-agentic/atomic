@@ -503,7 +503,8 @@ pub trait DurableRuntime: Send + Sync + Sized {
     /// Run unfinished workflow `id` again from its checkpoints, whichever
     /// executor last owned it, so [`result`](Self::result) can follow it.
     /// Its previous execution must have stopped. A finished workflow is left
-    /// as it is.
+    /// as it is. On [`Durare`], only this executor's engines that take
+    /// resumed runs run it.
     fn resume(&self, id: &str) -> impl Future<Output = Result<()>> + Send;
 
     /// Send `message` to workflow `run` on `topic`, from outside any
@@ -796,6 +797,9 @@ pub struct Durare {
     /// follows that execution, including a crash, which a lookup by id would
     /// not see.
     started: std::sync::Mutex<std::collections::HashMap<String, durare::WorkflowHandle<Value>>>,
+    /// The queue this engine resumes runs onto and alone takes them from, if
+    /// it takes resumed runs at all (see [`Durare::take_resumed_runs`]).
+    resume_queue: Option<String>,
 }
 
 impl Durare {
@@ -855,6 +859,27 @@ impl Durare {
     /// The identity this engine owns its runs as.
     pub fn executor_id(&self) -> &str {
         self.engine.executor_id()
+    }
+
+    /// Take resumed runs: [`DurableRuntime::resume`] puts a run on a queue
+    /// of this executor's own, `atomic.resume.<executor>`, which this engine
+    /// alone, of the engines that call this, dispatches. Without it, resume
+    /// is refused. Call it before [`launch`](DurableRuntime::launch).
+    ///
+    /// The queue belongs to the executor identity, so a run left on it by a
+    /// process that stopped is taken by the next one of that identity that
+    /// takes resumed runs, never by a process that only starts runs of its
+    /// own, or by another executor.
+    pub fn take_resumed_runs(&mut self) -> Result<()> {
+        let name = format!("atomic.resume.{}", self.engine.executor_id());
+        let mut queue = durare::WorkflowQueue::new(&name);
+        queue.base_polling_interval = std::time::Duration::from_millis(100);
+        self.engine.register_queue(queue);
+        self.engine
+            .listen_queues([name.clone()])
+            .map_err(from_durare)?;
+        self.resume_queue = Some(name);
+        Ok(())
     }
 
     /// The version this engine stamps on runs, and the only one it recovers.
@@ -938,8 +963,14 @@ impl Durare {
             app_version: Some(version.to_owned()),
             ..durare::EngineConfig::default()
         };
-        let engine = durare::DurableEngine::with_config(provider, config)
+        let mut engine = durare::DurableEngine::with_config(provider, config)
             .await
+            .map_err(from_durare)?;
+        // No queue but the engine's internal one, which atomic puts nothing
+        // on: an engine runs what it starts and recovers, and resumed runs
+        // only once it takes them (see `take_resumed_runs`).
+        engine
+            .listen_queues(Vec::<String>::new())
             .map_err(from_durare)?;
         let index =
             "CREATE INDEX IF NOT EXISTS atomic_threads_by_thread ON atomic_threads (thread_id)";
@@ -965,6 +996,7 @@ impl Durare {
             engine,
             reads,
             started: std::sync::Mutex::default(),
+            resume_queue: None,
         })
     }
 
@@ -1134,9 +1166,14 @@ impl DurableRuntime for Durare {
     fn resume(&self, id: &str) -> impl Future<Output = Result<()>> + Send {
         let id = id.to_owned();
         async move {
+            let queue = self.resume_queue.as_deref().ok_or_else(|| {
+                DurableError::Engine(
+                    "this engine takes no resumed runs; call take_resumed_runs first".into(),
+                )
+            })?;
             let handle = self
                 .engine
-                .resume_workflow::<Value>(&id)
+                .resume_workflow_on::<Value>(&id, queue)
                 .await
                 .map_err(from_durare)?;
             if let Ok(mut started) = self.started.lock() {

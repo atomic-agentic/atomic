@@ -138,6 +138,7 @@ pub async fn run(
         &args.engine,
         "atomic run",
         target::needs_model(&run),
+        engine::Takes::Own,
     )
     .await?;
     let run_id = match args.run_id {
@@ -189,7 +190,15 @@ pub async fn resume(
     json: bool,
 ) -> anyhow::Result<()> {
     let state = state(project)?;
-    let engine = engine::open(&state, paths, &args.engine, "atomic runs resume", true).await?;
+    let engine = engine::open(
+        &state,
+        paths,
+        &args.engine,
+        "atomic runs resume",
+        true,
+        engine::Takes::Resumed,
+    )
+    .await?;
     let id = &args.run_id;
     let record = engine.rt.run_record(id).await?;
     match record.as_ref().map(|r| &r.status) {
@@ -263,6 +272,7 @@ pub async fn resume(
             }
             eprintln!("run {id}: resuming");
             engine.rt.resume(id).await?;
+            atomic_durable::failpoint("resume:queued");
             finish(&engine, id, json).await
         }
     }
@@ -325,7 +335,15 @@ pub async fn serve(
 ) -> anyhow::Result<()> {
     let mut signals = Signals::new()?;
     let state = state(project)?;
-    let engine = engine::open(&state, paths, &args.engine, "atomic serve", true).await?;
+    let engine = engine::open(
+        &state,
+        paths,
+        &args.engine,
+        "atomic serve",
+        true,
+        engine::Takes::Resumed,
+    )
+    .await?;
     eprintln!(
         "atomic serve: project {}, store {}, executor {}",
         state.root().display(),

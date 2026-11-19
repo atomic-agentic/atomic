@@ -141,14 +141,25 @@ pub struct Engine {
     pub shared: bool,
 }
 
+/// Whether an engine takes resumed runs as well as running its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Takes {
+    /// Only the runs it starts: `atomic run`.
+    Own,
+    /// Resumed runs too, from its executor's own queue: `atomic runs resume`
+    /// and `atomic serve`.
+    Resumed,
+}
+
 /// Take the project's execution lock for `command`, open its store and
-/// launch `run_pipeline` on it.
+/// launch `run_pipeline` on it, taking the runs `takes` says.
 pub async fn open(
     state: &ProjectState,
     paths: &CodexPaths,
     args: &EngineArgs,
     command: &str,
     needs_model: bool,
+    takes: Takes,
 ) -> anyhow::Result<Engine> {
     state.create()?;
     // Held until the process exits: dropping the engine while a command it
@@ -212,6 +223,10 @@ pub async fn open(
             context: None,
         },
     );
+    if takes == Takes::Resumed {
+        rt.take_resumed_runs()
+            .context("take resumed runs on the durable runtime")?;
+    }
     rt.launch().await.context("launch the durable runtime")?;
     Ok(Engine {
         rt,
