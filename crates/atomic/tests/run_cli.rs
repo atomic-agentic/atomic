@@ -2529,7 +2529,7 @@ fn the_runner_role_keeps_its_exit_code_contract() {
 }
 
 #[test]
-fn the_executor_identity_is_atomics_own_and_required_on_postgres() {
+fn the_executor_identity_is_atomics_own_and_required_for_a_shared_store() {
     let dir = scratch("identity");
     let project = project(&dir);
     let model = [
@@ -2581,9 +2581,8 @@ fn the_executor_identity_is_atomics_own_and_required_on_postgres() {
 #[cfg(feature = "postgres-tests")]
 #[test]
 fn a_restarted_server_recovers_only_its_own_runs_on_postgres() {
-    let url = std::env::var("ATOMIC_TEST_DATABASE_URL")
-        .expect("postgres-tests needs ATOMIC_TEST_DATABASE_URL");
     on_codex_runtime(async move {
+        let url = atomic_durable::testing::database().await;
         let model = FakeModel::start(vec![
             Reply::Text(RANK.into()),
             Reply::Text(RANK.into()),
@@ -2699,10 +2698,9 @@ fn executor_env(dir: &Path, url: &str, schema: &str, name: &str) -> Vec<(&'stati
 /// executor has stopped.
 #[cfg(feature = "postgres-tests")]
 #[test]
-fn resuming_a_run_another_executor_owns_needs_its_owner_stopped() {
-    let url = std::env::var("ATOMIC_TEST_DATABASE_URL")
-        .expect("postgres-tests needs ATOMIC_TEST_DATABASE_URL");
+fn resuming_a_run_another_executor_owns_on_postgres_needs_its_owner_stopped() {
     on_codex_runtime(async move {
+        let url = atomic_durable::testing::database().await;
         let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
             .await
             .expect("fake model");
@@ -2792,9 +2790,8 @@ fn resuming_a_run_another_executor_owns_needs_its_owner_stopped() {
 #[cfg(feature = "postgres-tests")]
 #[test]
 fn a_resumed_run_is_taken_only_by_its_resumer_on_postgres() {
-    let url = std::env::var("ATOMIC_TEST_DATABASE_URL")
-        .expect("postgres-tests needs ATOMIC_TEST_DATABASE_URL");
     on_codex_runtime(async move {
+        let url = atomic_durable::testing::database().await;
         let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
             .await
             .expect("fake model");
@@ -2861,9 +2858,8 @@ fn a_resumed_run_is_taken_only_by_its_resumer_on_postgres() {
 #[cfg(all(feature = "postgres-tests", target_os = "linux"))]
 #[test]
 fn gates_are_listed_and_decided_in_the_postgres_store() {
-    let url = std::env::var("ATOMIC_TEST_DATABASE_URL")
-        .expect("postgres-tests needs ATOMIC_TEST_DATABASE_URL");
     on_codex_runtime(async move {
+        let url = atomic_durable::testing::database().await;
         let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
             .await
             .expect("fake model");

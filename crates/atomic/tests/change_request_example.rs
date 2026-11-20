@@ -19,6 +19,8 @@
 #![cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 #![recursion_limit = "512"]
 
+mod support;
+
 use atomic_app::pipeline::{PIPELINE, PipelineRun, Services, prepare, register_pipeline};
 use atomic_core::artifact::LocalStore;
 use atomic_core::codex::{CodexPaths, ModelEndpoint, StateGuard};
@@ -260,6 +262,7 @@ fn read(path: &Path) -> Value {
 const RUN: &str = "change-1";
 
 async fn run_example(layout: &str) {
+    support::require_sandbox();
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
         "atomic-change-request-{layout}-{}",
         std::process::id()

@@ -2365,6 +2365,20 @@ fn shape(value: &Value) -> Value {
     }
 }
 
+/// Run `run`'s open gate, once the run waits at it: a decision that comes
+/// before the wait begins is taken without one, and records fewer steps.
+async fn waiting_at_gate(rt: &Durare, run: &str) -> gate::Gate {
+    let g = open_gate(rt, run).await;
+    for _ in 0..600 {
+        let steps = rt.steps(run).await.expect("steps");
+        if steps.iter().any(|s| s.name == "DBOS.sleep") {
+            return g;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("{run} never waited at its gate");
+}
+
 /// `LAYOUT_VERSION` names the durable step layout `run_pipeline` records
 /// and the shape of the `PipelineRun` it is started with. This run, of an
 /// exec step, a gate and model steps, must record exactly what the golden
@@ -2407,14 +2421,14 @@ fn the_durable_layout_is_the_one_its_version_names() {
             run_shape["pipeline"]["atoms"] = json!({"<name>": atoms["send-note"].clone()});
         }
         rt.start(PIPELINE, "layout-1", run).await.expect("start");
-        let g = open_gate(&rt, "layout-1").await;
+        let g = waiting_at_gate(&rt, "layout-1").await;
         decide(&rt, &g, Verdict::Approve, "fine").await;
         let _: Value = rt.result("layout-1").await.expect("finishes");
         // And the path through a rejected gate.
         rt.start(PIPELINE, "layout-2", rejected)
             .await
             .expect("start");
-        let g = open_gate(&rt, "layout-2").await;
+        let g = waiting_at_gate(&rt, "layout-2").await;
         decide(&rt, &g, Verdict::Reject, "no").await;
         assert!(rt.result::<Value>("layout-2").await.is_err());
         // Each recorded step's name, and the shape of its checkpoint.

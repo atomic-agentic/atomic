@@ -79,10 +79,9 @@ fn sqlite_store() -> Store {
 }
 
 #[cfg(feature = "postgres-tests")]
-fn postgres_store() -> Store {
+async fn postgres_store() -> Store {
     // A suite that cannot reach its backend fails; it never skips.
-    let url = std::env::var("ATOMIC_TEST_DATABASE_URL")
-        .expect("the postgres-tests feature needs ATOMIC_TEST_DATABASE_URL");
+    let url = atomic_durable::testing::database().await;
     Store::Postgres(url, unique("atomic_gates_kill"))
 }
 
@@ -306,11 +305,11 @@ async fn sqlite_a_deadline_that_passes_while_offline_rejects_on_recovery() {
 #[cfg(feature = "postgres-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_a_gate_survives_a_kill_and_is_approved_from_a_second_process() {
-    a_gate_survives_a_kill_and_is_approved_from_a_second_process(postgres_store()).await;
+    a_gate_survives_a_kill_and_is_approved_from_a_second_process(postgres_store().await).await;
 }
 
 #[cfg(feature = "postgres-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_a_deadline_that_passes_while_offline_rejects_on_recovery() {
-    a_deadline_that_passes_while_offline_rejects_on_recovery(postgres_store()).await;
+    a_deadline_that_passes_while_offline_rejects_on_recovery(postgres_store().await).await;
 }

@@ -47,8 +47,7 @@ async fn the_sqlite_schema_matches_upstream() -> durare::Result<()> {
 #[cfg(feature = "postgres-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_postgres_schema_matches_upstream() -> durare::Result<()> {
-    let url = std::env::var("ATOMIC_TEST_DATABASE_URL")
-        .expect("the postgres-tests feature needs ATOMIC_TEST_DATABASE_URL");
+    let url = atomic_durable::testing::database().await;
     let schema = format!("dbos_fork_{}", std::process::id());
     let provider = Arc::new(durare::PostgresProvider::connect_with_schema(&url, &schema).await?);
     assert_eq!(

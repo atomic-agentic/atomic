@@ -108,7 +108,7 @@ reaches a cap. The commands that show budgets and spend come with run inspection
 
 The local baseline is saved run inspection and basic spans in v0.1 (M12).
 Full OpenTelemetry correlation/export and the optional `atomic dev --otel` local
-viewer helper belong to M44, assigned to v0.5 in the plan and these docs.
+viewer helper belong to M44, assigned to v0.5.
 Datadog and other compatible backends remain optional. See [observability](../operations/observability.md).
 
 ## Read examples by stage

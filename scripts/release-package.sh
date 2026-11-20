@@ -26,6 +26,12 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TARGET="${1:?usage: scripts/release-package.sh <target-triple>}"
 BIN="${ROOT}/target/${TARGET}/release/atomic"
 [ -x "${BIN}" ] || { echo "scripts/release-package.sh: ${BIN} is not built" >&2; exit 1; }
+# A binary built with the crash tests' failpoints features compiled in could
+# be killed by an environment variable. Never ship one.
+if grep -qa "ATOMIC_FAILPOINT" "${BIN}"; then
+    echo "scripts/release-package.sh: ${BIN} has crash-test failpoints compiled in; build it on its own, as above" >&2
+    exit 1
+fi
 
 VERSION="$(cd "${ROOT}" && cargo pkgid -p atomic-agentic)"
 VERSION="${VERSION##*@}"
