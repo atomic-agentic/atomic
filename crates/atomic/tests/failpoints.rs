@@ -243,10 +243,17 @@ fn each_failpoint_kills_the_process_there_and_the_run_recovers() {
     }
 }
 
-/// Every failpoint name or name template in a source file: the string
-/// literal passed to `failpoint(` directly or through `format!(`, with each
-/// `{...}` replaced by `x`.
-fn named_in(source: &str) -> Vec<String> {
+/// What a `failpoint(` call in the source passes.
+enum Named {
+    /// A name or template, with each `{...}` replaced by `x`.
+    Literal(String),
+    /// Something the scan cannot read, such as a variable, as written.
+    Unreadable(String),
+}
+
+/// Every `failpoint(` call in a source file: the string literal it passes,
+/// directly or through `format!(`, or what it passes instead.
+fn named_in(source: &str) -> Vec<Named> {
     let mut names = Vec::new();
     for (at, _) in source.match_indices("failpoint(") {
         let before = &source[..at];
@@ -256,6 +263,8 @@ fn named_in(source: &str) -> Vec<String> {
         let rest = source[at + "failpoint(".len()..].trim_start();
         let rest = rest.strip_prefix("&format!(").unwrap_or(rest).trim_start();
         let Some(rest) = rest.strip_prefix('"') else {
+            let arg: String = rest.chars().take_while(|c| *c != ')').collect();
+            names.push(Named::Unreadable(arg.trim().to_owned()));
             continue;
         };
         let Some(end) = rest.find('"') else {
@@ -274,10 +283,15 @@ fn named_in(source: &str) -> Vec<String> {
                 _ => {}
             }
         }
-        names.push(name);
+        names.push(Named::Literal(name));
     }
     names
 }
+
+/// Calls whose name the scan cannot read, by file and argument, each with
+/// the literal its name is built from, which the scan checks instead.
+const BUILT_ELSEWHERE: &[(&str, &str, &str)] =
+    &[("atomic/src/pipeline.rs", "&ran", "pipeline:ran:x")];
 
 fn sources(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).expect("read the source tree") {
@@ -304,10 +318,28 @@ fn every_failpoint_in_the_source_is_in_the_inventory_and_back() {
     let (mut found, mut all) = (Vec::new(), String::new());
     for file in &files {
         let text = std::fs::read_to_string(file).expect("source");
-        for name in named_in(&text) {
-            found.push((file.display().to_string(), name));
+        let shown = file.display().to_string();
+        for named in named_in(&text) {
+            match named {
+                Named::Literal(name) => found.push((shown.clone(), name)),
+                Named::Unreadable(arg) => {
+                    let Some((_, _, name)) = BUILT_ELSEWHERE
+                        .iter()
+                        .find(|(f, a, _)| shown.ends_with(f) && *a == arg)
+                    else {
+                        panic!(
+                            "{shown}: failpoint({arg}) passes a name the scan cannot read; pass \
+                             a literal or add it to BUILT_ELSEWHERE"
+                        );
+                    };
+                    found.push((shown.clone(), (*name).to_owned()));
+                }
+            }
         }
-        all.push_str(&text);
+        // The inventory itself names every site; it does not count.
+        if !shown.ends_with("atomic-durable/src/failpoints.rs") {
+            all.push_str(&text);
+        }
     }
     assert!(found.len() >= 10, "too few failpoints found: {found:?}");
     for (file, name) in &found {

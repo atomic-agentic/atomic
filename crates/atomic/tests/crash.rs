@@ -171,10 +171,18 @@ impl Scenario {
                 // The summary names the commit it was given, so the result
                 // shows which commit the step after the fix saw.
                 Some("summarize") => {
+                    // The renderer passes input.commit as data, in an
+                    // element of its own: `<data-… path="input.commit" …>`.
                     let commit = text
-                        .split("Commit: ")
+                        .split(r#"path=\"input.commit\""#)
                         .nth(1)
-                        .map(|rest| rest.chars().take_while(char::is_ascii_hexdigit).collect::<String>())
+                        .and_then(|rest| rest.split_once('>'))
+                        .map(|(_, value)| {
+                            value
+                                .chars()
+                                .take_while(char::is_ascii_hexdigit)
+                                .collect::<String>()
+                        })
                         .unwrap_or_default();
                     return Reply::Text(format!(r#"{{"line": "P1: fixed in {commit}"}}"#));
                 }
@@ -508,7 +516,9 @@ async fn engine(scenario: Scenario, dir: &Path, base_url: &str) -> Durare {
 /// terminal would, until the process ends.
 async fn approve_gates(rt: Arc<Durare>) {
     let operator = gate::HumanCredential::new(Principal::local("dev"), "the operator's secret");
-    gate::enroll(&*rt, &operator).await.expect("enroll the operator");
+    gate::enroll(&*rt, &operator)
+        .await
+        .expect("enroll the operator");
     loop {
         let filter = GateFilter {
             open_only: true,
@@ -800,6 +810,18 @@ async fn reference(scenario: Scenario) -> Reference {
         );
         failpoints.push(name);
     }
+    if scenario == Scenario::Pipeline {
+        let commit = result["commit"].as_str().unwrap_or_default();
+        assert!(
+            commit.len() == 40 && commit.chars().all(|c| c.is_ascii_hexdigit()),
+            "the uninterrupted run returned no commit: {result}"
+        );
+        assert_eq!(
+            result["line"],
+            json!(format!("P1: fixed in {commit}")),
+            "the summary did not name the accepted commit"
+        );
+    }
     let mut commits = BTreeMap::new();
     for step in scenario.code_changing() {
         let commit = result["commit"].as_str().expect("the accepted commit");
@@ -905,41 +927,50 @@ async fn kill_and_recover(
         fail!("the recovered run returned {result}, not {expected}");
     }
 
-    // No operation whose checkpoint committed before the kill ran again.
+    // No operation ran again once its checkpoint had committed, in either
+    // process: walking both logs in order, an operation's
+    // checkpoint:before after its checkpoint:after, or a second
+    // checkpoint:after, is a repeat.
+    let mut done: BTreeSet<&str> = BTreeSet::new();
+    for name in first.reached.iter().chain(&second.reached) {
+        if let Some(op) = name.strip_prefix("checkpoint:before:")
+            && done.contains(op)
+        {
+            fail!("{op} ran again after its checkpoint committed");
+        }
+        if let Some(op) = name.strip_prefix("checkpoint:after:")
+            && !done.insert(op)
+        {
+            fail!("{op} committed twice");
+        }
+    }
     let committed: BTreeSet<&str> = first
         .reached
         .iter()
         .filter_map(|n| n.strip_prefix("checkpoint:after:"))
         .collect();
-    for op in &committed {
-        if second.reached.contains(&format!("checkpoint:before:{op}")) {
-            fail!("{op} had committed and ran again");
-        }
-    }
 
-    // No atom whose turn committed called the model again.
+    // Each atom's model calls, by the fake model's count: the killed process
+    // made at most one run's worth, and the recovering one none if the turn
+    // had committed, and one run's worth otherwise.
     let after = calls(scenario, &model);
-    for step in scenario.atoms() {
-        let turn = format!("{step}.turn");
-        let (b, a) = (
-            before.get(step).copied().unwrap_or(0),
-            after.get(step).copied().unwrap_or(0),
-        );
-        if committed.contains(turn.as_str()) && a != b {
-            fail!(
-                "{step}'s turn had committed, and it called the model {} more times",
-                a - b
-            );
-        }
-    }
     if after.contains_key("unknown") {
         fail!("a model call came from no step: {after:?}");
     }
-    // A step that had not committed ran at most once more.
-    for (step, n) in &after {
+    for step in scenario.atoms() {
         let once = reference.calls.get(step).copied().unwrap_or(0);
-        if *n > 2 * once {
-            fail!("{step} called the model {n} times; one run calls it {once} times");
+        let killed = before.get(step).copied().unwrap_or(0);
+        let recovered = after.get(step).copied().unwrap_or(0) - killed;
+        let expected = if committed.contains(format!("{step}.turn").as_str()) {
+            0
+        } else {
+            once
+        };
+        if killed > once || recovered != expected {
+            fail!(
+                "{step} called the model {killed} times before the kill and {recovered} after; \
+                 one run calls it {once} times"
+            );
         }
     }
 
@@ -965,6 +996,19 @@ async fn kill_and_recover(
         if refs.len() != 1 || refs[0].1 != accepted {
             fail!("{step} left attempt refs {refs:?}, not one for {accepted}");
             continue;
+        }
+        // The first attempt's commit, unless the killed process had already
+        // recorded one and its turn had not committed.
+        let attempt = if first.reached.iter().any(|n| n == "pipeline:after-commit")
+            && !committed.contains(format!("{step}.turn").as_str())
+        {
+            2
+        } else {
+            1
+        };
+        let wanted = format!("refs/atomic/{RUN}/steps/{step}/{attempt}");
+        if refs[0].0 != wanted {
+            fail!("{step}'s accepted commit is {}, not {wanted}", refs[0].0);
         }
         let changed = changes(&dir, &base, accepted);
         if Some(&changed) != reference.commits.get(step) {
