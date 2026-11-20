@@ -2366,6 +2366,47 @@ fn serve_started_on_many_queued_runs_runs_each_once() {
 }
 
 #[test]
+fn signals_ignored_when_serve_starts_stay_ignored() {
+    let dir = scratch("nohup");
+    let project = project(&dir);
+    let log = dir.join("serve.log");
+    // As `nohup`, and a shell starting a background job, leave them.
+    let script = format!("trap '' HUP INT QUIT; exec '{ATOMIC}' serve");
+    let mut serve = command_as(
+        Path::new("/bin/sh"),
+        &dir,
+        &project,
+        &["-c", &script],
+        &UNUSED_MODEL,
+    )
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(std::fs::File::create(&log).expect("log"))
+    .spawn()
+    .expect("start serve");
+    wait_until("serve to start", || {
+        std::fs::read_to_string(&log).is_ok_and(|l| l.contains("serving until stopped"))
+    });
+    for sig in ["HUP", "INT", "QUIT"] {
+        signal(&serve, sig);
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            serve.try_wait().expect("wait").is_none(),
+            "SIG{sig} stopped it: {}",
+            std::fs::read_to_string(&log).unwrap_or_default()
+        );
+    }
+    // What it does not ignore still stops it.
+    terminate(&serve);
+    let status = wait_child(&mut serve, "serve");
+    assert!(
+        status.success(),
+        "{}",
+        std::fs::read_to_string(&log).unwrap_or_default()
+    );
+}
+
+#[test]
 fn the_runner_role_keeps_its_exit_code_contract() {
     let dir = scratch("runner-codes");
     // A request it cannot read is a usage error, and nothing is written.

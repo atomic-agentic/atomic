@@ -352,26 +352,30 @@ pub async fn resume(
 /// so that none is missed between the first and the second.
 struct Signals {
     #[cfg(unix)]
-    term: tokio::signal::unix::Signal,
-    #[cfg(unix)]
-    int: tokio::signal::unix::Signal,
-    #[cfg(unix)]
-    hup: tokio::signal::unix::Signal,
-    #[cfg(unix)]
-    quit: tokio::signal::unix::Signal,
+    streams: Vec<(&'static str, tokio::signal::unix::Signal)>,
 }
 
 impl Signals {
+    /// Each stop signal this process does not ignore. One it inherited as
+    /// ignored, as under `nohup` or for a shell's background job, stays
+    /// ignored: registering a handler would replace that.
     fn new() -> anyhow::Result<Self> {
         #[cfg(unix)]
         {
+            use atomic_exec::process::{StopSignal, ignored};
             use tokio::signal::unix::{SignalKind, signal};
-            Ok(Self {
-                term: signal(SignalKind::terminate())?,
-                int: signal(SignalKind::interrupt())?,
-                hup: signal(SignalKind::hangup())?,
-                quit: signal(SignalKind::quit())?,
-            })
+            let mut streams = Vec::new();
+            for (name, stop, kind) in [
+                ("SIGTERM", StopSignal::Term, SignalKind::terminate()),
+                ("SIGINT", StopSignal::Int, SignalKind::interrupt()),
+                ("SIGHUP", StopSignal::Hup, SignalKind::hangup()),
+                ("SIGQUIT", StopSignal::Quit, SignalKind::quit()),
+            ] {
+                if !ignored(stop) {
+                    streams.push((name, signal(kind)?));
+                }
+            }
+            Ok(Self { streams })
         }
         #[cfg(not(unix))]
         Ok(Self {})
@@ -381,12 +385,18 @@ impl Signals {
     async fn next(&mut self) -> &'static str {
         #[cfg(unix)]
         {
-            tokio::select! {
-                _ = self.term.recv() => "SIGTERM",
-                _ = self.int.recv() => "SIGINT",
-                _ = self.hup.recv() => "SIGHUP",
-                _ = self.quit.recv() => "SIGQUIT",
+            if self.streams.is_empty() {
+                return std::future::pending().await;
             }
+            std::future::poll_fn(|cx| {
+                for (name, stream) in self.streams.iter_mut() {
+                    if stream.poll_recv(cx).is_ready() {
+                        return std::task::Poll::Ready(*name);
+                    }
+                }
+                std::task::Poll::Pending
+            })
+            .await
         }
         #[cfg(not(unix))]
         {

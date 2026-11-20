@@ -75,19 +75,84 @@ pub enum Group {
 #[cfg(unix)]
 const STOP_SIGNALS: [libc::c_int; 4] = [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT];
 
+/// The signals that stop a process from a terminal or a supervisor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StopSignal {
+    /// SIGTERM.
+    Term,
+    /// SIGINT.
+    Int,
+    /// SIGHUP.
+    Hup,
+    /// SIGQUIT.
+    Quit,
+}
+
+impl StopSignal {
+    #[cfg(unix)]
+    fn number(self) -> libc::c_int {
+        match self {
+            Self::Term => libc::SIGTERM,
+            Self::Int => libc::SIGINT,
+            Self::Hup => libc::SIGHUP,
+            Self::Quit => libc::SIGQUIT,
+        }
+    }
+}
+
+/// Whether this process ignores `signal`, as `nohup`, or a shell starting a
+/// background job, makes it. A process that handles signals keeps an
+/// inherited ignore, so check before registering a handler.
+pub fn ignored(signal: StopSignal) -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: with a null new action, sigaction only reads the current
+        // one into `old`, which an all-zero value initialises.
+        #[allow(unsafe_code)]
+        unsafe {
+            let mut old: libc::sigaction = std::mem::zeroed();
+            libc::sigaction(signal.number(), std::ptr::null(), &mut old) == 0
+                && old.sa_sigaction == libc::SIG_IGN
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = signal;
+        false
+    }
+}
+
+/// The stop signals this process ignores only because it is a runner,
+/// one bit per signal in [`STOP_SIGNALS`]: the commands it starts get them
+/// back. A signal it inherited as ignored stays ignored for them too.
+static RESTORE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
 /// Ignore the stop signals in this process, as a runner does: a command in
 /// its process group may signal the whole group, and the runner must live
-/// to report how the command ended. The commands it starts get them back,
-/// and SIGKILL, which stopping a runner uses, cannot be ignored.
+/// to report how the command ended. The commands it starts get back each
+/// one this process did not already ignore, and SIGKILL, which stopping a
+/// runner uses, cannot be ignored.
 pub fn ignore_stop_signals() {
     #[cfg(unix)]
-    for signal in STOP_SIGNALS {
+    for (bit, signal) in [
+        StopSignal::Term,
+        StopSignal::Int,
+        StopSignal::Hup,
+        StopSignal::Quit,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if ignored(signal) {
+            continue;
+        }
         // SAFETY: setting a signal's disposition to ignore has no
         // handler to run.
         #[allow(unsafe_code)]
         unsafe {
-            libc::signal(signal, libc::SIG_IGN);
+            libc::signal(signal.number(), libc::SIG_IGN);
         }
+        RESTORE.fetch_or(1 << bit, Ordering::SeqCst);
     }
 }
 
@@ -188,8 +253,11 @@ pub fn run_in(
             std::os::unix::process::CommandExt::pre_exec(&mut command, move || {
                 // A runner ignores the stop signals, which its command,
                 // in its group, could send it; the command gets them back.
-                for signal in STOP_SIGNALS {
-                    libc::signal(signal, libc::SIG_DFL);
+                let restore = RESTORE.load(Ordering::SeqCst);
+                for (bit, signal) in STOP_SIGNALS.into_iter().enumerate() {
+                    if restore & (1 << bit) != 0 {
+                        libc::signal(signal, libc::SIG_DFL);
+                    }
                 }
                 #[cfg(target_os = "linux")]
                 {

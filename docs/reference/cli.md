@@ -201,7 +201,8 @@ command of the one that holds it, so two processes never execute the same
 project's runs. The lock is released only when its process exits.
 
 `atomic serve`, `atomic run` and `atomic runs resume` stop on SIGTERM, SIGINT,
-SIGHUP or SIGQUIT. No step starts after the first signal, and running steps get
+SIGHUP or SIGQUIT, except one they were started ignoring, as under `nohup` or
+as a shell's background job, which they keep ignoring. No step starts after the first signal, and running steps get
 up to 10 seconds to reach a checkpoint; a second signal stops the process at
 once. A command still running then is killed, with everything it
 started, also under `--runner process`, and the process exits without recording
