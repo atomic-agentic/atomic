@@ -279,6 +279,7 @@ where
                 model: model.clone(),
                 input_bound,
                 turn: false,
+                work: false,
             })
             .await
             .map_err(meter_error)?;

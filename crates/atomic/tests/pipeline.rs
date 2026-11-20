@@ -225,6 +225,7 @@ fn runtimes_on(dir: &Path, cwd: &Path, base_url: &str, model: &str) -> Arc<Runti
         },
         lite: LiteRuntime::new(endpoint, AtomConfig::default()),
         exec: Default::default(),
+        exec_meter: Default::default(),
         clock: None,
     })
 }
@@ -3677,5 +3678,194 @@ fn the_durable_layout_is_the_one_its_version_names() {
             atomic_app::pipeline::LAYOUT_VERSION,
             file.display()
         );
+    });
+}
+
+/// A project with `nap`, an exec atom whose command sleeps for the seconds
+/// its input names, with `budget` its own budget block (or none).
+fn napping_project(dir: &Path, budget: &str) -> PathBuf {
+    let project = project(dir);
+    std::fs::create_dir_all(project.join("tools")).expect("tools");
+    std::fs::write(
+        project.join("tools/nap.py"),
+        "import json, sys, time\nseconds = json.load(sys.stdin)['seconds']\ntime.sleep(seconds)\njson.dump({'slept': seconds}, sys.stdout)\n",
+    )
+    .expect("script");
+    let atoms = project.join("atoms");
+    std::fs::write(
+        atoms.join("nap.atom.astro"),
+        format!(
+            "---\nimport type {{ Props, Input, Output }} from '../.atomic/types/nap';\n\
+             import type {{ AtomConfig }} from '../.atomic/types/authoring';\n\
+             const {{ input }}: Props = Astro.props;\n\
+             export const config: AtomConfig<Input, Output> = {{ description: 'Nap.', kind: 'exec', exec: {{ command: ['python3', 'tools/nap.py'] }}{budget} }};\n---\n"
+        ),
+    )
+    .expect("atom");
+    for (role, schema) in [
+        ("input", object(json!({"seconds": {"type": "number"}}))),
+        ("output", object(json!({"slept": {"type": "number"}}))),
+    ] {
+        std::fs::write(
+            atoms.join(format!("nap.{role}.schema.json")),
+            schema.to_string(),
+        )
+        .expect("schema");
+    }
+    project
+}
+
+/// Two naps, with a gate between them when `gated`, under `budget`.
+fn naps(gated: bool, budget: &str) -> String {
+    let gate = if gated {
+        "  check:\n    after: [first]\n    gate:\n      title: \"'Check the nap'\"\n      show: steps.first.output\n      timeout: 24h\n"
+    } else {
+        ""
+    };
+    format!(
+        "atomic: 1\nname: naps\n\
+         input: {{ $ref: ../atoms/nap.input.schema.json }}\n\
+         output: {{ $ref: ../atoms/nap.output.schema.json }}\n\
+         steps:\n\
+         \x20 first:\n    atom: nap\n    with: {{ seconds: input.seconds }}\n\
+         {gate}\
+         \x20 second:\n    after: [{}]\n    atom: nap\n    with: {{ seconds: input.seconds }}\n\
+         returns: steps.second.output\n{budget}",
+        if gated { "check" } else { "first" }
+    )
+}
+
+/// The active time charged to run `run`'s allowance, in milliseconds.
+async fn charged_millis(rt: &Durare, run: &str) -> i64 {
+    rt.ledger()
+        .allowance(&format!("run:{run}"))
+        .await
+        .expect("ledger")
+        .expect("the run's allowance")
+        .charged
+        .millis
+}
+
+/// An exec atom's command is held to its minutes cap: cut off when its
+/// step's active time runs out, and charged the time it ran.
+#[test]
+fn an_exec_atoms_command_is_cut_off_at_its_minutes_cap() {
+    on_codex_runtime(async {
+        let dir = scratch("exec-minutes");
+        // Three seconds of active time for the atom.
+        let project = napping_project(&dir, ", budget: { minutes: 0.05 }");
+        let pipeline = load(&project, "naps.workflow.yaml", &naps(false, ""));
+        let model = FakeModel::start(Vec::new()).await.expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        let began = std::time::Instant::now();
+        rt.start(
+            PIPELINE,
+            "naps-1",
+            PipelineRun {
+                pipeline,
+                input: json!({"seconds": 20}),
+            },
+        )
+        .await
+        .expect("start");
+        let error = rt
+            .result::<Value>("naps-1")
+            .await
+            .expect_err("the nap was cut off");
+        assert!(
+            began.elapsed() < std::time::Duration::from_secs(15),
+            "the command ran past its cap: {:?}",
+            began.elapsed()
+        );
+        assert!(error.to_string().contains("nap"), "{error}");
+        let charged = charged_millis(&rt, "naps-1").await;
+        assert!(
+            (2_500..=6_000).contains(&charged),
+            "charged {charged} ms for a command cut off at 3 s"
+        );
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+/// Commands' active time counts toward the run's minutes, and time waiting
+/// at a gate does not: two one-second naps fit under four seconds however
+/// long the gate between them waits.
+#[test]
+fn exec_time_counts_toward_the_runs_minutes_and_gate_waits_do_not() {
+    on_codex_runtime(async {
+        let dir = scratch("exec-gate-minutes");
+        let project = napping_project(&dir, "");
+        let pipeline = load(
+            &project,
+            "naps.workflow.yaml",
+            &naps(true, "budget:\n  minutes: 0.07\n"),
+        );
+        let model = FakeModel::start(Vec::new()).await.expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "naps-2",
+            PipelineRun {
+                pipeline,
+                input: json!({"seconds": 1}),
+            },
+        )
+        .await
+        .expect("start");
+        let g = open_gate(&rt, "naps-2").await;
+        let after_first = charged_millis(&rt, "naps-2").await;
+        assert!(
+            (900..=3_000).contains(&after_first),
+            "the first nap charged {after_first} ms"
+        );
+        // Longer at the gate than the whole cap.
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        decide(&rt, &g, Verdict::Approve, "fine").await;
+        let out: Value = rt.result("naps-2").await.expect("finishes");
+        assert_eq!(out["slept"].as_f64(), Some(1.0), "{out}");
+        let total = charged_millis(&rt, "naps-2").await;
+        assert!(
+            (1_800..=4_200).contains(&total),
+            "charged {total} ms for two one-second naps and a five-second gate"
+        );
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+/// With less active time left than a command is worth starting with, the
+/// next exec step parks the run before its command runs.
+#[test]
+fn a_run_with_no_minutes_left_parks_before_the_next_command() {
+    on_codex_runtime(async {
+        let dir = scratch("exec-park");
+        let project = napping_project(&dir, "");
+        // 2.4 seconds: the first nap takes 2 of them.
+        let pipeline = load(
+            &project,
+            "naps.workflow.yaml",
+            &naps(false, "budget:\n  minutes: 0.04\n"),
+        );
+        let model = FakeModel::start(Vec::new()).await.expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "naps-3",
+            PipelineRun {
+                pipeline,
+                input: json!({"seconds": 2.0}),
+            },
+        )
+        .await
+        .expect("start");
+        let park = nth_park(&rt, "naps-3", 1).await;
+        assert!(park.reason.contains("run:naps-3"), "{}", park.reason);
+        assert!(park.step.starts_with("second"), "{}", park.step);
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
     });
 }

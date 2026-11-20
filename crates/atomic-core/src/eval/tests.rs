@@ -91,6 +91,7 @@ fn runtimes(model: &FakeModel, root: &Path) -> Runtimes {
         },
         lite: crate::lite::LiteRuntime::new(endpoint, AtomConfig::default()),
         exec: Default::default(),
+        exec_meter: Default::default(),
         clock: None,
     }
 }

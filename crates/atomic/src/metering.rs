@@ -45,6 +45,11 @@ pub struct BudgetPlan {
     pub atoms: BTreeMap<String, Resolved>,
     /// The model each model atom calls, by atom name.
     pub models: BTreeMap<String, String>,
+    /// Each exec atom's caps, by atom name: its command's active time is
+    /// charged to them and to the run's. A plan pinned before exec atoms
+    /// were metered has none, and its exec steps are not metered.
+    #[serde(default)]
+    pub exec: BTreeMap<String, Resolved>,
     /// The most one call may use, when its model has no maximum of its own.
     pub call: PlannedCall,
     /// The price table, cut to the models the run calls.
@@ -87,6 +92,7 @@ impl BudgetPlan {
         settings: &BudgetSettings,
         declared: &Budget,
         atoms: &[(&str, &Budget, &str)],
+        exec: &[(&str, &Budget)],
     ) -> Result<Self, (Option<String>, BudgetError)> {
         let models: Vec<&str> = atoms.iter().map(|(_, _, model)| *model).collect();
         let run = resolve(declared, Level::Workflow, settings, &models).map_err(|e| (None, e))?;
@@ -96,9 +102,18 @@ impl BudgetPlan {
                 .map_err(|e| (Some((*name).to_owned()), e))?;
             resolved.insert((*name).to_owned(), caps);
         }
+        // An exec atom calls no model: its caps need no price, and its
+        // tokens and cost stay at nothing.
+        let mut exec_caps = BTreeMap::new();
+        for (name, budget) in exec {
+            let caps = resolve(budget, Level::Atom, settings, &[])
+                .map_err(|e| (Some((*name).to_owned()), e))?;
+            exec_caps.insert((*name).to_owned(), caps);
+        }
         Ok(Self {
             run,
             atoms: resolved,
+            exec: exec_caps,
             models: atoms
                 .iter()
                 .map(|(name, _, model)| ((*name).to_owned(), (*model).to_owned()))
@@ -295,6 +310,57 @@ impl RunBudget {
     }
 }
 
+/// The least active time worth starting a command with: less left than
+/// this refuses it, and the run parks.
+const LEAST_WORK: Duration = Duration::from_millis(500);
+
+impl LedgerMeter {
+    /// Admit active work that is not a model call, such as an exec atom's
+    /// command: no tokens and no cost, and all the active time the chain has
+    /// left, as a turn takes; it is cut off when that runs out.
+    async fn admit_work(&self, call: Call) -> Result<Ticket, MeterError> {
+        let least = Charge {
+            tokens: 0,
+            millis: int(u64::try_from(LEAST_WORK.as_millis()).unwrap_or(500)),
+            micro_usd: 0,
+        };
+        let request = Request {
+            id: format!("{}:{}:{}", self.run, self.step, call.index),
+            run: self.run.clone(),
+            model: call.model.clone(),
+            chain: self.chain.clone(),
+            reserve: least,
+            maximum: least,
+            turn: true,
+        };
+        match self.ledger.admit(request).await.map_err(store)? {
+            Admission::Admitted {
+                request,
+                attempt,
+                millis,
+                bounded_by,
+            } => {
+                beat(&self.ledger, &request, attempt, millis);
+                if atomic_durable::failpoints::armed() {
+                    atomic_durable::failpoint(&format!("atom:after-admit:{request}"));
+                }
+                Ok(Ticket {
+                    request,
+                    attempt,
+                    model: call.model,
+                    admitted: Instant::now(),
+                    limit: Limit {
+                        output_tokens: None,
+                        time: Some(Duration::from_millis(u64::try_from(millis).unwrap_or(0))),
+                    },
+                    bounded_by,
+                })
+            }
+            Admission::Refused { reason, .. } => Err(Exhausted(reason).into()),
+        }
+    }
+}
+
 /// One atom step's meter.
 struct LedgerMeter {
     ledger: Ledger,
@@ -313,6 +379,9 @@ fn store(e: impl std::fmt::Display) -> MeterError {
 impl Meter for LedgerMeter {
     fn admit(&self, call: Call) -> MeterFuture<'_, Ticket> {
         Box::pin(async move {
+            if call.work {
+                return self.admit_work(call).await;
+            }
             // A dollar cap can hold only over priced calls: a call to a model
             // the plan does not price, as when the model changed since the
             // budget was resolved, is not made.

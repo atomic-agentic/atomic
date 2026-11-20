@@ -189,6 +189,7 @@ async fn engine(dir: &Path, project: &Path, base_url: &str) -> Durare {
         },
         lite: LiteRuntime::new(endpoint, AtomConfig::default()),
         exec: Default::default(),
+        exec_meter: Default::default(),
         clock: None,
     });
     let repo = Git::find()

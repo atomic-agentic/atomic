@@ -574,7 +574,13 @@ fn plan_budgets(
         .iter()
         .map(|(name, budget, model)| (*name, *budget, model.as_str()))
         .collect();
-    BudgetPlan::resolve(settings, &pipeline.budget, &atoms).map_err(|(atom, e)| match atom {
+    let exec: Vec<(&str, &Budget)> = pipeline
+        .atoms
+        .iter()
+        .filter(|(_, atom)| atom.kind == "exec")
+        .map(|(name, atom)| (name.as_str(), &atom.budget))
+        .collect();
+    BudgetPlan::resolve(settings, &pipeline.budget, &atoms, &exec).map_err(|(atom, e)| match atom {
         None => format!("workflow {}: budget: {e}", pipeline.name),
         Some(name) => format!("atom {name}: budget: {e}"),
     })
@@ -655,7 +661,7 @@ async fn run_pipeline<C: WorkflowContext>(
         .await?;
     let plan = pinned.budgets.clone();
     let budget = RunBudget::pinned(ledger, &plan);
-    let (caps, models) = (plan.atoms, plan.models);
+    let (caps, models, exec_caps) = (plan.atoms, plan.models, plan.exec);
     let mut steps = Map::new();
     // What each finished step's output is typed by, for CEL.
     let mut shapes = BTreeMap::new();
@@ -767,7 +773,14 @@ async fn run_pipeline<C: WorkflowContext>(
             &serde_json::to_vec(&atom_input)
                 .map_err(|e| failed(format!("step `{}`: encode its input: {e}", step.id)))?,
         );
-        let (budget, atom_caps) = (budget.clone(), caps.get(&step.atom).cloned());
+        // A model atom's caps, or an exec atom's, which its command's active
+        // time is charged to.
+        let (budget, atom_caps) = (
+            budget.clone(),
+            caps.get(&step.atom)
+                .or_else(|| exec_caps.get(&step.atom))
+                .cloned(),
+        );
         // A model atom runs on the model its budget was resolved for, and
         // only with caps: never unmetered, never at another model's price.
         if let Some(model) = model_of(&atom, &runtimes) {
@@ -874,11 +887,12 @@ async fn run_pipeline<C: WorkflowContext>(
                 // live.
                 let served = serving.as_ref().map(|r| r.serve(&id, &input_sha256));
                 let input_sha256 = input_sha256.clone();
-                // An exec atom calls no model and has no caps to meter.
+                // A model atom's calls, or an exec atom's command.
                 if let Some(atom_caps) = &atom_caps {
                     let meter = budget.meter(&position, atom_caps);
                     runtimes.codex.meter = meter.clone();
-                    runtimes.lite.meter = meter;
+                    runtimes.lite.meter = meter.clone();
+                    runtimes.exec_meter = meter;
                 }
                 async move {
                 if let Some(served) = served {
@@ -921,6 +935,7 @@ async fn run_pipeline<C: WorkflowContext>(
                         let backend = runtimes.exec.shared();
                         // The store the model runtimes check references against.
                         let artifacts = runtimes.codex.artifacts.clone();
+                        let meter = runtimes.exec_meter.clone();
                         propose_at(&place, true, async move {
                             let compiled = compile::compile(&atom, &Registry::new())
                                 .map_err(|e| AtomError::Runtime(e.to_string()))?;
@@ -944,6 +959,7 @@ async fn run_pipeline<C: WorkflowContext>(
                                 opened,
                                 clock.as_ref(),
                                 &artifacts,
+                                &meter,
                             )
                             .await
                         })

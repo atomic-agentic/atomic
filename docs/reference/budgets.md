@@ -156,6 +156,16 @@ started at all: the run parks without spending. A failed or interrupted turn is 
 the usage it reported before it stopped. Its reported tokens can exceed the
 bound; the ledger records any such overshoot.
 
+An exec atom's command counts toward `minutes` the same way: its step reserves
+the active time its atom has left (or less, if the run has less), the command is
+stopped when that runs out or at its own five-minute limit, whichever is first,
+and the step is charged the time the command ran. A command uses no tokens and
+costs nothing, so an exec atom's budget needs no price, even under a dollar cap.
+With less than half a second left, the command is not started: the run parks.
+Time at a gate is never charged. An exec atom's validators and the commits
+atomic makes after a worktree step are not metered yet, and a run whose budget
+was pinned before exec atoms were metered does not meter them.
+
 A run resolves the model each atom calls with its budget, and the atom runs on
 that model for the whole run. Under a dollar cap, a call to a model the run's
 budget does not price is not made.

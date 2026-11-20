@@ -88,6 +88,7 @@ fn runtimes(model: &FakeModel, tag: &str) -> Runtimes {
         codex,
         lite,
         exec: Default::default(),
+        exec_meter: Default::default(),
         clock: None,
     }
 }
@@ -1101,6 +1102,7 @@ fn exec_validators_follow_the_steps_clock() {
                 Arc::new(atomic_exec::LocalBackend::default()),
                 Some(&clock),
                 &Artifacts::none(),
+                &crate::usage::Metering::none(),
             )
             .await
             .expect("the recorded clock passes");
@@ -1114,6 +1116,7 @@ fn exec_validators_follow_the_steps_clock() {
             Arc::new(atomic_exec::LocalBackend::default()),
             None,
             &Artifacts::none(),
+            &crate::usage::Metering::none(),
         )
         .await;
         assert!(matches!(fresh, Err(AtomError::Validation(_))), "{fresh:?}");
@@ -2016,6 +2019,7 @@ fn an_exec_atom_output_names_only_artifacts_the_store_holds() {
                 Arc::new(atomic_exec::LocalBackend::default()),
                 None,
                 &Artifacts::new(store.clone()),
+                &crate::usage::Metering::none(),
             )
             .await;
             match want {
@@ -2110,6 +2114,7 @@ fn an_exec_output_cel_cannot_read_fails() {
             Arc::new(atomic_exec::LocalBackend::default()),
             None,
             &Artifacts::none(),
+            &crate::usage::Metering::none(),
         )
         .await;
         assert!(

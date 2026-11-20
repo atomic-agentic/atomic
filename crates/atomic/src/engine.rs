@@ -245,6 +245,7 @@ pub async fn open(
             ..LiteRuntime::new(endpoint, AtomConfig::default())
         },
         exec,
+        exec_meter: Default::default(),
         clock: None,
     });
     // A project in a git repository gets worktrees for its worktree steps.
