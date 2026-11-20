@@ -168,6 +168,11 @@ pub struct Resolved {
     pub sources: BTreeMap<String, Source>,
     /// Remarks for `--explain`, such as a variable that was ignored.
     pub notes: Vec<String>,
+    /// The person's own configuration file, read or not.
+    pub user: Option<PathBuf>,
+    /// Why a key the person named is not sent, when the endpoint is one the
+    /// project's files chose: a run that calls a model refuses to start.
+    pub withheld_key: Option<String>,
 }
 
 /// What resolution reads from outside: the environment, and a local
@@ -208,10 +213,7 @@ impl Surroundings<'static> {
 /// `~/.config/atomic/config.yaml`. `None` when neither variable names an
 /// absolute directory.
 pub fn user_config(env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
-    let absolute = |name: &str| env(name).map(PathBuf::from).filter(|p| p.is_absolute());
-    absolute("XDG_CONFIG_HOME")
-        .map(|d| d.join("atomic/config.yaml"))
-        .or_else(|| absolute("HOME").map(|h| h.join(".config/atomic/config.yaml")))
+    atomic_core::state::user_config_dir_in(env).map(|d| d.join("config.yaml"))
 }
 
 /// The directory whose `atomic.yaml` and siblings configure the project at
@@ -270,6 +272,27 @@ pub fn resolve(
     around: &Surroundings<'_>,
 ) -> Result<Resolved, ConfigError> {
     let user = user_config(around.env);
+    // A project could supply a "personal" file inside itself, as when the
+    // home directory is where the project is mounted.
+    if let Some(file) = &user
+        && let Ok(file) = std::fs::canonicalize(file)
+    {
+        let root = if dir.file_name().is_some_and(|n| n == ".atomic") {
+            dir.parent().unwrap_or(dir)
+        } else {
+            dir
+        };
+        if let Ok(root) = std::fs::canonicalize(root)
+            && file.starts_with(&root)
+        {
+            return Err(ConfigError::Invalid(format!(
+                "your own configuration, {}, is inside the project at {}, so the project could \
+                 have supplied it; point XDG_CONFIG_HOME, or HOME, outside the project",
+                file.display(),
+                root.display()
+            )));
+        }
+    }
     let resolved = config::resolve::<Settings>(&Layers {
         dir,
         user: user.as_deref(),
@@ -300,8 +323,16 @@ pub fn resolve(
             *slot = Some(raw);
         }
     }
-    refuse_from_project(&settings, &sources, user.as_deref())?;
+    let withheld_key = refuse_from_project(&settings, &sources, user.as_deref())?;
     let mut notes = Vec::new();
+    if let Some(why) = &withheld_key {
+        settings.model.api_key_env = None;
+        sources.insert(
+            "model.api_key_env".into(),
+            Source::Detected("not sent to an endpoint the project chose".into()),
+        );
+        notes.push(why.clone());
+    }
     let set = |v: Option<String>| v.filter(|v| !v.is_empty());
     let unset = |sources: &BTreeMap<String, Source>, path: &str| {
         matches!(sources.get(path), None | Some(Source::Default))
@@ -390,6 +421,8 @@ pub fn resolve(
         settings,
         sources,
         notes,
+        user,
+        withheld_key,
     })
 }
 
@@ -426,12 +459,9 @@ fn users_base_url(user: Option<&Path>) -> Option<String> {
 }
 
 /// Whether `url` carries a credential: a user name or password, which may
-/// be a token, or a query, which may hold a key. One that does not parse is
-/// taken to carry one.
-fn has_credential(url: &str) -> bool {
-    url::Url::parse(url).map_or(true, |u| {
-        !u.username().is_empty() || u.password().is_some() || u.query().is_some()
-    })
+/// be a token, or a query, which may hold a key.
+fn has_credential(url: &url::Url) -> bool {
+    !url.username().is_empty() || url.password().is_some() || url.query().is_some()
 }
 
 /// What the project's files may not set, because it would send something of
@@ -439,12 +469,15 @@ fn has_credential(url: &str) -> bool {
 /// whose value is sent as the model key, a key at all to an endpoint the
 /// project chose, the store for the run records, or a credential in the
 /// endpoint. Those come only from the person's own configuration
-/// ([`user_config`]), `ATOMIC_*` variables and flags.
+/// ([`user_config`]), `ATOMIC_*` variables and flags. A key the person
+/// named for an endpoint the project chose is not refused but withheld:
+/// the reason is returned, and nothing is sent.
 fn refuse_from_project(
     settings: &Settings,
     sources: &BTreeMap<String, Source>,
     user: Option<&Path>,
-) -> Result<(), ConfigError> {
+) -> Result<Option<String>, ConfigError> {
+    let mut withheld = None;
     let yours = format!(
         "your own configuration ({})",
         user.map_or_else(
@@ -481,30 +514,38 @@ fn refuse_from_project(
     }
     if let Some(at) = project_file(sources, "model.base_url", user) {
         let url = settings.model.base_url.as_deref().unwrap_or_default();
-        if has_credential(url) {
-            return Err(refuse(
-                at,
-                format!(
-                    "model.base_url carries a credential, a user, password or query, and the \
-                     project's files are shared: set it in {yours}, ATOMIC_MODEL_BASE_URL or \
-                     --model-base-url"
-                ),
-            ));
+        match url::Url::parse(url) {
+            Err(_) => {
+                return Err(refuse(
+                    at,
+                    "model.base_url does not read as a URL, such as https://host/v1".into(),
+                ));
+            }
+            Ok(parsed) if has_credential(&parsed) => {
+                return Err(refuse(
+                    at,
+                    format!(
+                        "model.base_url carries a credential, a user, password or query, and \
+                         the project's files are shared: set it in {yours}, \
+                         ATOMIC_MODEL_BASE_URL or --model-base-url"
+                    ),
+                ));
+            }
+            Ok(_) => {}
         }
         let same = |other: &str| other.trim_end_matches('/') == url.trim_end_matches('/');
         if settings.model.api_key_env.is_some()
             && let Some(key) = sources.get("model.api_key_env")
             && !users_base_url(user).is_some_and(|u| same(&u))
         {
-            return Err(refuse(
-                at,
-                format!(
-                    "model.base_url is set here, by the project, and model.api_key_env by {}: \
-                     atomic sends a key only to an endpoint the person running the project \
-                     chose. Set the same model.base_url in {yours}, or set it with \
-                     ATOMIC_MODEL_BASE_URL or --model-base-url, or unset model.api_key_env",
-                    describe(key)
-                ),
+            withheld = Some(format!(
+                "model.api_key_env, from {}, is not used: model.base_url is set by the project \
+                 ({}:{}), and atomic sends a key only to an endpoint the person running the \
+                 project chose. Set the same model.base_url in {yours}, ATOMIC_MODEL_BASE_URL \
+                 or --model-base-url to send it",
+                describe(key),
+                at.0.display(),
+                at.1
             ));
         }
     }
@@ -526,7 +567,7 @@ fn refuse_from_project(
             "runner, from {from}, must be local or process"
         )));
     }
-    Ok(())
+    Ok(withheld)
 }
 
 /// Read the settings of the project configured in `dir` as `atomic run`
@@ -714,7 +755,13 @@ impl Resolved {
         let m = &self.settings.model;
         let (base_url, name) = (m.base_url.as_deref()?, m.name.as_deref()?);
         let source = self.sources.get("model.base_url")?;
-        matches!(source, Source::Detected(_) | Source::File { .. }).then(|| {
+        // Not the person's own configuration: that endpoint they chose.
+        let announced = match source {
+            Source::Detected(_) => true,
+            Source::File { path, .. } => self.user.as_deref() != Some(path.as_path()),
+            _ => false,
+        };
+        announced.then(|| {
             format!(
                 "atomic: model {name} at {} ({}); `atomic config --explain` says why",
                 mask_url(base_url),

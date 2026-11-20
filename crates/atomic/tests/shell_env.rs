@@ -8,8 +8,13 @@
 //! entry point and under Codex's Linux sandbox, whose scripted model runs
 //! `env`, with canary values in atomic's environment for the variables that
 //! carry credentials: model and cloud keys, tokens, atomic's and Codex's own
-//! settings and database connections. None reaches the command, and the
-//! platform's core variables do.
+//! settings and database connections, and its shell profiles exporting a
+//! variable no pattern names. None reaches the command, and the platform's
+//! core variables do. The command cannot read the person's own
+//! configuration file either.
+//!
+//! This covers what the shell inherits and its configuration; files a
+//! command can read elsewhere in the home directory are another matter.
 //!
 //! Needs bubblewrap and unprivileged user namespaces, so it runs with the
 //! `sandbox-tests` feature (and `ATOMIC_DEV_SANDBOX=on` in the development
@@ -74,23 +79,44 @@ fn write_project(project: &Path) {
     }
 }
 
+/// The person's shell profiles, each exporting a variable whose name no
+/// exclusion pattern matches.
+const PROFILES: &[&str] = &[".profile", ".bash_profile", ".bashrc", ".zshenv"];
+
 #[test]
 fn an_atoms_shell_sees_none_of_the_persons_secrets() {
     support::require_sandbox();
     on_codex_runtime(async {
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("atomic-shell-env-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
+        std::fs::create_dir_all(home.join(".config/atomic")).unwrap();
+        for profile in PROFILES {
+            std::fs::write(
+                home.join(profile),
+                format!("export PROFILE_CANARY_PASSWORD=canary-profile-{profile}\n"),
+            )
+            .unwrap();
+        }
+        // The person's own configuration, which only they may read.
+        let config = home.join(".config/atomic/config.yaml");
+        std::fs::write(&config, "# canary-config\nrunner: local\n").unwrap();
+        let command = format!("env; cat {}; echo looked", config.display());
         let model = FakeModel::start(vec![
             Reply::Tool {
                 name: "exec_command".into(),
-                arguments: json!({"cmd": "env", "yield_time_ms": 20000}),
+                arguments: json!({"cmd": command, "yield_time_ms": 20000}),
+            },
+            // A login shell, asked for outright.
+            Reply::Tool {
+                name: "exec_command".into(),
+                arguments: json!({"cmd": "echo logged-in", "login": true, "yield_time_ms": 20000}),
             },
             Reply::Text(r#"{"done": true}"#.into()),
         ])
         .await
         .unwrap();
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-            .join(format!("atomic-shell-env-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("home")).unwrap();
         let project = dir.join("project");
         write_project(&project);
         let mut command = Command::new(env!("CARGO_BIN_EXE_atomic"));
@@ -125,17 +151,35 @@ fn an_atoms_shell_sees_none_of_the_persons_secrets() {
             String::from_utf8_lossy(&out.stderr)
         );
         let requests = model.requests();
-        let printed: String = requests.get(1).expect("Codex answered the tool call")["input"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|item| item["type"] == "function_call_output")
-            .map(|item| item["output"].as_str().unwrap_or_default().to_owned())
-            .collect::<Vec<_>>()
-            .join("\n");
+        let output_of = |n: usize| -> String {
+            requests.get(n).expect("Codex answered the tool call")["input"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|item| item["type"] == "function_call_output")
+                .map(|item| item["output"].as_str().unwrap_or_default().to_owned())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let printed = output_of(1);
+        // The next request carries both outputs; the login shell is refused.
+        let login = output_of(2).replace(&printed, "");
+        assert!(
+            !login.contains("logged-in") && login.contains("login shell is disabled"),
+            "a login shell ran: {login}"
+        );
         // The command ran, and saw the core variables.
         assert!(printed.contains("PATH="), "{printed}");
-        assert!(printed.contains("HOME="), "{printed}");
+        assert!(printed.contains("HOME=/nonexistent"), "{printed}");
+        assert!(printed.contains("looked"), "{printed}");
+        assert!(
+            !printed.contains("PROFILE_CANARY"),
+            "a shell profile ran: {printed}"
+        );
+        assert!(
+            !printed.contains("canary-config"),
+            "the command read the person's configuration: {printed}"
+        );
         for name in CANARIES {
             assert!(
                 !printed.contains(&format!("{name}=")) && !printed.contains("canary"),

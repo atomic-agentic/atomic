@@ -141,8 +141,9 @@ pub struct PrivateState {
     /// The project's state directory: its `private/` directory is denied,
     /// and each thread gets its temporary directory in its `tmp/`.
     pub state_dir: PathBuf,
-    /// Other directories denied whole: the context key and the credential
-    /// file store.
+    /// Other directories denied whole: the context key, the credential file
+    /// store and the person's own configuration, which can name a store
+    /// with its password or an endpoint with its credential.
     pub also: Vec<PathBuf>,
 }
 
@@ -159,6 +160,9 @@ impl StateGuard {
     pub fn deny_state_dir(state_dir: impl Into<PathBuf>) -> anyhow::Result<Self> {
         let mut also = vec![crate::state::credentials_dir()?];
         also.push(crate::context::default_key_dir().map_err(anyhow::Error::msg)?);
+        // Made if missing, like the others, so it is denied from the start
+        // and a file put there later is denied too.
+        also.extend(crate::state::user_config_dir());
         for dir in &also {
             crate::state::private_dir(dir)?;
         }
@@ -204,6 +208,11 @@ fn denied_paths(private: &PrivateState, codex_home: &Path) -> (Vec<PathBuf>, Vec
         }
         all.push(path);
     }
+    // A path inside another denied path is denied with it, and the sandbox
+    // cannot mount a denial inside one: such as the credential store inside
+    // the person's own configuration directory.
+    let inside_another = |p: &PathBuf| all.iter().any(|q| q != p && p.starts_with(q));
+    let all: Vec<PathBuf> = all.iter().filter(|p| !inside_another(p)).cloned().collect();
     // Codex creates its state database when the first thread starts, after
     // the list above is made: a pattern, expanded when each command starts,
     // covers it.
@@ -693,6 +702,9 @@ where
     // Set with the permissions, which start from Codex's defaults, so every
     // thread's shell gets it.
     confine_shell_environment(&mut config.permissions.shell_environment_policy);
+    // A login shell would run the person's profile, which can export
+    // anything; commands run in a plain shell.
+    config.permissions.allow_login_shell = false;
     let mut writable_roots = spec.writable_roots.clone();
     writable_roots.push(cwd.to_owned());
     refuse_uncovered_store(spec.sandbox, guard, &writable_roots)?;
@@ -1148,12 +1160,19 @@ pub const SHELL_EXCLUDES: &[&str] = &[
     "*_API_KEY",
 ];
 
+/// The home directory an atom's shell is given: one that does not exist.
+/// Codex runs commands in the person's own shell, which reads startup files
+/// from the home directory even when it is not a login shell (bash's
+/// `.bashrc` when its input is a socket, zsh's `.zshenv` always), and those
+/// can export anything.
+pub const SHELL_HOME: &str = "/nonexistent";
+
 /// The environment an atom's shell starts from: only the platform's core
-/// variables (`PATH`, `HOME`, `USER`, the locale and the like), less any
-/// whose name holds `KEY`, `SECRET` or `TOKEN`, less [`SHELL_EXCLUDES`].
-/// The model chooses the commands, and it can be any endpoint, so nothing
-/// of the person's environment reaches it by default. A variable an atom
-/// declares is set on top.
+/// variables (`PATH`, `USER`, the locale and the like), less any whose name
+/// holds `KEY`, `SECRET` or `TOKEN`, less [`SHELL_EXCLUDES`], with `HOME`
+/// at [`SHELL_HOME`]. The model chooses the commands, and it can be any
+/// endpoint, so none of the person's inherited environment or shell
+/// startup files reach it. A variable an atom declares is set on top.
 fn confine_shell_environment(policy: &mut codex_protocol::config_types::ShellEnvironmentPolicy) {
     use codex_protocol::config_types::{EnvironmentVariablePattern, ShellEnvironmentPolicyInherit};
     policy.inherit = ShellEnvironmentPolicyInherit::Core;
@@ -1164,6 +1183,7 @@ fn confine_shell_environment(policy: &mut codex_protocol::config_types::ShellEnv
             .push(EnvironmentVariablePattern::new_case_insensitive(pattern));
     }
     policy.use_profile = false;
+    policy.r#set.insert("HOME".into(), SHELL_HOME.into());
 }
 
 /// How long a turn waits for the thread to finish settling the previous one.
@@ -1288,6 +1308,26 @@ mod tests {
     use crate::testing::{FakeModel, Reply};
 
     #[test]
+    fn a_denied_path_inside_another_is_left_to_it() {
+        let dir = scratch("nested-deny");
+        let config = dir.join("config/atomic");
+        let credentials = config.join("credentials");
+        std::fs::create_dir_all(&credentials).expect("dirs");
+        std::fs::create_dir_all(dir.join("codex")).expect("codex home");
+        let private = PrivateState {
+            state_dir: dir.join("state"),
+            also: vec![credentials.clone(), dir.join("key"), config.clone()],
+        };
+        let (denied, _) = denied_paths(&private, &dir.join("codex"));
+        assert!(denied.contains(&config), "{denied:?}");
+        assert!(denied.contains(&dir.join("key")), "{denied:?}");
+        assert!(
+            !denied.iter().any(|p| p.starts_with(&credentials)),
+            "the sandbox cannot deny inside a denied directory: {denied:?}"
+        );
+    }
+
+    #[test]
     fn an_atoms_shell_inherits_no_secret() {
         let mut policy = codex_protocol::config_types::ShellEnvironmentPolicy::default();
         confine_shell_environment(&mut policy);
@@ -1313,6 +1353,7 @@ mod tests {
         let mut kept: Vec<&str> = env.keys().map(String::as_str).collect();
         kept.sort_unstable();
         assert_eq!(kept, ["HOME", "LANG", "NOTE_DIR", "PATH"], "{env:?}");
+        assert_eq!(env["HOME"], SHELL_HOME, "never the person's home");
     }
 
     #[test]

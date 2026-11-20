@@ -154,11 +154,14 @@ declarations would replace an atom's own `.atomic/types/<atom>.d.ts` is an error
 | `context` | Optional public execution-context schema; a context sidecar is also accepted. See [context schemas](#context-schemas) |
 | `exec`, `effects`, `env` | An exec atom's command, what it does outside Atomic, and its environment. See [exec atoms](#exec-atoms) |
 
-A Codex atom's shell starts from the platform's core variables only, such as
+A Codex atom's shell inherits only the platform's core variables, such as
 `PATH`, `HOME`, `USER` and the locale, without any whose name holds `KEY`,
-`SECRET` or `TOKEN`, and never sees `ATOMIC_*`, `OPENAI_*`, `CODEX_*`,
-`AWS_*`, `PG*`, `DATABASE_URL` or any `*_API_KEY`. The model chooses its
-commands, so nothing of your environment reaches the model through them.
+`SECRET` or `TOKEN`, and never `ATOMIC_*`, `OPENAI_*`, `CODEX_*`, `AWS_*`,
+`PG*`, `DATABASE_URL` or any `*_API_KEY`. Its `HOME` is a directory that
+does not exist and it is not a login shell, so none of your shell startup
+files run, and your own atomic configuration directory is denied to it. The model chooses its commands, so this keeps your inherited
+environment from the model; it does not yet cover credentials in files
+elsewhere in your home directory.
 
 Some integrations shown in the catalog remain staged. Unavailable permissions,
 remote atoms, credentials, skills and runtime declarations fail explicitly in the

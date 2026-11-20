@@ -557,48 +557,61 @@ fn the_probe_gives_up_at_its_deadline_however_slowly_an_answer_trickles() {
 }
 
 #[test]
-fn a_key_is_sent_to_an_endpoint_the_project_chose_only_if_the_person_chose_it_too() {
+fn a_key_goes_to_an_endpoint_the_project_chose_only_if_the_person_chose_it_too() {
     let d = dir(&[(
         "atomic.yaml",
         "atomic: 1\nname: notes\nmodel:\n  base_url: https://example.com/v1\n  name: m\n",
     )]);
-    // The person's shell names a key; the project names where it goes.
-    let said = resolved_where(
+    let withheld = |r: &Resolved| {
+        assert_eq!(r.settings.model.api_key_env, None, "no key is sent");
+        assert_eq!(r.endpoint().and_then(|e| e.api_key_env), None);
+        let why = r.withheld_key.clone().expect("withheld, and why");
+        assert!(r.notes.contains(&why), "{:?}", r.notes);
+        why
+    };
+    // The person's shell names a key; the project names where it goes. The
+    // settings still resolve, for commands that call no model.
+    let r = resolved(
         &d,
         &EngineArgs::default(),
         &[("ATOMIC_MODEL_API_KEY_ENV", "OPENAI_API_KEY")],
         &nobody,
-    )
-    .expect_err("refused")
-    .to_string();
-    assert!(said.contains("atomic.yaml:4"), "{said}");
+    );
+    let why = withheld(&r);
+    assert!(why.contains("atomic.yaml:4"), "{why}");
     assert!(
-        said.contains("environment variable ATOMIC_MODEL_API_KEY_ENV"),
-        "{said}"
+        why.contains("environment variable ATOMIC_MODEL_API_KEY_ENV"),
+        "{why}"
     );
     // So is a flag's, and one from the person's own configuration.
     let args = EngineArgs {
         model_api_key_env: Some("MY_KEY".into()),
         ..EngineArgs::default()
     };
-    let said = resolved_where(&d, &args, &[], &nobody)
-        .expect_err("refused")
-        .to_string();
-    assert!(said.contains("flag --model-api-key-env"), "{said}");
+    let why = withheld(&resolved(&d, &args, &[], &nobody));
+    assert!(why.contains("flag --model-api-key-env"), "{why}");
     let (_home, home) = person("model:\n  api_key_env: MY_KEY\n");
-    let said = resolved_where(&d, &EngineArgs::default(), &[("HOME", &home)], &nobody)
-        .expect_err("refused")
-        .to_string();
-    assert!(said.contains(".config/atomic/config.yaml:2"), "{said}");
-    // The person's configuration naming the same endpoint takes the key; a
-    // different one does not.
+    let why = withheld(&resolved(
+        &d,
+        &EngineArgs::default(),
+        &[("HOME", &home)],
+        &nobody,
+    ));
+    assert!(why.contains(".config/atomic/config.yaml:2"), "{why}");
+    let (_home, home) =
+        person("model:\n  base_url: https://other.example.com/v1\n  api_key_env: MY_KEY\n");
+    withheld(&resolved(
+        &d,
+        &EngineArgs::default(),
+        &[("HOME", &home)],
+        &nobody,
+    ));
+    // The person's configuration naming the same endpoint takes the key.
     let (_home, home) =
         person("model:\n  base_url: https://example.com/v1/\n  api_key_env: MY_KEY\n");
     let r = resolved(&d, &EngineArgs::default(), &[("HOME", &home)], &nobody);
     assert_eq!(r.settings.model.api_key_env.as_deref(), Some("MY_KEY"));
-    let (_home, home) =
-        person("model:\n  base_url: https://other.example.com/v1\n  api_key_env: MY_KEY\n");
-    resolved_where(&d, &EngineArgs::default(), &[("HOME", &home)], &nobody).expect_err("refused");
+    assert_eq!(r.withheld_key, None);
     // An endpoint the person sets by variable or flag takes the key.
     let r = resolved(
         &d,
@@ -613,6 +626,49 @@ fn a_key_is_sent_to_an_endpoint_the_project_chose_only_if_the_person_chose_it_to
         r.settings.model.api_key_env.as_deref(),
         Some("OPENAI_API_KEY")
     );
+    assert_eq!(r.withheld_key, None);
+}
+
+#[test]
+fn a_projects_endpoint_that_is_not_a_url_is_refused_as_one() {
+    let d = dir(&[(
+        "atomic.yaml",
+        "atomic: 1\nname: notes\nmodel:\n  base_url: example.com/v1\n",
+    )]);
+    let said = resolved_where(&d, &EngineArgs::default(), &[], &nobody)
+        .expect_err("refused")
+        .to_string();
+    assert!(said.contains("does not read as a URL"), "{said}");
+    assert!(!said.contains("credential"), "{said}");
+}
+
+#[test]
+fn a_personal_configuration_inside_the_project_is_refused() {
+    // The home directory is where the project is.
+    let d = dir(&[("atomic.yaml", MANIFEST_ONLY)]);
+    std::fs::create_dir_all(d.join(".config/atomic")).expect("config dir");
+    std::fs::write(d.join(".config/atomic/config.yaml"), "runner: local\n").expect("config");
+    let said = resolved_where(
+        &d,
+        &EngineArgs::default(),
+        &[("HOME", &d.display().to_string())],
+        &nobody,
+    )
+    .expect_err("refused")
+    .to_string();
+    assert!(said.contains("inside the project"), "{said}");
+    // Outside it, it is read.
+    let (_home, home) = person("runner: process\n");
+    let r = resolved(&d, &EngineArgs::default(), &[("HOME", &home)], &nobody);
+    assert_eq!(r.settings.runner, "process");
+}
+
+#[test]
+fn an_endpoint_the_person_configured_is_not_announced() {
+    let d = dir(&[("atomic.yaml", MANIFEST_ONLY)]);
+    let (_home, home) = person("model:\n  base_url: http://127.0.0.1:8000/v1\n  name: m\n");
+    let r = resolved(&d, &EngineArgs::default(), &[("HOME", &home)], &nobody);
+    assert_eq!(r.announcement(), None);
 }
 
 #[test]

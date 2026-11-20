@@ -283,6 +283,22 @@ pub fn credentials_dir() -> Result<PathBuf, StateError> {
     }
 }
 
+/// The directory of the person's own configuration, which no project
+/// supplies: `$XDG_CONFIG_HOME/atomic`, by default `~/.config/atomic`, on
+/// every platform. `None` when neither variable, as `env` reads them, names
+/// an absolute directory.
+pub fn user_config_dir_in(env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    let absolute = |name: &str| env(name).map(PathBuf::from).filter(|p| p.is_absolute());
+    absolute("XDG_CONFIG_HOME")
+        .map(|d| d.join("atomic"))
+        .or_else(|| absolute("HOME").map(|h| h.join(".config/atomic")))
+}
+
+/// [`user_config_dir_in`] this process's environment.
+pub fn user_config_dir() -> Option<PathBuf> {
+    user_config_dir_in(&|name| std::env::var(name).ok())
+}
+
 /// Create `dir` if needed, readable by its owner only.
 pub(crate) fn private_dir(dir: &Path) -> Result<(), StateError> {
     let fail = |source| StateError::Create {

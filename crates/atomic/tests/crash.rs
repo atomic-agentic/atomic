@@ -681,6 +681,8 @@ fn child(
         // No model endpoint from this machine: no Ollama, no key.
         .env("ATOMIC_DETECT_OLLAMA_ADDR", "127.0.0.1:9")
         .env_remove("OPENAI_API_KEY")
+        // None of the developer's own configuration.
+        .env("XDG_CONFIG_HOME", dir.join("config"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(std::fs::File::create(&stderr).expect("stderr"));

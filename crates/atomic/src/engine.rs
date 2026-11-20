@@ -88,6 +88,19 @@ pub fn settings(state: &ProjectState, args: &EngineArgs) -> anyhow::Result<setti
 
 /// The model endpoint, or with `required`, a failure saying how to set one.
 fn endpoint(resolved: &settings::Resolved, required: bool) -> anyhow::Result<ModelEndpoint> {
+    // The person's key goes nowhere the project chose: a run that calls a
+    // model has no model access until they choose the endpoint.
+    if required && let Some(why) = &resolved.withheld_key {
+        return Err(Failure::new(
+            "config.model",
+            format!("model atoms need a model endpoint you chose, and {why}"),
+            "set OPENAI_API_KEY to use OpenAI's API, start Ollama on this machine, or set \
+             ATOMIC_MODEL_BASE_URL and ATOMIC_MODEL (or pass --model-base-url and --model), \
+             and ATOMIC_MODEL_API_KEY_ENV if the endpoint needs a key; `atomic config \
+             --explain` shows what was found",
+        )
+        .into());
+    }
     match resolved.endpoint() {
         Some(endpoint) => Ok(endpoint),
         None if required => Err(Failure::new(

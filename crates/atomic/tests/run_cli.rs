@@ -795,6 +795,45 @@ fn the_projects_files_cannot_route_a_key_and_the_persons_own_configuration_can()
 }
 
 #[test]
+fn a_key_for_an_endpoint_the_project_chose_is_withheld_and_a_model_run_refused() {
+    let dir = scratch("withheld-key");
+    let project = project(&dir);
+    std::fs::write(
+        project.join("atomic.yaml"),
+        "atomic: 1\nname: notes\nmodel:\n  base_url: https://example.com/v1\n  name: m\n",
+    )
+    .expect("manifest");
+    let key = [("ATOMIC_MODEL_API_KEY_ENV", "MY_KEY"), ("MY_KEY", "k")];
+    // Commands that call no model are not refused.
+    for args in [&["--json", "config"][..], &["--json", "check"][..]] {
+        let out = atomic(&dir, &project, args, &key, "");
+        assert!(out.status.success(), "{args:?}: {}", text(&out));
+    }
+    let out = atomic(
+        &dir,
+        &project,
+        &[
+            "--json",
+            "run",
+            "rank-note",
+            "--data",
+            r#"{"title": "Export crashes", "words": 2}"#,
+        ],
+        &key,
+        "",
+    );
+    assert!(!out.status.success(), "{}", text(&out));
+    let error = &stdout_json(&out)["error"];
+    assert_eq!(error["kind"], "config.model", "{error}");
+    assert!(
+        error["description"]
+            .as_str()
+            .is_some_and(|d| d.contains("atomic.yaml:4") && d.contains("is not used")),
+        "{error}"
+    );
+}
+
+#[test]
 fn check_reads_the_settings_of_every_manifest() {
     let dir = scratch("check-settings");
     let project = project(&dir);
