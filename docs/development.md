@@ -106,19 +106,27 @@ database in its own output, with none of them ignored, and every test binary
 to report its result. It then runs the workspace's tests whose names say
 postgres, which adds the command-line tests in
 `crates/atomic/tests/run_cli.rs`, and requires every one to fail so, with the
-database unset and with it unreachable.
+database unset and with it unreachable: a test that passes or is ignored
+there is a failure of the check. Tests are told apart by binary and name, and
+each binary's own count of passed, failed and ignored tests must match the
+tests it listed. `scripts/backends-check-audit-test.sh` tests the reading of
+cargo's output, plain and coloured.
 
 Every checkout's tests share the one database, so each test reaches it only
 through `atomic_durable::testing::schema`, which gives it a schema of its own
 and drops that schema when the test ends, passed or failed. A schema's name is
-`atomic_test_<seconds>_<tag>_<process>_<n>_<random>`; the random part keeps
-names apart across containers, whose process IDs repeat. A test process that
+`atomic_test_<seconds>_<tag>_<process>_<n>_<random>`, with a tag of at most 16
+bytes so the name fits PostgreSQL's 63; the random part keeps names apart
+across containers, whose process IDs repeat. A schema a sweep cannot drop,
+because a lock on it is still held, is reported and left for the next sweep. A test process that
 was killed leaves its schemas behind; the first schema each test process asks
 for also sweeps those more than an hour old, and those older tests named under
 a known prefix with the time last. A test in
 `crates/atomic-durable/tests/test_database.rs` fails if anything else reads
 `ATOMIC_TEST_DATABASE_URL`, or if anything outside `atomic-agentic-durable`
-and `run_cli.rs`, the two places the check covers, uses the database.
+and `run_cli.rs`, the two places the check covers, uses the database: by
+naming `atomic_durable::testing`, importing `testing` from `atomic_durable`,
+renaming `atomic_durable`, or naming `testing::schema` or `TestSchema`.
 
 The database keeps its data on a 1 GB tmpfs under a 1.5 GB memory limit, with
 a small write-ahead log; a container started before that change keeps its old

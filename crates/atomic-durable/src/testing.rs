@@ -139,7 +139,7 @@ impl Drop for TestSchema {
                 .enable_all()
                 .build()
                 .map_err(|e| e.to_string())?
-                .block_on(drop_schema(&url, &name))
+                .block_on(drop_schema(&url, &name, LOCK_WAIT))
         })
         .join();
         match dropped {
@@ -151,18 +151,18 @@ impl Drop for TestSchema {
     }
 }
 
-/// A fresh schema for a test, named after `tag`: 1 to 20 lowercase ASCII
+/// A fresh schema for a test, named after `tag`: 1 to 16 lowercase ASCII
 /// letters, digits and `_`. Panics, naming what is missing, when the database
 /// is not configured or does not answer, and on any other tag.
 pub async fn schema(tag: &str) -> TestSchema {
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     static SWEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     assert!(
-        (1..=20).contains(&tag.len())
+        (1..=16).contains(&tag.len())
             && tag
                 .bytes()
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
-        "a test schema's tag is 1 to 20 of a-z, 0-9 and _, not {tag:?}"
+        "a test schema's tag is 1 to 16 of a-z, 0-9 and _, not {tag:?}"
     );
     let url = database().await;
     if !SWEPT.swap(true, std::sync::atomic::Ordering::SeqCst) {
@@ -184,11 +184,19 @@ fn name_for(tag: &str, at: Duration, n: usize) -> String {
     // as good as the process ID.
     let _ = getrandom::fill(&mut token);
     let token: String = token.iter().map(|b| format!("{b:02x}")).collect();
-    format!(
+    let name = format!(
         "{PREFIX}{}_{tag}_{}_{n}_{token}",
         at.as_secs(),
         std::process::id()
-    )
+    );
+    // PostgreSQL cuts a longer identifier short, and two cut names could
+    // meet; with a 16-byte tag this holds up to the hundred-thousandth
+    // schema of a process.
+    assert!(
+        name.len() <= 63,
+        "the test schema name {name} is longer than PostgreSQL's 63 bytes"
+    );
+    name
 }
 
 /// Drop every schema a test process made more than `older_than` ago: one
@@ -196,6 +204,14 @@ fn name_for(tag: &str, at: Duration, n: usize) -> String {
 /// prefix in [`EARLIER`]. A schema that cannot be dropped is reported and
 /// left for the next sweep. Returns how many were dropped.
 pub async fn sweep(url: &str, older_than: Duration) -> usize {
+    sweep_waiting(url, older_than, LOCK_WAIT).await
+}
+
+/// How long dropping one schema waits for a lock someone else holds on it.
+const LOCK_WAIT: Duration = Duration::from_secs(10);
+
+/// [`sweep`], waiting at most `lock_wait` for each schema's locks.
+async fn sweep_waiting(url: &str, older_than: Duration, lock_wait: Duration) -> usize {
     let names: Vec<(String,)> = match connect(url).await {
         Ok(mut connection) => {
             let names = sqlx::query_as("SELECT nspname::text FROM pg_namespace")
@@ -219,7 +235,7 @@ pub async fn sweep(url: &str, older_than: Duration) -> usize {
     let mut dropped = 0;
     for (name,) in names {
         if made_at(&name).is_some_and(|at| at < cutoff) {
-            match drop_schema(url, &name).await {
+            match drop_schema(url, &name, lock_wait).await {
                 Ok(()) => dropped += 1,
                 Err(e) => eprintln!("could not drop the stale test schema {name}: {e}"),
             }
@@ -254,12 +270,13 @@ fn made_at(name: &str) -> Option<Duration> {
     }
 }
 
-async fn drop_schema(url: &str, name: &str) -> Result<(), String> {
+async fn drop_schema(url: &str, name: &str, lock_wait: Duration) -> Result<(), String> {
     let mut connection = connect(url).await?;
     // A connection an engine left behind may still hold a lock; wait a
     // little, then leave the schema to a sweep.
     let dropped = sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-        "SET lock_timeout = '10s'; DROP SCHEMA IF EXISTS \"{}\" CASCADE",
+        "SET lock_timeout = '{}ms'; DROP SCHEMA IF EXISTS \"{}\" CASCADE",
+        lock_wait.as_millis(),
         name.replace('"', "\"\"")
     )))
     .execute(&mut connection)
@@ -379,9 +396,45 @@ mod tests {
             }
         }
         for name in leftover {
-            drop_schema(&url, name).await.expect("clean up");
+            drop_schema(&url, name, LOCK_WAIT).await.expect("clean up");
         }
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// A schema the sweep cannot drop, because a lock on it is held, is
+    /// reported and left, and the sweep goes on to drop the next one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_sweep_goes_on_past_a_schema_it_cannot_drop_on_postgres() {
+        let url = database().await;
+        let old = now() - STALE - Duration::from_secs(60);
+        let (held, next) = (name_for("sweeplock", old, 1), name_for("sweeplock", old, 2));
+        let mut connection = connect(&url).await.expect("connect");
+        for name in [&held, &next] {
+            sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                "CREATE SCHEMA \"{name}\"; CREATE TABLE \"{name}\".t (x int)"
+            )))
+            .execute(&mut connection)
+            .await
+            .expect("create");
+        }
+        // Another session holds a lock on a table in one of them.
+        let mut holder = connect(&url).await.expect("connect");
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "BEGIN; LOCK TABLE \"{held}\".t IN ACCESS SHARE MODE"
+        )))
+        .execute(&mut holder)
+        .await
+        .expect("lock");
+        sweep_waiting(&url, STALE, Duration::from_millis(200)).await;
+        let (kept, dropped) = (exists(&url, &held).await, !exists(&url, &next).await);
+        sqlx::raw_sql("ROLLBACK")
+            .execute(&mut holder)
+            .await
+            .expect("unlock");
+        let _ = drop_schema(&url, &held, LOCK_WAIT).await;
+        let _ = drop_schema(&url, &next, LOCK_WAIT).await;
+        assert!(kept, "{held} was locked, and is left for the next sweep");
+        assert!(dropped, "{next} was dropped all the same");
     }
 
     #[test]
@@ -426,10 +479,13 @@ mod tests {
             "{a}"
         );
         assert!(a.len() <= 63, "{a} fits a PostgreSQL identifier");
+        // The longest tag, far into a process's schemas, still fits.
+        let long = name_for("abcdefghijklmnop", at, 99_999);
+        assert!(long.len() <= 63, "{long}");
     }
 
     #[tokio::test]
-    #[should_panic(expected = "a test schema's tag is 1 to 20 of a-z, 0-9 and _")]
+    #[should_panic(expected = "a test schema's tag is 1 to 16 of a-z, 0-9 and _")]
     async fn a_tag_outside_its_charset_is_refused() {
         let _ = schema("Has-Dash").await;
     }
