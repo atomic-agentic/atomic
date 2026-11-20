@@ -44,6 +44,7 @@ fn runtimes(base_url: &str, model: &str, root: &Path) -> Runtimes {
             defaults: AtomConfig::default(),
             artifacts: Artifacts::none(),
             meter: crate::usage::Metering::none(),
+            backend: Default::default(),
         },
         lite: crate::lite::LiteRuntime::new(endpoint, AtomConfig::default()),
         exec: Default::default(),
@@ -286,9 +287,14 @@ async fn the_same_request_twice_is_recorded_twice_and_replayed_in_order() {
         .await
         .expect("fake model");
     let upstream = model.base_url();
+    // A temporary file a cut-short recording left is cleared away.
+    std::fs::create_dir_all(&tapes).expect("tapes");
+    let stale = tapes.join(".abc.json.0123456789abcdef.tmp");
+    std::fs::write(&stale, "half").expect("stale");
     let recorder = Cassette::start(&tapes, &root, &upstream, Mode::Record)
         .await
         .expect("cassette");
+    assert!(!stale.exists(), "a stale temporary file is left");
     let first = post(&recorder, "/v1/chat/completions", ASK, None).await;
     let second = post(&recorder, "/v1/chat/completions", ASK, None).await;
     assert_ne!(first.1, second.1, "two answers to the same request");

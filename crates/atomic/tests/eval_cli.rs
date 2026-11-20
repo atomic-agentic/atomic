@@ -29,7 +29,9 @@ const ATOMIC: &str = env!("CARGO_BIN_EXE_atomic");
 
 fn scratch(tag: &str) -> PathBuf {
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let dir = std::env::temp_dir().join(format!(
+    // Not under /tmp: the project's scratch directories may not be where a
+    // sandboxed turn may write.
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
         "atomic-eval-cli-{tag}-{}-{}",
         std::process::id(),
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -249,6 +251,29 @@ fn atomic_eval_records_replays_offline_and_fails_ci_on_a_pass_rate_drop() {
             "{out}"
         );
 
+        // A recorded answer that no longer satisfies its case, once the
+        // case expects something else, fails it on replay with no call.
+        let cases = project.join("evals/note/cases.jsonl");
+        let original = std::fs::read_to_string(&cases).expect("cases");
+        std::fs::write(
+            &cases,
+            original.replace("output.ticket == 'BUG-1'", "output.ticket == 'BUG-2'"),
+        )
+        .expect("cases");
+        let out = eval_async(&dir, &project, &url, &["note", "--json"]).await;
+        assert!(!out.status.success(), "{}", text(&out));
+        let report: Value = serde_json::from_slice(&out.stdout).expect("one JSON report");
+        assert_eq!(report["cassettes"][0]["replayed"], 2, "{report}");
+        assert_eq!(report["cassettes"][0]["missed"], 0, "{report}");
+        assert!(
+            report["reports"][0]["cases"][0]["failures"][0]
+                .as_str()
+                .is_some_and(|f| f.contains("BUG-2")),
+            "{report}"
+        );
+        assert_eq!(model.calls(), 3);
+        std::fs::write(&cases, original).expect("cases");
+
         // A regression: a case the recorded answers do not satisfy drops the
         // pass rate below the atom's threshold, and CI fails.
         let cases = project.join("evals/note/cases.jsonl");
@@ -460,6 +485,11 @@ fn a_live_eval_is_metered_and_stopped_by_its_budget() {
         assert!(!out.status.success(), "{}", text(&out));
         assert!(text(&out).contains("atom capped: budget"), "{}", text(&out));
         assert_eq!(model.calls(), 2, "no call was made");
+        // Every budget is resolved before any call: an atom after it that
+        // could run makes none either.
+        let out = eval_async(&dir, &project, &url, &["note", "capped", "--live"]).await;
+        assert!(!out.status.success(), "{}", text(&out));
+        assert_eq!(model.calls(), 2, "no call was made");
         let _ = std::fs::remove_dir_all(&dir);
     });
 }
@@ -504,7 +534,7 @@ fn a_replay_reads_no_api_key_and_sends_none() {
 }
 
 #[test]
-fn an_atom_that_could_write_or_a_codex_atom_under_cassettes_is_refused() {
+fn atoms_it_cannot_run_yet_are_listed_and_the_rest_run() {
     on_codex_runtime(async {
         let dir = scratch("refused");
         let project = project(&dir, None);
@@ -518,6 +548,18 @@ fn an_atom_that_could_write_or_a_codex_atom_under_cassettes_is_refused() {
         add_atom(&project, "reader", "kind: 'codex'", &row);
         add_atom(
             &project,
+            "undeclared",
+            "kind: 'exec', exec: { command: ['true'] }",
+            &row,
+        );
+        add_atom(
+            &project,
+            "sender",
+            "kind: 'exec', exec: { command: ['true'] }, effects: { external: 'idempotent' }",
+            &[],
+        );
+        add_atom(
+            &project,
             "lookup",
             "kind: 'exec', exec: { command: ['true'] }, effects: { external: 'read-only' }",
             &row,
@@ -526,7 +568,8 @@ fn an_atom_that_could_write_or_a_codex_atom_under_cassettes_is_refused() {
         let url = model.base_url();
         for (atom, args, says) in [
             ("writer", &["--no-cassettes"][..], "may write files"),
-            ("lookup", &[][..], "declares effects"),
+            ("undeclared", &[][..], "declares no effects"),
+            ("sender", &[][..], "writes to an outside system"),
             ("reader", &[][..], "is a Codex atom"),
             ("reader", &["--live"][..], "is a Codex atom"),
         ] {
@@ -535,8 +578,56 @@ fn an_atom_that_could_write_or_a_codex_atom_under_cassettes_is_refused() {
             let out = eval_async(&dir, &project, &url, &all).await;
             assert!(!out.status.success(), "{atom} {args:?}: {}", text(&out));
             assert!(text(&out).contains(says), "{atom}: {}", text(&out));
+            assert!(
+                text(&out).contains(&format!("REFUSED {atom}")),
+                "{}",
+                text(&out)
+            );
         }
-        assert_eq!(model.calls(), 0);
+        // An exec atom declared to only read is not refused.
+        let out = eval_async(&dir, &project, &url, &["lookup", "--json"]).await;
+        let report: Value = serde_json::from_slice(&out.stdout).expect("one JSON report");
+        assert_eq!(report["refused"], json!([]), "{report}");
+        assert_eq!(report["reports"][0]["atom"], "lookup");
+
+        // Refused atoms are listed with their reasons; the others run, and
+        // the command fails while any is refused, unless told to skip them.
+        let junit = dir.join("mixed.xml");
+        let j = junit.display().to_string();
+        let mixed = [
+            "note",
+            "writer",
+            "undeclared",
+            "--live",
+            "--junit",
+            j.as_str(),
+        ];
+        let out = eval_async(&dir, &project, &url, &mixed).await;
+        assert!(!out.status.success(), "{}", text(&out));
+        let said = text(&out);
+        assert!(said.contains("PASS note"), "{said}");
+        assert!(
+            said.contains("REFUSED writer") && said.contains("REFUSED undeclared"),
+            "{said}"
+        );
+        let xml = std::fs::read_to_string(&junit).expect("junit");
+        assert!(
+            xml.contains("<testsuite name=\"writer\" tests=\"1\" failures=\"1\""),
+            "{xml}"
+        );
+        let mut skipping = mixed.to_vec();
+        skipping.push("--skip-refused");
+        let out = eval_async(&dir, &project, &url, &skipping).await;
+        assert!(out.status.success(), "{}", text(&out));
+        assert!(text(&out).contains("SKIPPED writer"), "{}", text(&out));
+        let xml = std::fs::read_to_string(&junit).expect("junit");
+        assert!(
+            xml.contains(
+                "<testsuite name=\"writer\" tests=\"1\" failures=\"0\" errors=\"0\" skipped=\"1\""
+            ),
+            "{xml}"
+        );
+        assert_eq!(model.calls(), 4, "only note's cases reached the model");
         let _ = std::fs::remove_dir_all(&dir);
     });
 }

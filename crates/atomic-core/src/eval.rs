@@ -863,9 +863,43 @@ pub fn junit(report: &Report) -> String {
 
 /// `reports` as one JUnit XML document, a test suite per atom.
 pub fn junit_all(reports: &[Report]) -> String {
+    junit_with(reports, &[])
+}
+
+/// An atom an eval did not run, and why: a suite of one test case, failed
+/// when not running it fails the eval and skipped otherwise.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Unrun {
+    /// The atom.
+    pub atom: String,
+    /// Why it did not run.
+    pub reason: String,
+    /// Whether that fails the eval.
+    pub fails: bool,
+}
+
+/// `reports` and the atoms in `unrun` as one JUnit XML document.
+pub fn junit_with(reports: &[Report], unrun: &[Unrun]) -> String {
     let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<testsuites>\n");
     for report in reports {
         xml.push_str(&suite(report));
+    }
+    for u in unrun {
+        let (failures, skipped, element) = if u.fails {
+            (
+                1,
+                0,
+                format!("<failure message=\"{}\"/>", escape(&u.reason)),
+            )
+        } else {
+            (0, 1, "<skipped/>".to_owned())
+        };
+        xml.push_str(&format!(
+            "  <testsuite name=\"{atom}\" tests=\"1\" failures=\"{failures}\" errors=\"0\" \
+             skipped=\"{skipped}\">\n    <testcase classname=\"{atom}\" name=\"run\">\n      \
+             {element}\n    </testcase>\n  </testsuite>\n",
+            atom = escape(&u.atom)
+        ));
     }
     xml.push_str("</testsuites>\n");
     xml

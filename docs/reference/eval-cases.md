@@ -149,7 +149,11 @@ runs without changing what is asked. A recording answers only that request:
 changed instructions, a changed schema, another model or other settings miss, and
 the eval fails saying how to record it, whatever its pass rate. The same request
 made twice, as two cases with the same input make it, is recorded twice and
-replayed in the same order. A recording that cannot be read whole, or that
+replayed in the same order. The order counts within one run of `atomic eval`: the
+first such request a session makes gets the first recording, the second the
+second. A run that skips one of the cases, with `--case` or `--sample`, can
+therefore be answered with the recording another of them was given; the answers
+to repeated requests are only told apart by their order. A recording that cannot be read whole, or that
 records another request, is reported as corrupt. A change that sends nothing new,
 such as a `validate` rule, still replays, and the new rule is checked against the
 recorded answers. Results from cassettes are reported as a historical check of
@@ -190,10 +194,25 @@ given, and then they are reported as skipped. `--baseline` is refused for the sa
 reason: there is no scorer mean to compare.
 
 Until evals run in disposable fixture worktrees, `atomic eval` runs nothing that
-could write to the project's checkout: it refuses a Codex atom with a
-`workspace-write` sandbox and an exec atom that declares effects. It runs a Codex
-atom only with `--no-cassettes`, since cassettes do not yet stand in for every
-part of a Codex thread's endpoint.
+could write to the project's checkout or to anything else. It refuses:
+
+- a Codex atom with a `workspace-write` sandbox;
+- an exec atom that does not declare `effects: { external: 'read-only' }`. Its
+  command runs in the project, under the same confinement as in `atomic run`, for
+  every case and every replay, so only a command declared to read and nothing more
+  is run. One that declares `idempotent` writes to an outside system and is never
+  run; one that declares nothing could do anything. If a command only reads its
+  input, declare it `read-only`, as the order-report example's atoms do;
+- a Codex atom under cassettes: it runs only with `--no-cassettes`, since cassettes
+  do not yet stand in for every part of a Codex thread's endpoint.
+
+A refused atom is listed with the reason and what to change, and the other atoms
+run. The command fails while any atom is refused, unless `--skip-refused` is
+given; then refused atoms are reported as skipped, in JUnit too.
+
+A live eval's spend is recorded in the usage ledger under an eval scope,
+`eval:<atom>:<time>-<process>`, named in the output. It is a ledger scope, not a
+run: `atomic runs` does not show it.
 
 ## Coding fixture repositories
 

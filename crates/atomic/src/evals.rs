@@ -24,7 +24,7 @@
 //! (`--no-cassettes`), since cassettes do not yet stand in for every part of
 //! a Codex thread's endpoint.
 
-use crate::engine::{EngineArgs, RunnerKind};
+use crate::engine::EngineArgs;
 use crate::failure::Failure;
 use crate::target;
 use anyhow::Context;
@@ -79,6 +79,10 @@ pub struct EvalArgs {
     /// judge, `atomic eval` cannot run them.
     #[arg(long)]
     pub allow_unscored: bool,
+    /// Report an atom atomic eval will not run yet as skipped, instead of
+    /// failing the command. Either way the other atoms run.
+    #[arg(long)]
+    pub skip_refused: bool,
     /// The revision this run evaluates, recorded in its reports.
     #[arg(long)]
     pub revision: Option<String>,
@@ -188,43 +192,47 @@ impl Meter for Replayed {
     }
 }
 
-/// Refuse what `atomic eval` cannot run safely or faithfully yet.
-fn refuse(atom: &Atom, source: Source) -> anyhow::Result<()> {
-    let refused = |why: String, hint: &str| -> anyhow::Result<()> {
-        Err(Failure::new("eval.refused", why, hint).into())
-    };
+/// Why `atomic eval` will not run `atom` from `source` yet, and how to
+/// change that, if it will not.
+fn refusal(atom: &Atom, source: Source) -> Option<(String, &'static str)> {
     let writes = atom.frontmatter.get("sandbox").and_then(Value::as_str) == Some("workspace-write");
     if atom.kind == "codex" && writes {
-        return refused(
-            format!(
-                "`{}` may write files, and atomic eval would run it in the project's own \
-                 checkout",
-                atom.name
-            ),
+        return Some((
+            "it may write files, and atomic eval would run it in the project's own checkout".into(),
             "evaluate it once fixture worktrees are available, or make it read-only",
-        );
+        ));
     }
-    if atom.kind == "exec" && atom.frontmatter.get("effects").is_some() {
-        return refused(
-            format!(
-                "`{}` declares effects outside atomic, and atomic eval runs only exec atoms that \
-                 have none",
-                atom.name
-            ),
-            "cover it with code tests instead of eval cases",
-        );
+    if atom.kind == "exec" {
+        // Its command runs in the project, for every case and every replay:
+        // only one declared to read and nothing more is run.
+        match atom.external() {
+            Some(atomic_core::atom::External::ReadOnly) => {}
+            Some(atomic_core::atom::External::Idempotent) => {
+                return Some((
+                    "it writes to an outside system, and atomic eval never runs such an atom"
+                        .into(),
+                    "cover it with code tests instead of eval cases",
+                ));
+            }
+            None => {
+                return Some((
+                    "it declares no effects, so atomic eval cannot tell that its command only \
+                     reads"
+                        .into(),
+                    "if the command only reads, declare `effects: { external: 'read-only' }`",
+                ));
+            }
+        }
     }
     if atom.kind == "codex" && source != Source::Live {
-        return refused(
-            format!(
-                "`{}` is a Codex atom, and cassettes do not yet record a Codex thread's calls \
-                 faithfully",
-                atom.name
-            ),
+        return Some((
+            "it is a Codex atom, and cassettes do not yet record a Codex thread's calls \
+             faithfully"
+                .into(),
             "evaluate it live with --no-cassettes",
-        );
+        ));
     }
-    Ok(())
+    None
 }
 
 /// The model `atom` calls on `endpoint`.
@@ -269,10 +277,18 @@ pub async fn run(
         (_, true) => Source::Live,
         _ => Source::Recorded,
     };
-    let chosen = choose(&atoms, &args.atoms, &args.cases, &cwd)?;
-    for (atom, _, _) in &chosen.atoms {
-        refuse(atom, source)?;
-    }
+    let mut chosen = choose(&atoms, &args.atoms, &args.cases, &cwd)?;
+    // What cannot run yet is set aside and named, and the rest runs.
+    let mut refused = Vec::new();
+    chosen
+        .atoms
+        .retain(|(atom, _, _)| match refusal(atom, source) {
+            Some((why, hint)) => {
+                refused.push(json!({"atom": atom.name, "reason": why, "hint": hint}));
+                false
+            }
+            None => true,
+        });
     // One eval at a time, and none beside a command that runs workflows.
     state.create()?;
     let _lock = state.lock_execution("atomic eval")?;
@@ -308,6 +324,28 @@ pub async fn run(
         None
     };
     let budgets = BudgetSettings::default();
+    // Every live atom's budget is resolved before any call, so one that
+    // cannot be stops the eval before it spends anything.
+    let mut plans = std::collections::BTreeMap::new();
+    if ledger.is_some() {
+        for (atom, _, _) in chosen.atoms.iter().filter(|(a, _, _)| calls_model(a)) {
+            let model = model_of(atom, &endpoint);
+            let plan = BudgetPlan::resolve(
+                &budgets,
+                &Budget::default(),
+                &[(atom.name.as_str(), &atom.budget, model.as_str())],
+            )
+            .map_err(|(_, e)| {
+                Failure::new(
+                    "eval.budget",
+                    format!("atom {}: budget: {e}", atom.name),
+                    "fix the atom's budget block",
+                )
+            })?;
+            plans.insert(atom.name.clone(), plan);
+        }
+    }
+    let exec = crate::engine::exec_backend(&state, paths, &args.engine)?;
     let unique = format!(
         "{}-{}",
         std::time::SystemTime::now()
@@ -337,27 +375,15 @@ pub async fn run(
                 .await?,
             ),
         };
-        let mut runtimes = runtimes(&state, paths, &endpoint, cassette.as_ref(), &store, &args)?;
-        let metered = match (&ledger, calls_model(atom)) {
-            (Some(ledger), true) => {
+        let mut runtimes = runtimes(&state, paths, &endpoint, cassette.as_ref(), &store, &exec)?;
+        let metered = match (&ledger, plans.get(&atom.name)) {
+            (Some(ledger), Some(plan)) => {
                 let model = model_of(atom, &endpoint);
-                let plan = BudgetPlan::resolve(
-                    &budgets,
-                    &Budget::default(),
-                    &[(atom.name.as_str(), &atom.budget, model.as_str())],
-                )
-                .map_err(|(_, e)| {
-                    Failure::new(
-                        "eval.budget",
-                        format!("atom {}: budget: {e}", atom.name),
-                        "fix the atom's budget block",
-                    )
-                })?;
                 // Calls go to the model the budget was resolved for.
                 runtimes.codex.defaults.model = Some(model.clone());
                 runtimes.lite.defaults.model = Some(model);
                 Some(Metered {
-                    budget: RunBudget::pinned(ledger.clone(), &plan),
+                    budget: RunBudget::pinned(ledger.clone(), plan),
                     caps: plan.atoms[&atom.name].clone(),
                     run: format!("eval:{}:{unique}", atom.name),
                 })
@@ -430,8 +456,20 @@ pub async fn run(
         reports.push(report);
     }
 
+    let unrun: Vec<eval::Unrun> = refused
+        .iter()
+        .map(|r| eval::Unrun {
+            atom: r["atom"].as_str().unwrap_or_default().to_owned(),
+            reason: format!(
+                "not run: {}; {}",
+                r["reason"].as_str().unwrap_or_default(),
+                r["hint"].as_str().unwrap_or_default()
+            ),
+            fails: !args.skip_refused,
+        })
+        .collect();
     if let Some(path) = &args.junit {
-        std::fs::write(path, eval::junit_all(&reports))
+        std::fs::write(path, eval::junit_with(&reports, &unrun))
             .with_context(|| format!("write {}", path.display()))?;
     }
     if let Some(path) = &args.report {
@@ -445,13 +483,14 @@ pub async fn run(
         .collect();
     if json {
         let out = json!({
-            "passed": reports.iter().all(|r| r.passed),
+            "passed": reports.iter().all(|r| r.passed) && (refused.is_empty() || args.skip_refused),
             "source": match source {
                 Source::Recorded => "recorded",
                 Source::Recording => "recording",
                 Source::Live => "live",
             },
             "reports": reports,
+            "refused": refused,
             "no_cases": chosen.empty,
             "cassettes": tallies.iter().zip(&reports).filter_map(|(t, r)| {
                 t.as_ref().map(|t| json!({
@@ -468,12 +507,26 @@ pub async fn run(
         println!("{}", serde_json::to_string_pretty(&out)?);
     } else {
         print(&reports, &tallies, &skipped, source);
+        for r in &refused {
+            println!(
+                "{} {}: not run: {}; {}",
+                if args.skip_refused {
+                    "SKIPPED"
+                } else {
+                    "REFUSED"
+                },
+                r["atom"].as_str().unwrap_or_default(),
+                r["reason"].as_str().unwrap_or_default(),
+                r["hint"].as_str().unwrap_or_default()
+            );
+        }
         if !chosen.empty.is_empty() {
             println!("no eval cases: {}", chosen.empty.join(", "));
         }
         for s in &spent {
             println!(
-                "metered {}: {} model call(s), {} token(s), as run {}",
+                "metered {}: {} model call(s), {} token(s), in the usage ledger as {} (a ledger \
+                 scope, not a run `atomic runs` shows)",
                 s["atom"].as_str().unwrap_or_default(),
                 s["calls"],
                 s["tokens"],
@@ -481,11 +534,14 @@ pub async fn run(
             );
         }
     }
-    let failed: Vec<&str> = reports
+    let mut failed: Vec<&str> = reports
         .iter()
         .filter(|r| !r.passed)
         .map(|r| r.atom.as_str())
         .collect();
+    if !args.skip_refused {
+        failed.extend(refused.iter().filter_map(|r| r["atom"].as_str()));
+    }
     if failed.is_empty() {
         Ok(())
     } else if json {
@@ -495,7 +551,10 @@ pub async fn run(
     } else {
         Err(Failure::new(
             "eval.failed",
-            format!("the evals of {} did not pass", failed.join(", ")),
+            format!(
+                "the evals of {} did not pass or did not run",
+                failed.join(", ")
+            ),
             "read each failing case above, fix the atom or its cases, and run atomic eval again",
         )
         .into())
@@ -624,20 +683,15 @@ fn runtimes(
     endpoint: &ModelEndpoint,
     cassette: Option<&Cassette>,
     store: &LocalStore,
-    args: &EvalArgs,
+    exec: &atomic_exec::Backend,
 ) -> anyhow::Result<Runtimes> {
     let mut sent = endpoint.clone();
     if let Some(cassette) = cassette {
         sent.base_url = cassette.base_url(&endpoint.base_url);
     }
-    let lite = lite_runtime(endpoint, sent.clone());
-    let exec = match args.engine.runner {
-        RunnerKind::Local => atomic_exec::Backend::default(),
-        RunnerKind::Process => {
-            atomic_exec::Backend::new(atomic_exec::runner::ProcessRunner::atomic(
-                std::env::current_exe().context("find atomic's own executable for its runners")?,
-            ))
-        }
+    let lite = LiteRuntime {
+        backend: exec.clone(),
+        ..lite_runtime(endpoint, sent.clone())
     };
     Ok(Runtimes {
         codex: CodexRuntime {
@@ -649,9 +703,10 @@ fn runtimes(
             artifacts: Artifacts::new(store.clone()),
             meter: atomic_core::usage::Metering::none(),
             guard: atomic_core::codex::StateGuard::for_project(state)?,
+            backend: exec.clone(),
         },
         lite,
-        exec,
+        exec: exec.clone(),
         clock: None,
     })
 }

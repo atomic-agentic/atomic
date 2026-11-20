@@ -250,6 +250,9 @@ impl Cassette {
             Err(_) => dir.to_owned(),
         };
         real_directory(root, &dir, mode == Mode::Record)?;
+        if mode == Mode::Record {
+            remove_stale(&dir);
+        }
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let port = listener.local_addr()?.port();
         let tally = Arc::new(Mutex::new(Tally::default()));
@@ -376,6 +379,24 @@ fn file_for(dir: &Path, key: &str, n: usize) -> PathBuf {
     }
 }
 
+/// Remove the temporary files a recording cut short left in `dir`: a
+/// session that records owns the directory, so none of them is live.
+fn remove_stale(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with('.')
+            && name.ends_with(".tmp")
+            && entry.file_type().is_ok_and(|t| t.is_file())
+        {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// Write `text` to `file` whole: through a temporary file beside it, renamed
 /// over it, so a reader never sees half of it, and never through a link.
 fn write_whole(file: &Path, text: &str) -> std::io::Result<()> {
@@ -386,7 +407,10 @@ fn write_whole(file: &Path, text: &str) -> std::io::Result<()> {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("recording");
-    let temporary = file.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
+    let mut suffix = [0u8; 8];
+    getrandom::fill(&mut suffix).map_err(|e| std::io::Error::other(e.to_string()))?;
+    let suffix: String = suffix.iter().map(|b| format!("{b:02x}")).collect();
+    let temporary = file.with_file_name(format!(".{name}.{suffix}.tmp"));
     let written = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
