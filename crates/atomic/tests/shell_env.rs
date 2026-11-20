@@ -389,3 +389,60 @@ fn a_secret_place_linked_to_a_device_or_a_system_program_leaves_both_usable() {
         let _ = std::fs::remove_dir_all(&dir);
     });
 }
+
+#[test]
+fn a_secret_the_system_keeps_or_a_pipe_stays_denied_and_the_persons_programs_run() {
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let dir = std::env::temp_dir().join(format!("atomic-kept-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
+        std::fs::create_dir_all(home.join(".kube")).unwrap();
+        std::fs::create_dir_all(home.join(".config/fish/bin")).unwrap();
+        // A cluster's credentials kept by the system, root's own, outside
+        // the system's program directories: here /etc/hostname stands in.
+        let kept = Path::new("/etc/hostname");
+        let secret = std::fs::read_to_string(kept).expect("a file the system keeps");
+        assert!(!secret.trim().is_empty());
+        std::os::unix::fs::symlink(kept, home.join(".kube/config")).unwrap();
+        // A credential served through a pipe, which nothing writes to.
+        let made = Command::new("mkfifo")
+            .arg(home.join(".netrc"))
+            .status()
+            .unwrap();
+        assert!(made.success());
+        // A program of the person's own, linked from inside a denied
+        // directory, as a virtual environment's python is.
+        std::fs::create_dir_all(dir.join("tools")).unwrap();
+        std::fs::write(dir.join("tools/python3"), "#!/bin/sh\necho program-ran\n").unwrap();
+        std::fs::set_permissions(
+            dir.join("tools/python3"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            dir.join("tools/python3"),
+            home.join(".config/fish/bin/python3"),
+        )
+        .unwrap();
+        let command = format!(
+            "cat {h}/.kube/config /etc/hostname; timeout 3 cat {h}/.netrc; echo \"pipe=$?\"; \
+             {d}/tools/python3; echo looked",
+            h = home.display(),
+            d = dir.display()
+        );
+        let printed = look_once(&dir, &home, &command, &[]).await;
+        assert!(printed.contains("looked"), "{printed}");
+        assert!(
+            !printed.contains(secret.trim()),
+            "the kept secret was read: {printed}"
+        );
+        // Refused at once (1), not waited on until the time ran out (124).
+        assert!(
+            printed.lines().any(|l| l.trim() == "pipe=1"),
+            "the pipe was opened: {printed}"
+        );
+        assert!(printed.contains("program-ran"), "{printed}");
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}

@@ -299,12 +299,18 @@ under `$HOME` and under the home directory the system records for your user,
 wherever the variables that move them (`XDG_CONFIG_HOME`, `ZDOTDIR`,
 `HISTFILE`, `GNUPGHOME`, `CARGO_HOME`, `DOCKER_CONFIG`, the AWS file
 variables, `KUBECONFIG` and others) put them, and a link among them, up to
-four directory levels inside a denied directory, is denied as the file or
-directory it points at, when that is yours and outside the system's
-directories: a history file linked to `/dev/null`, or a tool linked to the
-system's `python3`, stays usable. A turn does not start when a denial would
-cover its working directory or a directory it may write, or when a linked
-secret lies inside a directory it may write. The model chooses the
+four directory levels inside a denied directory, is denied as what it
+points at, whoever owns it and wherever it is, under `/run`, `/etc` or
+`/opt` too, with three exceptions that keep commands working: anything
+under `/usr`, `/bin`, `/sbin`, `/lib*`, `/nix/store`, `/dev`, `/proc` or
+`/sys`; a device, such as `/dev/null`; and a program (a file anyone may run)
+or a directory someone else owns. So a history file linked to `/dev/null`,
+or a virtual environment's `python` linked to a toolchain's, stays usable,
+while a key linked to one a secrets manager keeps under `/run` is denied. A
+pipe or socket in a credential place is denied like a file. A turn does not
+start when a denial would cover its working directory or a directory it may
+write, or when a denied place, or a linked secret, lies inside a directory
+it may write, where a command could move it away from its denial. The model chooses the
 commands, so none of these reach it through them. atomic makes the list
 when the turn starts: a place on it that appears while a command runs is
 denied only to later commands, and a link made after the list is not

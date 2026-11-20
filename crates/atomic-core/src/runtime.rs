@@ -554,7 +554,7 @@ async fn run_contract(
         // The meter refused the next call: nothing was sent for it.
         Some(MeterError::Exhausted(refusal)) => AtomError::Budget(refusal.to_string()),
         Some(failure) => AtomError::Runtime(failure.to_string()),
-        None => AtomError::Model(format!("{e:#}")),
+        None => turn_failure(&e),
     })?;
     let metadata = RunMetadata {
         thread_id: report.thread_id,
@@ -584,6 +584,18 @@ async fn run_contract(
 /// directory, so no shell reads the developer's startup files and nothing
 /// is left in a shared temporary directory; a `workspace-write` turn may
 /// write there.
+/// What a turn that failed failed of: the model, or, when the sandbox's
+/// deny list could not be made, the machine it would have run on.
+fn turn_failure(e: &anyhow::Error) -> AtomError {
+    match e
+        .chain()
+        .find_map(|c| c.downcast_ref::<crate::codex::DenyRefused>())
+    {
+        Some(refused) => AtomError::Runtime(refused.to_string()),
+        None => AtomError::Model(format!("{e:#}")),
+    }
+}
+
 fn turn_in(workspace: &Workspace, spec: &mut TurnSpec) -> Result<PathBuf, AtomError> {
     let cwd = workspace
         .require_root()
@@ -652,7 +664,7 @@ pub async fn run_turn(runtime: &CodexRuntime, spec: &TurnSpec) -> Result<String,
         )
         .await
         .map(|(answer, _)| answer)
-        .map_err(|e| AtomError::Model(format!("{e:#}"))),
+        .map_err(|e| turn_failure(&e)),
         Err(e) => Err(e),
     };
     workspace.close().await;

@@ -113,14 +113,15 @@ configuration directory; the places in your home directory where credentials,
 shell startup files and history are kept (under both `$HOME` and the home
 directory the system records for your user, and wherever the variables that
 move them, such as `XDG_CONFIG_HOME`, `GNUPGHOME`, `CARGO_HOME` or
-`KUBECONFIG`, put them), and the file or directory of yours that a link
-among them points at, up to four directory levels inside a denied directory;
+`KUBECONFIG`, put them), and what a link among them points at, up to four
+directory levels inside a denied directory, except a program, a device, a
+directory someone else owns, or anything under the system's program,
+library and device directories;
 the kernel keyrings; the network; and sockets. Cargo's own configuration is
 not among them, so a registry token kept there rather than in
-`credentials.toml` is not protected. A link to something outside your own
-files, such as a history file linked to `/dev/null`, is left alone, and a
-command does not start when a denial would cover its working directory or a
-directory it may write, or a linked secret lies inside one. Other projects'
+`credentials.toml` is not protected. A command does not start when a denial
+would cover its working directory or a directory it may write, or when a
+denied place or a linked secret lies inside a directory it may write. Other projects'
 Codex records are not denied yet. atomic makes the list when a
 turn or an exec step starts: a place on it that appears while a command runs
 is denied only to the commands that start after it, and a link made after
