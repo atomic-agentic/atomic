@@ -616,6 +616,15 @@ pub(crate) fn to_durare(e: DurableError) -> durare::Error {
 /// and before the engine commits its checkpoint, `checkpoint:after:<op>` once
 /// the checkpoint is committed. The second is reached only when this process
 /// ran the body, not when a replay returned the recorded output.
+///
+/// Each is reached at most once per operation. The engine may run a
+/// transaction's body again within one operation: when the commit of its
+/// writes and checkpoint meets a conflict (on SQLite, a snapshot another
+/// connection's write made stale), it rolls the attempt back and retries on a
+/// fresh transaction. Nothing of the first attempt is kept, so it is not a
+/// second run of the operation, and it does not reach the failpoint again; a
+/// crash test counting runs would otherwise count it as one. A step's body is
+/// called once per operation in any case.
 #[derive(Clone)]
 struct Checkpoint {
     name: Arc<str>,
@@ -634,8 +643,8 @@ impl Checkpoint {
     }
 
     fn before(&self) {
-        self.ran.store(true, std::sync::atomic::Ordering::SeqCst);
-        if crate::failpoints::armed() {
+        let again = self.ran.swap(true, std::sync::atomic::Ordering::SeqCst);
+        if crate::failpoints::armed() && !again {
             crate::failpoint(&format!("checkpoint:before:{}", self.name));
         }
     }

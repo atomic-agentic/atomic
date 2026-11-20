@@ -937,7 +937,10 @@ async fn kill_and_recover(
     // checkpoint:before after its checkpoint:after, or a second
     // checkpoint:after, is a repeat.
     let mut done: BTreeSet<&str> = BTreeSet::new();
-    // And within one process, no operation's body finishes twice.
+    // And within one process, no operation of a name runs twice: these
+    // workflows run each operation once. An operation reaches its
+    // checkpoint:before failpoint once however often the engine retries its
+    // body, so a second one is a second operation, which is a repeat.
     for (process, log) in [("killed", &first.reached), ("recovering", &second.reached)] {
         let mut ran = BTreeSet::new();
         for op in log
@@ -945,7 +948,10 @@ async fn kill_and_recover(
             .filter_map(|n| n.strip_prefix("checkpoint:before:"))
         {
             if !ran.insert(op) {
-                fail!("{op} ran twice in the {process} process");
+                fail!(
+                    "{op} ran twice in the {process} process; its failpoints, in order:\n  {}",
+                    log.join("\n  ")
+                );
             }
         }
     }
