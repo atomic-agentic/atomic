@@ -68,7 +68,8 @@ may declare `env` too, for the commands its turn runs, such as the tool homes
 (`RUSTUP_HOME`, `CARGO_HOME`, `PYENV_ROOT`) they no longer find through `HOME`;
 it cannot set `HOME`, `ZDOTDIR` or `TMPDIR`, nor a variable the dynamic loader
 reads (`LD_*`, `DYLD_*`, `GCONV_PATH`, `GLIBC_TUNABLES`), which would load code
-into the sandbox helper.
+into the sandbox helper, nor one that makes a shell run a file or command as
+it starts (`BASH_ENV`, `ENV`, `PROMPT_COMMAND`).
 
 On Linux, an atom that runs commands, an exec atom or a codex atom, needs
 bubblewrap and unprivileged user namespaces. Where the sandbox cannot start,
@@ -235,10 +236,18 @@ A Codex atom's shell inherits only the platform's core variables, such as
 `PG*`, `DATABASE_URL` or any `*_API_KEY`. Its `HOME` and `ZDOTDIR` are its
 attempt's own scratch directory, or a directory that does not exist where
 no attempt gives it one, and it is not a login shell, so none of your shell
-startup files run, and your own atomic configuration directory is denied to
-it. The model chooses its commands, so this keeps your inherited
-environment from the model; it does not yet cover credentials in files
-elsewhere in your home directory.
+startup files run, and no functions or aliases from them are replayed into
+it.
+
+Its commands cannot read your own atomic configuration directory, nor the
+file behind a link in it, nor the places in your real home directory where
+credentials are kept: `.ssh`, `.aws`, `.netrc`, `.codex`, `.config/gcloud`,
+`.azure`, `.kube`, `.docker/config.json`, `.gnupg`, `.npmrc`, `.pypirc`,
+`.git-credentials`, `.config/gh`, cargo's `credentials` files,
+`.password-store`, `.local/share/keyrings`, and the shell startup, logout
+and history files of bash, zsh and fish. The model chooses the commands,
+so none of these reach it through them. Credentials kept anywhere else are
+not covered.
 
 Anything that finds its files through your home directory does not find
 them: rustup's and cargo's homes (`~/.rustup`, `~/.cargo`), the Go module

@@ -11,10 +11,10 @@
 //! settings and database connections, and its shell profiles exporting a
 //! variable no pattern names. None reaches the command, and the platform's
 //! core variables do. The command cannot read the person's own
-//! configuration file either.
-//!
-//! This covers what the shell inherits and its configuration; files a
-//! command can read elsewhere in the home directory are another matter.
+//! configuration file, nor the file a linked one points to, nor any of the
+//! places in the home directory where credentials are kept, and none of
+//! the functions or aliases the person's shell startup files define reach
+//! it.
 //!
 //! Needs bubblewrap and unprivileged user namespaces, so it runs with the
 //! `sandbox-tests` feature (and `ATOMIC_DEV_SANDBOX=on` in the development
@@ -79,6 +79,23 @@ fn write_project(project: &Path) {
     }
 }
 
+/// The entries of [`atomic_core::codex::HOME_SECRETS`] that are directories;
+/// the rest are files.
+const SECRET_DIRS: &[&str] = &[
+    ".ssh",
+    ".aws",
+    ".codex",
+    ".config/gcloud",
+    ".azure",
+    ".kube",
+    ".gnupg",
+    ".config/gh",
+    ".password-store",
+    ".local/share/keyrings",
+    ".config/fish",
+    ".local/share/fish",
+];
+
 /// The person's shell profiles, each exporting a variable whose name no
 /// exclusion pattern matches.
 const PROFILES: &[&str] = &[".profile", ".bash_profile", ".bashrc", ".zshenv"];
@@ -99,17 +116,44 @@ fn an_atoms_shell_sees_none_of_the_persons_secrets() {
         let _ = std::fs::remove_dir_all(&atomic_home);
         let home = dir.join("home");
         std::fs::create_dir_all(home.join(".config/atomic")).unwrap();
+        // Every place credentials are kept, holding a canary: a file, or a
+        // directory with a file in it.
+        let mut secrets = Vec::new();
+        for path in atomic_core::codex::HOME_SECRETS {
+            let at = home.join(path);
+            std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+            if SECRET_DIRS.contains(path) {
+                std::fs::create_dir_all(&at).unwrap();
+                std::fs::write(at.join("secret"), "canary-secret\n").unwrap();
+            } else {
+                std::fs::write(&at, "canary-secret\n").unwrap();
+            }
+            secrets.push(at);
+        }
         for profile in PROFILES {
             std::fs::write(
                 home.join(profile),
-                format!("export PROFILE_CANARY_PASSWORD=canary-profile-{profile}\n"),
+                format!(
+                    "export PROFILE_CANARY_PASSWORD=canary-profile-{profile}\n\
+                     canary_fn() {{ echo canary-function; }}\n\
+                     alias canary_alias='echo canary-alias'\n"
+                ),
             )
             .unwrap();
         }
-        // The person's own configuration, which only they may read.
+        // The person's own configuration, which only they may read, linked
+        // to a file kept elsewhere.
+        std::fs::create_dir_all(dir.join("kept")).unwrap();
+        let kept = dir.join("kept/config.yaml");
+        std::fs::write(&kept, "# canary-config\nrunner: local\n").unwrap();
         let config = home.join(".config/atomic/config.yaml");
-        std::fs::write(&config, "# canary-config\nrunner: local\n").unwrap();
-        let command = format!("env; cat {}; echo looked", config.display());
+        std::os::unix::fs::symlink(&kept, &config).unwrap();
+        let reads: String = secrets
+            .iter()
+            .chain([&config, &kept])
+            .map(|p| format!("cat '{0}' '{0}/secret';", p.display()))
+            .collect();
+        let command = format!("env; {reads} type canary_fn; alias; echo looked");
         let model = FakeModel::start(vec![
             Reply::Tool {
                 name: "exec_command".into(),
@@ -193,9 +237,20 @@ fn an_atoms_shell_sees_none_of_the_persons_secrets() {
             !printed.contains("canary-config"),
             "the command read the person's configuration: {printed}"
         );
+        assert!(
+            !printed.contains("canary-secret"),
+            "the command read a credential in the home directory: {printed}"
+        );
+        assert!(
+            !printed.contains("canary-function")
+                && !printed.contains("canary-alias")
+                && !printed.contains("canary_fn ()"),
+            "the shell's startup functions or aliases reached the command: {printed}"
+        );
         for name in CANARIES {
             assert!(
-                !printed.contains(&format!("{name}=")) && !printed.contains("canary"),
+                !printed.contains(&format!("{name}="))
+                    && !printed.contains(&format!("canary-{}", name.to_lowercase())),
                 "{name} reached the atom's shell: {printed}"
             );
         }

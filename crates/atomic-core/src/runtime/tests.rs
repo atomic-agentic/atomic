@@ -1229,6 +1229,18 @@ fn exec_declarations_are_checked_at_load() {
         ),
         ("kind: 'codex', env: { LD_LIBRARY_PATH: '/x' }", "load code"),
         ("kind: 'codex', env: { GCONV_PATH: '/x' }", "load code"),
+        (
+            "kind: 'codex', env: { BASH_ENV: '/home/dev/.bashrc' }",
+            "as it starts",
+        ),
+        (
+            "kind: 'codex', env: { ENV: '/home/dev/.profile' }",
+            "as it starts",
+        ),
+        (
+            "kind: 'codex', env: { PROMPT_COMMAND: 'cat /home/dev/.netrc' }",
+            "as it starts",
+        ),
         ("kind: 'codex', env: { HOME: '/x' }", "set by atomic"),
         ("kind: 'codex', env: { ZDOTDIR: '/x' }", "set by atomic"),
         ("kind: 'codex', env: { TMPDIR: '/x' }", "set by atomic"),
