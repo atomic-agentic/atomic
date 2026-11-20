@@ -13,7 +13,8 @@
 #       those passed or was ignored. Their names are written to FAILING.
 #
 # A child-process entry point, ignored with a reason that says it runs "in
-# a child process", is not a test of the suite and counts as neither.
+# a child process", is not a test of the suite and counts as neither, unless
+# its name says postgres: a Postgres variant must fail, whatever its reason.
 #
 # Either way, every test binary must have reported its result (one that
 # aborted or was killed has not) and exited normally or with test failures,
@@ -116,7 +117,13 @@ def audit(mode, log, message):
         problems.append("no test failed")
 
     if mode == "all-fail":
-        others = [k for k, o in outcome.items() if o not in ("FAILED", "child")]
+        # A Postgres variant is never a child-process entry point, whatever
+        # its reason says.
+        others = [
+            k
+            for k, o in outcome.items()
+            if o != "FAILED" and not (o == "child" and "postgres" not in k[1])
+        ]
         if others:
             problems.append(
                 "these did not fail without the backend: "

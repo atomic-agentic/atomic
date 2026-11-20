@@ -81,6 +81,9 @@ expect 1 "the same, coloured" all-fail "${WORK}/ignored-colour.log" "y_on_postgr
 # A child-process entry point, ignored by design, is not one of the tests.
 binary a FAILED:x_on_postgres child:x_child >"${WORK}/child.log"
 expect 0 "a child-process entry point is no test" all-fail "${WORK}/child.log"
+# A Postgres variant ignored as a child is still a Postgres variant.
+binary a FAILED:x_on_postgres child:y_on_postgres >"${WORK}/child-postgres.log"
+expect 1 "a Postgres variant is never let off as a child" all-fail "${WORK}/child-postgres.log" "y_on_postgres (a-0123: child)"
 
 binary a FAILED:x_on_postgres ok:y_on_postgres >"${WORK}/passed.log"
 expect 1 "a passing test is no failure" all-fail "${WORK}/passed.log" "y_on_postgres (a-0123: ok)"
