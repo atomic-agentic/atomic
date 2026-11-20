@@ -332,3 +332,28 @@ pub(crate) fn record_error(span: &tracing::Span, error: &anyhow::Error) {
         tracing::field::display(format!("{error:#}")),
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A call's time is its own limit, or its default when that is shorter
+    /// or it has none.
+    #[test]
+    fn a_limits_time_is_the_shorter_of_its_own_and_the_default() {
+        let five = Duration::from_secs(300);
+        let limit = |time: Option<Duration>| Limit {
+            output_tokens: None,
+            time,
+        };
+        assert_eq!(limit(None).time_within(five), five);
+        assert_eq!(
+            limit(Some(Duration::from_millis(700))).time_within(five),
+            Duration::from_millis(700)
+        );
+        assert_eq!(
+            limit(Some(Duration::from_secs(3600))).time_within(five),
+            five
+        );
+    }
+}

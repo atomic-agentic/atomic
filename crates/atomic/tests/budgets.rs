@@ -1407,3 +1407,60 @@ fn a_dollar_cap_on_an_unpriced_model_fails_configuration() {
         assert_eq!(r.micro_usd, Some(1_000_000));
     });
 }
+
+/// A command admitted by a process that then died is found when its step
+/// runs again: its reservation is settled then, not held for good, and a
+/// step whose command was never admitted is told apart from it.
+#[test]
+fn a_dead_commands_reservation_is_settled_when_it_is_found() {
+    on_codex_runtime(async {
+        let dir = scratch("dead-command");
+        let rt = Durare::sqlite(&dir.join("atomic.db"))
+            .await
+            .expect("engine");
+        let plan = atomic_app::metering::BudgetPlan::resolve(
+            &settings(10_000_000, 100_000_000),
+            &Budget::default(),
+            &[],
+            &[("nap", &Budget::default())],
+        )
+        .expect("a plan");
+        let budget = RunBudget::pinned(rt.ledger(), &plan);
+        let step = atomic_durable::StepInfo {
+            workflow_id: "dead".into(),
+            step_id: 3,
+        };
+        let meter = budget.meter(&step, &plan.exec["nap"]);
+        let admitted = meter
+            .admit(atomic_core::usage::Call {
+                index: 0,
+                model: atomic_core::usage::WORK_MODEL.into(),
+                input_bound: None,
+                turn: false,
+                work: true,
+            })
+            .await
+            .expect("admitted");
+        // Its process died before settling it.
+        drop(admitted);
+        assert_eq!(
+            rt.ledger().unsettled("dead").await.expect("ledger").len(),
+            1
+        );
+        assert!(budget.command_admitted(&step).await.expect("ledger"));
+        assert!(
+            rt.ledger()
+                .unsettled("dead")
+                .await
+                .expect("ledger")
+                .is_empty(),
+            "the dead command's reservation is still held"
+        );
+        let never = atomic_durable::StepInfo {
+            workflow_id: "dead".into(),
+            step_id: 5,
+        };
+        assert!(!budget.command_admitted(&never).await.expect("ledger"));
+        rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+    });
+}

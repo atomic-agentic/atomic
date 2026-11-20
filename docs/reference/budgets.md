@@ -176,10 +176,14 @@ the active time its atom has left (or less, if the run has less), the command is
 stopped when that runs out or at its own five-minute limit, whichever is first,
 and the step is charged the time the command ran. A command uses no tokens and
 costs nothing, so an exec atom's budget needs no price, even under a dollar cap.
-With less than half a second left, the command is not started: the run parks.
-Time at a gate is never charged. An exec atom's validators and the commits
-atomic makes after a worktree step are not metered yet, and a run whose budget
-was pinned before exec atoms were metered does not meter them.
+With less than half a second left, the command is not started: the run parks,
+and once a person raises the cap and releases it, the command runs. A command
+the cap stops mid-run parks the run the same way if its atom declares
+`effects: { external: 'idempotent' }` or `'read-only'`, and runs again once
+the cap is raised; any other fails, since whether its effects happened is
+unknown, and the error says so. Time at a gate is never charged. An exec atom's
+validators and the commits atomic makes after a worktree step are not metered
+yet.
 
 A run resolves the model each atom calls with its budget, and the atom runs on
 that model for the whole run. Under a dollar cap, a call to a model the run's

@@ -1134,28 +1134,40 @@ pub async fn run_exec_opened(
             MeterError::Exhausted(why) => AtomError::Budget(why.to_string()),
             e => AtomError::Runtime(format!("{}: meter its command: {e}", atom.name)),
         })?;
+    let time = limit.time_within(EXEC_TIME_LIMIT);
+    let bounded_by = ticket.as_ref().and_then(|t| t.bounded_by.clone());
     let done = run_command(
         &workspace,
         program.clone(),
         args,
         stdin,
         identity.environment(),
-        limit.time_within(EXEC_TIME_LIMIT),
+        time,
         exchange_env,
         read_only,
     )
     .await;
-    let finished = finish_exec(
-        atom,
-        &program,
-        done,
-        exchange,
-        artifacts,
-        identity,
-        output_contract,
-        &workspace,
-    )
-    .await;
+    // Cut off by the minutes cap, not by a command's own limit.
+    let capped = time < EXEC_TIME_LIMIT
+        && matches!(
+            &done,
+            Err(CommandError::Exec(atomic_exec::ExecError::TimedOut { .. }))
+        );
+    let finished = if capped {
+        Err(cut_off_at_cap(atom, time, bounded_by.as_deref()))
+    } else {
+        finish_exec(
+            atom,
+            &program,
+            done,
+            exchange,
+            artifacts,
+            identity,
+            output_contract,
+            &workspace,
+        )
+        .await
+    };
     // Whatever it came to, its time was spent; it used no tokens.
     if let Err(e) = meter
         .settle(ticket, crate::usage::Outcome::Reported(Default::default()))
@@ -1211,6 +1223,33 @@ const GATHER_LOCKED_RETRIES: u32 = 3;
 const GATHER_LOCKED_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
 /// The longest wait between a gather's tries.
 const GATHER_LOCKED_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// An exec atom's command that the minutes cap cut off after `time`, all
+/// the time the allowance `bounded_by` had left. One whose effects are
+/// declared safe to repeat stops on the budget, so its run parks until a
+/// person raises the cap and it runs again; any other fails, since whether
+/// its effects happened is unknown.
+fn cut_off_at_cap(
+    atom: &AtomFile,
+    time: std::time::Duration,
+    bounded_by: Option<&str>,
+) -> AtomError {
+    let stopped = format!(
+        "{}: its command was stopped at its time limit of {:.1} s, all the active time the \
+         allowance {} had left",
+        atom.name,
+        time.as_secs_f64(),
+        bounded_by.unwrap_or("of its atom")
+    );
+    match atom.external() {
+        Some(_) => AtomError::Budget(stopped),
+        None => AtomError::Runtime(format!(
+            "{stopped}: stopped by the minutes cap, and whether its effects happened is \
+             unknown. Declare `effects: {{ external: 'idempotent' }}` (or `'read-only'`) for its \
+             run to park at the cap instead, and run it again once the cap is raised"
+        )),
+    }
+}
 
 /// An artifact store's failure, as an atom's error: a refusal is the
 /// command's output's fault, anything else the store's.

@@ -46,8 +46,8 @@ pub struct BudgetPlan {
     /// The model each model atom calls, by atom name.
     pub models: BTreeMap<String, String>,
     /// Each exec atom's caps, by atom name: its command's active time is
-    /// charged to them and to the run's. A plan pinned before exec atoms
-    /// were metered has none, and its exec steps are not metered.
+    /// charged to them and to the run's. A plan without them reads, as one
+    /// with none, but a run that needs them refuses it.
     #[serde(default)]
     pub exec: BTreeMap<String, Resolved>,
     /// The most one call may use, when its model has no maximum of its own.
@@ -170,12 +170,20 @@ impl BudgetPlan {
     }
 
     /// Check that the plan has caps and a model for each of `atoms`, every
-    /// atom a run calls a model from.
-    pub fn covers(&self, atoms: &[&str]) -> Result<(), String> {
+    /// atom a run calls a model from, and caps for each of `exec`, every exec
+    /// atom it runs: none runs unmetered.
+    pub fn covers(&self, atoms: &[&str], exec: &[&str]) -> Result<(), String> {
         for atom in atoms {
             if !self.atoms.contains_key(*atom) || !self.models.contains_key(*atom) {
                 return Err(format!(
                     "atom {atom} calls a model, and the plan has no caps or model for it"
+                ));
+            }
+        }
+        for atom in exec {
+            if !self.exec.contains_key(*atom) {
+                return Err(format!(
+                    "atom {atom} runs a command, and the plan has no caps for it"
                 ));
             }
         }
@@ -286,6 +294,39 @@ impl RunBudget {
     /// The caps of an atom calling `model` with its own limits `declared`.
     pub fn atom(&self, declared: &Budget, model: &str) -> Result<Resolved, BudgetError> {
         resolve(declared, Level::Atom, &self.settings, &[model])
+    }
+
+    /// Whether an exec atom's command at step `step` was ever admitted, so
+    /// may have started: the ledger holds its work attempt. One that a cap
+    /// refused, and that parked, never started. An admitted attempt still
+    /// reserved belongs to a process that died with it, and is settled now,
+    /// so its reservation is not held for good: a command uses no tokens
+    /// and costs nothing, so that is all it spent, and its time is charged
+    /// until its last heartbeat.
+    pub async fn command_admitted(&self, step: &StepInfo) -> anyhow::Result<bool> {
+        let request = format!("{}:{}:0", step.workflow_id, step.step_id);
+        let attempts = self.ledger.attempts(&step.workflow_id).await?;
+        let mut admitted = false;
+        for a in attempts
+            .iter()
+            .filter(|a| a.request == request && a.model == atomic_core::usage::WORK_MODEL)
+        {
+            admitted = true;
+            if a.state == "reserved" {
+                self.ledger
+                    .settle(
+                        &a.request,
+                        a.attempt,
+                        atomic_durable::usage::Settlement::Reconciled {
+                            input_tokens: 0,
+                            output_tokens: 0,
+                            micro_usd: 0,
+                        },
+                    )
+                    .await?;
+            }
+        }
+        Ok(admitted)
     }
 
     /// The meter for the atom step `step`, with caps `atom`.

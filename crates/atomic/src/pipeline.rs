@@ -704,8 +704,15 @@ async fn run_pipeline<C: WorkflowContext>(
                 .filter(|(_, atom)| model_of(atom, &services.runtimes).is_some())
                 .map(|(name, _)| name.as_str())
                 .collect();
+            // And every exec atom its caps, which its command is held to.
+            let exec_atoms: Vec<&str> = pipeline
+                .atoms
+                .iter()
+                .filter(|(_, atom)| atom.kind == "exec")
+                .map(|(name, _)| name.as_str())
+                .collect();
             plan.validate()
-                .and_then(|()| plan.covers(&model_atoms))
+                .and_then(|()| plan.covers(&model_atoms, &exec_atoms))
                 .map(|()| plan.clone())
                 .map_err(|e| format!("workflow {}: its pinned budget: {e}", pipeline.name))
         }
@@ -931,6 +938,13 @@ async fn run_pipeline<C: WorkflowContext>(
                 )));
             }
         }
+        // An exec atom's command runs only with caps, never unmetered.
+        if atom.kind == "exec" && atom_caps.is_none() {
+            return Err(failed(format!(
+                "step `{}`: `{}` runs a command, and the run's budget has no caps for it",
+                step.id, atom.name
+            )));
+        }
         let tree = if step.worktree {
             let worktrees = services.worktrees.clone().ok_or_else(|| {
                 failed(format!(
@@ -1024,6 +1038,8 @@ async fn run_pipeline<C: WorkflowContext>(
                 // its checkpoint makes none.
                 let span = crate::telemetry::step_span(&atom.name, &id, &run_id);
                 let caller = (run_id.clone(), id.clone());
+                let (ledgered, metered, at) =
+                    (budget.clone(), atom_caps.is_some(), position.clone());
                 let work = async move {
                 if let Some(served) = served {
                     return served;
@@ -1046,10 +1062,20 @@ async fn run_pipeline<C: WorkflowContext>(
                         )));
                     }
                 }
-                if let Some((begun, declared, _, _)) = &guard
-                    && begun.interrupted()
-                    && !declared
-                {
+                // An earlier execution's attempt replays as interrupted, but
+                // its command may never have started: a cap refused it and
+                // the step parked. The ledger says which: only a command
+                // admitted may have run.
+                let interrupted = match &guard {
+                    Some((begun, false, _, _)) if begun.interrupted() => {
+                        !metered
+                            || ledgered.command_admitted(&at).await.map_err(|e| {
+                                failed(format!("step `{id}`: read its command's attempts: {e}"))
+                            })?
+                    }
+                    _ => false,
+                };
+                if interrupted {
                     return Err(failed(format!(
                         "step `{id}`: outcome_unknown: an earlier attempt of `{}` was interrupted \
                          before its result was saved, so whether its command's effects happened \
