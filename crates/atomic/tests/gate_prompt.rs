@@ -10,7 +10,11 @@
 //! - a question gate answered at the prompt resumes its step with the typed
 //!   answer, and writes the feedback entry when it asks to remember; an
 //!   answer outside the enum is refused, there and by `atomic gates answer`;
-//! - a question nobody answers in time resumes with its declared default.
+//! - a question nobody answers in time resumes with its declared default,
+//!   which the store records and the feedback log remembers;
+//! - replies typed ahead, or before anything is shown, decide no gate, and
+//!   an exec command cannot type into the prompt (it has no terminal);
+//! - a hostile title reaches the terminal escaped.
 //!
 //! The project's atoms are exec atoms, so no model is called. The prompt
 //! runs on a pseudo-terminal a small driver opens; the credential is in the
@@ -30,18 +34,48 @@ use std::time::{Duration, Instant};
 
 const ATOMIC: &str = env!("CARGO_BIN_EXE_atomic");
 
-/// Run a command on a pseudo-terminal and type `answers` into it, one each
-/// time it shows a prompt; print what it wrote and exit as it exited.
+/// Run a command on a pseudo-terminal, its controlling terminal, and type
+/// `answers` (a JSON list) into it, one each time it shows a prompt; with
+/// `DRIVER_EARLY`, type that line first, before anything is shown. Print
+/// what it wrote and exit as it exited; after `DRIVER_DEADLINE` seconds
+/// (90 by default) kill it.
 const DRIVER: &str = r#"
-import os, pty, select, subprocess, sys, time
-answers = sys.argv[1].split("\n") if sys.argv[1] else []
+import json, os, pty, select, subprocess, sys, time
+answers = json.loads(sys.argv[1])
 master, slave = pty.openpty()
-p = subprocess.Popen(sys.argv[2:], stdin=slave, stdout=slave, stderr=slave)
+def own_terminal():
+    os.setsid()
+    import fcntl, termios
+    fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+# With DRIVER_STDERR, standard error goes to that file, not the terminal.
+err = open(os.environ["DRIVER_STDERR"], "w") if os.environ.get("DRIVER_STDERR") else slave
+# With DRIVER_BACKGROUND, the command runs in a background process group of
+# the terminal's session, as `command &` from a shell would.
+BACKGROUND = """
+import os, sys, fcntl, termios
+os.setsid()
+fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+pid = os.fork()
+if pid == 0:
+    os.setpgid(0, 0)
+    os.execv(sys.argv[1], sys.argv[1:])
+_, status = os.waitpid(pid, 0)
+sys.exit(os.waitstatus_to_exitcode(status))
+"""
+if os.environ.get("DRIVER_BACKGROUND"):
+    p = subprocess.Popen([sys.executable, "-c", BACKGROUND] + sys.argv[2:], stdin=slave,
+                         stdout=slave, stderr=err)
+else:
+    p = subprocess.Popen(sys.argv[2:], stdin=slave, stdout=slave, stderr=err,
+                         preexec_fn=own_terminal)
 os.close(slave)
+if os.environ.get("DRIVER_EARLY"):
+    os.write(master, os.environ["DRIVER_EARLY"].encode() + b"\n")
 seen, out = 0, b""
 # A run that never prompts fails rather than hangs.
-deadline = time.time() + 90
+deadline = time.time() + float(os.environ.get("DRIVER_DEADLINE", "90"))
 markers = (b"comment if you like > ", b"(/reject to refuse) > ")
+# Each prompt counts once, by its count of markers so far.
 while True:
     r, _, _ = select.select([master], [], [], 0.2)
     if r:
@@ -60,7 +94,7 @@ while True:
         break
     if time.time() > deadline:
         p.kill()
-        out += b"\n[driver: no prompt within 90s]\n"
+        out += b"\n[driver: deadline]\n"
         break
 sys.stdout.buffer.write(out)
 sys.exit(p.wait())
@@ -123,6 +157,70 @@ impl Project {
                  returns: steps.last.output\n"
             )
         };
+        // Two gates in a row, the second the one that matters.
+        std::fs::write(
+            root.join("workflows/twice.workflow.yaml"),
+            "atomic: 1\nname: twice\n\
+             input: { $ref: ../atoms/echo-note.input.schema.json }\n\
+             output: { $ref: ../atoms/echo-note.output.schema.json }\n\
+             steps:\n  first:\n    atom: echo-note\n    with: { text: input.text }\n\
+             \x20 look:\n    after: [first]\n    gate:\n      title: \"'Look at it'\"\n\
+             \x20 deploy:\n    after: [look]\n    gate:\n      title: \"'DEPLOY TO PROD'\"\n\
+             returns: steps.first.output\n",
+        )
+        .unwrap();
+        // An exec atom that leaves a process behind, out of its group and
+        // in atomic's session if it can, to type an approval into the
+        // terminal once the gate's prompt shows.
+        std::fs::write(
+            root.join("tools/inject.py"),
+            "import json, os, sys, time\n\
+             note = json.load(sys.stdin)\n\
+             if os.fork() == 0:\n\
+             \x20   os.setpgid(0, 0)\n\
+             \x20   log = open(note['text'], 'w')\n\
+             \x20   try:\n\
+             \x20       tty = os.open('/dev/tty', os.O_RDWR)\n\
+             \x20   except OSError as e:\n\
+             \x20       log.write(f'no tty: {e}\\n'); log.flush(); os._exit(0)\n\
+             \x20   time.sleep(3)\n\
+             \x20   import fcntl, termios\n\
+             \x20   try:\n\
+             \x20       for c in b'a\\n':\n\
+             \x20           fcntl.ioctl(tty, termios.TIOCSTI, bytes([c]))\n\
+             \x20       log.write('typed\\n')\n\
+             \x20   except OSError as e:\n\
+             \x20       log.write(f'TIOCSTI refused: {e}\\n')\n\
+             \x20   log.flush(); os._exit(0)\n\
+             json.dump({'line': 'ok'}, sys.stdout)\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("atoms/inject-note.atom.astro"),
+            "---\nimport type { Props, Input, Output } from '../.atomic/types/inject-note';\n\
+             import type { AtomConfig } from '../.atomic/types/authoring';\n\
+             const { input }: Props = Astro.props;\n\
+             export const config: AtomConfig<Input, Output> = { description: 'Inject.', \
+             kind: 'exec', exec: { command: ['python3', 'tools/inject.py'] } };\n---\n\n",
+        )
+        .unwrap();
+        for role in ["input", "output"] {
+            std::fs::copy(
+                root.join(format!("atoms/echo-note.{role}.schema.json")),
+                root.join(format!("atoms/inject-note.{role}.schema.json")),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            root.join("workflows/injected.workflow.yaml"),
+            "atomic: 1\nname: injected\n\
+             input: { $ref: ../atoms/echo-note.input.schema.json }\n\
+             output: { $ref: ../atoms/echo-note.output.schema.json }\n\
+             steps:\n  first:\n    atom: inject-note\n    with: { text: input.text }\n\
+             \x20 deploy:\n    after: [first]\n    gate:\n      title: \"'DEPLOY TO PROD'\"\n\
+             returns: steps.first.output\n",
+        )
+        .unwrap();
         for (name, gate, then) in [
             (
                 "approval",
@@ -138,7 +236,7 @@ impl Project {
             (
                 "timed",
                 "      ask: \"'Which channel?'\"\n      answer: [stable, beta]\n      \
-                 timeout: 2s\n      on_timeout: { default: stable }\n",
+                 remember: true\n      timeout: 2s\n      on_timeout: { default: beta }\n",
                 "steps.pick.decision.answer",
             ),
         ] {
@@ -186,13 +284,45 @@ impl Project {
 
     /// `atomic args` on a terminal, typing `answers` at its prompts.
     fn at_terminal(&self, args: &[&str], answers: &[&str]) -> Output {
-        self.command("python3")
-            .arg(self.dir.join("driver.py"))
-            .arg(answers.join("\n"))
+        self.at_terminal_with(args, answers, &[])
+    }
+
+    /// [`Self::at_terminal`], with the driver's settings in `env`.
+    fn at_terminal_with(&self, args: &[&str], answers: &[&str], env: &[(&str, &str)]) -> Output {
+        let mut c = self.command("python3");
+        c.arg(self.dir.join("driver.py"))
+            .arg(serde_json::to_string(answers).unwrap())
             .arg(ATOMIC)
-            .args(args)
-            .output()
-            .unwrap()
+            .args(args);
+        for (k, v) in env {
+            c.env(k, v);
+        }
+        c.output().unwrap()
+    }
+
+    /// `atomic args` with no terminal, killed if the test fails first.
+    fn spawn(&self, args: &[&str]) -> Running {
+        Running(Some(
+            self.command(ATOMIC)
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        ))
+    }
+
+    /// Gate `id` as the store has it.
+    fn gate(&self, id: &str) -> gate::Gate {
+        let (db, id) = (self.state().join("private/atomic.db"), id.to_owned());
+        let found = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let into = found.clone();
+        on_codex_runtime(async move {
+            let rt = Durare::sqlite(&db).await.unwrap();
+            *into.lock().unwrap() = gate::find(&rt, &id).await.unwrap();
+        });
+        found.lock().unwrap().take().expect("the gate")
     }
 
     fn enroll(&self) {
@@ -204,6 +334,28 @@ impl Project {
         let out = self.atomic(&["debug", "state-dir"]);
         assert!(out.status.success(), "{}", text(&out));
         PathBuf::from(String::from_utf8_lossy(&out.stdout).trim())
+    }
+}
+
+/// A run in the background, killed when dropped unless waited for.
+struct Running(Option<std::process::Child>);
+
+impl Running {
+    fn wait(mut self) -> Output {
+        self.0.take().unwrap().wait_with_output().unwrap()
+    }
+
+    fn still(&mut self) -> bool {
+        self.0.as_mut().unwrap().try_wait().unwrap().is_none()
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -264,23 +416,16 @@ fn without_a_terminal_the_run_waits_for_a_decision_from_another() {
     use std::io::BufRead;
     let p = Project::new("no-tty");
     p.enroll();
-    let mut run = p
-        .command(ATOMIC)
-        .args([
-            "run",
-            "approval",
-            "--run-id",
-            "elsewhere",
-            "--data",
-            r#"{"text": "v2"}"#,
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut run = p.spawn(&[
+        "run",
+        "approval",
+        "--run-id",
+        "elsewhere",
+        "--data",
+        r#"{"text": "v2"}"#,
+    ]);
     let (tx, rx) = std::sync::mpsc::channel();
-    let stderr = run.stderr.take().unwrap();
+    let stderr = run.0.as_mut().unwrap().stderr.take().unwrap();
     std::thread::spawn(move || {
         for line in std::io::BufReader::new(stderr)
             .lines()
@@ -299,10 +444,10 @@ fn without_a_terminal_the_run_waits_for_a_decision_from_another() {
         "{told}"
     );
     std::thread::sleep(Duration::from_millis(500));
-    assert!(run.try_wait().unwrap().is_none(), "the run waits");
+    assert!(run.still(), "the run waits");
     let approved = p.atomic(&["gates", "approve", "elsewhere:pick"]);
     assert!(approved.status.success(), "{}", text(&approved));
-    let out = run.wait_with_output().unwrap();
+    let out = run.wait();
     let t = text(&out);
     assert!(out.status.success(), "{t}");
     assert!(t.contains("got got v2"), "{t}");
@@ -321,17 +466,17 @@ fn a_question_gate_answered_at_the_prompt_resumes_with_the_typed_answer_and_reme
             "--data",
             r#"{"text": "v3"}"#,
         ],
-        &["nightly", "2"],
+        &["nightly", "b"],
     );
     let t = text(&out);
     assert!(out.status.success(), "{t}");
     assert!(t.contains("question: Which channel for got v3?"), "{t}");
-    assert!(t.contains("1) stable") && t.contains("2) beta"), "{t}");
+    assert!(t.contains("a) stable") && t.contains("b) beta"), "{t}");
     assert!(
-        t.contains("\"nightly\" is not an answer to this question"),
+        t.contains("nightly is not an answer to this question"),
         "an answer outside the enum is refused: {t}"
     );
-    assert!(t.contains("answered \"beta\" by local:dev"), "{t}");
+    assert!(t.contains("answered beta by local:dev"), "{t}");
     assert!(
         t.contains("got beta"),
         "the step after it got the typed answer: {t}"
@@ -345,7 +490,7 @@ fn a_question_gate_answered_at_the_prompt_resumes_with_the_typed_answer_and_reme
         assert_eq!(log[0].gate, "asked:pick");
         assert_eq!(log[0].ask, "Which channel for got v3?");
         assert_eq!(log[0].answer, json!("beta"));
-        assert_eq!(log[0].by, Principal::local("dev"));
+        assert_eq!(log[0].by, Some(Principal::local("dev")));
         assert!(log[0].at > 0);
     });
 }
@@ -354,21 +499,14 @@ fn a_question_gate_answered_at_the_prompt_resumes_with_the_typed_answer_and_reme
 fn an_answer_outside_the_enum_is_refused_from_another_terminal_too() {
     let p = Project::new("refused");
     p.enroll();
-    let run = p
-        .command(ATOMIC)
-        .args([
-            "run",
-            "question",
-            "--run-id",
-            "typed",
-            "--data",
-            r#"{"text": "v4"}"#,
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let run = p.spawn(&[
+        "run",
+        "question",
+        "--run-id",
+        "typed",
+        "--data",
+        r#"{"text": "v4"}"#,
+    ]);
     let until = Instant::now() + Duration::from_secs(60);
     while !text(&p.atomic(&["gates", "list"])).contains("typed:pick") {
         assert!(Instant::now() < until, "the gate never opened");
@@ -388,7 +526,7 @@ fn an_answer_outside_the_enum_is_refused_from_another_terminal_too() {
     );
     let answered = p.atomic(&["gates", "answer", "typed:pick", "stable"]);
     assert!(answered.status.success(), "{}", text(&answered));
-    let out = run.wait_with_output().unwrap();
+    let out = run.wait();
     assert!(out.status.success(), "{}", text(&out));
     assert!(text(&out).contains("got stable"), "{}", text(&out));
     on_codex_runtime(async move {
@@ -406,29 +544,181 @@ fn an_answer_outside_the_enum_is_refused_from_another_terminal_too() {
 }
 
 #[test]
-fn a_question_nobody_answers_in_time_resumes_with_its_default() {
+fn a_question_nobody_answers_in_time_resumes_with_its_default_and_remembers_it() {
     let p = Project::new("timed");
-    let out = p.atomic(&[
-        "run",
-        "timed",
-        "--run-id",
-        "late",
-        "--data",
-        r#"{"text": "v5"}"#,
-    ]);
+    p.enroll();
+    let out = p.at_terminal(
+        &[
+            "run",
+            "timed",
+            "--run-id",
+            "late",
+            "--data",
+            r#"{"text": "v5"}"#,
+        ],
+        &[],
+    );
     let t = text(&out);
     assert!(out.status.success(), "{t}");
-    assert!(t.contains("got stable"), "the declared default: {t}");
+    assert!(
+        t.contains("silence selects beta"),
+        "the prompt says what silence does: {t}"
+    );
+    assert!(t.contains("got beta"), "the declared default: {t}");
+    let g = p.gate("late:pick");
+    assert!(
+        matches!(&g.resolution, Some(gate::Resolution::Defaulted { answer, .. }) if answer == &json!("beta")),
+        "recorded as resumed with the default: {g:?}"
+    );
+    let listed = text(&p.atomic(&["gates", "list", "--all"]));
+    assert!(listed.contains("silence selected beta"), "{listed}");
     on_codex_runtime(async move {
         let rt = Durare::sqlite(&p.state().join("private/atomic.db"))
             .await
             .unwrap();
-        // Nobody answered, and it asks nothing remembered.
-        assert!(gate::feedback(&rt).await.unwrap().is_empty());
-        let g = gate::find(&rt, "late:pick").await.unwrap().unwrap();
-        assert!(
-            matches!(g.resolution, Some(gate::Resolution::Expired { .. })),
-            "{g:?}"
-        );
+        let log = gate::feedback(&rt).await.unwrap();
+        assert_eq!(log.len(), 1, "the remembered default: {log:?}");
+        assert_eq!(log[0].answer, json!("beta"));
+        assert_eq!(log[0].by, None, "nobody answered");
     });
+}
+
+#[test]
+fn replies_typed_ahead_decide_no_gate_they_were_not_typed_at() {
+    let p = Project::new("ahead");
+    p.enroll();
+    // Two replies at once, at the first gate: the second must not decide
+    // the second gate, which nobody has seen yet.
+    let out = p.at_terminal_with(
+        &[
+            "run",
+            "twice",
+            "--run-id",
+            "ahead",
+            "--data",
+            r#"{"text": "v6"}"#,
+        ],
+        &["a looked\na deployed"],
+        &[("DRIVER_DEADLINE", "12")],
+    );
+    let t = text(&out);
+    assert!(t.contains("gate ahead:look: approved by local:dev"), "{t}");
+    assert!(t.contains("gate ahead:deploy is waiting for you"), "{t}");
+    assert!(!t.contains("gate ahead:deploy: approved"), "{t}");
+    assert_eq!(
+        p.gate("ahead:deploy").resolution,
+        None,
+        "the second gate waits"
+    );
+
+    // A line typed before anything is shown decides nothing either.
+    let out = p.at_terminal_with(
+        &[
+            "run",
+            "approval",
+            "--run-id",
+            "early",
+            "--data",
+            r#"{"text": "v7"}"#,
+        ],
+        &[],
+        &[("DRIVER_EARLY", "a"), ("DRIVER_DEADLINE", "10")],
+    );
+    let t = text(&out);
+    assert!(t.contains("gate early:pick is waiting for you"), "{t}");
+    assert!(!t.contains("approved by"), "{t}");
+    assert_eq!(p.gate("early:pick").resolution, None, "the gate waits");
+}
+
+#[test]
+fn an_exec_command_cannot_type_into_the_prompt() {
+    let p = Project::new("inject");
+    p.enroll();
+    let log = p.dir.join("inject.log");
+    let data = json!({"text": log.display().to_string()}).to_string();
+    let out = p.at_terminal_with(
+        &["run", "injected", "--run-id", "typed-in", "--data", &data],
+        &[],
+        &[("DRIVER_DEADLINE", "12")],
+    );
+    let t = text(&out);
+    assert!(t.contains("gate typed-in:deploy is waiting for you"), "{t}");
+    let tried = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        tried.starts_with("no tty"),
+        "the command reached the terminal: {tried} {t}"
+    );
+    assert!(!t.contains("approved by"), "{t}");
+    assert_eq!(p.gate("typed-in:deploy").resolution, None, "the gate waits");
+}
+
+#[test]
+fn a_hostile_title_reaches_the_terminal_escaped() {
+    let p = Project::new("hostile");
+    p.enroll();
+    let data = json!({"text": "\u{1b}]0;owned\u{7}\u{1b}[2J\u{202e}gpj.exe"}).to_string();
+    let run = p.spawn(&["run", "approval", "--run-id", "hostile", "--data", &data]);
+    let until = Instant::now() + Duration::from_secs(60);
+    let listed = loop {
+        let listed = p.atomic(&["gates", "list"]);
+        if text(&listed).contains("hostile:pick") {
+            break listed;
+        }
+        assert!(Instant::now() < until, "the gate never opened");
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    drop(run);
+    let raw = String::from_utf8_lossy(&listed.stdout).into_owned();
+    assert!(
+        !raw.contains('\u{1b}') && !raw.contains('\u{7}') && !raw.contains('\u{202e}'),
+        "{raw:?}"
+    );
+    assert!(raw.contains("\\u{001b}]0;owned"), "{raw}");
+}
+
+#[test]
+fn without_standard_error_on_the_terminal_or_in_the_background_it_does_not_prompt() {
+    let p = Project::new("not-here");
+    p.enroll();
+    let errors = p.dir.join("stderr.txt");
+    let errors_text = errors.display().to_string();
+    for (run, setting) in [
+        ("errors-elsewhere", ("DRIVER_STDERR", errors_text.as_str())),
+        ("backgrounded", ("DRIVER_BACKGROUND", "1")),
+    ] {
+        let out = std::thread::scope(|scope| {
+            let running = scope.spawn(|| {
+                p.at_terminal_with(
+                    &[
+                        "run",
+                        "approval",
+                        "--run-id",
+                        run,
+                        "--data",
+                        r#"{"text": "v8"}"#,
+                    ],
+                    &["a"],
+                    &[setting, ("DRIVER_DEADLINE", "60")],
+                )
+            });
+            let id = format!("{run}:pick");
+            let until = Instant::now() + Duration::from_secs(50);
+            while !text(&p.atomic(&["gates", "list"])).contains(&id) {
+                assert!(Instant::now() < until, "the gate never opened");
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            std::thread::sleep(Duration::from_secs(1));
+            assert_eq!(p.gate(&id).resolution, None, "nothing typed decided it");
+            // Decided from another terminal: a backgrounded run is not frozen.
+            let approved = p.atomic(&["gates", "approve", &id]);
+            assert!(approved.status.success(), "{}", text(&approved));
+            running.join().unwrap()
+        });
+        let t = text(&out);
+        assert!(out.status.success(), "{run}: {t}");
+        assert!(t.contains("got got v8"), "{run}: {t}");
+        assert!(!t.contains("approve or reject"), "{run} prompted: {t}");
+    }
+    let said = std::fs::read_to_string(&errors).unwrap();
+    assert!(said.contains("decide it from a terminal"), "{said}");
 }

@@ -366,6 +366,7 @@ async fn a_question_gate_takes_only_an_answer_that_fits<R: DurableRuntime>(mut r
         s.question = Some(Question {
             answer: json!({"enum": ["stable", "beta"]}),
             remember,
+            default: None,
         });
         gate(&ctx, "pick", s).await
     });
@@ -426,7 +427,7 @@ async fn a_question_gate_takes_only_an_answer_that_fits<R: DurableRuntime>(mut r
     assert_eq!(log[0].gate, results[0].0);
     assert_eq!(log[0].ask, "Which channel?");
     assert_eq!(log[0].answer, json!("beta"));
-    assert_eq!(log[0].by, operator());
+    assert_eq!(log[0].by, Some(operator()));
 
     // An approval gate takes no answer.
     let (_, plain) = start_gated(&rt, input(None)).await;
@@ -439,6 +440,79 @@ async fn a_question_gate_takes_only_an_answer_that_fits<R: DurableRuntime>(mut r
         Err(DecideError::BadAnswer { .. })
     ));
     rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+}
+
+/// Silence selects a question's default when its deadline passes: the store
+/// records the gate as resolved with that answer, remembers it when asked
+/// to (by no one), and a decision after it gets the default as its
+/// conflict. A null default is a default.
+async fn silence_selects_a_questions_default<R: DurableRuntime>(mut rt: R) {
+    rt.register("silent", |ctx: R::Context, default: Value| async move {
+        let mut s = spec(&input(Some(300)));
+        s.workflow = "silent".into();
+        s.title = "Which channel?".into();
+        s.on_timeout = OnTimeout::Default;
+        s.question = Some(Question {
+            answer: json!({"enum": ["stable", "beta", null]}),
+            remember: true,
+            default: Some(default),
+        });
+        gate(&ctx, "pick", s).await
+    });
+    register(&mut rt);
+    rt.launch().await.expect("launch");
+    let me = me(&rt).await;
+    for default in [json!("beta"), Value::Null] {
+        let run = unique("silent");
+        rt.start("silent", &run, default.clone())
+            .await
+            .expect("start");
+        let resolution = outcome(&rt, &run).await.expect("finishes");
+        let Resolution::Defaulted { answer, .. } = &resolution else {
+            panic!("{resolution:?}");
+        };
+        assert_eq!(answer, &default);
+        let stored = find(&rt, &gate_id(&run, "pick"))
+            .await
+            .expect("find")
+            .expect("stored");
+        assert_eq!(stored.resolution, Some(resolution.clone()));
+        assert_eq!(
+            stored.question.and_then(|q| q.default),
+            Some(default.clone())
+        );
+        let late = DecisionCommand {
+            answer: Some(json!("stable")),
+            ..command(
+                &stored_gate(&rt, &run).await,
+                &format!("{run}-late"),
+                Verdict::Approve,
+            )
+        };
+        assert!(matches!(
+            decide(&rt, &me, late).await,
+            Err(DecideError::Conflict {
+                winning: Resolution::Defaulted { .. },
+                ..
+            })
+        ));
+    }
+    let log = feedback(&rt).await.expect("feedback");
+    assert_eq!(log.len(), 2, "{log:?}");
+    assert!(
+        log.iter().all(|f| f.by.is_none()),
+        "silence answered: {log:?}"
+    );
+    assert_eq!(log[0].answer, json!("beta"));
+    assert_eq!(log[1].answer, Value::Null);
+    rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+}
+
+async fn stored_gate<R: DurableRuntime>(rt: &R, run: &str) -> Gate {
+    find(rt, &gate_id(run, "pick"))
+        .await
+        .expect("find")
+        .expect("stored")
 }
 
 async fn until_steps<R: DurableRuntime>(rt: &R, run: &str, n: usize) {
@@ -852,6 +926,7 @@ on_backend!(
     only_an_approver_on_the_shown_proposal_decides,
     only_the_enrolled_credential_decides,
     a_question_gate_takes_only_an_answer_that_fits,
+    silence_selects_a_questions_default,
     a_wake_up_the_store_does_not_back_passes_nothing,
     a_passed_deadline_expires_the_gate_and_a_later_decision_conflicts,
     a_decision_after_the_deadline_records_the_expiry,
@@ -873,6 +948,7 @@ on_backend!(
     only_an_approver_on_the_shown_proposal_decides,
     only_the_enrolled_credential_decides,
     a_question_gate_takes_only_an_answer_that_fits,
+    silence_selects_a_questions_default,
     a_wake_up_the_store_does_not_back_passes_nothing,
     a_passed_deadline_expires_the_gate_and_a_later_decision_conflicts,
     a_decision_after_the_deadline_records_the_expiry,

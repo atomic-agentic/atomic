@@ -307,9 +307,17 @@ fn a_question_gate_asks_for_a_typed_answer_and_a_default_that_fits() {
         "      ask: \"'Why?'\"\n      answer: { type: string, maxLength: 200 }\n",
     ))
     .expect("a free answer is a schema");
+    check(&question(
+        "      ask: \"'Which?'\"\n      answer: [a, b]\n      timeout: 1h\n      on_timeout: reject\n",
+    ))
+    .expect("an unanswered question may fail closed");
+    check(&question(
+        "      ask: \"'Which?'\"\n      answer: [a, null]\n      timeout: 1h\n      on_timeout: { default: null }\n",
+    ))
+    .expect("a null default is a default");
     for (gate, says) in [
         (
-            "      ask: \"'Which?'\"\n      answer: [stable, beta]\n      on_timeout: { default: nightly }\n",
+            "      ask: \"'Which?'\"\n      answer: [stable, beta]\n      timeout: 1h\n      on_timeout: { default: nightly }\n",
             "is not an answer",
         ),
         ("      ask: \"'Which?'\"\n", "needs an `answer`"),
@@ -330,8 +338,12 @@ fn a_question_gate_asks_for_a_typed_answer_and_a_default_that_fits() {
             "belongs to a question gate",
         ),
         (
-            "      ask: \"'Which?'\"\n      answer: [a]\n      on_timeout: reject\n",
+            "      ask: \"'Which?'\"\n      answer: [a]\n      on_timeout: never\n",
             "`{ default: <answer> }`",
+        ),
+        (
+            "      ask: \"'Which?'\"\n      answer: [a]\n      on_timeout: { default: a }\n",
+            "give the gate a `timeout`",
         ),
     ] {
         let e = err(&question(gate)).to_string();

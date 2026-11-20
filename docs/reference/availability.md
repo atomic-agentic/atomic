@@ -51,8 +51,10 @@ continues with `atomic runs resume <run-id>`, or under `atomic serve`, from its
 checkpoints. One process at a time executes a project's runs. Errors carry a
 description and an action, separately in `--json` output. `atomic gates enroll`,
 `list`, `approve` and `reject` decide gates from a second terminal; a gate
-decision counts only with the credential its person enrolled. The terminal
-prompt for gates in `atomic run` is not wired up yet.
+decision counts only with the credential its person enrolled. `atomic run` and
+`atomic runs resume` prompt at the terminal for each gate their run reaches, and
+question gates (`ask` with a typed `answer`, `remember`, and a default when time
+runs out) are built; `atomic gates answer` answers one from another terminal.
 
 `atomic serve` also runs on PostgreSQL (`ATOMIC_DATABASE_URL`) when the process
 has an executor identity (`ATOMIC_EXECUTOR_ID`). `atomic runner` and

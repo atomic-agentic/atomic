@@ -136,8 +136,10 @@ const MIGRATIONS: &[Migration] = &[
                 PRIMARY KEY (request_id, attempt)
             )"],
     },
+    // Version 6 is another branch's (atomic_executions); question gates are
+    // 7, so a store at 6 from either gets the other's tables.
     Migration {
-        version: 6,
+        version: 7,
         // Question gates (see `gate`): the question a gate asks, as JSON,
         // and the answer its decision gave; and the feedback log, a dated
         // entry for each answer a question gate asked to remember.
@@ -161,7 +163,7 @@ const MIGRATIONS: &[Migration] = &[
 ];
 
 /// The store version this binary writes and understands.
-pub const STORE_VERSION: i64 = 6;
+pub const STORE_VERSION: i64 = 7;
 
 /// Why the store could not be opened.
 #[derive(Debug, thiserror::Error)]
@@ -401,6 +403,43 @@ mod tests {
         set_version(&p, 0).await;
         assert_eq!(open_sqlite(&p).await.expect("migrate"), STORE_VERSION);
         let _ = std::fs::remove_file(&p);
+    }
+
+    /// Question gates' tables reach a store at 5, and one at 6 (another
+    /// branch's migration, which this binary does not have).
+    #[tokio::test]
+    async fn question_gates_migrate_onto_a_store_at_5_or_6() {
+        for from in [5, 6] {
+            let p = db(&format!("from-{from}"));
+            open_sqlite(&p).await.expect("open");
+            {
+                use sqlx::Connection;
+                let mut c = sqlx::SqliteConnection::connect(&format!("sqlite://{}", p.display()))
+                    .await
+                    .expect("connect");
+                for table in ["atomic_gate_questions", "atomic_feedback"] {
+                    sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE {table}")))
+                        .execute(&mut c)
+                        .await
+                        .expect("drop");
+                }
+            }
+            set_version(&p, from).await;
+            assert_eq!(open_sqlite(&p).await.expect("migrate"), STORE_VERSION);
+            {
+                use sqlx::Connection;
+                let mut c = sqlx::SqliteConnection::connect(&format!("sqlite://{}", p.display()))
+                    .await
+                    .expect("connect");
+                for table in ["atomic_gate_questions", "atomic_feedback"] {
+                    sqlx::query(sqlx::AssertSqlSafe(format!("SELECT * FROM {table}")))
+                        .fetch_all(&mut c)
+                        .await
+                        .unwrap_or_else(|e| panic!("{table} after migrating from {from}: {e}"));
+                }
+            }
+            let _ = std::fs::remove_file(&p);
+        }
     }
 
     #[tokio::test]

@@ -258,7 +258,18 @@ pub struct QuestionStep {
     pub remember: bool,
     /// The answer the step resumes with if nobody answers in time; without
     /// one, an unanswered question stops the run as an expired gate does.
+    /// `Some(null)` is a null default.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
     pub default: Option<Value>,
+}
+
+/// A field that is present, even as `null`, is `Some`.
+fn present<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<Value>, D::Error> {
+    <Value as serde::Deserialize>::deserialize(d).map(Some)
 }
 
 /// One step of a pipeline.
@@ -1073,10 +1084,14 @@ async fn run_gate<C: WorkflowContext>(
         approvers,
         tier: Tier::High,
         timeout: step.timeout.map(std::time::Duration::from_secs),
-        on_timeout: Default::default(),
+        on_timeout: match step.question.as_ref().and_then(|q| q.default.as_ref()) {
+            Some(_) => gate::OnTimeout::Default,
+            None => gate::OnTimeout::Reject,
+        },
         question: step.question.as_ref().map(|q| gate::Question {
             answer: q.answer.clone(),
             remember: q.remember,
+            default: q.default.clone(),
         }),
     };
     match gate::gate(ctx, &step.id, spec).await? {
@@ -1095,19 +1110,15 @@ async fn run_gate<C: WorkflowContext>(
             }
             Ok(decision)
         }
-        // Nobody answered in time: the question's declared default.
-        Resolution::Expired { at: when, .. }
-            if step.question.as_ref().is_some_and(|q| q.default.is_some()) =>
-        {
-            let default = step.question.as_ref().and_then(|q| q.default.clone());
-            Ok(json!({
-                "verdict": "default",
-                "answer": default,
-                "by": null,
-                "comment": null,
-                "at": when,
-            }))
-        }
+        // Nobody answered in time: silence selected the question's default,
+        // as the gate store recorded it.
+        Resolution::Defaulted { at: when, answer } => Ok(json!({
+            "verdict": "default",
+            "answer": answer,
+            "by": null,
+            "comment": null,
+            "at": when,
+        })),
         Resolution::Decided(d) => Err(at(format!(
             "rejected by {}{}, so no step after it runs",
             d.by,

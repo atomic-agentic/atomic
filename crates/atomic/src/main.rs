@@ -15,6 +15,7 @@ mod gates;
 mod prompt;
 mod runs;
 mod setup;
+mod shown;
 mod skills;
 mod target;
 

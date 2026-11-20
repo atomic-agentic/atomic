@@ -622,6 +622,7 @@ pub fn load(
                         "`on_timeout` is `reject`: an expired gate never approves".into(),
                     ));
                 }
+                (Some(t), Some(_)) if t.as_str() == Some("reject") => {}
                 (Some(t), Some(answer)) => {
                     let default = t
                         .as_object()
@@ -630,9 +631,19 @@ pub fn load(
                         .ok_or_else(|| {
                             fail(
                                 &tp,
-                                "a question gate's `on_timeout` is `{ default: <answer> }`".into(),
+                                "a question gate's `on_timeout` is `reject` or \
+                                 `{ default: <answer> }`"
+                                    .into(),
                             )
                         })?;
+                    if !g.contains_key("timeout") {
+                        return Err(fail(
+                            &tp,
+                            "a default answer takes effect when the `timeout` passes: give the \
+                             gate a `timeout`"
+                                .into(),
+                        ));
+                    }
                     let fits = jsonschema::validator_for(answer)
                         .map(|v| v.is_valid(default))
                         .unwrap_or(false);

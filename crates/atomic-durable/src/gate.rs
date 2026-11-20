@@ -91,18 +91,23 @@ pub enum OnTimeout {
     /// The gate expires, which authorizes nothing: the run does not pass it.
     #[default]
     Reject,
+    /// A question gate resolves with its question's default answer
+    /// ([`Question::default`]).
+    Default,
 }
 
 impl OnTimeout {
     fn as_str(self) -> &'static str {
         match self {
             Self::Reject => "reject",
+            Self::Default => "default",
         }
     }
 
     fn parse(s: &str) -> Result<Self> {
         match s {
             "reject" => Ok(Self::Reject),
+            "default" => Ok(Self::Default),
             other => Err(corrupt(format!("unknown on_timeout {other:?}"))),
         }
     }
@@ -122,6 +127,20 @@ pub struct Question {
     /// Whether the answer goes into the feedback log.
     #[serde(default)]
     pub remember: bool,
+    /// The answer silence selects: what the gate resolves with when its
+    /// deadline passes, with [`OnTimeout::Default`]. `Some(null)` is a null
+    /// default, not none.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    pub default: Option<Value>,
+}
+
+/// A field that is present, even as `null`, is `Some`.
+fn present<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<Value>, D::Error> {
+    Value::deserialize(d).map(Some)
 }
 
 impl Question {
@@ -199,6 +218,14 @@ pub enum Resolution {
         at: i64,
         /// What the deadline did.
         on_timeout: OnTimeout,
+    },
+    /// The deadline passed on a question gate that names a default, so
+    /// silence selected it.
+    Defaulted {
+        /// When, in milliseconds since the Unix epoch.
+        at: i64,
+        /// The question's default answer.
+        answer: Value,
     },
 }
 
@@ -473,6 +500,13 @@ fn gate_from_row(row: &Row) -> Result<Gate> {
             at: row.int("decided_at")?,
             on_timeout,
         }),
+        "defaulted" => Some(Resolution::Defaulted {
+            at: row.int("decided_at")?,
+            answer: decode(
+                &row.text_opt("answer")?
+                    .ok_or_else(|| corrupt("a defaulted gate with no answer"))?,
+            )?,
+        }),
         "approved" | "rejected" => Some(Resolution::Decided(Decision {
             verdict: if state == "approved" {
                 Verdict::Approve
@@ -540,15 +574,67 @@ async fn checked_gate(tx: &mut Tx<'_, '_>, id: &str, run: &str, proposal: &str) 
 /// Record that `gate` expired at `now`, if it is still open. Returns the
 /// gate as the store now has it.
 async fn expire(tx: &mut Tx<'_, '_>, gate: &Gate, now: i64) -> Result<Gate> {
-    tx.execute(
-        "UPDATE atomic_gates SET state = 'expired', decided_at = ? \
-         WHERE gate_id = ? AND state = 'open'",
-        &[Param::Int(now), Param::Text(gate.id.clone())],
-    )
-    .await?;
+    let default = match (gate.on_timeout, &gate.question) {
+        (OnTimeout::Default, Some(q)) => q.default.clone(),
+        _ => None,
+    };
+    let state = if default.is_some() {
+        "defaulted"
+    } else {
+        "expired"
+    };
+    let won = tx
+        .execute(
+            "UPDATE atomic_gates SET state = ?, decided_at = ? WHERE gate_id = ? AND state = 'open'",
+            &[
+                Param::Text(state.to_owned()),
+                Param::Int(now),
+                Param::Text(gate.id.clone()),
+            ],
+        )
+        .await?;
+    if won == 1
+        && let (Some(answer), Some(q)) = (&default, &gate.question)
+    {
+        let answer = encode(answer)?;
+        tx.execute(
+            "UPDATE atomic_gate_questions SET answer = ? WHERE gate_id = ?",
+            &[Param::Text(answer.clone()), Param::Text(gate.id.clone())],
+        )
+        .await?;
+        if q.remember {
+            remember(tx, gate, &answer, None, now).await?;
+        }
+    }
     read_gate(tx, &gate.id)
         .await?
         .ok_or_else(|| corrupt(format!("gate {} vanished", gate.id)))
+}
+
+/// Keep `answer` to `gate` in the feedback log, as given by `by`, or by
+/// silence when `None`.
+async fn remember(
+    tx: &mut Tx<'_, '_>,
+    gate: &Gate,
+    answer: &str,
+    by: Option<&Principal>,
+    now: i64,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO atomic_feedback (gate_id, workflow, step, ask, answer, decided_by, \
+         recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (gate_id) DO NOTHING",
+        &[
+            Param::Text(gate.id.clone()),
+            Param::Text(gate.workflow.clone()),
+            Param::Text(gate.step.clone()),
+            Param::Text(gate.title.clone()),
+            Param::Text(answer.to_owned()),
+            Param::Text(by.map(|b| b.as_str().to_owned()).unwrap_or_default()),
+            Param::Int(now),
+        ],
+    )
+    .await?;
+    Ok(())
 }
 
 fn past_deadline(gate: &Gate, now: i64) -> bool {
@@ -579,6 +665,13 @@ pub async fn gate<C: WorkflowContext>(ctx: &C, step: &str, spec: GateSpec) -> Re
     if let Some(bad) = spec.evidence.iter().find(|e| !is_digest(e)) {
         return Err(DurableError::Failed(format!(
             "gate {step}: evidence {bad:?} is not a content digest (sha256:<hex>)"
+        )));
+    }
+    let defaults = spec.question.as_ref().is_some_and(|q| q.default.is_some());
+    if (spec.on_timeout == OnTimeout::Default) != defaults || (defaults && spec.timeout.is_none()) {
+        return Err(DurableError::Failed(format!(
+            "gate {step}: `on_timeout: default` goes with a question that names a default, and \
+             a deadline for it"
         )));
     }
     let run = ctx.workflow_id().to_owned();
@@ -889,21 +982,7 @@ pub async fn decide<R: DurableRuntime>(
                         {
                             // In the decision's own transaction: remembered
                             // exactly when it is decided.
-                            tx.execute(
-                                "INSERT INTO atomic_feedback (gate_id, workflow, step, ask, \
-                                 answer, decided_by, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?) \
-                                 ON CONFLICT (gate_id) DO NOTHING",
-                                &[
-                                    Param::Text(gate.id.clone()),
-                                    Param::Text(gate.workflow.clone()),
-                                    Param::Text(gate.step.clone()),
-                                    Param::Text(gate.title.clone()),
-                                    Param::Text(answer.clone()),
-                                    Param::Text(by.as_str().to_owned()),
-                                    Param::Int(now),
-                                ],
-                            )
-                            .await?;
+                            remember(&mut tx, &gate, answer, Some(&by), now).await?;
                         }
                         let now_stored = read_gate(&mut tx, &gate.id)
                             .await?
@@ -981,8 +1060,8 @@ pub struct Feedback {
     pub ask: String,
     /// The answer.
     pub answer: Value,
-    /// Who answered.
-    pub by: Principal,
+    /// Who answered, or `None` when silence selected the default.
+    pub by: Option<Principal>,
     /// When, in milliseconds since the Unix epoch.
     pub at: i64,
 }
@@ -1005,7 +1084,9 @@ pub async fn feedback<R: DurableRuntime>(rt: &R) -> Result<Vec<Feedback>> {
                     step: row.text("step")?,
                     ask: row.text("ask")?,
                     answer: decode(&row.text("answer")?)?,
-                    by: Principal::stored(row.text("decided_by")?),
+                    by: Some(row.text("decided_by")?)
+                        .filter(|b| !b.is_empty())
+                        .map(Principal::stored),
                     at: row.int("recorded_at")?,
                 })
             })

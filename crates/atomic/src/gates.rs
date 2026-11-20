@@ -7,6 +7,7 @@
 //! store (see [`atomic_core::credential`]); the gate store checks it.
 //! Enrollment is a person's explicit command, run from a terminal.
 
+use crate::shown;
 use anyhow::{Context, bail};
 use atomic_core::credential;
 use atomic_core::state::ProjectState;
@@ -109,15 +110,7 @@ pub async fn run(command: GatesCommand, state: &ProjectState) -> anyhow::Result<
             decide(&rt, state, &gate.gate, args, Verdict::Reject, None).await
         }
         GatesCommand::Answer { gate, answer, args } => {
-            decide(
-                &rt,
-                state,
-                &gate,
-                args,
-                Verdict::Approve,
-                Some(parse_answer(&answer)),
-            )
-            .await
+            decide(&rt, state, &gate, args, Verdict::Approve, Some(answer)).await
         }
     }
 }
@@ -171,24 +164,46 @@ async fn list(rt: &Durare, all: bool, json: bool) -> anyhow::Result<()> {
         println!("{}", serde_json::to_string_pretty(&gates)?);
         return Ok(());
     }
+    // Titles, what gates show and their choices can come from a model: all
+    // of it is printed through the sanitizer.
     for g in &gates {
         let state = match &g.resolution {
             None => "open".to_owned(),
             Some(gate::Resolution::Expired { .. }) => "expired".to_owned(),
-            Some(gate::Resolution::Decided(d)) => format!("{:?} by {}", d.verdict, d.by),
+            Some(gate::Resolution::Defaulted { answer, .. }) => {
+                format!("silence selected {}", shown::value(answer))
+            }
+            Some(gate::Resolution::Decided(d)) => match &d.answer {
+                Some(a) => format!("answered {} by {}", shown::value(a), d.by),
+                None => format!("{:?} by {}", d.verdict, d.by).to_lowercase(),
+            },
         };
-        println!("{}  {}  [{}]", g.id, g.title, state.to_lowercase());
-        println!("    shows: {}", serde_json::to_string(&g.show)?);
+        println!(
+            "{}  {}  [{state}]",
+            shown::line(&g.id),
+            shown::line(&g.title)
+        );
+        if !g.show.is_null() {
+            println!("    shows: {}", shown::value(&g.show));
+        }
         if let Some(q) = &g.question {
-            println!("    answer: {}", serde_json::to_string(&q.answer)?);
+            match q.choices() {
+                Some(choices) => {
+                    let listed: Vec<String> = choices
+                        .iter()
+                        .enumerate()
+                        .map(|(i, c)| format!("{}) {}", shown::label(i), shown::value(c)))
+                        .collect();
+                    println!("    choices: {}", listed.join("  "));
+                }
+                None => println!("    answer: {}", shown::value(&q.answer)),
+            }
+            if let (Some(default), Some(_)) = (&q.default, g.deadline) {
+                println!("    silence selects: {}", shown::value(default));
+            }
         }
     }
     Ok(())
-}
-
-/// An answer as typed: JSON if it parses as JSON, the text otherwise.
-pub(crate) fn parse_answer(text: &str) -> serde_json::Value {
-    serde_json::from_str(text).unwrap_or_else(|_| serde_json::Value::String(text.to_owned()))
 }
 
 /// The local operator's credential for this project, from the configured
@@ -255,11 +270,16 @@ async fn decide(
     gate_id: &str,
     args: DecideArgs,
     verdict: Verdict,
-    answer: Option<serde_json::Value>,
+    answer: Option<String>,
 ) -> anyhow::Result<()> {
     let found = gate::find(rt, gate_id)
         .await?
-        .with_context(|| format!("no gate {gate_id}"))?;
+        .with_context(|| format!("no gate {}", shown::line(gate_id)))?;
+    // Read as the prompt reads it.
+    let answer = answer.map(|text| match &found.question {
+        Some(q) => shown::answer(q, &text),
+        None => serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text)),
+    });
     let decision = decide_as_operator(
         rt,
         state,
@@ -271,15 +291,15 @@ async fn decide(
         args.command_id,
     )
     .await?;
-    match &decision.answer {
-        Some(a) => println!(
-            "{} answered {a} by {} ({})",
-            found.id, decision.by, decision.command
-        ),
-        None => println!(
-            "{} {:?} by {} ({})",
-            found.id, decision.verdict, decision.by, decision.command
-        ),
-    }
+    let what = match &decision.answer {
+        Some(a) => format!("answered {}", shown::value(a)),
+        None => format!("{:?}", decision.verdict).to_lowercase(),
+    };
+    println!(
+        "{} {what} by {} ({})",
+        shown::line(&found.id),
+        decision.by,
+        decision.command
+    );
     Ok(())
 }
