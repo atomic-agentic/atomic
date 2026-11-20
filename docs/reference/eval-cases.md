@@ -24,6 +24,10 @@ expect:
 | `input` | Required JSON-compatible value matching the atom's input schema; an object when the schema requires one |
 | `expect` | Required nonempty list of CEL expressions; every expression must evaluate to `true` |
 
+A number in `input` or `output` takes its CEL type from the atom's schema, as
+[Numbers in CEL](workflow-files.md#numbers-in-cel) describes: an `integer` field
+is an `int`, and a `number` field is a `double`.
+
 An atom whose code declares a write to an outside system has no eval cases:
 Atomic never runs such code in an eval. Cover it with code tests and
 `atomic test`.
