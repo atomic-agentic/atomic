@@ -2820,8 +2820,12 @@ fn the_backend_wait_is_at_least_a_second() {
         "an empty value is no value: {}",
         text(&out)
     );
+    // Run or stopped for want of a sandbox, but not refused: no
+    // configuration error, and nothing said of the wait.
     assert!(
-        !text(&out).contains("ATOMIC_BACKEND_WAIT"),
+        !text(&out).contains("config.invalid")
+            && !text(&out).contains("backend_wait")
+            && !text(&out).contains("ATOMIC_BACKEND_WAIT"),
         "an empty value is no value: {}",
         text(&out)
     );
@@ -2841,7 +2845,38 @@ fn the_backend_wait_is_at_least_a_second() {
     assert!(
         stdout_json(&out)["error"]["description"]
             .as_str()
-            .is_some_and(|d| d.contains("backend_wait")),
+            .is_some_and(
+                |d| d.contains("backend_wait, from environment variable ATOMIC_BACKEND_WAIT")
+            ),
+        "{}",
+        text(&out)
+    );
+    // Written in the manifest, the wait is read like any setting: the
+    // project loads, a run runs, and `config --explain` says where it came
+    // from.
+    let manifest = project.join("atomic.yaml");
+    let written = std::fs::read_to_string(&manifest).expect("manifest");
+    std::fs::write(&manifest, format!("{written}backend_wait: 300\n")).expect("manifest");
+    let out = atomic(
+        &dir,
+        &project,
+        &["--json", "run", "count-only", "--data", NOTE],
+        &[],
+        "",
+    );
+    assert!(
+        !text(&out).contains("project.invalid")
+            && !text(&out).contains("config.invalid")
+            && !text(&out).contains("unknown manifest key"),
+        "{}",
+        text(&out)
+    );
+    let out = atomic(&dir, &project, &["config", "--explain"], &[], "");
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        text(&out)
+            .lines()
+            .any(|l| l.contains("backend_wait") && l.contains("300") && l.contains("atomic.yaml")),
         "{}",
         text(&out)
     );

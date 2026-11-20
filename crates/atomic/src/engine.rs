@@ -227,7 +227,7 @@ pub async fn open(
     atomic_core::runtime::limit_backend_wait(
         resolved
             .settings
-            .backend_wait
+            .backend_wait()
             .map(std::time::Duration::from_secs),
     );
     let database = store_of(state, &resolved.settings);
