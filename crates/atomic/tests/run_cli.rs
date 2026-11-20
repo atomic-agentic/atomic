@@ -3770,3 +3770,111 @@ fn help_and_the_version_create_nothing_even_from_a_deleted_directory() {
     assert!(out.stderr.is_empty(), "no warnings: {}", text(&out));
     assert!(!dir.join("atomic-home").exists(), "nothing was created");
 }
+
+/// A panic in atomic's own workflow code (made at a step's failpoint, for
+/// the test) is named as the cause, with its message, by `atomic run`,
+/// `atomic runs resume` and `atomic serve`, and kept in the project's
+/// private state; the resume hint says the panic will likely happen again.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[test]
+fn a_run_whose_workflow_code_panics_is_reported_as_a_panic() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
+    let dir = scratch("panicked");
+    let project = project(&dir);
+    // An exec atom only: the endpoint is never called, but resuming and
+    // serving need one configured.
+    let panic = [
+        ("ATOMIC_FAILPOINT_PANIC", "pipeline:after:count"),
+        ("ATOMIC_MODEL_BASE_URL", "http://127.0.0.1:9/v1"),
+        ("ATOMIC_MODEL", "synthetic"),
+    ];
+    let said = |out: &Output| {
+        let t = text(out);
+        assert!(!out.status.success(), "{t}");
+        assert!(t.contains("atomic's own workflow code panicked"), "{t}");
+        assert!(
+            t.contains("failpoint pipeline:after:count"),
+            "the panic's message: {t}"
+        );
+        assert!(t.contains("will likely happen again"), "{t}");
+        assert!(!t.contains("recovered more times"), "{t}");
+        t
+    };
+    let out = atomic(
+        &dir,
+        &project,
+        &["run", "count-only", "--run-id", "panicky", "--data", NOTE],
+        &panic,
+        "",
+    );
+    said(&out);
+    // Kept where a later process, or the run's inspection, finds it.
+    let state = state_dir(&dir, &project);
+    let private = state
+        .parent()
+        .and_then(Path::parent)
+        .expect("the atomic home")
+        .join("private")
+        .join(state.file_name().expect("the project's id"));
+    let kept = atomic_app::panics::kept(&private.join("panics"), "panicky").expect("kept");
+    assert!(kept.contains("failpoint pipeline:after:count"), "{kept}");
+
+    // Resumed as it is, it panics again, and says so before and after.
+    let out = atomic(&dir, &project, &["runs", "resume", "panicky"], &panic, "");
+    let t = said(&out);
+    assert!(
+        t.contains("was parked because atomic's own workflow code panicked"),
+        "{t}"
+    );
+
+    // A server started later names it, from what was kept.
+    let log = dir.join("serve.log");
+    let mut serve = spawn(&dir, &project, &["serve"], &panic, &log);
+    wait_until("serve to name the panicked run", || {
+        std::fs::read_to_string(&log).is_ok_and(|l| {
+            l.contains("serving until stopped")
+                && l.contains("run panicky stopped: atomic's own workflow code panicked")
+        })
+    });
+    terminate(&serve);
+    let _ = wait_child(&mut serve, "serve");
+
+    // One that panics while serving: killed where it would panic, then
+    // recovered by a server, which says so as it happens.
+    let killed = [
+        ("ATOMIC_FAILPOINT", "pipeline:after:count"),
+        ("ATOMIC_MODEL_BASE_URL", "http://127.0.0.1:9/v1"),
+        ("ATOMIC_MODEL", "synthetic"),
+    ];
+    let out = atomic(
+        &dir,
+        &project,
+        &[
+            "run",
+            "count-only",
+            "--run-id",
+            "panics-later",
+            "--data",
+            NOTE,
+        ],
+        &killed,
+        "",
+    );
+    assert!(!out.status.success(), "{}", text(&out));
+    let log = dir.join("serve-2.log");
+    let mut serve = spawn(&dir, &project, &["serve"], &panic, &log);
+    wait_until(
+        "serve to name the run that panicked while it served",
+        || {
+            std::fs::read_to_string(&log).is_ok_and(|l| {
+                l.contains(
+                    "atomic serve: run panics-later stopped: atomic's own workflow code panicked",
+                ) && l.contains("failpoint pipeline:after:count")
+            })
+        },
+    );
+    terminate(&serve);
+    let _ = wait_child(&mut serve, "serve");
+}

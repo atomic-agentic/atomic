@@ -194,6 +194,8 @@ pub async fn open(
     }
     let endpoint = args.endpoint(needs_model)?;
     let store = LocalStore::open(state.dir().join("artifacts")).context("the artifact store")?;
+    // A run whose workflow code panics is noted where later processes look.
+    atomic_app::panics::keep_in(state.private_dir().join("panics"));
     // Scratch directories live in the project's state directory, outside
     // every directory a sandboxed turn may write. Connected once: what the
     // backend states here is what runs plan on, and connecting reclaims

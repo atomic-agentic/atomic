@@ -60,7 +60,8 @@ pub enum DurableError {
     /// execution's state is behind the run's, so it stops, records nothing,
     /// and takes the outcome the winner records. Workflow code passes it on
     /// unchanged; turning it into a failure would record the loss as the
-    /// run's outcome.
+    /// run's outcome. A step's or transaction's body that returns it fails
+    /// its step, and so its run.
     #[error("another execution of run {0} recorded its step first")]
     Conflict(String),
 }
