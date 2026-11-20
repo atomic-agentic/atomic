@@ -149,6 +149,8 @@ takes the same pair when it is built.
 | `atomic gates list` | Inspect durable gates | v0.1 local |
 | `atomic gates approve <gate-id>` | Approve a recorded proposal as the local operator | v0.1 local |
 | `atomic gates reject <gate-id>` | Reject a recorded proposal as the local operator | v0.1 local |
+| `atomic gates answer <gate-id> <answer>` | Answer a question gate as the local operator | v0.1 local |
+| The prompt in `atomic run` and `atomic runs resume` | Decide or answer each gate the run reaches, at the terminal | v0.1 local |
 | `atomic workflows show <name>` | Inspect a workflow definition and its steps | v0.5 |
 | `atomic graph` | Inspect work items, status and blocking dependencies | v0.5 |
 | Live thread controls | Answer, steer, stop and take over work | v0.5 CLI |

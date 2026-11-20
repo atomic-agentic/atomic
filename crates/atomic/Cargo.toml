@@ -23,9 +23,10 @@ sandbox-tests = []
 postgres-tests = ["atomic-durable/postgres-tests"]
 
 [dependencies]
-tokio = { workspace = true, features = ["rt", "signal", "macros"] }
+tokio = { workspace = true, features = ["rt", "signal", "macros", "time"] }
 anyhow = { workspace = true }
 getrandom = { workspace = true }
+libc = { workspace = true }
 clap = { workspace = true }
 serde_json = { workspace = true }
 atomic-atoms = { workspace = true }

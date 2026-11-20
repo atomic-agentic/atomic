@@ -183,8 +183,12 @@ fn print_result(run_id: &str, output: &Value, json: bool) -> anyhow::Result<()> 
 ///
 /// A signal stops the command as one stops `atomic serve` (see [`stop`]):
 /// the run stays unfinished, for `atomic runs resume`.
+///
+/// While it waits, the terminal prompt shows each gate the run opens, so the
+/// person running the command can decide it there (see [`crate::prompt`]).
 async fn finish(
     engine: &engine::Engine,
+    state: &ProjectState,
     run_id: &str,
     json: bool,
     signals: &mut Signals,
@@ -201,13 +205,25 @@ async fn finish(
         }
         outcome
     };
+    let follow = async {
+        tokio::select! {
+            outcome = follow => outcome,
+            () = crate::prompt::at_gates(&engine.rt, state, run_id) => {
+                unreachable!("the prompt runs until the run ends")
+            }
+        }
+    };
     let outcome = tokio::select! {
         outcome = follow => Some(outcome),
         signal = signals.next() => {
-            atomic_core::log_line!(
-                "{who}: {signal}: run {run_id} stays unfinished; continue it with \
-                 `atomic runs resume {run_id}`"
-            );
+            // Names and atomic's words only, written as they are: a run id
+            // such as `rotate-secret` is not a secret.
+            atomic_core::redact::Line::new()
+                .plain(&format!(
+                    "{who}: {signal}: run {run_id} stays unfinished; continue it with \
+                     `atomic runs resume {run_id}`"
+                ))
+                .log();
             None
         }
     };
@@ -312,11 +328,14 @@ pub async fn run(
     }
     engine.launch().await?;
     // Before anything runs, so a run cut short can be resumed by its id.
-    atomic_core::log_line!(
-        "run {run_id}: {} in project {}",
-        run.pipeline.name,
-        found.name
-    );
+    // Names only, written as they are: a run id such as `rotate-secret` is
+    // not a secret.
+    atomic_core::redact::Line::new()
+        .plain(&format!(
+            "run {run_id}: {} in project {}",
+            run.pipeline.name, found.name
+        ))
+        .log();
     if let Some(f) = &run.pipeline.fixture {
         atomic_core::log_line!(
             "run {run_id}: fixture {} at {} pinned to commit {}",
@@ -326,7 +345,7 @@ pub async fn run(
         );
     }
     engine.rt.start(PIPELINE, &run_id, run).await?;
-    finish(&engine, &run_id, json, &mut signals, "atomic run").await
+    finish(&engine, &state, &run_id, json, &mut signals, "atomic run").await
 }
 
 /// The state of the project a command that names no target works on.
@@ -378,7 +397,15 @@ pub async fn resume(
         }
         Some(RunStatus::Succeeded) => {
             engine.launch().await?;
-            finish(&engine, id, json, &mut signals, "atomic runs resume").await
+            finish(
+                &engine,
+                &state,
+                id,
+                json,
+                &mut signals,
+                "atomic runs resume",
+            )
+            .await
         }
         Some(RunStatus::Other(state)) if state != PARKED => {
             let _ = engine.rt.shutdown(SHUTDOWN).await;
@@ -430,14 +457,24 @@ pub async fn resume(
                 )
                 .into());
             }
-            atomic_core::log_line!("run {id}: resuming");
+            atomic_core::redact::Line::new()
+                .plain(&format!("run {id}: resuming"))
+                .log();
             // Queued before this engine dispatches, so it takes the run once.
             engine.rt.resume(id).await?;
             atomic_durable::failpoint("resume:queued");
             engine.launch().await?;
             // A gate decided while the run was down may never have woken it.
             atomic_durable::gate::redeliver(&engine.rt).await?;
-            finish(&engine, id, json, &mut signals, "atomic runs resume").await
+            finish(
+                &engine,
+                &state,
+                id,
+                json,
+                &mut signals,
+                "atomic runs resume",
+            )
+            .await
         }
     }
 }

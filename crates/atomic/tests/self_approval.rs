@@ -249,6 +249,7 @@ fn register(rt: &mut Durare) {
             tier: Tier::High,
             timeout: None,
             on_timeout: OnTimeout::Reject,
+            question: None,
         };
         gate::gate(&ctx, "accept", spec).await
     });
@@ -474,6 +475,7 @@ fn an_atom_cannot_approve_its_own_gate_through_its_shell() {
                 verdict: Verdict::Approve,
                 comment: None,
                 proposal: opened.proposal.clone(),
+                answer: None,
             },
         )
         .await

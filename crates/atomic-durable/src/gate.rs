@@ -37,6 +37,10 @@
 //! expired the next time anything looks at it, before the workflow goes on,
 //! and a decision that arrives after it gets the expiry as its conflict.
 
+// A conflict carries the winning resolution by value, so callers can match
+// on it; the error is large for it.
+#![allow(clippy::result_large_err)]
+
 pub mod approvers;
 pub mod credential;
 
@@ -87,20 +91,80 @@ pub enum OnTimeout {
     /// The gate expires, which authorizes nothing: the run does not pass it.
     #[default]
     Reject,
+    /// A question gate resolves with its question's default answer
+    /// ([`Question::default`]).
+    Default,
 }
 
 impl OnTimeout {
     fn as_str(self) -> &'static str {
         match self {
             Self::Reject => "reject",
+            Self::Default => "default",
         }
     }
 
     fn parse(s: &str) -> Result<Self> {
         match s {
             "reject" => Ok(Self::Reject),
+            "default" => Ok(Self::Default),
             other => Err(corrupt(format!("unknown on_timeout {other:?}"))),
         }
+    }
+}
+
+/// What a question gate asks for instead of approval: a typed answer.
+///
+/// The answer is the decision. It must fit `answer`, a JSON Schema (for a
+/// list of choices, an `enum`); with `remember`, it is also kept as a dated
+/// entry in the feedback log ([`feedback`]). What happens when nobody
+/// answers in time is the workflow's to say (an approval gate's
+/// [`OnTimeout`] still applies to the store: the gate expires).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Question {
+    /// The JSON Schema an answer must fit.
+    pub answer: Value,
+    /// Whether the answer goes into the feedback log.
+    #[serde(default)]
+    pub remember: bool,
+    /// The answer silence selects: what the gate resolves with when its
+    /// deadline passes, with [`OnTimeout::Default`]. `Some(null)` is a null
+    /// default, not none.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    pub default: Option<Value>,
+}
+
+/// A field that is present, even as `null`, is `Some`.
+fn present<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<Value>, D::Error> {
+    Value::deserialize(d).map(Some)
+}
+
+impl Question {
+    /// `answer` if it fits, or why not.
+    pub fn check(&self, answer: &Value) -> std::result::Result<(), String> {
+        let validator = jsonschema::validator_for(&self.answer)
+            .map_err(|e| format!("the question's answer schema is invalid: {e}"))?;
+        let errors: Vec<String> = validator
+            .iter_errors(answer)
+            .map(|e| e.to_string())
+            .collect();
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+
+    /// The allowed choices, when the answer is one of a list.
+    pub fn choices(&self) -> Option<&[Value]> {
+        self.answer
+            .get("enum")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
     }
 }
 
@@ -132,6 +196,9 @@ pub struct Decision {
     pub by: Principal,
     /// What they said, if anything.
     pub comment: Option<String>,
+    /// A question gate's answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<Value>,
     /// The command that recorded it.
     pub command: String,
     /// When, in milliseconds since the Unix epoch.
@@ -151,6 +218,14 @@ pub enum Resolution {
         at: i64,
         /// What the deadline did.
         on_timeout: OnTimeout,
+    },
+    /// The deadline passed on a question gate that names a default, so
+    /// silence selected it.
+    Defaulted {
+        /// When, in milliseconds since the Unix epoch.
+        at: i64,
+        /// The question's default answer.
+        answer: Value,
     },
 }
 
@@ -190,6 +265,8 @@ pub struct GateSpec {
     pub timeout: Option<Duration>,
     /// What the deadline does.
     pub on_timeout: OnTimeout,
+    /// For a question gate, the answer it asks for.
+    pub question: Option<Question>,
 }
 
 /// A gate as the store records it.
@@ -222,6 +299,9 @@ pub struct Gate {
     pub deadline: Option<i64>,
     /// What the deadline does.
     pub on_timeout: OnTimeout,
+    /// For a question gate, the answer it asks for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question: Option<Question>,
     /// How it was resolved, once it has been.
     pub resolution: Option<Resolution>,
 }
@@ -242,6 +322,10 @@ pub struct DecisionCommand {
     /// The proposal digest of what the person was shown. A decision on
     /// anything else is refused.
     pub proposal: String,
+    /// The answer to a question gate, which an approval of one needs; an
+    /// approval gate takes none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<Value>,
 }
 
 /// Why a decision was not recorded.
@@ -254,6 +338,14 @@ pub enum DecideError {
     /// decision.
     #[error("{0} has no operator credential enrolled")]
     NotEnrolled(Principal),
+    /// The answer does not fit the question, or the gate asks none.
+    #[error("gate {gate}: {why}")]
+    BadAnswer {
+        /// The gate.
+        gate: String,
+        /// What is wrong with it.
+        why: String,
+    },
     /// The credential is not the one the principal enrolled.
     #[error("the credential presented for {0} is not the one it enrolled")]
     BadCredential(Principal),
@@ -389,9 +481,17 @@ fn decode<T: serde::de::DeserializeOwned>(s: &str) -> Result<T> {
 // ---------------------------------------------------------------------------
 // Rows.
 
-const COLUMNS: &str = "gate_id, run, workflow, step, title, show, evidence, proposal, \
-                       approvers, tier, opened_at, deadline, on_timeout, state, decided_by, \
-                       decided_at, comment, command_id";
+const COLUMNS: &str = "g.gate_id AS gate_id, g.run AS run, g.workflow AS workflow, \
+                       g.step AS step, g.title AS title, g.show AS show, \
+                       g.evidence AS evidence, g.proposal AS proposal, \
+                       g.approvers AS approvers, g.tier AS tier, g.opened_at AS opened_at, \
+                       g.deadline AS deadline, g.on_timeout AS on_timeout, g.state AS state, \
+                       g.decided_by AS decided_by, g.decided_at AS decided_at, \
+                       g.comment AS comment, g.command_id AS command_id, \
+                       q.question AS question, q.answer AS answer";
+
+/// The gates and their questions, if they ask one.
+const GATES: &str = "atomic_gates g LEFT JOIN atomic_gate_questions q ON q.gate_id = g.gate_id";
 
 fn gate_from_row(row: &Row) -> Result<Gate> {
     let state = row.text("state")?;
@@ -402,6 +502,13 @@ fn gate_from_row(row: &Row) -> Result<Gate> {
             at: row.int("decided_at")?,
             on_timeout,
         }),
+        "defaulted" => Some(Resolution::Defaulted {
+            at: row.int("decided_at")?,
+            answer: decode(
+                &row.text_opt("answer")?
+                    .ok_or_else(|| corrupt("a defaulted gate with no answer"))?,
+            )?,
+        }),
         "approved" | "rejected" => Some(Resolution::Decided(Decision {
             verdict: if state == "approved" {
                 Verdict::Approve
@@ -410,6 +517,7 @@ fn gate_from_row(row: &Row) -> Result<Gate> {
             },
             by: Principal::stored(row.text("decided_by")?),
             comment: row.text_opt("comment")?,
+            answer: row.text_opt("answer")?.map(|a| decode(&a)).transpose()?,
             command: row.text("command_id")?,
             at: row.int("decided_at")?,
         })),
@@ -429,12 +537,13 @@ fn gate_from_row(row: &Row) -> Result<Gate> {
         opened_at: row.int("opened_at")?,
         deadline: row.int_opt("deadline")?,
         on_timeout,
+        question: row.text_opt("question")?.map(|q| decode(&q)).transpose()?,
         resolution,
     })
 }
 
 async fn read_gate(tx: &mut Tx<'_, '_>, id: &str) -> Result<Option<Gate>> {
-    let sql = format!("SELECT {COLUMNS} FROM atomic_gates WHERE gate_id = ?");
+    let sql = format!("SELECT {COLUMNS} FROM {GATES} WHERE g.gate_id = ?");
     match tx.query_opt(&sql, &[Param::Text(id.to_owned())]).await? {
         Some(row) => Ok(Some(gate_from_row(&row)?)),
         None => Ok(None),
@@ -467,15 +576,67 @@ async fn checked_gate(tx: &mut Tx<'_, '_>, id: &str, run: &str, proposal: &str) 
 /// Record that `gate` expired at `now`, if it is still open. Returns the
 /// gate as the store now has it.
 async fn expire(tx: &mut Tx<'_, '_>, gate: &Gate, now: i64) -> Result<Gate> {
-    tx.execute(
-        "UPDATE atomic_gates SET state = 'expired', decided_at = ? \
-         WHERE gate_id = ? AND state = 'open'",
-        &[Param::Int(now), Param::Text(gate.id.clone())],
-    )
-    .await?;
+    let default = match (gate.on_timeout, &gate.question) {
+        (OnTimeout::Default, Some(q)) => q.default.clone(),
+        _ => None,
+    };
+    let state = if default.is_some() {
+        "defaulted"
+    } else {
+        "expired"
+    };
+    let won = tx
+        .execute(
+            "UPDATE atomic_gates SET state = ?, decided_at = ? WHERE gate_id = ? AND state = 'open'",
+            &[
+                Param::Text(state.to_owned()),
+                Param::Int(now),
+                Param::Text(gate.id.clone()),
+            ],
+        )
+        .await?;
+    if won == 1
+        && let (Some(answer), Some(q)) = (&default, &gate.question)
+    {
+        let answer = encode(answer)?;
+        tx.execute(
+            "UPDATE atomic_gate_questions SET answer = ? WHERE gate_id = ?",
+            &[Param::Text(answer.clone()), Param::Text(gate.id.clone())],
+        )
+        .await?;
+        if q.remember {
+            remember(tx, gate, &answer, None, now).await?;
+        }
+    }
     read_gate(tx, &gate.id)
         .await?
         .ok_or_else(|| corrupt(format!("gate {} vanished", gate.id)))
+}
+
+/// Keep `answer` to `gate` in the feedback log, as given by `by`, or by
+/// silence when `None`.
+async fn remember(
+    tx: &mut Tx<'_, '_>,
+    gate: &Gate,
+    answer: &str,
+    by: Option<&Principal>,
+    now: i64,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO atomic_feedback (gate_id, workflow, step, ask, answer, decided_by, \
+         recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (gate_id) DO NOTHING",
+        &[
+            Param::Text(gate.id.clone()),
+            Param::Text(gate.workflow.clone()),
+            Param::Text(gate.step.clone()),
+            Param::Text(gate.title.clone()),
+            Param::Text(answer.to_owned()),
+            Param::Text(by.map(|b| b.as_str().to_owned()).unwrap_or_default()),
+            Param::Int(now),
+        ],
+    )
+    .await?;
+    Ok(())
 }
 
 fn past_deadline(gate: &Gate, now: i64) -> bool {
@@ -508,9 +669,24 @@ pub async fn gate<C: WorkflowContext>(ctx: &C, step: &str, spec: GateSpec) -> Re
             "gate {step}: evidence {bad:?} is not a content digest (sha256:<hex>)"
         )));
     }
+    let defaults = spec.question.as_ref().is_some_and(|q| q.default.is_some());
+    if (spec.on_timeout == OnTimeout::Default) != defaults || (defaults && spec.timeout.is_none()) {
+        return Err(DurableError::Failed(format!(
+            "gate {step}: `on_timeout: default` goes with a question that names a default, and \
+             a deadline for it"
+        )));
+    }
     let run = ctx.workflow_id().to_owned();
     let id = gate_id(&run, step);
-    let proposal = proposal_digest(&spec.title, &spec.show, &spec.evidence);
+    let proposal = match &spec.question {
+        None => proposal_digest(&spec.title, &spec.show, &spec.evidence),
+        // The question is part of what the person decides on.
+        Some(q) => proposal_digest(
+            &spec.title,
+            &json!({"show": spec.show, "question": q}),
+            &spec.evidence,
+        ),
+    };
 
     let (open_id, open_run, open_step, open_proposal) =
         (id.clone(), run.clone(), step.to_owned(), proposal.clone());
@@ -556,6 +732,13 @@ pub async fn gate<C: WorkflowContext>(ctx: &C, step: &str, spec: GateSpec) -> Re
                     ],
                 )
                 .await?;
+                if let Some(q) = &spec.question {
+                    tx.execute(
+                        "INSERT INTO atomic_gate_questions (gate_id, question) VALUES (?, ?)",
+                        &[Param::Text(id.clone()), Param::Text(encode(q)?)],
+                    )
+                    .await?;
+                }
                 read_gate(&mut tx, &id)
                     .await?
                     .ok_or_else(|| corrupt(format!("gate {id} was not written")))
@@ -650,16 +833,19 @@ impl Recorded {
 /// a different request is told apart from a replay.
 fn request_digest(by: &Principal, cmd: &DecisionCommand) -> String {
     let mut bytes = Vec::new();
-    canonical(
-        &json!({
-            "by": by,
-            "gate": cmd.gate,
-            "verdict": cmd.verdict,
-            "comment": cmd.comment,
-            "proposal": cmd.proposal,
-        }),
-        &mut bytes,
-    );
+    let mut request = json!({
+        "by": by,
+        "gate": cmd.gate,
+        "verdict": cmd.verdict,
+        "comment": cmd.comment,
+        "proposal": cmd.proposal,
+    });
+    // Only when there is one: a command journaled before question gates
+    // keeps its digest, so its replay is still recognised.
+    if let Some(answer) = &cmd.answer {
+        request["answer"] = answer.clone();
+    }
+    canonical(&request, &mut bytes);
     format!("sha256:{:x}", Sha256::digest(&bytes))
 }
 
@@ -755,6 +941,19 @@ pub async fn decide<R: DurableRuntime>(
                         ));
                     }
                     None => {
+                        if let Err(why) = answer_fits(&gate, &cmd) {
+                            return Ok((
+                                Err(DecideError::BadAnswer {
+                                    gate: gate.id.clone(),
+                                    why,
+                                }),
+                                None,
+                            ));
+                        }
+                        let answer = match &cmd.answer {
+                            Some(a) if cmd.verdict == Verdict::Approve => Some(encode(a)?),
+                            _ => None,
+                        };
                         let won = tx
                             .execute(
                                 "UPDATE atomic_gates SET state = ?, decided_by = ?, \
@@ -770,6 +969,23 @@ pub async fn decide<R: DurableRuntime>(
                                 ],
                             )
                             .await?;
+                        if won == 1
+                            && let Some(answer) = &answer
+                        {
+                            tx.execute(
+                                "UPDATE atomic_gate_questions SET answer = ? WHERE gate_id = ?",
+                                &[Param::Text(answer.clone()), Param::Text(gate.id.clone())],
+                            )
+                            .await?;
+                        }
+                        if won == 1
+                            && let (Some(q), Some(answer)) = (&gate.question, &answer)
+                            && q.remember
+                        {
+                            // In the decision's own transaction: remembered
+                            // exactly when it is decided.
+                            remember(&mut tx, &gate, answer, Some(&by), now).await?;
+                        }
                         let now_stored = read_gate(&mut tx, &gate.id)
                             .await?
                             .ok_or_else(|| corrupt(format!("gate {} vanished", gate.id)))?;
@@ -817,6 +1033,71 @@ pub async fn decide<R: DurableRuntime>(
     recorded.into_result(&gate_id)
 }
 
+/// Whether `cmd` answers `gate` as it must: an approval of a question gate
+/// carries an answer that fits it, and nothing else carries one.
+fn answer_fits(gate: &Gate, cmd: &DecisionCommand) -> std::result::Result<(), String> {
+    match (&gate.question, &cmd.answer, cmd.verdict) {
+        (None, None, _) | (Some(_), None, Verdict::Reject) => Ok(()),
+        (None, Some(_), _) => Err("it asks no question, so it takes no answer".into()),
+        (Some(_), Some(_), Verdict::Reject) => {
+            Err("a rejection gives no answer; reject it without one".into())
+        }
+        (Some(_), None, Verdict::Approve) => Err("it asks a question: answer it".into()),
+        (Some(q), Some(a), Verdict::Approve) => q
+            .check(a)
+            .map_err(|why| format!("{a} does not answer it: {why}")),
+    }
+}
+
+/// One remembered answer in the feedback log.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Feedback {
+    /// The question gate.
+    pub gate: String,
+    /// Its workflow.
+    pub workflow: String,
+    /// Its step.
+    pub step: String,
+    /// What it asked.
+    pub ask: String,
+    /// The answer.
+    pub answer: Value,
+    /// Who answered, or `None` when silence selected the default.
+    pub by: Option<Principal>,
+    /// When, in milliseconds since the Unix epoch.
+    pub at: i64,
+}
+
+/// The feedback log, oldest first.
+pub async fn feedback<R: DurableRuntime>(rt: &R) -> Result<Vec<Feedback>> {
+    rt.control_transaction(|mut tx| {
+        Box::pin(async move {
+            tx.query_all(
+                "SELECT gate_id, workflow, step, ask, answer, decided_by, recorded_at \
+                 FROM atomic_feedback ORDER BY recorded_at, gate_id",
+                &[],
+            )
+            .await?
+            .iter()
+            .map(|row| {
+                Ok(Feedback {
+                    gate: row.text("gate_id")?,
+                    workflow: row.text("workflow")?,
+                    step: row.text("step")?,
+                    ask: row.text("ask")?,
+                    answer: decode(&row.text("answer")?)?,
+                    by: Some(row.text("decided_by")?)
+                        .filter(|b| !b.is_empty())
+                        .map(Principal::stored),
+                    at: row.int("recorded_at")?,
+                })
+            })
+            .collect()
+        })
+    })
+    .await
+}
+
 async fn wake<R: DurableRuntime>(rt: &R, run: &str, gate: &str) -> Result<()> {
     failpoint("gate:before-wake");
     rt.send(run, &topic(gate), json!({ "gate": gate }), gate)
@@ -828,16 +1109,16 @@ pub async fn gates<R: DurableRuntime>(rt: &R, filter: GateFilter) -> Result<Vec<
     rt.read_transaction(move |mut tx| {
         let filter = filter.clone();
         Box::pin(async move {
-            let mut sql = format!("SELECT {COLUMNS} FROM atomic_gates WHERE 1 = 1");
+            let mut sql = format!("SELECT {COLUMNS} FROM {GATES} WHERE 1 = 1");
             let mut ps = Vec::new();
             if filter.open_only {
-                sql.push_str(" AND state = 'open'");
+                sql.push_str(" AND g.state = 'open'");
             }
             if let Some(run) = filter.run {
-                sql.push_str(" AND run = ?");
+                sql.push_str(" AND g.run = ?");
                 ps.push(Param::Text(run));
             }
-            sql.push_str(" ORDER BY opened_at, gate_id");
+            sql.push_str(" ORDER BY g.opened_at, g.gate_id");
             tx.query_all(&sql, &ps)
                 .await?
                 .iter()

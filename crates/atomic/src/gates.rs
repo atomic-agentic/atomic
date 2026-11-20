@@ -7,6 +7,7 @@
 //! store (see [`atomic_core::credential`]); the gate store checks it.
 //! Enrollment is a person's explicit command, run from a terminal.
 
+use crate::shown;
 use anyhow::{Context, bail};
 use atomic_core::credential;
 use atomic_core::state::ProjectState;
@@ -36,15 +37,38 @@ pub enum GatesCommand {
         json: bool,
     },
     /// Approve a gate.
-    Approve(DecideArgs),
+    Approve {
+        #[command(flatten)]
+        gate: GateArg,
+        #[command(flatten)]
+        args: DecideArgs,
+    },
     /// Reject a gate.
-    Reject(DecideArgs),
+    Reject {
+        #[command(flatten)]
+        gate: GateArg,
+        #[command(flatten)]
+        args: DecideArgs,
+    },
+    /// Answer a question gate.
+    Answer {
+        /// The gate's id, as `atomic gates list` shows it.
+        gate: String,
+        /// The answer: JSON, or else the text itself.
+        answer: String,
+        #[command(flatten)]
+        args: DecideArgs,
+    },
+}
+
+#[derive(Debug, Args)]
+pub struct GateArg {
+    /// The gate's id, as `atomic gates list` shows it.
+    gate: String,
 }
 
 #[derive(Debug, Args)]
 pub struct DecideArgs {
-    /// The gate's id, as `atomic gates list` shows it.
-    gate: String,
     /// A comment to record with the decision.
     #[arg(long)]
     comment: Option<String>,
@@ -79,8 +103,15 @@ pub async fn run(command: GatesCommand, state: &ProjectState) -> anyhow::Result<
     match command {
         GatesCommand::Enroll { replace } => enroll(&rt, state, replace).await,
         GatesCommand::List { all, json } => list(&rt, all, json).await,
-        GatesCommand::Approve(args) => decide(&rt, state, args, Verdict::Approve).await,
-        GatesCommand::Reject(args) => decide(&rt, state, args, Verdict::Reject).await,
+        GatesCommand::Approve { gate, args } => {
+            decide(&rt, state, &gate.gate, args, Verdict::Approve, None).await
+        }
+        GatesCommand::Reject { gate, args } => {
+            decide(&rt, state, &gate.gate, args, Verdict::Reject, None).await
+        }
+        GatesCommand::Answer { gate, answer, args } => {
+            decide(&rt, state, &gate, args, Verdict::Approve, Some(answer)).await
+        }
     }
 }
 
@@ -133,34 +164,75 @@ async fn list(rt: &Durare, all: bool, json: bool) -> anyhow::Result<()> {
         println!("{}", serde_json::to_string_pretty(&gates)?);
         return Ok(());
     }
+    // Titles, what gates show and their choices can come from a model: all
+    // of it is printed through the sanitizer.
     for g in &gates {
         let state = match &g.resolution {
             None => "open".to_owned(),
             Some(gate::Resolution::Expired { .. }) => "expired".to_owned(),
-            Some(gate::Resolution::Decided(d)) => format!("{:?} by {}", d.verdict, d.by),
+            Some(gate::Resolution::Defaulted { answer, .. }) => {
+                format!("silence selected {}", shown::value(answer))
+            }
+            Some(gate::Resolution::Decided(d)) => match &d.answer {
+                Some(a) => format!("answered {} by {}", shown::value(a), d.by),
+                None => format!("{:?} by {}", d.verdict, d.by).to_lowercase(),
+            },
         };
-        println!("{}  {}  [{}]", g.id, g.title, state.to_lowercase());
-        println!("    shows: {}", serde_json::to_string(&g.show)?);
+        println!(
+            "{}  {}  [{state}]",
+            shown::line(&g.id),
+            shown::line(&g.title)
+        );
+        if !g.show.is_null() {
+            println!("    shows: {}", shown::value(&g.show));
+        }
+        if let Some(q) = &g.question {
+            match q.choices() {
+                Some(choices) => {
+                    let listed: Vec<String> = choices
+                        .iter()
+                        .enumerate()
+                        .map(|(i, c)| format!("{}) {}", shown::label(i), shown::value(c)))
+                        .collect();
+                    println!("    choices: {}", listed.join("  "));
+                }
+                None => println!("    answer: {}", shown::value(&q.answer)),
+            }
+            if let (Some(default), Some(_)) = (&q.default, g.deadline) {
+                println!("    silence selects: {}", shown::value(default));
+            }
+        }
     }
     Ok(())
 }
 
-async fn decide(
-    rt: &Durare,
-    state: &ProjectState,
-    args: DecideArgs,
-    verdict: Verdict,
-) -> anyhow::Result<()> {
+/// The local operator's credential for this project, from the configured
+/// store.
+pub(crate) fn operator_credential(state: &ProjectState) -> anyhow::Result<HumanCredential> {
     let (user, principal) = operator()?;
     let store = credential::configured_store(state.root())?;
     let account = credential::operator_account(state, &user);
     let secret = credential::operator_secret(store.as_ref(), &account)?.with_context(|| {
         format!("{principal} has no operator credential here; run atomic gates enroll")
     })?;
-    let found = gate::find(rt, &args.gate)
-        .await?
-        .with_context(|| format!("no gate {}", args.gate))?;
-    let command_id = match args.command_id {
+    Ok(HumanCredential::new(principal, secret))
+}
+
+/// Decide `found` as the local operator, with their credential, and wake
+/// its run.
+#[allow(clippy::too_many_arguments)] // each is one part of the decision
+pub(crate) async fn decide_as_operator(
+    rt: &Durare,
+    state: &ProjectState,
+    found: &gate::Gate,
+    verdict: Verdict,
+    comment: Option<String>,
+    answer: Option<serde_json::Value>,
+    proposal: Option<String>,
+    command_id: Option<String>,
+) -> anyhow::Result<gate::Decision> {
+    let credential = operator_credential(state)?;
+    let command_id = match command_id {
         Some(id) => id,
         None => format!(
             "cli-{}",
@@ -169,20 +241,17 @@ async fn decide(
     };
     let decision = gate::decide(
         rt,
-        &HumanCredential::new(principal, secret),
+        &credential,
         DecisionCommand {
             command_id,
             gate: found.id.clone(),
             verdict,
-            comment: args.comment,
-            proposal: args.proposal.unwrap_or(found.proposal),
+            comment,
+            proposal: proposal.unwrap_or_else(|| found.proposal.clone()),
+            answer,
         },
     )
     .await?;
-    println!(
-        "{} {:?} by {} ({})",
-        found.id, decision.verdict, decision.by, decision.command
-    );
     // The decision is recorded; waking the run is not part of it. Say so if
     // it fails, rather than leave the run to its deadline unannounced.
     if let Err(e) = gate::redeliver(rt).await {
@@ -193,5 +262,45 @@ async fn decide(
             found.run
         );
     }
+    Ok(decision)
+}
+
+async fn decide(
+    rt: &Durare,
+    state: &ProjectState,
+    gate_id: &str,
+    args: DecideArgs,
+    verdict: Verdict,
+    answer: Option<String>,
+) -> anyhow::Result<()> {
+    let found = gate::find(rt, gate_id)
+        .await?
+        .with_context(|| format!("no gate {}", shown::line(gate_id)))?;
+    // Read as the prompt reads it.
+    let answer = answer.map(|text| match &found.question {
+        Some(q) => shown::answer(q, &text),
+        None => serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text)),
+    });
+    let decision = decide_as_operator(
+        rt,
+        state,
+        &found,
+        verdict,
+        args.comment,
+        answer,
+        args.proposal,
+        args.command_id,
+    )
+    .await?;
+    let what = match &decision.answer {
+        Some(a) => format!("answered {}", shown::value(a)),
+        None => format!("{:?}", decision.verdict).to_lowercase(),
+    };
+    println!(
+        "{} {what} by {} ({})",
+        shown::line(&found.id),
+        decision.by,
+        decision.command
+    );
     Ok(())
 }
