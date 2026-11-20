@@ -106,6 +106,10 @@ impl Fixture {
     fn blobs(&self) -> usize {
         count_files(&self.dir.join("store/blobs"))
     }
+
+    fn staged(&self) -> usize {
+        count_files(&self.dir.join("store/staging"))
+    }
 }
 
 fn count_files(dir: &Path) -> usize {
@@ -354,24 +358,109 @@ fn a_damaged_blob_is_not_given_to_a_command() {
     assert!(!f.exchange.inputs.join(patch.digest()).exists());
 }
 
-/// A store that changes the file it is about to read, as a process the
-/// command left running might.
+/// A store that changes a file as it is about to read the `at`-th, counting
+/// from one, after atomic opened it, as a process the command left running
+/// might.
 struct Tampering<'a> {
     inner: &'a LocalStore,
     path: PathBuf,
     change: fn(&Path),
+    at: usize,
+    stages: std::sync::atomic::AtomicUsize,
 }
 
 impl ArtifactStore for Tampering<'_> {
     fn stage(&self, content: &mut dyn Read) -> Result<crate::artifact::Staged, ArtifactError> {
-        (self.change)(&self.path);
+        if self
+            .stages
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1
+            == self.at
+        {
+            (self.change)(&self.path);
+        }
         self.inner.stage(content)
     }
     fn commit(
         &self,
         staged: crate::artifact::Staged,
-        provenance: Provenance,
-    ) -> Result<crate::artifact::Manifest, ArtifactError> {
+        provenance: &[Provenance],
+    ) -> Result<Vec<crate::artifact::Manifest>, ArtifactError> {
+        self.inner.commit(staged, provenance)
+    }
+    fn discard(&self, staged: crate::artifact::Staged) {
+        self.inner.discard(staged)
+    }
+    fn contains(&self, artifact: &ArtifactRef) -> Result<bool, ArtifactError> {
+        self.inner.contains(artifact)
+    }
+    fn open(&self, artifact: &ArtifactRef) -> Result<Box<dyn Read + Send>, ArtifactError> {
+        self.inner.open(artifact)
+    }
+    fn manifests(
+        &self,
+        artifact: &ArtifactRef,
+    ) -> Result<Vec<crate::artifact::Manifest>, ArtifactError> {
+        self.inner.manifests(artifact)
+    }
+}
+
+/// A store that counts what it stages and commits, and fails the stage or
+/// the commit of the given number, counting from one.
+struct Counting<'a> {
+    inner: &'a LocalStore,
+    stages: std::sync::atomic::AtomicUsize,
+    commits: std::sync::atomic::AtomicUsize,
+    fail_stage: usize,
+    fail_commit: usize,
+}
+
+impl<'a> Counting<'a> {
+    fn new(inner: &'a LocalStore, fail_stage: usize, fail_commit: usize) -> Self {
+        Self {
+            inner,
+            stages: Default::default(),
+            commits: Default::default(),
+            fail_stage,
+            fail_commit,
+        }
+    }
+
+    fn stages(&self) -> usize {
+        self.stages.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+fn failed() -> ArtifactError {
+    ArtifactError::Io {
+        path: "counting".into(),
+        source: std::io::Error::other("the store failed"),
+    }
+}
+
+impl ArtifactStore for Counting<'_> {
+    fn stage(&self, content: &mut dyn Read) -> Result<crate::artifact::Staged, ArtifactError> {
+        let n = self
+            .stages
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        if n == self.fail_stage {
+            return Err(failed());
+        }
+        self.inner.stage(content)
+    }
+    fn commit(
+        &self,
+        staged: crate::artifact::Staged,
+        provenance: &[Provenance],
+    ) -> Result<Vec<crate::artifact::Manifest>, ArtifactError> {
+        let n = self
+            .commits
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        if n == self.fail_commit {
+            return Err(failed());
+        }
         self.inner.commit(staged, provenance)
     }
     fn discard(&self, staged: crate::artifact::Staged) {
@@ -425,6 +514,9 @@ fn a_file_that_changes_while_it_is_read_hands_over_only_what_it_had() {
                 .and_then(|file| file.set_len(4))
                 .expect("shrink");
         },
+        // As it is read, after the first file.
+        at: 2,
+        stages: Default::default(),
     };
     // Read after another file, which is then not stored either.
     f.write("a.diff", b"first");
@@ -437,6 +529,7 @@ fn a_file_that_changes_while_it_is_read_hands_over_only_what_it_had() {
         .expect_err("refused");
     assert!(matches!(e, ArtifactError::Refused(_)), "{e}");
     assert_eq!(f.blobs(), 0, "a shrunk file left a blob");
+    assert_eq!(f.staged(), 0, "a shrunk file left a staged file");
 
     f.write("grow.diff", b"0123456789");
     let growing = Tampering {
@@ -450,6 +543,8 @@ fn a_file_that_changes_while_it_is_read_hands_over_only_what_it_had() {
                 .and_then(|mut file| file.write_all(b"and more"))
                 .expect("grow");
         },
+        at: 1,
+        stages: Default::default(),
     };
     let mut output = json!({"patch": {"$file": "grow.diff", "mediaType": "text/x-diff"}});
     f.gather_through(&growing, &mut output).expect("gathered");
@@ -530,7 +625,10 @@ fn stand_ins_cannot_be_forged_and_one_name_may_have_two_media_types() {
         "patch": {"$file": "a.diff", "mediaType": "text/x-diff"},
         "more": [{"$file": "a.diff", "mediaType": "text/plain"}]
     });
-    f.gather(&mut output).expect("two media types");
+    let counting = Counting::new(&f.store, 0, 0);
+    f.gather_through(&counting, &mut output)
+        .expect("two media types");
+    assert_eq!(counting.stages(), 1, "the file was read once");
     let reference = reference_of(b"x");
     assert_eq!(output, json!({"patch": reference, "more": [reference]}));
     assert_eq!(f.blobs(), 1);
@@ -575,4 +673,75 @@ fn many_objects_naming_one_file_are_gathered_quickly() {
         started.elapsed()
     );
     assert_eq!(f.blobs(), 1);
+}
+
+/// A store that fails to stage or to commit one of several files leaves
+/// nothing staged.
+#[test]
+fn a_failed_stage_or_commit_leaves_nothing_staged() {
+    let f = fixture("leak");
+    f.write("a.diff", b"first");
+    f.write("b.diff", b"second");
+    f.write("c.diff", b"third");
+    for (fail_stage, fail_commit) in [(2, 0), (3, 0), (0, 1), (0, 2)] {
+        let failing = Counting::new(&f.store, fail_stage, fail_commit);
+        let mut output = json!({
+            "patch": {"$file": "a.diff", "mediaType": "text/x-diff"},
+            "more": [{"$file": "b.diff"}, {"$file": "c.diff"}]
+        });
+        let e = f
+            .gather_through(&failing, &mut output)
+            .expect_err("the store failed");
+        assert!(matches!(e, ArtifactError::Io { .. }), "{e}");
+        assert_eq!(
+            f.staged(),
+            0,
+            "stage {fail_stage} or commit {fail_commit} failing left staged files"
+        );
+    }
+}
+
+/// Past the most files one output may name, an output is refused before
+/// any is read; up to it, each is read in turn.
+#[test]
+fn an_output_naming_more_files_than_the_most_is_refused() {
+    let f = fixture("names");
+    let names = 1_500;
+    for i in 0..names {
+        f.write(&format!("{i}.txt"), format!("file {i}").as_bytes());
+    }
+    let more: Vec<Value> = (0..names)
+        .map(|i| json!({"$file": format!("{i}.txt")}))
+        .collect();
+    let mut output = json!({"patch": {"$file": "0.txt", "mediaType": "text/x-diff"}, "more": more});
+    let e = f.gather(&mut output).expect_err("too many files");
+    assert!(
+        matches!(&e, ArtifactError::Refused(m) if m.contains("at most")),
+        "{e}"
+    );
+    assert_eq!((f.blobs(), f.staged()), (0, 0));
+    let more: Vec<Value> = (1..MAX_FILES)
+        .map(|i| json!({"$file": format!("{i}.txt")}))
+        .collect();
+    let mut output = json!({"patch": {"$file": "0.txt", "mediaType": "text/x-diff"}, "more": more});
+    f.gather(&mut output).expect("as many as the most");
+    assert_eq!(f.blobs(), MAX_FILES);
+}
+
+/// `$file` objects where the contract expects no reference are the
+/// output's own, and do not count toward the most an output may name.
+#[test]
+fn the_outputs_own_file_objects_are_not_counted() {
+    let f = fixture("own-many");
+    f.write("a.diff", b"x");
+    let own: Vec<Value> = (0..=MAX_FILE_OBJECTS)
+        .map(|_| json!({"$file": "elsewhere"}))
+        .collect();
+    let mut output = json!({
+        "patch": {"$file": "a.diff", "mediaType": "text/x-diff"},
+        "meta": {"files": own.clone()}
+    });
+    f.gather(&mut output).expect("gathered");
+    assert_eq!(output["patch"], json!(reference_of(b"x")));
+    assert_eq!(output["meta"]["files"], json!(own));
 }

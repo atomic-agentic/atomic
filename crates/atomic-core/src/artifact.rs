@@ -14,7 +14,8 @@
 //! ```text
 //! blobs/sha256/<2 hex>/<62 hex>          the content, written once
 //! manifests/sha256/<digest>/<hash>.json  one file per distinct manifest
-//! staging/                               partial writes, renamed into place
+//! staging/<owner>-<random>               partial writes, renamed into place
+//! owners/<owner>                         locked by each open store
 //! ```
 //!
 //! Writes are atomic: content is streamed to a staging file while it is
@@ -24,6 +25,11 @@
 //! blob under its digest no longer matches it, which the new content then
 //! replaces. Reading a blob checks its digest as it goes: a reader that
 //! reaches the end of a blob that does not match fails.
+//!
+//! Each open store holds a lock on a file of its own under `owners/`, and
+//! names its staging files after it. A staging file outlives its write only
+//! when the process writing it died; opening the store removes such files
+//! once no one holds their owner's lock and they are [`STAGING_GRACE`] old.
 
 pub mod files;
 
@@ -110,19 +116,26 @@ pub trait ArtifactStore {
         provenance: Provenance,
     ) -> Result<Manifest, ArtifactError> {
         let staged = self.stage(content)?;
-        self.commit(staged, provenance)
+        let mut manifests = self.commit(staged, std::slice::from_ref(&provenance))?;
+        Ok(manifests.remove(0))
     }
 
     /// Read `content` aside, hashed but not yet stored: [`commit`] stores
-    /// it, [`discard`] drops it. Several contents can be staged and then all
-    /// committed, so that none is stored when one fails.
+    /// it, [`discard`] drops it, and so does dropping it. Several contents
+    /// can be staged and then all committed, so that none is stored when one
+    /// fails.
     ///
     /// [`commit`]: Self::commit
     /// [`discard`]: Self::discard
     fn stage(&self, content: &mut dyn Read) -> Result<Staged, ArtifactError>;
 
-    /// Store what [`stage`](Self::stage) read and record `provenance` for it.
-    fn commit(&self, staged: Staged, provenance: Provenance) -> Result<Manifest, ArtifactError>;
+    /// Store what [`stage`](Self::stage) read and record a manifest for each
+    /// of `provenance`, returned in its order.
+    fn commit(
+        &self,
+        staged: Staged,
+        provenance: &[Provenance],
+    ) -> Result<Vec<Manifest>, ArtifactError>;
 
     /// Drop what [`stage`](Self::stage) read, storing nothing.
     fn discard(&self, staged: Staged);
@@ -137,10 +150,11 @@ pub trait ArtifactStore {
     fn manifests(&self, artifact: &ArtifactRef) -> Result<Vec<Manifest>, ArtifactError>;
 }
 
-/// Content [`ArtifactStore::stage`] read aside, not yet stored.
+/// Content [`ArtifactStore::stage`] read aside, not yet stored. Dropped
+/// uncommitted, as when its holder fails or panics, it is removed.
 #[derive(Debug)]
 pub struct Staged {
-    /// Where it waits.
+    /// Where it waits; empty once it has been moved or removed.
     path: PathBuf,
     /// Its SHA-256, in hex.
     digest: String,
@@ -153,12 +167,137 @@ impl Staged {
     pub fn size(&self) -> u64 {
         self.size
     }
+
+    /// Its path, which it no longer removes.
+    fn take(&mut self) -> PathBuf {
+        std::mem::take(&mut self.path)
+    }
 }
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        if !self.path.as_os_str().is_empty() {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// How old a staging file must be, with no one holding its owner's lock,
+/// before opening a store removes it: long enough that a store just opening
+/// has taken its lock.
+pub const STAGING_GRACE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 /// An artifact store in a local directory.
 #[derive(Clone, Debug)]
 pub struct LocalStore {
     root: PathBuf,
+    owner: std::sync::Arc<Owner>,
+}
+
+/// An open store's claim on the staging files it names after itself: a
+/// lock held on `owners/<id>` while the store is open, which a sweep finds
+/// taken.
+#[derive(Debug)]
+struct Owner {
+    id: String,
+    path: PathBuf,
+    _lock: std::fs::File,
+}
+
+impl Owner {
+    fn take(root: &Path) -> Result<Self, ArtifactError> {
+        let id = random_name()?;
+        let path = root.join("owners").join(&id);
+        let lock = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(io(&path))?;
+        lock.try_lock().map_err(|e| ArtifactError::Io {
+            path: path.clone(),
+            source: std::io::Error::other(e.to_string()),
+        })?;
+        Ok(Self {
+            id,
+            path,
+            _lock: lock,
+        })
+    }
+}
+
+impl Drop for Owner {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Sixteen random bytes, in hex: a name no other process picks.
+fn random_name() -> Result<String, ArtifactError> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).map_err(|e| ArtifactError::Io {
+        path: PathBuf::from("getrandom"),
+        source: std::io::Error::other(e.to_string()),
+    })?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Remove what dead stores left in `root`'s staging directory: each file at
+/// least `grace` old whose owner no one holds, and each such owner's file.
+/// A file it cannot judge is left.
+fn sweep(root: &Path, grace: std::time::Duration) {
+    let now = std::time::SystemTime::now();
+    let old = |path: &Path| {
+        std::fs::symlink_metadata(path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .is_some_and(|age| age >= grace)
+    };
+    // The owners someone holds, or that are too new to judge.
+    let mut live = std::collections::HashSet::new();
+    let mut dead = Vec::new();
+    for entry in std::fs::read_dir(root.join("owners"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let (path, name) = (
+            entry.path(),
+            entry.file_name().to_string_lossy().into_owned(),
+        );
+        let held = match std::fs::OpenOptions::new().write(true).open(&path) {
+            Ok(file) => match file.try_lock() {
+                Ok(()) => {
+                    if old(&path) {
+                        dead.push((path, file));
+                    } else {
+                        live.insert(name.clone());
+                    }
+                    continue;
+                }
+                Err(_) => true,
+            },
+            Err(_) => true,
+        };
+        if held {
+            live.insert(name);
+        }
+    }
+    for entry in std::fs::read_dir(root.join("staging"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let owner = name.split('-').next().unwrap_or_default();
+        if !live.contains(owner) && old(&entry.path()) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    // Removed while locked, so no one judges it again meanwhile.
+    for (path, _file) in dead {
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 fn io(path: &Path) -> impl FnOnce(std::io::Error) -> ArtifactError + '_ {
@@ -170,13 +309,42 @@ fn io(path: &Path) -> impl FnOnce(std::io::Error) -> ArtifactError + '_ {
 
 impl LocalStore {
     /// A store rooted at `root`, creating its directories.
+    ///
+    /// It removes what stores that died left in staging (see the module's
+    /// documentation).
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, ArtifactError> {
+        Self::open_with_grace(root, STAGING_GRACE)
+    }
+
+    /// [`open`](Self::open), removing dead stores' staging files once they
+    /// are `grace` old.
+    pub fn open_with_grace(
+        root: impl Into<PathBuf>,
+        grace: std::time::Duration,
+    ) -> Result<Self, ArtifactError> {
         let root = root.into();
-        for d in ["blobs/sha256", "manifests/sha256", "staging"] {
+        for d in ["blobs/sha256", "manifests/sha256", "staging", "owners"] {
             let p = root.join(d);
             std::fs::create_dir_all(&p).map_err(io(&p))?;
         }
-        Ok(Self { root })
+        let owner = std::sync::Arc::new(Owner::take(&root)?);
+        sweep(&root, grace);
+        Ok(Self { root, owner })
+    }
+
+    /// A new staging file, created here and nowhere else, named after this
+    /// store's owner.
+    fn staging_file(&self) -> Result<(PathBuf, std::fs::File), ArtifactError> {
+        let path = self
+            .root
+            .join("staging")
+            .join(format!("{}-{}", self.owner.id, random_name()?));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(io(&path))?;
+        Ok((path, file))
     }
 
     fn blob_path(&self, a: &ArtifactRef) -> PathBuf {
@@ -194,14 +362,8 @@ impl LocalStore {
         dest: &Path,
         write: impl FnOnce(&mut std::fs::File) -> Result<(), ArtifactError>,
     ) -> Result<(), ArtifactError> {
-        let staging = self.root.join("staging");
-        let tmp = staging.join(format!(
-            "{}-{}",
-            std::process::id(),
-            STAGING_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
+        let (tmp, mut f) = self.staging_file()?;
         let result = (|| {
-            let mut f = std::fs::File::create(&tmp).map_err(io(&tmp))?;
             write(&mut f)?;
             f.sync_all().map_err(io(&tmp))?;
             if let Some(parent) = dest.parent() {
@@ -219,8 +381,6 @@ impl LocalStore {
         result
     }
 }
-
-static STAGING_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Make a stored file read-only: 0444 where modes exist.
 fn set_read_only(path: &Path) -> Result<(), ArtifactError> {
@@ -300,16 +460,10 @@ impl ArtifactStore for LocalStore {
     fn stage(&self, content: &mut dyn Read) -> Result<Staged, ArtifactError> {
         // Stream to staging while hashing; committing moves it into place
         // under its digest.
-        let staging = self.root.join("staging");
-        let tmp = staging.join(format!(
-            "{}-{}",
-            std::process::id(),
-            STAGING_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
+        let (tmp, mut f) = self.staging_file()?;
         let mut hasher = Sha256::new();
         let mut size = 0u64;
         let staged = (|| {
-            let mut f = std::fs::File::create(&tmp).map_err(io(&tmp))?;
             let mut buf = vec![0u8; 1 << 16];
             loop {
                 let n = content.read(&mut buf).map_err(io(&tmp))?;
@@ -335,62 +489,56 @@ impl ArtifactStore for LocalStore {
         })
     }
 
-    fn commit(&self, staged: Staged, provenance: Provenance) -> Result<Manifest, ArtifactError> {
-        let Staged {
-            path: tmp,
-            digest,
-            size,
-        } = staged;
-        let placed = (|| {
-            let artifact = ArtifactRef::from_digest(&digest).map_err(|e| ArtifactError::Io {
-                path: tmp.clone(),
-                source: std::io::Error::other(e.to_string()),
-            })?;
-            let blob = self.blob_path(&artifact);
-            if blob.exists() && blob_matches(&blob, &digest, size) {
-                // Already stored: identical content is kept once.
-                let _ = std::fs::remove_file(&tmp);
-            } else {
-                let parent = blob.parent().map(Path::to_owned).unwrap_or_default();
-                std::fs::create_dir_all(&parent).map_err(io(&parent))?;
-                std::fs::rename(&tmp, &blob).map_err(io(&blob))?;
-                sync_dir(&parent)?;
-            }
-            Ok(artifact)
-        })();
-        let artifact = match placed {
-            Ok(artifact) => artifact,
-            Err(e) => {
-                // Nothing is left behind in staging.
-                let _ = std::fs::remove_file(&tmp);
-                return Err(e);
-            }
-        };
-
-        let manifest = Manifest {
-            artifact: artifact.clone(),
-            media_type: provenance.media_type,
-            size,
-            workflow: provenance.workflow,
-            step: provenance.step,
-            origin: provenance.origin,
-            labels: provenance.labels,
-        };
-        let json =
-            serde_json::to_vec_pretty(&manifest).map_err(|source| ArtifactError::Manifest {
-                path: self.manifest_dir(&artifact),
-                source,
-            })?;
-        let name = format!("{:x}.json", Sha256::digest(&json));
-        let path = self.manifest_dir(&artifact).join(name);
-        if !path.exists() {
-            self.place(&path, |f| f.write_all(&json).map_err(io(&path)))?;
+    fn commit(
+        &self,
+        mut staged: Staged,
+        provenance: &[Provenance],
+    ) -> Result<Vec<Manifest>, ArtifactError> {
+        let (digest, size) = (staged.digest.clone(), staged.size);
+        let artifact = ArtifactRef::from_digest(&digest).map_err(|e| ArtifactError::Io {
+            path: staged.path.clone(),
+            source: std::io::Error::other(e.to_string()),
+        })?;
+        let blob = self.blob_path(&artifact);
+        if !(blob.exists() && blob_matches(&blob, &digest, size)) {
+            let parent = blob.parent().map(Path::to_owned).unwrap_or_default();
+            std::fs::create_dir_all(&parent).map_err(io(&parent))?;
+            std::fs::rename(&staged.path, &blob).map_err(io(&blob))?;
+            staged.take();
+            sync_dir(&parent)?;
         }
-        Ok(manifest)
+        // Already stored, identical content is kept once, and what was
+        // staged goes when it is dropped; so does a failed move's.
+        drop(staged);
+
+        let mut manifests = Vec::with_capacity(provenance.len());
+        for provenance in provenance {
+            let manifest = Manifest {
+                artifact: artifact.clone(),
+                media_type: provenance.media_type.clone(),
+                size,
+                workflow: provenance.workflow.clone(),
+                step: provenance.step.clone(),
+                origin: provenance.origin.clone(),
+                labels: provenance.labels.clone(),
+            };
+            let json =
+                serde_json::to_vec_pretty(&manifest).map_err(|source| ArtifactError::Manifest {
+                    path: self.manifest_dir(&artifact),
+                    source,
+                })?;
+            let name = format!("{:x}.json", Sha256::digest(&json));
+            let path = self.manifest_dir(&artifact).join(name);
+            if !path.exists() {
+                self.place(&path, |f| f.write_all(&json).map_err(io(&path)))?;
+            }
+            manifests.push(manifest);
+        }
+        Ok(manifests)
     }
 
     fn discard(&self, staged: Staged) {
-        let _ = std::fs::remove_file(staged.path);
+        drop(staged);
     }
 
     fn contains(&self, artifact: &ArtifactRef) -> Result<bool, ArtifactError> {

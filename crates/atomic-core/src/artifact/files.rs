@@ -26,13 +26,15 @@
 //! that handle afterwards, so swapping it for a link leads nowhere. A file
 //! is opened beneath it without following links, must be a regular file
 //! with one link, is read up to the size it had when it was opened, and is
-//! held to [`Limits`].
+//! held to [`Limits`]. An output may name at most [`MAX_FILES`] files, with
+//! at most [`MAX_FILE_OBJECTS`] objects where its contract expects
+//! references.
 
 use super::{ArtifactError, ArtifactRef, ArtifactStore, Provenance};
 use atomic_schema::artifact::ArtifactLookup;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -170,8 +172,9 @@ impl Exchange {
     /// references in those places passes `validate` and the contract's
     /// reference checks (media types, and the output's own references), and
     /// every named file opens, is a regular file of the command's own and
-    /// fits [`Limits`]. Then every file is read aside, and only when all
-    /// were read whole are they stored. Each name is read once.
+    /// fits [`Limits`]. Then every file is read aside, one at a time, and
+    /// only when all were read whole are they stored. Each name is read
+    /// once, and stored with a manifest for each media type it is given.
     #[allow(clippy::too_many_arguments)] // each is one thing the check needs
     pub fn gather(
         &self,
@@ -206,14 +209,9 @@ impl Exchange {
         nonce: &str,
     ) -> Result<(), ArtifactError> {
         let mut candidates = Vec::new();
-        named_files(output, String::new(), &mut candidates, MAX_FILE_OBJECTS + 1);
+        named_files(output, String::new(), &mut candidates, usize::MAX);
         if candidates.is_empty() {
             return Ok(());
-        }
-        if candidates.len() > MAX_FILE_OBJECTS {
-            return Err(refused(format!(
-                "the output names more than {MAX_FILE_OBJECTS} files"
-            )));
         }
         // Each candidate stands in as a reference of its own, made from a
         // nonce no output can know; the contract check says which stand
@@ -258,8 +256,13 @@ impl Exchange {
         if asked.is_empty() {
             return Ok(());
         }
-        // Every object well formed. A name given under two media types is
-        // stored once, with a manifest for each.
+        // Only the objects that stand where references do count.
+        if asked.len() > MAX_FILE_OBJECTS {
+            return Err(refused(format!(
+                "the output names files with more than {MAX_FILE_OBJECTS} objects"
+            )));
+        }
+        // Every object well formed.
         let mut files: Vec<(usize, (&str, &str))> = Vec::new();
         for &i in &asked {
             let (pointer, object) = &candidates[i];
@@ -267,67 +270,84 @@ impl Exchange {
                 .map_err(|why| refused(format!("{}: {why}", display_pointer(pointer))))?;
             files.push((i, named));
         }
-        let pairs: std::collections::BTreeSet<(&str, &str)> =
-            files.iter().map(|(_, named)| *named).collect();
+        // A name given under several media types is read once, with a
+        // manifest for each.
+        let mut names: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        for (_, (name, media)) in &files {
+            names.entry(name).or_default().insert(media);
+        }
+        if names.len() > MAX_FILES {
+            return Err(refused(format!(
+                "the output names {} files: a command hands over {MAX_FILES} at most",
+                names.len()
+            )));
+        }
         // The contract's every reference check, stand-ins and the output's
         // own references alike, then the rest of its schema.
         checked.map_err(|e| refused(e.to_string()))?;
         validate(&probe).map_err(refused)?;
-        // Every file opened and held to the limits, before any is read; a
-        // name counts toward the step's total once.
-        let mut opened: Vec<((&str, &str), std::fs::File, u64)> = Vec::new();
-        let mut sizes: BTreeMap<&str, u64> = BTreeMap::new();
-        for &(name, media) in &pairs {
-            let (file, size) = self.open_file(name, limits)?;
-            sizes.insert(name, size);
-            let total = sizes.values().fold(0u64, |t, s| t.saturating_add(*s));
-            if total > limits.per_step {
-                return Err(refused(format!(
+        // Every file held to the limits before any is read: each opened,
+        // checked and closed in turn, a name counting toward the step's
+        // total once.
+        let within_step = |total: &mut u64, size: u64| {
+            *total = total.saturating_add(size);
+            if *total > limits.per_step {
+                Err(refused(format!(
                     "the files the command hands over come to more than {} bytes, the most one \
                      step may",
                     limits.per_step
-                )));
+                )))
+            } else {
+                Ok(())
             }
-            opened.push(((name, media), file, size));
+        };
+        let mut total = 0u64;
+        for name in names.keys() {
+            let (_, size) = self.open_file(name, limits)?;
+            within_step(&mut total, size)?;
         }
-        // Each read aside whole, up to the size it had when opened; only
-        // when all are, are they stored.
-        let mut staged = Vec::new();
-        for (named, file, size) in opened {
+        // Then each, opened and checked again, read aside whole up to the
+        // size it has then, one at a time; only when all are, are they
+        // stored. One staged and not stored is removed when it is dropped.
+        let mut staged = Vec::with_capacity(names.len());
+        let mut total = 0u64;
+        for (&name, media) in &names {
+            let (file, size) = self.open_file(name, limits)?;
+            within_step(&mut total, size)?;
             let mut exact = Exact {
                 inner: file.take(size),
                 left: size,
                 short: false,
             };
             match store.stage(&mut exact) {
-                Ok(s) => staged.push((named, s)),
-                Err(e) => {
-                    staged.into_iter().for_each(|(_, s)| store.discard(s));
-                    return Err(if exact.short {
-                        refused(format!(
-                            "`{FILE_KEY}` names {:?}, which shrank while it was read",
-                            named.0
-                        ))
-                    } else {
-                        e
-                    });
+                Ok(s) => staged.push((name, media, s)),
+                Err(_) if exact.short => {
+                    return Err(refused(format!(
+                        "`{FILE_KEY}` names {name:?}, which shrank while it was read"
+                    )));
                 }
+                Err(e) => return Err(e),
             }
         }
-        let mut stored: BTreeMap<(&str, &str), String> = BTreeMap::new();
-        for (named, s) in staged {
-            let manifest = store.commit(
-                s,
-                Provenance {
-                    media_type: named.1.to_owned(),
+        let mut stored: HashMap<&str, String> = HashMap::new();
+        for (name, media, s) in staged {
+            let each: Vec<Provenance> = media
+                .iter()
+                .map(|media| Provenance {
+                    media_type: (*media).to_owned(),
                     ..provenance.clone()
-                },
-            )?;
-            stored.insert(named, manifest.artifact.to_string());
+                })
+                .collect();
+            let manifests = store.commit(s, &each)?;
+            if let Some(manifest) = manifests.first() {
+                stored.insert(name, manifest.artifact.to_string());
+            }
         }
-        for (i, named) in files {
-            if let Some(slot) = output.pointer_mut(&candidates[i].0) {
-                *slot = Value::String(stored[&named].clone());
+        for (i, (name, _)) in files {
+            if let (Some(slot), Some(reference)) =
+                (output.pointer_mut(&candidates[i].0), stored.get(name))
+            {
+                *slot = Value::String(reference.clone());
             }
         }
         Ok(())
@@ -444,8 +464,12 @@ pub fn names_a_file(value: &Value) -> bool {
     !found.is_empty()
 }
 
-/// The most `$file` objects one output may hold.
+/// The most `$file` objects one output may hold where its contract expects
+/// artifact references. Objects anywhere else are the output's own.
 pub const MAX_FILE_OBJECTS: usize = 10_000;
+
+/// The most distinct files one output may name.
+pub const MAX_FILES: usize = 256;
 
 /// The reference that stands in for candidate `i` while the contract is
 /// checked: a digest no content has, made from this check's `nonce`.

@@ -117,13 +117,16 @@ size it had when atomic opened it. `mediaType` defaults to
 `application/octet-stream`, and must be one the contract accepts. The output
 is checked against its contract, with stand-in references, and every file it
 names is opened and checked against the limits before anything is stored, so a
-rejected output leaves nothing in the store; files are read aside first and
-stored together. One name has one media type. Each name is stored
-once, however often the output names it.
+rejected output leaves nothing in the store; files are read aside first, one at
+a time, and stored together. Each name is read and stored once, however often
+the output names it; named under more than one media type, it is stored with a
+manifest for each.
 
 A file may be 1 GiB at most, and the files one step hands over 4 GiB
 together; `ATOMIC_EXEC_MAX_FILE_BYTES` and `ATOMIC_EXEC_MAX_STEP_BYTES` change
-those limits, in bytes.
+those limits, in bytes. An output may name 256 different files at most, with
+at most 10,000 `$file` objects where its contract expects references; objects
+anywhere else are the output's own and do not count.
 
 A later step's command finds each artifact its input references, where its
 input contract expects a reference, in the directory in `ATOMIC_INPUTS`,
