@@ -82,9 +82,16 @@ const WEAK_PARTS: &[&str] = &[
     "cookie",
     "authorization",
 ];
-/// Words that make `token` a kind of token rather than a credential:
-/// `prompt_token`, `error_token`, `next_token`.
+/// Words that make `token` a count of tokens or a kind of token rather than
+/// a credential: `max_token`, `prompt_token`, `error_token`, `next_token`.
 const TOKEN_KINDS: &[&str] = &[
+    "max",
+    "min",
+    "count",
+    "total",
+    "limit",
+    "num",
+    "used",
     "prompt",
     "completion",
     "input",
@@ -397,10 +404,12 @@ fn strength(name: &str) -> Strength {
     let weak =
         parts.iter().any(|part| WEAK_PARTS.contains(&part.as_str())) || joined.ends_with("token");
     // `max_token`, `prompt_token`, `error_token`: a count or a kind of
-    // token, which only hints.
-    let about = parts.iter().any(|part| {
-        NOT_SECRET_PARTS.contains(&part.as_str()) || TOKEN_KINDS.contains(&part.as_str())
-    });
+    // token, which only hints. Only `token` is so qualified: `INPUT_PASS`
+    // and `PROVIDER_TOKEN` are secrets' names.
+    let about = parts.iter().any(|part| part == "token" || part == "tokens")
+        && parts
+            .iter()
+            .any(|part| TOKEN_KINDS.contains(&part.as_str()));
     match (weak, parts.len()) {
         (false, _) => Strength::None,
         (true, 2..) if about => Strength::Weak,
@@ -499,6 +508,22 @@ fn escape_len(after: &str) -> usize {
     }
 }
 
+std::thread_local! {
+    /// How many steps this thread's scans have taken, for the tests that
+    /// check a scan stays linear.
+    #[cfg(test)]
+    static STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Count `n` steps of a scan (see [`STEPS`]); nothing outside tests.
+#[inline]
+fn step(n: usize) {
+    #[cfg(test)]
+    STEPS.with(|steps| steps.set(steps.get() + n as u64));
+    #[cfg(not(test))]
+    let _ = n;
+}
+
 /// How long the terminal escape sequence starting `rest` is, if one does: a
 /// control sequence (`ESC[1;33m`, `ESC[38:5:196m`, `ESC[1 q`), the
 /// introducer of a title, link or clipboard write (`ESC]`), or a character
@@ -543,6 +568,10 @@ fn escape_sequence_len(rest: &str) -> Option<usize> {
         b']' => Some(introducer.len() + 1),
         b'(' | b')' | b'*' | b'+' | b'-' | b'.' | b'/' => {
             let set = *bytes.get(1)?;
+            // A backslash starts an escape, as after `ESC[`.
+            if set == b'\\' {
+                return Some(introducer.len() + 1);
+            }
             (0x30..=0x7e).contains(&set).then_some(introducer.len() + 2)
         }
         _ => None,
@@ -560,6 +589,7 @@ fn shapes(input: &str) -> Option<String> {
     // or base64 text, such as after `/` or `+`.
     let mut boundary = true;
     while at < input.len() {
+        step(1);
         let rest = &input[at..];
         // Checked only where a block starts, so the scan stays linear.
         if let Some(found) = rest
@@ -568,7 +598,9 @@ fn shapes(input: &str) -> Option<String> {
             .flatten()
         {
             let end = format!("-----END {}-----", &found[1]);
-            let len = rest.find(&end).map_or(rest.len(), |i| i + end.len());
+            let ends = rest.find(&end);
+            step(ends.map_or(rest.len(), |i| i + end.len()));
+            let len = ends.map_or(rest.len(), |i| i + end.len());
             out.push_str(&input[copied..at]);
             out.push_str(REDACTED);
             at += len;
@@ -841,6 +873,7 @@ fn quoted_len(rest: &str, quote: u8, level: usize) -> Option<usize> {
     let bytes = rest.as_bytes();
     let mut backslashes = 0;
     for (i, b) in bytes.iter().enumerate() {
+        step(1);
         match *b {
             b'\n' => return None,
             b'\\' => backslashes += 1,
@@ -1196,27 +1229,35 @@ fn window_end(input: &str, chars: usize) -> &str {
 }
 
 /// How far before a window's cut, in characters, a secret whose rule needs
-/// what follows the cut may start and still be kept whole: the spare part of
-/// the redaction margin.
-const SPARE: usize = 16 * 1024;
+/// what lies across the cut may start: as long as a realistic secret.
+const REACH: usize = 4 * 1024;
+
+/// Whether redacting a window of `window` characters into `redacted`
+/// brought its cut into view: the window was longer than `chars` and the
+/// reach of a secret, and redaction shrank it to within them. A window
+/// that was short already, as one whose cut dropped a long token, did not.
+fn cut_came_into_view(window: &str, redacted: &str, chars: usize) -> bool {
+    let room = chars.saturating_add(REACH);
+    window.chars().count() > room && redacted.chars().count() <= room
+}
 
 /// `redacted`, a window that cut its input at its end, less its last line
-/// if that could come into view: a secret whose rule needs what the cut
-/// took (the `@` after a URL's password, the quote that ends a JSON value)
-/// is kept whole there. It could when redaction shrank the window to within
-/// `chars` and the spare margin.
-fn less_cut_line_at_end(redacted: &str, chars: usize) -> &str {
-    if redacted.chars().count() > chars.saturating_add(SPARE) {
+/// if redaction brought the cut into view: a secret whose rule needs what
+/// the cut took (the `@` after a URL's password, the quote that ends a JSON
+/// value) is kept whole there.
+fn less_cut_line_at_end<'a>(window: &str, redacted: &'a str, chars: usize) -> &'a str {
+    if !cut_came_into_view(window, redacted, chars) {
         return redacted;
     }
     redacted.rfind('\n').map_or("", |i| &redacted[..=i])
 }
 
 /// `redacted`, a window that cut its input at its start, less its first
-/// line if that could come into view (see [`less_cut_line_at_end`]): a
-/// token whose `Authorization: Bearer ` the cut took, say.
-fn less_cut_line_at_start(redacted: &str, chars: usize) -> &str {
-    if redacted.chars().count() > chars.saturating_add(SPARE) {
+/// line if redaction brought the cut into view (see
+/// [`less_cut_line_at_end`]): a token whose `Authorization: Bearer ` the
+/// cut took, say.
+fn less_cut_line_at_start<'a>(window: &str, redacted: &'a str, chars: usize) -> &'a str {
+    if !cut_came_into_view(window, redacted, chars) {
         return redacted;
     }
     redacted.find('\n').map_or("", |i| &redacted[i + 1..])
@@ -1252,7 +1293,7 @@ pub fn excerpt(input: &str, chars: usize) -> String {
     };
     let redacted = text(json.as_deref().unwrap_or(window));
     let shown = if left_out {
-        less_cut_line_at_end(&redacted, chars)
+        less_cut_line_at_end(window, &redacted, chars)
     } else {
         &redacted
     };
@@ -1266,7 +1307,7 @@ pub fn bounded(input: &str, chars: usize) -> String {
     let left_out = window.len() < input.len();
     let redacted = text(window);
     let shown = if left_out {
-        less_cut_line_at_end(&redacted, chars)
+        less_cut_line_at_end(window, &redacted, chars)
     } else {
         &redacted
     };
@@ -1281,7 +1322,7 @@ pub fn tail(input: &str, chars: usize) -> String {
     let cut_off = window.len() < input.len();
     let redacted = text(window);
     let shown = if cut_off {
-        less_cut_line_at_start(&redacted, chars)
+        less_cut_line_at_start(window, &redacted, chars)
     } else {
         &redacted
     };

@@ -1008,24 +1008,19 @@ fn redaction_never_panics_on_random_text() {
     }
 }
 
-/// The least time of `runs` redactions of `input`.
-fn least_time(input: &str, runs: usize) -> std::time::Duration {
-    (0..runs)
-        .map(|_| {
-            let start = std::time::Instant::now();
-            let _ = text(input);
-            start.elapsed()
-        })
-        .min()
-        .unwrap_or_default()
+/// How many steps redacting `input` takes (see `STEPS`).
+fn steps_of(input: &str) -> u64 {
+    STEPS.with(|steps| steps.set(0));
+    let _ = text(input);
+    STEPS.with(std::cell::Cell::get)
 }
 
 /// Two worst cases whose slower growth the megabyte bound could hide: quotes
 /// escaped ever deeper, whose cap keeps each depth's scan to one pass, and
 /// key blocks with no end, each consumed whole. At sixteen times the size,
-/// a linear scan takes about sixteen times as long, one that grows as the
-/// 1.5th power 64 times, a quadratic one 256 times; whatever the size or
-/// the machine, the ratio stays under 32.
+/// a linear scan takes about sixteen times the steps, one that grows as the
+/// 1.5th power 64 times, a quadratic one 256 times. Steps are counted, not
+/// timed, so no machine's load changes the answer.
 #[test]
 fn escaped_quotes_and_open_key_blocks_grow_linearly() {
     let quotes = |depths: usize| -> String {
@@ -1038,11 +1033,10 @@ fn escaped_quotes_and_open_key_blocks_grow_linearly() {
         ("escaped quotes", quotes(350), quotes(1400)),
         ("open key blocks", blocks(64 * 1024), blocks(1024 * 1024)),
     ] {
-        let ratio =
-            least_time(&large, 3).as_secs_f64() / least_time(&small, 5).as_secs_f64().max(1e-6);
+        let (small, large) = (steps_of(&small), steps_of(&large));
         assert!(
-            ratio < 32.0,
-            "{name}: {ratio:.1} times as long at sixteen times the size"
+            large < 32 * small,
+            "{name}: {large} steps at sixteen times the size of {small}"
         );
     }
 }
@@ -1091,7 +1085,7 @@ fn a_secret_the_cut_parted_from_its_neighbour_is_not_shown() {
     assert!(!out.contains(token), "the tail showed the token");
     assert!(out.starts_with('…'), "the tail does not say it was cut");
     // With nothing shrunk, the cut is far out of view and nothing more is
-    // dropped.
+    // dropped; so with a little shrunk, as one-line text with a key or two.
     let plain = format!("{}\n{}", "word ".repeat(window), "more");
     assert_eq!(bounded(&plain, chars), format!("{}…", &plain[..chars]));
 }
@@ -1155,6 +1149,8 @@ fn a_key_after_an_open_sequence_and_an_escape_is_found() {
         format!("\x1b[\\t{shape}"),
         format!("\\u001b[\\n{shape}"),
         format!("\\x1b[\\u0007{shape}"),
+        format!("\x1b(\\n{shape}"),
+        format!("\\x1b(\\n{shape}"),
     ];
     let wrong: Vec<usize> = inputs
         .iter()
@@ -1182,5 +1178,52 @@ fn counts_and_kinds_of_tokens_are_not_secrets() {
     assert_cases(&[
         ("GH_TOKEN=abc123", "GH_TOKEN=[REDACTED]"),
         ("access_token: Zx81kQ0pL2mN4bV6", "access_token: [REDACTED]"),
+    ]);
+}
+
+/// One-line text that redaction shrinks a little, or whose cut dropped a
+/// long token, keeps its leading text: the cut is still out of view.
+#[test]
+fn one_line_text_keeps_its_start_when_the_cut_stays_out_of_view() {
+    // A provider's JSON body, on one line, echoing keys.
+    let keys = vec![SAMPLE; 30].join(" ");
+    let body = format!(
+        "{{\"error\":{{\"message\":\"Incorrect API key provided: {keys}\",\"detail\":\"{}\"}}}}",
+        "lorem ipsum ".repeat(19 * 1024 / 12)
+    );
+    let out = excerpt(&body, 500);
+    assert!(
+        out.starts_with("{\"error\":{\"message\":\"Incorrect API key provided: [REDACTED]"),
+        "the body's start was dropped"
+    );
+    assert!(!out.contains(SAMPLE), "the body showed a key");
+    // A command's stderr on one line, with keys redacted along it.
+    let keys = vec![SAMPLE; 90].join(" ");
+    let stderr = format!(
+        "{} {keys} {} final words",
+        "warning ".repeat(15 * 1024 / 8),
+        "detail ".repeat(10 * 1024 / 7)
+    );
+    let out = tail(&stderr, 2000);
+    assert!(out.ends_with("final words"), "the tail's end was dropped");
+    assert!(out.starts_with('…'), "the tail does not say it was cut");
+    // A long base64 payload, dropped whole where the cut splits it, with
+    // its `payload=`, since `=` may be part of a key.
+    let upload = format!(
+        "error: upload failed for payload={}",
+        "QUJD".repeat(47 * 1024)
+    );
+    let out = bounded(&upload, 4096);
+    assert_eq!(out, "error: upload failed for …");
+}
+
+/// Hint words qualified by a word that is not a count or a kind of token
+/// still name secrets.
+#[test]
+fn only_a_count_or_kind_of_token_is_a_hint() {
+    assert_cases(&[
+        ("INPUT_PASS=hunter2", "INPUT_PASS=[REDACTED]"),
+        ("PROVIDER_TOKEN=abc123", "PROVIDER_TOKEN=[REDACTED]"),
+        ("ERROR_AUTH=abc", "ERROR_AUTH=[REDACTED]"),
     ]);
 }
