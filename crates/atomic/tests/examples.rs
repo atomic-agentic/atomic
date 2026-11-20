@@ -7,7 +7,7 @@
 //! into exactly its fixture output.
 
 use atomic_core::render::{self, RunInput};
-use atomic_core::{atom, collections, compile, project, runtime};
+use atomic_core::{atom, collections, compile, eval, project, runtime};
 use atomic_schema::registry::Registry;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -96,6 +96,7 @@ fn every_v0_1_example_passes_the_real_load_and_check() {
             registry.load_file(&schema.path).expect("schema");
         }
         let mut fixtures = 0;
+        let mut eval_cases = 0;
         for source in &files["atoms"] {
             let atom = atom::load(&source.path, &mut registry).expect("atom");
             let compiled = compile::compile(&atom, &registry).expect("compiles");
@@ -105,6 +106,44 @@ fn every_v0_1_example_passes_the_real_load_and_check() {
                 .and_then(|n| n.to_str())
                 .and_then(|n| n.strip_suffix(".atom.astro"))
                 .expect("atom file name");
+            // Its eval cases load, and each one's assertions hold against
+            // the golden output beside it: a YAML case `<name>.yaml` against
+            // `fixtures/<atom>/<name>.output.json`, line N of a JSONL file
+            // `<file>.jsonl` against line N of `<file>.outputs.jsonl`.
+            let settings = eval::settings(&atom, &project).expect("eval settings");
+            let cases =
+                eval::load_cases(&atom, &settings).unwrap_or_else(|e| panic!("{example}: {e}"));
+            let contracts = eval::Contracts::of(&atom).expect("contracts");
+            for case in &cases {
+                let golden = match case.id.split_once(".jsonl:") {
+                    Some((file, line)) => {
+                        let path = project
+                            .dir
+                            .join("fixtures")
+                            .join(stem)
+                            .join(format!("{file}.outputs.jsonl"));
+                        let text = std::fs::read_to_string(&path)
+                            .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+                        let n: usize = line.parse().expect("a line number");
+                        serde_json::from_str(text.lines().nth(n - 1).expect("a golden row"))
+                            .expect("a golden output")
+                    }
+                    None => read(
+                        &project
+                            .dir
+                            .join("fixtures")
+                            .join(stem)
+                            .join(format!("{}.output.json", case.id.trim_end_matches(".yaml"))),
+                    ),
+                };
+                let failures = eval::check(case, &golden, &contracts);
+                assert!(
+                    failures.is_empty(),
+                    "{example}/{stem}/{}: {failures:?}",
+                    case.id
+                );
+                eval_cases += 1;
+            }
             let Ok(entries) = std::fs::read_dir(project.dir.join("fixtures").join(stem)) else {
                 continue;
             };
@@ -179,6 +218,10 @@ fn every_v0_1_example_passes_the_real_load_and_check() {
         assert!(
             fixtures > 0 || *example == "04-embedded-review",
             "{example}: no fixtures checked"
+        );
+        assert!(
+            eval_cases > 0 || *example == "04-embedded-review",
+            "{example}: no eval cases checked"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -11,7 +11,7 @@
     "authoring/src/intrinsics.mjs": "1998f7bcfb276501618e48635e9f26731197a29fab362727eb0682e60f3b6995",
     "authoring/src/capture.mjs": "d667165af6d3803738aa71a3e1d344727c95f96468d57376e187280c2c0d1cd7",
     "authoring/src/fences.mjs": "90fa798848e0db3b538466bf88d26eaa2bda9dad8991727b6e518785b9f627c0",
-    "authoring/authoring.d.ts": "b98358f5ae04af50272f0ff39b71b6dd4f13403de89590a3e8935262153ccf5d",
+    "authoring/authoring.d.ts": "0fc50932695142a995e3ab3f02cf3690c44d7e9b0b9df021dfcb64c920cf394a",
     "authoring/package.json": "6e093c23679caafc5c476e18c2b903a64eaecbf0437d4fe01d38ed74989b6036",
     "authoring/package-lock.json": "9aa4288a0c0f6c7d44c63d081d5eb8d510cf54c41c337e147d0cf60265f67346"
   },

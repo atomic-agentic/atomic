@@ -224,7 +224,8 @@ time rather than passing unchecked.
 | `validate` | Expression-bodied typed callbacks over `{input, output}` |
 | `examples` | Named `{input, output}` examples checked against full contracts |
 | `case`, `judges` | Full evaluation-case and judge input/output schema declarations |
-| `scorers` | Interpreted judge bindings, numeric scores and mean thresholds |
+| `scorers` | Interpreted judge bindings, numeric scores, mean thresholds (`min_mean`) and the tolerated drop against a baseline (`max_drop`) |
+| `evals` | The eval-case directory relative to the atom file, or `{dir, pass_rate}`; see [eval cases](eval-cases.md#pass-rate-and-threshold) |
 | `context` | Optional public execution-context schema; a context sidecar is also accepted. See [context schemas](#context-schemas) |
 | `exec`, `effects`, `env` | An exec atom's command, what it does outside Atomic, and its environment. See [exec atoms](#exec-atoms). A codex atom may declare `env` too, for its turn's commands (see [exec atoms](#exec-atoms) for what it cannot set) |
 

@@ -648,6 +648,17 @@ pub fn load(file: &Path, registry: &mut Registry) -> Result<Atom, AtomError> {
                     "min_mean must be between zero and one".into(),
                 ));
             }
+            // How far the mean may fall below a baseline revision's.
+            if scorer
+                .get("max_drop")
+                .is_some_and(|v| v.as_f64().is_none_or(|d| !(0.0..=1.0).contains(&d)))
+            {
+                return Err(fail(
+                    1,
+                    "/scorers",
+                    "max_drop must be between zero and one".into(),
+                ));
+            }
         }
     }
     schemas.insert("Case".into(), case.clone());

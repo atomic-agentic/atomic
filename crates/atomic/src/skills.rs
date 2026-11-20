@@ -234,8 +234,9 @@ const FIELD_NOTES: &[(&str, &str)] = &[
     ),
     (
         "evals",
-        "The directory of eval cases, relative to the atom file. Omit it to use \
-         `evals/<name>/` beside the manifest.",
+        "The directory of eval cases, relative to the atom file, or `{dir, pass_rate}` \
+         where `pass_rate` (0 to 1, default 1) is the share of cases CI requires to pass. Omit \
+         it to use `evals/<name>/` beside the manifest and require every case.",
     ),
     (
         "exec",
@@ -254,7 +255,8 @@ const FIELD_NOTES: &[(&str, &str)] = &[
     (
         "scorers",
         "Bindings from a declared judge to a numeric score with a `min_mean` threshold \
-         between 0 and 1. Leave out unless the task needs a judge.",
+         between 0 and 1, and optionally a `max_drop` tolerance against a baseline revision. \
+         Leave out unless the task needs a judge.",
     ),
     (
         "examples",
