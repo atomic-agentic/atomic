@@ -77,7 +77,13 @@ exported, as atomic's log lines and error reports are: values in the formats
 of well-known keys and tokens, values given to a secret's name (`password`,
 `api_key`, `AWS_SECRET_KEY`, `DB_PASS`), and credential-looking values given to
 a name such as `token` or `pass`, become `[REDACTED]`. Each string is cut to
-4,096 characters before it is redacted. One message is not redacted: a
+4,096 characters before it is redacted. Redaction over-matches rather
+than under-matches, but it does let some things through: a short or
+word-like value after a name that only hints at a secret (`pass: 12`,
+`token: expired`), a `session=` value, a password given with `curl -u` or
+`mysql -p`, and a value that runs onto further lines. A webhook URL that
+carries its secret in its path (Slack, Discord, Microsoft Teams) is
+redacted after its host. One message is not redacted: a
 command-line usage error, such as an invalid value for a flag, repeats the
 argument as you typed it, since it is your own command line.
 

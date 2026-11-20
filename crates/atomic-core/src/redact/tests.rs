@@ -85,6 +85,67 @@ fn known_shapes_are_found() {
     assert!(wrong.is_empty(), "shapes {wrong:?} were not found");
 }
 
+/// A key with no known prefix, under a name that has `key` in it.
+#[test]
+fn a_key_under_a_key_name_is_found() {
+    const HEX: &str = "0123456789abcdef0123456789abcdef";
+    let names = [
+        "OPENAI_KEY=",
+        "ANTHROPIC_KEY=",
+        "AZURE_OPENAI_KEY=",
+        "SPEECH_KEY=",
+        "+ export OPENAI_KEY=",
+        "x-functions-key: ",
+        "\"primaryKey\": \"",
+        "key=",
+        "https://h/x?key=",
+        "\"key\": \"",
+        "Your API key: ",
+        "api key: ",
+    ];
+    let wrong: Vec<usize> = names
+        .iter()
+        .enumerate()
+        .filter(|(_, name)| {
+            let input = format!("{name}{HEX}\" x");
+            let out = text(&input);
+            out.contains(HEX) || !out.contains(REDACTED)
+        })
+        .map(|(index, _)| index)
+        .collect();
+    assert!(wrong.is_empty(), "cases {wrong:?} kept the key");
+    assert_cases(&[("api key: short", "api key: [REDACTED]")]);
+    assert_kept(&["duplicate key: name", "cache-key: v1-deps"]);
+}
+
+/// Webhook URLs carry their secret in the path.
+#[test]
+fn a_webhook_url_is_found() {
+    assert_cases(&[
+        (
+            concat!(
+                "post to https://hooks.slack.com/services/",
+                "T0001/B0002/abcdefghijABCDEFGHIJ1234 now"
+            ),
+            "post to https://hooks.slack.com/services/[REDACTED] now",
+        ),
+        (
+            concat!(
+                "https://discord.com/api/webhooks/",
+                "123456789012345678/abcDEF-ghi_JKL0123"
+            ),
+            "https://discord.com/api/webhooks/[REDACTED]",
+        ),
+        (
+            concat!(
+                "https://contoso.webhook.office.com/webhookb2/",
+                "a1b2c3@d4e5/IncomingWebhook/f6/g7"
+            ),
+            "https://contoso.webhook.office.com/webhookb2/[REDACTED]",
+        ),
+    ]);
+}
+
 /// Right after a JSON or C escape, or a terminal colour, as a provider's raw
 /// body or a coloured log line has them.
 #[test]
@@ -99,6 +160,11 @@ fn a_shape_right_after_an_escape_or_a_colour_is_found() {
         format!(r#"colour:\u001b[1;33m{shape}\u001b[0m"#),
         format!(r#"colour:\x1b[1;33m{shape}\x1b[0m"#),
         format!("\x1b]0;title\x07{shape}"),
+        format!("label\x1b[36m{shape}"),
+        format!("label\x1b(B{shape}"),
+        format!("label\x1b[38:5:196m{shape}"),
+        format!("label\x1b[1 q{shape}"),
+        format!(r#"nested:\\n{shape}"#),
     ];
     let wrong: Vec<usize> = inputs
         .iter()
@@ -110,6 +176,12 @@ fn a_shape_right_after_an_escape_or_a_colour_is_found() {
         .map(|(index, _)| index)
         .collect();
     assert!(wrong.is_empty(), "inputs {wrong:?} kept the shape");
+    // The sequences themselves are kept.
+    let coloured = format!("label\x1b[36m{shape}\x1b[0m");
+    assert!(
+        text(&coloured) == format!("label\x1b[36m{REDACTED}\x1b[0m"),
+        "the colours were not kept"
+    );
 }
 
 #[test]
@@ -348,6 +420,18 @@ fn ordinary_text_is_left_alone() {
         "Error: invalid token: missing",
         // An escaped backslash is not an escape: what follows is a word.
         r"C:\\new\\task-abc",
+        // Written-out escapes that are not whole sequences, or are, kept.
+        r"invalid regex [\s\e]+ at col 3; expected ]",
+        r"char class [^\e] then more",
+        r"C:\some\e[1]\file.txt",
+        r"printf '\033[1mbold\033[0m'",
+        "osc \\e]0;title then more text\nnext line",
+        // More ordinary stderr.
+        "no randomness for a new credential: Resource temporarily unavailable",
+        "credential: operator-1",
+        "auth_method: password",
+        "token: InvalidToken",
+        "export OPENAI_API_KEY=...",
     ]);
 }
 
@@ -403,6 +487,9 @@ fn every_string_and_key_of_a_value_is_covered() {
         "keys": [1, 2],
         "key": "value",
         "required": ["password", "email"],
+        "argv": ["deploy", "--password", "hunter2", "--name", "web"],
+        "env": [{"name": "DB_PASSWORD", "value": "hunter2"}, {"name": "HOME", "value": "/root"}],
+        "pair": ["X-Api-Key", "abc"],
     });
     value(&mut payload);
     let expected = json!({
@@ -418,12 +505,15 @@ fn every_string_and_key_of_a_value_is_covered() {
         "token_count": "12",
         "note": "fine",
         "pin_password": REDACTED,
-        "credentials": {"user": REDACTED, "password": REDACTED, "port": REDACTED, "on": true},
+        "credentials": {"user": "bob", "password": REDACTED, "port": 5, "on": true},
         "headers": [["Authorization", REDACTED], ["Accept", "json"]],
         "header_list": [{"name": "X-Api-Key", "value": REDACTED}, {"name": "Accept", "value": "json"}],
         "keys": [1, 2],
         "key": "value",
         "required": ["password", "email"],
+        "argv": ["deploy", "--password", REDACTED, "--name", "web"],
+        "env": [{"name": "DB_PASSWORD", "value": REDACTED}, {"name": "HOME", "value": "/root"}],
+        "pair": ["X-Api-Key", REDACTED],
     });
     let wrong: Vec<&String> = expected
         .as_object()
@@ -484,6 +574,20 @@ fn an_excerpt_of_a_json_body_is_redacted_as_json() {
         !out.contains(shape) && out.contains(REDACTED),
         "the cut body kept the key"
     );
+    // A key cut in half by the bound is dropped, not kept in part: after a
+    // long line that redaction shrinks, at the start and at the end.
+    let margin = 4096 * 2 + 16 * 1024;
+    let key = SAMPLE;
+    let lead = format!("Cookie: a={}\n", "b".repeat(margin - 20 - 11));
+    let head = format!("{lead}{key} after");
+    let out = bounded(&head, 4096);
+    assert!(!out.contains(&key[..20]), "bounded kept the key's head");
+    let out = excerpt(&head, 4096);
+    assert!(!out.contains(&key[..20]), "excerpt kept the key's head");
+    let trail = format!("\nCookie: a={}", "b".repeat(margin - 20 - 11));
+    let ending = format!("before {key}{trail}");
+    let out = tail(&ending, 4096);
+    assert!(!out.contains(&key[20..]), "tail kept the key's end");
     // Bounded before it is redacted: ten megabytes cost no more than the
     // excerpt's margin.
     let huge = "a=".repeat(5 * 1024 * 1024);
@@ -500,6 +604,15 @@ fn an_excerpt_of_a_json_body_is_redacted_as_json() {
             "{name} took {taken:?}"
         );
     }
+    // A JSON report's strings, and so a panic's message, are bounded too.
+    let mut report = json!({"description": huge});
+    let start = std::time::Instant::now();
+    value(&mut report);
+    let taken = start.elapsed();
+    assert!(
+        taken < std::time::Duration::from_secs(1),
+        "a JSON string took {taken:?}"
+    );
     // The excerpt is bounded, and so is the tail.
     let long = format!("{shape} {}", "y".repeat(10_000_000));
     assert!(excerpt(&long, 500).chars().count() <= 501);
@@ -575,6 +688,9 @@ fn worst_cases(size: usize) -> Vec<(&'static str, String)> {
         ("colours", repeated("\x1b[1;33m")),
         ("wrappers", repeated("api_key: Some(")),
         ("headers", repeated("Authorization: ")),
+        ("open templates", repeated("api_key={{ ")),
+        ("written-out colours", repeated("\\u001b[1;33m")),
+        ("open titles", repeated("\x1b]0;")),
         (
             "quotes escaped ever deeper",
             (1..1400)

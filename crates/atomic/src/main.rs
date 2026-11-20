@@ -176,6 +176,14 @@ fn main() -> std::process::ExitCode {
     }
 }
 
+/// Send the last spans, unless a signal says to stop at once.
+async fn flush_spans() {
+    if atomic_app::telemetry::flush_unless_signalled().await {
+        atomic_core::log_line!("stopping now, without sending the last spans");
+        std::process::exit(130);
+    }
+}
+
 /// The line `main` reports an error that reached it with, redacted: an
 /// error's chain, never its `Debug` form.
 fn error_line(e: &anyhow::Error) -> String {
@@ -266,10 +274,10 @@ fn real_main() -> anyhow::Result<()> {
         };
         if let Err(e) = outcome {
             failure::report(&failure::analyze(&e), json);
-            atomic_app::telemetry::flush();
+            flush_spans().await;
             std::process::exit(1);
         }
-        atomic_app::telemetry::flush();
+        flush_spans().await;
         Ok(())
     })
 }

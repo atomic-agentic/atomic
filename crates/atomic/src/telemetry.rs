@@ -254,6 +254,33 @@ pub fn flush() {
     }
 }
 
+/// As [`flush`], unless a signal comes first: then it stops waiting and
+/// returns `true`, so a collector that never answers holds up the exit only
+/// until Ctrl-C. Call it as a command ends normally.
+pub async fn flush_unless_signalled() -> bool {
+    if PROVIDER.get().is_none() {
+        atomic_core::spans::end_all();
+        return false;
+    }
+    let flushing = tokio::task::spawn_blocking(flush_blocking);
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        if let (Ok(mut interrupt), Ok(mut terminate)) = (
+            signal(SignalKind::interrupt()),
+            signal(SignalKind::terminate()),
+        ) {
+            return tokio::select! {
+                _ = flushing => false,
+                _ = interrupt.recv() => true,
+                _ = terminate.recv() => true,
+            };
+        }
+    }
+    let _ = flushing.await;
+    false
+}
+
 /// As [`flush`], on a thread that may block, such as one of
 /// `spawn_blocking`'s: a stopping process runs it there so that another
 /// signal can still stop it at once (see `runs::stop`).
@@ -350,27 +377,27 @@ mod tests {
     use opentelemetry_sdk::trace::InMemorySpanExporter;
 
     #[test]
-    fn an_exported_span_carries_no_secret() {
+    fn an_exported_span_carries_no_seeded_key() {
         let memory = InMemorySpanExporter::default();
         let provider = SdkTracerProvider::builder()
             .with_simple_exporter(Redacting(memory.clone()))
             .build();
-        let secret = concat!("sk-ant-", "api03-SEEDEDsecretVALUE0123456789abcdef");
+        let seeded = concat!("sk-ant-", "api03-SEEDEDsampleVALUE0123456789abcdef");
         tracing::subscriber::with_default(subscriber(&provider), || {
             let span = tracing::info_span!(
                 target: "atomic_app::telemetry",
                 "chat",
                 otel.name = "chat synthetic",
-                error.message = format!("401: {{\"error\": \"bad key {secret}\"}}"),
+                error.message = format!("401: {{\"error\": \"bad key {seeded}\"}}"),
             );
             let _entered = span.enter();
-            tracing::info!(target: "atomic_app::telemetry", "the provider said {secret}");
+            tracing::info!(target: "atomic_app::telemetry", "the provider said {seeded}");
         });
         provider.force_flush().expect("flush");
         let spans = memory.get_finished_spans().expect("spans");
         assert_eq!(spans.len(), 1, "{spans:?}");
         let shown = format!("{spans:?}");
-        assert!(!shown.contains(secret), "{shown}");
+        assert!(!shown.contains(seeded), "{shown}");
         assert!(shown.contains("[REDACTED]"), "{shown}");
         assert!(shown.contains("chat synthetic"), "{shown}");
     }

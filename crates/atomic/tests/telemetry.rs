@@ -376,6 +376,43 @@ fn a_key_in_a_steps_error_is_redacted_in_its_spans() {
     assert!(!received.bodies().contains(SEEDED), "the key was exported");
 }
 
+/// A command that ends normally sends its last spans, and a collector that
+/// never answers holds it up only until Ctrl-C.
+#[test]
+fn a_signal_stops_the_last_flush_of_a_command_that_ended() {
+    use std::io::BufRead;
+    let dir = scratch("hung-normal");
+    project(&dir);
+    let (model, _rt) = model(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())]);
+    let url = hung_collector();
+    let mut child = command(
+        &dir,
+        &model.base_url(),
+        &["run", "triage", "--data", NOTE],
+        &exporting(&url, "http/json"),
+    )
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+    // The run has printed its result: what is left is the flush.
+    let mut first = String::new();
+    std::io::BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut first)
+        .unwrap();
+    assert!(!first.is_empty(), "the run printed nothing");
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let signalled = std::time::Instant::now();
+    signal(&child, "INT");
+    let out = child.wait_with_output().unwrap();
+    let taken = signalled.elapsed();
+    assert!(
+        taken < std::time::Duration::from_secs(3),
+        "took {taken:?} after the signal: {}",
+        text(&out)
+    );
+}
+
 /// A panic's message, through the hook `main` installs.
 #[test]
 fn a_key_in_a_panic_is_redacted() {

@@ -47,8 +47,6 @@ const STRONG_PARTS: &[&str] = &[
     "pwd",
     "secret",
     "secrets",
-    "credential",
-    "credentials",
     "apikey",
 ];
 /// Endings of a name's parts run together that make it a secret's name:
@@ -73,6 +71,8 @@ const STRONG_ENDINGS: &[&str] = &[
 /// `GH_PAT`, `accessToken`, `X-Amz-Signature`), and only hint at one alone
 /// (`pass`, `token`).
 const WEAK_PARTS: &[&str] = &[
+    "credential",
+    "credentials",
     "token",
     "pass",
     "pat",
@@ -142,6 +142,17 @@ const NOT_SECRET_PARTS: &[&str] = &[
     "timeout",
     "header",
     "error",
+    "method",
+    "mode",
+    "scheme",
+    "provider",
+    "source",
+    "policy",
+    "strategy",
+    "format",
+    "version",
+    "status",
+    "state",
 ];
 /// Values that are words, not secrets, even beside a secret's name:
 /// `token: expired`, `password: required`, `ExpiredToken: The token…`.
@@ -287,14 +298,14 @@ static URL_USERINFO: LazyLock<Regex> =
 /// masks such as `***`.
 static REFERENCE: LazyLock<Regex> = LazyLock::new(|| {
     regex(
-        r"^(?:\$\{?[A-Z_][A-Z0-9_]*\}?|\$\{\{[^{}]*\}\}|%[A-Za-z_][A-Za-z0-9_]*%|\{\{[^{}]*\}\}|<[^<>\n]{1,64}>|\*{3,}|x{3,}|X{3,})$",
+        r"^(?:\$\{?[A-Z_][A-Z0-9_]*\}?|\$\{\{[^{}]*\}\}|%[A-Za-z_][A-Za-z0-9_]*%|\{\{[^{}]*\}\}|<[^<>\n]{1,64}>|\*{3,}|x{3,}|X{3,}|\.{3,}|…)$",
     )
 });
-/// Terminal escape sequences, as bytes or written out as JSON or C escapes:
-/// colours (`ESC[1;33m`) and titles (`ESC]0;…BEL`).
-static ANSI: LazyLock<Regex> = LazyLock::new(|| {
+/// Webhook URLs whose path is their secret: Slack's, Discord's and
+/// Microsoft Teams'. The host is kept, the path redacted.
+static WEBHOOK: LazyLock<Regex> = LazyLock::new(|| {
     regex(
-        r"(?:\x1b|\\u001[bB]|\\x1[bB]|\\e|\\033)(?:\[[0-9;?]*[@-~]|\][^\x07\x1b\n]*(?:\x07|\x1b\\|\\u0007|\\x07|\\a)?)",
+        r"(?i)\b(https?://(?:hooks\.slack\.com/(?:services|workflows|triggers)/|(?:canary\.|ptb\.)?discord(?:app)?\.com/api/webhooks/|[a-z0-9-]+\.webhook\.office\.com/webhookb2/|outlook\.office\.com/webhook/))([A-Za-z0-9@/_.%-]+)",
     )
 });
 static PRIVATE_KEY: LazyLock<Regex> =
@@ -359,6 +370,11 @@ fn strength(name: &str) -> Strength {
         || STRONG_ENDINGS.iter().any(|end| joined.ends_with(end))
     {
         return Strength::Strong;
+    }
+    // `key` unqualified, as in `OPENAI_KEY` or `primaryKey`, only hints:
+    // `cache-key: v1-deps` holds no secret.
+    if parts.iter().any(|part| part == "key") || joined.ends_with("key") {
+        return Strength::Weak;
     }
     let weak =
         parts.iter().any(|part| WEAK_PARTS.contains(&part.as_str())) || joined.ends_with("token");
@@ -433,8 +449,10 @@ fn known_shape(rest: &str) -> Option<usize> {
 }
 
 /// How many bytes after a backslash make one escape: `\n`, `\t`, `\"`,
-/// `\uXXXX`, `\x1b`. What an escape stands for is never part of a token, so
-/// a key right after `\n` still starts one.
+/// `\uXXXX`, `\x1b`. What an escape stands for is never part of a token,
+/// so a key right after `\n` still starts one, as it does after `\\n`,
+/// where JSON inside a JSON string escapes the backslash: the second
+/// backslash starts the escape.
 fn escape_len(after: &str) -> usize {
     let b = after.as_bytes();
     let hex = |range: std::ops::Range<usize>| {
@@ -444,10 +462,71 @@ fn escape_len(after: &str) -> usize {
         Some(b'u') if hex(1..5) => 5,
         Some(b'x') if hex(1..3) => 3,
         Some(
-            b'n' | b't' | b'r' | b'b' | b'f' | b'e' | b'a' | b'v' | b'0' | b'"' | b'\'' | b'\\'
-            | b'/',
+            b'n' | b't' | b'r' | b'b' | b'f' | b'e' | b'a' | b'v' | b'0' | b'"' | b'\'' | b'/',
         ) => 1,
         _ => 0,
+    }
+}
+
+/// How long the terminal escape sequence starting `rest` is, if a complete
+/// one does: a control sequence (`ESC[1;33m`, `ESC[38:5:196m`, `ESC[1 q`),
+/// a title or link (`ESC]0;title BEL`, ended by BEL or ST), or a character
+/// set (`ESC(B`). ESC is the byte, or written out as `\u001b`, `\x1b`, `\e`
+/// or `\033`. Anything short of a whole sequence is not one.
+fn escape_sequence_len(rest: &str) -> Option<usize> {
+    let introducer = [
+        "\x1b", "\\u001b", "\\u001B", "\\x1b", "\\x1B", "\\e", "\\033",
+    ]
+    .iter()
+    .find(|i| rest.starts_with(**i))?;
+    let raw = *introducer == "\x1b";
+    let body = &rest[introducer.len()..];
+    let bytes = body.as_bytes();
+    match bytes.first()? {
+        b'[' => {
+            // Parameters, then intermediates, then one final byte.
+            let params = bytes[1..]
+                .iter()
+                .take(32)
+                .take_while(|b| matches!(b, b'0'..=b'9' | b';' | b':' | b'?' | b'<' | b'=' | b'>'))
+                .count();
+            let inter = bytes[1 + params..]
+                .iter()
+                .take(4)
+                .take_while(|b| (0x20..=0x2f).contains(*b))
+                .count();
+            let fin = *bytes.get(1 + params + inter)?;
+            (0x40..=0x7e)
+                .contains(&fin)
+                .then_some(introducer.len() + 2 + params + inter)
+        }
+        b']' => {
+            // Ended by BEL or ST, raw or written as the introducer was.
+            let ends: &[&str] = if raw {
+                &["\x07", "\x1b\\"]
+            } else {
+                &[
+                    "\\u0007",
+                    "\\x07",
+                    "\\a",
+                    "\\u001b\\\\",
+                    "\\x1b\\\\",
+                    "\\e\\\\",
+                    "\\033\\\\",
+                ]
+            };
+            let window = &body[1..body.len().min(1 + 256)];
+            let window = &window[..window.find('\n').unwrap_or(window.len())];
+            ends.iter()
+                .filter_map(|end| window.find(end).map(|at| at + end.len()))
+                .min()
+                .map(|len| introducer.len() + 1 + len)
+        }
+        b'(' | b')' | b'*' | b'+' | b'-' | b'.' | b'/' => {
+            let set = *bytes.get(1)?;
+            (0x30..=0x7e).contains(&set).then_some(introducer.len() + 2)
+        }
+        _ => None,
     }
 }
 
@@ -475,6 +554,12 @@ fn shapes(input: &str) -> Option<String> {
             out.push_str(REDACTED);
             at += len;
             copied = at;
+            boundary = true;
+            continue;
+        }
+        // A terminal escape sequence, kept as it is: a boundary.
+        if let Some(len) = escape_sequence_len(rest) {
+            at += len;
             boundary = true;
             continue;
         }
@@ -532,15 +617,38 @@ fn looks_like_code(value: &str) -> bool {
         || (value.contains('<') && value.ends_with('>'))
 }
 
-/// Whether a value looks like a credential rather than a word or a number:
+/// Whether `segment` reads as words or a small number rather than random
+/// characters: `operator`, `InvalidToken`, `deps`, `v1`, `2024`.
+fn is_wordlike(segment: &str) -> bool {
+    let b = segment.as_bytes();
+    if b.len() <= 3 || (b.len() <= 4 && b.iter().all(u8::is_ascii_digit)) {
+        return true;
+    }
+    // Lower-case words, each but the first may start with a capital.
+    let mut previous_upper = false;
+    for (i, c) in b.iter().enumerate() {
+        match c {
+            b'a'..=b'z' => previous_upper = false,
+            b'A'..=b'Z' if i == 0 || !previous_upper => previous_upper = true,
+            _ => return false,
+        }
+    }
+    !previous_upper
+}
+
+/// Whether a value looks like a credential rather than words or a number:
 /// a known format, or eight or more characters, no spaces, of at least two
-/// kinds (lower case, upper case, digits, symbols), and not a capitalised
-/// word.
+/// kinds (lower case, upper case, digits, symbols), that are not just words
+/// and small numbers joined by `-`, `_`, `.`, `/` or `:` (`operator-1`,
+/// `InvalidToken`, `v1-deps`).
 fn looks_like_credential(value: &str) -> bool {
     if known_shape(value).is_some() {
         return true;
     }
     if value.chars().count() < 8 || value.contains(char::is_whitespace) {
+        return false;
+    }
+    if value.split(['-', '_', '.', '/', ':']).all(is_wordlike) {
         return false;
     }
     let mut kinds = [false; 4];
@@ -556,12 +664,7 @@ fn looks_like_credential(value: &str) -> bool {
         };
         kinds[kind] = true;
     }
-    let word = {
-        let mut chars = value.chars();
-        chars.next().is_some_and(|c| c.is_ascii_alphabetic())
-            && chars.all(|c| c.is_ascii_lowercase())
-    };
-    !word && kinds.iter().filter(|k| **k).count() >= 2
+    kinds.iter().filter(|k| **k).count() >= 2
 }
 
 /// Whether a value beside a name of this strength is the secret.
@@ -619,8 +722,13 @@ const SCHEMES: &[&str] = &[
 fn is_header_secret(header: &str, value: &str) -> bool {
     let value = value.trim();
     let first = value.split_whitespace().next().unwrap_or_default();
-    if header.to_ascii_lowercase().ends_with("cookie") {
+    let header = header.to_ascii_lowercase();
+    if header.ends_with("cookie") {
         return value.contains('=');
+    }
+    // A key header holds nothing but its key.
+    if header.starts_with("x-") {
+        return is_secret_value(Strength::Strong, first);
     }
     let scheme = SCHEMES.iter().any(|s| first.eq_ignore_ascii_case(s));
     (scheme && value.len() > first.len()) || looks_like_credential(first)
@@ -811,12 +919,17 @@ fn value_after(input: &str, at: usize) -> Option<(usize, usize)> {
                 .position(|b| b == b'>' || b == b'\n')?;
             (bytes[len] == b'>').then_some((at, at + len + 1))
         }
-        Some(_)
-            if (rest.starts_with("{{") || rest.starts_with("${{"))
-                && rest[..rest.find('\n').unwrap_or(rest.len())].contains("}}") =>
-        {
-            let end = rest.find("}}").map_or(rest.len(), |end| end + 2);
-            Some((at, at + end))
+        // Looked for within a bounded window, so the scan stays linear.
+        Some(_) if rest.starts_with("{{") || rest.starts_with("${{") => {
+            let window = &rest.as_bytes()[..rest.len().min(256)];
+            let close = window.windows(2).position(|w| w == b"}}");
+            match close {
+                Some(end) if !window[..end].contains(&b'\n') => Some((at, at + end + 2)),
+                _ => {
+                    let len = bare_value_len(rest);
+                    (len > 0).then_some((at, at + len))
+                }
+            }
         }
         Some(_) => {
             let len = bare_value_len(rest);
@@ -854,7 +967,22 @@ fn assigned(input: &str) -> Option<String> {
         let Some((name_start, name_end)) = name_before(input, sep) else {
             continue;
         };
-        let strength = strength(&input[name_start..name_end]);
+        let mut strength = strength(&input[name_start..name_end]);
+        // `api key: …`, `Your API key: …`: qualified by the word before.
+        if input[name_start..name_end].eq_ignore_ascii_case("key")
+            && name_start > 0
+            && bytes[name_start - 1] == b' '
+        {
+            let before = &input[name_start.saturating_sub(16)..name_start - 1];
+            let word = before
+                .rsplit(|c: char| !c.is_ascii_alphanumeric())
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if KEY_QUALIFIERS.contains(&word.as_str()) {
+                strength = Strength::Strong;
+            }
+        }
         if strength == Strength::None {
             continue;
         }
@@ -864,7 +992,6 @@ fn assigned(input: &str) -> Option<String> {
         };
         // `authorization=Bearer abc`: the scheme and its credential.
         let value = &input[value_from..value_to];
-        let mut strength = strength;
         if SCHEMES.iter().any(|s| value.eq_ignore_ascii_case(s))
             && input[value_to..].starts_with(' ')
             && let Some((credential_from, credential_to)) = value_after(input, value_to + 1)
@@ -930,13 +1057,10 @@ fn redact_userinfo(captures: &Captures<'_>) -> String {
 /// Replaces secrets in text. Linear in the length of `input`; callers
 /// with text of unknown length bound it first (see [`excerpt`]).
 pub fn text(input: &str) -> Cow<'_, str> {
-    let mut output = match ANSI.replace_all(input, "") {
-        Cow::Borrowed(_) => Cow::Borrowed(input),
-        Cow::Owned(stripped) => Cow::Owned(stripped),
+    let mut output = match shapes(input) {
+        Some(shaped) => Cow::Owned(shaped),
+        None => Cow::Borrowed(input),
     };
-    if let Some(shaped) = shapes(&output) {
-        output = Cow::Owned(shaped);
-    }
     let mut apply = |rule: &Regex, replace: &dyn Fn(&Captures<'_>) -> String| {
         // Most text has nothing, so this avoids building a new string for
         // each rule.
@@ -953,6 +1077,7 @@ pub fn text(input: &str) -> Cow<'_, str> {
         }
     });
     apply(&URL_USERINFO, &redact_userinfo);
+    apply(&WEBHOOK, &|c| format!("{}{REDACTED}", &c[1]));
     // The whole value, even when part of it was redacted already: the rest
     // of a cookie is as secret as its first part.
     apply(&HEADER, &|c| {
@@ -979,56 +1104,99 @@ fn cut(input: &str, chars: usize) -> Cow<'_, str> {
 }
 
 /// How much of a text to redact so that `chars` of it survive: enough to
-/// spare, so a secret cut in half at the bound is never in what is kept.
+/// spare that what redaction shrinks never brings the cut into view.
 fn margin(chars: usize) -> usize {
     chars.saturating_mul(2).saturating_add(16 * 1024)
 }
 
-/// The start of `input`, at most `chars` characters, redacted. The text is
-/// bounded before it is redacted, so a huge input costs little, with room to
-/// spare, so a secret cut in half there is never in the excerpt. JSON is
-/// redacted as JSON (see [`value`]), so its escapes hide no secret.
+/// The longest token cut off at a bound that is dropped whole, so that
+/// half a key is never kept.
+const MAX_CUT_TOKEN: usize = 1024;
+
+/// The start of `input` to the redaction margin for `chars`, less a token
+/// the margin cuts in half.
+fn window_start(input: &str, chars: usize) -> &str {
+    let Some((at, _)) = input.char_indices().nth(margin(chars)) else {
+        return input;
+    };
+    let head = &input[..at];
+    let keep = head
+        .char_indices()
+        .rev()
+        .take(MAX_CUT_TOKEN)
+        .find(|(_, c)| c.is_whitespace())
+        .map_or(head.len().saturating_sub(MAX_CUT_TOKEN), |(i, _)| i);
+    let keep = (0..=keep)
+        .rev()
+        .find(|i| head.is_char_boundary(*i))
+        .unwrap_or(0);
+    &head[..keep]
+}
+
+/// The end of `input` to the redaction margin for `chars`, less a token
+/// the margin cuts in half.
+fn window_end(input: &str, chars: usize) -> &str {
+    let count = input.chars().count();
+    let Some((at, _)) = input
+        .char_indices()
+        .nth(count.saturating_sub(margin(chars)))
+    else {
+        return input;
+    };
+    if at == 0 {
+        return input;
+    }
+    let tail = &input[at..];
+    let skip = tail
+        .char_indices()
+        .take(MAX_CUT_TOKEN)
+        .find(|(_, c)| c.is_whitespace())
+        .map_or(MAX_CUT_TOKEN.min(tail.len()), |(i, _)| i);
+    let skip = (skip..=tail.len())
+        .find(|i| tail.is_char_boundary(*i))
+        .unwrap_or(tail.len());
+    &tail[skip..]
+}
+
+/// The start of `input`, at most `chars` characters, redacted. Only a
+/// window with room to spare is redacted, so a huge input costs little,
+/// less any token the window cuts in half; then the result is cut. JSON is
+/// redacted as JSON (see [`value`]), so its escapes hide no secret, and
+/// then as text.
 pub fn excerpt(input: &str, chars: usize) -> String {
-    let bounded = cut(input, margin(chars));
-    let trimmed = bounded.trim_start();
-    let redacted = match serde_json::from_str::<Value>(trimmed) {
+    let window = window_start(input, chars);
+    let trimmed = window.trim_start();
+    let json = match serde_json::from_str::<Value>(trimmed) {
         Ok(mut doc) if trimmed.starts_with(['{', '[']) => {
             let before = doc.clone();
             value(&mut doc);
-            if doc == before {
-                text(&bounded).into_owned()
-            } else {
-                doc.to_string()
-            }
+            (doc != before).then(|| doc.to_string())
         }
-        _ => text(&bounded).into_owned(),
+        _ => None,
     };
+    let redacted = text(json.as_deref().unwrap_or(window)).into_owned();
     cut(&redacted, chars).into_owned()
 }
 
 /// The start of `input`, at most `chars` characters, redacted as text: as
 /// [`excerpt`], for a log line or a span's attribute.
 pub fn bounded(input: &str, chars: usize) -> String {
-    let bounded = cut(input, margin(chars));
-    let redacted = text(&bounded);
+    let redacted = text(window_start(input, chars));
     cut(&redacted, chars).into_owned()
 }
 
 /// The end of `input`, at most `chars` characters, redacted: as
 /// [`excerpt`], for the tail of a command's stderr.
 pub fn tail(input: &str, chars: usize) -> String {
-    let count = input.chars().count();
-    let from = input
-        .char_indices()
-        .nth(count.saturating_sub(margin(chars)))
-        .map_or(input.len(), |(at, _)| at);
-    let redacted = text(&input[from..]);
+    let redacted = text(window_end(input, chars));
     let count = redacted.chars().count();
     redacted.chars().skip(count.saturating_sub(chars)).collect()
 }
 
 fn redact_string(string: &mut String, nested: usize) {
-    if let Cow::Owned(redacted) = text(string) {
+    if string.len() > MAX_TEXT {
+        *string = bounded(string, MAX_TEXT);
+    } else if let Cow::Owned(redacted) = text(string) {
         *string = redacted;
     }
     // JSON inside a string, such as a model's raw tool arguments: an escape
@@ -1059,9 +1227,16 @@ fn redact_held(strength: Strength, value: &mut Value, nested: usize) {
         Value::Array(items) => items
             .iter_mut()
             .for_each(|item| redact_held(strength, item, nested)),
-        Value::Object(fields) => fields
-            .values_mut()
-            .for_each(|field| redact_held(strength, field, nested)),
+        // A field inside is held at least as surely as its own name says.
+        Value::Object(fields) => fields.iter_mut().for_each(|(key, field)| {
+            let own = self::strength(key);
+            let held = if own == Strength::Strong {
+                own
+            } else {
+                strength
+            };
+            redact_held(held, field, nested)
+        }),
         Value::Number(_) | Value::Null | Value::Bool(_) => {}
     }
 }
@@ -1077,16 +1252,22 @@ const HEADERS: &[&str] = &[
 ];
 
 /// Whether `secret` is the credential of a name and value pair named `name`:
-/// a header's credential, or a credential under a secret's name. Not
-/// `["password", "email"]`.
-fn pair_holds_secret(name: &str, secret: &Value) -> bool {
+/// a header's credential, or a credential under a secret's name. A pair
+/// that says it is one, `{"name": …, "value": …}`, needs only a secret's
+/// name; a bare pair, `[…, …]`, needs a value that looks like a
+/// credential too, so `["password", "email"]` is a list.
+fn pair_holds_secret(name: &str, secret: &Value, explicit: bool) -> bool {
     let Some(secret) = secret.as_str() else {
         return false;
     };
     if HEADERS.iter().any(|h| name.eq_ignore_ascii_case(h)) {
         return is_header_secret(name, secret);
     }
-    strength(name) == Strength::Strong && looks_like_credential(secret)
+    match strength(name) {
+        Strength::Strong if explicit => is_secret_value(Strength::Strong, secret),
+        Strength::None => false,
+        _ => looks_like_credential(secret),
+    }
 }
 
 /// A header as a pair, `["Authorization", "..."]`, or as an object,
@@ -1097,7 +1278,7 @@ fn header_pair(value: &mut Value) -> Option<&mut Value> {
         Value::Array(items) if items.len() == 2 => {
             let named = items[0]
                 .as_str()
-                .is_some_and(|name| pair_holds_secret(name, &items[1]));
+                .is_some_and(|name| pair_holds_secret(name, &items[1], false));
             named.then(|| &mut items[1])
         }
         Value::Object(fields) => {
@@ -1106,7 +1287,7 @@ fn header_pair(value: &mut Value) -> Option<&mut Value> {
                 fields
                     .get(*field)
                     .and_then(Value::as_str)
-                    .is_some_and(|name| pair_holds_secret(name, secret))
+                    .is_some_and(|name| pair_holds_secret(name, secret, true))
             });
             if named { fields.get_mut("value") } else { None }
         }
@@ -1120,9 +1301,25 @@ fn redact_nested(value: &mut Value, nested: usize) {
     }
     match value {
         Value::String(string) => redact_string(string, nested),
-        Value::Array(items) => items
-            .iter_mut()
-            .for_each(|item| redact_nested(item, nested)),
+        Value::Array(items) => {
+            // An argument list: the value after a secret-named flag.
+            for i in 1..items.len() {
+                let flag = items[i - 1]
+                    .as_str()
+                    .and_then(|f| f.strip_prefix("--").or_else(|| f.strip_prefix('-')))
+                    .filter(|f| !f.contains('='))
+                    .map(strength)
+                    .unwrap_or(Strength::None);
+                if flag != Strength::None
+                    && items[i].as_str().is_some_and(|v| is_secret_value(flag, v))
+                {
+                    items[i] = Value::String(REDACTED.into());
+                }
+            }
+            items
+                .iter_mut()
+                .for_each(|item| redact_nested(item, nested));
+        }
         Value::Object(fields) => {
             let renamed: Vec<(String, String)> = fields
                 .keys()
@@ -1248,7 +1445,7 @@ pub fn panic_message(info: &std::panic::PanicHookInfo<'_>) -> String {
     if backtrace.status() == std::backtrace::BacktraceStatus::Captured {
         message.push_str(&format!("\nstack backtrace:\n{backtrace}"));
     }
-    text(&message).into_owned()
+    bounded(&message, MAX_TEXT)
 }
 
 /// Make a panic write [`panic_message`] in place of the standard hook's
