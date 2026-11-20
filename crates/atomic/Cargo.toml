@@ -37,8 +37,15 @@ atomic-schema = { workspace = true }
 serde = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
 
 [dev-dependencies]
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 atomic-core = { workspace = true, features = ["fake-model", "failpoints"] }
 atomic-durable = { workspace = true, features = ["failpoints"] }
 sqlx = { workspace = true }
