@@ -123,6 +123,20 @@ fn a_mapping_that_cannot_fit_fails() {
         "{}",
         e.message
     );
+    // Both steps are named, and what to change comes separately.
+    assert!(
+        e.message
+            .contains("step `review` maps `steps.summarize.output`")
+            && e.message.contains("from step `summarize`'s output"),
+        "{}",
+        e.message
+    );
+    let action = e.action.expect("an action");
+    assert!(
+        action.contains("`with.draft` in step `review`")
+            && action.contains("atom `summarize-note` (step `summarize`)"),
+        "{action}"
+    );
 }
 
 #[test]

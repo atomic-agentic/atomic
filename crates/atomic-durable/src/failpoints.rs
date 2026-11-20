@@ -124,9 +124,19 @@ pub const SITES: &[Site] = &[
     },
 ];
 
-/// The site `name` comes from, if it is one of [`SITES`].
+/// Failpoint sites in atomic's commands rather than in the workflows the
+/// crash suite runs, such as `atomic runs resume`: the command-line tests
+/// drive them.
+pub const COMMAND_SITES: &[Site] = &[Site {
+    name: "resume:queued",
+    what: "runs resume put the run on its resume queue and its engine has not started \
+           dispatching it",
+}];
+
+/// The site `name` comes from, if it is one of [`SITES`] or
+/// [`COMMAND_SITES`].
 pub fn site_of(name: &str) -> Option<&'static Site> {
-    SITES.iter().find(|s| s.matches(name))
+    SITES.iter().chain(COMMAND_SITES).find(|s| s.matches(name))
 }
 
 /// Whether failpoints are compiled in. Callers that build a name check this

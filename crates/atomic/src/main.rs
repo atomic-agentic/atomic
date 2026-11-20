@@ -7,11 +7,15 @@ use atomic_core::codex::{self, CodexPaths, ModelEndpoint};
 use atomic_core::project;
 use atomic_core::state::ProjectState;
 use clap::{Args, Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+mod engine;
+mod failure;
 mod gates;
+mod runs;
 mod setup;
 mod skills;
+mod target;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -20,6 +24,14 @@ mod skills;
     about = "Small, typed, durable agents on Codex."
 )]
 struct Cli {
+    /// Print results and errors as JSON on stdout; an error's action is a
+    /// field of its own.
+    #[arg(long, global = true)]
+    json: bool,
+    /// The project: the directory holding its atomic.yaml (or
+    /// .atomic/atomic.yaml), or the manifest file itself.
+    #[arg(long, global = true, value_name = "PATH")]
+    project: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -33,6 +45,17 @@ enum Command {
     },
     /// Render an Astro prompt without calling a model or running scripts.
     Render(RenderArgs),
+    /// Run an atom or a workflow in the foreground and print its output.
+    Run(runs::RunArgs),
+    /// Continue runs.
+    #[command(subcommand)]
+    Runs(Runs),
+    /// Run the project's runtime in the foreground: recover unfinished runs
+    /// and keep running until stopped.
+    Serve(runs::ServeArgs),
+    /// Run commands for a control plane: one request on stdin, one response
+    /// on stdout, and an exit code from a fixed set.
+    Runner,
     /// Write JSON Schemas for editors: workflow files and the manifest, with
     /// the project's atom names and schema IDs.
     #[command(args_conflicts_with_subcommands = true)]
@@ -50,6 +73,13 @@ enum Command {
     /// Developer diagnostics.
     #[command(subcommand, hide = true)]
     Debug(Debug),
+}
+
+#[derive(Debug, Subcommand)]
+enum Runs {
+    /// Continue an unfinished run in the foreground, from its checkpoints,
+    /// with the definitions and input it started with.
+    Resume(runs::ResumeArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -119,6 +149,9 @@ impl PromptArgs {
     }
 }
 
+/// The names Codex starts this executable under to run one of its helpers.
+const CODEX_HELPER_NAMES: &[&str] = &["codex-linux-sandbox", "apply_patch", "applypatch"];
+
 fn main() -> anyhow::Result<()> {
     // A helper child serves one call and exits, before anything else starts:
     // no state directory, no Codex dispatch.
@@ -127,28 +160,123 @@ fn main() -> anyhow::Result<()> {
     {
         std::process::exit(atomic_core::helper_runtime::serve());
     }
+    // The runner role needs no state directory and no Codex: it runs one
+    // command for a control plane and exits with a code from its contract.
+    if std::env::args_os().nth(1).is_some_and(|a| a == "runner") {
+        std::process::exit(runner());
+    }
+    let parsed = Cli::try_parse();
+    // Help and the version create nothing on disk, and print only themselves:
+    // they need no Codex either, unless this process was started under the
+    // name of one of Codex's helpers, which read their own arguments.
+    let quiet = parsed.as_ref().err().is_some_and(|e| {
+        use clap::error::ErrorKind;
+        matches!(
+            e.kind(),
+            ErrorKind::DisplayHelp
+                | ErrorKind::DisplayVersion
+                | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        )
+    });
+    let not_a_helper = std::env::args_os()
+        .next()
+        .and_then(|arg0| {
+            Path::new(&arg0)
+                .file_name()
+                .map(|name| !CODEX_HELPER_NAMES.contains(&name.to_string_lossy().as_ref()))
+        })
+        .unwrap_or(true);
+    if quiet
+        && not_a_helper
+        && let Err(e) = &parsed
+    {
+        e.exit();
+    }
+    // The runner role after global flags, such as `atomic --json runner`.
+    if let Ok(Cli {
+        command: Some(Command::Runner),
+        ..
+    }) = &parsed
+    {
+        std::process::exit(atomic_exec::runner::serve_stdio());
+    }
     // Resolve and create the state directory before Codex starts, so its home
     // is never the user's own. A failure here is reported once the normal entry
     // point runs; Codex's helper invocations never need it.
-    let state = std::env::current_dir()
-        .context("read the working directory")
-        .and_then(|cwd| match project::discover(&cwd) {
-            Ok(p) => Ok(p.root().to_owned()),
-            // Outside any project, state is keyed by the working directory.
-            Err(project::ProjectError::NotFound(_)) => Ok(cwd),
-            Err(e) => Err(e.into()),
-        })
-        .and_then(|root| ProjectState::resolve(&root).map_err(anyhow::Error::from))
-        .and_then(|s| s.create().map(|()| s).map_err(anyhow::Error::from));
+    let state = if quiet {
+        Err(anyhow::anyhow!("no state directory"))
+    } else {
+        state_root(parsed.as_ref().ok())
+            .and_then(|root| ProjectState::resolve(&root).map_err(anyhow::Error::from))
+            .and_then(|s| s.create().map(|()| s).map_err(anyhow::Error::from))
+    };
     let codex_home = match &state {
         Ok(s) => s.codex_home(),
         // Never created: Codex finds no home and creates nothing.
         Err(_) => std::env::temp_dir().join("atomic-no-state-directory"),
     };
     codex::dispatch(&codex_home, move |paths| async move {
-        let state = state?;
-        run(Cli::parse(), paths, state).await
+        let cli = match parsed {
+            Ok(cli) => cli,
+            Err(_) => Cli::parse(),
+        };
+        let json = cli.json;
+        let outcome = match state {
+            Ok(state) => run(cli, paths, state).await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = outcome {
+            failure::report(&failure::analyze(&e), json);
+            std::process::exit(1);
+        }
+        Ok(())
     })
+}
+
+/// The project root a command's state belongs to: the project it works on,
+/// or, outside any project, the working directory.
+fn state_root(cli: Option<&Cli>) -> anyhow::Result<PathBuf> {
+    let cwd = std::env::current_dir().context("read the working directory")?;
+    let flag = cli.and_then(|c| c.project.as_deref());
+    let target = match cli.and_then(|c| c.command.as_ref()) {
+        Some(Command::Run(args)) => Some(args.target.as_str()),
+        _ => None,
+    };
+    match target::project_for(flag, target, &cwd) {
+        Ok(p) => Ok(p.root().to_owned()),
+        // Outside any project, state is keyed by the working directory.
+        Err(e)
+            if flag.is_none()
+                && target.is_none()
+                && matches!(
+                    e.downcast_ref::<project::ProjectError>(),
+                    Some(project::ProjectError::NotFound(_))
+                ) =>
+        {
+            Ok(cwd)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// `atomic runner`: one request on stdin, one response on stdout.
+fn runner() -> i32 {
+    /// Run commands for a control plane.
+    #[derive(Debug, Parser)]
+    #[command(name = "atomic runner", version)]
+    struct RunnerCli {}
+    let args = std::env::args_os().skip(1);
+    match RunnerCli::try_parse_from(args) {
+        Ok(RunnerCli {}) => atomic_exec::runner::serve_stdio(),
+        Err(e) if !e.use_stderr() => {
+            let _ = e.print();
+            atomic_exec::runner::code::CLEAN
+        }
+        Err(e) => {
+            let _ = e.print();
+            atomic_exec::runner::code::USAGE
+        }
+    }
 }
 
 async fn run(cli: Cli, paths: CodexPaths, state: ProjectState) -> anyhow::Result<()> {
@@ -156,9 +284,17 @@ async fn run(cli: Cli, paths: CodexPaths, state: ProjectState) -> anyhow::Result
     atomic_durable::store::open_sqlite(&state.database()).await?;
     // Turn directories a killed atomic left behind.
     codex::sweep_turn_temps(state.dir())?;
+    let (json, project) = (cli.json, cli.project);
+    let project = project.as_deref();
     match cli.command {
         Some(Command::Gates(command)) => gates::run(command, &state).await,
-        Some(Command::Check { path }) => tokio::task::spawn_blocking(move || check(path)).await?,
+        Some(Command::Check { path }) => {
+            tokio::task::spawn_blocking(move || check(path, json)).await?
+        }
+        Some(Command::Run(args)) => runs::run(args, project, &paths, json).await,
+        Some(Command::Runs(Runs::Resume(args))) => runs::resume(args, project, &paths, json).await,
+        Some(Command::Serve(args)) => runs::serve(args, project, &paths).await,
+        Some(Command::Runner) => Ok(()),
         Some(Command::Render(args)) => tokio::task::spawn_blocking(move || render(args)).await?,
         Some(Command::Schemas { path, command }) => match command {
             Some(SchemasCommand::Expand { atom }) => {
@@ -251,7 +387,7 @@ fn load_project_schemas(
     }
 }
 
-fn check(path: Option<PathBuf>) -> anyhow::Result<()> {
+fn check(path: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
     use atomic_core::{atom, collections, compile, workflow};
     let path = path.unwrap_or(std::env::current_dir()?);
     let mut registry = atomic_schema::registry::Registry::new();
@@ -263,7 +399,14 @@ fn check(path: Option<PathBuf>) -> anyhow::Result<()> {
         let atom = atom::load(&path, &mut registry)?;
         compile::compile(&atom, &registry)?;
         write_declarations(&atom)?;
-        println!("checked {}", atom.file.display());
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({"checked": {"atoms": 1, "workflows": 0}, "warnings": []})
+            );
+        } else {
+            println!("checked {}", atom.file.display());
+        }
         return Ok(());
     }
     let project = project::discover(&path)?;
@@ -280,8 +423,12 @@ fn check(path: Option<PathBuf>) -> anyhow::Result<()> {
             "duplicate atom name {name}"
         );
     }
+    let mut warnings = Vec::new();
     for source in &files["workflows"] {
-        workflow::load(&source.path, &atoms, &mut registry)?;
+        let loaded = workflow::load(&source.path, &atoms, &mut registry)?;
+        for w in loaded.warnings {
+            warnings.push(format!("{}: {w}", loaded.file.display()));
+        }
     }
     // Each OpenAPI toolset must give tools whose schemas compile.
     let mut operations = 0;
@@ -305,12 +452,29 @@ fn check(path: Option<PathBuf>) -> anyhow::Result<()> {
         }
         operations += tools.len();
     }
-    println!(
-        "checked {} Astro atoms, {} workflows and {} toolset operations",
-        atoms.len(),
-        files["workflows"].len(),
-        operations
-    );
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "checked": {
+                    "atoms": atoms.len(),
+                    "workflows": files["workflows"].len(),
+                    "toolset_operations": operations,
+                },
+                "warnings": warnings,
+            })
+        );
+    } else {
+        for w in &warnings {
+            eprintln!("warning: {w}");
+        }
+        println!(
+            "checked {} Astro atoms, {} workflows and {} toolset operations",
+            atoms.len(),
+            files["workflows"].len(),
+            operations
+        );
+    }
     Ok(())
 }
 
