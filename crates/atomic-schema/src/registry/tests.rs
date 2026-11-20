@@ -391,3 +391,14 @@ fn aliases_of_the_artifact_schema_inline_as_the_artifact_reference() {
         );
     }
 }
+
+#[test]
+fn a_reference_into_part_of_the_artifact_schema_is_refused() {
+    let mut registry = Registry::new();
+    let schema = serde_json::json!({"type": "object", "properties": {
+        "file": {"$ref": "atomic:artifact#/pattern"}}});
+    let error = registry
+        .inline_value(&schema, std::path::Path::new("/part.schema.json"))
+        .expect_err("refused");
+    assert!(error.to_string().contains("part of it"), "{error}");
+}

@@ -1371,6 +1371,25 @@ mod tests {
     }
 
     #[test]
+    fn a_property_named_id_is_not_an_embedded_resource() {
+        let schema = serde_json::json!({"type": "object", "properties": {
+            "$id": {"type": "object", "properties": {"self": {"$ref": "#"}}},
+            "file": {"$ref": "atomic:artifact", "mediaType": "text/x-diff"}
+        }});
+        assert_eq!(check_contract(&schema), Ok(()));
+        assert_eq!(
+            verdict(&schema, &serde_json::json!({"file": reference('b')})),
+            "wrong"
+        );
+        // A local reference inside a real embedded resource, reached only by
+        // reference, is refused: there `#` would mean the resource.
+        let schema = serde_json::json!({"type": "object",
+            "properties": {"file": {"$ref": "atomic:artifact"}, "x": {"$ref": "#/$defs/e/x-hidden/f"}},
+            "$defs": {"e": {"$id": "https://example.com/e", "x-hidden": {"f": {"$ref": "#"}}}}});
+        assert!(check_contract(&schema).is_err());
+    }
+
+    #[test]
     fn every_all_of_branch_must_hold() {
         let schema = serde_json::json!({"allOf": [
             {"type": "object", "properties": {"file": {"$ref": "atomic:artifact"}}},
@@ -1665,7 +1684,8 @@ fn lint(
     let Some(map) = node.as_object() else {
         return Ok(());
     };
-    let embedded = embedded || (!at.is_empty() && map.contains_key("$id"));
+    let embedded =
+        embedded || (!at.is_empty() && map.get("$id").is_some_and(serde_json::Value::is_string));
     lint_node(root, map, at, embedded)?;
     for (sub, _, s) in subschemas(node, at) {
         lint(root, s, &sub, embedded)?;
@@ -1736,9 +1756,11 @@ fn embedded_at(root: &serde_json::Value, at: &str) -> bool {
     for part in at.split('/').skip(1) {
         prefix.push('/');
         prefix.push_str(part);
+        // A string `$id` marks a resource; a property named `$id` maps to a
+        // schema, not a string.
         if root
             .pointer(&prefix)
-            .is_some_and(|n| n.get("$id").is_some())
+            .is_some_and(|n| n.get("$id").is_some_and(serde_json::Value::is_string))
         {
             return true;
         }

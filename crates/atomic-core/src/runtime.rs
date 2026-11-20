@@ -374,6 +374,15 @@ async fn run_typed<A: Atom>(
             A::NAME
         ))
     })?;
+    // A contract written in code is never inlined or checked at load: refuse
+    // one whose artifact references could not be checked before any model
+    // call, rather than at every answer.
+    atomic_schema::artifact::check_contract(&contract).map_err(|e| {
+        AtomError::Runtime(format!(
+            "the output schema of {} cannot be checked for artifact references: {e}",
+            A::NAME
+        ))
+    })?;
     let prompt = serde_json::to_string_pretty(input)
         .map_err(|e| AtomError::Runtime(format!("serialize the input: {e}")))?;
     let check = |v: &Value| -> Result<(), AtomError> {

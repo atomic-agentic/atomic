@@ -127,7 +127,9 @@ expression meets it.
 
 Comparisons work across the types, so `input.score >= 1` holds for a `number`
 field. Arithmetic does not: write `input.score * 2.0`, not `input.score * 2`,
-for a `number` field. A result that is not a finite number (`1.0 / 0.0`) is an
+for a `number` field. Type every field you do arithmetic on. An untyped
+number's CEL type follows its value (`2` is an `int`, `2.5` a `double`), so an
+expression that adds to it works for one answer and fails for the next. A result that is not a finite number (`1.0 / 0.0`) is an
 error, a map key in a result must be a string, and objects in a result have
 their keys in sorted order.
 

@@ -1351,3 +1351,63 @@ fn an_answer_cel_cannot_read_is_repaired() {
         );
     });
 }
+
+struct Hidden;
+
+impl Atom for Hidden {
+    type In = Note;
+    type Out = Value;
+    const NAME: &'static str = "hidden-artifact";
+    fn input_schema(&self) -> Value {
+        Classify.input_schema()
+    }
+    fn output_schema(&self) -> Value {
+        json!({"type": "object", "properties": {
+            "files": {"type": "array", "contains": {"$ref": "atomic:artifact"}}}})
+    }
+    fn instructions(&self) -> Cow<'static, str> {
+        "List the files.".into()
+    }
+}
+
+// A contract written in code whose artifact references cannot be checked is
+// refused before any model call.
+#[test]
+fn a_typed_contract_that_cannot_be_checked_is_refused_before_the_model() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(Vec::new()).await.expect("fake model");
+        let rt = runtime(&model, "hidden");
+        let r = run_codex_atom(&Hidden, &Note { text: "n".into() }, &rt).await;
+        assert!(
+            matches!(&r, Err(AtomError::Runtime(message)) if message.contains("contains")),
+            "{r:?}"
+        );
+        assert_eq!(model.calls(), 0);
+    });
+}
+
+// An exec atom's output CEL cannot read is a schema error, as a model's is.
+#[test]
+fn an_exec_output_cel_cannot_read_fails() {
+    on_codex_runtime(async {
+        let script = "import sys\nsys.stdin.read()\nsys.stdout.write('{\"total\": 1.0000000000000000000001}')\n";
+        let (_, a, compiled) = exec_project("exec-cel", script, "");
+        let r = run_exec(
+            &a,
+            &compiled,
+            &json!({"cents": [1]}),
+            &EffectIdentity {
+                run_id: "run-1".into(),
+                step_id: "total".into(),
+            },
+            Arc::new(atomic_exec::LocalBackend),
+            None,
+            &Artifacts::none(),
+        )
+        .await;
+        assert!(
+            matches!(&r, Err(AtomError::Schema { message, .. }) if message.contains("integer")),
+            "{r:?}"
+        );
+    });
+}

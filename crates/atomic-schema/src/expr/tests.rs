@@ -645,3 +645,63 @@ fn only_this_module_builds_a_cel_context() {
         "evaluate CEL through atomic_schema::expr::evaluate: {offenders:?}"
     );
 }
+
+#[test]
+fn large_doubles_written_the_short_way_are_accepted() {
+    let field = json!({"type": "number"});
+    let field = Shape::Schema(&field);
+    for text in [
+        "6.022e23",
+        "5.972e+24",
+        "1e23",
+        "1.989e30",
+        "1e38",
+        "1e22",
+        "1e39",
+    ] {
+        let want = text.parse::<f64>().expect("a double");
+        for shape in [&field, &Shape::Untyped] {
+            assert_same!(
+                cel_value(&number(text), shape),
+                Ok(cel::Value::Float(want)),
+                "{text}"
+            );
+        }
+    }
+    // An integer written out in full that no double stands for is still
+    // refused.
+    for text in ["9007199254740993", "123456789012345678901234567891"] {
+        assert!(cel_value(&number(text), &field).is_err(), "{text}");
+    }
+}
+
+#[test]
+fn integers_are_typed_through_maps_fields_and_references() {
+    let schema = json!({"type": "object", "properties": {
+        "map": {"type": "object", "additionalProperties": {"type": "integer"}},
+        "leaf": {"$ref": "#/$defs/count"}
+    }, "$defs": {"count": {"type": "integer"}}});
+    let shape = Shape::Schema(&schema);
+    for (field, fraction) in [("map", json!({"a": 1.5})), ("leaf", json!(1.5))] {
+        assert!(
+            cel_value(&json!({ field: fraction }), &shape).is_err(),
+            "{field}"
+        );
+    }
+    let count = json!({"type": "integer"});
+    let fields = Shape::fields([("n", Shape::Schema(&count))]);
+    assert!(cel_value(&json!({"n": 1.5}), &fields).is_err());
+    assert!(cel_value(&json!({"m": 1.5}), &fields).is_ok());
+}
+
+#[test]
+fn a_conversion_error_names_the_place() {
+    let schema = json!({"type": "object", "properties": {"count": {"type": "integer"}}});
+    let value = json!({"count": number("1.5")});
+    let error =
+        evaluate("output", &[("output", &value, &Shape::Schema(&schema))]).expect_err("refused");
+    assert!(error.starts_with("`output.count`: "), "{error}");
+    let error =
+        evaluate("output", &[("output", &number("1e400"), &Shape::Untyped)]).expect_err("refused");
+    assert!(error.starts_with("`output`: "), "{error}");
+}

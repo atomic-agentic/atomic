@@ -460,7 +460,16 @@ pub fn evaluate(source: &str, values: &[(&str, &Value, &Shape<'_>)]) -> Result<V
     let program = cel::Program::compile(source).map_err(|e| e.to_string())?;
     let mut context = cel::Context::default();
     for (name, value, shape) in values {
-        let value = cel_value(value, shape).map_err(|e| format!("`{name}`{e}"))?;
+        let value = cel_value(value, shape).map_err(|e| {
+            // A path (`.count`, `[0]`) continues the name; anything else
+            // is about the whole value.
+            match e.split_once(": ") {
+                Some((path, message)) if path.starts_with(['.', '[']) => {
+                    format!("`{name}{path}`: {message}")
+                }
+                _ => format!("`{name}`: {e}"),
+            }
+        })?;
         context.add_variable_from_value(*name, value);
     }
     let result = program
@@ -844,14 +853,11 @@ fn to_cel(value: &Value, ty: &Ty<'_>, at: &mut String) -> Result<cel::Value, Str
         Value::Null => cel::Value::Null,
         Value::Bool(b) => cel::Value::Bool(*b),
         Value::Number(n) => number(n, ty.kind()).map_err(|e| {
-            format!(
-                "{}: {e}",
-                if at.is_empty() {
-                    "the value"
-                } else {
-                    at.as_str()
-                }
-            )
+            if at.is_empty() {
+                e
+            } else {
+                format!("{at}: {e}")
+            }
         })?,
         Value::String(s) => cel::Value::String(std::sync::Arc::new(s.clone())),
         Value::Array(items) => {
@@ -909,12 +915,15 @@ fn number(n: &serde_json::Number, kind: Kind) -> Result<cel::Value, String> {
     }
 }
 
-/// An integer as a CEL double, only if the double is exactly that integer.
+/// An integer as a CEL double, only if the double stands for exactly that
+/// integer.
 fn exact_double(n: &serde_json::Number, value: i128) -> Result<cel::Value, String> {
     #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
     let f = value as f64;
+    // Exact, or the double whose shortest decimal form is this integer:
+    // `6.022e23` names the double nearest it, as every JSON writer means.
     #[allow(clippy::cast_possible_truncation)]
-    if f.is_finite() && f as i128 == value {
+    if f.is_finite() && (f as i128 == value || exact_integer(&format!("{f:e}")) == Some(value)) {
         Ok(cel::Value::Float(f))
     } else {
         Err(format!(

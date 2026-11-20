@@ -433,6 +433,46 @@ fn an_input_cel_cannot_read_fails_before_any_model_call() {
     });
 }
 
+// A `number` field in a step's output is a CEL double, however the model
+// writes it, so `returns` can do double arithmetic on it.
+#[test]
+fn a_number_output_is_a_double_in_cel() {
+    on_codex_runtime(async {
+        let dir = scratch("number-output");
+        let project = project(&dir);
+        write_atom(
+            &project,
+            "score-note",
+            "Score the note.\nNote: {input.text}",
+            object(json!({"text": {"type": "string"}})),
+            object(json!({"score": {"type": "number"}})),
+        );
+        let pipeline = load(
+            &project,
+            "score.workflow.yaml",
+            "atomic: 1\nname: score-note\n\
+             input: { $ref: ../atoms/score-note.input.schema.json }\n\
+             output: { $ref: ../atoms/score-note.output.schema.json }\n\
+             steps:\n  score:\n    atom: score-note\n    with: { text: input.text }\n\
+             returns: \"{'score': steps.score.output.score * 2.0}\"\n",
+        );
+        let model = FakeModel::start(vec![Reply::Text(r#"{"score": 2}"#.into())])
+            .await
+            .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        let run = PipelineRun {
+            pipeline,
+            input: json!({"text": "n"}),
+        };
+        rt.start(PIPELINE, "score-1", run).await.expect("start");
+        let out: Value = rt.result("score-1").await.expect("finishes");
+        assert_eq!(out, json!({"score": 4.0}));
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
 /// The triage workflow with a gate between ranking and summarizing.
 fn gated() -> String {
     TRIAGE.replace(

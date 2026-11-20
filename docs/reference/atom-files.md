@@ -172,12 +172,14 @@ way. It then refuses an output schema whose references the check could not
 follow: one reached through `contains`, `if`, `then`, `else`, `not`,
 `patternProperties` or another keyword besides `properties`, `items`,
 `prefixItems`, `additionalProperties`, `dependentSchemas`, `allOf`, `anyOf` and
-`oneOf`; a nested `$schema`; and a `mediaType` anywhere but beside
-`$ref: 'atomic:artifact'`. A contract written in code is not inlined, so for it
-any `$ref` other than `atomic:artifact` or a `#/...` pointer into the contract
-is refused too, when its output is checked. A schema whose alternatives would
-take too long to decide fails the check at run time rather than passing
-unchecked.
+`oneOf`; and a `mediaType` anywhere but beside `$ref: 'atomic:artifact'`. A
+contract written in code is not inlined. Before its atom calls a model, it is
+refused for a `$ref` to anything outside itself other than `atomic:artifact`
+(another file, or a spelling such as `atomic:artifact#`); if it has such a
+reference or holds artifact references, also for a subschema with its own
+`$schema` and for a reference the check cannot follow, such as an `$anchor`. A
+schema whose alternatives would take too long to decide fails the check at run
+time rather than passing unchecked.
 
 ## Configuration
 
