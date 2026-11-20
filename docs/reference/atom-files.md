@@ -115,8 +115,10 @@ else is the output's own. The name is one file name in the directory, with no
 FIFO, a directory, or a file with another hard link), and is read up to the
 size it had when atomic opened it. `mediaType` defaults to
 `application/octet-stream`, and must be one the contract accepts. The output
-is checked against its contract, with stand-in references, before anything is
-stored, so a rejected output leaves nothing in the store. Each name is stored
+is checked against its contract, with stand-in references, and every file it
+names is opened and checked against the limits before anything is stored, so a
+rejected output leaves nothing in the store; files are read aside first and
+stored together. One name has one media type. Each name is stored
 once, however often the output names it.
 
 A file may be 1 GiB at most, and the files one step hands over 4 GiB
@@ -127,8 +129,11 @@ A later step's command finds each artifact its input references, where its
 input contract expects a reference, in the directory in `ATOMIC_INPUTS`,
 named by its digest: `$ATOMIC_INPUTS/<digest>` for `artifact://sha256/<digest>`.
 Each is a copy, checked against its digest as it is made, and the directory
-and the copies are read-only: the command cannot change what it was given,
-nor, through it, the store.
+and the copies are read-only: on Linux, where the command is confined, it
+cannot change what it was given, nor, through it, the store; on macOS, where it
+is not, the copies are only marked read-only, and changing one changes only
+the copy. Handing files over is supported on Linux and macOS; on Windows an
+output that names a file is refused.
 
 Both directories are inside the command's scratch directory, in the project's
 state directory, and go when the step ends; what a killed process left is

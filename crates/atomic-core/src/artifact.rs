@@ -108,7 +108,24 @@ pub trait ArtifactStore {
         &self,
         content: &mut dyn Read,
         provenance: Provenance,
-    ) -> Result<Manifest, ArtifactError>;
+    ) -> Result<Manifest, ArtifactError> {
+        let staged = self.stage(content)?;
+        self.commit(staged, provenance)
+    }
+
+    /// Read `content` aside, hashed but not yet stored: [`commit`] stores
+    /// it, [`discard`] drops it. Several contents can be staged and then all
+    /// committed, so that none is stored when one fails.
+    ///
+    /// [`commit`]: Self::commit
+    /// [`discard`]: Self::discard
+    fn stage(&self, content: &mut dyn Read) -> Result<Staged, ArtifactError>;
+
+    /// Store what [`stage`](Self::stage) read and record `provenance` for it.
+    fn commit(&self, staged: Staged, provenance: Provenance) -> Result<Manifest, ArtifactError>;
+
+    /// Drop what [`stage`](Self::stage) read, storing nothing.
+    fn discard(&self, staged: Staged);
 
     /// Whether the content is present.
     fn contains(&self, artifact: &ArtifactRef) -> Result<bool, ArtifactError>;
@@ -118,6 +135,24 @@ pub trait ArtifactStore {
 
     /// Every manifest recorded for the content, in a stable order.
     fn manifests(&self, artifact: &ArtifactRef) -> Result<Vec<Manifest>, ArtifactError>;
+}
+
+/// Content [`ArtifactStore::stage`] read aside, not yet stored.
+#[derive(Debug)]
+pub struct Staged {
+    /// Where it waits.
+    path: PathBuf,
+    /// Its SHA-256, in hex.
+    digest: String,
+    /// Its size, in bytes.
+    size: u64,
+}
+
+impl Staged {
+    /// Its size, in bytes.
+    pub fn size(&self) -> u64 {
+        self.size
+    }
 }
 
 /// An artifact store in a local directory.
@@ -214,7 +249,9 @@ fn blob_matches(path: &Path, digest: &str, size: u64) -> bool {
 }
 
 /// A blob's reader that checks the blob's digest as it reads: at the end of
-/// one that no longer matches, it fails rather than report the end.
+/// one that no longer matches, it fails rather than report the end. Only a
+/// reader that reads to the end is checked: one that stops before it has
+/// read bytes no check vouched for.
 struct Verified {
     inner: std::fs::File,
     hasher: Sha256,
@@ -225,7 +262,8 @@ struct Verified {
 
 impl Read for Verified {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.ended {
+        // An empty buffer reads nothing, and is not the end.
+        if self.ended || buf.is_empty() {
             return Ok(0);
         }
         let n = self.inner.read(buf)?;
@@ -259,12 +297,9 @@ fn sync_dir(dir: &Path) -> Result<(), ArtifactError> {
 }
 
 impl ArtifactStore for LocalStore {
-    fn put(
-        &self,
-        content: &mut dyn Read,
-        provenance: Provenance,
-    ) -> Result<Manifest, ArtifactError> {
-        // Stream to staging while hashing, then move into place under the digest.
+    fn stage(&self, content: &mut dyn Read) -> Result<Staged, ArtifactError> {
+        // Stream to staging while hashing; committing moves it into place
+        // under its digest.
         let staging = self.root.join("staging");
         let tmp = staging.join(format!(
             "{}-{}",
@@ -285,29 +320,52 @@ impl ArtifactStore for LocalStore {
                 f.write_all(&buf[..n]).map_err(io(&tmp))?;
                 size += n as u64;
             }
-            f.sync_all().map_err(io(&tmp))
+            f.sync_all().map_err(io(&tmp))?;
+            // Read-only before it is in place: no one writes a stored blob.
+            set_read_only(&tmp)
         })();
         if let Err(e) = staged {
             let _ = std::fs::remove_file(&tmp);
             return Err(e);
         }
-        let digest = format!("{:x}", hasher.finalize());
-        let artifact = ArtifactRef::from_digest(&digest).map_err(|e| ArtifactError::Io {
-            path: tmp.clone(),
-            source: std::io::Error::other(e.to_string()),
-        })?;
-        let blob = self.blob_path(&artifact);
-        // Read-only before it is in place: no one writes a stored blob.
-        set_read_only(&tmp)?;
-        if blob.exists() && blob_matches(&blob, &digest, size) {
-            // Already stored: identical content is kept once.
-            let _ = std::fs::remove_file(&tmp);
-        } else {
-            let parent = blob.parent().map(Path::to_owned).unwrap_or_default();
-            std::fs::create_dir_all(&parent).map_err(io(&parent))?;
-            std::fs::rename(&tmp, &blob).map_err(io(&blob))?;
-            sync_dir(&parent)?;
-        }
+        Ok(Staged {
+            path: tmp,
+            digest: format!("{:x}", hasher.finalize()),
+            size,
+        })
+    }
+
+    fn commit(&self, staged: Staged, provenance: Provenance) -> Result<Manifest, ArtifactError> {
+        let Staged {
+            path: tmp,
+            digest,
+            size,
+        } = staged;
+        let placed = (|| {
+            let artifact = ArtifactRef::from_digest(&digest).map_err(|e| ArtifactError::Io {
+                path: tmp.clone(),
+                source: std::io::Error::other(e.to_string()),
+            })?;
+            let blob = self.blob_path(&artifact);
+            if blob.exists() && blob_matches(&blob, &digest, size) {
+                // Already stored: identical content is kept once.
+                let _ = std::fs::remove_file(&tmp);
+            } else {
+                let parent = blob.parent().map(Path::to_owned).unwrap_or_default();
+                std::fs::create_dir_all(&parent).map_err(io(&parent))?;
+                std::fs::rename(&tmp, &blob).map_err(io(&blob))?;
+                sync_dir(&parent)?;
+            }
+            Ok(artifact)
+        })();
+        let artifact = match placed {
+            Ok(artifact) => artifact,
+            Err(e) => {
+                // Nothing is left behind in staging.
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
+            }
+        };
 
         let manifest = Manifest {
             artifact: artifact.clone(),
@@ -329,6 +387,10 @@ impl ArtifactStore for LocalStore {
             self.place(&path, |f| f.write_all(&json).map_err(io(&path)))?;
         }
         Ok(manifest)
+    }
+
+    fn discard(&self, staged: Staged) {
+        let _ = std::fs::remove_file(staged.path);
     }
 
     fn contains(&self, artifact: &ArtifactRef) -> Result<bool, ArtifactError> {

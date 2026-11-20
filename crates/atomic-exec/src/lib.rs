@@ -132,7 +132,8 @@ pub struct Command {
 pub trait Confine: Send + Sync {
     /// The command that runs `command` confined. It must run `command` with
     /// exactly its environment and in its directory, and let it write only
-    /// [`Command::writable`]. `tmp` is the backend's private temporary
+    /// [`Command::writable`], except [`Command::read_only`] inside them,
+    /// which it may only read. `tmp` is the backend's private temporary
     /// directory, where the sandbox may keep records of its own.
     fn confine(&self, command: &Command, tmp: &std::path::Path) -> Result<Command, ExecError>;
 

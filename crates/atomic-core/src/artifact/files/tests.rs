@@ -94,6 +94,7 @@ impl Fixture {
     fn gather_within(&self, output: &mut Value, limits: Limits) -> Result<(), ArtifactError> {
         self.exchange.gather(
             &self.store,
+            &self.store,
             output,
             &contract(),
             &validate,
@@ -219,9 +220,7 @@ fn links_fifos_directories_and_hard_links_are_refused() {
         let mut output = json!({"patch": {"$file": name, "mediaType": "text/x-diff"}});
         let e = f.gather(&mut output).expect_err(name);
         assert_eq!(f.blobs(), 0, "{name} stored a blob");
-        if name != "missing" {
-            assert!(matches!(e, ArtifactError::Refused(_)), "{name}: {e}");
-        }
+        assert!(matches!(e, ArtifactError::Refused(_)), "{name}: {e}");
     }
 }
 
@@ -237,7 +236,7 @@ fn a_swapped_outputs_directory_leads_nowhere() {
     std::os::unix::fs::symlink(&elsewhere, &f.exchange.outputs).expect("swap");
     let mut output = json!({"patch": {"$file": "change.diff", "mediaType": "text/x-diff"}});
     let e = f.gather(&mut output).expect_err("the decoy is not read");
-    assert!(matches!(e, ArtifactError::Io { .. }), "{e}");
+    assert!(matches!(e, ArtifactError::Refused(_)), "{e}");
     assert_eq!(f.blobs(), 0);
     // What is in the directory it was given is still what it hands over.
     std::fs::write(f.dir.join("moved/change.diff"), b"its own").expect("write");
@@ -353,4 +352,227 @@ fn a_damaged_blob_is_not_given_to_a_command() {
         .expect_err("refused");
     assert!(matches!(e, ArtifactError::Corrupt(_)), "{e}");
     assert!(!f.exchange.inputs.join(patch.digest()).exists());
+}
+
+/// A store that changes the file it is about to read, as a process the
+/// command left running might.
+struct Tampering<'a> {
+    inner: &'a LocalStore,
+    path: PathBuf,
+    change: fn(&Path),
+}
+
+impl ArtifactStore for Tampering<'_> {
+    fn stage(&self, content: &mut dyn Read) -> Result<crate::artifact::Staged, ArtifactError> {
+        (self.change)(&self.path);
+        self.inner.stage(content)
+    }
+    fn commit(
+        &self,
+        staged: crate::artifact::Staged,
+        provenance: Provenance,
+    ) -> Result<crate::artifact::Manifest, ArtifactError> {
+        self.inner.commit(staged, provenance)
+    }
+    fn discard(&self, staged: crate::artifact::Staged) {
+        self.inner.discard(staged)
+    }
+    fn contains(&self, artifact: &ArtifactRef) -> Result<bool, ArtifactError> {
+        self.inner.contains(artifact)
+    }
+    fn open(&self, artifact: &ArtifactRef) -> Result<Box<dyn Read + Send>, ArtifactError> {
+        self.inner.open(artifact)
+    }
+    fn manifests(
+        &self,
+        artifact: &ArtifactRef,
+    ) -> Result<Vec<crate::artifact::Manifest>, ArtifactError> {
+        self.inner.manifests(artifact)
+    }
+}
+
+impl Fixture {
+    fn gather_through(
+        &self,
+        store: &dyn ArtifactStore,
+        output: &mut Value,
+    ) -> Result<(), ArtifactError> {
+        self.exchange.gather(
+            store,
+            &self.store,
+            output,
+            &contract(),
+            &validate,
+            &provenance(),
+            Limits::default(),
+        )
+    }
+}
+
+/// A file that shrinks while it is read is refused, and nothing is stored;
+/// one that grows is read up to the size it had when opened.
+#[test]
+fn a_file_that_changes_while_it_is_read_hands_over_only_what_it_had() {
+    let f = fixture("changes");
+    f.write("change.diff", b"0123456789");
+    let shrinking = Tampering {
+        inner: &f.store,
+        path: f.exchange.outputs.join("change.diff"),
+        change: |path| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .and_then(|file| file.set_len(4))
+                .expect("shrink");
+        },
+    };
+    // Read after another file, which is then not stored either.
+    f.write("a.diff", b"first");
+    let mut output = json!({
+        "patch": {"$file": "a.diff", "mediaType": "text/x-diff"},
+        "more": [{"$file": "change.diff"}]
+    });
+    let e = f
+        .gather_through(&shrinking, &mut output)
+        .expect_err("refused");
+    assert!(matches!(e, ArtifactError::Refused(_)), "{e}");
+    assert_eq!(f.blobs(), 0, "a shrunk file left a blob");
+
+    f.write("grow.diff", b"0123456789");
+    let growing = Tampering {
+        inner: &f.store,
+        path: f.exchange.outputs.join("grow.diff"),
+        change: |path| {
+            use std::io::Write;
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(path)
+                .and_then(|mut file| file.write_all(b"and more"))
+                .expect("grow");
+        },
+    };
+    let mut output = json!({"patch": {"$file": "grow.diff", "mediaType": "text/x-diff"}});
+    f.gather_through(&growing, &mut output).expect("gathered");
+    assert_eq!(output["patch"], json!(reference_of(b"0123456789")));
+}
+
+/// One refused file, of several, stores none of them.
+#[test]
+fn a_refusal_of_any_file_stores_none() {
+    let f = fixture("any");
+    f.write("a.diff", b"first");
+    f.write("big.diff", &[b'b'; 200]);
+    std::os::unix::fs::symlink(f.dir.join("store"), f.exchange.outputs.join("link")).expect("link");
+    for (second, limits) in [
+        ("link", Limits::default()),
+        ("missing", Limits::default()),
+        (
+            "big.diff",
+            Limits {
+                per_file: 100,
+                per_step: 1000,
+            },
+        ),
+        (
+            "big.diff",
+            Limits {
+                per_file: 1000,
+                per_step: 150,
+            },
+        ),
+    ] {
+        let mut output = json!({
+            "patch": {"$file": "a.diff", "mediaType": "text/x-diff"},
+            "more": [{"$file": second}]
+        });
+        let e = f.gather_within(&mut output, limits).expect_err(second);
+        assert!(matches!(e, ArtifactError::Refused(_)), "{second}: {e}");
+        assert_eq!(f.blobs(), 0, "{second} left the first file stored");
+    }
+    // The output's own reference to an artifact the store does not hold.
+    let missing = format!("artifact://sha256/{}", "0".repeat(64));
+    let mut output = json!({
+        "patch": {"$file": "a.diff", "mediaType": "text/x-diff"},
+        "more": [missing]
+    });
+    let e = f.gather(&mut output).expect_err("a missing reference");
+    assert!(matches!(e, ArtifactError::Refused(_)), "{e}");
+    assert_eq!(f.blobs(), 0, "a missing reference left the file stored");
+}
+
+#[test]
+fn stand_ins_cannot_be_forged_and_one_name_may_have_two_media_types() {
+    let f = fixture("forged");
+    f.write("a.diff", b"x");
+    // An output that holds this check's stand-in is refused.
+    let forged = stand_in("fixed", 0).to_string();
+    let mut output = json!({
+        "patch": {"$file": "a.diff", "mediaType": "text/x-diff"},
+        "note": forged
+    });
+    let e = f
+        .exchange
+        .gather_with(
+            &f.store,
+            &f.store,
+            &mut output,
+            &contract(),
+            &validate,
+            &provenance(),
+            Limits::default(),
+            "fixed",
+        )
+        .expect_err("a forged stand-in");
+    assert!(matches!(e, ArtifactError::Refused(_)), "{e}");
+    assert_eq!(f.blobs(), 0);
+    // One name under two media types: one blob, a manifest for each.
+    let mut output = json!({
+        "patch": {"$file": "a.diff", "mediaType": "text/x-diff"},
+        "more": [{"$file": "a.diff", "mediaType": "text/plain"}]
+    });
+    f.gather(&mut output).expect("two media types");
+    let reference = reference_of(b"x");
+    assert_eq!(output, json!({"patch": reference, "more": [reference]}));
+    assert_eq!(f.blobs(), 1);
+    let digest = reference.trim_start_matches("artifact://sha256/");
+    let manifests = f
+        .store
+        .manifests(&ArtifactRef::from_digest(digest).expect("a reference"))
+        .expect("manifests");
+    let mut types: Vec<String> = manifests.into_iter().map(|m| m.media_type).collect();
+    types.sort();
+    assert_eq!(types, ["text/plain", "text/x-diff"]);
+}
+
+#[test]
+fn an_output_naming_too_many_files_is_refused() {
+    let f = fixture("many");
+    f.write("a.diff", b"x");
+    let more: Vec<Value> = (0..MAX_FILE_OBJECTS)
+        .map(|_| json!({"$file": "a.diff"}))
+        .collect();
+    let mut output =
+        json!({"patch": {"$file": "a.diff", "mediaType": "text/x-diff"}, "more": more});
+    let e = f.gather(&mut output).expect_err("too many");
+    assert!(matches!(e, ArtifactError::Refused(_)), "{e}");
+}
+
+/// Ten thousand objects naming one file: the check stays linear.
+#[test]
+fn many_objects_naming_one_file_are_gathered_quickly() {
+    let f = fixture("one-many");
+    f.write("a.diff", b"x");
+    let more: Vec<Value> = (0..MAX_FILE_OBJECTS - 1)
+        .map(|_| json!({"$file": "a.diff"}))
+        .collect();
+    let mut output =
+        json!({"patch": {"$file": "a.diff", "mediaType": "text/x-diff"}, "more": more});
+    let started = std::time::Instant::now();
+    f.gather(&mut output).expect("gathered");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(f.blobs(), 1);
 }

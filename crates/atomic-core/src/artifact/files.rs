@@ -32,11 +32,11 @@ use super::{ArtifactError, ArtifactRef, ArtifactStore, Provenance};
 use atomic_schema::artifact::ArtifactLookup;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests;
 
 /// The key of the object a command uses to name a file it wrote.
@@ -163,50 +163,93 @@ impl Exchange {
     /// Replace each `{"$file": …}` object in `output` that sits where
     /// `contract` expects an artifact reference with the reference of the
     /// file it names, stored in `store` with `provenance`. An object
-    /// anywhere else is left as it is: it is the output's own.
+    /// anywhere else is left as it is: it is the output's own. `lookup` is
+    /// where the output's other references are checked.
     ///
-    /// Before anything is stored, the output with stand-in references in
-    /// those places must pass `validate`, and the media types its objects
-    /// give must be ones the contract accepts, so a rejected output leaves
-    /// no blob. Each name is read once.
+    /// Nothing is stored unless everything holds: the output with stand-in
+    /// references in those places passes `validate` and the contract's
+    /// reference checks (media types, and the output's own references), and
+    /// every named file opens, is a regular file of the command's own and
+    /// fits [`Limits`]. Then every file is read aside, and only when all
+    /// were read whole are they stored. Each name is read once.
+    #[allow(clippy::too_many_arguments)] // each is one thing the check needs
     pub fn gather(
         &self,
         store: &dyn ArtifactStore,
+        lookup: &(dyn ArtifactLookup + Sync),
         output: &mut Value,
         contract: &Value,
         validate: &dyn Fn(&Value) -> Result<(), String>,
         provenance: &Provenance,
         limits: Limits,
     ) -> Result<(), ArtifactError> {
+        let mut nonce = [0u8; 16];
+        getrandom::fill(&mut nonce)
+            .map_err(|e| refused(format!("no randomness for the stand-in references: {e}")))?;
+        let nonce: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
+        self.gather_with(
+            store, lookup, output, contract, validate, provenance, limits, &nonce,
+        )
+    }
+
+    /// [`gather`](Self::gather), with the stand-ins made from `nonce`.
+    #[allow(clippy::too_many_arguments)]
+    fn gather_with(
+        &self,
+        store: &dyn ArtifactStore,
+        lookup: &(dyn ArtifactLookup + Sync),
+        output: &mut Value,
+        contract: &Value,
+        validate: &dyn Fn(&Value) -> Result<(), String>,
+        provenance: &Provenance,
+        limits: Limits,
+        nonce: &str,
+    ) -> Result<(), ArtifactError> {
         let mut candidates = Vec::new();
-        named_files(output, String::new(), &mut candidates);
+        named_files(output, String::new(), &mut candidates, MAX_FILE_OBJECTS + 1);
         if candidates.is_empty() {
             return Ok(());
         }
-        // Each candidate stands in as a reference of its own; the contract
-        // check says which stand where a reference does.
-        let mut probe = output.clone();
-        let stand_ins: BTreeMap<String, usize> = candidates
-            .iter()
-            .enumerate()
-            .map(|(i, (pointer, _))| {
-                let stand_in = stand_in(i);
-                if let Some(slot) = probe.pointer_mut(pointer) {
-                    *slot = Value::String(stand_in.to_string());
-                }
-                (stand_in.digest().to_owned(), i)
-            })
+        if candidates.len() > MAX_FILE_OBJECTS {
+            return Err(refused(format!(
+                "the output names more than {MAX_FILE_OBJECTS} files"
+            )));
+        }
+        // Each candidate stands in as a reference of its own, made from a
+        // nonce no output can know; the contract check says which stand
+        // where a reference does.
+        let stand_ins: HashMap<String, usize> = (0..candidates.len())
+            .map(|i| (stand_in(nonce, i).digest().to_owned(), i))
             .collect();
+        if holds_any(output, &stand_ins) {
+            return Err(refused(
+                "the output holds a reference atomic uses while it checks one".into(),
+            ));
+        }
+        let mut probe = output.clone();
+        for (i, (pointer, _)) in candidates.iter().enumerate() {
+            if let Some(slot) = probe.pointer_mut(pointer) {
+                *slot = Value::String(stand_in(nonce, i).to_string());
+            }
+        }
         let lookup = StandIns {
             stand_ins: &stand_ins,
             candidates: &candidates,
-            asked: std::sync::Mutex::new(Vec::new()),
+            inner: lookup,
+            asked: std::sync::Mutex::new(HashSet::new()),
         };
         let checked = atomic_schema::artifact::check_refs(contract, &probe, &lookup);
-        let asked = lookup.asked.into_inner().unwrap_or_default();
+        let mut asked: Vec<usize> = lookup
+            .asked
+            .into_inner()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        asked.sort_unstable();
         // Put back the objects that are the output's own.
+        let taken: HashSet<usize> = asked.iter().copied().collect();
         for (i, (pointer, original)) in candidates.iter().enumerate() {
-            if !asked.contains(&i)
+            if !taken.contains(&i)
                 && let Some(slot) = probe.pointer_mut(pointer)
             {
                 *slot = original.clone();
@@ -215,58 +258,95 @@ impl Exchange {
         if asked.is_empty() {
             return Ok(());
         }
-        let mut files = Vec::new();
+        // Every object well formed. A name given under two media types is
+        // stored once, with a manifest for each.
+        let mut files: Vec<(usize, (&str, &str))> = Vec::new();
         for &i in &asked {
             let (pointer, object) = &candidates[i];
-            let (name, media) = file_object(object)
+            let named = file_object(object)
                 .map_err(|why| refused(format!("{}: {why}", display_pointer(pointer))))?;
-            files.push((i, name, media));
+            files.push((i, named));
         }
-        // A media type the contract does not accept, or any other break of
-        // the contract by a stand-in, is the output's fault.
-        if let Err(e) = checked
-            && stand_ins
-                .keys()
-                .any(|digest| e.to_string().contains(digest.as_str()))
-        {
-            return Err(refused(e.to_string()));
-        }
+        let pairs: std::collections::BTreeSet<(&str, &str)> =
+            files.iter().map(|(_, named)| *named).collect();
+        // The contract's every reference check, stand-ins and the output's
+        // own references alike, then the rest of its schema.
+        checked.map_err(|e| refused(e.to_string()))?;
         validate(&probe).map_err(refused)?;
-
-        let mut stored: BTreeMap<&str, String> = BTreeMap::new();
-        let mut total = 0u64;
-        for (i, name, media) in &files {
-            let reference = match stored.get(name) {
-                Some(reference) => reference.clone(),
-                None => {
-                    let reference =
-                        self.store_file(store, name, media, provenance, limits, &mut total)?;
-                    stored.insert(name, reference.clone());
-                    reference
-                }
+        // Every file opened and held to the limits, before any is read; a
+        // name counts toward the step's total once.
+        let mut opened: Vec<((&str, &str), std::fs::File, u64)> = Vec::new();
+        let mut sizes: BTreeMap<&str, u64> = BTreeMap::new();
+        for &(name, media) in &pairs {
+            let (file, size) = self.open_file(name, limits)?;
+            sizes.insert(name, size);
+            let total = sizes.values().fold(0u64, |t, s| t.saturating_add(*s));
+            if total > limits.per_step {
+                return Err(refused(format!(
+                    "the files the command hands over come to more than {} bytes, the most one \
+                     step may",
+                    limits.per_step
+                )));
+            }
+            opened.push(((name, media), file, size));
+        }
+        // Each read aside whole, up to the size it had when opened; only
+        // when all are, are they stored.
+        let mut staged = Vec::new();
+        for (named, file, size) in opened {
+            let mut exact = Exact {
+                inner: file.take(size),
+                left: size,
+                short: false,
             };
-            if let Some(slot) = output.pointer_mut(&candidates[*i].0) {
-                *slot = Value::String(reference);
+            match store.stage(&mut exact) {
+                Ok(s) => staged.push((named, s)),
+                Err(e) => {
+                    staged.into_iter().for_each(|(_, s)| store.discard(s));
+                    return Err(if exact.short {
+                        refused(format!(
+                            "`{FILE_KEY}` names {:?}, which shrank while it was read",
+                            named.0
+                        ))
+                    } else {
+                        e
+                    });
+                }
+            }
+        }
+        let mut stored: BTreeMap<(&str, &str), String> = BTreeMap::new();
+        for (named, s) in staged {
+            let manifest = store.commit(
+                s,
+                Provenance {
+                    media_type: named.1.to_owned(),
+                    ..provenance.clone()
+                },
+            )?;
+            stored.insert(named, manifest.artifact.to_string());
+        }
+        for (i, named) in files {
+            if let Some(slot) = output.pointer_mut(&candidates[i].0) {
+                *slot = Value::String(stored[&named].clone());
             }
         }
         Ok(())
     }
 
-    /// Store the file `name` in the outputs directory and return its
-    /// reference, adding its size to `total`.
-    fn store_file(
-        &self,
-        store: &dyn ArtifactStore,
-        name: &str,
-        media: &str,
-        provenance: &Provenance,
-        limits: Limits,
-        total: &mut u64,
-    ) -> Result<String, ArtifactError> {
+    /// Open the file `name` in the outputs directory, beneath the handle
+    /// held since before the command ran, and check it: a regular file with
+    /// one link, within the per-file limit. Returns it and its size.
+    fn open_file(&self, name: &str, limits: Limits) -> Result<(std::fs::File, u64), ArtifactError> {
         let path = self.outputs.join(name);
         let file = open_beneath(&self.outputs_dir, name).map_err(|e| match e.raw_os_error() {
             Some(libc::ELOOP) => refused(format!(
                 "`{FILE_KEY}` names {name:?}, a link: a command hands over regular files only"
+            )),
+            Some(libc::ENOENT) => refused(format!(
+                "`{FILE_KEY}` names {name:?}, which is not in the outputs directory"
+            )),
+            Some(libc::EACCES) => refused(format!(
+                "`{FILE_KEY}` names {name:?}, which atomic may not read"
             )),
             _ => io(&path)(e),
         })?;
@@ -294,33 +374,7 @@ impl Exchange {
                 limits.per_file
             )));
         }
-        *total = total.saturating_add(size);
-        if *total > limits.per_step {
-            return Err(refused(format!(
-                "the files the command hands over come to more than {} bytes, the most one \
-                 step may",
-                limits.per_step
-            )));
-        }
-        // Up to the size it had when opened: what is appended after is not
-        // read, and a file that shrank is refused.
-        let mut counted = Counted {
-            inner: file.take(size),
-            read: 0,
-        };
-        let manifest = store.put(
-            &mut counted,
-            Provenance {
-                media_type: media.to_owned(),
-                ..provenance.clone()
-            },
-        )?;
-        if counted.read != size {
-            return Err(refused(format!(
-                "`{FILE_KEY}` names {name:?}, which changed while it was read"
-            )));
-        }
-        Ok(manifest.artifact.to_string())
+        Ok((file, size))
     }
 }
 
@@ -359,20 +413,22 @@ impl ArtifactLookup for Recording<'_> {
 }
 
 /// A lookup that answers for the stand-in references, with the media type
-/// each one's object gives, and records which the check asked about.
+/// each one's object gives, and records which the check asked about; other
+/// references it asks `inner` about.
 struct StandIns<'a> {
-    stand_ins: &'a BTreeMap<String, usize>,
+    stand_ins: &'a HashMap<String, usize>,
     candidates: &'a [(String, Value)],
-    asked: std::sync::Mutex<Vec<usize>>,
+    inner: &'a (dyn ArtifactLookup + Sync),
+    asked: std::sync::Mutex<HashSet<usize>>,
 }
 
 impl ArtifactLookup for StandIns<'_> {
     fn media_types(&self, artifact: &ArtifactRef) -> Option<Vec<String>> {
-        let &i = self.stand_ins.get(artifact.digest())?;
-        if let Ok(mut asked) = self.asked.lock()
-            && !asked.contains(&i)
-        {
-            asked.push(i);
+        let Some(&i) = self.stand_ins.get(artifact.digest()) else {
+            return self.inner.media_types(artifact);
+        };
+        if let Ok(mut asked) = self.asked.lock() {
+            asked.insert(i);
         }
         let media = file_object(&self.candidates[i].1)
             .map(|(_, media)| media.to_owned())
@@ -381,27 +437,56 @@ impl ArtifactLookup for StandIns<'_> {
     }
 }
 
+/// Whether `value` holds an object naming a file, `{"$file": …}`.
+pub fn names_a_file(value: &Value) -> bool {
+    let mut found = Vec::new();
+    named_files(value, String::new(), &mut found, 1);
+    !found.is_empty()
+}
+
+/// The most `$file` objects one output may hold.
+pub const MAX_FILE_OBJECTS: usize = 10_000;
+
 /// The reference that stands in for candidate `i` while the contract is
-/// checked: a digest no content has.
-fn stand_in(i: usize) -> ArtifactRef {
-    let digest = format!("{:x}", Sha256::digest(format!("atomic stand-in {i}")));
+/// checked: a digest no content has, made from this check's `nonce`.
+fn stand_in(nonce: &str, i: usize) -> ArtifactRef {
+    let digest = format!(
+        "{:x}",
+        Sha256::digest(format!("atomic stand-in {nonce} {i}"))
+    );
     ArtifactRef::from_digest(&digest).expect("a SHA-256 digest is a reference")
 }
 
-/// Every object in `value` with a `$file` key, with its JSON Pointer.
-fn named_files(value: &Value, pointer: String, out: &mut Vec<(String, Value)>) {
+/// Whether a string in `value` is one of the stand-in references.
+fn holds_any(value: &Value, stand_ins: &HashMap<String, usize>) -> bool {
+    match value {
+        Value::String(s) => s
+            .strip_prefix("artifact://sha256/")
+            .is_some_and(|digest| stand_ins.contains_key(digest)),
+        Value::Array(items) => items.iter().any(|v| holds_any(v, stand_ins)),
+        Value::Object(fields) => fields.values().any(|v| holds_any(v, stand_ins)),
+        _ => false,
+    }
+}
+
+/// Every object in `value` with a `$file` key, with its JSON Pointer, up to
+/// `most` of them.
+fn named_files(value: &Value, pointer: String, out: &mut Vec<(String, Value)>, most: usize) {
+    if out.len() >= most {
+        return;
+    }
     match value {
         Value::Object(fields) if fields.contains_key(FILE_KEY) => {
             out.push((pointer, value.clone()));
         }
         Value::Object(fields) => {
             for (key, field) in fields {
-                named_files(field, format!("{pointer}/{}", escape(key)), out);
+                named_files(field, format!("{pointer}/{}", escape(key)), out, most);
             }
         }
         Value::Array(items) => {
             for (i, item) in items.iter().enumerate() {
-                named_files(item, format!("{pointer}/{i}"), out);
+                named_files(item, format!("{pointer}/{i}"), out, most);
             }
         }
         _ => {}
@@ -492,16 +577,25 @@ fn set_mode(path: &Path, mode: u32) -> Result<(), ArtifactError> {
     }
 }
 
-/// A reader that counts what it read.
-struct Counted<R> {
+/// A reader of exactly `left` more bytes: one that ends sooner fails, and
+/// says so in `short`, so what it read is never stored.
+struct Exact<R> {
     inner: R,
-    read: u64,
+    left: u64,
+    short: bool,
 }
 
-impl<R: Read> Read for Counted<R> {
+impl<R: Read> Read for Exact<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let n = self.inner.read(buf)?;
-        self.read += n as u64;
+        if n == 0 && self.left > 0 && !buf.is_empty() {
+            self.short = true;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "the file shrank while it was read",
+            ));
+        }
+        self.left = self.left.saturating_sub(n as u64);
         Ok(n)
     }
 }

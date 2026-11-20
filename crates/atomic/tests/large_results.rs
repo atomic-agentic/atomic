@@ -299,10 +299,22 @@ fn check_by_reference(dir: &Path, out: &Output, size: u64, stored: usize) {
         blob.display()
     );
     // Checkpoints, the ledger and the gate store are all in the durable
-    // store, which never held a patch.
-    let durable = size_of(&state.join("private"));
+    // store, in the project's private directory beside the state
+    // directory, which never held a patch.
+    let private = state
+        .parent()
+        .and_then(Path::parent)
+        .unwrap()
+        .join("private")
+        .join(state.file_name().unwrap());
     assert!(
-        durable < 8 * 1024 * 1024,
+        private.join("atomic.db").is_file(),
+        "no durable store at {}",
+        private.display()
+    );
+    let durable = size_of(&private);
+    assert!(
+        durable > 0 && durable < 8 * 1024 * 1024,
         "the durable store holds {durable} bytes"
     );
     // Nothing is left in the commands' scratch space.

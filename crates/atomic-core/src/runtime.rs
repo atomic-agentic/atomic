@@ -1068,12 +1068,18 @@ pub async fn run_exec_opened(
     let prompt_hash = format!("{:x}", h.finalize());
     // With a store, the command gets its exchange: an outputs directory to
     // hand files over in, and the artifacts its input references, read-only.
+    // Unix only: elsewhere a command hands no files over, and an output
+    // that names one is refused (see `finish_exec`).
     let exchange = match (&artifacts.1, workspace.workspace().scratch.clone()) {
-        (Some(store), Some(scratch)) => {
+        (Some(store), Some(scratch)) if cfg!(unix) => {
             let (store, input, contract) =
                 (store.clone(), input.clone(), contract("Input")?.clone());
             let lookup = artifacts.0.clone();
+            // The workspace stays open while its inputs are copied in, even
+            // when the run is cancelled meanwhile.
+            let held = workspace.hold();
             let made = tokio::task::spawn_blocking(move || {
+                let _held = held;
                 let exchange = crate::artifact::files::Exchange::create(&scratch)?;
                 let given = crate::artifact::files::referenced(&contract, &input, lookup.as_ref());
                 exchange.mount(store.as_ref(), &given)?;
@@ -1114,6 +1120,7 @@ pub async fn run_exec_opened(
         artifacts,
         identity,
         contract("Output")?,
+        &workspace,
     )
     .await;
     workspace.close().await;
@@ -1166,6 +1173,7 @@ fn store_error(atom: &str, doing: &str, e: crate::artifact::ArtifactError) -> At
 /// What an exec command's run came to, while its workspace is still open:
 /// its output, with the files it handed over stored and referenced, and
 /// its stdout as text.
+#[allow(clippy::too_many_arguments)] // each is one thing the check needs
 async fn finish_exec(
     atom: &AtomFile,
     program: &str,
@@ -1174,6 +1182,7 @@ async fn finish_exec(
     artifacts: &Artifacts,
     identity: &EffectIdentity,
     output_contract: &Value,
+    workspace: &WorkspaceGuard,
 ) -> Result<(Value, String), AtomError> {
     let done = done.map_err(|e| {
         let message = format!("{}: {e}", atom.name);
@@ -1226,7 +1235,12 @@ async fn finish_exec(
             labels: Default::default(),
         };
         let (limits, contract) = (artifacts.2, output_contract.clone());
+        let lookup = artifacts.0.clone();
+        // The workspace stays open while its files are read, even when the
+        // run is cancelled meanwhile.
+        let held = workspace.hold();
         let gathered = tokio::task::spawn_blocking(move || {
+            let _held = held;
             let validator = Registry::new()
                 .validator_for(&contract)
                 .map_err(|e| crate::artifact::ArtifactError::Refused(e.to_string()))?;
@@ -1247,6 +1261,7 @@ async fn finish_exec(
             exchange
                 .gather(
                     store.as_ref(),
+                    lookup.as_ref(),
                     &mut output,
                     &contract,
                     &validate,
@@ -1261,6 +1276,13 @@ async fn finish_exec(
             crate::artifact::ArtifactError::Refused(message) => schema_error(message),
             e => store_error(&atom.name, "store its files", e),
         })?;
+    }
+    if !cfg!(unix) && crate::artifact::files::names_a_file(&output) {
+        return Err(schema_error(format!(
+            "the output names a file with `{}`: handing files over is supported on Linux and \
+             macOS only",
+            crate::artifact::files::FILE_KEY
+        )));
     }
     let validator = Registry::new()
         .validator_for(&output_contract)
