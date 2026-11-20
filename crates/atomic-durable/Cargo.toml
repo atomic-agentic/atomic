@@ -36,8 +36,9 @@ sqlx = { workspace = true, features = ["postgres"] }
 thiserror = { workspace = true }
 # How a failpoint kills its process (failpoints only).
 libc = { workspace = true, optional = true }
-# The test database probe's time limit (postgres-tests only).
-tokio = { workspace = true, features = ["time"], optional = true }
+# The test database probe's time limit, and dropping test schemas
+# (postgres-tests only).
+tokio = { workspace = true, features = ["time", "rt"], optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
