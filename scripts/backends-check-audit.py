@@ -12,6 +12,9 @@
 #       exactly the Postgres variants (their names say postgres): none of
 #       those passed or was ignored. Their names are written to FAILING.
 #
+# A child-process entry point, ignored with a reason that says it runs "in
+# a child process", is not a test of the suite and counts as neither.
+#
 # Either way, every test binary must have reported its result (one that
 # aborted or was killed has not) and exited normally or with test failures,
 # and each binary's own count of passed, failed and ignored tests must match
@@ -24,11 +27,15 @@ import sys
 
 ESCAPE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 STARTS = re.compile(r"^\s+(Running|Doc-tests) (.+)$")
-OUTCOME = re.compile(r"^test (.+) \.\.\. (ok|FAILED|ignored)\b")
+OUTCOME = re.compile(r"^test (.+) \.\.\. (ok|FAILED|ignored)\b(.*)$")
+# What a child-process entry point's #[ignore] reason says: such a test is
+# not one of the suite's tests but a way for one to start a process, and it
+# is ignored by design.
+CHILD = "in a child process"
 RESULT = re.compile(
     r"^test result: \w+\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured;"
 )
-COUNTED = {"ok": 0, "FAILED": 1, "ignored": 2}
+COUNTED = {"ok": 0, "FAILED": 1, "ignored": 2, "child": 2}
 
 
 def short(started):
@@ -59,7 +66,10 @@ def audit(mode, log, message):
             continue
         m = OUTCOME.match(l)
         if m:
-            outcome[(binary, m.group(1))] = m.group(2)
+            seen = m.group(2)
+            if seen == "ignored" and CHILD in m.group(3):
+                seen = "child"
+            outcome[(binary, m.group(1))] = seen
             continue
         m = re.match(r"^---- (.+) stdout ----$", l)
         if m:
@@ -106,7 +116,7 @@ def audit(mode, log, message):
         problems.append("no test failed")
 
     if mode == "all-fail":
-        others = [k for k, o in outcome.items() if o != "FAILED"]
+        others = [k for k, o in outcome.items() if o not in ("FAILED", "child")]
         if others:
             problems.append(
                 "these did not fail without the backend: "

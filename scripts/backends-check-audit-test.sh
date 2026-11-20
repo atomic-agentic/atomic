@@ -27,6 +27,7 @@ binary() {
         case "${outcome}" in
         ok) p=$((p + 1)); printf 'test %s ... ok\n' "${t#*:}" ;;
         ignored) i=$((i + 1)); printf 'test %s ... ignored\n' "${t#*:}" ;;
+        child) i=$((i + 1)); printf 'test %s ... ignored, run by the suite in a child process\n' "${t#*:}" ;;
         FAILED*) f=$((f + 1)); printf 'test %s ... FAILED\n' "${t#*:}" ;;
         esac
     done
@@ -76,6 +77,10 @@ binary a FAILED:x_on_postgres ignored:y_on_postgres >"${WORK}/ignored.log"
 expect 1 "an ignored test is no failure" all-fail "${WORK}/ignored.log" "y_on_postgres (a-0123: ignored)"
 colour <"${WORK}/ignored.log" >"${WORK}/ignored-colour.log"
 expect 1 "the same, coloured" all-fail "${WORK}/ignored-colour.log" "y_on_postgres (a-0123: ignored)"
+
+# A child-process entry point, ignored by design, is not one of the tests.
+binary a FAILED:x_on_postgres child:x_child >"${WORK}/child.log"
+expect 0 "a child-process entry point is no test" all-fail "${WORK}/child.log"
 
 binary a FAILED:x_on_postgres ok:y_on_postgres >"${WORK}/passed.log"
 expect 1 "a passing test is no failure" all-fail "${WORK}/passed.log" "y_on_postgres (a-0123: ok)"
