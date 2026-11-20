@@ -13,21 +13,36 @@
 //! is a historical check of recorded answers, never a live pass. `--live`
 //! calls the model and records each answer. `--no-cassettes` calls the
 //! model and records nothing.
+//!
+//! A live call is metered in the project's usage ledger under the atom's
+//! budget and the defaults, as a workflow step's is; a replay makes no call
+//! and spends nothing.
+//!
+//! Until evals run in disposable fixture worktrees, `atomic eval` refuses an
+//! atom that could write: a Codex atom with a `workspace-write` sandbox, and
+//! an exec atom that declares any effect. It runs a Codex atom only live
+//! (`--no-cassettes`), since cassettes do not yet stand in for every part of
+//! a Codex thread's endpoint.
 
-use crate::engine::EngineArgs;
+use crate::engine::{EngineArgs, RunnerKind};
 use crate::failure::Failure;
 use crate::target;
 use anyhow::Context;
+use atomic_app::metering::{BudgetPlan, RunBudget};
+use atomic_app::pipeline::LAYOUT_VERSION;
 use atomic_core::AtomConfig;
 use atomic_core::artifact::LocalStore;
 use atomic_core::atom::{self, Atom};
+use atomic_core::budget::{Budget, BudgetSettings, Resolved};
 use atomic_core::cassette::{Cassette, Mode, Tally};
 use atomic_core::codex::{CodexPaths, ModelEndpoint};
 use atomic_core::collections;
 use atomic_core::eval::{self, AtomSubject, Options, Report, Sample};
-use atomic_core::lite::{LiteRuntime, Wire};
+use atomic_core::lite::{LimitField, LiteRuntime, Wire};
 use atomic_core::runtime::{Artifacts, CodexRuntime, Runtimes};
 use atomic_core::state::ProjectState;
+use atomic_core::usage::{Call, Limit, Meter, MeterFuture, Metering, Outcome, Ticket};
+use atomic_durable::{DurableRuntime, Durare};
 use atomic_schema::registry::Registry;
 use clap::Args;
 use serde_json::{Value, json};
@@ -55,11 +70,15 @@ pub struct EvalArgs {
     /// Write the reports as JSON to this file, to compare a later run with.
     #[arg(long, value_name = "PATH")]
     pub report: Option<PathBuf>,
-    /// The reports of an earlier revision (a file `--report` wrote): each
-    /// scorer's mean may not fall further below its mean there than the
-    /// scorer's `max_drop`.
+    /// The reports of an earlier revision (a file `--report` wrote), for each
+    /// scorer's `max_drop`. Refused for now: `atomic eval` has no judge, so
+    /// it has no scorer mean to compare.
     #[arg(long, value_name = "PATH")]
     pub baseline: Option<PathBuf>,
+    /// Report an atom's scorers as skipped instead of failing it: without a
+    /// judge, `atomic eval` cannot run them.
+    #[arg(long)]
+    pub allow_unscored: bool,
     /// The revision this run evaluates, recorded in its reports.
     #[arg(long)]
     pub revision: Option<String>,
@@ -97,6 +116,125 @@ impl Source {
     }
 }
 
+/// An eval run's metering: the ledger-backed budget each live call of one
+/// atom is admitted against.
+struct Metered {
+    budget: RunBudget,
+    caps: Resolved,
+    run: String,
+}
+
+/// The atom on its runtimes, each case's live calls metered as one atom
+/// step of the eval's run.
+struct Subject<'a> {
+    atom: &'a Atom,
+    runtimes: Runtimes,
+    metered: Option<Metered>,
+    next: std::sync::atomic::AtomicI32,
+}
+
+impl eval::Subject for Subject<'_> {
+    fn run<'a>(&'a self, case: &'a eval::Case) -> eval::BoxFuture<'a, Result<Value, String>> {
+        Box::pin(async move {
+            let mut runtimes = self.runtimes.clone();
+            if let Some(m) = &self.metered {
+                let step = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let meter = m.budget.meter(
+                    &atomic_durable::StepInfo {
+                        workflow_id: m.run.clone(),
+                        step_id: step,
+                    },
+                    &m.caps,
+                );
+                runtimes.codex.meter = meter.clone();
+                runtimes.lite.meter = meter;
+            }
+            AtomSubject {
+                atom: self.atom,
+                runtimes: &runtimes,
+            }
+            .run(case)
+            .await
+        })
+    }
+}
+
+/// A replay's meter: it spends nothing and records nothing, and holds each
+/// call to the output limit a live call is held to, so a replayed request is
+/// the one that was recorded.
+struct Replayed {
+    output_tokens: u64,
+}
+
+impl Meter for Replayed {
+    fn admit(&self, call: Call) -> MeterFuture<'_, Ticket> {
+        Box::pin(async move {
+            Ok(Ticket {
+                request: format!("replay:{}", call.index),
+                attempt: 1,
+                model: call.model,
+                admitted: std::time::Instant::now(),
+                limit: Limit {
+                    output_tokens: Some(self.output_tokens),
+                    time: None,
+                },
+                bounded_by: None,
+            })
+        })
+    }
+
+    fn settle(&self, _: Ticket, _: Outcome) -> MeterFuture<'_, ()> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// Refuse what `atomic eval` cannot run safely or faithfully yet.
+fn refuse(atom: &Atom, source: Source) -> anyhow::Result<()> {
+    let refused = |why: String, hint: &str| -> anyhow::Result<()> {
+        Err(Failure::new("eval.refused", why, hint).into())
+    };
+    let writes = atom.frontmatter.get("sandbox").and_then(Value::as_str) == Some("workspace-write");
+    if atom.kind == "codex" && writes {
+        return refused(
+            format!(
+                "`{}` may write files, and atomic eval would run it in the project's own \
+                 checkout",
+                atom.name
+            ),
+            "evaluate it once fixture worktrees are available, or make it read-only",
+        );
+    }
+    if atom.kind == "exec" && atom.frontmatter.get("effects").is_some() {
+        return refused(
+            format!(
+                "`{}` declares effects outside atomic, and atomic eval runs only exec atoms that \
+                 have none",
+                atom.name
+            ),
+            "cover it with code tests instead of eval cases",
+        );
+    }
+    if atom.kind == "codex" && source != Source::Live {
+        return refused(
+            format!(
+                "`{}` is a Codex atom, and cassettes do not yet record a Codex thread's calls \
+                 faithfully",
+                atom.name
+            ),
+            "evaluate it live with --no-cassettes",
+        );
+    }
+    Ok(())
+}
+
+/// The model `atom` calls on `endpoint`.
+fn model_of(atom: &Atom, endpoint: &ModelEndpoint) -> String {
+    atom.frontmatter
+        .get("model")
+        .and_then(Value::as_str)
+        .map_or_else(|| endpoint.model.clone(), str::to_owned)
+}
+
 /// `atomic eval`.
 pub async fn run(
     args: EvalArgs,
@@ -108,6 +246,15 @@ pub async fn run(
     let first = args.atoms.first().map(String::as_str);
     let found = target::project_for(project, first, &cwd)?;
     let state = ProjectState::resolve(found.root())?;
+    if args.baseline.is_some() {
+        return Err(Failure::new(
+            "eval.baseline",
+            "atomic eval has no judge to run scorers with, so there is no scorer mean to \
+             compare with a baseline",
+            "leave out --baseline; compare pass rates with the reports --report writes",
+        )
+        .into());
+    }
     let files = collections::collect(&found)?;
     let mut registry = Registry::new();
     for schema in &files["schemas"] {
@@ -117,62 +264,169 @@ pub async fn run(
     for source in &files["atoms"] {
         atoms.push(atom::load(&source.path, &mut registry)?);
     }
-    let chosen = choose(&atoms, &args.atoms, &cwd)?;
-    let baseline: Vec<Report> = match &args.baseline {
-        Some(path) => read_reports(path)?,
-        None => Vec::new(),
-    };
     let source = match (args.live, args.no_cassettes) {
         (true, _) => Source::Recording,
         (_, true) => Source::Live,
         _ => Source::Recorded,
     };
-    let needs_model = chosen.iter().any(|(a, _)| calls_model(a));
+    let chosen = choose(&atoms, &args.atoms, &args.cases, &cwd)?;
+    for (atom, _, _) in &chosen.atoms {
+        refuse(atom, source)?;
+    }
+    // One eval at a time, and none beside a command that runs workflows.
+    state.create()?;
+    let _lock = state.lock_execution("atomic eval")?;
+    let needs_model = chosen.atoms.iter().any(|(a, _, _)| calls_model(a));
     // A recording answers only the request it was made for, endpoint and
-    // model included, so replaying needs them configured as they were.
-    let endpoint = args.engine.endpoint(needs_model)?;
+    // model included, so replaying needs them configured as they were; it
+    // needs no key, so none is read.
+    let mut endpoint = args.engine.endpoint(needs_model)?;
+    if source == Source::Recorded {
+        endpoint.api_key_env = None;
+    }
+    // TODO: share the project store's lock with runs (`LocalStore::for_project`).
     let store = LocalStore::open(state.dir().join("artifacts")).context("the artifact store")?;
+    // A live call is metered: without the ledger, none is made.
+    let ledger = if source != Source::Recorded && needs_model {
+        let database = crate::engine::database(&state);
+        let executor = atomic_durable::executor_identity(args.engine.executor_id.as_deref())?;
+        let rt = Durare::open(&database, executor.as_deref(), LAYOUT_VERSION)
+            .await
+            .map_err(|e| {
+                Failure::new(
+                    "eval.ledger",
+                    format!(
+                        "a live eval is metered in the project's usage ledger, and it could not \
+                         be opened at {}: {e}",
+                        crate::engine::describe(&database)
+                    ),
+                    "fix the store, or replay from cassettes without --live",
+                )
+            })?;
+        Some(rt.ledger())
+    } else {
+        None
+    };
+    let budgets = BudgetSettings::default();
+    let unique = format!(
+        "{}-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis()),
+        std::process::id()
+    );
 
     let mut reports = Vec::new();
     let mut tallies = Vec::new();
-    for (atom, settings) in &chosen {
+    let mut spent = Vec::new();
+    for (atom, settings, select) in &chosen.atoms {
         let cases = eval::load_cases(atom, settings)?;
         let cassette = match (calls_model(atom), source) {
             (false, _) | (true, Source::Live) => None,
-            (true, Source::Recorded) => Some(
+            (true, recorded) => Some(
                 Cassette::start(
                     &settings.dir.join("cassettes"),
+                    &settings.project.dir,
                     &endpoint.base_url,
-                    Mode::Replay,
-                )
-                .await?,
-            ),
-            (true, Source::Recording) => Some(
-                Cassette::start(
-                    &settings.dir.join("cassettes"),
-                    &endpoint.base_url,
-                    Mode::Record,
+                    if recorded == Source::Recorded {
+                        Mode::Replay
+                    } else {
+                        Mode::Record
+                    },
                 )
                 .await?,
             ),
         };
-        let runtimes = runtimes(&state, paths, &endpoint, cassette.as_ref(), &store)?;
-        let subject = AtomSubject {
+        let mut runtimes = runtimes(&state, paths, &endpoint, cassette.as_ref(), &store, &args)?;
+        let metered = match (&ledger, calls_model(atom)) {
+            (Some(ledger), true) => {
+                let model = model_of(atom, &endpoint);
+                let plan = BudgetPlan::resolve(
+                    &budgets,
+                    &Budget::default(),
+                    &[(atom.name.as_str(), &atom.budget, model.as_str())],
+                )
+                .map_err(|(_, e)| {
+                    Failure::new(
+                        "eval.budget",
+                        format!("atom {}: budget: {e}", atom.name),
+                        "fix the atom's budget block",
+                    )
+                })?;
+                // Calls go to the model the budget was resolved for.
+                runtimes.codex.defaults.model = Some(model.clone());
+                runtimes.lite.defaults.model = Some(model);
+                Some(Metered {
+                    budget: RunBudget::pinned(ledger.clone(), &plan),
+                    caps: plan.atoms[&atom.name].clone(),
+                    run: format!("eval:{}:{unique}", atom.name),
+                })
+            }
+            _ => {
+                if source == Source::Recorded && calls_model(atom) {
+                    let model = model_of(atom, &endpoint);
+                    let meter = Metering::new(std::sync::Arc::new(Replayed {
+                        output_tokens: budgets.reservation(&model).output_tokens,
+                    }));
+                    runtimes.codex.defaults.model = Some(model.clone());
+                    runtimes.lite.defaults.model = Some(model);
+                    runtimes.codex.meter = meter.clone();
+                    runtimes.lite.meter = meter;
+                }
+                None
+            }
+        };
+        let run_id = metered.as_ref().map(|m| m.run.clone());
+        let subject = Subject {
             atom,
-            runtimes: &runtimes,
+            runtimes,
+            metered,
+            next: std::sync::atomic::AtomicI32::new(1),
         };
         let options = Options {
-            select: args.cases.clone(),
+            select: select.clone(),
             sample: args.sample.map(|size| Sample {
                 size,
                 seed: args.seed,
             }),
             judge: None,
-            baseline: baseline.iter().find(|r| r.atom == atom.name),
+            baseline: None,
             revision: args.revision.clone(),
         };
-        let report = eval::run(atom, cases, settings, &subject, options).await;
-        tallies.push(cassette.as_ref().map(Cassette::tally));
+        let mut report = eval::run(atom, cases, settings, &subject, options).await;
+        let tally = cassette.as_ref().map(Cassette::tally);
+        if let Some(t) = &tally {
+            // A call the cassette could not answer is a failure whatever the
+            // pass rate: the eval did not check what it was asked to.
+            if t.missed + t.corrupt > 0 {
+                report.failures.push(format!(
+                    "{} model call(s) had no usable recording ({} missing, {} corrupt): record \
+                     them with --live",
+                    t.missed + t.corrupt,
+                    t.missed,
+                    t.corrupt
+                ));
+                report.passed = false;
+            }
+        }
+        if !report.not_scored.is_empty() && !args.allow_unscored {
+            report.failures.push(format!(
+                "scorers {} are declared, and atomic eval has no judge to run them; pass \
+                 --allow-unscored to report them as skipped",
+                report.not_scored.join(", ")
+            ));
+            report.passed = false;
+        }
+        if let (Some(ledger), Some(run)) = (&ledger, run_id) {
+            let attempts = ledger.attempts(&run).await.unwrap_or_default();
+            spent.push(json!({
+                "atom": atom.name,
+                "run": run,
+                "calls": attempts.len(),
+                "tokens": attempts.iter().map(|a| a.charged.tokens).sum::<i64>(),
+            }));
+        }
+        tallies.push(tally);
         reports.push(report);
     }
 
@@ -198,11 +452,14 @@ pub async fn run(
                 Source::Live => "live",
             },
             "reports": reports,
+            "no_cases": chosen.empty,
             "cassettes": tallies.iter().zip(&reports).filter_map(|(t, r)| {
                 t.as_ref().map(|t| json!({
-                    "atom": r.atom, "replayed": t.replayed, "recorded": t.recorded, "missed": t.missed,
+                    "atom": r.atom, "replayed": t.replayed, "recorded": t.recorded,
+                    "missed": t.missed, "corrupt": t.corrupt, "keyed": t.keyed,
                 }))
             }).collect::<Vec<_>>(),
+            "usage": spent,
             "scorers_skipped": skipped.iter().map(|(atom, names)| json!({
                 "atom": atom, "scorers": names,
                 "reason": "atomic eval has no judge to call, so scorers are not run",
@@ -211,6 +468,18 @@ pub async fn run(
         println!("{}", serde_json::to_string_pretty(&out)?);
     } else {
         print(&reports, &tallies, &skipped, source);
+        if !chosen.empty.is_empty() {
+            println!("no eval cases: {}", chosen.empty.join(", "));
+        }
+        for s in &spent {
+            println!(
+                "metered {}: {} model call(s), {} token(s), as run {}",
+                s["atom"].as_str().unwrap_or_default(),
+                s["calls"],
+                s["tokens"],
+                s["run"].as_str().unwrap_or_default()
+            );
+        }
     }
     let failed: Vec<&str> = reports
         .iter()
@@ -233,28 +502,76 @@ pub async fn run(
     }
 }
 
-/// The atoms `targets` name, with their eval settings: every atom with eval
-/// cases when none is named.
+/// The atoms an eval runs, each with its eval settings and the case
+/// selectors that apply to it, and the atoms passed over for having no cases.
+struct Chosen<'a> {
+    atoms: Vec<(&'a Atom, eval::Settings, Vec<String>)>,
+    empty: Vec<String>,
+}
+
+/// The atoms `targets` name, or every atom with eval cases when none is
+/// named, with the `selectors` that name their cases. A selector that names
+/// no case of any atom chosen is an error. With no atom named, only the
+/// atoms some selector names run; a named atom gets every selector, so one
+/// that names none of its cases fails its report.
 fn choose<'a>(
     atoms: &'a [Atom],
     targets: &[String],
+    selectors: &[String],
     cwd: &Path,
-) -> anyhow::Result<Vec<(&'a Atom, eval::Settings)>> {
+) -> anyhow::Result<Chosen<'a>> {
     // The project an atom belongs to, which its eval directory must be in.
     let project_of = |atom: &Atom| -> anyhow::Result<atomic_core::project::Project> {
         Ok(atomic_core::project::discover(
             atom.file.parent().unwrap_or(Path::new("/")),
         )?)
     };
-    let mut chosen = Vec::new();
+    // The selectors in `selectors` that name one of `atom`'s cases.
+    let naming = |cases: &[eval::Case]| -> Vec<String> {
+        selectors
+            .iter()
+            .filter(|s| {
+                eval::unmatched(
+                    cases,
+                    &Options {
+                        select: vec![(*s).clone()],
+                        ..Options::default()
+                    },
+                )
+                .is_empty()
+            })
+            .cloned()
+            .collect()
+    };
+    let mut chosen = Chosen {
+        atoms: Vec::new(),
+        empty: Vec::new(),
+    };
+    let mut named = std::collections::BTreeSet::new();
     if targets.is_empty() {
         for atom in atoms {
             let settings = eval::settings(atom, &project_of(atom)?)?;
-            if !eval::load_cases(atom, &settings)?.is_empty() {
-                chosen.push((atom, settings));
+            let cases = eval::load_cases(atom, &settings)?;
+            if cases.is_empty() {
+                chosen.empty.push(atom.name.clone());
+                continue;
             }
+            let select = naming(&cases);
+            if !selectors.is_empty() && select.is_empty() {
+                continue;
+            }
+            named.extend(select.iter().cloned());
+            chosen.atoms.push((atom, settings, select));
         }
-        if chosen.is_empty() {
+        if let Some(stray) = selectors.iter().find(|s| !named.contains(*s)) {
+            return Err(Failure::new(
+                "eval.case",
+                format!("`{stray}` names no eval case of any atom in this project"),
+                "name a case by its file (`case.yaml`) or its file and line (`cases.jsonl:3`)",
+            )
+            .into());
+        }
+        if chosen.atoms.is_empty() {
             return Err(Failure::new(
                 "eval.none",
                 "no atom in this project has eval cases",
@@ -286,30 +603,17 @@ fn choose<'a>(
             )
             .into());
         };
-        chosen.push((atom, eval::settings(atom, &project_of(atom)?)?));
+        chosen.atoms.push((
+            atom,
+            eval::settings(atom, &project_of(atom)?)?,
+            selectors.to_vec(),
+        ));
     }
     Ok(chosen)
 }
 
 fn calls_model(atom: &Atom) -> bool {
     matches!(atom.kind.as_str(), "lite" | "codex")
-}
-
-/// Reports a run wrote with `--report`, or an `--json` output.
-fn read_reports(path: &Path) -> anyhow::Result<Vec<Report>> {
-    let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    let value: Value =
-        serde_json::from_str(&text).with_context(|| format!("{} is not JSON", path.display()))?;
-    let reports = match value {
-        Value::Object(mut fields) => fields.remove("reports").unwrap_or(Value::Null),
-        other => other,
-    };
-    serde_json::from_value(reports).with_context(|| {
-        format!(
-            "{} holds no eval reports: give a file `atomic eval --report` wrote",
-            path.display()
-        )
-    })
 }
 
 /// The runtimes atoms run on, their model calls through `cassette` if there
@@ -320,15 +624,21 @@ fn runtimes(
     endpoint: &ModelEndpoint,
     cassette: Option<&Cassette>,
     store: &LocalStore,
+    args: &EvalArgs,
 ) -> anyhow::Result<Runtimes> {
     let mut sent = endpoint.clone();
     if let Some(cassette) = cassette {
         sent.base_url = cassette.base_url(&endpoint.base_url);
     }
-    let mut lite = LiteRuntime::new(sent.clone(), AtomConfig::default());
-    // The wire the real endpoint takes, not the one the cassette's address
-    // would suggest.
-    lite.wire = Wire::for_base_url(&endpoint.base_url);
+    let lite = lite_runtime(endpoint, sent.clone());
+    let exec = match args.engine.runner {
+        RunnerKind::Local => atomic_exec::Backend::default(),
+        RunnerKind::Process => {
+            atomic_exec::Backend::new(atomic_exec::runner::ProcessRunner::atomic(
+                std::env::current_exe().context("find atomic's own executable for its runners")?,
+            ))
+        }
+    };
     Ok(Runtimes {
         codex: CodexRuntime {
             paths: paths.clone(),
@@ -341,9 +651,30 @@ fn runtimes(
             guard: atomic_core::codex::StateGuard::for_project(state)?,
         },
         lite,
-        exec: atomic_exec::Backend::default(),
+        exec,
         clock: None,
     })
+}
+
+/// The lite runtime for calls sent to `sent` in place of `endpoint`: with
+/// the wire and output-limit field the real endpoint takes, not the ones the
+/// cassette's loopback address would suggest.
+fn lite_runtime(endpoint: &ModelEndpoint, sent: ModelEndpoint) -> LiteRuntime {
+    let mut lite = LiteRuntime::new(sent, AtomConfig::default());
+    lite.wire = Wire::for_base_url(&endpoint.base_url);
+    lite.limit_field = Some(LimitField::for_endpoint(lite.wire, &endpoint.base_url));
+    lite
+}
+
+/// A pass rate and its threshold to three places, or in full when three
+/// places would show them equal while they are not.
+fn shares(rate: f64, threshold: f64) -> (String, String) {
+    let (r, t) = (format!("{rate:.3}"), format!("{threshold:.3}"));
+    if r == t && rate != threshold {
+        (rate.to_string(), threshold.to_string())
+    } else {
+        (r, t)
+    }
 }
 
 fn print(
@@ -355,13 +686,12 @@ fn print(
     println!("model calls: {}", source.describe());
     for (report, tally) in reports.iter().zip(tallies) {
         let passed = report.cases.iter().filter(|c| c.passed).count();
+        let (rate, threshold) = shares(report.pass_rate, report.threshold);
         println!(
-            "{} {}: {passed} of {} cases passed, pass rate {:.3}, threshold {:.3}",
+            "{} {}: {passed} of {} cases passed, pass rate {rate}, threshold {threshold}",
             if report.passed { "PASS" } else { "FAIL" },
             report.atom,
             report.cases.len(),
-            report.pass_rate,
-            report.threshold
         );
         for case in report.cases.iter().filter(|c| !c.passed) {
             println!("  failed {}: {}", case.id, case.failures.join("; "));
@@ -388,12 +718,46 @@ fn print(
         }
         if let Some(t) = tally {
             println!(
-                "  cassettes: {} replayed, {} recorded, {} without a recording",
-                t.replayed, t.recorded, t.missed
+                "  cassettes: {} replayed, {} recorded, {} without a recording{}",
+                t.replayed,
+                t.recorded,
+                t.missed,
+                if t.corrupt > 0 {
+                    format!(", {} corrupt", t.corrupt)
+                } else {
+                    String::new()
+                }
             );
         }
         for failure in &report.failures {
             println!("  {failure}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_lite_call_through_a_cassette_is_shaped_for_the_real_endpoint() {
+        let endpoint = ModelEndpoint {
+            base_url: "https://api.openai.com/v1".into(),
+            model: "m".into(),
+            api_key_env: None,
+        };
+        let mut sent = endpoint.clone();
+        sent.base_url = "http://127.0.0.1:4000/v1".into();
+        let lite = lite_runtime(&endpoint, sent);
+        assert_eq!(lite.endpoint.base_url, "http://127.0.0.1:4000/v1");
+        assert_eq!(lite.wire, Wire::Responses);
+        assert_eq!(lite.limit_field, Some(LimitField::MaxOutputTokens));
+    }
+
+    #[test]
+    fn a_threshold_close_to_the_pass_rate_is_shown_in_full() {
+        assert_eq!(shares(0.5, 0.5), ("0.500".into(), "0.500".into()));
+        assert_eq!(shares(0.6667, 2.0 / 3.0).0, "0.6667");
+        assert_eq!(shares(0.25, 0.5), ("0.250".into(), "0.500".into()));
     }
 }

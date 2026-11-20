@@ -78,7 +78,12 @@ Several authoring aids arrive in stages. Eval cases, in YAML and in JSONL files,
 are loaded and checked, and the eval runner reports pass rates against each
 atom's threshold and scorer means against their minimums and a baseline; the
 `atomic eval` command runs it from the terminal, from cassettes or `--live`, and
-fails CI below an atom's threshold; it has no judge to run scorers with yet. A
+fails CI below an atom's threshold. It has no judge to run scorers with yet, so an
+atom with scorers fails unless `--allow-unscored` is given, and `--baseline` is
+refused. Its live calls are metered in the usage ledger under each atom's budget.
+Until fixture worktrees exist it refuses an atom that could write (a Codex atom
+with a `workspace-write` sandbox, an exec atom that declares effects), and it runs
+Codex atoms only live, with `--no-cassettes`. A
 recorded workflow-file run can be replayed from its checkpoints as a new run:
 each atom step is served the result it published, with no model call and no
 command run, while gates open again, titled as a replay's, and wait. A replay

@@ -8,8 +8,17 @@
 //! - a pass rate that drops below the atom's threshold fails the command,
 //!   with the failing case in its JUnit file and its JSON report; one that
 //!   stays at or above the threshold passes;
-//! - an atom's scorers are reported as not run, since there is no judge;
-//! - a case selected by its identity runs alone.
+//! - an atom's scorers, which need a judge it does not have, fail it unless
+//!   `--allow-unscored` reports them as skipped; `--baseline` is refused;
+//! - a case selected by its identity runs alone, and with no atom named only
+//!   the atoms that have it run;
+//! - a call with no recording fails the eval whatever its pass rate;
+//! - a live eval is metered in the usage ledger, and a budget with no room
+//!   for a call stops it before any;
+//! - a replay reads no API key and sends none;
+//! - an atom that could write, or a Codex atom under cassettes, is refused;
+//! - JUnit holds a suite per atom, `--report` writes the reports, and
+//!   `--sample` runs a seeded sample.
 
 use atomic_core::testing::{FakeModel, Reply, on_codex_runtime};
 use serde_json::{Value, json};
@@ -120,7 +129,61 @@ fn answer(request: &Value) -> Reply {
     Reply::Text(json!({ "ticket": ticket }).to_string())
 }
 
+/// Add atom `name` with `config` (TypeScript, after `kind`) and `rows` as its
+/// JSONL cases.
+fn add_atom(project: &Path, name: &str, config: &str, rows: &[(&str, &str)]) {
+    let atoms = project.join("atoms");
+    std::fs::write(
+        atoms.join(format!("{name}.atom.astro")),
+        format!(
+            "---\nimport type {{ Props, Input, Output }} from '../.atomic/types/{name}';\n\
+             import type {{ AtomConfig }} from '../.atomic/types/authoring';\n\
+             const {{ input }}: Props = Astro.props;\n\
+             export const config: AtomConfig<Input, Output> = {{ description: 'Test.', {config} }};\n\
+             ---\nFile a ticket for: {{input.text}}\n"
+        ),
+    )
+    .expect("atom");
+    for (role, schema) in [
+        ("input", object(json!({"text": {"type": "string"}}))),
+        ("output", object(json!({"ticket": {"type": "string"}}))),
+    ] {
+        std::fs::write(
+            atoms.join(format!("{name}.{role}.schema.json")),
+            schema.to_string(),
+        )
+        .expect("schema");
+    }
+    if !rows.is_empty() {
+        let dir = project.join("evals").join(name);
+        std::fs::create_dir_all(&dir).expect("evals");
+        let lines: Vec<String> = rows
+            .iter()
+            .map(|(text, assertion)| {
+                json!({"input": {"text": text}, "expect": [assertion]}).to_string()
+            })
+            .collect();
+        std::fs::write(dir.join("cases.jsonl"), lines.join("\n") + "\n").expect("cases");
+    }
+}
+
+/// Run `atomic eval` off the test's runtime thread.
+async fn eval_async(dir: &Path, project: &Path, url: &str, args: &[&str]) -> Output {
+    let (d, p, u) = (dir.to_owned(), project.to_owned(), url.to_owned());
+    let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
+    tokio::task::spawn_blocking(move || {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        eval(&d, &p, &u, &args)
+    })
+    .await
+    .expect("eval")
+}
+
 fn eval(dir: &Path, project: &Path, url: &str, args: &[&str]) -> Output {
+    eval_with(dir, project, url, args, &[])
+}
+
+fn eval_with(dir: &Path, project: &Path, url: &str, args: &[&str], env: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new(ATOMIC);
     cmd.arg("eval")
         .args(args)
@@ -134,6 +197,9 @@ fn eval(dir: &Path, project: &Path, url: &str, args: &[&str]) -> Output {
         .env_remove("CODEX_HOME")
         .env_remove("ATOMIC_DATABASE_URL")
         .stdin(Stdio::null());
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
     cmd.output().expect("atomic eval")
 }
 
@@ -155,9 +221,10 @@ fn atomic_eval_records_replays_offline_and_fails_ci_on_a_pass_rate_drop() {
 
         // Recorded live: every atom with cases, three model calls.
         let (d, p, u) = (dir.clone(), project.clone(), url.clone());
-        let live = tokio::task::spawn_blocking(move || eval(&d, &p, &u, &["--live"]))
-            .await
-            .expect("eval");
+        let live =
+            tokio::task::spawn_blocking(move || eval(&d, &p, &u, &["--live", "--allow-unscored"]))
+                .await
+                .expect("eval");
         assert!(live.status.success(), "{}", text(&live));
         assert_eq!(model.calls(), 3);
         let out = String::from_utf8_lossy(&live.stdout);
@@ -170,7 +237,7 @@ fn atomic_eval_records_replays_offline_and_fails_ci_on_a_pass_rate_drop() {
 
         // Replayed: the same results, no model call, and labelled.
         let (d, p, u) = (dir.clone(), project.clone(), url.clone());
-        let replayed = tokio::task::spawn_blocking(move || eval(&d, &p, &u, &[]))
+        let replayed = tokio::task::spawn_blocking(move || eval(&d, &p, &u, &["--allow-unscored"]))
             .await
             .expect("eval");
         assert!(replayed.status.success(), "{}", text(&replayed));
@@ -238,11 +305,303 @@ fn atomic_eval_records_replays_offline_and_fails_ci_on_a_pass_rate_drop() {
 }
 
 #[test]
-fn a_pass_rate_at_its_threshold_passes() {
+fn a_pass_rate_exactly_at_its_threshold_passes() {
     on_codex_runtime(async {
         let dir = scratch("threshold");
-        // Two of three cases may pass.
-        let project = project(&dir, Some(0.6));
+        // Two of four cases may pass, and exactly two do.
+        let project = project(&dir, Some(0.5));
+        let cases = project.join("evals/note/cases.jsonl");
+        let mut rows = std::fs::read_to_string(&cases).expect("cases");
+        for wrong in ["BUG-9", "BUG-8"] {
+            rows.push_str(
+                &(json!({"input": {"text": "Export crashes"}, "expect": [format!("output.ticket == '{wrong}'")]})
+                    .to_string()
+                    + "\n"),
+            );
+        }
+        std::fs::write(&cases, rows).expect("cases");
+        let model = FakeModel::respond(answer).await.expect("fake model");
+        let url = model.base_url();
+        let out = eval_async(&dir, &project, &url, &["note", "--live"]).await;
+        assert!(out.status.success(), "{}", text(&out));
+        assert!(
+            String::from_utf8_lossy(&out.stdout)
+                .contains("PASS note: 2 of 4 cases passed, pass rate 0.500, threshold 0.500"),
+            "{}",
+            text(&out)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+#[test]
+fn declared_scorers_fail_the_atom_unless_allowed_and_a_baseline_is_refused() {
+    on_codex_runtime(async {
+        let dir = scratch("scorers");
+        let project = project(&dir, None);
+        let model = FakeModel::respond(answer).await.expect("fake model");
+        let url = model.base_url();
+        let out = eval_async(&dir, &project, &url, &["graded", "--no-cassettes"]).await;
+        assert!(!out.status.success(), "{}", text(&out));
+        assert!(
+            text(&out).contains("pass --allow-unscored"),
+            "{}",
+            text(&out)
+        );
+        let junit = dir.join("graded.xml");
+        let j = junit.display().to_string();
+        let out = eval_async(
+            &dir,
+            &project,
+            &url,
+            &[
+                "graded",
+                "--no-cassettes",
+                "--allow-unscored",
+                "--junit",
+                &j,
+            ],
+        )
+        .await;
+        assert!(out.status.success(), "{}", text(&out));
+        let xml = std::fs::read_to_string(&junit).expect("junit");
+        assert!(xml.contains("skipped=\"1\""), "{xml}");
+        // A baseline cannot be compared without scorer means.
+        let report = dir.join("report.json");
+        std::fs::write(&report, "[]").expect("report");
+        let r = report.display().to_string();
+        let out = eval_async(&dir, &project, &url, &["note", "--baseline", &r]).await;
+        assert!(!out.status.success());
+        assert!(
+            text(&out).contains("no scorer mean to compare"),
+            "{}",
+            text(&out)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+#[test]
+fn a_call_with_no_recording_fails_whatever_the_pass_rate() {
+    on_codex_runtime(async {
+        let dir = scratch("missing");
+        let project = project(&dir, Some(0.5));
+        let model = FakeModel::respond(answer).await.expect("fake model");
+        let url = model.base_url();
+        let out = eval_async(&dir, &project, &url, &["note", "--live"]).await;
+        assert!(out.status.success(), "{}", text(&out));
+        // A new case, never recorded: two of three still pass, above 0.5.
+        let cases = project.join("evals/note/cases.jsonl");
+        let mut rows = std::fs::read_to_string(&cases).expect("cases");
+        rows.push_str(
+            &(json!({"input": {"text": "A brand new note"}, "expect": ["true"]}).to_string()
+                + "\n"),
+        );
+        std::fs::write(&cases, rows).expect("cases");
+        let out = eval_async(&dir, &project, &url, &["note", "--json"]).await;
+        assert!(!out.status.success(), "{}", text(&out));
+        let report: Value = serde_json::from_slice(&out.stdout).expect("one JSON report");
+        assert_eq!(report["cassettes"][0]["missed"], 1);
+        assert!(
+            report["reports"][0]["failures"]
+                .to_string()
+                .contains("no usable recording"),
+            "{report}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+#[test]
+fn a_live_eval_is_metered_and_stopped_by_its_budget() {
+    on_codex_runtime(async {
+        let dir = scratch("metered");
+        let project = project(&dir, None);
+        let model = FakeModel::respond(answer).await.expect("fake model");
+        let url = model.base_url();
+        // Without cassettes: the model is called, nothing is recorded, and
+        // every call is in the ledger.
+        let out = eval_async(&dir, &project, &url, &["note", "--no-cassettes", "--json"]).await;
+        assert!(out.status.success(), "{}", text(&out));
+        assert_eq!(model.calls(), 2);
+        assert!(!project.join("evals/note/cassettes").exists());
+        let report: Value = serde_json::from_slice(&out.stdout).expect("one JSON report");
+        assert_eq!(report["source"], "live");
+        assert_eq!(report["usage"][0]["calls"], 2, "{report}");
+        assert!(
+            report["usage"][0]["tokens"].as_i64().unwrap_or(0) > 0,
+            "{report}"
+        );
+        // Without its ledger, a live eval does not start.
+        let (d, p, u) = (dir.clone(), project.clone(), url.clone());
+        let unreachable = [
+            (
+                "ATOMIC_DATABASE_URL",
+                "postgres://atomic@127.0.0.1:9/atomic",
+            ),
+            ("ATOMIC_EXECUTOR_ID", "eval-test"),
+        ];
+        let out = tokio::task::spawn_blocking(move || {
+            eval_with(&d, &p, &u, &["note", "--no-cassettes"], &unreachable)
+        })
+        .await
+        .expect("eval");
+        assert!(!out.status.success(), "{}", text(&out));
+        assert!(text(&out).contains("usage ledger"), "{}", text(&out));
+        assert_eq!(model.calls(), 2, "no call was made");
+        // A budget with no room for one call stops the eval before any.
+        add_atom(
+            &project,
+            "capped",
+            "kind: 'lite', budget: { tokens: 1000 }",
+            &[("Export crashes", "true")],
+        );
+        let out = eval_async(&dir, &project, &url, &["capped", "--live"]).await;
+        assert!(!out.status.success(), "{}", text(&out));
+        assert!(text(&out).contains("atom capped: budget"), "{}", text(&out));
+        assert_eq!(model.calls(), 2, "no call was made");
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+#[test]
+fn a_replay_reads_no_api_key_and_sends_none() {
+    on_codex_runtime(async {
+        let dir = scratch("keyless");
+        let project = project(&dir, None);
+        let model = FakeModel::respond(answer).await.expect("fake model");
+        let url = model.base_url();
+        let secret = [
+            ("ATOMIC_MODEL_API_KEY_ENV", "EVAL_TEST_KEY"),
+            ("EVAL_TEST_KEY", "sk-test-secret"),
+        ];
+        let (d, p, u) = (dir.clone(), project.clone(), url.clone());
+        let live = tokio::task::spawn_blocking(move || {
+            eval_with(&d, &p, &u, &["note", "--live"], &secret)
+        })
+        .await
+        .expect("eval");
+        assert!(live.status.success(), "{}", text(&live));
+        let (d, p, u) = (dir.clone(), project.clone(), url.clone());
+        let replay = tokio::task::spawn_blocking(move || {
+            eval_with(&d, &p, &u, &["note", "--json"], &secret)
+        })
+        .await
+        .expect("eval");
+        assert!(replay.status.success(), "{}", text(&replay));
+        let report: Value = serde_json::from_slice(&replay.stdout).expect("one JSON report");
+        assert_eq!(report["cassettes"][0]["replayed"], 2, "{report}");
+        assert_eq!(
+            report["cassettes"][0]["keyed"], 0,
+            "a key reached the replay: {report}"
+        );
+        for entry in std::fs::read_dir(project.join("evals/note/cassettes")).expect("cassettes") {
+            let tape = std::fs::read_to_string(entry.expect("entry").path()).expect("tape");
+            assert!(!tape.contains("sk-test-secret"), "{tape}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+#[test]
+fn an_atom_that_could_write_or_a_codex_atom_under_cassettes_is_refused() {
+    on_codex_runtime(async {
+        let dir = scratch("refused");
+        let project = project(&dir, None);
+        let row = [("Export crashes", "true")];
+        add_atom(
+            &project,
+            "writer",
+            "kind: 'codex', sandbox: 'workspace-write'",
+            &row,
+        );
+        add_atom(&project, "reader", "kind: 'codex'", &row);
+        add_atom(
+            &project,
+            "lookup",
+            "kind: 'exec', exec: { command: ['true'] }, effects: { external: 'read-only' }",
+            &row,
+        );
+        let model = FakeModel::respond(answer).await.expect("fake model");
+        let url = model.base_url();
+        for (atom, args, says) in [
+            ("writer", &["--no-cassettes"][..], "may write files"),
+            ("lookup", &[][..], "declares effects"),
+            ("reader", &[][..], "is a Codex atom"),
+            ("reader", &["--live"][..], "is a Codex atom"),
+        ] {
+            let mut all = vec![atom];
+            all.extend_from_slice(args);
+            let out = eval_async(&dir, &project, &url, &all).await;
+            assert!(!out.status.success(), "{atom} {args:?}: {}", text(&out));
+            assert!(text(&out).contains(says), "{atom}: {}", text(&out));
+        }
+        assert_eq!(model.calls(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+#[test]
+fn selection_sampling_reports_and_junit_cover_every_atom() {
+    on_codex_runtime(async {
+        let dir = scratch("select");
+        let project = project(&dir, None);
+        add_atom(&project, "silent", "kind: 'lite'", &[]);
+        let model = FakeModel::respond(answer).await.expect("fake model");
+        let url = model.base_url();
+        let junit = dir.join("all.xml");
+        let report = dir.join("reports.json");
+        let (j, r) = (junit.display().to_string(), report.display().to_string());
+        let out = eval_async(
+            &dir,
+            &project,
+            &url,
+            &["--live", "--allow-unscored", "--junit", &j, "--report", &r],
+        )
+        .await;
+        assert!(out.status.success(), "{}", text(&out));
+        // One suite per atom with cases; the atom with none is named.
+        let xml = std::fs::read_to_string(&junit).expect("junit");
+        assert!(xml.contains("<testsuite name=\"graded\""), "{xml}");
+        assert!(xml.contains("<testsuite name=\"note\""), "{xml}");
+        assert!(
+            text(&out).contains("no eval cases: silent"),
+            "{}",
+            text(&out)
+        );
+        let reports: Vec<atomic_core::eval::Report> =
+            serde_json::from_str(&std::fs::read_to_string(&report).expect("report"))
+                .expect("reports");
+        assert_eq!(reports.len(), 2);
+
+        // With no atom named, a case selects only the atoms that have it:
+        // only `note` has a second line.
+        let out = eval_async(&dir, &project, &url, &["--case", "cases.jsonl:2", "--json"]).await;
+        assert!(out.status.success(), "{}", text(&out));
+        let report: Value = serde_json::from_slice(&out.stdout).expect("one JSON report");
+        assert_eq!(
+            report["reports"].as_array().map(Vec::len),
+            Some(1),
+            "{report}"
+        );
+        assert_eq!(report["reports"][0]["atom"], "note");
+        // A case no atom has is an error.
+        let out = eval_async(&dir, &project, &url, &["--case", "cases.jsonl:9"]).await;
+        assert!(!out.status.success());
+        assert!(text(&out).contains("names no eval case"), "{}", text(&out));
+
+        // A seeded sample of one.
+        let out = eval_async(
+            &dir,
+            &project,
+            &url,
+            &["note", "--sample", "1", "--seed", "3"],
+        )
+        .await;
+        assert!(out.status.success(), "{}", text(&out));
+        assert!(text(&out).contains("1 of 1 cases passed"), "{}", text(&out));
+
+        // A failing eval without --json exits non-zero and says why.
         let cases = project.join("evals/note/cases.jsonl");
         let mut rows = std::fs::read_to_string(&cases).expect("cases");
         rows.push_str(
@@ -251,16 +610,10 @@ fn a_pass_rate_at_its_threshold_passes() {
                 + "\n"),
         );
         std::fs::write(&cases, rows).expect("cases");
-        let model = FakeModel::respond(answer).await.expect("fake model");
-        let url = model.base_url();
-        let (d, p, u) = (dir.clone(), project.clone(), url.clone());
-        let out = tokio::task::spawn_blocking(move || eval(&d, &p, &u, &["note", "--live"]))
-            .await
-            .expect("eval");
-        assert!(out.status.success(), "{}", text(&out));
+        let out = eval_async(&dir, &project, &url, &["note"]).await;
+        assert_eq!(out.status.code(), Some(1), "{}", text(&out));
         assert!(
-            String::from_utf8_lossy(&out.stdout)
-                .contains("PASS note: 2 of 3 cases passed, pass rate 0.667, threshold 0.600"),
+            text(&out).contains("the evals of note did not pass"),
             "{}",
             text(&out)
         );

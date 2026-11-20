@@ -855,7 +855,8 @@ async fn score(
 
 /// `report` as JUnit XML: one test suite for the atom, a test case per eval
 /// case, per scorer and per failure of the run as a whole, and a skipped
-/// test case per scorer that was not run.
+/// test case per scorer that was not run. A case whose atom gave no output
+/// is an error; one whose assertions did not hold is a failure.
 pub fn junit(report: &Report) -> String {
     junit_all(std::slice::from_ref(report))
 }
@@ -872,41 +873,62 @@ pub fn junit_all(reports: &[Report]) -> String {
 
 /// One atom's test suite.
 fn suite(report: &Report) -> String {
+    /// How a test case ended.
+    enum End<'a> {
+        Passed,
+        Failed(&'a str),
+        Errored(&'a str),
+        Skipped,
+    }
     let mut body = String::new();
-    let (mut tests, mut failed) = (0, 0);
-    let mut case = |name: &str, failure: Option<&str>, skipped: bool| {
+    let (mut tests, mut failed, mut errored, mut skipped) = (0, 0, 0, 0);
+    let mut case = |name: &str, end: End<'_>| {
         tests += 1;
         body.push_str(&format!(
             "    <testcase classname=\"{}\" name=\"{}\"",
             escape(&report.atom),
             escape(name)
         ));
-        match (failure, skipped) {
-            (Some(message), _) => {
+        let element = match end {
+            End::Passed => None,
+            End::Failed(message) => {
                 failed += 1;
-                body.push_str(&format!(
-                    ">\n      <failure message=\"{}\"/>\n    </testcase>\n",
-                    escape(message)
-                ));
+                Some(format!("<failure message=\"{}\"/>", escape(message)))
             }
-            (None, true) => body.push_str(">\n      <skipped/>\n    </testcase>\n"),
-            (None, false) => body.push_str("/>\n"),
+            End::Errored(message) => {
+                errored += 1;
+                Some(format!("<error message=\"{}\"/>", escape(message)))
+            }
+            End::Skipped => {
+                skipped += 1;
+                Some("<skipped/>".to_owned())
+            }
+        };
+        match element {
+            None => body.push_str("/>\n"),
+            Some(element) => body.push_str(&format!(">\n      {element}\n    </testcase>\n")),
         }
     };
     for c in &report.cases {
         let failures = c.failures.join("; ");
-        case(&c.id, (!c.passed).then_some(failures.as_str()), false);
+        let end = match (c.passed, &c.output) {
+            (true, _) => End::Passed,
+            (false, None) => End::Errored(&failures),
+            (false, Some(_)) => End::Failed(&failures),
+        };
+        case(&c.id, end);
     }
     for s in &report.scorers {
         let reason = s.reason.clone().unwrap_or_else(|| "failed".into());
-        case(
-            &format!("scorer:{}", s.name),
-            (!s.passed).then_some(reason.as_str()),
-            false,
-        );
+        let end = if s.passed {
+            End::Passed
+        } else {
+            End::Failed(&reason)
+        };
+        case(&format!("scorer:{}", s.name), end);
     }
     for name in &report.not_scored {
-        case(&format!("scorer:{name}"), None, true);
+        case(&format!("scorer:{name}"), End::Skipped);
     }
     // The failures of the run as a whole: no cases, the pass rate, the
     // baseline, a selector. Scorers' are their own test cases above.
@@ -916,7 +938,7 @@ fn suite(report: &Report) -> String {
         .filter(|f| !f.starts_with("scorer `"))
         .collect();
     if run.is_empty() {
-        case("run", None, false);
+        case("run", End::Passed);
     }
     for (n, failure) in run.iter().enumerate() {
         let name = if n == 0 {
@@ -924,10 +946,11 @@ fn suite(report: &Report) -> String {
         } else {
             format!("run:{}", n + 1)
         };
-        case(&name, Some(failure), false);
+        case(&name, End::Failed(failure));
     }
     format!(
-        "  <testsuite name=\"{}\" tests=\"{tests}\" failures=\"{failed}\">\n{body}  </testsuite>\n",
+        "  <testsuite name=\"{}\" tests=\"{tests}\" failures=\"{failed}\" errors=\"{errored}\" \
+         skipped=\"{skipped}\">\n{body}  </testsuite>\n",
         escape(&report.atom),
     )
 }
