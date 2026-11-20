@@ -373,9 +373,28 @@ fn an_atom_cannot_approve_its_own_gate_through_its_shell() {
         // The positive control: the key is there to be read.
         assert_eq!(read_from_session_keyring(&key), secret);
 
-        // A socket the command could reach if it could connect at all.
-        let sock = dir.join("admin.sock");
+        // A socket the command could reach if it could connect at all, in
+        // the test's directory, outside the atom's writable roots. Its path
+        // goes through a short link in /tmp: a Unix socket's path must fit
+        // in 108 bytes, and a deep checkout's target directory need not.
+        let short = Path::new("/tmp").join(format!(
+            "atomic-sa-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        std::os::unix::fs::symlink(&dir, &short).unwrap();
+        let sock = short.join("admin.sock");
         let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        assert!(
+            dir.join("admin.sock").exists(),
+            "the socket is in the test's directory"
+        );
+        // The positive control: outside the sandbox, the socket answers.
+        let _reached = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+        let _ = listener.accept().unwrap();
 
         // The atom's step: a worktree inside the state directory.
         let repo = Git::find().unwrap().discover(&project).unwrap();
@@ -403,6 +422,7 @@ fn an_atom_cannot_approve_its_own_gate_through_its_shell() {
             .unwrap();
         unlink_from_session_keyring(&key);
         drop(listener);
+        let _ = std::fs::remove_file(&short);
 
         // The step still works in its worktree...
         assert!(output.contains("wrote-exit=0"), "{output}");
