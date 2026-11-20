@@ -411,6 +411,42 @@ fn a_signal_stops_the_last_flush_of_a_command_that_ended() {
     );
 }
 
+/// A command that ends normally with a collector that never answers exits
+/// within the flush's deadline, not the exporter's ten-second timeout.
+#[test]
+fn a_collector_that_never_answers_delays_an_exit_only_briefly() {
+    use std::io::BufRead;
+    let dir = scratch("hung-bounded");
+    project(&dir);
+    let (model, _rt) = model(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())]);
+    let url = hung_collector();
+    let mut child = command(
+        &dir,
+        &model.base_url(),
+        &["run", "triage", "--data", NOTE],
+        &exporting(&url, "http/json"),
+    )
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+    // The run has printed its result: what is left is the flush.
+    let mut first = String::new();
+    std::io::BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut first)
+        .unwrap();
+    assert!(!first.is_empty(), "the run printed nothing");
+    let printed = std::time::Instant::now();
+    let out = child.wait_with_output().unwrap();
+    let taken = printed.elapsed();
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        taken < atomic_app::telemetry::FLUSH_DEADLINE + std::time::Duration::from_secs(3),
+        "took {taken:?} to exit after its result: {}",
+        text(&out)
+    );
+}
+
 /// A panic's message, through the hook `main` installs.
 #[test]
 fn a_key_in_a_panic_is_redacted() {

@@ -65,11 +65,11 @@ model call `atomic.model_call` or `atomic.meter`). A process that stops while
 runs are still going, such as one stopped while it waits at a gate, ends the
 spans still open with `atomic.stopped` set and exports them before it exits.
 
-A stopping process sends its last spans before it exits. A collector that
-accepts the connection and never answers holds the exit up for the
-exporter's timeout (`OTEL_EXPORTER_OTLP_TIMEOUT`, 10 seconds by default) and
-a short shutdown after it; send the signal again to exit at once, without
-those spans.
+A process sends its last spans before it exits, waiting at most two seconds
+for them: spans not sent by then are dropped. So a collector that accepts the
+connection and never answers holds up a command's exit by about two seconds,
+whatever the exporter's own timeout (`OTEL_EXPORTER_OTLP_TIMEOUT`). A signal
+during that wait stops it at once, without those spans.
 
 A step that replays from its checkpoint after a restart makes no span: only
 work that runs does. Each span's strings are redacted before they are
