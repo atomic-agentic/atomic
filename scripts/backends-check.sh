@@ -29,16 +29,21 @@ status=0
 
 # check <what> <message> <cargo test arguments...>: the tests the arguments
 # select must all fail, each with <message> in its own output, and every test
-# binary must report its result (see backends-check-audit.py).
+# binary must report its result (see backends-check-audit.py). With
+# `expected` set, exactly that many must fail.
+expected=""
 check() {
     local what="$1" message="$2"
     shift 2
     cargo test --color never --locked --no-fail-fast "$@" >"${LOG}" 2>&1
-    if out="$(python3 "${AUDIT}" all-fail "${LOG}" "${message}")"; then
+    local failed=""
+    if out="$(python3 "${AUDIT}" all-fail "${LOG}" "${message}")" &&
+        failed="$(sed -n 's/^  \([0-9][0-9]*\) tests failed.*/\1/p' <<<"${out}")" &&
+        { [ -z "${expected}" ] || [ "${failed}" = "${expected}" ]; }; then
         echo "ok ${what}:" >&2
         echo "${out}" >&2
     else
-        echo "FAIL ${what}:" >&2
+        echo "FAIL ${what}:${expected:+ ${failed:-no} tests failed of the ${expected} marked}" >&2
         echo "${out}" >&2
         grep -m3 -E "^error" "${LOG}" >&2
         status=1
@@ -87,15 +92,36 @@ sandbox)
         echo "scripts/backends-check.sh: the sandbox can start here, so its absence cannot be checked" >&2
         exit 2
     fi
-    # Every test file behind sandbox-tests, found by its cfg.
+    # Every test file behind sandbox-tests, found by its cfg: whole files,
+    # and in a file whose other tests need no sandbox, each test marked
+    # `// needs_sandbox` above its attributes.
     suites=()
     found=()
     for file in crates/*/tests/*.rs; do
-        if grep -q 'feature = "sandbox-tests"' "${file}"; then
-            name="$(basename "${file}" .rs)"
+        grep -q 'feature = "sandbox-tests"' "${file}" || continue
+        name="$(basename "${file}" .rs)"
+        if grep -q '^#!\[cfg(all(target_os = "linux", feature = "sandbox-tests"))\]' "${file}"; then
             suites+=(--test "${name}")
             found+=("${name}")
+            continue
         fi
+        mapfile -t tests < <(awk '
+            /^[[:space:]]*\/\/ needs_sandbox/ { marked = 1; next }
+            marked && /^[[:space:]]*(pub(\([a-z]+\))? )?(async )?fn [a-z0-9_]+\(/ {
+                sub(/^.*fn /, ""); sub(/\(.*/, ""); print; marked = 0
+            }
+        ' "${file}")
+        if [ "${#tests[@]}" -eq 0 ]; then
+            echo "scripts/backends-check.sh: ${file} names sandbox-tests but marks no test needs_sandbox" >&2
+            status=1
+            continue
+        fi
+        # Each marked test, and no other, fails.
+        expected="${#tests[@]}"
+        check "the ${#tests[@]} sandbox tests of ${name} with no sandbox" \
+            "the sandbox tests need Codex's Linux sandbox" \
+            --workspace --features "${FEATURES}" --test "${name}" -- --exact "${tests[@]}"
+        expected=""
     done
     [ "${#suites[@]}" -gt 0 ] || { echo "scripts/backends-check.sh: no sandbox suite found" >&2; exit 1; }
     check "sandbox suites (${found[*]}) with no sandbox" \

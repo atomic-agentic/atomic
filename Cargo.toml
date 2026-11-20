@@ -60,9 +60,6 @@ opentelemetry = { version = "0.31", default-features = false, features = ["trace
 opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace", "rt-tokio", "experimental_trace_batch_span_processor_with_async_runtime"] }
 opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "http-proto", "http-json", "grpc-tonic", "reqwest-blocking-client"] }
 url = "2"
-# The glob patterns Codex's shell environment policy is written in; Codex's
-# version.
-wildmatch = "2.6.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
@@ -84,6 +81,7 @@ codex-app-server = { git = "https://github.com/atomic-agentic/codex", rev = "f8e
 codex-core-api = { git = "https://github.com/atomic-agentic/codex", rev = "f8e52f30a7d56b045b93068c156aae8a4a312ba6" }
 codex-extension-api = { git = "https://github.com/atomic-agentic/codex", rev = "f8e52f30a7d56b045b93068c156aae8a4a312ba6" }
 codex-keyring-store = { git = "https://github.com/atomic-agentic/codex", rev = "f8e52f30a7d56b045b93068c156aae8a4a312ba6" }
+# For the shell environment policy types codex-core-api does not re-export.
 codex-protocol = { git = "https://github.com/atomic-agentic/codex", rev = "f8e52f30a7d56b045b93068c156aae8a4a312ba6" }
 
 # Codex is a large dependency; full debug info for every crate makes a debug

@@ -54,13 +54,71 @@ pub struct ChangeRequestResult {
     pub steps: Vec<Published>,
 }
 
+/// The exit code of a process that stopped because it cannot confine atoms'
+/// commands: a configuration error, as `atomic runner`'s contract has it.
+pub const UNCONFINABLE_EXIT: i32 = 78;
+
+/// Set by `atomic serve`: a run whose step cannot confine its commands is
+/// set aside instead of stopping the process (see [`settled`]).
+static SERVING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Make this process `atomic serve`: from now on a step that cannot confine
+/// its commands leaves its run unfinished and the process serving.
+pub fn serve_past_unconfinable_steps() {
+    SERVING.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Where a step's result goes once its atom has run, as [`atom_failure`] has it,
+/// except for a step whose commands cannot be confined on this machine:
+/// nothing ran, and nothing will here until the machine is fixed, so nothing
+/// is recorded. `atomic run` and `atomic runs resume` stop at once with
+/// [`UNCONFINABLE_EXIT`]. `atomic serve` keeps serving its other runs and
+/// leaves this one unfinished in this process, with no outcome and no
+/// recovery spent on it, for the next process that recovers it; `counted`
+/// says the run is counted in [`crate::pipeline::steps_running`], which then
+/// stops counting it, so a stop does not wait for it.
+pub(crate) async fn settled<T>(
+    result: std::result::Result<T, AtomError>,
+    place: &str,
+    counted: bool,
+) -> Result<T> {
+    match result {
+        Err(AtomError::Unconfinable(why)) if SERVING.load(std::sync::atomic::Ordering::SeqCst) => {
+            atomic_core::log_line!("atomic serve: {place}: {why}");
+            atomic_core::log_line!(
+                "atomic serve: {place} stays unfinished, with nothing recorded, until atomic \
+                 serve is started where the sandbox can start; other runs go on"
+            );
+            if counted {
+                crate::pipeline::set_aside();
+            }
+            std::future::pending().await
+        }
+        result => result.map_err(atom_failure),
+    }
+}
+
 /// Turn an atom's failure into its step's failure, recorded as the outcome;
 /// a cap that left no room for its next call parks the run instead. Every
 /// workflow converts an atom's error through this one function, so a budget
-/// refusal parks the run wherever the atom ran.
+/// refusal parks the run wherever the atom ran. (An execution backend with
+/// no room makes the run wait; see `atomic_core::runtime`.) A step whose
+/// commands cannot be confined goes through [`settled`] first, which keeps
+/// `atomic serve` from reaching the arm here that stops the process.
 pub fn atom_failure(e: AtomError) -> DurableError {
     match e {
         AtomError::Budget(why) => DurableError::Parked(why),
+        // Nothing ran, and nothing will on this machine until it is fixed:
+        // the process stops, recording nothing, and the run waits to be
+        // resumed where atoms' commands can be confined.
+        AtomError::Unconfinable(why) => {
+            atomic_core::log_line!("atomic: {why}");
+            atomic_core::log_line!(
+                "atomic: stopping without recording an outcome; resume the run where the sandbox \
+                 can start"
+            );
+            std::process::exit(UNCONFINABLE_EXIT);
+        }
         // Like a crash before the checkpoint: recovery runs the step again,
         // through its attempt guard.
         e @ AtomError::OutcomeUnknown(_) => DurableError::Interrupted(e.to_string()),
@@ -82,7 +140,17 @@ where
     O: Serialize + Send + 'static,
     F: Future<Output = std::result::Result<(O, RunMetadata), AtomError>> + Send + 'static,
 {
-    let (out, metadata) = contained(run).await.map_err(atom_failure)?;
+    propose_at("a step", false, run).await
+}
+
+/// [`propose`] for the step at `place`, whose run [`settled`] says is
+/// `counted` or not.
+pub(crate) async fn propose_at<O, F>(place: &str, counted: bool, run: F) -> Result<Proposal>
+where
+    O: Serialize + Send + 'static,
+    F: Future<Output = std::result::Result<(O, RunMetadata), AtomError>> + Send + 'static,
+{
+    let (out, metadata) = settled(contained(run).await, place, counted).await?;
     let encode = |v: serde_json::Result<serde_json::Value>| {
         v.map_err(|e| DurableError::Failed(format!("encode the atom's result: {e}")))
     };

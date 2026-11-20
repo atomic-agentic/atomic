@@ -29,6 +29,15 @@
 //! Model atoms call the scripted fake model, which counts calls; the exec
 //! atom logs each time its command runs.
 
+// On Linux, atomic runs exec atoms' commands only under Codex's sandbox,
+// and stops a run that needs it where it cannot start: the tests that run
+// commands need it (they are marked `needs_sandbox` below), and with the
+// `sandbox-tests` feature on, a sandbox that cannot start fails them. The
+// others run everywhere.
+#![cfg_attr(
+    all(target_os = "linux", not(feature = "sandbox-tests")),
+    allow(dead_code, unused_imports)
+)]
 #![recursion_limit = "512"]
 
 use atomic_core::testing::{FakeModel, Reply, on_codex_runtime};
@@ -39,6 +48,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
+mod support;
+
 const ATOMIC: &str = env!("CARGO_BIN_EXE_atomic");
 
 const NOTE: &str = r#"{"text": "Exporting a file named café.txt crashes the app."}"#;
@@ -47,7 +59,9 @@ const SUMMARY: &str = r#"{"line": "P1: Export crashes on accents"}"#;
 
 fn scratch(tag: &str) -> PathBuf {
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let dir = std::env::temp_dir().join(format!(
+    // Not under /tmp: atomic refuses scratch directories where sandboxed
+    // turns may write, and its state, scratch included, lives under HOME.
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
         "atomic-run-cli-{tag}-{}-{}",
         std::process::id(),
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -119,24 +133,30 @@ fn project(dir: &Path) -> PathBuf {
         std::fs::create_dir_all(project.join(sub)).expect("project");
     }
     std::fs::write(project.join("atomic.yaml"), "atomic: 1\nname: notes\n").expect("manifest");
-    // Each run logs the command line of the process that started it.
+    // Each run logs one line. Exec commands run confined, and may write only
+    // their scratch directory and the project's caches: the log is kept in
+    // the caches of the state directory the command runs under, found from
+    // its scratch directory (its HOME, `<state>/scratch/...`). The default
+    // home's is linked from `dir/count.log`; [`count_log`] reads every
+    // home's, for processes given a state directory of their own.
     std::fs::write(
         project.join("tools/count.py"),
         "import json, os, sys\n\
          note = json.load(sys.stdin)\n\
-         parent = open(f'/proc/{os.getppid()}/cmdline').read().replace('\\0', ' ')\n\
-         open(os.environ['COUNT_LOG'], 'a').write(parent.strip() + '\\n')\n\
+         at = os.environ['HOME']\n\
+         while os.path.basename(at) != 'scratch' and at != '/':\n    at = os.path.dirname(at)\n\
+         open(os.path.join(os.path.dirname(at), 'cache', 'count.log'), 'a').write('ran\\n')\n\
          json.dump({'title': note['text'][:25], 'words': len(note['text'].split())}, sys.stdout)\n",
     )
     .expect("script");
-    let log = dir.join("count.log");
+    let caches = state_dir(dir, &project).join("cache");
+    std::fs::create_dir_all(&caches).expect("caches");
+    let log = caches.join("count.log");
+    std::os::unix::fs::symlink(&log, dir.join("count.log")).expect("log link");
     write_atom(
         &project,
         "count-note",
-        &format!(
-            "description: 'Count words.', kind: 'exec', exec: {{ command: ['python3', 'tools/count.py'] }}, env: {{ COUNT_LOG: '{}' }}",
-            log.display()
-        ),
+        "description: 'Count words.', kind: 'exec', exec: { command: ['python3', 'tools/count.py'] }",
         "",
         object(json!({"text": {"type": "string"}})),
         object(json!({"title": {"type": "string"}, "words": {"type": "integer"}})),
@@ -179,12 +199,127 @@ fn project(dir: &Path) -> PathBuf {
     project
 }
 
-/// How many times the exec atom's command ran, and the command line of the
-/// process that started each run.
+/// One line for each time the exec atom's command ran, under any of the
+/// atomic homes in `dir`.
 fn count_log(dir: &Path) -> Vec<String> {
-    std::fs::read_to_string(dir.join("count.log"))
-        .map(|s| s.lines().map(str::to_owned).collect())
-        .unwrap_or_default()
+    let mut lines = Vec::new();
+    for home in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let projects = home.path().join("projects");
+        for state in std::fs::read_dir(projects).into_iter().flatten().flatten() {
+            let log = std::fs::read_to_string(state.path().join("cache/count.log"));
+            lines.extend(log.unwrap_or_default().lines().map(str::to_owned));
+        }
+    }
+    lines
+}
+
+/// A file named `name` that an exec atom's confined command may write: in
+/// the project's caches, beside `count.log`, and read through `dir/<name>`.
+fn command_log(dir: &Path, name: &str) -> PathBuf {
+    let caches = std::fs::read_link(dir.join("count.log")).expect("the log link");
+    let log = caches.parent().expect("the caches").join(name);
+    let link = dir.join(name);
+    if std::fs::symlink_metadata(&link).is_err() {
+        std::os::unix::fs::symlink(&log, &link).expect("log link");
+    }
+    log
+}
+
+/// The processes, as this process numbers them, whose command line has
+/// `marker`: a confined command runs in a process namespace of its own, so
+/// the ids it sees for itself are not these.
+fn pids_with(marker: &str) -> Vec<String> {
+    let mut pids = Vec::new();
+    for entry in std::fs::read_dir("/proc").expect("/proc").flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.bytes().all(|b| b.is_ascii_digit()) || name == std::process::id().to_string() {
+            continue;
+        }
+        let cmdline = std::fs::read(entry.path().join("cmdline")).unwrap_or_default();
+        if String::from_utf8_lossy(&cmdline).contains(marker) && alive(&name) {
+            pids.push(name);
+        }
+    }
+    pids
+}
+
+/// The parent of process `pid`, from field 4 of `/proc/<pid>/stat`.
+fn parent_of(pid: &str) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let parent = stat.rsplit(')').next()?.split_whitespace().nth(1)?;
+    Some(parent.to_owned())
+}
+
+/// The `atomic runner` process that started a process whose command line
+/// has `marker`, if one did.
+fn runner_of(marker: &str) -> Option<String> {
+    for pid in pids_with(marker) {
+        let mut at = pid;
+        while let Some(parent) = parent_of(&at).filter(|p| p != "0" && p != "1") {
+            let cmdline = std::fs::read(format!("/proc/{parent}/cmdline")).unwrap_or_default();
+            let args: Vec<&[u8]> = cmdline.split(|b| *b == 0).collect();
+            if args.get(1) == Some(&b"runner".as_slice()) {
+                return Some(parent);
+            }
+            at = parent;
+        }
+    }
+    None
+}
+
+/// Acts, from outside the sandbox, for exec commands that ask: a command
+/// writes `<log>.ask`, `<log>` being one of `logs` and in its own command
+/// line, and this finds the `atomic runner` that started it, calls `act` on
+/// it and writes `<log>.done`. A confined command cannot reach its runner
+/// itself. Stops when dropped.
+struct RunnerWatch {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl RunnerWatch {
+    fn new(logs: Vec<PathBuf>, act: impl Fn(&str) + Send + 'static) -> Self {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopping = stop.clone();
+        let thread = std::thread::spawn(move || {
+            while !stopping.load(std::sync::atomic::Ordering::SeqCst) {
+                for log in &logs {
+                    let ask = log.with_extension("ask");
+                    if !ask.exists() {
+                        continue;
+                    }
+                    if let Some(runner) = runner_of(&log.display().to_string()) {
+                        let _ = std::fs::remove_file(&ask);
+                        act(&runner);
+                        std::fs::write(log.with_extension("done"), "").expect("done");
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        Self {
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    /// Kill the asking command's runner.
+    fn killing(logs: Vec<PathBuf>) -> Self {
+        Self::new(logs, |runner| {
+            let _ = Command::new("/bin/sh")
+                .args(["-c", &format!("kill -KILL {runner}")])
+                .status();
+        })
+    }
+}
+
+impl Drop for RunnerWatch {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 /// `atomic`, from the executable at `program`, with a throwaway home and
@@ -325,6 +460,19 @@ fn state_dir(dir: &Path, project: &Path) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(&out.stdout).trim())
 }
 
+/// The database of the project whose state directory is `state`
+/// (`<home>/projects/<id>`): `<home>/private/<id>/atomic.db`.
+fn database(state: &Path) -> PathBuf {
+    let id = state.file_name().expect("a project id");
+    state
+        .parent()
+        .and_then(Path::parent)
+        .expect("the atomic home")
+        .join("private")
+        .join(id)
+        .join("atomic.db")
+}
+
 fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
     let started = Instant::now();
     while !done() {
@@ -403,8 +551,12 @@ fn wait_child(child: &mut Child, what: &str) -> std::process::ExitStatus {
     }
 }
 
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn a_name_a_path_and_the_project_flag_run_the_same_atom_on_the_same_input() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
     let dir = scratch("same");
     let project = project(&dir);
     let elsewhere = dir.join("elsewhere");
@@ -481,8 +633,12 @@ fn a_name_a_path_and_the_project_flag_run_the_same_atom_on_the_same_input() {
     );
 }
 
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn a_workflow_runs_by_name_and_by_file() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
     let dir = scratch("workflow");
     let project = project(&dir);
     let file = project.join("workflows/count-only.workflow.yaml");
@@ -584,8 +740,12 @@ fn errors_say_what_to_do_and_json_carries_the_action_apart() {
     assert!(count_log(&dir).is_empty());
 }
 
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn a_run_killed_after_a_step_resumes_by_its_id_and_reruns_nothing_finished() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
     on_codex_runtime(async {
         let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
             .await
@@ -636,8 +796,12 @@ fn a_run_killed_after_a_step_resumes_by_its_id_and_reruns_nothing_finished() {
     });
 }
 
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn a_run_stopped_mid_call_charges_the_call_only_the_time_it_ran() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
     on_codex_runtime(async {
         // Rank's call never answers before the run is stopped.
         let model = FakeModel::start(vec![Reply::Delayed {
@@ -663,9 +827,7 @@ fn a_run_stopped_mid_call_charges_the_call_only_the_time_it_ran() {
         assert!(!status.success(), "stopped short of its result");
         // Its call is settled as interrupted: the tokens stay at the bound,
         // the time is what it ran, not the 10 minutes it reserved.
-        let rt = Durare::sqlite(&state.join("private/atomic.db"))
-            .await
-            .expect("store");
+        let rt = Durare::sqlite(&database(&state)).await.expect("store");
         let attempts = rt.ledger().attempts("stopped-1").await.expect("attempts");
         assert_eq!(attempts.len(), 1, "{attempts:?}");
         let call = &attempts[0];
@@ -678,8 +840,12 @@ fn a_run_stopped_mid_call_charges_the_call_only_the_time_it_ran() {
     });
 }
 
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn a_resumed_run_keeps_the_budget_it_already_spent() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
     on_codex_runtime(async {
         let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
             .await
@@ -720,9 +886,7 @@ fn a_resumed_run_keeps_the_budget_it_already_spent() {
             &with(&env, &[]),
             &dir.join("resumed.log"),
         );
-        let rt = Durare::sqlite(&state.join("private/atomic.db"))
-            .await
-            .expect("store");
+        let rt = Durare::sqlite(&database(&state)).await.expect("store");
         let started = Instant::now();
         let park = loop {
             if let Some(p) = atomic_durable::parks(&rt, "budget-1")
@@ -748,8 +912,12 @@ fn a_resumed_run_keeps_the_budget_it_already_spent() {
     });
 }
 
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn an_unresolved_effect_stays_parked_across_resumes() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
     let dir = scratch("parked-effect");
     let project = project(&dir);
     // Killed after its command ran and before its step's checkpoint.
@@ -785,8 +953,12 @@ fn an_unresolved_effect_stays_parked_across_resumes() {
     }
 }
 
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn a_run_killed_at_a_gate_keeps_it_and_its_deadline_and_one_resume_runs_at_a_time() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
     on_codex_runtime(async {
         let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
             .await
@@ -802,9 +974,7 @@ fn a_run_killed_at_a_gate_keeps_it_and_its_deadline_and_one_resume_runs_at_a_tim
             &with(&env, &[]),
             &dir.join("first.log"),
         );
-        let rt = Durare::sqlite(&state.join("private/atomic.db"))
-            .await
-            .expect("store");
+        let rt = Durare::sqlite(&database(&state)).await.expect("store");
         let opened = open_gate(&rt, "gated-1").await;
         assert!(opened.deadline.is_some());
         first.kill().expect("SIGKILL the run");
@@ -903,9 +1073,7 @@ async fn decided_while_down(
         &with(env, &[]),
         &dir.join(format!("{id}.log")),
     );
-    let rt = Durare::sqlite(&state.join("private/atomic.db"))
-        .await
-        .expect("store");
+    let rt = Durare::sqlite(&database(state)).await.expect("store");
     open_gate(&rt, id).await;
     run.kill().expect("SIGKILL the run");
     run.wait().expect("reap");
@@ -915,12 +1083,10 @@ async fn decided_while_down(
 /// Approve run `id`'s gate from a decider that stops after recording its
 /// decision and before waking the run.
 async fn decide_without_waking(state: &Path, id: &str) {
-    let rt = Durare::sqlite(&state.join("private/atomic.db"))
-        .await
-        .expect("store");
+    let rt = Durare::sqlite(&database(state)).await.expect("store");
     let decider = Command::new(std::env::current_exe().expect("this test binary"))
         .args(["--exact", "decider_child", "--ignored", "--nocapture"])
-        .env(DECIDER_STORE, state.join("private/atomic.db"))
+        .env(DECIDER_STORE, database(state))
         .env(DECIDER_RUN, id)
         .env("ATOMIC_FAILPOINT", "gate:before-wake")
         .stdout(Stdio::null())
@@ -952,8 +1118,12 @@ async fn open_gate_id(rt: &Durare, run: &str) -> String {
     .id
 }
 
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn a_gate_decided_while_its_run_was_down_wakes_it_on_resume() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
     on_codex_runtime(async {
         let model = FakeModel::start(vec![
             Reply::Text(RANK.into()),
@@ -1001,9 +1171,7 @@ fn a_gate_decided_while_its_run_was_down_wakes_it_on_resume() {
             &dir.join("decided-3.log"),
         );
         {
-            let rt = Durare::sqlite(&state.join("private/atomic.db"))
-                .await
-                .expect("store");
+            let rt = Durare::sqlite(&database(&state)).await.expect("store");
             open_gate(&rt, "decided-3").await;
         }
         third.kill().expect("SIGKILL the run");
@@ -1015,9 +1183,7 @@ fn a_gate_decided_while_its_run_was_down_wakes_it_on_resume() {
             &with(&env, &[]),
             &dir.join("serve.log"),
         );
-        let rt = Durare::sqlite(&state.join("private/atomic.db"))
-            .await
-            .expect("store");
+        let rt = Durare::sqlite(&database(&state)).await.expect("store");
         let started = Instant::now();
         while rt.status("decided-2").await.expect("status") != Some(RunStatus::Succeeded) {
             assert!(
@@ -1051,8 +1217,12 @@ fn a_gate_decided_while_its_run_was_down_wakes_it_on_resume() {
     });
 }
 
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn serve_started_after_a_kill_recovers_the_run_and_finishes_it() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
     on_codex_runtime(async {
         let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
             .await
@@ -1086,9 +1256,7 @@ fn serve_started_after_a_kill_recovers_the_run_and_finishes_it() {
             &with(&env, &[]),
             &dir.join("serve.log"),
         );
-        let rt = Durare::sqlite(&state.join("private/atomic.db"))
-            .await
-            .expect("store");
+        let rt = Durare::sqlite(&database(&state)).await.expect("store");
         let started = Instant::now();
         while rt.status("served-1").await.expect("status") != Some(RunStatus::Succeeded) {
             assert!(
@@ -1158,8 +1326,12 @@ fn killed_after_rank(dir: &Path, project: &Path, env: &[(&'static str, String)],
     );
 }
 
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn a_run_started_by_one_build_resumes_and_recovers_under_another() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
     on_codex_runtime(async {
         let model = FakeModel::start(vec![
             Reply::Text(RANK.into()),
@@ -1213,9 +1385,7 @@ fn a_run_started_by_one_build_resumes_and_recovers_under_another() {
             &with(&env, &[]),
             &dir.join("serve.log"),
         );
-        let rt = Durare::sqlite(&state.join("private/atomic.db"))
-            .await
-            .expect("store");
+        let rt = Durare::sqlite(&database(&state)).await.expect("store");
         let started = Instant::now();
         while rt.status("built-2").await.expect("status") != Some(RunStatus::Succeeded) {
             assert!(
@@ -1235,8 +1405,12 @@ fn a_run_started_by_one_build_resumes_and_recovers_under_another() {
     });
 }
 
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn a_run_of_another_durable_layout_is_reported_not_resumed() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
     on_codex_runtime(async {
         let model = FakeModel::start(vec![Reply::Text(RANK.into())])
             .await
@@ -1250,12 +1424,9 @@ fn a_run_of_another_durable_layout_is_reported_not_resumed() {
             .await
             .expect("child");
         // As if an atomic of an earlier layout had started it.
-        let db = sqlx::SqlitePool::connect(&format!(
-            "sqlite://{}",
-            state.join("private/atomic.db").display()
-        ))
-        .await
-        .expect("store");
+        let db = sqlx::SqlitePool::connect(&format!("sqlite://{}", database(&state).display()))
+            .await
+            .expect("store");
         sqlx::query(
             "UPDATE workflow_status SET application_version = 'atomic.pipeline.0' \
              WHERE workflow_uuid = 'old-1'",
@@ -1312,8 +1483,12 @@ fn a_run_of_another_durable_layout_is_reported_not_resumed() {
     });
 }
 
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn a_resumed_run_left_queued_is_taken_by_no_other_command() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
     on_codex_runtime(async {
         let model = FakeModel::start(vec![
             Reply::Text(RANK.into()),
@@ -1364,9 +1539,7 @@ fn a_resumed_run_left_queued_is_taken_by_no_other_command() {
         .await
         .expect("child");
         assert!(out.status.success(), "{}", text(&out));
-        let rt = Durare::sqlite(&state.join("private/atomic.db"))
-            .await
-            .expect("store");
+        let rt = Durare::sqlite(&database(&state)).await.expect("store");
         assert_eq!(
             rt.status("left-1").await.expect("status"),
             Some(RunStatus::Pending)
@@ -1418,8 +1591,12 @@ fn a_resumed_run_left_queued_is_taken_by_no_other_command() {
     });
 }
 
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn a_run_id_that_already_exists_is_refused() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
     on_codex_runtime(async {
         let model = FakeModel::start(vec![Reply::Text(RANK.into())])
             .await
@@ -1492,8 +1669,12 @@ fn a_run_id_that_already_exists_is_refused() {
     });
 }
 
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn a_cancelled_run_is_not_resumed_and_a_parked_one_is() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
     on_codex_runtime(async {
         let model = FakeModel::start(vec![
             Reply::Text(RANK.into()),
@@ -1506,7 +1687,7 @@ fn a_cancelled_run_is_not_resumed_and_a_parked_one_is() {
         let project = project(&dir);
         let state = state_dir(&dir, &project);
         let env = model_env(&model.base_url());
-        let db_url = format!("sqlite://{}", state.join("private/atomic.db").display());
+        let db_url = format!("sqlite://{}", database(&state).display());
         for (id, status) in [
             ("cancelled-1", "CANCELLED"),
             ("parked-1", "MAX_RECOVERY_ATTEMPTS_EXCEEDED"),
@@ -1557,8 +1738,432 @@ fn a_cancelled_run_is_not_resumed_and_a_parked_one_is() {
     });
 }
 
+/// `atomic run` confines an exec atom's command: through the engine as it
+/// is wired, the command cannot read the project's database or the
+/// credential store, write a gate decision, or open a socket, and can still
+/// read the project.
+#[cfg(target_os = "linux")]
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[test]
+fn atomic_run_confines_an_exec_atoms_command() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
+    let dir = scratch("confined");
+    let project = project(&dir);
+    let state = state_dir(&dir, &project);
+    let db = database(&state);
+    let credentials = dir.join("atomic-home/credentials");
+    std::fs::create_dir_all(&credentials).expect("credentials");
+    let credential = credentials.join("local-dev");
+    std::fs::write(&credential, "the operator's secret").expect("credential");
+    std::fs::write(
+        project.join("tools/probe.py"),
+        "import json, os, socket, sqlite3, sys\n\
+         json.load(sys.stdin)\n\
+         def attempt(f):\n    try:\n        f()\n        return 'ok'\n    except Exception as e:\n        return type(e).__name__ + ': ' + str(e)\n\
+         def read(p):\n    return lambda: open(p, 'rb').read(1)\n\
+         def gate():\n    c = sqlite3.connect(os.environ['DB'])\n    c.execute(\"INSERT INTO atomic_gate_commands VALUES ('f', 'g', '{}', '{}', 0)\")\n    c.commit()\n\
+         def tcp():\n    socket.create_connection(('127.0.0.1', 9), timeout=5)\n\
+         json.dump({'db': attempt(read(os.environ['DB'])), 'gate': attempt(gate), \
+         'credential': attempt(read(os.environ['CREDENTIAL'])), 'tcp': attempt(tcp), \
+         'project': attempt(read('atomic.yaml'))}, sys.stdout)\n",
+    )
+    .expect("script");
+    let field = json!({"type": "string"});
+    write_atom(
+        &project,
+        "probe-private",
+        &format!(
+            "description: 'Probe.', kind: 'exec', exec: {{ command: ['python3', 'tools/probe.py'] }}, \
+             env: {{ DB: '{}', CREDENTIAL: '{}' }}",
+            db.display(),
+            credential.display()
+        ),
+        "",
+        object(json!({})),
+        object(
+            json!({"db": field, "gate": field, "credential": field, "tcp": field, "project": field}),
+        ),
+    );
+    let denied = |p: &Path| {
+        format!(
+            "PermissionError: [Errno 13] Permission denied: '{}'",
+            p.display()
+        )
+    };
+    // As the engine wires it, on this process's backend and through a
+    // runner process.
+    for runner in ["local", "process"] {
+        let out = atomic(
+            &dir,
+            &project,
+            &["run", "probe-private", "--runner", runner, "--data", "{}"],
+            &[],
+            "",
+        );
+        assert!(out.status.success(), "{runner}: {}", text(&out));
+        assert_eq!(
+            stdout_json(&out),
+            json!({
+                "db": denied(&db),
+                "gate": "OperationalError: unable to open database file",
+                "credential": denied(&credential),
+                "tcp": "PermissionError: [Errno 1] Operation not permitted",
+                "project": "ok",
+            }),
+            "{runner}"
+        );
+    }
+}
+
+/// An exec atom's confined command has no controlling terminal, even when
+/// atomic has one: it cannot open `/dev/tty`, so it cannot type into
+/// atomic's terminal (TIOCSTI) or answer a prompt there. Nor can it reach
+/// that terminal by its path in `/dev/pts`, or through another process's
+/// descriptors in `/proc`, to draw on the screen: its `/dev` and `/proc` are
+/// its own. atomic runs here on a pseudo-terminal of its own, which a
+/// command run directly there opens, by `/dev/tty` and by its path.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[cfg(target_os = "linux")]
+#[test]
+fn a_confined_command_has_no_controlling_terminal() {
+    support::require_sandbox();
+    let dir = scratch("tty");
+    let project = project(&dir);
+    std::fs::write(
+        project.join("tools/tty.py"),
+        format!(
+            "import fcntl, json, os, sys, termios\n\
+             json.load(sys.stdin)\n\
+             def attempt(f):\n    try:\n        f()\n        return 'ok'\n    except Exception as e:\n        return type(e).__name__ + ': ' + str(e)\n\
+             def tty():\n    os.close(os.open('/dev/tty', os.O_RDWR))\n\
+             def sti():\n    fd = os.open('/dev/tty', os.O_RDWR)\n    fcntl.ioctl(fd, termios.TIOCSTI, b'x')\n\
+             def by_path():\n    os.close(os.open(open('{pty}').read().strip(), os.O_WRONLY))\n\
+             def through_proc():\n\
+             \x20   for pid in os.listdir('/proc'):\n\
+             \x20       if not pid.isdigit(): continue\n\
+             \x20       try: fds = os.listdir(f'/proc/{{pid}}/fd')\n\
+             \x20       except OSError: continue\n\
+             \x20       for fd in fds:\n\
+             \x20           try: target = os.readlink(f'/proc/{{pid}}/fd/{{fd}}')\n\
+             \x20           except OSError: continue\n\
+             \x20           if target.startswith('/dev/pts/'):\n\
+             \x20               os.close(os.open(f'/proc/{{pid}}/fd/{{fd}}', os.O_WRONLY))\n\
+             \x20               return\n\
+             \x20   raise OSError('no terminal among the processes it sees')\n\
+             json.dump({{'tty': attempt(tty), 'sti': attempt(sti), 'by_path': attempt(by_path), \
+             'through_proc': attempt(through_proc)}}, sys.stdout)\n",
+            pty = dir.join("pty-path").display()
+        ),
+    )
+    .expect("script");
+    let field = json!({"type": "string"});
+    write_atom(
+        &project,
+        "tty-probe",
+        "description: 'Probe the terminal.', kind: 'exec', exec: { command: ['python3', 'tools/tty.py'] }",
+        "",
+        object(json!({})),
+        object(json!({"tty": field, "sti": field, "by_path": field, "through_proc": field})),
+    );
+    // `pty.spawn` runs its arguments with a new pseudo-terminal as their
+    // controlling terminal; `tty` first writes that terminal's path where
+    // the probe reads it.
+    let record = format!(
+        "tty > '{}' && exec \"$0\" \"$@\"",
+        dir.join("pty-path").display()
+    );
+    let run = |program: &str, args: &[&str]| -> String {
+        let out = command_as(Path::new("/usr/bin/env"), &dir, &project, &[], &[])
+            .args(["python3", "-c", "import pty, sys; pty.spawn(sys.argv[1:])"])
+            .args(["sh", "-c", record.as_str(), program])
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run on a pseudo-terminal");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    // Directly on the terminal, the same checks open it.
+    let direct = run(
+        "python3",
+        &[
+            "-c",
+            "import os; os.close(os.open('/dev/tty', os.O_RDWR)); \
+             os.close(os.open(os.ttyname(0), os.O_WRONLY)); print('opened')",
+        ],
+    );
+    assert!(
+        direct.contains("opened"),
+        "the test has a terminal: {direct}"
+    );
+    for runner in ["local", "process"] {
+        let out = run(
+            ATOMIC,
+            &["run", "tty-probe", "--runner", runner, "--data", "{}"],
+        );
+        let json = out
+            .find('{')
+            .and_then(|start| out[start..].rfind('}').map(|end| &out[start..=start + end]))
+            .unwrap_or_else(|| panic!("{runner}: no result in {out}"));
+        let result: Value = serde_json::from_str(json).unwrap_or_else(|e| panic!("{e}: {out}"));
+        // Each fails, as OSError or one of its kinds.
+        for probe in ["tty", "sti", "by_path", "through_proc"] {
+            assert!(
+                result[probe]
+                    .as_str()
+                    .is_some_and(|r| r != "ok" && r.contains("Error")),
+                "{runner}: {probe}: {result}"
+            );
+        }
+    }
+}
+
+/// A `bwrap` in front of the real one, in `dir/bwrap-bin`: while
+/// `dir/bwrap-full` exists it fails as bubblewrap does on a full disk, and
+/// while `dir/bwrap-refuse` exists as it does where user namespaces are not
+/// allowed. Returns the `PATH` to run atomic with.
+fn bwrap_in_front(dir: &Path) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let path = std::env::var("PATH").unwrap_or_default();
+    let real = path
+        .split(':')
+        .map(|d| Path::new(d).join("bwrap"))
+        .find(|p| p.is_file())
+        .expect("bubblewrap on PATH");
+    let bin = dir.join("bwrap-bin");
+    std::fs::create_dir_all(&bin).expect("bin");
+    let script = format!(
+        "#!/bin/sh\n\
+         if [ \"$1\" != --help ]; then\n\
+         \x20 if [ -e '{full}' ]; then\n\
+         \x20   echo 'bwrap: Cannot make directory /tmp/x: No space left on device' >&2; exit 1\n\
+         \x20 fi\n\
+         \x20 if [ -e '{refuse}' ]; then\n\
+         \x20   echo 'bwrap: No permissions to create a new namespace, likely because the kernel \
+         does not allow non-privileged user namespaces.' >&2; exit 1\n\
+         \x20 fi\n\
+         fi\n\
+         exec '{real}' \"$@\"\n",
+        full = dir.join("bwrap-full").display(),
+        refuse = dir.join("bwrap-refuse").display(),
+        real = real.display(),
+    );
+    let wrapper = bin.join("bwrap");
+    std::fs::write(&wrapper, script).expect("wrapper");
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    format!("{}:{path}", bin.display())
+}
+
+/// A project that ran before has its backend's temporary directory, so a
+/// full disk shows first in the sandbox's trial before the next run's first
+/// command: the run waits, records nothing, and finishes once there is room.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[test]
+fn a_sandbox_trial_failing_for_want_of_room_makes_the_run_wait_then_finish() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
+    let dir = scratch("sandbox-full");
+    let project = project(&dir);
+    let path = bwrap_in_front(&dir);
+    let env = [("PATH", path.as_str())];
+    let out = atomic(
+        &dir,
+        &project,
+        &["run", "count-only", "--data", NOTE],
+        &env,
+        "",
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(count_log(&dir).len(), 1);
+
+    let full = dir.join("bwrap-full");
+    std::fs::write(&full, "").expect("the disk fills");
+    let log = dir.join("full.log");
+    let mut run = spawn(
+        &dir,
+        &project,
+        &["run", "count-only", "--data", NOTE],
+        &env,
+        &log,
+    );
+    wait_until("the run to wait", || {
+        std::fs::read_to_string(&log)
+            .is_ok_and(|l| l.contains("is waiting for the execution backend"))
+    });
+    let waiting = std::fs::read_to_string(&log).expect("log");
+    assert!(waiting.contains("No space left on device"), "{waiting}");
+    assert!(!waiting.contains("cannot start here"), "{waiting}");
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(
+        run.try_wait().expect("wait").is_none(),
+        "it waits rather than stopping: {waiting}"
+    );
+    assert_eq!(count_log(&dir).len(), 1, "nothing ran meanwhile");
+
+    std::fs::remove_file(&full).expect("room again");
+    let status = wait_child(&mut run, "the waiting run");
+    let text = std::fs::read_to_string(&log).expect("log");
+    assert!(status.success(), "{text}");
+    assert!(text.contains("can open its workspace again"), "{text}");
+    assert_eq!(count_log(&dir).len(), 2, "its command ran once");
+}
+
+/// Under `atomic serve`, a run whose commands cannot be confined is set
+/// aside, unfinished and with nothing recorded, and serve goes on with the
+/// others and stops at once when asked; where the sandbox starts again the
+/// run resumes and finishes. `atomic run` stops with its exit code instead.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[test]
+fn serve_sets_aside_a_run_whose_commands_cannot_be_confined_and_serves_the_rest() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
+            .await
+            .expect("fake model");
+        let dir = scratch("serve-unconfinable");
+        let project = project(&dir);
+        write_two_steps(&project, &dir);
+        let state = state_dir(&dir, &project);
+        let path = bwrap_in_front(&dir);
+        let env = model_env(&model.base_url());
+        let with_path = with(&env, &[("PATH", path.as_str())]);
+        // A run at its gate, with no command left to run after it.
+        let mut gated = spawn(
+            &dir,
+            &project,
+            &["run", "gated", "--run-id", "gated-1", "--data", NOTE],
+            &with_path,
+            &dir.join("gated.log"),
+        );
+        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        let opened = open_gate(&rt, "gated-1").await;
+        gated.kill().expect("SIGKILL the run");
+        gated.wait().expect("reap");
+        // A run stopped after its first command, with a second to run.
+        let (d, p, e) = (dir.clone(), project.clone(), path.clone());
+        let out = tokio::task::spawn_blocking(move || {
+            atomic(
+                &d,
+                &p,
+                &["run", "two-steps", "--run-id", "two-1", "--data", NOTE],
+                &[
+                    ("PATH", e.as_str()),
+                    ("ATOMIC_FAILPOINT", "pipeline:after:first"),
+                ],
+                "",
+            )
+        })
+        .await
+        .expect("child");
+        assert!(!out.status.success(), "{}", text(&out));
+
+        // The sandbox cannot start now.
+        std::fs::write(dir.join("bwrap-refuse"), "").expect("refuse");
+        let (d, p, e) = (dir.clone(), project.clone(), path.clone());
+        let out = tokio::task::spawn_blocking(move || {
+            let mut env = UNUSED_MODEL.to_vec();
+            env.push(("PATH", e.as_str()));
+            atomic(&d, &p, &["runs", "resume", "two-1"], &env, "")
+        })
+        .await
+        .expect("child");
+        assert_eq!(
+            out.status.code(),
+            Some(atomic_app::workflows::UNCONFINABLE_EXIT),
+            "{}",
+            text(&out)
+        );
+        let log = dir.join("serve.log");
+        let mut serve = spawn(&dir, &project, &["serve"], &with_path, &log);
+        wait_until("serve to set the run aside", || {
+            std::fs::read_to_string(&log).is_ok_and(|l| l.contains("stays unfinished"))
+        });
+        approve(&rt, &opened).await;
+        let started = Instant::now();
+        while rt.status("gated-1").await.expect("status") != Some(RunStatus::Succeeded) {
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "serve never finished the other run: {}",
+                std::fs::read_to_string(&log).unwrap_or_default()
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(serve.try_wait().expect("wait").is_none(), "serve goes on");
+        assert_eq!(
+            rt.status("two-1").await.expect("status"),
+            Some(RunStatus::Pending),
+            "set aside, with nothing recorded"
+        );
+        let stopping = Instant::now();
+        terminate(&serve);
+        let status = tokio::task::spawn_blocking(move || wait_child(&mut serve, "serve"))
+            .await
+            .expect("child");
+        let text_log = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(status.success(), "{text_log}");
+        assert!(
+            stopping.elapsed() < Duration::from_secs(8),
+            "a set-aside run is not one a stop waits for: {text_log}"
+        );
+        assert_eq!(
+            steps_log(&dir),
+            ["first start", "first end"],
+            "second never ran"
+        );
+
+        // Where the sandbox starts, the run finishes, its second step once.
+        std::fs::remove_file(dir.join("bwrap-refuse")).expect("fixed");
+        let (d, p, e) = (dir.clone(), project.clone(), path.clone());
+        let out = tokio::task::spawn_blocking(move || {
+            let mut env = UNUSED_MODEL.to_vec();
+            env.push(("PATH", e.as_str()));
+            atomic(&d, &p, &["runs", "resume", "two-1"], &env, "")
+        })
+        .await
+        .expect("child");
+        assert!(out.status.success(), "{}", text(&out));
+        assert_eq!(steps_log(&dir), ["first start", "first end", "second"]);
+    });
+}
+
+/// State under /tmp would put atom commands' scratch directories where
+/// sandboxed turns may write, so atomic refuses to run there.
+#[test]
+fn state_under_the_temporary_directory_is_refused() {
+    let dir = scratch("tmp-state");
+    let project = project(&dir);
+    let home =
+        std::env::temp_dir().join(format!("atomic-run-cli-tmp-state-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    let home_text = home.to_string_lossy().into_owned();
+    let out = atomic(
+        &dir,
+        &project,
+        &["run", "count-note", "--data", NOTE],
+        &[("ATOMIC_HOME", &home_text)],
+        "",
+    );
+    let _ = std::fs::remove_dir_all(&home);
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(
+        text(&out).contains("where a sandboxed turn may write"),
+        "{}",
+        text(&out)
+    );
+    assert!(count_log(&dir).is_empty(), "nothing ran");
+}
+
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn exec_commands_run_in_a_runner_process_when_asked() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
     let dir = scratch("runner");
     let project = project(&dir);
     let local = atomic(
@@ -1579,33 +2184,50 @@ fn exec_commands_run_in_a_runner_process_when_asked() {
         assert!(out.status.success(), "{}", text(out));
     }
     assert_eq!(stdout_json(&local), stdout_json(&split));
-    let log = count_log(&dir);
-    assert_eq!(log.len(), 2);
-    assert!(log[0].contains(" run count-note"), "{}", log[0]);
-    assert!(
-        log[1].ends_with(" runner"),
-        "the runner started it: {}",
-        log[1]
-    );
+    assert_eq!(count_log(&dir).len(), 2);
 
-    // The runner process itself has only PATH from atomic's environment,
-    // which has HOME, USER and ATOMIC_HOME too.
+    // A runner process starts the command, and has only PATH from atomic's
+    // environment, which has HOME, USER and ATOMIC_HOME too. The command
+    // cannot see what started it, so it asks from here.
+    let log = command_log(&dir, "parent-env.log");
     std::fs::write(
         project.join("tools/parent-env.py"),
-        "import json, os, sys\n\
+        "import json, os, sys, time\n\
          json.load(sys.stdin)\n\
-         names = [e.split(b'=')[0].decode() for e in open(f'/proc/{os.getppid()}/environ', 'rb').read().split(b'\\0') if e]\n\
-         json.dump({'names': sorted(names)}, sys.stdout)\n",
+         log = sys.argv[1]\n\
+         open(log.removesuffix('.log') + '.ask', 'w').close()\n\
+         done = log.removesuffix('.log') + '.done'\n\
+         for _ in range(500):\n\
+         \x20   if os.path.exists(done): break\n\
+         \x20   time.sleep(0.02)\n\
+         json.dump({'seen': os.path.exists(done)}, sys.stdout)\n",
     )
     .expect("script");
     write_atom(
         &project,
         "parent-env",
-        "description: 'Name the parent environment.', kind: 'exec', exec: { command: ['python3', 'tools/parent-env.py'] }",
+        &format!(
+            "description: 'Ask for the runner.', kind: 'exec', exec: {{ command: ['python3', 'tools/parent-env.py', '{}'] }}",
+            log.display()
+        ),
         "",
         object(json!({"text": {"type": "string"}})),
-        object(json!({"names": {"type": "array", "items": {"type": "string"}}})),
+        object(json!({"seen": {"type": "boolean"}})),
     );
+    let names = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let seen = names.clone();
+    let watch = RunnerWatch::new(vec![log], move |runner| {
+        let environ = std::fs::read(format!("/proc/{runner}/environ")).expect("environ");
+        let mut found: Vec<String> = environ
+            .split(|b| *b == 0)
+            .filter(|e| !e.is_empty())
+            .map(|e| {
+                String::from_utf8_lossy(e.split(|b| *b == b'=').next().unwrap_or(e)).into_owned()
+            })
+            .collect();
+        found.sort();
+        *seen.lock().expect("names") = found;
+    });
     let out = atomic(
         &dir,
         &project,
@@ -1613,23 +2235,39 @@ fn exec_commands_run_in_a_runner_process_when_asked() {
         &[],
         "",
     );
+    drop(watch);
     assert!(out.status.success(), "{}", text(&out));
-    assert_eq!(stdout_json(&out), json!({"names": ["PATH"]}));
+    assert_eq!(
+        stdout_json(&out),
+        json!({"seen": true}),
+        "a runner started it"
+    );
+    assert_eq!(*names.lock().expect("names"), ["PATH"]);
 }
 
 /// An exec atom whose command logs that it ran, then, the first time or
-/// `always`, SIGKILLs the process that started it: with `--runner process`,
-/// its runner.
-fn write_runner_killer(project: &Path, dir: &Path, name: &str, effects: &str, always: bool) {
+/// `always`, has the process that started it, with `--runner process` its
+/// runner, SIGKILLed by a [`RunnerWatch::killing`] on its log, which this
+/// returns.
+fn write_runner_killer(
+    project: &Path,
+    dir: &Path,
+    name: &str,
+    effects: &str,
+    always: bool,
+) -> PathBuf {
+    let log = command_log(dir, &format!("{name}.log"));
     std::fs::write(
         project.join("tools/kill-runner.py"),
-        "import json, os, signal, sys\n\
+        "import json, os, sys, time\n\
          note = json.load(sys.stdin)\n\
-         log = os.environ['KILL_LOG']\n\
+         log = sys.argv[1]\n\
          open(log, 'a').write('ran\\n')\n\
          if os.environ.get('KILL_ALWAYS') or not os.path.exists(log + '.killed'):\n\
          \x20   open(log + '.killed', 'w').close()\n\
-         \x20   os.kill(os.getppid(), signal.SIGKILL)\n\
+         \x20   open(log.removesuffix('.log') + '.ask', 'w').close()\n\
+         \x20   time.sleep(30)\n\
+         \x20   sys.exit(1)\n\
          json.dump({'title': note['text'][:25], 'words': len(note['text'].split())}, sys.stdout)\n",
     )
     .expect("script");
@@ -1637,14 +2275,19 @@ fn write_runner_killer(project: &Path, dir: &Path, name: &str, effects: &str, al
         project,
         name,
         &format!(
-            "description: 'Kill the runner.', kind: 'exec', exec: {{ command: ['python3', 'tools/kill-runner.py'] }}, env: {{ KILL_LOG: '{}'{} }}{effects}",
-            dir.join(format!("{name}.log")).display(),
-            if always { ", KILL_ALWAYS: '1'" } else { "" }
+            "description: 'Kill the runner.', kind: 'exec', exec: {{ command: ['python3', 'tools/kill-runner.py', '{}'] }}{}{effects}",
+            log.display(),
+            if always {
+                ", env: { KILL_ALWAYS: '1' }"
+            } else {
+                ""
+            }
         ),
         "",
         object(json!({"text": {"type": "string"}})),
         object(json!({"title": {"type": "string"}, "words": {"type": "integer"}})),
     );
+    log
 }
 
 fn lines(file: &Path) -> usize {
@@ -1653,18 +2296,24 @@ fn lines(file: &Path) -> usize {
         .unwrap_or(0)
 }
 
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn a_command_that_kills_its_runner_is_never_run_again_unless_it_may_be() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
     let dir = scratch("runner-killed");
     let project = project(&dir);
-    write_runner_killer(&project, &dir, "undeclared", "", false);
-    write_runner_killer(
-        &project,
-        &dir,
-        "idempotent",
-        ", effects: { external: 'idempotent' }",
-        false,
-    );
+    let _watch = RunnerWatch::killing(vec![
+        write_runner_killer(&project, &dir, "undeclared", "", false),
+        write_runner_killer(
+            &project,
+            &dir,
+            "idempotent",
+            ", effects: { external: 'idempotent' }",
+            false,
+        ),
+    ]);
     // Undeclared: it may have done what it does, so it parks after one run.
     let out = atomic(
         &dir,
@@ -1713,16 +2362,19 @@ fn a_command_that_kills_its_runner_is_never_run_again_unless_it_may_be() {
 }
 
 /// An idempotent exec atom whose command starts a child that sleeps, logs
-/// `start <pid> <child pid>`, then waits a minute before it would answer.
+/// `start`, then waits a minute before it would answer. The command and its
+/// child have the log's path on their command lines, for [`slow_pids`].
 fn write_slow(project: &Path, dir: &Path) {
+    let log = command_log(dir, "slow.log");
     std::fs::write(
         project.join("tools/slow.py"),
         "import json, os, subprocess, sys, time\n\
          note = json.load(sys.stdin)\n\
-         child = subprocess.Popen(['sleep', '60'])\n\
-         open(os.environ['SLOW_LOG'], 'a').write(f'start {os.getpid()} {child.pid}\\n')\n\
+         log = sys.argv[1]\n\
+         child = subprocess.Popen(['python3', '-c', 'import time; time.sleep(60)', log])\n\
+         open(log, 'a').write('start\\n')\n\
          time.sleep(60)\n\
-         open(os.environ['SLOW_LOG'], 'a').write('end\\n')\n\
+         open(log, 'a').write('end\\n')\n\
          json.dump({'title': note['text'][:25], 'words': len(note['text'].split())}, sys.stdout)\n",
     )
     .expect("script");
@@ -1730,8 +2382,8 @@ fn write_slow(project: &Path, dir: &Path) {
         project,
         "slow",
         &format!(
-            "description: 'Take a minute.', kind: 'exec', exec: {{ command: ['python3', 'tools/slow.py'] }}, env: {{ SLOW_LOG: '{}' }}, effects: {{ external: 'idempotent' }}",
-            dir.join("slow.log").display()
+            "description: 'Take a minute.', kind: 'exec', exec: {{ command: ['python3', 'tools/slow.py', '{}'] }}, effects: {{ external: 'idempotent' }}",
+            log.display()
         ),
         "",
         object(json!({"text": {"type": "string"}})),
@@ -1744,16 +2396,20 @@ const UNUSED_MODEL: [(&str, &str); 2] = [
     ("ATOMIC_MODEL", "unused"),
 ];
 
-/// For each start of the slow command, its pid and its child's.
-fn slow_starts(dir: &Path) -> Vec<[String; 2]> {
+/// How many times the slow command has started.
+fn slow_starts(dir: &Path) -> usize {
     std::fs::read_to_string(dir.join("slow.log"))
         .unwrap_or_default()
         .lines()
-        .filter_map(|l| {
-            let (pid, child) = l.strip_prefix("start ")?.split_once(' ')?;
-            Some([pid.to_owned(), child.to_owned()])
-        })
-        .collect()
+        .filter(|l| *l == "start")
+        .count()
+}
+
+/// The processes of the slow command that run now, with everything that
+/// started it inside its sandbox, and its child.
+fn slow_pids(dir: &Path) -> Vec<String> {
+    let log = std::fs::read_link(dir.join("slow.log")).expect("the log link");
+    pids_with(&log.display().to_string())
 }
 
 /// Whether serve has said it stopped or failed.
@@ -1782,6 +2438,18 @@ fn alive(pid: &str) -> bool {
     reached && !(cfg!(target_os = "linux") && zombie())
 }
 
+/// Wait until no process with `marker` on its command line runs.
+fn all_gone_with(marker: &str, what: &str) {
+    let started = Instant::now();
+    while let Some(pid) = pids_with(marker).first() {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{what}: process {pid} survived"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// Wait until none of `pids` runs.
 fn all_gone(pids: &[String], what: &str) {
     let started = Instant::now();
@@ -1799,7 +2467,7 @@ fn lock_held(state: &Path) -> bool {
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open(state.join("private/runtime.lock"))
+        .open(database(state).with_file_name("runtime.lock"))
         .expect("the lock file");
     matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock))
 }
@@ -1815,8 +2483,8 @@ fn signal(child: &Child, signal: &str) {
 
 /// Start the slow atom as run `id` and SIGKILL `atomic run` while its
 /// command runs. Nothing can catch SIGKILL: on Linux the command's
-/// parent-death signal stops it, but not its child, which this kills.
-/// Returns the project's state.
+/// parent-death signal stops it, and the sandbox it runs in with it; this
+/// kills whatever is left. Returns the project's state.
 fn slow_run_killed_mid_command(dir: &Path, project: &Path, id: &str) -> PathBuf {
     write_slow(project, dir);
     let state = state_dir(dir, project);
@@ -1827,18 +2495,21 @@ fn slow_run_killed_mid_command(dir: &Path, project: &Path, id: &str) -> PathBuf 
         &[],
         &dir.join("run.log"),
     );
-    wait_until("the command to start", || slow_starts(dir).len() == 1);
+    wait_until("the command to start", || slow_starts(dir) == 1);
+    let pids = slow_pids(dir);
     run.kill().expect("SIGKILL atomic run");
     run.wait().expect("reap");
-    let [pid, child] = slow_starts(dir)[0].clone();
     if cfg!(target_os = "linux") {
         // Well before it would end by itself.
-        all_gone(std::slice::from_ref(&pid), "the command outlived atomic");
+        all_gone(&pids, "the command outlived atomic");
     }
-    let _ = Command::new("/bin/sh")
-        .args(["-c", &format!("kill -KILL {pid} {child} 2>/dev/null")])
-        .status();
-    all_gone(&[pid, child], "cleaning up");
+    let pids = slow_pids(dir);
+    if !pids.is_empty() {
+        let _ = Command::new("/bin/sh")
+            .args(["-c", &format!("kill -KILL {} 2>/dev/null", pids.join(" "))])
+            .status();
+    }
+    all_gone(&pids, "cleaning up");
     state
 }
 
@@ -1862,8 +2533,12 @@ fn stop_twice(child: &mut Child, sig: &str, log: &Path, code: i32) -> String {
     text
 }
 
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn serve_stopped_mid_command_holds_the_lock_until_it_exits_and_runs_nothing_twice() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
     let dir = scratch("serve-stop");
     let project = project(&dir);
     let state = slow_run_killed_mid_command(&dir, &project, "slow-1");
@@ -1876,15 +2551,15 @@ fn serve_stopped_mid_command_holds_the_lock_until_it_exits_and_runs_nothing_twic
         &dir.join("serve.log"),
     );
     wait_until("serve to start the command again", || {
-        slow_starts(&dir).len() == 2 || serve_ended(&dir)
+        slow_starts(&dir) == 2 || serve_ended(&dir)
     });
     assert_eq!(
-        slow_starts(&dir).len(),
+        slow_starts(&dir),
         2,
         "{}",
         std::fs::read_to_string(dir.join("serve.log")).unwrap_or_default()
     );
-    let pids = slow_starts(&dir)[1].clone();
+    let pids = slow_pids(&dir);
     terminate(&serve);
     // Until serve exits, the lock stays held and the command stays its own.
     let stopping = Instant::now();
@@ -1911,11 +2586,15 @@ fn serve_stopped_mid_command_holds_the_lock_until_it_exits_and_runs_nothing_twic
     assert!(!lock_held(&state), "the lock went with the process");
     let ends = std::fs::read_to_string(dir.join("slow.log")).expect("log");
     assert!(!ends.contains("end"), "no command ran to its end: {ends}");
-    assert_eq!(slow_starts(&dir).len(), 2, "started twice, never at once");
+    assert_eq!(slow_starts(&dir), 2, "started twice, never at once");
 }
 
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn a_second_signal_stops_serve_at_once_with_everything_its_command_started() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
     // With the command a child of serve, and in a runner process of its own.
     for runner in ["local", "process"] {
         let dir = scratch("serve-twice");
@@ -1930,28 +2609,22 @@ fn a_second_signal_stops_serve_at_once_with_everything_its_command_started() {
             &log,
         );
         wait_until("serve to start the command again", || {
-            slow_starts(&dir).len() == 2 || serve_ended(&dir)
+            slow_starts(&dir) == 2 || serve_ended(&dir)
         });
         assert_eq!(
-            slow_starts(&dir).len(),
+            slow_starts(&dir),
             2,
             "{runner}: {}",
             std::fs::read_to_string(&log).unwrap_or_default()
         );
-        let pids = slow_starts(&dir)[1].clone();
+        let pids = slow_pids(&dir);
         if runner == "process" && cfg!(target_os = "linux") {
-            // Field 4 of /proc/<pid>/stat: the parent.
-            let stat = std::fs::read_to_string(format!("/proc/{}/stat", pids[0])).expect("stat");
-            let parent = stat
-                .rsplit(')')
-                .next()
-                .unwrap_or("")
-                .split_whitespace()
-                .nth(1);
-            assert_ne!(
-                parent,
-                Some(serve.id().to_string().as_str()),
-                "a runner started it"
+            let log = std::fs::read_link(dir.join("slow.log")).expect("the log link");
+            let started_by = runner_of(&log.display().to_string()).expect("a runner started it");
+            assert_eq!(
+                parent_of(&started_by),
+                Some(serve.id().to_string()),
+                "serve's own runner"
             );
         }
         terminate(&serve);
@@ -1963,12 +2636,16 @@ fn a_second_signal_stops_serve_at_once_with_everything_its_command_started() {
         assert!(text.contains("stopped 1 command(s)"), "{runner}: {text}");
         all_gone(&pids, runner);
         assert!(!lock_held(&state));
-        assert_eq!(slow_starts(&dir).len(), 2);
+        assert_eq!(slow_starts(&dir), 2);
     }
 }
 
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn a_signal_stops_run_and_resume_with_everything_their_command_started() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
     // Each stop signal, run and resume, both runners, and both paths: a
     // second signal at once, or one signal and the ten seconds the running
     // step has to reach its checkpoint.
@@ -2007,8 +2684,8 @@ fn a_signal_stops_run_and_resume_with_everything_their_command_started() {
             );
             (child, 2)
         };
-        wait_until("the command to start", || slow_starts(&dir).len() == starts);
-        let pids = slow_starts(&dir)[starts - 1].clone();
+        wait_until("the command to start", || slow_starts(&dir) == starts);
+        let pids = slow_pids(&dir);
         let text = if twice {
             stop_twice(&mut child, sig, &log, 130)
         } else {
@@ -2065,19 +2742,23 @@ fn atomic_run_reading_its_input_stops_on_a_signal() {
     }
 }
 
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn a_run_that_keeps_stopping_is_dead_lettered_after_a_few_tries() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
     let dir = scratch("dead-letter");
     let project = project(&dir);
     // Idempotent, so each recovery may run it again, and its runner always
     // dies under it.
-    write_runner_killer(
+    let _watch = RunnerWatch::killing(vec![write_runner_killer(
         &project,
         &dir,
         "doomed",
         ", effects: { external: 'idempotent' }",
         true,
-    );
+    )]);
     let out = atomic(
         &dir,
         &project,
@@ -2103,7 +2784,7 @@ fn a_run_that_keeps_stopping_is_dead_lettered_after_a_few_tries() {
 /// A workflow of two undeclared exec steps: `first` logs `first start`,
 /// takes three seconds and logs `first end`; `second` logs `second`.
 fn write_two_steps(project: &Path, dir: &Path) {
-    let log = dir.join("steps.log");
+    let log = command_log(dir, "steps.log");
     for (name, body) in [
         (
             "first",
@@ -2154,8 +2835,12 @@ fn steps_log(dir: &Path) -> Vec<String> {
         .collect()
 }
 
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn no_step_starts_after_the_first_signal() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
     let dir = scratch("no-new-steps");
     let project = project(&dir);
     write_two_steps(&project, &dir);
@@ -2190,8 +2875,12 @@ fn no_step_starts_after_the_first_signal() {
     assert_eq!(steps_log(&dir), ["first start", "first end", "second"]);
 }
 
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn serve_restarts_do_not_park_a_healthy_run() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
     on_codex_runtime(async {
         let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
             .await
@@ -2207,9 +2896,7 @@ fn serve_restarts_do_not_park_a_healthy_run() {
             &with(&env, &[]),
             &dir.join("first.log"),
         );
-        let rt = Durare::sqlite(&state.join("private/atomic.db"))
-            .await
-            .expect("store");
+        let rt = Durare::sqlite(&database(&state)).await.expect("store");
         let opened = open_gate(&rt, "waiting-1").await;
         first.kill().expect("SIGKILL the run");
         first.wait().expect("reap");
@@ -2261,8 +2948,12 @@ fn serve_restarts_do_not_park_a_healthy_run() {
     });
 }
 
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn a_command_that_signals_its_own_group_does_not_kill_its_runner() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
     let dir = scratch("group-signal");
     let project = project(&dir);
     // The command shares its runner's process group, and sends the whole
@@ -2293,7 +2984,7 @@ fn a_command_that_signals_its_own_group_does_not_kill_its_runner() {
 /// A workflow of two exec steps: `mark`, and then `tally`, idempotent,
 /// which logs the run it ran for.
 fn write_tally(project: &Path, dir: &Path) {
-    let log = dir.join("tally.log");
+    let log = command_log(dir, "tally.log");
     for (name, body, effects) in [
         ("mark", "", ""),
         (
@@ -2336,8 +3027,12 @@ fn write_tally(project: &Path, dir: &Path) {
     .expect("workflow");
 }
 
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn serve_started_on_many_queued_runs_runs_each_once() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
     on_codex_runtime(async {
         let dir = scratch("many-queued");
         let project = project(&dir);
@@ -2374,9 +3069,7 @@ fn serve_started_on_many_queued_runs_runs_each_once() {
             &UNUSED_MODEL,
             &dir.join("serve.log"),
         );
-        let rt = Durare::sqlite(&state.join("private/atomic.db"))
-            .await
-            .expect("store");
+        let rt = Durare::sqlite(&database(&state)).await.expect("store");
         let started = Instant::now();
         for id in &ids {
             while rt.status(id).await.expect("status") != Some(RunStatus::Succeeded) {
@@ -2448,18 +3141,22 @@ fn signals_ignored_when_serve_starts_stay_ignored() {
     );
 }
 
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn a_leftover_holding_a_commands_output_does_not_hold_its_step_under_the_runner() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
     let dir = scratch("runner-leftover");
     let project = project(&dir);
-    let pid_file = dir.join("leftover.pid");
-    // The command leaves a child that keeps its stdout, in the runner's group.
+    // The command leaves a child that keeps its stdout, in the runner's
+    // group, and is found by the marker on its command line.
+    let marker = dir.join("leftover-marker").display().to_string();
     write_atom(
         &project,
         "leaves-a-child",
         &format!(
-            r#"description: 'Leave a child.', kind: 'exec', exec: {{ command: ['sh', '-c', "sleep 30 & echo $! > '{}'; cat > /dev/null; printf '{{\"title\": \"t\", \"words\": 1}}'"] }}"#,
-            pid_file.display()
+            r#"description: 'Leave a child.', kind: 'exec', exec: {{ command: ['sh', '-c', "python3 -c 'import time; time.sleep(30)' '{marker}' & cat > /dev/null; printf '{{\"title\": \"t\", \"words\": 1}}'"] }}"#
         ),
         "",
         object(json!({"text": {"type": "string"}})),
@@ -2486,15 +3183,15 @@ fn a_leftover_holding_a_commands_output_does_not_hold_its_step_under_the_runner(
         "the step waited {:?} for the child",
         started.elapsed()
     );
-    let pid = std::fs::read_to_string(&pid_file)
-        .expect("pid")
-        .trim()
-        .to_owned();
-    all_gone(&[pid], "the child went with its runner's group");
+    all_gone_with(&marker, "the child went with its runner's group");
 }
 
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn a_run_that_gets_further_each_time_is_not_dead_lettered() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
     let dir = scratch("progress");
     let project = project(&dir);
     // More steps than one process may recover a run at the same step, each
@@ -2505,14 +3202,15 @@ fn a_run_that_gets_further_each_time_is_not_dead_lettered() {
          input: { $ref: ../atoms/bump-0.input.schema.json }\n\
          output: { $ref: ../atoms/bump-0.output.schema.json }\nsteps:\n",
     );
+    let mut logs = Vec::new();
     for i in 0..n {
-        write_runner_killer(
+        logs.push(write_runner_killer(
             &project,
             &dir,
             &format!("bump-{i}"),
             ", effects: { external: 'idempotent' }",
             false,
-        );
+        ));
         let text = if i == 0 {
             "input.text".to_owned()
         } else {
@@ -2529,6 +3227,7 @@ fn a_run_that_gets_further_each_time_is_not_dead_lettered() {
     }
     workflow.push_str(&format!("returns: steps.s{}.output\n", n - 1));
     std::fs::write(project.join("workflows/bumpy.workflow.yaml"), workflow).expect("workflow");
+    let _watch = RunnerWatch::killing(logs);
     let out = atomic(
         &dir,
         &project,
@@ -2620,6 +3319,8 @@ fn the_executor_identity_is_atomics_own_and_required_for_a_shared_store() {
 /// Two processes on one PostgreSQL store, each with its own identity, each
 /// with a run waiting at a gate. One is killed; `atomic serve` restarted
 /// under its identity recovers its run and not the live one's.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[cfg(feature = "postgres-tests")]
 #[test]
 fn a_restarted_server_recovers_only_its_own_runs_on_postgres() {
@@ -2628,6 +3329,8 @@ fn a_restarted_server_recovers_only_its_own_runs_on_postgres() {
         // dropped after them.
         let guard = atomic_durable::testing::schema("cli").await;
         let (url, schema) = (guard.url().to_owned(), guard.name().to_owned());
+        #[cfg(target_os = "linux")]
+        support::require_sandbox();
         let model = FakeModel::start(vec![
             Reply::Text(RANK.into()),
             Reply::Text(RANK.into()),
@@ -2766,6 +3469,8 @@ fn executor_env(dir: &Path, url: &str, schema: &str, name: &str) -> Vec<(&'stati
 /// run another executor owns is refused unless the operator says that
 /// executor has stopped.
 #[cfg(feature = "postgres-tests")]
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn resuming_a_run_another_executor_owns_on_postgres_needs_its_owner_stopped() {
     on_codex_runtime(async move {
@@ -2773,6 +3478,8 @@ fn resuming_a_run_another_executor_owns_on_postgres_needs_its_owner_stopped() {
         // dropped after them.
         let guard = atomic_durable::testing::schema("owned").await;
         let (url, schema) = (guard.url().to_owned(), guard.name().to_owned());
+        #[cfg(target_os = "linux")]
+        support::require_sandbox();
         let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
             .await
             .expect("fake model");
@@ -2855,6 +3562,8 @@ fn resuming_a_run_another_executor_owns_on_postgres_needs_its_owner_stopped() {
 /// A run resumed by one executor goes on that executor's own queue: an
 /// unrelated `atomic run` on another executor never takes it.
 #[cfg(feature = "postgres-tests")]
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn a_resumed_run_is_taken_only_by_its_resumer_on_postgres() {
     on_codex_runtime(async move {
@@ -2862,6 +3571,8 @@ fn a_resumed_run_is_taken_only_by_its_resumer_on_postgres() {
         // dropped after them.
         let guard = atomic_durable::testing::schema("queue").await;
         let (url, schema) = (guard.url().to_owned(), guard.name().to_owned());
+        #[cfg(target_os = "linux")]
+        support::require_sandbox();
         let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
             .await
             .expect("fake model");
@@ -2921,6 +3632,8 @@ fn a_resumed_run_is_taken_only_by_its_resumer_on_postgres() {
 /// `atomic gates` on PostgreSQL: a second terminal enrolls, lists the gate
 /// a live run waits at, and approves it, all in the runs' own store.
 #[cfg(all(feature = "postgres-tests", target_os = "linux"))]
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn gates_are_listed_and_decided_in_the_postgres_store() {
     on_codex_runtime(async move {
@@ -2928,6 +3641,8 @@ fn gates_are_listed_and_decided_in_the_postgres_store() {
         // dropped after them.
         let guard = atomic_durable::testing::schema("gates_cli").await;
         let (url, schema) = (guard.url().to_owned(), guard.name().to_owned());
+        #[cfg(target_os = "linux")]
+        support::require_sandbox();
         let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
             .await
             .expect("fake model");

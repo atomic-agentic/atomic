@@ -60,17 +60,64 @@ has an executor identity (`ATOMIC_EXECUTOR_ID`). `atomic runner` and
 exit-code contract; Codex turns and their shell still run in the control
 plane's process, and a runner reached over the network is not built yet.
 
-On Linux, atomic has verified that an atom's sandbox cannot reach the gate store
-or the credential: the private part of the state directory, Codex's own records
-and the credential and key directories are denied to its commands, which also
-cannot use the kernel keyrings or connect to a socket. On macOS and Windows this
-has not been verified, so atomic keeps no operator credential there and refuses
-credentialed gate decisions.
+Every atom run goes through the execution backend: once its prompt is
+rendered, which runs the atom's helpers, it opens a workspace there before any
+model call or command, and closes it however the run ends, including a panic or
+a cancelled run, and only once a command running in it has ended. A backend
+with no room for a workspace makes the run wait, recording nothing and saying
+on stderr that it waits, and the run goes on once there is room. The local backend is the only one with a Codex shell, and
+it states that its workspaces are durable. A backend that states anything else,
+or a value atomic does not recognize, is treated as ephemeral, and a workflow
+with a `worktree: true` step is refused on it before anything runs.
 
-A `workspace-write` atom cannot write `/tmp`, `/var/tmp` or `$TMPDIR`: each turn
-gets a temporary directory of its own, named by `TMPDIR` and removed when the
-turn ends (a killed atomic's are removed at its next start). A tool that ignores
-`TMPDIR` and writes to `/tmp` directly, such as a JVM's default
+A command an atom runs, whether an exec atom's or one a model runs in a Codex
+turn, gets the platform's core variables and what the atom declares, never
+atomic's own environment or its credentials. A turn's commands run with no
+login shell; their `HOME` (and `ZDOTDIR`) is a private scratch directory of the
+attempt's own, and their `TMPDIR` is one private directory every turn of the
+project shares (Codex's sandbox keeps a registry there that turns sharing a
+writable root must share), so no shell startup file runs. Tools found through `HOME` are
+therefore not found: rustup, cargo, pyenv, nvm, Maven's `~/.m2` and the like.
+A codex or exec atom names them in its `env`, as in
+`env: { RUSTUP_HOME: '/home/me/.rustup', CARGO_HOME: '/home/me/.cargo' }`. An
+exec atom's command gets its own scratch directory as `HOME` and `TMPDIR`.
+Scratch directories live in the project's state directory, where no sandboxed
+turn may write; atomic refuses to run when that would be under `/tmp`,
+`$TMPDIR` or the project. A turn's shell always runs on the machine its backend
+names; `CODEX_EXEC_SERVER_URL` and an `environments.toml` in Codex's home have
+no effect.
+
+`atomic run` and `atomic serve` do not read public context settings yet, so they
+refuse a step whose atom declares a context.
+
+On Linux, atomic has verified that no atom's commands can reach the gate store
+or the credential: a Codex turn's commands and an exec atom's alike run under
+Codex's sandbox, which denies them the atomic home's `private/` directory, where
+every project keeps its database, its execution lock and its context
+checkpoints; the current project's
+Codex records; the credential and key directories; the default atomic home's
+data and configuration when `ATOMIC_HOME` points elsewhere; the kernel keyrings;
+the network; and sockets. Other projects' Codex records are not denied yet. An
+exec atom's command may write only its scratch directory and the project's
+caches; `--runner process` confines it the same way. It runs in a process
+namespace of its own, so it can neither see nor signal atomic, its runner or
+any other process outside, and in a session of its own, with no controlling
+terminal and a `/dev` and `/proc` of its own, so it cannot type into, read or
+draw on the terminal atomic runs in, whether through `/dev/tty`, the
+terminal's path in `/dev/pts` or another process's descriptors. A step that runs commands
+needs bubblewrap and unprivileged user namespaces there: where the sandbox
+cannot start, `atomic run` and `atomic runs resume` stop, saying what it needs,
+before the step runs and without recording an outcome, and the run continues
+when resumed where the sandbox can start. `atomic serve` instead leaves that run
+unfinished, says so, and goes on serving the others; the run continues when a
+later process recovers it. A sandbox that fails in a way that may pass, such as
+on a full disk, makes the step wait, as a backend with no room does. Atoms that run no commands run as usual. On macOS and
+Windows this has not been verified: exec atoms' commands run unconfined there,
+so atomic keeps no operator credential and refuses credentialed gate decisions.
+
+A `workspace-write` atom cannot write `/tmp`, `/var/tmp` or `$TMPDIR` as atomic
+found them: its commands' `TMPDIR` is the project's private one above. A tool
+that ignores `TMPDIR` and writes to `/tmp` directly, such as a JVM's default
 `java.io.tmpdir`, fails there; point it at `$TMPDIR` (for the JVM,
 `-Djava.io.tmpdir=$TMPDIR`).
 

@@ -87,6 +87,9 @@ pub struct LiteRuntime {
     pub artifacts: crate::runtime::Artifacts,
     /// What admits and settles each call (see [`crate::usage`]).
     pub meter: crate::usage::Metering,
+    /// The execution backend each run opens its workspace on. A lite atom's
+    /// workspace has no files and no shell.
+    pub backend: atomic_exec::Backend,
     /// The request field the endpoint reads a call's output limit from, or
     /// `None` to tell from the endpoint's URL ([`LimitField::for_endpoint`]).
     /// Set it for a gateway or a server the URL does not identify.
@@ -95,7 +98,7 @@ pub struct LiteRuntime {
 
 impl LiteRuntime {
     /// A runtime on `endpoint`, with the wire [`Wire::for_base_url`] picks,
-    /// the default timeout and no artifact store.
+    /// the default timeout, no artifact store and the local backend.
     pub fn new(endpoint: ModelEndpoint, defaults: AtomConfig) -> Self {
         Self {
             wire: Wire::for_base_url(&endpoint.base_url),
@@ -104,6 +107,7 @@ impl LiteRuntime {
             timeout: DEFAULT_TIMEOUT,
             artifacts: crate::runtime::Artifacts::none(),
             meter: crate::usage::Metering::none(),
+            backend: atomic_exec::Backend::default(),
             limit_field: None,
         }
     }
