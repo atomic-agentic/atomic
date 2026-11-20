@@ -239,10 +239,21 @@ async fn engine_with(dir: &Path, base_url: &str, budgets: BudgetSettings) -> Dur
 
 /// As [`engine_with`], with `model` as the default model.
 async fn engine_on(dir: &Path, base_url: &str, budgets: BudgetSettings, model: &str) -> Durare {
+    let store = LocalStore::open(dir.join("artifacts")).expect("artifact store");
+    engine_storing(dir, base_url, budgets, model, store).await
+}
+
+/// As [`engine_on`], storing artifacts in `store`.
+async fn engine_storing(
+    dir: &Path,
+    base_url: &str,
+    budgets: BudgetSettings,
+    model: &str,
+    store: LocalStore,
+) -> Durare {
     let mut rt = Durare::sqlite(&dir.join("atomic.db"))
         .await
         .expect("engine");
-    let store = LocalStore::open(dir.join("artifacts")).expect("artifact store");
     // A project in a git repository gets worktrees for its worktree steps.
     let project = dir.join("project");
     let (runtimes, worktrees) = if project.join(".git").exists() {
@@ -2990,5 +3001,135 @@ fn the_durable_layout_is_the_one_its_version_names() {
             atomic_app::pipeline::LAYOUT_VERSION,
             file.display()
         );
+    });
+}
+
+/// A store whose lock is held elsewhere stops the run for now: it is not
+/// failed or dead-lettered however many times it stops, records no pin, and
+/// is run again on its own until the store is free, when it finishes.
+#[test]
+fn a_store_held_elsewhere_interrupts_the_run_and_recovery_finishes_it() {
+    on_codex_runtime(async {
+        let dir = scratch("store-locked");
+        let project = project(&dir);
+        let model = FakeModel::start(vec![
+            Reply::Text(READ.into()),
+            Reply::Text(RANK.into()),
+            Reply::Text(SUMMARY.into()),
+        ])
+        .await
+        .expect("fake model");
+        let store = LocalStore::open(dir.join("artifacts"))
+            .expect("store")
+            .waiting_at_most(std::time::Duration::from_millis(100));
+        let holder = std::fs::File::options()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(dir.join("artifacts/lock"))
+            .expect("lock file");
+        holder.lock().expect("hold the lock");
+        let rt = engine_storing(
+            &dir,
+            &model.base_url(),
+            BudgetSettings::default(),
+            "synthetic",
+            store,
+        )
+        .await;
+        let run = PipelineRun {
+            pipeline: load(&project, "triage.workflow.yaml", TRIAGE),
+            input: json!({"text": "Exporting a file named café.txt crashes the app."}),
+        };
+        rt.start(PIPELINE, "locked", run).await.expect("start");
+        // Long enough for more executions than dead-lettering allows, each
+        // trying for the lock a few times.
+        tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+        assert_eq!(
+            rt.status("locked").await.expect("status"),
+            Some(RunStatus::Pending)
+        );
+        let steps: Vec<String> = rt
+            .steps("locked")
+            .await
+            .expect("steps")
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert!(!steps.iter().any(|s| s == "pin"), "{steps:?}");
+        assert_eq!(model.calls(), 0);
+        drop(holder);
+        let started = std::time::Instant::now();
+        while rt.status("locked").await.expect("status") != Some(RunStatus::Succeeded) {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(60),
+                "once the store was free, it did not finish: {:?}",
+                rt.status("locked").await
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        // Run again from the start: pinned once, and every step called once.
+        let pins = rt
+            .steps("locked")
+            .await
+            .expect("steps")
+            .into_iter()
+            .filter(|s| s.name == "pin")
+            .count();
+        assert_eq!(pins, 1);
+        assert_eq!(model.calls(), 3);
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+/// A store held only briefly is waited out: the run pins and finishes with
+/// no recovery.
+#[test]
+fn a_store_held_briefly_is_waited_out() {
+    on_codex_runtime(async {
+        let dir = scratch("store-busy");
+        let project = project(&dir);
+        let model = FakeModel::start(vec![
+            Reply::Text(READ.into()),
+            Reply::Text(RANK.into()),
+            Reply::Text(SUMMARY.into()),
+        ])
+        .await
+        .expect("fake model");
+        let store = LocalStore::open(dir.join("artifacts"))
+            .expect("store")
+            .waiting_at_most(std::time::Duration::from_millis(100));
+        let holder = std::fs::File::options()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(dir.join("artifacts/lock"))
+            .expect("lock file");
+        holder.lock().expect("hold the lock");
+        let rt = engine_storing(
+            &dir,
+            &model.base_url(),
+            BudgetSettings::default(),
+            "synthetic",
+            store,
+        )
+        .await;
+        let run = PipelineRun {
+            pipeline: load(&project, "triage.workflow.yaml", TRIAGE),
+            input: json!({"text": "Exporting a file named café.txt crashes the app."}),
+        };
+        rt.start(PIPELINE, "busy", run).await.expect("start");
+        // Longer than one wait for the lock, shorter than the tries.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        drop(holder);
+        let out: Value = rt.result("busy").await.expect("it ran");
+        assert_eq!(out, json!({"line": "P1: Export crashes on accents"}));
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
     });
 }

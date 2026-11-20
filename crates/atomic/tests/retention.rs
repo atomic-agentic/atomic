@@ -8,6 +8,9 @@
 //!   survives once. The gate store's pins keep content by themselves.
 //! - A run waiting at a gate keeps its pinned definitions and the artifact
 //!   its step recorded, with nothing passed in to keep.
+//! - A run keeps what its input, its steps' outputs and errors and its own
+//!   result name, whole or inside longer text; and every run is read, however
+//!   many there are.
 //! - Content written again is recent again, and survives a sweep's grace.
 //! - Two sweeps at once both succeed and remove each unkept blob once.
 //! - A write fails, within its deadline and saying why, while something
@@ -22,8 +25,8 @@ use atomic_durable::gate::{
     self, DecisionCommand, Deployment, GateSpec, HumanCredential, OnTimeout, Principal, Tier,
     Verdict,
 };
-use atomic_durable::{DurableRuntime, Durare, DurareContext, WorkflowContext};
-use serde_json::json;
+use atomic_durable::{DurableError, DurableRuntime, Durare, DurareContext, WorkflowContext};
+use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -129,6 +132,9 @@ fn register(rt: &mut Durare) {
             gate::gate(&ctx, "accept", spec(Vec::new())?).await
         },
     );
+    rt.register("names", |_ctx: DurareContext, named: String| async move {
+        Ok::<_, DurableError>(named)
+    });
 }
 
 async fn opened(rt: &Durare, run: &str) -> gate::Gate {
@@ -341,4 +347,110 @@ fn a_write_fails_in_time_while_something_holds_the_lock() {
     drop(holder);
     put(&store, b"once it is free");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_run_keeps_what_its_input_steps_and_result_name_however_written() {
+    on_codex_runtime(async {
+        let dir = scratch("named");
+        let store = LocalStore::open(dir.join("artifacts")).unwrap();
+        let [note, report, fails, result, gave_up, loose] = [
+            "named in the run's input",
+            "named in a step's markdown",
+            "named in a step's error",
+            "named in the run's result",
+            "named in another run's error",
+            "named nowhere",
+        ]
+        .map(|text| put(&store, text.as_bytes()));
+        let mut rt = Durare::sqlite(&dir.join("atomic.db")).await.unwrap();
+        // Only the note comes in with the input; the rest the run's steps and
+        // its own code name.
+        let names = (
+            report.to_string(),
+            format!("sha256:{}", fails.digest()),
+            result.to_string(),
+        );
+        rt.register("naming", move |ctx: DurareContext, _note: String| {
+            let (report, fails, result) = names.clone();
+            async move {
+                let _: Value = ctx
+                    .step("report", move |_| async move {
+                        Ok(json!({"body": format!("# Report\n\nThe diff is {report}.")}))
+                    })
+                    .await?;
+                // A step that fails, naming what it could not read; the run
+                // goes on.
+                let flaky: Result<Value, DurableError> = ctx
+                    .step("flaky", move |_| async move {
+                        Err(DurableError::Failed(format!("could not read {fails}")))
+                    })
+                    .await;
+                assert!(flaky.is_err());
+                // The run's own result, which no step returned.
+                Ok(json!({"summary": format!("done: {result}, in the notes")}))
+            }
+        });
+        // A run that fails, naming an artifact in its own error.
+        let why = format!("gave up on {gave_up}");
+        rt.register("giving-up", move |_ctx: DurareContext, (): ()| {
+            let why = why.clone();
+            async move { Err::<(), _>(DurableError::Failed(why)) }
+        });
+        rt.launch().await.unwrap();
+        rt.start("giving-up", "giving-up-run", ()).await.unwrap();
+        assert!(rt.result::<()>("giving-up-run").await.is_err());
+        rt.start(
+            "naming",
+            "naming-run",
+            format!("Notes: see sha256:{} and the rest.", note.digest()),
+        )
+        .await
+        .unwrap();
+        let _: Value = rt.result("naming-run").await.unwrap();
+        let swept = retention::sweep(&store, &rt, &BTreeSet::new(), Grace::none_for_tests())
+            .await
+            .unwrap();
+        assert_eq!(swept.removed, [loose]);
+        for (what, a) in [
+            ("input", &note),
+            ("step output", &report),
+            ("step error", &fails),
+            ("result", &result),
+            ("other run's error", &gave_up),
+        ] {
+            assert!(held(&store, a), "what the run's {what} names was swept");
+        }
+        rt.shutdown(Duration::from_secs(5)).await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+#[test]
+fn every_run_is_read_however_many_there_are() {
+    on_codex_runtime(async {
+        let dir = scratch("many");
+        let store = LocalStore::open(dir.join("artifacts")).unwrap();
+        let mut rt = Durare::sqlite(&dir.join("atomic.db")).await.unwrap();
+        register(&mut rt);
+        rt.launch().await.unwrap();
+        // More runs than a scan reads at once.
+        let mut named = Vec::new();
+        for i in 0..230 {
+            let a = put(&store, format!("result {i}").as_bytes());
+            let run = format!("names-{i:03}");
+            rt.start("names", &run, a.to_string()).await.unwrap();
+            named.push((run, a));
+        }
+        for (run, _) in &named {
+            let _: String = rt.result(run).await.unwrap();
+        }
+        let swept = retention::sweep(&store, &rt, &BTreeSet::new(), Grace::none_for_tests())
+            .await
+            .unwrap();
+        assert!(swept.removed.is_empty(), "{:?}", swept.removed);
+        assert_eq!(swept.kept, named.len());
+        rt.shutdown(Duration::from_secs(5)).await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    });
 }

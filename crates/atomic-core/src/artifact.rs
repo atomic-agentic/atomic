@@ -18,16 +18,23 @@
 //! ```
 //!
 //! Writes are atomic: content is streamed to a staging file while it is
-//! hashed, synced, then renamed into place, so a crash never leaves a blob
-//! under its digest that does not match it. Steps run at least once, and
-//! writing the same content again stores nothing new (it only marks the
-//! content as just written, for [`LocalStore::sweep`]).
+//! hashed, made read-only, synced, then renamed into place, so a crash never
+//! leaves a blob under its digest that does not match it, and no one changes
+//! a blob in place through a link to it. Steps run at least once, and writing
+//! the same content again stores nothing new: it marks the content as just
+//! written, for [`LocalStore::sweep`], and replaces a blob that no longer
+//! holds its content.
 //!
-//! Retention is a sweep over the store with a set of digests to keep:
-//! whatever the caller says is still referenced, such as the evidence gates
-//! pin (`atomic_app::retention`). Content written recently is kept too, so a
-//! step that has stored a result but not yet recorded a reference to it
-//! never loses it.
+//! A project's store takes its lock in the state directory's `private/`,
+//! which atoms' commands cannot open; writes share it, and a sweep holds it
+//! alone. Waiting for it is bounded: past [`LOCK_WAIT`], a write or a sweep
+//! fails with [`ArtifactError::Locked`], which is transient.
+//!
+//! Retention is a sweep over the store with a set of digests to keep, read
+//! at a given time: whatever the caller says is still referenced (for runs
+//! and gates, `atomic_app::retention` finds it). Content written within the
+//! grace period before that time is kept too, so a step that has stored a
+//! result but not yet recorded a reference to it never loses it.
 
 pub use atomic_schema::artifact::ArtifactRef;
 use serde::{Deserialize, Serialize};
@@ -142,12 +149,22 @@ fn io(path: &Path) -> impl FnOnce(std::io::Error) -> ArtifactError + '_ {
 }
 
 impl LocalStore {
-    /// A store rooted at `root`, creating its directories, with its lock
-    /// file in `root`: for a store no atom's sandbox can read, such as a
-    /// test's. A project's store is [`Self::for_project`].
+    /// A store rooted at `root`, creating its directories. A project's
+    /// store, `artifacts` in a state directory that has a `private/`, takes
+    /// the same lock as [`Self::for_project`]; any other store's lock file
+    /// is in `root`, for a store no atom's sandbox can read, such as a
+    /// test's.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, ArtifactError> {
         let root = root.into();
-        let lock = root.join("lock");
+        let lock = match root.parent() {
+            Some(state)
+                if root.file_name().is_some_and(|n| n == "artifacts")
+                    && state.join("private").is_dir() =>
+            {
+                state.join("private").join("artifacts.lock")
+            }
+            _ => root.join("lock"),
+        };
         Self::open_locked_at(root, lock)
     }
 
@@ -225,13 +242,17 @@ impl LocalStore {
 
 static STAGING_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Make `f` readable by everyone and writable by no one.
+/// Make `f` writable by no one, keeping who may read it.
 fn read_only(f: &std::fs::File) -> std::io::Result<()> {
     let mut permissions = f.metadata()?.permissions();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        permissions.set_mode(0o444);
+        let mode = permissions.mode();
+        if mode & 0o222 == 0 {
+            return Ok(());
+        }
+        permissions.set_mode(mode & !0o222);
     }
     #[cfg(not(unix))]
     permissions.set_readonly(true);
@@ -361,28 +382,34 @@ fn is_prefix(name: &str) -> bool {
 
 impl LocalStore {
     /// Remove every blob, and its manifests, that `keep` does not name and
-    /// that was last written longer than `grace` ago, and partial writes
-    /// left in staging as long. Entries in the blob tree that are not
-    /// content (a stray file, a prefix directory that is a link) are left
-    /// alone and reported in [`Swept::skipped`].
+    /// that was last written more than `grace` before `read_at`, the time the
+    /// caller began reading what to keep; and partial writes as old. Entries
+    /// in the blob tree that are not content (a stray file, a prefix
+    /// directory that is a link) are left alone and reported in
+    /// [`Swept::skipped`].
     ///
-    /// It holds the store's lock while it runs, so a write waits for it and
-    /// another sweep runs after it; content a write kept or added is then as
-    /// recent as that write. What it keeps is the caller's to say: a sweep
-    /// keeps nothing another caller needs unless that is in `keep` or recent.
+    /// Content written after the caller began reading is kept, however long
+    /// the reading and the wait for the lock took: a reference to it may have
+    /// been recorded after the caller read past it. It holds the store's
+    /// lock while it runs, so a write waits for it and another sweep runs
+    /// after it; content a write kept or added is then as recent as that
+    /// write. What it keeps is the caller's to say: a sweep keeps nothing
+    /// another caller needs unless that is in `keep` or recent.
     pub fn sweep(
         &self,
         keep: &BTreeSet<ArtifactRef>,
         grace: Grace,
+        read_at: std::time::SystemTime,
     ) -> Result<Swept, ArtifactError> {
         let _lock = StoreLock::take(&self.lock, true, self.lock_wait)?;
-        let grace = grace.0;
-        let now = std::time::SystemTime::now();
+        let cutoff = read_at
+            .checked_sub(grace.0)
+            .unwrap_or(std::time::UNIX_EPOCH);
         let old = |path: &Path| -> Result<bool, ArtifactError> {
             let written = std::fs::symlink_metadata(path)
                 .and_then(|m| m.modified())
                 .map_err(io(path))?;
-            Ok(now.duration_since(written).is_ok_and(|age| age > grace))
+            Ok(written < cutoff)
         };
         let mut swept = Swept::default();
         let blobs = self.root.join("blobs/sha256");
@@ -482,21 +509,34 @@ impl ArtifactStore for LocalStore {
         })?;
         let blob = self.blob_path(&artifact);
         let parent = blob.parent().map(Path::to_owned).unwrap_or_default();
-        if intact(&blob, &digest, size)? {
+        let whole = intact(&blob, &digest, size);
+        if whole.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        if whole? {
             // Already stored: identical content is kept once, and is now as
             // recent as this write, so a sweep's grace period covers it. The
             // blob is opened read-only (its owner may set its times). The
             // time is not synced: after a crash it may be older, and the
             // content is then only as safe as the caller's keep set.
             let _ = std::fs::remove_file(&tmp);
+            // A blob an older atomic left writable is made read-only too.
             std::fs::File::open(&blob)
-                .and_then(|f| f.set_modified(std::time::SystemTime::now()))
+                .and_then(|f| {
+                    f.set_modified(std::time::SystemTime::now())?;
+                    read_only(&f)
+                })
                 .map_err(io(&blob))?;
         } else {
             // New, or a blob that no longer holds its content: the content
             // just written takes its place.
-            std::fs::create_dir_all(&parent).map_err(io(&parent))?;
-            std::fs::rename(&tmp, &blob).map_err(io(&blob))?;
+            let placed = std::fs::create_dir_all(&parent)
+                .map_err(io(&parent))
+                .and_then(|()| std::fs::rename(&tmp, &blob).map_err(io(&blob)));
+            if placed.is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
+            placed?;
             sync_dir(&parent)?;
         }
 

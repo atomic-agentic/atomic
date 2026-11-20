@@ -164,6 +164,20 @@ pub struct RunRecord {
     pub queue: Option<String>,
 }
 
+/// A run with what it was given and what it returned or failed with, as
+/// [`Durare::runs_page`] reads it.
+#[derive(Clone, Debug)]
+pub struct RunContents {
+    /// The run.
+    pub record: RunRecord,
+    /// Its input, as stored.
+    pub input: Value,
+    /// What it returned, once it succeeded.
+    pub output: Option<Value>,
+    /// Its error, once it failed.
+    pub error: Option<String>,
+}
+
 /// What every resume queue's name starts with.
 pub const RESUME_QUEUES: &str = "atomic.resume.";
 
@@ -1079,14 +1093,28 @@ impl Durare {
         Ok(found.into_iter().map(RunRecord::from).collect())
     }
 
-    /// Every run in the store, finished or not, whoever owns it.
-    pub async fn every_run(&self) -> Result<Vec<RunRecord>> {
+    /// A page of the store's runs, finished or not, whoever owns them, oldest
+    /// first: at most `limit`, after the first `offset`, each with what it
+    /// was given and what it returned or failed with.
+    pub async fn runs_page(&self, offset: i64, limit: i64) -> Result<Vec<RunContents>> {
         let found = self
             .engine
-            .list_workflows(&durare::ListFilter::default())
+            .list_workflows(&durare::ListFilter {
+                offset: Some(offset),
+                limit: Some(limit),
+                ..durare::ListFilter::default()
+            })
             .await
             .map_err(from_durare)?;
-        Ok(found.into_iter().map(RunRecord::from).collect())
+        Ok(found
+            .into_iter()
+            .map(|w| RunContents {
+                input: w.input.clone(),
+                output: w.output.clone(),
+                error: w.error.clone(),
+                record: RunRecord::from(w),
+            })
+            .collect())
     }
 
     /// Every unfinished run in the store, whoever owns it and whatever its

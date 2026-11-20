@@ -51,7 +51,7 @@
 
 use crate::metering::{BudgetPlan, RunBudget};
 use crate::workflows::{atom_failure, propose};
-use atomic_core::artifact::{ArtifactStore, LocalStore, Provenance};
+use atomic_core::artifact::{ArtifactError, ArtifactStore, LocalStore, Provenance};
 use atomic_core::astro::StepClock;
 use atomic_core::atom::Atom;
 use atomic_core::budget::{Budget, BudgetSettings};
@@ -145,6 +145,18 @@ fn reached(id: &str, position: usize) -> Result<()> {
         return Err(failed(why));
     }
     Ok(())
+}
+
+/// Take back the count [`reached`] made for this execution of run `id` at
+/// `position`: it stopped there for a reason outside the run, such as a
+/// store held elsewhere, and must not bring the run nearer dead-lettering.
+fn not_reached(id: &str, position: usize) {
+    let mut progress = PROGRESS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((top, entries)) = progress.get_mut(id)
+        && *top == position
+    {
+        *entries = entries.saturating_sub(1);
+    }
 }
 
 /// Set once this process is stopping: no run starts another step.
@@ -502,6 +514,33 @@ fn failed(message: String) -> DurableError {
     DurableError::Failed(message)
 }
 
+/// How many more times a write tries for a store whose lock another holder
+/// keeps, waiting twice as long before each.
+const LOCKED_RETRIES: u32 = 3;
+const LOCKED_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Put `content` in `store`, trying again with backoff, up to a bound, while
+/// the store's lock is held elsewhere. Each try waits for the lock as long
+/// as the store does.
+fn put_waiting_out_the_lock(
+    store: &LocalStore,
+    content: &[u8],
+    provenance: Provenance,
+) -> std::result::Result<atomic_core::artifact::Manifest, ArtifactError> {
+    let mut backoff = LOCKED_BACKOFF;
+    let mut retries = 0;
+    loop {
+        match store.put(&mut &content[..], provenance.clone()) {
+            Err(ArtifactError::Locked { .. }) if retries < LOCKED_RETRIES => {
+                retries += 1;
+                std::thread::sleep(backoff);
+                backoff *= 2;
+            }
+            stored => return stored,
+        }
+    }
+}
+
 /// Check `value` against `contract`, naming every place it fails.
 fn fits(what: &str, contract: &Value, value: &Value) -> Result<()> {
     let validator = Registry::new()
@@ -611,25 +650,36 @@ async fn run_pipeline<C: WorkflowContext>(
         serde_json::to_vec(&pipeline).map_err(|e| failed(format!("encode the pipeline: {e}")))?;
     let files = pipeline.pins.clone();
     let run_id = ctx.workflow_id().to_owned();
+    let pinning = run_id.clone();
     let helper_runtime = atomic_core::astro::Program::current_helper_runtime();
     let pinned: Pinned = ctx
         .step("pin", move |_| async move {
             let budgets = planned.map_err(failed)?;
-            let manifest = tokio::task::spawn_blocking(move || {
-                store.put(
-                    &mut snapshot.as_slice(),
-                    Provenance {
-                        media_type: SNAPSHOT_MEDIA_TYPE.into(),
-                        workflow: Some(run_id),
-                        step: Some("pin".into()),
-                        origin: Some("run_pipeline".into()),
-                        labels: Default::default(),
-                    },
-                )
+            let provenance = Provenance {
+                media_type: SNAPSHOT_MEDIA_TYPE.into(),
+                workflow: Some(run_id),
+                step: Some("pin".into()),
+                origin: Some("run_pipeline".into()),
+                labels: Default::default(),
+            };
+            let stored = tokio::task::spawn_blocking(move || {
+                put_waiting_out_the_lock(&store, &snapshot, provenance)
             })
             .await
-            .map_err(|e| failed(format!("store the pipeline: {e}")))?
             .map_err(|e| failed(format!("store the pipeline: {e}")))?;
+            let manifest = match stored {
+                Ok(manifest) => manifest,
+                // A store held elsewhere is in the way for now, not a fault
+                // of the run: it stops without recording anything, and
+                // recovery runs it again.
+                Err(e @ ArtifactError::Locked { .. }) => {
+                    not_reached(&pinning, 0);
+                    return Err(DurableError::Interrupted(format!(
+                        "store the pipeline: {e}; the run is recovered once the store is free"
+                    )));
+                }
+                Err(e) => return Err(failed(format!("store the pipeline: {e}"))),
+            };
             Ok(Pinned {
                 snapshot: manifest.artifact.to_string(),
                 files,

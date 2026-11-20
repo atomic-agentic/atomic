@@ -183,6 +183,7 @@ fn a_sweep_keeps_what_it_is_told_and_what_is_recent_and_clears_stale_partial_wri
         .sweep(
             &BTreeSet::new(),
             Grace::at_least(std::time::Duration::from_secs(3600)),
+            std::time::SystemTime::now(),
         )
         .expect("sweep");
     assert!(swept.removed.is_empty());
@@ -192,6 +193,7 @@ fn a_sweep_keeps_what_it_is_told_and_what_is_recent_and_clears_stale_partial_wri
         .sweep(
             &BTreeSet::from_iter([&kept].into_iter().cloned()),
             Grace::none_for_tests(),
+            std::time::SystemTime::now(),
         )
         .expect("sweep");
     assert_eq!(swept.removed, std::slice::from_ref(&loose));
@@ -262,5 +264,98 @@ fn a_stored_blob_is_read_only_and_a_damaged_one_is_replaced_by_the_next_write() 
         let mode = std::fs::metadata(&blob).expect("blob").permissions().mode() & 0o777;
         assert_eq!(mode, 0o444, "{mode:o}");
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Date `path` `ago` back.
+fn written_ago(path: &Path, ago: std::time::Duration) {
+    std::fs::File::open(path)
+        .expect("open")
+        .set_modified(std::time::SystemTime::now() - ago)
+        .expect("date");
+}
+
+#[test]
+fn the_grace_runs_back_from_when_the_keep_set_was_read() {
+    let (store, dir) = store();
+    let a = store
+        .put(
+            &mut &b"stored while the keep set was read"[..],
+            provenance("s1"),
+        )
+        .expect("put")
+        .artifact;
+    let minute = std::time::Duration::from_secs(60);
+    // Written ten minutes ago; the caller began reading what to keep nine
+    // and a half minutes ago, and took that long to reach the sweep.
+    written_ago(&store.blob_path(&a), 10 * minute);
+    let read_at = std::time::SystemTime::now() - (10 * minute - minute / 2);
+    let swept = store
+        .sweep(&BTreeSet::new(), Grace::at_least(minute), read_at)
+        .expect("sweep");
+    assert!(swept.removed.is_empty(), "{swept:?}");
+    assert!(store.contains(&a).expect("contains"));
+    // Read now, it is past its grace.
+    let swept = store
+        .sweep(
+            &BTreeSet::new(),
+            Grace::at_least(minute),
+            std::time::SystemTime::now(),
+        )
+        .expect("sweep");
+    assert_eq!(swept.removed, [a]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_projects_store_takes_its_lock_in_private_however_it_is_opened() {
+    let (_, dir) = store();
+    let state = dir.join("state");
+    std::fs::create_dir_all(state.join("private")).expect("private");
+    let store = LocalStore::open(state.join("artifacts")).expect("open");
+    assert_eq!(store.lock, state.join("private/artifacts.lock"));
+    let other = LocalStore::open(dir.join("elsewhere")).expect("open");
+    assert_eq!(other.lock, dir.join("elsewhere/lock"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_writable_blob_is_made_read_only_when_written_again_keeping_its_readers() {
+    use std::os::unix::fs::PermissionsExt;
+    let (store, dir) = store();
+    let a = store
+        .put(&mut &b"left writable"[..], provenance("s1"))
+        .expect("put")
+        .artifact;
+    let blob = store.blob_path(&a);
+    std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o640)).expect("chmod");
+    store
+        .put(&mut &b"left writable"[..], provenance("s2"))
+        .expect("put again");
+    let mode = std::fs::metadata(&blob).expect("blob").permissions().mode() & 0o777;
+    assert_eq!(mode, 0o440, "{mode:o}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_write_that_cannot_check_the_stored_blob_leaves_no_partial_write() {
+    use std::os::unix::fs::PermissionsExt;
+    let (store, dir) = store();
+    let a = store
+        .put(&mut &b"unreadable later"[..], provenance("s1"))
+        .expect("put")
+        .artifact;
+    let blob = store.blob_path(&a);
+    std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+    let refused = store.put(&mut &b"unreadable later"[..], provenance("s2"));
+    assert!(refused.is_err(), "{refused:?}");
+    assert_eq!(
+        files_under(&dir.join("staging")),
+        0,
+        "a partial write was left"
+    );
+    std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o444)).expect("chmod");
     let _ = std::fs::remove_dir_all(&dir);
 }
