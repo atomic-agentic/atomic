@@ -303,6 +303,11 @@ impl RunBudget {
     /// so its reservation is not held for good: a command uses no tokens
     /// and costs nothing, so that is all it spent, and its time is charged
     /// until its last heartbeat.
+    ///
+    /// That rests on the step running again only once the process that
+    /// admitted the command is gone: a durable step runs in one process at
+    /// a time, and a stopping process kills its commands before it exits,
+    /// so a reserved attempt found here is no longer running.
     pub async fn command_admitted(&self, step: &StepInfo) -> anyhow::Result<bool> {
         let request = format!("{}:{}:0", step.workflow_id, step.step_id);
         let attempts = self.ledger.attempts(&step.workflow_id).await?;

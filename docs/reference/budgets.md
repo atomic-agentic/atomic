@@ -179,8 +179,8 @@ costs nothing, so an exec atom's budget needs no price, even under a dollar cap.
 With less than half a second left, the command is not started: the run parks,
 and once a person raises the cap and releases it, the command runs. A command
 the cap stops mid-run parks the run the same way if its atom declares
-`effects: { external: 'idempotent' }` or `'read-only'`, and runs again once
-the cap is raised; any other fails, since whether its effects happened is
+`effects: { external: 'idempotent' }` or `'read-only'`, and once the cap is
+raised it runs again from the start; any other fails, since whether its effects happened is
 unknown, and the error says so. Time at a gate is never charged. An exec atom's
 validators and the commits atomic makes after a worktree step are not metered
 yet.

@@ -1242,7 +1242,9 @@ fn cut_off_at_cap(
         bounded_by.unwrap_or("of its atom")
     );
     match atom.external() {
-        Some(_) => AtomError::Budget(stopped),
+        Some(_) => AtomError::Budget(format!(
+            "{stopped}; once the cap is raised, it runs again from the start"
+        )),
         None => AtomError::Runtime(format!(
             "{stopped}: stopped by the minutes cap, and whether its effects happened is \
              unknown. Declare `effects: {{ external: 'idempotent' }}` (or `'read-only'`) for its \

@@ -2692,9 +2692,9 @@ fn a_stored_budget_plan_reads_past_fields_a_later_version_adds() {
     assert_eq!(read, plan);
 }
 
-/// A plan pinned under `atomic.pipeline.3`, before exec atoms were metered,
-/// has no exec caps. It still reads, as a plan with none: a run of that
-/// layout is not recovered by this build, which says so when asked to
+/// A plan pinned before exec atoms were metered, under a layout before
+/// this one, has no exec caps. It still reads, as a plan with none: a run of
+/// that layout is not recovered by this build, which says so when asked to
 /// replay it, but its stored plan is still read back.
 #[test]
 fn a_budget_plan_pinned_before_exec_atoms_were_metered_still_reads() {
@@ -4412,7 +4412,7 @@ fn a_run_with_no_minutes_left_parks_before_the_next_command() {
     on_codex_runtime(async move {
         let model = FakeModel::start(Vec::new()).await.expect("fake model");
         let rt = engine(&dir, &model.base_url()).await;
-        rt.recover().await.expect("recover");
+        assert_eq!(rt.recover().await.expect("recover"), 1, "the parked run");
         rt.ledger()
             .raise(
                 "run:naps-3",
