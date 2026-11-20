@@ -46,17 +46,50 @@ struct Started {
 /// Record durable step `name` before the guarded step. Each invocation gets
 /// a new identity, including automatic recovery within the same process.
 pub async fn begin<C: WorkflowContext>(ctx: &C, name: &str) -> Result<Attempt> {
+    let (attempt, _) = begin_with(ctx, name, || async { Ok(()) }).await?;
+    Ok(attempt)
+}
+
+/// [`begin`], running `prepare` in the recording step's own body first, so
+/// the attempt is recorded only once `prepare` has succeeded: an attempt
+/// whose preparation failed, or never ran, is never taken for one whose
+/// guarded step may have run. Returns what `prepare` made when it ran in
+/// this execution, and `None` when the step was recorded by an earlier one
+/// and replays without running its body.
+pub async fn begin_with<C, T, F, Fut>(
+    ctx: &C,
+    name: &str,
+    prepare: F,
+) -> Result<(Attempt, Option<T>)>
+where
+    C: WorkflowContext,
+    T: Send + 'static,
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<T>> + Send + 'static,
+{
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes)
         .map_err(|e| DurableError::Engine(format!("create an attempt identity: {e}")))?;
     let here: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
     let token = here.clone();
+    let made = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let slot = made.clone();
     let started: Started = ctx
-        .step(name, move |_| async move { Ok(Started { process: token }) })
+        .step(name, move |_| async move {
+            let value = prepare().await?;
+            if let Ok(mut slot) = slot.lock() {
+                *slot = Some(value);
+            }
+            Ok(Started { process: token })
+        })
         .await?;
-    Ok(Attempt {
-        interrupted: started.process != here,
-    })
+    let value = made.lock().ok().and_then(|mut slot| slot.take());
+    Ok((
+        Attempt {
+            interrupted: started.process != here,
+        },
+        value,
+    ))
 }
 
 #[cfg(test)]

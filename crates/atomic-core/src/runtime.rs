@@ -251,24 +251,27 @@ fn new_attempt() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// How often, and after how long, an open the backend reports unavailable
-/// is tried again before the run parks.
-const OPEN_RETRIES: [std::time::Duration; 2] = [
-    std::time::Duration::from_millis(200),
-    std::time::Duration::from_secs(1),
-];
+/// The first wait after a backend reports it has no room, doubled after each
+/// refusal up to [`OPEN_WAIT_MAX`].
+const OPEN_WAIT_FIRST: std::time::Duration = std::time::Duration::from_millis(200);
+/// The longest wait between tries.
+const OPEN_WAIT_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+/// How often a run still waiting says so.
+const OPEN_WAIT_REPORT: std::time::Duration = std::time::Duration::from_secs(600);
 
-/// Open a workspace on `backend`, on the blocking pool. An open the backend
-/// reports [`atomic_exec::ExecError::Unavailable`] is tried again, a few
-/// times; if it stays unavailable the run fails with
-/// [`AtomError::Unavailable`]: nothing was started, and a durable run stops
-/// without recording anything, to run the step again later.
+/// Open a workspace on `backend`, on the blocking pool. While the backend
+/// reports [`atomic_exec::ExecError::Unavailable`] (no room; nothing was
+/// started) the run waits, trying again with a growing pause, for as long
+/// as it takes: it records nothing and spends none of the durable engine's
+/// recovery attempts, and it says on stderr that it is waiting, then again
+/// every ten minutes. Stopping the run stops the wait.
 pub(crate) async fn open_workspace(
     backend: Arc<dyn ExecutionBackend>,
     request: Open,
 ) -> Result<WorkspaceGuard, AtomError> {
     let label = request.label.clone();
-    let mut waits = OPEN_RETRIES.iter();
+    let mut wait = OPEN_WAIT_FIRST;
+    let mut reported: Option<std::time::Instant> = None;
     loop {
         let (b, r) = (backend.clone(), request.clone());
         let opened = tokio::task::spawn_blocking(move || b.open(&r))
@@ -276,15 +279,26 @@ pub(crate) async fn open_workspace(
             .map_err(|e| AtomError::Runtime(format!("{label}: open its workspace: {e}")))?;
         match opened {
             Ok(workspace) => {
+                if reported.is_some() {
+                    eprintln!("atomic: {label}: the execution backend has room again");
+                }
                 return Ok(WorkspaceGuard(Some(Arc::new(Closer {
                     backend,
                     workspace: Some(workspace),
                 }))));
             }
-            Err(e @ atomic_exec::ExecError::Unavailable { .. }) => match waits.next() {
-                Some(wait) => tokio::time::sleep(*wait).await,
-                None => return Err(AtomError::Unavailable(format!("{label}: {e}"))),
-            },
+            Err(e @ atomic_exec::ExecError::Unavailable { .. }) => {
+                if reported.is_none_or(|at| at.elapsed() >= OPEN_WAIT_REPORT) {
+                    eprintln!(
+                        "atomic: {label} is waiting for room on the execution backend \
+                         (run {}, step {}): {e}",
+                        request.run, request.step
+                    );
+                    reported = Some(std::time::Instant::now());
+                }
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(OPEN_WAIT_MAX);
+            }
             Err(e) => return Err(AtomError::Runtime(format!("{label}: {e}"))),
         }
     }

@@ -1222,6 +1222,19 @@ fn exec_declarations_are_checked_at_load() {
         ("kind: 'codex', env: { 'BAD-NAME': 'x' }", "variable name"),
         ("kind: 'codex', env: { RUSTUP_HOME: 1 }", "a string"),
         (
+            "kind: 'codex', env: { LD_PRELOAD: '/x/evil.so' }",
+            "load code",
+        ),
+        ("kind: 'codex', env: { LD_LIBRARY_PATH: '/x' }", "load code"),
+        ("kind: 'codex', env: { GCONV_PATH: '/x' }", "load code"),
+        ("kind: 'codex', env: { HOME: '/x' }", "set by atomic"),
+        ("kind: 'codex', env: { ZDOTDIR: '/x' }", "set by atomic"),
+        ("kind: 'codex', env: { TMPDIR: '/x' }", "set by atomic"),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, env: { HOME: '/x' }",
+            "set by atomic",
+        ),
+        (
             "kind: 'codex', exec: { command: ['x'] }",
             "for `kind: 'exec'`",
         ),
@@ -1566,16 +1579,17 @@ fn a_codex_atom_whose_workspace_has_no_shell_sends_nothing() {
     });
 }
 
-/// An open the backend reports unavailable is tried again; one that stays
-/// unavailable fails the run as unavailable, which a durable run parks on.
+/// While the backend has no room the run waits, trying again, and runs once
+/// there is room; a run that waits sends nothing, and stopping it stops the
+/// wait.
 #[test]
-fn an_unavailable_workspace_is_tried_again_then_reported_unavailable() {
+fn an_unavailable_workspace_is_waited_for() {
     on_codex_runtime(async {
         let model = FakeModel::start(vec![Reply::Text(CLASSIFIED.into())])
             .await
             .expect("fake model");
         let busy = Recording {
-            unavailable: Arc::new(std::sync::atomic::AtomicUsize::new(2)),
+            unavailable: Arc::new(std::sync::atomic::AtomicUsize::new(4)),
             ..Recording::default()
         };
         let mut rt = runtime(&model, "seam-busy");
@@ -1583,15 +1597,9 @@ fn an_unavailable_workspace_is_tried_again_then_reported_unavailable() {
         run_codex_atom(&Classify, &Note { text: "n".into() }, &rt)
             .await
             .expect("runs once the backend has room");
-        assert_eq!(
-            busy.calls(),
-            [
-                "open classify-note",
-                "open classify-note",
-                "open classify-note",
-                "close classify-note"
-            ]
-        );
+        let mut expected = vec!["open classify-note"; 5];
+        expected.push("close classify-note");
+        assert_eq!(busy.calls(), expected);
         assert_eq!(model.calls(), 1);
 
         let full = Recording {
@@ -1599,12 +1607,18 @@ fn an_unavailable_workspace_is_tried_again_then_reported_unavailable() {
             ..Recording::default()
         };
         rt.backend = full.backend();
-        let r = run_codex_atom(&Classify, &Note { text: "n".into() }, &rt).await;
+        let waiting = tokio::spawn(async move {
+            run_codex_atom(&Classify, &Note { text: "n".into() }, &rt).await
+        });
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        assert!(!waiting.is_finished(), "it waits");
         assert!(
-            matches!(&r, Err(AtomError::Unavailable(m)) if m.contains("no runner is free")),
-            "{r:?}"
+            full.calls().len() >= 3,
+            "and tries again: {:?}",
+            full.calls()
         );
-        assert_eq!(full.calls().len(), 3, "tried three times");
+        waiting.abort();
+        assert!(waiting.await.expect_err("stopped").is_cancelled());
         assert_eq!(model.calls(), 1, "nothing more was sent");
     });
 }

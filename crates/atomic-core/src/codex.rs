@@ -177,6 +177,18 @@ impl StateGuard {
 /// spellings of a path reached through a link are denied.
 fn denied_paths(private: &PrivateState, codex_home: &Path) -> (Vec<PathBuf>, Vec<String>) {
     let mut denied = vec![private.state_dir.join("private")];
+    // Every other project's private state under the same atomic home too, as
+    // the projects stand when the thread or command starts.
+    if let Some(projects) = private.state_dir.parent() {
+        denied.extend(
+            std::fs::read_dir(projects)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|project| project.path().join("private"))
+                .filter(|dir| dir.is_dir() && *dir != private.state_dir.join("private")),
+        );
+    }
     denied.extend(private.also.iter().cloned());
     let children = |dir: &Path, keep: &str| -> Vec<PathBuf> {
         std::fs::read_dir(dir)
@@ -433,10 +445,18 @@ pub fn is_helper(mut args: impl Iterator<Item = std::ffi::OsString>) -> bool {
         return true;
     }
     let first = args.next().unwrap_or_default();
-    let first = first.to_string_lossy();
-    first.starts_with("--codex-run-as-")
-        || first.starts_with("--__codex-")
-        || first == "--run-as-windows-sandbox"
+    // Exactly the first arguments Codex's dispatch at the pinned revision
+    // answers to (arg0, apply-patch, the exec-server's helpers, the pty
+    // setup, the Windows sandboxes).
+    matches!(
+        first.to_string_lossy().as_ref(),
+        "--codex-run-as-apply-patch"
+            | "--codex-run-as-arg0-exec-helper"
+            | "--codex-run-as-fs-helper"
+            | "--codex-run-as-process-setup"
+            | "--__codex-windows-mxc"
+            | "--run-as-windows-sandbox"
+    )
 }
 
 /// Run as the Codex helper this process was started as (see [`is_helper`]).
@@ -472,13 +492,11 @@ fn keep_sandbox_off_keyrings() {
 /// Confines an exec atom's command under Codex's Linux sandbox helper, as a
 /// turn's commands are confined: the whole filesystem readable except
 /// atomic's private state, which is denied as it is to turns (see
-/// [`denied_paths`]); only the command's own writable directories, such as
-/// its scratch directory, and the project's caches writable. The command still runs
-/// with exactly its environment, in its directory.
-///
-/// It keeps the network an exec command had before it was confined, so an
-/// exec atom that calls an outside API still can, until atoms can declare
-/// the network they need.
+/// [`denied_paths`]), and the private state of every other project under
+/// the same atomic home; only the command's own writable directories, such
+/// as its scratch directory, and the project's caches writable; no network
+/// and no sockets, since no atom can declare network access at this version.
+/// The command still runs with exactly its environment, in its directory.
 #[derive(Clone, Debug)]
 pub struct ExecSandbox {
     helper: PathBuf,
@@ -532,7 +550,7 @@ impl ExecSandbox {
         }
         Ok(PermissionProfile::from_runtime_permissions(
             &policy,
-            NetworkSandboxPolicy::Enabled,
+            NetworkSandboxPolicy::Restricted,
         ))
     }
 }
@@ -541,6 +559,7 @@ impl atomic_exec::Confine for ExecSandbox {
     fn confine(
         &self,
         command: &atomic_exec::Command,
+        tmp: &Path,
     ) -> Result<atomic_exec::Command, atomic_exec::ExecError> {
         let fail = |message: String| atomic_exec::ExecError::Start {
             program: command.program.clone(),
@@ -550,20 +569,23 @@ impl atomic_exec::Confine for ExecSandbox {
         // environment has none unless it declares one.
         let program = atomic_exec::process::resolve(&command.program).map_err(fail)?;
         let env = atomic_exec::process::resolve("env").map_err(fail)?;
-        let profile = self
-            .profile(&command.writable)
-            .and_then(|p| serde_json::to_string(&p).context("encode the sandbox profile"))
-            .map_err(|e| fail(format!("{e:#}")))?;
-        let cwd = command
-            .cwd
-            .to_str()
-            .ok_or_else(|| fail("its directory is not UTF-8".into()))?
-            .to_owned();
         let text = |p: &Path| {
             p.to_str()
                 .map(str::to_owned)
                 .ok_or_else(|| fail(format!("{} is not UTF-8", p.display())))
         };
+        let program = text(&program)?;
+        // `env` would read a program path holding `=` as one more variable.
+        if program.contains('=') {
+            return Err(fail(format!(
+                "{program} has `=` in its path, which a confined command cannot run from"
+            )));
+        }
+        let profile = self
+            .profile(&command.writable)
+            .and_then(|p| serde_json::to_string(&p).context("encode the sandbox profile"))
+            .map_err(|e| fail(format!("{e:#}")))?;
+        let cwd = text(&command.cwd)?;
         let mut args = vec![
             "--sandbox-policy-cwd".to_owned(),
             cwd.clone(),
@@ -572,23 +594,62 @@ impl atomic_exec::Confine for ExecSandbox {
             "--permission-profile".to_owned(),
             profile,
             "--".to_owned(),
-            // The helper needs PATH to find bubblewrap; the command gets
-            // exactly its own environment, nothing of the helper's.
+            // The command gets exactly its own environment, nothing of the
+            // helper's.
             text(&env)?,
             "-i".to_owned(),
         ];
         args.extend(command.env.iter().map(|(k, v)| format!("{k}={v}")));
-        args.push(text(&program)?);
+        args.push(program);
         args.extend(command.args.iter().cloned());
+        // The helper needs PATH to find bubblewrap, and keeps its registry of
+        // the mount points it makes in TMPDIR: the backend's own, which the
+        // turns' helpers share.
+        let mut helper_env = vec![("TMPDIR".to_owned(), text(tmp)?)];
+        if let Ok(path) = std::env::var("PATH") {
+            helper_env.push(("PATH".to_owned(), path));
+        }
         Ok(atomic_exec::Command {
             program: text(&self.helper)?,
             args,
-            env: std::env::var("PATH")
-                .map(|path| vec![("PATH".to_owned(), path)])
-                .unwrap_or_default(),
+            env: helper_env,
             writable: Vec::new(),
             ..command.clone()
         })
+    }
+
+    /// Run `true` confined: the helper, bubblewrap and the user namespaces
+    /// it needs either work here or the backend refuses to connect.
+    fn check(&self, tmp: &Path) -> Result<(), atomic_exec::ExecError> {
+        let probe = atomic_exec::Command {
+            program: "true".into(),
+            cwd: tmp.to_owned(),
+            time_limit: std::time::Duration::from_secs(30),
+            output_limit: 4096,
+            ..Default::default()
+        };
+        let confined = self.confine(&probe, tmp)?;
+        let done =
+            atomic_exec::ExecutionBackend::run(&atomic_exec::LocalBackend::default(), &confined);
+        let refuse = |why: String| atomic_exec::ExecError::Workspace {
+            label: "connect".into(),
+            message: format!(
+                "exec atoms' commands run under Codex's Linux sandbox, which cannot start here \
+                 ({why}). It needs bubblewrap and unprivileged user namespaces; in a container, \
+                 allow them (for docker, `--security-opt seccomp=unconfined` and \
+                 `--security-opt systempaths=unconfined`, or a profile that permits unshare)"
+            ),
+        };
+        match done {
+            Ok(done) if done.success() => Ok(()),
+            Ok(done) => Err(refuse(format!(
+                "a trial command exited with {}: {}",
+                done.code
+                    .map_or_else(|| "a signal".to_owned(), |c| format!("code {c}")),
+                String::from_utf8_lossy(&done.stderr).trim()
+            ))),
+            Err(e) => Err(refuse(e.to_string())),
+        }
     }
 }
 
@@ -1506,22 +1567,26 @@ mod tests {
         let sandbox = ExecSandbox::new(&paths, guard, state.join("codex"))
             .expect("a helper")
             .also_writing(vec![state.join("cache")]);
+        let tmp = state.join("scratch/.tmp");
         let confined = sandbox
-            .confine(&atomic_exec::Command {
-                program: "sh".into(),
-                args: vec!["-c".into(), "true".into()],
-                cwd: state.clone(),
-                env: vec![("HOME".into(), scratch_dir.display().to_string())],
-                writable: vec![scratch_dir.clone()],
-                ..Default::default()
-            })
+            .confine(
+                &atomic_exec::Command {
+                    program: "sh".into(),
+                    args: vec!["-c".into(), "true".into()],
+                    cwd: state.clone(),
+                    env: vec![("HOME".into(), scratch_dir.display().to_string())],
+                    writable: vec![scratch_dir.clone()],
+                    ..Default::default()
+                },
+                &tmp,
+            )
             .expect("confined");
         assert_eq!(confined.program, "/opt/bin/codex-linux-sandbox");
-        assert!(
-            confined.env.iter().all(|(k, _)| k == "PATH"),
-            "{:?}",
-            confined.env
-        );
+        // The helper gets its registry's TMPDIR and PATH, nothing else: no
+        // variable the command declares loads into it.
+        let names: Vec<&str> = confined.env.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(names, ["TMPDIR", "PATH"]);
+        assert_eq!(confined.env[0].1, tmp.display().to_string());
         let at = |flag: &str| {
             confined
                 .args
@@ -1550,7 +1615,52 @@ mod tests {
                 "{writable:?}: {text}"
             );
         }
-        assert!(text.contains("enabled"), "the network stays open: {text}");
+        assert!(text.contains("restricted"), "no network: {text}");
+    }
+
+    /// A machine where the sandbox helper cannot run a command fails the
+    /// backend's connect with what is needed, not every exec command later.
+    #[test]
+    fn a_sandbox_that_cannot_start_fails_the_backend_at_connect() {
+        use atomic_exec::ExecutionBackend;
+        // Not under /tmp, which connect refuses before it checks the sandbox.
+        let state = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/atomic-core-tests")
+            .join(format!("exec-sandbox-check-{}", std::process::id()));
+        let paths =
+            CodexPaths::with_helpers(PathBuf::from("/bin/false"), PathBuf::from("/bin/false"));
+        let sandbox = ExecSandbox::new(&paths, StateGuard::NoProjectState, state.join("codex"))
+            .expect("a helper");
+        let backend = atomic_exec::LocalBackend::in_dir(state.join("scratch"))
+            .confined(std::sync::Arc::new(sandbox));
+        let error = backend.connect().expect_err("refused");
+        assert!(
+            error.to_string().contains("cannot start here")
+                && error.to_string().contains("unprivileged user namespaces"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn only_codex_helper_invocations_are_helpers() {
+        let args = |a: &[&str]| a.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
+        for helper in [
+            &["/usr/bin/codex-linux-sandbox", "--sandbox-policy-cwd", "/x"][..],
+            &["/opt/apply_patch"][..],
+            &["atomic", "--codex-run-as-apply-patch", "p"][..],
+            &["atomic", "--codex-run-as-fs-helper"][..],
+            &["atomic", "--codex-run-as-process-setup"][..],
+        ] {
+            assert!(is_helper(args(helper).into_iter()), "{helper:?}");
+        }
+        for not in [
+            &["atomic", "run", "x"][..],
+            &["atomic", "--codex-run-as-anything"][..],
+            &["atomic", "--__codex-whatever"][..],
+            &["codex-linux-sandbox-x"][..],
+        ] {
+            assert!(!is_helper(args(not).into_iter()), "{not:?}");
+        }
     }
 
     #[test]

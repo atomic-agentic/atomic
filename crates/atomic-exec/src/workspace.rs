@@ -429,23 +429,35 @@ pub(crate) fn remove_tree(path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Give this user write access to every directory under `path`, not
-/// following symlinks.
+/// Give this user write access to every directory under `path`, never
+/// following a symlink: each directory is opened without following one, and
+/// changed through that descriptor, so swapping it for a link changes
+/// nothing outside.
 fn make_writable(path: &Path) {
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
-        return;
-    };
-    if !meta.is_dir() {
-        return;
-    }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let Ok(dir) = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+            .open(path)
+        else {
+            return;
+        };
+        let Ok(meta) = dir.metadata() else {
+            return;
+        };
         let mode = meta.permissions().mode() | 0o700;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+        let _ = dir.set_permissions(std::fs::Permissions::from_mode(mode));
     }
     #[cfg(not(unix))]
     {
+        let Ok(meta) = std::fs::symlink_metadata(path) else {
+            return;
+        };
+        if !meta.is_dir() {
+            return;
+        }
         let mut permissions = meta.permissions();
         #[allow(clippy::permissions_set_readonly_false)]
         permissions.set_readonly(false);
@@ -453,7 +465,9 @@ fn make_writable(path: &Path) {
     }
     if let Ok(entries) = std::fs::read_dir(path) {
         for entry in entries.flatten() {
-            make_writable(&entry.path());
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                make_writable(&entry.path());
+            }
         }
     }
 }
@@ -481,6 +495,11 @@ fn alive(pid: u32) -> bool {
         let _ = pid;
         true
     }
+}
+
+/// [`private_dir`], for the backend.
+pub(crate) fn ensure_private(dir: &Path) -> std::io::Result<()> {
+    private_dir(dir)
 }
 
 /// Create `dir`, and its parents, readable and writable by this user only.

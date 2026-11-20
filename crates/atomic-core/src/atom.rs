@@ -151,7 +151,7 @@ fn check_exec(kind: &str, fm: &serde_json::Map<String, Value>) -> Result<(), (St
                 );
             }
         }
-        return check_env(fm);
+        return check_env(kind, fm);
     }
     let Some(Value::Object(exec)) = fm.get("exec") else {
         return refuse(
@@ -181,7 +181,7 @@ fn check_exec(kind: &str, fm: &serde_json::Map<String, Value>) -> Result<(), (St
             );
         }
     }
-    check_env(fm)?;
+    check_env(kind, fm)?;
     match fm.get("effects") {
         None => {}
         Some(Value::Object(effects)) => {
@@ -212,8 +212,20 @@ fn check_exec(kind: &str, fm: &serde_json::Map<String, Value>) -> Result<(), (St
     Ok(())
 }
 
-/// Check an atom's `env`: variable names mapped to literal string values.
-fn check_env(fm: &serde_json::Map<String, Value>) -> Result<(), (String, String)> {
+/// Variables the dynamic loader reads. A codex atom's turn starts Codex's
+/// sandbox helper, outside the sandbox, with the environment its commands
+/// get, so one of these would load code there. (An exec atom's command gets
+/// its environment only inside the sandbox; the helper that starts it gets
+/// none of it.)
+fn loads_code(name: &str) -> bool {
+    name.starts_with("LD_")
+        || name.starts_with("DYLD_")
+        || matches!(name, "GCONV_PATH" | "GLIBC_TUNABLES")
+}
+
+/// Check an atom's `env`: variable names mapped to literal string values,
+/// none that atomic sets itself or, for a codex atom, that loads code.
+fn check_env(kind: &str, fm: &serde_json::Map<String, Value>) -> Result<(), (String, String)> {
     let refuse = |pointer: &str, message: &str| Err((pointer.to_owned(), message.to_owned()));
     match fm.get("env") {
         None => {}
@@ -226,6 +238,29 @@ fn check_env(fm: &serde_json::Map<String, Value>) -> Result<(), (String, String)
                     return refuse(
                         &format!("/env/{name}"),
                         "an environment variable name is letters, digits and `_`",
+                    );
+                }
+                let own: &[&str] = if kind == "codex" {
+                    &["HOME", "ZDOTDIR", "TMPDIR"]
+                } else {
+                    &["HOME", "TMPDIR"]
+                };
+                if own.contains(&name.as_str()) {
+                    return refuse(
+                        &format!("/env/{name}"),
+                        &format!(
+                            "`{name}` is set by atomic: a command's HOME and TMPDIR are its \
+                             workspace's own directories"
+                        ),
+                    );
+                }
+                if kind == "codex" && loads_code(name) {
+                    return refuse(
+                        &format!("/env/{name}"),
+                        &format!(
+                            "`{name}` would load code into Codex's sandbox helper, which runs \
+                             outside the sandbox; a codex atom cannot declare it"
+                        ),
                     );
                 }
                 if crate::runtime::EFFECT_VARIABLES.contains(&name.as_str()) {

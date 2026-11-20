@@ -113,7 +113,10 @@ ATOMIC_DEV_SANDBOX=on scripts/dev.sh cargo test --workspace --locked \
   --features atomic-agentic-durable/postgres-tests,atomic-agentic/sandbox-tests
 ```
 
-With the feature on, a sandbox that cannot start fails the tests.
+With the feature on, a sandbox that cannot start fails the tests. atomic itself
+needs the sandbox on Linux to run exec atoms, and refuses to start without it,
+so the tests that drive the `atomic` executable (`crates/atomic/tests/run_cli.rs`)
+are behind the same feature there.
 
 ## Releases
 

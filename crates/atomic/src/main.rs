@@ -641,9 +641,11 @@ async fn prompt(
     state: &ProjectState,
     args: &PromptArgs,
 ) -> anyhow::Result<String> {
-    // The same backend `atomic run` uses: the turn opens a workspace there.
+    // A backend of its own, beside the one `atomic run` and `atomic serve`
+    // use: this command takes no execution lock, and connecting empties a
+    // backend's shared temporary directory, which their turns may be using.
     let backend = atomic_exec::Backend::connect(atomic_exec::LocalBackend::in_dir(
-        state.dir().join("scratch"),
+        state.dir().join("scratch-debug"),
     ))
     .context("connect to the execution backend")?;
     let runtime = atomic_core::runtime::CodexRuntime {

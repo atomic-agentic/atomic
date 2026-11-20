@@ -48,12 +48,30 @@ in `env`, plus its own `HOME` and `TMPDIR` and the effect variables below.
 
 On Linux the command runs under the same sandbox as a Codex atom's commands. It
 can read the project and the rest of the filesystem except atomic's private
-state (the project's database and gate store, Codex's records, the credential
-and key directories), write only its own scratch directory (its `HOME` and
-`TMPDIR`) and the project's build caches; a command that writes anywhere else
-fails. It keeps network access, so a command can still call an outside API,
-until atoms can declare the network they need.
-On macOS and Windows the command is not confined yet.
+state (every project's database and gate store, Codex's records, the credential
+and key directories). It can write only its own scratch directory (its `HOME`
+and `TMPDIR`) and the project's build caches; a command that writes anywhere
+else fails. It has no network and cannot use sockets, until atoms can declare
+the network they need. It also:
+
+- finds `.aws`, `.codex`, `.git` and `.agents` in its `HOME` read-only, as the
+  sandbox keeps them in every writable directory;
+- cannot gain privileges (no `sudo`, no setuid programs) and sees no GPU or
+  other devices beyond the basic ones;
+- is not told where the caches are: name the directory in `env` if a tool needs
+  it;
+- cannot be a program whose path holds `=`.
+
+`env` cannot set `HOME` or `TMPDIR`, which are the command's own. A codex atom
+may declare `env` too, for the commands its turn runs, such as the tool homes
+(`RUSTUP_HOME`, `CARGO_HOME`, `PYENV_ROOT`) they no longer find through `HOME`;
+it cannot set `HOME`, `ZDOTDIR` or `TMPDIR`, nor a variable the dynamic loader
+reads (`LD_*`, `DYLD_*`, `GCONV_PATH`, `GLIBC_TUNABLES`), which would load code
+into the sandbox helper.
+
+On Linux, atomic needs bubblewrap and unprivileged user namespaces to run, and
+says so when it starts if the sandbox cannot run there. On macOS and Windows
+the command is not confined yet.
 
 A step runs at least once, and Atomic cannot see what a command does to other
 systems. If execution is interrupted after the command started and before its
@@ -161,7 +179,7 @@ declarations would replace an atom's own `.atomic/types/<atom>.d.ts` is an error
 | `case`, `judges` | Full evaluation-case and judge input/output schema declarations |
 | `scorers` | Interpreted judge bindings, numeric scores and mean thresholds |
 | `context` | Optional public execution-context schema; a context sidecar is also accepted. See [context schemas](#context-schemas) |
-| `exec`, `effects`, `env` | An exec atom's command, what it does outside Atomic, and its environment. See [exec atoms](#exec-atoms). A codex atom may declare `env` too: literal values its turn's commands get, such as the tool homes (`RUSTUP_HOME`, `CARGO_HOME`, `PYENV_ROOT`) they no longer find through `HOME` |
+| `exec`, `effects`, `env` | An exec atom's command, what it does outside Atomic, and its environment. See [exec atoms](#exec-atoms). A codex atom may declare `env` too, for its turn's commands (see [exec atoms](#exec-atoms) for what it cannot set) |
 
 Some integrations shown in the catalog remain staged. Unavailable permissions,
 remote atoms, credentials, skills and runtime declarations fail explicitly in the

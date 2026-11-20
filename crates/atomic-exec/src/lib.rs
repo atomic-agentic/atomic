@@ -128,8 +128,17 @@ pub struct Command {
 pub trait Confine: Send + Sync {
     /// The command that runs `command` confined. It must run `command` with
     /// exactly its environment and in its directory, and let it write only
-    /// [`Command::writable`].
-    fn confine(&self, command: &Command) -> Result<Command, ExecError>;
+    /// [`Command::writable`]. `tmp` is the backend's private temporary
+    /// directory, where the sandbox may keep records of its own.
+    fn confine(&self, command: &Command, tmp: &std::path::Path) -> Result<Command, ExecError>;
+
+    /// Check, once, that commands can be confined here at all, so a machine
+    /// that cannot confine them fails at connect with a reason rather than
+    /// in every command.
+    fn check(&self, tmp: &std::path::Path) -> Result<(), ExecError> {
+        let _ = tmp;
+        Ok(())
+    }
 }
 
 /// How a command ended.
@@ -382,7 +391,7 @@ impl LocalBackend {
     /// one.
     pub fn prepare(&self, command: &Command) -> Result<Command, ExecError> {
         match &self.confine {
-            Some(confine) => confine.confine(command),
+            Some(confine) => confine.confine(command, &self.tmp),
             None => Ok(command.clone()),
         }
     }
@@ -440,6 +449,13 @@ impl ExecutionBackend for LocalBackend {
         // No turn of this backend runs yet: what earlier turns left in the
         // shared temporary directory goes.
         workspace::empty_dir(&self.tmp);
+        if let Some(confine) = &self.confine {
+            workspace::ensure_private(&self.tmp).map_err(|e| ExecError::Workspace {
+                label: "connect".into(),
+                message: format!("create {}: {e}", self.tmp.display()),
+            })?;
+            confine.check(&self.tmp)?;
+        }
         Ok(Self::STATEMENT)
     }
 

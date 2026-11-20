@@ -20,6 +20,10 @@
 //! Model atoms call the scripted fake model, which counts calls; the exec
 //! atom logs each time its command runs.
 
+// On Linux, atomic runs exec atoms' commands only under Codex's sandbox,
+// and refuses to start where it cannot: these tests need it, and with the
+// `sandbox-tests` feature on, a sandbox that cannot start fails them.
+#![cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #![recursion_limit = "512"]
 
 use atomic_core::testing::{FakeModel, Reply, on_codex_runtime};
@@ -760,6 +764,76 @@ fn serve_started_after_a_kill_recovers_the_run_and_finishes_it() {
             .expect("child");
         assert!(status.success(), "serve stops cleanly on SIGTERM: {status}");
     });
+}
+
+/// `atomic run` confines an exec atom's command: through the engine as it
+/// is wired, the command cannot read the project's database or the
+/// credential store, write a gate decision, or open a socket, and can still
+/// read the project.
+#[cfg(target_os = "linux")]
+#[test]
+fn atomic_run_confines_an_exec_atoms_command() {
+    let dir = scratch("confined");
+    let project = project(&dir);
+    let state = state_dir(&dir, &project);
+    let db = state.join("private/atomic.db");
+    let credentials = dir.join("atomic-home/credentials");
+    std::fs::create_dir_all(&credentials).expect("credentials");
+    let credential = credentials.join("local-dev");
+    std::fs::write(&credential, "the operator's secret").expect("credential");
+    std::fs::write(
+        project.join("tools/probe.py"),
+        "import json, os, socket, sqlite3, sys\n\
+         json.load(sys.stdin)\n\
+         def attempt(f):\n    try:\n        f()\n        return 'ok'\n    except Exception as e:\n        return type(e).__name__ + ': ' + str(e)\n\
+         def read(p):\n    return lambda: open(p, 'rb').read(1)\n\
+         def gate():\n    c = sqlite3.connect(os.environ['DB'])\n    c.execute(\"INSERT INTO atomic_gate_commands VALUES ('f', 'g', '{}', '{}', 0)\")\n    c.commit()\n\
+         def tcp():\n    socket.create_connection(('127.0.0.1', 9), timeout=5)\n\
+         json.dump({'db': attempt(read(os.environ['DB'])), 'gate': attempt(gate), \
+         'credential': attempt(read(os.environ['CREDENTIAL'])), 'tcp': attempt(tcp), \
+         'project': attempt(read('atomic.yaml'))}, sys.stdout)\n",
+    )
+    .expect("script");
+    let field = json!({"type": "string"});
+    write_atom(
+        &project,
+        "probe-private",
+        &format!(
+            "description: 'Probe.', kind: 'exec', exec: {{ command: ['python3', 'tools/probe.py'] }}, \
+             env: {{ DB: '{}', CREDENTIAL: '{}' }}",
+            db.display(),
+            credential.display()
+        ),
+        "",
+        object(json!({})),
+        object(
+            json!({"db": field, "gate": field, "credential": field, "tcp": field, "project": field}),
+        ),
+    );
+    let out = atomic(
+        &dir,
+        &project,
+        &["run", "probe-private", "--data", "{}"],
+        &[],
+        "",
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    let denied = |p: &Path| {
+        format!(
+            "PermissionError: [Errno 13] Permission denied: '{}'",
+            p.display()
+        )
+    };
+    assert_eq!(
+        stdout_json(&out),
+        json!({
+            "db": denied(&db),
+            "gate": "OperationalError: unable to open database file",
+            "credential": denied(&credential),
+            "tcp": "PermissionError: [Errno 1] Operation not permitted",
+            "project": "ok",
+        })
+    );
 }
 
 /// State under /tmp would put atom commands' scratch directories where

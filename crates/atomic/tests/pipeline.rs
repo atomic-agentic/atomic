@@ -221,7 +221,52 @@ fn runtimes_in(dir: &Path, cwd: &Path, base_url: &str) -> Arc<Runtimes> {
 }
 
 async fn engine(dir: &Path, base_url: &str) -> Durare {
-    engine_on(dir, base_url, None).await
+    // A child process asked to log the workspaces it opens.
+    let logged = std::env::var_os(ENV_OPEN_LOG).map(|log| {
+        atomic_exec::Backend::connect(Logging {
+            log: PathBuf::from(log),
+            local: atomic_exec::LocalBackend::default(),
+        })
+        .expect("connects")
+    });
+    engine_on(dir, base_url, logged).await
+}
+
+/// Where a child process logs the workspaces it opens, when set.
+const ENV_OPEN_LOG: &str = "ATOMIC_PIPELINE_OPEN_LOG";
+
+/// The local backend, logging each workspace it opens.
+struct Logging {
+    log: PathBuf,
+    local: atomic_exec::LocalBackend,
+}
+
+impl atomic_exec::ExecutionBackend for Logging {
+    fn connect(&self) -> Result<atomic_exec::Statement, atomic_exec::ExecError> {
+        Ok(atomic_exec::LocalBackend::STATEMENT)
+    }
+    fn open(
+        &self,
+        request: &atomic_exec::Open,
+    ) -> Result<atomic_exec::Workspace, atomic_exec::ExecError> {
+        use std::io::Write;
+        let mut log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.log)
+            .expect("open log");
+        writeln!(log, "open {}", request.label).expect("log");
+        self.local.open(request)
+    }
+    fn run(
+        &self,
+        command: &atomic_exec::Command,
+    ) -> Result<atomic_exec::Completed, atomic_exec::ExecError> {
+        self.local.run(command)
+    }
+    fn close(&self, workspace: &atomic_exec::Workspace) -> Result<(), atomic_exec::ExecError> {
+        self.local.close(workspace)
+    }
 }
 
 /// [`engine`], with every atom running on `backend` when one is given.
@@ -1148,12 +1193,12 @@ impl atomic_exec::ExecutionBackend for Busy {
     }
 }
 
-/// A backend with no room stops the run without recording anything: it
-/// neither fails nor parks, and once the backend has room, recovery runs
-/// the step and the run finishes. Its first step is an exec atom that
-/// declares no effects, whose attempt would be parked as outcome_unknown
-/// if an attempt whose workspace never opened counted as one that may
-/// have run.
+/// A backend with no room makes the run wait, recording nothing: it neither
+/// fails nor parks, spends none of the engine's recovery attempts, and
+/// finishes in the same execution once the backend has room. Its first step
+/// is an exec atom that declares no effects, whose attempt would be parked
+/// as outcome_unknown if an attempt whose workspace never opened counted as
+/// one that may have run.
 #[test]
 fn a_run_whose_backend_has_no_room_runs_again_once_it_has() {
     on_codex_runtime(async {
@@ -1205,7 +1250,7 @@ fn a_run_whose_backend_has_no_room_runs_again_once_it_has() {
             input: json!({"text": "Export crashes on accented names"}),
         };
         rt.start(PIPELINE, "busy-1", run).await.expect("start");
-        // Refused, more than once: the run is tried again, not recorded.
+        // Refused, more than once: the open is tried again, nothing recorded.
         let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while busy.refused.load(std::sync::atomic::Ordering::SeqCst) < 4 {
             assert!(
@@ -1230,32 +1275,27 @@ fn a_run_whose_backend_has_no_room_runs_again_once_it_has() {
         );
         assert_eq!(model.calls(), 0, "nothing was sent");
 
-        busy.room.store(true, std::sync::atomic::Ordering::SeqCst);
-        // Recovery, not this process's first execution, finishes it.
-        let until = std::time::Instant::now() + std::time::Duration::from_secs(120);
-        loop {
-            match rt.status("busy-1").await.expect("status") {
-                Some(RunStatus::Succeeded) => break,
-                Some(RunStatus::Failed(e)) => panic!("the run failed: {e}"),
-                _ => {}
-            }
-            assert!(std::time::Instant::now() < until, "the run never finished");
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        // This process's first handle on the run saw it stop; what the run
-        // recorded once it ran again is in its steps.
-        let summarized = rt
+        // Nothing of the step is recorded while it waits.
+        let recorded: Vec<String> = rt
             .steps("busy-1")
             .await
             .expect("steps")
             .into_iter()
-            .find(|s| s.name == "summarize.turn")
-            .and_then(|s| s.output)
-            .expect("summarize ran");
-        assert_eq!(
-            summarized["Candidate"]["proposal"]["output"],
-            json!({"line": "P1: Export crashes on accents"})
+            .map(|s| s.name)
+            .collect();
+        assert!(
+            !recorded.iter().any(|n| n.starts_with("read.")),
+            "{recorded:?}"
         );
+
+        busy.room.store(true, std::sync::atomic::Ordering::SeqCst);
+        // The same execution finishes it: an execution that had stopped for
+        // recovery would have handed this process an interruption.
+        let out: Value = rt
+            .result("busy-1")
+            .await
+            .expect("finishes once there is room");
+        assert_eq!(out, json!({"line": "P1: Export crashes on accents"}));
         assert_eq!(model.calls(), 2);
         rt.shutdown(std::time::Duration::from_secs(5))
             .await
@@ -1447,6 +1487,67 @@ fn an_interrupted_exec_step_declared_idempotent_runs_again() {
 #[test]
 fn an_interrupted_exec_step_declared_read_only_runs_again() {
     on_codex_runtime(interrupted_declared_exec_runs_again("read-only"));
+}
+
+/// A finished exec step is never opened again: recovering the run after a
+/// kill that followed the step replays it from its record, and its backend
+/// sees one workspace for it, in the first process.
+#[test]
+fn recovery_after_a_finished_exec_step_does_not_open_its_workspace_again() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
+            .await
+            .expect("fake model");
+        let dir = scratch("replayed-exec");
+        project(&dir);
+        write_send_note(&dir, None);
+        let (url, log) = (model.base_url(), dir.join("opens.log"));
+        let log_text = log.display().to_string();
+        let (d, u, l) = (dir.clone(), url.clone(), log_text.clone());
+        let status = tokio::task::spawn_blocking(move || {
+            child_in(
+                &d,
+                &u,
+                "start-sent",
+                "replayed-1",
+                Some("pipeline:after:read"),
+                "UTC",
+                &[(ENV_OPEN_LOG, &l)],
+            )
+        })
+        .await
+        .expect("child");
+        assert!(!status.success(), "killed after the exec step: {status}");
+        assert_eq!(sends(&dir), 1);
+        let (d, u, l) = (dir.clone(), url.clone(), log_text.clone());
+        let status = tokio::task::spawn_blocking(move || {
+            child_in(
+                &d,
+                &u,
+                "recover",
+                "replayed-1",
+                None,
+                "UTC",
+                &[(ENV_OPEN_LOG, &l)],
+            )
+        })
+        .await
+        .expect("child");
+        assert!(status.success(), "recovered: {status}");
+        assert!(dir.join("result.json").exists());
+        assert_eq!(sends(&dir), 1, "the command did not run again");
+        let opens: Vec<String> = std::fs::read_to_string(&log)
+            .expect("log")
+            .lines()
+            .filter(|l| l.ends_with(" send-note"))
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(
+            opens.len(),
+            1,
+            "opened once, in the first process: {opens:?}"
+        );
+    });
 }
 
 #[test]

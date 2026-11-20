@@ -64,9 +64,8 @@ Every atom run goes through the execution backend: once its prompt is
 rendered, which runs the atom's helpers, it opens a workspace there before any
 model call or command, and closes it however the run ends, including a panic or
 a cancelled run, and only once a command running in it has ended. A backend
-with no room for a workspace stops the run without recording anything, and the
-run continues when recovery runs the step again: in `atomic serve`, or with
-`atomic runs resume`. The local backend is the only one with a Codex shell, and
+with no room for a workspace makes the run wait, recording nothing and saying
+on stderr that it waits, and the run goes on once there is room. The local backend is the only one with a Codex shell, and
 it states that its workspaces are durable. A backend that states anything else,
 or a value atomic does not recognize, is treated as ephemeral, and a workflow
 with a `worktree: true` step is refused on it before anything runs.
@@ -93,14 +92,14 @@ refuse a step whose atom declares a context.
 
 On Linux, atomic has verified that no atom's commands can reach the gate store
 or the credential: a Codex turn's commands and an exec atom's alike run under
-Codex's sandbox, which denies them the private part of the state directory,
-Codex's own records, the credential and key directories and the kernel
-keyrings. A turn's commands have no network or sockets. An exec atom's command
-may write only its scratch directory and the project's caches, and keeps
-network access until atoms can declare the network they need; `--runner
-process` confines it the same way. On macOS and Windows this has not been
-verified: exec atoms' commands run unconfined there, so atomic keeps no
-operator credential and refuses credentialed gate decisions.
+Codex's sandbox, which denies them the private part of every project's state
+directory, Codex's own records, the credential and key directories, the kernel
+keyrings, the network and sockets. An exec atom's command may write only its
+scratch directory and the project's caches; `--runner process` confines it the
+same way. Atomic needs bubblewrap and unprivileged user namespaces there, and
+refuses to start, saying so, where the sandbox cannot run. On macOS and Windows
+this has not been verified: exec atoms' commands run unconfined there, so
+atomic keeps no operator credential and refuses credentialed gate decisions.
 
 A `workspace-write` atom cannot write `/tmp`, `/var/tmp` or `$TMPDIR` as atomic
 found them: its commands' `TMPDIR` is the project's private one above. A tool

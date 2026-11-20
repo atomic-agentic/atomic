@@ -563,21 +563,25 @@ async fn run_pipeline<C: WorkflowContext>(
         } else {
             None
         };
-        // An exec step's workspace opens before its attempt is recorded, so a
-        // backend with no room stops the run before the attempt counts: on
-        // recovery, an attempt whose workspace never opened is not one whose
-        // command may have run. (A step that finished opens one again on
-        // replay, and closes it unused.)
+        // An exec step's workspace opens in the body of the step that records
+        // its attempt, so the attempt is recorded only once the workspace is
+        // open: on recovery, an attempt whose workspace never opened is not
+        // one whose command may have run. A replayed attempt step runs no
+        // body, so a step that finished never touches the backend again; one
+        // whose turn did not finish opens a workspace in its turn.
         let guard = if atom.kind == "exec" {
             let identity = atomic_core::runtime::EffectIdentity {
                 run_id: run_id.clone(),
                 step_id: step.id.clone(),
             };
-            let opened =
-                atomic_core::runtime::open_exec_workspace(&atom, &identity, runtimes.exec.shared())
-                    .await
-                    .map_err(crate::workflows::failed)?;
-            let begun = attempt::begin(&ctx, &format!("{}.attempt", step.id)).await?;
+            let (opening, who, backend) = (atom.clone(), identity.clone(), runtimes.exec.shared());
+            let (begun, opened) =
+                attempt::begin_with(&ctx, &format!("{}.attempt", step.id), move || async move {
+                    atomic_core::runtime::open_exec_workspace(&opening, &who, backend)
+                        .await
+                        .map_err(crate::workflows::failed)
+                })
+                .await?;
             Some((begun, atom.external().is_some(), opened, identity))
         } else {
             None
@@ -630,9 +634,21 @@ async fn run_pipeline<C: WorkflowContext>(
                 let proposal = match (tree, guard) {
                     (_, Some((_, _, opened, identity))) => {
                         let clock = runtimes.clock.clone();
+                        let backend = runtimes.exec.shared();
                         propose(async move {
                             let compiled = compile::compile(&atom, &Registry::new())
                                 .map_err(|e| AtomError::Runtime(e.to_string()))?;
+                            // Opened with the attempt, or, when the attempt
+                            // was recorded by an earlier execution, now.
+                            let opened = match opened {
+                                Some(opened) => opened,
+                                None => {
+                                    atomic_core::runtime::open_exec_workspace(
+                                        &atom, &identity, backend,
+                                    )
+                                    .await?
+                                }
+                            };
                             atomic_core::runtime::run_exec_opened(
                                 &atom,
                                 &compiled,
