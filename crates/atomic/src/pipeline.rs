@@ -1005,7 +1005,8 @@ async fn run_pipeline<C: WorkflowContext>(
                 // The turn runs again after a park is released, so each run
                 // takes its own copies.
                 let mut runtimes = runtimes.clone();
-                let (atom, atom_input, origins) = (atom.clone(), atom_input.clone(), origins.clone());
+                let (atom, atom_input, origins) =
+                    (atom.clone(), atom_input.clone(), origins.clone());
                 let (id, ran, run_id) = (id.clone(), ran.clone(), run_id.clone());
                 let (snapshot, tree, guard) = (snapshot.clone(), tree.clone(), guard.clone());
                 let pinned_helpers = pinned_helpers.clone();
@@ -1026,103 +1027,116 @@ async fn run_pipeline<C: WorkflowContext>(
                 let span = crate::telemetry::step_span(&atom.name, &id, &run_id);
                 let caller = (run_id.clone(), id.clone());
                 let work = async move {
-                if let Some(served) = served {
-                    return served;
-                }
-                // The run's helpers run only as recorded, on the runtime the
-                // run started on; anything else is refused rather than
-                // recaptured. Checked only when the turn runs: a finished
-                // turn replays from its checkpoint, whatever the runtime.
-                if !atom.program.helpers.is_empty() {
-                    atom.program
-                        .verify_helpers()
-                        .map_err(|e| failed(format!("step `{id}`: {e}")))?;
-                    let now = atomic_core::astro::Program::current_helper_runtime();
-                    if pinned_helpers.as_deref() != Some(now.as_str()) {
-                        return Err(failed(format!(
-                            "step `{id}`: this run started on another helper runtime ({}), and \
+                    if let Some(served) = served {
+                        return served;
+                    }
+                    // The run's helpers run only as recorded, on the runtime the
+                    // run started on; anything else is refused rather than
+                    // recaptured. Checked only when the turn runs: a finished
+                    // turn replays from its checkpoint, whatever the runtime.
+                    if !atom.program.helpers.is_empty() {
+                        atom.program
+                            .verify_helpers()
+                            .map_err(|e| failed(format!("step `{id}`: {e}")))?;
+                        let now = atomic_core::astro::Program::current_helper_runtime();
+                        if pinned_helpers.as_deref() != Some(now.as_str()) {
+                            return Err(failed(format!(
+                                "step `{id}`: this run started on another helper runtime ({}), and \
                              its helpers cannot resume on this one ({now}); their behaviour could \
                              differ from what the run already recorded. Start a new run",
-                            pinned_helpers.as_deref().unwrap_or("not recorded"),
+                                pinned_helpers.as_deref().unwrap_or("not recorded"),
+                            )));
+                        }
+                    }
+                    if let Some((begun, declared, opened, _)) = &guard
+                        && !declared
+                        && let Some(why) = ran_before(
+                            &atom.name,
+                            begun.interrupted(),
+                            opened.lock().map_or(true, |o| o.is_none()),
+                        )
+                    {
+                        return Err(failed(format!(
+                            "step `{id}`: outcome_unknown: {why}, so whether its command's effects \
+                         happened is unknown. The step is parked and its command does not run \
+                         again. If repeating it is safe, declare `effects: {{ external: \
+                         'idempotent' }}` (or `'read-only'` if it only reads)"
                         )));
                     }
-                }
-                if let Some((begun, declared, _, _)) = &guard
-                    && begun.interrupted()
-                    && !declared
-                {
-                    return Err(failed(format!(
-                        "step `{id}`: outcome_unknown: an earlier attempt of `{}` was interrupted \
-                         before its result was saved, so whether its command's effects happened \
-                         is unknown. The step is parked and its command does not run again. If \
-                         repeating it is safe, declare `effects: {{ external: 'idempotent' }}` \
-                         (or `'read-only'` if it only reads)",
-                        atom.name
-                    )));
-                }
-                let proposal = match (tree, guard) {
-                    (_, Some((_, _, opened, identity))) => {
-                        let clock = runtimes.clock.clone();
-                        let backend = runtimes.backend.shared();
-                        // The store the model runtimes check references against.
-                        let artifacts = runtimes.codex.artifacts.clone();
-                        propose_at(&place, true, async move {
-                            let compiled = compile::compile(&atom, &Registry::new())
-                                .map_err(|e| AtomError::Runtime(e.to_string()))?;
-                            // Opened with the attempt, or, when the attempt
-                            // was recorded by an earlier execution, now.
-                            let first = opened.lock().ok().and_then(|mut o| o.take());
-                            let opened = match first {
-                                Some(opened) => opened,
-                                None => {
-                                    atomic_core::runtime::open_exec_workspace(
-                                        &atom, &identity, backend,
-                                    )
-                                    .await?
-                                }
-                            };
-                            atomic_core::runtime::run_exec_opened(
-                                &atom,
-                                &compiled,
-                                &atom_input,
-                                &identity,
-                                opened,
-                                clock.as_ref(),
-                                &artifacts,
-                            )
-                            .await
-                        })
-                        .await
-                    }
-                    (None, None) => {
-                        propose_at(&place, true, async move {
-                            run_in(&atom, &atom_input, &origins, &run_id, &id, snapshot.as_ref(), &runtimes)
+                    let proposal = match (tree, guard) {
+                        (_, Some((_, _, opened, identity))) => {
+                            let clock = runtimes.clock.clone();
+                            let backend = runtimes.backend.shared();
+                            // The store the model runtimes check references against.
+                            let artifacts = runtimes.codex.artifacts.clone();
+                            propose_at(&place, true, async move {
+                                let compiled = compile::compile(&atom, &Registry::new())
+                                    .map_err(|e| AtomError::Runtime(e.to_string()))?;
+                                // Opened with the attempt, or, when the attempt
+                                // was recorded by an earlier execution, now.
+                                let first = opened.lock().ok().and_then(|mut o| o.take());
+                                let opened = match first {
+                                    Some(opened) => opened,
+                                    None => {
+                                        atomic_core::runtime::open_exec_workspace(
+                                            &atom, &identity, backend,
+                                        )
+                                        .await?
+                                    }
+                                };
+                                atomic_core::runtime::run_exec_opened(
+                                    &atom,
+                                    &compiled,
+                                    &atom_input,
+                                    &identity,
+                                    opened,
+                                    clock.as_ref(),
+                                    &artifacts,
+                                )
                                 .await
-                        })
+                            })
                             .await
-                    }
-                    (Some((worktrees, request)), None) => {
-                        let runtimes = Arc::new(runtimes);
-                        let call = StepCall {
-                            atom,
-                            input: atom_input,
-                            origins,
-                            snapshot,
-                            run_id,
-                        };
-                        in_worktree(worktrees, request, call, runtimes, &place).await
-                    }
-                }?;
-                let mut proposal = proposal;
-                let Value::Object(metadata) = &mut proposal.metadata else {
-                    return Err(failed("an atom step's metadata is not an object".into()));
-                };
-                metadata.insert("input_sha256".into(), Value::String(input_sha256));
-                failpoint(&ran);
-                Ok(proposal)
+                        }
+                        (None, None) => {
+                            propose_at(&place, true, async move {
+                                run_in(
+                                    &atom,
+                                    &atom_input,
+                                    &origins,
+                                    &run_id,
+                                    &id,
+                                    snapshot.as_ref(),
+                                    &runtimes,
+                                )
+                                .await
+                            })
+                            .await
+                        }
+                        (Some((worktrees, request)), None) => {
+                            let runtimes = Arc::new(runtimes);
+                            let call = StepCall {
+                                atom,
+                                input: atom_input,
+                                origins,
+                                snapshot,
+                                run_id,
+                            };
+                            in_worktree(worktrees, request, call, runtimes, &place).await
+                        }
+                    }?;
+                    let mut proposal = proposal;
+                    let Value::Object(metadata) = &mut proposal.metadata else {
+                        return Err(failed("an atom step's metadata is not an object".into()));
+                    };
+                    metadata.insert("input_sha256".into(), Value::String(input_sha256));
+                    failpoint(&ran);
+                    Ok(proposal)
                 };
                 // Model calls name the run and step on their spans.
-                crate::telemetry::traced(span, atomic_core::usage::for_step(caller.0, caller.1, work))
+                crate::telemetry::traced(
+                    span,
+                    atomic_core::usage::for_step(caller.0, caller.1, work),
+                )
             },
             Vec::new(),
         )
@@ -1573,9 +1587,40 @@ fn recorded_results(
     Ok(recorded)
 }
 
+/// Why the command of exec atom `atom`, about to run in its step's body,
+/// may have run already, so that running it again could repeat its
+/// effects; `None` when this is its first run. Either an earlier execution
+/// was `interrupted` after the step's attempt began, or, in this process,
+/// an earlier run of the step's body took the workspace its attempt opened
+/// (`workspace_taken`), and so ran its command or began to.
+fn ran_before(atom: &str, interrupted: bool, workspace_taken: bool) -> Option<String> {
+    if interrupted {
+        Some(format!(
+            "an earlier attempt of `{atom}` was interrupted before its result was saved"
+        ))
+    } else if workspace_taken {
+        Some(format!(
+            "this step already ran `{atom}`'s command, or began to, in this process"
+        ))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A command runs again only through the effects rule: after an
+    /// interrupted attempt, and after an earlier run of the step's body in
+    /// this process took its attempt's workspace.
+    #[test]
+    fn an_exec_command_that_may_have_run_is_not_run_again_unchecked() {
+        assert_eq!(ran_before("x", false, false), None, "its first run");
+        assert!(ran_before("x", true, true).is_some_and(|why| why.contains("interrupted")));
+        assert!(ran_before("x", true, false).is_some_and(|why| why.contains("interrupted")));
+        assert!(ran_before("x", false, true).is_some_and(|why| why.contains("in this process")));
+    }
 
     fn run() -> PipelineRun {
         serde_json::from_value(json!({
