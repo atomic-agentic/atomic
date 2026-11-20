@@ -61,6 +61,18 @@ bill of materials.
   beads' design: items, dependencies, claims and the ready queue. It contains
   no beads source code. atomic does not ship a program named `bd`.
 
+## rig-core
+
+- Upstream: <https://github.com/0xPlaygrounds/rig> (crate `rig-core`, 0.46)
+- Licence: MIT
+- Copyright (c) 2024, Playgrounds Analytics Inc.
+- Use: part of atomic's redaction module,
+  [`crates/atomic-core/src/redact.rs`](crates/atomic-core/src/redact.rs), is
+  adapted from rig-core's `src/redact.rs`: the finder for secrets of a known
+  format (its table of provider key prefixes, in its order, and its JSON Web
+  Token scan) and the check that a value beside a secret name is plausibly
+  the secret. atomic does not depend on rig-core.
+
 The MIT License, as it applies to the projects above that use it:
 
 > Permission is hereby granted, free of charge, to any person obtaining a copy

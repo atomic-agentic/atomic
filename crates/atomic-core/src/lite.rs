@@ -597,8 +597,12 @@ fn responses_answer(value: &Value) -> anyhow::Result<Answer> {
 }
 
 /// The start of a response body, for an error message.
+/// The start of a provider's response, for an error message, with any
+/// secret it echoes redacted first, so the cut cannot hide one.
 fn excerpt(text: &str) -> String {
     const MAX: usize = 500;
+    let text = crate::redact::text(text);
+    let text = text.as_ref();
     match text.char_indices().nth(MAX) {
         Some((at, _)) => format!("{}…", &text[..at]),
         None => text.to_owned(),

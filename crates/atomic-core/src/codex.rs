@@ -358,7 +358,7 @@ where
             leave_session_keyring()
         };
         if let Err(e) = kept_off {
-            eprintln!("atomic: cannot keep a sandboxed command off the kernel keyrings: {e}");
+            crate::log_line!("atomic: cannot keep a sandboxed command off the kernel keyrings: {e}");
             std::process::exit(1);
         }
     }
@@ -1215,7 +1215,8 @@ async fn turn(
                     .last_agent_message
                     .context("the turn completed without a message");
             }
-            EventMsg::Error(event) => bail!(event.message),
+            // A provider's error can echo what it was sent.
+            EventMsg::Error(event) => bail!("{}", crate::redact::text(&event.message)),
             EventMsg::TurnAborted(_) => bail!("turn aborted"),
             EventMsg::ExecApprovalRequest(_) => bail!("turn requested exec approval"),
             EventMsg::ApplyPatchApprovalRequest(_) => bail!("turn requested patch approval"),

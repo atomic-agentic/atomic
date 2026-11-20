@@ -466,7 +466,7 @@ fn check(path: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
         );
     } else {
         for w in &warnings {
-            eprintln!("warning: {w}");
+            atomic_core::log_line!("warning: {w}");
         }
         println!(
             "checked {} Astro atoms, {} workflows and {} toolset operations",

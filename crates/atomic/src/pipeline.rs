@@ -141,7 +141,7 @@ fn reached(id: &str, position: usize) -> Result<()> {
             "{DEAD_LETTERED} run {id} stopped {RECOVERY_LIMIT} times in this process at the same \
              step without finishing it, so it is not run again"
         );
-        eprintln!("{why}");
+        atomic_core::log_line!("{why}");
         return Err(failed(why));
     }
     Ok(())
