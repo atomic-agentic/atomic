@@ -221,6 +221,7 @@ fn runtimes_on(dir: &Path, cwd: &Path, base_url: &str, model: &str) -> Arc<Runti
             defaults: AtomConfig::default(),
             artifacts: Artifacts::none(),
             meter: atomic_core::usage::Metering::none(),
+            backend: Default::default(),
         },
         lite: LiteRuntime::new(endpoint, AtomConfig::default()),
         exec: Default::default(),
@@ -229,7 +230,106 @@ fn runtimes_on(dir: &Path, cwd: &Path, base_url: &str, model: &str) -> Arc<Runti
 }
 
 async fn engine(dir: &Path, base_url: &str) -> Durare {
-    engine_with(dir, base_url, BudgetSettings::default()).await
+    // A child process asked to log the workspaces it opens.
+    let logged = std::env::var_os(ENV_OPEN_LOG).map(|log| {
+        atomic_exec::Backend::connect(Logging {
+            log: PathBuf::from(log),
+            local: atomic_exec::LocalBackend::default(),
+        })
+        .expect("connects")
+    });
+    // A child process on a machine whose sandbox cannot start: a helper
+    // that runs nothing and fails as bubblewrap does where user namespaces
+    // are not allowed.
+    let unconfinable = std::env::var_os(ENV_UNCONFINABLE).map(|_| {
+        use std::os::unix::fs::PermissionsExt;
+        let helper = dir.join("refusing-helper");
+        std::fs::write(
+            &helper,
+            "#!/bin/sh\necho 'bwrap: No permissions to create a new namespace' >&2\nexit 1\n",
+        )
+        .expect("helper");
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let paths = atomic_core::codex::CodexPaths::with_helpers(helper.clone(), helper);
+        let sandbox = atomic_core::codex::ExecSandbox::new(
+            &paths,
+            atomic_core::codex::StateGuard::NoProjectState,
+            dir.join("codex"),
+        )
+        .expect("a helper");
+        atomic_exec::Backend::connect(
+            atomic_exec::LocalBackend::in_dir(
+                Path::new(env!("CARGO_TARGET_TMPDIR"))
+                    .join(format!("pipeline-unconfinable-{}", std::process::id())),
+            )
+            .confined(Arc::new(sandbox)),
+        )
+        .expect("connects")
+    });
+    engine_full(
+        dir,
+        base_url,
+        BudgetSettings::default(),
+        "synthetic",
+        logged.or(unconfinable),
+    )
+    .await
+}
+
+/// Set in a child process whose sandbox cannot start.
+const ENV_UNCONFINABLE: &str = "ATOMIC_PIPELINE_UNCONFINABLE";
+
+/// Where a child process logs the workspaces it opens, when set.
+const ENV_OPEN_LOG: &str = "ATOMIC_PIPELINE_OPEN_LOG";
+
+/// The local backend, logging each workspace it opens.
+struct Logging {
+    log: PathBuf,
+    local: atomic_exec::LocalBackend,
+}
+
+impl atomic_exec::ExecutionBackend for Logging {
+    fn connect(&self) -> Result<atomic_exec::Statement, atomic_exec::ExecError> {
+        Ok(atomic_exec::LocalBackend::STATEMENT)
+    }
+    fn open(
+        &self,
+        request: &atomic_exec::Open,
+    ) -> Result<atomic_exec::Workspace, atomic_exec::ExecError> {
+        use std::io::Write;
+        let mut log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.log)
+            .expect("open log");
+        writeln!(log, "open {}", request.label).expect("log");
+        self.local.open(request)
+    }
+    fn run(
+        &self,
+        command: &atomic_exec::Command,
+    ) -> Result<atomic_exec::Completed, atomic_exec::ExecError> {
+        self.local.run(command)
+    }
+    fn close(&self, workspace: &atomic_exec::Workspace) -> Result<(), atomic_exec::ExecError> {
+        self.local.close(workspace)
+    }
+}
+
+/// [`engine`], with every atom running on `backend`.
+async fn engine_backed(
+    dir: &Path,
+    base_url: &str,
+    backend: Option<atomic_exec::Backend>,
+) -> Durare {
+    engine_full(
+        dir,
+        base_url,
+        BudgetSettings::default(),
+        "synthetic",
+        backend,
+    )
+    .await
 }
 
 /// As [`engine`], metering model calls under `budgets`.
@@ -239,6 +339,18 @@ async fn engine_with(dir: &Path, base_url: &str, budgets: BudgetSettings) -> Dur
 
 /// As [`engine_with`], with `model` as the default model.
 async fn engine_on(dir: &Path, base_url: &str, budgets: BudgetSettings, model: &str) -> Durare {
+    engine_full(dir, base_url, budgets, model, None).await
+}
+
+/// The engine every helper above opens: `model` the default model, calls
+/// metered under `budgets`, and every atom on `backend` when one is given.
+async fn engine_full(
+    dir: &Path,
+    base_url: &str,
+    budgets: BudgetSettings,
+    model: &str,
+    backend: Option<atomic_exec::Backend>,
+) -> Durare {
     let mut rt = Durare::sqlite(&dir.join("atomic.db"))
         .await
         .expect("engine");
@@ -256,6 +368,16 @@ async fn engine_on(dir: &Path, base_url: &str, budgets: BudgetSettings, model: &
         )
     } else {
         (runtimes_on(dir, &dir.join("cwd"), base_url, model), None)
+    };
+    let runtimes = match backend {
+        Some(backend) => {
+            let mut on = (*runtimes).clone();
+            on.codex.backend = backend.clone();
+            on.lite.backend = backend.clone();
+            on.exec = backend;
+            Arc::new(on)
+        }
+        None => runtimes,
     };
     register_pipeline(
         &mut rt,
@@ -1082,6 +1204,257 @@ fn a_worktree_step_runs_at_its_base_and_atomic_commits_what_it_left() {
     });
 }
 
+/// A backend on the local machine that states its durability as a runner
+/// on the wire would: as a JSON value it is given.
+struct Stating(Value);
+
+impl atomic_exec::ExecutionBackend for Stating {
+    fn connect(&self) -> Result<atomic_exec::Statement, atomic_exec::ExecError> {
+        serde_json::from_value(self.0.clone()).map_err(|e| atomic_exec::ExecError::Io {
+            program: "connect".into(),
+            message: e.to_string(),
+        })
+    }
+    fn open(
+        &self,
+        request: &atomic_exec::Open,
+    ) -> Result<atomic_exec::Workspace, atomic_exec::ExecError> {
+        atomic_exec::LocalBackend::default().open(request)
+    }
+    fn run(
+        &self,
+        command: &atomic_exec::Command,
+    ) -> Result<atomic_exec::Completed, atomic_exec::ExecError> {
+        atomic_exec::LocalBackend::default().run(command)
+    }
+    fn close(&self, workspace: &atomic_exec::Workspace) -> Result<(), atomic_exec::ExecError> {
+        atomic_exec::LocalBackend::default().close(workspace)
+    }
+}
+
+/// The run plans from what the backend states, not from which backend it
+/// is: the same local machine, stating an ephemeral or an unrecognized
+/// durability, gets a worktree step refused before anything runs, and
+/// stating durable gets it run.
+#[test]
+fn a_worktree_step_is_refused_on_a_backend_that_does_not_state_durable_workspaces() {
+    on_codex_runtime(async {
+        for (tag, statement) in [
+            ("ephemeral", json!({"durability": "ephemeral"})),
+            ("unrecognized", json!({"durability": "snapshot"})),
+            ("unstated", json!({})),
+        ] {
+            let dir = scratch(&format!("worktree-{tag}"));
+            let (project, base) = repository_project(&dir);
+            let pipeline = load(&project, "fix.workflow.yaml", FIX);
+            let model = FakeModel::start(vec![
+                Reply::Text(r#"{"done": true}"#.into()),
+                Reply::Text(r#"{"ok": true}"#.into()),
+            ])
+            .await
+            .expect("fake model");
+            let backend = atomic_exec::Backend::connect(Stating(statement)).expect("connects");
+            assert_eq!(backend.durability(), atomic_exec::Durability::Ephemeral);
+            let rt = engine_backed(&dir, &model.base_url(), Some(backend)).await;
+            let run = PipelineRun {
+                pipeline,
+                input: json!({"title": "Export crashes on accents", "base": base}),
+            };
+            rt.start(PIPELINE, "fix-1", run).await.expect("start");
+            let error = rt
+                .result::<Value>("fix-1")
+                .await
+                .expect_err("refused")
+                .to_string();
+            assert!(
+                error.contains("step `fix` runs in a worktree")
+                    && error.contains("workspaces are ephemeral"),
+                "{tag}: {error}"
+            );
+            assert_eq!(model.calls(), 0, "{tag}: nothing ran");
+            let made = std::fs::read_dir(dir.join("state/worktrees"))
+                .map(|d| d.count())
+                .unwrap_or(0);
+            assert_eq!(made, 0, "{tag}: no worktree was made");
+            rt.shutdown(std::time::Duration::from_secs(5))
+                .await
+                .expect("shutdown");
+        }
+
+        // The same machine, stating durable workspaces, runs the step.
+        let dir = scratch("worktree-durable");
+        let (project, base) = repository_project(&dir);
+        let pipeline = load(&project, "fix.workflow.yaml", FIX);
+        let model = FakeModel::start(vec![
+            Reply::Text(r#"{"done": true}"#.into()),
+            Reply::Text(r#"{"ok": true}"#.into()),
+        ])
+        .await
+        .expect("fake model");
+        let backend = atomic_exec::Backend::connect(Stating(json!({"durability": "durable"})))
+            .expect("connects");
+        let rt = engine_backed(&dir, &model.base_url(), Some(backend)).await;
+        let run = PipelineRun {
+            pipeline,
+            input: json!({"title": "Export crashes on accents", "base": base}),
+        };
+        rt.start(PIPELINE, "fix-1", run).await.expect("start");
+        let out: Value = rt.result("fix-1").await.expect("finishes");
+        assert_eq!(out, json!({"ok": true}));
+        assert_eq!(model.calls(), 2);
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+/// A backend that has no room for another workspace until `room` is set.
+#[derive(Clone)]
+struct Busy {
+    room: Arc<std::sync::atomic::AtomicBool>,
+    refused: Arc<std::sync::atomic::AtomicUsize>,
+    local: atomic_exec::LocalBackend,
+}
+
+impl atomic_exec::ExecutionBackend for Busy {
+    fn connect(&self) -> Result<atomic_exec::Statement, atomic_exec::ExecError> {
+        self.local.connect()
+    }
+    fn open(
+        &self,
+        request: &atomic_exec::Open,
+    ) -> Result<atomic_exec::Workspace, atomic_exec::ExecError> {
+        if !self.room.load(std::sync::atomic::Ordering::SeqCst) {
+            self.refused
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return Err(atomic_exec::ExecError::Unavailable {
+                label: request.label.clone(),
+                message: "no runner is free".into(),
+            });
+        }
+        self.local.open(request)
+    }
+    fn run(
+        &self,
+        command: &atomic_exec::Command,
+    ) -> Result<atomic_exec::Completed, atomic_exec::ExecError> {
+        self.local.run(command)
+    }
+    fn close(&self, workspace: &atomic_exec::Workspace) -> Result<(), atomic_exec::ExecError> {
+        self.local.close(workspace)
+    }
+}
+
+/// A backend with no room makes the run wait, recording nothing: it neither
+/// fails nor parks, spends none of the engine's recovery attempts, and
+/// finishes in the same execution once the backend has room. Its first step
+/// is an exec atom that declares no effects, whose attempt would be parked
+/// as outcome_unknown if an attempt whose workspace never opened counted as
+/// one that may have run.
+#[test]
+fn a_run_whose_backend_has_no_room_runs_again_once_it_has() {
+    on_codex_runtime(async {
+        let dir = scratch("busy");
+        let project = project(&dir);
+        std::fs::create_dir_all(project.join("tools")).expect("tools");
+        std::fs::write(
+            project.join("tools/count.py"),
+            "import json, sys\nnote = json.load(sys.stdin)\njson.dump({'title': note['text'][:20], 'words': len(note['text'].split())}, sys.stdout)\n",
+        )
+        .expect("script");
+        let atoms = project.join("atoms");
+        std::fs::write(
+            atoms.join("count-note.atom.astro"),
+            "---\nimport type { Props, Input, Output } from '../.atomic/types/count-note';\n\
+             import type { AtomConfig } from '../.atomic/types/authoring';\n\
+             const { input }: Props = Astro.props;\n\
+             export const config: AtomConfig<Input, Output> = { description: 'Count words.', kind: 'exec', exec: { command: ['python3', 'tools/count.py'] } };\n---\n",
+        )
+        .expect("atom");
+        for role in ["input", "output"] {
+            std::fs::copy(
+                atoms.join(format!("read-note.{role}.schema.json")),
+                atoms.join(format!("count-note.{role}.schema.json")),
+            )
+            .expect("schema");
+        }
+        let workflow = TRIAGE
+            .replace("name: triage-note", "name: counted-triage")
+            .replace("atom: read-note", "atom: count-note");
+        let pipeline = load(&project, "counted.workflow.yaml", &workflow);
+        let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
+            .await
+            .expect("fake model");
+        let busy = Busy {
+            room: Arc::default(),
+            refused: Arc::default(),
+            // Not under /tmp, where this test's other files are: connect
+            // refuses a scratch root a sandboxed turn could write.
+            local: atomic_exec::LocalBackend::in_dir(
+                Path::new(env!("CARGO_TARGET_TMPDIR"))
+                    .join(format!("pipeline-busy-scratch-{}", std::process::id())),
+            ),
+        };
+        let backend = atomic_exec::Backend::connect(busy.clone()).expect("connects");
+        let rt = engine_backed(&dir, &model.base_url(), Some(backend)).await;
+        let run = PipelineRun {
+            pipeline,
+            input: json!({"text": "Export crashes on accented names"}),
+        };
+        rt.start(PIPELINE, "busy-1", run).await.expect("start");
+        // Refused, more than once: the open is tried again, nothing recorded.
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while busy.refused.load(std::sync::atomic::Ordering::SeqCst) < 4 {
+            assert!(
+                std::time::Instant::now() < until,
+                "the open was not tried again"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            matches!(
+                rt.status("busy-1").await.expect("status"),
+                Some(RunStatus::Pending)
+            ),
+            "the run neither failed nor finished"
+        );
+        assert!(
+            atomic_durable::parks(&rt, "busy-1")
+                .await
+                .expect("parks")
+                .is_empty(),
+            "and did not park"
+        );
+        assert_eq!(model.calls(), 0, "nothing was sent");
+
+        // Nothing of the step is recorded while it waits.
+        let recorded: Vec<String> = rt
+            .steps("busy-1")
+            .await
+            .expect("steps")
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert!(
+            !recorded.iter().any(|n| n.starts_with("read.")),
+            "{recorded:?}"
+        );
+
+        busy.room.store(true, std::sync::atomic::Ordering::SeqCst);
+        // The same execution finishes it: an execution that had stopped for
+        // recovery would have handed this process an interruption.
+        let out: Value = rt
+            .result("busy-1")
+            .await
+            .expect("finishes once there is room");
+        assert_eq!(out, json!({"line": "P1: Export crashes on accents"}));
+        assert_eq!(model.calls(), 2);
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
 #[test]
 fn a_worktree_step_killed_after_its_commit_commits_again_and_keeps_one() {
     on_codex_runtime(async {
@@ -1269,6 +1642,125 @@ fn an_interrupted_exec_step_declared_idempotent_runs_again() {
 #[test]
 fn an_interrupted_exec_step_declared_read_only_runs_again() {
     on_codex_runtime(interrupted_declared_exec_runs_again("read-only"));
+}
+
+/// Where the sandbox cannot start, a step that runs commands stops the
+/// process with what the sandbox needs, recording nothing: the run stays
+/// pending, its command never ran, and it finishes when resumed where the
+/// sandbox can start. (A step's failure, recorded, would end it for good.)
+#[test]
+fn a_run_stops_without_an_outcome_where_the_sandbox_cannot_start() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
+            .await
+            .expect("fake model");
+        let dir = scratch("unconfinable");
+        project(&dir);
+        write_send_note(&dir, None);
+        let url = model.base_url();
+        let (d, u) = (dir.clone(), url.clone());
+        let status = tokio::task::spawn_blocking(move || {
+            child_in(
+                &d,
+                &u,
+                "start-sent",
+                "unconfinable-1",
+                None,
+                "UTC",
+                &[(ENV_UNCONFINABLE, "1")],
+            )
+        })
+        .await
+        .expect("child");
+        assert_eq!(
+            status.code(),
+            Some(atomic_app::workflows::UNCONFINABLE_EXIT),
+            "stopped as unconfinable: {status}"
+        );
+        assert_eq!(sends(&dir), 0, "the command never ran");
+        assert_eq!(model.calls(), 0);
+        {
+            let rt = Durare::sqlite(&dir.join("atomic.db")).await.expect("store");
+            assert!(
+                matches!(
+                    rt.status("unconfinable-1").await.expect("status"),
+                    Some(RunStatus::Pending)
+                ),
+                "no outcome was recorded"
+            );
+        }
+        // Resumed where the sandbox can start, it runs.
+        let (d, u) = (dir.clone(), url.clone());
+        let status = tokio::task::spawn_blocking(move || {
+            child_in(&d, &u, "recover", "unconfinable-1", None, "UTC", &[])
+        })
+        .await
+        .expect("child");
+        assert!(status.success(), "resumed: {status}");
+        assert_eq!(sends(&dir), 1);
+        assert!(dir.join("result.json").exists());
+    });
+}
+
+/// A finished exec step is never opened again: recovering the run after a
+/// kill that followed the step replays it from its record, and its backend
+/// sees one workspace for it, in the first process.
+#[test]
+fn recovery_after_a_finished_exec_step_does_not_open_its_workspace_again() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
+            .await
+            .expect("fake model");
+        let dir = scratch("replayed-exec");
+        project(&dir);
+        write_send_note(&dir, None);
+        let (url, log) = (model.base_url(), dir.join("opens.log"));
+        let log_text = log.display().to_string();
+        let (d, u, l) = (dir.clone(), url.clone(), log_text.clone());
+        let status = tokio::task::spawn_blocking(move || {
+            child_in(
+                &d,
+                &u,
+                "start-sent",
+                "replayed-1",
+                Some("pipeline:after:read"),
+                "UTC",
+                &[(ENV_OPEN_LOG, &l)],
+            )
+        })
+        .await
+        .expect("child");
+        assert!(!status.success(), "killed after the exec step: {status}");
+        assert_eq!(sends(&dir), 1);
+        let (d, u, l) = (dir.clone(), url.clone(), log_text.clone());
+        let status = tokio::task::spawn_blocking(move || {
+            child_in(
+                &d,
+                &u,
+                "recover",
+                "replayed-1",
+                None,
+                "UTC",
+                &[(ENV_OPEN_LOG, &l)],
+            )
+        })
+        .await
+        .expect("child");
+        assert!(status.success(), "recovered: {status}");
+        assert!(dir.join("result.json").exists());
+        assert_eq!(sends(&dir), 1, "the command did not run again");
+        let opens: Vec<String> = std::fs::read_to_string(&log)
+            .expect("log")
+            .lines()
+            .filter(|l| l.ends_with(" send-note"))
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(
+            opens.len(),
+            1,
+            "opened once, in the first process: {opens:?}"
+        );
+    });
 }
 
 #[test]
@@ -1497,6 +1989,59 @@ async fn nth_park(rt: &Durare, run: &str, n: usize) -> atomic_durable::Park {
         assert!(std::time::Instant::now() < until, "the run parked");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
+}
+
+/// A replay serves each step its recorded result, so it opens no
+/// workspace on the execution backend: not for its exec step, whose attempt
+/// it records with nothing prepared, and not for its model steps.
+#[test]
+fn replaying_a_recorded_run_opens_no_workspace() {
+    on_codex_runtime(async {
+        let dir = scratch("replay-opens");
+        let project = project(&dir);
+        write_send_note(&dir, Some("idempotent"));
+        let pipeline = load(&project, "sent.workflow.yaml", &sent());
+        let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
+            .await
+            .expect("fake model");
+        let log = dir.join("opens.log");
+        let backend = atomic_exec::Backend::connect(Logging {
+            log: log.clone(),
+            local: atomic_exec::LocalBackend::default(),
+        })
+        .expect("connects");
+        let rt = engine_backed(&dir, &model.base_url(), Some(backend)).await;
+        let opens = || {
+            std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        rt.start(
+            PIPELINE,
+            "recorded",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "Exporting a file named café.txt crashes the app."}),
+            },
+        )
+        .await
+        .expect("start");
+        let recorded: Value = rt.result("recorded").await.expect("finishes");
+        let live = opens();
+        assert!(
+            live.contains(&"open send-note".to_owned()),
+            "the recorded run opened its exec step's workspace: {live:?}"
+        );
+
+        let replay = replay_of(&rt, "recorded").await.expect("a replay");
+        rt.start(REPLAY, "replayed", replay).await.expect("start");
+        let replayed: Value = rt.result("replayed").await.expect("the replay finishes");
+        assert_eq!(replayed, recorded);
+        assert_eq!(opens(), live, "the replay opened a workspace");
+        assert_eq!(sends(&dir), 1, "the replay ran no command");
+    });
 }
 
 #[test]

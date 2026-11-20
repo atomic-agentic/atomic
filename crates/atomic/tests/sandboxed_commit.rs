@@ -28,9 +28,11 @@
 mod support;
 
 use atomic_core::Sandbox;
-use atomic_core::codex::{self, CodexPaths, ModelEndpoint, PrivateState, StateGuard, TurnSpec};
+use atomic_core::codex::{CodexPaths, ModelEndpoint, PrivateState, StateGuard, TurnSpec};
 use atomic_core::git::{Git, Signature};
+use atomic_core::runtime::{Artifacts, CodexRuntime, run_turn};
 use atomic_core::testing::{FakeModel, Reply, on_codex_runtime};
+use atomic_core::usage::Metering;
 use atomic_core::worktree::{Caches, Worktrees};
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -121,6 +123,14 @@ async fn sandboxed(f: &Fixture, cwd: &Path, command: &str, extra: TurnSpec) -> S
     .await
 }
 
+/// Where the turns' backend keeps its scratch directories: not under /tmp,
+/// where some fixtures keep their project and state, since a scratch root
+/// there is refused.
+fn scratch_root() -> PathBuf {
+    Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("atomic-sandboxed-scratch-{}", std::process::id()))
+}
+
 /// Run one turn of `spec` under `guard` in `cwd` whose model runs `command`
 /// once, and return what the command printed.
 async fn sandboxed_with(
@@ -143,16 +153,24 @@ async fn sandboxed_with(
         PathBuf::from(env!("CARGO_BIN_EXE_atomic")),
         f.dir.join("bin/codex-linux-sandbox"),
     );
-    let answer = codex::run(
-        &paths,
-        &f.dir.join("codex-home"),
-        cwd,
-        &ModelEndpoint {
+    let runtime = CodexRuntime {
+        paths,
+        codex_home: f.dir.join("codex-home"),
+        cwd: cwd.to_owned(),
+        endpoint: ModelEndpoint {
             base_url: model.base_url(),
             model: "synthetic".into(),
             api_key_env: None,
         },
-        guard,
+        defaults: Default::default(),
+        artifacts: Artifacts::none(),
+        meter: Metering::none(),
+        guard: guard.clone(),
+        backend: atomic_exec::Backend::connect(atomic_exec::LocalBackend::in_dir(scratch_root()))
+            .unwrap(),
+    };
+    let answer = run_turn(
+        &runtime,
         &TurnSpec {
             prompt: "Do the work.".into(),
             ..spec
@@ -294,6 +312,7 @@ fn a_project_under_the_system_temporary_directory_stays_out_of_reach() {
         );
         let guard = StateGuard::Deny(PrivateState {
             state_dir: state.clone(),
+            private: state.join("private"),
             also: Vec::new(),
         });
         let spec = TurnSpec {
@@ -313,7 +332,7 @@ fn a_project_under_the_system_temporary_directory_stays_out_of_reach() {
         assert!(!common.join("forged").exists());
         assert!(!state.join("private/forged").exists());
         assert_eq!(f.worktrees.repo().refs("refs/heads/").unwrap().len(), 1);
-        // Its temporary files go to a directory of its own, removed after.
+        // Its temporary files go to a private directory, not /tmp.
         assert!(output.contains("mktemp-exit=0"), "{output}");
         // The output is the JSON text of what the command printed.
         let temp = output
@@ -322,14 +341,14 @@ fn a_project_under_the_system_temporary_directory_stays_out_of_reach() {
             .and_then(|rest| rest.split("\\n").next())
             .expect("mktemp printed its file")
             .to_owned();
+        // The project's private temporary directory, which every turn of
+        // its backend shares (Codex's sandbox keeps a registry there), outside
+        // /tmp; it is emptied when the backend next connects.
         assert!(
-            Path::new(&temp).starts_with(state.join("tmp")),
-            "{temp} is not in the turn's own temporary directory"
+            Path::new(&temp).starts_with(scratch_root().join(".tmp")),
+            "{temp} is not in the backend's private temporary directory"
         );
-        assert!(
-            !Path::new(&temp).exists(),
-            "the turn's temporary directory was removed"
-        );
+        assert!(!temp.starts_with("/tmp/"), "{temp}");
     });
 }
 
@@ -344,6 +363,7 @@ fn a_read_only_turn_in_a_worktree_sees_its_checkout() {
         assert!(wt.path.starts_with(&state));
         let guard = StateGuard::Deny(PrivateState {
             state_dir: state.clone(),
+            private: state.join("private"),
             also: Vec::new(),
         });
         // One stream, so what the commands print arrives in order: Codex

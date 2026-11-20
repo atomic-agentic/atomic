@@ -46,6 +46,37 @@ project root. The command reads its input as JSON on stdin and writes its output
 as JSON on stdout; a nonzero exit fails the step. It receives only the variables
 in `env`, plus its own `HOME` and `TMPDIR` and the effect variables below.
 
+On Linux the command runs under the same sandbox as a Codex atom's commands. It
+can read the project and the rest of the filesystem except atomic's private
+state (every project's database and gate store under the atomic home's
+`private/`, the current project's Codex records, the credential and key
+directories). It can write only its own scratch directory (its `HOME`
+and `TMPDIR`) and the project's build caches; a command that writes anywhere
+else fails. It has no network and cannot use sockets, until atoms can declare
+the network they need. It also:
+
+- finds `.aws`, `.codex`, `.git` and `.agents` in its `HOME` read-only, as the
+  sandbox keeps them in every writable directory;
+- cannot gain privileges (no `sudo`, no setuid programs) and sees no GPU or
+  other devices beyond the basic ones;
+- is not told where the caches are: name the directory in `env` if a tool needs
+  it;
+- cannot be a program whose path holds `=`.
+
+`env` cannot set `HOME` or `TMPDIR`, which are the command's own. A codex atom
+may declare `env` too, for the commands its turn runs, such as the tool homes
+(`RUSTUP_HOME`, `CARGO_HOME`, `PYENV_ROOT`) they no longer find through `HOME`;
+it cannot set `HOME`, `ZDOTDIR` or `TMPDIR`, nor a variable the dynamic loader
+reads (`LD_*`, `DYLD_*`, `GCONV_PATH`, `GLIBC_TUNABLES`), which would load code
+into the sandbox helper.
+
+On Linux, an atom that runs commands, an exec atom or a codex atom, needs
+bubblewrap and unprivileged user namespaces. Where the sandbox cannot start,
+atomic stops before such a step runs, saying what it needs and recording
+nothing, so the run continues once resumed where the sandbox can start; atoms
+that run no commands, such as lite atoms, run as usual. On macOS and Windows the
+command is not confined yet.
+
 A step runs at least once, and Atomic cannot see what a command does to other
 systems. If execution is interrupted after the command started and before its
 result was saved, `effects.external` decides what recovery does. This includes
@@ -196,7 +227,7 @@ time rather than passing unchecked.
 | `scorers` | Interpreted judge bindings, numeric scores, mean thresholds (`min_mean`) and the tolerated drop against a baseline (`max_drop`) |
 | `evals` | The eval-case directory relative to the atom file, or `{dir, pass_rate}`; see [eval cases](eval-cases.md#pass-rate-and-threshold) |
 | `context` | Optional public execution-context schema; a context sidecar is also accepted. See [context schemas](#context-schemas) |
-| `exec`, `effects`, `env` | An exec atom's command, what it does outside Atomic, and its environment. See [exec atoms](#exec-atoms) |
+| `exec`, `effects`, `env` | An exec atom's command, what it does outside Atomic, and its environment. See [exec atoms](#exec-atoms). A codex atom may declare `env` too, for its turn's commands (see [exec atoms](#exec-atoms) for what it cannot set) |
 
 Some integrations shown in the catalog remain staged. Unavailable permissions,
 remote atoms, credentials, skills and runtime declarations fail explicitly in the
