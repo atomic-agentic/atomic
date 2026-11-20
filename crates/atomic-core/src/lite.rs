@@ -268,7 +268,6 @@ where
         let input_bound = serde_json::to_vec(&unlimited)
             .map(|b| b.len() as u64 + 64)
             .ok();
-        let span = crate::usage::call_span(&model);
         // Admitted before it is dispatched, settled once after.
         let (ticket, limit) = runtime
             .meter
@@ -281,6 +280,11 @@ where
             .await
             .map_err(meter_error)?;
         index += 1;
+        // Opened once the call is admitted, so a refused call exports none.
+        let span = crate::usage::call_span(
+            &model,
+            crate::usage::provider_name(&runtime.endpoint.base_url),
+        );
         let called = call(
             &client,
             runtime,
@@ -299,6 +303,7 @@ where
         if let Err(e) = &called.answer {
             crate::usage::record_error(&span, e);
         }
+        drop(span);
         let outcome = match (&called.answer, called.usage) {
             // What the provider reported, whatever it answered.
             (_, Some(usage)) => Outcome::Reported(usage),
@@ -610,10 +615,15 @@ fn responses_answer(value: &Value) -> anyhow::Result<Answer> {
 /// secret it echoes redacted first, so the cut cannot hide one.
 fn excerpt(text: &str) -> String {
     const MAX: usize = 500;
-    let text = crate::redact::text(text);
+    // Bounded before it is redacted, so a huge body costs little; with room
+    // to spare, so a secret cut in half there is never in the excerpt.
+    const BOUND: usize = 64 * 1024;
+    let cut = |text: &str, max: usize| text.char_indices().nth(max).map(|(at, _)| at);
+    let bounded = &text[..cut(text, BOUND).unwrap_or(text.len())];
+    let text = crate::redact::text(bounded);
     let text = text.as_ref();
-    match text.char_indices().nth(MAX) {
-        Some((at, _)) => format!("{}…", &text[..at]),
+    match cut(text, MAX) {
+        Some(at) => format!("{}…", &text[..at]),
         None => text.to_owned(),
     }
 }

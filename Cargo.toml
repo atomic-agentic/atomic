@@ -57,9 +57,12 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry"] }
 tracing-opentelemetry = { version = "0.32", default-features = false }
 opentelemetry = { version = "0.31", default-features = false, features = ["trace"] }
-opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace", "rt-tokio", "experimental_trace_batch_span_processor_with_async_runtime"] }
 opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "http-proto", "http-json", "grpc-tonic", "reqwest-blocking-client"] }
 url = "2"
+# The glob patterns Codex's shell environment policy is written in; Codex's
+# version.
+wildmatch = "2.6.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

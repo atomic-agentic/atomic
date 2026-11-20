@@ -27,7 +27,6 @@ use atomic_durable::{
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tracing::Instrument;
 
 /// The change-request workflow: draft a task from a request, then review a
 /// candidate commit against it.
@@ -138,7 +137,7 @@ pub fn register_change_request<R: DurableRuntime>(
                 (budget.clone(), draft_caps.clone(), review_caps.clone());
             let run = ctx.workflow_id().to_owned();
             let span = crate::telemetry::workflow_span(CHANGE_REQUEST, &run);
-            async move {
+            let work = async move {
                 let lite = runtimes.lite.clone();
                 let request = ChangeRequest {
                     request: input.request.clone(),
@@ -153,9 +152,15 @@ pub fn register_change_request<R: DurableRuntime>(
                         let request = request.clone();
                         let span =
                             crate::telemetry::step_span("draft-task", "draft", &step.workflow_id);
-                        propose(
-                            async move { run_lite_atom(&DraftTask, &request, &lite).await }
-                                .instrument(span),
+                        let step_id = step.workflow_id.clone();
+                        crate::telemetry::traced(
+                            span,
+                            atomic_core::usage::for_step(step_id, "draft", async move {
+                                propose(
+                                    async move { run_lite_atom(&DraftTask, &request, &lite).await },
+                                )
+                                .await
+                            }),
                         )
                     },
                     Vec::new(),
@@ -187,12 +192,16 @@ pub fn register_change_request<R: DurableRuntime>(
                             "review",
                             &step.workflow_id,
                         );
-                        propose(
-                                async move {
+                        let step_id = step.workflow_id.clone();
+                        crate::telemetry::traced(
+                            span,
+                            atomic_core::usage::for_step(step_id, "review", async move {
+                                propose(async move {
                                     run_codex_atom(&ReviewPatch, &review_request, &codex).await
-                                }
-                                .instrument(span),
-                            )
+                                })
+                                .await
+                            }),
+                        )
                     },
                     Vec::new(),
                 )
@@ -203,8 +212,8 @@ pub fn register_change_request<R: DurableRuntime>(
                     verdict,
                     steps: vec![draft, review],
                 })
-            }
-            .instrument(span)
+            };
+            crate::telemetry::traced(span, work)
         },
     );
     Ok(())

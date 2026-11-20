@@ -24,14 +24,19 @@
 //! Names follow the GenAI semantic conventions where they fit, with atomic's
 //! own under `atomic.*` (see [`attributes`]).
 
+use atomic_durable::DurableError;
 use opentelemetry::trace::{Status, TracerProvider as _};
 use opentelemetry::{KeyValue, Value};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::error::OTelSdkResult;
 use opentelemetry_sdk::trace::{SdkTracerProvider, SpanData, SpanExporter};
 use std::borrow::Cow;
-use std::sync::OnceLock;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::task::{Context, Poll};
 use std::time::Duration;
+use tracing::field::Empty;
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 
@@ -51,9 +56,11 @@ pub fn workflow_span(workflow: &str, run: &str) -> tracing::Span {
     tracing::info_span!(
         "invoke_workflow",
         otel.name = %format!("{} {workflow}", attributes::WORKFLOW_SPAN),
+        error.type = Empty,
         gen_ai.operation.name = attributes::WORKFLOW_SPAN,
         atomic.workflow = %workflow,
         atomic.workflow.id = %run,
+        atomic.stopped = Empty,
         gen_ai.conversation.id = %run,
     )
 }
@@ -63,10 +70,12 @@ pub fn step_span(atom: &str, step: &str, run: &str) -> tracing::Span {
     tracing::info_span!(
         "invoke_agent",
         otel.name = %format!("{} {atom}", attributes::AGENT_SPAN),
+        error.type = Empty,
         gen_ai.operation.name = attributes::AGENT_SPAN,
         gen_ai.agent.name = %atom,
         atomic.step = %step,
         atomic.workflow.id = %run,
+        atomic.stopped = Empty,
     )
 }
 
@@ -75,10 +84,106 @@ pub fn gate_span(gate: &str, run: &str) -> tracing::Span {
     tracing::info_span!(
         "atomic.gate",
         otel.name = %format!("{} {gate}", attributes::GATE_SPAN),
+        error.type = Empty,
         atomic.gate = %gate,
         atomic.step = %gate,
         atomic.workflow.id = %run,
+        atomic.stopped = Empty,
     )
+}
+
+/// The class of a durable failure, for `error.type`, or `None` for an
+/// outcome that is not a failure (a run that parks is waiting).
+fn error_type(e: &DurableError) -> Option<&'static str> {
+    match e {
+        DurableError::Parked(_) => None,
+        DurableError::Failed(_) => Some("atomic.failed"),
+        DurableError::Interrupted(_) => Some("atomic.interrupted"),
+        _ => Some("atomic.error"),
+    }
+}
+
+/// Mark `span` failed with `e`: ERROR status with its message (redacted on
+/// export) and its class.
+pub fn mark_failed(span: &tracing::Span, e: &DurableError) {
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+    if let Some(kind) = error_type(e) {
+        span.set_status(Status::error(e.to_string()));
+        span.record("error.type", kind);
+    }
+}
+
+/// The spans still open in this process, so that a process that stops while
+/// a run waits, at a gate say, can end and export them first (see
+/// [`flush`]).
+static OPEN: Mutex<Vec<Weak<Mutex<Option<tracing::Span>>>>> = Mutex::new(Vec::new());
+
+/// A future run inside `span`, which ends when the future does, when the
+/// future is dropped, or when the process [`flush`]es before it exits,
+/// whichever comes first. A failure the future returns marks the span
+/// failed.
+pub struct Traced<F> {
+    inner: Pin<Box<F>>,
+    slot: Arc<Mutex<Option<tracing::Span>>>,
+}
+
+/// Run `future` inside `span` (see [`Traced`]).
+pub fn traced<F, T>(span: tracing::Span, future: F) -> Traced<F>
+where
+    F: Future<Output = Result<T, DurableError>>,
+{
+    let slot = Arc::new(Mutex::new(Some(span)));
+    if let Ok(mut open) = OPEN.lock() {
+        open.retain(|w| w.strong_count() > 0);
+        open.push(Arc::downgrade(&slot));
+    }
+    Traced {
+        inner: Box::pin(future),
+        slot,
+    }
+}
+
+impl<F, T> Future for Traced<F>
+where
+    F: Future<Output = Result<T, DurableError>>,
+{
+    type Output = F::Output;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let span = self.slot.lock().ok().and_then(|s| s.clone());
+        let polled = match &span {
+            Some(span) => {
+                let _entered = span.enter();
+                self.inner.as_mut().poll(cx)
+            }
+            None => self.inner.as_mut().poll(cx),
+        };
+        if let Poll::Ready(out) = &polled {
+            if let (Some(span), Err(e)) = (&span, out) {
+                mark_failed(span, e);
+            }
+            drop(span);
+            // Ended now, not when the future's owner drops it.
+            if let Ok(mut slot) = self.slot.lock() {
+                slot.take();
+            }
+        }
+        polled
+    }
+}
+
+/// End every span still open, marking each stopped: they are exported with
+/// what they recorded so far.
+fn end_open() {
+    let open: Vec<_> = OPEN
+        .lock()
+        .map(|mut o| std::mem::take(&mut *o))
+        .unwrap_or_default();
+    for slot in open.iter().filter_map(Weak::upgrade) {
+        if let Some(span) = slot.lock().ok().and_then(|mut s| s.take()) {
+            span.record("atomic.stopped", true);
+        }
+    }
 }
 
 /// The installed exporter, kept so that [`flush`] can send what is buffered
@@ -97,39 +202,62 @@ fn protocol() -> String {
     .unwrap_or_else(|| "http/protobuf".into())
 }
 
-/// Whether the variables ask for spans to be exported.
+/// Whether the variables ask for spans to be exported: an endpoint is set,
+/// and neither `OTEL_SDK_DISABLED=true` nor `OTEL_TRACES_EXPORTER=none` turns
+/// export off.
 fn configured() -> bool {
     let set = |v: &str| std::env::var(v).is_ok_and(|s| !s.is_empty());
-    let disabled = std::env::var("OTEL_SDK_DISABLED").is_ok_and(|s| s.eq_ignore_ascii_case("true"));
-    !disabled && (set("OTEL_EXPORTER_OTLP_ENDPOINT") || set("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"))
+    let is = |v: &str, value: &str| std::env::var(v).is_ok_and(|s| s.eq_ignore_ascii_case(value));
+    !is("OTEL_SDK_DISABLED", "true")
+        && !is("OTEL_TRACES_EXPORTER", "none")
+        && (set("OTEL_EXPORTER_OTLP_ENDPOINT") || set("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"))
 }
 
 /// Install the exporter the standard variables configure, if they configure
-/// one, as this process's tracing subscriber. Call it once, early; call
-/// [`flush`] before the process exits.
+/// one, as this process's tracing subscriber. Call it once, on the process's
+/// Tokio runtime, which the gRPC exporter runs on; call [`flush`] before the
+/// process exits.
 pub fn init_from_env() -> anyhow::Result<()> {
     if !configured() {
         return Ok(());
     }
     use opentelemetry_otlp::{Protocol, WithExportConfig};
-    let exporter = match protocol().as_str() {
-        "grpc" => opentelemetry_otlp::SpanExporter::builder()
-            .with_tonic()
-            .build()?,
-        "http/json" => opentelemetry_otlp::SpanExporter::builder()
-            .with_http()
-            .with_protocol(Protocol::HttpJson)
-            .build()?,
-        "http/protobuf" => opentelemetry_otlp::SpanExporter::builder()
-            .with_http()
-            .with_protocol(Protocol::HttpBinary)
-            .build()?,
+    let builder = SdkTracerProvider::builder();
+    let builder = match protocol().as_str() {
+        // tonic needs a Tokio reactor for its connection and for every
+        // export, so its batches are sent from a task on the runtime.
+        "grpc" => {
+            let exporter = opentelemetry_otlp::SpanExporter::builder()
+                .with_tonic()
+                .build()?;
+            let processor =
+                opentelemetry_sdk::trace::span_processor_with_async_runtime::BatchSpanProcessor::builder(
+                    Redacting(exporter),
+                    opentelemetry_sdk::runtime::Tokio,
+                )
+                .build();
+            builder.with_span_processor(processor)
+        }
+        // HTTP batches are sent from the processor's own thread, with a
+        // blocking client.
+        "http/json" => builder.with_batch_exporter(Redacting(
+            opentelemetry_otlp::SpanExporter::builder()
+                .with_http()
+                .with_protocol(Protocol::HttpJson)
+                .build()?,
+        )),
+        "http/protobuf" => builder.with_batch_exporter(Redacting(
+            opentelemetry_otlp::SpanExporter::builder()
+                .with_http()
+                .with_protocol(Protocol::HttpBinary)
+                .build()?,
+        )),
         other => anyhow::bail!(
             "OTEL_EXPORTER_OTLP_PROTOCOL is {other:?}; atomic exports grpc, http/protobuf or \
              http/json"
         ),
     };
-    install(SdkTracerProvider::builder().with_batch_exporter(Redacting(exporter)))
+    install(builder)
 }
 
 /// Install `builder`'s provider, with atomic's resource, as this process's
@@ -153,12 +281,23 @@ pub fn subscriber(provider: &SdkTracerProvider) -> impl tracing::Subscriber + Se
     tracing_subscriber::registry().with(layer)
 }
 
-/// Send the spans buffered so far and stop exporting. Call it before the
-/// process exits; afterwards nothing is exported.
+/// End the spans still open, send what is buffered and stop exporting. Call
+/// it before the process exits; afterwards nothing is exported.
 pub fn flush() {
+    end_open();
     if let Some(provider) = PROVIDER.get() {
-        let _ = provider.force_flush();
-        let _ = provider.shutdown_with_timeout(Duration::from_secs(5));
+        let finish = || {
+            let _ = provider.force_flush();
+            let _ = provider.shutdown_with_timeout(Duration::from_secs(5));
+        };
+        // The gRPC processor's task runs on this runtime: wait for it on a
+        // thread that may block.
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(finish)
+            }
+            _ => finish(),
+        }
     }
 }
 

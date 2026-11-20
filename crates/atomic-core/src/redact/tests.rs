@@ -19,7 +19,23 @@ fn known_shapes_are_found() {
         concat!("xoxb-", "1234567890-abcdefghij"),
         concat!("sk_live_", "abcdefghijklmnop1234"),
         concat!("hf_", "abcdefghijklmnopqrstuvwxyz0123456"),
-        concat!("eyJ", "hbGciOiJSUzI1NiJ9.eyJ", "zdWIiOiIxMjM0In0.c2lnbmF0dXJlLWJ5dGVz"),
+        concat!(
+            "eyJ",
+            "hbGciOiJSUzI1NiJ9.eyJ",
+            "zdWIiOiIxMjM0In0.c2lnbmF0dXJlLWJ5dGVz"
+        ),
+        concat!("gsk_", "abcdefghijklmnopqrstuvwxyz0123456789"),
+        concat!("xai-", "abcdefghijklmnopqrstuvwxyz0123456789"),
+        concat!("nvapi-", "abcdefghijklmnopqrstuvwxyz0123456789"),
+        concat!("npm_", "abcdefghijklmnopqrstuvwxyz0123456789"),
+        concat!("ya29.", "a0AfH6SMBabcdefghijklmnopqrstuvwxyz"),
+        concat!(
+            "SG.",
+            "abcdefghijklmnopqrstuv.abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG"
+        ),
+        concat!("whsec_", "abcdefghijklmnopqrstuvwxyz0123"),
+        concat!("xoxe-", "1-abcdefghij0123456789"),
+        concat!("xapp-", "1-A0123456789-abcdefghij"),
     ] {
         let redacted = text(&format!("before {secret} after")).into_owned();
         assert_eq!(redacted, format!("before {REDACTED} after"), "{secret}");
@@ -40,7 +56,11 @@ fn a_known_shape_inside_a_longer_word_is_not_one() {
 
 #[test]
 fn a_private_key_block_is_found_even_when_cut_off() {
-    let whole = concat!("x -----BEGIN RSA PRIVATE", " KEY-----\nMIIEsecret\n-----END RSA PRIVATE", " KEY----- y");
+    let whole = concat!(
+        "x -----BEGIN RSA PRIVATE",
+        " KEY-----\nMIIEsecret\n-----END RSA PRIVATE",
+        " KEY----- y"
+    );
     assert_eq!(text(whole), format!("x {REDACTED} y"));
     let cut = concat!("x -----BEGIN OPENSSH PRIVATE", " KEY-----\nMIIEsecret");
     assert_eq!(text(cut), format!("x {REDACTED}"));
@@ -70,6 +90,81 @@ fn a_value_next_to_a_secret_name_is_found_in_any_case() {
             r#"{\"password\":\"[REDACTED]\",\"x\":1}"#,
         ),
         ("a?token=abcdefgh1234&page=2", "a?token=[REDACTED]&page=2"),
+    ];
+    for (input, expected) in cases {
+        assert_eq!(text(input), expected, "{input}");
+    }
+}
+
+#[test]
+fn a_secret_word_anywhere_in_a_name_is_found() {
+    let cases = [
+        ("SECRET_KEY=abc123xyz", "SECRET_KEY=[REDACTED]"),
+        (
+            "AWS_SECRET_KEY=wJalrXUtnFEMIK7MDENG x",
+            "AWS_SECRET_KEY=[REDACTED] x",
+        ),
+        (
+            "DefaultEndpointsProtocol=https;AccountName=acct;AccountKey=abcdEFGH0123==;EndpointSuffix=core.windows.net",
+            "DefaultEndpointsProtocol=https;AccountName=acct;AccountKey=[REDACTED];EndpointSuffix=core.windows.net",
+        ),
+        ("DB_PASS=pw", "DB_PASS=[REDACTED]"),
+        ("GH_PAT=abc", "GH_PAT=[REDACTED]"),
+        (
+            "s3?X-Amz-Credential=AKIDEXAMPLE%2F2013&X-Amz-Signature=fe5f80f77d5f&X-Amz-Date=2013",
+            "s3?X-Amz-Credential=[REDACTED]&X-Amz-Signature=[REDACTED]&X-Amz-Date=2013",
+        ),
+        (
+            "Ocp-Apim-Subscription-Key: 0123abcd",
+            "Ocp-Apim-Subscription-Key: [REDACTED]",
+        ),
+        ("accessToken=abc", "accessToken=[REDACTED]"),
+        ("run --db-pass hunter2 now", "run --db-pass [REDACTED] now"),
+    ];
+    for (input, expected) in cases {
+        assert_eq!(text(input), expected, "{input}");
+    }
+}
+
+#[test]
+fn any_value_in_a_secret_position_is_found() {
+    let cases = [
+        // Short values and digits.
+        ("token: 12345678", "token: [REDACTED]"),
+        ("API_KEY=short", "API_KEY=[REDACTED]"),
+        ("pin_password=1234", "pin_password=[REDACTED]"),
+        // Leading characters that only look like references.
+        ("password=$ecret123", "password=[REDACTED]"),
+        ("password=%p4ss", "password=[REDACTED]"),
+        ("password={{p4ss", "password=[REDACTED]"),
+        // Punctuation and brackets inside the value.
+        ("password=ab,cd;ef&gh x", "password=[REDACTED] x"),
+        ("password=p(a)ss[1]{2} x", "password=[REDACTED] x"),
+        ("(password=hunter2) x", "(password=[REDACTED]) x"),
+        (
+            "password=hunter2, user=bob",
+            "password=[REDACTED], user=bob",
+        ),
+        // Rust's Debug output.
+        (
+            r#"Endpoint { api_key: Some("hunter2"), model: "m" }"#,
+            r#"Endpoint { api_key: Some("[REDACTED]"), model: "m" }"#,
+        ),
+        ("api_key: Some(hunter2)", "api_key: Some([REDACTED])"),
+        // Basic credentials, and a URL whose user is a token.
+        ("got Basic dXNlcjpwYXNz back", "got Basic [REDACTED] back"),
+        (
+            "https://abcdef0123456789abcd@github.com/o/r",
+            "https://[REDACTED]@github.com/o/r",
+        ),
+        // The rest of a cookie after a part already redacted by its shape.
+        (
+            concat!(
+                "Cookie: a=ghp_",
+                "abcdefghijklmnopqrstuvwxyz0123456789; b=othersecret"
+            ),
+            "Cookie: [REDACTED]",
+        ),
     ];
     for (input, expected) in cases {
         assert_eq!(text(input), expected, "{input}");
@@ -116,9 +211,20 @@ fn ordinary_text_is_left_alone() {
         "max_tokens: 4096",
         "max_tokens=4096",
         "token_count: 12345678",
-        "token: 12345678",
         "TOKEN_BUDGET=generous-enough",
-        "API_KEY=short",
+        "api_key_env: OPENAI_API_KEY",
+        "token_file=/run/secrets/token",
+        "monkey: banana",
+        "token::Kind",
+        "atomic_core::redact::text",
+        "password=***",
+        "password=<your-password>",
+        "token=%TOKEN%",
+        "token={{ secrets.token }}",
+        "token=${{ secrets.TOKEN }}",
+        "Basic settings",
+        "https://x-access-token@github.com/o/r",
+        "ssh://git@github.com/o/r",
         "let token = next_token();",
         "token: Option<String>,",
         "password: string",
@@ -146,6 +252,13 @@ fn redacting_twice_changes_nothing() {
         "password=hunter2hunter2",
         "Authorization: Bearer abcd1234efgh",
         "Cookie: a=b",
+        concat!(
+            "Cookie: a=ghp_",
+            "abcdefghijklmnopqrstuvwxyz0123456789; b=c"
+        ),
+        "api_key: Some(\"hunter2\")",
+        "https://abcdef0123456789abcd@github.com/o/r",
+        "Basic dXNlcjpwYXNz",
         "postgres://u:hunter2@h/d",
         "--password hunter2",
         "Bearer abcd1234efgh",
@@ -169,6 +282,11 @@ fn every_string_and_key_of_a_value_is_covered() {
         "token": "",
         "token_count": "12",
         "note": "fine",
+        "pin_password": 1234,
+        "credentials": {"user": "bob", "password": "x", "port": 5, "on": true},
+        "headers": [["Authorization", "Bearer x"], ["Accept", "json"]],
+        "header_list": [{"name": "X-Api-Key", "value": "abc"}, {"name": "Accept", "value": "json"}],
+        "keys": [1, 2],
     });
     value(&mut payload);
     assert_eq!(
@@ -185,8 +303,33 @@ fn every_string_and_key_of_a_value_is_covered() {
             "token": "",
             "token_count": "12",
             "note": "fine",
+            "pin_password": REDACTED,
+            "credentials": {"user": REDACTED, "password": REDACTED, "port": REDACTED, "on": true},
+            "headers": [["Authorization", REDACTED], ["Accept", "json"]],
+            "header_list": [{"name": "X-Api-Key", "value": REDACTED}, {"name": "Accept", "value": "json"}],
+            "keys": [1, 2],
         })
     );
+}
+
+/// The hook `main` installs writes what this returns.
+#[test]
+fn a_panic_message_is_redacted() {
+    use std::sync::{Arc, Mutex};
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if let Ok(mut seen) = sink.lock() {
+            seen.push(panic_message(info));
+        }
+    }));
+    let secret = concat!("glpat-", "PANICKEDwithAsecret0123");
+    let _ = std::panic::catch_unwind(|| panic!("the provider said {secret}"));
+    std::panic::set_hook(previous);
+    let seen = seen.lock().expect("lock").join("\n");
+    assert!(seen.contains("the provider said [REDACTED]"), "{seen}");
+    assert!(!seen.contains(secret), "{seen}");
 }
 
 /// As a model's raw tool arguments arrive: an escape sits just before the

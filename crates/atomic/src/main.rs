@@ -156,7 +156,22 @@ impl PromptArgs {
 /// The names Codex starts this executable under to run one of its helpers.
 const CODEX_HELPER_NAMES: &[&str] = &["codex-linux-sandbox", "apply_patch", "applypatch"];
 
-fn main() -> anyhow::Result<()> {
+fn main() -> std::process::ExitCode {
+    // A panic's message can quote what it was handling: it is redacted like
+    // every other line atomic writes.
+    atomic_core::redact::install_panic_hook();
+    match real_main() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        // Reported here, redacted, rather than by the default `{:?}` of a
+        // returned error.
+        Err(e) => {
+            atomic_core::log_line!("error: {e:#}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn real_main() -> anyhow::Result<()> {
     // A helper child serves one call and exits, before anything else starts:
     // no state directory, no Codex dispatch.
     if std::env::args_os().nth(1).as_deref()
@@ -202,7 +217,9 @@ fn main() -> anyhow::Result<()> {
         ..
     }) = &parsed
     {
-        std::process::exit(atomic_exec::runner::serve_stdio());
+        std::process::exit(atomic_exec::runner::serve_stdio(
+            &mut atomic_core::redact::stderr_lines(),
+        ));
     }
     // Resolve and create the state directory before Codex starts, so its home
     // is never the user's own. A failure here is reported once the normal entry
@@ -214,17 +231,19 @@ fn main() -> anyhow::Result<()> {
             .and_then(|root| ProjectState::resolve(&root).map_err(anyhow::Error::from))
             .and_then(|s| s.create().map(|()| s).map_err(anyhow::Error::from))
     };
-    // Spans go where the standard OTEL_EXPORTER_OTLP_* variables say, if
-    // they say; a bad setting is reported and the command runs without them.
-    if let Err(e) = atomic_app::telemetry::init_from_env() {
-        atomic_core::log_line!("warning: telemetry is off: {e:#}");
-    }
     let codex_home = match &state {
         Ok(s) => s.codex_home(),
         // Never created: Codex finds no home and creates nothing.
         Err(_) => std::env::temp_dir().join("atomic-no-state-directory"),
     };
     codex::dispatch(&codex_home, move |paths| async move {
+        // Only this role, the command itself, exports spans; Codex's helper
+        // roles never reach here. Spans go where the standard
+        // OTEL_EXPORTER_OTLP_* variables say, if they say, from this runtime;
+        // a bad setting is reported and the command runs without them.
+        if let Err(e) = atomic_app::telemetry::init_from_env() {
+            atomic_core::log_line!("warning: telemetry is off: {e:#}");
+        }
         let cli = match parsed {
             Ok(cli) => cli,
             Err(_) => Cli::parse(),
@@ -278,7 +297,9 @@ fn runner() -> i32 {
     struct RunnerCli {}
     let args = std::env::args_os().skip(1);
     match RunnerCli::try_parse_from(args) {
-        Ok(RunnerCli {}) => atomic_exec::runner::serve_stdio(),
+        Ok(RunnerCli {}) => {
+            atomic_exec::runner::serve_stdio(&mut atomic_core::redact::stderr_lines())
+        }
         Err(e) if !e.use_stderr() => {
             let _ = e.print();
             atomic_exec::runner::code::CLEAN
@@ -438,7 +459,9 @@ fn check(path: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
     for source in &files["workflows"] {
         let loaded = workflow::load(&source.path, &atoms, &mut registry)?;
         for w in loaded.warnings {
-            warnings.push(format!("{}: {w}", loaded.file.display()));
+            // Redacted here, so the JSON form is too, not only the log lines.
+            let w = format!("{}: {w}", loaded.file.display());
+            warnings.push(atomic_core::redact::text(&w).into_owned());
         }
     }
     // Each OpenAPI toolset must give tools whose schemas compile.

@@ -864,7 +864,12 @@ where
     T: Send + 'static,
     F: std::future::Future<Output = Result<T, AtomError>> + Send + 'static,
 {
-    match tokio::spawn(run).await {
+    // The atom's task runs inside the caller's span, for the run and step
+    // the caller runs, so its model calls' spans are children of the step's.
+    use tracing::Instrument;
+    let caller = crate::usage::caller();
+    let task = crate::usage::with_caller(caller, run).in_current_span();
+    match tokio::spawn(task).await {
         Ok(result) => result,
         Err(e) if e.is_panic() => {
             let payload = e.into_panic();

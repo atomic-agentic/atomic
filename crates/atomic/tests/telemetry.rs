@@ -3,280 +3,131 @@
 //! Telemetry and redaction, end to end, through the `atomic` binary:
 //!
 //! - a run configured by the standard `OTEL_EXPORTER_OTLP_*` variables
-//!   exports, over OTLP/HTTP to a collector this test serves on loopback,
-//!   spans that name the workflow, each step and each model call;
-//! - a secret a provider echoes in its error reaches neither the command's
-//!   log lines nor its error report nor the exported spans;
+//!   exports, to a collector this test serves on loopback, over each OTLP
+//!   protocol (gRPC, HTTP with protobuf, HTTP with JSON), spans that name the
+//!   workflow, each step and each model call, each call's span a child of its
+//!   step's, with the run and the step on it;
+//! - nothing is exported when the variables turn export off;
+//! - a run that stops while it waits at a gate still ends and exports its
+//!   workflow's and its gate's spans, and a run that fails marks its spans
+//!   failed;
+//! - each place atomic redacts is tested with a secret of its own, which
+//!   reaches it and no other: a lite provider's error, a command's stderr in
+//!   the text and the `--json` report and in the spans, a warning line, and
+//!   the runner's own errors (a Codex provider's error is in
+//!   `telemetry_sandbox.rs`, since Codex needs its sandbox);
 //! - the exporter's own headers, which can carry a collector's credential,
-//!   are sent to the collector and reach neither the log nor the atoms'
-//!   commands.
+//!   are sent to the collector and reach neither the log nor the exec atoms'
+//!   commands (Codex atoms' commands: `telemetry_sandbox.rs`).
 
 #![allow(clippy::unwrap_used)]
 
-use atomic_core::testing::{FakeModel, Reply};
+mod telemetry_common;
+
+use atomic_core::testing::Reply;
 use serde_json::{Value, json};
-use std::io::{Read, Write};
-use std::net::TcpListener;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
-use std::sync::{Arc, Mutex};
-
-const ATOMIC: &str = env!("CARGO_BIN_EXE_atomic");
-const NOTE: &str = r#"{"text": "Exporting a file named café.txt crashes the app."}"#;
-const RANK: &str = r#"{"priority": 1}"#;
-const SUMMARY: &str = r#"{"line": "P1: Export crashes on accents"}"#;
-/// A secret seeded where a provider might echo it.
-const SECRET: &str = concat!("sk-ant-", "api03-SEEDEDsecretVALUE0123456789abcdef");
-/// A collector credential, in the exporter's headers.
-const COLLECTOR_TOKEN: &str = concat!("glpat-", "COLLECTORcredential0123456789");
-
-fn scratch(tag: &str) -> PathBuf {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("atomic-telemetry-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    for sub in [
-        "home",
-        "project/atoms",
-        "project/workflows",
-        "project/tools",
-    ] {
-        std::fs::create_dir_all(dir.join(sub)).unwrap();
-    }
-    dir
-}
-
-fn object(properties: Value) -> Value {
-    let required: Vec<String> = properties.as_object().unwrap().keys().cloned().collect();
-    json!({"type": "object", "additionalProperties": false, "required": required, "properties": properties})
-}
-
-fn write_atom(project: &Path, name: &str, config: &str, body: &str, input: Value, output: Value) {
-    let atoms = project.join("atoms");
-    std::fs::write(
-        atoms.join(format!("{name}.atom.astro")),
-        format!(
-            "---\nimport type {{ Props, Input, Output }} from '../.atomic/types/{name}';\n\
-             import type {{ AtomConfig }} from '../.atomic/types/authoring';\n\
-             const {{ input }}: Props = Astro.props;\n\
-             export const config: AtomConfig<Input, Output> = {{ {config} }};\n\
-             ---\n{body}\n"
-        ),
-    )
-    .unwrap();
-    for (role, schema) in [("input", input), ("output", output)] {
-        std::fs::write(
-            atoms.join(format!("{name}.{role}.schema.json")),
-            schema.to_string(),
-        )
-        .unwrap();
-    }
-}
-
-/// A project with an exec atom that counts a note's words and records its
-/// own environment, two model atoms, and a workflow over the three.
-fn project(dir: &Path) -> PathBuf {
-    let project = dir.join("project");
-    std::fs::write(project.join("atomic.yaml"), "atomic: 1\nname: notes\n").unwrap();
-    std::fs::write(
-        project.join("tools/count.py"),
-        "import json, os, sys\n\
-         note = json.load(sys.stdin)\n\
-         json.dump(dict(os.environ), open(os.environ['ENV_LOG'], 'w'))\n\
-         json.dump({'title': note['text'][:25], 'words': len(note['text'].split())}, sys.stdout)\n",
-    )
-    .unwrap();
-    write_atom(
-        &project,
-        "count-note",
-        &format!(
-            "description: 'Count words.', kind: 'exec', exec: {{ command: ['python3', 'tools/count.py'] }}, env: {{ ENV_LOG: '{}' }}",
-            dir.join("env.json").display()
-        ),
-        "",
-        object(json!({"text": {"type": "string"}})),
-        object(json!({"title": {"type": "string"}, "words": {"type": "integer"}})),
-    );
-    write_atom(
-        &project,
-        "rank-note",
-        "description: 'rank-note'",
-        "Rank the note from 1 (urgent) to 3.\nTitle: {input.title}\nWords: {input.words}",
-        object(json!({"title": {"type": "string"}, "words": {"type": "integer"}})),
-        object(json!({"priority": {"type": "integer", "minimum": 1, "maximum": 3}})),
-    );
-    write_atom(
-        &project,
-        "summarize-note",
-        "description: 'summarize-note'",
-        "Write one line for the triage board.\nTitle: {input.title}\nPriority: {input.priority}",
-        object(json!({"title": {"type": "string"}, "priority": {"type": "integer"}})),
-        object(json!({"line": {"type": "string"}})),
-    );
-    std::fs::write(
-        project.join("workflows/triage.workflow.yaml"),
-        "atomic: 1\nname: triage\n\
-         input: { $ref: ../atoms/count-note.input.schema.json }\n\
-         output: { $ref: ../atoms/summarize-note.output.schema.json }\n\
-         steps:\n\
-         \x20 count:\n    atom: count-note\n    with: { text: input.text }\n\
-         \x20 rank:\n    after: [count]\n    atom: rank-note\n\
-         \x20   with: { title: steps.count.output.title, words: steps.count.output.words }\n\
-         \x20 summarize:\n    after: [rank]\n    atom: summarize-note\n\
-         \x20   with: { title: steps.count.output.title, priority: steps.rank.output.priority }\n\
-         returns: steps.summarize.output\n",
-    )
-    .unwrap();
-    project
-}
-
-/// One request the collector received: its path, its head and its body.
-type Request = (String, String, Vec<u8>);
-
-/// What the collector received.
-#[derive(Clone, Default)]
-struct Received(Arc<Mutex<Vec<Request>>>);
-
-impl Received {
-    fn bodies(&self) -> String {
-        let all = self.0.lock().unwrap();
-        all.iter()
-            .map(|(_, _, body)| String::from_utf8_lossy(body).into_owned())
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    fn headers(&self) -> String {
-        let all = self.0.lock().unwrap();
-        all.iter()
-            .map(|(path, headers, _)| format!("{path}\n{headers}"))
-            .collect()
-    }
-}
-
-/// An OTLP/HTTP collector on loopback that accepts everything.
-fn collector() -> (String, Received) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
-    let received = Received::default();
-    let keep = received.clone();
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { continue };
-            let keep = keep.clone();
-            std::thread::spawn(move || {
-                loop {
-                    let mut head = Vec::new();
-                    let mut byte = [0u8; 1];
-                    while !head.ends_with(b"\r\n\r\n") {
-                        match stream.read(&mut byte) {
-                            Ok(1) => head.push(byte[0]),
-                            _ => return,
-                        }
-                    }
-                    let head = String::from_utf8_lossy(&head).into_owned();
-                    let length: usize = head
-                        .lines()
-                        .filter_map(|l| l.split_once(':'))
-                        .find(|(k, _)| k.trim().eq_ignore_ascii_case("content-length"))
-                        .and_then(|(_, v)| v.trim().parse().ok())
-                        .unwrap_or(0);
-                    let mut body = vec![0u8; length];
-                    if stream.read_exact(&mut body).is_err() {
-                        return;
-                    }
-                    let path = head
-                        .split_whitespace()
-                        .nth(1)
-                        .unwrap_or_default()
-                        .to_owned();
-                    keep.0.lock().unwrap().push((path, head, body));
-                    let _ = stream.write_all(
-                        b"HTTP/1.1 200 OK\r\nContent-Type: application/x-protobuf\r\nContent-Length: 0\r\n\r\n",
-                    );
-                }
-            });
-        }
-    });
-    (url, received)
-}
-
-/// `atomic run triage` in `dir`'s project, against the model at `model`,
-/// exporting to `collector`.
-fn run(dir: &Path, model: &str, collector: &str) -> Output {
-    let project = dir.join("project");
-    Command::new(ATOMIC)
-        .args(["run", "triage", "--data", NOTE])
-        .current_dir(&project)
-        .env("HOME", dir.join("home"))
-        .env("ATOMIC_HOME", dir.join("atomic-home"))
-        .env("USER", "dev")
-        .env("ATOMIC_MODEL_BASE_URL", model)
-        .env("ATOMIC_MODEL", "synthetic")
-        .env_remove("ATOMIC_MODEL_API_KEY_ENV")
-        .env_remove("ATOMIC_DATABASE_URL")
-        .env("OTEL_EXPORTER_OTLP_ENDPOINT", collector)
-        .env("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf")
-        .env(
-            "OTEL_EXPORTER_OTLP_HEADERS",
-            format!("authorization=Bearer {COLLECTOR_TOKEN}"),
-        )
-        .stdin(Stdio::null())
-        .output()
-        .unwrap()
-}
-
-fn text(out: &Output) -> String {
-    format!(
-        "stdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    )
-}
-
-/// The fake model, served on a runtime of its own for the test's length.
-fn model(script: Vec<Reply>) -> (FakeModel, tokio::runtime::Runtime) {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
-        .enable_all()
-        .build()
-        .unwrap();
-    let model = rt.block_on(FakeModel::start(script)).unwrap();
-    (model, rt)
-}
+use std::io::Write;
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use telemetry_common::*;
 
 #[test]
-fn a_run_exports_spans_naming_its_workflow_each_step_and_each_model_call() {
-    let dir = scratch("spans");
+fn spans_over_http_json_parent_each_call_to_its_step_and_each_step_to_its_run() {
+    let dir = scratch("json");
     project(&dir);
     let (model, _rt) = model(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())]);
     let (url, received) = collector();
-    let out = run(&dir, &model.base_url(), &url);
+    let out = run(
+        &dir,
+        &model.base_url(),
+        "triage",
+        NOTE,
+        &exporting(&url, "http/json"),
+    );
+    assert!(out.status.success(), "{}", text(&out));
+
+    let spans = received.spans();
+    let workflow = named(&spans, "invoke_workflow triage");
+    let run_id = attribute(workflow, "atomic.workflow.id").expect("the run");
+    for (atom, step) in [
+        ("count-note", "count"),
+        ("rank-note", "rank"),
+        ("summarize-note", "summarize"),
+    ] {
+        let span = named(&spans, &format!("invoke_agent {atom}"));
+        assert_eq!(
+            span["parentSpanId"], workflow["spanId"],
+            "{step} is the run's"
+        );
+        assert_eq!(span["traceId"], workflow["traceId"]);
+        assert_eq!(attribute(span, "atomic.step").as_deref(), Some(step));
+        assert_eq!(attribute(span, "atomic.workflow.id"), Some(run_id.clone()));
+        assert!(!failed(span), "{span}");
+    }
+    let calls: Vec<&Value> = spans
+        .iter()
+        .filter(|s| s["name"] == "chat synthetic")
+        .collect();
+    assert_eq!(calls.len(), 2, "one span per model call: {spans:#?}");
+    for call in calls {
+        let step = attribute(call, "atomic.step").expect("the call's step");
+        let atom = if step == "rank" {
+            "rank-note"
+        } else {
+            "summarize-note"
+        };
+        let parent = named(&spans, &format!("invoke_agent {atom}"));
+        assert_eq!(
+            call["parentSpanId"], parent["spanId"],
+            "the {step} call is its step's"
+        );
+        assert_eq!(attribute(call, "atomic.workflow.id"), Some(run_id.clone()));
+        assert_eq!(
+            attribute(call, "gen_ai.provider.name").as_deref(),
+            Some("openai_compatible")
+        );
+        assert!(
+            attribute(call, "gen_ai.usage.input_tokens").is_some(),
+            "{call}"
+        );
+        let kind = &call["kind"];
+        assert!(
+            kind == 3 || kind == "SPAN_KIND_CLIENT",
+            "a client span: {call}"
+        );
+    }
+    assert!(received.headers().contains("/v1/traces"));
+}
+
+#[test]
+fn spans_over_http_protobuf_carry_the_exporters_headers_which_no_atom_sees() {
+    let dir = scratch("protobuf");
+    project(&dir);
+    let (model, _rt) = model(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())]);
+    let (url, received) = collector();
+    let out = run(
+        &dir,
+        &model.base_url(),
+        "triage",
+        NOTE,
+        &exporting(&url, "http/protobuf"),
+    );
     assert!(out.status.success(), "{}", text(&out));
 
     let spans = received.bodies();
     for name in [
-        // The workflow, by operation and by name.
         "invoke_workflow triage",
-        "atomic.workflow.id",
-        // Each step: the exec atom and the two model atoms.
         "invoke_agent count-note",
         "invoke_agent rank-note",
         "invoke_agent summarize-note",
-        "atomic.step",
-        // Each model call, with its model and what it spent.
         "chat synthetic",
-        "gen_ai.usage.input_tokens",
     ] {
         assert!(spans.contains(name), "no {name} in what was exported");
     }
-    assert_eq!(
-        spans.matches("chat synthetic").count(),
-        2,
-        "one span per model call"
-    );
     // Sent where the variables say, with the headers they name.
     let headers = received.headers();
     assert!(headers.contains("/v1/traces"), "{headers}");
+    assert!(headers.contains("application/x-protobuf"), "{headers}");
     assert!(
         headers.contains(COLLECTOR_TOKEN),
         "the collector got its credential"
@@ -289,32 +140,272 @@ fn a_run_exports_spans_naming_its_workflow_each_step_and_each_model_call() {
 }
 
 #[test]
-fn a_secret_a_provider_echoes_reaches_no_log_line_report_or_span() {
-    let dir = scratch("secret");
+fn spans_over_grpc_are_exported_from_the_commands_runtime() {
+    let dir = scratch("grpc");
     project(&dir);
-    let echoed = format!(
-        r#"{{"error": {{"message": "Incorrect API key provided: {SECRET}", "type": "invalid_request_error"}}}}"#
+    let (model, _rt) = model(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())]);
+    let (url, received) = grpc_collector();
+    let out = run(
+        &dir,
+        &model.base_url(),
+        "triage",
+        NOTE,
+        &exporting(&url, "grpc"),
     );
-    let (model, _rt) = model(vec![Reply::Http {
-        status: 401,
-        body: echoed,
-    }]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(!text(&out).contains("panicked"), "{}", text(&out));
+    assert!(!text(&out).contains("telemetry is off"), "{}", text(&out));
+    let spans = received.bodies();
+    for name in [
+        "invoke_workflow triage",
+        "invoke_agent count-note",
+        "invoke_agent rank-note",
+        "invoke_agent summarize-note",
+        "chat synthetic",
+    ] {
+        assert!(
+            spans.contains(name),
+            "no {name} in what was exported over gRPC"
+        );
+    }
+}
+
+#[test]
+fn nothing_is_exported_when_the_variables_turn_export_off() {
+    for (var, value) in [
+        ("OTEL_SDK_DISABLED", "true"),
+        ("OTEL_TRACES_EXPORTER", "none"),
+    ] {
+        let dir = scratch(&format!("off-{var}"));
+        project(&dir);
+        let (model, _rt) = model(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())]);
+        let (url, received) = collector();
+        let mut env = exporting(&url, "http/json");
+        env.push((var, value.into()));
+        let out = run(&dir, &model.base_url(), "triage", NOTE, &env);
+        assert!(out.status.success(), "{}", text(&out));
+        assert!(
+            received.0.lock().unwrap().is_empty(),
+            "{var}={value} exported"
+        );
+    }
+}
+
+#[test]
+fn a_run_stopped_at_a_gate_ends_and_exports_its_spans() {
+    let dir = scratch("gate");
+    project(&dir);
+    let (model, _rt) = model(vec![Reply::Text(RANK.into())]);
     let (url, received) = collector();
-    let out = run(&dir, &model.base_url(), &url);
+    let mut child = command(
+        &dir,
+        &model.base_url(),
+        &["run", "gated", "--data", NOTE],
+        &exporting(&url, "http/json"),
+    )
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+    // Waiting at the gate once `atomic gates list` shows it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        let listed = command(&dir, &model.base_url(), &["gates", "list", "--json"], &[])
+            .output()
+            .unwrap();
+        let open: Value = serde_json::from_slice(&listed.stdout).unwrap_or(json!([]));
+        if open.as_array().is_some_and(|g| !g.is_empty()) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no gate opened: {}",
+            text(&listed)
+        );
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the run ended before its gate"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    let killed = Command::new("/bin/sh")
+        .args(["-c", &format!("kill -TERM {}", child.id())])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    let out = child.wait_with_output().unwrap();
+    assert!(!out.status.success(), "{}", text(&out));
+
+    let spans = received.spans();
+    let workflow = named(&spans, "invoke_workflow gated");
+    let gate = named(&spans, "atomic.gate check");
+    assert_eq!(gate["parentSpanId"], workflow["spanId"]);
+    for span in [workflow, gate] {
+        assert_eq!(
+            attribute(span, "atomic.stopped").as_deref(),
+            Some("true"),
+            "{span}"
+        );
+        assert!(!failed(span), "a stop is not a failure: {span}");
+    }
+    named(&spans, "invoke_agent rank-note");
+}
+
+/// A lite provider's error: its excerpt is redacted where it is made, so
+/// the run's stored error never holds the secret, nor does anything shown.
+#[test]
+fn a_secret_a_lite_provider_echoes_is_redacted_in_its_excerpt() {
+    const SECRET: &str = concat!("sk-ant-", "api03-LITEexcerptSECRET0123456789abcdef");
+    let dir = scratch("lite-secret");
+    project(&dir);
+    let (model, _rt) = model(vec![echoing(SECRET)]);
+    let (url, received) = collector();
+    let out = run(
+        &dir,
+        &model.base_url(),
+        "triage",
+        NOTE,
+        &exporting(&url, "http/json"),
+    );
     assert!(!out.status.success(), "the call failed: {}", text(&out));
     let shown = text(&out);
     assert!(shown.contains("401"), "the error is reported: {shown}");
-    assert!(!shown.contains(SECRET), "the secret was logged: {shown}");
+    assert!(!shown.contains(SECRET), "the secret was shown: {shown}");
     assert!(shown.contains("[REDACTED]"), "{shown}");
+    assert_eq!(
+        stored(&dir.join("atomic-home"), SECRET),
+        Vec::<PathBuf>::new()
+    );
 
-    let spans = received.bodies();
+    // Its spans say it failed, and why, redacted.
+    let spans = received.spans();
     assert!(
-        spans.contains("chat synthetic"),
-        "the failed call has its span"
+        !received.bodies().contains(SECRET),
+        "the secret was exported"
     );
-    assert!(!spans.contains(SECRET), "the secret was exported");
+    let call = named(&spans, "chat synthetic");
+    assert!(failed(call), "{call}");
+    assert_eq!(
+        attribute(call, "error.type").as_deref(),
+        Some("atomic.model_call")
+    );
     assert!(
-        spans.contains("[REDACTED]"),
-        "its redacted error was exported"
+        attribute(call, "error.message")
+            .unwrap()
+            .contains("[REDACTED]")
     );
+    for name in ["invoke_agent rank-note", "invoke_workflow triage"] {
+        let span = named(&spans, name);
+        assert!(failed(span), "{span}");
+        assert_eq!(
+            attribute(span, "error.type").as_deref(),
+            Some("atomic.failed"),
+            "{span}"
+        );
+    }
+}
+
+/// A command's stderr is part of its step's error as it was: the report
+/// redacts it, as text and as JSON, and so does the exporter.
+#[test]
+fn a_secret_in_a_commands_stderr_is_redacted_in_the_text_report() {
+    const SECRET: &str = concat!("glpat-", "TEXTreportSECRET0123456789");
+    let dir = scratch("text-report");
+    project(&dir);
+    let out = run(&dir, "http://127.0.0.1:9/v1", "leaky", &note(SECRET), &[]);
+    assert!(!out.status.success(), "{}", text(&out));
+    let shown = text(&out);
+    assert!(shown.contains("the provider said [REDACTED]"), "{shown}");
+    assert!(!shown.contains(SECRET), "{shown}");
+}
+
+#[test]
+fn a_secret_in_a_commands_stderr_is_redacted_in_the_json_report() {
+    const SECRET: &str = concat!("glpat-", "JSONreportSECRET0123456789");
+    let dir = scratch("json-report");
+    project(&dir);
+    let out = command(
+        &dir,
+        "http://127.0.0.1:9/v1",
+        &["--json", "run", "leaky", "--data", &note(SECRET)],
+        &[],
+    )
+    .output()
+    .unwrap();
+    assert!(!out.status.success(), "{}", text(&out));
+    let report: Value = serde_json::from_slice(&out.stdout).expect("a JSON report");
+    assert!(
+        report.to_string().contains("the provider said [REDACTED]"),
+        "{report}"
+    );
+    assert!(!text(&out).contains(SECRET), "{}", text(&out));
+}
+
+#[test]
+fn a_secret_in_a_commands_stderr_is_redacted_in_its_spans() {
+    const SECRET: &str = concat!("glpat-", "SPANstatusSECRET0123456789");
+    let dir = scratch("span-status");
+    project(&dir);
+    let (url, received) = collector();
+    let out = run(
+        &dir,
+        "http://127.0.0.1:9/v1",
+        "leaky",
+        &note(SECRET),
+        &exporting(&url, "http/json"),
+    );
+    assert!(!out.status.success(), "{}", text(&out));
+    let spans = received.spans();
+    let step = named(&spans, "invoke_agent leak-note");
+    assert!(failed(step), "{step}");
+    let why = step["status"]["message"].as_str().unwrap_or_default();
+    assert!(why.contains("the provider said [REDACTED]"), "{step}");
+    assert!(
+        !received.bodies().contains(SECRET),
+        "the secret was exported"
+    );
+}
+
+/// A warning line, here about a setting that quotes what it was given.
+#[test]
+fn a_secret_in_a_warning_line_is_redacted() {
+    const SECRET: &str = concat!("glpat-", "WARNINGlineSECRET0123456789");
+    let dir = scratch("warning");
+    project(&dir);
+    let (url, _received) = collector();
+    let mut env = exporting(&url, "http/json");
+    env.push(("OTEL_EXPORTER_OTLP_PROTOCOL", format!("bogus {SECRET}")));
+    let out = command(&dir, "http://127.0.0.1:9/v1", &["debug", "state-dir"], &env)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    let shown = text(&out);
+    assert!(shown.contains("telemetry is off"), "{shown}");
+    assert!(shown.contains("[REDACTED]"), "{shown}");
+    assert!(!shown.contains(SECRET), "{shown}");
+}
+
+/// The runner role's own errors, which quote the request they refuse.
+#[test]
+fn a_secret_in_a_runners_error_is_redacted() {
+    const SECRET: &str = concat!("glpat-", "RUNNERerrorSECRET0123456789");
+    let dir = scratch("runner");
+    let mut child = command(&dir, "http://127.0.0.1:9/v1", &["runner"], &[])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(json!({"protocol": SECRET}).to_string().as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(64), "{}", text(&out));
+    let shown = text(&out);
+    assert!(shown.contains("atomic runner:"), "{shown}");
+    assert!(shown.contains("[REDACTED]"), "{shown}");
+    assert!(!shown.contains(SECRET), "{shown}");
 }

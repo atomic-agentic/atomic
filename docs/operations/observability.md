@@ -38,22 +38,39 @@ export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf   # or grpc, or http/json
 atomic run triage --data '{"text": "..."}'
 ```
 
-`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS` and the
-exporter's other `OTEL_*` variables work as the specification says, and
-`OTEL_SDK_DISABLED=true` turns export off. With no endpoint set, nothing is
-exported.
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL`,
+`OTEL_EXPORTER_OTLP_HEADERS` and the exporter's other `OTEL_*` variables work as
+the specification says, and `OTEL_SDK_DISABLED=true` or
+`OTEL_TRACES_EXPORTER=none` turns export off. With no endpoint set, nothing is
+exported. A protocol atomic does not export is reported in a warning, and the
+command runs without spans. The `OTEL_*` variables are atomic's own: atoms'
+commands, exec and Codex alike, never see them, so a collector credential in
+`OTEL_EXPORTER_OTLP_HEADERS` stays with atomic.
 
 | Span | Names | Attributes |
 | --- | --- | --- |
 | A workflow run | `invoke_workflow <workflow>` | `atomic.workflow`, `atomic.workflow.id`, `gen_ai.conversation.id` |
 | An atom step | `invoke_agent <atom>` | `gen_ai.agent.name`, `atomic.step`, `atomic.workflow.id` |
 | A gate step | `atomic.gate <gate>` | `atomic.gate`, `atomic.step`, `atomic.workflow.id` |
-| A model call | `chat <model>` | `gen_ai.request.model`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `error.message` |
+| A model call | `chat <model>` | `gen_ai.provider.name`, `gen_ai.request.model`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `atomic.workflow.id`, `atomic.step`, `error.type`, `error.message` |
+
+Each step's span is a child of its run's, and each model call's a child of its
+step's, a client span. A Codex atom's call is one turn, which may make several
+requests to the provider, and its span covers them all. `gen_ai.provider.name`
+is `openai` for OpenAI's API and `openai_compatible` for any other endpoint.
+
+A step or run that fails ends its span with an error status, the failure's
+message and `error.type` (`atomic.failed`, `atomic.interrupted`, or for a
+model call `atomic.model_call` or `atomic.meter`). A process that stops while
+runs are still going, such as one stopped while it waits at a gate, ends the
+spans still open with `atomic.stopped` set and exports them before it exits.
 
 A step that replays from its checkpoint after a restart makes no span: only
 work that runs does. Each span's strings are redacted before they are
 exported, as atomic's log lines and error reports are: values that look like
-keys, tokens, passwords or credentials become `[REDACTED]`.
+keys, tokens, passwords or credentials, and values given to a name with a word
+such as `key`, `secret`, `token`, `pass` or `signature` in it, become
+`[REDACTED]`.
 
 ## Add an optional local trace viewer
 

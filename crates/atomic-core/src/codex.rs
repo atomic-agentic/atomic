@@ -722,6 +722,13 @@ where
         config.workspace_roots = roots;
         config.workspace_roots_explicit = true;
     }
+    // The exporter's settings are this process's, not the atom's: they can
+    // name a collector's credential (OTEL_EXPORTER_OTLP_HEADERS).
+    config
+        .permissions
+        .shell_environment_policy
+        .exclude
+        .push(wildmatch::WildMatchPattern::new_case_insensitive("OTEL_*"));
     for (name, value) in &env {
         config
             .permissions
@@ -806,7 +813,12 @@ where
             Err(e) => break Err(meter_error(e)),
         };
         report.turns += 1;
-        let span = crate::usage::call_span(&endpoint.model);
+        // One span per turn, which may make several requests; it ends before
+        // the turn is settled.
+        let span = crate::usage::call_span(
+            &endpoint.model,
+            crate::usage::provider_name(&endpoint.base_url),
+        );
         let bounded_by = ticket.as_ref().and_then(|t| t.bounded_by.clone());
         // A turn is cut off when its reserved time runs out; a failed or cut
         // off turn still reports the usage seen before it stopped.
@@ -839,6 +851,7 @@ where
             }
             None => Outcome::Unknown,
         };
+        drop(span);
         if let Err(e) = meter.settle(ticket, outcome).await {
             break Err(meter_error(e));
         }

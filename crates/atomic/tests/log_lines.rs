@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! atomic's log lines go through redaction: no product code writes to
-//! stderr except through `atomic_core::redact::log`.
+//! stderr except through `atomic_core::redact`.
 
 #![allow(clippy::unwrap_used)]
 
@@ -60,12 +60,17 @@ fn every_log_line_goes_through_redaction() {
             .split("#[cfg(test)]\nmod tests")
             .next()
             .unwrap_or(&text);
-        if product.contains("eprintln!(") {
-            writers.push(relative);
+        // Every way to stderr: the print macros, `dbg!`, and the handle,
+        // whether written to with `writeln!` or `write_all`.
+        for writer in ["eprintln!(", "eprint!(", "dbg!(", "io::stderr()", "Stderr"] {
+            if product.contains(writer) {
+                writers.push(format!("{relative}: {writer}"));
+            }
         }
     }
     assert!(
         writers.is_empty(),
-        "these write log lines without redaction; use atomic_core::log_line!: {writers:?}"
+        "these write to stderr without redaction; use atomic_core::log_line! or \
+         atomic_core::redact::stderr_lines: {writers:?}"
     );
 }

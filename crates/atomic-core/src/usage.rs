@@ -207,18 +207,87 @@ pub(crate) fn meter_failure(e: &anyhow::Error) -> Option<&MeterError> {
     e.chain().find_map(|c| c.downcast_ref::<MeterError>())
 }
 
+/// The run and step a model call is made for, which its span names. Set by
+/// the workflow code that runs a step, around the step's work; see
+/// [`for_step`].
+#[derive(Clone, Debug)]
+pub struct Caller {
+    /// The run's workflow ID.
+    pub run: String,
+    /// The step's ID.
+    pub step: String,
+}
+
+tokio::task_local! {
+    static CALLER: Caller;
+}
+
+/// Run `work` as step `step` of run `run`: model calls it makes name them on
+/// their spans.
+pub async fn for_step<F: std::future::Future>(
+    run: impl Into<String>,
+    step: impl Into<String>,
+    work: F,
+) -> F::Output {
+    let caller = Caller {
+        run: run.into(),
+        step: step.into(),
+    };
+    CALLER.scope(caller, work).await
+}
+
+/// The caller the current task runs for, to carry into a task it spawns.
+pub(crate) fn caller() -> Option<Caller> {
+    CALLER.try_with(Caller::clone).ok()
+}
+
+/// Run `work` for `caller`, as the task that spawned it was.
+pub(crate) async fn with_caller<F: std::future::Future>(
+    caller: Option<Caller>,
+    work: F,
+) -> F::Output {
+    match caller {
+        Some(caller) => CALLER.scope(caller, work).await,
+        None => work.await,
+    }
+}
+
 /// The span of one model call, named as the GenAI conventions name a chat
-/// call. Its usage is recorded on it when the provider reports any.
-pub(crate) fn call_span(model: &str) -> tracing::Span {
-    tracing::info_span!(
+/// call, a child of the step's span. Its usage is recorded on it when the
+/// provider reports any. A Codex atom's call is one turn, which may make
+/// several requests to the provider: its span covers them all.
+pub(crate) fn call_span(model: &str, provider: &str) -> tracing::Span {
+    let caller = caller();
+    let span = tracing::info_span!(
         "chat",
         otel.name = %format!("chat {model}"),
+        otel.kind = "client",
+        otel.status_code = tracing::field::Empty,
+        error.type = tracing::field::Empty,
         gen_ai.operation.name = "chat",
+        gen_ai.provider.name = %provider,
         gen_ai.request.model = %model,
         gen_ai.usage.input_tokens = tracing::field::Empty,
         gen_ai.usage.output_tokens = tracing::field::Empty,
         error.message = tracing::field::Empty,
-    )
+        atomic.workflow.id = tracing::field::Empty,
+        atomic.step = tracing::field::Empty,
+    );
+    if let Some(caller) = caller {
+        span.record("atomic.workflow.id", caller.run.as_str());
+        span.record("atomic.step", caller.step.as_str());
+    }
+    span
+}
+
+/// The provider a base URL names, for `gen_ai.provider.name`: OpenAI's own
+/// API, or another that speaks its protocol.
+pub(crate) fn provider_name(base_url: &str) -> &'static str {
+    if crate::lite::is_openai_api(base_url) {
+        "openai"
+    } else {
+        "openai_compatible"
+    }
 }
 
 /// Record on `span` what a call spent.
@@ -229,6 +298,15 @@ pub(crate) fn record_usage(span: &tracing::Span, usage: &Usage) {
 
 /// Record on `span` why a call failed. The exporter redacts it.
 pub(crate) fn record_error(span: &tracing::Span, error: &anyhow::Error) {
+    span.record("otel.status_code", "ERROR");
+    span.record(
+        "error.type",
+        if meter_failure(error).is_some() {
+            "atomic.meter"
+        } else {
+            "atomic.model_call"
+        },
+    );
     span.record(
         "error.message",
         tracing::field::display(format!("{error:#}")),

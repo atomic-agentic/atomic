@@ -74,7 +74,6 @@ use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::Instrument;
 
 /// The name `run_pipeline` is registered under.
 pub const PIPELINE: &str = "atomic.pipeline";
@@ -669,9 +668,12 @@ async fn run_pipeline<C: WorkflowContext>(
             Step::Gate(g) => {
                 // Waiting for a person is not work a stop waits for.
                 working = None;
-                let decision = run_gate(&ctx, &pipeline.name, g, &values, &services.deployment)
-                    .instrument(crate::telemetry::gate_span(&g.id, ctx.workflow_id()))
-                    .await?;
+                let decision = run_gate(&ctx, &pipeline.name, g, &values, &services.deployment);
+                let decision = crate::telemetry::traced(
+                    crate::telemetry::gate_span(&g.id, ctx.workflow_id()),
+                    decision,
+                )
+                .await?;
                 failpoint(&format!("pipeline:after:{}", g.id));
                 steps.insert(g.id.clone(), json!({ "decision": decision }));
                 shapes.insert(
@@ -819,7 +821,8 @@ async fn run_pipeline<C: WorkflowContext>(
                 // Made here, in the step's body, so a step that replays from
                 // its checkpoint makes none.
                 let span = crate::telemetry::step_span(&atom.name, &id, &run_id);
-                async move {
+                let caller = (run_id.clone(), id.clone());
+                let work = async move {
                 // The run's helpers run only as recorded, on the runtime the
                 // run started on; anything else is refused rather than
                 // recaptured. Checked only when the turn runs: a finished
@@ -873,8 +876,9 @@ async fn run_pipeline<C: WorkflowContext>(
                 }?;
                 failpoint(&ran);
                 Ok(proposal)
-                }
-                .instrument(span)
+                };
+                // Model calls name the run and step on their spans.
+                crate::telemetry::traced(span, atomic_core::usage::for_step(caller.0, caller.1, work))
             },
             Vec::new(),
         )
@@ -1132,6 +1136,9 @@ pub fn register_pipeline<R: DurableRuntime>(rt: &mut R, services: Services) {
     let ledger = rt.ledger();
     rt.register(PIPELINE, move |ctx: R::Context, run: PipelineRun| {
         let span = crate::telemetry::workflow_span(&run.pipeline.name, ctx.workflow_id());
-        run_pipeline(ctx, run, services.clone(), ledger.clone()).instrument(span)
+        crate::telemetry::traced(
+            span,
+            run_pipeline(ctx, run, services.clone(), ledger.clone()),
+        )
     });
 }
