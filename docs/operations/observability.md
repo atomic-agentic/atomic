@@ -77,7 +77,9 @@ exported, as atomic's log lines and error reports are: values in the formats
 of well-known keys and tokens, values given to a secret's name (`password`,
 `api_key`, `AWS_SECRET_KEY`, `DB_PASS`), and credential-looking values given to
 a name such as `token` or `pass`, become `[REDACTED]`. Each string is cut to
-4,096 characters before it is redacted.
+4,096 characters before it is redacted. One message is not redacted: a
+command-line usage error, such as an invalid value for a flag, repeats the
+argument as you typed it, since it is your own command line.
 
 ## Add an optional local trace viewer
 
