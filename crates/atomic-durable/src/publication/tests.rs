@@ -12,7 +12,10 @@
 //! - a publication and a takeover that race are ordered by the fence's row
 //!   lock: a takeover waits for a publication already past its fence, and a
 //!   publication that meets a takeover in progress is refused once the
-//!   takeover commits.
+//!   takeover commits;
+//! - a turn that parks waits on its park's topic, and once released runs
+//!   again as a new turn told its first turn's position;
+//! - a turn checkpoint written before turns could park still decodes.
 //!
 //! The races interleave on PostgreSQL only. On SQLite every write
 //! transaction begins IMMEDIATE and so runs alone: a publication and a
@@ -204,13 +207,16 @@ async fn candidate_survives_a_crash_before_publication(mut engine: Durare) -> Re
     engine.register("atom", move |ctx: DurareContext, (): ()| {
         let (calls, runs) = (calls.clone(), runs.clone());
         async move {
-            let candidate = execute_candidate(&ctx, "turn", move || async move {
-                calls.fetch_add(1, Ordering::SeqCst);
-                Ok(Proposal {
-                    output: json!({"answer": 42}),
-                    metadata: json!({}),
-                    writes: vec![insert(Some("a")), insert(Some("b"))],
-                })
+            let candidate = execute_candidate(&ctx, "turn", move || {
+                let calls = calls.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(Proposal {
+                        output: json!({"answer": 42}),
+                        metadata: json!({}),
+                        writes: vec![insert(Some("a")), insert(Some("b"))],
+                    })
+                }
             })
             .await?;
             if runs.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -257,12 +263,15 @@ async fn publication_is_all_or_nothing(mut engine: Durare) -> Result<()> {
     engine.register(
         "atom",
         |ctx: DurareContext, writes: Vec<Write>| async move {
-            let candidate = execute_candidate(&ctx, "turn", move || async move {
-                Ok(Proposal {
-                    output: json!("done"),
-                    metadata: json!({}),
-                    writes,
-                })
+            let candidate = execute_candidate(&ctx, "turn", move || {
+                let writes = writes.clone();
+                async move {
+                    Ok(Proposal {
+                        output: json!("done"),
+                        metadata: json!({}),
+                        writes,
+                    })
+                }
             })
             .await?;
             let once = publish_candidate(
@@ -596,13 +605,16 @@ async fn run_atom_records_sibling_steps_in_a_stable_order(mut engine: Durare) ->
             let plan = run_atom(
                 &ctx,
                 "plan",
-                move || async move {
-                    a1.fetch_add(1, Ordering::SeqCst);
-                    Ok(Proposal {
-                        output: json!({"steps": ["one"]}),
-                        metadata: json!({"thread_id": "t-plan"}),
-                        writes: vec![insert(Some("plan"))],
-                    })
+                move || {
+                    let a1 = a1.clone();
+                    async move {
+                        a1.fetch_add(1, Ordering::SeqCst);
+                        Ok(Proposal {
+                            output: json!({"steps": ["one"]}),
+                            metadata: json!({"thread_id": "t-plan"}),
+                            writes: vec![insert(Some("plan"))],
+                        })
+                    }
                 },
                 Vec::new(),
             )
@@ -615,13 +627,16 @@ async fn run_atom_records_sibling_steps_in_a_stable_order(mut engine: Durare) ->
             let review = run_atom(
                 &ctx,
                 "review",
-                move || async move {
-                    a2.fetch_add(1, Ordering::SeqCst);
-                    Ok(Proposal {
-                        output: json!({"reviewed": steps}),
-                        metadata: json!({"thread_id": "t-review"}),
-                        writes: Vec::new(),
-                    })
+                move || {
+                    let (a2, steps) = (a2.clone(), steps.clone());
+                    async move {
+                        a2.fetch_add(1, Ordering::SeqCst);
+                        Ok(Proposal {
+                            output: json!({"reviewed": steps}),
+                            metadata: json!({"thread_id": "t-review"}),
+                            writes: Vec::new(),
+                        })
+                    }
                 },
                 Vec::new(),
             )
@@ -685,6 +700,153 @@ async fn run_atom_records_sibling_steps_in_a_stable_order(mut engine: Durare) ->
     );
     assert_eq!(engine.thread("t-unknown").await?, None);
     assert_eq!(counts(&engine).await?, (1, 2));
+    engine.shutdown(Duration::from_secs(5)).await
+}
+
+async fn a_released_park_runs_the_turn_again(mut engine: Durare) -> Result<()> {
+    register_common(&mut engine);
+    // The positions each turn was told, in order.
+    let told = Arc::new(Mutex::new(Vec::new()));
+    let t = told.clone();
+    engine.register("parks", move |ctx: DurareContext, (): ()| {
+        let t = t.clone();
+        async move {
+            run_atom_at(
+                &ctx,
+                "plan",
+                move |step| {
+                    let t = t.clone();
+                    async move {
+                        let turns = {
+                            let mut told = t.lock().expect("told");
+                            told.push(step.step_id);
+                            told.len()
+                        };
+                        if turns < 3 {
+                            return Err(DurableError::Parked(format!("no room, turn {turns}")));
+                        }
+                        Ok(Proposal {
+                            output: json!("planned"),
+                            metadata: json!({}),
+                            writes: Vec::new(),
+                        })
+                    }
+                },
+                Vec::new(),
+            )
+            .await
+        }
+    });
+    engine.launch().await?;
+    setup(&engine, 1).await?;
+    let run = unique("parks");
+    engine.start("parks", &run, ()).await?;
+    let parked = |n: usize| {
+        let (engine, run) = (&engine, run.clone());
+        async move {
+            let until = Instant::now() + Duration::from_secs(30);
+            loop {
+                let found = parks(engine, &run).await?;
+                if found.len() >= n {
+                    return Ok::<_, DurableError>(found);
+                }
+                assert!(Instant::now() < until, "park {n} recorded");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    };
+    let first = parked(1).await?;
+    assert_eq!(first[0].reason, "no room, turn 1");
+    assert_eq!(first[0].step, "plan.park");
+    // Parked, the run waits: nothing runs until the park is released.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(told.lock().expect("told").len(), 1);
+    assert_eq!(engine.status(&run).await?, Some(RunStatus::Pending));
+    // Released, it runs the turn again, which parks again: a park of its own.
+    release(&engine, &first[0]).await?;
+    release(&engine, &first[0]).await?;
+    let second = parked(2).await?;
+    assert_ne!(second[1].id, first[0].id);
+    assert_eq!(second[1].reason, "no room, turn 2");
+    release(&engine, &second[1]).await?;
+    let published: Published = engine.result(&run).await?;
+    assert_eq!(published.output, json!("planned"));
+    // Every turn was told the first turn's position.
+    let told = told.lock().expect("told").clone();
+    assert_eq!(
+        told.len(),
+        3,
+        "one turn per release; the repeat release did nothing"
+    );
+    assert!(told.iter().all(|p| *p == told[0]), "{told:?}");
+    let names: Vec<String> = engine
+        .steps(&run)
+        .await?
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
+    assert_eq!(names.first().map(String::as_str), Some("plan.turn"));
+    assert_eq!(names.last().map(String::as_str), Some("plan.publish"));
+    assert_eq!(names.iter().filter(|n| *n == "plan.turn").count(), 3);
+    assert_eq!(names.iter().filter(|n| *n == "plan.park").count(), 2);
+    engine.shutdown(Duration::from_secs(5)).await
+}
+
+async fn a_pre_upgrade_turn_checkpoint_still_decodes(mut engine: Durare) -> Result<()> {
+    register_common(&mut engine);
+    let executions = Arc::new(AtomicUsize::new(0));
+    let authors = Arc::new(AtomicUsize::new(0));
+    let (e, a) = (executions.clone(), authors.clone());
+    engine.register("legacy", move |ctx: DurareContext, (): ()| {
+        let (e, a) = (e.clone(), a.clone());
+        async move {
+            if e.fetch_add(1, Ordering::SeqCst) == 0 {
+                // As a store written before turns could park records it:
+                // the bare candidate.
+                let _: Candidate = ctx
+                    .step("plan.turn", |step| async move {
+                        let proposal = Proposal {
+                            output: json!("from before"),
+                            metadata: json!({}),
+                            writes: vec![insert(Some("legacy"))],
+                        };
+                        Ok(Candidate {
+                            id: format!("{}:{}", step.workflow_id, step.step_id),
+                            digest: digest(&proposal)?,
+                            proposal,
+                        })
+                    })
+                    .await?;
+                panic!("the process stops before the publication");
+            }
+            run_atom(
+                &ctx,
+                "plan",
+                move || {
+                    let a = a.clone();
+                    async move {
+                        a.fetch_add(1, Ordering::SeqCst);
+                        Err(DurableError::Failed("the author ran again".into()))
+                    }
+                },
+                Vec::new(),
+            )
+            .await
+        }
+    });
+    engine.launch().await?;
+    setup(&engine, 1).await?;
+    let run = unique("legacy");
+    engine.start("legacy", &run, ()).await?;
+    assert!(engine.result::<Value>(&run).await.is_err(), "crashed");
+    engine.recover().await?;
+    let published: Published = engine.result(&run).await?;
+    assert_eq!(published.output, json!("from before"));
+    assert_eq!(
+        authors.load(Ordering::SeqCst),
+        0,
+        "the checkpoint was reused"
+    );
     engine.shutdown(Duration::from_secs(5)).await
 }
 
@@ -786,4 +948,26 @@ async fn an_unaccepted_candidate_is_never_published_on_postgres() -> Result<()> 
 async fn run_atom_records_sibling_steps_in_a_stable_order_on_postgres() -> Result<()> {
     let (rt, _schema) = postgres().await?;
     run_atom_records_sibling_steps_in_a_stable_order(rt).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_released_park_runs_the_turn_again_on_sqlite() -> Result<()> {
+    a_released_park_runs_the_turn_again(sqlite().await?).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pre_upgrade_turn_checkpoint_still_decodes_on_sqlite() -> Result<()> {
+    a_pre_upgrade_turn_checkpoint_still_decodes(sqlite().await?).await
+}
+
+#[cfg(feature = "postgres-tests")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_released_park_runs_the_turn_again_on_postgres() -> Result<()> {
+    a_released_park_runs_the_turn_again(postgres().await?).await
+}
+
+#[cfg(feature = "postgres-tests")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pre_upgrade_turn_checkpoint_still_decodes_on_postgres() -> Result<()> {
+    a_pre_upgrade_turn_checkpoint_still_decodes(postgres().await?).await
 }

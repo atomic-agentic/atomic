@@ -150,8 +150,8 @@ A run in the cost view shows what each step has used against its
 
 ```mermaid
 flowchart TD
-  n1["summarize<br/>completed<br/>2,140 of 20,000 tokens"]
-  n2["review<br/>completed<br/>3,480 of 20,000 tokens"]
+  n1["summarize<br/>completed<br/>2,140 of 200,000 tokens"]
+  n2["review<br/>completed<br/>3,480 of 200,000 tokens"]
   n3{"accept<br/>waiting for approval"}
   n1 --> n2
   n2 --> n3

@@ -637,6 +637,48 @@ fn a_run_killed_after_a_step_resumes_by_its_id_and_reruns_nothing_finished() {
 }
 
 #[test]
+fn a_run_stopped_mid_call_charges_the_call_only_the_time_it_ran() {
+    on_codex_runtime(async {
+        // Rank's call never answers before the run is stopped.
+        let model = FakeModel::start(vec![Reply::Delayed {
+            after: Duration::from_secs(300),
+            reply: Box::new(Reply::Text(RANK.into())),
+        }])
+        .await
+        .expect("fake model");
+        let dir = scratch("stopped");
+        let project = project(&dir);
+        let state = state_dir(&dir, &project);
+        let env = model_env(&model.base_url());
+        let mut run = spawn(
+            &dir,
+            &project,
+            &["run", "triage", "--run-id", "stopped-1", "--data", NOTE],
+            &with(&env, &[]),
+            &dir.join("stopped.log"),
+        );
+        wait_until("rank's call reached the model", || model.calls() >= 1);
+        terminate(&run);
+        let status = wait_child(&mut run, "the stopped run");
+        assert!(!status.success(), "stopped short of its result");
+        // Its call is settled as interrupted: the tokens stay at the bound,
+        // the time is what it ran, not the 10 minutes it reserved.
+        let rt = Durare::sqlite(&state.join("private/atomic.db"))
+            .await
+            .expect("store");
+        let attempts = rt.ledger().attempts("stopped-1").await.expect("attempts");
+        assert_eq!(attempts.len(), 1, "{attempts:?}");
+        let call = &attempts[0];
+        assert_eq!(call.state, "reserved");
+        assert_eq!(call.reserved.millis, 600_000);
+        assert!(call.charged.millis < 60_000, "{call:?}");
+        assert_eq!(call.charged.tokens, call.reserved.tokens);
+        let log = std::fs::read_to_string(dir.join("stopped.log")).unwrap_or_default();
+        assert!(log.contains("settled 1 model call"), "{log}");
+    });
+}
+
+#[test]
 fn a_resumed_run_keeps_the_budget_it_already_spent() {
     on_codex_runtime(async {
         let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])

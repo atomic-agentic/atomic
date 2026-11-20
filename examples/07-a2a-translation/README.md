@@ -3,7 +3,7 @@
 [The atom](atoms/translate.atom.astro) delegates a translation through a pinned and
 approved remote Agent Card, validates the typed result and checks that the target
 language is unchanged. Its name, version and schema locations follow convention.
-It overrides kind and bounds the remote wait to five minutes.
+It overrides kind and bounds the remote wait to fifteen minutes.
 
 The `.invalid` URL is a deliberate placeholder. `translator-a2a-token` is a
 secret reference; no credential belongs in this directory. To deploy, replace
