@@ -26,6 +26,67 @@ This is application-level inspection from durable records. It does not require
 Docker, a Collector, a Datadog account or a trace viewer, and does not imply that
 Atomic embeds a full APM database or dashboard product.
 
+## Export basic spans (v0.1)
+
+Set the standard OpenTelemetry exporter variables and atomic exports a span for
+each workflow run, one for each step it executes and one for each model call,
+over OTLP:
+
+```sh
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf   # or grpc, or http/json
+atomic run triage --data '{"text": "..."}'
+```
+
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL`,
+`OTEL_EXPORTER_OTLP_HEADERS` and the exporter's other `OTEL_*` variables work as
+the specification says, and `OTEL_SDK_DISABLED=true` or
+`OTEL_TRACES_EXPORTER=none` turns export off. With no endpoint set, nothing is
+exported. A protocol atomic does not export is reported in a warning, and the
+command runs without spans. The `OTEL_*` variables are atomic's own: atoms'
+commands, exec and Codex alike, never see them, so a collector credential in
+`OTEL_EXPORTER_OTLP_HEADERS` stays with atomic.
+
+| Span | Names | Attributes |
+| --- | --- | --- |
+| A workflow run | `invoke_workflow <workflow>` | `atomic.workflow`, `atomic.workflow.id`, `gen_ai.conversation.id` |
+| An atom step | `invoke_agent <atom>` | `gen_ai.agent.name`, `atomic.step`, `atomic.workflow.id` |
+| A gate step | `atomic.gate <gate>` | `atomic.gate`, `atomic.step`, `atomic.workflow.id` |
+| A model call | `chat <model>` | `gen_ai.provider.name`, `gen_ai.request.model`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `atomic.workflow.id`, `atomic.step`, `error.type`, `error.message` |
+
+Each step's span is a child of its run's, and each model call's a child of its
+step's, a client span. A Codex atom's call is one turn, which may make several
+requests to the provider, and its span covers them all. `gen_ai.provider.name`
+is `openai` for OpenAI's API and `openai_compatible` for any other endpoint.
+
+A step or run that fails ends its span with an error status, the failure's
+message and `error.type` (`atomic.failed`, `atomic.interrupted`, or for a
+model call `atomic.model_call` or `atomic.meter`). A process that stops while
+runs are still going, such as one stopped while it waits at a gate, ends the
+spans still open with `atomic.stopped` set and exports them before it exits.
+
+A process sends its last spans before it exits, waiting at most two seconds
+for them: spans not sent by then are dropped, and atomic says so on stderr. So a collector that accepts the
+connection and never answers holds up a command's exit by about two seconds,
+whatever the exporter's own timeout (`OTEL_EXPORTER_OTLP_TIMEOUT`). A signal
+during that wait stops it at once, without those spans.
+
+A step that replays from its checkpoint after a restart makes no span: only
+work that runs does. Each span's strings are redacted before they are
+exported, as atomic's log lines and error reports are: values in the formats
+of well-known keys and tokens, values given to a secret's name (`password`,
+`api_key`, `AWS_SECRET_KEY`, `DB_PASS`), and credential-looking values given to
+a name such as `token` or `pass`, become `[REDACTED]`. Each string is cut to
+4,096 characters before it is redacted. Redaction over-matches rather
+than under-matches, but it does let some things through: a short or
+word-like value after a name that only hints at a secret (`pass: 12`,
+`token: expired`), a `session=` value, a password given with `curl -u` or
+`mysql -p`, and a value that runs onto further lines. A webhook URL that
+carries its secret in its path (Slack, Discord, Microsoft Teams) is
+redacted after its host. One message is not redacted: a
+command-line usage error, such as an invalid value for a flag, repeats the
+argument as you typed it, since it is your own command line.
+
 ## Add an optional local trace viewer
 
 The planned developer helper is:

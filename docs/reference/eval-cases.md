@@ -138,14 +138,96 @@ performance. Use case assertions for the behavior you need to evaluate.
 - A golden fixture is an expected result written or reviewed by a person.
 - A recording stores an actual call/result under its effective execution identity.
 
-Applicable recordings can support regression checks without live model calls.
-Changing prompts, model settings, generation schemas or prepared context can
-invalidate their applicability. The later `--live` and `--compare` development
-commands are v0.5 features. A hand-authored fixture is never a live-model pass.
+`atomic eval` answers model calls from **cassettes**, recordings kept beside the
+cases in `evals/<atom>/cassettes/`, so evals run offline and give the same answers
+every time. A recording is keyed by the request as sent: the endpoint (its scheme,
+host and path, with the default port left out) and path, and the body, which holds
+the compiled messages and input, the generation schema, the model and its settings,
+the output limit and any tool definitions. The body's `prompt_cache_key`,
+`metadata`, `user` and `client_metadata` are left out, since they change between
+runs without changing what is asked. A recording answers only that request:
+changed instructions, a changed schema, another model or other settings miss, and
+the eval fails saying how to record it, whatever its pass rate. The same request
+made twice, as two cases with the same input make it, is recorded twice and
+replayed in the same order. The order counts within one run of `atomic eval`: the
+first such request a session makes gets the first recording, the second the
+second. A run that skips one of the cases, with `--case` or `--sample`, can
+therefore be answered with the recording another of them was given; the answers
+to repeated requests are only told apart by their order. A recording that cannot be read whole, or that
+records another request, is reported as corrupt. A change that sends nothing new,
+such as a `validate` rule, still replays, and the new rule is checked against the
+recorded answers. Results from cassettes are reported as a historical check of
+recorded answers, never as a live pass.
+
+```sh
+atomic eval summarize-note --live   # call the model and record each answer
+atomic eval summarize-note          # replay the recordings, with no model call
+atomic eval --no-cassettes          # call the model and record nothing
+```
+
+Replaying needs the model endpoint and model configured as they were when the
+answers were recorded, since both are part of what a recording answers; no call
+reaches them, and no API key is read or sent. Set `model.base_url` and
+`model.name` in `atomic.yaml` (or `ATOMIC_MODEL_BASE_URL` and `ATOMIC_MODEL`) to fix
+a replay's endpoint and model wherever it runs. Without them the endpoint is
+detected as for a run: from `OPENAI_API_KEY`, or by probing for a local Ollama, so
+a replay in CI can find another endpoint than the recording did and miss. The
+budget's call bound and price table set the output cap each request carries, so a
+different call bound or price table in CI than when the answers were recorded
+also makes replays miss.
+A recording holds the request body and the response, never a header, so not the
+endpoint's key; an endpoint whose URL holds credentials or a query is refused. A
+recording is written whole, never through a symbolic link, and a cassette
+directory reached through one is refused. The body holds
+what the atom was asked, case inputs included: review a cassette like any other
+test data before you commit it. A hand-authored fixture is never a live-model pass.
+`--compare` is a v0.5 feature.
+
+A live eval, `--live` or `--no-cassettes`, is metered as a workflow step is: each
+atom's calls are admitted against its `budget` block and the defaults in the
+project's usage ledger, and the spend is reported. A budget with no room for a call
+stops the eval before any call, and a live eval does not start if the ledger cannot
+be opened. A replay spends nothing.
+
+`atomic eval` exits non-zero when any atom's report fails, so CI fails with it.
+`--case <id>` runs chosen cases; with no atom named, only the atoms that have
+them run, and a case no atom has is an error. `--sample N --seed S` runs a seeded
+sample, `--junit <file>` writes JUnit XML (a suite per atom, with failures, errors
+and skipped scorers counted), `--report <file>` writes the reports as JSON, and
+`--revision <rev>` records the revision being evaluated in each report. An atom
+with no cases is named in the output. Scorers need a judge, and `atomic eval` has
+none to call yet: an atom that declares scorers fails unless `--allow-unscored` is
+given, and then they are reported as skipped. `--baseline` is refused for the same
+reason: there is no scorer mean to compare.
+
+Until evals run in disposable fixture worktrees, `atomic eval` refuses the atoms
+that could write to the project's checkout or to anything else. On Linux, where
+exec commands run confined, that holds for what it does run too; elsewhere an exec
+command runs unconfined (see [availability](availability.md)), so the declared
+effects are all that stands between it and the project. It refuses:
+
+- a Codex atom with a `workspace-write` sandbox;
+- an exec atom that does not declare `effects: { external: 'read-only' }`. Its
+  command runs in the project, under the same confinement as in `atomic run`, for
+  every case and every replay, so only a command declared to read and nothing more
+  is run. One that declares `idempotent` writes to an outside system and is never
+  run; one that declares nothing could do anything. If a command only reads its
+  input, declare it `read-only`, as the order-report example's atoms do;
+- a Codex atom under cassettes: it runs only with `--no-cassettes`, since cassettes
+  do not yet stand in for every part of a Codex thread's endpoint.
+
+A refused atom is listed with the reason and what to change, and the other atoms
+run. The command fails while any atom is refused, unless `--skip-refused` is
+given; then refused atoms are reported as skipped, in JUnit too.
+
+A live eval's spend is recorded in the usage ledger under an eval scope,
+`eval:<atom>:<time>-<process>`, named in the output. It is a ledger scope, not a
+run: `atomic runs` does not show it.
 
 ## Coding fixture repositories
 
-The v0.1 target selects a prepared local Git repository explicitly:
+The v0.1 target selects a prepared local Git repository explicitly. `atomic eval`
+does not take these flags yet; this is the design it is built to:
 
 ```sh
 atomic --project /path/to/project eval review-patch \

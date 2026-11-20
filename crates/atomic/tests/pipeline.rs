@@ -352,10 +352,32 @@ async fn engine_full(
     model: &str,
     backend: Option<atomic_exec::Backend>,
 ) -> Durare {
+    let store = LocalStore::open(dir.join("artifacts")).expect("artifact store");
+    engine_built(dir, base_url, budgets, model, backend, store).await
+}
+
+/// As [`engine_on`], storing artifacts in `store`.
+async fn engine_storing(
+    dir: &Path,
+    base_url: &str,
+    budgets: BudgetSettings,
+    model: &str,
+    store: LocalStore,
+) -> Durare {
+    engine_built(dir, base_url, budgets, model, None, store).await
+}
+
+async fn engine_built(
+    dir: &Path,
+    base_url: &str,
+    budgets: BudgetSettings,
+    model: &str,
+    backend: Option<atomic_exec::Backend>,
+    store: LocalStore,
+) -> Durare {
     let mut rt = Durare::sqlite(&dir.join("atomic.db"))
         .await
         .expect("engine");
-    let store = LocalStore::open(dir.join("artifacts")).expect("artifact store");
     // A project in a git repository gets worktrees for its worktree steps.
     let project = dir.join("project");
     let (runtimes, worktrees) = if project.join(".git").exists() {
@@ -948,6 +970,11 @@ fn child_in(
         .env(ENV_RUN, run)
         .env(ENV_DIR, dir)
         .env(ENV_URL, url)
+        // No model endpoint from this machine: no Ollama, no key.
+        .env("ATOMIC_DETECT_OLLAMA_ADDR", "127.0.0.1:9")
+        .env_remove("OPENAI_API_KEY")
+        // None of the developer's own configuration.
+        .env("XDG_CONFIG_HOME", dir.join("config"))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -2043,6 +2070,145 @@ fn replaying_a_recorded_run_opens_no_workspace() {
         assert_eq!(opens(), live, "the replay opened a workspace");
         assert_eq!(sends(&dir), 1, "the replay ran no command");
     });
+}
+
+#[test]
+fn a_pipeline_execution_that_loses_a_step_race_takes_the_winners_outcome() {
+    on_codex_runtime(async {
+        tokio::time::timeout(std::time::Duration::from_secs(120), the_race())
+            .await
+            .expect("the race ended in time");
+    });
+}
+
+/// Creates its files when dropped, releasing the fake model's held answers.
+struct Release(Vec<PathBuf>);
+
+impl Drop for Release {
+    fn drop(&mut self) {
+        for file in &self.0 {
+            let _ = std::fs::write(file, "");
+        }
+    }
+}
+
+async fn the_race() {
+    {
+        let dir = scratch("race");
+        let project = project(&dir);
+        let pipeline = load(&project, "triage.workflow.yaml", TRIAGE);
+        // Each atom is answered by its prompt. The first execution's read is
+        // held until the second has recorded its own, and the second's rank
+        // until the test has watched the first lose.
+        let (first_read, winner_rank) = (dir.join("release-read"), dir.join("release-rank"));
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (gate_read, gate_rank, counted) =
+            (first_read.clone(), winner_rank.clone(), reads.clone());
+        let model = FakeModel::respond(move |request| {
+            let text = request.to_string();
+            if text.contains("Give the note a short title") {
+                let reply = Reply::Text(READ.into());
+                if counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    return Reply::Gated {
+                        file: gate_read.clone(),
+                        reply: Box::new(reply),
+                    };
+                }
+                reply
+            } else if text.contains("Rank the note") {
+                Reply::Gated {
+                    file: gate_rank.clone(),
+                    reply: Box::new(Reply::Text(RANK.into())),
+                }
+            } else {
+                Reply::Text(SUMMARY.into())
+            }
+        })
+        .await
+        .expect("fake model");
+        let first = engine(&dir, &model.base_url()).await;
+        let second = engine(&dir, &model.base_url()).await;
+        first.launch().await.expect("launch");
+        second.launch().await.expect("launch");
+        // Declared after the engines, so dropped before them: a failure
+        // below lets every held answer go, so nothing waits on the engines
+        // as they are dropped and the test fails rather than hangs.
+        let _release = Release(vec![first_read.clone(), winner_rank.clone()]);
+        first
+            .start(
+                PIPELINE,
+                "raced",
+                PipelineRun {
+                    pipeline,
+                    input: json!({"text": "Exporting a file named café.txt crashes the app."}),
+                },
+            )
+            .await
+            .expect("start");
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let wait = |calls: usize, what: &'static str| {
+            let model = &model;
+            async move {
+                while model.calls() < calls {
+                    assert!(std::time::Instant::now() < until, "{what}");
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            }
+        };
+        wait(1, "the first execution never asked for its read").await;
+        // A second engine recovers the run while the first still runs it.
+        second.recover().await.expect("recover");
+        // The second records its read and asks for its rank.
+        wait(3, "the second execution never reached its rank").await;
+        std::fs::write(&first_read, "").expect("release the first read");
+        // The first now finishes its read's turn and loses the race to record
+        // it: it must record nothing while the winner waits.
+        let watch = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut recorded = None;
+        while std::time::Instant::now() < watch && recorded.is_none() {
+            let status = first.status("raced").await.expect("status");
+            if status != Some(RunStatus::Pending) {
+                recorded = Some(status);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        std::fs::write(&winner_rank, "").expect("release the rank");
+        let status = loop {
+            let status = first.status("raced").await.expect("status");
+            if matches!(status, Some(RunStatus::Succeeded | RunStatus::Failed(_)))
+                || std::time::Instant::now() > until
+            {
+                break status;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        let result = second.result::<Value>("raced").await;
+        let reads = first
+            .steps("raced")
+            .await
+            .expect("steps")
+            .into_iter()
+            .filter(|s| s.name == "read.turn")
+            .count();
+        let calls = model.calls();
+        // Both engines stop before anything is judged, so a failure below
+        // fails the test instead of leaving work for the runtime to wait on.
+        drop(_release);
+        for rt in [first, second] {
+            let _ = rt.shutdown(std::time::Duration::from_secs(5)).await;
+        }
+        assert_eq!(
+            recorded, None,
+            "the execution that lost the race recorded an outcome"
+        );
+        assert_eq!(status, Some(RunStatus::Succeeded));
+        assert_eq!(
+            result.expect("the winner's result"),
+            serde_json::from_str::<Value>(SUMMARY).expect("summary")
+        );
+        assert_eq!(calls, 4, "the loser made no call after its read");
+        assert_eq!(reads, 1, "one read recorded");
+    }
 }
 
 #[test]
@@ -3271,16 +3437,20 @@ fn another_run_gets_another_effect_key_and_atoms_cannot_set_it() {
 
         let atom = project.join("atoms/send-note.atom.astro");
         let source = std::fs::read_to_string(&atom).expect("atom");
-        std::fs::write(
-            &atom,
-            source.replace(
-                "env: { SENT_LOG:",
-                "env: { ATOMIC_EFFECT_KEY: 'mine', SENT_LOG:",
-            ),
-        )
-        .expect("atom");
-        let error = atomic_core::atom::load(&atom, &mut Registry::new()).expect_err("refused");
-        assert!(error.message.contains("set by atomic"), "{error}");
+        // Nor the directories its command hands files over in and reads its
+        // artifacts from.
+        for name in ["ATOMIC_EFFECT_KEY", "ATOMIC_OUTPUTS", "ATOMIC_INPUTS"] {
+            std::fs::write(
+                &atom,
+                source.replace(
+                    "env: { SENT_LOG:",
+                    &format!("env: {{ {name}: 'mine', SENT_LOG:"),
+                ),
+            )
+            .expect("atom");
+            let error = atomic_core::atom::load(&atom, &mut Registry::new()).expect_err("refused");
+            assert!(error.message.contains("set by atomic"), "{name}: {error}");
+        }
     });
 }
 
@@ -3707,6 +3877,246 @@ fn the_durable_layout_is_the_one_its_version_names() {
             atomic_app::pipeline::LAYOUT_VERSION,
             file.display()
         );
+    });
+}
+
+/// A store whose lock is held elsewhere stops the run for now: it is not
+/// failed or dead-lettered however many times it stops, records no pin, and
+/// is run again on its own until the store is free, when it finishes.
+#[test]
+fn a_store_held_elsewhere_interrupts_the_run_and_recovery_finishes_it() {
+    on_codex_runtime(async {
+        let dir = scratch("store-locked");
+        let project = project(&dir);
+        let model = FakeModel::start(vec![
+            Reply::Text(READ.into()),
+            Reply::Text(RANK.into()),
+            Reply::Text(SUMMARY.into()),
+        ])
+        .await
+        .expect("fake model");
+        let store = LocalStore::open(dir.join("artifacts"))
+            .expect("store")
+            .waiting_at_most(std::time::Duration::from_millis(100));
+        let holder = std::fs::File::options()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(dir.join("artifacts/lock"))
+            .expect("lock file");
+        holder.lock().expect("hold the lock");
+        let rt = engine_storing(
+            &dir,
+            &model.base_url(),
+            BudgetSettings::default(),
+            "synthetic",
+            store,
+        )
+        .await;
+        let run = PipelineRun {
+            pipeline: load(&project, "triage.workflow.yaml", TRIAGE),
+            input: json!({"text": "Exporting a file named café.txt crashes the app."}),
+        };
+        rt.start(PIPELINE, "locked", run).await.expect("start");
+        // More executions than dead-lettering allows: each tries for the lock
+        // a bounded number of times before it stops the run.
+        let executions = atomic_app::pipeline::RECOVERY_LIMIT + 2;
+        let started = std::time::Instant::now();
+        // Ten waits an execution: its tries but the last, which stops it.
+        while atomic_app::pipeline::store_waits("locked") < 10 * executions {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(240),
+                "{} waits so far",
+                atomic_app::pipeline::store_waits("locked")
+            );
+            let status = rt.status("locked").await.expect("status");
+            assert_eq!(status, Some(RunStatus::Pending), "it stopped waiting");
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            rt.status("locked").await.expect("status"),
+            Some(RunStatus::Pending)
+        );
+        let steps: Vec<String> = rt
+            .steps("locked")
+            .await
+            .expect("steps")
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert!(!steps.iter().any(|s| s == "pin"), "{steps:?}");
+        assert_eq!(model.calls(), 0);
+        drop(holder);
+        let started = std::time::Instant::now();
+        while rt.status("locked").await.expect("status") != Some(RunStatus::Succeeded) {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(60),
+                "once the store was free, it did not finish: {:?}",
+                rt.status("locked").await
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        // Run again from the start: pinned once, and every step called once.
+        let pins = rt
+            .steps("locked")
+            .await
+            .expect("steps")
+            .into_iter()
+            .filter(|s| s.name == "pin")
+            .count();
+        assert_eq!(pins, 1);
+        assert_eq!(model.calls(), 3);
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+/// A store held only briefly is waited out: the run pins and finishes with
+/// no recovery.
+#[test]
+fn a_store_held_briefly_is_waited_out() {
+    on_codex_runtime(async {
+        let dir = scratch("store-busy");
+        let project = project(&dir);
+        let model = FakeModel::start(vec![
+            Reply::Text(READ.into()),
+            Reply::Text(RANK.into()),
+            Reply::Text(SUMMARY.into()),
+        ])
+        .await
+        .expect("fake model");
+        let store = LocalStore::open(dir.join("artifacts"))
+            .expect("store")
+            .waiting_at_most(std::time::Duration::from_millis(100));
+        let holder = std::fs::File::options()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(dir.join("artifacts/lock"))
+            .expect("lock file");
+        holder.lock().expect("hold the lock");
+        let rt = engine_storing(
+            &dir,
+            &model.base_url(),
+            BudgetSettings::default(),
+            "synthetic",
+            store,
+        )
+        .await;
+        let run = PipelineRun {
+            pipeline: load(&project, "triage.workflow.yaml", TRIAGE),
+            input: json!({"text": "Exporting a file named café.txt crashes the app."}),
+        };
+        rt.start(PIPELINE, "busy", run).await.expect("start");
+        // Freed once the run has found it held: its next try takes it.
+        let started = std::time::Instant::now();
+        while atomic_app::pipeline::store_waits("busy") == 0 {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(60),
+                "the run never waited for the store"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        drop(holder);
+        let out: Value = rt.result("busy").await.expect("it ran");
+        assert_eq!(out, json!({"line": "P1: Export crashes on accents"}));
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+/// A replay stores nothing, so a store held elsewhere does not hold it up.
+#[test]
+fn a_replay_takes_no_lock_on_the_store() {
+    on_codex_runtime(async {
+        let dir = scratch("replay-unlocked");
+        let project = project(&dir);
+        let model = FakeModel::start(vec![
+            Reply::Text(READ.into()),
+            Reply::Text(RANK.into()),
+            Reply::Text(SUMMARY.into()),
+        ])
+        .await
+        .expect("fake model");
+        let store = LocalStore::open(dir.join("artifacts"))
+            .expect("store")
+            .waiting_at_most(std::time::Duration::from_millis(100));
+        let rt = engine_storing(
+            &dir,
+            &model.base_url(),
+            BudgetSettings::default(),
+            "synthetic",
+            store,
+        )
+        .await;
+        let run = PipelineRun {
+            pipeline: load(&project, "triage.workflow.yaml", TRIAGE),
+            input: json!({"text": "Exporting a file named café.txt crashes the app."}),
+        };
+        rt.start(PIPELINE, "recorded-unlocked", run)
+            .await
+            .expect("start");
+        let recorded: Value = rt.result("recorded-unlocked").await.expect("finishes");
+        // The replay marks the recorded definitions as just used.
+        let pin = rt
+            .steps("recorded-unlocked")
+            .await
+            .expect("steps")
+            .into_iter()
+            .find(|s| s.name == "pin")
+            .and_then(|s| s.output)
+            .expect("the pin");
+        let snapshot: atomic_core::artifact::ArtifactRef = pin["snapshot"]
+            .as_str()
+            .expect("snapshot")
+            .parse()
+            .expect("a ref");
+        let d = snapshot.digest();
+        let blob = dir
+            .join("artifacts/blobs/sha256")
+            .join(&d[..2])
+            .join(&d[2..]);
+        let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::open(&blob)
+            .expect("blob")
+            .set_modified(hour_ago)
+            .expect("backdate");
+        let replay = replay_of(&rt, "recorded-unlocked").await.expect("a replay");
+        rt.start(REPLAY, "replayed-fresh", replay)
+            .await
+            .expect("start");
+        let _: Value = rt.result("replayed-fresh").await.expect("replays");
+        let touched = std::fs::metadata(&blob)
+            .expect("blob")
+            .modified()
+            .expect("time");
+        assert!(
+            touched > hour_ago + std::time::Duration::from_secs(60),
+            "not refreshed"
+        );
+        let holder = std::fs::File::options()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(dir.join("artifacts/lock"))
+            .expect("lock file");
+        holder.lock().expect("hold the lock");
+        let replay = replay_of(&rt, "recorded-unlocked").await.expect("a replay");
+        rt.start(REPLAY, "replayed-unlocked", replay)
+            .await
+            .expect("start");
+        let replayed: Value = rt.result("replayed-unlocked").await.expect("replays");
+        assert_eq!(replayed, recorded);
+        assert_eq!(atomic_app::pipeline::store_waits("replayed-unlocked"), 0);
+        drop(holder);
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
     });
 }
 

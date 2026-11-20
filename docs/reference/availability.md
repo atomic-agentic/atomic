@@ -44,8 +44,12 @@ gates and `worktree: true` steps, which run a Codex atom in its own worktree at
 the step's `base` and record atomic's commit in `steps.<id>.metadata.commit`.
 A run keeps the definitions it started with.
 
-`atomic run`, `atomic runs resume` and a local foreground `atomic serve` are
-built. `atomic run` takes an atom or workflow by name, by file or with
+`atomic init`, `atomic run`, `atomic runs resume`, `atomic runs show`,
+`atomic config --explain` and a local foreground `atomic serve` are built.
+`atomic init` writes a manifest, a lite atom with its schemas, a one-step
+workflow and an eval case: at the top of an empty directory, or under
+`.atomic/` in one that already holds code. With only `OPENAI_API_KEY` set, or a
+local Ollama running, the new project runs with no configuration. `atomic run` takes an atom or workflow by name, by file or with
 `--project`, and input from a file, standard input or `--data`; a run cut short
 continues with `atomic runs resume <run-id>`, or under `atomic serve`, from its
 checkpoints. One process at a time executes a project's runs. Errors carry a
@@ -53,6 +57,14 @@ description and an action, separately in `--json` output. `atomic gates enroll`,
 `list`, `approve` and `reject` decide gates from a second terminal; a gate
 decision counts only with the credential its person enrolled. The terminal
 prompt for gates in `atomic run` is not wired up yet.
+
+A project's artifact store takes a lock in its private state while it is
+written or swept. A run that finds it held by another process, such as a sweep,
+says so once, waits and tries again for a bounded time (about 7.4 minutes with
+the store's 30-second wait: 11 tries and the pauses between them), then stops
+and is run again. Each stop spends one
+of durare's recoveries of the run, and once they run out the run waits for
+`atomic runs resume`.
 
 `atomic serve` also runs on PostgreSQL (`ATOMIC_DATABASE_URL`) when the process
 has an executor identity (`ATOMIC_EXECUTOR_ID`). `atomic runner` and
@@ -99,7 +111,7 @@ Codex records; the credential and key directories; the default atomic home's
 data and configuration when `ATOMIC_HOME` points elsewhere; the kernel keyrings;
 the network; and sockets. Other projects' Codex records are not denied yet. An
 exec atom's command may write only its scratch directory and the project's
-caches; `--runner process` confines it the same way. It runs in a process
+caches, and only read the artifacts it is given there; `--runner process` confines it the same way. It runs in a process
 namespace of its own, so it can neither see nor signal atomic, its runner or
 any other process outside, and in a session of its own, with no controlling
 terminal and a `/dev` and `/proc` of its own, so it cannot type into, read or
@@ -115,6 +127,14 @@ on a full disk, makes the step wait, as a backend with no room does. Atoms that 
 Windows this has not been verified: exec atoms' commands run unconfined there,
 so atomic keeps no operator credential and refuses credentialed gate decisions.
 
+An exec atom's command hands large results over by reference: it writes a
+file to its outputs directory and names it in its output, and the next step's
+command reads it from its inputs directory, a read-only copy (see
+[atom files](atom-files.md#large-results-go-by-reference)). A file may be 1 GiB
+and a step's files 4 GiB, unless `ATOMIC_EXEC_MAX_FILE_BYTES` and
+`ATOMIC_EXEC_MAX_STEP_BYTES` say otherwise. Only exec atoms hand files over;
+a Codex atom's turn does not yet.
+
 A `workspace-write` atom cannot write `/tmp`, `/var/tmp` or `$TMPDIR` as atomic
 found them: its commands' `TMPDIR` is the project's private one above. A tool
 that ignores `TMPDIR` and writes to `/tmp` directly, such as a JVM's default
@@ -124,7 +144,15 @@ that ignores `TMPDIR` and writes to `/tmp` directly, such as a JVM's default
 Several authoring aids arrive in stages. Eval cases, in YAML and in JSONL files,
 are loaded and checked, and the eval runner reports pass rates against each
 atom's threshold and scorer means against their minimums and a baseline; the
-`atomic eval` command that runs it from the terminal is not built yet. A
+`atomic eval` command runs it from the terminal, from cassettes or `--live`, and
+fails CI below an atom's threshold. It has no judge to run scorers with yet, so an
+atom with scorers fails unless `--allow-unscored` is given, and `--baseline` is
+refused. Its live calls are metered in the usage ledger under each atom's budget.
+Until fixture worktrees exist it refuses an atom that could write: a Codex atom
+with a `workspace-write` sandbox, and an exec atom that does not declare
+`effects: { external: 'read-only' }`, whether it declares `idempotent` or
+nothing. It runs Codex atoms only live, with `--no-cassettes`. It lists what it
+refuses, runs the rest, and fails unless `--skip-refused` is given. A
 recorded workflow-file run can be replayed from its checkpoints as a new run:
 each atom step is served the result it published, with no model call and no
 command run, while gates open again, titled as a replay's, and wait. A replay

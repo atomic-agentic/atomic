@@ -2,6 +2,10 @@
 
 //! The `atomic` command-line program.
 
+// The workflows' futures, spans around them included, nest deeply inside
+// Codex's; proving them Send needs more than the default query depth.
+#![recursion_limit = "512"]
+
 use anyhow::Context;
 use atomic_core::codex::{self, CodexPaths, ModelEndpoint};
 use atomic_core::project;
@@ -10,10 +14,14 @@ use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
 mod engine;
+mod evals;
 mod failure;
 mod gates;
+mod init;
 mod runs;
+mod settings;
 mod setup;
+mod show;
 mod skills;
 mod target;
 
@@ -45,8 +53,18 @@ enum Command {
     },
     /// Render an Astro prompt without calling a model or running scripts.
     Render(RenderArgs),
+    /// Show every setting the project resolves to here; with --explain,
+    /// where each came from and why, secrets masked.
+    Config(settings::ConfigArgs),
+    /// Make a new project here: a manifest, a sample atom and schemas, a
+    /// workflow and an eval case. In a directory that holds code, under
+    /// `.atomic/`.
+    Init(init::InitArgs),
     /// Run an atom or a workflow in the foreground and print its output.
     Run(runs::RunArgs),
+    /// Run atoms' eval cases and fail when an atom's pass rate is below its
+    /// threshold; model calls are answered from cassettes unless --live.
+    Eval(evals::EvalArgs),
     /// Continue runs.
     #[command(subcommand)]
     Runs(Runs),
@@ -80,6 +98,10 @@ enum Runs {
     /// Continue an unfinished run in the foreground, from its checkpoints,
     /// with the definitions and input it started with.
     Resume(runs::ResumeArgs),
+    /// Show everything the store recorded about a run: its steps, which
+    /// attempt ran each and which came from checkpoints, its input and
+    /// output, its spend, its gates and its transcripts.
+    Show(show::ShowArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -121,6 +143,11 @@ enum Debug {
     Probe(PromptArgs),
     /// Print the project's state directory.
     StateDir,
+    /// Panic with this message, to see what a panic writes.
+    Panic {
+        /// The message.
+        message: String,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -149,7 +176,37 @@ impl PromptArgs {
     }
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> std::process::ExitCode {
+    // A panic's message can quote what it was handling: it is redacted like
+    // every other line atomic writes.
+    atomic_core::redact::install_panic_hook();
+    atomic_exec::set_log(|line| atomic_core::redact::log(line));
+    match real_main() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        // Reported here, redacted, rather than by the default `{:?}` of a
+        // returned error.
+        Err(e) => {
+            atomic_core::redact::log(error_line(&e));
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// Send the last spans, unless a signal says to stop at once.
+async fn flush_spans() {
+    if atomic_app::telemetry::flush_unless_signalled().await {
+        atomic_core::log_line!("stopping now, without sending the last spans");
+        std::process::exit(130);
+    }
+}
+
+/// The line `main` reports an error that reached it with, redacted: an
+/// error's chain, never its `Debug` form.
+fn error_line(e: &anyhow::Error) -> String {
+    atomic_core::redact::bounded(&format!("error: {e:#}"), atomic_core::redact::MAX_TEXT)
+}
+
+fn real_main() -> anyhow::Result<()> {
     // A Codex helper, such as the Linux sandbox inside a turn, runs before
     // anything else: no state directory is resolved or created, since its
     // HOME is the turn's own scratch directory.
@@ -189,7 +246,9 @@ fn main() -> anyhow::Result<()> {
         ..
     }) = &parsed
     {
-        std::process::exit(atomic_exec::runner::serve_stdio());
+        std::process::exit(atomic_exec::runner::serve_stdio(
+            &mut atomic_core::redact::stderr_lines(),
+        ));
     }
     // Resolve and create the state directory before Codex starts, so its home
     // is never the user's own. A failure here is reported once the normal entry
@@ -207,6 +266,13 @@ fn main() -> anyhow::Result<()> {
         Err(_) => std::env::temp_dir().join("atomic-no-state-directory"),
     };
     codex::dispatch(&codex_home, move |paths| async move {
+        // Only this role, the command itself, exports spans; Codex's helper
+        // roles never reach here. Spans go where the standard
+        // OTEL_EXPORTER_OTLP_* variables say, if they say, from this runtime;
+        // a bad setting is reported and the command runs without them.
+        if let Err(e) = atomic_app::telemetry::init_from_env() {
+            atomic_core::log_line!("warning: telemetry is off: {e:#}");
+        }
         let cli = match parsed {
             Ok(cli) => cli,
             Err(_) => Cli::parse(),
@@ -218,8 +284,10 @@ fn main() -> anyhow::Result<()> {
         };
         if let Err(e) = outcome {
             failure::report(&failure::analyze(&e), json);
+            flush_spans().await;
             std::process::exit(1);
         }
+        flush_spans().await;
         Ok(())
     })
 }
@@ -231,6 +299,7 @@ fn state_root(cli: Option<&Cli>) -> anyhow::Result<PathBuf> {
     let flag = cli.and_then(|c| c.project.as_deref());
     let target = match cli.and_then(|c| c.command.as_ref()) {
         Some(Command::Run(args)) => Some(args.target.as_str()),
+        Some(Command::Eval(args)) => args.atoms.first().map(String::as_str),
         _ => None,
     };
     match target::project_for(flag, target, &cwd) {
@@ -258,7 +327,9 @@ fn runner() -> i32 {
     struct RunnerCli {}
     let args = std::env::args_os().skip(1);
     match RunnerCli::try_parse_from(args) {
-        Ok(RunnerCli {}) => atomic_exec::runner::serve_stdio(),
+        Ok(RunnerCli {}) => {
+            atomic_exec::runner::serve_stdio(&mut atomic_core::redact::stderr_lines())
+        }
         Err(e) if !e.use_stderr() => {
             let _ = e.print();
             atomic_exec::runner::code::CLEAN
@@ -283,10 +354,14 @@ async fn run(cli: Cli, paths: CodexPaths, state: ProjectState) -> anyhow::Result
             tokio::task::spawn_blocking(move || check(path, json)).await?
         }
         Some(Command::Run(args)) => runs::run(args, project, &paths, json).await,
+        Some(Command::Eval(args)) => evals::run(args, project, &paths, json).await,
         Some(Command::Runs(Runs::Resume(args))) => runs::resume(args, project, &paths, json).await,
+        Some(Command::Runs(Runs::Show(args))) => show::show(args, project, json).await,
         Some(Command::Serve(args)) => runs::serve(args, project, &paths).await,
         Some(Command::Runner) => Ok(()),
         Some(Command::Render(args)) => tokio::task::spawn_blocking(move || render(args)).await?,
+        Some(Command::Config(args)) => settings::config(&args, project, json),
+        Some(Command::Init(args)) => init::init(args),
         Some(Command::Schemas { path, command }) => match command {
             Some(SchemasCommand::Expand { atom }) => {
                 tokio::task::spawn_blocking(move || expand(&atom)).await?
@@ -298,6 +373,7 @@ async fn run(cli: Cli, paths: CodexPaths, state: ProjectState) -> anyhow::Result
             println!("atomic {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
+        Some(Command::Debug(Debug::Panic { message })) => panic!("{message}"),
         Some(Command::Debug(Debug::StateDir)) => {
             println!("{}", state.dir().display());
             Ok(())
@@ -404,6 +480,23 @@ fn check(path: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
         return Ok(());
     }
     let project = project::discover(&path)?;
+    // Each manifest's settings, read as `atomic run` from its directory
+    // would read them, contacting nothing: a setting run would refuse fails
+    // here instead.
+    let mut manifests = vec![project.clone()];
+    if project.members.is_some() {
+        manifests.extend(project::members(&project)?);
+    }
+    for manifest in &manifests {
+        settings::check(&manifest.dir).map_err(|e| {
+            failure::Failure::new(
+                "config.invalid",
+                format!("the configuration cannot be read: {e}"),
+                "fix the setting it names; `atomic config --explain` lists every setting and \
+                 where it comes from",
+            )
+        })?;
+    }
     let files = collections::collect(&project)?;
     collections::load_schemas(&project, &mut registry).map_err(anyhow::Error::msg)?;
     let mut atoms = std::collections::BTreeMap::new();
@@ -421,7 +514,9 @@ fn check(path: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
     for source in &files["workflows"] {
         let loaded = workflow::load(&source.path, &atoms, &mut registry)?;
         for w in loaded.warnings {
-            warnings.push(format!("{}: {w}", loaded.file.display()));
+            // Redacted here, so the JSON form is too, not only the log lines.
+            let w = format!("{}: {w}", loaded.file.display());
+            warnings.push(atomic_core::redact::text(&w).into_owned());
         }
     }
     // Each OpenAPI toolset must give tools whose schemas compile.
@@ -446,13 +541,6 @@ fn check(path: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
         }
         operations += tools.len();
     }
-    let mut warnings = Vec::new();
-    for source in &files["workflows"] {
-        let loaded = workflow::load(&source.path, &atoms, &mut registry)?;
-        for w in loaded.warnings {
-            warnings.push(format!("{}: {w}", loaded.file.display()));
-        }
-    }
     if json {
         println!(
             "{}",
@@ -467,7 +555,7 @@ fn check(path: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
         );
     } else {
         for w in &warnings {
-            eprintln!("warning: {w}");
+            atomic_core::log_line!("warning: {w}");
         }
         println!(
             "checked {} Astro atoms, {} workflows and {} toolset operations",
@@ -680,4 +768,20 @@ async fn prompt(
         ..codex::TurnSpec::default()
     };
     Ok(atomic_core::runtime::run_turn(&runtime, &spec).await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mains_error_line_is_redacted() {
+        let sample = concat!("glpat-", "MAINerrorLINEsample0123");
+        let e = anyhow::anyhow!("the provider said {sample}").context("start Codex");
+        let line = error_line(&e);
+        assert!(
+            line == "error: start Codex: the provider said [REDACTED]",
+            "the line was not redacted as expected"
+        );
+    }
 }

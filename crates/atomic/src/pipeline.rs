@@ -51,7 +51,7 @@
 
 use crate::metering::{BudgetPlan, RunBudget};
 use crate::workflows::propose_at;
-use atomic_core::artifact::{ArtifactStore, LocalStore, Provenance};
+use atomic_core::artifact::{ArtifactError, ArtifactRef, ArtifactStore, LocalStore, Provenance};
 use atomic_core::astro::StepClock;
 use atomic_core::atom::Atom;
 use atomic_core::budget::{Budget, BudgetSettings};
@@ -143,10 +143,22 @@ fn reached(id: &str, position: usize) -> Result<()> {
             "{DEAD_LETTERED} run {id} stopped {RECOVERY_LIMIT} times in this process at the same \
              step without finishing it, so it is not run again"
         );
-        eprintln!("{why}");
+        atomic_core::log_line!("{why}");
         return Err(failed(why));
     }
     Ok(())
+}
+
+/// Take back the count [`reached`] made for this execution of run `id` at
+/// `position`: it stopped there for a reason outside the run, such as a
+/// store held elsewhere, and must not bring the run nearer dead-lettering.
+fn not_reached(id: &str, position: usize) {
+    let mut progress = PROGRESS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((top, entries)) = progress.get_mut(id)
+        && *top == position
+    {
+        *entries = entries.saturating_sub(1);
+    }
 }
 
 /// Set once this process is stopping: no run starts another step.
@@ -515,6 +527,66 @@ fn failed(message: String) -> DurableError {
     DurableError::Failed(message)
 }
 
+/// How many more times a write tries for a store whose lock another holder
+/// keeps, within one execution of the run, before it stops the run to be
+/// run again: each try waits as long as the store waits for its lock, and
+/// the wait between tries doubles up to that long. With the store's 30 s,
+/// an execution waits about 7.4 minutes (11 tries of 30 s, and 111 s
+/// between them) before it spends one of durare's recoveries.
+const LOCKED_RETRIES: u32 = 10;
+const LOCKED_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// How many times this process has found the artifact store held elsewhere
+/// for each run, try by try.
+static STORE_WAITS: std::sync::Mutex<BTreeMap<String, u32>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+/// How many times this process has found the artifact store held
+/// elsewhere while pinning run `id`.
+pub fn store_waits(id: &str) -> u32 {
+    STORE_WAITS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(id)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Put `content` in `store` for run `id`, trying again with backoff, up to
+/// a bound, while the store's lock is held elsewhere, and saying so once.
+fn put_waiting_out_the_lock(
+    id: &str,
+    store: &LocalStore,
+    content: &[u8],
+    provenance: Provenance,
+) -> std::result::Result<atomic_core::artifact::Manifest, ArtifactError> {
+    let cap = store.lock_wait().max(LOCKED_BACKOFF);
+    let mut backoff = LOCKED_BACKOFF.min(cap);
+    let mut retries = 0;
+    loop {
+        match store.put(&mut &content[..], provenance.clone()) {
+            Err(ArtifactError::Locked { .. }) if retries < LOCKED_RETRIES => {
+                let waits = {
+                    let mut all = STORE_WAITS.lock().unwrap_or_else(|e| e.into_inner());
+                    let n = all.entry(id.to_owned()).or_insert(0);
+                    *n += 1;
+                    *n
+                };
+                if waits == 1 {
+                    atomic_core::log_line!(
+                        "atomic: run {id}: the artifact store is held by another process, such \
+                         as a sweep; the run waits for it and tries again"
+                    );
+                }
+                retries += 1;
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(cap);
+            }
+            stored => return stored,
+        }
+    }
+}
+
 /// Check `value` against `contract`, naming every place it fails.
 fn fits(what: &str, contract: &Value, value: &Value) -> Result<()> {
     let validator = Registry::new()
@@ -598,6 +670,19 @@ async fn run_pipeline<C: WorkflowContext>(
 ) -> Result<Value> {
     let PipelineRun { pipeline, input } = run;
     let id = ctx.workflow_id().to_owned();
+    // Before anything is recorded: which execution this is, so `runs show`
+    // can tell what each one ran and what it found checkpointed. Only that
+    // view depends on it, so a record that cannot be written costs the run
+    // nothing but the view's accuracy; an execution that no longer owns its
+    // run stops.
+    match atomic_durable::history::begin(&ctx).await {
+        Ok(_) => {}
+        Err(e @ DurableError::Interrupted(_)) => return Err(e),
+        Err(e) => atomic_core::log_line!(
+            "atomic: run {id}: this execution of it could not be recorded ({e}); `atomic runs \
+             show` may credit its steps to an earlier one"
+        ),
+    }
     // Working from here to its end, but for waits at gates: a stopping
     // process gives it its grace, and begins none of its steps.
     let mut working = Some(begin_work().await);
@@ -632,25 +717,62 @@ async fn run_pipeline<C: WorkflowContext>(
         serde_json::to_vec(&pipeline).map_err(|e| failed(format!("encode the pipeline: {e}")))?;
     let files = pipeline.pins.clone();
     let run_id = ctx.workflow_id().to_owned();
+    let pinning = run_id.clone();
+    let replaying = replay.is_some();
     let helper_runtime = atomic_core::astro::Program::current_helper_runtime();
     let pinned: Pinned = ctx
         .step("pin", move |_| async move {
             let budgets = planned.map_err(failed)?;
-            let manifest = tokio::task::spawn_blocking(move || {
-                store.put(
-                    &mut snapshot.as_slice(),
-                    Provenance {
-                        media_type: SNAPSHOT_MEDIA_TYPE.into(),
-                        workflow: Some(run_id),
-                        step: Some("pin".into()),
-                        origin: Some("run_pipeline".into()),
-                        labels: Default::default(),
-                    },
-                )
+            let provenance = Provenance {
+                media_type: SNAPSHOT_MEDIA_TYPE.into(),
+                workflow: Some(run_id),
+                step: Some("pin".into()),
+                origin: Some("run_pipeline".into()),
+                labels: Default::default(),
+            };
+            // A replay stores nothing new: its definitions are the recorded
+            // run's, already in the store, and it waits for no lock to find
+            // them. It marks them as just used, unless a sweep holds the
+            // store, so a sweep's grace covers them. Gone, they are stored
+            // again as any run's are.
+            if replaying {
+                let digest = sha256(&snapshot);
+                if let Ok(stored) = ArtifactRef::from_digest(&digest)
+                    && matches!(
+                        store.refresh(&stored),
+                        Ok(atomic_core::artifact::Refreshed::Now)
+                            | Ok(atomic_core::artifact::Refreshed::Held)
+                    )
+                    && store.contains(&stored).unwrap_or(false)
+                {
+                    return Ok(Pinned {
+                        snapshot: stored.to_string(),
+                        files,
+                        helper_runtime: Some(helper_runtime),
+                        budgets,
+                    });
+                }
+            }
+            let pinning_id = pinning.clone();
+            let stored = tokio::task::spawn_blocking(move || {
+                put_waiting_out_the_lock(&pinning_id, &store, &snapshot, provenance)
             })
             .await
-            .map_err(|e| failed(format!("store the pipeline: {e}")))?
             .map_err(|e| failed(format!("store the pipeline: {e}")))?;
+            let manifest = match stored {
+                Ok(manifest) => manifest,
+                // A store held elsewhere is in the way for now, not a fault
+                // of the run: it stops without recording anything, and
+                // recovery runs it again.
+                Err(e @ ArtifactError::Locked { .. }) => {
+                    not_reached(&pinning, 0);
+                    return Err(DurableError::Interrupted(format!(
+                        "store the pipeline: {e}; the run is run again, and once durare's \
+                         recoveries of it run out, it waits for `atomic runs resume`"
+                    )));
+                }
+                Err(e) => return Err(failed(format!("store the pipeline: {e}"))),
+            };
             Ok(Pinned {
                 snapshot: manifest.artifact.to_string(),
                 files,
@@ -697,6 +819,10 @@ async fn run_pipeline<C: WorkflowContext>(
                     &values,
                     &services.deployment,
                     replaying,
+                );
+                let decision = crate::telemetry::traced(
+                    crate::telemetry::gate_span(&g.id, ctx.workflow_id()),
+                    decision,
                 )
                 .await?;
                 failpoint(&format!("pipeline:after:{}", g.id));
@@ -894,7 +1020,11 @@ async fn run_pipeline<C: WorkflowContext>(
                     runtimes.lite.meter = meter.clone();
                     runtimes.exec_meter = meter;
                 }
-                async move {
+                // Made here, in the step's body, so a step that replays from
+                // its checkpoint makes none.
+                let span = crate::telemetry::step_span(&atom.name, &id, &run_id);
+                let caller = (run_id.clone(), id.clone());
+                let work = async move {
                 if let Some(served) = served {
                     return served;
                 }
@@ -991,7 +1121,9 @@ async fn run_pipeline<C: WorkflowContext>(
                 metadata.insert("input_sha256".into(), Value::String(input_sha256));
                 failpoint(&ran);
                 Ok(proposal)
-                }
+                };
+                // Model calls name the run and step on their spans.
+                crate::telemetry::traced(span, atomic_core::usage::for_step(caller.0, caller.1, work))
             },
             Vec::new(),
         )
@@ -1291,16 +1423,24 @@ pub fn register_pipeline<R: DurableRuntime>(rt: &mut R, services: Services) {
     let ledger = rt.ledger();
     let (replaying, replay_ledger) = (services.clone(), ledger.clone());
     rt.register(PIPELINE, move |ctx: R::Context, run: PipelineRun| {
-        run_pipeline(ctx, run, services.clone(), ledger.clone(), None)
+        let span = crate::telemetry::workflow_span(&run.pipeline.name, ctx.workflow_id());
+        crate::telemetry::traced(
+            span,
+            run_pipeline(ctx, run, services.clone(), ledger.clone(), None),
+        )
     });
     rt.register(REPLAY, move |ctx: R::Context, replay: ReplayRun| {
         let ReplayRun { of, run, recorded } = replay;
-        run_pipeline(
-            ctx,
-            run,
-            replaying.clone(),
-            replay_ledger.clone(),
-            Some(Arc::new(Replay { of, recorded })),
+        let span = crate::telemetry::workflow_span(&run.pipeline.name, ctx.workflow_id());
+        crate::telemetry::traced(
+            span,
+            run_pipeline(
+                ctx,
+                run,
+                replaying.clone(),
+                replay_ledger.clone(),
+                Some(Arc::new(Replay { of, recorded })),
+            ),
         )
     });
 }

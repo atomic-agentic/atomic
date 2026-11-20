@@ -100,7 +100,7 @@ pub struct Ticket {
 
 /// An admission: the ticket to settle, if the call is metered, and the
 /// limit to hold it to.
-pub(crate) type Admitted = (Option<Ticket>, Limit);
+pub type Admitted = (Option<Ticket>, Limit);
 
 /// How a call ended, for its settlement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,8 +109,23 @@ pub enum Outcome {
     /// answer still spent it.
     Reported(Usage),
     /// The call may have reached the provider, but no usage is known: it
-    /// stays charged at its bound until a usage query reconciles it.
+    /// stays charged at its bound until a usage query reconciles it (none is
+    /// built yet, so it stays charged at its bound).
     Unknown,
+    /// Part of what the call spent is known: it reported `reported`, and
+    /// was then stopped with a provider request in flight, which reported
+    /// nothing. The request in flight is taken to be as large as one
+    /// request's bound, or as `last`, the last request that reported, if
+    /// that was larger: a turn's requests grow as it goes. It is charged the
+    /// reported usage and that estimate, at least its reservation, and stays
+    /// open for a usage query, which is not built yet: until one is, the
+    /// charge keeps that value.
+    Partial {
+        /// What it reported.
+        reported: Usage,
+        /// What its last request that reported used, if any did.
+        last: Option<Usage>,
+    },
     /// The call certainly never reached the provider, so nothing was spent.
     NotDispatched,
 }
@@ -171,7 +186,7 @@ impl Metering {
     }
 
     /// Admit `call`; with no meter, no ticket and no limit.
-    pub(crate) async fn admit(&self, call: Call) -> Result<Admitted, MeterError> {
+    pub async fn admit(&self, call: Call) -> Result<Admitted, MeterError> {
         match &self.0 {
             Some(meter) => meter.admit(call).await.map(|t| {
                 let limit = t.limit;
@@ -182,11 +197,7 @@ impl Metering {
     }
 
     /// Settle `ticket`, if there is one.
-    pub(crate) async fn settle(
-        &self,
-        ticket: Option<Ticket>,
-        outcome: Outcome,
-    ) -> Result<(), MeterError> {
+    pub async fn settle(&self, ticket: Option<Ticket>, outcome: Outcome) -> Result<(), MeterError> {
         match (&self.0, ticket) {
             (Some(meter), Some(ticket)) => meter.settle(ticket, outcome).await,
             _ => Ok(()),
@@ -213,4 +224,111 @@ pub(crate) fn meter_error(e: MeterError) -> anyhow::Error {
 /// The meter's refusal or failure inside `e`, if that is what stopped it.
 pub(crate) fn meter_failure(e: &anyhow::Error) -> Option<&MeterError> {
     e.chain().find_map(|c| c.downcast_ref::<MeterError>())
+}
+
+/// The run and step a model call is made for, which its span names. Set by
+/// the workflow code that runs a step, around the step's work; see
+/// [`for_step`].
+#[derive(Clone, Debug)]
+pub struct Caller {
+    /// The run's workflow ID.
+    pub run: String,
+    /// The step's ID.
+    pub step: String,
+}
+
+tokio::task_local! {
+    static CALLER: Caller;
+}
+
+/// Run `work` as step `step` of run `run`: model calls it makes name them on
+/// their spans.
+pub async fn for_step<F: std::future::Future>(
+    run: impl Into<String>,
+    step: impl Into<String>,
+    work: F,
+) -> F::Output {
+    let caller = Caller {
+        run: run.into(),
+        step: step.into(),
+    };
+    CALLER.scope(caller, work).await
+}
+
+/// The caller the current task runs for, to carry into a task it spawns.
+pub(crate) fn caller() -> Option<Caller> {
+    CALLER.try_with(Caller::clone).ok()
+}
+
+/// Run `work` for `caller`, as the task that spawned it was.
+pub(crate) async fn with_caller<F: std::future::Future>(
+    caller: Option<Caller>,
+    work: F,
+) -> F::Output {
+    match caller {
+        Some(caller) => CALLER.scope(caller, work).await,
+        None => work.await,
+    }
+}
+
+/// The span of one model call, named as the GenAI conventions name a chat
+/// call, a child of the step's span. Its usage is recorded on it when the
+/// provider reports any. A Codex atom's call is one turn, which may make
+/// several requests to the provider: its span covers them all.
+pub(crate) fn call_span(model: &str, provider: &str) -> tracing::Span {
+    let caller = caller();
+    let span = tracing::info_span!(
+        "chat",
+        otel.name = %format!("chat {model}"),
+        otel.kind = "client",
+        otel.status_code = tracing::field::Empty,
+        error.type = tracing::field::Empty,
+        gen_ai.operation.name = "chat",
+        gen_ai.provider.name = %provider,
+        gen_ai.request.model = %model,
+        gen_ai.usage.input_tokens = tracing::field::Empty,
+        gen_ai.usage.output_tokens = tracing::field::Empty,
+        error.message = tracing::field::Empty,
+        atomic.workflow.id = tracing::field::Empty,
+        atomic.step = tracing::field::Empty,
+        atomic.stopped = tracing::field::Empty,
+    );
+    if let Some(caller) = caller {
+        span.record("atomic.workflow.id", caller.run.as_str());
+        span.record("atomic.step", caller.step.as_str());
+    }
+    span
+}
+
+/// The provider a base URL names, for `gen_ai.provider.name`: OpenAI's own
+/// API, or another that speaks its protocol.
+pub(crate) fn provider_name(base_url: &str) -> &'static str {
+    if crate::lite::is_openai_api(base_url) {
+        "openai"
+    } else {
+        "openai_compatible"
+    }
+}
+
+/// Record on `span` what a call spent.
+pub(crate) fn record_usage(span: &tracing::Span, usage: &Usage) {
+    span.record("gen_ai.usage.input_tokens", usage.input_tokens);
+    span.record("gen_ai.usage.output_tokens", usage.output_tokens);
+}
+
+/// Record on `span` why a call failed. The exporter redacts it.
+pub(crate) fn record_error(span: &tracing::Span, error: &anyhow::Error) {
+    span.record("otel.status_code", "ERROR");
+    span.record(
+        "error.type",
+        if meter_failure(error).is_some() {
+            "atomic.meter"
+        } else {
+            "atomic.model_call"
+        },
+    );
+    span.record(
+        "error.message",
+        tracing::field::display(format!("{error:#}")),
+    );
 }

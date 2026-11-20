@@ -473,6 +473,36 @@ impl Meter for LedgerMeter {
                     }
                 }
                 Outcome::Unknown => Settlement::Unknown,
+                Outcome::Partial { reported, last } => {
+                    let tokens = |v: i64| u64::try_from(v).unwrap_or(0);
+                    // The request in flight: one request's bound, or the
+                    // last request's size if that was larger.
+                    let bound = self.settings.reservation(&ticket.model);
+                    let (last_tokens, last_micro) = last.map_or((0, 0), |l| {
+                        (
+                            tokens(l.input_tokens).saturating_add(tokens(l.output_tokens)),
+                            self.settings.cost(
+                                &ticket.model,
+                                tokens(l.input_tokens),
+                                tokens(l.output_tokens),
+                            ),
+                        )
+                    });
+                    Settlement::Partial {
+                        input_tokens: reported.input_tokens,
+                        output_tokens: reported.output_tokens,
+                        micro_usd: int(self.settings.cost(
+                            &ticket.model,
+                            tokens(reported.input_tokens),
+                            tokens(reported.output_tokens),
+                        )),
+                        in_flight: Charge {
+                            tokens: int(bound.tokens.max(last_tokens)),
+                            millis: 0,
+                            micro_usd: int(bound.micro_usd.max(last_micro)),
+                        },
+                    }
+                }
                 Outcome::NotDispatched => Settlement::NotDispatched,
             };
             self.ledger

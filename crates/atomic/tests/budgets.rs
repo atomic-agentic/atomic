@@ -1152,6 +1152,10 @@ fn a_codex_turn_longer_than_a_request_bound_runs_within_its_atoms_time() {
         assert_eq!(journal[0].reserved.millis, 600);
         assert_eq!(journal[1].reserved.millis, 6_000, "{:?}", journal[1]);
         assert!(journal[1].charged.millis >= 1_500, "{:?}", journal[1]);
+        // A turn that completed is charged what it reported: one input and
+        // one output token from its one request.
+        assert_eq!(journal[1].usage, Some((1, 1)), "{:?}", journal[1]);
+        assert_eq!(journal[1].charged.tokens, 2, "{:?}", journal[1]);
         rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
     });
 }
@@ -1185,6 +1189,128 @@ fn a_codex_turn_that_runs_out_of_its_atoms_time_parks_the_run() {
         let park = parks(&rt, "outoftime").await.expect("parks")[0].clone();
         assert_eq!(park.step, "review.park");
         rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+    });
+}
+
+#[test]
+fn a_codex_turn_cut_off_with_a_request_in_flight_is_charged_what_it_reported_and_one_bound() {
+    on_codex_runtime(async {
+        // One request is bounded at two tokens. The review turn's first two
+        // requests report two tokens each and call a tool, past its
+        // reservation; its third is in flight when the atom's time runs out.
+        let tool = || Reply::Tool {
+            name: "no_such_tool".into(),
+            arguments: serde_json::json!({}),
+        };
+        let model = FakeModel::start(vec![
+            Reply::Text(DRAFT.into()),
+            tool(),
+            tool(),
+            // Held well past the cut-off, so the turn is always stopped
+            // waiting on it, however slow the runner.
+            Reply::Delayed {
+                after: Duration::from_secs(120),
+                reply: Box::new(Reply::Text(REVIEW.into())),
+            },
+        ])
+        .await
+        .expect("fake model");
+        let dir = scratch("inflight");
+        // Nine seconds for the turn: ample for its first two requests.
+        let mut budgets = timed(0.01, 0.15);
+        budgets.call.input_tokens = 1;
+        budgets.call.output_tokens = 1;
+        let rt = engine(&dir, &model.base_url(), budgets).await;
+        rt.launch().await.expect("launch");
+        rt.start(CHANGE_REQUEST, "inflight", input())
+            .await
+            .expect("start");
+        let Outcome::Parked(reason) = outcome(&rt, "inflight").await else {
+            panic!("the run should park");
+        };
+        assert!(reason.contains("cut off"), "{reason}");
+        assert_eq!(model.calls(), 4, "the turn's third request was made");
+        let journal = attempts(&rt, "inflight").await;
+        let turn = &journal[1];
+        assert_eq!(turn.reserved.tokens, 2, "{turn:?}");
+        // What its requests reported, and the bound of the one in flight;
+        // the reported usage is kept, and the attempt left open.
+        assert_eq!(turn.usage, Some((2, 2)), "{turn:?}");
+        assert_eq!(turn.charged.tokens, 4 + 2, "{turn:?}");
+        assert_eq!(turn.overshoot(), 4, "{turn:?}");
+        assert_eq!(turn.state, "reserved", "{turn:?}");
+        rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+    });
+}
+
+#[test]
+fn a_request_in_flight_is_estimated_at_the_larger_of_one_bound_and_the_last_request() {
+    on_codex_runtime(async {
+        let dir = scratch("estimate");
+        let rt = Durare::sqlite(&dir.join("atomic.db"))
+            .await
+            .expect("engine");
+        // One request is bounded at 10 input and 5 output tokens, at one
+        // micro-dollar an input token and two an output token: 15 tokens and
+        // 20 micro-dollars.
+        let mut settings = settings(10_000_000, 100_000_000);
+        settings.call.input_tokens = 10;
+        settings.call.output_tokens = 5;
+        settings.pricing.insert(
+            "synthetic".into(),
+            Price {
+                input_usd_per_mtok: 1.0,
+                output_usd_per_mtok: 2.0,
+                max_input_tokens: None,
+                max_output_tokens: None,
+            },
+        );
+        let plan = atomic_app::metering::BudgetPlan::resolve(
+            &settings,
+            &Budget::default(),
+            &[("turn", &Budget::default(), "synthetic")],
+            &[],
+        )
+        .expect("a plan");
+        let budget = RunBudget::pinned(rt.ledger(), &plan);
+        let meter = budget.meter(
+            &atomic_durable::StepInfo {
+                workflow_id: "estimate".into(),
+                step_id: 1,
+            },
+            &plan.atoms["turn"],
+        );
+        let (ticket, _) = meter
+            .admit(atomic_core::usage::Call {
+                index: 0,
+                model: "synthetic".into(),
+                input_bound: None,
+                turn: true,
+                work: false,
+            })
+            .await
+            .expect("admitted");
+        // It reported 100 and 20, and its last request 60 and 30: larger
+        // than one request's bound in tokens (90 to 15) and in dollars (120
+        // to 20 micro-dollars).
+        let usage = |input_tokens, output_tokens| atomic_core::usage::Usage {
+            input_tokens,
+            output_tokens,
+        };
+        meter
+            .settle(
+                ticket,
+                atomic_core::usage::Outcome::Partial {
+                    reported: usage(100, 20),
+                    last: Some(usage(60, 30)),
+                },
+            )
+            .await
+            .expect("settled");
+        let attempt = &rt.ledger().attempts("estimate").await.expect("attempts")[0];
+        assert_eq!(attempt.usage, Some((100, 20)));
+        assert_eq!(attempt.charged.tokens, 120 + 90, "{attempt:?}");
+        assert_eq!(attempt.charged.micro_usd, 140 + 120, "{attempt:?}");
     });
 }
 

@@ -93,8 +93,55 @@ create-only write or a check for its own earlier write. Atomic gives every exec
 command one in its environment: `ATOMIC_EFFECT_KEY` is the same on every attempt
 of a step and differs for any other step or run, beside `ATOMIC_RUN_ID` and
 `ATOMIC_STEP_ID`. Send it as an idempotency key, or put it in what the command
-writes so a repeated write is recognisable. An atom's `env` cannot set these
-three names.
+writes so a repeated write is recognisable.
+
+### Large results go by reference
+
+A command hands over a file too big for its stdout, such as a patch, a report
+or a log, by writing it to the directory in `ATOMIC_OUTPUTS` and naming it in
+its output, where the contract expects an
+[artifact reference](#artifact-references), with an object:
+
+```json
+{"patch": {"$file": "change.diff", "mediaType": "text/x-diff"}}
+```
+
+Atomic stores the file in the artifact store and puts its reference,
+`artifact://sha256/<digest>`, in the object's place before it checks the
+output, so the step's output, and every checkpoint, holds only the reference.
+Only an object where the contract expects a reference is taken; one anywhere
+else is the output's own. The name is one file name in the directory, with no
+`/`; the file must be a regular file of the command's own (not a link, a
+FIFO, a directory, or a file with another hard link), and is read up to the
+size it had when atomic opened it. `mediaType` defaults to
+`application/octet-stream`, and must be one the contract accepts. The output
+is checked against its contract, with stand-in references, and every file it
+names is opened and checked against the limits before anything is stored, so a
+rejected output leaves nothing in the store; files are read aside first, one at
+a time, and stored together. Each name is read and stored once, however often
+the output names it; named under more than one media type, it is stored with a
+manifest for each.
+
+A file may be 1 GiB at most, and the files one step hands over 4 GiB
+together; `ATOMIC_EXEC_MAX_FILE_BYTES` and `ATOMIC_EXEC_MAX_STEP_BYTES` change
+those limits, in bytes. An output may name 256 different files at most, with
+at most 10,000 `$file` objects where its contract expects references; objects
+anywhere else are the output's own and do not count.
+
+A later step's command finds each artifact its input references, where its
+input contract expects a reference, in the directory in `ATOMIC_INPUTS`,
+named by its digest: `$ATOMIC_INPUTS/<digest>` for `artifact://sha256/<digest>`.
+Each is a copy, checked against its digest as it is made, and the directory
+and the copies are read-only: on Linux, where the command is confined, it
+cannot change what it was given, nor, through it, the store; on macOS, where it
+is not, the copies are only marked read-only, and changing one changes only
+the copy. Handing files over is supported on Linux and macOS; on Windows an
+output that names a file is refused.
+
+Both directories are inside the command's scratch directory, in the project's
+state directory, and go when the step ends; what a killed process left is
+removed when atomic next starts. An atom's `env` cannot set `ATOMIC_RUN_ID`,
+`ATOMIC_STEP_ID`, `ATOMIC_EFFECT_KEY`, `ATOMIC_OUTPUTS` or `ATOMIC_INPUTS`.
 
 ## Schema locations
 
@@ -228,6 +275,23 @@ time rather than passing unchecked.
 | `evals` | The eval-case directory relative to the atom file, or `{dir, pass_rate}`; see [eval cases](eval-cases.md#pass-rate-and-threshold) |
 | `context` | Optional public execution-context schema; a context sidecar is also accepted. See [context schemas](#context-schemas) |
 | `exec`, `effects`, `env` | An exec atom's command, what it does outside Atomic, and its environment. See [exec atoms](#exec-atoms). A codex atom may declare `env` too, for its turn's commands (see [exec atoms](#exec-atoms) for what it cannot set) |
+
+A Codex atom's shell inherits only the platform's core variables, such as
+`PATH`, `HOME`, `USER` and the locale, without any whose name holds `KEY`,
+`SECRET` or `TOKEN`, and never `ATOMIC_*`, `OPENAI_*`, `CODEX_*`, `AWS_*`,
+`PG*`, `DATABASE_URL` or any `*_API_KEY`. Its `HOME` and `ZDOTDIR` are its
+attempt's own scratch directory, or a directory that does not exist where
+no attempt gives it one, and it is not a login shell, so none of your shell
+startup files run, and your own atomic configuration directory is denied to
+it. The model chooses its commands, so this keeps your inherited
+environment from the model; it does not yet cover credentials in files
+elsewhere in your home directory.
+
+Anything that finds its files through your home directory does not find
+them: rustup's and cargo's homes (`~/.rustup`, `~/.cargo`), the Go module
+cache, pyenv and asdf shims, `~/.gitconfig` and `~/.npmrc`. A tool the
+atom's commands need has to be on `PATH` without them, and settings it
+needs passed in the atom's `env`.
 
 Some integrations shown in the catalog remain staged. Unavailable permissions,
 remote atoms, credentials, skills and runtime declarations fail explicitly in the
