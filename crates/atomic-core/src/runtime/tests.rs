@@ -2317,9 +2317,10 @@ fn a_cancelled_run_waits_for_its_files_to_be_copied_and_read() {
     });
 }
 
-/// A store held by a sweep while a command's files are stored leaves the
-/// step's outcome unknown, as a crash there would, not failed: recovery runs
-/// it again through its attempt guard.
+/// A store held by a sweep while a command's files are stored is waited
+/// out a few times; held past them, it leaves the step's outcome unknown,
+/// as a crash there would, not failed, for recovery to take up through the
+/// step's attempt guard.
 #[cfg(unix)]
 #[test]
 fn a_store_held_while_files_are_stored_leaves_the_outcome_unknown() {
@@ -2342,32 +2343,55 @@ fn a_store_held_while_files_are_stored_leaves_the_outcome_unknown() {
         let mut registry = Registry::new();
         let a = atom::load(&dir.join("atoms/total.atom.astro"), &mut registry).expect("loads");
         let compiled = compile::compile(&a, &registry).expect("compiles");
+        let artifacts = Artifacts::store(store, Default::default());
         // A sweep's hold on the store.
-        let held = std::fs::File::options()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(root.join("lock"))
-            .expect("the store's lock");
-        held.lock().expect("held");
-        let r = run_exec(
-            &a,
-            &compiled,
-            &json!({"cents": [1]}),
-            &EffectIdentity {
-                run_id: "run-1".into(),
-                step_id: "total".into(),
-            },
-            Arc::new(atomic_exec::LocalBackend::default()),
-            None,
-            &Artifacts::store(store, Default::default()),
-        )
-        .await;
+        let hold = || {
+            let held = std::fs::File::options()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(root.join("lock"))
+                .expect("the store's lock");
+            held.lock().expect("held");
+            held
+        };
+        let identity = EffectIdentity {
+            run_id: "run-1".into(),
+            step_id: "total".into(),
+        };
+        let input = json!({"cents": [1]});
+        let run = || {
+            run_exec(
+                &a,
+                &compiled,
+                &input,
+                &identity,
+                Arc::new(atomic_exec::LocalBackend::default()),
+                None,
+                &artifacts,
+            )
+        };
+        let held = hold();
+        let r = run().await;
         assert!(
             matches!(&r, Err(AtomError::OutcomeUnknown(m)) if m.contains("lock")),
             "{r:?}"
         );
         drop(held);
+        // A sweep that lets go while the gather waits.
+        let held = hold();
+        let sweep = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            drop(held);
+        });
+        let (out, _) = run().await.expect("stored once the sweep let go");
+        assert!(
+            out["patch"]
+                .as_str()
+                .is_some_and(|r| r.starts_with("artifact://sha256/")),
+            "{out}"
+        );
+        sweep.join().expect("sweep");
     });
 }

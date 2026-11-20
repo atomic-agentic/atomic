@@ -595,3 +595,28 @@ fn a_sweep_leaves_an_open_stores_partial_writes() {
     assert!(s.contains(&m[0].artifact).expect("contains"));
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// A blob committed after a sweep began reading what to keep is kept, however
+/// long before it was staged: a gather may stage for a long time before it
+/// commits.
+#[test]
+fn a_blob_committed_after_a_sweep_began_reading_is_kept() {
+    let (s, dir) = store();
+    let staged = s.stage(&mut &b"staged long ago"[..]).expect("stage");
+    let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    std::fs::File::open(&staged.path)
+        .and_then(|f| f.set_modified(long_ago))
+        .expect("backdate");
+    let read_at = std::time::SystemTime::now();
+    let m = s.commit(staged, &[provenance("late")]).expect("commit");
+    let swept = s
+        .sweep(
+            &BTreeSet::new(),
+            Grace::at_least(std::time::Duration::from_secs(60)),
+            read_at,
+        )
+        .expect("sweep");
+    assert!(swept.removed.is_empty(), "{swept:?}");
+    assert!(s.contains(&m[0].artifact).expect("contains"));
+    let _ = std::fs::remove_dir_all(dir);
+}

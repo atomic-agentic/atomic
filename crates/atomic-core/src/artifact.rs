@@ -924,7 +924,12 @@ impl ArtifactStore for LocalStore {
                 .map_err(io(&blob))?;
         } else {
             // New, or a blob that no longer holds its content: the content
-            // just written takes its place.
+            // just written takes its place, as recent as this commit rather
+            // than its staging, which may have been long before, so a sweep
+            // that began reading before now keeps it.
+            std::fs::File::open(&staged.path)
+                .and_then(|f| f.set_modified(std::time::SystemTime::now()))
+                .map_err(io(&staged.path))?;
             std::fs::create_dir_all(&parent).map_err(io(&parent))?;
             std::fs::rename(&staged.path, &blob).map_err(io(&blob))?;
             staged.take();

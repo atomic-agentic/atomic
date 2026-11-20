@@ -1161,6 +1161,16 @@ pub async fn run_exec_opened(
     ))
 }
 
+/// How many times a gather that found the artifact store held by a sweep
+/// tries again, each after waiting for the store's lock, before the step's
+/// outcome is unknown.
+const GATHER_LOCKED_RETRIES: u32 = 3;
+/// The first wait between a gather's tries, doubled each time up to
+/// [`GATHER_LOCKED_BACKOFF_MAX`].
+const GATHER_LOCKED_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
+/// The longest wait between a gather's tries.
+const GATHER_LOCKED_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// An artifact store's failure, as an atom's error: a refusal is the
 /// command's output's fault, anything else the store's.
 fn store_error(atom: &str, doing: &str, e: crate::artifact::ArtifactError) -> AtomError {
@@ -1169,9 +1179,10 @@ fn store_error(atom: &str, doing: &str, e: crate::artifact::ArtifactError) -> At
             message,
             answer: String::new(),
         },
-        // Held by a sweep for now: the command ran and its files were not
-        // stored, as if the step had crashed there, so recovery runs it
-        // again through its attempt guard.
+        // Held by a sweep for now, past the gather's tries: the command ran
+        // and its files were not stored, as if the step had crashed there.
+        // Recovery takes it up through its attempt guard: an idempotent
+        // command runs again, any other parks the run as outcome unknown.
         e @ crate::artifact::ArtifactError::Locked { .. } => {
             AtomError::OutcomeUnknown(format!("{atom}: {doing}: {e}"))
         }
@@ -1260,8 +1271,13 @@ async fn finish_exec(
                     Err(errors.join("; "))
                 }
             };
-            exchange
-                .gather(
+            // A store held by a sweep is waited out a few times: a gather
+            // that found it held stored nothing it needs, so it can start
+            // again.
+            let mut wait = GATHER_LOCKED_BACKOFF;
+            let mut retries = 0;
+            loop {
+                match exchange.gather(
                     store.as_ref(),
                     lookup.as_ref(),
                     &mut output,
@@ -1269,8 +1285,17 @@ async fn finish_exec(
                     &validate,
                     &provenance,
                     limits,
-                )
-                .map(|()| output)
+                ) {
+                    Err(crate::artifact::ArtifactError::Locked { .. })
+                        if retries < GATHER_LOCKED_RETRIES =>
+                    {
+                        retries += 1;
+                        std::thread::sleep(wait);
+                        wait = (wait * 2).min(GATHER_LOCKED_BACKOFF_MAX);
+                    }
+                    gathered => break gathered.map(|()| output),
+                }
+            }
         })
         .await
         .map_err(|e| AtomError::Runtime(format!("{}: store its files: {e}", atom.name)))?;
