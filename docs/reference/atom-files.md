@@ -65,13 +65,15 @@ the network they need. It also:
   it;
 - cannot be a program whose path holds `=`.
 
-`env` cannot set `HOME` or `TMPDIR`, which are the command's own. A codex atom
-may declare `env` too, for the commands its turn runs, such as the tool homes
-(`RUSTUP_HOME`, `CARGO_HOME`, `PYENV_ROOT`) they no longer find through `HOME`;
-it cannot set `HOME`, `ZDOTDIR` or `TMPDIR`, nor a variable the dynamic loader
-reads (`LD_*`, `DYLD_*`, `GCONV_PATH`, `GLIBC_TUNABLES`), which would load code
-into the sandbox helper, nor one that makes a shell run a file or command as
-it starts (`BASH_ENV`, `ENV`, `PROMPT_COMMAND`).
+`env` cannot set `HOME` or `TMPDIR`, which are the command's own, nor
+`ATOMIC_TURN_TMPDIR`, which atomic uses to hand a turn's commands their
+`TMPDIR`. A codex atom may declare `env` too, for the commands its turn runs,
+such as the tool homes (`RUSTUP_HOME`, `CARGO_HOME`, `PYENV_ROOT`) they no
+longer find through `HOME`; it cannot set `HOME`, `ZDOTDIR`, `TMPDIR` or
+`ATOMIC_TURN_TMPDIR`, nor a variable the dynamic loader reads (`LD_*`,
+`DYLD_*`, `GCONV_PATH`, `GLIBC_TUNABLES`), which would load code into the
+sandbox helper, nor one that makes a shell run a file or command as it starts
+(`BASH_ENV`, `ENV`, `PROMPT_COMMAND`).
 
 On Linux, an atom that runs commands, an exec atom or a codex atom, needs
 bubblewrap and unprivileged user namespaces. Where the sandbox cannot start,
