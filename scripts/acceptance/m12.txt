@@ -73,9 +73,14 @@ atomic_durable usage::tests::on_sqlite::a_partly_known_attempt_is_charged_its_re
 atomic_durable usage::tests::on_postgres::a_partly_known_attempt_is_charged_its_reported_usage_and_one_more_bound
 
 ## CI fails when a scorer's mean drops below its declared floor, or falls further than its allowed tolerance relative to a baseline revision.
-pending: shown in the eval runner only; atomic eval has no judge to score with, and refuses --baseline, so CI cannot yet fail on a scorer
+# For v0.1 this clause is shown by the eval runner, which fails a report on a
+# scorer below its floor or past its tolerance, and by atomic eval, which exits
+# non-zero on a failed report and fails an atom whose scorers it cannot run. A
+# judged run through atomic eval comes with model-judged scorers.
 atomic_core eval::tests::a_scorer_below_its_minimum_or_past_its_tolerance_fails_the_report
 atomic_core eval::tests::scorers_score_passing_cases_against_a_comparable_baseline
+eval_cli atomic_eval_records_replays_offline_and_fails_ci_on_a_pass_rate_drop
+eval_cli declared_scorers_fail_the_atom_unless_allowed_and_a_baseline_is_refused
 
 ## Cases kept many to a JSONL file behave like cases kept one to a file.
 atomic_core eval::tests::cases_in_a_jsonl_file_run_the_same_as_cases_one_to_a_file
