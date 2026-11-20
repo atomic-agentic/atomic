@@ -169,6 +169,49 @@ part of the compiled atom, so editing an unrelated schema does not change it. An
 import whose schema file does not exist fails the check. A schema file whose
 declarations would replace an atom's own `.atomic/types/<atom>.d.ts` is an error.
 
+### Artifact references
+
+A field typed `{$ref: 'atomic:artifact'}` holds a reference to a stored
+artifact, `artifact://sha256/<digest>`, never its bytes. A `mediaType` beside
+the `$ref` says what the artifact must be:
+
+```yaml
+properties:
+  patch: {$ref: 'atomic:artifact', mediaType: text/x-diff}
+```
+
+Atomic checks every reference in an output, from a model or an exec command,
+against the artifact store: it must exist and have that media type. A reference
+under `anyOf` or `oneOf` is held to the alternative the value fits. JSON
+Schema's own rule decides which that is, so a plain-string alternative beside an
+artifact accepts any string, a reference to a missing artifact included. Tag the
+alternatives with a required `const` property, or close them with
+`additionalProperties: false`, so that the artifact's alternative is the only
+one a reference fits:
+
+```yaml
+anyOf:
+  - {type: object, additionalProperties: false, required: [kind, file],
+     properties: {kind: {const: diff}, file: {$ref: 'atomic:artifact', mediaType: text/x-diff}}}
+  - {type: object, additionalProperties: false, required: [kind, text],
+     properties: {kind: {const: text}, text: {type: string, maxLength: 2000}}}
+```
+
+`atomic check` inlines references to other schema files and `$anchor`s first,
+and writes any spelling of `atomic:artifact` (`atomic:artifact#`) the canonical
+way. It then refuses an output schema whose references the check could not
+follow: one reached through `contains`, `if`, `then`, `else`, `not`,
+`patternProperties` or another keyword besides `properties`, `items`,
+`prefixItems`, `additionalProperties`, `dependentSchemas`, `allOf`, `anyOf` and
+`oneOf`; and a `mediaType` anywhere but beside `$ref: 'atomic:artifact'`. A
+contract written in code is not inlined. Before its atom calls a model, it is
+refused for a `$ref` to anything outside itself other than `atomic:artifact`
+(another file, or a spelling such as `atomic:artifact#`); if it has such a
+reference or holds artifact references, also for a subschema with its own
+`$schema` and for a reference the check cannot follow, such as an `$anchor`. A
+schema whose alternatives would take too long to decide fails the check at run
+time rather than passing unchecked.
+
 ## Configuration
 
 | Field | Meaning |

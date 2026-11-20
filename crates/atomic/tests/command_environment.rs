@@ -184,6 +184,7 @@ fn atom_commands_get_only_core_and_declared_variables_on_every_backend() {
                 },
                 backend,
                 None,
+                &runtime::Artifacts::none(),
             )
             .await
             .unwrap_or_else(|e| panic!("{what}: {e}"));

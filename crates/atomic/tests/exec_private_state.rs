@@ -132,6 +132,7 @@ async fn probe(
         },
         backend,
         None,
+        &runtime::Artifacts::none(),
     )
     .await
     .expect("the command runs");

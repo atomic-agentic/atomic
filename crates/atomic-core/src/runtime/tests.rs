@@ -1100,6 +1100,7 @@ fn exec_validators_follow_the_steps_clock() {
                 &identity,
                 Arc::new(atomic_exec::LocalBackend::default()),
                 Some(&clock),
+                &Artifacts::none(),
             )
             .await
             .expect("the recorded clock passes");
@@ -1112,6 +1113,7 @@ fn exec_validators_follow_the_steps_clock() {
             &identity,
             Arc::new(atomic_exec::LocalBackend::default()),
             None,
+            &Artifacts::none(),
         )
         .await;
         assert!(matches!(fresh, Err(AtomError::Validation(_))), "{fresh:?}");
@@ -1956,6 +1958,163 @@ fn a_check_that_may_pass_is_waited_for_and_kept_once_it_passes() {
             checks.load(std::sync::atomic::Ordering::SeqCst),
             3,
             "two refusals, one pass, then kept"
+        );
+    });
+}
+
+// An exec atom's output is held to the artifact store like a model's answer.
+#[test]
+fn an_exec_atom_output_names_only_artifacts_the_store_holds() {
+    use crate::artifact::{ArtifactStore, LocalStore, Provenance};
+    use crate::{atom, compile};
+    on_codex_runtime(async {
+        let store = LocalStore::open(scratch("exec-artifacts")).expect("store");
+        let put = |bytes: &[u8], media: &str| {
+            store
+                .put(
+                    &mut &bytes[..],
+                    Provenance {
+                        media_type: media.into(),
+                        workflow: None,
+                        step: None,
+                        origin: None,
+                        labels: Default::default(),
+                    },
+                )
+                .expect("put")
+                .artifact
+                .uri()
+        };
+        let diff = put(b"--- a\n+++ b\n", "text/x-diff");
+        let text = put(b"a note", "text/plain");
+        let missing = format!("artifact://sha256/{}", "0".repeat(64));
+        for (reference, want) in [
+            (&diff, None),
+            (&text, Some("text/x-diff")),
+            (&missing, Some("no artifact")),
+        ] {
+            let script = format!(
+                "import json, sys\njson.load(sys.stdin)\njson.dump({{'total': 1, 'patch': '{reference}'}}, sys.stdout)\n"
+            );
+            let (dir, _, _) = exec_project("exec-artifact", &script, "");
+            std::fs::write(
+                dir.join("atoms/total.output.schema.yaml"),
+                "type: object\nadditionalProperties: false\nrequired: [total, patch]\nproperties:\n  total: {type: integer}\n  patch: {$ref: 'atomic:artifact', mediaType: text/x-diff}\n",
+            )
+            .expect("output");
+            let mut registry = Registry::new();
+            let a = atom::load(&dir.join("atoms/total.atom.astro"), &mut registry).expect("loads");
+            let compiled = compile::compile(&a, &registry).expect("compiles");
+            let r = run_exec(
+                &a,
+                &compiled,
+                &json!({"cents": [1]}),
+                &EffectIdentity {
+                    run_id: "run-1".into(),
+                    step_id: "total".into(),
+                },
+                Arc::new(atomic_exec::LocalBackend::default()),
+                None,
+                &Artifacts::new(store.clone()),
+            )
+            .await;
+            match want {
+                None => assert!(r.is_ok(), "{r:?}"),
+                Some(says) => assert!(
+                    matches!(&r, Err(AtomError::Schema { message, .. }) if message.contains(says)),
+                    "{r:?}"
+                ),
+            }
+        }
+    });
+}
+
+// A number that validates but that CEL cannot read as its contract types it
+// is a schema error at acceptance: repaired, and never checkpointed.
+#[test]
+fn an_answer_cel_cannot_read_is_repaired() {
+    on_codex_runtime(async {
+        let wedging = Reply::Text(
+            r#"{"category": "bug", "summary": "s", "line": 1.0000000000000000000001}"#.into(),
+        );
+        let good = Reply::Text(r#"{"category": "bug", "summary": "s", "line": 1}"#.into());
+        let model = FakeModel::start(vec![wedging.clone(), good])
+            .await
+            .expect("fake model");
+        let rt = runtime(&model, "cel-repair");
+        let (out, _) = run_codex_atom(&Classify, &Note { text: "n".into() }, &rt)
+            .await
+            .expect("repaired");
+        assert_eq!(out.line, Some(1));
+        assert_eq!(model.calls(), 2, "one repair");
+        let model = FakeModel::start(vec![wedging.clone(), wedging])
+            .await
+            .expect("fake model");
+        let rt = runtime(&model, "cel-repair-fails");
+        let r = run_codex_atom(&Classify, &Note { text: "n".into() }, &rt).await;
+        assert!(
+            matches!(&r, Err(AtomError::Schema { message, .. }) if message.contains("integer")),
+            "{r:?}"
+        );
+    });
+}
+
+struct Hidden;
+
+impl Atom for Hidden {
+    type In = Note;
+    type Out = Value;
+    const NAME: &'static str = "hidden-artifact";
+    fn input_schema(&self) -> Value {
+        Classify.input_schema()
+    }
+    fn output_schema(&self) -> Value {
+        json!({"type": "object", "properties": {
+            "files": {"type": "array", "contains": {"$ref": "atomic:artifact"}}}})
+    }
+    fn instructions(&self) -> Cow<'static, str> {
+        "List the files.".into()
+    }
+}
+
+// A contract written in code whose artifact references cannot be checked is
+// refused before any model call.
+#[test]
+fn a_typed_contract_that_cannot_be_checked_is_refused_before_the_model() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(Vec::new()).await.expect("fake model");
+        let rt = runtime(&model, "hidden");
+        let r = run_codex_atom(&Hidden, &Note { text: "n".into() }, &rt).await;
+        assert!(
+            matches!(&r, Err(AtomError::Runtime(message)) if message.contains("contains")),
+            "{r:?}"
+        );
+        assert_eq!(model.calls(), 0);
+    });
+}
+
+// An exec atom's output CEL cannot read is a schema error, as a model's is.
+#[test]
+fn an_exec_output_cel_cannot_read_fails() {
+    on_codex_runtime(async {
+        let script = "import sys\nsys.stdin.read()\nsys.stdout.write('{\"total\": 1.0000000000000000000001}')\n";
+        let (_, a, compiled) = exec_project("exec-cel", script, "");
+        let r = run_exec(
+            &a,
+            &compiled,
+            &json!({"cents": [1]}),
+            &EffectIdentity {
+                run_id: "run-1".into(),
+                step_id: "total".into(),
+            },
+            Arc::new(atomic_exec::LocalBackend::default()),
+            None,
+            &Artifacts::none(),
+        )
+        .await;
+        assert!(
+            matches!(&r, Err(AtomError::Schema { message, .. }) if message.contains("integer")),
+            "{r:?}"
         );
     });
 }

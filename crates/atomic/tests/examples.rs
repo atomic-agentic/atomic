@@ -154,6 +154,7 @@ fn every_v0_1_example_passes_the_real_load_and_check() {
                             },
                             Arc::new(atomic_exec::LocalBackend::default()),
                             None,
+                            &runtime::Artifacts::none(),
                         ))
                         .unwrap_or_else(|e| panic!("{what}: {e}"));
                     assert_eq!(out, golden, "{what}: the command's output");
