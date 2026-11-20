@@ -702,10 +702,11 @@ fn worst_cases(size: usize) -> Vec<(&'static str, String)> {
 
 /// A megabyte of each, in a debug build on a shared machine, within a
 /// bound a quadratic scan could not meet. A linear pass over a megabyte
-/// takes well under a second, but a loaded CI runner running other tests
-/// alongside has stretched one past three; a quadratic one takes about
-/// 25 s for 64 KB and so hours for a megabyte. Thirty seconds keeps the
-/// two far apart.
+/// takes about a second a case on a loaded CI runner running other tests
+/// alongside, and has taken past three; a quadratic one takes about 25 s
+/// for 64 KB and so hours for a megabyte. Thirty seconds keeps the two far
+/// apart. Two cases whose slower growth this bound could hide have their
+/// own check (see `escaped_quotes_and_open_key_blocks_grow_linearly`).
 #[test]
 fn worst_cases_finish_quickly() {
     let slow: Vec<(&str, std::time::Duration)> = worst_cases(1024 * 1024)
@@ -1005,4 +1006,181 @@ fn redaction_never_panics_on_random_text() {
         });
         assert!(survived.is_ok(), "case {case} panicked");
     }
+}
+
+/// The least time of `runs` redactions of `input`.
+fn least_time(input: &str, runs: usize) -> std::time::Duration {
+    (0..runs)
+        .map(|_| {
+            let start = std::time::Instant::now();
+            let _ = text(input);
+            start.elapsed()
+        })
+        .min()
+        .unwrap_or_default()
+}
+
+/// Two worst cases whose slower growth the megabyte bound could hide: quotes
+/// escaped ever deeper, whose cap keeps each depth's scan to one pass, and
+/// key blocks with no end, each consumed whole. At sixteen times the size,
+/// a linear scan takes about sixteen times as long, one that grows as the
+/// 1.5th power 64 times, a quadratic one 256 times; whatever the size or
+/// the machine, the ratio stays under 32.
+#[test]
+fn escaped_quotes_and_open_key_blocks_grow_linearly() {
+    let quotes = |depths: usize| -> String {
+        (1..depths)
+            .map(|depth| format!("password={}\"x ", "\\".repeat(depth)))
+            .collect()
+    };
+    let blocks = |size: usize| concat!("-----BEGIN RSA PRIVATE", " KEY-----\n").repeat(size / 32);
+    for (name, small, large) in [
+        ("escaped quotes", quotes(350), quotes(1400)),
+        ("open key blocks", blocks(64 * 1024), blocks(1024 * 1024)),
+    ] {
+        let ratio =
+            least_time(&large, 3).as_secs_f64() / least_time(&small, 5).as_secs_f64().max(1e-6);
+        assert!(
+            ratio < 32.0,
+            "{name}: {ratio:.1} times as long at sixteen times the size"
+        );
+    }
+}
+
+/// A private key block of `chars` characters in all, with its end.
+fn key_block(chars: usize) -> String {
+    let begin = concat!("-----BEGIN RSA PRIVATE", " KEY-----\n");
+    let end = concat!("\n-----END RSA PRIVATE", " KEY-----\n");
+    format!(
+        "{begin}{}{end}",
+        "A".repeat(chars - begin.len() - end.len())
+    )
+}
+
+/// A secret whose rule needs what a window's cut took, the `@` after a
+/// URL's password, the quote that ends a JSON value or the `Bearer ` before
+/// a token, is not shown when redacting what comes before it shrinks the
+/// window enough to bring the cut into view.
+#[test]
+fn a_secret_the_cut_parted_from_its_neighbour_is_not_shown() {
+    const SEEDED: &str = "hunter2-seeded-passphrase";
+    let chars = 100;
+    let window = margin(chars);
+    let at_end = |line: String, after: &str| {
+        let block = key_block(window - line.len());
+        format!("{block}{line}{after}")
+    };
+    let url = at_end(
+        format!("connect postgres://app:{SEEDED}"),
+        "@db.internal/x\n",
+    );
+    let json = at_end(format!("{{\"password\": \"{SEEDED}"), "\"}\n");
+    let shown = [
+        bounded(&url, chars),
+        excerpt(&url, chars),
+        bounded(&json, chars),
+    ];
+    for (i, out) in shown.iter().enumerate() {
+        assert!(!out.contains(SEEDED), "case {i} showed the secret");
+        assert!(out.ends_with('…'), "case {i} does not say it was cut");
+    }
+    let token = concat!("abcdef0123456789", "abcdef0123456789");
+    let block = key_block(window - token.len() - 1);
+    let header = format!("Authorization: Bearer {token}\n{block}");
+    let out = tail(&header, chars);
+    assert!(!out.contains(token), "the tail showed the token");
+    assert!(out.starts_with('…'), "the tail does not say it was cut");
+    // With nothing shrunk, the cut is far out of view and nothing more is
+    // dropped.
+    let plain = format!("{}\n{}", "word ".repeat(window), "more");
+    assert_eq!(bounded(&plain, chars), format!("{}…", &plain[..chars]));
+}
+
+/// A window that left everything out says so, rather than show nothing:
+/// one unbroken token longer than the window, say.
+#[test]
+fn a_window_that_leaves_everything_out_says_so() {
+    let long = "k".repeat(50_000);
+    assert_eq!(bounded(&long, 100), "…");
+    assert_eq!(excerpt(&long, 100), "…");
+    assert_eq!(tail(&long, 100), "…");
+    // What fits is shown whole, unmarked.
+    assert_eq!(bounded("short", 100), "short");
+    assert_eq!(tail("short", 100), "short");
+}
+
+/// A redaction that never ends, as one waiting on a rule its panicking
+/// thread was building would, does not hold the hook: it writes the fixed
+/// message.
+#[test]
+fn a_panic_redaction_that_never_ends_writes_the_fixed_message() {
+    fn hangs(_: &str) -> String {
+        loop {
+            std::thread::park();
+        }
+    }
+    let (done, written) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done.send(redact_panic_within(
+            "anything".into(),
+            hangs,
+            std::time::Duration::from_millis(200),
+        ));
+    });
+    let written = written
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("the hook waited on redaction for good");
+    assert_eq!(written, UNREDACTED_PANIC);
+}
+
+/// A panic in redaction writes nothing of its own: the hook that waited on
+/// it writes the fixed message, once.
+#[test]
+fn a_panic_in_redaction_is_written_once() {
+    assert_eq!(hook_line(true, || UNREDACTED_PANIC.to_owned()), None);
+    assert_eq!(
+        hook_line(false, || "message".into()),
+        Some("message".into())
+    );
+}
+
+/// A sequence cut short by an escape, `ESC[` then `\n`, does not take the
+/// escape's letter: the key after it is found whole.
+#[test]
+fn a_key_after_an_open_sequence_and_an_escape_is_found() {
+    let shape = SHAPES[0];
+    let inputs = [
+        format!("\x1b[\\n{shape}"),
+        format!("\x1b[1;33\\n{shape}"),
+        format!("\x1b[\\t{shape}"),
+        format!("\\u001b[\\n{shape}"),
+        format!("\\x1b[\\u0007{shape}"),
+    ];
+    let wrong: Vec<usize> = inputs
+        .iter()
+        .enumerate()
+        .filter(|(_, input)| {
+            let out = text(input);
+            out.contains(&shape[4..]) || !out.contains(REDACTED)
+        })
+        .map(|(index, _)| index)
+        .collect();
+    assert!(wrong.is_empty(), "inputs {wrong:?} kept part of the key");
+}
+
+/// Names of a count or a kind of token, and Telegram URLs that hold no
+/// bot token, are not secrets.
+#[test]
+fn counts_and_kinds_of_tokens_are_not_secrets() {
+    assert_kept(&[
+        "max_token=4096",
+        "prompt_token: 12",
+        "error_token: abc",
+        "next_token: page2",
+        "https://api.telegram.org/botinfo",
+    ]);
+    assert_cases(&[
+        ("GH_TOKEN=abc123", "GH_TOKEN=[REDACTED]"),
+        ("access_token: Zx81kQ0pL2mN4bV6", "access_token: [REDACTED]"),
+    ]);
 }
