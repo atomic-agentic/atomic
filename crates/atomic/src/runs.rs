@@ -321,6 +321,8 @@ pub async fn resume(
             eprintln!("run {id}: resuming");
             engine.rt.resume(id).await?;
             atomic_durable::failpoint("resume:queued");
+            // A gate decided while the run was down may never have woken it.
+            atomic_durable::gate::redeliver(&engine.rt).await?;
             finish(&engine, id, json, &mut signals, "atomic runs resume").await
         }
     }
@@ -439,6 +441,8 @@ pub async fn serve(
         engine.rt.executor_id()
     );
     let recovered = engine.rt.recover().await?;
+    // A gate decided while its run was down may never have woken it.
+    atomic_durable::gate::redeliver(&engine.rt).await?;
     // Runs of another layout are this executor's too, but only an atomic of
     // their layout can continue them.
     let stranded: Vec<String> = engine

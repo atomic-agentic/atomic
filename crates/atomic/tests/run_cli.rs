@@ -823,6 +823,147 @@ fn a_run_killed_at_a_gate_keeps_it_and_its_deadline_and_one_resume_runs_at_a_tim
     });
 }
 
+const DECIDER_STORE: &str = "ATOMIC_TEST_DECIDER_STORE";
+const DECIDER_RUN: &str = "ATOMIC_TEST_DECIDER_RUN";
+
+/// A second terminal approving a run's open gate: run by
+/// [`decided_while_down`] in a process of its own, so a failpoint can stop
+/// it after the decision is recorded and before the run is woken.
+#[test]
+#[ignore = "run by a_gate_decided_while_its_run_was_down_wakes_it_on_resume in a child process"]
+fn decider_child() {
+    let store = std::env::var(DECIDER_STORE).expect("store");
+    let run = std::env::var(DECIDER_RUN).expect("run");
+    on_codex_runtime(async move {
+        let rt = Durare::sqlite(Path::new(&store)).await.expect("store");
+        let g = open_gate(&rt, &run).await;
+        approve(&rt, &g).await;
+    });
+}
+
+/// Start `gated` as `id`, kill it at its gate, then approve the gate from a
+/// decider that stops after recording its decision and before waking the
+/// run.
+async fn decided_while_down(
+    dir: &Path,
+    project: &Path,
+    state: &Path,
+    env: &[(&'static str, String)],
+    id: &str,
+) {
+    let mut run = spawn(
+        dir,
+        project,
+        &["run", "gated", "--run-id", id, "--data", NOTE],
+        &with(env, &[]),
+        &dir.join(format!("{id}.log")),
+    );
+    let rt = Durare::sqlite(&state.join("atomic.db"))
+        .await
+        .expect("store");
+    open_gate(&rt, id).await;
+    run.kill().expect("SIGKILL the run");
+    run.wait().expect("reap");
+    let decider = Command::new(std::env::current_exe().expect("this test binary"))
+        .args(["--exact", "decider_child", "--ignored", "--nocapture"])
+        .env(DECIDER_STORE, state.join("atomic.db"))
+        .env(DECIDER_RUN, id)
+        .env("ATOMIC_FAILPOINT", "gate:before-wake")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("decider");
+    assert!(!decider.success(), "the decider stopped before the wake-up");
+    let g = gate::find(&rt, &open_gate_id(&rt, id).await)
+        .await
+        .expect("gate")
+        .expect("exists");
+    assert!(g.resolution.is_some(), "the decision was recorded");
+}
+
+/// The id of run `run`'s gate, open or not.
+async fn open_gate_id(rt: &Durare, run: &str) -> String {
+    gate::gates(
+        rt,
+        GateFilter {
+            open_only: false,
+            run: Some(run.to_owned()),
+        },
+    )
+    .await
+    .expect("gates")
+    .into_iter()
+    .next()
+    .expect("a gate")
+    .id
+}
+
+#[test]
+fn a_gate_decided_while_its_run_was_down_wakes_it_on_resume() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![
+            Reply::Text(RANK.into()),
+            Reply::Text(SUMMARY.into()),
+            Reply::Text(RANK.into()),
+            Reply::Text(SUMMARY.into()),
+        ])
+        .await
+        .expect("fake model");
+        let dir = scratch("redeliver");
+        let project = project(&dir);
+        let state = state_dir(&dir, &project);
+        let env = model_env(&model.base_url());
+
+        // Resumed: it goes on without waiting for the gate's day-long deadline.
+        decided_while_down(&dir, &project, &state, &env, "decided-1").await;
+        let (d, p, e) = (dir.clone(), project.clone(), env.clone());
+        let out = tokio::task::spawn_blocking(move || {
+            atomic(
+                &d,
+                &p,
+                &["--json", "runs", "resume", "decided-1"],
+                &with(&e, &[]),
+                "",
+            )
+        })
+        .await
+        .expect("child");
+        assert!(out.status.success(), "{}", text(&out));
+        assert_eq!(
+            stdout_json(&out)["output"],
+            json!({"line": "P1: Export crashes on accents"})
+        );
+
+        // Recovered by serve: the same.
+        decided_while_down(&dir, &project, &state, &env, "decided-2").await;
+        let mut serve = spawn(
+            &dir,
+            &project,
+            &["serve"],
+            &with(&env, &[]),
+            &dir.join("serve.log"),
+        );
+        let rt = Durare::sqlite(&state.join("atomic.db"))
+            .await
+            .expect("store");
+        let started = Instant::now();
+        while rt.status("decided-2").await.expect("status") != Some(RunStatus::Succeeded) {
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "serve left the run waiting at its decided gate: {}",
+                std::fs::read_to_string(dir.join("serve.log")).unwrap_or_default()
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(model.calls(), 4, "each run ranked and summarized once");
+        terminate(&serve);
+        let status = tokio::task::spawn_blocking(move || wait_child(&mut serve, "serve"))
+            .await
+            .expect("child");
+        assert!(status.success());
+    });
+}
+
 #[test]
 fn serve_started_after_a_kill_recovers_the_run_and_finishes_it() {
     on_codex_runtime(async {
