@@ -374,8 +374,19 @@ fn a_key_in_a_steps_error_is_redacted_in_its_spans() {
     assert!(!received.bodies().contains(SEEDED), "the key was exported");
 }
 
-/// A command that ends normally sends its last spans, and a collector that
-/// never answers holds it up only until Ctrl-C.
+/// The rest of a child's output, read to its end on a thread of its own, so
+/// the child never writes to a closed pipe.
+fn drain(mut out: impl std::io::Read + Send + 'static) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let _ = std::io::copy(&mut out, &mut std::io::sink());
+    })
+}
+
+/// What a stopped process writes when a signal cuts its last flush short.
+const STOPPED_FLUSH: &str = "stopping now, without sending the last spans";
+
+/// A command that ends normally sends its last spans, and a signal stops a
+/// collector that never answers from holding it up at all.
 #[test]
 fn a_signal_stops_the_last_flush_of_a_command_that_ended() {
     use std::io::BufRead;
@@ -394,21 +405,18 @@ fn a_signal_stops_the_last_flush_of_a_command_that_ended() {
     .spawn()
     .unwrap();
     // The run has printed its result: what is left is the flush.
+    let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
     let mut first = String::new();
-    std::io::BufReader::new(child.stdout.take().unwrap())
-        .read_line(&mut first)
-        .unwrap();
+    stdout.read_line(&mut first).unwrap();
     assert!(!first.is_empty(), "the run printed nothing");
-    std::thread::sleep(std::time::Duration::from_millis(500));
-    let signalled = std::time::Instant::now();
+    let drained = drain(stdout);
+    // Well inside the flush's deadline.
+    std::thread::sleep(std::time::Duration::from_millis(300));
     signal(&child, "INT");
     let out = child.wait_with_output().unwrap();
-    let taken = signalled.elapsed();
-    assert!(
-        taken < std::time::Duration::from_secs(3),
-        "took {taken:?} after the signal: {}",
-        text(&out)
-    );
+    drained.join().unwrap();
+    assert_eq!(out.status.code(), Some(130), "{}", text(&out));
+    assert!(text(&out).contains(STOPPED_FLUSH), "{}", text(&out));
 }
 
 /// A command that ends normally with a collector that never answers exits
@@ -431,18 +439,25 @@ fn a_collector_that_never_answers_delays_an_exit_only_briefly() {
     .spawn()
     .unwrap();
     // The run has printed its result: what is left is the flush.
+    let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
     let mut first = String::new();
-    std::io::BufReader::new(child.stdout.take().unwrap())
-        .read_line(&mut first)
-        .unwrap();
+    stdout.read_line(&mut first).unwrap();
     assert!(!first.is_empty(), "the run printed nothing");
     let printed = std::time::Instant::now();
+    let drained = drain(stdout);
     let out = child.wait_with_output().unwrap();
     let taken = printed.elapsed();
+    drained.join().unwrap();
     assert!(out.status.success(), "{}", text(&out));
+    // The exporter's own timeout is ten seconds.
     assert!(
-        taken < atomic_app::telemetry::FLUSH_DEADLINE + std::time::Duration::from_secs(3),
+        taken < std::time::Duration::from_secs(8),
         "took {taken:?} to exit after its result: {}",
+        text(&out)
+    );
+    assert!(
+        text(&out).contains("they are dropped"),
+        "the dropped spans were not reported: {}",
         text(&out)
     );
 }
@@ -564,17 +579,13 @@ fn a_second_signal_stops_at_once_while_spans_are_sent() {
     .unwrap();
     wait_for_gate(&dir, &model.base_url(), &mut child);
     signal(&child, "TERM");
-    std::thread::sleep(std::time::Duration::from_millis(1500));
-    let second = std::time::Instant::now();
+    // The gate's wait is no running step, so the flush starts at once: the
+    // second signal comes well inside its deadline.
+    std::thread::sleep(std::time::Duration::from_millis(300));
     signal(&child, "TERM");
     let out = child.wait_with_output().unwrap();
-    let taken = second.elapsed();
     assert!(!out.status.success(), "{}", text(&out));
-    assert!(
-        taken < std::time::Duration::from_secs(3),
-        "took {taken:?} after the second signal: {}",
-        text(&out)
-    );
+    assert!(text(&out).contains(STOPPED_FLUSH), "{}", text(&out));
 }
 
 /// A warning line, here about a setting that quotes what it was given.

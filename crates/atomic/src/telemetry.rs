@@ -255,8 +255,9 @@ pub fn flush() {
 }
 
 /// As [`flush`], unless a signal comes first: then it stops waiting and
-/// returns `true`, so a collector that never answers holds up the exit only
-/// until Ctrl-C. Call it as a command ends normally.
+/// returns `true`, so a collector that never answers holds up the exit
+/// until Ctrl-C or [`FLUSH_DEADLINE`], whichever is first. Call it as a
+/// command ends normally.
 pub async fn flush_unless_signalled() -> bool {
     if PROVIDER.get().is_none() {
         atomic_core::spans::end_all();
@@ -293,8 +294,14 @@ pub const FLUSH_DEADLINE: Duration = Duration::from_secs(2);
 /// [`FLUSH_DEADLINE`].
 pub fn flush_blocking() {
     atomic_core::spans::end_all();
-    if let Some(provider) = PROVIDER.get() {
-        flush_within(provider.clone(), FLUSH_DEADLINE);
+    if let Some(provider) = PROVIDER.get()
+        && !flush_within(provider.clone(), FLUSH_DEADLINE)
+    {
+        atomic_core::log_line!(
+            "atomic: the trace collector did not take the last spans within {} s; they are \
+             dropped",
+            FLUSH_DEADLINE.as_secs()
+        );
     }
 }
 
@@ -305,7 +312,7 @@ fn flush_within(provider: SdkTracerProvider, deadline: Duration) -> bool {
     let started = std::time::Instant::now();
     let (done, finished) = std::sync::mpsc::channel();
     let flushing = std::thread::Builder::new()
-        .name("atomic-span-flush".into())
+        .name("atomic-flush".into())
         .spawn(move || {
             let _ = provider.force_flush();
             let left = deadline.saturating_sub(started.elapsed());

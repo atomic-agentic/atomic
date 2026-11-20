@@ -66,7 +66,7 @@ runs are still going, such as one stopped while it waits at a gate, ends the
 spans still open with `atomic.stopped` set and exports them before it exits.
 
 A process sends its last spans before it exits, waiting at most two seconds
-for them: spans not sent by then are dropped. So a collector that accepts the
+for them: spans not sent by then are dropped, and atomic says so on stderr. So a collector that accepts the
 connection and never answers holds up a command's exit by about two seconds,
 whatever the exporter's own timeout (`OTEL_EXPORTER_OTLP_TIMEOUT`). A signal
 during that wait stops it at once, without those spans.
