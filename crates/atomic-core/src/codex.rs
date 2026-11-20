@@ -815,6 +815,7 @@ where
     Fut: Future<Output = anyhow::Result<()>>,
 {
     keep_sandbox_off_keyrings();
+    give_the_command_its_own_tmpdir();
     // SAFETY: called at the start of main, while the process has one thread,
     // so no other thread can read the environment concurrently.
     // The person's own Codex home stays denied to atoms' commands.
@@ -867,9 +868,56 @@ pub fn is_helper(mut args: impl Iterator<Item = std::ffi::OsString>) -> bool {
 /// touched.
 pub fn run_helper() -> anyhow::Result<()> {
     keep_sandbox_off_keyrings();
+    give_the_command_its_own_tmpdir();
     arg0_dispatch_or_else(|_| async {
         bail!("this process was started as a Codex helper Codex does not know")
     })
+}
+
+/// The variable that carries a turn's own temporary directory past Codex's
+/// sandbox helper to the command (see [`give_the_command_its_own_tmpdir`]).
+pub(crate) const TURN_TMPDIR: &str = "ATOMIC_TURN_TMPDIR";
+
+/// When this process is the inner stage of Codex's Linux sandbox helper,
+/// just before the command runs, give the command its own `TMPDIR`: the
+/// directory in [`TURN_TMPDIR`], private to its turn. The helper's outer
+/// stage keeps the backend's shared `TMPDIR`, where Codex keeps its registry
+/// of the mount points it makes, which every turn sharing a writable root
+/// must share; the command never writes there.
+fn give_the_command_its_own_tmpdir() {
+    #[cfg(target_os = "linux")]
+    if invoked_as_linux_sandbox()
+        && is_inner_stage(std::env::args_os())
+        && let Some(own) = std::env::var_os(TURN_TMPDIR)
+    {
+        // SAFETY: the helper is single-threaded here, before it applies its
+        // restrictions and executes the command.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var("TMPDIR", own);
+            std::env::remove_var(TURN_TMPDIR);
+        }
+    }
+}
+
+/// Whether the Linux sandbox helper's arguments `args` (the first being its
+/// own name) are its inner stage's: `--apply-seccomp-then-exec` among its
+/// options, before the `--` that ends them. After that `--` is the command,
+/// whose own arguments, the model's to choose, say nothing about the stage;
+/// Codex's own launcher reads them the same way.
+#[cfg(any(target_os = "linux", test))]
+fn is_inner_stage(args: impl IntoIterator<Item = std::ffi::OsString>) -> bool {
+    args.into_iter()
+        .skip(1)
+        .take_while(an_option)
+        .any(|a| a == "--apply-seccomp-then-exec")
+}
+
+/// Whether `arg`, read in order from the helper's arguments, is still one
+/// of its options: not the `--` after which the command begins.
+#[cfg(any(target_os = "linux", test))]
+fn an_option(arg: &std::ffi::OsString) -> bool {
+    arg != "--"
 }
 
 /// When this process is Codex's Linux sandbox helper, keep the command it
@@ -878,7 +926,7 @@ pub fn run_helper() -> anyhow::Result<()> {
 fn keep_sandbox_off_keyrings() {
     #[cfg(target_os = "linux")]
     if invoked_as_linux_sandbox() {
-        let inner = std::env::args_os().any(|a| a == "--apply-seccomp-then-exec");
+        let inner = is_inner_stage(std::env::args_os());
         let kept_off = if inner {
             // Inside the sandbox, just before the command runs.
             deny_keyrings()
@@ -2723,6 +2771,46 @@ mod tests {
             &["codex-linux-sandbox-x"][..],
         ] {
             assert!(!is_helper(args(not).into_iter()), "{not:?}");
+        }
+    }
+
+    /// The helper's stage is read from its own options only: a command that
+    /// is, or holds, the inner stage's flag leaves the outer stage outer.
+    #[test]
+    fn only_the_helpers_own_options_name_its_inner_stage() {
+        let args = |a: &[&str]| a.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
+        let helper = "/x/codex-linux-sandbox";
+        for inner in [
+            &[
+                helper,
+                "--sandbox-policy-cwd",
+                "/w",
+                "--apply-seccomp-then-exec",
+                "--",
+                "ls",
+            ][..],
+            &[
+                helper,
+                "--apply-seccomp-then-exec",
+                "--",
+                "--apply-seccomp-then-exec",
+            ][..],
+        ] {
+            assert!(is_inner_stage(args(inner)), "{inner:?}");
+        }
+        for outer in [
+            &[
+                helper,
+                "--sandbox-policy-cwd",
+                "/w",
+                "--",
+                "--apply-seccomp-then-exec",
+            ][..],
+            &[helper, "--", "/bin/bash", "-c", "--apply-seccomp-then-exec"][..],
+            &[helper, "--sandbox-policy-cwd", "/w", "--", "ls"][..],
+            &["--apply-seccomp-then-exec"][..],
+        ] {
+            assert!(!is_inner_stage(args(outer)), "{outer:?}");
         }
     }
 
