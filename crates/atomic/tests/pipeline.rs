@@ -3745,7 +3745,8 @@ fn a_store_held_elsewhere_interrupts_the_run_and_recovery_finishes_it() {
         // a bounded number of times before it stops the run.
         let executions = atomic_app::pipeline::RECOVERY_LIMIT + 2;
         let started = std::time::Instant::now();
-        while atomic_app::pipeline::store_waits("locked") < 11 * executions {
+        // Ten waits an execution: its tries but the last, which stops it.
+        while atomic_app::pipeline::store_waits("locked") < 10 * executions {
             assert!(
                 started.elapsed() < std::time::Duration::from_secs(240),
                 "{} waits so far",
@@ -3882,6 +3883,43 @@ fn a_replay_takes_no_lock_on_the_store() {
             .await
             .expect("start");
         let recorded: Value = rt.result("recorded-unlocked").await.expect("finishes");
+        // The replay marks the recorded definitions as just used.
+        let pin = rt
+            .steps("recorded-unlocked")
+            .await
+            .expect("steps")
+            .into_iter()
+            .find(|s| s.name == "pin")
+            .and_then(|s| s.output)
+            .expect("the pin");
+        let snapshot: atomic_core::artifact::ArtifactRef = pin["snapshot"]
+            .as_str()
+            .expect("snapshot")
+            .parse()
+            .expect("a ref");
+        let d = snapshot.digest();
+        let blob = dir
+            .join("artifacts/blobs/sha256")
+            .join(&d[..2])
+            .join(&d[2..]);
+        let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::open(&blob)
+            .expect("blob")
+            .set_modified(hour_ago)
+            .expect("backdate");
+        let replay = replay_of(&rt, "recorded-unlocked").await.expect("a replay");
+        rt.start(REPLAY, "replayed-fresh", replay)
+            .await
+            .expect("start");
+        let _: Value = rt.result("replayed-fresh").await.expect("replays");
+        let touched = std::fs::metadata(&blob)
+            .expect("blob")
+            .modified()
+            .expect("time");
+        assert!(
+            touched > hour_ago + std::time::Duration::from_secs(60),
+            "not refreshed"
+        );
         let holder = std::fs::File::options()
             .create(true)
             .truncate(false)

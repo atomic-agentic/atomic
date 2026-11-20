@@ -149,26 +149,70 @@ fn io(path: &Path) -> impl FnOnce(std::io::Error) -> ArtifactError + '_ {
 }
 
 impl LocalStore {
-    /// A store rooted at `root`, creating its directories. A store laid out
-    /// as a project's is in an atomic home, `<home>/projects/<id>/artifacts`,
-    /// takes the same lock as [`Self::for_project`],
-    /// `<home>/private/<id>/artifacts.lock`, creating that directory readable
-    /// by its owner only if it is not there yet. Any other store, outside
-    /// every atomic home's layout (such as a test's), keeps its lock file in
-    /// `root`.
+    /// A store rooted at `root`, creating its directories. A project's store
+    /// in an atomic home, `<home>/projects/<id>/artifacts`, takes the same
+    /// lock as [`Self::for_project`], `<home>/private/<id>/artifacts.lock`:
+    /// `<home>` is an atomic home when it is the configured one or already has
+    /// its `private/`. The project's private directory is made, readable by
+    /// its owner only, when it is not there; one that is there and readable
+    /// by others is refused, never changed. Any other store, outside every
+    /// atomic home (such as a test's), keeps its lock file in `root`.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, ArtifactError> {
         let root = root.into();
         let lock = match project_private(&root) {
             Some(private) => {
-                crate::state::private_dir(&private).map_err(|e| ArtifactError::Io {
-                    path: private.clone(),
-                    source: std::io::Error::other(e.to_string()),
-                })?;
+                own_private_dir(&private)?;
                 private.join("artifacts.lock")
             }
             None => root.join("lock"),
         };
         Self::open_locked_at(root, lock)
+    }
+
+    /// Every blob the store holds, by its digest. Takes no lock: content
+    /// written while it reads may or may not be listed.
+    pub fn stored(&self) -> Result<BTreeSet<ArtifactRef>, ArtifactError> {
+        let mut all = BTreeSet::new();
+        let blobs = self.root.join("blobs/sha256");
+        for prefix in std::fs::read_dir(&blobs).map_err(io(&blobs))?.flatten() {
+            let name = prefix.file_name().to_string_lossy().into_owned();
+            if !prefix.file_type().is_ok_and(|t| t.is_dir()) || !is_prefix(&name) {
+                continue;
+            }
+            for blob in std::fs::read_dir(prefix.path())
+                .map_err(io(&prefix.path()))?
+                .flatten()
+            {
+                let digest = format!("{name}{}", blob.file_name().to_string_lossy());
+                if blob.file_type().is_ok_and(|t| t.is_file())
+                    && let Ok(a) = ArtifactRef::from_digest(&digest)
+                {
+                    all.insert(a);
+                }
+            }
+        }
+        Ok(all)
+    }
+
+    /// Mark `artifact`, if the store holds it, as just written, so a sweep's
+    /// grace covers it, without waiting: while a sweep holds the store, it
+    /// does nothing. Returns whether it did.
+    pub fn refresh(&self, artifact: &ArtifactRef) -> Result<bool, ArtifactError> {
+        let _lock = match StoreLock::take(&self.lock, false, std::time::Duration::ZERO) {
+            Ok(lock) => lock,
+            Err(ArtifactError::Locked { .. }) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        let blob = self.blob_path(artifact);
+        match std::fs::File::open(&blob) {
+            Ok(f) => {
+                f.set_modified(std::time::SystemTime::now())
+                    .map_err(io(&blob))?;
+                Ok(true)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(io(&blob)(e)),
+        }
     }
 
     /// How long a write or a sweep waits for the store's lock.
@@ -384,8 +428,9 @@ impl StoreLock {
 }
 
 /// The private directory of the project whose store is `root`, when `root`
-/// is laid out as an atomic home lays out a project's store:
-/// `<home>/projects/<id>/artifacts` has `<home>/private/<id>`.
+/// is a project's store in an atomic home: `<home>/projects/<id>/artifacts`
+/// has `<home>/private/<id>`. A home is the configured one, or one that
+/// already has its `private/`.
 fn project_private(root: &Path) -> Option<PathBuf> {
     if root.file_name()? != "artifacts" {
         return None;
@@ -395,7 +440,55 @@ fn project_private(root: &Path) -> Option<PathBuf> {
     if projects.file_name()? != "projects" {
         return None;
     }
-    Some(projects.parent()?.join("private").join(state.file_name()?))
+    let home = projects.parent()?;
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
+    let configured = crate::state::base_dir().is_ok_and(|b| real(&b) == real(home));
+    if !configured && !home.join("private").is_dir() {
+        return None;
+    }
+    Some(home.join("private").join(state.file_name()?))
+}
+
+/// Make `dir`, readable by its owner only, if it is not there; refuse one
+/// that is there but is not a directory, or that others may read or enter.
+/// An existing directory is never changed.
+fn own_private_dir(dir: &Path) -> Result<(), ArtifactError> {
+    let refuse = |why: String| ArtifactError::Io {
+        path: dir.to_owned(),
+        source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, why),
+    };
+    match std::fs::symlink_metadata(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(true);
+            #[cfg(unix)]
+            std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+            builder.create(dir).map_err(io(dir))
+        }
+        Err(e) => Err(io(dir)(e)),
+        Ok(meta) if !meta.is_dir() => Err(refuse(
+            "the project's private directory is not a directory; the store's lock is not \
+             kept there"
+                .into(),
+        )),
+        Ok(meta) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = meta.permissions().mode();
+                if mode & 0o077 != 0 {
+                    return Err(refuse(format!(
+                        "the project's private directory is open to others (mode {:o}); the \
+                         store's lock is not kept there",
+                        mode & 0o777
+                    )));
+                }
+            }
+            #[cfg(not(unix))]
+            let _ = meta;
+            Ok(())
+        }
+    }
 }
 
 /// Whether `name` is a two-hex-digit prefix directory of the blob tree.

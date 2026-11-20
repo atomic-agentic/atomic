@@ -4,10 +4,11 @@
 //! runs and gates may still read.
 //!
 //! The sweep fails closed. Besides what the caller keeps, it keeps every
-//! artifact whose digest appears, as a run of 64 hex digits in either case,
-//! anywhere in a string at any depth (as `artifact://sha256/<hex>`,
-//! `sha256:<hex>`, with JSON-escaped slashes, bare, or inside markdown or
-//! JSON carried as text), in:
+//! blob whose digest appears, in either case, anywhere in a string at any
+//! depth: as `artifact://sha256/<hex>`, `sha256:<hex>`, the store's path
+//! form `sha256/<2 hex>/<62 hex>`, bare, within a longer hex string, with
+//! JSON-escaped or percent-encoded slashes, or inside markdown or JSON
+//! carried as text. It looks for digests the store holds, in:
 //!
 //! - every run's input, and its result or error once it has one;
 //! - every step's recorded output or error, in every run in the store,
@@ -28,7 +29,7 @@
 use atomic_core::artifact::{ArtifactRef, Grace, LocalStore, Swept};
 use atomic_durable::{DurableRuntime, Durare};
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 
 /// How many runs a scan reads at a time.
 const PAGE: i64 = 100;
@@ -43,22 +44,38 @@ pub struct Kept {
     pub read_at: std::time::SystemTime,
 }
 
-/// Read what a sweep keeps: `keep` and everything [`referenced`] finds,
-/// with the time the reading began.
-pub async fn read_kept(rt: &Durare, keep: &BTreeSet<ArtifactRef>) -> anyhow::Result<Kept> {
+/// Read what a sweep of `store` keeps: `keep` and everything
+/// [`referenced`] finds, with the time the reading began.
+pub async fn read_kept(
+    store: &LocalStore,
+    rt: &Durare,
+    keep: &BTreeSet<ArtifactRef>,
+) -> anyhow::Result<Kept> {
     let read_at = std::time::SystemTime::now();
     let mut artifacts = keep.clone();
-    artifacts.extend(referenced(rt).await?);
+    artifacts.extend(referenced(store, rt).await?);
     Ok(Kept { artifacts, read_at })
 }
 
-/// Every artifact `text` may name: each run of exactly 64 hex digits in
-/// it, in either case, whatever surrounds it. That finds
-/// `artifact://sha256/<hex>` and `sha256:<hex>` whole, inside longer text,
-/// with JSON-escaped slashes or upper-case hex, and a bare digest too. It
-/// keeps more than is named, which only keeps more.
-fn named_in(text: &str, into: &mut BTreeSet<ArtifactRef>) {
+/// Every blob of `present` that `text` may name, in either case: any 64 hex
+/// digits within it, however much hex surrounds them, and the store's own
+/// path form, `sha256/<2 hex>/<62 hex>`. Slashes may be JSON-escaped (`\/`)
+/// or percent-encoded (`%2F`). That finds `artifact://sha256/<hex>`,
+/// `sha256:<hex>`, a bare digest and one inside a longer hex string; only a
+/// digest the store holds is kept, so unrelated hashes cost nothing.
+fn named_in(text: &str, present: &HashSet<String>, into: &mut BTreeSet<ArtifactRef>) {
+    let text = text
+        .to_ascii_lowercase()
+        .replace("\\/", "/")
+        .replace("%2f", "/");
     let bytes = text.as_bytes();
+    let mut keep = |digest: &str| {
+        if present.contains(digest)
+            && let Ok(a) = ArtifactRef::from_digest(digest)
+        {
+            into.insert(a);
+        }
+    };
     let mut i = 0;
     while i < bytes.len() {
         if !bytes[i].is_ascii_hexdigit() {
@@ -69,57 +86,74 @@ fn named_in(text: &str, into: &mut BTreeSet<ArtifactRef>) {
         while i < bytes.len() && bytes[i].is_ascii_hexdigit() {
             i += 1;
         }
-        if i - start == 64
-            && let Ok(a) = ArtifactRef::from_digest(&text[start..i].to_ascii_lowercase())
+        let run = &text[start..i];
+        for at in 0..run.len().saturating_sub(63) {
+            keep(&run[at..at + 64]);
+        }
+        // The path form: two hex digits, a slash, then the other 62.
+        if run.len() >= 62
+            && start >= 3
+            && bytes[start - 1] == b'/'
+            && bytes[start - 2].is_ascii_hexdigit()
+            && bytes[start - 3].is_ascii_hexdigit()
+            && (start == 3 || !bytes[start - 4].is_ascii_hexdigit())
         {
-            into.insert(a);
+            keep(&format!("{}{}", &text[start - 3..start - 1], &run[..62]));
         }
     }
 }
 
-/// Every artifact named in any string in `value`, at any depth, keys
-/// included.
-fn references(value: &Value, into: &mut BTreeSet<ArtifactRef>) {
+/// Every blob of `present` named in any string in `value`, at any depth,
+/// keys included.
+fn references(value: &Value, present: &HashSet<String>, into: &mut BTreeSet<ArtifactRef>) {
     match value {
-        Value::String(s) => named_in(s, into),
-        Value::Array(items) => items.iter().for_each(|v| references(v, into)),
+        Value::String(s) => named_in(s, present, into),
+        Value::Array(items) => items.iter().for_each(|v| references(v, present, into)),
         Value::Object(map) => map.iter().for_each(|(k, v)| {
-            named_in(k, into);
-            references(v, into);
+            named_in(k, present, into);
+            references(v, present, into);
         }),
         _ => {}
     }
 }
 
 /// What the store's runs and gates refer to: [`recorded`] and [`pinned`].
-pub async fn referenced(rt: &Durare) -> anyhow::Result<BTreeSet<ArtifactRef>> {
-    let mut found = recorded(rt).await?;
+pub async fn referenced(store: &LocalStore, rt: &Durare) -> anyhow::Result<BTreeSet<ArtifactRef>> {
+    let mut found = recorded(store, rt).await?;
     found.extend(pinned(rt).await?);
     Ok(found)
 }
 
-/// Every artifact any run in the store names, finished or not: in its input,
-/// its result or error, and every step's recorded output or error. Runs are
-/// read a page at a time, in order of creation and id.
-pub async fn recorded(rt: &Durare) -> anyhow::Result<BTreeSet<ArtifactRef>> {
+/// Every blob in `store` any run in the store names, finished or not: in its
+/// input, its result or error, and every step's recorded output or error.
+/// Runs are read a page at a time, in order of creation and id.
+pub async fn recorded(store: &LocalStore, rt: &Durare) -> anyhow::Result<BTreeSet<ArtifactRef>> {
+    let present: HashSet<String> = {
+        let store = store.clone();
+        tokio::task::spawn_blocking(move || store.stored())
+            .await??
+            .into_iter()
+            .map(|a| a.digest().to_owned())
+            .collect()
+    };
     let mut found = BTreeSet::new();
     let mut after = None;
     loop {
         let page = rt.runs_after(after.as_ref(), PAGE).await?;
         for (_, run) in &page {
-            references(&run.input, &mut found);
+            references(&run.input, &present, &mut found);
             if let Some(output) = &run.output {
-                references(output, &mut found);
+                references(output, &present, &mut found);
             }
             if let Some(error) = &run.error {
-                named_in(error, &mut found);
+                named_in(error, &present, &mut found);
             }
             for step in rt.steps(&run.record.id).await? {
                 if let Some(output) = &step.output {
-                    references(output, &mut found);
+                    references(output, &present, &mut found);
                 }
                 if let Some(error) = &step.error {
-                    named_in(error, &mut found);
+                    named_in(error, &present, &mut found);
                 }
             }
         }
@@ -153,7 +187,7 @@ pub async fn sweep(
     keep: &BTreeSet<ArtifactRef>,
     grace: Grace,
 ) -> anyhow::Result<Swept> {
-    let kept = read_kept(rt, keep).await?;
+    let kept = read_kept(store, rt, keep).await?;
     let store = store.clone();
     Ok(
         tokio::task::spawn_blocking(move || store.sweep(&kept.artifacts, grace, kept.read_at))

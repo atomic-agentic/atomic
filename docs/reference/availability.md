@@ -56,8 +56,9 @@ prompt for gates in `atomic run` is not wired up yet.
 
 A project's artifact store takes a lock in its private state while it is
 written or swept. A run that finds it held by another process, such as a sweep,
-says so once, waits and tries again for a bounded time (about ten minutes with
-the store's 30-second wait), then stops and is run again. Each stop spends one
+says so once, waits and tries again for a bounded time (about 7.4 minutes with
+the store's 30-second wait: 11 tries and the pauses between them), then stops
+and is run again. Each stop spends one
 of durare's recoveries of the run, and once they run out the run waits for
 `atomic runs resume`.
 

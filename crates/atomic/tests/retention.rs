@@ -445,17 +445,7 @@ fn every_run_is_read_however_many_there_are() {
         for (run, _) in &named {
             let _: String = rt.result(run).await.unwrap();
         }
-        // Every run created in the same millisecond: the scan's order ties
-        // throughout, across every page.
-        rt.control_transaction(|mut tx| {
-            Box::pin(async move {
-                tx.execute("UPDATE workflow_status SET created_at = 1", &[])
-                    .await
-                    .map(|_| ())
-            })
-        })
-        .await
-        .unwrap();
+
         let swept = retention::sweep(&store, &rt, &BTreeSet::new(), Grace::none_for_tests())
             .await
             .unwrap();
@@ -479,7 +469,10 @@ fn the_keep_set_is_dated_from_before_the_runs_are_read() {
             let _: String = rt.result(&run).await.unwrap();
         }
         let before = SystemTime::now();
-        let kept = retention::read_kept(&rt, &BTreeSet::new()).await.unwrap();
+        let store = LocalStore::open(dir.join("artifacts")).unwrap();
+        let kept = retention::read_kept(&store, &rt, &BTreeSet::new())
+            .await
+            .unwrap();
         let reading = before.elapsed().unwrap();
         // Dated when the reading began, not when it ended: content written
         // while the runs were read is within the grace.
@@ -513,6 +506,43 @@ fn a_digest_is_found_in_any_case_escaped_or_bare() {
                 format!(r#"{{"patch":"artifact:\/\/sha256\/{}"}}"#, escaped.digest()),
             ),
             ("bare", format!("digest {} in a log", bare.digest())),
+        ] {
+            rt.start("names", run, named).await.unwrap();
+            let _: String = rt.result(run).await.unwrap();
+        }
+        let swept = retention::sweep(&store, &rt, &BTreeSet::new(), Grace::none_for_tests())
+            .await
+            .unwrap();
+        assert_eq!(swept.removed, [loose]);
+        rt.shutdown(Duration::from_secs(5)).await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+#[test]
+fn a_digest_is_found_within_longer_hex_and_in_the_stores_path_form() {
+    on_codex_runtime(async {
+        let dir = scratch("windows");
+        let store = LocalStore::open(dir.join("artifacts")).unwrap();
+        let [encoded, trailed, pathed, loose] =
+            ["encoded", "trailed", "pathed", "loose"].map(|text| put(&store, text.as_bytes()));
+        let mut rt = Durare::sqlite(&dir.join("atomic.db")).await.unwrap();
+        register(&mut rt);
+        rt.launch().await.unwrap();
+        let d = |a: &ArtifactRef| a.digest().to_owned();
+        for (run, named) in [
+            (
+                "encoded",
+                format!("https://example.invalid/a?ref=sha256%2F{}", d(&encoded)),
+            ),
+            (
+                "trailed",
+                format!("{}f00d is the digest and more", d(&trailed)),
+            ),
+            (
+                "pathed",
+                format!("blobs/sha256/{}/{}", &d(&pathed)[..2], &d(&pathed)[2..]),
+            ),
         ] {
             rt.start("names", run, named).await.unwrap();
             let _: String = rt.result(run).await.unwrap();

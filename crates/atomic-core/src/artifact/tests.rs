@@ -310,10 +310,12 @@ fn the_grace_runs_back_from_when_the_keep_set_was_read() {
 #[test]
 fn a_projects_store_takes_its_lock_in_private_however_it_is_opened() {
     let (_, dir) = store();
-    // Before the project's private directory exists as after: the layout
-    // says where the lock is.
-    let state = dir.join("home/projects/p");
-    let private = dir.join("home/private/p");
+    // In an atomic home (one with its private/), before the project's
+    // private directory exists as after: the layout says where the lock is.
+    let home = dir.join("home");
+    std::fs::create_dir_all(home.join("private")).expect("home");
+    let state = home.join("projects/p");
+    let private = home.join("private/p");
     let store = LocalStore::open(state.join("artifacts")).expect("open");
     assert_eq!(store.lock, private.join("artifacts.lock"));
     #[cfg(unix)]
@@ -324,10 +326,22 @@ fn a_projects_store_takes_its_lock_in_private_however_it_is_opened() {
             .permissions()
             .mode();
         assert_eq!(mode & 0o077, 0, "{mode:o}");
+        // A private directory others may read is refused, and left as it is.
+        let open = home.join("private/q");
+        std::fs::create_dir_all(&open).expect("q");
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        assert!(LocalStore::open(home.join("projects/q/artifacts")).is_err());
+        let mode = std::fs::metadata(&open).expect("q").permissions().mode();
+        assert_eq!(mode & 0o777, 0o755, "{mode:o}");
     }
     let again = LocalStore::open(state.join("artifacts")).expect("open");
     assert_eq!(again.lock, store.lock);
-    // A store outside any atomic home's layout keeps its lock in its root.
+    // Shaped like one, but in no atomic home: its lock stays in its root, and
+    // nothing is made beside it.
+    let elsewhere = dir.join("not-a-home");
+    let loose = LocalStore::open(elsewhere.join("projects/p/artifacts")).expect("open");
+    assert_eq!(loose.lock, elsewhere.join("projects/p/artifacts/lock"));
+    assert!(!elsewhere.join("private").exists());
     let loose = LocalStore::open(dir.join("artifacts")).expect("open");
     assert_eq!(loose.lock, dir.join("artifacts/lock"));
     let other = LocalStore::open(dir.join("elsewhere")).expect("open");

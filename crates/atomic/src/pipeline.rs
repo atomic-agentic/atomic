@@ -531,8 +531,8 @@ fn failed(message: String) -> DurableError {
 /// keeps, within one execution of the run, before it stops the run to be
 /// run again: each try waits as long as the store waits for its lock, and
 /// the wait between tries doubles up to that long. With the store's 30 s,
-/// an execution waits about ten minutes before it spends one of durare's
-/// recoveries.
+/// an execution waits about 7.4 minutes (11 tries of 30 s, and 111 s
+/// between them) before it spends one of durare's recoveries.
 const LOCKED_RETRIES: u32 = 10;
 const LOCKED_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
 
@@ -712,12 +712,15 @@ async fn run_pipeline<C: WorkflowContext>(
                 labels: Default::default(),
             };
             // A replay stores nothing new: its definitions are the recorded
-            // run's, already in the store, and it takes no lock to find them.
+            // run's, already in the store, and it waits for no lock to find
+            // them. It marks them as just used, unless a sweep holds the
+            // store, so a sweep's grace covers them.
             if replaying {
                 let digest = sha256(&snapshot);
                 if let Ok(stored) = ArtifactRef::from_digest(&digest)
                     && store.contains(&stored).unwrap_or(false)
                 {
+                    let _ = store.refresh(&stored);
                     return Ok(Pinned {
                         snapshot: stored.to_string(),
                         files,
