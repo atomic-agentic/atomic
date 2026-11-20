@@ -379,6 +379,19 @@ fn file_for(dir: &Path, key: &str, n: usize) -> PathBuf {
     }
 }
 
+/// Whether `name` is one of the cassette's own temporary files,
+/// `.<recording>.<sixteen hex digits>.tmp`, as [`write_whole`] names them.
+fn is_temporary(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix('.').and_then(|n| n.strip_suffix(".tmp")) else {
+        return false;
+    };
+    rest.rsplit_once('.').is_some_and(|(recording, suffix)| {
+        recording.ends_with(".json")
+            && suffix.len() == 16
+            && suffix.bytes().all(|b| b.is_ascii_hexdigit())
+    })
+}
+
 /// Remove the temporary files a recording cut short left in `dir`: a
 /// session that records owns the directory, so none of them is live.
 fn remove_stale(dir: &Path) {
@@ -388,10 +401,7 @@ fn remove_stale(dir: &Path) {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name.starts_with('.')
-            && name.ends_with(".tmp")
-            && entry.file_type().is_ok_and(|t| t.is_file())
-        {
+        if is_temporary(&name) && entry.file_type().is_ok_and(|t| t.is_file()) {
             let _ = std::fs::remove_file(entry.path());
         }
     }

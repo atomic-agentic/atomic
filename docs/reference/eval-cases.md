@@ -193,8 +193,11 @@ none to call yet: an atom that declares scorers fails unless `--allow-unscored` 
 given, and then they are reported as skipped. `--baseline` is refused for the same
 reason: there is no scorer mean to compare.
 
-Until evals run in disposable fixture worktrees, `atomic eval` runs nothing that
-could write to the project's checkout or to anything else. It refuses:
+Until evals run in disposable fixture worktrees, `atomic eval` refuses the atoms
+that could write to the project's checkout or to anything else. On Linux, where
+exec commands run confined, that holds for what it does run too; elsewhere an exec
+command runs unconfined (see [availability](availability.md)), so the declared
+effects are all that stands between it and the project. It refuses:
 
 - a Codex atom with a `workspace-write` sandbox;
 - an exec atom that does not declare `effects: { external: 'read-only' }`. Its

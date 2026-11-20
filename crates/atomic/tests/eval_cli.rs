@@ -193,12 +193,19 @@ fn eval_with(dir: &Path, project: &Path, url: &str, args: &[&str], env: &[(&str,
         .env("HOME", dir.join("home"))
         .env("ATOMIC_HOME", dir.join("atomic-home"))
         .env("USER", "dev")
-        .env("ATOMIC_MODEL_BASE_URL", url)
-        .env("ATOMIC_MODEL", "synthetic")
         .env_remove("ATOMIC_MODEL_API_KEY_ENV")
+        .env_remove("OPENAI_API_KEY")
         .env_remove("CODEX_HOME")
         .env_remove("ATOMIC_DATABASE_URL")
         .stdin(Stdio::null());
+    // With no URL, the endpoint comes from the project's files.
+    if url.is_empty() {
+        cmd.env_remove("ATOMIC_MODEL_BASE_URL")
+            .env_remove("ATOMIC_MODEL");
+    } else {
+        cmd.env("ATOMIC_MODEL_BASE_URL", url)
+            .env("ATOMIC_MODEL", "synthetic");
+    }
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -534,6 +541,58 @@ fn a_replay_reads_no_api_key_and_sends_none() {
 }
 
 #[test]
+fn a_replay_needs_the_endpoint_it_was_recorded_for_and_no_key() {
+    on_codex_runtime(async {
+        let dir = scratch("identity");
+        let project = project(&dir, None);
+        let model = FakeModel::respond(answer).await.expect("fake model");
+        let url = model.base_url();
+        let out = eval_async(&dir, &project, &url, &["note", "--live"]).await;
+        assert!(out.status.success(), "{}", text(&out));
+        // The project's files now choose the endpoint, and the person's key
+        // is named for it: a key atomic withholds from such an endpoint.
+        std::fs::write(
+            project.join("atomic.yaml"),
+            format!("atomic: 1\nname: tickets\nmodel:\n  base_url: {url}\n  name: synthetic\n"),
+        )
+        .expect("manifest");
+        let key = [
+            ("ATOMIC_MODEL_API_KEY_ENV", "MY_KEY"),
+            ("MY_KEY", "sk-withheld"),
+        ];
+        // A replay reads no key, so the withheld one does not stop it.
+        let (d, p) = (dir.clone(), project.clone());
+        let replay =
+            tokio::task::spawn_blocking(move || eval_with(&d, &p, "", &["note", "--json"], &key))
+                .await
+                .expect("eval");
+        assert!(replay.status.success(), "{}", text(&replay));
+        let report: Value = serde_json::from_slice(&replay.stdout).expect("one JSON report");
+        assert_eq!(report["cassettes"][0]["replayed"], 2, "{report}");
+        assert_eq!(report["cassettes"][0]["keyed"], 0, "{report}");
+        // A live eval calls the endpoint as a run would, and is refused.
+        let (d, p) = (dir.clone(), project.clone());
+        let live =
+            tokio::task::spawn_blocking(move || eval_with(&d, &p, "", &["note", "--live"], &key))
+                .await
+                .expect("eval");
+        assert!(!live.status.success(), "{}", text(&live));
+        assert!(text(&live).contains("is not used"), "{}", text(&live));
+        assert_eq!(model.calls(), 2, "no call after the recording");
+        // Without any endpoint, a replay says what it needs.
+        std::fs::write(project.join("atomic.yaml"), "atomic: 1\nname: tickets\n")
+            .expect("manifest");
+        let (d, p) = (dir.clone(), project.clone());
+        let none = tokio::task::spawn_blocking(move || eval_with(&d, &p, "", &["note"], &[]))
+            .await
+            .expect("eval");
+        assert!(!none.status.success(), "{}", text(&none));
+        assert!(text(&none).contains("recorded for"), "{}", text(&none));
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+#[test]
 fn atoms_it_cannot_run_yet_are_listed_and_the_rest_run() {
     on_codex_runtime(async {
         let dir = scratch("refused");
@@ -628,6 +687,41 @@ fn atoms_it_cannot_run_yet_are_listed_and_the_rest_run() {
             "{xml}"
         );
         assert_eq!(model.calls(), 4, "only note's cases reached the model");
+        // Skipping every atom chosen is no pass: something must run.
+        let out = eval_async(
+            &dir,
+            &project,
+            &url,
+            &["writer", "undeclared", "--skip-refused"],
+        )
+        .await;
+        assert!(!out.status.success(), "{}", text(&out));
+        assert!(
+            text(&out).contains("can run none of the atoms chosen"),
+            "{}",
+            text(&out)
+        );
+        // With no atom named, one that writes outside and has cases is listed
+        // with the refused, and the eval goes on.
+        let sender_cases = project.join("evals/sender");
+        std::fs::create_dir_all(&sender_cases).expect("evals");
+        std::fs::write(
+            sender_cases.join("cases.jsonl"),
+            json!({"input": {"text": "Export crashes"}, "expect": ["true"]}).to_string() + "\n",
+        )
+        .expect("cases");
+        let out = eval_async(&dir, &project, &url, &["--json", "--allow-unscored"]).await;
+        let report: Value = serde_json::from_slice(&out.stdout).expect("one JSON report");
+        assert!(
+            report["refused"].to_string().contains("\"sender\""),
+            "{report}"
+        );
+        assert!(
+            report["reports"]
+                .as_array()
+                .is_some_and(|r| r.iter().any(|r| r["atom"] == "note")),
+            "{report}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     });
 }

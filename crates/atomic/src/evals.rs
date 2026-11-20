@@ -289,6 +289,20 @@ pub async fn run(
             }
             None => true,
         });
+    // Something must run: skipping every atom chosen is not a pass. (Without
+    // --skip-refused the refusals are listed below, and fail the eval.)
+    if args.skip_refused && chosen.atoms.is_empty() && !refused.is_empty() {
+        let names: Vec<&str> = refused.iter().filter_map(|r| r["atom"].as_str()).collect();
+        return Err(Failure::new(
+            "eval.refused",
+            format!(
+                "atomic eval can run none of the atoms chosen ({}): each is refused",
+                names.join(", ")
+            ),
+            "run atomic eval without --skip-refused to see why each is refused",
+        )
+        .into());
+    }
     // One eval at a time, and none beside a command that runs workflows.
     state.create()?;
     let _lock = state.lock_execution("atomic eval")?;
@@ -620,7 +634,16 @@ fn choose<'a>(
     if targets.is_empty() {
         for atom in atoms {
             let settings = eval::settings(atom, &project_of(atom)?)?;
-            let cases = eval::load_cases(atom, &settings)?;
+            let cases = match eval::load_cases(atom, &settings) {
+                Ok(cases) => cases,
+                // An atom that writes outside has cases it may not run: it is
+                // listed with the atoms eval refuses, not an end to the eval.
+                Err(_) if atom.external() == Some(atomic_core::atom::External::Idempotent) => {
+                    chosen.atoms.push((atom, settings, Vec::new()));
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            };
             if cases.is_empty() {
                 chosen.empty.push(atom.name.clone());
                 continue;

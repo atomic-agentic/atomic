@@ -291,10 +291,14 @@ async fn the_same_request_twice_is_recorded_twice_and_replayed_in_order() {
     std::fs::create_dir_all(&tapes).expect("tapes");
     let stale = tapes.join(".abc.json.0123456789abcdef.tmp");
     std::fs::write(&stale, "half").expect("stale");
+    // A file of someone else's that only looks temporary is kept.
+    let theirs = tapes.join(".notes.tmp");
+    std::fs::write(&theirs, "mine").expect("theirs");
     let recorder = Cassette::start(&tapes, &root, &upstream, Mode::Record)
         .await
         .expect("cassette");
     assert!(!stale.exists(), "a stale temporary file is left");
+    assert!(theirs.exists(), "a file not the cassette's was removed");
     let first = post(&recorder, "/v1/chat/completions", ASK, None).await;
     let second = post(&recorder, "/v1/chat/completions", ASK, None).await;
     assert_ne!(first.1, second.1, "two answers to the same request");
