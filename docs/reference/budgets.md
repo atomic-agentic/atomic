@@ -114,11 +114,13 @@ separate wall-clock deadline and continues during an offline interval.
 Before dispatch, Atomic durably reserves against the atom and every parent budget
 under a stable request/attempt ID, independently of output checkpoints. Settlement
 is idempotent by that ID. Failed or rejected attempts still count; an uncertain
-request retains its maximum reservation until usage is reconciled. Nothing
-reconciles usage yet: the usage query that would learn an uncertain request's
-real usage from the provider is not built, so an unknown or partly known charge
-keeps its value. A new actual
-retry needs another reservation rather than reusing uncertain allowance.
+request keeps its maximum reservation charged. No provider atomic calls can be
+asked afterwards what one request used: atomic has providers store nothing of its
+requests (`store: false` on OpenAI's Responses API), so a response cannot be
+fetched again, Chat Completions keep none to look up, a provider's usage reports
+are totals over time rather than per request, and local servers keep no record.
+An unknown or partly known charge therefore keeps its value. A new actual retry
+needs another reservation rather than reusing uncertain allowance.
 
 For a supported bounded request, reserve its whole provider maximum: intentional
 unreserved overshoot is zero. Any declared excess is bounded by `max(0, B - R)`

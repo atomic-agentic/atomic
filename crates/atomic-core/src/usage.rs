@@ -101,17 +101,16 @@ pub enum Outcome {
     /// answer still spent it.
     Reported(Usage),
     /// The call may have reached the provider, but no usage is known: it
-    /// stays charged at its bound until a usage query reconciles it (none is
-    /// built yet, so it stays charged at its bound).
+    /// stays charged at its bound, since no provider atomic calls can be
+    /// asked afterwards what one call used.
     Unknown,
     /// Part of what the call spent is known: it reported `reported`, and
     /// was then stopped with a provider request in flight, which reported
     /// nothing. The request in flight is taken to be as large as one
     /// request's bound, or as `last`, the last request that reported, if
     /// that was larger: a turn's requests grow as it goes. It is charged the
-    /// reported usage and that estimate, at least its reservation, and stays
-    /// open for a usage query, which is not built yet: until one is, the
-    /// charge keeps that value.
+    /// reported usage and that estimate, at least its reservation, and the
+    /// charge keeps that value, as an unknown one does.
     Partial {
         /// What it reported.
         reported: Usage,
