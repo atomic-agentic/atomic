@@ -29,12 +29,27 @@ fn reaches_testing(text: &str) -> Option<String> {
             return Some(format!("names `{token}`"));
         }
     }
-    let squashed: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-    if squashed.contains("atomic_durable::testing") {
+    // Whitespace runs as one space, and none around `::`, braces and `*`:
+    // words stay apart, so `testing as t` is three words, not one.
+    let spaced = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut tight = String::with_capacity(spaced.len());
+    let chars: Vec<char> = spaced.chars().collect();
+    for (i, c) in chars.iter().enumerate() {
+        let sticky = |c: Option<&char>| matches!(c, Some(':' | '{' | '}' | '*'));
+        if *c == ' ' && (sticky(chars.get(i + 1)) || i > 0 && sticky(chars.get(i - 1))) {
+            continue;
+        }
+        tight.push(*c);
+    }
+    if tight.contains("atomic_durable::testing") {
         return Some("names `atomic_durable::testing`".into());
     }
-    // `use atomic_durable::{Durare, testing};`, nested groups included.
-    let mut rest = squashed.as_str();
+    // A glob brings `testing` in under its own name, unseen.
+    if tight.contains("atomic_durable::*") {
+        return Some("imports everything from atomic_durable; name what it uses".into());
+    }
+    // `use atomic_durable::{Durare, testing as t};`, nested groups included.
+    let mut rest = tight.as_str();
     while let Some(at) = rest.find("atomic_durable::{") {
         let group = &rest[at + "atomic_durable::".len()..];
         let mut depth = 0;
@@ -62,7 +77,6 @@ fn reaches_testing(text: &str) -> Option<String> {
         rest = &group[end..];
     }
     // A renamed crate hides its paths from the checks above.
-    let spaced = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if spaced.contains("atomic_durable as ") {
         return Some("renames atomic_durable; name it as it is".into());
     }
@@ -75,6 +89,10 @@ fn the_scan_sees_every_way_to_reach_the_testing_module() {
         "use atomic_durable::testing;",
         "let s = atomic_durable :: testing :: schema(\"x\");",
         "use atomic_durable::{Durare, testing};",
+        "use atomic_durable::{Durare, testing as t};",
+        "use atomic_durable :: { Durare,\n    testing as t };",
+        "use atomic_durable::*;",
+        "use atomic_durable :: * ;",
         "use atomic_durable::{gate::{self, Gate}, testing::TestSchema as S};",
         "use atomic_durable as ad;",
         "let schema = testing::schema(\"t\").await;",
