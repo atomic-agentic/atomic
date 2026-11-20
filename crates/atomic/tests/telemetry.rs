@@ -272,10 +272,10 @@ fn a_key_a_lite_provider_echoes_is_redacted_in_its_excerpt() {
             !received.bodies().contains(seeded),
             "body {index} was exported"
         );
-        if index > 0 {
-            continue;
-        }
-        // Its spans say it failed, and why, redacted.
+        // Its call's span says it failed, and why: the status and the type
+        // of error the provider named, if it named one, none of its own
+        // text, which the run's stored error keeps; and the status code, as
+        // an integer.
         let spans = received.spans();
         let call = named(&spans, "chat synthetic");
         assert!(failed(call), "{call}");
@@ -283,11 +283,31 @@ fn a_key_a_lite_provider_echoes_is_redacted_in_its_excerpt() {
             attribute(call, "error.type").as_deref(),
             Some("atomic.model_call")
         );
-        assert!(
-            attribute(call, "error.message")
-                .unwrap()
-                .contains("[REDACTED]")
+        let expected = if index == 0 {
+            "401 Unauthorized: invalid_request_error"
+        } else {
+            "401 Unauthorized"
+        };
+        assert_eq!(
+            attribute(call, "error.message").as_deref(),
+            Some(expected),
+            "{call}"
         );
+        let status = call["attributes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|a| a["key"] == "http.response.status_code")
+            .map(|a| &a["value"]);
+        // OTLP/JSON may write an integer as a number or a string; either
+        // way it is an intValue, not a stringValue.
+        let int = status
+            .and_then(|v| v.get("intValue"))
+            .map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_owned));
+        assert_eq!(int.as_deref(), Some("401"), "{call}");
+        if index > 0 {
+            continue;
+        }
         for name in ["invoke_agent rank-note", "invoke_workflow triage"] {
             let span = named(&spans, name);
             assert!(failed(span), "{span}");
