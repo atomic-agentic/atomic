@@ -136,10 +136,20 @@ const MIGRATIONS: &[Migration] = &[
                 PRIMARY KEY (request_id, attempt)
             )"],
     },
+    Migration {
+        version: 6,
+        // Each execution of each run (see `history`): when it began.
+        sql: &["CREATE TABLE IF NOT EXISTS atomic_executions (
+                run TEXT NOT NULL,
+                attempt BIGINT NOT NULL,
+                started_at BIGINT NOT NULL,
+                PRIMARY KEY (run, attempt)
+            )"],
+    },
 ];
 
 /// The store version this binary writes and understands.
-pub const STORE_VERSION: i64 = 5;
+pub const STORE_VERSION: i64 = 6;
 
 /// Why the store could not be opened.
 #[derive(Debug, thiserror::Error)]
@@ -283,6 +293,17 @@ async fn migrate(conn: &mut SqliteConnection, path: &str) -> Result<i64, StoreEr
         path: path.to_owned(),
         source,
     };
+    // A store already at this version is opened without the write lock, so
+    // a reader such as `atomic runs show` never waits on a writer.
+    let current: Option<i64> =
+        sqlx::query("SELECT COALESCE(MAX(version), 0) AS v FROM atomic_store_version")
+            .fetch_one(&mut *conn)
+            .await
+            .ok()
+            .and_then(|row| row.try_get("v").ok());
+    if current == Some(STORE_VERSION) {
+        return Ok(STORE_VERSION);
+    }
     // One writer at a time: BEGIN IMMEDIATE takes the write lock up front, so
     // two processes opening the store cannot both apply a migration.
     sqlx::query("BEGIN IMMEDIATE")

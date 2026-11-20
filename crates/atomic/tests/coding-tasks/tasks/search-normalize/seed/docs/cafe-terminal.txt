@@ -1,0 +1,6 @@
+Café terminal setup
+
+The Café on the third floor runs its own point of sale terminal. When the terminal
+loses its network, sales are kept on the device and sent in a batch later. A refund
+at the Café needs a supervisor card. Restart the terminal from the back panel, never
+by pulling the cable.

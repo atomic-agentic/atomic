@@ -232,6 +232,24 @@ ATOMIC_DEV_SANDBOX=on ATOMIC_TEST_CRASH_ONLY=pipeline:after-commit scripts/dev.s
 
 CI runs it on Linux, in a step of its own.
 
+## Coding tasks
+
+`crates/atomic/tests/coding-tasks/` holds fourteen coding tasks, eval fixtures
+for atoms that change code. Each is a seed project, a request, a checker,
+hidden tests and a reference solution; [its README](../crates/atomic/tests/coding-tasks/README.md)
+gives the contract and what each task covers. `crates/atomic/tests/coding_tasks.rs`
+holds that contract: every seed fails its checker with exit 1, every reference
+solution passes, every wrong fix kept beside a task fails for its reason, a
+checker changes nothing it grades, and a workspace holding a link, a Python
+startup hook, a hidden test's name or a standard-library module's name fails. A
+checker runs the attempt's code: run it only inside a sandbox. The checkers need
+Linux, `python3` and GNU `timeout`, which the development container has; the
+test runs on Linux only, and fails there without them.
+
+```bash
+scripts/dev.sh cargo test -p atomic-agentic --locked --test coding_tasks
+```
+
 ## Releases
 
 A release starts from a tag `v<version>` whose version equals the
