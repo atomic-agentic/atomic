@@ -368,15 +368,21 @@ pub(crate) async fn open_workspace(
     let mut set_aside: Option<SetAsideForRoom> = None;
     loop {
         let (b, r) = (backend.clone(), request.clone());
-        let opened = tokio::task::spawn_blocking(move || b.open(&r))
-            .await
-            .map_err(|e| AtomError::Runtime(format!("{label}: open its workspace: {e}")))?;
+        // The workspace's closer is made where it opens, on the blocking
+        // pool: if the run that awaits it is cancelled meanwhile, the open
+        // still finishes there, and its closer, dropped with the result no
+        // one takes, closes it.
+        let opened = tokio::task::spawn_blocking(move || {
+            b.open(&r).map(|workspace| Closer {
+                backend: b,
+                workspace: Some(workspace),
+            })
+        })
+        .await
+        .map_err(|e| AtomError::Runtime(format!("{label}: open its workspace: {e}")))?;
         match opened {
-            Ok(workspace) => {
-                let guard = WorkspaceGuard(Some(Arc::new(Closer {
-                    backend,
-                    workspace: Some(workspace),
-                })));
+            Ok(closer) => {
+                let guard = WorkspaceGuard(Some(Arc::new(closer)));
                 // Counted as running again before the stop is read, so a
                 // stop that began meanwhile either finds it here or waits
                 // for it.
