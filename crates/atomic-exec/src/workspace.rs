@@ -389,6 +389,28 @@ fn owner_may_run(tag: &str) -> bool {
     }
 }
 
+/// Remove what is in `dir`, keeping `dir`; what cannot be removed is left
+/// with a warning.
+pub(crate) fn empty_dir(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let removed = if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            remove_tree(&path)
+        } else {
+            match std::fs::remove_file(&path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                other => other,
+            }
+        };
+        if let Err(e) = removed {
+            warn(&format!("could not remove {}: {e}", path.display()));
+        }
+    }
+}
+
 /// Remove `path` and everything under it. A directory that is not writable,
 /// such as a Go module cache's, is made writable and the removal tried
 /// again. Symlinks are removed, never followed.

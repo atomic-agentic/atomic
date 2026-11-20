@@ -1650,6 +1650,13 @@ fn a_run_that_panics_closes_its_workspace() {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert_eq!(recorded.calls(), ["open panics", "close panics"]);
+        // Recorded as the close starts; the removal follows.
+        for _ in 0..200 {
+            if !scratch.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         assert!(!scratch.exists());
     });
 }

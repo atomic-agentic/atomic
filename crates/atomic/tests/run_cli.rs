@@ -112,17 +112,24 @@ fn project(dir: &Path) -> PathBuf {
         std::fs::create_dir_all(project.join(sub)).expect("project");
     }
     std::fs::write(project.join("atomic.yaml"), "atomic: 1\nname: notes\n").expect("manifest");
-    // Each run logs the command line of the process that started it.
+    // Each run logs one line. Exec commands run confined, and may write only
+    // their scratch directory and the project's caches: the log is kept in
+    // the caches of the state directory `atomic` uses here, and read through
+    // `dir/count.log`. A process given a state directory of its own cannot
+    // write it, and does not count.
     std::fs::write(
         project.join("tools/count.py"),
         "import json, os, sys\n\
          note = json.load(sys.stdin)\n\
-         parent = open(f'/proc/{os.getppid()}/cmdline').read().replace('\\0', ' ')\n\
-         open(os.environ['COUNT_LOG'], 'a').write(parent.strip() + '\\n')\n\
+         try:\n    open(os.environ['COUNT_LOG'], 'a').write('ran\\n')\n\
+         except OSError:\n    pass  # a state directory of its own: its caches are elsewhere\n\
          json.dump({'title': note['text'][:25], 'words': len(note['text'].split())}, sys.stdout)\n",
     )
     .expect("script");
-    let log = dir.join("count.log");
+    let caches = state_dir(dir, &project).join("cache");
+    std::fs::create_dir_all(&caches).expect("caches");
+    let log = caches.join("count.log");
+    std::os::unix::fs::symlink(&log, dir.join("count.log")).expect("log link");
     write_atom(
         &project,
         "count-note",
@@ -172,8 +179,7 @@ fn project(dir: &Path) -> PathBuf {
     project
 }
 
-/// How many times the exec atom's command ran, and the command line of the
-/// process that started each run.
+/// One line for each time the exec atom's command ran.
 fn count_log(dir: &Path) -> Vec<String> {
     std::fs::read_to_string(dir.join("count.log"))
         .map(|s| s.lines().map(str::to_owned).collect())
@@ -613,7 +619,7 @@ fn a_run_killed_at_a_gate_keeps_it_and_its_deadline_and_one_resume_runs_at_a_tim
             &with(&env, &[]),
             &dir.join("first.log"),
         );
-        let rt = Durare::sqlite(&state.join("atomic.db"))
+        let rt = Durare::sqlite(&state.join("private/atomic.db"))
             .await
             .expect("store");
         let opened = open_gate(&rt, "gated-1").await;
@@ -714,7 +720,7 @@ fn serve_started_after_a_kill_recovers_the_run_and_finishes_it() {
             &with(&env, &[]),
             &dir.join("serve.log"),
         );
-        let rt = Durare::sqlite(&state.join("atomic.db"))
+        let rt = Durare::sqlite(&state.join("private/atomic.db"))
             .await
             .expect("store");
         let started = Instant::now();
@@ -805,14 +811,10 @@ fn exec_commands_run_in_a_runner_process_when_asked() {
         assert!(out.status.success(), "{}", text(out));
     }
     assert_eq!(stdout_json(&local), stdout_json(&split));
-    let log = count_log(&dir);
-    assert_eq!(log.len(), 2);
-    assert!(log[0].contains(" run count-note"), "{}", log[0]);
-    assert!(
-        log[1].ends_with(" runner"),
-        "the runner started it: {}",
-        log[1]
-    );
+    assert_eq!(count_log(&dir).len(), 2);
+    // That the runner process started the second command is shown by the
+    // runner's own tests: a confined command runs in a process namespace of
+    // its own and cannot see what started it.
 }
 
 #[test]

@@ -361,6 +361,12 @@ pub struct ThreadReport {
 pub struct CodexPaths(Arg0DispatchPaths);
 
 impl CodexPaths {
+    /// Codex's Linux sandbox helper, when this process has one: atomic's own
+    /// executable, run under the helper's name.
+    pub fn linux_sandbox(&self) -> Option<&Path> {
+        self.0.codex_linux_sandbox_exe.as_deref()
+    }
+
     /// Paths for a process that did not start through [`dispatch`], such as
     /// a test: Codex can re-run this executable, but has no sandbox helper.
     pub fn without_helpers() -> Self {
@@ -460,6 +466,128 @@ fn keep_sandbox_off_keyrings() {
             eprintln!("atomic: cannot keep a sandboxed command off the kernel keyrings: {e}");
             std::process::exit(1);
         }
+    }
+}
+
+/// Confines an exec atom's command under Codex's Linux sandbox helper, as a
+/// turn's commands are confined: the whole filesystem readable except
+/// atomic's private state, which is denied as it is to turns (see
+/// [`denied_paths`]); only the command's own writable directories, such as
+/// its scratch directory, and the project's caches writable; no network. The command still runs
+/// with exactly its environment, in its directory.
+///
+/// Exec atoms declare no network at this version (see the atom loader), so
+/// none is given.
+#[derive(Clone, Debug)]
+pub struct ExecSandbox {
+    helper: PathBuf,
+    guard: StateGuard,
+    codex_home: PathBuf,
+    also_writable: Vec<PathBuf>,
+}
+
+impl ExecSandbox {
+    /// Confinement through `paths`' sandbox helper, denying what `guard`
+    /// denies; `codex_home` is the Codex home atom threads use, whose records
+    /// are denied too. Fails where this process has no helper.
+    pub fn new(paths: &CodexPaths, guard: StateGuard, codex_home: PathBuf) -> anyhow::Result<Self> {
+        let helper = paths.linux_sandbox().map(Path::to_owned).context(
+            "this process has no Linux sandbox helper to confine exec atoms' commands with; \
+             run atomic itself, which provides one",
+        )?;
+        Ok(Self {
+            helper,
+            guard,
+            codex_home,
+            also_writable: Vec::new(),
+        })
+    }
+
+    /// The same confinement, letting every command also write `dirs`, such
+    /// as the project's build and package caches.
+    pub fn also_writing(mut self, dirs: Vec<PathBuf>) -> Self {
+        self.also_writable = dirs;
+        self
+    }
+
+    /// The profile for a command that may write `writable`.
+    fn profile(&self, writable: &[PathBuf]) -> anyhow::Result<PermissionProfile> {
+        use codex_protocol::permissions::{
+            FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry, NetworkSandboxPolicy,
+        };
+        let read_only = permission_profile(
+            crate::typed::Sandbox::ReadOnly,
+            &self.guard,
+            &self.codex_home,
+        )?;
+        let mut policy = read_only.file_system_sandbox_policy();
+        for dir in writable.iter().chain(&self.also_writable) {
+            let dir = AbsolutePathBuf::from_absolute_path(dir)
+                .with_context(|| format!("resolve the writable directory {}", dir.display()))?;
+            policy.entries.push(FileSystemSandboxEntry::new(
+                FileSystemPath::from(dir),
+                FileSystemAccessMode::Write,
+            ));
+        }
+        Ok(PermissionProfile::from_runtime_permissions(
+            &policy,
+            NetworkSandboxPolicy::Restricted,
+        ))
+    }
+}
+
+impl atomic_exec::Confine for ExecSandbox {
+    fn confine(
+        &self,
+        command: &atomic_exec::Command,
+    ) -> Result<atomic_exec::Command, atomic_exec::ExecError> {
+        let fail = |message: String| atomic_exec::ExecError::Start {
+            program: command.program.clone(),
+            message,
+        };
+        // Resolved here, on this machine's PATH: the command's own
+        // environment has none unless it declares one.
+        let program = atomic_exec::process::resolve(&command.program).map_err(fail)?;
+        let env = atomic_exec::process::resolve("env").map_err(fail)?;
+        let profile = self
+            .profile(&command.writable)
+            .and_then(|p| serde_json::to_string(&p).context("encode the sandbox profile"))
+            .map_err(|e| fail(format!("{e:#}")))?;
+        let cwd = command
+            .cwd
+            .to_str()
+            .ok_or_else(|| fail("its directory is not UTF-8".into()))?
+            .to_owned();
+        let text = |p: &Path| {
+            p.to_str()
+                .map(str::to_owned)
+                .ok_or_else(|| fail(format!("{} is not UTF-8", p.display())))
+        };
+        let mut args = vec![
+            "--sandbox-policy-cwd".to_owned(),
+            cwd.clone(),
+            "--command-cwd".to_owned(),
+            cwd,
+            "--permission-profile".to_owned(),
+            profile,
+            "--".to_owned(),
+            // The helper needs PATH to find bubblewrap; the command gets
+            // exactly its own environment, nothing of the helper's.
+            text(&env)?,
+            "-i".to_owned(),
+        ];
+        args.extend(command.env.iter().map(|(k, v)| format!("{k}={v}")));
+        args.push(text(&program)?);
+        args.extend(command.args.iter().cloned());
+        Ok(atomic_exec::Command {
+            program: text(&self.helper)?,
+            args,
+            env: std::env::var("PATH")
+                .map(|path| vec![("PATH".to_owned(), path)])
+                .unwrap_or_default(),
+            writable: Vec::new(),
+            ..command.clone()
+        })
     }
 }
 
@@ -1354,6 +1482,74 @@ mod tests {
             assert_eq!(report.turns as usize, TURNS);
             assert_eq!(model.calls(), TURNS);
         });
+    }
+
+    /// An exec command, confined, is the sandbox helper running `env -i`
+    /// with exactly the command's environment, then the command: its
+    /// profile denies atomic's private state and lets it write only its own
+    /// directories and the project's caches.
+    #[test]
+    fn an_exec_command_is_confined_under_the_sandbox_helper() {
+        use atomic_exec::Confine;
+        let state = scratch("exec-sandbox");
+        let scratch_dir = state.join("scratch/a1");
+        std::fs::create_dir_all(&scratch_dir).expect("scratch");
+        let paths = CodexPaths::with_helpers(
+            PathBuf::from("/opt/atomic"),
+            PathBuf::from("/opt/bin/codex-linux-sandbox"),
+        );
+        let guard = StateGuard::Deny(PrivateState {
+            state_dir: state.clone(),
+            also: vec![state.join("keys")],
+        });
+        let sandbox = ExecSandbox::new(&paths, guard, state.join("codex"))
+            .expect("a helper")
+            .also_writing(vec![state.join("cache")]);
+        let confined = sandbox
+            .confine(&atomic_exec::Command {
+                program: "sh".into(),
+                args: vec!["-c".into(), "true".into()],
+                cwd: state.clone(),
+                env: vec![("HOME".into(), scratch_dir.display().to_string())],
+                writable: vec![scratch_dir.clone()],
+                ..Default::default()
+            })
+            .expect("confined");
+        assert_eq!(confined.program, "/opt/bin/codex-linux-sandbox");
+        assert!(
+            confined.env.iter().all(|(k, _)| k == "PATH"),
+            "{:?}",
+            confined.env
+        );
+        let at = |flag: &str| {
+            confined
+                .args
+                .iter()
+                .position(|a| a == flag)
+                .unwrap_or_else(|| panic!("{flag} in {:?}", confined.args))
+        };
+        let profile = &confined.args[at("--permission-profile") + 1];
+        let rest = &confined.args[at("--") + 1..];
+        assert!(rest[0].ends_with("/env") && rest[1] == "-i", "{rest:?}");
+        assert_eq!(rest[2], format!("HOME={}", scratch_dir.display()));
+        assert!(rest[3].ends_with("/sh"), "resolved: {rest:?}");
+        assert_eq!(&rest[4..], ["-c", "true"]);
+        assert!(confined.writable.is_empty());
+        let profile: serde_json::Value = serde_json::from_str(profile).expect("json");
+        let text = profile.to_string();
+        for denied in [state.join("private"), state.join("keys")] {
+            assert!(
+                text.contains(&denied.display().to_string()),
+                "{denied:?}: {text}"
+            );
+        }
+        for writable in [&scratch_dir, &state.join("cache")] {
+            assert!(
+                text.contains(&writable.display().to_string()),
+                "{writable:?}: {text}"
+            );
+        }
+        assert!(text.contains("restricted"), "no network: {text}");
     }
 
     #[test]

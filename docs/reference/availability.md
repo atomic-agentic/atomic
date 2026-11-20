@@ -91,11 +91,14 @@ no effect.
 `atomic run` and `atomic serve` do not read public context settings yet, so they
 refuse a step whose atom declares a context.
 
-On Linux, atomic has verified that an atom's sandbox cannot reach the gate store
-or the credential: the private part of the state directory, Codex's own records
-and the credential and key directories are denied to its commands, which also
-cannot use the kernel keyrings or connect to a socket. On macOS and Windows this
-has not been verified, so atomic keeps no operator credential there and refuses
+On Linux, atomic has verified that no atom's commands can reach the gate store
+or the credential: a Codex turn's commands and an exec atom's alike run under
+Codex's sandbox, which denies them the private part of the state directory,
+Codex's own records and the credential and key directories, the kernel keyrings
+and sockets. An exec atom's command may write only its scratch directory and the
+project's caches, and has no network; `--runner process` confines it the same
+way. On macOS and Windows this has not been verified: exec atoms' commands run
+unconfined there, so atomic keeps no operator credential and refuses
 credentialed gate decisions.
 
 A `workspace-write` atom cannot write `/tmp`, `/var/tmp` or `$TMPDIR` as atomic

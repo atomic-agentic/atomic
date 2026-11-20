@@ -1125,6 +1125,8 @@ async fn run_command(
         stdin,
         time_limit: EXEC_TIME_LIMIT,
         output_limit: EXEC_OUTPUT_LIMIT,
+        // A confining backend lets it write its scratch directory only.
+        writable: workspace.scratch.iter().cloned().collect(),
     };
     // The command holds its workspace open until it ends, even when the run
     // that started it is cancelled and drops its guard.

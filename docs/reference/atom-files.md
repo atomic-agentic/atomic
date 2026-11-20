@@ -46,6 +46,14 @@ project root. The command reads its input as JSON on stdin and writes its output
 as JSON on stdout; a nonzero exit fails the step. It receives only the variables
 in `env`, plus its own `HOME` and `TMPDIR` and the effect variables below.
 
+On Linux the command runs under the same sandbox as a Codex atom's commands. It
+can read the project and the rest of the filesystem except atomic's private
+state (the project's database and gate store, Codex's records, the credential
+and key directories), write only its own scratch directory (its `HOME` and
+`TMPDIR`) and the project's build caches, and has no network: an atom cannot
+declare network access at this version. A command that writes elsewhere fails.
+On macOS and Windows the command is not confined yet.
+
 A step runs at least once, and Atomic cannot see what a command does to other
 systems. If execution is interrupted after the command started and before its
 result was saved, `effects.external` decides what recovery does. This includes

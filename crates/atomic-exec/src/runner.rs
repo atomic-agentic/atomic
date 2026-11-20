@@ -174,6 +174,8 @@ impl Request {
             stdin: unhex(&self.stdin).ok_or("stdin is not hex")?,
             time_limit: Duration::from_millis(self.time_limit_ms),
             output_limit: self.output_limit,
+            // Confined, if at all, before it was sent.
+            writable: Vec::new(),
         })
     }
 }
@@ -352,7 +354,10 @@ impl ExecutionBackend for ProcessRunner {
         self.workspaces.close(workspace)
     }
 
+    /// The command is confined here, before it crosses, as its workspaces'
+    /// backend confines it: the runner runs what it is sent.
     fn run(&self, command: &Command) -> Result<Completed, ExecError> {
+        let command = &self.workspaces.prepare(command)?;
         let request = serde_json::to_vec(&Request::new(command)).map_err(|e| ExecError::Io {
             program: command.program.clone(),
             message: format!("encode the runner request: {e}"),

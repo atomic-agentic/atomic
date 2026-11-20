@@ -99,7 +99,7 @@ pub struct Statement {
 }
 
 /// One command for a backend to run.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Command {
     /// The program, found on the control plane's `PATH` when it has no `/`.
     pub program: String,
@@ -115,6 +115,21 @@ pub struct Command {
     pub time_limit: Duration,
     /// The most stdout it may write, in bytes.
     pub output_limit: usize,
+    /// The directories it may write, such as its workspace's scratch
+    /// directory, when its backend confines it (see [`Confine`]). A backend
+    /// that does not confine its commands ignores it.
+    pub writable: Vec<PathBuf>,
+}
+
+/// Puts a command under a sandbox before a backend runs it: what it may
+/// read, write and reach. atomic's runtime gives the local backend one that
+/// keeps commands out of atomic's private state; the trait names no
+/// sandbox, so a backend elsewhere is free to confine its own way.
+pub trait Confine: Send + Sync {
+    /// The command that runs `command` confined. It must run `command` with
+    /// exactly its environment and in its directory, and let it write only
+    /// [`Command::writable`].
+    fn confine(&self, command: &Command) -> Result<Command, ExecError>;
 }
 
 /// How a command ended.
@@ -309,11 +324,36 @@ impl ExecutionBackend for Backend {
 /// [`scratch_root`](Self::scratch_root), named by the attempt's run and step
 /// (see [`workspace`]). Give it a directory no sandboxed turn may write, such
 /// as one in the project's state directory: [`LocalBackend::in_dir`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct LocalBackend {
     scratch_root: PathBuf,
     tmp: PathBuf,
+    confine: Option<Arc<dyn Confine>>,
 }
+
+impl std::fmt::Debug for LocalBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalBackend")
+            .field("scratch_root", &self.scratch_root)
+            .field("tmp", &self.tmp)
+            .field("confined", &self.confine.is_some())
+            .finish()
+    }
+}
+
+impl PartialEq for LocalBackend {
+    fn eq(&self, other: &Self) -> bool {
+        self.scratch_root == other.scratch_root
+            && self.tmp == other.tmp
+            && match (&self.confine, &other.confine) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+}
+
+impl Eq for LocalBackend {}
 
 impl LocalBackend {
     /// What it states: a workspace is a directory on this machine's disk,
@@ -328,6 +368,22 @@ impl LocalBackend {
         Self {
             tmp: scratch_root.join(".tmp"),
             scratch_root,
+            confine: None,
+        }
+    }
+
+    /// The same backend, running every command under `confine`.
+    pub fn confined(mut self, confine: Arc<dyn Confine>) -> Self {
+        self.confine = Some(confine);
+        self
+    }
+
+    /// `command` as this backend runs it: under its confinement, if it has
+    /// one.
+    pub fn prepare(&self, command: &Command) -> Result<Command, ExecError> {
+        match &self.confine {
+            Some(confine) => confine.confine(command),
+            None => Ok(command.clone()),
         }
     }
 
@@ -362,6 +418,7 @@ impl Default for LocalBackend {
                 NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             )),
             tmp: base.join(".tmp"),
+            confine: None,
         }
     }
 }
@@ -380,6 +437,9 @@ impl ExecutionBackend for LocalBackend {
             },
         )?;
         workspace::sweep_local(&self.scratch_root);
+        // No turn of this backend runs yet: what earlier turns left in the
+        // shared temporary directory goes.
+        workspace::empty_dir(&self.tmp);
         Ok(Self::STATEMENT)
     }
 
@@ -392,6 +452,7 @@ impl ExecutionBackend for LocalBackend {
     }
 
     fn run(&self, command: &Command) -> Result<Completed, ExecError> {
+        let command = &self.prepare(command)?;
         let program = process::resolve(&command.program).map_err(|message| ExecError::Start {
             program: command.program.clone(),
             message,

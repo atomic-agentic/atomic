@@ -12,6 +12,7 @@ fn shell(script: &str, stdin: &[u8], time: Duration) -> Result<Completed, ExecEr
         stdin: stdin.to_vec(),
         time_limit: time,
         output_limit: 1024,
+        writable: Vec::new(),
     })
 }
 
@@ -65,6 +66,7 @@ fn no_shell_expands_the_arguments() {
             stdin: Vec::new(),
             time_limit: Duration::from_secs(10),
             output_limit: 1024,
+            writable: Vec::new(),
         })
         .expect("runs");
     assert_eq!(done.stdout, b"$HOME;`id`");
@@ -81,6 +83,7 @@ fn a_missing_program_cannot_start() {
             stdin: Vec::new(),
             time_limit: Duration::from_secs(10),
             output_limit: 1024,
+            writable: Vec::new(),
         })
         .expect_err("missing");
     assert!(matches!(error, ExecError::Start { .. }), "{error}");
@@ -348,8 +351,10 @@ fn turns_on_one_backend_share_a_private_temporary_directory() {
     local.close(&a).expect("closes");
     local.close(&b).expect("closes");
     assert!(tmp.is_dir(), "it outlives the workspaces");
+    std::fs::write(tmp.join("left"), "by a turn").expect("write");
     local.connect().expect("connects");
     assert!(tmp.is_dir(), "and the sweep");
+    assert!(!tmp.join("left").exists(), "emptied when no turn runs");
     let _ = workspace::remove_tree(local.scratch_root());
     let _ = std::fs::remove_dir_all(&src);
 }
@@ -447,6 +452,7 @@ fn a_command_in_a_local_workspace_runs_as_it_would_directly() {
         stdin: b" and stdin".to_vec(),
         time_limit: Duration::from_secs(10),
         output_limit: 1024,
+        writable: Vec::new(),
     };
     let through = LocalBackend::default().run(&command).expect("runs");
     let direct = process::run(
