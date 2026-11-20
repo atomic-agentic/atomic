@@ -132,11 +132,9 @@ fn spans_over_http_protobuf_carry_the_exporters_headers_which_no_atom_sees() {
         headers.contains(COLLECTOR_SEED),
         "the collector got its credential"
     );
-    // Which no log line and no atom's command saw.
+    // Which no log line saw, and no atom's command: count-note's fails the
+    // run if its environment holds any OTEL_ variable or the credential.
     assert!(!text(&out).contains(COLLECTOR_SEED), "{}", text(&out));
-    let env = std::fs::read_to_string(dir.join("env.json")).unwrap();
-    assert!(!env.contains(COLLECTOR_SEED), "{env}");
-    assert!(!env.contains("OTEL_EXPORTER_OTLP_HEADERS"), "{env}");
 }
 
 #[test]

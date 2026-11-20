@@ -501,13 +501,6 @@ fn check(path: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
         }
         operations += tools.len();
     }
-    let mut warnings = Vec::new();
-    for source in &files["workflows"] {
-        let loaded = workflow::load(&source.path, &atoms, &mut registry)?;
-        for w in loaded.warnings {
-            warnings.push(format!("{}: {w}", loaded.file.display()));
-        }
-    }
     if json {
         println!(
             "{}",

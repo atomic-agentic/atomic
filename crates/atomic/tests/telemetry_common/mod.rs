@@ -86,8 +86,8 @@ pub fn write_atom(
     }
 }
 
-/// A project with an exec atom that counts a note's words and records its
-/// own environment, two model atoms, and workflows over them: `triage`,
+/// A project with an exec atom that counts a note's words and fails if its
+/// environment holds the exporter's settings, two model atoms, and workflows over them: `triage`,
 /// `gated` (with a gate before the summary), `leaky` (an exec atom that
 /// fails, writing its input to stderr) and `review` (one Codex atom).
 pub fn project(dir: &Path) -> PathBuf {
@@ -97,7 +97,8 @@ pub fn project(dir: &Path) -> PathBuf {
         project.join("tools/count.py"),
         "import json, os, sys\n\
          note = json.load(sys.stdin)\n\
-         json.dump(dict(os.environ), open(os.environ['ENV_LOG'], 'w'))\n\
+         seen = [k for k, v in os.environ.items() if k.startswith('OTEL_') or 'COLLECTOR' in v]\n\
+         if seen: sys.exit('the command saw the exporter settings ' + ' '.join(seen))\n\
          json.dump({'title': note['text'][:25], 'words': len(note['text'].split())}, sys.stdout)\n",
     )
     .unwrap();
@@ -120,10 +121,7 @@ pub fn project(dir: &Path) -> PathBuf {
     write_atom(
         &project,
         "count-note",
-        &format!(
-            "description: 'Count words.', kind: 'exec', exec: {{ command: ['python3', 'tools/count.py'] }}, env: {{ ENV_LOG: '{}' }}",
-            dir.join("env.json").display()
-        ),
+        "description: 'Count words.', kind: 'exec', exec: { command: ['python3', 'tools/count.py'] }",
         "",
         note(),
         object(json!({"title": {"type": "string"}, "words": {"type": "integer"}})),
