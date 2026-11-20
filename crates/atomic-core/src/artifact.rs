@@ -20,7 +20,14 @@
 //! Writes are atomic: content is streamed to a staging file while it is
 //! hashed, synced, then renamed into place, so a crash never leaves a blob
 //! under its digest that does not match it. Steps run at least once, and
-//! writing the same content again is a no-op.
+//! writing the same content again stores nothing new (it only marks the
+//! content as just written, for [`LocalStore::sweep`]).
+//!
+//! Retention is a sweep over the store with a set of digests to keep:
+//! whatever the caller says is still referenced, such as the evidence gates
+//! pin (`atomic_app::retention`). Content written recently is kept too, so a
+//! step that has stored a result but not yet recorded a reference to it
+//! never loses it.
 
 pub use atomic_schema::artifact::ArtifactRef;
 use serde::{Deserialize, Serialize};
@@ -187,13 +194,127 @@ fn sync_dir(dir: &Path) -> Result<(), ArtifactError> {
     Ok(())
 }
 
+/// What a [`LocalStore::sweep`] did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Swept {
+    /// The content it removed, with its manifests.
+    pub removed: Vec<ArtifactRef>,
+    /// How many blobs it kept.
+    pub kept: usize,
+}
+
+/// A lock on the store's `lock` file, held until dropped: shared by writers,
+/// exclusive for a sweep, so no write lands between a sweep's look at a blob
+/// and its removal, and sweeps run one at a time.
+struct StoreLock(#[allow(dead_code)] std::fs::File);
+
+impl StoreLock {
+    fn take(root: &Path, exclusive: bool) -> Result<Self, ArtifactError> {
+        let path = root.join("lock");
+        let file = std::fs::File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .map_err(io(&path))?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            let how = if exclusive {
+                libc::LOCK_EX
+            } else {
+                libc::LOCK_SH
+            };
+            // SAFETY: flock on a descriptor this function owns.
+            #[allow(unsafe_code)]
+            let locked = unsafe { libc::flock(file.as_raw_fd(), how) };
+            if locked != 0 {
+                return Err(io(&path)(std::io::Error::last_os_error()));
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = exclusive;
+        Ok(Self(file))
+    }
+}
+
+impl LocalStore {
+    /// Remove every blob, and its manifests, whose digest is not in `keep`
+    /// and that was last written longer than `grace` ago. Digests in `keep`
+    /// are lowercase hex, with or without a `sha256:` prefix. Partial writes
+    /// left in staging longer than `grace` go too.
+    ///
+    /// It holds the store's lock while it runs, so a write waits for it and
+    /// another sweep runs after it; content a write kept or added is then as
+    /// recent as that write. What it keeps is the caller's to say: a sweep
+    /// keeps nothing another caller needs unless that is in `keep` or recent.
+    pub fn sweep(
+        &self,
+        keep: &BTreeSet<String>,
+        grace: std::time::Duration,
+    ) -> Result<Swept, ArtifactError> {
+        let _lock = StoreLock::take(&self.root, true)?;
+        let keep: BTreeSet<&str> = keep
+            .iter()
+            .map(|d| d.strip_prefix("sha256:").unwrap_or(d))
+            .collect();
+        let now = std::time::SystemTime::now();
+        let old = |path: &Path| -> Result<bool, ArtifactError> {
+            let written = std::fs::metadata(path)
+                .and_then(|m| m.modified())
+                .map_err(io(path))?;
+            Ok(now.duration_since(written).is_ok_and(|age| age > grace))
+        };
+        let mut swept = Swept::default();
+        let blobs = self.root.join("blobs/sha256");
+        for prefix in std::fs::read_dir(&blobs).map_err(io(&blobs))?.flatten() {
+            let prefix_path = prefix.path();
+            let prefix_name = prefix.file_name().to_string_lossy().into_owned();
+            for blob in std::fs::read_dir(&prefix_path)
+                .map_err(io(&prefix_path))?
+                .flatten()
+            {
+                let digest = format!("{prefix_name}{}", blob.file_name().to_string_lossy());
+                let Ok(artifact) = ArtifactRef::from_digest(&digest) else {
+                    continue;
+                };
+                if keep.contains(artifact.digest()) || !old(&blob.path())? {
+                    swept.kept += 1;
+                    continue;
+                }
+                // The manifests first: a blob with no manifest is still
+                // whole, a manifest with no blob would point at nothing.
+                let manifests = self.manifest_dir(&artifact);
+                match std::fs::remove_dir_all(&manifests) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                        return Err(io(&manifests)(e));
+                    }
+                    _ => {}
+                }
+                std::fs::remove_file(blob.path()).map_err(io(&blob.path()))?;
+                swept.removed.push(artifact);
+            }
+        }
+        let staging = self.root.join("staging");
+        for partial in std::fs::read_dir(&staging).map_err(io(&staging))?.flatten() {
+            if old(&partial.path())? {
+                let _ = std::fs::remove_file(partial.path());
+            }
+        }
+        swept.removed.sort_by(|a, b| a.digest().cmp(b.digest()));
+        Ok(swept)
+    }
+}
+
 impl ArtifactStore for LocalStore {
     fn put(
         &self,
         content: &mut dyn Read,
         provenance: Provenance,
     ) -> Result<Manifest, ArtifactError> {
-        // Stream to staging while hashing, then move into place under the digest.
+        // Stream to staging while hashing, then move into place under the
+        // digest, with no sweep in between.
+        let _lock = StoreLock::take(&self.root, false)?;
         let staging = self.root.join("staging");
         let tmp = staging.join(format!(
             "{}-{}",
@@ -227,8 +348,14 @@ impl ArtifactStore for LocalStore {
         })?;
         let blob = self.blob_path(&artifact);
         if blob.exists() {
-            // Already stored: identical content is kept once.
+            // Already stored: identical content is kept once, and is now as
+            // recent as this write, so a sweep's grace period covers it.
             let _ = std::fs::remove_file(&tmp);
+            std::fs::File::options()
+                .write(true)
+                .open(&blob)
+                .and_then(|f| f.set_modified(std::time::SystemTime::now()))
+                .map_err(io(&blob))?;
         } else {
             let parent = blob.parent().map(Path::to_owned).unwrap_or_default();
             std::fs::create_dir_all(&parent).map_err(io(&parent))?;
