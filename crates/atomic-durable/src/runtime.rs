@@ -171,6 +171,30 @@ pub struct RunRecord {
     pub queue: Option<String>,
 }
 
+/// Where a run stands in [`Durare::runs_after`]'s order: when it was
+/// created, in milliseconds since the epoch, and its id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunKey {
+    /// When the run was created.
+    pub created_at: i64,
+    /// Its id.
+    pub id: String,
+}
+
+/// A run with what it was given and what it returned or failed with, as
+/// [`Durare::runs_after`] reads it.
+#[derive(Clone, Debug)]
+pub struct RunContents {
+    /// The run.
+    pub record: RunRecord,
+    /// Its input, as stored.
+    pub input: Value,
+    /// What it returned, once it succeeded.
+    pub output: Option<Value>,
+    /// Its error, once it failed.
+    pub error: Option<String>,
+}
+
 /// What every resume queue's name starts with.
 pub const RESUME_QUEUES: &str = "atomic.resume.";
 
@@ -1117,6 +1141,88 @@ impl Durare {
             .await
             .map_err(from_durare)?;
         Ok(found.into_iter().map(RunRecord::from).collect())
+    }
+
+    /// A page of the store's runs, finished or not, whoever owns them: at
+    /// most `limit` of them, in order of creation and then of id, after the
+    /// run `after` names, each with what it was given and what it returned
+    /// or failed with. Paging by that key misses no run however many share a
+    /// creation time, and a run removed between pages shifts nothing.
+    pub async fn runs_after(
+        &self,
+        after: Option<&RunKey>,
+        limit: i64,
+    ) -> Result<Vec<(RunKey, RunContents)>> {
+        let after = after.cloned();
+        let keys: Vec<RunKey> = self
+            .control_transaction(move |mut tx| {
+                let after = after.clone();
+                Box::pin(async move {
+                    let rows = match &after {
+                        None => {
+                            tx.query_all(
+                                "SELECT workflow_uuid AS id, created_at FROM workflow_status \
+                                 ORDER BY created_at, workflow_uuid LIMIT ?",
+                                &[Param::Int(limit)],
+                            )
+                            .await?
+                        }
+                        Some(key) => {
+                            tx.query_all(
+                                "SELECT workflow_uuid AS id, created_at FROM workflow_status \
+                                 WHERE created_at > ? OR (created_at = ? AND workflow_uuid > ?) \
+                                 ORDER BY created_at, workflow_uuid LIMIT ?",
+                                &[
+                                    Param::Int(key.created_at),
+                                    Param::Int(key.created_at),
+                                    Param::Text(key.id.clone()),
+                                    Param::Int(limit),
+                                ],
+                            )
+                            .await?
+                        }
+                    };
+                    rows.iter()
+                        .map(|r| {
+                            Ok(RunKey {
+                                id: r.text("id")?,
+                                created_at: r.int("created_at")?,
+                            })
+                        })
+                        .collect()
+                })
+            })
+            .await?;
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut found: std::collections::BTreeMap<String, durare::WorkflowStatus> = self
+            .engine
+            .list_workflows(&durare::ListFilter {
+                workflow_ids: keys.iter().map(|k| k.id.clone()).collect(),
+                ..durare::ListFilter::default()
+            })
+            .await
+            .map_err(from_durare)?
+            .into_iter()
+            .map(|w| (w.id.clone(), w))
+            .collect();
+        // A run removed since its key was read is passed over.
+        Ok(keys
+            .into_iter()
+            .filter_map(|key| {
+                let w = found.remove(&key.id)?;
+                Some((
+                    key,
+                    RunContents {
+                        input: w.input.clone(),
+                        output: w.output.clone(),
+                        error: w.error.clone(),
+                        record: RunRecord::from(w),
+                    },
+                ))
+            })
+            .collect())
     }
 
     /// Every unfinished run in the store, whoever owns it and whatever its

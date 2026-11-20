@@ -9,5 +9,6 @@
 
 pub mod metering;
 pub mod pipeline;
+pub mod retention;
 pub mod telemetry;
 pub mod workflows;

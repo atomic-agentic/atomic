@@ -665,6 +665,16 @@ fn a_workflow_runs_by_name_and_by_file() {
         stdout_json(&by_name),
         json!({"title": "Exporting a file named ca", "words": 8})
     );
+    // The run's artifact store took its lock where no atom can open it.
+    let state = state_dir(&dir, &project);
+    let private = state
+        .parent()
+        .and_then(Path::parent)
+        .expect("the atomic home")
+        .join("private")
+        .join(state.file_name().expect("the project's id"));
+    assert!(private.join("artifacts.lock").is_file());
+    assert!(!state.join("artifacts/lock").exists());
 }
 
 #[test]

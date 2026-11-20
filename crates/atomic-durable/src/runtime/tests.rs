@@ -501,6 +501,47 @@ async fn control_authorization_is_rechecked_on_workflow_replay<R: DurableRuntime
     rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
 }
 
+/// Paging by creation time and then id reads every run once, however many
+/// share a millisecond: here, all of them.
+async fn runs_sharing_a_millisecond_are_each_paged_once(mut rt: Durare) {
+    rt.register("named", |_ctx: DurareContext, named: String| async move {
+        Ok::<_, DurableError>(named)
+    });
+    rt.launch().await.expect("launch");
+    let mut ids: Vec<String> = (0..25).map(|i| unique(&format!("tied-{i}"))).collect();
+    for id in &ids {
+        rt.start("named", id, id.clone()).await.expect("start");
+        let _: String = rt.result(id).await.expect("finishes");
+    }
+    rt.control_transaction(|mut tx| {
+        Box::pin(async move {
+            tx.execute("UPDATE workflow_status SET created_at = 1", &[])
+                .await
+                .map(|_| ())
+        })
+    })
+    .await
+    .expect("tie every run");
+    let mut read = Vec::new();
+    let mut after = None;
+    loop {
+        let page = rt.runs_after(after.as_ref(), 4).await.expect("page");
+        read.extend(page.iter().map(|(_, run)| run.record.id.clone()));
+        match page.last() {
+            Some((key, _)) if page.len() == 4 => after = Some(key.clone()),
+            _ => break,
+        }
+    }
+    // Each once, in the store's own order of ids (its collation's).
+    let mut sorted = read.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted.len(), read.len(), "a run was read twice: {read:?}");
+    ids.sort();
+    assert_eq!(sorted, ids);
+    rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+}
+
 async fn the_loser_of_a_checkpoint_race_takes_the_winners_outcome<R: DurableRuntime>(mut rt: R) {
     let entered = Arc::new(AtomicUsize::new(0));
     let meet = Arc::new(tokio::sync::Barrier::new(2));
@@ -670,6 +711,7 @@ on_backend!(
     a_message_is_received_once_and_replayed_after_a_crash,
     a_receive_times_out_at_its_deadline,
     a_control_transaction_commits_its_writes_or_nothing,
+    runs_sharing_a_millisecond_are_each_paged_once,
 );
 
 #[cfg(feature = "postgres-tests")]
@@ -688,6 +730,7 @@ on_backend!(
     a_message_is_received_once_and_replayed_after_a_crash,
     a_receive_times_out_at_its_deadline,
     a_control_transaction_commits_its_writes_or_nothing,
+    runs_sharing_a_millisecond_are_each_paged_once,
 );
 
 /// A serialization conflict raised once in a transaction step is retried by

@@ -193,7 +193,7 @@ pub async fn open(
         .into());
     }
     let endpoint = args.endpoint(needs_model)?;
-    let store = LocalStore::open(state.dir().join("artifacts")).context("the artifact store")?;
+    let store = LocalStore::for_project(state).context("the artifact store")?;
     // Scratch directories live in the project's state directory, outside
     // every directory a sandboxed turn may write. Connected once: what the
     // backend states here is what runs plan on, and connecting reclaims
