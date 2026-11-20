@@ -27,6 +27,7 @@ use atomic_durable::{
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tracing::Instrument;
 
 /// The change-request workflow: draft a task from a request, then review a
 /// candidate commit against it.
@@ -135,6 +136,8 @@ pub fn register_change_request<R: DurableRuntime>(
             let runtimes = runtimes.clone();
             let (budget, draft_caps, review_caps) =
                 (budget.clone(), draft_caps.clone(), review_caps.clone());
+            let run = ctx.workflow_id().to_owned();
+            let span = crate::telemetry::workflow_span(CHANGE_REQUEST, &run);
             async move {
                 let lite = runtimes.lite.clone();
                 let request = ChangeRequest {
@@ -148,7 +151,12 @@ pub fn register_change_request<R: DurableRuntime>(
                         let mut lite = lite.clone();
                         lite.meter = meter.meter(&step, &draft_caps);
                         let request = request.clone();
-                        propose(async move { run_lite_atom(&DraftTask, &request, &lite).await })
+                        let span =
+                            crate::telemetry::step_span("draft-task", "draft", &step.workflow_id);
+                        propose(
+                            async move { run_lite_atom(&DraftTask, &request, &lite).await }
+                                .instrument(span),
+                        )
                     },
                     Vec::new(),
                 )
@@ -174,9 +182,17 @@ pub fn register_change_request<R: DurableRuntime>(
                         let mut codex = codex.clone();
                         codex.meter = budget.meter(&step, &review_caps);
                         let review_request = review_request.clone();
-                        propose(async move {
-                            run_codex_atom(&ReviewPatch, &review_request, &codex).await
-                        })
+                        let span = crate::telemetry::step_span(
+                            "review-patch",
+                            "review",
+                            &step.workflow_id,
+                        );
+                        propose(
+                                async move {
+                                    run_codex_atom(&ReviewPatch, &review_request, &codex).await
+                                }
+                                .instrument(span),
+                            )
                     },
                     Vec::new(),
                 )
@@ -188,6 +204,7 @@ pub fn register_change_request<R: DurableRuntime>(
                     steps: vec![draft, review],
                 })
             }
+            .instrument(span)
         },
     );
     Ok(())

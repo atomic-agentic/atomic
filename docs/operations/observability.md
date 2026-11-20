@@ -26,6 +26,35 @@ This is application-level inspection from durable records. It does not require
 Docker, a Collector, a Datadog account or a trace viewer, and does not imply that
 Atomic embeds a full APM database or dashboard product.
 
+## Export basic spans (v0.1)
+
+Set the standard OpenTelemetry exporter variables and atomic exports a span for
+each workflow run, one for each step it executes and one for each model call,
+over OTLP:
+
+```sh
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf   # or grpc, or http/json
+atomic run triage --data '{"text": "..."}'
+```
+
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS` and the
+exporter's other `OTEL_*` variables work as the specification says, and
+`OTEL_SDK_DISABLED=true` turns export off. With no endpoint set, nothing is
+exported.
+
+| Span | Names | Attributes |
+| --- | --- | --- |
+| A workflow run | `invoke_workflow <workflow>` | `atomic.workflow`, `atomic.workflow.id`, `gen_ai.conversation.id` |
+| An atom step | `invoke_agent <atom>` | `gen_ai.agent.name`, `atomic.step`, `atomic.workflow.id` |
+| A gate step | `atomic.gate <gate>` | `atomic.gate`, `atomic.step`, `atomic.workflow.id` |
+| A model call | `chat <model>` | `gen_ai.request.model`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `error.message` |
+
+A step that replays from its checkpoint after a restart makes no span: only
+work that runs does. Each span's strings are redacted before they are
+exported, as atomic's log lines and error reports are: values that look like
+keys, tokens, passwords or credentials become `[REDACTED]`.
+
 ## Add an optional local trace viewer
 
 The planned developer helper is:

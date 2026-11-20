@@ -229,7 +229,8 @@ pub async fn run(
     // Before anything runs, so a run cut short can be resumed by its id.
     atomic_core::log_line!(
         "run {run_id}: {} in project {}",
-        run.pipeline.name, found.name
+        run.pipeline.name,
+        found.name
     );
     engine.rt.start(PIPELINE, &run_id, run).await?;
     finish(&engine, &run_id, json, &mut signals, "atomic run").await
@@ -465,6 +466,7 @@ async fn stop(signals: &mut Signals, who: &str, exit: Exit) -> ! {
     }
     // Exit here, not by returning: the runtime would wait for the blocked
     // threads of the stopped commands, which never return.
+    atomic_app::telemetry::flush();
     std::process::exit(match exit {
         Exit::Served if forced.is_none() && stopped == 0 => 0,
         Exit::Served => 1,
@@ -540,7 +542,9 @@ pub async fn serve(
             stranded.join(", ")
         );
     }
-    atomic_core::log_line!("atomic serve: recovered {recovered} unfinished run(s); serving until stopped");
+    atomic_core::log_line!(
+        "atomic serve: recovered {recovered} unfinished run(s); serving until stopped"
+    );
     // A decider that stopped before waking its run is caught up within a
     // few seconds, not only at the next start.
     let signal = loop {

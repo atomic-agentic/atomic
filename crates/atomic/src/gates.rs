@@ -189,7 +189,8 @@ async fn decide(
         atomic_core::log_line!(
             "warning: the decision is recorded, but waking run {} failed: {e}; atomic serve or \
              atomic runs resume {} delivers it",
-            found.run, found.run
+            found.run,
+            found.run
         );
     }
     Ok(())

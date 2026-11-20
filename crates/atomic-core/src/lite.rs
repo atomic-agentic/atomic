@@ -26,6 +26,7 @@ use crate::usage::{Call, Limit, Outcome, Usage, meter_error};
 use anyhow::{Context, anyhow, bail};
 use serde_json::{Value, json};
 use std::time::Duration;
+use tracing::Instrument;
 
 /// How long one call may take before it fails, unless the runtime says
 /// otherwise. Reasoning models on local hardware can think for minutes.
@@ -267,6 +268,7 @@ where
         let input_bound = serde_json::to_vec(&unlimited)
             .map(|b| b.len() as u64 + 64)
             .ok();
+        let span = crate::usage::call_span(&model);
         // Admitted before it is dispatched, settled once after.
         let (ticket, limit) = runtime
             .meter
@@ -289,7 +291,14 @@ where
             schema.as_ref(),
             &limit,
         )
+        .instrument(span.clone())
         .await;
+        if let Some(usage) = &called.usage {
+            crate::usage::record_usage(&span, usage);
+        }
+        if let Err(e) = &called.answer {
+            crate::usage::record_error(&span, e);
+        }
         let outcome = match (&called.answer, called.usage) {
             // What the provider reported, whatever it answered.
             (_, Some(usage)) => Outcome::Reported(usage),

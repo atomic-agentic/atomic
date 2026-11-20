@@ -74,6 +74,7 @@ use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tracing::Instrument;
 
 /// The name `run_pipeline` is registered under.
 pub const PIPELINE: &str = "atomic.pipeline";
@@ -668,8 +669,9 @@ async fn run_pipeline<C: WorkflowContext>(
             Step::Gate(g) => {
                 // Waiting for a person is not work a stop waits for.
                 working = None;
-                let decision =
-                    run_gate(&ctx, &pipeline.name, g, &values, &services.deployment).await?;
+                let decision = run_gate(&ctx, &pipeline.name, g, &values, &services.deployment)
+                    .instrument(crate::telemetry::gate_span(&g.id, ctx.workflow_id()))
+                    .await?;
                 failpoint(&format!("pipeline:after:{}", g.id));
                 steps.insert(g.id.clone(), json!({ "decision": decision }));
                 shapes.insert(
@@ -814,6 +816,9 @@ async fn run_pipeline<C: WorkflowContext>(
                     runtimes.codex.meter = meter.clone();
                     runtimes.lite.meter = meter;
                 }
+                // Made here, in the step's body, so a step that replays from
+                // its checkpoint makes none.
+                let span = crate::telemetry::step_span(&atom.name, &id, &run_id);
                 async move {
                 // The run's helpers run only as recorded, on the runtime the
                 // run started on; anything else is refused rather than
@@ -869,6 +874,7 @@ async fn run_pipeline<C: WorkflowContext>(
                 failpoint(&ran);
                 Ok(proposal)
                 }
+                .instrument(span)
             },
             Vec::new(),
         )
@@ -1125,6 +1131,7 @@ pub fn register_pipeline<R: DurableRuntime>(rt: &mut R, services: Services) {
     let services = Arc::new(services);
     let ledger = rt.ledger();
     rt.register(PIPELINE, move |ctx: R::Context, run: PipelineRun| {
-        run_pipeline(ctx, run, services.clone(), ledger.clone())
+        let span = crate::telemetry::workflow_span(&run.pipeline.name, ctx.workflow_id());
+        run_pipeline(ctx, run, services.clone(), ledger.clone()).instrument(span)
     });
 }

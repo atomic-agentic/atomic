@@ -206,3 +206,31 @@ pub(crate) fn meter_error(e: MeterError) -> anyhow::Error {
 pub(crate) fn meter_failure(e: &anyhow::Error) -> Option<&MeterError> {
     e.chain().find_map(|c| c.downcast_ref::<MeterError>())
 }
+
+/// The span of one model call, named as the GenAI conventions name a chat
+/// call. Its usage is recorded on it when the provider reports any.
+pub(crate) fn call_span(model: &str) -> tracing::Span {
+    tracing::info_span!(
+        "chat",
+        otel.name = %format!("chat {model}"),
+        gen_ai.operation.name = "chat",
+        gen_ai.request.model = %model,
+        gen_ai.usage.input_tokens = tracing::field::Empty,
+        gen_ai.usage.output_tokens = tracing::field::Empty,
+        error.message = tracing::field::Empty,
+    )
+}
+
+/// Record on `span` what a call spent.
+pub(crate) fn record_usage(span: &tracing::Span, usage: &Usage) {
+    span.record("gen_ai.usage.input_tokens", usage.input_tokens);
+    span.record("gen_ai.usage.output_tokens", usage.output_tokens);
+}
+
+/// Record on `span` why a call failed. The exporter redacts it.
+pub(crate) fn record_error(span: &tracing::Span, error: &anyhow::Error) {
+    span.record(
+        "error.message",
+        tracing::field::display(format!("{error:#}")),
+    );
+}

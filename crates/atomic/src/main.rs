@@ -2,6 +2,10 @@
 
 //! The `atomic` command-line program.
 
+// The workflows' futures, spans around them included, nest deeply inside
+// Codex's; proving them Send needs more than the default query depth.
+#![recursion_limit = "512"]
+
 use anyhow::Context;
 use atomic_core::codex::{self, CodexPaths, ModelEndpoint};
 use atomic_core::project;
@@ -210,6 +214,11 @@ fn main() -> anyhow::Result<()> {
             .and_then(|root| ProjectState::resolve(&root).map_err(anyhow::Error::from))
             .and_then(|s| s.create().map(|()| s).map_err(anyhow::Error::from))
     };
+    // Spans go where the standard OTEL_EXPORTER_OTLP_* variables say, if
+    // they say; a bad setting is reported and the command runs without them.
+    if let Err(e) = atomic_app::telemetry::init_from_env() {
+        atomic_core::log_line!("warning: telemetry is off: {e:#}");
+    }
     let codex_home = match &state {
         Ok(s) => s.codex_home(),
         // Never created: Codex finds no home and creates nothing.
@@ -227,8 +236,10 @@ fn main() -> anyhow::Result<()> {
         };
         if let Err(e) = outcome {
             failure::report(&failure::analyze(&e), json);
+            atomic_app::telemetry::flush();
             std::process::exit(1);
         }
+        atomic_app::telemetry::flush();
         Ok(())
     })
 }

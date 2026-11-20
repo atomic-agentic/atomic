@@ -358,7 +358,9 @@ where
             leave_session_keyring()
         };
         if let Err(e) = kept_off {
-            crate::log_line!("atomic: cannot keep a sandboxed command off the kernel keyrings: {e}");
+            crate::log_line!(
+                "atomic: cannot keep a sandboxed command off the kernel keyrings: {e}"
+            );
             std::process::exit(1);
         }
     }
@@ -804,10 +806,19 @@ where
             Err(e) => break Err(meter_error(e)),
         };
         report.turns += 1;
+        let span = crate::usage::call_span(&endpoint.model);
         let bounded_by = ticket.as_ref().and_then(|t| t.bounded_by.clone());
         // A turn is cut off when its reserved time runs out; a failed or cut
         // off turn still reports the usage seen before it stopped.
-        let (turn, totals) = run_turn(&thread, &current, limit.time).await;
+        let (turn, totals) = {
+            use tracing::Instrument;
+            run_turn(&thread, &current, limit.time)
+                .instrument(span.clone())
+                .await
+        };
+        if let Err(e) = &turn {
+            crate::usage::record_error(&span, e);
+        }
         // Codex repeats the last totals in every token count, so a turn
         // whose requests reported nothing shows them unchanged; a request
         // that reports usage always grows them. A turn with nothing reported
@@ -820,6 +831,7 @@ where
                     output_tokens: (output - seen.1).max(0),
                 };
                 seen = (input, output);
+                crate::usage::record_usage(&span, &grown);
                 report.input_tokens = input;
                 report.output_tokens = output;
                 report.total_tokens = total;
