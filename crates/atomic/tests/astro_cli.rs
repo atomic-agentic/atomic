@@ -29,6 +29,7 @@ impl Fixture {
             .env_remove("XDG_STATE_HOME")
             .env_remove("XDG_CACHE_HOME")
             .env_remove("XDG_CONFIG_HOME")
+            .env_remove("XDG_CONFIG_HOME")
             .env("SUPPORT_REGION", region)
             .output()
             .expect("CLI process")

@@ -1,0 +1,12 @@
+{"time": 1767225600, "severity": "info", "message": "service started on port 9411"}
+{"time": 1767225601, "severity": "debug", "message": "loaded 42 tariff rules from /srv/tariffs/current.yaml in 18 ms"}
+{"time": 1767225602, "severity": "warning", "message": "retrying invoice export for account 88123 after a timeout from the ledger service (attempt 3 of 5)"}
+{"time": 1767225603, "severity": "info", "message": "customer note:\n\tplease call before delivery"}
+{"time": 1767225604, "severity": "info", "message": "請求書 88123 を送信しました。お客様の住所が変更されているため、配送部門に確認を依頼しています。"}
+{"time": 1767225605, "severity": "notice", "message": "Rechnung für Müller & Söhne erstellt; Zahlungsziel überschritten, Mahnstufe zwei wird vorbereitet für nächste Woche"}
+{"time": 1767225606, "severity": "err", "message": "payment provider answered 502 🙁🙁🙁 for batch 7781, keeping the batch queued for the next run"}
+{"time": 1767225607, "severity": "info", "host": "brú-edge-01", "message": "nightly reconciliation finished: 1204 invoices matched, 3 left for review by the accounts team"}
+{"time": 1767225608, "severity": "info", "app": "fakturačný-modul", "message": "export to the archive finished for the period 2025-12, 9134 documents written"}
+{"time": 1767225609, "severity": "crit", "message": "ledger connection pool exhausted"}
+{"time": 1767225610, "severity": "info", "message": "客户 5521 的订单已确认，仓库正在准备发货，预计三个工作日内送达，请留意短信通知"}
+{"time": 1767225611, "severity": "debug", "message": "short"}

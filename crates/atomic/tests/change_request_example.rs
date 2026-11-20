@@ -100,6 +100,10 @@ fn repository(dir: &Path, layout: &str) -> (PathBuf, String) {
         .arg("check")
         .current_dir(&project)
         .env("ATOMIC_HOME", dir.join("atomic-home"))
+        // None of the developer's own configuration, and no model found.
+        .env("XDG_CONFIG_HOME", dir.join("config"))
+        .env("ATOMIC_DETECT_OLLAMA_ADDR", "127.0.0.1:9")
+        .env_remove("OPENAI_API_KEY")
         .output()
         .expect("atomic check");
     assert!(
@@ -185,6 +189,7 @@ async fn engine(dir: &Path, project: &Path, base_url: &str) -> Durare {
             defaults: AtomConfig::default(),
             artifacts: Artifacts::none(),
             meter: atomic_core::usage::Metering::none(),
+            backend: Default::default(),
         },
         lite: LiteRuntime::new(endpoint, AtomConfig::default()),
         exec: Default::default(),

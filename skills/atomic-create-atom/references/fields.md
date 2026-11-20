@@ -56,11 +56,11 @@ Every field is optional.
 - **`budget`** (`unknown`): Spending limits for one run. Omit it to inherit the finite project defaults.
 - **`retry`** (`unknown`): Repair and retry policy. Omit it to use the defaults.
 - **`validate`** (`((context: Context<I, O, C, R>) => boolean)[]`): A list of expression-bodied arrow functions over `{input, output}` that return a boolean, for rules a schema cannot state. A `false` result rejects the answer and the rule's source goes back to the model for repair. Never quoted CEL strings.
-- **`evals`** (`unknown`): The directory of eval cases, relative to the atom file. Omit it to use `evals/<name>/` beside the manifest.
+- **`evals`** (`string | {dir?: string; pass_rate?: number}`): The directory of eval cases, relative to the atom file, or `{dir, pass_rate}` where `pass_rate` (0 to 1, default 1) is the share of cases CI requires to pass. Omit it to use `evals/<name>/` beside the manifest and require every case.
 - **`exec`** (`unknown`): For `kind: 'exec'`: `{command: ['program', 'arg', …]}`. The command reads the input as JSON on standard input and writes the output as JSON on standard output.
 - **`effects`** (`unknown`): Outside-world effects an `exec` atom performs. Omit it for atoms that only compute.
 - **`env`** (`unknown`): Public environment variable names the atom may read through its context. Never secrets.
-- **`scorers`** (`Record<string, Scorer<I, O, C, J, R>>`): Bindings from a declared judge to a numeric score with a `min_mean` threshold between 0 and 1. Leave out unless the task needs a judge.
+- **`scorers`** (`Record<string, Scorer<I, O, C, J, R>>`): Bindings from a declared judge to a numeric score with a `min_mean` threshold between 0 and 1, and optionally a `max_drop` tolerance against a baseline revision. Leave out unless the task needs a judge.
 - **`examples`** (`{name: string; input: I; output: O}[]`): Named `{name, input, output}` examples. `atomic check` validates both values against the full schemas. Write at least one.
 - **`context`** (`unknown`): The schema of public execution context the prompt reads, or a `<file-stem>.context.schema.yaml` sidecar. Leave out unless the prompt reads context.
 - **`case`** (`unknown`): The schema of the metadata eval cases carry for judges. Leave out unless the atom has judges.

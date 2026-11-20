@@ -37,12 +37,14 @@ async fn sqlite() -> Durare {
     Durare::sqlite(&path).await.expect("sqlite engine")
 }
 
+/// An engine on a schema of its own, which the returned guard drops.
 #[cfg(feature = "postgres-tests")]
-async fn postgres() -> Durare {
-    let url = crate::testing::database().await;
-    Durare::postgres(&url, &unique("atomic_usage"))
+async fn postgres() -> (Durare, crate::testing::TestSchema) {
+    let schema = crate::testing::schema("usage").await;
+    let rt = Durare::postgres(schema.url(), schema.name())
         .await
-        .expect("postgres engine")
+        .expect("postgres engine");
+    (rt, schema)
 }
 
 const BOUND: Charge = Charge {
@@ -814,7 +816,9 @@ macro_rules! on_postgres {
             $(
                 #[tokio::test(flavor = "multi_thread")]
                 async fn $name() {
-                    super::$name(super::postgres().await).await;
+                    // The schema outlives the engine.
+                    let (rt, _schema) = super::postgres().await;
+                    super::$name(rt).await;
                 }
             )*
         }

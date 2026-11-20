@@ -234,8 +234,9 @@ const FIELD_NOTES: &[(&str, &str)] = &[
     ),
     (
         "evals",
-        "The directory of eval cases, relative to the atom file. Omit it to use \
-         `evals/<name>/` beside the manifest.",
+        "The directory of eval cases, relative to the atom file, or `{dir, pass_rate}` \
+         where `pass_rate` (0 to 1, default 1) is the share of cases CI requires to pass. Omit \
+         it to use `evals/<name>/` beside the manifest and require every case.",
     ),
     (
         "exec",
@@ -254,7 +255,8 @@ const FIELD_NOTES: &[(&str, &str)] = &[
     (
         "scorers",
         "Bindings from a declared judge to a numeric score with a `min_mean` threshold \
-         between 0 and 1. Leave out unless the task needs a judge.",
+         between 0 and 1, and optionally a `max_drop` tolerance against a baseline revision. \
+         Leave out unless the task needs a judge.",
     ),
     (
         "examples",
@@ -797,7 +799,12 @@ pub fn cel_reference() -> String {
         "\nCEL is not JavaScript: strings use `size()`, not `.length`; lists use \
          `exists`, `all`, `filter` and `map` with a variable name as the first argument; \
          `has(output.field)` tests an optional field; strings are single- or \
-         double-quoted; `==` compares values and there is no `===`.\n",
+         double-quoted; `==` compares values and there is no `===`.\n\n\
+         Numbers take their type from the schema: an `integer` field is a CEL `int` \
+         and a `number` field a `double`, however the value is written; a field the \
+         schema does not type keeps an integer as an `int`. Comparisons mix the two \
+         (`output.score >= 1`), arithmetic does not: write `output.score * 2.0` for a \
+         `number` field.\n",
     );
     out
 }

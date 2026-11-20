@@ -7,13 +7,16 @@ use atomic_core::codex::{self, CodexPaths, ModelEndpoint};
 use atomic_core::project;
 use atomic_core::state::ProjectState;
 use clap::{Args, Parser, Subcommand};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 mod engine;
 mod failure;
 mod gates;
+mod init;
 mod runs;
+mod settings;
 mod setup;
+mod show;
 mod skills;
 mod target;
 
@@ -45,6 +48,13 @@ enum Command {
     },
     /// Render an Astro prompt without calling a model or running scripts.
     Render(RenderArgs),
+    /// Show every setting the project resolves to here; with --explain,
+    /// where each came from and why, secrets masked.
+    Config(settings::ConfigArgs),
+    /// Make a new project here: a manifest, a sample atom and schemas, a
+    /// workflow and an eval case. In a directory that holds code, under
+    /// `.atomic/`.
+    Init(init::InitArgs),
     /// Run an atom or a workflow in the foreground and print its output.
     Run(runs::RunArgs),
     /// Continue runs.
@@ -80,6 +90,10 @@ enum Runs {
     /// Continue an unfinished run in the foreground, from its checkpoints,
     /// with the definitions and input it started with.
     Resume(runs::ResumeArgs),
+    /// Show everything the store recorded about a run: its steps, which
+    /// attempt ran each and which came from checkpoints, its input and
+    /// output, its spend, its gates and its transcripts.
+    Show(show::ShowArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -149,10 +163,13 @@ impl PromptArgs {
     }
 }
 
-/// The names Codex starts this executable under to run one of its helpers.
-const CODEX_HELPER_NAMES: &[&str] = &["codex-linux-sandbox", "apply_patch", "applypatch"];
-
 fn main() -> anyhow::Result<()> {
+    // A Codex helper, such as the Linux sandbox inside a turn, runs before
+    // anything else: no state directory is resolved or created, since its
+    // HOME is the turn's own scratch directory.
+    if codex::is_helper(std::env::args_os()) {
+        return codex::run_helper();
+    }
     // A helper child serves one call and exits, before anything else starts:
     // no state directory, no Codex dispatch.
     if std::env::args_os().nth(1).as_deref()
@@ -167,8 +184,7 @@ fn main() -> anyhow::Result<()> {
     }
     let parsed = Cli::try_parse();
     // Help and the version create nothing on disk, and print only themselves:
-    // they need no Codex either, unless this process was started under the
-    // name of one of Codex's helpers, which read their own arguments.
+    // they need no Codex either (Codex's helpers were dispatched above).
     let quiet = parsed.as_ref().err().is_some_and(|e| {
         use clap::error::ErrorKind;
         matches!(
@@ -178,18 +194,7 @@ fn main() -> anyhow::Result<()> {
                 | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
         )
     });
-    let not_a_helper = std::env::args_os()
-        .next()
-        .and_then(|arg0| {
-            Path::new(&arg0)
-                .file_name()
-                .map(|name| !CODEX_HELPER_NAMES.contains(&name.to_string_lossy().as_ref()))
-        })
-        .unwrap_or(true);
-    if quiet
-        && not_a_helper
-        && let Err(e) = &parsed
-    {
+    if quiet && let Err(e) = &parsed {
         e.exit();
     }
     // The runner role after global flags, such as `atomic --json runner`.
@@ -293,9 +298,12 @@ async fn run(cli: Cli, paths: CodexPaths, state: ProjectState) -> anyhow::Result
         }
         Some(Command::Run(args)) => runs::run(args, project, &paths, json).await,
         Some(Command::Runs(Runs::Resume(args))) => runs::resume(args, project, &paths, json).await,
+        Some(Command::Runs(Runs::Show(args))) => show::show(args, project, json).await,
         Some(Command::Serve(args)) => runs::serve(args, project, &paths).await,
         Some(Command::Runner) => Ok(()),
         Some(Command::Render(args)) => tokio::task::spawn_blocking(move || render(args)).await?,
+        Some(Command::Config(args)) => settings::config(&args, project, json),
+        Some(Command::Init(args)) => init::init(args),
         Some(Command::Schemas { path, command }) => match command {
             Some(SchemasCommand::Expand { atom }) => {
                 tokio::task::spawn_blocking(move || expand(&atom)).await?
@@ -402,7 +410,10 @@ fn check(path: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
         if json {
             println!(
                 "{}",
-                serde_json::json!({"checked": {"atoms": 1, "workflows": 0}, "warnings": []})
+                serde_json::json!({
+                    "checked": {"atoms": 1, "workflows": 0, "toolset_operations": 0},
+                    "warnings": []
+                })
             );
         } else {
             println!("checked {}", atom.file.display());
@@ -410,6 +421,23 @@ fn check(path: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
         return Ok(());
     }
     let project = project::discover(&path)?;
+    // Each manifest's settings, read as `atomic run` from its directory
+    // would read them, contacting nothing: a setting run would refuse fails
+    // here instead.
+    let mut manifests = vec![project.clone()];
+    if project.members.is_some() {
+        manifests.extend(project::members(&project)?);
+    }
+    for manifest in &manifests {
+        settings::check(&manifest.dir).map_err(|e| {
+            failure::Failure::new(
+                "config.invalid",
+                format!("the configuration cannot be read: {e}"),
+                "fix the setting it names; `atomic config --explain` lists every setting and \
+                 where it comes from",
+            )
+        })?;
+    }
     let files = collections::collect(&project)?;
     collections::load_schemas(&project, &mut registry).map_err(anyhow::Error::msg)?;
     let mut atoms = std::collections::BTreeMap::new();
@@ -451,6 +479,13 @@ fn check(path: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
             }
         }
         operations += tools.len();
+    }
+    let mut warnings = Vec::new();
+    for source in &files["workflows"] {
+        let loaded = workflow::load(&source.path, &atoms, &mut registry)?;
+        for w in loaded.warnings {
+            warnings.push(format!("{}: {w}", loaded.file.display()));
+        }
     }
     if json {
         println!(
@@ -656,15 +691,27 @@ async fn prompt(
     state: &ProjectState,
     args: &PromptArgs,
 ) -> anyhow::Result<String> {
-    let cwd: PathBuf = state.root().to_owned();
-    let guard = codex::StateGuard::for_project(state)?;
-    codex::one_turn(
-        paths,
-        &state.codex_home(),
-        &cwd,
-        &args.endpoint(),
-        &guard,
-        &args.prompt.join(" "),
-    )
-    .await
+    // A backend of its own, beside the one `atomic run` and `atomic serve`
+    // use: this command takes no execution lock, and connecting empties a
+    // backend's shared temporary directory, which their turns may be using.
+    let backend = atomic_exec::Backend::connect(atomic_exec::LocalBackend::in_dir(
+        state.dir().join("scratch-debug"),
+    ))
+    .context("connect to the execution backend")?;
+    let runtime = atomic_core::runtime::CodexRuntime {
+        paths: paths.clone(),
+        codex_home: state.codex_home(),
+        cwd: state.root().to_owned(),
+        endpoint: args.endpoint(),
+        defaults: atomic_core::AtomConfig::default(),
+        artifacts: atomic_core::runtime::Artifacts::none(),
+        meter: atomic_core::usage::Metering::none(),
+        guard: codex::StateGuard::for_project(state)?,
+        backend,
+    };
+    let spec = codex::TurnSpec {
+        prompt: args.prompt.join(" "),
+        ..codex::TurnSpec::default()
+    };
+    Ok(atomic_core::runtime::run_turn(&runtime, &spec).await?)
 }

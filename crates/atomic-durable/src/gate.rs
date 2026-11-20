@@ -823,7 +823,7 @@ async fn wake<R: DurableRuntime>(rt: &R, run: &str, gate: &str) -> Result<()> {
 
 /// Every gate the filter selects, oldest first.
 pub async fn gates<R: DurableRuntime>(rt: &R, filter: GateFilter) -> Result<Vec<Gate>> {
-    rt.control_transaction(move |mut tx| {
+    rt.read_transaction(move |mut tx| {
         let filter = filter.clone();
         Box::pin(async move {
             let mut sql = format!("SELECT {COLUMNS} FROM atomic_gates WHERE 1 = 1");

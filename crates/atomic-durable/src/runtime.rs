@@ -111,6 +111,10 @@ pub struct StepRecord {
     pub output: Option<Value>,
     /// Its error, if it failed.
     pub error: Option<String>,
+    /// When it started, in milliseconds since the Unix epoch, if recorded.
+    pub started_at: Option<i64>,
+    /// When it completed, in milliseconds since the Unix epoch, if recorded.
+    pub completed_at: Option<i64>,
 }
 
 /// Which model thread a published step ran on.
@@ -568,6 +572,14 @@ pub trait DurableRuntime: Send + Sync + Sized {
         T: Send + 'static,
         F: for<'t, 'c> Fn(Tx<'t, 'c>) -> TxFuture<'t, T> + Send + Sync + 'static;
 
+    /// Read atomic's tables in one transaction, outside any workflow, that
+    /// takes no write lock, so it answers while a writer holds one; it is
+    /// rolled back. The body only reads.
+    fn read_transaction<T, F>(&self, body: F) -> impl Future<Output = Result<T>> + Send
+    where
+        T: Send + 'static,
+        F: for<'t, 'c> Fn(Tx<'t, 'c>) -> TxFuture<'t, T> + Send + Sync + 'static;
+
     /// The usage ledger in this runtime's database (see [`crate::usage`]):
     /// budget accounting, apart from step outputs and telemetry.
     fn ledger(&self) -> Ledger;
@@ -907,6 +919,29 @@ impl Reads {
         }
     }
 
+    /// Run read-only `body` in a transaction on atomic's tables that takes no
+    /// write lock, so it answers while a writer holds one, and roll it back.
+    pub(crate) async fn read<T, F>(&self, body: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: for<'t, 'c> Fn(Tx<'t, 'c>) -> TxFuture<'t, T> + Send + Sync + 'static,
+    {
+        match self {
+            Reads::Sqlite(pool) => {
+                let mut tx = pool.begin().await.map_err(db)?;
+                let out = body(Tx(TxInner::Sqlite(&mut tx))).await;
+                tx.rollback().await.map_err(db)?;
+                out
+            }
+            Reads::Postgres(pool) => {
+                let mut tx = pool.begin().await.map_err(db)?;
+                let out = body(Tx(TxInner::Postgres(&mut tx))).await;
+                tx.rollback().await.map_err(db)?;
+                out
+            }
+        }
+    }
+
     /// Run `body` in one short transaction on atomic's tables, committing or
     /// rolling back as it says; an error rolls back. On SQLite the write lock
     /// is taken up front, so a read followed by a write in the body cannot
@@ -1069,6 +1104,20 @@ impl Durare {
             .await
             .map_err(from_durare)?;
         Ok(found.into_iter().next().map(RunRecord::from))
+    }
+
+    /// The input run `id` was started with, as stored, or `None` if there
+    /// is no such run.
+    pub async fn run_input(&self, id: &str) -> Result<Option<Value>> {
+        let found = self
+            .engine
+            .list_workflows(&durare::ListFilter {
+                workflow_ids: vec![id.to_owned()],
+                ..durare::ListFilter::default()
+            })
+            .await
+            .map_err(from_durare)?;
+        Ok(found.into_iter().next().map(|w| w.input))
     }
 
     /// Every run in the store in engine state `state`, such as
@@ -1328,6 +1377,8 @@ impl DurableRuntime for Durare {
                     name: s.name,
                     output: s.output,
                     error: s.error,
+                    started_at: s.started_at.map(|t| t.timestamp_millis()),
+                    completed_at: s.completed_at.map(|t| t.timestamp_millis()),
                 })
                 .collect())
         }
@@ -1401,6 +1452,14 @@ impl DurableRuntime for Durare {
         F: for<'t, 'c> Fn(Tx<'t, 'c>) -> TxFuture<'t, T> + Send + Sync + 'static,
     {
         self.reads.control_transaction(body).await
+    }
+
+    async fn read_transaction<T, F>(&self, body: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: for<'t, 'c> Fn(Tx<'t, 'c>) -> TxFuture<'t, T> + Send + Sync + 'static,
+    {
+        self.reads.read(body).await
     }
 
     fn ledger(&self) -> Ledger {

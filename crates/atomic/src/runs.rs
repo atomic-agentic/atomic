@@ -318,7 +318,7 @@ pub async fn run(
 }
 
 /// The state of the project a command that names no target works on.
-fn state(project: Option<&Path>) -> anyhow::Result<ProjectState> {
+pub(crate) fn state(project: Option<&Path>) -> anyhow::Result<ProjectState> {
     let cwd = std::env::current_dir()?;
     let found = target::project_for(project, None, &cwd)?;
     Ok(ProjectState::resolve(found.root())?)
@@ -562,6 +562,9 @@ pub async fn serve(
     paths: &CodexPaths,
 ) -> anyhow::Result<()> {
     let mut signals = Signals::new()?;
+    // One run whose commands cannot be confined here does not stop the
+    // others: it stays unfinished, and serve goes on.
+    atomic_app::workflows::serve_past_unconfinable_steps();
     let state = state(project)?;
     let engine = engine::open(
         &state,
