@@ -750,7 +750,7 @@ async fn prompt(
     state: &ProjectState,
     args: &PromptArgs,
 ) -> anyhow::Result<String> {
-    // The one model call atomic makes outside a run: said, never silent.
+    // The only model call atomic makes without a meter: said, never silent.
     atomic_core::log_line!("{UNMETERED}");
     // A backend of its own, beside the one `atomic run` and `atomic serve`
     // use: this command takes no execution lock, and connecting empties a

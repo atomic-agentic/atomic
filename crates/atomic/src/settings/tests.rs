@@ -826,27 +826,39 @@ fn the_budget_layers_like_every_other_setting_and_says_where_each_limit_came_fro
     assert_eq!(file(&r, "budget.workflow.minutes"), "atomic.yaml");
     assert_eq!(file(&r, "budget.call.minutes"), "config.yaml");
     assert_eq!(source(&r, "budget.atom.minutes"), &Source::Default);
+    assert_eq!(
+        source(&r, "budget.workflow.cost_usd"),
+        &Source::Env("ATOMIC_BUDGET_WORKFLOW_COST_USD".into())
+    );
 
     // Without the variable, the local file wins; without that, the
     // project's; without that, the person's own.
     let r = resolved(&d, &EngineArgs::default(), &vars[..1], &nobody);
     assert_eq!(r.settings.budget.atom.tokens, 300);
+    assert_eq!(file(&r, "budget.atom.tokens"), "atomic.local.yaml");
     std::fs::remove_file(d.join("atomic.local.yaml")).expect("remove");
     let r = resolved(&d, &EngineArgs::default(), &vars[..1], &nobody);
     assert_eq!(r.settings.budget.atom.tokens, 200);
+    assert_eq!(file(&r, "budget.atom.tokens"), "atomic.yaml");
     std::fs::write(d.join("atomic.yaml"), MANIFEST_ONLY).expect("manifest");
     let r = resolved(&d, &EngineArgs::default(), &vars[..1], &nobody);
     assert_eq!(r.settings.budget.atom.tokens, 100);
+    assert_eq!(file(&r, "budget.atom.tokens"), "config.yaml");
 
-    // A variable that does not read as its limit is refused, by name.
-    let said = resolved_where(
-        &d,
-        &EngineArgs::default(),
-        &[("ATOMIC_BUDGET_ATOM_TOKENS", "lots")],
-        &nobody,
-    )
-    .expect_err("refused")
-    .to_string();
-    assert!(said.contains("ATOMIC_BUDGET_ATOM_TOKENS"), "{said}");
-    assert!(!said.contains("lots"), "{said}");
+    // A variable that does not read as its limit is refused, by name and
+    // without its value: a word, a negative count, and a word for a dollar
+    // cap, which has no default to read it by.
+    for (name, value) in [
+        ("ATOMIC_BUDGET_ATOM_TOKENS", "lots"),
+        ("ATOMIC_BUDGET_ATOM_TOKENS", "-5"),
+        ("ATOMIC_BUDGET_CALL_MINUTES", "soon"),
+        ("ATOMIC_BUDGET_ATOM_COST_USD", "lots"),
+        ("ATOMIC_BUDGET_WORKFLOW_COST_USD", "plenty"),
+    ] {
+        let said = resolved_where(&d, &EngineArgs::default(), &[(name, value)], &nobody)
+            .expect_err("refused")
+            .to_string();
+        assert!(said.contains(name), "{name}={value}: {said}");
+        assert!(!said.contains(value), "{name}={value}: {said}");
+    }
 }

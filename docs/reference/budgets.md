@@ -3,13 +3,13 @@
 Budgets bound the work an atom or workflow can attempt. They are part of the
 **v0.1 target**. The `budget` field, its defaults, the price table and the usage
 ledger described below are implemented and tested against the scripted fake
-model; the `atomic config --explain` and `atomic runs show` commands that display
-them are not yet.
+model. `atomic config --explain` shows the budget settings and where each came
+from, and `atomic runs show` shows a run's model calls and tokens.
 
 You can start with finite runtime defaults. Inspect them with
-`atomic config --explain` once it ships; override a cap when the task needs it.
-The current defaults are provisional and may change as they are tested against
-real providers.
+`atomic config --explain`; override a cap when the task needs it. The current
+defaults are provisional and may change as they are tested against real
+providers.
 
 ## Set a cap
 
@@ -55,8 +55,13 @@ and an estimated cost range, beside the cap, without calling a model.
 ## Defaults and prices
 
 Omitted limits come from the `budget` section of the configuration, which layers
-like every other setting (`atomic.yaml`, `atomic.local.yaml`, a profile, then
-`ATOMIC_*` variables such as `ATOMIC_BUDGET_ATOM_TOKENS`):
+like every other setting: your own configuration
+(`~/.config/atomic/config.yaml`), then `atomic.yaml`, then `atomic.local.yaml`,
+then `ATOMIC_BUDGET_*` variables such as `ATOMIC_BUDGET_ATOM_TOKENS`, each limit
+taken from the last of them that sets it. A variable atomic cannot read as its
+limit is refused, naming the variable. `pricing` is one setting, not one per
+model: a layer that sets it replaces the whole table below it rather than adding
+to it.
 
 ```yaml
 budget:
@@ -92,9 +97,10 @@ them: a run resumed after the configuration changed is metered as it began.
 from.
 
 Every model call a run makes is metered: a step whose atom calls a model and
-that the run has no caps for is refused, never run without a meter. The hidden
-developer diagnostics `atomic debug codex-prompt` and `atomic debug probe` make
-the one model call outside a run; it is not metered, and they say so on stderr.
+that the run has no caps for is refused, never run without a meter. A live
+`atomic eval` is metered as a step is (see [eval cases](eval-cases.md)). The
+hidden developer diagnostics `atomic debug codex-prompt` and `atomic debug probe`
+make the only model call atomic makes without a meter, and say so on stderr.
 
 ## Bound a whole workflow
 
