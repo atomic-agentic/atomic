@@ -632,7 +632,7 @@ impl atomic_exec::Confine for ExecSandbox {
         let done =
             atomic_exec::ExecutionBackend::run(&atomic_exec::LocalBackend::default(), &confined);
         let refuse = |why: String| atomic_exec::ExecError::Workspace {
-            label: "connect".into(),
+            label: "the execution backend".into(),
             message: format!(
                 "exec atoms' commands run under Codex's Linux sandbox, which cannot start here \
                  ({why}). It needs bubblewrap and unprivileged user namespaces; in a container, \
@@ -1616,29 +1616,6 @@ mod tests {
             );
         }
         assert!(text.contains("restricted"), "no network: {text}");
-    }
-
-    /// A machine where the sandbox helper cannot run a command fails the
-    /// backend's connect with what is needed, not every exec command later.
-    #[test]
-    fn a_sandbox_that_cannot_start_fails_the_backend_at_connect() {
-        use atomic_exec::ExecutionBackend;
-        // Not under /tmp, which connect refuses before it checks the sandbox.
-        let state = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/atomic-core-tests")
-            .join(format!("exec-sandbox-check-{}", std::process::id()));
-        let paths =
-            CodexPaths::with_helpers(PathBuf::from("/bin/false"), PathBuf::from("/bin/false"));
-        let sandbox = ExecSandbox::new(&paths, StateGuard::NoProjectState, state.join("codex"))
-            .expect("a helper");
-        let backend = atomic_exec::LocalBackend::in_dir(state.join("scratch"))
-            .confined(std::sync::Arc::new(sandbox));
-        let error = backend.connect().expect_err("refused");
-        assert!(
-            error.to_string().contains("cannot start here")
-                && error.to_string().contains("unprivileged user namespaces"),
-            "{error}"
-        );
     }
 
     #[test]

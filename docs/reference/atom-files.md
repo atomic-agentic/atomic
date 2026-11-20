@@ -69,9 +69,11 @@ it cannot set `HOME`, `ZDOTDIR` or `TMPDIR`, nor a variable the dynamic loader
 reads (`LD_*`, `DYLD_*`, `GCONV_PATH`, `GLIBC_TUNABLES`), which would load code
 into the sandbox helper.
 
-On Linux, atomic needs bubblewrap and unprivileged user namespaces to run, and
-says so when it starts if the sandbox cannot run there. On macOS and Windows
-the command is not confined yet.
+On Linux, an atom that runs commands, an exec atom or a codex atom, needs
+bubblewrap and unprivileged user namespaces. Where the sandbox cannot run, the
+first such step fails before anything runs, saying what it needs; atoms that
+run no commands, such as lite atoms, run as usual. On macOS and Windows the
+command is not confined yet.
 
 A step runs at least once, and Atomic cannot see what a command does to other
 systems. If execution is interrupted after the command started and before its

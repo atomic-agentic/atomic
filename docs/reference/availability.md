@@ -96,8 +96,9 @@ Codex's sandbox, which denies them the private part of every project's state
 directory, Codex's own records, the credential and key directories, the kernel
 keyrings, the network and sockets. An exec atom's command may write only its
 scratch directory and the project's caches; `--runner process` confines it the
-same way. Atomic needs bubblewrap and unprivileged user namespaces there, and
-refuses to start, saying so, where the sandbox cannot run. On macOS and Windows
+same way. A step that runs commands needs bubblewrap and unprivileged user
+namespaces there; where the sandbox cannot run, it fails before anything runs,
+saying so, and atoms that run no commands still run. On macOS and Windows
 this has not been verified: exec atoms' commands run unconfined there, so
 atomic keeps no operator credential and refuses credentialed gate decisions.
 

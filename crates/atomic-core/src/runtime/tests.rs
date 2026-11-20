@@ -1787,3 +1787,84 @@ fn a_codex_atom_passes_its_declared_tool_homes_to_its_workspace() {
         }
     });
 }
+
+/// Where the sandbox cannot run, the backend still connects and an atom
+/// that needs no sandbox, such as a lite atom, runs; an exec atom, or a
+/// codex atom whose turn would run commands, fails before anything runs,
+/// with what the sandbox needs. The check is made once.
+#[test]
+fn only_atoms_that_run_commands_need_the_sandbox() {
+    use crate::codex::{CodexPaths, ExecSandbox, StateGuard};
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(CLASSIFIED.into())])
+            .await
+            .expect("fake model");
+        // Not under /tmp, which connect refuses.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/atomic-core-tests")
+            .join(format!("no-sandbox-{}", std::process::id()));
+        let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        struct Counting(ExecSandbox, Arc<std::sync::atomic::AtomicUsize>);
+        impl atomic_exec::Confine for Counting {
+            fn confine(
+                &self,
+                command: &atomic_exec::Command,
+                tmp: &std::path::Path,
+            ) -> Result<atomic_exec::Command, atomic_exec::ExecError> {
+                self.0.confine(command, tmp)
+            }
+            fn check(&self, tmp: &std::path::Path) -> Result<(), atomic_exec::ExecError> {
+                self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.0.check(tmp)
+            }
+        }
+        // A helper that cannot run anything, as on a machine without user
+        // namespaces.
+        let paths = CodexPaths::with_helpers("/bin/false".into(), "/bin/false".into());
+        let sandbox = ExecSandbox::new(&paths, StateGuard::NoProjectState, root.join("codex"))
+            .expect("a helper");
+        let backend = atomic_exec::Backend::connect(
+            atomic_exec::LocalBackend::in_dir(root.join("scratch"))
+                .confined(Arc::new(Counting(sandbox, checks.clone()))),
+        )
+        .expect("connects without checking the sandbox");
+        assert_eq!(checks.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        let mut all = runtimes(&model, "no-sandbox");
+        all.codex.backend = backend.clone();
+        all.lite.backend = backend.clone();
+        all.exec = backend;
+        run_lite_atom(&LiteClassify, &Note { text: "n".into() }, &all.lite)
+            .await
+            .expect("a lite atom needs no sandbox");
+        assert_eq!(checks.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        let (_, a, compiled) = exec_project("no-sandbox", TOTAL, "");
+        let r = run_declarative(
+            &a,
+            &compiled,
+            &mut Registry::new(),
+            &json!({"cents": [1]}),
+            "run-1",
+            "external",
+            &all,
+        )
+        .await;
+        let refused = |e: Option<&AtomError>| {
+            matches!(e, Some(AtomError::Runtime(m))
+                if m.contains("cannot start here")
+                    && m.contains("bubblewrap")
+                    && m.contains("unprivileged user namespaces")
+                    && m.contains("--security-opt"))
+        };
+        assert!(refused(r.as_ref().err()), "{r:?}");
+        let r = run_codex_atom(&Classify, &Note { text: "n".into() }, &all.codex).await;
+        assert!(refused(r.as_ref().err()), "{r:?}");
+        assert_eq!(
+            checks.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "checked once"
+        );
+        assert_eq!(model.calls(), 1, "only the lite atom called the model");
+    });
+}

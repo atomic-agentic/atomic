@@ -338,6 +338,9 @@ pub struct LocalBackend {
     scratch_root: PathBuf,
     tmp: PathBuf,
     confine: Option<Arc<dyn Confine>>,
+    /// Whether its confinement works here, checked the first time a
+    /// workspace with files opens, and kept.
+    checked: Arc<std::sync::OnceLock<Result<(), ExecError>>>,
 }
 
 impl std::fmt::Debug for LocalBackend {
@@ -378,6 +381,7 @@ impl LocalBackend {
             tmp: scratch_root.join(".tmp"),
             scratch_root,
             confine: None,
+            checked: Arc::default(),
         }
     }
 
@@ -428,6 +432,7 @@ impl Default for LocalBackend {
             )),
             tmp: base.join(".tmp"),
             confine: None,
+            checked: Arc::default(),
         }
     }
 }
@@ -449,17 +454,28 @@ impl ExecutionBackend for LocalBackend {
         // No turn of this backend runs yet: what earlier turns left in the
         // shared temporary directory goes.
         workspace::empty_dir(&self.tmp);
-        if let Some(confine) = &self.confine {
-            workspace::ensure_private(&self.tmp).map_err(|e| ExecError::Workspace {
-                label: "connect".into(),
-                message: format!("create {}: {e}", self.tmp.display()),
-            })?;
-            confine.check(&self.tmp)?;
-        }
         Ok(Self::STATEMENT)
     }
 
+    /// A workspace with files is where confined commands, or a turn's
+    /// commands, will run: the first one checks that its confinement works
+    /// here ([`Confine::check`]), once for the backend, and while it does not
+    /// every such workspace is refused with the check's reason, before
+    /// anything runs. A workspace with no files, such as a lite atom's, needs
+    /// no check.
     fn open(&self, request: &Open) -> Result<Workspace, ExecError> {
+        if let (Some(confine), Some(_)) = (&self.confine, &request.source) {
+            let checked = self.checked.get_or_init(|| {
+                workspace::ensure_private(&self.tmp).map_err(|e| ExecError::Workspace {
+                    label: request.label.clone(),
+                    message: format!("create {}: {e}", self.tmp.display()),
+                })?;
+                confine.check(&self.tmp)
+            });
+            if let Err(e) = checked {
+                return Err(e.clone());
+            }
+        }
         workspace::open_local(&self.scratch_root, &self.tmp, request)
     }
 
