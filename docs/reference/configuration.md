@@ -33,7 +33,8 @@ and nothing else is sent anywhere; `ATOMIC_DETECT_OLLAMA_ADDR` names another
 loopback address, as an IP address and port, and any other address is
 refused. No key is sent to a detected Ollama, even when `model.api_key_env`
 is set. A model endpoint set in a file, a variable or a flag turns detection
-off.
+off, and so does a ChatGPT sign-in (`atomic model login`): a configured
+endpoint comes first, then the sign-in, for Codex atoms, then detection.
 
 When the endpoint was detected, or set by the project's files rather than by
 whoever runs it, `atomic run`, `atomic runs resume` and `atomic serve` say

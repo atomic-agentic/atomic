@@ -37,6 +37,17 @@ fn resolved_where(
     vars: &[(&str, &str)],
     ollama: &dyn Fn(SocketAddr) -> Option<Vec<String>>,
 ) -> Result<Resolved, ConfigError> {
+    resolved_signed_in(dir, args, vars, ollama, &|_| Ok(None))
+}
+
+/// [`resolved_where`], with `sign_in` saying who is signed in.
+fn resolved_signed_in(
+    dir: &Path,
+    args: &EngineArgs,
+    vars: &[(&str, &str)],
+    ollama: &dyn Fn(SocketAddr) -> Option<Vec<String>>,
+    sign_in: &dyn Fn(Option<&Path>) -> SignInFound,
+) -> Result<Resolved, ConfigError> {
     let vars: BTreeMap<String, String> = vars
         .iter()
         .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
@@ -49,6 +60,7 @@ fn resolved_where(
             env: &env,
             env_names: vars.keys().cloned().collect(),
             ollama,
+            sign_in,
         },
     )
 }
@@ -100,6 +112,124 @@ fn an_openai_key_makes_openai_the_endpoint_without_showing_the_key() {
         shown.contains("OPENAI_API_KEY (set; its value is not shown)"),
         "{shown}"
     );
+}
+
+#[test]
+fn a_configured_endpoint_comes_first_then_the_sign_in_then_detection() {
+    let d = dir(&[("atomic.yaml", MANIFEST_ONLY)]);
+    let auth = d.join("auth");
+    let looked = AtomicUsize::new(0);
+    let signed_in = |project: Option<&Path>| {
+        looked.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(project, Some(d.as_path()), "kept apart from the project");
+        Ok(Some(SignIn::in_files(&auth)))
+    };
+    let model = ("ATOMIC_MODEL", "gpt-5-codex");
+    // Signed in, with a key set and an Ollama answering: the sign-in.
+    let r = resolved_signed_in(
+        &d,
+        &EngineArgs::default(),
+        &[("OPENAI_API_KEY", "sk-secret-value"), model],
+        &|_| panic!("no probe when someone is signed in"),
+        &signed_in,
+    )
+    .expect("resolves");
+    assert!(r.on_sign_in());
+    let endpoint = r.endpoint().expect("an endpoint");
+    assert_eq!(endpoint.base_url, atomic_core::signin::CODEX_BACKEND);
+    assert_eq!(endpoint.model, "gpt-5-codex");
+    assert_eq!(endpoint.api_key_env, None, "no key beside the sign-in");
+    assert!(endpoint.sign_in.is_some());
+    assert!(
+        !matches!(source(&r, "model.base_url"), Source::Detected(_)),
+        "nothing was detected: {:?}",
+        source(&r, "model.base_url")
+    );
+    assert!(
+        r.notes
+            .iter()
+            .any(|n| n.contains("OPENAI_API_KEY is set and not used")),
+        "{:?}",
+        r.notes
+    );
+    // A configured endpoint, from a variable, a flag or a file, comes
+    // before the sign-in, which is not even looked for.
+    looked.store(0, Ordering::Relaxed);
+    let flag = EngineArgs {
+        model_base_url: Some("http://127.0.0.1:4000/v1".into()),
+        ..EngineArgs::default()
+    };
+    for (args, vars) in [
+        (
+            EngineArgs::default(),
+            vec![("ATOMIC_MODEL_BASE_URL", "http://127.0.0.1:4000/v1"), model],
+        ),
+        (flag, vec![model]),
+    ] {
+        let r = resolved_signed_in(&d, &args, &vars, &nobody, &signed_in).expect("resolves");
+        assert!(!r.on_sign_in());
+        let endpoint = r.endpoint().expect("an endpoint");
+        assert_eq!(endpoint.base_url, "http://127.0.0.1:4000/v1");
+        assert!(endpoint.sign_in.is_none());
+    }
+    let file = dir(&[(
+        "atomic.yaml",
+        "atomic: 1\nname: notes\nmodel:\n  base_url: http://127.0.0.1:4000/v1\n  name: m\n",
+    )]);
+    let r = resolved_signed_in(&file, &EngineArgs::default(), &[], &nobody, &|_| {
+        looked.fetch_add(1, Ordering::Relaxed);
+        Ok(Some(SignIn::in_files(&auth)))
+    })
+    .expect("resolves");
+    assert!(r.endpoint().expect("an endpoint").sign_in.is_none());
+    assert_eq!(
+        looked.load(Ordering::Relaxed),
+        0,
+        "the sign-in was looked for"
+    );
+    // An empty base URL is no endpoint: the sign-in.
+    let empty = EngineArgs {
+        model_base_url: Some(" ".into()),
+        ..EngineArgs::default()
+    };
+    let r = resolved_signed_in(&d, &empty, &[model], &nobody, &signed_in).expect("resolves");
+    assert!(r.on_sign_in(), "{:?}", r.settings.model);
+    // No one signed in: detection, as before.
+    let r = resolved_signed_in(
+        &d,
+        &EngineArgs::default(),
+        &[("OPENAI_API_KEY", "sk-secret-value")],
+        &nobody,
+        &|_| Ok(None),
+    )
+    .expect("resolves");
+    assert_eq!(r.endpoint().expect("an endpoint").base_url, OPENAI_BASE_URL);
+    // A sign-in that cannot be read is said, and detection goes on.
+    let r = resolved_signed_in(
+        &d,
+        &EngineArgs::default(),
+        &[("OPENAI_API_KEY", "sk-secret-value")],
+        &nobody,
+        &|_| Err("the keyring is locked".into()),
+    )
+    .expect("resolves");
+    assert_eq!(r.endpoint().expect("an endpoint").base_url, OPENAI_BASE_URL);
+    assert_eq!(
+        r.sign_in_unreadable.as_deref(),
+        Some("the keyring is locked")
+    );
+    assert!(r.notes.iter().any(|n| n.contains("the keyring is locked")));
+}
+
+#[test]
+fn outside_a_project_the_sign_in_is_looked_for_with_no_project() {
+    let d = dir(&[]);
+    let r = resolved_signed_in(&d, &EngineArgs::default(), &[], &nobody, &|project| {
+        assert_eq!(project, None);
+        Ok(None)
+    })
+    .expect("resolves");
+    assert!(!r.on_sign_in());
 }
 
 #[test]

@@ -1470,6 +1470,9 @@ async fn new_config(
             // For tests: the backend's Codex route.
             model_provider.base_url = sign_in.backend().map(|b| format!("{b}/codex"));
             model_provider.supports_websockets = false;
+            // The organization and project headers are for OpenAI's API
+            // keys, never for a ChatGPT sign-in.
+            model_provider.env_http_headers = None;
             OPENAI_PROVIDER_ID.to_string()
         }
         // An OpenAI-compatible Responses endpoint: the built-in OpenAI
@@ -2090,6 +2093,35 @@ mod tests {
         ] {
             assert!(!is_openai_default(other), "{other}");
         }
+    }
+
+    #[test]
+    fn a_sign_in_sends_no_organization_or_project_headers() {
+        on_codex_runtime(async {
+            let (home, auth) = (scratch("home-headers"), scratch("auth-headers"));
+            let signed_in = ModelEndpoint {
+                base_url: crate::signin::CODEX_BACKEND.into(),
+                model: "synthetic".into(),
+                api_key_env: None,
+                sign_in: Some(crate::signin::SignIn::in_files(&auth)),
+            };
+            let config = new_config(&signed_in, &home, &home, Arg0DispatchPaths::default())
+                .await
+                .expect("config");
+            assert_eq!(config.model_provider_id, OPENAI_PROVIDER_ID);
+            assert_eq!(config.model_provider.env_http_headers, None);
+            // OpenAI's API with a key keeps them: the provider has them.
+            let api = ModelEndpoint {
+                base_url: "https://api.openai.com/v1".into(),
+                api_key_env: Some("OPENAI_API_KEY".into()),
+                sign_in: None,
+                ..signed_in.clone()
+            };
+            let config = new_config(&api, &home, &home, Arg0DispatchPaths::default())
+                .await
+                .expect("config");
+            assert!(config.model_provider.env_http_headers.is_some());
+        });
     }
 
     fn scratch(tag: &str) -> std::path::PathBuf {

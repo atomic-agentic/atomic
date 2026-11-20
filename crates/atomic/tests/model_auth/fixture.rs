@@ -139,6 +139,28 @@ impl Fixture {
         None
     }
 
+    /// The person's own configuration, `text`, in a directory outside the
+    /// checkout (atomic refuses one a project could have supplied): pass it
+    /// as XDG_CONFIG_HOME, and remove it after.
+    pub fn person_configures(&self, tag: &str, text: &str) -> PathBuf {
+        let home = std::env::temp_dir().join(format!(
+            "atomic-model-auth-config-{tag}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(home.join("atomic")).unwrap();
+        std::fs::write(home.join("atomic/config.yaml"), text).unwrap();
+        home
+    }
+
+    /// `atomic args...`, started, its stderr piped.
+    pub fn spawn(&self, args: &[&str], env: &[(&str, &str)]) -> std::process::Child {
+        self.command(args, env)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    }
+
     /// `atomic args...` from `cwd` rather than the project.
     pub fn atomic_from(&self, cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
         let mut c = self.command(args, env);
@@ -156,12 +178,20 @@ impl Fixture {
             .env("HOME", self.dir.join("home"))
             .env("ATOMIC_HOME", self.dir.join("atomic-home"))
             .env("ATOMIC_CREDENTIAL_STORE", "file")
+            // The person's own configuration is under the throwaway home.
+            .env("XDG_CONFIG_HOME", self.dir.join("home/.config"))
+            // No Ollama, whatever runs on this machine.
+            .env("ATOMIC_DETECT_OLLAMA_ADDR", "127.0.0.1:9")
             .env("USER", "dev")
             .stdin(Stdio::null());
         for name in [
             "CODEX_HOME",
             "XDG_DATA_HOME",
             "ATOMIC_DATABASE_URL",
+            "ATOMIC_DATABASE_SCHEMA",
+            "ATOMIC_EXECUTOR_ID",
+            "ATOMIC_RUNNER",
+            "DATABASE_URL",
             "ATOMIC_MODEL_BASE_URL",
             "ATOMIC_MODEL",
             "ATOMIC_MODEL_API_KEY_ENV",

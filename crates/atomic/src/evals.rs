@@ -315,7 +315,8 @@ pub async fn run(
     // run would.
     let endpoint = match (source, needs_model) {
         (Source::Recorded, true) => crate::engine::identity(&resolved)?,
-        _ => crate::engine::endpoint(&resolved, needs_model)?,
+        // An eval is the person's own, here, as `atomic run` is.
+        _ => crate::engine::endpoint(&resolved, needs_model, None)?,
     };
     if source != Source::Recorded
         && needs_model

@@ -149,8 +149,10 @@ pub fn exec_backend(
 /// withheld key does not refuse a replay.
 pub fn identity(resolved: &settings::Resolved) -> anyhow::Result<ModelEndpoint> {
     match resolved.endpoint() {
+        // No token is read either.
         Some(endpoint) => Ok(ModelEndpoint {
             api_key_env: None,
+            sign_in: None,
             ..endpoint
         }),
         None => Err(Failure::new(
@@ -166,7 +168,14 @@ pub fn identity(resolved: &settings::Resolved) -> anyhow::Result<ModelEndpoint> 
 }
 
 /// The model endpoint, or with `required`, a failure saying how to set one.
-pub fn endpoint(resolved: &settings::Resolved, required: bool) -> anyhow::Result<ModelEndpoint> {
+/// A configured endpoint comes first, then the person's ChatGPT sign-in,
+/// then what atomic detects (see [`settings::resolve`]). `personal_refused`
+/// says why the sign-in, which is the person's own, may not serve here.
+pub fn endpoint(
+    resolved: &settings::Resolved,
+    required: bool,
+    personal_refused: Option<&str>,
+) -> anyhow::Result<ModelEndpoint> {
     // The person's key goes nowhere the project chose: a run that calls a
     // model has no model access until they choose the endpoint.
     if required && let Some(why) = &resolved.withheld_key {
@@ -180,25 +189,65 @@ pub fn endpoint(resolved: &settings::Resolved, required: bool) -> anyhow::Result
         )
         .into());
     }
+    if resolved.on_sign_in() {
+        match (personal_refused, required) {
+            (Some(why), true) => {
+                return Err(Failure::new(
+                    "config.model",
+                    format!(
+                        "your ChatGPT sign-in is yours, for local use, and {why}, so no model \
+                         is configured here"
+                    ),
+                    "configure a model endpoint: set ATOMIC_MODEL_BASE_URL and ATOMIC_MODEL (or \
+                     pass --model-base-url and --model), and ATOMIC_MODEL_API_KEY_ENV to the \
+                     variable holding its key if it needs one",
+                )
+                .into());
+            }
+            // Nothing here calls a model, and nothing may on the sign-in.
+            (Some(_), false) => return Ok(unconfigured()),
+            (None, true) if resolved.settings.model.name.is_none() => {
+                return Err(Failure::new(
+                    "config.model",
+                    "you are signed in with ChatGPT, and no model is configured",
+                    "set ATOMIC_MODEL (or pass --model) to a model your plan offers for Codex",
+                )
+                .into());
+            }
+            _ => {}
+        }
+    }
     match resolved.endpoint() {
         Some(endpoint) => Ok(endpoint),
         None if required => Err(Failure::new(
             "config.model",
-            "no model endpoint is configured or detected, and model atoms need one",
-            "set OPENAI_API_KEY to use OpenAI's API, start Ollama on this machine, or set \
-             ATOMIC_MODEL_BASE_URL and ATOMIC_MODEL (or pass --model-base-url and --model), \
-             and ATOMIC_MODEL_API_KEY_ENV if the endpoint needs a key; `atomic config \
-             --explain` shows what was found",
+            match &resolved.sign_in_unreadable {
+                Some(why) => format!(
+                    "no model endpoint is configured or detected, model atoms need one, and \
+                     the ChatGPT sign-in could not be read: {why}"
+                ),
+                None => {
+                    "no model endpoint is configured or detected, and model atoms need one".into()
+                }
+            },
+            "sign in with `atomic model login` (Codex atoms only), set OPENAI_API_KEY to use \
+             OpenAI's API, start Ollama on this machine, or set ATOMIC_MODEL_BASE_URL and \
+             ATOMIC_MODEL (or pass --model-base-url and --model), and ATOMIC_MODEL_API_KEY_ENV \
+             if the endpoint needs a key; `atomic config --explain` shows what was found",
         )
         .into()),
-        // Nothing will call a model; an endpoint that cannot be reached
-        // makes any call that does fail loudly.
-        None => Ok(ModelEndpoint {
-            base_url: "http://127.0.0.1:9/unconfigured".into(),
-            model: "unconfigured".into(),
-            api_key_env: None,
-            sign_in: None,
-        }),
+        None => Ok(unconfigured()),
+    }
+}
+
+/// The endpoint when nothing will call a model: one that cannot be reached,
+/// so any call that does fails loudly.
+fn unconfigured() -> ModelEndpoint {
+    ModelEndpoint {
+        base_url: "http://127.0.0.1:9/unconfigured".into(),
+        model: "unconfigured".into(),
+        api_key_env: None,
+        sign_in: None,
     }
 }
 
@@ -317,7 +366,18 @@ pub async fn open(
         )
         .into());
     }
-    let endpoint = endpoint(&resolved, needs_model)?;
+    // A personal sign-in serves runs in a store no other host's executors
+    // share, and never `atomic serve`; the store is the one the settings
+    // name, whichever file or variable names it. `atomic runs resume` on
+    // such a store uses it for whichever run is resumed.
+    let personal_refused = if matches!(database, Database::Postgres { .. }) {
+        Some("the store is shared (PostgreSQL)")
+    } else if takes == Takes::Waiting {
+        Some("`atomic serve` runs whatever the store's runs need")
+    } else {
+        None
+    };
+    let endpoint = endpoint(&resolved, needs_model, personal_refused)?;
     let signed_in = endpoint.sign_in.is_some();
     // Where model calls go, when the person running this did not say.
     if let Some(line) = resolved.announcement() {

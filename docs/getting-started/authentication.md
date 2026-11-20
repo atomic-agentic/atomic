@@ -23,13 +23,17 @@ separate API billing. Check current eligibility in
 [OpenAI's authentication guide](https://learn.chatgpt.com/docs/auth). Device
 login must be enabled for the account or workspace.
 
-When no model endpoint is configured (`ATOMIC_MODEL_BASE_URL` unset), Codex
-atoms use the sign-in, with no API key. Set `ATOMIC_MODEL` to a model your plan
-offers for Codex. A configured endpoint always takes precedence.
+When no model endpoint is configured (`ATOMIC_MODEL_BASE_URL` unset, and no
+`model.base_url` in a configuration file or flag), Codex atoms use the sign-in,
+with no API key. Set `ATOMIC_MODEL` to a model your plan offers for Codex. A
+configured endpoint always comes first, and the sign-in comes before what atomic
+detects: with someone signed in, `OPENAI_API_KEY` and a local Ollama are not
+used. `atomic config --explain` shows the sign-in as `model.sign_in`, how and
+where it is kept, never a token or an email, and whether it is used.
 
 The sign-in is yours, for local use. atomic refuses it on a shared
-(PostgreSQL) store and for `atomic serve`, and asks for a configured endpoint
-there instead. On a project's own store it serves `atomic run`, and
+(PostgreSQL) store, whether a variable or your configuration file names it, and
+for `atomic serve`, and asks for a configured endpoint there instead. On a project's own store it serves `atomic run`, and
 `atomic runs resume` for whichever run in that store you resume.
 
 Codex's managed login restrictions hold for the sign-in as they do for Codex's
@@ -50,9 +54,9 @@ atomic never prints the token, and no atom's commands see it: Codex sends it
 to the model from atomic's own process, which cannot be dumped or read through
 `/proc`; Codex atoms' commands and exec atoms' alike run under Codex's sandbox,
 which denies them the credential directory; and they can neither use the
-kernel keyrings nor reach the Secret Service. A signed-in atom has none of ChatGPT's connectors, plugins or
-hosted tools: the token reaches the model and nothing else, and an atom's tools
-are the ones its file declares. As with the operator credential, this has been
+kernel keyrings nor reach the Secret Service. A signed-in atom has none of
+ChatGPT's connectors, plugins or hosted tools: the token reaches the model and
+nothing else, and an atom's tools are the ones its file declares. As with the operator credential, this has been
 verified on Linux only, so `atomic model login` is refused on macOS and Windows
 for now. atomic does not reuse an existing `codex login`.
 

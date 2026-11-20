@@ -111,7 +111,8 @@ minimal lite-atom quickstart.
 | `atomic model status` | Say who is signed in (the email masked), on which plan and where it is kept, never a token; creates nothing; `--json` for scripts | v0.1 local, Linux |
 | `atomic model logout` | Revoke the sign-in where the issuer allows, and forget it in both the keyring and the file store, saying what it found | v0.1 local, Linux |
 
-With no `ATOMIC_MODEL_BASE_URL`, Codex atoms use the sign-in and `ATOMIC_MODEL`.
+With no model endpoint configured, Codex atoms use the sign-in and
+`ATOMIC_MODEL`, ahead of a detected `OPENAI_API_KEY` or Ollama.
 Lite atoms need an endpoint. See [subscriptions and
 authentication](../getting-started/authentication.md).
 

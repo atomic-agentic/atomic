@@ -23,6 +23,8 @@
 //! and are not covered: they need an endpoint and, if it asks for one, a
 //! key.
 //!
+//! A model endpoint someone configured comes first; with none, the sign-in
+//! comes before what atomic detects (`OPENAI_API_KEY`, a local Ollama).
 //! The sign-in is personal: a shared store or `atomic serve` never uses it
 //! (the caller refuses it there). Codex's managed login restrictions
 //! (`forced_login_method`, `forced_chatgpt_workspace_id`, and the managed
@@ -123,6 +125,9 @@ pub enum SignInError {
 }
 
 const KEYRING: AuthKeyringBackendKind = AuthKeyringBackendKind::Direct;
+
+/// The model endpoint a sign-in's Codex atoms use: ChatGPT's Codex backend.
+pub const CODEX_BACKEND: &str = "https://chatgpt.com/backend-api/codex";
 
 /// Refused unless sign-ins may be kept on this platform.
 pub fn protected() -> Result<(), SignInError> {
@@ -342,7 +347,9 @@ impl SignIn {
             codex_login::run_device_code_login(options).await?;
         } else {
             let server = codex_login::run_login_server(options)?;
-            eprintln!(
+            // Redacted as every log line is; the address carries no secret
+            // (see the test below), so it reaches the person whole.
+            crate::log_line!(
                 "Sign in in your browser. If it did not open, go to:\n\n  {}\n",
                 server.auth_url
             );
@@ -619,5 +626,18 @@ mod tests {
             );
             assert!(refused.contains(os), "{refused}");
         }
+    }
+
+    #[test]
+    fn the_address_to_sign_in_at_survives_redaction() {
+        let url = "https://auth.openai.com/oauth/authorize?response_type=code\
+                   &client_id=app_EMoamEEZ73f0CkXaXp7hrann\
+                   &redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback\
+                   &scope=openid%20profile%20email%20offline_access\
+                   &code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM\
+                   &code_challenge_method=S256&id_token_add_organizations=true\
+                   &codex_cli_simplified_flow=true\
+                   &state=Y2FkZmY0ZDctNDk5Yi00YzBkLWI3ZWMtZWQ2YmQ2ZDc2NjU0&originator=codex_cli_rs";
+        assert_eq!(crate::redact::bounded(url, crate::redact::MAX_TEXT), url);
     }
 }

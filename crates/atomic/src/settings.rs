@@ -5,8 +5,11 @@
 //! ([`atomic_core::config`]), with what atomic detects around it filling
 //! what nothing set, and where each came from, for `atomic config --explain`.
 //!
-//! Detection fills only what no file, variable or flag set, and it discovers;
-//! it never grants. It reads:
+//! Model access is ranked: a model endpoint set in a file, a variable or a
+//! flag; then the person's ChatGPT sign-in (`atomic model login`, for Codex
+//! atoms); then detection. Detection fills only what no file, variable or
+//! flag set, and nothing when someone is signed in; it discovers, and it
+//! never grants. It reads:
 //!
 //! - `OPENAI_API_KEY`: when it is set, OpenAI's API is the model endpoint, and
 //!   `OPENAI_API_KEY` the variable its key is read from. Its value is never
@@ -22,6 +25,7 @@ use crate::engine::{EngineArgs, RunnerKind};
 use atomic_core::budget::BudgetSettings;
 use atomic_core::codex::ModelEndpoint;
 use atomic_core::config::{self, ConfigError, Layers, Source};
+use atomic_core::signin::SignIn;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -173,10 +177,20 @@ pub struct Resolved {
     /// Why a key the person named is not sent, when the endpoint is one the
     /// project's files chose: a run that calls a model refuses to start.
     pub withheld_key: Option<String>,
+    /// The person's ChatGPT sign-in, when no endpoint is set and someone is
+    /// signed in: Codex atoms' model access, ahead of detection.
+    pub sign_in: Option<SignIn>,
+    /// Why the sign-in could not be read, when it was looked for and could
+    /// not be: said, never taken for "signed out".
+    pub sign_in_unreadable: Option<String>,
 }
 
-/// What resolution reads from outside: the environment, and a local
-/// Ollama. Passed in, so tests choose what is there.
+/// What looking for the person's sign-in found: the sign-in, if someone is
+/// signed in, or why it could not be read.
+pub type SignInFound = Result<Option<SignIn>, String>;
+
+/// What resolution reads from outside: the environment, a local Ollama, and
+/// the person's sign-in. Passed in, so tests choose what is there.
 pub struct Surroundings<'a> {
     /// A variable's value.
     pub env: &'a dyn Fn(&str) -> Option<String>,
@@ -184,19 +198,24 @@ pub struct Surroundings<'a> {
     pub env_names: Vec<String>,
     /// The models a local Ollama at an address lists, if one answers.
     pub ollama: &'a dyn Fn(SocketAddr) -> Option<Vec<String>>,
+    /// The person's sign-in, kept apart from the project rooted at the path
+    /// when there is one.
+    pub sign_in: &'a dyn Fn(Option<&Path>) -> SignInFound,
 }
 
 impl Surroundings<'static> {
-    /// This process's environment and a real probe.
+    /// This process's environment, a real probe and the person's sign-in.
     pub fn here() -> Self {
         Self {
             ollama: &probe_ollama,
+            sign_in: &signed_in,
             ..Self::without_probe()
         }
     }
 
-    /// [`Surroundings::here`], but no Ollama answers: for `atomic check`,
-    /// which reads the settings and contacts nothing.
+    /// [`Surroundings::here`], but no Ollama answers and no sign-in is read:
+    /// for `atomic check` and for finding the store, which read the settings
+    /// and contact nothing.
     pub fn without_probe() -> Self {
         Self {
             env: &|name| std::env::var(name).ok(),
@@ -204,7 +223,32 @@ impl Surroundings<'static> {
                 .filter_map(|(k, _)| k.into_string().ok())
                 .collect(),
             ollama: &|_| None,
+            sign_in: &|_| Ok(None),
         }
+    }
+}
+
+/// The person's sign-in, if someone is signed in, found without creating
+/// anything. Off Linux, where sign-ins are not kept, there is none.
+pub fn signed_in(project: Option<&Path>) -> SignInFound {
+    match SignIn::located(project) {
+        Ok(sign_in) => match sign_in.account() {
+            Ok(Some(_)) => Ok(Some(sign_in)),
+            Ok(None) => Ok(None),
+            Err(e) => Err(format!("{e:#}")),
+        },
+        Err(atomic_core::signin::SignInError::Unprotected(_)) => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// The root of the project configured in `dir`: `dir`, or its parent for an
+/// embedded project's `.atomic/`.
+fn project_root(dir: &Path) -> &Path {
+    if dir.file_name().is_some_and(|n| n == ".atomic") {
+        dir.parent().unwrap_or(dir)
+    } else {
+        dir
     }
 }
 
@@ -279,25 +323,19 @@ pub fn resolve(
     if dir.join("atomic.yaml").is_file()
         && let Some(file) = &user
         && let Ok(file) = std::fs::canonicalize(file)
+        && let Ok(root) = std::fs::canonicalize(project_root(dir))
     {
-        let root = if dir.file_name().is_some_and(|n| n == ".atomic") {
-            dir.parent().unwrap_or(dir)
-        } else {
-            dir
-        };
-        if let Ok(root) = std::fs::canonicalize(root) {
-            let checkout = root.ancestors().find(|d| d.join(".git").exists());
-            for (what, enclosing) in std::iter::once(("project", root.as_path()))
-                .chain(checkout.map(|c| ("checkout holding the project", c)))
-            {
-                if file.starts_with(enclosing) {
-                    return Err(ConfigError::Invalid(format!(
-                        "your own configuration, {}, is inside the {what} at {}, so the project \
-                         could have supplied it; point XDG_CONFIG_HOME, or HOME, outside it",
-                        file.display(),
-                        enclosing.display()
-                    )));
-                }
+        let checkout = root.ancestors().find(|d| d.join(".git").exists());
+        for (what, enclosing) in std::iter::once(("project", root.as_path()))
+            .chain(checkout.map(|c| ("checkout holding the project", c)))
+        {
+            if file.starts_with(enclosing) {
+                return Err(ConfigError::Invalid(format!(
+                    "your own configuration, {}, is inside the {what} at {}, so the project \
+                     could have supplied it; point XDG_CONFIG_HOME, or HOME, outside it",
+                    file.display(),
+                    enclosing.display()
+                )));
             }
         }
     }
@@ -363,8 +401,39 @@ pub fn resolve(
         );
     }
 
-    // Detection, for what nothing set.
+    // An empty base URL is no endpoint.
+    if settings
+        .model
+        .base_url
+        .as_deref()
+        .is_some_and(|u| u.trim().is_empty())
+    {
+        settings.model.base_url = None;
+        sources.insert("model.base_url".into(), Source::Default);
+    }
+    // With no endpoint set, the person's sign-in, kept apart from the
+    // project when there is one, comes before detection.
+    let (mut sign_in, mut sign_in_unreadable) = (None, None);
     if unset(&sources, "model.base_url") {
+        let project = dir.join("atomic.yaml").is_file().then(|| project_root(dir));
+        match (around.sign_in)(project) {
+            Ok(found) => sign_in = found,
+            Err(why) => {
+                notes.push(format!("the ChatGPT sign-in could not be read: {why}"));
+                sign_in_unreadable = Some(why);
+            }
+        }
+    }
+    if sign_in.is_some() && set((around.env)("OPENAI_API_KEY")).is_some() {
+        notes.push(
+            "OPENAI_API_KEY is set and not used: the ChatGPT sign-in comes before detection; \
+             set model.base_url to use OpenAI's API"
+                .into(),
+        );
+    }
+
+    // Detection, for what nothing set, when no one is signed in.
+    if unset(&sources, "model.base_url") && sign_in.is_none() {
         if set((around.env)("OPENAI_API_KEY")).is_some() {
             let why = "OPENAI_API_KEY is set".to_owned();
             settings.model.base_url = Some(OPENAI_BASE_URL.into());
@@ -431,6 +500,8 @@ pub fn resolve(
         notes,
         user,
         withheld_key,
+        sign_in,
+        sign_in_unreadable,
     })
 }
 
@@ -709,15 +780,32 @@ fn dechunk(mut rest: &[u8]) -> Option<Option<Vec<u8>>> {
 }
 
 impl Resolved {
-    /// The model endpoint, if one is set or detected.
+    /// The model endpoint, if one is set, signed in to or detected, and a
+    /// model is named.
     pub fn endpoint(&self) -> Option<ModelEndpoint> {
         let m = &self.settings.model;
-        Some(ModelEndpoint {
-            base_url: m.base_url.clone()?,
-            model: m.name.clone()?,
-            api_key_env: m.api_key_env.clone(),
-            sign_in: None,
-        })
+        match (&m.base_url, &self.sign_in) {
+            (Some(base_url), _) => Some(ModelEndpoint {
+                base_url: base_url.clone(),
+                model: m.name.clone()?,
+                api_key_env: m.api_key_env.clone(),
+                sign_in: None,
+            }),
+            // No key: the sign-in's tokens are Codex's to send.
+            (None, Some(sign_in)) => Some(ModelEndpoint {
+                base_url: atomic_core::signin::CODEX_BACKEND.into(),
+                model: m.name.clone()?,
+                api_key_env: None,
+                sign_in: Some(sign_in.clone()),
+            }),
+            (None, None) => None,
+        }
+    }
+
+    /// Whether model atoms would run on the sign-in: someone is signed in
+    /// and no endpoint is set.
+    pub fn on_sign_in(&self) -> bool {
+        self.sign_in.is_some() && self.settings.model.base_url.is_none()
     }
 
     /// Every setting for `atomic config --explain`: its path, its value as
@@ -857,16 +945,38 @@ pub struct ConfigArgs {
 /// for `atomic run`; nothing else does.
 pub fn config(args: &ConfigArgs, project: Option<&Path>, json: bool) -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
-    let root = match crate::target::project_for(project, None, &cwd) {
-        Ok(found) => found.root().to_owned(),
+    let (root, in_project) = match crate::target::project_for(project, None, &cwd) {
+        Ok(found) => (found.root().to_owned(), true),
         // Outside a project, only the variables and detection apply.
-        Err(_) if project.is_none() => cwd,
+        Err(_) if project.is_none() => (cwd, false),
         Err(e) => return Err(e),
     };
     let dir = config_dir(&root);
     let resolved = resolve(&dir, &args.engine, &Surroundings::here())
         .map_err(|e| anyhow::anyhow!("the configuration cannot be read: {e}"))?;
-    let rows = resolved.explain(&|name| std::env::var(name).ok());
+    let mut rows = resolved.explain(&|name| std::env::var(name).ok());
+    // The sign-in, if anyone is signed in: how and where it is kept, never a
+    // token or an email, and whether model atoms use it here.
+    let signed_in = match SignIn::located(in_project.then_some(root.as_path())) {
+        Ok(sign_in) => sign_in.explain(),
+        Err(atomic_core::signin::SignInError::Unprotected(_)) => None,
+        Err(e) => return Err(e.into()),
+    };
+    if let Some(explained) = signed_in {
+        let source = if resolved.on_sign_in() {
+            explained.source
+        } else {
+            format!(
+                "{}; not used: a model endpoint is configured, which comes first",
+                explained.source
+            )
+        };
+        rows.push((
+            "model.sign_in".into(),
+            Value::String(explained.value),
+            source,
+        ));
+    }
     if json {
         let settings: Vec<Value> = rows
             .iter()

@@ -12,8 +12,12 @@
 //!   or configure an endpoint; signed in, with no model, it says to set one;
 //! - signed in, a lite atom reports that the sign-in is for Codex atoms only
 //!   and what it needs instead, before it calls anything;
-//! - the sign-in is personal: on a shared (PostgreSQL) store, and for
-//!   `atomic serve`, it is refused, with what to configure instead.
+//! - the sign-in is personal: on a shared (PostgreSQL) store, however its
+//!   URL is set, and for `atomic serve`, it is refused, with what to
+//!   configure instead;
+//! - a configured endpoint comes before the sign-in, and the sign-in before
+//!   detection, as `atomic config --explain` says;
+//! - a running atomic cannot be read through /proc by its own user.
 //!
 //! A Codex atom running on the sign-in, with no API key set, is tested in
 //! process (atomic_core's runtime tests), against the scripted fake model
@@ -132,6 +136,19 @@ fn a_shared_store_or_serve_refuses_the_personal_sign_in() {
     assert!(!out.status.success(), "{t}");
     assert!(t.contains("the store is shared"), "{t}");
     assert!(t.contains("ATOMIC_MODEL_BASE_URL"), "{t}");
+    // The same store named by the person's own configuration file.
+    let config = f.person_configures(
+        "shared",
+        "database:\n  url: postgres://atomic:atomic@127.0.0.1:9/atomic\nexecutor_id: host-1\n",
+    );
+    let out = f.atomic(
+        &["run", "tidy-codex", "--data", r#"{"text": "a note"}"#],
+        &[model[0], ("XDG_CONFIG_HOME", config.to_str().unwrap())],
+    );
+    let _ = std::fs::remove_dir_all(&config);
+    let t = text(&out);
+    assert!(!out.status.success(), "{t}");
+    assert!(t.contains("the store is shared"), "{t}");
     // `atomic serve`, on the project's own SQLite store.
     let out = f
         .atomic_within(&["serve"], &model, 60)
@@ -140,6 +157,85 @@ fn a_shared_store_or_serve_refuses_the_personal_sign_in() {
     assert!(!out.status.success(), "{t}");
     assert!(t.contains("`atomic serve`"), "{t}");
     assert!(t.contains("ATOMIC_MODEL_BASE_URL"), "{t}");
+}
+
+#[test]
+fn a_configured_endpoint_comes_before_the_sign_in_and_the_sign_in_before_detection() {
+    let f = Fixture::new("ranked");
+    f.sign_in();
+    let explain = |env: &[(&str, &str)]| {
+        let out = f.atomic(&["config", "--explain"], env);
+        assert!(out.status.success(), "{}", text(&out));
+        text(&out)
+    };
+    // Signed in, with OPENAI_API_KEY set: the sign-in, and the key unused.
+    let t = explain(&[("OPENAI_API_KEY", "sk-unused")]);
+    assert!(t.contains("model.sign_in"), "{t}");
+    assert!(t.contains("signed in with"), "{t}");
+    assert!(!t.contains("not used: a model endpoint"), "{t}");
+    assert!(t.contains("OPENAI_API_KEY is set and not used"), "{t}");
+    assert!(!t.contains("detected: OPENAI_API_KEY"), "{t}");
+    assert!(
+        !t.contains("dev@example.invalid"),
+        "the email was shown: {t}"
+    );
+    // A configured endpoint comes first, and the sign-in says it is unused.
+    let t = explain(&[("ATOMIC_MODEL_BASE_URL", "http://127.0.0.1:9/v1")]);
+    assert!(
+        t.contains("not used: a model endpoint is configured"),
+        "{t}"
+    );
+}
+
+#[test]
+fn a_running_atomic_cannot_be_read_through_proc_by_its_own_user() {
+    use std::io::BufRead;
+    let f = Fixture::new("hardened");
+    let mut serve = f.spawn(
+        &["serve"],
+        &[
+            ("ATOMIC_MODEL_BASE_URL", "http://127.0.0.1:9/v1"),
+            ("ATOMIC_MODEL", "synthetic"),
+            ("ATOMIC_TEST_CANARY", "canary-in-atomics-environment"),
+        ],
+    );
+    let stderr = serve.stderr.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+        {
+            let _ = tx.send(line);
+        }
+    });
+    let serving = rx
+        .iter()
+        .find(|l| l.contains("serving until stopped") || l.contains("error"));
+    // This test process: the same user, not sandboxed, and a process whose
+    // own environment it can read.
+    let read = std::fs::read(format!("/proc/{}/environ", serve.id()));
+    let _ = serve.kill();
+    let _ = serve.wait();
+    assert!(
+        serving
+            .as_deref()
+            .is_some_and(|l| l.contains("serving until stopped")),
+        "atomic serve did not start: {serving:?}"
+    );
+    assert!(std::fs::read("/proc/self/environ").is_ok());
+    match read {
+        Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}"),
+        Ok(env) => panic!(
+            "read atomic's environment through /proc ({} bytes, the canary {})",
+            env.len(),
+            if String::from_utf8_lossy(&env).contains("canary-in-atomics-environment") {
+                "in it"
+            } else {
+                "not in it"
+            }
+        ),
+    }
 }
 
 #[test]
