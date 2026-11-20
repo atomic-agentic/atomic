@@ -855,43 +855,114 @@ async fn score(
 
 /// `report` as JUnit XML: one test suite for the atom, a test case per eval
 /// case, per scorer and per failure of the run as a whole, and a skipped
-/// test case per scorer that was not run.
+/// test case per scorer that was not run. A case whose atom gave no output
+/// is an error; one whose assertions did not hold is a failure.
 pub fn junit(report: &Report) -> String {
+    junit_all(std::slice::from_ref(report))
+}
+
+/// `reports` as one JUnit XML document, a test suite per atom.
+pub fn junit_all(reports: &[Report]) -> String {
+    junit_with(reports, &[])
+}
+
+/// An atom an eval did not run, and why: a suite of one test case, failed
+/// when not running it fails the eval and skipped otherwise.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Unrun {
+    /// The atom.
+    pub atom: String,
+    /// Why it did not run.
+    pub reason: String,
+    /// Whether that fails the eval.
+    pub fails: bool,
+}
+
+/// `reports` and the atoms in `unrun` as one JUnit XML document.
+pub fn junit_with(reports: &[Report], unrun: &[Unrun]) -> String {
+    let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<testsuites>\n");
+    for report in reports {
+        xml.push_str(&suite(report));
+    }
+    for u in unrun {
+        let (failures, skipped, element) = if u.fails {
+            (
+                1,
+                0,
+                format!("<failure message=\"{}\"/>", escape(&u.reason)),
+            )
+        } else {
+            (0, 1, "<skipped/>".to_owned())
+        };
+        xml.push_str(&format!(
+            "  <testsuite name=\"{atom}\" tests=\"1\" failures=\"{failures}\" errors=\"0\" \
+             skipped=\"{skipped}\">\n    <testcase classname=\"{atom}\" name=\"run\">\n      \
+             {element}\n    </testcase>\n  </testsuite>\n",
+            atom = escape(&u.atom)
+        ));
+    }
+    xml.push_str("</testsuites>\n");
+    xml
+}
+
+/// One atom's test suite.
+fn suite(report: &Report) -> String {
+    /// How a test case ended.
+    enum End<'a> {
+        Passed,
+        Failed(&'a str),
+        Errored(&'a str),
+        Skipped,
+    }
     let mut body = String::new();
-    let (mut tests, mut failed) = (0, 0);
-    let mut case = |name: &str, failure: Option<&str>, skipped: bool| {
+    let (mut tests, mut failed, mut errored, mut skipped) = (0, 0, 0, 0);
+    let mut case = |name: &str, end: End<'_>| {
         tests += 1;
         body.push_str(&format!(
             "    <testcase classname=\"{}\" name=\"{}\"",
             escape(&report.atom),
             escape(name)
         ));
-        match (failure, skipped) {
-            (Some(message), _) => {
+        let element = match end {
+            End::Passed => None,
+            End::Failed(message) => {
                 failed += 1;
-                body.push_str(&format!(
-                    ">\n      <failure message=\"{}\"/>\n    </testcase>\n",
-                    escape(message)
-                ));
+                Some(format!("<failure message=\"{}\"/>", escape(message)))
             }
-            (None, true) => body.push_str(">\n      <skipped/>\n    </testcase>\n"),
-            (None, false) => body.push_str("/>\n"),
+            End::Errored(message) => {
+                errored += 1;
+                Some(format!("<error message=\"{}\"/>", escape(message)))
+            }
+            End::Skipped => {
+                skipped += 1;
+                Some("<skipped/>".to_owned())
+            }
+        };
+        match element {
+            None => body.push_str("/>\n"),
+            Some(element) => body.push_str(&format!(">\n      {element}\n    </testcase>\n")),
         }
     };
     for c in &report.cases {
         let failures = c.failures.join("; ");
-        case(&c.id, (!c.passed).then_some(failures.as_str()), false);
+        let end = match (c.passed, &c.output) {
+            (true, _) => End::Passed,
+            (false, None) => End::Errored(&failures),
+            (false, Some(_)) => End::Failed(&failures),
+        };
+        case(&c.id, end);
     }
     for s in &report.scorers {
         let reason = s.reason.clone().unwrap_or_else(|| "failed".into());
-        case(
-            &format!("scorer:{}", s.name),
-            (!s.passed).then_some(reason.as_str()),
-            false,
-        );
+        let end = if s.passed {
+            End::Passed
+        } else {
+            End::Failed(&reason)
+        };
+        case(&format!("scorer:{}", s.name), end);
     }
     for name in &report.not_scored {
-        case(&format!("scorer:{name}"), None, true);
+        case(&format!("scorer:{name}"), End::Skipped);
     }
     // The failures of the run as a whole: no cases, the pass rate, the
     // baseline, a selector. Scorers' are their own test cases above.
@@ -901,7 +972,7 @@ pub fn junit(report: &Report) -> String {
         .filter(|f| !f.starts_with("scorer `"))
         .collect();
     if run.is_empty() {
-        case("run", None, false);
+        case("run", End::Passed);
     }
     for (n, failure) in run.iter().enumerate() {
         let name = if n == 0 {
@@ -909,11 +980,11 @@ pub fn junit(report: &Report) -> String {
         } else {
             format!("run:{}", n + 1)
         };
-        case(&name, Some(failure), false);
+        case(&name, End::Failed(failure));
     }
     format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<testsuites>\n  <testsuite name=\"{}\" \
-         tests=\"{tests}\" failures=\"{failed}\">\n{body}  </testsuite>\n</testsuites>\n",
+        "  <testsuite name=\"{}\" tests=\"{tests}\" failures=\"{failed}\" errors=\"{errored}\" \
+         skipped=\"{skipped}\">\n{body}  </testsuite>\n",
         escape(&report.atom),
     )
 }

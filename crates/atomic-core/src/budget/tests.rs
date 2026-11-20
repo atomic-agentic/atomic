@@ -118,6 +118,7 @@ fn the_defaults_layer_like_every_other_setting() {
     let env = |name: &str| (name == "ATOMIC_BUDGET_ATOM_MINUTES").then(|| "12".to_owned());
     let resolved = layered::<Config>(&Layers {
         dir: &dir,
+        user: None,
         profile: None,
         env: &env,
         env_names: vec!["ATOMIC_BUDGET_ATOM_MINUTES".into()],
