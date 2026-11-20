@@ -14,6 +14,7 @@ mod failure;
 mod gates;
 mod runs;
 mod setup;
+mod show;
 mod skills;
 mod target;
 
@@ -80,6 +81,10 @@ enum Runs {
     /// Continue an unfinished run in the foreground, from its checkpoints,
     /// with the definitions and input it started with.
     Resume(runs::ResumeArgs),
+    /// Show everything the store recorded about a run: its steps, which
+    /// attempt ran each and which came from checkpoints, its input and
+    /// output, its spend, its gates and its transcripts.
+    Show(show::ShowArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -293,6 +298,7 @@ async fn run(cli: Cli, paths: CodexPaths, state: ProjectState) -> anyhow::Result
         }
         Some(Command::Run(args)) => runs::run(args, project, &paths, json).await,
         Some(Command::Runs(Runs::Resume(args))) => runs::resume(args, project, &paths, json).await,
+        Some(Command::Runs(Runs::Show(args))) => show::show(args, project, json).await,
         Some(Command::Serve(args)) => runs::serve(args, project, &paths).await,
         Some(Command::Runner) => Ok(()),
         Some(Command::Render(args)) => tokio::task::spawn_blocking(move || render(args)).await?,

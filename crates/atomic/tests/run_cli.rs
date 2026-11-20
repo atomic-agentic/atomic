@@ -2543,6 +2543,110 @@ fn a_run_that_gets_further_each_time_is_not_dead_lettered() {
 }
 
 #[test]
+fn runs_show_says_which_steps_came_from_checkpoints_and_which_attempt_ran_them() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
+            .await
+            .expect("fake model");
+        let dir = scratch("show");
+        let project = project(&dir);
+        let env = model_env(&model.base_url());
+        let (d, p, e) = (dir.clone(), project.clone(), env.clone());
+        tokio::task::spawn_blocking(move || killed_after_rank(&d, &p, &e, "shown-1"))
+            .await
+            .expect("child");
+        let (d, p, e) = (dir.clone(), project.clone(), env.clone());
+        let out = tokio::task::spawn_blocking(move || {
+            atomic(&d, &p, &["runs", "resume", "shown-1"], &with(&e, &[]), "")
+        })
+        .await
+        .expect("child");
+        assert!(out.status.success(), "{}", text(&out));
+
+        // Read from the store alone: no model, no lock.
+        let out = atomic(
+            &dir,
+            &project,
+            &["--json", "runs", "show", "shown-1"],
+            &[],
+            "",
+        );
+        assert!(out.status.success(), "{}", text(&out));
+        let doc = stdout_json(&out);
+        assert_eq!(doc["run"], "shown-1", "{doc}");
+        assert_eq!(doc["workflow"], "triage");
+        assert_eq!(doc["status"], "succeeded");
+        assert_eq!(
+            doc["input"],
+            serde_json::from_str::<Value>(NOTE).expect("note")
+        );
+        assert_eq!(
+            doc["output"],
+            json!({"line": "P1: Export crashes on accents"})
+        );
+        let attempts = doc["attempts"].as_array().expect("attempts");
+        assert_eq!(attempts.len(), 2, "the killed run and its resume: {doc}");
+        let steps = doc["steps"].as_array().expect("steps");
+        let attempt_of = |prefix: &str| -> Vec<i64> {
+            steps
+                .iter()
+                .filter(|s| s["name"].as_str().is_some_and(|n| n.starts_with(prefix)))
+                .map(|s| s["attempt"].as_i64().expect("attempt"))
+                .collect()
+        };
+        // What finished before the kill came from checkpoints on resume.
+        for prefix in ["pin", "count.", "rank."] {
+            let seen = attempt_of(prefix);
+            assert!(
+                !seen.is_empty() && seen.iter().all(|a| *a == 1),
+                "{prefix}: {seen:?}"
+            );
+        }
+        // What the resume ran itself.
+        let seen = attempt_of("summarize.");
+        assert!(
+            !seen.is_empty() && seen.iter().all(|a| *a == 2),
+            "summarize: {seen:?}"
+        );
+        assert_eq!(
+            attempts[0]["ran"],
+            json!(attempt_of("").iter().filter(|a| **a == 1).count())
+        );
+        assert_eq!(attempts[1]["replayed"], attempts[0]["ran"]);
+        assert!(attempts[1]["ran"].as_u64().is_some_and(|n| n > 0), "{doc}");
+        assert_eq!(doc["usage"]["calls"], 2, "rank and summarize: {doc}");
+
+        // The same for a person.
+        let out = atomic(&dir, &project, &["runs", "show", "shown-1"], &[], "");
+        assert!(out.status.success(), "{}", text(&out));
+        let said = String::from_utf8_lossy(&out.stdout);
+        assert!(said.contains("2 attempts"), "{said}");
+        assert!(said.contains("from checkpoints"), "{said}");
+        let summarize = said
+            .lines()
+            .find(|l| l.contains("summarize.publish"))
+            .unwrap_or_else(|| panic!("{said}"));
+        assert!(summarize.contains("attempt 2"), "{summarize}");
+        let rank = said
+            .lines()
+            .find(|l| l.contains("rank.publish"))
+            .unwrap_or_else(|| panic!("{said}"));
+        assert!(rank.contains("attempt 1"), "{rank}");
+
+        // An id the store does not know.
+        let out = atomic(
+            &dir,
+            &project,
+            &["--json", "runs", "show", "no-such-run"],
+            &[],
+            "",
+        );
+        assert!(!out.status.success());
+        assert_eq!(stdout_json(&out)["error"]["kind"], "run.not_found");
+    });
+}
+
+#[test]
 fn the_runner_role_keeps_its_exit_code_contract() {
     let dir = scratch("runner-codes");
     // A request it cannot read is a usage error, and nothing is written.

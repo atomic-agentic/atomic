@@ -44,8 +44,8 @@ gates and `worktree: true` steps, which run a Codex atom in its own worktree at
 the step's `base` and record atomic's commit in `steps.<id>.metadata.commit`.
 A run keeps the definitions it started with.
 
-`atomic run`, `atomic runs resume` and a local foreground `atomic serve` are
-built. `atomic run` takes an atom or workflow by name, by file or with
+`atomic run`, `atomic runs resume`, `atomic runs show` and a local foreground
+`atomic serve` are built. `atomic run` takes an atom or workflow by name, by file or with
 `--project`, and input from a file, standard input or `--data`; a run cut short
 continues with `atomic runs resume <run-id>`, or under `atomic serve`, from its
 checkpoints. One process at a time executes a project's runs. Errors carry a

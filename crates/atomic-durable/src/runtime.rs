@@ -111,6 +111,10 @@ pub struct StepRecord {
     pub output: Option<Value>,
     /// Its error, if it failed.
     pub error: Option<String>,
+    /// When it started, in milliseconds since the Unix epoch, if recorded.
+    pub started_at: Option<i64>,
+    /// When it completed, in milliseconds since the Unix epoch, if recorded.
+    pub completed_at: Option<i64>,
 }
 
 /// Which model thread a published step ran on.
@@ -149,7 +153,7 @@ pub enum RunStatus {
 }
 
 /// What the store records about a run beside its steps.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RunRecord {
     /// Its id.
     pub id: String,
@@ -162,6 +166,10 @@ pub struct RunRecord {
     pub version: String,
     /// The queue it waits on, or was last taken from, if any.
     pub queue: Option<String>,
+    /// The workflow it runs, as registered.
+    pub workflow: String,
+    /// What it was started with.
+    pub input: Value,
 }
 
 /// What every resume queue's name starts with.
@@ -190,6 +198,8 @@ impl From<durare::WorkflowStatus> for RunRecord {
             executor: w.executor_id,
             version: w.app_version,
             queue: w.queue_name,
+            workflow: w.name,
+            input: w.input,
         }
     }
 }
@@ -1322,6 +1332,8 @@ impl DurableRuntime for Durare {
                     name: s.name,
                     output: s.output,
                     error: s.error,
+                    started_at: s.started_at.map(|t| t.timestamp_millis()),
+                    completed_at: s.completed_at.map(|t| t.timestamp_millis()),
                 })
                 .collect())
         }

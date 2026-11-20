@@ -136,10 +136,20 @@ const MIGRATIONS: &[Migration] = &[
                 PRIMARY KEY (request_id, attempt)
             )"],
     },
+    Migration {
+        version: 6,
+        // Each execution of each run (see `history`): when it began.
+        sql: &["CREATE TABLE IF NOT EXISTS atomic_executions (
+                run TEXT NOT NULL,
+                attempt BIGINT NOT NULL,
+                started_at BIGINT NOT NULL,
+                PRIMARY KEY (run, attempt)
+            )"],
+    },
 ];
 
 /// The store version this binary writes and understands.
-pub const STORE_VERSION: i64 = 5;
+pub const STORE_VERSION: i64 = 6;
 
 /// Why the store could not be opened.
 #[derive(Debug, thiserror::Error)]

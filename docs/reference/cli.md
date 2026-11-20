@@ -32,6 +32,15 @@ and state store. It uses saved inputs and definitions; there is no replacement
 and does not start a competing executor. See [recovery](../concepts/durable-execution.md#resume-existing-work)
 for gate deadlines, budgets and recovery limits.
 
+`atomic runs show <run-id>` prints what the store recorded about a run: its
+workflow, status, input and output; each attempt, which is each time the run
+executed, from its start or from its checkpoints; each recorded step with the
+attempt that ran it, so after a kill and a resume it shows which steps the
+resume found checkpointed and which it ran again; its model calls and tokens;
+its gates; and the Codex threads that hold its transcripts. `--json` gives the
+same as one document, with each step's output. It reads the store alone: no
+model, no lock, nothing run.
+
 ## Choose what to run and what to send
 
 Inside a project directory, name the atom or workflow:

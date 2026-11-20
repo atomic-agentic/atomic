@@ -576,6 +576,9 @@ async fn run_pipeline<C: WorkflowContext>(
 ) -> Result<Value> {
     let PipelineRun { pipeline, input } = run;
     let id = ctx.workflow_id().to_owned();
+    // Before anything is recorded: which execution this is, so `runs show`
+    // can tell what each one ran and what it found checkpointed.
+    atomic_durable::history::begin(&ctx).await?;
     // Working from here to its end, but for waits at gates: a stopping
     // process gives it its grace, and begins none of its steps.
     let mut working = Some(begin_work().await);
