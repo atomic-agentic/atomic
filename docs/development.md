@@ -97,7 +97,17 @@ scripts/dev.sh bash -c 'psql "$ATOMIC_TEST_DATABASE_URL"'   # a SQL shell
 Set `ATOMIC_DEV_DB=off` to run a command without starting the database.
 
 A test suite that needs Postgres fails when `ATOMIC_TEST_DATABASE_URL` is not
-set. It never skips silently.
+set, or when the database it names does not answer, with a message naming it.
+It never skips silently. `scripts/backends-check.sh postgres` shows this: it
+runs every Postgres test without the database and requires each to fail so.
+
+The tests that need Postgres are behind the `atomic-agentic` package's
+`postgres-tests` feature, which turns on the durable store's as well; without
+it they are not built.
+
+```bash
+scripts/dev.sh cargo test --workspace --locked --features atomic-agentic/postgres-tests
+```
 
 ## The sandbox tests
 
@@ -110,14 +120,83 @@ those two restrictions for one command, and leaves capabilities dropped and
 
 ```bash
 ATOMIC_DEV_SANDBOX=on scripts/dev.sh cargo test --workspace --locked \
-  --features atomic-agentic-durable/postgres-tests,atomic-agentic/sandbox-tests
+  --features atomic-agentic/postgres-tests,atomic-agentic/sandbox-tests
 ```
 
-With the feature on, a sandbox that cannot start fails the tests. atomic itself
-needs the sandbox on Linux to run exec atoms and codex atoms' commands, and
-stops before such a step without it, so the tests in
+With the feature on, a sandbox that cannot start fails the tests, each with a
+message saying what the sandbox needs. Run without `ATOMIC_DEV_SANDBOX=on`,
+`scripts/dev.sh scripts/backends-check.sh sandbox` requires exactly that.
+atomic itself needs the sandbox on Linux to run exec atoms and codex atoms'
+commands, and stops before such a step without it, so the tests in
 `crates/atomic/tests/run_cli.rs` that run commands are behind the same feature
-there; the rest of that file runs in a plain `cargo test`.
+there, each marked `// needs_sandbox`; the rest of that file runs in a plain
+`cargo test`. The sandbox check runs each marked test, as it runs every test
+of a file that is behind the feature as a whole.
+
+## Controls are tested by removing them
+
+Each security control has a test that fails when the control is switched off.
+`scripts/controls-check.sh` proves it: for each v0.1 control (the hardened git
+command's settings, its neutralized filter drivers and its explicit git
+directory; the sandbox's confinement of writes, which keeps the state
+directory and a worktree's git directory out of a turn's reach, its exclusion
+of `/tmp`, and its denial of atomic's private state, to turns and to exec
+atoms' commands; and the confinement of exec atoms' commands itself), it
+switches the control off in the source, requires the control's test to fail,
+puts the source back and requires the test to pass. Each control costs a rebuild, so it
+runs by hand rather than in CI:
+
+```bash
+ATOMIC_DEV_SANDBOX=on scripts/dev.sh scripts/controls-check.sh
+```
+
+In a linked worktree, also mount the main checkout's `.git` with
+`ATOMIC_DEV_MOUNTS`, since the script hashes files with git. It puts every
+file it edits back, even when interrupted, and `scripts/controls-check-test.sh`
+(in CI) tests that.
+
+A control added later gets a row in the script. A row whose code has moved
+fails until it is updated.
+
+## The crash suite
+
+atomic's crash tests kill the process at named failpoints. A failpoint is
+compiled in only with the `failpoints` features of `atomic-agentic-durable` and
+`atomic-agentic-core`, which the `atomic-agentic` package's tests turn on; a
+release build has none. Two variables drive them:
+
+- `ATOMIC_FAILPOINT=<name>` kills the process (SIGKILL, so no core is dumped)
+  at the first failpoint of that name;
+- `ATOMIC_FAILPOINT_LOG=<file>` appends the name of every failpoint the process
+  reaches to `<file>`.
+
+`atomic_durable::failpoints::SITES` lists every site: before and after every
+durable checkpoint, at each message wait's record, between a model call's
+admission, its answer and its settlement, between the steps of a commit and of
+a finished run's cleanup, and around gates and parks. A site reached more than
+once in a run names each occurrence, such as
+`usage:before-settle:<request>`. A test reads the source to check that every
+failpoint named there is in `SITES`, and every site is named somewhere.
+
+The crash suite, `crates/atomic/tests/crash.rs`, runs each v0.1 workflow once
+to record the failpoints it passes, then, for each of them, kills a fresh run
+there and recovers it in a new process. Every recovered run must finish with
+the result an uninterrupted run gives, repeat no step whose checkpoint had
+committed, and leave one accepted commit for each code-changing step, changing
+what an uninterrupted run's commit changes. Across the workflows, every site
+must be reached, and no name twice in one run. Its code-changing atom runs a
+command under Codex's sandbox, so the suite is behind `sandbox-tests`. It
+takes a few minutes; while you work on one failpoint, `ATOMIC_TEST_CRASH_ONLY`
+narrows it:
+
+```bash
+ATOMIC_DEV_SANDBOX=on scripts/dev.sh cargo test -p atomic-agentic --locked \
+  --features sandbox-tests --test crash
+ATOMIC_DEV_SANDBOX=on ATOMIC_TEST_CRASH_ONLY=pipeline:after-commit scripts/dev.sh \
+  cargo test -p atomic-agentic --locked --features sandbox-tests --test crash
+```
+
+CI runs it on Linux, in a step of its own.
 
 ## Releases
 

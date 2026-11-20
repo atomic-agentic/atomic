@@ -51,6 +51,11 @@ jobs:
       - run: scripts/lock-check.sh
       # The V8 rule in lock-check against small lockfiles.
       - run: scripts/lock-check-test.sh
+      # controls-check.sh restores the source it edits, and refuses what it
+      # cannot do safely; tested with a stand-in for cargo.
+      - run: scripts/controls-check-test.sh
+      # release-package.sh refuses a binary with failpoints compiled in.
+      - run: scripts/release-package-test.sh
 
   # The Astro interpreter's own tests, and a rebuild of the bundled compiler
   # from its sources: the committed assets must be exactly what the sources
@@ -206,6 +211,11 @@ jobs:
 
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # The suites behind the test features (the crash suite, the sandbox and
+      # Postgres variants) only compile with them.
+      - name: Clippy with the test features (Linux)
+        if: runner.os == 'Linux'
+        run: cargo clippy --workspace --all-targets --locked --features atomic-agentic/postgres-tests,atomic-agentic/sandbox-tests -- -D warnings
       - run: cargo build --workspace --locked
       # The graph still resolves from scratch onto the libsqlite3-sys Codex
       # locks, which both Codex and the durare fork link.
@@ -220,9 +230,34 @@ jobs:
       # Postgres variants run where the test database is, and the sandbox tests
       # where Codex's Linux sandbox can start; with the features on, a missing
       # database or sandbox fails them rather than skipping.
+      # The crash suite runs in a step of its own, below.
       - name: Test (Linux, with Postgres and the sandbox)
+        id: test
         if: runner.os == 'Linux'
-        run: cargo test --workspace --locked --no-fail-fast --features atomic-agentic-durable/postgres-tests,atomic-agentic/sandbox-tests
+        run: cargo test --workspace --locked --no-fail-fast --features atomic-agentic/postgres-tests,atomic-agentic/sandbox-tests -- --skip every_failpoint_triggered_in_turn
+      # The crash suite: every failpoint, triggered in turn, against real
+      # workflows and the scripted fake model; each run killed there must
+      # finish when recovered, with no completed step repeated. Its codex atom
+      # runs under the sandbox, hence sandbox-tests. The same features as the
+      # step above, so nothing rebuilds. Linux only.
+      # These two also run when the test step failed, but not when it never
+      # ran because the build did not.
+      - name: Crash suite (Linux)
+        if: runner.os == 'Linux' && !cancelled() && steps.test.conclusion != 'skipped'
+        run: cargo test --workspace --locked --features atomic-agentic/postgres-tests,atomic-agentic/sandbox-tests --test crash
+      # A suite that cannot reach its backend fails; it never skips. The
+      # Postgres and sandbox suites run once more with their backend missing,
+      # and every one of their tests must fail, naming it. Nothing rebuilds.
+      - name: Suites fail without their backends (Linux)
+        if: runner.os == 'Linux' && !cancelled() && steps.test.conclusion != 'skipped'
+        run: |
+          scripts/backends-check.sh postgres
+          old="$(sysctl -n user.max_user_namespaces)"
+          sudo sysctl -w user.max_user_namespaces=0
+          status=0
+          scripts/backends-check.sh sandbox || status=$?
+          sudo sysctl -w user.max_user_namespaces="${old}"
+          exit "${status}"
       - name: Test (macOS)
         if: runner.os == 'macOS'
         run: cargo test --workspace --locked --no-fail-fast

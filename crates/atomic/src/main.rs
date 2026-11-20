@@ -169,7 +169,8 @@ fn main() -> anyhow::Result<()> {
         std::process::exit(runner());
     }
     let parsed = Cli::try_parse();
-    // Help and the version create nothing on disk.
+    // Help and the version create nothing on disk, and print only themselves:
+    // they need no Codex either (Codex's helpers were dispatched above).
     let quiet = parsed.as_ref().err().is_some_and(|e| {
         use clap::error::ErrorKind;
         matches!(
@@ -179,6 +180,17 @@ fn main() -> anyhow::Result<()> {
                 | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
         )
     });
+    if quiet && let Err(e) = &parsed {
+        e.exit();
+    }
+    // The runner role after global flags, such as `atomic --json runner`.
+    if let Ok(Cli {
+        command: Some(Command::Runner),
+        ..
+    }) = &parsed
+    {
+        std::process::exit(atomic_exec::runner::serve_stdio());
+    }
     // Resolve and create the state directory before Codex starts, so its home
     // is never the user's own. A failure here is reported once the normal entry
     // point runs; Codex's helper invocations never need it.
@@ -259,9 +271,6 @@ fn runner() -> i32 {
 }
 
 async fn run(cli: Cli, paths: CodexPaths, state: ProjectState) -> anyhow::Result<()> {
-    if let Some(Command::Runner) = cli.command {
-        std::process::exit(atomic_exec::runner::serve_stdio());
-    }
     // Before anything else: a store written by a newer atomic is refused.
     atomic_durable::store::open_sqlite(&state.database()).await?;
     // Turn directories a killed atomic left behind.
@@ -407,6 +416,13 @@ fn check(path: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
             atoms.insert(name.clone(), atom).is_none(),
             "duplicate atom name {name}"
         );
+    }
+    let mut warnings = Vec::new();
+    for source in &files["workflows"] {
+        let loaded = workflow::load(&source.path, &atoms, &mut registry)?;
+        for w in loaded.warnings {
+            warnings.push(format!("{}: {w}", loaded.file.display()));
+        }
     }
     // Each OpenAPI toolset must give tools whose schemas compile.
     let mut operations = 0;

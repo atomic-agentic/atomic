@@ -6,40 +6,26 @@
 //! only through this crate.
 
 pub mod attempt;
+pub mod failpoints;
 pub mod gate;
 pub mod publication;
 pub mod runtime;
-
-/// A named point where a crash test can kill the process: with the
-/// `failpoints` feature, when the `ATOMIC_FAILPOINT` environment variable
-/// equals `name`, the process aborts here, as if killed. Without the feature
-/// it does nothing.
-pub fn failpoint(name: &str) {
-    #[cfg(feature = "failpoints")]
-    if std::env::var("ATOMIC_FAILPOINT").is_ok_and(|f| f == name) {
-        eprintln!("failpoint {name}: aborting");
-        std::process::abort();
-    }
-    #[cfg(not(feature = "failpoints"))]
-    let _ = name;
-}
 pub mod store;
+#[cfg(feature = "postgres-tests")]
+pub mod testing;
 pub mod usage;
 
+pub use failpoints::failpoint;
 pub use publication::{
     Acceptance, Candidate, Park, Precondition, Proposal, Published, Write, execute_candidate,
     execute_candidate_at, parks, publish_candidate, review_candidate, run_atom, run_atom_at,
 };
 pub use runtime::{
-    Database, DurableError, DurableRuntime, Durare, DurareContext, ENGINE_IDENTITY_VARIABLE,
-    IdentityError, Param, Result, Row, RunStatus, StepInfo, StepRecord, ThreadRecord, Tx, TxFuture,
-    WorkflowContext, executor_identity,
+    DEFAULT_VERSION, Database, DurableError, DurableRuntime, Durare, DurareContext,
+    ENGINE_IDENTITY_VARIABLE, ENGINE_VERSION_VARIABLE, IdentityError, Param, RESUME_QUEUES, Result,
+    Row, RunRecord, RunStatus, StepInfo, StepRecord, ThreadRecord, Tx, TxFuture, WorkflowContext,
+    executor_identity,
 };
-
-/// Whether this build runs the PostgreSQL variants of the tests (the
-/// `postgres-tests` feature), for test suites in other crates, which cannot
-/// see this crate's features. With it on, a missing database fails them.
-pub const POSTGRES_TESTS: bool = cfg!(feature = "postgres-tests");
 
 use std::path::Path;
 use std::sync::Arc;

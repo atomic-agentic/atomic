@@ -63,7 +63,13 @@ host or StatefulSet member name, never a random container or pod name. On
 PostgreSQL `atomic serve` refuses to start without one. A restarted process
 recovers the unfinished runs it owns and leaves other processes' runs alone.
 Atomic takes the identity only from its own setting and refuses to start when
-the durable engine's own variable (`DBOS__VMID`) is set.
+the durable engine's own variables (`DBOS__VMID`, `DBOS__APPVERSION`) are set.
+
+The execution lock that keeps two processes from running the same project's
+runs covers one host. On PostgreSQL, `atomic runs resume` therefore refuses a
+run that another executor owns, which may still be running it. Once that
+executor has stopped for good, pass `--owner-stopped` to take the run over;
+passing it while the owner still runs lets two processes run the same steps.
 
 Atomic currently plans API keys, approved enterprise providers or workload identity
 as its defaults for unattended model access. Eligible documented account-auth

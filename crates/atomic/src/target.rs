@@ -261,8 +261,12 @@ fn atom_pipeline(atom: Atom, input: &Value) -> anyhow::Result<Pipeline> {
             id: "run".into(),
             atom: atom.name.clone(),
             origins: with
-                .keys()
-                .map(|k| (k.clone(), "external".to_owned()))
+                .iter()
+                .map(|(field, source)| {
+                    let origin = atomic_core::workflow::binding_origin(source, &BTreeMap::new())
+                        .unwrap_or("external");
+                    (field.clone(), origin.to_owned())
+                })
                 .collect(),
             with,
             worktree: false,

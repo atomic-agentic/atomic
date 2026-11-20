@@ -21,6 +21,9 @@
 
 #![recursion_limit = "512"]
 
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
+mod support;
+
 use atomic_core::runtime::{self, EffectIdentity};
 use atomic_core::testing::on_codex_runtime;
 use atomic_schema::registry::Registry;
@@ -124,8 +127,11 @@ fn assert_clean(what: &str, seen: &str) {
     );
 }
 
+// needs_sandbox (its Codex turn)
 #[test]
 fn atom_commands_get_only_core_and_declared_variables_on_every_backend() {
+    #[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
+    support::require_sandbox();
     // A HOME whose shell profiles export a marker.
     let home = scratch("home");
     for profile in [

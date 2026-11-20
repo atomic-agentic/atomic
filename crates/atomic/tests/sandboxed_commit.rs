@@ -25,6 +25,8 @@
 #![recursion_limit = "512"]
 #![allow(clippy::unwrap_used)]
 
+mod support;
+
 use atomic_core::Sandbox;
 use atomic_core::codex::{CodexPaths, ModelEndpoint, PrivateState, StateGuard, TurnSpec};
 use atomic_core::git::{Git, Signature};
@@ -77,6 +79,7 @@ fn fixture(tag: &str) -> Fixture {
 }
 
 fn fixture_in(parent: &Path, tag: &str) -> Fixture {
+    support::require_sandbox();
     let dir = parent.join(format!("atomic-sandboxed-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     for sub in ["project", "state", "codex-home", "bin"] {
@@ -363,9 +366,11 @@ fn a_read_only_turn_in_a_worktree_sees_its_checkout() {
             private: state.join("private"),
             also: Vec::new(),
         });
+        // One stream, so what the commands print arrives in order: Codex
+        // reports stdout and stderr separately, in no fixed order.
         let command = format!(
-            "echo cwd=$(pwd); cat a.txt; echo read-exit=$?; cat {}/private/atomic.db; \
-             echo private-exit=$?; echo x > a.txt; echo write-exit=$?",
+            "exec 2>&1; echo cwd=$(pwd); cat a.txt; echo read-exit=$?; \
+             cat {}/private/atomic.db; echo private-exit=$?; echo x > a.txt; echo write-exit=$?",
             state.display()
         );
         let output = sandboxed_with(

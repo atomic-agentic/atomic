@@ -18,10 +18,14 @@
 //! | 64 | usage error | fail the attempt; do not retry |
 //! | 78 | configuration or credential error | fail the attempt; do not retry until fixed |
 //! | 75 | workspace lease held elsewhere | wait, then try again, a bounded number of times |
-//! | any other, or a signal | crash | run the command again, a bounded number of times |
+//! | any other, or a signal | crash | report the outcome as unknown; never run it again |
 //!
-//! Commands run at least once: a crash after the command ran and before the
-//! response was written runs it again, as any retried step would.
+//! A runner that crashes, or exits cleanly with no response it can read, may
+//! have run the command, in part or in full, before it ended. The control
+//! plane cannot know, so [`ProcessRunner`] never runs the command again: it
+//! returns [`ExecError::Lost`], and the durable step, which knows what the
+//! command declares about its effects, decides whether it may run again.
+//! Only the codes that mean the command never started are retried.
 //!
 //! The runner process starts with only the environment the control plane
 //! gives it, so it never sees the control plane's own credentials, and the
@@ -41,8 +45,8 @@ pub const PROTOCOL: u32 = 1;
 pub mod code {
     /// It ran the request and wrote the response.
     pub const CLEAN: i32 = 0;
-    /// It failed in a way that says nothing about the request: run it again.
-    /// Any code not listed here means the same.
+    /// It failed in a way that says nothing about the request, which may have
+    /// run. Any code not listed here means the same.
     pub const CRASH: i32 = 70;
     /// The request or the command line was not one it accepts.
     pub const USAGE: i32 = 64;
@@ -72,8 +76,8 @@ pub enum Exit {
 pub enum Action {
     /// Read the response.
     Accept,
-    /// Run the command again, up to a bound.
-    Rerun,
+    /// Report that the command may have run and how it ended is unknown.
+    Unknown,
     /// Fail the attempt; retrying cannot help.
     Fail,
     /// Fail the attempt; retrying cannot help until the configuration is fixed.
@@ -109,7 +113,7 @@ impl Exit {
     pub fn action(self) -> Action {
         match self {
             Self::Clean => Action::Accept,
-            Self::Crash => Action::Rerun,
+            Self::Crash => Action::Unknown,
             Self::Usage => Action::Fail,
             Self::Config => Action::FailUntilFixed,
             Self::LeaseHeld => Action::Defer,
@@ -258,14 +262,37 @@ pub fn serve(
 }
 
 /// The runner's side on this process's stdin, stdout and stderr, running
-/// commands as child processes.
+/// commands as child processes in the runner's own process group, so that
+/// the control plane stops a command, with everything it started, by
+/// stopping its runner's group.
 pub fn serve_stdio() -> i32 {
+    process::ignore_stop_signals();
     serve(
         &mut std::io::stdin().lock(),
         &mut std::io::stdout().lock(),
         &mut std::io::stderr().lock(),
-        &LocalBackend::default(),
+        &InRunnerGroup(LocalBackend::default()),
     )
+}
+
+/// [`LocalBackend`], with each command in the runner's process group. The
+/// command comes already confined: the control plane confines it before it
+/// crosses to the runner.
+struct InRunnerGroup(LocalBackend);
+
+impl ExecutionBackend for InRunnerGroup {
+    fn connect(&self) -> Result<crate::Statement, ExecError> {
+        self.0.connect()
+    }
+    fn open(&self, request: &crate::Open) -> Result<crate::Workspace, ExecError> {
+        self.0.open(request)
+    }
+    fn run(&self, command: &Command) -> Result<Completed, ExecError> {
+        LocalBackend::run_in(process::Group::Inherit, command)
+    }
+    fn close(&self, workspace: &crate::Workspace) -> Result<(), ExecError> {
+        self.0.close(workspace)
+    }
 }
 
 /// The control plane's side: an [`ExecutionBackend`] that runs each command
@@ -278,7 +305,8 @@ pub struct ProcessRunner {
     pub args: Vec<String>,
     /// The runner process's whole environment. Nothing else is inherited.
     pub env: Vec<(String, String)>,
-    /// How many more times a command is tried after a crash or a held lease.
+    /// How many more times a command is tried after a held lease, which
+    /// means it never started. A crash is never retried.
     pub retries: u32,
     /// How long to wait for a held lease before trying again.
     pub lease_wait: Duration,
@@ -307,7 +335,10 @@ impl ProcessRunner {
 
     /// Start one runner on `request` and classify how it ended.
     fn attempt(&self, command: &Command, request: &[u8]) -> Result<(Exit, Completed), ExecError> {
-        let done = process::run(
+        // The runner's group holds its command too: whatever is left in it
+        // when the runner ends goes with it.
+        let done = process::run_in(
+            process::Group::Own,
             &self.program,
             &self.args,
             None,
@@ -325,6 +356,15 @@ impl ProcessRunner {
             },
         )?;
         Ok((Exit::classify(done.code), done))
+    }
+
+    fn lost(&self, command: &Command, runner: &Completed, why: &str) -> ExecError {
+        ExecError::Lost {
+            program: command.program.clone(),
+            code: runner.code,
+            message: why.to_owned(),
+            stderr: String::from_utf8_lossy(&runner.stderr).trim().to_owned(),
+        }
     }
 
     fn failure(&self, command: &Command, exit: Exit, runner: &Completed, why: &str) -> ExecError {
@@ -364,56 +404,57 @@ impl ExecutionBackend for ProcessRunner {
         })?;
         let mut tries = 0;
         loop {
-            let (exit, runner) = self.attempt(command, &request)?;
+            let (exit, runner) = match self.attempt(command, &request) {
+                Ok(ended) => ended,
+                // A runner that never started ran nothing.
+                Err(e @ ExecError::Start { .. }) => return Err(e),
+                // One stopped or unreadable after it started may have run it.
+                Err(e) => {
+                    return Err(ExecError::Lost {
+                        program: command.program.clone(),
+                        code: None,
+                        message: e.to_string(),
+                        stderr: String::new(),
+                    });
+                }
+            };
             let retry = tries < self.retries;
             tries += 1;
             match exit.action() {
                 Action::Accept => {
-                    match serde_json::from_slice::<Response>(&runner.stdout) {
+                    // A clean exit with no response it can read is a runner
+                    // fault after the command may have run.
+                    return match serde_json::from_slice::<Response>(&runner.stdout) {
                         Ok(Response::Completed {
                             code,
                             stdout,
                             stderr,
                         }) => match (unhex(&stdout), unhex(&stderr)) {
-                            (Some(stdout), Some(stderr)) => {
-                                return Ok(Completed {
-                                    code,
-                                    stdout,
-                                    stderr,
-                                });
-                            }
-                            _ if retry => continue,
-                            _ => {
-                                return Err(self.failure(
-                                    command,
-                                    Exit::Crash,
-                                    &runner,
-                                    "its response is not hex",
-                                ));
-                            }
+                            (Some(stdout), Some(stderr)) => Ok(Completed {
+                                code,
+                                stdout,
+                                stderr,
+                            }),
+                            _ => Err(self.lost(command, &runner, "its response is not hex")),
                         },
-                        Ok(Response::Failed { error }) => return Err(error),
-                        // A clean exit with no readable response is a
-                        // runner fault, so it is handled as a crash.
-                        Err(_) if retry => continue,
-                        Err(e) => {
-                            return Err(self.failure(
-                                command,
-                                Exit::Crash,
-                                &runner,
-                                &format!("it exited cleanly with no response it could read: {e}"),
-                            ));
-                        }
-                    }
+                        Ok(Response::Failed { error }) => Err(error),
+                        Err(e) => Err(self.lost(
+                            command,
+                            &runner,
+                            &format!("it exited cleanly with no response it could read: {e}"),
+                        )),
+                    };
                 }
-                Action::Rerun if retry => continue,
+                Action::Unknown => {
+                    return Err(self.lost(command, &runner, "it crashed"));
+                }
                 Action::Defer if retry => std::thread::sleep(self.lease_wait),
-                Action::Rerun | Action::Defer => {
+                Action::Defer => {
                     return Err(self.failure(
                         command,
                         exit,
                         &runner,
-                        &format!("it failed {tries} times"),
+                        &format!("the lease was still held after {tries} tries"),
                     ));
                 }
                 Action::Fail => {

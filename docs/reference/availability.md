@@ -50,9 +50,9 @@ built. `atomic run` takes an atom or workflow by name, by file or with
 continues with `atomic runs resume <run-id>`, or under `atomic serve`, from its
 checkpoints. One process at a time executes a project's runs. Errors carry a
 description and an action, separately in `--json` output. `atomic gates enroll`,
-`list`, `approve` and `reject` are built, and a gate decision counts only with
-the credential its person enrolled; the terminal prompt for gates in
-`atomic run` is not wired up yet.
+`list`, `approve` and `reject` decide gates from a second terminal; a gate
+decision counts only with the credential its person enrolled. The terminal
+prompt for gates in `atomic run` is not wired up yet.
 
 `atomic serve` also runs on PostgreSQL (`ATOMIC_DATABASE_URL`) when the process
 has an executor identity (`ATOMIC_EXECUTOR_ID`). `atomic runner` and
@@ -146,7 +146,7 @@ reaches a cap. The commands that show budgets and spend come with run inspection
 
 The local baseline is saved run inspection and basic spans in v0.1 (M12).
 Full OpenTelemetry correlation/export and the optional `atomic dev --otel` local
-viewer helper belong to M44, assigned to v0.5 in the plan and these docs.
+viewer helper belong to M44, assigned to v0.5.
 Datadog and other compatible backends remain optional. See [observability](../operations/observability.md).
 
 ## Read examples by stage

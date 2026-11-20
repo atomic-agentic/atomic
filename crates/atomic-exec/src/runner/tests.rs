@@ -55,15 +55,15 @@ fn starts(dir: &Path) -> usize {
 fn every_exit_code_has_one_class_and_an_unknown_code_is_a_crash() {
     let table = [
         (Some(0), Exit::Clean, Action::Accept),
-        (Some(70), Exit::Crash, Action::Rerun),
+        (Some(70), Exit::Crash, Action::Unknown),
         (Some(64), Exit::Usage, Action::Fail),
         (Some(78), Exit::Config, Action::FailUntilFixed),
         (Some(75), Exit::LeaseHeld, Action::Defer),
-        (Some(1), Exit::Crash, Action::Rerun),
-        (Some(2), Exit::Crash, Action::Rerun),
-        (Some(101), Exit::Crash, Action::Rerun),
-        (Some(-1), Exit::Crash, Action::Rerun),
-        (None, Exit::Crash, Action::Rerun),
+        (Some(1), Exit::Crash, Action::Unknown),
+        (Some(2), Exit::Crash, Action::Unknown),
+        (Some(101), Exit::Crash, Action::Unknown),
+        (Some(-1), Exit::Crash, Action::Unknown),
+        (None, Exit::Crash, Action::Unknown),
     ];
     for (code, class, action) in table {
         assert_eq!(Exit::classify(code), class, "{code:?}");
@@ -180,23 +180,25 @@ fn a_clean_exit_returns_the_commands_own_result() {
 }
 
 #[test]
-fn a_crash_runs_the_command_again_up_to_a_bound() {
+fn a_crash_is_an_unknown_outcome_and_the_command_never_runs_again() {
+    // The command may have run before the runner died, so the runner never
+    // runs it again: whether it may is the durable step's to decide.
     for script in ["exit 70", "exit 1", "kill -9 $$"] {
         let dir = scratch("crash");
         let error = fake(&dir, &format!("printf 'boom' >&2; {script}"))
             .run(&command("anything", &[], b""))
             .expect_err("fails");
-        assert_eq!(starts(&dir), 3, "{script}: one try and two reruns");
-        let ExecError::Runner { class, stderr, .. } = &error else {
+        assert_eq!(starts(&dir), 1, "{script}: started once");
+        assert!(error.outcome_unknown(), "{script}: {error}");
+        let ExecError::Lost { stderr, .. } = &error else {
             panic!("{script}: {error}");
         };
-        assert_eq!(class, "crash", "{script}");
         assert_eq!(stderr, "boom", "{script}: stderr is attached as it was");
     }
 }
 
 #[test]
-fn a_crash_then_a_clean_run_succeeds() {
+fn a_crash_is_not_retried_even_when_a_retry_would_succeed() {
     let dir = scratch("flaky");
     let response = serde_json::to_string(&Response::Completed {
         code: Some(0),
@@ -209,11 +211,11 @@ fn a_crash_then_a_clean_run_succeeds() {
         "cat > /dev/null; if [ -e '{m}' ]; then printf '%s' '{response}'; else : > '{m}'; exit 70; fi",
         m = marker.display()
     );
-    let done = fake(&dir, &script)
+    let error = fake(&dir, &script)
         .run(&command("anything", &[], b""))
-        .expect("the rerun completes");
-    assert_eq!(done.stdout, b"done");
-    assert_eq!(starts(&dir), 2);
+        .expect_err("the crash is reported");
+    assert!(error.outcome_unknown(), "{error}");
+    assert_eq!(starts(&dir), 1);
 }
 
 #[test]
@@ -231,6 +233,7 @@ fn a_usage_or_configuration_error_is_never_retried() {
         .run(&command("anything", &[], b""))
         .expect_err("fails");
         assert_eq!(starts(&dir), 1, "{script}");
+        assert!(!error.outcome_unknown(), "{script}: nothing ran");
         let ExecError::Runner { class: got, .. } = &error else {
             panic!("{script}: {error}");
         };
@@ -244,7 +247,12 @@ fn a_held_lease_waits_and_tries_again() {
     let error = fake(&dir, "exit 75")
         .run(&command("anything", &[], b""))
         .expect_err("still held");
-    assert_eq!(starts(&dir), 3);
+    assert_eq!(
+        starts(&dir),
+        3,
+        "a held lease means nothing ran, so it tries again"
+    );
+    assert!(!error.outcome_unknown(), "{error}");
     assert!(
         matches!(&error, ExecError::Runner { class, .. } if class == "lease held elsewhere"),
         "{error}"
@@ -252,16 +260,21 @@ fn a_held_lease_waits_and_tries_again() {
 }
 
 #[test]
-fn a_clean_exit_with_no_response_is_a_crash() {
-    let dir = scratch("garbled");
-    let error = fake(&dir, "printf 'half a resp'")
-        .run(&command("anything", &[], b""))
-        .expect_err("fails");
-    assert_eq!(starts(&dir), 3);
-    assert!(
-        matches!(&error, ExecError::Runner { class, .. } if class == "crash"),
-        "{error}"
-    );
+fn a_clean_exit_with_no_readable_response_is_an_unknown_outcome() {
+    for script in [
+        "printf 'half a resp'",
+        "printf '{\"outcome\":\"completed\",\"code\":0,\"stdout\":\"zz\",\"stderr\":\"\"}'",
+    ] {
+        let dir = scratch("garbled");
+        let error = fake(&dir, script)
+            .run(&command("anything", &[], b""))
+            .expect_err("fails");
+        assert_eq!(starts(&dir), 1, "{script}");
+        assert!(
+            matches!(&error, ExecError::Lost { .. }) && error.outcome_unknown(),
+            "{script}: {error}"
+        );
+    }
 }
 
 #[test]

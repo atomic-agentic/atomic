@@ -27,3 +27,8 @@ serde = { workspace = true }
 serde_json = { workspace = true, features = ["preserve_order"] }
 thiserror = { workspace = true }
 url = { workspace = true }
+
+[dev-dependencies]
+# Codex's crates turn on arbitrary-precision numbers in the atomic binary; the
+# tests run with it too, so the JSON-to-CEL conversion is tested as it runs.
+serde_json = { workspace = true, features = ["preserve_order", "arbitrary_precision"] }

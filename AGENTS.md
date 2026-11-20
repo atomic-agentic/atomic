@@ -111,9 +111,10 @@ under memory, CPU and time limits, and starts a throwaway Postgres for tests.
 ```bash
 scripts/dev.sh cargo build --workspace --locked
 scripts/dev.sh cargo test --workspace --locked --no-fail-fast
-scripts/dev.sh cargo test --workspace --locked --features atomic-agentic-durable/postgres-tests
+scripts/dev.sh cargo test --workspace --locked --features atomic-agentic/postgres-tests
 scripts/dev.sh cargo fmt --all --check
 scripts/dev.sh cargo clippy --workspace --all-targets --locked -- -D warnings
+scripts/dev.sh cargo clippy --workspace --all-targets --locked --features atomic-agentic/postgres-tests,atomic-agentic/sandbox-tests -- -D warnings
 scripts/dev.sh cargo test -p atomic-agentic-core --lib --features fake-model   # one crate
 ```
 

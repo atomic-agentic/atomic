@@ -388,7 +388,7 @@ fn killing_after_the_call_and_before_settlement_ends_parked_at_the_cap() {
                 "unsettled",
                 role,
                 caps,
-                Some("usage:before-settle"),
+                Some("usage:before-settle:unsettled:0:0"),
             )
             .await;
             assert_eq!(seen, None, "process {kill} was killed");
@@ -403,7 +403,7 @@ fn killing_after_the_call_and_before_settlement_ends_parked_at_the_cap() {
             "unsettled",
             "recover",
             caps,
-            Some("usage:before-settle"),
+            Some("usage:before-settle:unsettled:0:0"),
         )
         .await
         .expect("the recovery parked instead of dying");
@@ -498,7 +498,7 @@ fn a_killed_and_resumed_run_reports_the_same_usage_plus_only_real_retries() {
                 "retried",
                 "start",
                 caps,
-                Some("usage:before-settle")
+                Some("usage:before-settle:retried:0:0")
             )
             .await,
             None

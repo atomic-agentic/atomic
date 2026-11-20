@@ -1037,7 +1037,13 @@ pub async fn run_exec_opened(
     )
     .await;
     workspace.close().await;
-    let done = done.map_err(|e| AtomError::Runtime(format!("{}: {e}", atom.name)))?;
+    let done = done.map_err(|e| {
+        let message = format!("{}: {e}", atom.name);
+        match e {
+            CommandError::Exec(e) if e.outcome_unknown() => AtomError::OutcomeUnknown(message),
+            _ => AtomError::Runtime(message),
+        }
+    })?;
     if !done.success() {
         let stderr = String::from_utf8_lossy(&done.stderr);
         let tail: String = stderr
@@ -1117,14 +1123,10 @@ async fn run_command(
     args: Vec<String>,
     stdin: Vec<u8>,
     effect: [(String, String); 3],
-) -> Result<atomic_exec::Completed, String> {
+) -> Result<atomic_exec::Completed, CommandError> {
     let workspace = guard.workspace();
-    let cwd = workspace.require_root().map_err(|e| e.to_string())?.clone();
-    let scratch = workspace
-        .require_scratch()
-        .map_err(|e| e.to_string())?
-        .display()
-        .to_string();
+    let cwd = workspace.require_root()?.clone();
+    let scratch = workspace.require_scratch()?.display().to_string();
     let mut env: Vec<(String, String)> = workspace
         .env
         .iter()
@@ -1154,8 +1156,19 @@ async fn run_command(
         done
     })
     .await
-    .map_err(|e| e.to_string())?
-    .map_err(|e| e.to_string())
+    .map_err(|e| CommandError::Join(e.to_string()))?
+    .map_err(CommandError::Exec)
+}
+
+/// Why [`run_command`] has no result.
+#[derive(Debug, thiserror::Error)]
+enum CommandError {
+    /// The backend's error, which says whether the command may have run.
+    #[error(transparent)]
+    Exec(#[from] atomic_exec::ExecError),
+    /// The blocking task running it failed.
+    #[error("{0}")]
+    Join(String),
 }
 
 async fn validate_output(

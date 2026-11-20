@@ -16,6 +16,8 @@
 #![cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 #![recursion_limit = "512"]
 
+mod support;
+
 use atomic_core::codex::{CodexPaths, ModelEndpoint, TurnSpec};
 use atomic_core::runtime::{Artifacts, CodexRuntime, run_codex_atom, run_turn};
 use atomic_core::testing::{FakeModel, Reply, on_codex_runtime};
@@ -153,6 +155,7 @@ impl Atom for Report {
 
 #[test]
 fn a_turn_runs_where_its_workspace_says() {
+    support::require_sandbox();
     on_codex_runtime(async {
         let dir = scratch("placed");
         let model = FakeModel::start(vec![
@@ -235,6 +238,7 @@ async fn plant_in_live_exec_scratch(dir: &Path, scratch_root: PathBuf) -> (bool,
 
 #[test]
 fn a_turn_cannot_plant_files_in_a_live_exec_scratch() {
+    support::require_sandbox();
     on_codex_runtime(async {
         let dir = scratch("plant");
         // Where atomic keeps scratch directories: the project's state
@@ -259,6 +263,7 @@ fn a_turn_cannot_plant_files_in_a_live_exec_scratch() {
 /// TMPDIR and never remove a mount point the other is using.
 #[test]
 fn concurrent_turns_in_one_directory_never_break_each_others_sandbox() {
+    support::require_sandbox();
     const TURNS: usize = 4;
     const COMMANDS: usize = 80;
     on_codex_runtime(async {

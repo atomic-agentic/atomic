@@ -24,7 +24,8 @@ interactive coding, the target entry experience also works in an ordinary
 directory without a project manifest.
 
 `atomic run` returns a typed result when successful and provides a run identity
-for inspection. Local workflow gates can wait for your decision in the terminal.
+for inspection. `--run-id` names the new run; an id that is already in the store
+is refused, since that run continues only with `atomic runs resume`. Local workflow gates can wait for your decision in the terminal.
 Use `atomic runs resume <run-id>` after an interruption, from the same project
 and state store. It uses saved inputs and definitions; there is no replacement
 `--input`. If another local runtime owns the project, it reports that owner
@@ -197,13 +198,49 @@ from a second terminal. It is not a detach command.
 `atomic run`, `atomic runs resume` and `atomic serve` each hold the project's
 execution lock while they run. A second one is refused with the process id and
 command of the one that holds it, so two processes never execute the same
-project's runs. `atomic serve` stops on SIGTERM or SIGINT; unfinished work stays
-recorded for the next `serve` or `runs resume`.
+project's runs. The lock is released only when its process exits.
+
+`atomic serve`, `atomic run` and `atomic runs resume` stop on SIGTERM, SIGINT,
+SIGHUP or SIGQUIT, except one they were started ignoring, as under `nohup` or
+as a shell's background job, which they keep ignoring. No step starts after the first signal, and running steps get
+up to 10 seconds to reach a checkpoint; a second signal stops the process at
+once. A command still running then is killed, with everything it
+started, also under `--runner process`, and the process exits without recording
+how the command ended: `atomic serve` with status 1, `atomic run` and
+`atomic runs resume` with status 130, leaving the run for `atomic runs resume`. Unfinished work stays recorded for the
+next `serve` or `runs resume`, and an interrupted command runs again only if it
+declares `effects.external` as `read-only` or `idempotent`; any other is parked
+as `outcome_unknown`. Each command runs in a process group of its own (under
+`--runner process`, its runner's), and on Linux it is killed if atomic dies.
+Whatever a command leaves running in its group when it ends is stopped then
+(under `--runner process`, when its runner ends). Output that arrives more than
+two seconds after a command exits is not its output, so a process that left
+its group, such as one started with `setsid`, cannot hold the step open,
+though atomic cannot stop it. A runner
+ignores the stop signals a command in its group might send it.
+
+One process recovers a run at most five times at the same step before it fails
+it as dead-lettered (a run that gets further counts afresh), so a step whose process keeps dying stops soon; restarting
+`atomic serve` does not count against a run. A run the engine parks after many
+restarts (`MAX_RECOVERY_ATTEMPTS_EXCEEDED`) is named by `atomic serve` and goes
+on with `atomic runs resume`.
+
+A resumed run goes on a queue of the resuming executor's own: only
+`atomic runs resume` and `atomic serve` of that executor run it, and
+`atomic run` only ever runs the run it started.
+
+Each run is stamped with the layout of the durable steps atomic records, not
+with the build that started it, so a rebuilt or upgraded atomic with the same
+layout resumes and recovers it. A run of another layout is refused by
+`atomic runs resume` and listed by `atomic serve`, which leaves it as it is.
+Atomic refuses to start when the durable engine's own version variable
+(`DBOS__APPVERSION`) is set.
 
 | Setting | Meaning |
 | --- | --- |
 | `ATOMIC_MODEL_BASE_URL`, `ATOMIC_MODEL` (`--model-base-url`, `--model`) | The OpenAI-compatible endpoint and model that model atoms use; `ATOMIC_MODEL_API_KEY_ENV` names the variable holding its key |
 | `ATOMIC_DATABASE_URL`, `ATOMIC_DATABASE_SCHEMA` | PostgreSQL instead of the project's local SQLite store; the schema defaults to `atomic` |
+| `--owner-stopped` (`runs resume` only) | On PostgreSQL, take over a run another executor owns, asserting that executor has stopped; without it such a resume is refused |
 | `ATOMIC_EXECUTOR_ID` (`--executor-id`) | This process's identity as owner of its runs: unique to the process and the same across its restarts, so a restart recovers its own unfinished runs and no one else's. Required on PostgreSQL |
 | `ATOMIC_RUNNER` (`--runner`) | `local` (the default) runs exec atoms' commands as child processes; `process` runs each in an `atomic runner` process of its own, which sees only `PATH` from its parent |
 
@@ -221,7 +258,7 @@ about it. It creates no state directory.
 | 64 | Usage error | Fails the attempt, no retry |
 | 78 | Configuration or credential error | Fails the attempt, no retry until fixed |
 | 75 | Workspace lease held elsewhere | Waits, then tries again a bounded number of times |
-| Any other, or a signal | Crash | Runs the command again a bounded number of times |
+| Any other, or a signal | Crash | Never runs the command again: it may have run, so the step's attempt is interrupted, and only a command declared `read-only` or `idempotent` runs again; any other is parked as `outcome_unknown` |
 
 Its stderr is attached to a failure as it is, never parsed. Runners reached over
 the network and other execution backends are planned for the platform stage.

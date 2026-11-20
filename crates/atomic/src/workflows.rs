@@ -76,6 +76,9 @@ pub(crate) fn failed(e: AtomError) -> DurableError {
             );
             std::process::exit(UNCONFINABLE_EXIT);
         }
+        // Like a crash before the checkpoint: recovery runs the step again,
+        // through its attempt guard.
+        e @ AtomError::OutcomeUnknown(_) => DurableError::Interrupted(e.to_string()),
         e => DurableError::Failed(e.to_string()),
     }
 }

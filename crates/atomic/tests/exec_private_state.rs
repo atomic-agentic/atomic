@@ -14,6 +14,8 @@
 #![cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 #![recursion_limit = "512"]
 
+mod support;
+
 use atomic_core::codex::{CodexPaths, ExecSandbox, StateGuard};
 use atomic_core::runtime::{self, EffectIdentity};
 use atomic_core::testing::on_codex_runtime;
@@ -138,6 +140,7 @@ async fn probe(
 
 #[test]
 fn an_exec_atom_cannot_reach_atomics_private_state() {
+    support::require_sandbox();
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("atomic-exec-private-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);

@@ -238,6 +238,31 @@ pub enum ExecError {
         /// Why.
         message: String,
     },
+    /// The runner process it was sent to ended without saying how the
+    /// command ended. The command may have run, in part or in full, so what
+    /// it did is unknown, and the backend never runs it again on its own.
+    #[error("the runner for {program} ended without its result{}: {message}{}; the command may have run",
+        code.map(|c| format!(" (exit code {c})")).unwrap_or_default(),
+        if stderr.is_empty() { String::new() } else { format!("; its stderr: {stderr}") })]
+    Lost {
+        /// The program.
+        program: String,
+        /// The runner's exit code, or `None` if a signal ended it.
+        code: Option<i32>,
+        /// What the control plane concluded.
+        message: String,
+        /// What the runner wrote to stderr, as it was: captured, never parsed.
+        stderr: String,
+    },
+}
+
+impl ExecError {
+    /// Whether the command may have run although no result came back, so
+    /// running it again could repeat what it did. Only the caller, which
+    /// knows what the command declares about its effects, may decide to.
+    pub fn outcome_unknown(&self) -> bool {
+        matches!(self, Self::Lost { .. })
+    }
 }
 
 /// Where atoms run. The control plane reaches runners only through this.
@@ -501,13 +526,23 @@ impl ExecutionBackend for LocalBackend {
         workspace::close_local(workspace)
     }
 
+    /// Runs `command` under this backend's confinement, if it has one, in a
+    /// process group of its own.
     fn run(&self, command: &Command) -> Result<Completed, ExecError> {
-        let command = &self.prepare(command)?;
+        Self::run_in(process::Group::Own, &self.prepare(command)?)
+    }
+}
+
+impl LocalBackend {
+    /// Run `command` as it is, unconfined, in `group`: what
+    /// [`ExecutionBackend::run`] does once the command is confined.
+    pub fn run_in(group: process::Group, command: &Command) -> Result<Completed, ExecError> {
         let program = process::resolve(&command.program).map_err(|message| ExecError::Start {
             program: command.program.clone(),
             message,
         })?;
-        process::run(
+        process::run_in(
+            group,
             &program,
             &command.args,
             Some(&command.cwd),

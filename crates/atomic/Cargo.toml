@@ -17,6 +17,10 @@ workspace = true
 # Run the tests that need Codex's Linux sandbox (bubblewrap and unprivileged
 # user namespaces). With this on, a sandbox that cannot start fails them.
 sandbox-tests = []
+# Run the tests that need PostgreSQL at ATOMIC_TEST_DATABASE_URL, here and
+# in the durable store. With this on, a database that cannot be reached fails
+# them; with it off, they are not built.
+postgres-tests = ["atomic-durable/postgres-tests"]
 
 [dependencies]
 tokio = { workspace = true, features = ["rt", "signal", "macros"] }
@@ -35,8 +39,7 @@ sha2 = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-cel = { workspace = true }
-atomic-core = { workspace = true, features = ["fake-model"] }
+atomic-core = { workspace = true, features = ["fake-model", "failpoints"] }
 atomic-durable = { workspace = true, features = ["failpoints"] }
 sqlx = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "time"] }

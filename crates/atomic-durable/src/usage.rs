@@ -577,7 +577,9 @@ impl Ledger {
     pub async fn settle(&self, request: &str, attempt: i64, how: Settlement) -> Result<Settled> {
         // Where a crash test kills the process: after the provider was
         // called, before its usage is recorded.
-        failpoint("usage:before-settle");
+        if crate::failpoints::armed() {
+            failpoint(&format!("usage:before-settle:{request}"));
+        }
         let request = request.to_owned();
         self.transact(move |mut tx| {
             let request = request.clone();

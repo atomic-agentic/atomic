@@ -13,13 +13,13 @@
 
 use crate::failure::Failure;
 use anyhow::Context;
-use atomic_app::pipeline::{Services, register_pipeline};
+use atomic_app::pipeline::{LAYOUT_VERSION, Services, register_pipeline};
 use atomic_core::AtomConfig;
 use atomic_core::artifact::LocalStore;
 use atomic_core::codex::{CodexPaths, ModelEndpoint};
 use atomic_core::lite::LiteRuntime;
 use atomic_core::runtime::{Artifacts, CodexRuntime, Runtimes};
-use atomic_core::state::{ExecutionLock, ProjectState};
+use atomic_core::state::ProjectState;
 use atomic_core::worktree::Worktrees;
 use atomic_durable::gate::{Deployment, Principal};
 use atomic_durable::{Database, DurableRuntime, Durare};
@@ -115,6 +115,10 @@ pub fn describe(database: &Database) -> String {
 }
 
 /// One developer on one machine: the local operator decides gates.
+///
+/// `$USER` only names that operator in gate records. It is not a
+/// credential: anyone who can set it can set it to anything, so it must never
+/// be what proves a decision came from a person.
 pub fn deployment() -> Deployment {
     let user = std::env::var("USER")
         .ok()
@@ -125,26 +129,53 @@ pub fn deployment() -> Deployment {
     }
 }
 
-/// A control plane for one project, holding its execution lock.
+/// A control plane for one project. Its process holds the project's
+/// execution lock until it exits.
 pub struct Engine {
     /// The durable runtime, launched, with `run_pipeline` registered.
     pub rt: Durare,
     /// Where its store is, for messages.
     pub store: String,
-    _lock: ExecutionLock,
+    /// Whether the store is shared with other hosts' executors, which this
+    /// process's execution lock does not exclude.
+    pub shared: bool,
+}
+
+impl Engine {
+    /// Start running: dispatch the resumed runs it takes, so a run resumed
+    /// before this is taken once, by this engine.
+    pub async fn launch(&self) -> anyhow::Result<()> {
+        self.rt.launch().await.context("launch the durable runtime")
+    }
+}
+
+/// Which resumed runs an engine takes, besides the runs it starts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Takes {
+    /// None: `atomic run`.
+    Own,
+    /// This one, from its own queue: `atomic runs resume <run>`.
+    Run(String),
+    /// Every run waiting on one of its executor's resume queues:
+    /// `atomic serve`.
+    Waiting,
 }
 
 /// Take the project's execution lock for `command`, open its store and
-/// launch `run_pipeline` on it.
+/// register `run_pipeline` on it, taking the runs `takes` says; then
+/// [`Engine::launch`] it.
 pub async fn open(
     state: &ProjectState,
     paths: &CodexPaths,
     args: &EngineArgs,
     command: &str,
     needs_model: bool,
+    takes: Takes,
 ) -> anyhow::Result<Engine> {
     state.create()?;
-    let lock = state.lock_execution(command)?;
+    // Held until the process exits: dropping the engine while a command it
+    // started still runs must not let another process recover that run.
+    state.lock_execution(command)?.hold_until_exit();
     let database = database(state);
     let executor = atomic_durable::executor_identity(args.executor_id.as_deref())?;
     if matches!(database, Database::Postgres { .. }) && executor.is_none() {
@@ -218,7 +249,7 @@ pub async fn open(
     });
     // A project in a git repository gets worktrees for its worktree steps.
     let worktrees = Worktrees::open(state).ok().map(Arc::new);
-    let mut rt = Durare::open(&database, executor.as_deref())
+    let mut rt = Durare::open(&database, executor.as_deref(), LAYOUT_VERSION)
         .await
         .with_context(|| format!("open the durable store at {}", describe(&database)))?;
     register_pipeline(
@@ -231,15 +262,24 @@ pub async fn open(
             // The CLI reads no configuration files yet, so every run is
             // metered under the built-in budget defaults.
             budgets: Arc::default(),
-            // The CLI reads no public context settings yet, so a step whose
-            // atom declares a context is refused.
+            // No context settings yet: a step whose atom declares a public
+            // context is refused rather than resolved from nothing.
             context: None,
         },
     );
-    rt.launch().await.context("launch the durable runtime")?;
+    let only = match &takes {
+        Takes::Own => None,
+        Takes::Run(run) => Some(Some(run.as_str())),
+        Takes::Waiting => Some(None),
+    };
+    if let Some(only) = only {
+        rt.take_resumed_runs(only)
+            .await
+            .context("take resumed runs on the durable runtime")?;
+    }
     Ok(Engine {
         rt,
         store: describe(&database),
-        _lock: lock,
+        shared: matches!(database, Database::Postgres { .. }),
     })
 }

@@ -34,6 +34,8 @@
 #![recursion_limit = "512"]
 #![allow(clippy::unwrap_used)]
 
+mod support;
+
 use atomic_core::Sandbox;
 use atomic_core::codex::{CodexPaths, ModelEndpoint, PrivateState, StateGuard, TurnSpec};
 use atomic_core::credential::{self, MemorySecrets};
@@ -325,6 +327,7 @@ async fn sandboxed(
 
 #[test]
 fn an_atom_cannot_approve_its_own_gate_through_its_shell() {
+    support::require_sandbox();
     on_codex_runtime(async {
         let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
             .join(format!("atomic-self-approval-{}", std::process::id()));
@@ -490,6 +493,7 @@ fn wrapped_bwrap(bin: &Path, argv0: bool) -> PathBuf {
 /// bubblewrap re-runs the helper by name (`--argv0`) or by that path.
 #[test]
 fn a_turn_through_atomics_own_entry_point_runs_with_its_helper_in_the_state_directory() {
+    support::require_sandbox();
     for argv0 in [true, false] {
         on_codex_runtime(async move {
             let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))

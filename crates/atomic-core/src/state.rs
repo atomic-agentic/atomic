@@ -13,6 +13,7 @@
 //!                             entry for the whole of `<home>/private`:
 //!     atomic.db     atomic's own database (durable workflows, the gate store)
 //!     context/      context checkpoints
+//!     runtime.lock  held by the one process that executes the project's runs
 //! <state>/ = <home>/projects/<project>/
 //!   codex/        Codex's home for atom threads, with its own state database
 //!                 (denied to atoms too, apart from the shell snapshots and
@@ -22,7 +23,6 @@
 //!   tmp/          each turn's own temporary directory
 //!   scratch/      each atom attempt's scratch directory, and the
 //!                 temporary directory its backend's turns share
-//!   runtime.lock  held by the one process that executes the project's runs
 //! ```
 //!
 //! Atom threads therefore never mix with the user's own Codex sessions.
@@ -33,8 +33,9 @@
 //!
 //! One process at a time executes a project's runs: `atomic run`,
 //! `atomic runs resume` and `atomic serve` each take the [`ExecutionLock`]
-//! first, so two of them never recover or run the same work. The operating
-//! system releases it when its holder exits, however it exits.
+//! (`<home>/private/<project>/runtime.lock`) first, so two of them never recover or run the
+//! same work. The operating system releases it when its holder exits,
+//! however it exits.
 
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -71,11 +72,11 @@ pub enum StateError {
     },
     /// State an older atomic left is still in use, so it cannot move yet.
     #[error(
-        "the database at {path} is open in another atomic process, so its state cannot move \
-         to {to} yet; stop that process, then run atomic again"
+        "{path} is in use by another atomic process, so its state cannot move to {to} yet; \
+         stop that process, then run atomic again"
     )]
     InUse {
-        /// The database in use.
+        /// The database, or execution lock, in use.
         path: PathBuf,
         /// Where it would move.
         to: PathBuf,
@@ -147,6 +148,18 @@ impl ProjectState {
                     to: self.database(),
                 });
             }
+            // An older atomic kept its execution lock in `<state>/private`: a
+            // process holding it may still run the project's work.
+            let old_lock = dir.join("runtime.lock");
+            if dir != self.dir && old_lock.exists() {
+                if lock_held(&old_lock) {
+                    return Err(StateError::InUse {
+                        path: old_lock,
+                        to: self.lock_file(),
+                    });
+                }
+                let _ = std::fs::remove_file(&old_lock);
+            }
             for name in LEGACY {
                 let (old, new) = (dir.join(name), self.private.join(name));
                 if old.exists() && !new.exists() {
@@ -203,7 +216,7 @@ impl ProjectState {
 
     /// The file the execution lock is held on.
     pub fn lock_file(&self) -> PathBuf {
-        self.dir.join("runtime.lock")
+        self.private_dir().join("runtime.lock")
     }
 
     /// Take the project's execution lock for `command`, or say who holds it.
@@ -224,11 +237,9 @@ impl ProjectState {
         match file.try_lock() {
             Ok(()) => {}
             Err(std::fs::TryLockError::WouldBlock) => {
-                let mut owner = String::new();
-                let _ = std::io::Read::read_to_string(&mut file, &mut owner);
                 return Err(LockError::Held {
+                    owner: holder(&path),
                     path,
-                    owner: owner.trim().to_owned(),
                 });
             }
             Err(std::fs::TryLockError::Error(e)) => return Err(io(e)),
@@ -238,6 +249,48 @@ impl ProjectState {
         file.set_len(0).map_err(io)?;
         std::io::Write::write_all(&mut file, owner.as_bytes()).map_err(io)?;
         Ok(ExecutionLock { _file: file, owner })
+    }
+}
+
+/// Who holds the lock at `path`, as it wrote: `pid <n> (<command>)`. A
+/// holder writes only after it has the lock, so the file can be empty, or
+/// still say who held it last; words whose process is gone are not
+/// reported as the holder's.
+fn holder(path: &Path) -> String {
+    for _ in 0..10 {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        let text = text.trim();
+        let pid = text
+            .strip_prefix("pid ")
+            .and_then(|rest| rest.split_whitespace().next());
+        let current = pid.is_some_and(running);
+        if current {
+            return text.to_owned();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    "another process, which has not yet said which".into()
+}
+
+/// Whether process `pid` exists.
+fn running(pid: &str) -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(pid) = pid.parse::<libc::pid_t>() else {
+            return false;
+        };
+        if pid <= 0 {
+            return false;
+        }
+        // SAFETY: signal 0 sends nothing; it only checks that the process
+        // exists and may be signalled.
+        #[allow(unsafe_code)]
+        let found = unsafe { libc::kill(pid, 0) } == 0;
+        found || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
+    {
+        !pid.is_empty()
     }
 }
 
@@ -253,6 +306,14 @@ impl ExecutionLock {
     /// Who holds it, as others are told: this process and its command.
     pub fn owner(&self) -> &str {
         &self.owner
+    }
+
+    /// Hold it until this process exits, however it exits: never released
+    /// while anything this process started may still be running, such as a
+    /// command a blocked thread is waiting on as the process stops. The
+    /// file is closed on exec, so no child keeps it.
+    pub fn hold_until_exit(self) {
+        std::mem::forget(self);
     }
 }
 
@@ -280,6 +341,15 @@ pub enum LockError {
 /// What an older layout kept in the state directory, at its top or in its
 /// `private/`.
 const LEGACY: [&str; 4] = ["atomic.db", "atomic.db-wal", "atomic.db-shm", "context"];
+
+/// Whether another process holds the lock on the file at `path`.
+fn lock_held(path: &Path) -> bool {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .is_ok_and(|file| matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock)))
+}
 
 /// Whether another process has the SQLite database at `path` open in WAL
 /// mode: each such connection holds a read lock on its shared-memory file's
@@ -414,6 +484,47 @@ mod tests {
     }
 
     #[test]
+    fn a_holder_that_has_not_yet_said_who_it_is_is_not_misnamed() {
+        let dir = std::env::temp_dir().join(format!("atomic-lock-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let state = ProjectState {
+            root: dir.clone(),
+            dir: dir.join("state"),
+            private: dir.join("private/p"),
+        };
+        state.create().expect("state");
+        // A previous holder's words, left in the file, and a new holder that
+        // has the lock but has not written yet.
+        std::fs::write(state.lock_file(), "pid 2147483000 (atomic serve)").expect("stale");
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(state.lock_file())
+            .expect("open");
+        holder.try_lock().expect("hold");
+        match state.lock_execution("atomic runs resume") {
+            Err(LockError::Held { owner, .. }) => {
+                assert!(!owner.contains("2147483000"), "{owner}");
+                assert!(owner.contains("has not yet said"), "{owner}");
+            }
+            other => panic!("{other:?}"),
+        }
+        // Once it has, its own words are reported.
+        std::fs::write(
+            state.lock_file(),
+            format!("pid {} (atomic serve)", std::process::id()),
+        )
+        .expect("owner");
+        match state.lock_execution("atomic runs resume") {
+            Err(LockError::Held { owner, .. }) => {
+                assert_eq!(owner, format!("pid {} (atomic serve)", std::process::id()));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
     fn an_older_layout_moves_into_the_private_directory() {
         let dir = std::env::temp_dir().join(format!("atomic-state-layout-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -485,6 +596,19 @@ mod tests {
         assert!(old_db.exists(), "nothing moved");
         holder.kill().expect("stop the holder");
         holder.wait().expect("reaped");
+        // An older atomic's execution lock, still held, stops the move too.
+        let old_lock = old.join("runtime.lock");
+        let held = std::fs::File::create(&old_lock).expect("old lock");
+        held.lock().expect("hold");
+        match state.create() {
+            Err(StateError::InUse { path, to }) => {
+                assert_eq!(path, old_lock);
+                assert_eq!(to, state.lock_file());
+            }
+            other => panic!("moved under a held execution lock: {other:?}"),
+        }
+        assert!(old_db.exists(), "nothing moved");
+        drop(held);
         state.create().expect("moves once closed");
         assert!(state.database().is_file());
         assert!(state.context_dir().is_dir());
