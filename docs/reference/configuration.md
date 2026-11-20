@@ -70,7 +70,7 @@ search mode and service-connection configuration remain to be finalized.
 used for that purpose because it commonly belongs to the application being worked
 on. Application data sources are separately declared capabilities.
 
-For signing in with ChatGPT (`atomic login`) and API keys, see
+For signing in with ChatGPT (`atomic model login`) and API keys, see
 [subscriptions and authentication](../getting-started/authentication.md).
 
 ## Keep credentials out of definitions

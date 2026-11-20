@@ -569,3 +569,100 @@ fn a_turn_through_atomics_own_entry_point_runs_with_its_helper_in_the_state_dire
         });
     }
 }
+
+/// A signed-in thread's command cannot read the sign-in: the credential
+/// directory is denied to the sandbox, while Codex, outside it, sends the
+/// token to the (test) backend.
+#[test]
+fn a_signed_in_threads_command_cannot_read_the_sign_in() {
+    on_codex_runtime(async {
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("atomic-signed-in-sandbox-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for sub in [
+            "project",
+            "state/codex",
+            "state/private",
+            "bin",
+            "credentials/codex-auth",
+        ] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        let dir = std::fs::canonicalize(dir).unwrap();
+        std::os::unix::fs::symlink(
+            env!("CARGO_BIN_EXE_atomic"),
+            dir.join("bin/codex-linux-sandbox"),
+        )
+        .unwrap();
+        let auth = dir.join("credentials/codex-auth");
+        std::fs::write(
+            auth.join("auth.json"),
+            json!({"auth_mode": "chatgpt", "OPENAI_API_KEY": null, "tokens": {
+                "id_token": atomic_core::testing::fake_id_token("dev@example.invalid", "account-1"),
+                "access_token": "sandbox-hidden-token", "refresh_token": "r",
+                "account_id": "account-1"},
+                "last_refresh": "2099-01-01T00:00:00Z"})
+            .to_string(),
+        )
+        .unwrap();
+        let project = dir.join("project");
+        let command = format!(
+            "cat {}/auth.json; echo read-exit=$?; ls {}; echo list-exit=$?",
+            auth.display(),
+            dir.join("credentials").display()
+        );
+        let model = FakeModel::start(vec![
+            Reply::Tool {
+                name: "exec_command".into(),
+                arguments: json!({"cmd": command, "workdir": project, "yield_time_ms": 20000}),
+            },
+            Reply::Text("Done.".into()),
+        ])
+        .await
+        .unwrap();
+        let backend = model.base_url().replace("/v1", "/backend-api");
+        let state = dir.join("state");
+        let answer = codex::run(
+            &CodexPaths::with_helpers(
+                PathBuf::from(env!("CARGO_BIN_EXE_atomic")),
+                dir.join("bin/codex-linux-sandbox"),
+            ),
+            &state.join("codex"),
+            &project,
+            &ModelEndpoint {
+                base_url: "unused".into(),
+                model: "synthetic".into(),
+                api_key_env: None,
+                sign_in: Some(atomic_core::signin::SignIn::in_files(&auth).with_backend(&backend)),
+            },
+            &StateGuard::Deny(PrivateState {
+                state_dir: state.clone(),
+                also: vec![dir.join("credentials")],
+            }),
+            &TurnSpec {
+                prompt: "Do the work.".into(),
+                sandbox: Sandbox::WorkspaceWrite,
+                ..TurnSpec::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(answer, "Done.");
+        let output = command_output(&model);
+        assert!(
+            !output.contains("sandbox-hidden-token"),
+            "the token leaked: {output}"
+        );
+        assert!(!output.contains("read-exit=0"), "{output}");
+        assert!(!output.contains("list-exit=0"), "{output}");
+        // Codex itself used it, from outside the sandbox.
+        assert!(
+            model.headers().iter().all(|h| h
+                .iter()
+                .any(|(k, v)| k == "authorization" && v == "Bearer sandbox-hidden-token")),
+            "{:?}",
+            model.headers()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}

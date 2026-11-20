@@ -12,7 +12,7 @@ For the **v0.1 target**, start with [your first atom](first-atom.md) and then
 [your first workflow](first-workflow.md). See [installation](installation.md)
 for release status; this repository does not yet ship an executable.
 
-For model access, run `atomic login` to **sign in with ChatGPT** for Codex atoms
+For model access, run `atomic model login` to **sign in with ChatGPT** for Codex atoms
 on an eligible subscription, or configure an endpoint and API key, which lite
 atoms need too. See [subscriptions and authentication](authentication.md).
 

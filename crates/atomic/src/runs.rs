@@ -200,6 +200,23 @@ pub async fn run(
         engine::Takes::Own,
     )
     .await?;
+    // Refused before it starts, not at its first lite step.
+    let lite = target::lite_atoms(&run);
+    if engine.signed_in && !lite.is_empty() {
+        let _ = engine.rt.shutdown(SHUTDOWN).await;
+        return Err(Failure::new(
+            "config.model",
+            format!(
+                "{} calls a model API itself (lite: {}), and the ChatGPT sign-in serves Codex \
+                 atoms only",
+                run.pipeline.name,
+                lite.join(", ")
+            ),
+            "set ATOMIC_MODEL_BASE_URL and ATOMIC_MODEL to an OpenAI-compatible endpoint, and \
+             ATOMIC_MODEL_API_KEY_ENV to the variable holding its key if it needs one",
+        )
+        .into());
+    }
     let run_id = match args.run_id {
         Some(id) => id,
         None => new_run_id()?,

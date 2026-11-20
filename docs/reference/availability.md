@@ -54,8 +54,8 @@ description and an action, separately in `--json` output. `atomic gates enroll`,
 decision counts only with the credential its person enrolled. The terminal
 prompt for gates in `atomic run` is not wired up yet.
 
-Codex atoms can run on a ChatGPT sign-in (`atomic login`, `login status`,
-`logout`), kept in the OS keyring or the opt-in credential file store, on Linux
+Codex atoms can run on a ChatGPT sign-in (`atomic model login`, `model status`,
+`model logout`), kept in the OS keyring or the opt-in credential file store, on Linux
 only; lite atoms need a model endpoint and say so.
 
 `atomic serve` also runs on PostgreSQL (`ATOMIC_DATABASE_URL`) when the process

@@ -49,6 +49,7 @@ codex-extension-api = { workspace = true }
 deno_core = { workspace = true }
 codex-keyring-store = { workspace = true }
 codex-login = { workspace = true }
+codex-process-hardening = { workspace = true }
 codex-protocol = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]

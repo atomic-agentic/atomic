@@ -180,25 +180,7 @@ impl FileSecrets {
     pub fn open(dir: &Path, project: &Path) -> Result<Self, CredentialError> {
         protected_platform()?;
         let fail = |what: String| CredentialError::File(what);
-        if !dir.is_absolute() {
-            return Err(fail(format!("{} is not an absolute path", dir.display())));
-        }
-        let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
-        let projects = real(
-            &crate::state::base_dir()
-                .map_err(|e| fail(e.to_string()))?
-                .join("projects"),
-        );
-        let (here, project) = (real(dir), real(project));
-        if here.starts_with(&projects) || projects.starts_with(&here) {
-            return Err(fail(format!(
-                "{} overlaps atomic's state directories",
-                dir.display()
-            )));
-        }
-        if here.starts_with(&project) || project.starts_with(&here) {
-            return Err(fail(format!("{} overlaps the project", dir.display())));
-        }
+        placed_apart(dir, Some(project))?;
         crate::state::private_dir(dir).map_err(|e| fail(e.to_string()))?;
         Ok(Self {
             dir: dir.to_owned(),
@@ -268,6 +250,36 @@ impl SecretStore for FileSecrets {
             Err(e) => Err(CredentialError::File(e.to_string())),
         }
     }
+}
+
+/// Refused unless `dir` is an absolute path outside every state directory
+/// and, given one, outside and not above `project`: where the private file
+/// stores may live.
+pub(crate) fn placed_apart(dir: &Path, project: Option<&Path>) -> Result<(), CredentialError> {
+    let fail = |what: String| CredentialError::File(what);
+    if !dir.is_absolute() {
+        return Err(fail(format!("{} is not an absolute path", dir.display())));
+    }
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
+    let projects = real(
+        &crate::state::base_dir()
+            .map_err(|e| fail(e.to_string()))?
+            .join("projects"),
+    );
+    let here = real(dir);
+    if here.starts_with(&projects) || projects.starts_with(&here) {
+        return Err(fail(format!(
+            "{} overlaps atomic's state directories",
+            dir.display()
+        )));
+    }
+    if let Some(project) = project {
+        let project = real(project);
+        if here.starts_with(&project) || project.starts_with(&here) {
+            return Err(fail(format!("{} overlaps the project", dir.display())));
+        }
+    }
+    Ok(())
 }
 
 /// Secrets kept in memory, for tests. Nothing outlives the value.

@@ -60,6 +60,7 @@ struct State {
     requests: Vec<Value>,
     paths: Vec<String>,
     headers: Vec<Vec<(String, String)>>,
+    every: Vec<(String, String)>,
 }
 
 /// A running fake model. It stops when dropped.
@@ -127,6 +128,15 @@ impl FakeModel {
             .unwrap_or_default()
     }
 
+    /// Every request it received, model call or not, as method and path,
+    /// in order.
+    pub fn every_request(&self) -> Vec<(String, String)> {
+        self.state
+            .lock()
+            .map(|s| s.every.clone())
+            .unwrap_or_default()
+    }
+
     /// The request headers of every model call, in order, names lowercased.
     pub fn headers(&self) -> Vec<Vec<(String, String)>> {
         self.state
@@ -183,6 +193,9 @@ async fn serve(socket: &mut tokio::net::TcpStream, state: &Mutex<State>) -> std:
             parts.next().unwrap_or_default(),
         );
         let path = path.split('?').next().unwrap_or_default();
+        if let Ok(mut s) = state.lock() {
+            s.every.push((method.to_owned(), path.to_owned()));
+        }
 
         let chat = path.ends_with("/chat/completions");
         let (status, content_type, text) = if method == "POST"
@@ -360,4 +373,38 @@ pub fn on_codex_runtime<F: std::future::Future<Output = ()> + Send + 'static>(f:
         Ok(Err(panic)) => std::panic::resume_unwind(panic),
         Err(e) => panic!("could not start the thread: {e}"),
     }
+}
+
+/// Unpadded base64url, for a test token.
+pub fn b64url(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let n = chunk.iter().fold(0u32, |n, b| (n << 8) | u32::from(*b)) << (8 * (3 - chunk.len()));
+        for i in 0..=chunk.len() {
+            out.push(char::from(ALPHABET[((n >> (18 - 6 * i)) & 63) as usize]));
+        }
+    }
+    out
+}
+
+/// An unsigned ChatGPT id token, as a test issuer would hand out, for
+/// `email` on a Plus plan in workspace `account`.
+pub fn fake_id_token(email: &str, account: &str) -> String {
+    format!(
+        "{}.{}.sig",
+        b64url(br#"{"alg":"none","typ":"JWT"}"#),
+        b64url(
+            serde_json::json!({
+                "email": email,
+                "https://api.openai.com/auth": {
+                    "chatgpt_plan_type": "plus",
+                    "chatgpt_account_id": account,
+                    "chatgpt_user_id": "user-1",
+                },
+            })
+            .to_string()
+            .as_bytes()
+        )
+    )
 }

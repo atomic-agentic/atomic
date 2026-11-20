@@ -1415,39 +1415,11 @@ fn an_exec_output_cel_cannot_read_fails() {
     });
 }
 
-/// Unpadded base64url, for a test token.
-fn b64url(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::new();
-    for chunk in bytes.chunks(3) {
-        let n = chunk.iter().fold(0u32, |n, b| (n << 8) | u32::from(*b)) << (8 * (3 - chunk.len()));
-        for i in 0..=chunk.len() {
-            out.push(char::from(ALPHABET[((n >> (18 - 6 * i)) & 63) as usize]));
-        }
-    }
-    out
-}
-
 /// A ChatGPT sign-in, as Codex's login keeps it in a file store, with a
 /// token no real backend would take.
 fn signed_in(dir: &std::path::Path, backend: &str) -> crate::signin::SignIn {
     std::fs::create_dir_all(dir).expect("auth home");
-    let id_token = format!(
-        "{}.{}.sig",
-        b64url(br#"{"alg":"none","typ":"JWT"}"#),
-        b64url(
-            json!({
-                "email": "dev@example.invalid",
-                "https://api.openai.com/auth": {
-                    "chatgpt_plan_type": "plus",
-                    "chatgpt_account_id": "account-1",
-                    "chatgpt_user_id": "user-1",
-                },
-            })
-            .to_string()
-            .as_bytes()
-        )
-    );
+    let id_token = crate::testing::fake_id_token("dev@example.invalid", "account-1");
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("time")
@@ -1468,9 +1440,7 @@ fn signed_in(dir: &std::path::Path, backend: &str) -> crate::signin::SignIn {
         .to_string(),
     )
     .expect("auth.json");
-    let mut sign_in = crate::signin::SignIn::in_files(dir);
-    sign_in.backend = Some(backend.to_owned());
-    sign_in
+    crate::signin::SignIn::in_files(dir).with_backend(backend)
 }
 
 /// `secs` since the epoch as an RFC 3339 UTC time.
@@ -1504,7 +1474,7 @@ fn a_codex_atom_runs_on_a_chatgpt_sign_in_with_no_api_key() {
         .await
         .expect("fake model");
         let mut rt = runtime(&model, "signed-in");
-        let backend = model.base_url().replace("/v1", "/backend-api/codex");
+        let backend = model.base_url().replace("/v1", "/backend-api");
         let auth = rt.codex_home.with_file_name("auth");
         rt.endpoint = ModelEndpoint {
             base_url: "unused".into(),
@@ -1512,8 +1482,12 @@ fn a_codex_atom_runs_on_a_chatgpt_sign_in_with_no_api_key() {
             api_key_env: None,
             sign_in: Some(signed_in(&auth, &backend)),
         };
-        for key in ["OPENAI_API_KEY", "CODEX_API_KEY"] {
-            assert!(std::env::var_os(key).is_none(), "{key} is set in the test");
+        // A key in the environment does not replace the sign-in. Only this
+        // test reads or writes CODEX_API_KEY.
+        // SAFETY: as above; nothing else in this binary touches it.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var("CODEX_API_KEY", "sk-from-the-environment");
         }
         let (out, _) = run_codex_atom(
             &Classify,
@@ -1539,7 +1513,28 @@ fn a_codex_atom_runs_on_a_chatgpt_sign_in_with_no_api_key() {
             Some("Bearer synthetic-access-token")
         );
         assert_eq!(header("chatgpt-account-id"), Some("account-1"));
+        // Everything the thread asked of the backend: the model, and nothing
+        // that reaches the account's apps, connectors or plugins.
+        eprintln!("every request: {:?}", model.every_request());
+        assert_eq!(model.every_request(), expected_backend_requests());
+        // SAFETY: as above.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::remove_var("CODEX_API_KEY");
+        }
     });
+}
+
+/// The requests a signed-in thread makes of the Codex backend, in order.
+fn expected_backend_requests() -> Vec<(String, String)> {
+    // The model catalog, then the turn.
+    [
+        ("GET", "/backend-api/codex/models"),
+        ("POST", "/backend-api/codex/responses"),
+    ]
+    .into_iter()
+    .map(|(m, p)| (m.to_owned(), p.to_owned()))
+    .collect()
 }
 
 #[test]
@@ -1552,7 +1547,10 @@ fn a_lite_atom_says_a_sign_in_is_not_for_it() {
             base_url: model.base_url(),
             model: "synthetic".into(),
             api_key_env: None,
-            sign_in: Some(signed_in(&auth, &model.base_url())),
+            sign_in: Some(signed_in(
+                &auth,
+                &model.base_url().replace("/v1", "/backend-api"),
+            )),
         };
         let lite = crate::lite::LiteRuntime::new(endpoint, AtomConfig::default());
         let refused = run_lite_atom(

@@ -74,7 +74,6 @@ use codex_core_api::arg0_dispatch_or_else;
 use codex_core_api::bootstrap_auth_config;
 use codex_core_api::built_in_model_providers;
 use codex_core_api::init_state_db;
-use codex_core_api::install_image_generation_extension;
 use codex_core_api::load_config_toml_with_layer_stack;
 use codex_core_api::local_agent_graph_store_from_state_db;
 use codex_core_api::passthrough_image_store;
@@ -366,11 +365,23 @@ where
             std::process::exit(1);
         }
     }
+    // atomic itself, not one of Codex's helpers run under their own names:
+    // the process that holds a sign-in's token and the operator credential
+    // cannot be dumped, read through /proc by a same-user process, or leave
+    // a core file (and loses LD_* variables).
+    if !invoked_as_helper() {
+        codex_process_hardening::pre_main_hardening();
+    }
     // SAFETY: called at the start of main, while the process has one thread,
     // so no other thread can read the environment concurrently.
     #[allow(unsafe_code)]
     unsafe {
         std::env::set_var("CODEX_HOME", codex_home);
+        // Nothing in the environment stands in for, or redirects, a
+        // sign-in's tokens.
+        for name in OVERRIDES {
+            std::env::remove_var(name);
+        }
     }
     arg0_dispatch_or_else(move |paths| main_fn(CodexPaths(paths)))
 }
@@ -497,6 +508,27 @@ fn process_alive(pid: u32) -> bool {
         let _ = pid;
         true
     }
+}
+
+/// Variables Codex reads that would replace a sign-in's token, or send its
+/// refresh or revocation elsewhere.
+const OVERRIDES: &[&str] = &[
+    codex_login::CODEX_ACCESS_TOKEN_ENV_VAR,
+    codex_login::REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR,
+    codex_login::REVOKE_TOKEN_URL_OVERRIDE_ENV_VAR,
+];
+
+/// Whether this process runs as one of Codex's helpers, by the name it was
+/// started under.
+fn invoked_as_helper() -> bool {
+    std::env::args_os()
+        .next()
+        .as_deref()
+        .map(Path::new)
+        .and_then(Path::file_name)
+        .is_some_and(|name| {
+            name == "codex-linux-sandbox" || name == "apply_patch" || name == "applypatch"
+        })
 }
 
 /// Whether this process is Codex's Linux sandbox helper: this executable,
@@ -733,14 +765,17 @@ where
     }
     let state_db = init_state_db(&config).await;
 
+    if endpoint.sign_in.is_some() {
+        crate::signin::protected()?;
+    }
     let auth_manager = match &endpoint.sign_in {
         // The developer's own sign-in, kept apart from every project (see
         // `crate::signin`); never a key from the environment.
         Some(sign_in) => Arc::new(
             AuthManager::new(
-                sign_in.auth_home.clone(),
+                sign_in.auth_home().to_path_buf(),
                 /*enable_codex_api_key_env*/ false,
-                sign_in.store,
+                sign_in.store(),
                 /*forced_chatgpt_workspace_id*/ None,
                 Some(config.chatgpt_base_url.clone()),
                 sign_in.keyring_kind(),
@@ -753,7 +788,10 @@ where
         }
     };
     if endpoint.sign_in.is_some() && auth_manager.auth().await.is_none() {
-        bail!("no one is signed in: sign in with `atomic login`, or configure a model endpoint");
+        bail!(
+            "no one is signed in with ChatGPT: sign in with `atomic model login`, or configure a \
+             model endpoint"
+        );
     }
     let local_runtime_paths = ExecServerRuntimeOptions::from_optional_paths(
         config.codex_self_exe.clone(),
@@ -772,10 +810,8 @@ where
     let user_instructions_provider = Arc::new(CodexHomeUserInstructionsProvider::new(
         config.codex_home.clone(),
     ));
-    let mut extensions = ExtensionRegistryBuilder::<Config>::new();
-    install_image_generation_extension(&mut extensions, auth_manager.clone(), |config: &Config| {
-        Some(config.codex_home.clone())
-    });
+    // No extensions: an atom's tools are the ones its file declares.
+    let extensions = ExtensionRegistryBuilder::<Config>::new();
     let startup = codex_core_api::build_startup_models(
         &config,
         Arc::clone(&auth_manager),
@@ -939,7 +975,8 @@ async fn new_config(
         // The built-in OpenAI provider as it is, with the sign-in's tokens:
         // ChatGPT's Codex backend.
         Some(sign_in) => {
-            model_provider.base_url = sign_in.backend.clone();
+            // For tests: the backend's Codex route.
+            model_provider.base_url = sign_in.backend().map(|b| format!("{b}/codex"));
             model_provider.supports_websockets = false;
             OPENAI_PROVIDER_ID.to_string()
         }
@@ -1135,10 +1172,26 @@ async fn new_config(
         tool_suggest: ToolSuggestConfig::default(),
         otel: OtelConfig::default(),
     };
+    if let Some(backend) = endpoint.sign_in.as_ref().and_then(|s| s.backend()) {
+        // Every ChatGPT route, not only the model's: nothing reaches the
+        // real backend from a test.
+        config.chatgpt_base_url = format!("{backend}/");
+        config.chatgpt_base_url_is_explicit = true;
+    }
     config
         .features
         .set(Features::with_defaults())
         .context("configure default features")?;
+    // Nothing that reaches a ChatGPT account's connectors, plugins, apps or
+    // hosted tools, or acts outside the sandbox: with a sign-in those would
+    // carry its token, and read-only connector tools need no approval. An
+    // atom's tools are the ones its file declares.
+    for feature in ATOMIC_OFF {
+        config
+            .features
+            .set_enabled(*feature, false)
+            .with_context(|| format!("turn off Codex feature {feature:?}"))?;
+    }
     // AuthManager and MCP both derive their credential backend from Config.
     config.features.set_enabled(
         Feature::SecretAuthStorage,
@@ -1166,6 +1219,42 @@ pub(crate) async fn auth_route_config(
     .await?;
     Ok(config.auth_route_config())
 }
+
+/// Codex features atomic's threads never have: ChatGPT apps and connectors
+/// (the codex_apps MCP server), plugins and their suggestions, hosted image
+/// generation, browser and computer use, realtime and in-app surfaces.
+const ATOMIC_OFF: &[Feature] = &[
+    Feature::Apps,
+    Feature::EnableMcpApps,
+    Feature::CodexAppsMcp20260728,
+    Feature::AppsEarlyResourceDiscovery,
+    Feature::Plugins,
+    Feature::RemotePlugin,
+    Feature::RecommendedPlugins,
+    Feature::PluginSharing,
+    Feature::PluginDiscoveryPrefetch,
+    Feature::PluginHooks,
+    Feature::ToolSuggest,
+    Feature::SkillMcpDependencyInstall,
+    Feature::ImageGeneration,
+    Feature::ImageGenerationAnimation,
+    Feature::InAppBrowser,
+    Feature::BrowserAnnotationApi,
+    Feature::BrowserUse,
+    Feature::BrowserUseFullCdpAccess,
+    Feature::BrowserUseExternal,
+    Feature::ComputerUse,
+    Feature::InAppChat,
+    Feature::InAppDictation,
+    Feature::InAppVoice,
+    Feature::InAppLocalAutomation,
+    Feature::InAppUpdates,
+    Feature::RealtimeConversation,
+    Feature::RemoteControl,
+    Feature::WebSearchRequest,
+    Feature::WebSearchCached,
+    Feature::StandaloneWebSearch,
+];
 
 /// How long a turn waits for the thread to finish settling the previous one.
 const NOT_IDLE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);

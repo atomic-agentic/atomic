@@ -2,8 +2,8 @@
 
 //! Model authentication for local use, through the `atomic` executable:
 //!
-//! - `atomic login status` says who is signed in, from atomic's own sign-in
-//!   store and never with a token, and `atomic logout` forgets the sign-in;
+//! - `atomic model status` says who is signed in, from atomic's own sign-in
+//!   store and never with a token, and `atomic model logout` forgets the sign-in;
 //! - with no endpoint and no sign-in, a run of a model atom says to sign in
 //!   or configure an endpoint; signed in, with no model, it says to set one;
 //! - signed in, a lite atom reports that the sign-in is for Codex atoms only
@@ -55,6 +55,35 @@ impl Fixture {
         std::fs::create_dir_all(project.join("atoms")).unwrap();
         std::fs::create_dir_all(dir.join("home")).unwrap();
         std::fs::write(project.join("atomic.yaml"), "atomic: 1\nname: auth\n").unwrap();
+        // An exec atom that reports whether it can read atomic's environment
+        // through /proc.
+        std::fs::create_dir_all(project.join("tools")).unwrap();
+        std::fs::write(
+            project.join("tools/peek.py"),
+            "import json, os, sys\njson.load(sys.stdin)\n\
+             try:\n    seen = open(f'/proc/{os.getppid()}/environ', 'rb').read().decode(errors='replace')\n\
+             except OSError as e:\n    seen = f'refused: {e}'\n\
+             json.dump({'line': seen}, sys.stdout)\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("atoms/peek.atom.astro"),
+            "---\nimport type { Props, Input, Output } from '../.atomic/types/peek';\n\
+             import type { AtomConfig } from '../.atomic/types/authoring';\n\
+             const { input }: Props = Astro.props;\n\
+             export const config: AtomConfig<Input, Output> = { description: 'Peek.', \
+             kind: 'exec', exec: { command: ['python3', 'tools/peek.py'] } };\n---\n\n",
+        )
+        .unwrap();
+        for (role, field) in [("input", "text"), ("output", "line")] {
+            std::fs::write(
+                project.join(format!("atoms/peek.{role}.schema.json")),
+                json!({"type": "object", "additionalProperties": false, "required": [field],
+                       "properties": {field: {"type": "string"}}})
+                .to_string(),
+            )
+            .unwrap();
+        }
         for (name, kind) in [("tidy-lite", "lite"), ("tidy-codex", "codex")] {
             std::fs::write(
                 project.join(format!("atoms/{name}.atom.astro")),
@@ -80,8 +109,17 @@ impl Fixture {
         Self { dir }
     }
 
-    /// Keep a ChatGPT sign-in in the file store, as `atomic login` would.
+    /// Keep a ChatGPT sign-in in the file store, as `atomic model login` would.
     fn sign_in(&self) {
+        self.sign_in_with("synthetic-access-token", "synthetic-refresh-token");
+    }
+
+    /// A sign-in with no token to revoke, so logging out calls no issuer.
+    fn sign_in_unrevocable(&self) {
+        self.sign_in_with("", "");
+    }
+
+    fn sign_in_with(&self, access: &str, refresh: &str) {
         let auth = self.dir.join("atomic-home/credentials/codex-auth");
         std::fs::create_dir_all(&auth).unwrap();
         let id_token = format!(
@@ -97,8 +135,8 @@ impl Fixture {
         std::fs::write(
             auth.join("auth.json"),
             json!({"auth_mode": "chatgpt", "OPENAI_API_KEY": null, "tokens": {
-                "id_token": id_token, "access_token": "synthetic-access-token",
-                "refresh_token": "synthetic-refresh-token", "account_id": "account-1"}})
+                "id_token": id_token, "access_token": access,
+                "refresh_token": refresh, "account_id": "account-1"}})
             .to_string(),
         )
         .unwrap();
@@ -143,15 +181,16 @@ fn text(o: &Output) -> String {
 #[test]
 fn login_status_says_who_is_signed_in_and_logout_forgets_it() {
     let f = Fixture::new("status");
-    let none = f.atomic(&["login", "status"], &[]);
+    let none = f.atomic(&["model", "status"], &[]);
     assert!(!none.status.success());
     assert!(
         text(&none).contains("no one is signed in"),
         "{}",
         text(&none)
     );
-    f.sign_in();
-    let status = f.atomic(&["login", "status"], &[]);
+    // No token to revoke: logging out below calls no issuer.
+    f.sign_in_unrevocable();
+    let status = f.atomic(&["model", "status"], &[]);
     let t = text(&status);
     assert!(status.status.success(), "{t}");
     assert!(
@@ -162,9 +201,15 @@ fn login_status_says_who_is_signed_in_and_logout_forgets_it() {
         !t.contains("synthetic-access-token"),
         "a token was printed: {t}"
     );
-    let out = f.atomic(&["logout"], &[]);
+    let json: serde_json::Value =
+        serde_json::from_slice(&f.atomic(&["--json", "model", "status"], &[]).stdout)
+            .expect("json");
+    assert_eq!(json["signed_in"], true);
+    assert_eq!(json["account"]["mode"], "chatgpt");
+    assert_eq!(json["account"]["store"], "the credential file store");
+    let out = f.atomic(&["model", "logout"], &[]);
     assert!(text(&out).contains("signed out"), "{}", text(&out));
-    assert!(!f.atomic(&["login", "status"], &[]).status.success());
+    assert!(!f.atomic(&["model", "status"], &[]).status.success());
 }
 
 #[test]
@@ -174,7 +219,7 @@ fn a_model_atom_with_no_model_access_says_how_to_get_it() {
     let out = f.atomic(&["run", "tidy-codex", data[0], data[1]], &[]);
     let t = text(&out);
     assert!(!out.status.success());
-    assert!(t.contains("atomic login"), "{t}");
+    assert!(t.contains("atomic model login"), "{t}");
     assert!(t.contains("ATOMIC_MODEL_BASE_URL"), "{t}");
     f.sign_in();
     let out = f.atomic(&["run", "tidy-codex", data[0], data[1]], &[]);
@@ -194,4 +239,66 @@ fn signed_in_a_lite_atom_says_what_it_needs() {
     assert!(!out.status.success(), "{t}");
     assert!(t.contains("serves Codex atoms only"), "{t}");
     assert!(t.contains("ATOMIC_MODEL_BASE_URL"), "{t}");
+}
+
+#[test]
+fn a_command_atomic_runs_cannot_read_its_environment() {
+    let f = Fixture::new("environ");
+    let out = f.atomic(
+        &["run", "peek", "--data", r#"{"text": "x"}"#],
+        &[("ATOMIC_TEST_CANARY", "canary-in-atomics-environment")],
+    );
+    let t = text(&out);
+    assert!(out.status.success(), "{t}");
+    assert!(
+        !t.contains("canary-in-atomics-environment"),
+        "read through /proc: {t}"
+    );
+    assert!(t.contains("refused"), "{t}");
+}
+
+/// A Codex thread through `atomic run` reads its instructions through the
+/// sandbox helper, so this needs Codex's Linux sandbox.
+#[cfg(feature = "sandbox-tests")]
+#[test]
+fn a_configured_endpoint_wins_and_gets_no_sign_in_token() {
+    use atomic_core::testing::{FakeModel, Reply, on_codex_runtime};
+    let f = Fixture::new("precedence");
+    f.sign_in();
+    on_codex_runtime(async move {
+        let model = FakeModel::start(vec![Reply::Text(r#"{"line": "tidied"}"#.into())])
+            .await
+            .unwrap();
+        let base = model.base_url();
+        let f = std::sync::Arc::new(f);
+        let run = f.clone();
+        let out = tokio::task::spawn_blocking(move || {
+            run.atomic(
+                &["run", "tidy-codex", "--data", r#"{"text": "a note"}"#],
+                &[
+                    ("ATOMIC_MODEL_BASE_URL", base.as_str()),
+                    ("ATOMIC_MODEL", "synthetic"),
+                ],
+            )
+        })
+        .await
+        .unwrap();
+        assert!(out.status.success(), "{}", text(&out));
+        assert!(model.calls() >= 1);
+        for headers in model.headers() {
+            for (name, value) in headers {
+                assert!(
+                    !value.contains("synthetic-access-token"),
+                    "the sign-in's token went to the endpoint in {name}"
+                );
+            }
+        }
+        // And an empty base URL is no endpoint: the sign-in serves, and asks
+        // for a model.
+        let out = f.atomic(
+            &["run", "tidy-codex", "--data", r#"{"text": "a note"}"#],
+            &[("ATOMIC_MODEL_BASE_URL", "")],
+        );
+        assert!(text(&out).contains("set ATOMIC_MODEL"), "{}", text(&out));
+    });
 }

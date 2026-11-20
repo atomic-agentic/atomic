@@ -68,16 +68,30 @@ impl EngineArgs {
     fn endpoint(&self, required: bool) -> anyhow::Result<ModelEndpoint> {
         // A configured endpoint wins; with none, a ChatGPT sign-in serves
         // Codex atoms (see atomic_core::signin).
-        let signed_in = || {
-            atomic_core::signin::SignIn::configured()
-                .ok()
-                .filter(|s| s.account().ok().flatten().is_some())
-        };
-        let sign_in = match (&self.model_base_url, required) {
-            (None, true) => signed_in(),
+        // An empty base URL is no endpoint.
+        let base_url = self.model_base_url.clone().filter(|u| !u.trim().is_empty());
+        // Off Linux there is no sign-in to find; any other failure to read
+        // one is said, not taken for "signed out".
+        let mut unreadable = None;
+        let sign_in = match (&base_url, required) {
+            (None, true) => match atomic_core::signin::SignIn::configured() {
+                Ok(s) => match s.account() {
+                    Ok(Some(_)) => Some(s),
+                    Ok(None) => None,
+                    Err(e) => {
+                        unreadable = Some(e.to_string());
+                        None
+                    }
+                },
+                Err(atomic_core::signin::SignInError::Unprotected(_)) => None,
+                Err(e) => {
+                    unreadable = Some(e.to_string());
+                    None
+                }
+            },
             _ => None,
         };
-        match (&self.model_base_url, &self.model) {
+        match (&base_url, &self.model) {
             (Some(base_url), Some(model)) => Ok(ModelEndpoint {
                 base_url: base_url.clone(),
                 model: model.clone(),
@@ -103,8 +117,14 @@ impl EngineArgs {
             }
             _ if required => Err(Failure::new(
                 "config.model",
-                "no model is configured, and model atoms need one",
-                "sign in with `atomic login` (Codex atoms only), or set ATOMIC_MODEL_BASE_URL \
+                match unreadable {
+                    Some(why) => format!(
+                        "no model is configured, model atoms need one, and the ChatGPT \
+                         sign-in could not be read: {why}"
+                    ),
+                    None => "no model is configured, and model atoms need one".to_owned(),
+                },
+                "sign in with `atomic model login` (Codex atoms only), or set ATOMIC_MODEL_BASE_URL \
                  and ATOMIC_MODEL (or pass --model-base-url and --model), and \
                  ATOMIC_MODEL_API_KEY_ENV if the endpoint needs a key",
             )
@@ -170,6 +190,9 @@ pub struct Engine {
     /// Whether the store is shared with other hosts' executors, which this
     /// process's execution lock does not exclude.
     pub shared: bool,
+    /// Whether model atoms run on a ChatGPT sign-in, which lite atoms cannot
+    /// use.
+    pub signed_in: bool,
 }
 
 impl Engine {
@@ -224,6 +247,7 @@ pub async fn open(
         .into());
     }
     let endpoint = args.endpoint(needs_model)?;
+    let signed_in = endpoint.sign_in.is_some();
     let store = LocalStore::open(state.dir().join("artifacts")).context("the artifact store")?;
     let exec = match args.runner {
         RunnerKind::Local => atomic_exec::Backend::default(),
@@ -281,5 +305,6 @@ pub async fn open(
         rt,
         store: describe(&database),
         shared: matches!(database, Database::Postgres { .. }),
+        signed_in,
     })
 }

@@ -34,7 +34,7 @@ See [availability](../reference/availability.md) before trying a feature.
   and this step goes away.
 
 Read [subscriptions and authentication](authentication.md) for model access:
-`atomic login` signs Codex atoms in with ChatGPT, and an endpoint with an API key
+`atomic model login` signs Codex atoms in with ChatGPT, and an endpoint with an API key
 serves any atom. Keep credentials out of atom files and committed configuration.
 Local-model setup instructions will accompany the matching release.
 

@@ -7,10 +7,10 @@ atoms call a model API themselves and always need an endpoint.
 ## Sign in with ChatGPT for Codex atoms
 
 ```sh
-atomic login                 # sign in in your browser
-atomic login --device-auth   # on a machine with no browser: a code to enter elsewhere
-atomic login status          # who is signed in, and on which plan
-atomic logout
+atomic model login                # sign in in your browser
+atomic model login --device-auth  # with no browser: a code to enter elsewhere
+atomic model status               # who is signed in, on which plan, kept where
+atomic model logout               # revoke the sign-in and forget every copy
 ```
 
 The sign-in uses your account's Codex entitlement and limits; API keys use
@@ -31,10 +31,13 @@ every project and from your personal Codex sessions:
   `~/.config/atomic/credentials/codex-auth`).
 
 atomic never prints the token, and atoms never see it: Codex sends it to the
-model from atomic's own process, the credential directory is denied to every
-atom's sandbox, and atoms' commands can neither use the kernel keyrings nor
-reach the Secret Service. As with the operator credential, this has been
-verified on Linux only, so `atomic login` is refused on macOS and Windows for
+model from atomic's own process, which cannot be dumped or read through `/proc`;
+the credential directory is denied to every atom's sandbox; and atoms' commands
+can neither use the kernel keyrings nor reach the Secret Service. A signed-in
+atom has none of ChatGPT's connectors, plugins or hosted tools: the token
+reaches the model and nothing else, and an atom's tools are the ones its file
+declares. As with the operator credential, this has been
+verified on Linux only, so `atomic model login` is refused on macOS and Windows for
 now. atomic does not reuse an existing `codex login`.
 
 ## API keys
@@ -48,9 +51,7 @@ export ATOMIC_MODEL=<model>
 export ATOMIC_MODEL_API_KEY_ENV=OPENAI_API_KEY
 ```
 
-Keep the key's value out of committed files. atomic reads it from the
-environment and never passes it, or any other variable whose name contains
-KEY, SECRET or TOKEN, to atoms' commands.
+Keep the key's value out of committed files.
 
 ## Lite atoms
 
