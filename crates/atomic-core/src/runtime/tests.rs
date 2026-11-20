@@ -2490,3 +2490,118 @@ fn a_store_held_while_files_are_stored_leaves_the_outcome_unknown() {
         sweep.join().expect("sweep");
     });
 }
+
+/// A local backend whose open waits, once it has begun, until it is let
+/// go, and that counts its closes.
+#[derive(Clone, Default)]
+struct HeldOpen {
+    state: Arc<(std::sync::Mutex<(bool, bool)>, std::sync::Condvar)>,
+    closes: Arc<std::sync::atomic::AtomicUsize>,
+    opened: Arc<std::sync::Mutex<Option<Workspace>>>,
+}
+
+impl HeldOpen {
+    fn begun(&self) -> bool {
+        self.state.0.lock().expect("state").0
+    }
+
+    fn let_go(&self) {
+        let (lock, wake) = &*self.state;
+        if let Ok(mut state) = lock.lock() {
+            state.1 = true;
+        }
+        wake.notify_all();
+    }
+
+    fn closes(&self) -> usize {
+        self.closes.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl ExecutionBackend for HeldOpen {
+    fn connect(&self) -> Result<atomic_exec::Statement, atomic_exec::ExecError> {
+        Ok(atomic_exec::LocalBackend::STATEMENT)
+    }
+
+    fn open(&self, request: &atomic_exec::Open) -> Result<Workspace, atomic_exec::ExecError> {
+        let (lock, wake) = &*self.state;
+        let mut state = lock.lock().expect("state");
+        state.0 = true;
+        wake.notify_all();
+        while !state.1 {
+            state = wake.wait(state).expect("state");
+        }
+        drop(state);
+        let ws = atomic_exec::LocalBackend::default().open(request)?;
+        *self.opened.lock().expect("opened") = Some(ws.clone());
+        Ok(ws)
+    }
+
+    fn run(
+        &self,
+        command: &atomic_exec::Command,
+    ) -> Result<atomic_exec::Completed, atomic_exec::ExecError> {
+        atomic_exec::LocalBackend::default().run(command)
+    }
+
+    fn close(&self, workspace: &Workspace) -> Result<(), atomic_exec::ExecError> {
+        self.closes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        atomic_exec::LocalBackend::default().close(workspace)
+    }
+}
+
+/// A run cancelled while its workspace is still opening leaves nothing
+/// open: the open finishes, and the workspace it made is closed, once.
+#[test]
+fn a_workspace_that_opens_after_its_run_was_cancelled_is_closed() {
+    on_codex_runtime(async {
+        let dir = scratch("cancelled-open");
+        std::fs::create_dir_all(&dir).expect("source");
+        let backend = HeldOpen::default();
+        let shared: Arc<dyn ExecutionBackend> = Arc::new(backend.clone());
+        let request = atomic_exec::Open {
+            label: "held".into(),
+            run: "run-1".into(),
+            step: "held".into(),
+            attempt: "attempt-1".into(),
+            source: Some(dir.clone()),
+            ..atomic_exec::Open::default()
+        };
+        let opening = tokio::spawn(open_workspace(shared, request));
+        for _ in 0..500 {
+            if backend.begun() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(backend.begun(), "the open never began");
+        opening.abort();
+        assert!(matches!(opening.await, Err(e) if e.is_cancelled()));
+        // The open succeeds once no one waits for it.
+        backend.let_go();
+        for _ in 0..500 {
+            if backend.closes() > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(backend.closes(), 1, "the workspace was left open");
+        let scratch = backend
+            .opened
+            .lock()
+            .expect("opened")
+            .as_ref()
+            .and_then(|ws| ws.scratch.clone())
+            .expect("a scratch directory");
+        for _ in 0..200 {
+            if !scratch.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(!scratch.exists(), "its scratch directory is left");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(backend.closes(), 1, "closed more than once");
+    });
+}

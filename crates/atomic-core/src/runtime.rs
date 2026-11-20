@@ -291,20 +291,26 @@ pub(crate) async fn open_workspace(
     let mut reported: Option<std::time::Instant> = None;
     loop {
         let (b, r) = (backend.clone(), request.clone());
-        let opened = tokio::task::spawn_blocking(move || b.open(&r))
-            .await
-            .map_err(|e| AtomError::Runtime(format!("{label}: open its workspace: {e}")))?;
+        // The workspace's closer is made where it opens, on the blocking
+        // pool: if the run that awaits it is cancelled meanwhile, the open
+        // still finishes there, and its closer, dropped with the result no
+        // one takes, closes it.
+        let opened = tokio::task::spawn_blocking(move || {
+            b.open(&r).map(|workspace| Closer {
+                backend: b,
+                workspace: Some(workspace),
+            })
+        })
+        .await
+        .map_err(|e| AtomError::Runtime(format!("{label}: open its workspace: {e}")))?;
         match opened {
-            Ok(workspace) => {
+            Ok(closer) => {
                 if reported.is_some() {
                     crate::log_line!(
                         "atomic: {label}: the execution backend can open its workspace again"
                     );
                 }
-                return Ok(WorkspaceGuard(Some(Arc::new(Closer {
-                    backend,
-                    workspace: Some(workspace),
-                }))));
+                return Ok(WorkspaceGuard(Some(Arc::new(closer))));
             }
             Err(e @ atomic_exec::ExecError::Unavailable { .. }) => {
                 if reported.is_none_or(|at| at.elapsed() >= OPEN_WAIT_REPORT) {
