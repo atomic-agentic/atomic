@@ -3,7 +3,8 @@
 //! Model authentication through `atomic run` with a Codex thread, which
 //! reads its instructions through Codex's Linux sandbox helper: a configured
 //! endpoint wins over a ChatGPT sign-in and is sent none of its token, and
-//! an empty base URL is no endpoint.
+//! an empty base URL is no endpoint. And an exec atom's command, confined
+//! under the same sandbox, cannot read atomic's environment through /proc.
 //!
 //! Needs bubblewrap and unprivileged user namespaces, so it runs with the
 //! `sandbox-tests` feature (and `ATOMIC_DEV_SANDBOX=on` in the development
@@ -61,4 +62,23 @@ fn a_configured_endpoint_wins_and_gets_no_sign_in_token() {
         );
         assert!(text(&out).contains("set ATOMIC_MODEL"), "{}", text(&out));
     });
+}
+
+#[test]
+fn a_command_atomic_runs_cannot_read_its_environment() {
+    support::require_sandbox();
+    let f = Fixture::new("environ");
+    let out = f.atomic(
+        &["run", "peek", "--data", r#"{"text": "x"}"#],
+        &[("ATOMIC_TEST_CANARY", "canary-in-atomics-environment")],
+    );
+    let t = text(&out);
+    assert!(out.status.success(), "{t}");
+    // Its parent is the sandbox, in a process namespace of its own, whose
+    // environment is not atomic's; atomic itself cannot be read through
+    // /proc by a process of the same user.
+    assert!(
+        !t.contains("canary-in-atomics-environment"),
+        "read through /proc: {t}"
+    );
 }

@@ -81,7 +81,7 @@ impl EngineArgs {
         // one is said, not taken for "signed out".
         let mut unreadable = None;
         let sign_in = match (&base_url, required) {
-            (None, true) => match atomic_core::signin::SignIn::configured(project) {
+            (None, true) => match atomic_core::signin::SignIn::configured(Some(project)) {
                 Ok(s) => match s.account() {
                     Ok(Some(_)) => Some(s),
                     Ok(None) => None,
@@ -265,8 +265,9 @@ pub async fn open(
         )
         .into());
     }
-    // A personal sign-in serves this process's own runs only, from a store
-    // no one else's executors share.
+    // A personal sign-in serves runs in a store no other host's executors
+    // share, and never `atomic serve`. `atomic runs resume` on such a store
+    // uses it for whichever run is resumed.
     let personal_refused = if matches!(database, Database::Postgres { .. }) {
         Some("the store is shared (PostgreSQL)")
     } else if takes == Takes::Waiting {
@@ -277,12 +278,39 @@ pub async fn open(
     let endpoint = args.endpoint(needs_model, state.root(), personal_refused)?;
     let signed_in = endpoint.sign_in.is_some();
     let store = LocalStore::open(state.dir().join("artifacts")).context("the artifact store")?;
-    let exec = match args.runner {
-        RunnerKind::Local => atomic_exec::Backend::default(),
-        RunnerKind::Process => atomic_exec::Backend::new(ProcessRunner::atomic(
-            std::env::current_exe().context("find atomic's own executable for its runners")?,
-        )),
+    // Scratch directories live in the project's state directory, outside
+    // every directory a sandboxed turn may write. Connected once: what the
+    // backend states here is what runs plan on, and connecting reclaims
+    // what attempts of dead processes left.
+    let local = atomic_exec::LocalBackend::in_dir(state.dir().join("scratch"));
+    // Exec atoms' commands run under the same sandbox helper as turns'
+    // commands, denied atomic's private state. Elsewhere than Linux this is
+    // not verified, and they run unconfined (see the availability notes).
+    // They may write their scratch directory and the project's caches.
+    #[cfg(target_os = "linux")]
+    let local = {
+        let caches = atomic_core::worktree::Caches::for_state(state);
+        caches.create().context("the project's caches")?;
+        local.confined(std::sync::Arc::new(
+            atomic_core::codex::ExecSandbox::new(
+                paths,
+                atomic_core::codex::StateGuard::for_project(state)?,
+                state.codex_home(),
+            )
+            .context("confine exec atoms' commands")?
+            .also_writing(vec![caches.dir().to_owned()]),
+        ))
     };
+    let exec = match args.runner {
+        RunnerKind::Local => atomic_exec::Backend::connect(local),
+        RunnerKind::Process => atomic_exec::Backend::connect(ProcessRunner {
+            workspaces: local,
+            ..ProcessRunner::atomic(
+                std::env::current_exe().context("find atomic's own executable for its runners")?,
+            )
+        }),
+    }
+    .context("connect to the execution backend")?;
     let runtimes = Arc::new(Runtimes {
         codex: CodexRuntime {
             paths: paths.clone(),
@@ -292,10 +320,14 @@ pub async fn open(
             defaults: AtomConfig::default(),
             artifacts: Artifacts::new(store.clone()),
             meter: atomic_core::usage::Metering::none(),
-            // Atoms' commands never reach atomic's private state.
+            // Atoms' commands are kept out of atomic's private state.
             guard: atomic_core::codex::StateGuard::for_project(state)?,
+            backend: exec.clone(),
         },
-        lite: LiteRuntime::new(endpoint, AtomConfig::default()),
+        lite: LiteRuntime {
+            backend: exec.clone(),
+            ..LiteRuntime::new(endpoint, AtomConfig::default())
+        },
         exec,
         clock: None,
     });

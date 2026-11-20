@@ -43,32 +43,47 @@ pub struct SignIn {
     issuer: Option<String>,
 }
 
-/// Who is signed in, without any token.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+/// Who is signed in, without any token. Its `Debug` masks the email.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Account {
     /// How: `chatgpt`, or `api key` for a key saved by a login.
     pub mode: String,
-    /// The account's email, if the sign-in says, masked: its first
-    /// character and its domain, such as `d***@example.com`.
+    /// The account's email, if the sign-in says. Never shown as it is:
+    /// [`mask_email`] it first.
     pub email: Option<String>,
     /// The ChatGPT plan, if the sign-in says.
     pub plan: Option<String>,
     /// Where it is kept: the OS keyring or the credential file store.
     pub store: String,
     /// The ChatGPT workspace it belongs to, for the managed restrictions.
-    #[serde(skip)]
     workspace: Option<String>,
 }
 
-/// `email` with all of its local part but the first character hidden.
-pub fn mask_email(email: &str) -> String {
-    match email.rsplit_once('@') {
-        Some((local, domain)) => {
-            let first: String = local.chars().take(1).collect();
-            format!("{first}***@{domain}")
-        }
-        None => "***".to_owned(),
+impl std::fmt::Debug for Account {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Account")
+            .field("mode", &self.mode)
+            .field("email", &self.email.as_deref().map(mask_email))
+            .field("plan", &self.plan)
+            .field("store", &self.store)
+            .finish_non_exhaustive()
     }
+}
+
+/// `email` with all of its local part but the first character hidden, as a
+/// new string built from those parts: `d***@example.com`. Masking a masked
+/// email gives it back.
+pub fn mask_email(email: &str) -> String {
+    let Some((local, domain)) = email.rsplit_once('@') else {
+        return "***".to_owned();
+    };
+    let mut shown = String::with_capacity(domain.len() + 5);
+    if let Some(first) = local.chars().next() {
+        shown.push(first);
+    }
+    shown.push_str("***@");
+    shown.push_str(domain);
+    shown
 }
 
 /// What a logout forgot.
@@ -124,14 +139,16 @@ fn protected_on(os: &'static str) -> Result<(), SignInError> {
 
 impl SignIn {
     /// Where the sign-in store `ATOMIC_CREDENTIAL_STORE` chooses is, without
-    /// creating anything: outside every state directory and outside, and not
-    /// above, `project`, as the operator credential's file store is.
-    pub fn located(project: &Path) -> Result<Self, SignInError> {
+    /// creating anything: outside every state directory and, when there is
+    /// one, outside and not above `project`, as the operator credential's
+    /// file store is. Outside any project (as from the home directory, above
+    /// the store) there is no project to keep it apart from.
+    pub fn located(project: Option<&Path>) -> Result<Self, SignInError> {
         protected()?;
         let dir = crate::state::credentials_dir()
             .map_err(|e| CredentialError::File(e.to_string()))?
             .join("codex-auth");
-        crate::credential::placed_apart(&dir, Some(project))?;
+        crate::credential::placed_apart(&dir, project)?;
         // One spelling, so the keyring entry Codex keys by it is the same
         // however the directory is reached.
         let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
@@ -152,7 +169,7 @@ impl SignIn {
     /// The sign-in store `ATOMIC_CREDENTIAL_STORE` chooses, as
     /// [`SignIn::located`] finds it, its directory created readable by its
     /// owner only. Refused off Linux.
-    pub fn configured(project: &Path) -> Result<Self, SignInError> {
+    pub fn configured(project: Option<&Path>) -> Result<Self, SignInError> {
         let located = Self::located(project)?;
         crate::state::private_dir(&located.auth_home)
             .map_err(|e| CredentialError::File(e.to_string()))?;
@@ -220,7 +237,7 @@ impl SignIn {
             if let Some(tokens) = &a.tokens {
                 return Some(Account {
                     mode: "chatgpt".into(),
-                    email: tokens.id_token.email.as_deref().map(mask_email),
+                    email: tokens.id_token.email.clone(),
                     plan: tokens.id_token.get_chatgpt_plan_type(),
                     store: store.clone(),
                     workspace: tokens.id_token.chatgpt_account_id.clone(),
@@ -436,6 +453,7 @@ mod tests {
         assert_eq!(mask_email("a.b@c@example.com"), "a***@example.com");
         assert_eq!(mask_email("@example.com"), "***@example.com");
         assert_eq!(mask_email("no-at-sign"), "***");
+        assert_eq!(mask_email("d***@example.invalid"), "d***@example.invalid");
     }
 
     /// A test issuer on loopback: it hands out a sign-in for `account` at
@@ -543,7 +561,7 @@ mod tests {
             browser_login(&sign_in).await.expect("logged in");
             let account = sign_in.account().expect("account").expect("signed in");
             assert_eq!(account.mode, "chatgpt");
-            assert_eq!(account.email.as_deref(), Some("d***@example.invalid"));
+            assert_eq!(account.email.as_deref(), Some("dev@example.invalid"));
             let kept = std::fs::read_to_string(dir.join("auth.json")).expect("kept");
             assert!(kept.contains("issued-access-token"));
             assert!(

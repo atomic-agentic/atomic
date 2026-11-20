@@ -94,10 +94,19 @@ fn logout_forgets_the_file_copy_whichever_store_is_chosen() {
             t.contains("forgot the sign-in in the credential file store"),
             "{store}: {t}"
         );
-        // This machine has no OS keyring, and logging out says so.
+        // The keyring's copy is looked for too: forgotten, absent, or not
+        // reachable here, and said so.
+        let json: serde_json::Value = serde_json::from_slice(
+            &f.atomic(
+                &["--json", "model", "logout"],
+                &[("ATOMIC_CREDENTIAL_STORE", store)],
+            )
+            .stdout,
+        )
+        .expect("json");
         assert!(
-            t.contains("the OS keyring could not be checked"),
-            "{store}: {t}"
+            json["keyring"].is_boolean() || json["keyring_error"].is_string(),
+            "{store}: {json}"
         );
     }
 }
@@ -163,17 +172,30 @@ fn signed_in_a_lite_atom_says_what_it_needs() {
 }
 
 #[test]
-fn a_command_atomic_runs_cannot_read_its_environment() {
-    let f = Fixture::new("environ");
-    let out = f.atomic(
-        &["run", "peek", "--data", r#"{"text": "x"}"#],
-        &[("ATOMIC_TEST_CANARY", "canary-in-atomics-environment")],
-    );
+fn model_commands_work_from_above_the_store_outside_any_project() {
+    let f = Fixture::new("above");
+    f.sign_in_unrevocable();
+    // The working directory holds the credential store, and no project.
+    let out = f.atomic_from(&f.dir, &["model", "status"], &[]);
     let t = text(&out);
     assert!(out.status.success(), "{t}");
-    assert!(
-        !t.contains("canary-in-atomics-environment"),
-        "read through /proc: {t}"
-    );
-    assert!(t.contains("refused"), "{t}");
+    assert!(t.contains("signed in with chatgpt"), "{t}");
+}
+
+#[test]
+fn model_commands_load_no_codex_home_from_the_temporary_directory() {
+    let f = Fixture::new("no-codex-home");
+    f.sign_in_unrevocable();
+    // Another user's planted .env, where an unowned Codex home would be.
+    let tmp = f.dir.join("tmp");
+    std::fs::create_dir_all(tmp.join("atomic-no-state-directory")).unwrap();
+    std::fs::write(
+        tmp.join("atomic-no-state-directory/.env"),
+        "ATOMIC_CREDENTIAL_STORE=planted\n",
+    )
+    .unwrap();
+    let out = f.atomic(&["model", "status"], &[("TMPDIR", tmp.to_str().unwrap())]);
+    let t = text(&out);
+    assert!(out.status.success(), "{t}");
+    assert!(!t.contains("planted"), "a planted .env was loaded: {t}");
 }

@@ -16,6 +16,7 @@ pub mod config;
 pub mod context;
 pub mod credential;
 pub mod editor;
+pub mod eval;
 pub mod evaluation;
 pub mod failpoint;
 pub mod failure;

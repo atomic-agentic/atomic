@@ -77,6 +77,7 @@ fn runtime(model: &FakeModel, tag: &str) -> CodexRuntime {
         defaults: AtomConfig::default(),
         artifacts: Artifacts::none(),
         meter: crate::usage::Metering::none(),
+        backend: Default::default(),
     }
 }
 
@@ -606,6 +607,8 @@ fn compiler_failures_never_spend_a_repair_call() {
                     contract: &contract,
                     validator: &validator,
                     name: "infrastructure-test",
+                    place: Place::of("run-1", "infrastructure-test"),
+                    env: Default::default(),
                 },
                 &check,
             )
@@ -1097,7 +1100,7 @@ fn exec_validators_follow_the_steps_clock() {
                 &compiled,
                 &input,
                 &identity,
-                Arc::new(atomic_exec::LocalBackend),
+                Arc::new(atomic_exec::LocalBackend::default()),
                 Some(&clock),
                 &Artifacts::none(),
             )
@@ -1110,7 +1113,7 @@ fn exec_validators_follow_the_steps_clock() {
             &compiled,
             &input,
             &identity,
-            Arc::new(atomic_exec::LocalBackend),
+            Arc::new(atomic_exec::LocalBackend::default()),
             None,
             &Artifacts::none(),
         )
@@ -1220,6 +1223,25 @@ fn exec_declarations_are_checked_at_load() {
             "variable name",
         ),
         ("kind: 'lite', env: { REGION: 'eu' }", "for `kind: 'exec'`"),
+        ("kind: 'codex', env: { 'BAD-NAME': 'x' }", "variable name"),
+        ("kind: 'codex', env: { RUSTUP_HOME: 1 }", "a string"),
+        (
+            "kind: 'codex', env: { LD_PRELOAD: '/x/evil.so' }",
+            "load code",
+        ),
+        ("kind: 'codex', env: { LD_LIBRARY_PATH: '/x' }", "load code"),
+        ("kind: 'codex', env: { GCONV_PATH: '/x' }", "load code"),
+        ("kind: 'codex', env: { HOME: '/x' }", "set by atomic"),
+        ("kind: 'codex', env: { ZDOTDIR: '/x' }", "set by atomic"),
+        ("kind: 'codex', env: { TMPDIR: '/x' }", "set by atomic"),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, env: { HOME: '/x' }",
+            "set by atomic",
+        ),
+        (
+            "kind: 'codex', exec: { command: ['x'] }",
+            "for `kind: 'exec'`",
+        ),
         (
             "kind: 'exec', exec: { command: ['x'] }, effects: { external: 'sometimes' }",
             "`read-only` (the command only reads) or `idempotent`",
@@ -1256,6 +1278,690 @@ fn exec_declarations_are_checked_at_load() {
             atom::load(&dir.join("atoms/x.atom.astro"), &mut Registry::new()).expect_err(problem);
         assert!(error.message.contains(problem), "{config}: {error}");
     }
+}
+
+/// A lite atom with [`Classify`]'s contract.
+struct LiteClassify;
+
+impl Atom for LiteClassify {
+    type In = Note;
+    type Out = Classified;
+    const NAME: &'static str = "classify-note-lite";
+    fn input_schema(&self) -> Value {
+        Classify.input_schema()
+    }
+    fn output_schema(&self) -> Value {
+        Classify.output_schema()
+    }
+    fn instructions(&self) -> Cow<'static, str> {
+        Classify.instructions()
+    }
+    fn kind(&self) -> crate::typed::AtomKind {
+        crate::typed::AtomKind::Lite
+    }
+}
+
+/// An execution backend that records every call before passing it to the
+/// local backend, and can refuse to open a workspace.
+#[derive(Clone, Default)]
+struct Recording {
+    calls: Arc<std::sync::Mutex<Vec<String>>>,
+    opened: Arc<std::sync::Mutex<Vec<(atomic_exec::Open, Workspace)>>>,
+    refuse: bool,
+    no_shell: bool,
+    unavailable: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Recording {
+    fn calls(&self) -> Vec<String> {
+        self.calls.lock().expect("calls").clone()
+    }
+
+    fn opened(&self) -> Vec<(atomic_exec::Open, Workspace)> {
+        self.opened.lock().expect("opened").clone()
+    }
+
+    fn backend(&self) -> atomic_exec::Backend {
+        atomic_exec::Backend::connect(self.clone()).expect("connects")
+    }
+}
+
+impl ExecutionBackend for Recording {
+    fn connect(&self) -> Result<atomic_exec::Statement, atomic_exec::ExecError> {
+        Ok(atomic_exec::LocalBackend::STATEMENT)
+    }
+
+    fn open(&self, request: &atomic_exec::Open) -> Result<Workspace, atomic_exec::ExecError> {
+        self.calls
+            .lock()
+            .expect("calls")
+            .push(format!("open {}", request.label));
+        if self.refuse {
+            return Err(atomic_exec::ExecError::Workspace {
+                label: request.label.clone(),
+                message: "no room on this backend".into(),
+            });
+        }
+        if self
+            .unavailable
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |n| n.checked_sub(1),
+            )
+            .is_ok()
+        {
+            return Err(atomic_exec::ExecError::Unavailable {
+                label: request.label.clone(),
+                message: "no runner is free".into(),
+            });
+        }
+        let mut ws = atomic_exec::LocalBackend::default().open(request)?;
+        if self.no_shell {
+            ws.shell = atomic_exec::Shell::None;
+        }
+        self.opened
+            .lock()
+            .expect("opened")
+            .push((request.clone(), ws.clone()));
+        Ok(ws)
+    }
+
+    fn run(
+        &self,
+        command: &atomic_exec::Command,
+    ) -> Result<atomic_exec::Completed, atomic_exec::ExecError> {
+        self.calls
+            .lock()
+            .expect("calls")
+            .push(format!("run {}", command.program));
+        atomic_exec::LocalBackend::default().run(command)
+    }
+
+    fn close(&self, workspace: &Workspace) -> Result<(), atomic_exec::ExecError> {
+        self.calls
+            .lock()
+            .expect("calls")
+            .push(format!("close {}", workspace.label));
+        atomic_exec::LocalBackend::default().close(workspace)
+    }
+}
+
+const CLASSIFIED: &str = r#"{"category": "bug", "summary": "Export crashes.", "line": null}"#;
+
+/// Every kind of atom opens its workspace on its runtime's backend before
+/// anything runs, and closes it after: a codex atom's in the runtime's
+/// directory with a local shell, a lite atom's with no files or shell, and
+/// an exec atom's in its project, where its command runs through the
+/// backend with the workspace's scratch directory as its home.
+#[test]
+fn every_kind_of_atom_runs_through_its_execution_backend() {
+    on_codex_runtime(async {
+        let note = Note {
+            text: "Export crashes on é.".into(),
+        };
+        let model = FakeModel::start(vec![
+            Reply::Text(CLASSIFIED.into()),
+            Reply::Text(CLASSIFIED.into()),
+        ])
+        .await
+        .expect("fake model");
+
+        let codex = Recording::default();
+        let mut rt = runtime(&model, "seam-codex");
+        rt.backend = codex.backend();
+        run_codex_atom(&Classify, &note, &rt).await.expect("runs");
+        assert_eq!(codex.calls(), ["open classify-note", "close classify-note"]);
+        let (asked, given) = &codex.opened()[0];
+        assert_eq!(asked.source.as_ref(), Some(&rt.cwd));
+        assert_eq!(asked.sandbox, crate::typed::Sandbox::ReadOnly);
+        assert_eq!(given.shell, atomic_exec::Shell::Local);
+        assert!(
+            !given.scratch.as_ref().expect("scratch").exists(),
+            "closed when the run ended"
+        );
+
+        let lite = Recording::default();
+        let mut lrt = crate::lite::LiteRuntime::new(rt.endpoint.clone(), AtomConfig::default());
+        lrt.backend = lite.backend();
+        run_lite_atom(&LiteClassify, &note, &lrt)
+            .await
+            .expect("runs");
+        assert_eq!(
+            lite.calls(),
+            ["open classify-note-lite", "close classify-note-lite"]
+        );
+        let (asked, given) = &lite.opened()[0];
+        assert_eq!(asked.source, None);
+        assert_eq!(given.shell, atomic_exec::Shell::None);
+        assert_eq!(model.calls(), 2);
+
+        let exec = Recording::default();
+        let mut all = runtimes(&model, "seam-exec");
+        all.exec = exec.backend();
+        let script = "import json, os, sys\norder = json.load(sys.stdin)\n\
+            json.dump({'total': len(os.listdir(os.environ['HOME']))}, sys.stdout)\n";
+        let (dir, a, compiled) = exec_project("seam-exec", script, "");
+        let (out, _) = run_declarative(
+            &a,
+            &compiled,
+            &mut Registry::new(),
+            &json!({"cents": [1]}),
+            "run-1",
+            "external",
+            &all,
+        )
+        .await
+        .expect("runs");
+        assert_eq!(out, json!({"total": 0}), "the scratch home starts empty");
+        assert_eq!(exec.calls(), ["open total", "run python3", "close total"]);
+        let (asked, given) = &exec.opened()[0];
+        assert_eq!(asked.source.as_ref(), Some(&a.program.root));
+        assert!(dir.join("atomic.yaml").is_file());
+        assert!(!given.scratch.as_ref().expect("scratch").exists());
+        assert_eq!(model.calls(), 2, "an exec atom calls no model");
+    });
+}
+
+/// A backend that cannot open a workspace fails the run before anything is
+/// sent to a model or run: no atom gets around the backend.
+#[test]
+fn a_run_whose_workspace_cannot_be_opened_sends_and_runs_nothing() {
+    on_codex_runtime(async {
+        let note = Note { text: "n".into() };
+        let model = FakeModel::start(vec![Reply::Text(CLASSIFIED.into())])
+            .await
+            .expect("fake model");
+        let refusing = Recording {
+            refuse: true,
+            ..Recording::default()
+        };
+
+        let mut rt = runtime(&model, "seam-refuse");
+        rt.backend = refusing.backend();
+        let r = run_codex_atom(&Classify, &note, &rt).await;
+        assert!(
+            matches!(&r, Err(AtomError::Runtime(m)) if m.contains("no room on this backend")),
+            "{r:?}"
+        );
+
+        let mut lrt = crate::lite::LiteRuntime::new(rt.endpoint.clone(), AtomConfig::default());
+        lrt.backend = refusing.backend();
+        let r = run_lite_atom(&LiteClassify, &note, &lrt).await;
+        assert!(matches!(&r, Err(AtomError::Runtime(_))), "{r:?}");
+
+        let mut all = runtimes(&model, "seam-refuse-exec");
+        all.exec = refusing.backend();
+        let (_, a, compiled) = exec_project("seam-refuse", TOTAL, "");
+        let r = run_declarative(
+            &a,
+            &compiled,
+            &mut Registry::new(),
+            &json!({"cents": [1]}),
+            "run-1",
+            "external",
+            &all,
+        )
+        .await;
+        assert!(matches!(&r, Err(AtomError::Runtime(_))), "{r:?}");
+
+        assert_eq!(model.calls(), 0, "nothing reached the model");
+        assert_eq!(
+            refusing.calls(),
+            [
+                "open classify-note",
+                "open classify-note-lite",
+                "open total"
+            ],
+            "nothing ran and nothing was left open"
+        );
+    });
+}
+
+/// A run that fails still closes its workspace.
+#[test]
+fn a_failed_run_closes_its_workspace() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![
+            Reply::Text("not json".into()),
+            Reply::Text("still not json".into()),
+        ])
+        .await
+        .expect("fake model");
+        let codex = Recording::default();
+        let mut rt = runtime(&model, "seam-fail");
+        rt.backend = codex.backend();
+        let r = run_codex_atom(&Classify, &Note { text: "n".into() }, &rt).await;
+        assert!(matches!(&r, Err(AtomError::Schema { .. })), "{r:?}");
+        assert_eq!(codex.calls(), ["open classify-note", "close classify-note"]);
+
+        let exec = Recording::default();
+        let mut all = runtimes(&model, "seam-fail-exec");
+        all.exec = exec.backend();
+        let (_, a, compiled) = exec_project("seam-fail", "import sys\nsys.exit(3)\n", "");
+        let r = run_declarative(
+            &a,
+            &compiled,
+            &mut Registry::new(),
+            &json!({"cents": [1]}),
+            "run-1",
+            "external",
+            &all,
+        )
+        .await;
+        assert!(matches!(&r, Err(AtomError::Runtime(_))), "{r:?}");
+        assert_eq!(exec.calls(), ["open total", "run python3", "close total"]);
+        let (_, given) = &exec.opened()[0];
+        assert!(!given.scratch.as_ref().expect("scratch").exists());
+    });
+}
+
+/// A codex atom whose backend gives its turn no shell fails before any model
+/// call, and its workspace is closed.
+#[test]
+fn a_codex_atom_whose_workspace_has_no_shell_sends_nothing() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(CLASSIFIED.into())])
+            .await
+            .expect("fake model");
+        let shell_less = Recording {
+            no_shell: true,
+            ..Recording::default()
+        };
+        let mut rt = runtime(&model, "seam-no-shell");
+        rt.backend = shell_less.backend();
+        let r = run_codex_atom(&Classify, &Note { text: "n".into() }, &rt).await;
+        assert!(
+            matches!(&r, Err(AtomError::Runtime(m)) if m.contains("no shell")),
+            "{r:?}"
+        );
+        assert_eq!(model.calls(), 0);
+        assert_eq!(
+            shell_less.calls(),
+            ["open classify-note", "close classify-note"]
+        );
+    });
+}
+
+/// While the backend has no room the run waits, trying again, and runs once
+/// there is room; a run that waits sends nothing, and stopping it stops the
+/// wait.
+#[test]
+fn an_unavailable_workspace_is_waited_for() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(CLASSIFIED.into())])
+            .await
+            .expect("fake model");
+        let busy = Recording {
+            unavailable: Arc::new(std::sync::atomic::AtomicUsize::new(4)),
+            ..Recording::default()
+        };
+        let mut rt = runtime(&model, "seam-busy");
+        rt.backend = busy.backend();
+        run_codex_atom(&Classify, &Note { text: "n".into() }, &rt)
+            .await
+            .expect("runs once the backend has room");
+        let mut expected = vec!["open classify-note"; 5];
+        expected.push("close classify-note");
+        assert_eq!(busy.calls(), expected);
+        assert_eq!(model.calls(), 1);
+
+        let full = Recording {
+            unavailable: Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX)),
+            ..Recording::default()
+        };
+        rt.backend = full.backend();
+        let waiting = tokio::spawn(async move {
+            run_codex_atom(&Classify, &Note { text: "n".into() }, &rt).await
+        });
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        assert!(!waiting.is_finished(), "it waits");
+        assert!(
+            full.calls().len() >= 3,
+            "and tries again: {:?}",
+            full.calls()
+        );
+        waiting.abort();
+        assert!(waiting.await.expect_err("stopped").is_cancelled());
+        assert_eq!(model.calls(), 1, "nothing more was sent");
+    });
+}
+
+/// An atom that panics after its workspace opened still closes it.
+#[test]
+fn a_run_that_panics_closes_its_workspace() {
+    struct Panics;
+    impl Atom for Panics {
+        type In = Note;
+        type Out = Classified;
+        const NAME: &'static str = "panics";
+        fn input_schema(&self) -> Value {
+            Classify.input_schema()
+        }
+        fn output_schema(&self) -> Value {
+            Classify.output_schema()
+        }
+        fn instructions(&self) -> Cow<'static, str> {
+            Classify.instructions()
+        }
+        fn validate(&self, _: &Classified) -> Result<(), AtomError> {
+            panic!("the atom's own check panicked")
+        }
+    }
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(CLASSIFIED.into())])
+            .await
+            .expect("fake model");
+        let recorded = Recording::default();
+        let mut rt = runtime(&model, "seam-panic");
+        rt.backend = recorded.backend();
+        let r = contained(
+            async move { run_codex_atom(&Panics, &Note { text: "n".into() }, &rt).await },
+        )
+        .await;
+        assert!(matches!(&r, Err(AtomError::Panicked(_))), "{r:?}");
+        let scratch = recorded.opened()[0].1.scratch.clone().expect("scratch");
+        for _ in 0..200 {
+            if recorded.calls().len() == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(recorded.calls(), ["open panics", "close panics"]);
+        // Recorded as the close starts; the removal follows.
+        for _ in 0..200 {
+            if !scratch.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(!scratch.exists());
+    });
+}
+
+/// A run that is cancelled after its workspace opened still closes it.
+#[test]
+fn a_cancelled_run_closes_its_workspace() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(Vec::new()).await.expect("fake model");
+        let recorded = Recording::default();
+        let mut all = runtimes(&model, "seam-cancel");
+        all.exec = recorded.backend();
+        // The command writes in its HOME, the scratch directory, after a
+        // while: its workspace must still be there.
+        let (_, a, compiled) = exec_project(
+            "seam-cancel",
+            "import os, time\ntime.sleep(2)\nopen(os.path.join(os.environ['HOME'], 'late'), 'w').write('x')\n",
+            "",
+        );
+        let task = tokio::spawn(async move {
+            run_declarative(
+                &a,
+                &compiled,
+                &mut Registry::new(),
+                &json!({"cents": [1]}),
+                "run-1",
+                "external",
+                &all,
+            )
+            .await
+        });
+        for _ in 0..500 {
+            if recorded.calls().iter().any(|c| c.starts_with("run ")) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(recorded.calls(), ["open total", "run python3"]);
+        task.abort();
+        assert!(task.await.expect_err("cancelled").is_cancelled());
+        // The command still runs, so its workspace stays open...
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let scratch = recorded.opened()[0].1.scratch.clone().expect("scratch");
+        assert_eq!(recorded.calls(), ["open total", "run python3"]);
+        assert!(scratch.is_dir(), "closed under a running command");
+        // ...until it ends.
+        for _ in 0..1000 {
+            if recorded.calls().len() == 3 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            recorded.calls(),
+            ["open total", "run python3", "close total"]
+        );
+        assert!(!scratch.exists());
+    });
+}
+
+/// A codex atom declares the environment its turn's commands get, such as
+/// the tool homes its build finds through HOME otherwise: it reaches the
+/// workspace the run opens.
+#[test]
+fn a_codex_atom_passes_its_declared_tool_homes_to_its_workspace() {
+    use crate::{atom, compile};
+    on_codex_runtime(async {
+        let dir = scratch("codex-env");
+        std::fs::create_dir_all(dir.join("atoms")).expect("atoms");
+        std::fs::write(
+            dir.join("atoms/build.atom.astro"),
+            "---\nimport type { Props, Input, Output } from './.atomic/types/build';\n\
+             import type { AtomConfig } from './.atomic/types/authoring';\n\
+             const { input }: Props = Astro.props;\n\
+             export const config: AtomConfig<Input, Output> = { description: 'Build.', kind: 'codex', \
+             env: { RUSTUP_HOME: '/opt/rustup', CARGO_HOME: '/opt/cargo', PYENV_ROOT: '/opt/pyenv' } };\n---\nBuild {input.text}\n",
+        )
+        .expect("atom");
+        for role in ["input", "output"] {
+            std::fs::write(
+                dir.join(format!("atoms/build.{role}.schema.yaml")),
+                "type: object\nadditionalProperties: false\nrequired: [text]\nproperties:\n  text: {type: string}\n",
+            )
+            .expect("schema");
+        }
+        let mut registry = Registry::new();
+        let a = atom::load(&dir.join("atoms/build.atom.astro"), &mut registry).expect("loads");
+        let compiled = compile::compile(&a, &registry).expect("compiles");
+        let model = FakeModel::start(vec![Reply::Text(r#"{"text": "built"}"#.into())])
+            .await
+            .expect("fake model");
+        let recorded = Recording::default();
+        let mut all = runtimes(&model, "codex-env");
+        all.codex.backend = recorded.backend();
+        run_declarative(
+            &a,
+            &compiled,
+            &mut registry,
+            &json!({"text": "it"}),
+            "run-1",
+            "external",
+            &all,
+        )
+        .await
+        .expect("runs");
+        let (asked, given) = &recorded.opened()[0];
+        for (name, value) in [
+            ("RUSTUP_HOME", "/opt/rustup"),
+            ("CARGO_HOME", "/opt/cargo"),
+            ("PYENV_ROOT", "/opt/pyenv"),
+        ] {
+            assert_eq!(asked.env.get(name).map(String::as_str), Some(value));
+            assert_eq!(given.env.get(name).map(String::as_str), Some(value));
+        }
+    });
+}
+
+/// Where the sandbox cannot run, the backend still connects and an atom
+/// that needs no sandbox, such as a lite atom, runs; an exec atom, or a
+/// codex atom whose turn would run commands, is refused before anything
+/// runs as unconfinable, with what the sandbox needs, which a durable run
+/// stops on without recording anything. A failed check is not kept: each
+/// such atom checks again.
+#[test]
+fn only_atoms_that_run_commands_need_the_sandbox() {
+    use crate::codex::{CodexPaths, ExecSandbox, StateGuard};
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(CLASSIFIED.into())])
+            .await
+            .expect("fake model");
+        // Not under /tmp, which connect refuses.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/atomic-core-tests")
+            .join(format!("no-sandbox-{}", std::process::id()));
+        let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        struct Counting(ExecSandbox, Arc<std::sync::atomic::AtomicUsize>);
+        impl atomic_exec::Confine for Counting {
+            fn confine(
+                &self,
+                command: &atomic_exec::Command,
+                tmp: &std::path::Path,
+            ) -> Result<atomic_exec::Command, atomic_exec::ExecError> {
+                self.0.confine(command, tmp)
+            }
+            fn check(&self, tmp: &std::path::Path) -> Result<(), atomic_exec::ExecError> {
+                self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.0.check(tmp)
+            }
+        }
+        // A helper that fails as bubblewrap does on a machine without user
+        // namespaces, and one that fails as it does on a full disk.
+        let helper = |name: &str, says: &str| {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::create_dir_all(&root).expect("root");
+            let path = root.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\necho '{says}' >&2\nexit 1\n"))
+                .expect("helper");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+            CodexPaths::with_helpers(path.clone(), path)
+        };
+        let paths = helper(
+            "refusing",
+            "bwrap: No permissions to create a new namespace, likely because the kernel does \
+             not allow non-privileged user namespaces.",
+        );
+        let full = helper(
+            "full",
+            "error building bubblewrap command: No space left on device (os error 28)",
+        );
+        let tmp = root.join("check-tmp");
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let passing = ExecSandbox::new(&full, StateGuard::NoProjectState, root.join("codex"))
+            .expect("a helper");
+        assert!(
+            matches!(
+                atomic_exec::Confine::check(&passing, &tmp),
+                Err(atomic_exec::ExecError::Unavailable { ref message, .. })
+                    if message.contains("No space left on device")
+            ),
+            "a failure that may pass waits"
+        );
+        let sandbox = ExecSandbox::new(&paths, StateGuard::NoProjectState, root.join("codex"))
+            .expect("a helper");
+        let backend = atomic_exec::Backend::connect(
+            atomic_exec::LocalBackend::in_dir(root.join("scratch"))
+                .confined(Arc::new(Counting(sandbox, checks.clone()))),
+        )
+        .expect("connects without checking the sandbox");
+        assert_eq!(checks.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        let mut all = runtimes(&model, "no-sandbox");
+        all.codex.backend = backend.clone();
+        all.lite.backend = backend.clone();
+        all.exec = backend;
+        run_lite_atom(&LiteClassify, &Note { text: "n".into() }, &all.lite)
+            .await
+            .expect("a lite atom needs no sandbox");
+        assert_eq!(checks.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        let (_, a, compiled) = exec_project("no-sandbox", TOTAL, "");
+        let r = run_declarative(
+            &a,
+            &compiled,
+            &mut Registry::new(),
+            &json!({"cents": [1]}),
+            "run-1",
+            "external",
+            &all,
+        )
+        .await;
+        let refused = |e: Option<&AtomError>| {
+            matches!(e, Some(AtomError::Unconfinable(m))
+                if m.contains("cannot start here")
+                    && m.contains("bubblewrap")
+                    && m.contains("unprivileged user namespaces")
+                    && m.contains("--security-opt"))
+        };
+        assert!(refused(r.as_ref().err()), "{r:?}");
+        let r = run_codex_atom(&Classify, &Note { text: "n".into() }, &all.codex).await;
+        assert!(refused(r.as_ref().err()), "{r:?}");
+        assert_eq!(
+            checks.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "a failed check is made again"
+        );
+        assert_eq!(model.calls(), 1, "only the lite atom called the model");
+    });
+}
+
+/// A sandbox check that fails for a reason that may pass (no room, no
+/// process to spare) makes the run wait, as a backend with no room does,
+/// and once it passes it is kept.
+#[test]
+fn a_check_that_may_pass_is_waited_for_and_kept_once_it_passes() {
+    struct Flaky(Arc<std::sync::atomic::AtomicUsize>);
+    impl atomic_exec::Confine for Flaky {
+        fn confine(
+            &self,
+            command: &atomic_exec::Command,
+            _: &std::path::Path,
+        ) -> Result<atomic_exec::Command, atomic_exec::ExecError> {
+            Ok(command.clone())
+        }
+        fn check(&self, _: &std::path::Path) -> Result<(), atomic_exec::ExecError> {
+            if self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
+                return Err(atomic_exec::ExecError::Unavailable {
+                    label: "the sandbox check".into(),
+                    message: "no process to spare".into(),
+                });
+            }
+            Ok(())
+        }
+    }
+    on_codex_runtime(async {
+        let model = FakeModel::start(Vec::new()).await.expect("fake model");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/atomic-core-tests")
+            .join(format!("flaky-check-{}", std::process::id()));
+        let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let backend = atomic_exec::Backend::connect(
+            atomic_exec::LocalBackend::in_dir(root.join("scratch"))
+                .confined(Arc::new(Flaky(checks.clone()))),
+        )
+        .expect("connects");
+        let mut all = runtimes(&model, "flaky-check");
+        all.exec = backend;
+        let (_, a, compiled) = exec_project("flaky-check", TOTAL, "");
+        for run in ["run-1", "run-2"] {
+            let (out, _) = run_declarative(
+                &a,
+                &compiled,
+                &mut Registry::new(),
+                &json!({"cents": [1, 2]}),
+                run,
+                "external",
+                &all,
+            )
+            .await
+            .expect("runs once the check passes");
+            assert_eq!(out, json!({"total": 3}));
+        }
+        assert_eq!(
+            checks.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "two refusals, one pass, then kept"
+        );
+    });
 }
 
 // An exec atom's output is held to the artifact store like a model's answer.
@@ -1309,7 +2015,7 @@ fn an_exec_atom_output_names_only_artifacts_the_store_holds() {
                     run_id: "run-1".into(),
                     step_id: "total".into(),
                 },
-                Arc::new(atomic_exec::LocalBackend),
+                Arc::new(atomic_exec::LocalBackend::default()),
                 None,
                 &Artifacts::new(store.clone()),
             )
@@ -1403,7 +2109,7 @@ fn an_exec_output_cel_cannot_read_fails() {
                 run_id: "run-1".into(),
                 step_id: "total".into(),
             },
-            Arc::new(atomic_exec::LocalBackend),
+            Arc::new(atomic_exec::LocalBackend::default()),
             None,
             &Artifacts::none(),
         )

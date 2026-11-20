@@ -139,10 +139,20 @@ impl Fixture {
         None
     }
 
+    /// `atomic args...` from `cwd` rather than the project.
+    pub fn atomic_from(&self, cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
+        let mut c = self.command(args, env);
+        c.current_dir(cwd);
+        c.output().unwrap()
+    }
+
     fn command(&self, args: &[&str], env: &[(&str, &str)]) -> Command {
         let mut c = Command::new(ATOMIC);
         c.args(args)
             .current_dir(self.dir.join("project"))
+            // No Secret Service: whether one runs here does not change what
+            // a test sees.
+            .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent/bus")
             .env("HOME", self.dir.join("home"))
             .env("ATOMIC_HOME", self.dir.join("atomic-home"))
             .env("ATOMIC_CREDENTIAL_STORE", "file")

@@ -55,6 +55,7 @@ use codex_core_api::RealtimeAudioConfig;
 use codex_core_api::RealtimeConfig;
 use codex_core_api::SessionPickerViewMode;
 use codex_core_api::SessionSource;
+use codex_core_api::ShellEnvironmentPolicy;
 use codex_core_api::SqliteConfig;
 use codex_core_api::StartIfIdleSubmission;
 use codex_core_api::StartThreadOptions;
@@ -141,11 +142,15 @@ pub enum StateGuard {
 /// What [`StateGuard::Deny`] denies.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrivateState {
-    /// The project's state directory: its `private/` directory is denied,
-    /// and each thread gets its temporary directory in its `tmp/`.
+    /// The project's state directory, where each thread gets its temporary
+    /// directory in its `tmp/`.
     pub state_dir: PathBuf,
-    /// Other directories denied whole: the context key and the credential
-    /// file store.
+    /// Where every project of the atomic home keeps its private state
+    /// (`<home>/private`): denied whole, by one entry, so a project made
+    /// while a thread runs is covered too.
+    pub private: PathBuf,
+    /// Other directories denied whole: the context key, the credential file
+    /// store, and another atomic home's state.
     pub also: Vec<PathBuf>,
 }
 
@@ -157,16 +162,28 @@ impl StateGuard {
         Self::deny_state_dir(state.dir())
     }
 
-    /// The guard for a state directory at `state_dir`, with the user-wide
-    /// private directories as configured.
+    /// The guard for a state directory at `state_dir`, with the atomic home's
+    /// private state and the user-wide private directories as configured.
     pub fn deny_state_dir(state_dir: impl Into<PathBuf>) -> anyhow::Result<Self> {
+        let private = crate::state::base_dir()?.join("private");
+        crate::state::private_dir(&private)?;
         let mut also = vec![crate::state::credentials_dir()?];
         also.push(crate::context::default_key_dir().map_err(anyhow::Error::msg)?);
         for dir in &also {
             crate::state::private_dir(dir)?;
         }
+        // With ATOMIC_HOME set, the default home's state, credentials and
+        // keys are another atomic's: denied too, where they exist.
+        if std::env::var_os("ATOMIC_HOME").is_some_and(|h| !h.is_empty()) {
+            let defaults = [
+                dirs::data_dir().map(|d| d.join("atomic")),
+                dirs::config_dir().map(|d| d.join("atomic")),
+            ];
+            also.extend(defaults.into_iter().flatten().filter(|d| d.exists()));
+        }
         Ok(Self::Deny(PrivateState {
             state_dir: state_dir.into(),
+            private,
             also,
         }))
     }
@@ -179,7 +196,9 @@ impl StateGuard {
 /// below, so the sandbox needs no mount inside a denied directory. Both
 /// spellings of a path reached through a link are denied.
 fn denied_paths(private: &PrivateState, codex_home: &Path) -> (Vec<PathBuf>, Vec<String>) {
-    let mut denied = vec![private.state_dir.join("private")];
+    // Every project's private state, by one entry, however many projects
+    // the home holds.
+    let mut denied = vec![private.private.clone()];
     denied.extend(private.also.iter().cloned());
     let children = |dir: &Path, keep: &str| -> Vec<PathBuf> {
         std::fs::read_dir(dir)
@@ -220,6 +239,9 @@ const CODEX_HOME_FILES: &[&str] = &[".env", "config.toml"];
 
 /// Create `path` empty, readable by its owner only, unless it exists.
 fn planted_never(path: &Path) -> anyhow::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    }
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -265,6 +287,22 @@ pub(crate) fn permission_profile(
         planted_never(&codex_home.join(name))?;
     }
     let mut policy = base.file_system_sandbox_policy();
+    // The rest of Codex's home is readable and never writable, even under a
+    // writable root that covers it: no command plants a file Codex reads
+    // from there (environments.toml, AGENTS.md, rules, hooks) for the next
+    // thread.
+    let homes = [
+        Some(codex_home.to_owned()),
+        std::fs::canonicalize(codex_home).ok(),
+    ];
+    for home in homes.into_iter().flatten() {
+        let home = AbsolutePathBuf::from_absolute_path(&home)
+            .with_context(|| format!("resolve the Codex home {}", home.display()))?;
+        policy.entries.push(FileSystemSandboxEntry::new(
+            FileSystemPath::from(home),
+            FileSystemAccessMode::Read,
+        ));
+    }
     let (paths, globs) = denied_paths(private, codex_home);
     for p in paths {
         let p = AbsolutePathBuf::from_absolute_path(&p)
@@ -317,6 +355,55 @@ fn refuse_uncovered_store(
     Ok(())
 }
 
+/// atomic's own variables: its configuration and the credentials it holds,
+/// such as its database URL, project secrets and telemetry headers.
+const ATOMIC_OWN: [&str; 3] = ["ATOMIC_*", "DBOS__*", "OTEL_EXPORTER_OTLP_HEADERS"];
+
+/// The environment of every command a thread runs: the platform's core
+/// variables from this process (`PATH`, `HOME`, `USER` and the like),
+/// except any whose name holds `KEY`, `SECRET` or `TOKEN` and any of
+/// atomic's own, and then exactly what the atom declares (`declared`).
+/// Nothing else of atomic's environment reaches the command, and through
+/// its output, the model.
+pub(crate) fn command_environment(declared: &BTreeMap<String, String>) -> ShellEnvironmentPolicy {
+    use codex_protocol::config_types::{EnvironmentVariablePattern, ShellEnvironmentPolicyInherit};
+    ShellEnvironmentPolicy {
+        inherit: ShellEnvironmentPolicyInherit::Core,
+        ignore_default_excludes: false,
+        exclude: ATOMIC_OWN
+            .iter()
+            .map(|pattern| EnvironmentVariablePattern::new_case_insensitive(pattern))
+            .collect(),
+        r#set: declared
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect(),
+        include_only: Vec::new(),
+        use_profile: false,
+    }
+}
+
+/// The environments a thread's shell and file work may run in: this machine,
+/// and nothing else.
+///
+/// Codex's usual constructors read `CODEX_HOME/environments.toml`, then
+/// `CODEX_EXEC_SERVER_URL` and the `CODEX_EXEC_SERVER_NOISE_*` variables
+/// from this process's environment, any of which would move a turn's shell
+/// to an exec-server the execution backend never chose. At the pinned
+/// revision the only public constructor that reads none of them is the one
+/// Codex names for tests: with no URL it builds exactly the local
+/// environment, and it fails only without runtime paths, which are always
+/// given. What it built is checked before any thread uses it.
+async fn local_environment(paths: ExecServerRuntimeOptions) -> anyhow::Result<EnvironmentManager> {
+    let manager = EnvironmentManager::create_for_tests(/*exec_server_url*/ None, Some(paths)).await;
+    let ids = manager.default_environment_ids();
+    let local = manager.default_environment();
+    if ids != ["local"] || local.as_ref().is_none_or(|e| e.is_remote()) {
+        bail!("the turn's shell would not run on this machine: environments {ids:?}");
+    }
+    Ok(manager)
+}
+
 /// What a thread did: its id, how many turns it ran and the tokens it used,
 /// as the provider reported them.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -338,6 +425,12 @@ pub struct ThreadReport {
 pub struct CodexPaths(Arg0DispatchPaths);
 
 impl CodexPaths {
+    /// Codex's Linux sandbox helper, when this process has one: atomic's own
+    /// executable, run under the helper's name.
+    pub fn linux_sandbox(&self) -> Option<&Path> {
+        self.0.codex_linux_sandbox_exe.as_deref()
+    }
+
     /// Paths for a process that did not start through [`dispatch`], such as
     /// a test: Codex can re-run this executable, but has no sandbox helper.
     pub fn without_helpers() -> Self {
@@ -372,10 +465,108 @@ where
     F: FnOnce(CodexPaths) -> Fut + Send + 'static,
     Fut: Future<Output = anyhow::Result<()>>,
 {
+    keep_sandbox_off_keyrings();
+    // atomic itself, not one of Codex's helpers: the process that holds a
+    // sign-in's token and the operator credential cannot be dumped, read
+    // through /proc by a same-user process, or leave a core file. It loses
+    // its LD_* variables, and the commands it starts inherit a core-file
+    // limit of zero (on macOS it also refuses a debugger).
+    if !is_helper(std::env::args_os()) {
+        codex_process_hardening::pre_main_hardening();
+    }
+    // SAFETY: called at the start of main, while the process has one thread,
+    // so no other thread can read the environment concurrently.
+    #[allow(unsafe_code)]
+    unsafe {
+        std::env::set_var("CODEX_HOME", codex_home);
+    }
+    scrub_overrides();
+    arg0_dispatch_or_else(move |paths| main_fn(CodexPaths(paths)))
+}
+
+/// The entry point for a command that starts no Codex thread, such as
+/// `atomic model`: hardened as [`dispatch`] hardens atomic, with nothing in
+/// the environment standing in for a sign-in's tokens, but with no Codex
+/// home, so no `.env` of one is loaded. Call this first in `main`, before any
+/// thread starts.
+pub fn without_threads<Fut>(main_fn: Fut) -> anyhow::Result<()>
+where
+    Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    if !is_helper(std::env::args_os()) {
+        codex_process_hardening::pre_main_hardening();
+    }
+    scrub_overrides();
+    // Codex's own entry point gives its futures this much stack.
+    const STACK: usize = 16 * 1024 * 1024;
+    let handle = std::thread::Builder::new()
+        .name("atomic-main".into())
+        .stack_size(STACK)
+        .spawn(move || {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .thread_stack_size(STACK)
+                .build()?
+                .block_on(main_fn)
+        })?;
+    match handle.join() {
+        Ok(result) => result,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+/// Whether this process was started as one of Codex's helpers rather than
+/// as atomic: under a helper's name (the Linux sandbox, `apply_patch`) or with
+/// a helper's first argument. A helper must run before atomic touches
+/// anything, such as its state directory: it runs inside a turn, where
+/// `HOME` is the turn's scratch directory, which the turn may write.
+pub fn is_helper(mut args: impl Iterator<Item = std::ffi::OsString>) -> bool {
+    let name = args
+        .next()
+        .and_then(|argv0| {
+            Path::new(&argv0)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(str::to_owned)
+        })
+        .unwrap_or_default();
+    if matches!(
+        name.as_str(),
+        "codex-linux-sandbox" | "apply_patch" | "applypatch"
+    ) {
+        return true;
+    }
+    let first = args.next().unwrap_or_default();
+    // Exactly the first arguments Codex's dispatch at the pinned revision
+    // answers to (arg0, apply-patch, the exec-server's helpers, the pty
+    // setup, the Windows sandboxes).
+    matches!(
+        first.to_string_lossy().as_ref(),
+        "--codex-run-as-apply-patch"
+            | "--codex-run-as-arg0-exec-helper"
+            | "--codex-run-as-fs-helper"
+            | "--codex-run-as-process-setup"
+            | "--__codex-windows-mxc"
+            | "--run-as-windows-sandbox"
+    )
+}
+
+/// Run as the Codex helper this process was started as (see [`is_helper`]).
+/// A helper never returns; anything else is an error, and nothing was
+/// touched.
+pub fn run_helper() -> anyhow::Result<()> {
+    keep_sandbox_off_keyrings();
+    arg0_dispatch_or_else(|_| async {
+        bail!("this process was started as a Codex helper Codex does not know")
+    })
+}
+
+/// When this process is Codex's Linux sandbox helper, keep the command it
+/// runs off the kernel keyrings, or exit: with them in reach the command
+/// could read what they hold, or plant a key.
+fn keep_sandbox_off_keyrings() {
     #[cfg(target_os = "linux")]
     if invoked_as_linux_sandbox() {
-        // Running the command with the kernel keyrings in reach would let it
-        // read what they hold, or plant a key: refuse instead.
         let inner = std::env::args_os().any(|a| a == "--apply-seccomp-then-exec");
         let kept_off = if inner {
             // Inside the sandbox, just before the command runs.
@@ -388,24 +579,215 @@ where
             std::process::exit(1);
         }
     }
-    // atomic itself, not one of Codex's helpers: the process that holds a
-    // sign-in's token and the operator credential cannot be dumped, read
-    // through /proc by a same-user process, or leave a core file. It loses
-    // its LD_* variables, and the commands it starts inherit a core-file
-    // limit of zero (on macOS it also refuses a debugger).
-    let mut args = std::env::args_os();
-    let (arg0, arg1) = (args.next(), args.next());
-    if !is_helper(arg0.as_deref(), arg1.as_deref()) {
-        codex_process_hardening::pre_main_hardening();
+}
+
+/// Confines an exec atom's command under Codex's Linux sandbox helper, as a
+/// turn's commands are confined: the whole filesystem readable except
+/// atomic's private state, which is denied as it is to turns (see
+/// [`denied_paths`]), and the private state of every other project under
+/// the same atomic home; only the command's own writable directories, such
+/// as its scratch directory, and the project's caches writable; no network
+/// and no sockets, since no atom can declare network access at this version.
+/// The command still runs with exactly its environment, in its directory.
+#[derive(Clone, Debug)]
+pub struct ExecSandbox {
+    helper: PathBuf,
+    guard: StateGuard,
+    codex_home: PathBuf,
+    also_writable: Vec<PathBuf>,
+}
+
+impl ExecSandbox {
+    /// Confinement through `paths`' sandbox helper, denying what `guard`
+    /// denies; `codex_home` is the Codex home atom threads use, whose records
+    /// are denied too. Fails where this process has no helper.
+    pub fn new(paths: &CodexPaths, guard: StateGuard, codex_home: PathBuf) -> anyhow::Result<Self> {
+        let helper = paths.linux_sandbox().map(Path::to_owned).context(
+            "this process has no Linux sandbox helper to confine exec atoms' commands with; \
+             run atomic itself, which provides one",
+        )?;
+        Ok(Self {
+            helper,
+            guard,
+            codex_home,
+            also_writable: Vec::new(),
+        })
     }
-    // SAFETY: called at the start of main, while the process has one thread,
-    // so no other thread can read the environment concurrently.
-    #[allow(unsafe_code)]
-    unsafe {
-        std::env::set_var("CODEX_HOME", codex_home);
+
+    /// The same confinement, letting every command also write `dirs`, such
+    /// as the project's build and package caches.
+    pub fn also_writing(mut self, dirs: Vec<PathBuf>) -> Self {
+        self.also_writable = dirs;
+        self
     }
-    scrub_overrides();
-    arg0_dispatch_or_else(move |paths| main_fn(CodexPaths(paths)))
+
+    /// The profile for a command that may write `writable`.
+    fn profile(&self, writable: &[PathBuf]) -> anyhow::Result<PermissionProfile> {
+        use codex_protocol::permissions::{
+            FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry, NetworkSandboxPolicy,
+        };
+        let read_only = permission_profile(
+            crate::typed::Sandbox::ReadOnly,
+            &self.guard,
+            &self.codex_home,
+        )?;
+        let mut policy = read_only.file_system_sandbox_policy();
+        for dir in writable.iter().chain(&self.also_writable) {
+            let dir = AbsolutePathBuf::from_absolute_path(dir)
+                .with_context(|| format!("resolve the writable directory {}", dir.display()))?;
+            policy.entries.push(FileSystemSandboxEntry::new(
+                FileSystemPath::from(dir),
+                FileSystemAccessMode::Write,
+            ));
+        }
+        Ok(PermissionProfile::from_runtime_permissions(
+            &policy,
+            NetworkSandboxPolicy::Restricted,
+        ))
+    }
+}
+
+impl atomic_exec::Confine for ExecSandbox {
+    fn confine(
+        &self,
+        command: &atomic_exec::Command,
+        tmp: &Path,
+    ) -> Result<atomic_exec::Command, atomic_exec::ExecError> {
+        let fail = |message: String| atomic_exec::ExecError::Start {
+            program: command.program.clone(),
+            message,
+        };
+        // Resolved here, on this machine's PATH: the command's own
+        // environment has none unless it declares one.
+        let program = atomic_exec::process::resolve(&command.program).map_err(fail)?;
+        let env = atomic_exec::process::resolve("env").map_err(fail)?;
+        let text = |p: &Path| {
+            p.to_str()
+                .map(str::to_owned)
+                .ok_or_else(|| fail(format!("{} is not UTF-8", p.display())))
+        };
+        let program = text(&program)?;
+        // `env` would read a program path holding `=` as one more variable.
+        if program.contains('=') {
+            return Err(fail(format!(
+                "{program} has `=` in its path, which a confined command cannot run from"
+            )));
+        }
+        let profile = self
+            .profile(&command.writable)
+            .and_then(|p| serde_json::to_string(&p).context("encode the sandbox profile"))
+            .map_err(|e| fail(format!("{e:#}")))?;
+        let cwd = text(&command.cwd)?;
+        let mut args = vec![
+            "--sandbox-policy-cwd".to_owned(),
+            cwd.clone(),
+            "--command-cwd".to_owned(),
+            cwd,
+            "--permission-profile".to_owned(),
+            profile,
+            "--".to_owned(),
+            // The command gets exactly its own environment, nothing of the
+            // helper's.
+            text(&env)?,
+            "-i".to_owned(),
+        ];
+        args.extend(command.env.iter().map(|(k, v)| format!("{k}={v}")));
+        args.push(program);
+        args.extend(command.args.iter().cloned());
+        // The helper needs PATH to find bubblewrap, and keeps its registry of
+        // the mount points it makes in TMPDIR: the backend's own, which the
+        // turns' helpers share.
+        let mut helper_env = vec![("TMPDIR".to_owned(), text(tmp)?)];
+        if let Ok(path) = std::env::var("PATH") {
+            helper_env.push(("PATH".to_owned(), path));
+        }
+        Ok(atomic_exec::Command {
+            program: text(&self.helper)?,
+            args,
+            env: helper_env,
+            writable: Vec::new(),
+            ..command.clone()
+        })
+    }
+
+    /// Run `true` confined: the helper, bubblewrap and the user namespaces
+    /// it needs either work here or the backend refuses to connect.
+    fn check(&self, tmp: &Path) -> Result<(), atomic_exec::ExecError> {
+        let probe = atomic_exec::Command {
+            program: "true".into(),
+            cwd: tmp.to_owned(),
+            time_limit: std::time::Duration::from_secs(30),
+            output_limit: 4096,
+            ..Default::default()
+        };
+        let confined = self.confine(&probe, tmp)?;
+        let done =
+            atomic_exec::ExecutionBackend::run(&atomic_exec::LocalBackend::default(), &confined);
+        let refuse = |why: String| atomic_exec::ExecError::Unconfinable {
+            message: format!(
+                "exec atoms' commands run under Codex's Linux sandbox, which cannot start here \
+                 ({why}). It needs bubblewrap and unprivileged user namespaces; in a container, \
+                 allow them (for docker, `--security-opt seccomp=unconfined` and \
+                 `--security-opt systempaths=unconfined`, or a profile that permits unshare)"
+            ),
+        };
+        match done {
+            Ok(done) if done.success() => Ok(()),
+            Ok(done) => {
+                let stderr = String::from_utf8_lossy(&done.stderr);
+                let why = format!(
+                    "a trial command exited with {}: {}",
+                    done.code
+                        .map_or_else(|| "a signal".to_owned(), |c| format!("code {c}")),
+                    stderr.trim()
+                );
+                // Only a refusal this machine will repeat until it is fixed
+                // stops the run; anything else, such as a full disk under the
+                // helper's registry of mount points, may pass, and the run
+                // waits.
+                if sandbox_refused(&stderr) {
+                    Err(refuse(why))
+                } else {
+                    Err(atomic_exec::ExecError::Unavailable {
+                        label: "the sandbox check".into(),
+                        message: why,
+                    })
+                }
+            }
+            // The trial could not even start: no room or no process to
+            // spare, which may pass.
+            Err(e) => Err(atomic_exec::ExecError::Unavailable {
+                label: "the sandbox check".into(),
+                message: e.to_string(),
+            }),
+        }
+    }
+}
+
+/// Whether a sandbox trial that failed with `stderr` failed because this
+/// machine cannot confine commands at all: bubblewrap missing or not
+/// runnable, user namespaces or the mounts bubblewrap makes refused, or the
+/// helper unable to drop its capabilities or apply its seccomp filter. Each
+/// stays so until the machine changes. Anything else is taken to be passing.
+pub(crate) fn sandbox_refused(stderr: &str) -> bool {
+    const HELPER: [&str; 5] = [
+        "bubblewrap is unavailable",
+        "failed to exec system bubblewrap",
+        "failed to exec bundled bubblewrap",
+        "retained effective or permitted capabilities",
+        "error applying Linux sandbox restrictions",
+    ];
+    const BWRAP: [&str; 5] = [
+        "namespace",
+        "uid map",
+        "gid map",
+        "Operation not permitted",
+        "Permission denied",
+    ];
+    stderr.lines().any(|line| {
+        HELPER.iter().any(|s| line.contains(s))
+            || (line.trim_start().starts_with("bwrap:") && BWRAP.iter().any(|s| line.contains(s)))
+    })
 }
 
 /// A thread's own temporary directory, `<state>/tmp/turn-…`, writable from
@@ -543,38 +925,22 @@ const OVERRIDES: &[&str] = &[
 /// Remove [`OVERRIDES`] from the environment: nothing in it stands in for,
 /// or redirects, a sign-in's tokens. Codex's own `.env` loading never sets a
 /// `CODEX_` variable, so none comes back.
-fn scrub_overrides() {
-    // SAFETY: called from `dispatch` at the start of main, while the process
-    // has one thread (and from a test that alone uses these variables).
-    #[allow(unsafe_code)]
-    unsafe {
-        for name in OVERRIDES {
+pub fn scrub_overrides() {
+    scrub(|name| {
+        // SAFETY: called at the start of main, while the process has one
+        // thread, so no other thread can read the environment concurrently.
+        #[allow(unsafe_code)]
+        unsafe {
             std::env::remove_var(name);
         }
-    }
+    });
 }
 
-/// The first arguments Codex's helpers are dispatched by, after the
-/// executable: they run a command or an operation for a thread, inside its
-/// sandbox, and hold nothing to protect.
-const HELPER_ARG1: &[&str] = &[
-    "--codex-run-as-arg0-exec-helper",
-    "--codex-run-as-fs-helper",
-    "--codex-run-as-apply-patch",
-    "--__codex-windows-mxc",
-    "--run-as-windows-sandbox",
-];
-
-/// Whether a process started as `arg0 arg1 ...` is one of Codex's helpers:
-/// by the name it was started under, or by its first argument.
-fn is_helper(arg0: Option<&std::ffi::OsStr>, arg1: Option<&std::ffi::OsStr>) -> bool {
-    let by_name = arg0
-        .map(Path::new)
-        .and_then(Path::file_name)
-        .is_some_and(|name| {
-            name == "codex-linux-sandbox" || name == "apply_patch" || name == "applypatch"
-        });
-    by_name || arg1.is_some_and(|a| HELPER_ARG1.iter().any(|h| a == *h))
+/// Remove each of [`OVERRIDES`] with `remove`.
+fn scrub(mut remove: impl FnMut(&str)) {
+    for name in OVERRIDES {
+        remove(name);
+    }
 }
 
 /// Whether this process is Codex's Linux sandbox helper: this executable,
@@ -685,7 +1051,12 @@ fn deny_keyrings() -> std::io::Result<()> {
 /// Run one turn on a fresh, ephemeral Codex thread and return the model's
 /// final message. The thread runs with read-only permissions and never asks
 /// for approval.
-pub async fn one_turn(
+///
+/// This and the entry points below take a directory, not a workspace, so
+/// only the runtime calls them, once its backend has opened one (see
+/// [`crate::runtime::run_turn`]).
+#[cfg(test)]
+pub(crate) async fn one_turn(
     paths: &CodexPaths,
     codex_home: &Path,
     cwd: &Path,
@@ -702,7 +1073,8 @@ pub async fn one_turn(
 
 /// Run `spec` as one turn on a fresh, ephemeral thread and return the final
 /// message.
-pub async fn run(
+#[cfg(test)]
+pub(crate) async fn run(
     paths: &CodexPaths,
     codex_home: &Path,
     cwd: &Path,
@@ -719,7 +1091,8 @@ pub async fn run(
 /// follow-up turn `next` returns on the same thread, until it returns `None`.
 /// Returns the last answer and how many turns ran. Follow-up turns use the
 /// thread's instructions and model; their own are ignored.
-pub async fn converse<F>(
+#[cfg(test)]
+pub(crate) async fn converse<F>(
     paths: &CodexPaths,
     codex_home: &Path,
     cwd: &Path,
@@ -747,7 +1120,7 @@ where
 /// Conversation with asynchronous checks between turns. Each turn is
 /// admitted by `meter` before it is submitted and settled once after it.
 #[allow(clippy::too_many_arguments)] // each is one thing every thread needs
-pub async fn converse_async<F, Fut>(
+pub(crate) async fn converse_async<F, Fut>(
     paths: &CodexPaths,
     codex_home: &Path,
     cwd: &Path,
@@ -779,9 +1152,15 @@ where
     // Under workspace-write the system temporary directories are not
     // writable (see `permission_profile`): the thread gets its own, removed
     // when the thread ends.
+    // A workspace that names a TMPDIR (the backend's shared one, see
+    // `crate::runtime`) keeps it: Codex's sandbox keeps its registry of
+    // protected mount points there, and turns that share a writable root
+    // must share it.
     let temp = match spec.sandbox {
-        crate::typed::Sandbox::WorkspaceWrite => Some(TurnTemp::create(guard)?),
-        crate::typed::Sandbox::ReadOnly => None,
+        crate::typed::Sandbox::WorkspaceWrite if !spec.env.contains_key("TMPDIR") => {
+            Some(TurnTemp::create(guard)?)
+        }
+        _ => None,
     };
     let mut env = spec.env.clone();
     if let Some(temp) = &temp {
@@ -802,13 +1181,14 @@ where
         config.workspace_roots = roots;
         config.workspace_roots_explicit = true;
     }
-    for (name, value) in &env {
-        config
-            .permissions
-            .shell_environment_policy
-            .r#set
-            .insert(name.clone(), value.clone());
-    }
+    config.permissions.shell_environment_policy = command_environment(&env);
+    // No login shell, and no snapshot taken from one: a command never runs
+    // the developer's or the system's shell startup files.
+    config.permissions.allow_login_shell = false;
+    config
+        .features
+        .set_enabled(Feature::ShellSnapshot, false)
+        .context("turn shell snapshots off")?;
     let state_db = init_state_db(&config).await;
 
     if let Some(sign_in) = &endpoint.sign_in {
@@ -847,14 +1227,7 @@ where
         config.codex_linux_sandbox_exe.clone(),
     )?;
     let thread_store = ThreadStoreBuilder::from_config(&config, state_db.clone()).build();
-    let environment_manager = Arc::new(
-        EnvironmentManager::from_codex_home(
-            config.codex_home.clone(),
-            Some(local_runtime_paths),
-            config.http_client_factory(),
-        )
-        .await?,
-    );
+    let environment_manager = Arc::new(local_environment(local_runtime_paths).await?);
     let installation_id = resolve_installation_id(&config.codex_home).await?;
     let user_instructions_provider = Arc::new(CodexHomeUserInstructionsProvider::new(
         config.codex_home.clone(),
@@ -1525,6 +1898,185 @@ mod tests {
         });
     }
 
+    /// An exec command, confined, is the sandbox helper running `env -i`
+    /// with exactly the command's environment, then the command: its
+    /// profile denies atomic's private state and lets it write only its own
+    /// directories and the project's caches.
+    #[test]
+    fn an_exec_command_is_confined_under_the_sandbox_helper() {
+        use atomic_exec::Confine;
+        let state = scratch("exec-sandbox");
+        let scratch_dir = state.join("scratch/a1");
+        std::fs::create_dir_all(&scratch_dir).expect("scratch");
+        let paths = CodexPaths::with_helpers(
+            PathBuf::from("/opt/atomic"),
+            PathBuf::from("/opt/bin/codex-linux-sandbox"),
+        );
+        let guard = StateGuard::Deny(PrivateState {
+            state_dir: state.clone(),
+            private: state.join("private"),
+            also: vec![state.join("keys")],
+        });
+        let sandbox = ExecSandbox::new(&paths, guard, state.join("codex"))
+            .expect("a helper")
+            .also_writing(vec![state.join("cache")]);
+        let tmp = state.join("scratch/.tmp");
+        let confined = sandbox
+            .confine(
+                &atomic_exec::Command {
+                    program: "sh".into(),
+                    args: vec!["-c".into(), "true".into()],
+                    cwd: state.clone(),
+                    env: vec![("HOME".into(), scratch_dir.display().to_string())],
+                    writable: vec![scratch_dir.clone()],
+                    ..Default::default()
+                },
+                &tmp,
+            )
+            .expect("confined");
+        assert_eq!(confined.program, "/opt/bin/codex-linux-sandbox");
+        // The helper gets its registry's TMPDIR and PATH, nothing else: no
+        // variable the command declares loads into it.
+        let names: Vec<&str> = confined.env.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(names, ["TMPDIR", "PATH"]);
+        assert_eq!(confined.env[0].1, tmp.display().to_string());
+        let at = |flag: &str| {
+            confined
+                .args
+                .iter()
+                .position(|a| a == flag)
+                .unwrap_or_else(|| panic!("{flag} in {:?}", confined.args))
+        };
+        let profile = &confined.args[at("--permission-profile") + 1];
+        let rest = &confined.args[at("--") + 1..];
+        assert!(rest[0].ends_with("/env") && rest[1] == "-i", "{rest:?}");
+        assert_eq!(rest[2], format!("HOME={}", scratch_dir.display()));
+        assert!(rest[3].ends_with("/sh"), "resolved: {rest:?}");
+        assert_eq!(&rest[4..], ["-c", "true"]);
+        assert!(confined.writable.is_empty());
+        let profile: serde_json::Value = serde_json::from_str(profile).expect("json");
+        let text = profile.to_string();
+        for denied in [state.join("private"), state.join("keys")] {
+            assert!(
+                text.contains(&denied.display().to_string()),
+                "{denied:?}: {text}"
+            );
+        }
+        for writable in [&scratch_dir, &state.join("cache")] {
+            assert!(
+                text.contains(&writable.display().to_string()),
+                "{writable:?}: {text}"
+            );
+        }
+        assert!(text.contains("restricted"), "no network: {text}");
+    }
+
+    /// However many projects the atomic home holds, their private state is
+    /// denied by one entry: the profile a command carries on its command
+    /// line stays the same size.
+    #[test]
+    fn the_profile_stays_bounded_however_many_projects_there_are() {
+        use atomic_exec::Confine;
+        let home = scratch("many-projects");
+        let paths =
+            CodexPaths::with_helpers("/opt/atomic".into(), "/opt/codex-linux-sandbox".into());
+        let profile_len = |home: &Path| {
+            let guard = StateGuard::Deny(PrivateState {
+                state_dir: home.join("projects/p0"),
+                private: home.join("private"),
+                also: Vec::new(),
+            });
+            let sandbox =
+                ExecSandbox::new(&paths, guard, home.join("projects/p0/codex")).expect("helper");
+            let confined = sandbox
+                .confine(
+                    &atomic_exec::Command {
+                        program: "sh".into(),
+                        cwd: home.to_owned(),
+                        ..Default::default()
+                    },
+                    home,
+                )
+                .expect("confined");
+            confined.args.iter().map(String::len).sum::<usize>()
+        };
+        std::fs::create_dir_all(home.join("private/p0")).expect("one project");
+        let one = profile_len(&home);
+        for n in 1..1000 {
+            std::fs::create_dir_all(home.join(format!("private/p{n}"))).expect("project");
+            std::fs::create_dir_all(home.join(format!("projects/p{n}"))).expect("state");
+        }
+        assert_eq!(
+            profile_len(&home),
+            one,
+            "the profile grew with the projects"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn only_codex_helper_invocations_are_helpers() {
+        let args = |a: &[&str]| a.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
+        for helper in [
+            &["/usr/bin/codex-linux-sandbox", "--sandbox-policy-cwd", "/x"][..],
+            &["/opt/apply_patch"][..],
+            &["atomic", "--codex-run-as-apply-patch", "p"][..],
+            &["atomic", "--codex-run-as-fs-helper"][..],
+            &["atomic", "--codex-run-as-process-setup"][..],
+        ] {
+            assert!(is_helper(args(helper).into_iter()), "{helper:?}");
+        }
+        for not in [
+            &["atomic", "run", "x"][..],
+            &["atomic", "--codex-run-as-anything"][..],
+            &["atomic", "--__codex-whatever"][..],
+            &["codex-linux-sandbox-x"][..],
+        ] {
+            assert!(!is_helper(args(not).into_iter()), "{not:?}");
+        }
+    }
+
+    #[test]
+    fn commands_get_only_core_and_declared_variables() {
+        let inherited = [
+            ("PATH", "/usr/bin"),
+            ("HOME", "/home/dev"),
+            ("USER", "dev"),
+            ("ATOMIC_DATABASE_URL", "postgres://atomic:pw@db/atomic"),
+            ("ATOMIC_SECRET_DEPLOY", "s3cret"),
+            ("GITHUB_TOKEN", "ghp_x"),
+            ("AWS_SECRET_ACCESS_KEY", "aws"),
+            ("OPENAI_API_KEY", "sk"),
+            ("DBOS__APPVERSION", "1"),
+            ("OTEL_EXPORTER_OTLP_HEADERS", "authorization=Bearer x"),
+            ("SOME_TOOL_SETTING", "x"),
+        ]
+        .map(|(k, v)| (k.to_owned(), v.to_owned()));
+        let declared = BTreeMap::from([
+            ("ATOMIC_CACHE_DIR".to_owned(), "/cache".to_owned()),
+            ("CARGO_TARGET_DIR".to_owned(), "/cache/target".to_owned()),
+        ]);
+        let env = codex_protocol::shell_environment::create_env_from_vars(
+            inherited,
+            &command_environment(&declared),
+            None,
+        );
+        let names: std::collections::BTreeSet<&str> = env.keys().map(String::as_str).collect();
+        assert_eq!(
+            names,
+            [
+                "ATOMIC_CACHE_DIR",
+                "CARGO_TARGET_DIR",
+                "HOME",
+                "PATH",
+                "USER"
+            ]
+            .into(),
+            "{env:?}"
+        );
+        assert_eq!(env["CARGO_TARGET_DIR"], "/cache/target");
+    }
+
     #[test]
     fn sandboxes_map_to_codex_permission_profiles() {
         use crate::typed::Sandbox;
@@ -1580,39 +2132,17 @@ mod tests {
     }
 
     #[test]
-    fn codex_helpers_are_known_by_name_or_first_argument() {
-        use std::ffi::OsStr;
-        let helper = |a0: &str, a1: &str| is_helper(Some(OsStr::new(a0)), Some(OsStr::new(a1)));
-        assert!(helper(
-            "/state/codex/tmp/arg0-linux/codex-linux-sandbox",
-            "--"
-        ));
-        assert!(helper("apply_patch", ""));
-        assert!(helper("/usr/bin/atomic", "--codex-run-as-arg0-exec-helper"));
-        assert!(helper("/usr/bin/atomic", "--codex-run-as-fs-helper"));
-        assert!(helper("/usr/bin/atomic", "--codex-run-as-apply-patch"));
-        assert!(!helper("/usr/bin/atomic", "run"));
-        assert!(!helper("/usr/bin/atomic", "--codex-run-as-something-else"));
-        assert!(!is_helper(None, None));
-    }
-
-    #[test]
     fn the_environment_cannot_stand_in_for_or_redirect_a_sign_ins_tokens() {
-        // SAFETY: no other test reads or writes these variables.
-        #[allow(unsafe_code)]
-        unsafe {
-            for name in OVERRIDES {
-                std::env::set_var(name, "http://127.0.0.1:9/elsewhere");
-            }
-        }
-        scrub_overrides();
-        for name in [
-            "CODEX_ACCESS_TOKEN",
-            "CODEX_REFRESH_TOKEN_URL_OVERRIDE",
-            "CODEX_REVOKE_TOKEN_URL_OVERRIDE",
-        ] {
-            assert!(std::env::var_os(name).is_none(), "{name} is still set");
-        }
+        let mut removed = Vec::new();
+        scrub(|name| removed.push(name.to_owned()));
+        assert_eq!(
+            removed,
+            [
+                "CODEX_ACCESS_TOKEN",
+                "CODEX_REFRESH_TOKEN_URL_OVERRIDE",
+                "CODEX_REVOKE_TOKEN_URL_OVERRIDE",
+            ]
+        );
     }
 
     #[test]
@@ -1634,6 +2164,7 @@ mod tests {
         std::fs::create_dir_all(home.join("tmp/other")).expect("codex tmp");
         let guard = StateGuard::Deny(PrivateState {
             state_dir: state.clone(),
+            private: state.join("private"),
             also: vec![dir.join("keys"), dir.join("credentials")],
         });
         let write = permission_profile(Sandbox::WorkspaceWrite, &guard, &home).expect("rw");
@@ -1654,6 +2185,25 @@ mod tests {
             // There from the start, so a command cannot plant them.
             assert_eq!(at(&p("codex/.env")), Deny);
             assert_eq!(at(&p("codex/config.toml")), Deny);
+            // Nothing else Codex reads from its home can be planted, even
+            // under a writable root over the whole state directory.
+            let state_dir = state.display().to_string();
+            for planted in [
+                "environments.toml",
+                "AGENTS.md",
+                "AGENTS.override.md",
+                "hooks.json",
+                "rules/default.rules",
+                "skills/x/SKILL.md",
+            ] {
+                let at_all = access(
+                    profile,
+                    &worktree,
+                    &[&state_dir],
+                    &p(&format!("codex/{planted}")),
+                );
+                assert_ne!(at_all, Write, "{planted} could be planted");
+            }
             assert_eq!(at(&p("codex/log/x")), Deny);
             assert_eq!(at(&p("codex/tmp/other/x")), Deny);
             // What Codex's shell needs, and the thread's own checkout.
@@ -1748,6 +2298,7 @@ mod tests {
         }
         let mine = TurnTemp::create(&StateGuard::Deny(PrivateState {
             state_dir: state.clone(),
+            private: state.join("private"),
             also: Vec::new(),
         }))
         .expect("live");
@@ -1798,6 +2349,37 @@ mod tests {
         });
     }
 
+    /// A sandbox trial stops the run only for what the machine repeats until
+    /// it is fixed; a failure that may pass, such as a full disk, waits.
+    #[test]
+    fn only_a_refusal_the_machine_repeats_makes_a_trial_unconfinable() {
+        for refused in [
+            "bwrap: No permissions to create a new namespace, likely because the kernel does not \
+             allow non-privileged user namespaces.",
+            "bwrap: Creating new namespace failed: Operation not permitted",
+            "bwrap: Can't mount proc on /newroot/proc: Operation not permitted",
+            "bwrap: setting up uid map: Permission denied",
+            "thread 'main' panicked at linux-sandbox/src/launcher.rs:60:13:\nbubblewrap is \
+             unavailable: no system bwrap was found on PATH",
+            "thread 'main' panicked at x.rs:1:1:\nfailed to exec system bubblewrap /usr/bin/bwrap: \
+             Permission denied (os error 13)",
+            "thread 'main' panicked at x.rs:1:1:\nLinux sandbox retained effective or permitted \
+             capabilities",
+        ] {
+            assert!(sandbox_refused(refused), "{refused}");
+        }
+        for passing in [
+            "",
+            "thread 'main' panicked at linux-sandbox/src/bwrap.rs:721:13:\nerror building \
+             bubblewrap command: No space left on device (os error 28)",
+            "bwrap: Can't make directory /tmp/x: No space left on device",
+            "bwrap: Can't create file at /tmp/x: Disk quota exceeded",
+            "error building bubblewrap command: Permission denied (os error 13)",
+            "fork: Resource temporarily unavailable",
+        ] {
+            assert!(!sandbox_refused(passing), "{passing}");
+        }
+    }
     // -----------------------------------------------------------------------
     // Metering: each turn admitted first and settled once, each reported
     // token charged once.

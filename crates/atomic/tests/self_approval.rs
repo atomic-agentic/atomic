@@ -37,7 +37,7 @@
 mod support;
 
 use atomic_core::Sandbox;
-use atomic_core::codex::{self, CodexPaths, ModelEndpoint, PrivateState, StateGuard, TurnSpec};
+use atomic_core::codex::{CodexPaths, ModelEndpoint, PrivateState, StateGuard, TurnSpec};
 use atomic_core::credential::{self, MemorySecrets};
 use atomic_core::git::Git;
 use atomic_core::testing::{FakeModel, Reply, on_codex_runtime};
@@ -293,17 +293,26 @@ async fn sandboxed(
         PathBuf::from(env!("CARGO_BIN_EXE_atomic")),
         dir.join("bin/codex-linux-sandbox"),
     );
-    let answer = codex::run(
-        &paths,
-        &state.join("codex"),
-        cwd,
-        &ModelEndpoint {
+    // Scratch outside `state`, which this turn may write all of.
+    let scratch = dir.join("scratch-root");
+    let runtime = atomic_core::runtime::CodexRuntime {
+        paths,
+        codex_home: state.join("codex"),
+        cwd: cwd.to_owned(),
+        endpoint: ModelEndpoint {
             base_url: model.base_url(),
             model: "synthetic".into(),
             api_key_env: None,
             sign_in: None,
         },
-        guard,
+        defaults: Default::default(),
+        artifacts: atomic_core::runtime::Artifacts::none(),
+        meter: atomic_core::usage::Metering::none(),
+        guard: guard.clone(),
+        backend: atomic_exec::Backend::connect(atomic_exec::LocalBackend::in_dir(scratch)).unwrap(),
+    };
+    let answer = atomic_core::runtime::run_turn(
+        &runtime,
         &TurnSpec {
             prompt: "Do the work.".into(),
             sandbox: Sandbox::WorkspaceWrite,
@@ -387,10 +396,33 @@ fn an_atom_cannot_approve_its_own_gate_through_its_shell() {
             .unwrap();
         let guard = StateGuard::Deny(PrivateState {
             state_dir: state.clone(),
+            private: state.join("private"),
             also: vec![dir.join("credentials")],
         });
+        // Files Codex reads from its home, which a command must not plant
+        // for the next thread, even with a writable root over all of state.
+        let home_files = [
+            ".env",
+            "config.toml",
+            "environments.toml",
+            "AGENTS.md",
+            "AGENTS.override.md",
+            "hooks.json",
+            "rules/default.rules",
+        ];
+        let plants: String = home_files
+            .iter()
+            .map(|name| {
+                let path = state.join("codex").join(name);
+                format!(
+                    "mkdir -p {} 2>/dev/null; printf planted > {} 2>/dev/null; ",
+                    path.parent().unwrap().display(),
+                    path.display()
+                )
+            })
+            .collect();
         let command = format!(
-            "printf 'changed\\n' > a.txt; echo wrote-exit=$?; \
+            "printf 'changed\\n' > a.txt; echo wrote-exit=$?; {plants}\
              python3 {} {} {} {key} {description} {}",
             dir.join("bin/probe.py").display(),
             state.display(),
@@ -411,6 +443,12 @@ fn an_atom_cannot_approve_its_own_gate_through_its_shell() {
             std::fs::read_to_string(wt.path.join("a.txt")).unwrap(),
             "changed\n"
         );
+        // ...nothing is planted in Codex's home...
+        for name in home_files {
+            let path = state.join("codex").join(name);
+            let held = std::fs::read_to_string(&path).unwrap_or_default();
+            assert!(!held.contains("planted"), "{name} was planted");
+        }
         // ...and every way to the approval is refused.
         for attempt in [
             "forge", "list", "codexdb", "key", "search", "link", "plant", "connect",
@@ -507,11 +545,16 @@ fn a_turn_through_atomics_own_entry_point_runs_with_its_helper_in_the_state_dire
                 assert!(out.status.success(), "{out:?}");
                 PathBuf::from(String::from_utf8(out.stdout).unwrap().trim())
             };
-            assert!(state.join("private/atomic.db").exists());
+            // The project's private state is in the home's `private/`.
+            let db = dir
+                .join("home/private")
+                .join(state.file_name().unwrap())
+                .join("atomic.db");
+            assert!(db.exists());
             let command = format!(
-                "cat a.txt; echo read-exit=$?; head -c 15 {}/private/atomic.db; echo; \
+                "cat a.txt; echo read-exit=$?; head -c 15 {}; echo; \
                  echo db-exit=$?",
-                state.display()
+                db.display()
             );
             let model = FakeModel::start(vec![
                 Reply::Tool {
@@ -630,23 +673,34 @@ fn a_signed_in_threads_command_cannot_read_the_sign_in() {
         .unwrap();
         let backend = model.base_url().replace("/v1", "/backend-api");
         let state = dir.join("state");
-        let answer = codex::run(
-            &CodexPaths::with_helpers(
+        let runtime = atomic_core::runtime::CodexRuntime {
+            paths: CodexPaths::with_helpers(
                 PathBuf::from(env!("CARGO_BIN_EXE_atomic")),
                 dir.join("bin/codex-linux-sandbox"),
             ),
-            &state.join("codex"),
-            &project,
-            &ModelEndpoint {
+            codex_home: state.join("codex"),
+            cwd: project.clone(),
+            endpoint: ModelEndpoint {
                 base_url: "unused".into(),
                 model: "synthetic".into(),
                 api_key_env: None,
                 sign_in: Some(atomic_core::signin::SignIn::in_files(&auth).with_backend(&backend)),
             },
-            &StateGuard::Deny(PrivateState {
+            defaults: Default::default(),
+            artifacts: atomic_core::runtime::Artifacts::none(),
+            meter: atomic_core::usage::Metering::none(),
+            guard: StateGuard::Deny(PrivateState {
                 state_dir: state.clone(),
+                private: state.join("private"),
                 also: vec![dir.join("credentials")],
             }),
+            backend: atomic_exec::Backend::connect(atomic_exec::LocalBackend::in_dir(
+                dir.join("scratch-root"),
+            ))
+            .unwrap(),
+        };
+        let answer = atomic_core::runtime::run_turn(
+            &runtime,
             &TurnSpec {
                 prompt: "Do the work.".into(),
                 sandbox: Sandbox::WorkspaceWrite,
@@ -661,8 +715,10 @@ fn a_signed_in_threads_command_cannot_read_the_sign_in() {
             !output.contains("sandbox-hidden-token"),
             "the token leaked: {output}"
         );
-        // The command ran, and was refused both: cat fails with 1, ls with 2.
+        // The command ran, and was refused both: cat fails with 1, ls with 2,
+        // for want of permission, not for want of the file.
         assert!(output.contains("read-exit=1"), "{output}");
+        assert!(output.contains("Permission denied"), "{output}");
         assert!(output.contains("list-exit=2"), "{output}");
         // Codex itself used it, from outside the sandbox.
         assert!(

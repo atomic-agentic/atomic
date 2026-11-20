@@ -5,11 +5,29 @@
 //! The control plane drives runners only through this trait, even when both run
 //! in one process, so moving runners elsewhere never changes workflow code.
 //!
-//! The trait starts with what an exec atom needs: run one command, with no
-//! shell, in a given directory, with exactly the environment it is given, one
-//! input on stdin and bounded output. [`LocalBackend`] runs it as a child
-//! process on this machine. Workspaces and a model turn's shell and file work
-//! join the trait as they move behind it.
+//! Every atom run goes through it:
+//!
+//! 1. [`ExecutionBackend::open`] opens a [`Workspace`] for the attempt: the
+//!    directory its work runs in, as the runner sees it, a scratch directory
+//!    of its own, and where a model turn's shell and file work runs
+//!    ([`Shell`]), under the sandbox and with the environment the request
+//!    names (see [`workspace`]);
+//! 2. a model turn runs its shell and file work there, and an exec atom's
+//!    command runs through [`ExecutionBackend::run`]: no shell, a directory
+//!    in the workspace, exactly the environment it is given, one input on
+//!    stdin and bounded output, returning how it ended;
+//! 3. [`ExecutionBackend::close`] releases the workspace, whether the run
+//!    succeeded or not.
+//!
+//! Before any of that, the control plane connects: [`ExecutionBackend::connect`]
+//! returns the backend's [`Statement`], which says once whether its
+//! workspaces survive the runner process ([`Durability`]). The control plane
+//! plans from that statement, never from which backend it is, and reads a
+//! value it does not recognize as ephemeral.
+//!
+//! [`LocalBackend`] is the backend on this machine: the workspace is the
+//! directory itself, a turn's shell runs under Codex's own sandbox in this
+//! process, and commands run as child processes.
 //!
 //! [`runner`] moves the trait across a process boundary: `atomic runner`
 //! runs commands in a process of its own, with an exit-code contract, and
@@ -21,13 +39,67 @@
 pub mod process;
 pub mod quiescence;
 pub mod runner;
+pub mod workspace;
 
+pub use workspace::{Open, Sandbox, Shell, Workspace};
+
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Whether a backend's workspaces survive its runner process.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Durability {
+    /// A workspace outlives the runner process: what an attempt left in it
+    /// is still there after the runner stops or crashes.
+    Durable,
+    /// A workspace may go with the runner process, so nothing may depend on
+    /// finding it again. A statement that is missing or not recognized
+    /// means this.
+    #[default]
+    Ephemeral,
+}
+
+impl Durability {
+    /// The durability a backend's statement names: `durable` is durable,
+    /// and anything else, recognized or not, is ephemeral.
+    pub fn from_statement(value: &str) -> Self {
+        match value {
+            "durable" => Self::Durable,
+            _ => Self::Ephemeral,
+        }
+    }
+
+    /// Its name in a statement.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Durable => "durable",
+            Self::Ephemeral => "ephemeral",
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Durability {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Any value at all: one that is not a string it recognizes is read
+        // as ephemeral, never refused.
+        let value = serde_json::Value::deserialize(deserializer)?;
+        Ok(value.as_str().map_or(Self::Ephemeral, Self::from_statement))
+    }
+}
+
+/// What a backend states when the control plane connects to it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Statement {
+    /// Whether its workspaces survive its runner process.
+    #[serde(default)]
+    pub durability: Durability,
+}
+
 /// One command for a backend to run.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Command {
     /// The program, found on the control plane's `PATH` when it has no `/`.
     pub program: String,
@@ -43,6 +115,30 @@ pub struct Command {
     pub time_limit: Duration,
     /// The most stdout it may write, in bytes.
     pub output_limit: usize,
+    /// The directories it may write, such as its workspace's scratch
+    /// directory, when its backend confines it (see [`Confine`]). A backend
+    /// that does not confine its commands ignores it.
+    pub writable: Vec<PathBuf>,
+}
+
+/// Puts a command under a sandbox before a backend runs it: what it may
+/// read, write and reach. atomic's runtime gives the local backend one that
+/// keeps commands out of atomic's private state; the trait names no
+/// sandbox, so a backend elsewhere is free to confine its own way.
+pub trait Confine: Send + Sync {
+    /// The command that runs `command` confined. It must run `command` with
+    /// exactly its environment and in its directory, and let it write only
+    /// [`Command::writable`]. `tmp` is the backend's private temporary
+    /// directory, where the sandbox may keep records of its own.
+    fn confine(&self, command: &Command, tmp: &std::path::Path) -> Result<Command, ExecError>;
+
+    /// Check, once, that commands can be confined here at all, so a machine
+    /// that cannot confine them fails at connect with a reason rather than
+    /// in every command.
+    fn check(&self, tmp: &std::path::Path) -> Result<(), ExecError> {
+        let _ = tmp;
+        Ok(())
+    }
 }
 
 /// How a command ended.
@@ -116,6 +212,32 @@ pub enum ExecError {
         /// What the runner wrote to stderr, as it was: captured, never parsed.
         stderr: String,
     },
+    /// A workspace could not be opened or closed.
+    #[error("the workspace for {label}: {message}")]
+    Workspace {
+        /// The workspace's label.
+        label: String,
+        /// What failed.
+        message: String,
+    },
+    /// Commands cannot be confined on this machine at all, such as where
+    /// user namespaces are not allowed: nothing was started, and nothing will
+    /// start until the machine is fixed.
+    #[error("{message}")]
+    Unconfinable {
+        /// What the sandbox needs.
+        message: String,
+    },
+    /// The backend cannot open a workspace now, for a reason that may pass,
+    /// such as a full disk or no room for another runner: trying again later
+    /// may succeed, and nothing was started.
+    #[error("the workspace for {label} is not available now: {message}")]
+    Unavailable {
+        /// The workspace's label.
+        label: String,
+        /// Why.
+        message: String,
+    },
     /// The runner process it was sent to ended without saying how the
     /// command ended. The command may have run, in part or in full, so what
     /// it did is unknown, and the backend never runs it again on its own.
@@ -143,54 +265,277 @@ impl ExecError {
     }
 }
 
-/// Where commands run. The control plane reaches runners only through this.
+/// Where atoms run. The control plane reaches runners only through this.
+///
+/// Every method may block: callers on an async executor call it on the
+/// blocking pool.
 pub trait ExecutionBackend: Send + Sync {
-    /// Run `command` to completion. A nonzero exit is a [`Completed`] with
-    /// that code, not an error: the caller decides what it means.
+    /// Connect, and state what the control plane may plan on.
+    fn connect(&self) -> Result<Statement, ExecError>;
+
+    /// Open a workspace for one attempt of one atom run. Each call opens a
+    /// workspace of its own, even for a request opened before: an attempt
+    /// that runs again starts in a new one.
+    fn open(&self, request: &Open) -> Result<Workspace, ExecError>;
+
+    /// Run `command` to completion in a workspace this backend opened. A
+    /// nonzero exit is a [`Completed`] with that code, not an error: the
+    /// caller decides what it means.
     fn run(&self, command: &Command) -> Result<Completed, ExecError>;
+
+    /// Release `workspace`. Closing one that is closed already succeeds.
+    fn close(&self, workspace: &Workspace) -> Result<(), ExecError>;
 }
 
-/// A backend shared by everything that runs commands, such as the runtimes
-/// atoms run on. The default is [`LocalBackend`].
+/// A connected backend, shared by everything that runs atoms, such as the
+/// runtimes atoms run on, with the statement it made when it connected. The
+/// default is [`LocalBackend`].
 #[derive(Clone)]
-pub struct Backend(Arc<dyn ExecutionBackend>);
+pub struct Backend {
+    inner: Arc<dyn ExecutionBackend>,
+    statement: Statement,
+}
 
 impl Backend {
-    /// Share `backend`.
-    pub fn new(backend: impl ExecutionBackend + 'static) -> Self {
-        Self(Arc::new(backend))
+    /// Connect to `backend` once and share it.
+    pub fn connect(backend: impl ExecutionBackend + 'static) -> Result<Self, ExecError> {
+        let statement = backend.connect()?;
+        Ok(Self {
+            inner: Arc::new(backend),
+            statement,
+        })
     }
 
     /// The shared backend itself.
     pub fn shared(&self) -> Arc<dyn ExecutionBackend> {
-        self.0.clone()
+        self.inner.clone()
+    }
+
+    /// What it stated when it connected.
+    pub fn statement(&self) -> Statement {
+        self.statement
+    }
+
+    /// Whether its workspaces survive its runner process, as it stated.
+    pub fn durability(&self) -> Durability {
+        self.statement.durability
     }
 }
 
 impl Default for Backend {
     fn default() -> Self {
-        Self::new(LocalBackend)
+        Self {
+            inner: Arc::new(LocalBackend::default()),
+            statement: LocalBackend::STATEMENT,
+        }
     }
 }
 
 impl std::fmt::Debug for Backend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Backend(..)")
+        f.debug_struct("Backend")
+            .field("statement", &self.statement)
+            .finish_non_exhaustive()
     }
 }
 
 impl ExecutionBackend for Backend {
+    /// The statement it made when it connected: a backend is connected once.
+    fn connect(&self) -> Result<Statement, ExecError> {
+        Ok(self.statement)
+    }
+
+    fn open(&self, request: &Open) -> Result<Workspace, ExecError> {
+        self.inner.open(request)
+    }
+
     fn run(&self, command: &Command) -> Result<Completed, ExecError> {
-        self.0.run(command)
+        self.inner.run(command)
+    }
+
+    fn close(&self, workspace: &Workspace) -> Result<(), ExecError> {
+        self.inner.close(workspace)
     }
 }
 
-/// Runs commands as child processes on this machine.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct LocalBackend;
+/// The backend on this machine, in the control plane's process: a
+/// workspace is the source directory itself, a model turn's shell and file
+/// work runs under Codex's own sandbox, and commands run as child processes.
+///
+/// Each attempt's scratch directory is a private one under
+/// [`scratch_root`](Self::scratch_root), named by the attempt's run and step
+/// (see [`workspace`]). Give it a directory no sandboxed turn may write, such
+/// as one in the project's state directory: [`LocalBackend::in_dir`].
+#[derive(Clone)]
+pub struct LocalBackend {
+    scratch_root: PathBuf,
+    tmp: PathBuf,
+    confine: Option<Arc<dyn Confine>>,
+    /// Set once its confinement has been seen to work here; a check that
+    /// fails is made again the next time.
+    checked: Arc<std::sync::OnceLock<()>>,
+}
+
+impl std::fmt::Debug for LocalBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalBackend")
+            .field("scratch_root", &self.scratch_root)
+            .field("tmp", &self.tmp)
+            .field("confined", &self.confine.is_some())
+            .finish()
+    }
+}
+
+impl PartialEq for LocalBackend {
+    fn eq(&self, other: &Self) -> bool {
+        self.scratch_root == other.scratch_root
+            && self.tmp == other.tmp
+            && match (&self.confine, &other.confine) {
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+}
+
+impl Eq for LocalBackend {}
 
 impl LocalBackend {
-    /// Run `command` as [`ExecutionBackend::run`] does, in `group`.
+    /// What it states: a workspace is a directory on this machine's disk,
+    /// which outlives any process, so it is durable.
+    pub const STATEMENT: Statement = Statement {
+        durability: Durability::Durable,
+    };
+
+    /// A backend keeping its scratch directories under `scratch_root`,
+    /// which it creates, private, when it first needs it.
+    pub fn in_dir(scratch_root: PathBuf) -> Self {
+        Self {
+            tmp: scratch_root.join(".tmp"),
+            scratch_root,
+            confine: None,
+            checked: Arc::default(),
+        }
+    }
+
+    /// The same backend, running every command under `confine`.
+    pub fn confined(mut self, confine: Arc<dyn Confine>) -> Self {
+        self.confine = Some(confine);
+        self
+    }
+
+    /// `command` as this backend runs it: under its confinement, if it has
+    /// one.
+    pub fn prepare(&self, command: &Command) -> Result<Command, ExecError> {
+        match &self.confine {
+            Some(confine) => confine.confine(command, &self.tmp),
+            None => Ok(command.clone()),
+        }
+    }
+
+    /// Where it keeps its scratch directories.
+    pub fn scratch_root(&self) -> &std::path::Path {
+        &self.scratch_root
+    }
+}
+
+impl Default for LocalBackend {
+    /// Scratch directories of this backend's own under a private directory
+    /// of this user's in the system's temporary directory, and a temporary
+    /// directory every such backend of this user shares. Sandboxed turns may
+    /// write there, so [`connect`](ExecutionBackend::connect) refuses it:
+    /// atomic itself always uses [`LocalBackend::in_dir`] with a directory
+    /// in the project's state directory, and this one is for tests that
+    /// open workspaces without connecting. Each has its own scratch root,
+    /// since runs of different stores may share a run and step name.
+    fn default() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        #[cfg(unix)]
+        // SAFETY: getuid cannot fail and touches no memory.
+        #[allow(unsafe_code)]
+        let user = unsafe { libc::getuid() }.to_string();
+        #[cfg(not(unix))]
+        let user = std::env::var("USERNAME").unwrap_or_default();
+        let base = std::env::temp_dir().join(format!("atomic-scratch-{user}"));
+        Self {
+            scratch_root: base.join(format!(
+                "{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            )),
+            tmp: base.join(".tmp"),
+            confine: None,
+            checked: Arc::default(),
+        }
+    }
+}
+
+impl ExecutionBackend for LocalBackend {
+    /// States durable workspaces, after checking that its scratch root is
+    /// outside the system's temporary directories, which sandboxed turns may
+    /// write, and removing what attempts of processes that no longer run left
+    /// there. Each workspace it opens is also checked against the turn's own
+    /// writable directories.
+    fn connect(&self) -> Result<Statement, ExecError> {
+        workspace::check_outside(&self.scratch_root, &workspace::temporary_roots()).map_err(
+            |message| ExecError::Workspace {
+                label: "connect".into(),
+                message,
+            },
+        )?;
+        workspace::sweep_local(&self.scratch_root);
+        // No turn of this backend runs yet: what earlier turns left in the
+        // shared temporary directory goes.
+        workspace::empty_dir(&self.tmp);
+        Ok(Self::STATEMENT)
+    }
+
+    /// A workspace with files is where confined commands, or a turn's
+    /// commands, will run: until its confinement has been seen to work here
+    /// ([`Confine::check`]), each such open checks it first and is refused,
+    /// before anything runs, if it does not: with
+    /// [`ExecError::Unavailable`] when the check may pass later (no room, no
+    /// process to spare), or [`ExecError::Unconfinable`] when the machine
+    /// cannot confine commands at all. Only a check that passed is kept. A
+    /// workspace with no files, such as a lite atom's, needs no check.
+    fn open(&self, request: &Open) -> Result<Workspace, ExecError> {
+        if let (Some(confine), Some(_)) = (&self.confine, &request.source)
+            && self.checked.get().is_none()
+        {
+            workspace::ensure_private(&self.tmp).map_err(|e| {
+                let message = format!("create {}: {e}", self.tmp.display());
+                if workspace::transient(&e) {
+                    ExecError::Unavailable {
+                        label: request.label.clone(),
+                        message,
+                    }
+                } else {
+                    ExecError::Workspace {
+                        label: request.label.clone(),
+                        message,
+                    }
+                }
+            })?;
+            confine.check(&self.tmp)?;
+            let _ = self.checked.set(());
+        }
+        workspace::open_local(&self.scratch_root, &self.tmp, request)
+    }
+
+    fn close(&self, workspace: &Workspace) -> Result<(), ExecError> {
+        workspace::close_local(workspace)
+    }
+
+    /// Runs `command` under this backend's confinement, if it has one, in a
+    /// process group of its own.
+    fn run(&self, command: &Command) -> Result<Completed, ExecError> {
+        Self::run_in(process::Group::Own, &self.prepare(command)?)
+    }
+}
+
+impl LocalBackend {
+    /// Run `command` as it is, unconfined, in `group`: what
+    /// [`ExecutionBackend::run`] does once the command is confined.
     pub fn run_in(group: process::Group, command: &Command) -> Result<Completed, ExecError> {
         let program = process::resolve(&command.program).map_err(|message| ExecError::Start {
             program: command.program.clone(),
@@ -209,12 +554,6 @@ impl LocalBackend {
                 stderr: process::STDERR_LIMIT,
             },
         )
-    }
-}
-
-impl ExecutionBackend for LocalBackend {
-    fn run(&self, command: &Command) -> Result<Completed, ExecError> {
-        Self::run_in(process::Group::Own, command)
     }
 }
 
