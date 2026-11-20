@@ -101,6 +101,9 @@ if [ "${ATOMIC_DEV_DB:-on}" != "off" ]; then
     net_flags=(--network atomic-dev)
     env_flags+=(-e "ATOMIC_TEST_DATABASE_URL=$("${ROOT}/scripts/dev-db.sh" url)")
 fi
+# The container's /tmp is this run's own, so a test may create and remove
+# entries there that a Codex session on the host would otherwise see.
+env_flags+=(-e ATOMIC_TEST_PRIVATE_TMP=1)
 for name in "${!ATOMIC_TEST_@}" RUST_LOG RUST_BACKTRACE; do
     if [ -n "${!name+x}" ]; then
         env_flags+=(-e "${name}")

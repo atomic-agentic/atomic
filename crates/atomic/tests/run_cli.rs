@@ -350,6 +350,7 @@ fn command_as(
         "ATOMIC_MODEL",
         "ATOMIC_MODEL_API_KEY_ENV",
         "ATOMIC_RUNNER",
+        "ATOMIC_BACKEND_WAIT",
     ] {
         cmd.env_remove(name);
     }
@@ -543,10 +544,12 @@ fn wait_child(child: &mut Child, what: &str) -> std::process::ExitStatus {
         if let Some(status) = child.try_wait().expect("wait") {
             return status;
         }
-        assert!(
-            started.elapsed() < Duration::from_secs(120),
-            "{what} did not exit"
-        );
+        if started.elapsed() >= Duration::from_secs(120) {
+            // Not left running after the test.
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("{what} did not exit");
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
 }
@@ -2009,6 +2012,7 @@ fn a_sandbox_trial_failing_for_want_of_room_makes_the_run_wait_then_finish() {
     assert!(status.success(), "{text}");
     assert!(text.contains("can open its workspace again"), "{text}");
     assert_eq!(count_log(&dir).len(), 2, "its command ran once");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// With `--backend-wait`, a run whose step finds no room on the execution
@@ -2088,6 +2092,7 @@ fn a_run_that_waits_too_long_for_room_stops_unfinished_and_resumes() {
     );
     assert!(out.status.success(), "{}", text(&out));
     assert_eq!(count_log(&dir).len(), 2, "its command ran once");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A signal stops a run waiting for room on the execution backend at once,
@@ -2150,6 +2155,129 @@ fn a_signal_ends_a_wait_for_room_at_once() {
     );
     assert!(out.status.success(), "{}", text(&out));
     assert_eq!(count_log(&dir).len(), 2, "its command ran once");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Under `atomic serve`, a step that found no room within the wait is set
+/// aside, not given up: serve says so, keeps trying at most half a minute
+/// apart and says so each time, stops at once when asked meanwhile, and runs
+/// the step once there is room. The wait comes from `ATOMIC_BACKEND_WAIT`.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[test]
+fn serve_keeps_trying_a_step_that_found_no_room_in_time() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
+    let dir = scratch("serve-room");
+    let project = project(&dir);
+    write_two_steps(&project, &dir);
+    let path = bwrap_in_front(&dir);
+    // A run stopped after its first command, with a second to run.
+    let out = atomic(
+        &dir,
+        &project,
+        &["run", "two-steps", "--run-id", "two-1", "--data", NOTE],
+        &[
+            ("PATH", path.as_str()),
+            ("ATOMIC_FAILPOINT", "pipeline:after:first"),
+        ],
+        "",
+    );
+    assert!(!out.status.success(), "{}", text(&out));
+    let full = dir.join("bwrap-full");
+    std::fs::write(&full, "").expect("the disk fills");
+    let env = with_unused(&[("PATH", path.as_str()), ("ATOMIC_BACKEND_WAIT", "1")]);
+    let log = dir.join("serve.log");
+    let mut serve = spawn(&dir, &project, &["serve"], &env, &log);
+    wait_until("serve to set the step aside", || {
+        std::fs::read_to_string(&log).is_ok_and(|l| l.contains("is set aside"))
+    });
+    // A stop while a step is set aside does not wait for it.
+    let stopping = Instant::now();
+    terminate(&serve);
+    let status = wait_child(&mut serve, "serve");
+    let text_log = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(status.success(), "{text_log}");
+    assert!(
+        stopping.elapsed() < Duration::from_secs(5),
+        "a set-aside step is not one a stop waits for: {text_log}"
+    );
+    assert_eq!(
+        steps_log(&dir),
+        ["first start", "first end"],
+        "second has not run"
+    );
+
+    // Started again, serve sets the step aside again, keeps trying, and
+    // runs it, once, when there is room.
+    let log = dir.join("serve-again.log");
+    let mut serve = spawn(&dir, &project, &["serve"], &env, &log);
+    wait_until("serve to try again", || {
+        std::fs::read_to_string(&log)
+            .is_ok_and(|l| l.contains("is set aside") && l.contains("still no room"))
+    });
+    assert!(serve.try_wait().expect("wait").is_none(), "serve goes on");
+    std::fs::remove_file(&full).expect("room again");
+    wait_until("serve to run the step", || {
+        steps_log(&dir).contains(&"second".to_owned())
+    });
+    terminate(&serve);
+    let status = wait_child(&mut serve, "serve");
+    let text_log = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(status.success(), "{text_log}");
+    assert_eq!(steps_log(&dir), ["first start", "first end", "second"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `--backend-wait` is a whole number of seconds, at least 1, and so is
+/// `ATOMIC_BACKEND_WAIT`, whose empty value means none was given. Each is
+/// checked before anything runs; with no sandbox here the empty case may
+/// stop for that, never for the wait.
+#[test]
+fn the_backend_wait_is_at_least_a_second() {
+    let dir = scratch("backend-wait-zero");
+    let project = project(&dir);
+    let out = atomic(
+        &dir,
+        &project,
+        &["run", "no-such-atom", "--backend-wait", "0", "--data", "{}"],
+        &[],
+        "",
+    );
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+    assert!(text(&out).contains("--backend-wait"), "{}", text(&out));
+    let out = atomic(
+        &dir,
+        &project,
+        &["--json", "run", "count-only", "--data", NOTE],
+        &[("ATOMIC_BACKEND_WAIT", "")],
+        "",
+    );
+    assert_ne!(
+        out.status.code(),
+        Some(2),
+        "an empty value is no value: {}",
+        text(&out)
+    );
+    assert!(
+        !text(&out).contains("ATOMIC_BACKEND_WAIT"),
+        "an empty value is no value: {}",
+        text(&out)
+    );
+    let out = atomic(
+        &dir,
+        &project,
+        &["--json", "run", "count-only", "--data", NOTE],
+        &[("ATOMIC_BACKEND_WAIT", "0")],
+        "",
+    );
+    assert_eq!(
+        stdout_json(&out)["error"]["kind"],
+        "config.backend_wait",
+        "{}",
+        text(&out)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// `env` with an unused model endpoint, as `atomic runs resume` needs one.

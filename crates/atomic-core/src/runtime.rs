@@ -284,12 +284,49 @@ pub fn stop_waiting_for_backend() {
     STOP_WAITING.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// Set by a long-running process, such as `atomic serve`: a step that has
+/// waited its limit is set aside rather than given up, and keeps trying,
+/// at most [`OPEN_WAIT_MAX`] apart, so its run goes on once there is room.
+static KEEP_TRYING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// How many steps of this process are set aside, past their limit.
+static SET_ASIDE_FOR_ROOM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Make a step that has waited its limit ([`limit_backend_wait`]) keep
+/// trying, set aside, instead of giving up: for `atomic serve`.
+pub fn keep_trying_past_the_limit() {
+    KEEP_TRYING.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// How many steps are set aside now, waiting past their limit for room:
+/// work a stopping process need not wait for, since they record nothing.
+pub fn steps_set_aside_for_room() -> usize {
+    SET_ASIDE_FOR_ROOM.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Counts one step in [`steps_set_aside_for_room`] while it lives.
+struct SetAsideForRoom;
+
+impl SetAsideForRoom {
+    fn start() -> Self {
+        SET_ASIDE_FOR_ROOM.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for SetAsideForRoom {
+    fn drop(&mut self) {
+        SET_ASIDE_FOR_ROOM.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Open a workspace on `backend`, on the blocking pool. While the backend
 /// reports [`atomic_exec::ExecError::Unavailable`] (no room, or a sandbox
 /// that failed in a way that may pass, such as a full disk; nothing was
 /// started) the run waits, trying again with a growing pause, for as long
 /// as it takes, or up to the process's limit ([`limit_backend_wait`]),
-/// after which it gives up with [`AtomError::NoRoom`]. It records nothing
+/// after which it gives up with [`AtomError::NoRoom`], or, in a process
+/// that keeps trying ([`keep_trying_past_the_limit`]), is set aside and
+/// tries again at most [`OPEN_WAIT_MAX`] apart, saying so each time. It records nothing
 /// and spends none of the durable engine's recovery attempts, and it says
 /// on stderr that it is waiting, then again every ten minutes. Stopping the
 /// run, or the process ([`stop_waiting_for_backend`]), stops the wait.
@@ -302,6 +339,7 @@ pub(crate) async fn open_workspace(
     let mut wait = OPEN_WAIT_FIRST;
     let mut reported: Option<std::time::Instant> = None;
     let started = std::time::Instant::now();
+    let mut set_aside: Option<SetAsideForRoom> = None;
     loop {
         let (b, r) = (backend.clone(), request.clone());
         let opened = tokio::task::spawn_blocking(move || b.open(&r))
@@ -309,15 +347,21 @@ pub(crate) async fn open_workspace(
             .map_err(|e| AtomError::Runtime(format!("{label}: open its workspace: {e}")))?;
         match opened {
             Ok(workspace) => {
+                let guard = WorkspaceGuard(Some(Arc::new(Closer {
+                    backend,
+                    workspace: Some(workspace),
+                })));
+                // Opened as this process stops: nothing starts in it.
+                if STOP_WAITING.load(Ordering::SeqCst) {
+                    guard.close().await;
+                    return Err(AtomError::Stopping);
+                }
                 if reported.is_some() {
                     eprintln!(
                         "atomic: {label}: the execution backend can open its workspace again"
                     );
                 }
-                return Ok(WorkspaceGuard(Some(Arc::new(Closer {
-                    backend,
-                    workspace: Some(workspace),
-                }))));
+                return Ok(guard);
             }
             Err(e @ atomic_exec::ExecError::Unavailable { .. }) => {
                 if reported.is_none_or(|at| at.elapsed() >= OPEN_WAIT_REPORT) {
@@ -332,21 +376,45 @@ pub(crate) async fn open_workspace(
                     0 => None,
                     ms => Some(std::time::Duration::from_millis(ms)),
                 };
-                if let Some(limit) = limit
-                    && started.elapsed() >= limit
+                let past = limit.is_some_and(|limit| started.elapsed() >= limit);
+                if let Some(limit) = limit.filter(|_| past)
+                    && !KEEP_TRYING.load(Ordering::SeqCst)
                 {
                     return Err(AtomError::NoRoom(format!(
                         "{label}: the execution backend could not open its workspace in {}s, \
                          the most this process waits (run {}, step {}): {e}",
-                        limit.as_secs_f64().ceil(),
+                        limit.as_secs(),
                         request.run,
                         request.step
                     )));
                 }
+                if past {
+                    if set_aside.is_none() {
+                        set_aside = Some(SetAsideForRoom::start());
+                        eprintln!(
+                            "atomic: {label} (run {}, step {}) is set aside, with nothing \
+                             recorded: no room on the execution backend in the time this \
+                             process waits; it keeps trying, at most {}s apart",
+                            request.run,
+                            request.step,
+                            OPEN_WAIT_MAX.as_secs()
+                        );
+                    } else {
+                        eprintln!(
+                            "atomic: {label} (run {}, step {}): still no room on the execution \
+                             backend; trying again in {}s",
+                            request.run,
+                            request.step,
+                            wait.as_secs_f64().ceil()
+                        );
+                    }
+                }
                 // In slices, to give up as soon as this process stops, and
                 // no longer than the limit leaves.
-                let mut left =
-                    limit.map_or(wait, |l| wait.min(l.saturating_sub(started.elapsed())));
+                let mut left = match limit.filter(|_| !past) {
+                    Some(l) => wait.min(l.saturating_sub(started.elapsed())),
+                    None => wait,
+                };
                 while !left.is_zero() {
                     if STOP_WAITING.load(Ordering::SeqCst) {
                         return Err(AtomError::Stopping);

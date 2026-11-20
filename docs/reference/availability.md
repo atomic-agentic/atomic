@@ -68,8 +68,10 @@ with no room for a workspace makes the run wait, recording nothing and saying
 on stderr that it waits, and the run goes on once there is room. With
 `--backend-wait <seconds>` it waits at most that long: `atomic run` and
 `atomic runs resume` then stop with exit code 75, the run unfinished and nothing
-recorded, for `atomic runs resume` to continue, and `atomic serve` leaves the
-run unfinished until it is started again. A signal ends a wait at once. The
+recorded, for `atomic runs resume` to continue, and `atomic serve` sets the
+step aside and keeps trying, at most 30 seconds apart, so the run goes on once
+there is room. A signal ends a wait at once, and a workspace that opens as the
+process stops is closed again before anything runs in it. The
 local backend is the only one with a Codex shell, and
 it states that its workspaces are durable. A backend that states anything else,
 or a value atomic does not recognize, is treated as ephemeral, and a workflow

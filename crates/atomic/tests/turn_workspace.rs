@@ -48,9 +48,8 @@ fn scratch(tag: &str) -> PathBuf {
 }
 
 /// One scratch root for every test here, as one project's backend has:
-/// tests run at once, and turns that share a writable root (here `/tmp`,
-/// which `workspace-write` leaves writable at this Codex revision) must
-/// share the TMPDIR where Codex's sandbox keeps its mount-point registry.
+/// tests run at once, and turns that share a writable root must share the
+/// TMPDIR where Codex's sandbox keeps its mount-point registry.
 fn shared_scratch() -> PathBuf {
     static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     ROOT.get_or_init(|| {
@@ -308,36 +307,84 @@ fn concurrent_turns_in_one_directory_never_break_each_others_sandbox() {
     });
 }
 
+/// The variable that says `/tmp` belongs to this test run alone, as in
+/// `scripts/dev.sh`'s container or a CI job's machine: only then does a test
+/// create and remove `/tmp/.codex`, which any Codex session sharing that
+/// `/tmp` would see.
+const PRIVATE_TMP: &str = "ATOMIC_TEST_PRIVATE_TMP";
+
+/// Creates and removes `/tmp/.codex` as fast as it can until dropped, then
+/// stops, and leaves no `/tmp/.codex` of its own behind, whatever the test
+/// did; one it did not create it never touches.
+struct TmpCodexToggler {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    toggled: Arc<std::sync::atomic::AtomicUsize>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl TmpCodexToggler {
+    const TARGET: &str = "/tmp/.codex";
+
+    fn start() -> Self {
+        assert!(
+            !Path::new(Self::TARGET).exists(),
+            "/tmp/.codex exists already, and this test touches only one it makes"
+        );
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let toggled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let thread = {
+            let (stop, toggled) = (stop.clone(), toggled.clone());
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    if std::fs::create_dir(Self::TARGET).is_ok() {
+                        // Ours until removed: removed at once.
+                        let _ = std::fs::remove_dir(Self::TARGET);
+                        toggled.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+            })
+        };
+        Self {
+            stop,
+            toggled,
+            thread: Some(thread),
+        }
+    }
+
+    fn toggled(&self) -> usize {
+        self.toggled.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for TmpCodexToggler {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 /// A `/tmp/.codex` that something else creates and removes while a turn runs
 /// does not break the turn's sandbox. Codex keeps a `.codex` read-only in
 /// every writable root, so one that came and went under a writable `/tmp`
 /// failed bubblewrap's remount; `/tmp` is no writable root of a turn's.
+///
+/// It runs only where `/tmp` is this test run's own ([`PRIVATE_TMP`]), and
+/// fails rather than skips elsewhere under `sandbox-tests`.
 #[test]
 fn a_tmp_codex_that_comes_and_goes_does_not_break_a_turn() {
     support::require_sandbox();
-    const COMMANDS: usize = 60;
-    let target = Path::new("/tmp/.codex");
-    // Only one this test makes and removes: someone else's stays as it is.
     assert!(
-        !target.exists(),
-        "/tmp/.codex exists already; remove it to run this test"
+        std::env::var_os(PRIVATE_TMP).is_some_and(|v| v == "1"),
+        "this test creates and removes /tmp/.codex, which a Codex session sharing /tmp would \
+         see: run it where /tmp is this run's own, as scripts/dev.sh and CI do, with \
+         {PRIVATE_TMP}=1"
     );
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let toggled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    const COMMANDS: usize = 60;
     // As fast as it can: with `/tmp` a writable root, this breaks about half
     // of the turn's commands.
-    let toggler = {
-        let (stop, toggled) = (stop.clone(), toggled.clone());
-        std::thread::spawn(move || {
-            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
-                if std::fs::create_dir(target).is_ok() {
-                    let _ = std::fs::remove_dir(target);
-                    toggled.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                }
-            }
-            let _ = std::fs::remove_dir(target);
-        })
-    };
+    let toggler = TmpCodexToggler::start();
     on_codex_runtime(async {
         let dir = scratch("tmp-codex");
         let backend = Backend::connect(LocalBackend::in_dir(shared_scratch())).expect("connects");
@@ -366,11 +413,12 @@ fn a_tmp_codex_that_comes_and_goes_does_not_break_a_turn() {
             failed.is_empty(),
             "commands that failed: {failed:?}: {last}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
     });
-    stop.store(true, std::sync::atomic::Ordering::SeqCst);
-    toggler.join().expect("toggler");
+    let toggled = toggler.toggled();
+    drop(toggler);
     assert!(
-        toggled.load(std::sync::atomic::Ordering::SeqCst) > COMMANDS,
+        toggled > COMMANDS,
         "/tmp/.codex came and went during the turn"
     );
 }

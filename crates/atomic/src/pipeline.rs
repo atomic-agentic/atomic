@@ -195,6 +195,7 @@ pub fn steps_running() -> usize {
     RUNNING
         .load(std::sync::atomic::Ordering::SeqCst)
         .saturating_sub(SET_ASIDE.load(std::sync::atomic::Ordering::SeqCst))
+        .saturating_sub(atomic_core::runtime::steps_set_aside_for_room())
 }
 
 /// How many of the [`RUNNING`] runs wait for good, set aside by

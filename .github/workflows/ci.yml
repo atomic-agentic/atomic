@@ -235,6 +235,10 @@ jobs:
       - name: Test (Linux, with Postgres and the sandbox)
         id: test
         if: runner.os == 'Linux'
+        # The runner's /tmp belongs to this job alone, so a test may create
+        # and remove entries there (turn_workspace.rs).
+        env:
+          ATOMIC_TEST_PRIVATE_TMP: "1"
         run: cargo test --workspace --locked --no-fail-fast --features atomic-agentic/postgres-tests,atomic-agentic/sandbox-tests -- --skip every_failpoint_triggered_in_turn
       # The crash suite: every failpoint, triggered in turn, against real
       # workflows and the scripted fake model; each run killed there must
