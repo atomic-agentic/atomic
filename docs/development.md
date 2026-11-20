@@ -101,6 +101,14 @@ set, or when the database it names does not answer, with a message naming it.
 It never skips silently. `scripts/backends-check.sh postgres` shows this: it
 runs every Postgres test without the database and requires each to fail so.
 
+The tests that need Postgres are behind the `atomic-agentic` package's
+`postgres-tests` feature, which turns on the durable store's as well; without
+it they are not built.
+
+```bash
+scripts/dev.sh cargo test --workspace --locked --features atomic-agentic/postgres-tests
+```
+
 ## The sandbox tests
 
 Tests that run Codex's Linux sandbox are behind the `atomic-agentic` package's
@@ -112,7 +120,7 @@ those two restrictions for one command, and leaves capabilities dropped and
 
 ```bash
 ATOMIC_DEV_SANDBOX=on scripts/dev.sh cargo test --workspace --locked \
-  --features atomic-agentic-durable/postgres-tests,atomic-agentic/sandbox-tests
+  --features atomic-agentic/postgres-tests,atomic-agentic/sandbox-tests
 ```
 
 With the feature on, a sandbox that cannot start fails the tests, each with a

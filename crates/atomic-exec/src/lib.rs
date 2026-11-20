@@ -11,13 +11,19 @@
 //! process on this machine. Workspaces and a model turn's shell and file work
 //! join the trait as they move behind it.
 //!
+//! [`runner`] moves the trait across a process boundary: `atomic runner`
+//! runs commands in a process of its own, with an exit-code contract, and
+//! [`runner::ProcessRunner`] drives it from the control plane.
+//!
 //! [`quiescence`] is the runner's side of a sandbox backend that suspends:
 //! whether its sandbox is safe to suspend.
 
 pub mod process;
 pub mod quiescence;
+pub mod runner;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// One command for a backend to run.
@@ -58,7 +64,8 @@ impl Completed {
 }
 
 /// Why a command could not be run to completion.
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ExecError {
     /// It could not be started.
     #[error("cannot start {program}: {message}")]
@@ -92,6 +99,48 @@ pub enum ExecError {
         /// What failed.
         message: String,
     },
+    /// The runner process it was sent to ended without running it: see
+    /// [`runner`] for the classes and what each one means.
+    #[error("the runner for {program} ended with a {class}{}: {message}{}",
+        code.map(|c| format!(" (exit code {c})")).unwrap_or_default(),
+        if stderr.is_empty() { String::new() } else { format!("; its stderr: {stderr}") })]
+    Runner {
+        /// The program.
+        program: String,
+        /// The runner's exit class.
+        class: String,
+        /// Its exit code, or `None` if a signal ended it.
+        code: Option<i32>,
+        /// What the control plane concluded.
+        message: String,
+        /// What the runner wrote to stderr, as it was: captured, never parsed.
+        stderr: String,
+    },
+    /// The runner process it was sent to ended without saying how the
+    /// command ended. The command may have run, in part or in full, so what
+    /// it did is unknown, and the backend never runs it again on its own.
+    #[error("the runner for {program} ended without its result{}: {message}{}; the command may have run",
+        code.map(|c| format!(" (exit code {c})")).unwrap_or_default(),
+        if stderr.is_empty() { String::new() } else { format!("; its stderr: {stderr}") })]
+    Lost {
+        /// The program.
+        program: String,
+        /// The runner's exit code, or `None` if a signal ended it.
+        code: Option<i32>,
+        /// What the control plane concluded.
+        message: String,
+        /// What the runner wrote to stderr, as it was: captured, never parsed.
+        stderr: String,
+    },
+}
+
+impl ExecError {
+    /// Whether the command may have run although no result came back, so
+    /// running it again could repeat what it did. Only the caller, which
+    /// knows what the command declares about its effects, may decide to.
+    pub fn outcome_unknown(&self) -> bool {
+        matches!(self, Self::Lost { .. })
+    }
 }
 
 /// Where commands run. The control plane reaches runners only through this.
@@ -101,17 +150,54 @@ pub trait ExecutionBackend: Send + Sync {
     fn run(&self, command: &Command) -> Result<Completed, ExecError>;
 }
 
+/// A backend shared by everything that runs commands, such as the runtimes
+/// atoms run on. The default is [`LocalBackend`].
+#[derive(Clone)]
+pub struct Backend(Arc<dyn ExecutionBackend>);
+
+impl Backend {
+    /// Share `backend`.
+    pub fn new(backend: impl ExecutionBackend + 'static) -> Self {
+        Self(Arc::new(backend))
+    }
+
+    /// The shared backend itself.
+    pub fn shared(&self) -> Arc<dyn ExecutionBackend> {
+        self.0.clone()
+    }
+}
+
+impl Default for Backend {
+    fn default() -> Self {
+        Self::new(LocalBackend)
+    }
+}
+
+impl std::fmt::Debug for Backend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Backend(..)")
+    }
+}
+
+impl ExecutionBackend for Backend {
+    fn run(&self, command: &Command) -> Result<Completed, ExecError> {
+        self.0.run(command)
+    }
+}
+
 /// Runs commands as child processes on this machine.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LocalBackend;
 
-impl ExecutionBackend for LocalBackend {
-    fn run(&self, command: &Command) -> Result<Completed, ExecError> {
+impl LocalBackend {
+    /// Run `command` as [`ExecutionBackend::run`] does, in `group`.
+    pub fn run_in(group: process::Group, command: &Command) -> Result<Completed, ExecError> {
         let program = process::resolve(&command.program).map_err(|message| ExecError::Start {
             program: command.program.clone(),
             message,
         })?;
-        process::run(
+        process::run_in(
+            group,
             &program,
             &command.args,
             Some(&command.cwd),
@@ -123,6 +209,12 @@ impl ExecutionBackend for LocalBackend {
                 stderr: process::STDERR_LIMIT,
             },
         )
+    }
+}
+
+impl ExecutionBackend for LocalBackend {
+    fn run(&self, command: &Command) -> Result<Completed, ExecError> {
+        Self::run_in(process::Group::Own, command)
     }
 }
 

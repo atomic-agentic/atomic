@@ -59,6 +59,9 @@ pub struct ChangeRequestResult {
 fn failed(e: AtomError) -> DurableError {
     match e {
         AtomError::Budget(why) => DurableError::Parked(why),
+        // Like a crash before the checkpoint: recovery runs the step again,
+        // through its attempt guard.
+        e @ AtomError::OutcomeUnknown(_) => DurableError::Interrupted(e.to_string()),
         e => DurableError::Failed(e.to_string()),
     }
 }
