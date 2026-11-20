@@ -50,7 +50,9 @@ On Linux the command runs under the same sandbox as a Codex atom's commands. It
 can read the project and the rest of the filesystem except atomic's private
 state (every project's database and gate store under the atomic home's
 `private/`, the current project's Codex records, the credential and key
-directories). It can write only its own scratch directory (its `HOME`
+directories) and the places in your home directory where credentials are
+kept, the same ones a Codex atom's commands cannot read (see
+[configuration](#configuration)). It can write only its own scratch directory (its `HOME`
 and `TMPDIR`) and the project's build caches; a command that writes anywhere
 else fails. It has no network and cannot use sockets, until atoms can declare
 the network they need. It also:
@@ -239,15 +241,23 @@ no attempt gives it one, and it is not a login shell, so none of your shell
 startup files run, and no functions or aliases from them are replayed into
 it.
 
-Its commands cannot read your own atomic configuration directory, nor the
-file behind a link in it, nor the places in your real home directory where
-credentials are kept: `.ssh`, `.aws`, `.netrc`, `.codex`, `.config/gcloud`,
+On Linux, atomic has verified that its commands cannot read your own atomic
+configuration directory, nor the file behind a link in it, nor the places in
+your real home directory where credentials are kept: `.ssh`, `.aws`, `.netrc`, `.codex`, `.config/gcloud`,
 `.azure`, `.kube`, `.docker/config.json`, `.gnupg`, `.npmrc`, `.pypirc`,
 `.git-credentials`, `.config/gh`, cargo's `credentials` files,
 `.password-store`, `.local/share/keyrings`, and the shell startup, logout
-and history files of bash, zsh and fish. The model chooses the commands,
-so none of these reach it through them. Credentials kept anywhere else are
-not covered.
+and history files of bash, zsh and fish, among others. They are denied
+under `$HOME` and under the home directory the system records for your user,
+wherever the variables that move them (`XDG_CONFIG_HOME`, `ZDOTDIR`,
+`HISTFILE`, `GNUPGHOME`, `CARGO_HOME`, `DOCKER_CONFIG`, the AWS file
+variables, `KUBECONFIG` and others) put them, and a link among them is
+denied as what it points at, followed up to four links deep. The model
+chooses the commands, so none of these reach it through them. atomic makes
+the list when the turn starts: a place on it that appears while a command
+runs is denied only to later commands, and a link made after the list is not
+followed until the next turn. Credentials kept anywhere else are not
+covered.
 
 Anything that finds its files through your home directory does not find
 them: rustup's and cargo's homes (`~/.rustup`, `~/.cargo`), the Go module

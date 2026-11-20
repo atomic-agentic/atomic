@@ -228,7 +228,11 @@ fn loads_code(name: &str) -> bool {
 /// drives, so one of these would have that shell source any file named,
 /// such as the person's own startup file, by its absolute path.
 fn runs_at_shell_start(name: &str) -> bool {
-    matches!(name, "BASH_ENV" | "ENV" | "ZDOTDIR" | "PROMPT_COMMAND")
+    // ZDOTDIR is atomic's own, refused before this is asked.
+    matches!(
+        name,
+        "BASH_ENV" | "ENV" | "PROMPT_COMMAND" | "SHELLOPTS" | "PS4"
+    )
 }
 
 /// Check an atom's `env`: variable names mapped to literal string values,

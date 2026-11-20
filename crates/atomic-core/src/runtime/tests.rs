@@ -1239,6 +1239,14 @@ fn exec_declarations_are_checked_at_load() {
             "as it starts",
         ),
         (
+            "kind: 'codex', env: { SHELLOPTS: 'xtrace' }",
+            "as it starts",
+        ),
+        (
+            "kind: 'codex', env: { PS4: '$(cat /home/dev/.netrc)' }",
+            "as it starts",
+        ),
+        (
             "kind: 'codex', env: { PROMPT_COMMAND: 'cat /home/dev/.netrc' }",
             "as it starts",
         ),
