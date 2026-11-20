@@ -319,11 +319,14 @@ impl<'a> Loader<'a> {
 fn core_int(text: &str) -> Option<Number> {
     let digits = text.strip_prefix(['-', '+']).unwrap_or(text);
     if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+        // An integer too large for 64 bits is still an integer, as JSON
+        // reads it, never a string.
         return text
             .parse::<i64>()
             .map(Number::from)
             .ok()
-            .or_else(|| text.parse::<u64>().map(Number::from).ok());
+            .or_else(|| text.parse::<u64>().map(Number::from).ok())
+            .or_else(|| text.trim_start_matches('+').parse::<Number>().ok());
     }
     if let Some(oct) = text.strip_prefix("0o") {
         return i64::from_str_radix(oct, 8).ok().map(Number::from);

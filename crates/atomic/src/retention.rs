@@ -4,9 +4,10 @@
 //! runs and gates may still read.
 //!
 //! The sweep fails closed. Besides what the caller keeps, it keeps every
-//! artifact named, as `artifact://sha256/<64 hex>` or `sha256:<64 hex>`
-//! anywhere in a string (a whole value, or inside markdown or JSON carried as
-//! text), at any depth, in:
+//! artifact whose digest appears, as a run of 64 hex digits in either case,
+//! anywhere in a string at any depth (as `artifact://sha256/<hex>`,
+//! `sha256:<hex>`, with JSON-escaped slashes, bare, or inside markdown or
+//! JSON carried as text), in:
 //!
 //! - every run's input, and its result or error once it has one;
 //! - every step's recorded output or error, in every run in the store,
@@ -32,21 +33,46 @@ use std::collections::BTreeSet;
 /// How many runs a scan reads at a time.
 const PAGE: i64 = 100;
 
-/// Every artifact named in `text`: `artifact://sha256/<64 hex>` or
-/// `sha256:<64 hex>`, as the whole string or within it.
+/// What a sweep keeps, as read from the store's runs and gates at a time.
+#[derive(Clone, Debug)]
+pub struct Kept {
+    /// The artifacts to keep.
+    pub artifacts: BTreeSet<ArtifactRef>,
+    /// When the reading began: content written within a grace period before
+    /// it is kept too.
+    pub read_at: std::time::SystemTime,
+}
+
+/// Read what a sweep keeps: `keep` and everything [`referenced`] finds,
+/// with the time the reading began.
+pub async fn read_kept(rt: &Durare, keep: &BTreeSet<ArtifactRef>) -> anyhow::Result<Kept> {
+    let read_at = std::time::SystemTime::now();
+    let mut artifacts = keep.clone();
+    artifacts.extend(referenced(rt).await?);
+    Ok(Kept { artifacts, read_at })
+}
+
+/// Every artifact `text` may name: each run of exactly 64 hex digits in
+/// it, in either case, whatever surrounds it. That finds
+/// `artifact://sha256/<hex>` and `sha256:<hex>` whole, inside longer text,
+/// with JSON-escaped slashes or upper-case hex, and a bare digest too. It
+/// keeps more than is named, which only keeps more.
 fn named_in(text: &str, into: &mut BTreeSet<ArtifactRef>) {
-    for marker in ["artifact://sha256/", "sha256:"] {
-        for (at, _) in text.match_indices(marker) {
-            let rest = &text[at + marker.len()..];
-            let hex = rest
-                .bytes()
-                .take_while(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-                .count();
-            if hex >= 64
-                && let Ok(a) = ArtifactRef::from_digest(&rest[..64])
-            {
-                into.insert(a);
-            }
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_hexdigit() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && bytes[i].is_ascii_hexdigit() {
+            i += 1;
+        }
+        if i - start == 64
+            && let Ok(a) = ArtifactRef::from_digest(&text[start..i].to_ascii_lowercase())
+        {
+            into.insert(a);
         }
     }
 }
@@ -74,13 +100,13 @@ pub async fn referenced(rt: &Durare) -> anyhow::Result<BTreeSet<ArtifactRef>> {
 
 /// Every artifact any run in the store names, finished or not: in its input,
 /// its result or error, and every step's recorded output or error. Runs are
-/// read a page at a time.
+/// read a page at a time, in order of creation and id.
 pub async fn recorded(rt: &Durare) -> anyhow::Result<BTreeSet<ArtifactRef>> {
     let mut found = BTreeSet::new();
-    let mut offset = 0;
+    let mut after = None;
     loop {
-        let page = rt.runs_page(offset, PAGE).await?;
-        for run in &page {
+        let page = rt.runs_after(after.as_ref(), PAGE).await?;
+        for (_, run) in &page {
             references(&run.input, &mut found);
             if let Some(output) = &run.output {
                 references(output, &mut found);
@@ -97,10 +123,10 @@ pub async fn recorded(rt: &Durare) -> anyhow::Result<BTreeSet<ArtifactRef>> {
                 }
             }
         }
-        if (page.len() as i64) < PAGE {
-            return Ok(found);
+        match page.last() {
+            Some((key, _)) if page.len() as i64 == PAGE => after = Some(key.clone()),
+            _ => return Ok(found),
         }
-        offset += PAGE;
     }
 }
 
@@ -120,16 +146,17 @@ pub async fn pinned(rt: &Durare) -> anyhow::Result<BTreeSet<ArtifactRef>> {
 
 /// Sweep `store`, keeping `keep`, everything [`referenced`] finds, and
 /// anything written within `grace` before it began reading the store's runs
-/// (see [`LocalStore::sweep`]).
+/// (see [`read_kept`] and [`LocalStore::sweep`]).
 pub async fn sweep(
     store: &LocalStore,
     rt: &Durare,
     keep: &BTreeSet<ArtifactRef>,
     grace: Grace,
 ) -> anyhow::Result<Swept> {
-    let read_at = std::time::SystemTime::now();
-    let mut all = keep.clone();
-    all.extend(referenced(rt).await?);
+    let kept = read_kept(rt, keep).await?;
     let store = store.clone();
-    Ok(tokio::task::spawn_blocking(move || store.sweep(&all, grace, read_at)).await??)
+    Ok(
+        tokio::task::spawn_blocking(move || store.sweep(&kept.artifacts, grace, kept.read_at))
+            .await??,
+    )
 }

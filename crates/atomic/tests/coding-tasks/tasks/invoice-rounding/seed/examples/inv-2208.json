@@ -1,0 +1,11 @@
+{
+  "number": "INV-2208",
+  "date": "2026-10-05",
+  "currency": "GBP",
+  "customer": {"id": "C-204", "name": "Mireille Frames"},
+  "lines": [
+    {"sku": "ASH-20", "description": "Ash board, 20 mm, per metre", "quantity": "4", "unit_price": "12.50", "tax": "std"},
+    {"sku": "LAB-H", "description": "Bench time, per hour", "quantity": "2", "unit_price": "85", "tax": "std"},
+    {"sku": "DEL", "description": "Delivery", "quantity": "1", "unit_price": "15", "tax": "zero"}
+  ]
+}

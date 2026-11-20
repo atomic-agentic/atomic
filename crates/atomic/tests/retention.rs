@@ -445,11 +445,82 @@ fn every_run_is_read_however_many_there_are() {
         for (run, _) in &named {
             let _: String = rt.result(run).await.unwrap();
         }
+        // Every run created in the same millisecond: the scan's order ties
+        // throughout, across every page.
+        rt.control_transaction(|mut tx| {
+            Box::pin(async move {
+                tx.execute("UPDATE workflow_status SET created_at = 1", &[])
+                    .await
+                    .map(|_| ())
+            })
+        })
+        .await
+        .unwrap();
         let swept = retention::sweep(&store, &rt, &BTreeSet::new(), Grace::none_for_tests())
             .await
             .unwrap();
         assert!(swept.removed.is_empty(), "{:?}", swept.removed);
         assert_eq!(swept.kept, named.len());
+        rt.shutdown(Duration::from_secs(5)).await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+#[test]
+fn the_keep_set_is_dated_from_before_the_runs_are_read() {
+    on_codex_runtime(async {
+        let dir = scratch("dated");
+        let mut rt = Durare::sqlite(&dir.join("atomic.db")).await.unwrap();
+        register(&mut rt);
+        rt.launch().await.unwrap();
+        for i in 0..300 {
+            let run = format!("dated-{i:03}");
+            rt.start("names", &run, format!("run {i}")).await.unwrap();
+            let _: String = rt.result(&run).await.unwrap();
+        }
+        let before = SystemTime::now();
+        let kept = retention::read_kept(&rt, &BTreeSet::new()).await.unwrap();
+        let reading = before.elapsed().unwrap();
+        // Dated when the reading began, not when it ended: content written
+        // while the runs were read is within the grace.
+        let late = kept.read_at.duration_since(before).unwrap_or_default();
+        assert!(
+            late < reading / 2,
+            "dated {late:?} into a reading of {reading:?}"
+        );
+        rt.shutdown(Duration::from_secs(5)).await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+#[test]
+fn a_digest_is_found_in_any_case_escaped_or_bare() {
+    on_codex_runtime(async {
+        let dir = scratch("spellings");
+        let store = LocalStore::open(dir.join("artifacts")).unwrap();
+        let [upper, escaped, bare, loose] =
+            ["upper", "escaped", "bare", "loose"].map(|text| put(&store, text.as_bytes()));
+        let mut rt = Durare::sqlite(&dir.join("atomic.db")).await.unwrap();
+        register(&mut rt);
+        rt.launch().await.unwrap();
+        for (run, named) in [
+            (
+                "upper",
+                format!("SHA256:{}", upper.digest().to_ascii_uppercase()),
+            ),
+            (
+                "escaped",
+                format!(r#"{{"patch":"artifact:\/\/sha256\/{}"}}"#, escaped.digest()),
+            ),
+            ("bare", format!("digest {} in a log", bare.digest())),
+        ] {
+            rt.start("names", run, named).await.unwrap();
+            let _: String = rt.result(run).await.unwrap();
+        }
+        let swept = retention::sweep(&store, &rt, &BTreeSet::new(), Grace::none_for_tests())
+            .await
+            .unwrap();
+        assert_eq!(swept.removed, [loose]);
         rt.shutdown(Duration::from_secs(5)).await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     });

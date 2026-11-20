@@ -310,10 +310,26 @@ fn the_grace_runs_back_from_when_the_keep_set_was_read() {
 #[test]
 fn a_projects_store_takes_its_lock_in_private_however_it_is_opened() {
     let (_, dir) = store();
-    let state = dir.join("state");
-    std::fs::create_dir_all(state.join("private")).expect("private");
+    // Before the project's private directory exists as after: the layout
+    // says where the lock is.
+    let state = dir.join("home/projects/p");
+    let private = dir.join("home/private/p");
     let store = LocalStore::open(state.join("artifacts")).expect("open");
-    assert_eq!(store.lock, state.join("private/artifacts.lock"));
+    assert_eq!(store.lock, private.join("artifacts.lock"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&private)
+            .expect("private")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0, "{mode:o}");
+    }
+    let again = LocalStore::open(state.join("artifacts")).expect("open");
+    assert_eq!(again.lock, store.lock);
+    // A store outside any atomic home's layout keeps its lock in its root.
+    let loose = LocalStore::open(dir.join("artifacts")).expect("open");
+    assert_eq!(loose.lock, dir.join("artifacts/lock"));
     let other = LocalStore::open(dir.join("elsewhere")).expect("open");
     assert_eq!(other.lock, dir.join("elsewhere/lock"));
     let _ = std::fs::remove_dir_all(&dir);

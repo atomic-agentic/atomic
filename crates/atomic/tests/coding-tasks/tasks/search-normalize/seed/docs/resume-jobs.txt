@@ -1,0 +1,5 @@
+Resume a stopped batch job
+
+To resume a batch job after a failure, find its last checkpoint in the job log and
+start it again with the checkpoint id. Jobs that stopped during an export must start
+from the beginning. Do not resume a job twice.

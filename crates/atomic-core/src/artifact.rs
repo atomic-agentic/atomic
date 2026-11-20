@@ -25,7 +25,7 @@
 //! written, for [`LocalStore::sweep`], and replaces a blob that no longer
 //! holds its content.
 //!
-//! A project's store takes its lock in the state directory's `private/`,
+//! A project's store takes its lock in the project's private directory,
 //! which atoms' commands cannot open; writes share it, and a sweep holds it
 //! alone. Waiting for it is bounded: past [`LOCK_WAIT`], a write or a sweep
 //! fails with [`ArtifactError::Locked`], which is transient.
@@ -149,27 +149,35 @@ fn io(path: &Path) -> impl FnOnce(std::io::Error) -> ArtifactError + '_ {
 }
 
 impl LocalStore {
-    /// A store rooted at `root`, creating its directories. A project's
-    /// store, `artifacts` in a state directory that has a `private/`, takes
-    /// the same lock as [`Self::for_project`]; any other store's lock file
-    /// is in `root`, for a store no atom's sandbox can read, such as a
-    /// test's.
+    /// A store rooted at `root`, creating its directories. A store laid out
+    /// as a project's is in an atomic home, `<home>/projects/<id>/artifacts`,
+    /// takes the same lock as [`Self::for_project`],
+    /// `<home>/private/<id>/artifacts.lock`, creating that directory readable
+    /// by its owner only if it is not there yet. Any other store, outside
+    /// every atomic home's layout (such as a test's), keeps its lock file in
+    /// `root`.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, ArtifactError> {
         let root = root.into();
-        let lock = match root.parent() {
-            Some(state)
-                if root.file_name().is_some_and(|n| n == "artifacts")
-                    && state.join("private").is_dir() =>
-            {
-                state.join("private").join("artifacts.lock")
+        let lock = match project_private(&root) {
+            Some(private) => {
+                crate::state::private_dir(&private).map_err(|e| ArtifactError::Io {
+                    path: private.clone(),
+                    source: std::io::Error::other(e.to_string()),
+                })?;
+                private.join("artifacts.lock")
             }
-            _ => root.join("lock"),
+            None => root.join("lock"),
         };
         Self::open_locked_at(root, lock)
     }
 
+    /// How long a write or a sweep waits for the store's lock.
+    pub fn lock_wait(&self) -> std::time::Duration {
+        self.lock_wait
+    }
+
     /// The project's store, `<state>/artifacts`, with its lock file in the
-    /// state directory's `private/`, which atoms' commands cannot open: an
+    /// project's private directory, which atoms' commands cannot open: an
     /// atom that could take the lock could stall every write.
     pub fn for_project(state: &crate::state::ProjectState) -> Result<Self, ArtifactError> {
         Self::open_locked_at(
@@ -373,6 +381,21 @@ impl StoreLock {
             }
         }
     }
+}
+
+/// The private directory of the project whose store is `root`, when `root`
+/// is laid out as an atomic home lays out a project's store:
+/// `<home>/projects/<id>/artifacts` has `<home>/private/<id>`.
+fn project_private(root: &Path) -> Option<PathBuf> {
+    if root.file_name()? != "artifacts" {
+        return None;
+    }
+    let state = root.parent()?;
+    let projects = state.parent()?;
+    if projects.file_name()? != "projects" {
+        return None;
+    }
+    Some(projects.parent()?.join("private").join(state.file_name()?))
 }
 
 /// Whether `name` is a two-hex-digit prefix directory of the blob tree.

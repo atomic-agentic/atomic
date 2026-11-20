@@ -1,0 +1,5 @@
+Onboarding checklist
+
+On the first day: a badge, a laptop, and accounts for mail and the tracker. In the
+first week: meet the team, read the runbooks, and shadow someone on call. Coffee at
+the CAFE is free for the first month.
