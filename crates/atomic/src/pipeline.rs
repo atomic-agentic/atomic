@@ -83,7 +83,9 @@ pub const PIPELINE: &str = "atomic.pipeline";
 /// runs, and one with another layout leaves them alone. Change it exactly
 /// when a run started under the old layout would replay differently under
 /// the new one: a step added, removed, renamed or moved, or a checkpoint's
-/// shape changed.
+/// or the [`PipelineRun`]'s shape changed. The pipeline tests hold the
+/// golden layout of each version, under `tests/layout/`, and fail when the
+/// layout no longer matches this one's.
 pub const LAYOUT_VERSION: &str = "atomic.pipeline.1";
 
 /// How many times the engine recovers one run of `run_pipeline` before it

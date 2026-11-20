@@ -1,0 +1,94 @@
+{
+  "steps": [
+    "pin",
+    "read.attempt",
+    "read.turn",
+    "read.publish",
+    "rank.turn",
+    "rank.publish",
+    "check.gate",
+    "DBOS.recv",
+    "DBOS.sleep",
+    "check.decision",
+    "summarize.turn",
+    "summarize.publish"
+  ],
+  "run": {
+    "pipeline": {
+      "name": "string",
+      "steps": [
+        {
+          "kind": "string",
+          "id": "string",
+          "atom": "string",
+          "with": "object",
+          "worktree": "bool",
+          "origins": "object"
+        },
+        {
+          "kind": "string",
+          "id": "string",
+          "atom": "string",
+          "with": "object",
+          "worktree": "bool",
+          "origins": "object"
+        },
+        {
+          "kind": "string",
+          "id": "string",
+          "title": "string",
+          "show": "scalar",
+          "timeout": "number",
+          "approvers": "null"
+        },
+        {
+          "kind": "string",
+          "id": "string",
+          "atom": "string",
+          "with": "object",
+          "worktree": "bool",
+          "origins": "object"
+        }
+      ],
+      "returns": "string",
+      "input": "object",
+      "output": "object",
+      "atoms": {
+        "<name>": {
+          "file": "string",
+          "name": "string",
+          "version": "number",
+          "kind": "string",
+          "description": "string",
+          "input": "scalar",
+          "output": "scalar",
+          "budget": {
+            "tokens": "null",
+            "millis": "null",
+            "micro_usd": "null"
+          },
+          "frontmatter": "object",
+          "program": {
+            "file": "string",
+            "root": "string",
+            "sources": "object",
+            "contracts": "object",
+            "source_paths": "object",
+            "helpers": "object"
+          },
+          "context": "null",
+          "case": "bool",
+          "judges": "object",
+          "declarations": "object"
+        }
+      },
+      "budget": {
+        "tokens": "null",
+        "millis": "null",
+        "micro_usd": "null"
+      },
+      "pins": "object"
+    },
+    "input": "object"
+  }
+}
