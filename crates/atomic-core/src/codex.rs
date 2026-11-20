@@ -1154,6 +1154,11 @@ where
         // that reports usage always grows them. A turn with nothing reported
         // spent something unknown and stays charged at its reservation.
         let fresh = totals.filter(|(input, output, _)| *input > seen.0 || *output > seen.1);
+        // A turn cut off at its reserved time was stopped with a request in
+        // flight, which has reported nothing yet: what the thread grew by is
+        // less than the turn spent. It stays charged at its reservation, as
+        // an unknown, until a usage query reconciles it.
+        let cut_off = matches!(&turn, Err(e) if e.downcast_ref::<CutOff>().is_some());
         let outcome = match fresh {
             Some((input, output, total)) => {
                 let grown = Usage {
@@ -1164,7 +1169,11 @@ where
                 report.input_tokens = input;
                 report.output_tokens = output;
                 report.total_tokens = total;
-                Outcome::Reported(grown)
+                if cut_off {
+                    Outcome::Unknown
+                } else {
+                    Outcome::Reported(grown)
+                }
             }
             None => Outcome::Unknown,
         };
@@ -2275,6 +2284,39 @@ mod tests {
             let e = ended.expect_err("cut off");
             assert!(format!("{e:#}").contains("cut off"), "{e:#}");
             assert!(began.elapsed() < std::time::Duration::from_secs(20));
+            assert_eq!(settled, [Outcome::Unknown]);
+        });
+    }
+
+    #[test]
+    fn a_turn_cut_off_with_a_request_in_flight_stays_at_its_reservation() {
+        on_codex_runtime(async {
+            // The turn's first request reports its usage and calls a tool;
+            // the second is still in flight when its time runs out.
+            let (ended, settled, calls) = metered_conversation(
+                "inflight",
+                vec![
+                    Reply::Tool {
+                        name: "no_such_tool".into(),
+                        arguments: serde_json::json!({}),
+                    },
+                    Reply::Delayed {
+                        after: std::time::Duration::from_secs(30),
+                        reply: Box::new(Reply::Text("late".into())),
+                    },
+                ],
+                1,
+                Limit {
+                    output_tokens: None,
+                    time: Some(std::time::Duration::from_secs(3)),
+                },
+            )
+            .await;
+            let e = ended.expect_err("cut off");
+            assert!(format!("{e:#}").contains("cut off"), "{e:#}");
+            assert_eq!(calls, 2, "the second request was made");
+            // Not the first request's usage alone: the second spent
+            // something no one has reported.
             assert_eq!(settled, [Outcome::Unknown]);
         });
     }

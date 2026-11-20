@@ -152,9 +152,12 @@ the `call` time does not bound it. A turn reserves the active time its atom has
 left (or less, if the run has less), and is interrupted when that runs out; the
 run then parks, as at any other cap, and the park's reason names the allowance
 that ran out. With less time left than one request's bound, a turn is not
-started at all: the run parks without spending. A failed or interrupted turn is settled with
-the usage it reported before it stopped. Its reported tokens can exceed the
-bound; the ledger records any such overshoot.
+started at all: the run parks without spending. A turn that completes, or fails, is
+settled with the usage it reported. A turn interrupted when its time runs out was
+stopped with a request in flight, which has reported nothing, so it is settled as
+unknown: its tokens and dollars stay charged at its reservation, however little the
+requests before it reported. Reported tokens can exceed the bound; the ledger
+records any such overshoot.
 
 A run resolves the model each atom calls with its budget, and the atom runs on
 that model for the whole run. Under a dollar cap, a call to a model the run's
