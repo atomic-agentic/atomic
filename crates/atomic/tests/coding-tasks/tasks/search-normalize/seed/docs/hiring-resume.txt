@@ -1,0 +1,5 @@
+Screening a résumé
+
+Read each résumé against the role's must-haves first. Note gaps without judging them.
+A resume that lists a state-of-the-art tool should say what the person built with it.
+Keep notes in the hiring tracker, not in email.
