@@ -325,8 +325,14 @@ async fn prompt(rt: &Durare, state: &ProjectState, g: &Gate, lines: &Lines) -> D
     lines.drain();
     describe(g);
     loop {
-        ask(g);
+        // Taken before the prompt is written: a reply to it arrives after
+        // the write, so it is never older than this, however long this
+        // thread waits between writing the prompt and reading on. Taken
+        // after, a reply could arrive in that wait and be dropped as typed
+        // ahead, leaving the person typing at a prompt that never answers.
         let since = Instant::now();
+        ask(g);
+        atomic_core::failpoint::pause("prompt:after-ask");
         let line = loop {
             match lines.next_after(since) {
                 Ok(Some(line)) => break line,

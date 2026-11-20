@@ -429,6 +429,33 @@ fn an_approval_gate_is_approved_at_the_prompt_and_the_workflow_continues() {
 }
 
 #[test]
+fn a_reply_is_taken_however_late_the_prompt_reads_on_after_showing() {
+    let p = Project::new("late");
+    p.enroll();
+    // atomic held up between writing the prompt and reading on, as a busy
+    // machine may hold it: the reply typed at the prompt arrives meanwhile,
+    // and is still the reply to it.
+    let out = p.at_terminal_with(
+        &[
+            "run",
+            "approval",
+            "--run-id",
+            "late",
+            "--data",
+            r#"{"text": "v8"}"#,
+        ],
+        &["a"],
+        &[
+            ("ATOMIC_FAILPOINT_PAUSE", "prompt:after-ask"),
+            ("DRIVER_DEADLINE", "30"),
+        ],
+    );
+    let t = text(&out);
+    assert!(out.status.success(), "{t}");
+    assert!(t.contains("gate late:pick: approved by local:dev"), "{t}");
+}
+
+#[test]
 fn without_a_terminal_the_run_waits_for_a_decision_from_another() {
     use std::io::BufRead;
     let p = Project::new("no-tty");
