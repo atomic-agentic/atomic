@@ -215,9 +215,14 @@ fn command_as(
         "ATOMIC_MODEL",
         "ATOMIC_MODEL_API_KEY_ENV",
         "ATOMIC_RUNNER",
+        "OPENAI_API_KEY",
+        "DATABASE_URL",
     ] {
         cmd.env_remove(name);
     }
+    // No Ollama, whatever runs on this machine: a test that wants one points
+    // this at a fake.
+    cmd.env("ATOMIC_DETECT_OLLAMA_ADDR", "127.0.0.1:9");
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -519,6 +524,150 @@ fn a_misspelled_atom_fails_check_with_the_fix() {
             .as_str()
             .is_some_and(|a| a.starts_with("did you mean `rank-note`?")),
         "{error}"
+    );
+}
+
+/// Where `model` listens, as an address: its base URL without `/v1`.
+fn address_of(model: &FakeModel) -> String {
+    model
+        .base_url()
+        .trim_start_matches("http://")
+        .trim_end_matches("/v1")
+        .to_owned()
+}
+
+#[test]
+fn with_only_a_local_ollama_a_model_atom_runs_and_explain_says_why() {
+    on_codex_runtime(async {
+        // The fake model stands in for Ollama: it lists one model, synthetic.
+        let model = FakeModel::start(vec![Reply::Text(RANK.into())])
+            .await
+            .expect("fake model");
+        let dir = scratch("ollama");
+        let project = project(&dir);
+        let addr = address_of(&model);
+        let (d, p, a) = (dir.clone(), project.clone(), addr.clone());
+        let out = tokio::task::spawn_blocking(move || {
+            atomic(
+                &d,
+                &p,
+                &[
+                    "run",
+                    "rank-note",
+                    "--data",
+                    r#"{"title": "Export crashes", "words": 2}"#,
+                ],
+                &[("ATOMIC_DETECT_OLLAMA_ADDR", a.as_str())],
+                "",
+            )
+        })
+        .await
+        .expect("child");
+        assert!(out.status.success(), "{}", text(&out));
+        assert_eq!(stdout_json(&out), json!({"priority": 1}));
+        assert_eq!(
+            model.calls(),
+            1,
+            "the model atom called the detected Ollama"
+        );
+
+        let (d, p, a) = (dir.clone(), project.clone(), addr.clone());
+        let out = tokio::task::spawn_blocking(move || {
+            atomic(
+                &d,
+                &p,
+                &["--json", "config", "--explain"],
+                &[("ATOMIC_DETECT_OLLAMA_ADDR", a.as_str())],
+                "",
+            )
+        })
+        .await
+        .expect("child");
+        assert!(out.status.success(), "{}", text(&out));
+        let doc = stdout_json(&out);
+        let source = |setting: &str| -> String {
+            doc["settings"]
+                .as_array()
+                .and_then(|all| all.iter().find(|s| s["setting"] == setting))
+                .and_then(|s| s["source"].as_str())
+                .unwrap_or_else(|| panic!("no {setting}: {doc}"))
+                .to_owned()
+        };
+        assert_eq!(
+            source("model.base_url"),
+            format!("detected: Ollama answered at {addr}")
+        );
+        assert!(
+            source("model.name").contains("first model it lists"),
+            "{doc}"
+        );
+        assert_eq!(source("runner"), "default");
+        // Every setting says where it came from.
+        assert!(
+            doc["settings"].as_array().is_some_and(|all| all.len() > 10
+                && all
+                    .iter()
+                    .all(|s| s["source"].as_str().is_some_and(|s| !s.is_empty()))),
+            "{doc}"
+        );
+    });
+}
+
+#[test]
+fn with_only_an_api_key_explain_names_openai_and_never_the_key() {
+    let dir = scratch("api-key");
+    let project = project(&dir);
+    let out = atomic(
+        &dir,
+        &project,
+        &["config", "--explain"],
+        &[("OPENAI_API_KEY", "sk-test-not-for-printing")],
+        "",
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(!said.contains("sk-test-not-for-printing"), "{said}");
+    let line = |setting: &str| -> String {
+        said.lines()
+            .find(|l| l.split_whitespace().next() == Some(setting))
+            .unwrap_or_else(|| panic!("no {setting} in {said}"))
+            .to_owned()
+    };
+    assert!(
+        line("model.base_url").contains("https://api.openai.com/v1")
+            && line("model.base_url").contains("detected: OPENAI_API_KEY is set"),
+        "{said}"
+    );
+    assert!(
+        line("model.api_key_env").contains("OPENAI_API_KEY (set"),
+        "{said}"
+    );
+    assert!(line("database.url").contains("default"), "{said}");
+    // An explicit setting wins, and says so.
+    let out = atomic(
+        &dir,
+        &project,
+        &["config", "--explain", "--model", "my-model"],
+        &[
+            ("OPENAI_API_KEY", "sk-test-not-for-printing"),
+            ("ATOMIC_RUNNER", "process"),
+        ],
+        "",
+    );
+    let said = String::from_utf8_lossy(&out.stdout);
+    let line = |setting: &str| -> String {
+        said.lines()
+            .find(|l| l.split_whitespace().next() == Some(setting))
+            .unwrap_or_else(|| panic!("no {setting} in {said}"))
+            .to_owned()
+    };
+    assert!(
+        line("model.name").contains("my-model") && line("model.name").contains("flag --model"),
+        "{said}"
+    );
+    assert!(
+        line("runner").contains("environment variable ATOMIC_RUNNER"),
+        "{said}"
     );
 }
 

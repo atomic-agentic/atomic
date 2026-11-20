@@ -67,7 +67,7 @@ fn operator() -> anyhow::Result<(String, Principal)> {
 pub async fn run(command: GatesCommand, state: &ProjectState) -> anyhow::Result<()> {
     // The store the project's runs use: its SQLite database, or PostgreSQL
     // when ATOMIC_DATABASE_URL names one.
-    let database = crate::engine::database(state);
+    let database = crate::engine::database(state)?;
     let rt = Durare::open(&database, None, atomic_app::pipeline::LAYOUT_VERSION)
         .await
         .with_context(|| {

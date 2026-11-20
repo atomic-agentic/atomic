@@ -244,7 +244,7 @@ pub async fn show(
     json: bool,
 ) -> anyhow::Result<()> {
     let state = crate::runs::state(project)?;
-    let database = engine::database(&state);
+    let database = engine::database(&state)?;
     let rt = Durare::open(&database, None, LAYOUT_VERSION)
         .await
         .with_context(|| format!("open the store at {}", engine::describe(&database)))?;

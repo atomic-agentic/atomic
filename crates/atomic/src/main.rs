@@ -13,6 +13,7 @@ mod engine;
 mod failure;
 mod gates;
 mod runs;
+mod settings;
 mod setup;
 mod show;
 mod skills;
@@ -46,6 +47,9 @@ enum Command {
     },
     /// Render an Astro prompt without calling a model or running scripts.
     Render(RenderArgs),
+    /// Show every setting the project resolves to here; with --explain,
+    /// where each came from and why, secrets masked.
+    Config(settings::ConfigArgs),
     /// Run an atom or a workflow in the foreground and print its output.
     Run(runs::RunArgs),
     /// Continue runs.
@@ -302,6 +306,7 @@ async fn run(cli: Cli, paths: CodexPaths, state: ProjectState) -> anyhow::Result
         Some(Command::Serve(args)) => runs::serve(args, project, &paths).await,
         Some(Command::Runner) => Ok(()),
         Some(Command::Render(args)) => tokio::task::spawn_blocking(move || render(args)).await?,
+        Some(Command::Config(args)) => settings::config(&args, project, json),
         Some(Command::Schemas { path, command }) => match command {
             Some(SchemasCommand::Expand { atom }) => {
                 tokio::task::spawn_blocking(move || expand(&atom)).await?

@@ -12,6 +12,7 @@
 //! another live process's.
 
 use crate::failure::Failure;
+use crate::settings;
 use anyhow::Context;
 use atomic_app::pipeline::{LAYOUT_VERSION, Services, register_pipeline};
 use atomic_core::AtomConfig;
@@ -29,8 +30,6 @@ use std::sync::Arc;
 
 /// The environment variable that names atomic's PostgreSQL database.
 pub const DATABASE_URL: &str = "ATOMIC_DATABASE_URL";
-/// The environment variable that names the schema in it.
-pub const DATABASE_SCHEMA: &str = "ATOMIC_DATABASE_SCHEMA";
 
 /// Where exec atoms' commands run.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
@@ -43,65 +42,98 @@ pub enum RunnerKind {
     Process,
 }
 
-/// How a command that executes runs is set up.
+/// How a command that executes runs is set up, by flag. Each is also a
+/// setting, which a file or an `ATOMIC_*` variable can give (see
+/// [`crate::settings`]); a flag wins over both.
 #[derive(Clone, Debug, Default, Args)]
 pub struct EngineArgs {
-    /// Base URL of the OpenAI-compatible Responses API that model atoms use.
-    #[arg(long, env = "ATOMIC_MODEL_BASE_URL")]
+    /// Base URL of the OpenAI-compatible API that model atoms use
+    /// (`model.base_url`, `ATOMIC_MODEL_BASE_URL`).
+    #[arg(long)]
     pub model_base_url: Option<String>,
-    /// Model id at that endpoint.
-    #[arg(long, env = "ATOMIC_MODEL")]
+    /// Model id at that endpoint (`model.name`, `ATOMIC_MODEL`).
+    #[arg(long)]
     pub model: Option<String>,
-    /// Environment variable that holds the endpoint's API key, if it needs one.
-    #[arg(long, env = "ATOMIC_MODEL_API_KEY_ENV")]
+    /// Environment variable that holds the endpoint's API key, if it needs
+    /// one (`model.api_key_env`, `ATOMIC_MODEL_API_KEY_ENV`).
+    #[arg(long)]
     pub model_api_key_env: Option<String>,
-    /// Where exec atoms' commands run.
-    #[arg(long, env = "ATOMIC_RUNNER", value_enum, default_value_t)]
-    pub runner: RunnerKind,
+    /// Where exec atoms' commands run (`runner`, `ATOMIC_RUNNER`).
+    #[arg(long, value_enum)]
+    pub runner: Option<RunnerKind>,
     /// This process's executor identity: unique to it and the same across
-    /// its restarts. Required on PostgreSQL.
-    #[arg(long, env = "ATOMIC_EXECUTOR_ID")]
+    /// its restarts. Required on PostgreSQL (`executor_id`,
+    /// `ATOMIC_EXECUTOR_ID`).
+    #[arg(long)]
     pub executor_id: Option<String>,
 }
 
-impl EngineArgs {
-    fn endpoint(&self, required: bool) -> anyhow::Result<ModelEndpoint> {
-        match (&self.model_base_url, &self.model) {
-            (Some(base_url), Some(model)) => Ok(ModelEndpoint {
-                base_url: base_url.clone(),
-                model: model.clone(),
-                api_key_env: self.model_api_key_env.clone(),
-            }),
-            _ if required => Err(Failure::new(
-                "config.model",
-                "no model endpoint is configured, and model atoms need one",
-                "set ATOMIC_MODEL_BASE_URL and ATOMIC_MODEL (or pass --model-base-url and \
-                 --model), and ATOMIC_MODEL_API_KEY_ENV if the endpoint needs a key",
-            )
-            .into()),
-            // Nothing will call a model; an endpoint that cannot be reached
-            // makes any call that does fail loudly.
-            _ => Ok(ModelEndpoint {
-                base_url: "http://127.0.0.1:9/unconfigured".into(),
-                model: "unconfigured".into(),
-                api_key_env: None,
-            }),
-        }
+/// The settings for the project at `state`, with `args` on top.
+pub fn settings(state: &ProjectState, args: &EngineArgs) -> anyhow::Result<settings::Resolved> {
+    settings::resolve(
+        &settings::config_dir(state.root()),
+        args,
+        &settings::Surroundings::here(),
+    )
+    .map_err(|e| {
+        Failure::new(
+            "config.invalid",
+            format!("the configuration cannot be read: {e}"),
+            "fix the setting it names; `atomic config --explain` lists every setting and \
+             where it comes from",
+        )
+        .into()
+    })
+}
+
+/// The model endpoint, or with `required`, a failure saying how to set one.
+fn endpoint(resolved: &settings::Resolved, required: bool) -> anyhow::Result<ModelEndpoint> {
+    match resolved.endpoint() {
+        Some(endpoint) => Ok(endpoint),
+        None if required => Err(Failure::new(
+            "config.model",
+            "no model endpoint is configured or detected, and model atoms need one",
+            "set OPENAI_API_KEY to use OpenAI's API, start Ollama on this machine, or set \
+             ATOMIC_MODEL_BASE_URL and ATOMIC_MODEL (or pass --model-base-url and --model), \
+             and ATOMIC_MODEL_API_KEY_ENV if the endpoint needs a key; `atomic config \
+             --explain` shows what was found",
+        )
+        .into()),
+        // Nothing will call a model; an endpoint that cannot be reached
+        // makes any call that does fail loudly.
+        None => Ok(ModelEndpoint {
+            base_url: "http://127.0.0.1:9/unconfigured".into(),
+            model: "unconfigured".into(),
+            api_key_env: None,
+        }),
     }
 }
 
-/// The store atomic is configured to use.
-pub fn database(state: &ProjectState) -> Database {
-    match std::env::var(DATABASE_URL).ok().filter(|u| !u.is_empty()) {
+/// The store the resolved settings name.
+fn store_of(state: &ProjectState, settings: &settings::Settings) -> Database {
+    match settings.database.url.clone().filter(|u| !u.is_empty()) {
         Some(url) => Database::Postgres {
             url,
-            schema: std::env::var(DATABASE_SCHEMA)
-                .ok()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "atomic".into()),
+            schema: settings.database.schema.clone(),
         },
         None => Database::Sqlite(state.database()),
     }
+}
+
+/// The store atomic is configured to use for the project at `state`.
+pub fn database(state: &ProjectState) -> anyhow::Result<Database> {
+    // The store needs no model, so no Ollama is looked for.
+    let around = settings::Surroundings {
+        ollama: &|_| None,
+        ..settings::Surroundings::here()
+    };
+    let resolved = settings::resolve(
+        &settings::config_dir(state.root()),
+        &EngineArgs::default(),
+        &around,
+    )
+    .map_err(|e| anyhow::anyhow!("the configuration cannot be read: {e}"))?;
+    Ok(store_of(state, &resolved.settings))
 }
 
 /// Where the store is, for a person: never the URL, which holds a password.
@@ -176,8 +208,9 @@ pub async fn open(
     // Held until the process exits: dropping the engine while a command it
     // started still runs must not let another process recover that run.
     state.lock_execution(command)?.hold_until_exit();
-    let database = database(state);
-    let executor = atomic_durable::executor_identity(args.executor_id.as_deref())?;
+    let resolved = settings(state, args)?;
+    let database = store_of(state, &resolved.settings);
+    let executor = atomic_durable::executor_identity(resolved.settings.executor_id.as_deref())?;
     if matches!(database, Database::Postgres { .. }) && executor.is_none() {
         return Err(Failure::new(
             "config.executor_id",
@@ -192,9 +225,21 @@ pub async fn open(
         )
         .into());
     }
-    let endpoint = args.endpoint(needs_model)?;
+    let endpoint = endpoint(&resolved, needs_model)?;
     let store = LocalStore::open(state.dir().join("artifacts")).context("the artifact store")?;
-    let exec = match args.runner {
+    let runner = match resolved.settings.runner.as_str() {
+        "local" => RunnerKind::Local,
+        "process" => RunnerKind::Process,
+        other => {
+            return Err(Failure::new(
+                "config.invalid",
+                format!("runner is `{other}`, and atomic knows `local` and `process`"),
+                "set runner (ATOMIC_RUNNER, or --runner) to local or process",
+            )
+            .into());
+        }
+    };
+    let exec = match runner {
         RunnerKind::Local => atomic_exec::Backend::default(),
         RunnerKind::Process => atomic_exec::Backend::new(ProcessRunner::atomic(
             std::env::current_exe().context("find atomic's own executable for its runners")?,
@@ -228,9 +273,8 @@ pub async fn open(
             store,
             deployment: deployment(),
             worktrees,
-            // The CLI reads no configuration files yet, so every run is
-            // metered under the built-in budget defaults.
-            budgets: Arc::default(),
+            // Budget caps and prices, through the configuration layers.
+            budgets: Arc::new(resolved.settings.budget.clone()),
             // No context settings yet: a step whose atom declares a public
             // context is refused rather than resolved from nothing.
             context: None,

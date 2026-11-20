@@ -49,6 +49,8 @@ pub enum Source {
     Env(String),
     /// A command-line flag.
     Flag(String),
+    /// Found in the surroundings, for the reason given, where nothing set it.
+    Detected(String),
 }
 
 /// What to read, and from where.

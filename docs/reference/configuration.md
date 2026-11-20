@@ -8,7 +8,40 @@ atomic config --explain
 ```
 
 The output identifies each setting's value, source and reason, with secrets
-masked. Configuration explanation is part of the intended first-release CLI.
+masked: a database URL's password is replaced by `***`, and an API key's
+variable is named, with whether it is set, never its value. `--json` gives the
+same as one document. Without `--explain`, `atomic config` lists the values
+alone.
+
+## Detected defaults
+
+What nothing sets, atomic looks for, and says so as `detected:` in
+`--explain`. Detection discovers; it never grants a permission or a
+credential.
+
+| Found | Sets |
+| --- | --- |
+| `OPENAI_API_KEY` is set | the model endpoint to OpenAI's API (`https://api.openai.com/v1`), `model.api_key_env` to `OPENAI_API_KEY`, and the model to `gpt-5-mini` unless one is set |
+| Ollama answers on this machine, at `127.0.0.1:11434` | the model endpoint to that Ollama, with the first model it lists unless one is set |
+
+The key's value is never read for detection. Looking for Ollama is one
+`GET /api/tags` to the loopback address, and nothing else is sent anywhere;
+`ATOMIC_DETECT_OLLAMA_ADDR` names another loopback address, and any other
+address is refused. A model endpoint set in a file, a variable or a flag
+turns detection off.
+
+The settings `atomic run`, `atomic runs resume` and `atomic serve` resolve:
+
+| Setting | Variable | Flag |
+| --- | --- | --- |
+| `model.base_url` | `ATOMIC_MODEL_BASE_URL` | `--model-base-url` |
+| `model.name` | `ATOMIC_MODEL` or `ATOMIC_MODEL_NAME` | `--model` |
+| `model.api_key_env` | `ATOMIC_MODEL_API_KEY_ENV` | `--model-api-key-env` |
+| `database.url` | `ATOMIC_DATABASE_URL` | |
+| `database.schema` | `ATOMIC_DATABASE_SCHEMA` | |
+| `runner` | `ATOMIC_RUNNER` | `--runner` |
+| `executor_id` | `ATOMIC_EXECUTOR_ID` | `--executor-id` |
+| `budget.*` | `ATOMIC_BUDGET_*` | |
 
 ## Start small
 

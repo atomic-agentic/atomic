@@ -14,7 +14,7 @@ Angle brackets below mean a value you supply, not literal shell syntax.
 | `atomic curl <name> -d '<json>'` | Send JSON to an atom or workflow on a running runtime and print the typed result | v0.5 |
 | `atomic check` | Validate project definitions and references | v0.1 |
 | `atomic eval <atom>` | Evaluate an atom against its cases | v0.1 |
-| `atomic config --explain` | Inspect resolved values, sources and detected defaults | v0.1 |
+| `atomic config --explain` | Inspect resolved values, sources and detected defaults | v0.1, built |
 | `atomic runs show <run-id>` | Inspect saved results, metadata and run state | v0.1 |
 | `atomic runs resume <run-id>` | Continue the same unfinished local run in the foreground | v0.1 |
 | `atomic serve` | Run the local headless runtime and recover eligible unfinished runs | v0.1 local; team service v0.5 |
