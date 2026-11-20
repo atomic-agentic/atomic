@@ -190,6 +190,45 @@ fn try_load(
 }
 
 /// One developer on one machine.
+/// Release `park` as the local operator, with their credential, raising
+/// `raise` first if given: the person's action, as `atomic` exposes it.
+async fn release_raising(
+    rt: &Durare,
+    park: &atomic_durable::Park,
+    raise: Option<atomic_durable::release::Raise>,
+) -> Result<atomic_durable::release::Released, atomic_durable::release::ReleaseError> {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let me = atomic_durable::gate::HumanCredential::new(
+        atomic_durable::gate::Principal::local("dev"),
+        "the operator's secret",
+    );
+    let _ = atomic_durable::gate::enroll(rt, &me).await;
+    atomic_durable::release::release_park(
+        rt,
+        &me,
+        atomic_durable::release::ReleaseCommand {
+            command_id: format!(
+                "{}-{}",
+                park.id,
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ),
+            park: park.id.clone(),
+            raise,
+            comment: None,
+        },
+    )
+    .await
+}
+
+/// [`release_raising`] with no raise.
+#[allow(dead_code)]
+async fn release(
+    rt: &Durare,
+    park: &atomic_durable::Park,
+) -> Result<atomic_durable::release::Released, atomic_durable::release::ReleaseError> {
+    release_raising(rt, park, None).await
+}
+
 fn local() -> Deployment {
     Deployment::Local {
         operator: Principal::local("dev"),
@@ -2329,19 +2368,20 @@ fn resumed_run_keeps_its_budgets(tag: &str, pinned: bool) {
         let rt = engine_on(&dir, &model.base_url(), later, "renamed").await;
         rt.recover().await.expect("recover");
         let park = nth_park(&rt, "pinned", 1).await;
-        rt.ledger()
-            .raise(
-                "run:pinned",
-                Caps {
+        release_raising(
+            &rt,
+            &park,
+            Some(atomic_durable::release::Raise {
+                scope: "run:pinned".to_owned(),
+                caps: Caps {
                     tokens: 10_000,
                     millis: 0,
                     micro_usd: None,
                 },
-            )
-            .await
-            .expect("raise")
-            .expect("exists");
-        atomic_durable::release(&rt, &park).await.expect("release");
+            }),
+        )
+        .await
+        .expect("release");
         let out: Value = rt.result("pinned").await.expect("finishes");
         assert_eq!(out, json!({"line": "P1: Export crashes on accents"}));
         // The steps after the park ran on the model the run began with.
@@ -2568,19 +2608,20 @@ fn a_budget_refusal_in_a_worktree_step_parks_the_run() {
             .and_then(|(_, rest)| rest.split_once(' '))
             .map(|(scope, _)| scope.to_owned())
             .expect("the refusing allowance");
-        rt.ledger()
-            .raise(
-                &scope,
-                Caps {
+        release_raising(
+            &rt,
+            &park,
+            Some(atomic_durable::release::Raise {
+                scope: scope.clone(),
+                caps: Caps {
                     tokens: 10_000,
                     millis: 0,
                     micro_usd: None,
                 },
-            )
-            .await
-            .expect("raise")
-            .expect("exists");
-        atomic_durable::release(&rt, &park).await.expect("release");
+            }),
+        )
+        .await
+        .expect("release");
         let out: Value = rt.result("fix-park").await.expect("finishes");
         assert_eq!(out, json!({"ok": true}));
         let turn = rt

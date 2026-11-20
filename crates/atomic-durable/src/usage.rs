@@ -209,7 +209,7 @@ pub enum Settled {
 }
 
 /// An allowance as the ledger has it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Allowance {
     /// Its id.
     pub scope: String,
@@ -335,6 +335,53 @@ fn allowance_from_row(row: &Row) -> Result<Allowance> {
             micro_usd: row.int("micro_usd_charged")?,
         },
     })
+}
+
+/// [`Ledger::raise`], in the caller's transaction.
+pub(crate) async fn raise_in(
+    tx: &mut Tx<'_, '_>,
+    scope: &str,
+    caps: Caps,
+) -> Result<Option<Allowance>> {
+    if [caps.tokens, caps.millis]
+        .into_iter()
+        .chain(caps.micro_usd)
+        .any(|n| !(0..=MOST).contains(&n))
+    {
+        return Err(corrupt(format!(
+            "a cap for {scope} is below zero or past {MOST}"
+        )));
+    }
+    // Locked before it is read, so a concurrent raise cannot be undone by
+    // this one.
+    tx.execute(
+        "UPDATE atomic_usage_allowances SET tokens_cap = tokens_cap WHERE scope = ?",
+        &[Param::Text(scope.to_owned())],
+    )
+    .await?;
+    let Some(a) = read_allowance(tx, scope).await? else {
+        return Ok(None);
+    };
+    let raised = Caps {
+        tokens: a.caps.tokens.max(caps.tokens),
+        millis: a.caps.millis.max(caps.millis),
+        micro_usd: match (a.caps.micro_usd, caps.micro_usd) {
+            (Some(old), Some(new)) => Some(old.max(new)),
+            (old, _) => old,
+        },
+    };
+    tx.execute(
+        "UPDATE atomic_usage_allowances SET tokens_cap = ?, millis_cap = ?, \
+         micro_usd_cap = NULLIF(?, -1) WHERE scope = ?",
+        &[
+            Param::Int(raised.tokens),
+            Param::Int(raised.millis),
+            Param::Int(raised.micro_usd.unwrap_or(NONE)),
+            Param::Text(scope.to_owned()),
+        ],
+    )
+    .await?;
+    read_allowance(tx, scope).await
 }
 
 async fn read_allowance(tx: &mut Tx<'_, '_>, scope: &str) -> Result<Option<Allowance>> {
@@ -939,53 +986,22 @@ impl Ledger {
 
     /// Raise allowance `scope`'s caps to `caps`, each only where it is
     /// larger: a cap is never lowered here, and a `micro_usd` of `None`
-    /// leaves the dollar cap as it is. A person's action, from a human
-    /// credential only; resuming a run never calls it. Returns the
-    /// allowance as it stands after, or `None` if there is no such one.
-    pub async fn raise(&self, scope: &str, caps: Caps) -> Result<Option<Allowance>> {
-        if [caps.tokens, caps.millis]
-            .into_iter()
-            .chain(caps.micro_usd)
-            .any(|n| !(0..=MOST).contains(&n))
-        {
-            return Err(corrupt(format!(
-                "a cap for {scope} is below zero or past {MOST}"
-            )));
-        }
+    /// leaves the dollar cap as it is. Returns the allowance as it stands
+    /// after, or `None` if there is no such one.
+    ///
+    /// Not public: a person raises a cap through
+    /// [`crate::release::release_park`], with a human credential, and the
+    /// raise is recorded. Resuming a run never raises one.
+    #[cfg(test)]
+    pub(crate) async fn raise(&self, scope: &str, caps: Caps) -> Result<Option<Allowance>> {
         let scope = scope.to_owned();
         self.transact(move |mut tx| {
             let scope = scope.clone();
             Box::pin(async move {
-                // Locked before it is read, so a concurrent raise cannot be
-                // undone by this one.
-                tx.execute(
-                    "UPDATE atomic_usage_allowances SET tokens_cap = tokens_cap WHERE scope = ?",
-                    &[Param::Text(scope.clone())],
-                )
-                .await?;
-                let Some(a) = read_allowance(&mut tx, &scope).await? else {
-                    return Ok(End::Rollback(None));
-                };
-                let raised = Caps {
-                    tokens: a.caps.tokens.max(caps.tokens),
-                    millis: a.caps.millis.max(caps.millis),
-                    micro_usd: match (a.caps.micro_usd, caps.micro_usd) {
-                        (Some(old), Some(new)) => Some(old.max(new)),
-                        (old, _) => old,
-                    },
-                };
-                tx.execute(
-                    "UPDATE atomic_usage_allowances SET tokens_cap = ?, millis_cap = ?, \
-                     micro_usd_cap = NULLIF(?, -1) WHERE scope = ?",
-                    &[
-                        Param::Int(raised.tokens),
-                        Param::Int(raised.millis),
-                        Param::Int(raised.micro_usd.unwrap_or(NONE)),
-                        Param::Text(scope.clone()),
-                    ],
-                )
-                .await?;
-                Ok(End::Commit(read_allowance(&mut tx, &scope).await?))
+                Ok(match raise_in(&mut tx, &scope, caps).await? {
+                    Some(a) => End::Commit(Some(a)),
+                    None => End::Rollback(None),
+                })
             })
         })
         .await

@@ -16,6 +16,7 @@ use std::path::PathBuf;
 mod engine;
 mod failure;
 mod gates;
+mod parks;
 mod runs;
 mod setup;
 mod skills;
@@ -72,6 +73,10 @@ enum Command {
     /// Enroll your operator credential, list gates and decide them.
     #[command(subcommand)]
     Gates(gates::GatesCommand),
+    /// List the runs parked on a budget cap, and release one, raising its
+    /// cap, with your operator credential.
+    #[command(subcommand)]
+    Parks(parks::ParksCommand),
     /// Install atomic's authoring skills for a coding agent.
     Setup(setup::SetupArgs),
     /// Developer diagnostics.
@@ -331,6 +336,7 @@ async fn run(cli: Cli, paths: CodexPaths, state: ProjectState) -> anyhow::Result
     let project = project.as_deref();
     match cli.command {
         Some(Command::Gates(command)) => gates::run(command, &state).await,
+        Some(Command::Parks(command)) => parks::run(command, &state).await,
         Some(Command::Check { path }) => {
             tokio::task::spawn_blocking(move || check(path, json)).await?
         }
