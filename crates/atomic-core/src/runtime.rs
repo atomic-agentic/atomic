@@ -288,8 +288,9 @@ pub fn stop_waiting_for_backend() {
 /// waited its limit is set aside rather than given up, and keeps trying,
 /// at most [`OPEN_WAIT_MAX`] apart, so its run goes on once there is room.
 static KEEP_TRYING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// How many steps of this process are set aside, past their limit.
-static SET_ASIDE_FOR_ROOM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// The runs whose step is set aside now, past its limit, each once per
+/// such step.
+static SET_ASIDE_FOR_ROOM: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 /// Make a step that has waited its limit ([`limit_backend_wait`]) keep
 /// trying, set aside, instead of giving up: for `atomic serve`.
@@ -297,25 +298,34 @@ pub fn keep_trying_past_the_limit() {
     KEEP_TRYING.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
-/// How many steps are set aside now, waiting past their limit for room:
-/// work a stopping process need not wait for, since they record nothing.
-pub fn steps_set_aside_for_room() -> usize {
-    SET_ASIDE_FOR_ROOM.load(std::sync::atomic::Ordering::SeqCst)
+/// The runs whose step is set aside now, waiting past its limit for room:
+/// work a stopping process need not wait for, since it records nothing.
+pub fn runs_set_aside_for_room() -> Vec<String> {
+    SET_ASIDE_FOR_ROOM
+        .lock()
+        .map(|runs| runs.clone())
+        .unwrap_or_default()
 }
 
-/// Counts one step in [`steps_set_aside_for_room`] while it lives.
-struct SetAsideForRoom;
+/// Lists one run in [`runs_set_aside_for_room`] while it lives.
+struct SetAsideForRoom(String);
 
 impl SetAsideForRoom {
-    fn start() -> Self {
-        SET_ASIDE_FOR_ROOM.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Self
+    fn start(run: &str) -> Self {
+        if let Ok(mut runs) = SET_ASIDE_FOR_ROOM.lock() {
+            runs.push(run.to_owned());
+        }
+        Self(run.to_owned())
     }
 }
 
 impl Drop for SetAsideForRoom {
     fn drop(&mut self) {
-        SET_ASIDE_FOR_ROOM.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        if let Ok(mut runs) = SET_ASIDE_FOR_ROOM.lock()
+            && let Some(at) = runs.iter().position(|run| *run == self.0)
+        {
+            runs.swap_remove(at);
+        }
     }
 }
 
@@ -351,6 +361,10 @@ pub(crate) async fn open_workspace(
                     backend,
                     workspace: Some(workspace),
                 })));
+                // Counted as running again before the stop is read, so a
+                // stop that began meanwhile either finds it here or waits
+                // for it.
+                drop(set_aside.take());
                 // Opened as this process stops: nothing starts in it.
                 if STOP_WAITING.load(Ordering::SeqCst) {
                     guard.close().await;
@@ -390,7 +404,7 @@ pub(crate) async fn open_workspace(
                 }
                 if past {
                     if set_aside.is_none() {
-                        set_aside = Some(SetAsideForRoom::start());
+                        set_aside = Some(SetAsideForRoom::start(&request.run));
                         eprintln!(
                             "atomic: {label} (run {}, step {}) is set aside, with nothing \
                              recorded: no room on the execution backend in the time this \

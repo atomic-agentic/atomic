@@ -96,17 +96,9 @@ pub(crate) async fn settled<T>(
             }
             std::future::pending().await
         }
-        Err(AtomError::NoRoom(why)) if SERVING.load(std::sync::atomic::Ordering::SeqCst) => {
-            eprintln!("atomic serve: {place}: {why}");
-            eprintln!(
-                "atomic serve: {place} stays unfinished, with nothing recorded, until atomic \
-                 serve is started again; other runs go on"
-            );
-            if counted {
-                crate::pipeline::set_aside();
-            }
-            std::future::pending().await
-        }
+        // Only `atomic run` and `atomic runs resume` give up: under `atomic
+        // serve` a step past its limit is set aside and keeps trying
+        // (`atomic_core::runtime::keep_trying_past_the_limit`).
         Err(AtomError::NoRoom(why)) => {
             eprintln!("atomic: {why}");
             eprintln!(

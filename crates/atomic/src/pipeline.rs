@@ -163,9 +163,9 @@ pub fn stop_starting_steps() {
 
 /// Before a run's next piece of work: go on counted as working, or wait for
 /// good if this process is stopping.
-async fn keep_working(working: &mut Option<Running>) {
+async fn keep_working(working: &mut Option<Running>, run: &str) {
     match working {
-        None => *working = Some(begin_work().await),
+        None => *working = Some(begin_work(run).await),
         Some(_) if STOPPING.load(std::sync::atomic::Ordering::SeqCst) => {
             *working = None;
             std::future::pending::<()>().await;
@@ -177,8 +177,8 @@ async fn keep_working(working: &mut Option<Running>) {
 /// Count this run as working in [`steps_running`], then wait for good if
 /// this process is stopping. Counted first, so a stop that finds nothing
 /// running has seen every run that could still begin work.
-async fn begin_work() -> Running {
-    let running = Running::start();
+async fn begin_work(run: &str) -> Running {
+    let running = Running::start(run);
     if STOPPING.load(std::sync::atomic::Ordering::SeqCst) {
         drop(running);
         return std::future::pending::<Running>().await;
@@ -187,15 +187,20 @@ async fn begin_work() -> Running {
 }
 
 /// How many atom steps this process is running now.
-static RUNNING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// The runs working now, each as many times as it counts.
+static RUNNING: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 /// How many atom steps this process is running now: a stopping process
-/// waits for them to reach their checkpoints.
+/// waits for them to reach their checkpoints. A run whose step is set aside,
+/// waiting past its limit for room ([`atomic_core::runtime`]), is not one;
+/// a set-aside step of a run not counted here takes nothing off.
 pub fn steps_running() -> usize {
-    RUNNING
-        .load(std::sync::atomic::Ordering::SeqCst)
-        .saturating_sub(SET_ASIDE.load(std::sync::atomic::Ordering::SeqCst))
-        .saturating_sub(atomic_core::runtime::steps_set_aside_for_room())
+    let aside = atomic_core::runtime::runs_set_aside_for_room();
+    let counted = RUNNING
+        .lock()
+        .map(|runs| runs.iter().filter(|run| !aside.contains(*run)).count())
+        .unwrap_or_default();
+    counted.saturating_sub(SET_ASIDE.load(std::sync::atomic::Ordering::SeqCst))
 }
 
 /// How many of the [`RUNNING`] runs wait for good, set aside by
@@ -207,19 +212,25 @@ pub(crate) fn set_aside() {
     SET_ASIDE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 }
 
-/// Counts one running atom step in [`steps_running`] while it lives.
-struct Running;
+/// Counts one run's work in [`steps_running`] while it lives.
+struct Running(String);
 
 impl Running {
-    fn start() -> Self {
-        RUNNING.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Self
+    fn start(run: &str) -> Self {
+        if let Ok(mut runs) = RUNNING.lock() {
+            runs.push(run.to_owned());
+        }
+        Self(run.to_owned())
     }
 }
 
 impl Drop for Running {
     fn drop(&mut self) {
-        RUNNING.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        if let Ok(mut runs) = RUNNING.lock()
+            && let Some(at) = runs.iter().position(|run| *run == self.0)
+        {
+            runs.swap_remove(at);
+        }
     }
 }
 
@@ -597,7 +608,7 @@ async fn run_pipeline<C: WorkflowContext>(
     let id = ctx.workflow_id().to_owned();
     // Working from here to its end, but for waits at gates: a stopping
     // process gives it its grace, and begins none of its steps.
-    let mut working = Some(begin_work().await);
+    let mut working = Some(begin_work(&id).await);
     reached(&id, 0)?;
     let store = services.store.clone();
     fits("the workflow's input", &pipeline.input, &input)?;
@@ -673,7 +684,7 @@ async fn run_pipeline<C: WorkflowContext>(
     let mut accepted = Vec::new();
     for (position, step) in pipeline.steps.iter().enumerate() {
         // Before its attempt is recorded: a stopping process begins nothing.
-        keep_working(&mut working).await;
+        keep_working(&mut working, &id).await;
         reached(&id, position + 1)?;
         let scope = json!(steps);
         let steps_shape = Shape::Fields(shapes.clone());
@@ -1016,7 +1027,7 @@ async fn run_pipeline<C: WorkflowContext>(
             ]),
         );
     }
-    keep_working(&mut working).await;
+    keep_working(&mut working, &id).await;
     let scope = json!(steps);
     let steps_shape = Shape::Fields(shapes);
     let result = atomic_schema::expr::evaluate(

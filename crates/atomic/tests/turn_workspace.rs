@@ -47,9 +47,9 @@ fn scratch(tag: &str) -> PathBuf {
     dir
 }
 
-/// One scratch root for every test here, as one project's backend has:
-/// tests run at once, and turns that share a writable root must share the
-/// TMPDIR where Codex's sandbox keeps its mount-point registry.
+/// One scratch root, and so one backend TMPDIR, for every test here, as one
+/// project's turns share theirs: the tests' turns run at once, and Codex's
+/// sandbox keeps its registry of the mount points it makes in TMPDIR.
 fn shared_scratch() -> PathBuf {
     static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     ROOT.get_or_init(|| {
