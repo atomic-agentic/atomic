@@ -714,13 +714,18 @@ async fn run_pipeline<C: WorkflowContext>(
             // A replay stores nothing new: its definitions are the recorded
             // run's, already in the store, and it waits for no lock to find
             // them. It marks them as just used, unless a sweep holds the
-            // store, so a sweep's grace covers them.
+            // store, so a sweep's grace covers them. Gone, they are stored
+            // again as any run's are.
             if replaying {
                 let digest = sha256(&snapshot);
                 if let Ok(stored) = ArtifactRef::from_digest(&digest)
+                    && matches!(
+                        store.refresh(&stored),
+                        Ok(atomic_core::artifact::Refreshed::Now)
+                            | Ok(atomic_core::artifact::Refreshed::Held)
+                    )
                     && store.contains(&stored).unwrap_or(false)
                 {
-                    let _ = store.refresh(&stored);
                     return Ok(Pinned {
                         snapshot: stored.to_string(),
                         files,

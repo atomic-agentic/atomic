@@ -389,3 +389,50 @@ fn a_write_that_cannot_check_the_stored_blob_leaves_no_partial_write() {
     std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o444)).expect("chmod");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[cfg(unix)]
+#[test]
+fn listing_what_is_stored_fails_on_an_entry_it_cannot_read() {
+    use std::os::unix::fs::PermissionsExt;
+    let (store, dir) = store();
+    let a = store
+        .put(&mut &b"behind a closed door"[..], provenance("s1"))
+        .expect("put")
+        .artifact;
+    assert_eq!(store.stored().expect("listed"), BTreeSet::from([a.clone()]));
+    let prefix = store.blob_path(&a).parent().expect("prefix").to_owned();
+    std::fs::set_permissions(&prefix, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+    let listed = store.stored();
+    std::fs::set_permissions(&prefix, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    assert!(
+        listed.is_err(),
+        "an unreadable prefix was left out: {listed:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_refresh_says_whether_it_marked_found_nothing_or_was_held_off() {
+    let (store, dir) = store();
+    let a = store
+        .put(&mut &b"refreshed"[..], provenance("s1"))
+        .expect("put")
+        .artifact;
+    assert_eq!(store.refresh(&a).expect("refresh"), Refreshed::Now);
+    let missing = ArtifactRef::from_digest(&"0".repeat(64)).expect("ref");
+    assert_eq!(
+        store.refresh(&missing).expect("refresh"),
+        Refreshed::Missing
+    );
+    let holder = std::fs::File::options()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&store.lock)
+        .expect("lock");
+    holder.lock().expect("hold");
+    assert_eq!(store.refresh(&a).expect("refresh"), Refreshed::Held);
+    drop(holder);
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -170,21 +170,24 @@ impl LocalStore {
     }
 
     /// Every blob the store holds, by its digest. Takes no lock: content
-    /// written while it reads may or may not be listed.
+    /// written while it reads may or may not be listed. An entry it cannot
+    /// read fails it, rather than leaving that content out of what a sweep
+    /// looks for; one that is not content (a stray file, a link) is passed
+    /// over, as a sweep passes it over.
     pub fn stored(&self) -> Result<BTreeSet<ArtifactRef>, ArtifactError> {
         let mut all = BTreeSet::new();
         let blobs = self.root.join("blobs/sha256");
-        for prefix in std::fs::read_dir(&blobs).map_err(io(&blobs))?.flatten() {
+        for prefix in std::fs::read_dir(&blobs).map_err(io(&blobs))? {
+            let prefix = prefix.map_err(io(&blobs))?;
+            let path = prefix.path();
             let name = prefix.file_name().to_string_lossy().into_owned();
-            if !prefix.file_type().is_ok_and(|t| t.is_dir()) || !is_prefix(&name) {
+            if !prefix.file_type().map_err(io(&path))?.is_dir() || !is_prefix(&name) {
                 continue;
             }
-            for blob in std::fs::read_dir(prefix.path())
-                .map_err(io(&prefix.path()))?
-                .flatten()
-            {
+            for blob in std::fs::read_dir(&path).map_err(io(&path))? {
+                let blob = blob.map_err(io(&path))?;
                 let digest = format!("{name}{}", blob.file_name().to_string_lossy());
-                if blob.file_type().is_ok_and(|t| t.is_file())
+                if blob.file_type().map_err(io(&blob.path()))?.is_file()
                     && let Ok(a) = ArtifactRef::from_digest(&digest)
                 {
                     all.insert(a);
@@ -194,13 +197,12 @@ impl LocalStore {
         Ok(all)
     }
 
-    /// Mark `artifact`, if the store holds it, as just written, so a sweep's
-    /// grace covers it, without waiting: while a sweep holds the store, it
-    /// does nothing. Returns whether it did.
-    pub fn refresh(&self, artifact: &ArtifactRef) -> Result<bool, ArtifactError> {
+    /// Mark `artifact` as just written, so a sweep's grace covers it,
+    /// without waiting for the store's lock.
+    pub fn refresh(&self, artifact: &ArtifactRef) -> Result<Refreshed, ArtifactError> {
         let _lock = match StoreLock::take(&self.lock, false, std::time::Duration::ZERO) {
             Ok(lock) => lock,
-            Err(ArtifactError::Locked { .. }) => return Ok(false),
+            Err(ArtifactError::Locked { .. }) => return Ok(Refreshed::Held),
             Err(e) => return Err(e),
         };
         let blob = self.blob_path(artifact);
@@ -208,9 +210,9 @@ impl LocalStore {
             Ok(f) => {
                 f.set_modified(std::time::SystemTime::now())
                     .map_err(io(&blob))?;
-                Ok(true)
+                Ok(Refreshed::Now)
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Refreshed::Missing),
             Err(e) => Err(io(&blob)(e)),
         }
     }
@@ -339,6 +341,17 @@ fn sync_dir(dir: &Path) -> Result<(), ArtifactError> {
     #[cfg(not(unix))]
     let _ = dir;
     Ok(())
+}
+
+/// What [`LocalStore::refresh`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refreshed {
+    /// The content is marked as just written.
+    Now,
+    /// A sweep holds the store; nothing was done.
+    Held,
+    /// The store does not hold it.
+    Missing,
 }
 
 /// What a [`LocalStore::sweep`] did.
