@@ -1504,9 +1504,17 @@ fn replaying_a_recorded_run_makes_no_model_call_and_runs_no_command() {
     on_codex_runtime(async {
         let dir = scratch("replay");
         let project = project(&dir);
-        // An exec step that writes a log line, then two model steps.
+        // An exec step that writes a log line, then two model steps, the
+        // second given the first's thread, which only metadata holds.
         write_send_note(&dir, Some("idempotent"));
-        let pipeline = load(&project, "sent.workflow.yaml", &sent());
+        let pipeline = load(
+            &project,
+            "sent.workflow.yaml",
+            &sent().replace(
+                "with: { title: steps.read.output.title, priority: steps.rank.output.priority }",
+                "with: { title: steps.rank.metadata.thread_id, priority: steps.rank.output.priority }",
+            ),
+        );
         let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
             .await
             .expect("fake model");

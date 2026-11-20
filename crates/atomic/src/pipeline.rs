@@ -83,8 +83,10 @@ pub const PIPELINE: &str = "atomic.pipeline";
 /// version, so any build of atomic with the same layout continues the same
 /// runs, and one with another layout leaves them alone. Change it exactly
 /// when a run started under the old layout would replay differently under
-/// the new one: a step added, removed, renamed or moved, or a checkpoint's
-/// or the [`PipelineRun`]'s shape changed. The pipeline tests hold the
+/// the new one: a step added, removed, renamed or moved, a checkpoint's or
+/// the [`PipelineRun`]'s shape changed, or the conversion of recorded values
+/// to CEL changed, so that a mapping over them could give another answer.
+/// The pipeline tests hold the
 /// golden layout of each version, under `tests/layout/`: the steps two runs
 /// record, through an approved and a rejected gate, with the shape of each
 /// checkpoint, and the run's own shape. They fail when the layout no longer
@@ -803,6 +805,9 @@ async fn run_pipeline<C: WorkflowContext>(
         } else {
             None
         };
+        // replay: no workspace. A replayed step runs no command, so whatever
+        // the attempt step comes to prepare for one (an exec workspace, say)
+        // stays unprepared when `replay` is set.
         let guard = if atom.kind == "exec" {
             let begun = attempt::begin(&ctx, &format!("{}.attempt", step.id)).await?;
             Some((begun, atom.external().is_some()))
@@ -812,7 +817,7 @@ async fn run_pipeline<C: WorkflowContext>(
         let origins = step.origins.clone();
         let pinned_helpers = pinned.helper_runtime.clone();
         let (id, ran) = (step.id.clone(), format!("pipeline:ran:{}", step.id));
-        let replay = replay.clone();
+        let serving = replay.clone();
         let published = run_atom_at(
             &ctx,
             &step.id,
@@ -827,7 +832,7 @@ async fn run_pipeline<C: WorkflowContext>(
                 // In a replay, the step's recorded result, with no model call
                 // and no command run; a step with none fails rather than run
                 // live.
-                let served = replay.as_ref().map(|r| r.serve(&id, &input_sha256));
+                let served = serving.as_ref().map(|r| r.serve(&id, &input_sha256));
                 let input_sha256 = input_sha256.clone();
                 // An exec atom calls no model and has no caps to meter.
                 if let Some(atom_caps) = &atom_caps {
@@ -908,9 +913,16 @@ async fn run_pipeline<C: WorkflowContext>(
             accepted.push(commit.to_owned());
         }
         failpoint(&format!("pipeline:after:{}", step.id));
+        // A replay keeps the recorded metadata in `steps`, thread and all, so
+        // a later step that maps it is given what it was recorded with; only
+        // what is published here leaves the thread out.
+        let metadata = replay
+            .as_ref()
+            .and_then(|r| r.recorded.get(&step.id))
+            .map_or(published.metadata, |r| r.proposal.metadata.clone());
         steps.insert(
             step.id.clone(),
-            json!({"output": published.output, "metadata": published.metadata}),
+            json!({"output": published.output, "metadata": metadata}),
         );
         let output = match pipeline
             .atoms

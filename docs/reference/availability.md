@@ -84,7 +84,9 @@ command run, while gates open again, titled as a replay's, and wait. A replay
 never runs an atom live: a step with no published result, or whose input differs
 from the one it was recorded with, fails it, and a run recorded under another
 layout, or whose results make writes, is refused. The served results do not take
-over the recorded run's model threads. The `atomic runs replay` command that
+over the recorded run's model threads. A step that maps a gate's `decision` cannot
+be replayed past that gate: the new decision's time, decider and comment differ
+from the recorded one's, so the step's input does too. The `atomic runs replay` command that
 starts one is not built yet. Compact schemas, variants, the `--plan` cost preview, declared effect caps
 and the staged `--effects preview` mode are planned for v0.5. The `file` tag
 follows with code context in v0.7. The committed `atomic.policy.lock`, and

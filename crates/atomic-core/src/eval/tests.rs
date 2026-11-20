@@ -536,6 +536,25 @@ fn a_case_file_is_strict_json_or_yaml_and_errors_point_at_the_field() {
         "{error}"
     );
     assert_eq!(error.line, Some(1));
+    // Numbers load as written, as a YAML case's do.
+    let numbers = "{\"input\": {\"text\": \"a\", \"x\": [12.5, 1e3, 123456789012345678901234567890]}, \
+                   \"expect\": [\"true\"]}";
+    let (jsonl, yaml) = (
+        strict_json(numbers).expect("a JSON line"),
+        atomic_schema::yaml::load(Path::new("case.yaml"), numbers)
+            .expect("a YAML document")
+            .value,
+    );
+    // Each is the same number either way: 1e3 keeps its JSON spelling, and
+    // YAML's core schema reads it as the float 1000.0.
+    let (j, y) = (&jsonl["input"]["x"], &yaml["input"]["x"]);
+    for n in 0..3 {
+        assert!(j[n].is_number() && y[n].is_number(), "{jsonl} {yaml}");
+        assert_eq!(j[n].as_f64(), y[n].as_f64(), "{jsonl} {yaml}");
+    }
+    assert_eq!(j[0], json!(12.5));
+    assert_eq!(j[2].to_string(), "123456789012345678901234567890");
+    assert_eq!(j[2], y[2]);
     // A JSONL line that is not JSON is refused, even if YAML would read it.
     write(&root.join("loose/cases.jsonl"), "input: {text: a}\n");
     assert!(load_cases(&atom, &at(&root, "loose", 1.0)).is_err());
@@ -621,8 +640,8 @@ fn the_eval_directory_stays_inside_the_project() {
     assert!(error.message.contains("'other' does not exist"), "{error}");
 }
 
-#[test]
-fn a_case_fits_the_atoms_case_schema_and_an_outside_writer_has_none() {
+#[tokio::test]
+async fn a_case_fits_the_atoms_case_schema_and_an_outside_writer_has_none() {
     let (root, atom) = atom_with(SCORED);
     write(
         &root.join("meta/case.yaml"),
@@ -644,6 +663,18 @@ fn a_case_fits_the_atoms_case_schema_and_an_outside_writer_has_none() {
             .expect("none")
             .is_empty()
     );
+    // Nor does the atom run, however its cases were come by.
+    let model = FakeModel::start(Vec::new()).await.expect("fake model");
+    let rt = runtimes(&model, &root.join("rt"));
+    let subject = AtomSubject {
+        atom: &atom,
+        runtimes: &rt,
+    };
+    let error = subject
+        .run(&case("a", "true"))
+        .await
+        .expect_err("never run");
+    assert!(error.contains("never runs such an atom"), "{error}");
     // A scorer's tolerance is a share.
     for bad in ["2", "-0.1"] {
         let config = SCORED.replace("max_drop:0.25", &format!("max_drop:{bad}"));

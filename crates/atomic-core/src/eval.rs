@@ -360,65 +360,62 @@ fn case_from(value: &Value, id: String, contracts: &Contracts) -> Result<Case, R
 }
 
 /// Parse one JSONL line as JSON, refusing an object that repeats a key: a
-/// plain parse would keep the last one and hide the first.
+/// plain parse would keep the last one and hide the first. The value comes
+/// from serde_json's own parse, which keeps every number as written; a
+/// second pass over the same text only looks for repeated keys.
 fn strict_json(line: &str) -> Result<Value, String> {
     use serde::de::{Deserializer, MapAccess, SeqAccess, Visitor};
-    struct Strict;
-    impl<'de> serde::de::DeserializeSeed<'de> for Strict {
-        type Value = Value;
-        fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<Value, D::Error> {
-            d.deserialize_any(Strict)
+    /// Visits a document and keeps nothing, failing on a repeated key.
+    struct Unique;
+    impl<'de> serde::de::DeserializeSeed<'de> for Unique {
+        type Value = ();
+        fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+            d.deserialize_any(Unique)
         }
     }
-    impl<'de> Visitor<'de> for Strict {
-        type Value = Value;
+    impl<'de> Visitor<'de> for Unique {
+        type Value = ();
         fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
             f.write_str("a JSON value")
         }
-        fn visit_bool<E>(self, v: bool) -> Result<Value, E> {
-            Ok(Value::Bool(v))
+        fn visit_bool<E>(self, _: bool) -> Result<(), E> {
+            Ok(())
         }
-        fn visit_i64<E>(self, v: i64) -> Result<Value, E> {
-            Ok(v.into())
+        fn visit_i64<E>(self, _: i64) -> Result<(), E> {
+            Ok(())
         }
-        fn visit_u64<E>(self, v: u64) -> Result<Value, E> {
-            Ok(v.into())
+        fn visit_u64<E>(self, _: u64) -> Result<(), E> {
+            Ok(())
         }
-        fn visit_f64<E>(self, v: f64) -> Result<Value, E> {
-            Ok(serde_json::Number::from_f64(v).map_or(Value::Null, Value::Number))
+        fn visit_f64<E>(self, _: f64) -> Result<(), E> {
+            Ok(())
         }
-        fn visit_str<E>(self, v: &str) -> Result<Value, E> {
-            Ok(Value::String(v.to_owned()))
+        fn visit_str<E>(self, _: &str) -> Result<(), E> {
+            Ok(())
         }
-        fn visit_string<E>(self, v: String) -> Result<Value, E> {
-            Ok(Value::String(v))
+        fn visit_unit<E>(self) -> Result<(), E> {
+            Ok(())
         }
-        fn visit_unit<E>(self) -> Result<Value, E> {
-            Ok(Value::Null)
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+            while seq.next_element_seed(Unique)?.is_some() {}
+            Ok(())
         }
-        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
-            let mut items = Vec::new();
-            while let Some(item) = seq.next_element_seed(Strict)? {
-                items.push(item);
-            }
-            Ok(Value::Array(items))
-        }
-        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
-            let mut fields = serde_json::Map::new();
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+            // A number may arrive as a one-entry map of serde_json's own
+            // (with its arbitrary precision on); it has no repeated key.
+            let mut seen = std::collections::BTreeSet::new();
             while let Some(key) = map.next_key::<String>()? {
-                if fields.contains_key(&key) {
+                if !seen.insert(key.clone()) {
                     return Err(serde::de::Error::custom(format!("duplicate key {key:?}")));
                 }
-                let value = map.next_value_seed(Strict)?;
-                fields.insert(key, value);
+                map.next_value_seed(Unique)?;
             }
-            Ok(Value::Object(fields))
+            Ok(())
         }
     }
+    let value: Value = serde_json::from_str(line).map_err(|e| e.to_string())?;
     let mut d = serde_json::Deserializer::from_str(line);
-    let value =
-        serde::de::DeserializeSeed::deserialize(Strict, &mut d).map_err(|e| e.to_string())?;
-    d.end().map_err(|e| e.to_string())?;
+    serde::de::DeserializeSeed::deserialize(Unique, &mut d).map_err(|e| e.to_string())?;
     Ok(value)
 }
 
@@ -943,8 +940,9 @@ fn escape(text: &str) -> String {
 }
 
 /// The atom itself as a [`Subject`]: each case's input run on `runtimes`,
-/// as team-curated input, its output checked against the atom's contract
-/// and its `validate` rules as any run's is.
+/// as external input, its output checked against the atom's contract and
+/// its `validate` rules as any run's is. An atom that writes to an outside
+/// system is never run, whatever loaded its cases.
 pub struct AtomSubject<'a> {
     /// The atom.
     pub atom: &'a Atom,
@@ -955,6 +953,13 @@ pub struct AtomSubject<'a> {
 impl Subject for AtomSubject<'_> {
     fn run<'a>(&'a self, case: &'a Case) -> BoxFuture<'a, Result<Value, String>> {
         Box::pin(async move {
+            if self.atom.external() == Some(crate::atom::External::Idempotent) {
+                return Err(format!(
+                    "`{}` writes to an outside system, and atomic never runs such an atom in an \
+                     eval",
+                    self.atom.name
+                ));
+            }
             if case.prepared.is_some() {
                 return Err(
                     "a case's `prepared` values are not supported by this runner yet".into(),
