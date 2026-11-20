@@ -2452,6 +2452,55 @@ fn a_leftover_holding_a_commands_output_does_not_hold_its_step_under_the_runner(
 }
 
 #[test]
+fn a_run_that_gets_further_each_time_is_not_dead_lettered() {
+    let dir = scratch("progress");
+    let project = project(&dir);
+    // More steps than one process may recover a run at the same step, each
+    // of whose runners dies once under it.
+    let n = atomic_app::pipeline::RECOVERY_LIMIT as usize + 2;
+    let mut workflow = String::from(
+        "atomic: 1\nname: bumpy\n\
+         input: { $ref: ../atoms/bump-0.input.schema.json }\n\
+         output: { $ref: ../atoms/bump-0.output.schema.json }\nsteps:\n",
+    );
+    for i in 0..n {
+        write_runner_killer(
+            &project,
+            &dir,
+            &format!("bump-{i}"),
+            ", effects: { external: 'idempotent' }",
+            false,
+        );
+        let text = if i == 0 {
+            "input.text".to_owned()
+        } else {
+            format!("steps.s{}.output.title", i - 1)
+        };
+        let after = if i == 0 {
+            String::new()
+        } else {
+            format!("    after: [s{}]\n", i - 1)
+        };
+        workflow.push_str(&format!(
+            "  s{i}:\n{after}    atom: bump-{i}\n    with: {{ text: {text} }}\n"
+        ));
+    }
+    workflow.push_str(&format!("returns: steps.s{}.output\n", n - 1));
+    std::fs::write(project.join("workflows/bumpy.workflow.yaml"), workflow).expect("workflow");
+    let out = atomic(
+        &dir,
+        &project,
+        &["run", "bumpy", "--runner", "process", "--data", NOTE],
+        &[],
+        "",
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    for i in 0..n {
+        assert_eq!(lines(&dir.join(format!("bump-{i}.log"))), 2, "step {i}");
+    }
+}
+
+#[test]
 fn the_runner_role_keeps_its_exit_code_contract() {
     let dir = scratch("runner-codes");
     // A request it cannot read is a usage error, and nothing is written.

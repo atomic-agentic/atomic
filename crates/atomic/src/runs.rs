@@ -136,7 +136,7 @@ async fn finish(
     let _ = engine.rt.shutdown(SHUTDOWN).await;
     match outcome {
         Ok(output) => print_result(run_id, &output, json),
-        Err(DurableError::Failed(why)) if why.contains(atomic_app::pipeline::DEAD_LETTERED) => {
+        Err(DurableError::Failed(why)) if atomic_app::pipeline::dead_lettered(run_id) => {
             Err(Failure::new(
                 "run.dead_lettered",
                 format!("run {run_id} failed: {why}"),

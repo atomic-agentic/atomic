@@ -219,8 +219,8 @@ its group, such as one started with `setsid`, cannot hold the step open,
 though atomic cannot stop it. A runner
 ignores the stop signals a command in its group might send it.
 
-One process recovers a run at most five times before it fails it as
-dead-lettered, so a step whose process keeps dying stops soon; restarting
+One process recovers a run at most five times at the same step before it fails
+it as dead-lettered (a run that gets further counts afresh), so a step whose process keeps dying stops soon; restarting
 `atomic serve` does not count against a run. A run the engine parks after many
 restarts (`MAX_RECOVERY_ATTEMPTS_EXCEEDED`) is named by `atomic serve` and goes
 on with `atomic runs resume`.

@@ -90,17 +90,61 @@ pub const PIPELINE: &str = "atomic.pipeline";
 /// matches this version's, whose file is never rewritten.
 pub const LAYOUT_VERSION: &str = "atomic.pipeline.1";
 
-/// How many times one process recovers one run of `run_pipeline` before it
-/// fails the run as dead-lettered: enough for a crash or two, few enough
-/// that a step whose process keeps dying, such as an idempotent command
-/// whose runner always dies, stops soon. Each process counts afresh, so
-/// restarting `atomic serve` never counts against a healthy run; the
-/// engine's own cap, which counts every recovery claim, stays at its
-/// default.
+/// How many times one process recovers one run of `run_pipeline` at the
+/// same step before it fails the run as dead-lettered: enough for a crash
+/// or two, few enough that a step whose process keeps dying, such as an
+/// idempotent command whose runner always dies, stops soon. A run that gets
+/// further counts afresh, and so does each process, so restarting
+/// `atomic serve` never counts against a healthy run; the engine's own cap,
+/// which counts every recovery claim, stays at its default.
 pub const RECOVERY_LIMIT: u32 = 5;
 
-/// How many times this process has started each run, by id.
-static EXECUTIONS: std::sync::Mutex<BTreeMap<String, u32>> = std::sync::Mutex::new(BTreeMap::new());
+/// For each run this process has executed: the furthest position it has
+/// reached (the pin is 0, each step one more), and how many of this
+/// process's executions of the run have reached it.
+static PROGRESS: std::sync::Mutex<BTreeMap<String, (usize, u32)>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+/// The runs this process has dead-lettered.
+static DEAD: std::sync::Mutex<std::collections::BTreeSet<String>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Whether this process failed run `id` as dead-lettered.
+pub fn dead_lettered(id: &str) -> bool {
+    DEAD.lock().unwrap_or_else(|e| e.into_inner()).contains(id)
+}
+
+/// Count an execution of run `id` reaching `position`, and fail the run
+/// as dead-lettered once more executions than [`RECOVERY_LIMIT`] allows
+/// have reached it without getting further. Each execution reaches each
+/// position once; one replaying positions short of the furthest counts
+/// nothing.
+fn reached(id: &str, position: usize) -> Result<()> {
+    let entries = {
+        let mut progress = PROGRESS.lock().unwrap_or_else(|e| e.into_inner());
+        let (top, entries) = progress.entry(id.to_owned()).or_insert((position, 0));
+        if position > *top {
+            *top = position;
+            *entries = 0;
+        }
+        if position == *top {
+            *entries += 1;
+        }
+        *entries
+    };
+    if entries > 1 + RECOVERY_LIMIT {
+        DEAD.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.to_owned());
+        let why = format!(
+            "{DEAD_LETTERED} run {id} stopped {RECOVERY_LIMIT} times in this process at the same \
+             step without finishing it, so it is not run again"
+        );
+        eprintln!("{why}");
+        return Err(failed(why));
+    }
+    Ok(())
+}
 
 /// Set once this process is stopping: no run starts another step.
 static STOPPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -112,11 +156,29 @@ pub fn stop_starting_steps() {
     STOPPING.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
-/// Wait for good if this process is stopping.
-async fn unless_stopping() {
-    if STOPPING.load(std::sync::atomic::Ordering::SeqCst) {
-        std::future::pending::<()>().await;
+/// Before a run's next piece of work: go on counted as working, or wait for
+/// good if this process is stopping.
+async fn keep_working(working: &mut Option<Running>) {
+    match working {
+        None => *working = Some(begin_work().await),
+        Some(_) if STOPPING.load(std::sync::atomic::Ordering::SeqCst) => {
+            *working = None;
+            std::future::pending::<()>().await;
+        }
+        Some(_) => {}
     }
+}
+
+/// Count this run as working in [`steps_running`], then wait for good if
+/// this process is stopping. Counted first, so a stop that finds nothing
+/// running has seen every run that could still begin work.
+async fn begin_work() -> Running {
+    let running = Running::start();
+    if STOPPING.load(std::sync::atomic::Ordering::SeqCst) {
+        drop(running);
+        return std::future::pending::<Running>().await;
+    }
+    running
 }
 
 /// How many atom steps this process is running now.
@@ -144,7 +206,8 @@ impl Drop for Running {
     }
 }
 
-/// The marker a dead-lettered run's error starts with.
+/// The marker a dead-lettered run's error starts with, for readers in
+/// other processes; this one asks [`dead_lettered`].
 pub const DEAD_LETTERED: &str = "dead-lettered:";
 
 /// One atom step, as the interpreter runs it.
@@ -493,21 +556,10 @@ async fn run_pipeline<C: WorkflowContext>(
 ) -> Result<Value> {
     let PipelineRun { pipeline, input } = run;
     let id = ctx.workflow_id().to_owned();
-    let executions = {
-        let mut started = EXECUTIONS.lock().unwrap_or_else(|e| e.into_inner());
-        let n = started.entry(id.clone()).or_default();
-        *n += 1;
-        *n
-    };
-    if executions > 1 + RECOVERY_LIMIT {
-        let why = format!(
-            "{DEAD_LETTERED} run {id} stopped {RECOVERY_LIMIT} times in this process without \
-             finishing, so it is not run again"
-        );
-        eprintln!("{why}");
-        return Err(failed(why));
-    }
-    unless_stopping().await;
+    // Working from here to its end, but for waits at gates: a stopping
+    // process gives it its grace, and begins none of its steps.
+    let mut working = Some(begin_work().await);
+    reached(&id, 0)?;
     let store = services.store.clone();
     fits("the workflow's input", &pipeline.input, &input)?;
     let (budget, caps) = budgets(
@@ -550,14 +602,17 @@ async fn run_pipeline<C: WorkflowContext>(
     let mut steps = Map::new();
     let mut used_worktrees = false;
     let mut accepted = Vec::new();
-    for step in &pipeline.steps {
+    for (position, step) in pipeline.steps.iter().enumerate() {
         // Before its attempt is recorded: a stopping process begins nothing.
-        unless_stopping().await;
+        keep_working(&mut working).await;
+        reached(&id, position + 1)?;
         let scope = json!(steps);
         let values = [("input", &input), ("steps", &scope)];
         let step = match step {
             Step::Atom(step) => step,
             Step::Gate(g) => {
+                // Waiting for a person is not work a stop waits for.
+                working = None;
                 let decision =
                     run_gate(&ctx, &pipeline.name, g, &values, &services.deployment).await?;
                 failpoint(&format!("pipeline:after:{}", g.id));
@@ -565,7 +620,6 @@ async fn run_pipeline<C: WorkflowContext>(
                 continue;
             }
         };
-        let _running = Running::start();
         let mut mapped = Map::new();
         for (field, source) in &step.with {
             let value = atomic_schema::expr::evaluate(source, &values)
@@ -740,6 +794,7 @@ async fn run_pipeline<C: WorkflowContext>(
             json!({"output": published.output, "metadata": published.metadata}),
         );
     }
+    keep_working(&mut working).await;
     let scope = json!(steps);
     let result =
         atomic_schema::expr::evaluate(&pipeline.returns, &[("input", &input), ("steps", &scope)])
@@ -759,6 +814,7 @@ async fn run_pipeline<C: WorkflowContext>(
             })
             .await?;
     }
+    drop(working);
     Ok(result)
 }
 
