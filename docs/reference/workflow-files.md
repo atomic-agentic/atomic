@@ -58,13 +58,19 @@ outside the sandbox, and records the commit in `steps.<id>.metadata.commit`,
 beside `base` and `commit_ref`. The worktrees are removed when the run finishes;
 accepted commits keep their refs.
 
-A worktree step's commands share the project's build caches with its other
-worktree steps, and may write them: `XDG_CACHE_HOME`, `CARGO_HOME`,
-`CARGO_TARGET_DIR`, npm's, pip's and Go's caches (`GOCACHE`, `GOMODCACHE`) and
-`ATOMIC_CACHE_DIR` all point there. `RUSTUP_HOME` points at the toolchains
-installed for you, which the commands may only read. Their `HOME` is the
-attempt's own, empty, directory, which they may write. A variable the atom
-declares in `env` wins over these.
+Nothing an atom writes outlives its run. A worktree step's commands get
+build caches of the run's own, which they may write and which are removed
+when the run finishes: `XDG_CACHE_HOME`, npm's, pip's and Go's caches
+(`GOCACHE`, `GOMODCACHE`) and `ATOMIC_CACHE_DIR` all point into one private
+directory in the state directory, shared by the run's worktree steps.
+`CARGO_TARGET_DIR` is each worktree's own, so no worktree runs what another
+built. Their `HOME` is the attempt's own, empty, directory, which they may
+write, and `CARGO_HOME` is `.cargo` inside it, never shared and never yours.
+`RUSTUP_HOME` points at the toolchains installed for you (your `RUSTUP_HOME`,
+or `~/.rustup`), which the commands may only read: a step does not start if
+it is inside, or holds, a directory the turn may write. A read-only step finds
+the same variables and writes nothing. A variable the atom declares in `env`
+wins over these. Each run therefore builds from cold.
 
 ### Where each input came from
 

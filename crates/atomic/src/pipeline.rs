@@ -789,6 +789,9 @@ async fn run_pipeline<C: WorkflowContext>(
     }});
     let decision_schema = json!({"type": "object", "properties": {"at": {"type": "integer"}}});
     let mut used_worktrees = false;
+    // The run's build caches, made once for all its worktree steps, with
+    // the person's rustup toolchains found once.
+    let mut run_caches: Option<atomic_core::worktree::Caches> = None;
     let mut accepted = Vec::new();
     for (position, step) in pipeline.steps.iter().enumerate() {
         // Before its attempt is recorded: a stopping process begins nothing.
@@ -930,8 +933,19 @@ async fn run_pipeline<C: WorkflowContext>(
                 .and_then(Value::as_str)
                 .ok_or_else(|| failed(format!("step `{}`: `base` is not a commit", step.id)))?;
             used_worktrees = true;
+            let caches = match &run_caches {
+                Some(caches) => caches.clone(),
+                None => {
+                    let rustup = atomic_core::worktree::rustup_home(&|n| std::env::var(n).ok());
+                    let caches = worktrees
+                        .caches(&run_id, rustup)
+                        .map_err(|e| failed(format!("the run's build caches: {e}")))?;
+                    run_caches.insert(caches).clone()
+                }
+            };
             Some((
                 worktrees,
+                caches,
                 StepRequest {
                     run: run_id.clone(),
                     step: step.id.clone(),
@@ -1086,7 +1100,7 @@ async fn run_pipeline<C: WorkflowContext>(
                         })
                             .await
                     }
-                    (Some((worktrees, request)), None) => {
+                    (Some((worktrees, caches, request)), None) => {
                         let runtimes = Arc::new(runtimes);
                         let call = StepCall {
                             atom,
@@ -1095,7 +1109,7 @@ async fn run_pipeline<C: WorkflowContext>(
                             snapshot,
                             run_id,
                         };
-                        in_worktree(worktrees, request, call, runtimes, &place).await
+                        in_worktree(worktrees, caches, request, call, runtimes, &place).await
                     }
                 }?;
                 let mut proposal = proposal;
@@ -1158,16 +1172,22 @@ async fn run_pipeline<C: WorkflowContext>(
     .map_err(|e| failed(format!("`returns`: {e}")))?;
     fits("the workflow's result", &pipeline.output, &result)?;
     if used_worktrees && let Some(worktrees) = services.worktrees.clone() {
-        // The run's worktrees go; its accepted commits keep their refs. A
-        // repeat finds less to remove and removes it.
+        // The run's worktrees and build caches go; its accepted commits keep
+        // their refs. A repeat finds less to remove and removes it.
         let run_id = ctx.workflow_id().to_owned();
+        let caches = worktrees.caches(&run_id, None);
         let _removed: usize = ctx
             .step("cleanup", move |_| async move {
-                tokio::task::spawn_blocking(move || worktrees.cleanup(&run_id, &accepted))
-                    .await
-                    .map_err(|e| failed(format!("clean up the worktrees: {e}")))?
-                    .map(|c| c.refs.len() + c.worktrees.len())
-                    .map_err(|e| failed(format!("clean up the worktrees: {e}")))
+                tokio::task::spawn_blocking(move || {
+                    if let Ok(caches) = &caches {
+                        caches.remove()?;
+                    }
+                    worktrees.cleanup(&run_id, &accepted)
+                })
+                .await
+                .map_err(|e| failed(format!("clean up the worktrees: {e}")))?
+                .map(|c| c.refs.len() + c.worktrees.len())
+                .map_err(|e| failed(format!("clean up the worktrees: {e}")))
             })
             .await?;
     }
@@ -1254,6 +1274,7 @@ struct StepCall {
 /// over anything the atom reported.
 async fn in_worktree(
     worktrees: Arc<Worktrees>,
+    caches: atomic_core::worktree::Caches,
     request: StepRequest,
     call: StepCall,
     runtimes: Arc<Runtimes>,
@@ -1269,8 +1290,8 @@ async fn in_worktree(
     let step = request.step.clone();
     let finished = contained(async move {
         let subdirectory = source_subdirectory(runtimes.codex.cwd.clone()).await?;
-        // The build caches the project's worktree steps share.
-        let caches = worktrees.caches();
+        // The run's build caches, with a Cargo target directory of this
+        // worktree's own.
         caches
             .create()
             .map_err(|e| AtomError::Runtime(format!("the build caches: {e}")))?;
@@ -1278,7 +1299,7 @@ async fn in_worktree(
             .run_step(request, |tree| async move {
                 let mut here = (*runtimes).clone();
                 here.codex.cwd = tree.join(subdirectory);
-                here.codex.caches = Some(caches);
+                here.codex.caches = Some(caches.in_worktree(&tree));
                 run_in(
                     &atom,
                     &input,

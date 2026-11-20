@@ -89,9 +89,14 @@ login shell; their `HOME` (and `ZDOTDIR`) is a private scratch directory of the
 attempt's own, and their `TMPDIR` is one private directory every turn of the
 project shares (Codex's sandbox keeps a registry there that turns sharing a
 writable root must share), so no shell startup file runs. Tools found through `HOME` are
-therefore not found: rustup, cargo, pyenv, nvm, Maven's `~/.m2` and the like.
-A codex or exec atom names them in its `env`, as in
-`env: { RUSTUP_HOME: '/home/me/.rustup', CARGO_HOME: '/home/me/.cargo' }`. An
+therefore not found: cargo's registry and tools, pyenv, nvm, Maven's `~/.m2`
+and the like. A worktree step's turn is pointed at its run's own build caches,
+removed when the run finishes, with a Cargo target directory for each
+worktree and `CARGO_HOME` in the attempt's own home, and at your rustup
+toolchains, read-only (see
+[worktree steps](workflow-files.md#atom-steps)). Otherwise a codex or exec
+atom names what it needs in its `env`, as in `env: { RUSTUP_HOME:
+'/home/me/.rustup' }`. An
 exec atom's command gets its own scratch directory as `HOME` and `TMPDIR`.
 Scratch directories live in the project's state directory, where no sandboxed
 turn may write; atomic refuses to run when that would be under `/tmp`,

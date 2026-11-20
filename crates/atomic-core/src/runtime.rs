@@ -219,17 +219,13 @@ impl Backend<'_> {
             Self::Lite(_) => None,
         };
         let (mut env, mut writable_roots) = (std::collections::BTreeMap::new(), Vec::new());
-        // A worktree step's build tools find the shared caches, and its
+        // A worktree step's build tools find its run's caches, and its
         // rustup proxies the person's toolchains; what the atom declares
         // wins.
         if let Self::Codex(rt) = self
             && let Some(caches) = &rt.caches
         {
             env.extend(caches.env());
-            if let Some(toolchains) = crate::worktree::rustup_home(&|name| std::env::var(name).ok())
-            {
-                env.insert("RUSTUP_HOME".into(), toolchains.display().to_string());
-            }
             if request.sandbox == crate::typed::Sandbox::WorkspaceWrite {
                 writable_roots.push(caches.dir().to_owned());
             }
@@ -634,10 +630,38 @@ fn turn_in(workspace: &Workspace, spec: &mut TurnSpec) -> Result<PathBuf, AtomEr
     };
     private("HOME", &workspace.scratch, spec);
     private("ZDOTDIR", &workspace.scratch, spec);
+    // Cargo's home is the attempt's own, never shared and never the
+    // person's, unless the atom declares one.
+    if let Some(scratch) = &workspace.scratch {
+        spec.env
+            .entry("CARGO_HOME".into())
+            .or_insert_with(|| scratch.join(".cargo").display().to_string());
+    }
     // Shared by every turn on the backend: Codex's sandbox keeps its
     // registry of protected mount points in TMPDIR, and turns that share a
     // writable root must share that registry.
     private("TMPDIR", &workspace.tmp, spec);
+    // The toolchains rustup runs are only ever read: never inside, or
+    // holding, anything the turn may write.
+    if let Some(rustup) = spec.env.get("RUSTUP_HOME").map(PathBuf::from) {
+        let real = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
+        let rustup = real(&rustup);
+        let mut writable: Vec<PathBuf> = spec.writable_roots.iter().map(|r| real(r)).collect();
+        if workspace.sandbox == crate::typed::Sandbox::WorkspaceWrite {
+            writable.push(real(&cwd));
+        }
+        if let Some(root) = writable
+            .iter()
+            .find(|r| rustup.starts_with(r) || r.starts_with(&rustup))
+        {
+            return Err(AtomError::Runtime(format!(
+                "RUSTUP_HOME {} overlaps {}, which the turn may write; the toolchains its \
+                 commands run must be read-only to them",
+                rustup.display(),
+                root.display()
+            )));
+        }
+    }
     Ok(cwd)
 }
 

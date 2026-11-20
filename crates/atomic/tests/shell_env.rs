@@ -27,7 +27,7 @@ mod support;
 
 use atomic_core::testing::{FakeModel, Reply, on_codex_runtime};
 use serde_json::json;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 /// Variables that carry credentials, each set to a value holding `canary`.
@@ -52,17 +52,36 @@ fn write_project(project: &Path) {
     std::fs::create_dir_all(project.join("atoms")).unwrap();
     std::fs::write(project.join("atomic.yaml"), "atomic: 1\nname: env-check\n").unwrap();
     write_codex_atom(project, "look", "read-only");
+    write_codex_atom(project, "peek", "read-only");
     write_codex_atom(project, "tidy", "workspace-write");
-    // `tidy` may write, so it runs as a worktree step at a base commit.
+    // `tidy` may write, so it runs as a worktree step at a base commit;
+    // `peek` runs as one too, and may not write; `tidy-twice` runs `tidy`
+    // in two worktrees, the second on the first's commit.
     std::fs::create_dir_all(project.join("workflows")).unwrap();
+    for (name, atom) in [("tidy-up", "tidy"), ("peek-in", "peek")] {
+        std::fs::write(
+            project.join(format!("workflows/{name}.workflow.yaml")),
+            format!(
+                "atomic: 1\nname: {name}\n\
+                 input: {{ $ref: ../atoms/{atom}.input.schema.json }}\n\
+                 output: {{ $ref: ../atoms/{atom}.output.schema.json }}\n\
+                 steps:\n  step:\n    atom: {atom}\n    with: {{ base: input.base, text: input.text }}\n    \
+                 worktree: true\n\
+                 returns: steps.step.output\n"
+            ),
+        )
+        .unwrap();
+    }
     std::fs::write(
-        project.join("workflows/tidy-up.workflow.yaml"),
-        "atomic: 1\nname: tidy-up\n\
+        project.join("workflows/tidy-twice.workflow.yaml"),
+        "atomic: 1\nname: tidy-twice\n\
          input: { $ref: ../atoms/tidy.input.schema.json }\n\
          output: { $ref: ../atoms/tidy.output.schema.json }\n\
-         steps:\n  tidy:\n    atom: tidy\n    with: { base: input.base, text: input.text }\n    \
+         steps:\n  first:\n    atom: tidy\n    with: { base: input.base, text: input.text }\n    \
          worktree: true\n\
-         returns: steps.tidy.output\n",
+         \x20 second:\n    after: [first]\n    atom: tidy\n    \
+         with: { base: steps.first.metadata.commit, text: input.text }\n    worktree: true\n\
+         returns: steps.second.output\n",
     )
     .unwrap();
 }
@@ -80,7 +99,7 @@ fn write_codex_atom(project: &Path, name: &str, sandbox: &str) {
         ),
     )
     .unwrap();
-    let input = if name == "tidy" {
+    let input = if name != "look" {
         json!({"type": "object", "additionalProperties": false, "required": ["base", "text"],
                "properties": {"base": {"type": "string", "format": "git-commit"},
                               "text": {"type": "string"}}})
@@ -104,20 +123,37 @@ fn write_codex_atom(project: &Path, name: &str, sandbox: &str) {
     }
 }
 
-/// Run atom `atom` of `project` through `atomic run` as a person with home
-/// `home` would, on `model`, and return what its one command printed.
-async fn run_once(home: &Path, project: &Path, target: &str, data: &str, command: &str) -> String {
-    let model = FakeModel::start(vec![
-        Reply::Tool {
-            name: "exec_command".into(),
-            arguments: json!({"cmd": command, "yield_time_ms": 20000}),
-        },
-        Reply::Text(r#"{"done": true}"#.into()),
-    ])
-    .await
-    .unwrap();
-    let atomic_home = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("atomic-shell-env-{}-{target}", std::process::id()));
+/// Where [`run_steps`] keeps the atomic home for `target`.
+fn atomic_home_for(target: &str) -> PathBuf {
+    Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("atomic-shell-env-{}-{target}", std::process::id()))
+}
+
+/// Run `target` of `project` through `atomic run` as a person with home
+/// `home` and the variables `env` would, on a model whose turns each run
+/// one of `commands`, and return what each printed.
+async fn run_steps(
+    home: &Path,
+    project: &Path,
+    target: &str,
+    data: &str,
+    commands: &[String],
+    env: &[(&str, &str)],
+) -> Vec<String> {
+    let replies = commands
+        .iter()
+        .flat_map(|command| {
+            [
+                Reply::Tool {
+                    name: "exec_command".into(),
+                    arguments: json!({"cmd": command, "yield_time_ms": 20000}),
+                },
+                Reply::Text(r#"{"done": true}"#.into()),
+            ]
+        })
+        .collect();
+    let model = FakeModel::start(replies).await.unwrap();
+    let atomic_home = atomic_home_for(target);
     let _ = std::fs::remove_dir_all(&atomic_home);
     let mut run = Command::new(env!("CARGO_BIN_EXE_atomic"));
     run.args(["run", target, "--data", data])
@@ -135,8 +171,12 @@ async fn run_once(home: &Path, project: &Path, target: &str, data: &str, command
         "ATOMIC_DATABASE_URL",
         "ATOMIC_EXECUTOR_ID",
         "ATOMIC_MODEL_API_KEY_ENV",
+        "RUSTUP_HOME",
     ] {
         run.env_remove(name);
+    }
+    for (name, value) in env {
+        run.env(name, value);
     }
     let out = tokio::task::spawn_blocking(move || run.output().unwrap())
         .await
@@ -147,14 +187,59 @@ async fn run_once(home: &Path, project: &Path, target: &str, data: &str, command
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    model.requests()[1]["input"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|item| item["type"] == "function_call_output")
-        .map(|item| item["output"].as_str().unwrap_or_default().to_owned())
-        .collect::<Vec<_>>()
-        .join("\n")
+    let requests = model.requests();
+    (0..commands.len())
+        .map(|i| {
+            requests[2 * i + 1]["input"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|item| item["type"] == "function_call_output")
+                .map(|item| item["output"].as_str().unwrap_or_default().to_owned())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .collect()
+}
+
+/// [`run_steps`] for a workflow of one step.
+async fn run_once(
+    home: &Path,
+    project: &Path,
+    target: &str,
+    data: &str,
+    command: &str,
+    env: &[(&str, &str)],
+) -> String {
+    run_steps(home, project, target, data, &[command.to_owned()], env)
+        .await
+        .remove(0)
+}
+
+/// The value of `name=` that a command printed on a line of its own.
+fn printed_value(output: &str, name: &str) -> String {
+    output
+        .lines()
+        .find_map(|l| l.strip_prefix(&format!("{name}=")))
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// The directory of the one run's build caches, under `target`'s atomic
+/// home, from a path inside it that a command printed.
+fn run_caches(target: &str, inside: &str) -> PathBuf {
+    let path = Path::new(inside);
+    let at = path
+        .ancestors()
+        .find(|a| {
+            a.parent()
+                .and_then(Path::file_name)
+                .is_some_and(|n| n == "cache")
+        })
+        .unwrap_or_else(|| panic!("{inside} is in no run's caches"))
+        .to_owned();
+    assert!(at.starts_with(atomic_home_for(target)), "{inside}");
+    at
 }
 
 #[test]
@@ -167,6 +252,7 @@ fn a_turn_writes_a_home_of_its_own_and_still_reads_nothing_of_the_persons() {
         std::fs::create_dir_all(home.join(".ssh")).unwrap();
         std::fs::write(home.join(".ssh/id_ed25519"), "canary-key\n").unwrap();
         std::fs::write(home.join(".profile"), "export TOKEN=canary-profile\n").unwrap();
+        std::fs::create_dir_all(home.join(".rustup")).unwrap();
         let project = dir.join("project");
         write_project(&project);
         let base = git(&project);
@@ -176,13 +262,15 @@ fn a_turn_writes_a_home_of_its_own_and_still_reads_nothing_of_the_persons() {
              mkdir -p \"$HOME/.cache\" && echo cached > \"$HOME/.cache/x\" && cat \"$HOME/.cache/x\"; \
              cat {0}/.ssh/id_ed25519 {0}/.profile; echo \"home=$HOME\"; \
              echo \"cargo=$CARGO_HOME\"; echo \"rustup=$RUSTUP_HOME\"; echo \"gomod=$GOMODCACHE\"; \
-             mkdir -p \"$CARGO_HOME\" && touch \"$CARGO_HOME/w\" && echo cache-written; \
+             echo \"target=$CARGO_TARGET_DIR\"; \
+             mkdir -p \"$XDG_CACHE_HOME\" && touch \"$XDG_CACHE_HOME/w\" && echo cache-written; \
+             touch \"$RUSTUP_HOME/w\" 2>/dev/null && echo rustup-written; \
              echo looked",
             home.display(),
             PROTECTED = PROTECTED.join(" ")
         );
         let data = json!({"base": base, "text": "the note"}).to_string();
-        let printed = run_once(&home, &project, "tidy-up", &data, &command).await;
+        let printed = run_once(&home, &project, "tidy-up", &data, &command, &[]).await;
         let output = printed
             .split_once("Output:\n")
             .map_or(printed.as_str(), |(_, o)| o);
@@ -205,20 +293,117 @@ fn a_turn_writes_a_home_of_its_own_and_still_reads_nothing_of_the_persons() {
             !rest.contains(&format!("home={}\n", home.display())),
             "{printed}"
         );
-        // A worktree step's tools find the project's shared caches, which it
-        // may write, and the toolchains rustup has.
-        let value = |name: &str| {
-            rest.lines()
-                .find_map(|l| l.strip_prefix(&format!("{name}=")))
-                .unwrap_or_default()
-                .to_owned()
-        };
-        for name in ["cargo", "gomod"] {
-            assert!(value(name).contains("/cache/"), "{name}: {printed}");
-        }
-        assert!(!value("rustup").is_empty(), "{printed}");
+        // A worktree step's tools find its run's own caches, which it may
+        // write and which go when the run ends; cargo's home is its own
+        // home's; and the toolchains rustup has, which it may only read.
+        let value = |name: &str| printed_value(rest, name);
+        assert_eq!(
+            value("cargo"),
+            format!("{}/.cargo", value("home")),
+            "{printed}"
+        );
+        let caches = run_caches("tidy-up", &value("gomod"));
+        assert_eq!(Path::new(&value("gomod")), caches.join("go-mod"));
+        assert!(
+            Path::new(&value("target")).starts_with(caches.join("cargo-target")),
+            "{printed}"
+        );
+        assert!(!caches.exists(), "the run's caches outlived it");
+        assert_eq!(
+            value("rustup"),
+            home.join(".rustup").display().to_string(),
+            "{printed}"
+        );
         assert!(rest.contains("cache-written"), "{printed}");
+        assert!(!rest.contains("rustup-written"), "{printed}");
         assert!(rest.contains("looked"), "{printed}");
+        // RUSTUP_HOME, where the person sets it.
+        let toolchains = dir.join("toolchains");
+        std::fs::create_dir_all(&toolchains).unwrap();
+        let toolchains = toolchains.display().to_string();
+        let printed = run_once(
+            &home,
+            &project,
+            "tidy-up",
+            &data,
+            "echo \"rustup=$RUSTUP_HOME\"; touch \"$RUSTUP_HOME/w\" 2>/dev/null && echo rustup-written",
+            &[("RUSTUP_HOME", &toolchains)],
+        )
+        .await;
+        assert_eq!(printed_value(&printed, "rustup"), toolchains, "{printed}");
+        assert!(!printed.contains("rustup-written"), "{printed}");
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+#[test]
+fn a_read_only_worktree_step_finds_its_caches_and_writes_nothing_there() {
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let dir = std::env::temp_dir().join(format!("atomic-peek-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let project = dir.join("project");
+        write_project(&project);
+        let base = git(&project);
+        let data = json!({"base": base, "text": "the note"}).to_string();
+        let command = "echo \"xdg=$XDG_CACHE_HOME\"; \
+                       mkdir -p \"$XDG_CACHE_HOME/x\" 2>/dev/null && echo cache-written; \
+                       mkdir -p \"$CARGO_TARGET_DIR\" 2>/dev/null && echo target-written; echo looked";
+        let printed = run_once(&home, &project, "peek-in", &data, command, &[]).await;
+        run_caches("peek-in", &printed_value(&printed, "xdg"));
+        assert!(printed.contains("looked"), "{printed}");
+        for wrote in ["cache-written", "target-written"] {
+            assert!(!printed.contains(wrote), "{wrote}: {printed}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+#[test]
+fn each_worktree_builds_in_a_target_directory_of_its_own() {
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let dir = std::env::temp_dir().join(format!("atomic-twice-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let project = dir.join("project");
+        write_project(&project);
+        let base = git(&project);
+        let data = json!({"base": base, "text": "the note"}).to_string();
+        let build = "mkdir -p \"$CARGO_TARGET_DIR\" && ls -A \"$CARGO_TARGET_DIR\"; echo listed; \
+                     echo built > \"$CARGO_TARGET_DIR/built-here\"; echo \"target=$CARGO_TARGET_DIR\"";
+        let printed = run_steps(
+            &home,
+            &project,
+            "tidy-twice",
+            &data,
+            &[build.to_owned(), build.to_owned()],
+            &[],
+        )
+        .await;
+        let (first, second) = (&printed[0], &printed[1]);
+        let output = |p: &str| p.split_once("Output:\n").map_or(p, |(_, o)| o).to_owned();
+        let (listing, _) = output(second)
+            .split_once("listed\n")
+            .map(|(l, r)| (l.to_owned(), r.to_owned()))
+            .expect("listed");
+        assert_eq!(
+            listing.trim(),
+            "",
+            "the second worktree found the first's build: {second}"
+        );
+        let (one, two) = (
+            printed_value(first, "target"),
+            printed_value(second, "target"),
+        );
+        assert_ne!(one, two, "{first}\n{second}");
+        assert_eq!(
+            run_caches("tidy-twice", &one),
+            run_caches("tidy-twice", &two)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     });
 }

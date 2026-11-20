@@ -321,7 +321,7 @@ home directory fails to read them.
 Anything that finds its files through your home directory does not find
 them: rustup's and cargo's homes (`~/.rustup`, `~/.cargo`), the Go module
 cache, pyenv and asdf shims, `~/.gitconfig` and `~/.npmrc`. A worktree step
-is pointed at the project's build caches and your rustup toolchains (see
+is pointed at its run's own build caches and your rustup toolchains (see
 [worktree steps](workflow-files.md#atom-steps)); for anything else, a tool the
 atom's commands need has to be on `PATH` without them, and settings it needs
 passed in the atom's `env`.

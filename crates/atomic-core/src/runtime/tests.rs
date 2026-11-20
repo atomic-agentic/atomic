@@ -2141,7 +2141,7 @@ fn an_exec_output_cel_cannot_read_fails() {
 }
 
 #[tokio::test]
-async fn a_worktree_steps_turn_finds_the_shared_caches_and_only_it_may_write_them() {
+async fn a_worktree_steps_turn_finds_its_runs_caches_and_only_it_may_write_them() {
     let model = FakeModel::start(vec![]).await.expect("model");
     let mut rt = runtime(&model, "caches");
     let contract = json!({"type": "object"});
@@ -2170,8 +2170,12 @@ async fn a_worktree_steps_turn_finds_the_shared_caches_and_only_it_may_write_the
     let caches = crate::worktree::Caches::new(std::env::temp_dir().join("atomic-caches-x"));
     rt.caches = Some(caches.clone());
     let open = Backend::Codex(&rt).open(&request(WorkspaceWrite, &[("CARGO_TARGET_DIR", "/mine")]));
+    assert!(
+        !open.env.contains_key("CARGO_HOME"),
+        "cargo's home is the attempt's own: {open:?}"
+    );
     for name in [
-        "CARGO_HOME",
+        "PIP_CACHE_DIR",
         "GOMODCACHE",
         "XDG_CACHE_HOME",
         "ATOMIC_CACHE_DIR",
@@ -2193,8 +2197,41 @@ async fn a_worktree_steps_turn_finds_the_shared_caches_and_only_it_may_write_the
     assert_eq!(open.writable_roots, [caches.dir().to_owned()]);
     // A read-only turn finds them, and writes nothing.
     let open = Backend::Codex(&rt).open(&request(ReadOnly, &[]));
-    assert!(open.env.contains_key("CARGO_HOME"));
+    assert!(open.env.contains_key("XDG_CACHE_HOME"));
     assert!(open.writable_roots.is_empty(), "{open:?}");
+}
+
+#[test]
+fn a_turns_cargo_home_is_its_own_and_its_toolchains_are_only_read() {
+    use crate::typed::Sandbox::WorkspaceWrite;
+    let dir = std::env::temp_dir().join(format!("atomic-turn-in-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for sub in ["tree", "scratch", "tmp", "caches", "toolchains"] {
+        std::fs::create_dir_all(dir.join(sub)).expect("dir");
+    }
+    let workspace = |rustup: &std::path::Path| atomic_exec::Workspace {
+        label: "fix".into(),
+        root: Some(dir.join("tree")),
+        scratch: Some(dir.join("scratch")),
+        tmp: Some(dir.join("tmp")),
+        shell: Shell::Local,
+        sandbox: WorkspaceWrite,
+        writable_roots: vec![dir.join("caches")],
+        env: [("RUSTUP_HOME".to_owned(), rustup.display().to_string())].into(),
+    };
+    let mut spec = TurnSpec::default();
+    turn_in(&workspace(&dir.join("toolchains")), &mut spec).expect("toolchains apart");
+    assert_eq!(
+        spec.env["CARGO_HOME"],
+        dir.join("scratch/.cargo").display().to_string()
+    );
+    // Toolchains inside, or holding, anything the turn may write.
+    for inside in ["caches/rustup", "tree/rustup", "scratch/.rustup", ""] {
+        let mut spec = TurnSpec::default();
+        let refused = turn_in(&workspace(&dir.join(inside)), &mut spec).expect_err(inside);
+        assert!(refused.to_string().contains("RUSTUP_HOME"), "{refused}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A store that, when `at` is reached (`"open"` as an input is copied in,
