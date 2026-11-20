@@ -126,24 +126,31 @@ pub enum SignInError {
 
 const KEYRING: AuthKeyringBackendKind = AuthKeyringBackendKind::Direct;
 
-/// Refused when `dir` is inside the checkout holding `project`: a file
-/// there is one the repository could have supplied.
+/// Refused when `dir` is inside a checkout holding `project`, its own or
+/// one around it (a submodule's superproject, the checkout a worktree sits
+/// in): a file there is one a repository could have supplied. Paths are
+/// compared as they really are, a directory not made yet by its nearest
+/// existing parent.
 fn outside_the_checkout(dir: &Path, project: Option<&Path>) -> Result<(), SignInError> {
     let Some(project) = project else {
         return Ok(());
     };
-    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
-    let (here, project) = (real(dir), real(project));
-    match project.ancestors().find(|d| d.join(".git").exists()) {
-        Some(checkout) if here.starts_with(checkout) => {
-            Err(SignInError::Store(CredentialError::File(format!(
-                "{} is inside the checkout holding the project, at {}, so the repository could \
-                 have supplied it; point ATOMIC_HOME outside it",
-                dir.display(),
-                checkout.display()
-            ))))
-        }
-        _ => Ok(()),
+    let (here, project) = (
+        crate::state::real_path(dir),
+        crate::state::real_path(project),
+    );
+    match project
+        .ancestors()
+        .filter(|d| d.join(".git").exists())
+        .find(|checkout| here.starts_with(checkout))
+    {
+        Some(checkout) => Err(SignInError::Store(CredentialError::File(format!(
+            "{} is inside the checkout holding the project, at {}, so the repository could \
+             have supplied it; point ATOMIC_HOME outside it",
+            dir.display(),
+            checkout.display()
+        )))),
+        None => Ok(()),
     }
 }
 
@@ -200,13 +207,49 @@ impl SignIn {
     /// owner only. Refused off Linux.
     pub fn configured(project: Option<&Path>) -> Result<Self, SignInError> {
         let located = Self::located(project)?;
+        let existed = located.auth_home.is_dir();
         crate::state::private_dir(&located.auth_home)
             .map_err(|e| CredentialError::File(e.to_string()))?;
-        let auth_home = std::fs::canonicalize(&located.auth_home).unwrap_or(located.auth_home);
+        let auth_home =
+            std::fs::canonicalize(&located.auth_home).unwrap_or_else(|_| located.auth_home.clone());
+        // Where it was made, as it really is: a link on the way, such as a
+        // linked home, could have put it somewhere the checks above did not
+        // see. Refused there, it is removed again.
+        let placed = crate::credential::placed_apart(&auth_home, project)
+            .map_err(SignInError::from)
+            .and_then(|()| outside_the_checkout(&auth_home, project));
+        if let Err(e) = placed {
+            if !existed {
+                let _ = std::fs::remove_dir(&auth_home);
+            }
+            return Err(e);
+        }
         Ok(Self {
             auth_home,
             ..located
         })
+    }
+
+    /// Remove the sign-in's directory if it holds no sign-in, only Codex's
+    /// empty lock files, as after a login that did not finish or a logout:
+    /// with no directory, no store is read (see [`SignIn::account`]).
+    fn tidy(&self) {
+        let Ok(entries) = std::fs::read_dir(&self.auth_home) else {
+            return;
+        };
+        let mut locks = Vec::new();
+        for entry in entries.flatten() {
+            let lock = entry.file_name().to_string_lossy().ends_with(".lock")
+                && entry.metadata().is_ok_and(|m| m.is_file() && m.len() == 0);
+            if !lock {
+                return;
+            }
+            locks.push(entry.path());
+        }
+        for lock in locks {
+            let _ = std::fs::remove_file(lock);
+        }
+        let _ = std::fs::remove_dir(&self.auth_home);
     }
 
     /// A sign-in kept in files under `dir`, for tests.
@@ -257,9 +300,14 @@ impl SignIn {
         }
     }
 
-    /// Who is signed in, if anyone.
+    /// Who is signed in, if anyone. `atomic model login` creates the
+    /// sign-in's directory, so with none no one is, and no store is read:
+    /// a keyring entry that outlived its directory is not a sign-in.
     pub fn account(&self) -> anyhow::Result<Option<Account>> {
         protected()?;
+        if !self.auth_home.is_dir() {
+            return Ok(None);
+        }
         let auth = codex_login::load_auth_dot_json(&self.auth_home, self.store, KEYRING)?;
         let store = self.store_name().to_owned();
         Ok(auth.and_then(|a| {
@@ -339,6 +387,14 @@ impl SignIn {
     /// at hand, and keep the sign-in. The keyring is checked first, so a
     /// machine without one is told so before any browser flow.
     pub async fn login(&self, device: bool) -> anyhow::Result<()> {
+        let outcome = self.log_in(device).await;
+        if outcome.is_err() {
+            self.tidy();
+        }
+        outcome
+    }
+
+    async fn log_in(&self, device: bool) -> anyhow::Result<()> {
         protected()?;
         // Codex's login restrictions, as its own login applies them: the
         // method first, then the workspaces the issuer must sign in to.
@@ -362,7 +418,14 @@ impl SignIn {
             KEYRING,
             policy.auth_route_config.clone(),
         );
-        if let Some(issuer) = &self.issuer {
+        // For tests of the `atomic` executable: an issuer of their own, and
+        // a port of the system's choosing, never Codex's fixed one, whose
+        // listener a busy port would make Codex cancel.
+        #[cfg(feature = "fake-model")]
+        let test_issuer = std::env::var("ATOMIC_TEST_LOGIN_ISSUER").ok();
+        #[cfg(not(feature = "fake-model"))]
+        let test_issuer: Option<String> = None;
+        if let Some(issuer) = self.issuer.as_ref().or(test_issuer.as_ref()) {
             options.issuer = issuer.clone();
             options.open_browser = false;
             options.port = 0;
@@ -371,12 +434,10 @@ impl SignIn {
             codex_login::run_device_code_login(options).await?;
         } else {
             let server = codex_login::run_login_server(options)?;
-            // Redacted as every log line is; the address carries no secret
-            // (see the test below), so it reaches the person whole.
-            crate::log_line!(
-                "Sign in in your browser. If it did not open, go to:\n\n  {}\n",
-                server.auth_url
-            );
+            // The address is Codex's own, holding no secret: a random state
+            // or challenge can look like a token, so it is written as it is
+            // (see `redact::log_sign_in_address`).
+            crate::redact::log_sign_in_address(&server.auth_url);
             #[cfg(any(test, feature = "fake-model"))]
             if let Some(hook) = LOGIN_STARTED.get() {
                 hook(&server.auth_url, server.actual_port);
@@ -412,6 +473,7 @@ impl SignIn {
         )
         .await
         .map_err(|e| e.to_string());
+        self.tidy();
         Ok(Forgotten { file, keyring })
     }
 
@@ -595,7 +657,7 @@ mod tests {
             let sign_in = SignIn::in_files(&dir).with_issuer(&at);
             browser_login(&sign_in).await.expect("logged in");
             // The address the person is shown, as Codex builds it, comes
-            // through atomic's redaction whole.
+            // through whole.
             let url = LOGIN_URLS
                 .lock()
                 .expect("urls")
@@ -604,10 +666,9 @@ mod tests {
                 .expect("a login address");
             assert!(url.contains("api.connectors.read"), "{url}");
             assert!(url.contains("code_challenge="), "{url}");
-            assert_eq!(
-                crate::redact::bounded(&url, crate::redact::MAX_TEXT),
-                url,
-                "redaction changed the address to sign in at"
+            assert!(
+                crate::redact::sign_in_line(&url).contains(&url),
+                "the address to sign in at is not written whole: {url}"
             );
             let account = sign_in.account().expect("account").expect("signed in");
             assert_eq!(account.mode, "chatgpt");

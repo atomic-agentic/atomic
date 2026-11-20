@@ -260,7 +260,7 @@ pub(crate) fn placed_apart(dir: &Path, project: Option<&Path>) -> Result<(), Cre
     if !dir.is_absolute() {
         return Err(fail(format!("{} is not an absolute path", dir.display())));
     }
-    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
+    let real = crate::state::real_path;
     let projects = real(
         &crate::state::base_dir()
             .map_err(|e| fail(e.to_string()))?

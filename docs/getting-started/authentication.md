@@ -64,9 +64,11 @@ ChatGPT's connectors, plugins or hosted tools: the token reaches the model and
 nothing else, and an atom's tools are the ones its file declares. As with the
 operator credential, this has been verified on Linux only, so `atomic model
 login` is refused on macOS and Windows for now. atomic does not reuse an
-existing `codex login`. A sign-in kept inside the checkout that holds the
-project (`ATOMIC_HOME` pointed there) is refused, since the repository could
-have supplied it.
+existing `codex login`. A sign-in kept inside a checkout that holds the
+project (`ATOMIC_HOME` pointed there, directly or through a link), the
+project's own or one around it such as a submodule's superproject, is refused,
+since a repository could have supplied it. A login that does not finish, and a
+logout, leave no sign-in directory behind, so later runs read no store.
 
 Keeping the token out of reach has side effects on atomic's own process, and so
 on everything it starts:

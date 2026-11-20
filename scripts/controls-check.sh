@@ -57,6 +57,7 @@ CONTROLS=(
     "signin-token-overrides|crates/atomic-core/src/codex.rs|        remove(name);|        let _ = name;|-p atomic-agentic-core --lib the_environment_cannot_stand_in_for_or_redirect_a_sign_ins_tokens"
     "codex-home-read-only|crates/atomic-core/src/codex.rs|    for home in homes.into_iter().flatten() {|    for home in homes.into_iter().flatten().take(0) {|-p atomic-agentic-core --lib private_state_is_denied_and_the_rest_of_the_state_directory_is_not"
     "codex-home-files|crates/atomic-core/src/codex.rs|        planted_never(&codex_home.join(name))?;|        let _ = name;|-p atomic-agentic-core --lib private_state_is_denied_and_the_rest_of_the_state_directory_is_not"
+    "signin-in-checkout|crates/atomic-core/src/signin.rs|        outside_the_checkout(&dir, project)?;|        let _ = (&dir, project);|-p atomic-agentic --test model_auth a_sign_in_inside_the_checkout_holding_the_project_is_refused_and_explain_says_so"
 )
 
 die() {

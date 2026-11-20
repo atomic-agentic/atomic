@@ -446,6 +446,26 @@ pub fn base_dir() -> Result<PathBuf, StateError> {
     }
 }
 
+/// `path` as it really is: its nearest existing ancestor with every link
+/// resolved, and the rest of it as written. A directory not made yet is
+/// where making it would put it, a linked parent followed.
+pub fn real_path(path: &Path) -> PathBuf {
+    let mut rest = Vec::new();
+    let mut at = path;
+    loop {
+        if let Ok(real) = std::fs::canonicalize(at) {
+            return rest.iter().rev().fold(real, |p, part| p.join(part));
+        }
+        match (at.parent(), at.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_owned());
+                at = parent;
+            }
+            _ => return path.to_owned(),
+        }
+    }
+}
+
 /// Where the opt-in file store keeps operator credentials (see
 /// [`crate::credential::FileSecrets`]): `$ATOMIC_HOME/credentials`, or
 /// `atomic/credentials` in the user configuration directory. Outside every

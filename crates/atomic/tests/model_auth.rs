@@ -259,6 +259,74 @@ fn a_sign_in_inside_the_checkout_holding_the_project_is_refused_and_explain_says
     assert!(out.status.success(), "{t}");
     assert!(t.contains("the ChatGPT sign-in could not be read"), "{t}");
     assert!(t.contains("inside the checkout holding the project"), "{t}");
+    // The project in a checkout of its own inside that one, as a submodule
+    // or a worktree is: the outer checkout still holds it.
+    std::fs::create_dir_all(f.dir.join("project/.git")).unwrap();
+    let out = f.atomic(&["model", "status"], &home);
+    let t = text(&out);
+    assert!(!out.status.success(), "{t}");
+    assert!(t.contains("inside the checkout holding the project"), "{t}");
+    // Reached through a link from outside, as a linked home is: the
+    // sign-in is placed where the link leads, and refused there, before
+    // anything is made.
+    let link = f.outside.join("linked-home");
+    std::os::unix::fs::symlink(&inside, &link).unwrap();
+    let home = [
+        ("ATOMIC_HOME", link.to_str().unwrap()),
+        ("ATOMIC_TEST_LOGIN_ISSUER", "http://127.0.0.1:9"),
+    ];
+    let out = f
+        .atomic_within(&["model", "login"], &home, 60)
+        .expect("login stopped");
+    let t = text(&out);
+    assert!(!out.status.success(), "{t}");
+    assert!(t.contains("inside the checkout holding the project"), "{t}");
+    assert!(
+        !inside.join("credentials/codex-auth").exists(),
+        "the sign-in's directory was made inside the checkout"
+    );
+}
+
+#[test]
+fn a_login_that_fails_and_a_logout_leave_no_sign_in_directory() {
+    let f = Fixture::new("tidy");
+    let auth = f.credentials().join("codex-auth");
+    // The keyring store, with no Secret Service here: the login is refused.
+    let keyring = [("ATOMIC_CREDENTIAL_STORE", "keyring")];
+    let out = f.atomic(&["model", "login"], &keyring);
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(!auth.exists(), "a failed login left {}", auth.display());
+    // So no later run is told a sign-in could not be read.
+    let out = f.atomic(&["config", "--explain"], &keyring);
+    assert!(!text(&out).contains("could not be read"), "{}", text(&out));
+    // Nor does a logout leave one, signed in or not.
+    for signed_in in [false, true] {
+        if signed_in {
+            f.sign_in_unrevocable();
+        }
+        let out = f.atomic(&["model", "logout"], &[]);
+        assert!(out.status.success(), "{}", text(&out));
+        assert!(
+            !auth.exists(),
+            "a logout left {}: {:?}",
+            auth.display(),
+            std::fs::read_dir(&auth)
+                .map(|d| d.flatten().map(|e| e.file_name()).collect::<Vec<_>>())
+        );
+    }
+}
+
+#[test]
+fn a_keyring_entry_without_its_directory_is_no_sign_in() {
+    let f = Fixture::new("no-dir");
+    // No sign-in directory: the keyring is not read, so where it cannot be
+    // reached nothing says so, and no one is signed in.
+    let keyring = [("ATOMIC_CREDENTIAL_STORE", "keyring")];
+    let out = f.atomic(&["model", "status"], &keyring);
+    let t = text(&out);
+    assert!(!out.status.success(), "{t}");
+    assert!(t.contains("no one is signed in"), "{t}");
+    assert!(!t.contains("keyring"), "the keyring was read: {t}");
 }
 
 /// Start `atomic args`, wait for a stderr line containing `ready`, then
@@ -318,11 +386,13 @@ fn a_running_atomic_cannot_be_read_through_proc_by_its_own_user() {
         "serving until stopped",
     );
     // One that does not, and holds a sign-in while it runs: the login,
-    // waiting for the browser (which opens nothing here).
+    // waiting for the browser. Its issuer is the discard port, on a port
+    // the system picks, never Codex's fixed one, so no other login is
+    // cancelled and nothing is opened.
     read_while_running(
         &f,
         &["model", "login"],
-        &[("BROWSER", "true")],
+        &[("ATOMIC_TEST_LOGIN_ISSUER", "http://127.0.0.1:9")],
         "Sign in in your browser",
     );
 }

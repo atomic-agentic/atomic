@@ -866,6 +866,18 @@ fn a_personal_configuration_in_the_checkout_holding_the_project_is_refused() {
     .expect_err("refused")
     .to_string();
     assert!(said.contains("checkout holding the project"), "{said}");
+    // The project in a checkout of its own inside that one, as a submodule
+    // or a worktree is: the outer checkout still holds it.
+    std::fs::create_dir_all(checkout.join("services/notes/.git")).expect("inner git dir");
+    let said = resolved_where(
+        &checkout.join("services/notes"),
+        &EngineArgs::default(),
+        &[("HOME", &checkout.display().to_string())],
+        &nobody,
+    )
+    .expect_err("refused")
+    .to_string();
+    assert!(said.contains("checkout holding the project"), "{said}");
 }
 
 #[test]

@@ -346,9 +346,11 @@ pub fn resolve(
         && let Ok(file) = std::fs::canonicalize(file)
         && let Ok(root) = std::fs::canonicalize(project_root(dir))
     {
-        let checkout = root.ancestors().find(|d| d.join(".git").exists());
+        // Every checkout around the project counts, not only the nearest:
+        // a submodule's superproject, or the checkout a worktree sits in.
+        let checkouts = root.ancestors().filter(|d| d.join(".git").exists());
         for (what, enclosing) in std::iter::once(("project", root.as_path()))
-            .chain(checkout.map(|c| ("checkout holding the project", c)))
+            .chain(checkouts.map(|c| ("checkout holding the project", c)))
         {
             if file.starts_with(enclosing) {
                 return Err(ConfigError::Invalid(format!(
