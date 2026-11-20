@@ -38,9 +38,7 @@ async fn sqlite() -> Durare {
 
 #[cfg(feature = "postgres-tests")]
 async fn postgres() -> Durare {
-    // A suite that cannot reach its backend fails; it never skips.
-    let url = std::env::var("ATOMIC_TEST_DATABASE_URL")
-        .expect("the postgres-tests feature needs ATOMIC_TEST_DATABASE_URL");
+    let url = crate::testing::database().await;
     Durare::postgres(&url, &unique("atomic_rt"))
         .await
         .expect("postgres engine")
@@ -604,8 +602,7 @@ async fn a_newer_store_is_refused_untouched() {
 #[cfg(feature = "postgres-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_newer_postgres_store_is_refused_untouched() {
-    let url = std::env::var("ATOMIC_TEST_DATABASE_URL")
-        .expect("the postgres-tests feature needs ATOMIC_TEST_DATABASE_URL");
+    let url = crate::testing::database().await;
     let schema = unique("atomic_newer");
     let rt = Durare::postgres(&url, &schema)
         .await

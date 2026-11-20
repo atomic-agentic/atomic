@@ -6,26 +6,16 @@
 //! only through this crate.
 
 pub mod attempt;
+pub mod failpoints;
 pub mod gate;
 pub mod publication;
 pub mod runtime;
-
-/// A named point where a crash test can kill the process: with the
-/// `failpoints` feature, when the `ATOMIC_FAILPOINT` environment variable
-/// equals `name`, the process aborts here, as if killed. Without the feature
-/// it does nothing.
-pub fn failpoint(name: &str) {
-    #[cfg(feature = "failpoints")]
-    if std::env::var("ATOMIC_FAILPOINT").is_ok_and(|f| f == name) {
-        eprintln!("failpoint {name}: aborting");
-        std::process::abort();
-    }
-    #[cfg(not(feature = "failpoints"))]
-    let _ = name;
-}
 pub mod store;
+#[cfg(feature = "postgres-tests")]
+pub mod testing;
 pub mod usage;
 
+pub use failpoints::failpoint;
 pub use publication::{
     Acceptance, Candidate, Park, Precondition, Proposal, Published, Write, execute_candidate,
     execute_candidate_at, parks, publish_candidate, review_candidate, run_atom, run_atom_at,

@@ -17,6 +17,7 @@ pub mod context;
 pub mod credential;
 pub mod editor;
 pub mod evaluation;
+pub mod failpoint;
 pub mod failure;
 pub mod git;
 pub mod helper_runtime;

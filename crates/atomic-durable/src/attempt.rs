@@ -132,8 +132,7 @@ mod tests {
     #[cfg(feature = "postgres-tests")]
     #[tokio::test]
     async fn postgres_recovery_in_the_same_process_does_not_repeat_an_effect() {
-        let url =
-            std::env::var("ATOMIC_TEST_DATABASE_URL").expect("postgres-tests needs its backend");
+        let url = crate::testing::database().await;
         same_process_recovery(Durare::postgres(&url, &unique()).await.expect("postgres")).await;
     }
 }

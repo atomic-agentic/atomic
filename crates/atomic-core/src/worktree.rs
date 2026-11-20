@@ -263,6 +263,9 @@ impl Worktrees {
         self.check_admin(&worktree.git_dir, &worktree.path)?;
         let tree = self.repo.linked(&worktree.git_dir, &worktree.path);
         let commit = tree.commit_all(&worktree.base, message, signature)?;
+        if crate::failpoint::armed() {
+            crate::failpoint::failpoint(&format!("commit:before-ref:{}", worktree.step));
+        }
         let prefix = format!(
             "refs/atomic/{}/steps/{}/",
             component(&worktree.run),
@@ -314,6 +317,9 @@ impl Worktrees {
             request.base.clone(),
         );
         let worktree = blocking(move || this.prepare(&run, &step, &base)).await?;
+        if crate::failpoint::armed() {
+            crate::failpoint::failpoint(&format!("worktree:after-prepare:{}", request.step));
+        }
         let out = body(worktree.path.clone()).await.map_err(StepError::Body)?;
         let this = self.clone();
         let commit =
@@ -333,6 +339,10 @@ impl Worktrees {
                 self.repo.delete_ref(&r.name, &r.sha)?;
                 report.refs.push(r.name);
             }
+        }
+        // The unaccepted refs are gone and the worktrees are not.
+        if crate::failpoint::armed() {
+            crate::failpoint::failpoint(&format!("cleanup:after-refs:{run}"));
         }
         let start = format!("{}.", component(run));
         let entries = match std::fs::read_dir(&self.dir) {
