@@ -181,8 +181,8 @@ fn backend_wait(value: &Value, source: Option<&Source>) -> Result<Value, ConfigE
         None => {
             let from = source.map_or_else(|| "default".into(), describe);
             Err(ConfigError::Invalid(format!(
-                "backend_wait, from {from}, is a whole number of seconds, at least 1; leave it \
-                 unset for a step to wait as long as it takes"
+                "backend_wait, from {from}, is a whole number of seconds, at least 1; to \
+                 override a limit set elsewhere, set a larger number"
             )))
         }
     }

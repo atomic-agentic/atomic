@@ -53,6 +53,12 @@ The settings `atomic run`, `atomic runs resume` and `atomic serve` resolve:
 | `backend_wait` | `ATOMIC_BACKEND_WAIT` | `--backend-wait` |
 | `budget.*` | `ATOMIC_BUDGET_*` | |
 
+`backend_wait` is a whole number of seconds, at least 1. An empty
+`ATOMIC_BACKEND_WAIT` sets nothing, but a null, `~` or blank value, in a file
+or a variable, is refused, so a higher layer cannot remove a limit a lower one
+set: to override it, set a larger number. Without any, a step waits for as
+long as it takes.
+
 Your own configuration is `$XDG_CONFIG_HOME/atomic/config.yaml`, by default
 `~/.config/atomic/config.yaml`. No project supplies it. It holds the same
 settings as `atomic.yaml`, and the project's files override it.
