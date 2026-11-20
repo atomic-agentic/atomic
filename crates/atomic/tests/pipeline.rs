@@ -230,10 +230,18 @@ async fn engine(dir: &Path, base_url: &str) -> Durare {
         .expect("connects")
     });
     // A child process on a machine whose sandbox cannot start: a helper
-    // that runs nothing.
+    // that runs nothing and fails as bubblewrap does where user namespaces
+    // are not allowed.
     let unconfinable = std::env::var_os(ENV_UNCONFINABLE).map(|_| {
-        let paths =
-            atomic_core::codex::CodexPaths::with_helpers("/bin/false".into(), "/bin/false".into());
+        use std::os::unix::fs::PermissionsExt;
+        let helper = dir.join("refusing-helper");
+        std::fs::write(
+            &helper,
+            "#!/bin/sh\necho 'bwrap: No permissions to create a new namespace' >&2\nexit 1\n",
+        )
+        .expect("helper");
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let paths = atomic_core::codex::CodexPaths::with_helpers(helper.clone(), helper);
         let sandbox = atomic_core::codex::ExecSandbox::new(
             &paths,
             atomic_core::codex::StateGuard::NoProjectState,

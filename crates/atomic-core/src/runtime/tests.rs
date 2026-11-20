@@ -1820,9 +1820,38 @@ fn only_atoms_that_run_commands_need_the_sandbox() {
                 self.0.check(tmp)
             }
         }
-        // A helper that cannot run anything, as on a machine without user
-        // namespaces.
-        let paths = CodexPaths::with_helpers("/bin/false".into(), "/bin/false".into());
+        // A helper that fails as bubblewrap does on a machine without user
+        // namespaces, and one that fails as it does on a full disk.
+        let helper = |name: &str, says: &str| {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::create_dir_all(&root).expect("root");
+            let path = root.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\necho '{says}' >&2\nexit 1\n"))
+                .expect("helper");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+            CodexPaths::with_helpers(path.clone(), path)
+        };
+        let paths = helper(
+            "refusing",
+            "bwrap: No permissions to create a new namespace, likely because the kernel does \
+             not allow non-privileged user namespaces.",
+        );
+        let full = helper(
+            "full",
+            "error building bubblewrap command: No space left on device (os error 28)",
+        );
+        let tmp = root.join("check-tmp");
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        let passing = ExecSandbox::new(&full, StateGuard::NoProjectState, root.join("codex"))
+            .expect("a helper");
+        assert!(
+            matches!(
+                atomic_exec::Confine::check(&passing, &tmp),
+                Err(atomic_exec::ExecError::Unavailable { ref message, .. })
+                    if message.contains("No space left on device")
+            ),
+            "a failure that may pass waits"
+        );
         let sandbox = ExecSandbox::new(&paths, StateGuard::NoProjectState, root.join("codex"))
             .expect("a helper");
         let backend = atomic_exec::Backend::connect(

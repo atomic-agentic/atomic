@@ -647,12 +647,27 @@ impl atomic_exec::Confine for ExecSandbox {
         };
         match done {
             Ok(done) if done.success() => Ok(()),
-            Ok(done) => Err(refuse(format!(
-                "a trial command exited with {}: {}",
-                done.code
-                    .map_or_else(|| "a signal".to_owned(), |c| format!("code {c}")),
-                String::from_utf8_lossy(&done.stderr).trim()
-            ))),
+            Ok(done) => {
+                let stderr = String::from_utf8_lossy(&done.stderr);
+                let why = format!(
+                    "a trial command exited with {}: {}",
+                    done.code
+                        .map_or_else(|| "a signal".to_owned(), |c| format!("code {c}")),
+                    stderr.trim()
+                );
+                // Only a refusal this machine will repeat until it is fixed
+                // stops the run; anything else, such as a full disk under the
+                // helper's registry of mount points, may pass, and the run
+                // waits.
+                if sandbox_refused(&stderr) {
+                    Err(refuse(why))
+                } else {
+                    Err(atomic_exec::ExecError::Unavailable {
+                        label: "the sandbox check".into(),
+                        message: why,
+                    })
+                }
+            }
             // The trial could not even start: no room or no process to
             // spare, which may pass.
             Err(e) => Err(atomic_exec::ExecError::Unavailable {
@@ -661,6 +676,32 @@ impl atomic_exec::Confine for ExecSandbox {
             }),
         }
     }
+}
+
+/// Whether a sandbox trial that failed with `stderr` failed because this
+/// machine cannot confine commands at all: bubblewrap missing or not
+/// runnable, user namespaces or the mounts bubblewrap makes refused, or the
+/// helper unable to drop its capabilities or apply its seccomp filter. Each
+/// stays so until the machine changes. Anything else is taken to be passing.
+pub(crate) fn sandbox_refused(stderr: &str) -> bool {
+    const HELPER: [&str; 5] = [
+        "bubblewrap is unavailable",
+        "failed to exec system bubblewrap",
+        "failed to exec bundled bubblewrap",
+        "retained effective or permitted capabilities",
+        "error applying Linux sandbox restrictions",
+    ];
+    const BWRAP: [&str; 5] = [
+        "namespace",
+        "uid map",
+        "gid map",
+        "Operation not permitted",
+        "Permission denied",
+    ];
+    stderr.lines().any(|line| {
+        HELPER.iter().any(|s| line.contains(s))
+            || (line.trim_start().starts_with("bwrap:") && BWRAP.iter().any(|s| line.contains(s)))
+    })
 }
 
 /// A thread's own temporary directory, `<state>/tmp/turn-…`, writable from
@@ -1968,5 +2009,37 @@ mod tests {
             // The second call carries the failed tool call's result.
             assert!(model.requests()[1].to_string().contains("call_synthetic"));
         });
+    }
+
+    /// A sandbox trial stops the run only for what the machine repeats until
+    /// it is fixed; a failure that may pass, such as a full disk, waits.
+    #[test]
+    fn only_a_refusal_the_machine_repeats_makes_a_trial_unconfinable() {
+        for refused in [
+            "bwrap: No permissions to create a new namespace, likely because the kernel does not \
+             allow non-privileged user namespaces.",
+            "bwrap: Creating new namespace failed: Operation not permitted",
+            "bwrap: Can't mount proc on /newroot/proc: Operation not permitted",
+            "bwrap: setting up uid map: Permission denied",
+            "thread 'main' panicked at linux-sandbox/src/launcher.rs:60:13:\nbubblewrap is \
+             unavailable: no system bwrap was found on PATH",
+            "thread 'main' panicked at x.rs:1:1:\nfailed to exec system bubblewrap /usr/bin/bwrap: \
+             Permission denied (os error 13)",
+            "thread 'main' panicked at x.rs:1:1:\nLinux sandbox retained effective or permitted \
+             capabilities",
+        ] {
+            assert!(sandbox_refused(refused), "{refused}");
+        }
+        for passing in [
+            "",
+            "thread 'main' panicked at linux-sandbox/src/bwrap.rs:721:13:\nerror building \
+             bubblewrap command: No space left on device (os error 28)",
+            "bwrap: Can't make directory /tmp/x: No space left on device",
+            "bwrap: Can't create file at /tmp/x: Disk quota exceeded",
+            "error building bubblewrap command: Permission denied (os error 13)",
+            "fork: Resource temporarily unavailable",
+        ] {
+            assert!(!sandbox_refused(passing), "{passing}");
+        }
     }
 }

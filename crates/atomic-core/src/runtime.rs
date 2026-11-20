@@ -260,7 +260,8 @@ const OPEN_WAIT_MAX: std::time::Duration = std::time::Duration::from_secs(30);
 const OPEN_WAIT_REPORT: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// Open a workspace on `backend`, on the blocking pool. While the backend
-/// reports [`atomic_exec::ExecError::Unavailable`] (no room; nothing was
+/// reports [`atomic_exec::ExecError::Unavailable`] (no room, or a sandbox
+/// that failed in a way that may pass, such as a full disk; nothing was
 /// started) the run waits, trying again with a growing pause, for as long
 /// as it takes: it records nothing and spends none of the durable engine's
 /// recovery attempts, and it says on stderr that it is waiting, then again
@@ -280,7 +281,9 @@ pub(crate) async fn open_workspace(
         match opened {
             Ok(workspace) => {
                 if reported.is_some() {
-                    eprintln!("atomic: {label}: the execution backend has room again");
+                    eprintln!(
+                        "atomic: {label}: the execution backend can open its workspace again"
+                    );
                 }
                 return Ok(WorkspaceGuard(Some(Arc::new(Closer {
                     backend,
@@ -290,7 +293,7 @@ pub(crate) async fn open_workspace(
             Err(e @ atomic_exec::ExecError::Unavailable { .. }) => {
                 if reported.is_none_or(|at| at.elapsed() >= OPEN_WAIT_REPORT) {
                     eprintln!(
-                        "atomic: {label} is waiting for room on the execution backend \
+                        "atomic: {label} is waiting for the execution backend \
                          (run {}, step {}): {e}",
                         request.run, request.step
                     );

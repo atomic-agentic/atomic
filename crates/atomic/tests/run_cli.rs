@@ -1773,6 +1773,217 @@ fn atomic_run_confines_an_exec_atoms_command() {
     }
 }
 
+/// A `bwrap` in front of the real one, in `dir/bwrap-bin`: while
+/// `dir/bwrap-full` exists it fails as bubblewrap does on a full disk, and
+/// while `dir/bwrap-refuse` exists as it does where user namespaces are not
+/// allowed. Returns the `PATH` to run atomic with.
+fn bwrap_in_front(dir: &Path) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let path = std::env::var("PATH").unwrap_or_default();
+    let real = path
+        .split(':')
+        .map(|d| Path::new(d).join("bwrap"))
+        .find(|p| p.is_file())
+        .expect("bubblewrap on PATH");
+    let bin = dir.join("bwrap-bin");
+    std::fs::create_dir_all(&bin).expect("bin");
+    let script = format!(
+        "#!/bin/sh\n\
+         if [ \"$1\" != --help ]; then\n\
+         \x20 if [ -e '{full}' ]; then\n\
+         \x20   echo 'bwrap: Cannot make directory /tmp/x: No space left on device' >&2; exit 1\n\
+         \x20 fi\n\
+         \x20 if [ -e '{refuse}' ]; then\n\
+         \x20   echo 'bwrap: No permissions to create a new namespace, likely because the kernel \
+         does not allow non-privileged user namespaces.' >&2; exit 1\n\
+         \x20 fi\n\
+         fi\n\
+         exec '{real}' \"$@\"\n",
+        full = dir.join("bwrap-full").display(),
+        refuse = dir.join("bwrap-refuse").display(),
+        real = real.display(),
+    );
+    let wrapper = bin.join("bwrap");
+    std::fs::write(&wrapper, script).expect("wrapper");
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    format!("{}:{path}", bin.display())
+}
+
+/// A project that ran before has its backend's temporary directory, so a
+/// full disk shows first in the sandbox's trial before the next run's first
+/// command: the run waits, records nothing, and finishes once there is room.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[test]
+fn a_sandbox_trial_failing_for_want_of_room_makes_the_run_wait_then_finish() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
+    let dir = scratch("sandbox-full");
+    let project = project(&dir);
+    let path = bwrap_in_front(&dir);
+    let env = [("PATH", path.as_str())];
+    let out = atomic(
+        &dir,
+        &project,
+        &["run", "count-only", "--data", NOTE],
+        &env,
+        "",
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(count_log(&dir).len(), 1);
+
+    let full = dir.join("bwrap-full");
+    std::fs::write(&full, "").expect("the disk fills");
+    let log = dir.join("full.log");
+    let mut run = spawn(
+        &dir,
+        &project,
+        &["run", "count-only", "--data", NOTE],
+        &env,
+        &log,
+    );
+    wait_until("the run to wait", || {
+        std::fs::read_to_string(&log)
+            .is_ok_and(|l| l.contains("is waiting for the execution backend"))
+    });
+    let waiting = std::fs::read_to_string(&log).expect("log");
+    assert!(waiting.contains("No space left on device"), "{waiting}");
+    assert!(!waiting.contains("cannot start here"), "{waiting}");
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(
+        run.try_wait().expect("wait").is_none(),
+        "it waits rather than stopping: {waiting}"
+    );
+    assert_eq!(count_log(&dir).len(), 1, "nothing ran meanwhile");
+
+    std::fs::remove_file(&full).expect("room again");
+    let status = wait_child(&mut run, "the waiting run");
+    let text = std::fs::read_to_string(&log).expect("log");
+    assert!(status.success(), "{text}");
+    assert!(text.contains("can open its workspace again"), "{text}");
+    assert_eq!(count_log(&dir).len(), 2, "its command ran once");
+}
+
+/// Under `atomic serve`, a run whose commands cannot be confined is set
+/// aside, unfinished and with nothing recorded, and serve goes on with the
+/// others and stops at once when asked; where the sandbox starts again the
+/// run resumes and finishes. `atomic run` stops with its exit code instead.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[test]
+fn serve_sets_aside_a_run_whose_commands_cannot_be_confined_and_serves_the_rest() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
+            .await
+            .expect("fake model");
+        let dir = scratch("serve-unconfinable");
+        let project = project(&dir);
+        write_two_steps(&project, &dir);
+        let state = state_dir(&dir, &project);
+        let path = bwrap_in_front(&dir);
+        let env = model_env(&model.base_url());
+        let with_path = with(&env, &[("PATH", path.as_str())]);
+        // A run at its gate, with no command left to run after it.
+        let mut gated = spawn(
+            &dir,
+            &project,
+            &["run", "gated", "--run-id", "gated-1", "--data", NOTE],
+            &with_path,
+            &dir.join("gated.log"),
+        );
+        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        let opened = open_gate(&rt, "gated-1").await;
+        gated.kill().expect("SIGKILL the run");
+        gated.wait().expect("reap");
+        // A run stopped after its first command, with a second to run.
+        let (d, p, e) = (dir.clone(), project.clone(), path.clone());
+        let out = tokio::task::spawn_blocking(move || {
+            atomic(
+                &d,
+                &p,
+                &["run", "two-steps", "--run-id", "two-1", "--data", NOTE],
+                &[
+                    ("PATH", e.as_str()),
+                    ("ATOMIC_FAILPOINT", "pipeline:after:first"),
+                ],
+                "",
+            )
+        })
+        .await
+        .expect("child");
+        assert!(!out.status.success(), "{}", text(&out));
+
+        // The sandbox cannot start now.
+        std::fs::write(dir.join("bwrap-refuse"), "").expect("refuse");
+        let (d, p, e) = (dir.clone(), project.clone(), path.clone());
+        let out = tokio::task::spawn_blocking(move || {
+            let mut env = UNUSED_MODEL.to_vec();
+            env.push(("PATH", e.as_str()));
+            atomic(&d, &p, &["runs", "resume", "two-1"], &env, "")
+        })
+        .await
+        .expect("child");
+        assert_eq!(
+            out.status.code(),
+            Some(atomic_app::workflows::UNCONFINABLE_EXIT),
+            "{}",
+            text(&out)
+        );
+        let log = dir.join("serve.log");
+        let mut serve = spawn(&dir, &project, &["serve"], &with_path, &log);
+        wait_until("serve to set the run aside", || {
+            std::fs::read_to_string(&log).is_ok_and(|l| l.contains("stays unfinished"))
+        });
+        approve(&rt, &opened).await;
+        let started = Instant::now();
+        while rt.status("gated-1").await.expect("status") != Some(RunStatus::Succeeded) {
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "serve never finished the other run: {}",
+                std::fs::read_to_string(&log).unwrap_or_default()
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(serve.try_wait().expect("wait").is_none(), "serve goes on");
+        assert_eq!(
+            rt.status("two-1").await.expect("status"),
+            Some(RunStatus::Pending),
+            "set aside, with nothing recorded"
+        );
+        let stopping = Instant::now();
+        terminate(&serve);
+        let status = tokio::task::spawn_blocking(move || wait_child(&mut serve, "serve"))
+            .await
+            .expect("child");
+        let text_log = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(status.success(), "{text_log}");
+        assert!(
+            stopping.elapsed() < Duration::from_secs(8),
+            "a set-aside run is not one a stop waits for: {text_log}"
+        );
+        assert_eq!(
+            steps_log(&dir),
+            ["first start", "first end"],
+            "second never ran"
+        );
+
+        // Where the sandbox starts, the run finishes, its second step once.
+        std::fs::remove_file(dir.join("bwrap-refuse")).expect("fixed");
+        let (d, p, e) = (dir.clone(), project.clone(), path.clone());
+        let out = tokio::task::spawn_blocking(move || {
+            let mut env = UNUSED_MODEL.to_vec();
+            env.push(("PATH", e.as_str()));
+            atomic(&d, &p, &["runs", "resume", "two-1"], &env, "")
+        })
+        .await
+        .expect("child");
+        assert!(out.status.success(), "{}", text(&out));
+        assert_eq!(steps_log(&dir), ["first start", "first end", "second"]);
+    });
+}
+
 /// State under /tmp would put atom commands' scratch directories where
 /// sandboxed turns may write, so atomic refuses to run there.
 #[test]

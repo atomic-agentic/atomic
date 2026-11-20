@@ -103,9 +103,12 @@ caches; `--runner process` confines it the same way. It runs in a process
 namespace of its own, so it can neither see nor signal atomic, its runner or
 any other process outside. A step that runs commands
 needs bubblewrap and unprivileged user namespaces there: where the sandbox
-cannot start, atomic stops, saying what it needs, before the step runs and
-without recording an outcome, and the run continues when resumed where the
-sandbox can start. Atoms that run no commands run as usual. On macOS and
+cannot start, `atomic run` and `atomic runs resume` stop, saying what it needs,
+before the step runs and without recording an outcome, and the run continues
+when resumed where the sandbox can start. `atomic serve` instead leaves that run
+unfinished, says so, and goes on serving the others; the run continues when a
+later process recovers it. A sandbox that fails in a way that may pass, such as
+on a full disk, makes the step wait, as a backend with no room does. Atoms that run no commands run as usual. On macOS and
 Windows this has not been verified: exec atoms' commands run unconfined there,
 so atomic keeps no operator credential and refuses credentialed gate decisions.
 

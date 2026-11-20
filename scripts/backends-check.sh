@@ -23,7 +23,9 @@ trap 'rm -f "${LOG}"' EXIT
 status=0
 
 # check <what> <message> <cargo test arguments...>: the tests the arguments
-# select must all fail, and each failure must carry <message>.
+# select must all fail, and each failure must carry <message>. With
+# `expected` set, exactly that many must fail.
+expected=""
 check() {
     local what="$1" message="$2"
     shift 2
@@ -35,8 +37,9 @@ check() {
     # Each failing test prints its panic once: "thread '<test>' ... panicked at".
     named="$(grep -A3 "panicked at" "${LOG}" | grep -c -F "${message}")"
     if [ "${code}" -eq 0 ] || [ "${passed}" -ne 0 ] || [ "${failed}" -eq 0 ] ||
-        [ "${named}" -lt "${failed}" ]; then
-        echo "FAIL ${what}: exit ${code}, ${passed} passed, ${failed} failed, ${named} naming '${message}'" >&2
+        [ "${named}" -lt "${failed}" ] ||
+        { [ -n "${expected}" ] && [ "${failed}" -ne "${expected}" ]; }; then
+        echo "FAIL ${what}: exit ${code}, ${passed} passed, ${failed} failed${expected:+ of ${expected}}, ${named} naming '${message}'" >&2
         grep -E "^test .* (ok|FAILED)$|panicked at" "${LOG}" | head -40 >&2
         grep -m3 -E "^error" "${LOG}" >&2
         status=1
@@ -77,17 +80,22 @@ sandbox)
             continue
         fi
         mapfile -t tests < <(awk '
-            /^\/\/ needs_sandbox/ { marked = 1; next }
-            marked && /^fn [a-z0-9_]+\(/ { sub(/^fn /, ""); sub(/\(.*/, ""); print; marked = 0 }
+            /^[[:space:]]*\/\/ needs_sandbox/ { marked = 1; next }
+            marked && /^[[:space:]]*(pub(\([a-z]+\))? )?(async )?fn [a-z0-9_]+\(/ {
+                sub(/^.*fn /, ""); sub(/\(.*/, ""); print; marked = 0
+            }
         ' "${file}")
         if [ "${#tests[@]}" -eq 0 ]; then
             echo "scripts/backends-check.sh: ${file} names sandbox-tests but marks no test needs_sandbox" >&2
             status=1
             continue
         fi
+        # Each marked test, and no other, fails.
+        expected="${#tests[@]}"
         check "the ${#tests[@]} sandbox tests of ${name} with no sandbox" \
             "the sandbox tests need Codex's Linux sandbox" \
             --workspace --features "${FEATURES}" --test "${name}" -- --exact "${tests[@]}"
+        expected=""
     done
     [ "${#suites[@]}" -gt 0 ] || { echo "scripts/backends-check.sh: no sandbox suite found" >&2; exit 1; }
     check "sandbox suites (${found[*]}) with no sandbox" \

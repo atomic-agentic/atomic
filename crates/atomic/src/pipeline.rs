@@ -50,7 +50,7 @@
 //! command with no model, and gates.
 
 use crate::metering::RunBudget;
-use crate::workflows::propose;
+use crate::workflows::propose_at;
 use atomic_core::artifact::{ArtifactStore, LocalStore, Provenance};
 use atomic_core::astro::StepClock;
 use atomic_core::atom::Atom;
@@ -187,7 +187,18 @@ static RUNNING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize:
 /// How many atom steps this process is running now: a stopping process
 /// waits for them to reach their checkpoints.
 pub fn steps_running() -> usize {
-    RUNNING.load(std::sync::atomic::Ordering::SeqCst)
+    RUNNING
+        .load(std::sync::atomic::Ordering::SeqCst)
+        .saturating_sub(SET_ASIDE.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+/// How many of the [`RUNNING`] runs wait for good, set aside by
+/// [`crate::workflows::settled`] in `atomic serve`.
+static SET_ASIDE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Stop counting, in [`steps_running`], a run that waits for good.
+pub(crate) fn set_aside() {
+    SET_ASIDE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// Counts one running atom step in [`steps_running`] while it lives.
@@ -718,11 +729,12 @@ async fn run_pipeline<C: WorkflowContext>(
                 step_id: step.id.clone(),
             };
             let (opening, who, backend) = (atom.clone(), identity.clone(), runtimes.exec.shared());
+            let place = format!("run {run_id}, step {}", step.id);
             let (begun, opened) =
                 attempt::begin_with(&ctx, &format!("{}.attempt", step.id), move || async move {
-                    atomic_core::runtime::open_exec_workspace(&opening, &who, backend)
-                        .await
-                        .map_err(crate::workflows::failed)
+                    let opened =
+                        atomic_core::runtime::open_exec_workspace(&opening, &who, backend).await;
+                    crate::workflows::settled(opened, &place, true).await
                 })
                 .await?;
             Some((begun, atom.external().is_some(), opened, identity))
@@ -732,6 +744,7 @@ async fn run_pipeline<C: WorkflowContext>(
         let origins = step.origins.clone();
         let pinned_helpers = pinned.helper_runtime.clone();
         let (id, ran) = (step.id.clone(), format!("pipeline:ran:{}", step.id));
+        let place = format!("run {run_id}, step {}", step.id);
         let published = run_atom_at(
             &ctx,
             &step.id,
@@ -778,7 +791,7 @@ async fn run_pipeline<C: WorkflowContext>(
                     (_, Some((_, _, opened, identity))) => {
                         let clock = runtimes.clock.clone();
                         let backend = runtimes.exec.shared();
-                        propose(async move {
+                        propose_at(&place, true, async move {
                             let compiled = compile::compile(&atom, &Registry::new())
                                 .map_err(|e| AtomError::Runtime(e.to_string()))?;
                             // Opened with the attempt, or, when the attempt
@@ -805,7 +818,7 @@ async fn run_pipeline<C: WorkflowContext>(
                         .await
                     }
                     (None, None) => {
-                        propose(async move {
+                        propose_at(&place, true, async move {
                             run_in(&atom, &atom_input, &origins, &run_id, &id, snapshot.as_ref(), &runtimes)
                                 .await
                         })
@@ -820,7 +833,7 @@ async fn run_pipeline<C: WorkflowContext>(
                             snapshot,
                             run_id,
                         };
-                        in_worktree(worktrees, request, call, runtimes).await
+                        in_worktree(worktrees, request, call, runtimes, &place).await
                     }
                 }?;
                 failpoint(&ran);
@@ -947,6 +960,7 @@ async fn in_worktree(
     request: StepRequest,
     call: StepCall,
     runtimes: Arc<Runtimes>,
+    place: &str,
 ) -> Result<Proposal> {
     let StepCall {
         atom,
@@ -956,7 +970,7 @@ async fn in_worktree(
         run_id,
     } = call;
     let step = request.step.clone();
-    let ((output, metadata), commit) = contained(async move {
+    let finished = contained(async move {
         let subdirectory = source_subdirectory(runtimes.codex.cwd.clone()).await?;
         worktrees
             .run_step(request, |tree| async move {
@@ -979,8 +993,8 @@ async fn in_worktree(
                 StepError::Worktree(e) => AtomError::Runtime(format!("the step's worktree: {e}")),
             })
     })
-    .await
-    .map_err(crate::workflows::failed)?;
+    .await;
+    let ((output, metadata), commit) = crate::workflows::settled(finished, place, true).await?;
     failpoint("pipeline:after-commit");
     let mut metadata = serde_json::to_value(metadata)
         .map_err(|e| failed(format!("encode the atom's metadata: {e}")))?;
