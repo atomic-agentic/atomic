@@ -88,11 +88,62 @@ pub const PIPELINE: &str = "atomic.pipeline";
 /// layout no longer matches this one's.
 pub const LAYOUT_VERSION: &str = "atomic.pipeline.1";
 
-/// How many times the engine recovers one run of `run_pipeline` before it
-/// parks it as `MAX_RECOVERY_ATTEMPTS_EXCEEDED`: enough for a crash or two,
-/// few enough that a step whose process keeps dying, such as an idempotent
-/// command whose runner always dies, stops soon.
-pub const RECOVERY_LIMIT: i32 = 5;
+/// How many times one process recovers one run of `run_pipeline` before it
+/// fails the run as dead-lettered: enough for a crash or two, few enough
+/// that a step whose process keeps dying, such as an idempotent command
+/// whose runner always dies, stops soon. Each process counts afresh, so
+/// restarting `atomic serve` never counts against a healthy run; the
+/// engine's own cap, which counts every recovery claim, stays at its
+/// default.
+pub const RECOVERY_LIMIT: u32 = 5;
+
+/// How many times this process has started each run, by id.
+static EXECUTIONS: std::sync::Mutex<BTreeMap<String, u32>> = std::sync::Mutex::new(BTreeMap::new());
+
+/// Set once this process is stopping: no run starts another step.
+static STOPPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Start no more steps in this process: every run waits before its next
+/// step until the process exits, so a step that was running may still reach
+/// its checkpoint while nothing new begins. Call it when a stop begins.
+pub fn stop_starting_steps() {
+    STOPPING.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Wait for good if this process is stopping.
+async fn unless_stopping() {
+    if STOPPING.load(std::sync::atomic::Ordering::SeqCst) {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// How many atom steps this process is running now.
+static RUNNING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many atom steps this process is running now: a stopping process
+/// waits for them to reach their checkpoints.
+pub fn steps_running() -> usize {
+    RUNNING.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Counts one running atom step in [`steps_running`] while it lives.
+struct Running;
+
+impl Running {
+    fn start() -> Self {
+        RUNNING.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        RUNNING.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// The marker a dead-lettered run's error starts with.
+pub const DEAD_LETTERED: &str = "dead-lettered:";
 
 /// One atom step, as the interpreter runs it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -439,6 +490,22 @@ async fn run_pipeline<C: WorkflowContext>(
     ledger: Ledger,
 ) -> Result<Value> {
     let PipelineRun { pipeline, input } = run;
+    let id = ctx.workflow_id().to_owned();
+    let executions = {
+        let mut started = EXECUTIONS.lock().unwrap_or_else(|e| e.into_inner());
+        let n = started.entry(id.clone()).or_default();
+        *n += 1;
+        *n
+    };
+    if executions > 1 + RECOVERY_LIMIT {
+        let why = format!(
+            "{DEAD_LETTERED} run {id} stopped {RECOVERY_LIMIT} times in this process without \
+             finishing, so it is not run again"
+        );
+        eprintln!("{why}");
+        return Err(failed(why));
+    }
+    unless_stopping().await;
     let store = services.store.clone();
     fits("the workflow's input", &pipeline.input, &input)?;
     let (budget, caps) = budgets(
@@ -482,6 +549,8 @@ async fn run_pipeline<C: WorkflowContext>(
     let mut used_worktrees = false;
     let mut accepted = Vec::new();
     for step in &pipeline.steps {
+        // Before its attempt is recorded: a stopping process begins nothing.
+        unless_stopping().await;
         let scope = json!(steps);
         let values = [("input", &input), ("steps", &scope)];
         let step = match step {
@@ -494,6 +563,7 @@ async fn run_pipeline<C: WorkflowContext>(
                 continue;
             }
         };
+        let _running = Running::start();
         let mut mapped = Map::new();
         for (field, source) in &step.with {
             let value = atomic_schema::expr::evaluate(source, &values)

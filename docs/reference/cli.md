@@ -200,9 +200,10 @@ execution lock while they run. A second one is refused with the process id and
 command of the one that holds it, so two processes never execute the same
 project's runs. The lock is released only when its process exits.
 
-`atomic serve`, `atomic run` and `atomic runs resume` stop on SIGTERM or SIGINT.
-Running steps get 10 seconds to reach a checkpoint; a second signal stops the
-process at once. A command still running then is killed, with everything it
+`atomic serve`, `atomic run` and `atomic runs resume` stop on SIGTERM, SIGINT,
+SIGHUP or SIGQUIT. No step starts after the first signal, and running steps get
+up to 10 seconds to reach a checkpoint; a second signal stops the process at
+once. A command still running then is killed, with everything it
 started, also under `--runner process`, and the process exits without recording
 how the command ended: `atomic serve` with status 1, `atomic run` and
 `atomic runs resume` with status 130, leaving the run for `atomic runs resume`. Unfinished work stays recorded for the
@@ -210,6 +211,12 @@ next `serve` or `runs resume`, and an interrupted command runs again only if it
 declares `effects.external` as `read-only` or `idempotent`; any other is parked
 as `outcome_unknown`. Each command runs in a process group of its own (under
 `--runner process`, its runner's), and on Linux it is killed if atomic dies.
+
+One process recovers a run at most five times before it fails it as
+dead-lettered, so a step whose process keeps dying stops soon; restarting
+`atomic serve` does not count against a run. A run the engine parks after many
+restarts (`MAX_RECOVERY_ATTEMPTS_EXCEEDED`) is named by `atomic serve` and goes
+on with `atomic runs resume`.
 
 A resumed run goes on a queue of the resuming executor's own: only
 `atomic runs resume` and `atomic serve` of that executor run it, and

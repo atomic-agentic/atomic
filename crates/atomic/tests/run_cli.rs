@@ -1386,11 +1386,15 @@ fn a_run_id_that_already_exists_is_refused() {
 }
 
 #[test]
-fn a_cancelled_or_parked_run_is_not_resumed() {
+fn a_cancelled_run_is_not_resumed_and_a_parked_one_is() {
     on_codex_runtime(async {
-        let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(RANK.into())])
-            .await
-            .expect("fake model");
+        let model = FakeModel::start(vec![
+            Reply::Text(RANK.into()),
+            Reply::Text(RANK.into()),
+            Reply::Text(SUMMARY.into()),
+        ])
+        .await
+        .expect("fake model");
         let dir = scratch("cancelled");
         let project = project(&dir);
         let state = state_dir(&dir, &project);
@@ -1411,8 +1415,10 @@ fn a_cancelled_or_parked_run_is_not_resumed() {
                 .execute(&db)
                 .await
                 .expect("set the status");
+        }
+        let resume = |id: &'static str| {
             let (d, p, e) = (dir.clone(), project.clone(), env.clone());
-            let out = tokio::task::spawn_blocking(move || {
+            tokio::task::spawn_blocking(move || {
                 atomic(
                     &d,
                     &p,
@@ -1421,19 +1427,26 @@ fn a_cancelled_or_parked_run_is_not_resumed() {
                     "",
                 )
             })
-            .await
-            .expect("child");
-            assert!(!out.status.success(), "{}", text(&out));
-            let error = &stdout_json(&out)["error"];
-            assert_eq!(error["kind"], "run.not_resumable", "{id}: {error}");
-            assert!(
-                error["description"]
-                    .as_str()
-                    .is_some_and(|d| d.contains(status)),
-                "{error}"
-            );
-        }
+        };
+        let out = resume("cancelled-1").await.expect("child");
+        assert!(!out.status.success(), "{}", text(&out));
+        let error = &stdout_json(&out)["error"];
+        assert_eq!(error["kind"], "run.not_resumable", "{error}");
+        assert!(
+            error["description"]
+                .as_str()
+                .is_some_and(|d| d.contains("CANCELLED")),
+            "{error}"
+        );
         assert_eq!(model.calls(), 2, "nothing ran again");
+        // A run the engine parked for its recovery count goes on.
+        let out = resume("parked-1").await.expect("child");
+        assert!(out.status.success(), "{}", text(&out));
+        assert_eq!(
+            stdout_json(&out)["output"],
+            json!({"line": "P1: Export crashes on accents"})
+        );
+        assert_eq!(model.calls(), 3);
     });
 }
 
@@ -1923,6 +1936,167 @@ fn a_run_that_keeps_stopping_is_dead_lettered_after_a_few_tries() {
         1 + atomic_app::pipeline::RECOVERY_LIMIT as usize,
         "once, then once per recovery"
     );
+}
+
+/// A workflow of two undeclared exec steps: `first` logs `first start`,
+/// takes three seconds and logs `first end`; `second` logs `second`.
+fn write_two_steps(project: &Path, dir: &Path) {
+    let log = dir.join("steps.log");
+    for (name, body) in [
+        (
+            "first",
+            "log('first start')\ntime.sleep(3)\nlog('first end')\n",
+        ),
+        ("second", "log('second')\n"),
+    ] {
+        std::fs::write(
+            project.join(format!("tools/{name}.py")),
+            format!(
+                "import json, os, sys, time\n\
+                 def log(line): open(os.environ['STEPS_LOG'], 'a').write(line + '\\n')\n\
+                 note = json.load(sys.stdin)\n\
+                 {body}\
+                 json.dump({{'title': note['text'][:25], 'words': len(note['text'].split())}}, sys.stdout)\n"
+            ),
+        )
+        .expect("script");
+        write_atom(
+            project,
+            name,
+            &format!(
+                "description: '{name}', kind: 'exec', exec: {{ command: ['python3', 'tools/{name}.py'] }}, env: {{ STEPS_LOG: '{}' }}",
+                log.display()
+            ),
+            "",
+            object(json!({"text": {"type": "string"}})),
+            object(json!({"title": {"type": "string"}, "words": {"type": "integer"}})),
+        );
+    }
+    std::fs::write(
+        project.join("workflows/two-steps.workflow.yaml"),
+        "atomic: 1\nname: two-steps\n\
+         input: { $ref: ../atoms/first.input.schema.json }\n\
+         output: { $ref: ../atoms/second.output.schema.json }\n\
+         steps:\n  first:\n    atom: first\n    with: { text: input.text }\n\
+         \x20 second:\n    after: [first]\n    atom: second\n    with: { text: steps.first.output.title }\n\
+         returns: steps.second.output\n",
+    )
+    .expect("workflow");
+}
+
+fn steps_log(dir: &Path) -> Vec<String> {
+    std::fs::read_to_string(dir.join("steps.log"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn no_step_starts_after_the_first_signal() {
+    let dir = scratch("no-new-steps");
+    let project = project(&dir);
+    write_two_steps(&project, &dir);
+    let log = dir.join("run.log");
+    let mut run = spawn(
+        &dir,
+        &project,
+        &["run", "two-steps", "--run-id", "two-1", "--data", NOTE],
+        &[],
+        &log,
+    );
+    wait_until("the first step to start", || {
+        steps_log(&dir).contains(&"first start".to_owned())
+    });
+    signal(&run, "TERM");
+    let status = wait_child(&mut run, "atomic run");
+    let said = std::fs::read_to_string(&log).expect("log");
+    assert_eq!(status.code(), Some(130), "{said}");
+    // The running step finished and was recorded; nothing began after it.
+    assert_eq!(steps_log(&dir), ["first start", "first end"], "{said}");
+    assert!(!said.contains("stopped 1 command"), "{said}");
+
+    // The run goes on from the step after it.
+    let out = atomic(
+        &dir,
+        &project,
+        &["runs", "resume", "two-1"],
+        &UNUSED_MODEL,
+        "",
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(steps_log(&dir), ["first start", "first end", "second"]);
+}
+
+#[test]
+fn serve_restarts_do_not_park_a_healthy_run() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
+            .await
+            .expect("fake model");
+        let dir = scratch("restarts");
+        let project = project(&dir);
+        let state = state_dir(&dir, &project);
+        let env = model_env(&model.base_url());
+        let mut first = spawn(
+            &dir,
+            &project,
+            &["run", "gated", "--run-id", "waiting-1", "--data", NOTE],
+            &with(&env, &[]),
+            &dir.join("first.log"),
+        );
+        let rt = Durare::sqlite(&state.join("private/atomic.db"))
+            .await
+            .expect("store");
+        let opened = open_gate(&rt, "waiting-1").await;
+        first.kill().expect("SIGKILL the run");
+        first.wait().expect("reap");
+        // More restarts than one process may recover a run.
+        for n in 0..(atomic_app::pipeline::RECOVERY_LIMIT + 2) {
+            let log = dir.join(format!("serve-{n}.log"));
+            let mut serve = spawn(&dir, &project, &["serve"], &with(&env, &[]), &log);
+            wait_until("serve to recover", || {
+                std::fs::read_to_string(&log).is_ok_and(|l| l.contains("serving until stopped"))
+            });
+            terminate(&serve);
+            let (d, l) = (dir.clone(), log.clone());
+            let status = tokio::task::spawn_blocking(move || wait_child(&mut serve, "serve"))
+                .await
+                .expect("child");
+            let _ = d;
+            let text = std::fs::read_to_string(&l).unwrap_or_default();
+            assert!(status.success(), "{text}");
+            assert!(!text.contains("parked"), "restart {n}: {text}");
+        }
+        assert_eq!(
+            rt.status("waiting-1").await.expect("status"),
+            Some(RunStatus::Pending),
+            "still waiting at its gate"
+        );
+        approve(&rt, &open_gate(&rt, "waiting-1").await).await;
+        let mut serve = spawn(
+            &dir,
+            &project,
+            &["serve"],
+            &with(&env, &[]),
+            &dir.join("serve-last.log"),
+        );
+        let started = Instant::now();
+        while rt.status("waiting-1").await.expect("status") != Some(RunStatus::Succeeded) {
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "the approved run never finished"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let _ = opened;
+        assert_eq!(model.calls(), 2, "rank once, summarize once");
+        terminate(&serve);
+        let status = tokio::task::spawn_blocking(move || wait_child(&mut serve, "serve"))
+            .await
+            .expect("child");
+        assert!(status.success());
+    });
 }
 
 #[test]

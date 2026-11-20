@@ -924,13 +924,6 @@ impl Durare {
         Ok(())
     }
 
-    /// Park a run of `workflow` as `MAX_RECOVERY_ATTEMPTS_EXCEEDED` once it
-    /// has been recovered `max` times. Call it before
-    /// [`launch`](DurableRuntime::launch).
-    pub fn cap_recoveries(&mut self, workflow: &str, max: i32) {
-        self.engine.max_recovery_attempts_for(workflow, max);
-    }
-
     /// The version this engine stamps on runs, and the only one it recovers.
     pub fn version(&self) -> &str {
         self.engine.app_version()
@@ -947,6 +940,20 @@ impl Durare {
             .await
             .map_err(from_durare)?;
         Ok(found.into_iter().next().map(RunRecord::from))
+    }
+
+    /// Every run in the store in engine state `state`, such as
+    /// `MAX_RECOVERY_ATTEMPTS_EXCEEDED`.
+    pub async fn runs_in(&self, state: &str) -> Result<Vec<RunRecord>> {
+        let found = self
+            .engine
+            .list_workflows(&durare::ListFilter {
+                status: vec![state.to_owned()],
+                ..durare::ListFilter::default()
+            })
+            .await
+            .map_err(from_durare)?;
+        Ok(found.into_iter().map(RunRecord::from).collect())
     }
 
     /// Every unfinished run in the store, whoever owns it and whatever its

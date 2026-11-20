@@ -25,6 +25,9 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+/// The state of a run the engine parked for its recovery count.
+const PARKED: &str = "MAX_RECOVERY_ATTEMPTS_EXCEEDED";
+
 /// How long a stopping process gives running work to reach a checkpoint.
 const SHUTDOWN: Duration = Duration::from_secs(10);
 
@@ -125,11 +128,20 @@ async fn finish(
         }
     };
     let Some(outcome) = outcome else {
-        stop(engine, signals, who, Exit::Signalled).await
+        stop(signals, who, Exit::Signalled).await
     };
     let _ = engine.rt.shutdown(SHUTDOWN).await;
     match outcome {
         Ok(output) => print_result(run_id, &output, json),
+        Err(DurableError::Failed(why)) if why.contains(atomic_app::pipeline::DEAD_LETTERED) => {
+            Err(Failure::new(
+                "run.dead_lettered",
+                format!("run {run_id} failed: {why}"),
+                "find why its step keeps stopping, such as a command whose runner dies under it, \
+                 fix that, and start a new run",
+            )
+            .into())
+        }
         Err(DurableError::Failed(why)) => Err(Failure::new(
             "run.failed",
             format!("run {run_id} failed: {why}"),
@@ -144,14 +156,12 @@ async fn finish(
             ) =>
         {
             Err(Failure::new(
-                "run.dead_lettered",
+                "run.parked",
                 format!(
-                    "run {run_id} stopped and was recovered {} times without finishing, so it is \
-                     parked for good: {e}",
-                    atomic_app::pipeline::RECOVERY_LIMIT
+                    "run {run_id} was recovered more times than the engine allows, so it is \
+                     parked: {e}"
                 ),
-                "find why its step keeps stopping, such as a command whose runner dies under it, \
-                 fix that, and start a new run",
+                format!("continue it with `atomic runs resume {run_id}`"),
             )
             .into())
         }
@@ -171,11 +181,12 @@ pub async fn run(
     paths: &CodexPaths,
     json: bool,
 ) -> anyhow::Result<()> {
-    let mut signals = Signals::new()?;
     let cwd = std::env::current_dir()?;
     let found = target::project_for(project, Some(&args.target), &cwd)?;
     let state = ProjectState::resolve(found.root())?;
     let input = target::input(args.input.as_deref(), args.data.as_deref(), &cwd)?;
+    // After the input is read: until then a signal stops atomic as usual.
+    let mut signals = Signals::new()?;
     let run = target::load(&found, &args.target, &cwd, input, &engine::deployment())?;
     let engine = engine::open(
         &state,
@@ -270,7 +281,7 @@ pub async fn resume(
         Some(RunStatus::Succeeded) => {
             finish(&engine, id, json, &mut signals, "atomic runs resume").await
         }
-        Some(RunStatus::Other(state)) => {
+        Some(RunStatus::Other(state)) if state != PARKED => {
             let _ = engine.rt.shutdown(SHUTDOWN).await;
             Err(Failure::new(
                 "run.not_resumable",
@@ -279,7 +290,8 @@ pub async fn resume(
             )
             .into())
         }
-        Some(RunStatus::Pending) => {
+        // A run parked for its recovery count resumes with a fresh count.
+        Some(RunStatus::Pending | RunStatus::Other(_)) => {
             let record = record.as_ref().expect("a status has a record");
             // The engine runs only runs of its own layout: resuming another
             // would wait for ever.
@@ -335,6 +347,10 @@ struct Signals {
     term: tokio::signal::unix::Signal,
     #[cfg(unix)]
     int: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    hup: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    quit: tokio::signal::unix::Signal,
 }
 
 impl Signals {
@@ -345,6 +361,8 @@ impl Signals {
             Ok(Self {
                 term: signal(SignalKind::terminate())?,
                 int: signal(SignalKind::interrupt())?,
+                hup: signal(SignalKind::hangup())?,
+                quit: signal(SignalKind::quit())?,
             })
         }
         #[cfg(not(unix))]
@@ -358,6 +376,8 @@ impl Signals {
             tokio::select! {
                 _ = self.term.recv() => "SIGTERM",
                 _ = self.int.recv() => "SIGINT",
+                _ = self.hup.recv() => "SIGHUP",
+                _ = self.quit.recv() => "SIGQUIT",
             }
         }
         #[cfg(not(unix))]
@@ -384,14 +404,21 @@ enum Exit {
 /// execution lock, so no other process can recover a run while a command of
 /// this one still runs. Each interrupted command's attempt guard decides
 /// whether it may run again.
-async fn stop(engine: &engine::Engine, signals: &mut Signals, who: &str, exit: Exit) -> ! {
+async fn stop(signals: &mut Signals, who: &str, exit: Exit) -> ! {
     eprintln!(
         "{who}: stopping; running steps have {} seconds to reach a checkpoint (send another \
          signal to stop now)",
         SHUTDOWN.as_secs()
     );
+    // Nothing begins from here; what runs may finish its step.
+    atomic_app::pipeline::stop_starting_steps();
+    let idle = async {
+        while atomic_app::pipeline::steps_running() > 0 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
     let forced = tokio::select! {
-        _ = engine.rt.shutdown(SHUTDOWN) => None,
+        _ = tokio::time::timeout(SHUTDOWN, idle) => None,
         again = signals.next() => Some(again),
     };
     if let Some(again) = forced {
@@ -440,7 +467,23 @@ pub async fn serve(
         engine.store,
         engine.rt.executor_id()
     );
+    let parked = |records: Vec<atomic_durable::RunRecord>| -> std::collections::BTreeSet<String> {
+        records
+            .into_iter()
+            .filter(|r| matches!(&r.status, RunStatus::Other(s) if s == PARKED))
+            .map(|r| r.id)
+            .collect()
+    };
+    let before = parked(engine.rt.runs_in(PARKED).await?);
     let recovered = engine.rt.recover().await?;
+    // The engine parks a run it has recovered too often instead of
+    // recovering it once more: name each one.
+    for id in parked(engine.rt.runs_in(PARKED).await?).difference(&before) {
+        eprintln!(
+            "atomic serve: run {id} was recovered more times than the engine allows, so it is \
+             parked; continue it with `atomic runs resume {id}`"
+        );
+    }
     // A gate decided while its run was down may never have woken it.
     atomic_durable::gate::redeliver(&engine.rt).await?;
     // Runs of another layout are this executor's too, but only an atomic of
@@ -466,5 +509,5 @@ pub async fn serve(
     eprintln!("atomic serve: recovered {recovered} unfinished run(s); serving until stopped");
     let signal = signals.next().await;
     eprintln!("atomic serve: {signal}");
-    stop(&engine, &mut signals, "atomic serve", Exit::Served).await
+    stop(&mut signals, "atomic serve", Exit::Served).await
 }
