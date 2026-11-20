@@ -52,7 +52,7 @@ commands, exec and Codex alike, never see them, so a collector credential in
 | A workflow run | `invoke_workflow <workflow>` | `atomic.workflow`, `atomic.workflow.id`, `gen_ai.conversation.id` |
 | An atom step | `invoke_agent <atom>` | `gen_ai.agent.name`, `atomic.step`, `atomic.workflow.id` |
 | A gate step | `atomic.gate <gate>` | `atomic.gate`, `atomic.step`, `atomic.workflow.id` |
-| A model call | `chat <model>` | `gen_ai.provider.name`, `gen_ai.request.model`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `atomic.workflow.id`, `atomic.step`, `error.type`, `error.message` |
+| A model call | `chat <model>` | `gen_ai.provider.name`, `gen_ai.request.model`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `atomic.workflow.id`, `atomic.step`, `error.type`, `error.message`, `http.response.status_code` |
 
 Each step's span is a child of its run's, and each model call's a child of its
 step's, a client span. A Codex atom's call is one turn, which may make several
@@ -61,7 +61,12 @@ is `openai` for OpenAI's API and `openai_compatible` for any other endpoint.
 
 A step or run that fails ends its span with an error status, the failure's
 message and `error.type` (`atomic.failed`, `atomic.interrupted`, or for a
-model call `atomic.model_call` or `atomic.meter`). A process that stops while
+model call `atomic.model_call` or `atomic.meter`). A model call's
+`error.message` carries none of the provider's own text: for an error the
+provider answered with, its status and the type of error it names, such as
+`401 Unauthorized: invalid_request_error`, with `http.response.status_code`;
+for any other, at most 200 characters. The run's stored error keeps the
+whole, redacted. A process that stops while
 runs are still going, such as one stopped while it waits at a gate, ends the
 spans still open with `atomic.stopped` set and exports them before it exits.
 

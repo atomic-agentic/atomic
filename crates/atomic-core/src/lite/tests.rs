@@ -736,3 +736,45 @@ async fn an_answer_a_content_filter_stopped_is_not_a_truncation() {
         })]
     );
 }
+
+/// A chat span says of a provider's error its status and the type of error
+/// it names, none of the provider's own text; any other error is cut. The
+/// error itself keeps the start of the body.
+#[test]
+fn a_chat_spans_error_is_the_status_and_type_not_the_body() {
+    let body = format!(
+        "{{\"error\":{{\"message\":\"{}\",\"type\":\"invalid_request_error\"}}}}",
+        "the provider's own words ".repeat(200)
+    );
+    let value: Value = serde_json::from_str(&body).expect("JSON");
+    let error = anyhow::Error::from(ProviderError {
+        url: "http://127.0.0.1:9/v1/chat/completions".into(),
+        status: "401 Unauthorized".into(),
+        code: 401,
+        kind: error_kind(&value),
+        excerpt: excerpt(&body),
+    })
+    .context("rank-note");
+    let (message, status) = crate::usage::span_error(&error);
+    assert_eq!(message, "401 Unauthorized: invalid_request_error");
+    assert_eq!(status, Some(401));
+    assert!(format!("{error:#}").contains("the provider's own words"));
+    // A type that is not an identifier is the provider's text, not kept.
+    assert_eq!(
+        error_kind(&json!({"error": {"type": "see the words here"}})),
+        None
+    );
+    assert_eq!(
+        error_kind(&json!({"error": {"code": "rate_limit_exceeded"}})).as_deref(),
+        Some("rate_limit_exceeded")
+    );
+    // Any other error is cut to the span's bound.
+    let long = anyhow!("{}", "word ".repeat(1000));
+    let (message, status) = crate::usage::span_error(&long);
+    assert!(
+        message.chars().count() <= crate::usage::MAX_SPAN_ERROR + 1,
+        "{} characters",
+        message.chars().count()
+    );
+    assert_eq!(status, None);
+}

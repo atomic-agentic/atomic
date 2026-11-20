@@ -283,10 +283,17 @@ fn a_key_a_lite_provider_echoes_is_redacted_in_its_excerpt() {
             attribute(call, "error.type").as_deref(),
             Some("atomic.model_call")
         );
-        assert!(
-            attribute(call, "error.message")
-                .unwrap()
-                .contains("[REDACTED]")
+        // The status and the type of error the provider named, none of its
+        // own text: the run's stored error keeps that.
+        assert_eq!(
+            attribute(call, "error.message").as_deref(),
+            Some("401 Unauthorized: invalid_request_error"),
+            "{call}"
+        );
+        assert_eq!(
+            attribute(call, "http.response.status_code").as_deref(),
+            Some("401"),
+            "{call}"
         );
         for name in ["invoke_agent rank-note", "invoke_workflow triage"] {
             let span = named(&spans, name);
