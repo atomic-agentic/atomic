@@ -1148,17 +1148,19 @@ where
         let bounded_by = ticket.as_ref().and_then(|t| t.bounded_by.clone());
         // A turn is cut off when its reserved time runs out; a failed or cut
         // off turn still reports the usage seen before it stopped.
-        let (turn, totals) = run_turn(&thread, &current, limit.time).await;
+        let (turn, progress) = run_turn(&thread, &current, limit.time).await;
+        let totals = progress.usage;
         // Codex repeats the last totals in every token count, so a turn
         // whose requests reported nothing shows them unchanged; a request
         // that reports usage always grows them. A turn with nothing reported
         // spent something unknown and stays charged at its reservation.
         let fresh = totals.filter(|(input, output, _)| *input > seen.0 || *output > seen.1);
-        // A turn cut off at its reserved time was stopped with a request in
-        // flight, which has reported nothing yet: what the thread grew by is
-        // less than the turn spent. It stays charged at its reservation, as
-        // an unknown, until a usage query reconciles it.
+        // A turn stopped with a provider request in flight, which has
+        // reported nothing yet, spent more than the thread grew by: it is
+        // charged the growth and one more request's bound (see
+        // [`Progress::in_flight`]).
         let cut_off = matches!(&turn, Err(e) if e.downcast_ref::<CutOff>().is_some());
+        let in_flight = progress.in_flight(cut_off, turn.is_err());
         let outcome = match fresh {
             Some((input, output, total)) => {
                 let grown = Usage {
@@ -1169,8 +1171,8 @@ where
                 report.input_tokens = input;
                 report.output_tokens = output;
                 report.total_tokens = total;
-                if cut_off {
-                    Outcome::Unknown
+                if in_flight {
+                    Outcome::Partial(grown)
                 } else {
                     Outcome::Reported(grown)
                 }
@@ -1474,45 +1476,110 @@ struct CutOff(std::time::Duration);
 /// How long an interrupted turn has to wind down.
 const INTERRUPT_PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Where a turn got to, as its events show.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Progress {
+    /// The thread's running token totals (input, output, total), as last
+    /// reported.
+    usage: Option<(i64, i64, i64)>,
+    /// Tools running now, between provider requests.
+    tools: usize,
+    /// Whether a provider response has begun streaming and not completed.
+    streaming: bool,
+    /// Whether the turn completed.
+    completed: bool,
+}
+
+impl Progress {
+    /// Follow one event of the turn.
+    fn observe(&mut self, msg: &EventMsg) {
+        match msg {
+            EventMsg::TokenCount(count) => {
+                // Sent after every response, broken ones too, repeating the
+                // totals when nothing new was reported.
+                if let Some(info) = &count.info {
+                    let t = &info.total_token_usage;
+                    self.usage = Some((t.input_tokens, t.output_tokens, t.total_tokens));
+                }
+            }
+            // A response completed, its usage reported in the next totals.
+            EventMsg::RawResponseCompleted(_) => self.streaming = false,
+            EventMsg::AgentMessageContentDelta(_)
+            | EventMsg::ReasoningContentDelta(_)
+            | EventMsg::ReasoningRawContentDelta(_)
+            | EventMsg::PlanDelta(_)
+            | EventMsg::StreamError(_) => self.streaming = true,
+            EventMsg::ExecCommandBegin(_)
+            | EventMsg::McpToolCallBegin(_)
+            | EventMsg::WebSearchBegin(_)
+            | EventMsg::ImageGenerationBegin(_)
+            | EventMsg::PatchApplyBegin(_) => self.tools += 1,
+            EventMsg::ExecCommandEnd(_)
+            | EventMsg::McpToolCallEnd(_)
+            | EventMsg::WebSearchEnd(_)
+            | EventMsg::ImageGenerationEnd(_)
+            | EventMsg::PatchApplyEnd(_) => self.tools = self.tools.saturating_sub(1),
+            EventMsg::TurnComplete(_) => self.completed = true,
+            _ => {}
+        }
+    }
+
+    /// Whether the turn stopped with a provider request in flight: one sent
+    /// whose usage is not in the totals. A turn cut off at its time was
+    /// waiting on a request unless it had completed or was running a tool;
+    /// a turn that failed was, only if a response had begun streaming and
+    /// broke off, not if the provider refused the request outright.
+    fn in_flight(&self, cut_off: bool, failed: bool) -> bool {
+        if self.completed {
+            return false;
+        }
+        if cut_off {
+            return self.tools == 0;
+        }
+        failed && self.streaming
+    }
+}
+
 /// Run one turn, cut off after `time` if one is given. Returns how it ended
-/// and the thread's running totals (input, output, total) as last reported,
-/// whether or not it succeeded.
+/// and where it got to, the thread's running totals as last reported among
+/// it, whether or not it succeeded.
 async fn run_turn(
     thread: &CodexThread,
     spec: &TurnSpec,
     time: Option<std::time::Duration>,
-) -> (anyhow::Result<String>, Option<(i64, i64, i64)>) {
-    let mut usage = None;
+) -> (anyhow::Result<String>, Progress) {
+    let mut progress = Progress::default();
     let ended = match time {
-        None => turn(thread, spec, &mut usage).await,
-        Some(time) => match tokio::time::timeout(time, turn(thread, spec, &mut usage)).await {
+        None => turn(thread, spec, &mut progress).await,
+        Some(time) => match tokio::time::timeout(time, turn(thread, spec, &mut progress)).await {
             Ok(ended) => ended,
             Err(_) => {
-                interrupt(thread, &mut usage).await;
+                interrupt(thread, &mut progress).await;
                 Err(anyhow::Error::new(CutOff(time)))
             }
         },
     };
-    (ended, usage)
+    (ended, progress)
 }
 
 /// Interrupt the running turn and wait, briefly, for it to stop, keeping
-/// any usage it reports on the way.
-async fn interrupt(thread: &CodexThread, usage: &mut Option<(i64, i64, i64)>) {
+/// any usage it reports on the way. A turn that completed before the
+/// interrupt took says so; one aborted keeps where it was when stopped.
+async fn interrupt(thread: &CodexThread, progress: &mut Progress) {
     if thread.submit(Op::Interrupt).await.is_err() {
         return;
     }
     let _ = tokio::time::timeout(INTERRUPT_PATIENCE, async {
         while let Ok(event) = thread.next_event().await {
-            match event.msg {
-                EventMsg::TokenCount(count) => {
-                    if let Some(info) = count.info {
-                        let t = info.total_token_usage;
-                        *usage = Some((t.input_tokens, t.output_tokens, t.total_tokens));
-                    }
-                }
-                EventMsg::TurnAborted(_) | EventMsg::TurnComplete(_) => break,
+            match &event.msg {
+                EventMsg::TokenCount(_) | EventMsg::TurnComplete(_) => progress.observe(&event.msg),
                 _ => {}
+            }
+            if matches!(
+                event.msg,
+                EventMsg::TurnAborted(_) | EventMsg::TurnComplete(_)
+            ) {
+                break;
             }
         }
     })
@@ -1522,7 +1589,7 @@ async fn interrupt(thread: &CodexThread, usage: &mut Option<(i64, i64, i64)>) {
 async fn turn(
     thread: &CodexThread,
     spec: &TurnSpec,
-    usage: &mut Option<(i64, i64, i64)>,
+    progress: &mut Progress,
 ) -> anyhow::Result<String> {
     // Codex sends TurnComplete before it marks the thread idle, so a follow-up
     // turn submitted straight after one can be declined as NotIdle. That
@@ -1553,13 +1620,8 @@ async fn turn(
 
     loop {
         let event = thread.next_event().await.context("read Codex event")?;
+        progress.observe(&event.msg);
         match event.msg {
-            EventMsg::TokenCount(count) => {
-                if let Some(info) = count.info {
-                    let t = info.total_token_usage;
-                    *usage = Some((t.input_tokens, t.output_tokens, t.total_tokens));
-                }
-            }
             EventMsg::TurnComplete(done) => {
                 return done
                     .last_agent_message
@@ -2289,6 +2351,52 @@ mod tests {
     }
 
     #[test]
+    fn a_turn_whose_last_response_breaks_off_is_charged_as_one_in_flight() {
+        on_codex_runtime(async {
+            // The first request reports its usage and calls a tool; every
+            // later response begins and breaks off, Codex's retries too.
+            let mut replies = vec![Reply::Tool {
+                name: "no_such_tool".into(),
+                arguments: serde_json::json!({}),
+            }];
+            replies.extend((0..12).map(|_| Reply::Broken("par".into())));
+            let (ended, settled, calls) =
+                metered_conversation("broken", replies, 1, Limit::default()).await;
+            assert!(ended.is_err(), "the turn failed");
+            assert!((3..=13).contains(&calls), "{calls}");
+            assert_eq!(
+                settled,
+                [Outcome::Partial(Usage {
+                    input_tokens: 1,
+                    output_tokens: 1
+                })]
+            );
+        });
+    }
+
+    #[test]
+    fn a_request_is_in_flight_only_when_one_was_sent_and_not_answered() {
+        let at = |tools, streaming, completed| Progress {
+            usage: None,
+            tools,
+            streaming,
+            completed,
+        };
+        // Cut off waiting on a request, or as a response streamed.
+        assert!(at(0, false, false).in_flight(true, true));
+        assert!(at(0, true, false).in_flight(true, true));
+        // Cut off while a tool ran between requests, or once it completed.
+        assert!(!at(1, false, false).in_flight(true, true));
+        assert!(!at(0, false, true).in_flight(true, true));
+        // A failure is in flight only if a response broke off midway, not
+        // when a request was refused outright.
+        assert!(at(0, true, false).in_flight(false, true));
+        assert!(!at(0, false, false).in_flight(false, true));
+        // A completed turn never is.
+        assert!(!at(0, false, true).in_flight(false, false));
+    }
+
+    #[test]
     fn a_turn_cut_off_with_a_request_in_flight_stays_at_its_reservation() {
         on_codex_runtime(async {
             // The turn's first request reports its usage and calls a tool;
@@ -2315,9 +2423,15 @@ mod tests {
             let e = ended.expect_err("cut off");
             assert!(format!("{e:#}").contains("cut off"), "{e:#}");
             assert_eq!(calls, 2, "the second request was made");
-            // Not the first request's usage alone: the second spent
-            // something no one has reported.
-            assert_eq!(settled, [Outcome::Unknown]);
+            // The first request's usage and one more request's bound: the
+            // second spent something no one has reported.
+            assert_eq!(
+                settled,
+                [Outcome::Partial(Usage {
+                    input_tokens: 1,
+                    output_tokens: 1
+                })]
+            );
         });
     }
 }

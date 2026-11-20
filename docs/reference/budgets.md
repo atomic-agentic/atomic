@@ -114,7 +114,10 @@ separate wall-clock deadline and continues during an offline interval.
 Before dispatch, Atomic durably reserves against the atom and every parent budget
 under a stable request/attempt ID, independently of output checkpoints. Settlement
 is idempotent by that ID. Failed or rejected attempts still count; an uncertain
-request retains its maximum reservation until usage is reconciled. A new actual
+request retains its maximum reservation until usage is reconciled. Nothing
+reconciles usage yet: the usage query that would learn an uncertain request's
+real usage from the provider is not built, so an unknown or partly known charge
+keeps its value. A new actual
 retry needs another reservation rather than reusing uncertain allowance.
 
 For a supported bounded request, reserve its whole provider maximum: intentional
@@ -152,12 +155,16 @@ the `call` time does not bound it. A turn reserves the active time its atom has
 left (or less, if the run has less), and is interrupted when that runs out; the
 run then parks, as at any other cap, and the park's reason names the allowance
 that ran out. With less time left than one request's bound, a turn is not
-started at all: the run parks without spending. A turn that completes, or fails, is
-settled with the usage it reported. A turn interrupted when its time runs out was
-stopped with a request in flight, which has reported nothing, so it is settled as
-unknown: its tokens and dollars stay charged at its reservation, however little the
-requests before it reported. Reported tokens can exceed the bound; the ledger
-records any such overshoot.
+started at all: the run parks without spending. A turn that completes is settled
+with the usage it reported. A turn stopped with a provider request in flight is
+charged what its requests reported and one more request's bound for the request
+that reported nothing, and never less than its reservation: one interrupted when
+its time ran out while it waited on a request, or one whose last response began
+and broke off. A turn interrupted while it ran a tool between requests, or that
+had already completed, and one whose request the provider refused outright, is
+charged what it reported. A turn's reported tokens can exceed its reservation,
+since every request sends the conversation again; the ledger records the
+overshoot, including the in-flight bound added to it.
 
 A run resolves the model each atom calls with its budget, and the atom runs on
 that model for the whole run. Under a dollar cap, a call to a model the run's

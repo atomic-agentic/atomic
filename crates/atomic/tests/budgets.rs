@@ -1192,16 +1192,19 @@ fn a_codex_turn_that_runs_out_of_its_atoms_time_parks_the_run() {
 }
 
 #[test]
-fn a_codex_turn_cut_off_with_a_request_in_flight_is_charged_its_reservation() {
+fn a_codex_turn_cut_off_with_a_request_in_flight_is_charged_what_it_reported_and_one_bound() {
     on_codex_runtime(async {
-        // The review turn's first request reports its usage and calls a
-        // tool; its second is in flight when the atom's time runs out.
+        // One request is bounded at two tokens. The review turn's first two
+        // requests report two tokens each and call a tool, past its
+        // reservation; its third is in flight when the atom's time runs out.
+        let tool = || Reply::Tool {
+            name: "no_such_tool".into(),
+            arguments: serde_json::json!({}),
+        };
         let model = FakeModel::start(vec![
             Reply::Text(DRAFT.into()),
-            Reply::Tool {
-                name: "no_such_tool".into(),
-                arguments: serde_json::json!({}),
-            },
+            tool(),
+            tool(),
             Reply::Delayed {
                 after: Duration::from_secs(20),
                 reply: Box::new(Reply::Text(REVIEW.into())),
@@ -1210,7 +1213,10 @@ fn a_codex_turn_cut_off_with_a_request_in_flight_is_charged_its_reservation() {
         .await
         .expect("fake model");
         let dir = scratch("inflight");
-        let rt = engine(&dir, &model.base_url(), timed(0.01, 0.05)).await;
+        let mut budgets = timed(0.01, 0.05);
+        budgets.call.input_tokens = 1;
+        budgets.call.output_tokens = 1;
+        let rt = engine(&dir, &model.base_url(), budgets).await;
         rt.launch().await.expect("launch");
         rt.start(CHANGE_REQUEST, "inflight", input())
             .await
@@ -1219,19 +1225,16 @@ fn a_codex_turn_cut_off_with_a_request_in_flight_is_charged_its_reservation() {
             panic!("the run should park");
         };
         assert!(reason.contains("cut off"), "{reason}");
-        assert_eq!(model.calls(), 3, "the turn's second request was made");
+        assert_eq!(model.calls(), 4, "the turn's third request was made");
         let journal = attempts(&rt, "inflight").await;
         let turn = &journal[1];
-        // Not the two tokens its first request reported: the request it was
-        // stopped in spent something no one reported, so the turn stays
-        // charged at its reservation.
-        assert!(
-            turn.charged.tokens >= turn.reserved.tokens,
-            "charged {:?}, reserved {:?}",
-            turn.charged,
-            turn.reserved
-        );
-        assert!(turn.charged.tokens > 2, "{turn:?}");
+        assert_eq!(turn.reserved.tokens, 2, "{turn:?}");
+        // What its requests reported, and the bound of the one in flight;
+        // the reported usage is kept, and the attempt left open.
+        assert_eq!(turn.usage, Some((2, 2)), "{turn:?}");
+        assert_eq!(turn.charged.tokens, 4 + 2, "{turn:?}");
+        assert_eq!(turn.overshoot(), 4, "{turn:?}");
+        assert_eq!(turn.state, "reserved", "{turn:?}");
         rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
     });
 }

@@ -183,6 +183,23 @@ pub enum Settlement {
     Unknown,
     /// The call was never dispatched: the reservation is released.
     NotDispatched,
+    /// Part of the call's usage is known: it reported this much, and was
+    /// then stopped with a request in flight that reported nothing, whose
+    /// most is `in_flight`. Its tokens and dollars are charged the reported
+    /// amounts plus `in_flight`, and at least what was reserved; its time,
+    /// as for [`Settlement::Unknown`]. The reported usage is recorded, and
+    /// the attempt stays open, as an unknown one does, for a usage query to
+    /// correct.
+    Partial {
+        /// Input tokens reported.
+        input_tokens: i64,
+        /// Output tokens reported.
+        output_tokens: i64,
+        /// What the reported usage cost, in micro-dollars.
+        micro_usd: i64,
+        /// The most one more request could have spent.
+        in_flight: Charge,
+    },
     /// Its usage, learned after the fact from a usage query or a person,
     /// for an attempt that was never settled: it replaces the reservation.
     /// The active time is what passed since admission, at most what was
@@ -709,6 +726,71 @@ async fn settle_dead_in(tx: &mut Tx<'_, '_>, request: &Request, now: i64) -> Res
     })
 }
 
+/// Charge an attempt known only in part: `reported` (input and output
+/// tokens and micro-dollars) and `in_flight`, the most a request that
+/// reported nothing could have spent, and at least what it was charged
+/// already, its reservation. The reported usage is recorded; the attempt
+/// stays reserved, so it is still open to a usage query.
+async fn partly(
+    tx: &mut Tx<'_, '_>,
+    request: &str,
+    attempt: i64,
+    reported: (i64, i64, i64),
+    in_flight: Charge,
+) -> Result<End<Settled>> {
+    let key = [Param::Text(request.to_owned()), Param::Int(attempt)];
+    let row = tx
+        .query_one(
+            "SELECT state, scopes, charged_tokens, charged_micro_usd \
+             FROM atomic_usage_attempts WHERE request_id = ? AND attempt = ?",
+            &key,
+        )
+        .await?;
+    if row.text("state")? != "reserved" {
+        return Ok(End::Rollback(Settled::Already));
+    }
+    let scopes: Vec<String> = serde_json::from_str(&row.text("scopes")?).map_err(corrupt)?;
+    let (charged_tokens, charged_micro) =
+        (row.int("charged_tokens")?, row.int("charged_micro_usd")?);
+    let held = |n: i64| n.clamp(0, MOST);
+    let (input, output, micro) = (held(reported.0), held(reported.1), held(reported.2));
+    let tokens = (input + output + held(in_flight.tokens))
+        .min(MOST)
+        .max(charged_tokens);
+    let micro_usd = (micro + held(in_flight.micro_usd))
+        .min(MOST)
+        .max(charged_micro);
+    let changed = tx
+        .execute(
+            "UPDATE atomic_usage_attempts SET input_tokens = ?, output_tokens = ?, \
+             charged_tokens = ?, charged_micro_usd = ? \
+             WHERE request_id = ? AND attempt = ? AND state = 'reserved'",
+            &[
+                Param::Int(input),
+                Param::Int(output),
+                Param::Int(tokens),
+                Param::Int(micro_usd),
+                Param::Text(request.to_owned()),
+                Param::Int(attempt),
+            ],
+        )
+        .await?;
+    if changed != 1 {
+        return Ok(End::Rollback(Settled::Already));
+    }
+    add_charge(
+        tx,
+        &scopes,
+        Charge {
+            tokens: tokens - charged_tokens,
+            millis: 0,
+            micro_usd: micro_usd - charged_micro,
+        },
+    )
+    .await?;
+    Ok(End::Commit(Settled::Uncertain))
+}
+
 async fn settle_in(
     tx: &mut Tx<'_, '_>,
     request: &str,
@@ -733,16 +815,35 @@ async fn settle_in(
         return Ok(End::Rollback(Settled::Already));
     }
     // Usage that is not reported still took time: settle that much now.
-    if matches!(how, Settlement::Unknown | Settlement::Reconciled { .. }) {
+    if matches!(
+        how,
+        Settlement::Unknown | Settlement::Partial { .. } | Settlement::Reconciled { .. }
+    ) {
         // The owner settles an unknown call as it ends; a reconciliation
         // comes after, for a call whose process may be long gone.
         let measure = match how {
-            Settlement::Unknown => Measure::Owner,
-            _ => Measure::Dead,
+            Settlement::Reconciled { .. } => Measure::Dead,
+            _ => Measure::Owner,
         };
         settle_time(tx, request, attempt, now, measure).await?;
         if matches!(how, Settlement::Unknown) {
             return Ok(End::Commit(Settled::Uncertain));
+        }
+        if let Settlement::Partial {
+            input_tokens,
+            output_tokens,
+            micro_usd,
+            in_flight,
+        } = how
+        {
+            return partly(
+                tx,
+                request,
+                attempt,
+                (input_tokens, output_tokens, micro_usd),
+                in_flight,
+            )
+            .await;
         }
     }
     let row = tx
@@ -762,7 +863,9 @@ async fn settle_in(
     // overflow.
     let held = |n: i64| n.clamp(0, MOST);
     let (state, actual, usage) = match how {
-        Settlement::Unknown => return Ok(End::Commit(Settled::Uncertain)),
+        Settlement::Unknown | Settlement::Partial { .. } => {
+            return Ok(End::Commit(Settled::Uncertain));
+        }
         Settlement::NotDispatched => ("released", Charge::default(), None),
         Settlement::Reported {
             input_tokens,

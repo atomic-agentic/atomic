@@ -101,8 +101,15 @@ pub enum Outcome {
     /// answer still spent it.
     Reported(Usage),
     /// The call may have reached the provider, but no usage is known: it
-    /// stays charged at its bound until a usage query reconciles it.
+    /// stays charged at its bound until a usage query reconciles it (none is
+    /// built yet, so it stays charged at its bound).
     Unknown,
+    /// Part of what the call spent is known: it reported this usage, and
+    /// was then stopped with a provider request in flight, which reported
+    /// nothing. It is charged this usage and one more request's bound, at
+    /// least its reservation, and stays open for a usage query, which is not
+    /// built yet: until one is, the charge keeps that value.
+    Partial(Usage),
     /// The call certainly never reached the provider, so nothing was spent.
     NotDispatched,
 }

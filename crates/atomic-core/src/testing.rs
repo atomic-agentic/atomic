@@ -41,6 +41,10 @@ pub enum Reply {
     /// This JSON as the whole body of a 200 response, for a non-streaming
     /// call.
     Json(Value),
+    /// A streamed answer that begins with this text and breaks off before
+    /// it completes, as a dropped connection leaves it: no usage, and no
+    /// completion. Answered only on a streaming Responses call.
+    Broken(String),
     /// This reply, sent once this long has passed.
     Delayed {
         /// How long to wait before answering.
@@ -239,7 +243,7 @@ fn model_of(request: &Value) -> &str {
 /// The Responses API's output item for one reply.
 fn output_item(reply: &Reply) -> Value {
     match reply {
-        Reply::Text(text) | Reply::WithoutUsage(text) => json!({
+        Reply::Text(text) | Reply::WithoutUsage(text) | Reply::Broken(text) => json!({
             "type": "message", "id": "msg_synthetic", "role": "assistant", "status": "completed",
             "content": [{"type": "output_text", "text": text, "annotations": []}]
         }),
@@ -273,7 +277,7 @@ fn chat_completion(request: &Value, reply: &Reply) -> Value {
             "tool_calls": [{"id": "call_synthetic", "type": "function",
                             "function": {"name": name, "arguments": arguments.to_string()}}]
         }),
-        Reply::Text(text) | Reply::WithoutUsage(text) => {
+        Reply::Text(text) | Reply::WithoutUsage(text) | Reply::Broken(text) => {
             json!({"role": "assistant", "content": text})
         }
         Reply::Http { .. } | Reply::Delayed { .. } | Reply::Json(_) => Value::Null,
@@ -291,6 +295,35 @@ fn chat_completion(request: &Value, reply: &Reply) -> Value {
 
 /// The Responses API's server-sent events for one reply.
 fn stream(request: &Value, reply: &Reply) -> String {
+    if let Reply::Broken(text) = reply {
+        // Begun, with some of its text, and never completed.
+        let mut response = completed(request, reply);
+        response["status"] = json!("in_progress");
+        response["output"] = json!([]);
+        if let Some(r) = response.as_object_mut() {
+            r.remove("usage");
+        }
+        let item = json!({"type": "message", "id": "msg_synthetic", "role": "assistant",
+                          "status": "in_progress", "content": []});
+        return [
+            (
+                "response.created",
+                json!({"type": "response.created", "response": response}),
+            ),
+            (
+                "response.output_item.added",
+                json!({"type": "response.output_item.added", "output_index": 0, "item": item}),
+            ),
+            (
+                "response.output_text.delta",
+                json!({"type": "response.output_text.delta", "item_id": "msg_synthetic",
+                       "output_index": 0, "content_index": 0, "delta": text}),
+            ),
+        ]
+        .iter()
+        .map(|(name, data)| format!("event: {name}\ndata: {data}\n\n"))
+        .collect();
+    }
     let item = output_item(reply);
     let done = completed(request, reply);
     let mut response = done.clone();
