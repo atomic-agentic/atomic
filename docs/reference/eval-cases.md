@@ -234,18 +234,22 @@ atomic --project /path/to/project eval review-patch \
   --fixture /path/to/seed-repository --fixture-rev <revision>
 ```
 
-The same paired flags apply to `atomic run <name> --input <file>`. `--project`
-selects the manifest directory independently of your working directory; fixture
-paths resolve from the caller's directory. Coding development runs require the
-fixture/revision pair. Lite and non-repository tasks need neither.
+The same paired flags apply to `atomic run <name> --input <file>`, where they
+are built (see the [CLI reference](cli.md#coding-fixture-selection));
+`atomic eval` is not built yet. `--project` selects the manifest directory
+independently of your working directory; fixture paths resolve from the
+caller's directory. Coding development runs require the fixture/revision pair.
+Lite and non-repository tasks need neither.
 
-Resolve the revision to an immutable commit at admission, copy the required Git
-objects into Atomic state and use detached attempt worktrees from that snapshot.
-No source checkout is edited. Inputs marked `format: git-commit` must name real
-commit objects in the snapshot; base fields must match the selected revision.
-Invalid paths, missing objects and placeholder hashes fail setup before any model
-call. Missing submodules/LFS content or external alternates fail setup unless
-explicitly materialized; there is no implicit network fetch or checkout fallback.
+The revision is resolved to an immutable commit at admission, the Git objects
+it reaches are copied into Atomic state, and each worktree step runs in a
+detached worktree of that snapshot. No source checkout is edited. Inputs marked
+`format: git-commit` must name real commit objects in the snapshot; base fields
+must match the selected revision. Invalid paths, missing objects and
+placeholder hashes fail setup before any model call. Submodules, LFS content,
+external alternates, a shallow or grafted history, a SHA-256 repository and a
+directory inside a repository rather than its top fail setup; there is no
+implicit network fetch or checkout fallback.
 
 Trusted setup is performed by the operator before invoking Atomic. The
 [coding example and preparation helper](../../examples/02-change-request/README.md)

@@ -95,13 +95,49 @@ serving, it fails and suggests `atomic run`.
 
 ## Coding fixture selection
 
-In the v0.1 target, `--project` selects a project explicitly, by its manifest directory or manifest file.
-Repository-backed development runs/evals also require paired `--fixture <repo>`
-and `--fixture-rev <revision>` options. The runtime pins the resolved commit and
-uses private snapshot worktrees; invalid/missing commits fail before a model call.
-See [fixture repositories](eval-cases.md#coding-fixture-repositories) for setup and
-an example that works from an unrelated directory. These flags do not change the
-minimal lite-atom quickstart.
+`--project` selects a project explicitly, by its manifest directory or
+manifest file. A workflow that changes code, one with a `worktree: true` step,
+also needs its repository named, with the pair `--fixture <repo>` and
+`--fixture-rev <revision>`:
+
+```sh
+atomic --project /path/to/project run change-request --input request.json \
+  --fixture ../seed-repository --fixture-rev main
+```
+
+`--fixture` is resolved from the directory you run the command in, so the same
+command from an unrelated directory binds the same repository and commit.
+When the run is admitted, atomic resolves the revision to its commit, copies
+the objects that commit reaches into a snapshot in the project's state
+directory, and runs every worktree step in a worktree of that snapshot. The
+repository you named and your own checkout are never written to, and a branch
+that moves later does not change an admitted run. Nothing is fetched, and
+nothing the repository's own configuration names, its hooks, file system
+monitor, filter drivers or remotes, ever runs.
+
+`--fixture` names a repository's top, or a bare repository, never a directory
+inside one. A revision such as `HEAD` is that checkout's own, so a linked
+worktree binds at its own `HEAD`. The atom works at the top of its worktree of
+the snapshot, wherever the project itself is. Each worktree step starts from
+the bound commit or from a commit an earlier step of the same run made; a
+step whose base is anything else, such as a commit another run made on the
+same fixture, fails before its turn. Commit fields in the input name commits
+of the fixture's history, and one whose schema allows `null` may be `null`.
+
+Before anything runs, atomic refuses, with the kind of failure in `--json`:
+
+| Kind | When |
+| --- | --- |
+| `fixture.required` | The workflow changes code and no fixture is named |
+| `fixture.path` | `--fixture` is not a git repository on this machine, or is a directory inside one rather than its top |
+| `fixture.revision` | `--fixture-rev` is not a commit, branch or tag of it |
+| `fixture.unsupported` | Its commit has submodules or Git LFS content; the repository borrows objects from another (alternates), is shallow or has grafts, is missing objects its commit reaches (as a partial clone may be), or names its objects with SHA-256 |
+| `fixture.schema` | The workflow's input types a commit where atomic does not check it, such as under `oneOf` |
+| `fixture.input` | An input field typed `format: git-commit` is not in the fixture's history at the revision, or its `base` is not the bound commit |
+| `fixture.snapshot` | The snapshot could not be made, or something atomic did not make is where it goes; atomic never removes it |
+
+Lite atoms and workflows that change no code need neither flag. `atomic eval`
+takes the same pair when it is built.
 
 ## Model access
 
