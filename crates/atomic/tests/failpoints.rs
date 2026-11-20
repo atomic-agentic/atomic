@@ -88,13 +88,16 @@ async fn engine(dir: &Path) -> Durare {
             let three = run_atom(
                 &ctx,
                 "three",
-                move || async move {
-                    note(&d, "three");
-                    Ok(Proposal {
-                        output: json!(3),
-                        metadata: Value::Null,
-                        writes: Vec::new(),
-                    })
+                move || {
+                    let d = d.clone();
+                    async move {
+                        note(&d, "three");
+                        Ok(Proposal {
+                            output: json!(3),
+                            metadata: Value::Null,
+                            writes: Vec::new(),
+                        })
+                    }
                 },
                 Vec::new(),
             )

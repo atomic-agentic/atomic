@@ -10,7 +10,10 @@
 //!   which layer set each one;
 //! - a dollar cap on an unpriced model fails configuration with a hint to
 //!   cap tokens or minutes; on a priced model it resolves;
-//! - a call reserves its whole bound, priced from the table.
+//! - a call reserves its whole bound, priced from the table;
+//! - a cap smaller than one call's reservation fails configuration, naming
+//!   the settings that make up the reservation;
+//! - out-of-range settings and budget values are refused.
 
 use super::*;
 use crate::config::{Layers, Source, resolve as layered};
@@ -48,17 +51,17 @@ fn an_atom_with_no_budget_still_has_a_finite_resolved_cap() {
 
 #[test]
 fn written_limits_win_one_by_one() {
-    let declared = Budget::parse(&json!({"tokens": 20000, "minutes": 1.5})).expect("parse");
+    let declared = Budget::parse(&json!({"tokens": 100000, "minutes": 12.5})).expect("parse");
     assert_eq!(
         declared,
         Budget {
-            tokens: Some(20_000),
-            millis: Some(90_000),
+            tokens: Some(100_000),
+            millis: Some(750_000),
             micro_usd: None,
         }
     );
     let r = atom(&declared, &BudgetSettings::default());
-    assert_eq!((r.tokens, r.millis), (20_000, 90_000));
+    assert_eq!((r.tokens, r.millis), (100_000, 750_000));
     assert_eq!(r.origins[0], Origin::Declared);
     assert_eq!(r.origins[1], Origin::Declared);
     assert_eq!(r.origins[2], Origin::Default("budget.atom.cost_usd".into()));
@@ -72,6 +75,9 @@ fn a_budget_block_must_be_positive_and_well_formed() {
         (json!({"tokens": -3}), "/tokens", "positive integer"),
         (json!({"minutes": 0}), "/minutes", "positive number"),
         (json!({"minutes": "5"}), "/minutes", "positive number"),
+        (json!({"minutes": 1e300}), "/minutes", "sane size"),
+        (json!({"tokens": 1u64 << 60}), "/tokens", "at most"),
+        (json!({"cost_usd": 1e20}), "/cost_usd", "sane size"),
         (json!({"cost_usd": -1}), "/cost_usd", "positive number"),
         (json!({"dollars": 1}), "/dollars", "unknown budget field"),
         (json!(5), "", "mapping"),
@@ -106,10 +112,10 @@ fn the_defaults_layer_like_every_other_setting() {
     std::fs::create_dir_all(&dir).expect("dir");
     std::fs::write(
         dir.join("atomic.yaml"),
-        "budget:\n  atom:\n    tokens: 1234\n  pricing:\n    gpt-test:\n      input_usd_per_mtok: 2.5\n      output_usd_per_mtok: 10\n",
+        "budget:\n  atom:\n    tokens: 123400\n  pricing:\n    gpt-test:\n      input_usd_per_mtok: 2.5\n      output_usd_per_mtok: 10\n",
     )
     .expect("write");
-    let env = |name: &str| (name == "ATOMIC_BUDGET_ATOM_MINUTES").then(|| "7".to_owned());
+    let env = |name: &str| (name == "ATOMIC_BUDGET_ATOM_MINUTES").then(|| "12".to_owned());
     let resolved = layered::<Config>(&Layers {
         dir: &dir,
         profile: None,
@@ -119,8 +125,8 @@ fn the_defaults_layer_like_every_other_setting() {
     })
     .expect("layers");
     let settings = resolved.config.budget;
-    assert_eq!(settings.atom.tokens, 1234);
-    assert!((settings.atom.minutes - 7.0).abs() < f64::EPSILON);
+    assert_eq!(settings.atom.tokens, 123_400);
+    assert!((settings.atom.minutes - 12.0).abs() < f64::EPSILON);
     assert!(settings.pricing.contains_key("gpt-test"));
     // Each default the resolution names has a source to explain.
     let r = atom(&Budget::default(), &settings);
@@ -198,7 +204,7 @@ fn a_dollar_cap_on_an_unpriced_model_fails_configuration() {
         .is_err()
     );
     // Token and time caps need no pricing.
-    let plain = Budget::parse(&json!({"tokens": 100})).expect("parse");
+    let plain = Budget::parse(&json!({"tokens": 100_000})).expect("parse");
     assert!(resolve(&plain, Level::Atom, &settings, &["local-model"]).is_ok());
     // On a priced model the dollar cap holds.
     let r = resolve(&capped, Level::Atom, &settings, &["gpt-test"]).expect("priced");
@@ -213,6 +219,8 @@ fn a_call_reserves_its_whole_bound_at_the_models_price() {
     assert_eq!(
         settings.reservation("gpt-test"),
         Reservation {
+            input_tokens: 1_000,
+            output_tokens: 500,
             tokens: 1_500,
             millis: 600_000,
             micro_usd: 7_500,
@@ -226,4 +234,119 @@ fn a_call_reserves_its_whole_bound_at_the_models_price() {
     assert_eq!(settings.cost("gpt-test", 1, 0), 3);
     assert_eq!(settings.cost("gpt-test", 0, 0), 0);
     assert_eq!(settings.cost("local-model", 1_000, 1_000), 0);
+}
+
+#[test]
+fn a_cap_smaller_than_one_call_fails_configuration() {
+    // The default call reserves 64000 + 16000 tokens and 10 minutes.
+    let settings = BudgetSettings::default();
+    let small = Budget::parse(&json!({"tokens": 20000})).expect("parse");
+    let refused = resolve(&small, Level::Atom, &settings, &["synthetic"]).expect_err("too small");
+    let message = refused.to_string();
+    assert!(
+        matches!(&refused, BudgetError::BelowCall(below) if below.field == "tokens"),
+        "{refused:?}"
+    );
+    for says in [
+        "20000 tokens",
+        "80000 tokens",
+        "written in its budget block",
+        "budget.call.input_tokens + budget.call.output_tokens",
+    ] {
+        assert!(message.contains(says), "{says:?} in {message}");
+    }
+    // Time, against budget.call.minutes.
+    let brief = Budget::parse(&json!({"minutes": 5})).expect("parse");
+    let message = resolve(&brief, Level::Atom, &settings, &["synthetic"])
+        .expect_err("too short")
+        .to_string();
+    assert!(message.contains("budget.call.minutes"), "{message}");
+    // A model's own maximum is named when it makes up the reservation.
+    let mut priced = priced();
+    let message = resolve(
+        &Budget::parse(&json!({"tokens": 1000})).expect("parse"),
+        Level::Workflow,
+        &priced,
+        &["gpt-test"],
+    )
+    .expect_err("below 1500")
+    .to_string();
+    assert!(
+        message.contains("budget.pricing.gpt-test.max_input_tokens"),
+        "{message}"
+    );
+    // A dollar cap below one priced call: 7500 micro-dollars.
+    let message = resolve(
+        &Budget::parse(&json!({"cost_usd": 0.005})).expect("parse"),
+        Level::Atom,
+        &priced,
+        &["gpt-test"],
+    )
+    .expect_err("below one call's cost")
+    .to_string();
+    assert!(message.contains("cost_usd cap"), "{message}");
+    // A default that is too small is named as the default.
+    priced.atom.tokens = 1_000;
+    let message = resolve(&Budget::default(), Level::Atom, &priced, &["gpt-test"])
+        .expect_err("default too small")
+        .to_string();
+    assert!(
+        message.contains("the default budget.atom.tokens"),
+        "{message}"
+    );
+    // Exactly one call's room resolves.
+    let exact = Budget::parse(&json!({"tokens": 80000, "minutes": 10})).expect("parse");
+    assert!(resolve(&exact, Level::Atom, &settings, &["synthetic"]).is_ok());
+}
+
+#[test]
+fn out_of_range_settings_are_refused() {
+    let refused = |change: &dyn Fn(&mut BudgetSettings), setting: &str| {
+        let mut settings = priced();
+        change(&mut settings);
+        let e =
+            resolve(&Budget::default(), Level::Atom, &settings, &["gpt-test"]).expect_err(setting);
+        assert!(
+            matches!(&e, BudgetError::Default { setting: s, .. } if s == setting),
+            "{setting}: {e:?}"
+        );
+    };
+    refused(&|s| s.call.minutes = 0.0, "budget.call.minutes");
+    refused(&|s| s.call.minutes = f64::NAN, "budget.call.minutes");
+    refused(&|s| s.call.minutes = f64::INFINITY, "budget.call.minutes");
+    refused(&|s| s.call.output_tokens = 0, "budget.call.output_tokens");
+    refused(&|s| s.atom.tokens = u64::MAX, "budget.atom.tokens");
+    refused(&|s| s.workflow.minutes = -1.0, "budget.workflow.minutes");
+    refused(
+        &|s| s.atom.cost_usd = Some(f64::NAN),
+        "budget.atom.cost_usd",
+    );
+    let price = |f: fn(&mut Price)| {
+        move |s: &mut BudgetSettings| {
+            if let Some(p) = s.pricing.get_mut("gpt-test") {
+                f(p);
+            }
+        }
+    };
+    refused(
+        &price(|p| p.input_usd_per_mtok = -1.0),
+        "budget.pricing.gpt-test.input_usd_per_mtok",
+    );
+    refused(
+        &price(|p| p.output_usd_per_mtok = f64::NAN),
+        "budget.pricing.gpt-test.output_usd_per_mtok",
+    );
+    refused(
+        &price(|p| p.max_output_tokens = Some(0)),
+        "budget.pricing.gpt-test.max_output_tokens",
+    );
+    // A free model is priced at zero.
+    let mut free = priced();
+    if let Some(p) = free.pricing.get_mut("gpt-test") {
+        p.input_usd_per_mtok = 0.0;
+        p.output_usd_per_mtok = 0.0;
+    }
+    assert!(free.validate().is_ok());
+    // A cost never passes LIMIT, so the ledger's sums cannot overflow.
+    assert!(priced().cost("gpt-test", LIMIT, LIMIT) <= LIMIT);
 }

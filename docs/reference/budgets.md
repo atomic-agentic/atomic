@@ -17,18 +17,24 @@ Add this frontmatter fragment to a model-backed atom:
 
 ```yaml
 budget:
-  tokens: 20000
-  minutes: 5
+  tokens: 200000
+  minutes: 20
 ```
 
 For API-billed calls with reliable model pricing, you can also set:
 
 ```yaml
 budget:
-  tokens: 20000
-  minutes: 5
+  tokens: 200000
+  minutes: 20
   cost_usd: 1.00
 ```
+
+A cap must leave room for at least one model call. With the default call bound
+below, one call reserves 80,000 tokens and 10 minutes, so these caps admit two
+calls' worth of tokens at a time. A smaller cap fails configuration, with a
+diagnostic that names the `call` settings, or the model's `max_input_tokens` and
+`max_output_tokens`, that make up the reservation.
 
 | Field | Meaning |
 | --- | --- |
@@ -77,7 +83,11 @@ budget:
 Token and time caps always resolve to finite values. A dollar cap, written on an
 atom or workflow or set as a default, needs every model it covers in `pricing`;
 otherwise configuration fails before the run starts, with a hint to cap tokens or
-minutes instead.
+minutes instead. Every value must be finite and positive (a price may be zero);
+anything else, or an amount too large to account exactly, fails configuration.
+
+A run resolves its caps, call bounds and prices once, when it starts, and keeps
+them: a run resumed after the configuration changed is metered as it began.
 
 ## Bound a whole workflow
 
@@ -85,8 +95,8 @@ A workflow can set the same top-level block:
 
 ```yaml
 budget:
-  tokens: 60000
-  minutes: 15
+  tokens: 600000
+  minutes: 45
 ```
 
 Place it beside `input`, `output` and `steps` in the workflow file. This bounds the
@@ -115,17 +125,57 @@ billing deviations still require reconciliation, so this is not an invoice ceili
 
 Admission reserves the call's whole bound: the model's `max_input_tokens` and
 `max_output_tokens` from `pricing`, else the `call` defaults, priced at the model's
-rate, and the `call` time. A Codex turn can make several provider requests, so its
-reported usage can exceed that bound; the ledger records any such overshoot.
+rate, and the `call` time. The call is held to that bound: a lite call is sent
+with the bound's output tokens as its output limit, in the field its endpoint
+reads (`max_completion_tokens` on OpenAI's and Azure OpenAI's Chat Completions,
+in any region or cloud, `max_tokens` on other OpenAI-compatible servers,
+`max_output_tokens` on the Responses API), and is cut off when its reserved time
+runs out. The field is told from the endpoint's URL. A lite runtime can name the
+field itself, as one must for a gateway the URL does not identify, but no
+configuration setting or command-line flag exposes that yet. An answer cut off
+at its output limit fails as such, without a repair turn. A lite request larger
+than the bound's input tokens is recorded in the attempt's declared maximum.
+
+The usage a response reports is settled before its answer is judged, so a refusal
+or an empty answer is charged what it spent. A response that reports no usage is
+settled as unknown: its tokens and dollars stay charged at its reservation, and
+it is never taken as free. Its active time can always be measured, so it is
+charged the time that passed, at most what was reserved. A call still running
+when its process is stopped by a signal is settled this way as the process
+stops. While a call runs, its meter records every few seconds that it is still
+alive, so a call whose process was killed outright is charged only until shortly
+after the last such record, however long the process stayed down, once its atom,
+run again, admits its next call.
+
+A Codex turn can make several provider requests and run tools between them, so
+the `call` time does not bound it. A turn reserves the active time its atom has
+left (or less, if the run has less), and is interrupted when that runs out; the
+run then parks, as at any other cap, and the park's reason names the allowance
+that ran out. With less time left than one request's bound, a turn is not
+started at all: the run parks without spending. A failed or interrupted turn is settled with
+the usage it reported before it stopped. Its reported tokens can exceed the
+bound; the ledger records any such overshoot.
+
+A run resolves the model each atom calls with its budget, and the atom runs on
+that model for the whole run. Under a dollar cap, a call to a model the run's
+budget does not price is not made.
 
 When a cap prevents more work, the run parks for inspection rather than silently
 starting another attempt. The call is not made, the park is recorded with its
-reason, and the run waits; resuming it finds it parked again. Already-started work and uncertain provider usage can
+reason, and the run waits on it; resuming it finds it parked again. Already-started work and uncertain provider usage can
 require reconciliation; a configured cap is not a promise of a perfectly bounded
 provider bill. Pending usage is not treated as free after a crash.
 
-Inspect the run with `atomic runs show <run-id>`. This draft does not define a
-budget-increase command; resuming alone cannot bypass a cap.
+A released park runs the parked atom again, as new attempts at the same requests,
+and admits its calls against the caps as they are stored then. Releasing alone
+raises nothing, so a run released with no more room parks again. Room comes from
+raising the cap in the usage ledger, from an attempt left reserved being
+reconciled with its real usage, or, for a refusal caused by a sibling's
+reservation, from that sibling settling.
+
+Inspect the run with `atomic runs show <run-id>`. This draft does not yet define
+the command that raises a cap and releases the park; resuming alone cannot bypass
+a cap.
 
 See [atom fields](atom-files.md), [workflow fields](workflow-files.md#top-level-fields)
 and [observability](../operations/observability.md).

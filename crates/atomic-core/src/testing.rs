@@ -36,6 +36,18 @@ pub enum Reply {
         /// The response body.
         body: String,
     },
+    /// An assistant message with this text, and no usage reported.
+    WithoutUsage(String),
+    /// This JSON as the whole body of a 200 response, for a non-streaming
+    /// call.
+    Json(Value),
+    /// This reply, sent once this long has passed.
+    Delayed {
+        /// How long to wait before answering.
+        after: std::time::Duration,
+        /// The answer.
+        reply: Box<Reply>,
+    },
 }
 
 /// Picks the reply to one model call from its request body.
@@ -158,50 +170,56 @@ async fn serve(socket: &mut tokio::net::TcpStream, state: &Mutex<State>) -> std:
         let path = path.split('?').next().unwrap_or_default();
 
         let chat = path.ends_with("/chat/completions");
-        let (status, content_type, text) =
-            if method == "POST" && (chat || path.ends_with("/responses")) {
-                let request: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-                let reply = match state.lock() {
-                    Ok(mut s) => {
-                        let index = s.requests.len();
-                        s.requests.push(request.clone());
-                        s.paths.push(path.to_owned());
-                        match &s.responder {
-                            Some(respond) => Some(respond(&request)),
-                            None => s.script.get(index).cloned(),
-                        }
+        let (status, content_type, text) = if method == "POST"
+            && (chat || path.ends_with("/responses"))
+        {
+            let request: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            let reply = match state.lock() {
+                Ok(mut s) => {
+                    let index = s.requests.len();
+                    s.requests.push(request.clone());
+                    s.paths.push(path.to_owned());
+                    match &s.responder {
+                        Some(respond) => Some(respond(&request)),
+                        None => s.script.get(index).cloned(),
                     }
-                    Err(_) => None,
-                };
-                let reply = reply.unwrap_or_else(|| Reply::Text("Synthetic reply.".into()));
-                let streaming = request.get("stream").and_then(Value::as_bool) != Some(false);
-                match &reply {
-                    Reply::Http { status, body } => {
-                        (format!("{status} Error"), "application/json", body.clone())
-                    }
-                    _ if chat => (
-                        "200 OK".to_owned(),
-                        "application/json",
-                        chat_completion(&request, &reply).to_string(),
-                    ),
-                    _ if streaming => (
-                        "200 OK".to_owned(),
-                        "text/event-stream",
-                        stream(&request, &reply),
-                    ),
-                    _ => (
-                        "200 OK".to_owned(),
-                        "application/json",
-                        completed(&request, &reply).to_string(),
-                    ),
                 }
-            } else {
-                (
-                    "404 Not Found".to_owned(),
-                    "application/json",
-                    "{}".to_owned(),
-                )
+                Err(_) => None,
             };
+            let mut reply = reply.unwrap_or_else(|| Reply::Text("Synthetic reply.".into()));
+            while let Reply::Delayed { after, reply: then } = reply {
+                tokio::time::sleep(after).await;
+                reply = *then;
+            }
+            let streaming = request.get("stream").and_then(Value::as_bool) != Some(false);
+            match &reply {
+                Reply::Json(body) => ("200 OK".to_owned(), "application/json", body.to_string()),
+                Reply::Http { status, body } => {
+                    (format!("{status} Error"), "application/json", body.clone())
+                }
+                _ if chat => (
+                    "200 OK".to_owned(),
+                    "application/json",
+                    chat_completion(&request, &reply).to_string(),
+                ),
+                _ if streaming => (
+                    "200 OK".to_owned(),
+                    "text/event-stream",
+                    stream(&request, &reply),
+                ),
+                _ => (
+                    "200 OK".to_owned(),
+                    "application/json",
+                    completed(&request, &reply).to_string(),
+                ),
+            }
+        } else {
+            (
+                "404 Not Found".to_owned(),
+                "application/json",
+                "{}".to_owned(),
+            )
+        };
         let response = format!(
             "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\r\n{text}",
             text.len()
@@ -221,7 +239,7 @@ fn model_of(request: &Value) -> &str {
 /// The Responses API's output item for one reply.
 fn output_item(reply: &Reply) -> Value {
     match reply {
-        Reply::Text(text) => json!({
+        Reply::Text(text) | Reply::WithoutUsage(text) => json!({
             "type": "message", "id": "msg_synthetic", "role": "assistant", "status": "completed",
             "content": [{"type": "output_text", "text": text, "annotations": []}]
         }),
@@ -229,18 +247,22 @@ fn output_item(reply: &Reply) -> Value {
             "type": "function_call", "id": "fc_synthetic", "call_id": "call_synthetic",
             "name": name, "arguments": arguments.to_string(), "status": "completed"
         }),
-        Reply::Http { .. } => Value::Null,
+        Reply::Http { .. } | Reply::Delayed { .. } | Reply::Json(_) => Value::Null,
     }
 }
 
 /// A completed Responses API response for one reply, as a non-streaming call
 /// returns it.
 fn completed(request: &Value, reply: &Reply) -> Value {
-    json!({
+    let mut done = json!({
         "id": "resp_synthetic", "object": "response", "status": "completed",
         "model": model_of(request), "output": [output_item(reply)],
         "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
-    })
+    });
+    if let (Reply::WithoutUsage(_), Some(d)) = (reply, done.as_object_mut()) {
+        d.remove("usage");
+    }
+    done
 }
 
 /// A Chat Completions response for one reply.
@@ -251,14 +273,20 @@ fn chat_completion(request: &Value, reply: &Reply) -> Value {
             "tool_calls": [{"id": "call_synthetic", "type": "function",
                             "function": {"name": name, "arguments": arguments.to_string()}}]
         }),
-        Reply::Text(text) => json!({"role": "assistant", "content": text}),
-        Reply::Http { .. } => Value::Null,
+        Reply::Text(text) | Reply::WithoutUsage(text) => {
+            json!({"role": "assistant", "content": text})
+        }
+        Reply::Http { .. } | Reply::Delayed { .. } | Reply::Json(_) => Value::Null,
     };
-    json!({
+    let mut done = json!({
         "id": "chatcmpl_synthetic", "object": "chat.completion", "model": model_of(request),
         "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
         "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
-    })
+    });
+    if let (Reply::WithoutUsage(_), Some(d)) = (reply, done.as_object_mut()) {
+        d.remove("usage");
+    }
+    done
 }
 
 /// The Responses API's server-sent events for one reply.

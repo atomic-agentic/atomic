@@ -37,8 +37,9 @@
 //!   approves, and a lite atom after it;
 //! - `change-request`: the change-request workflow written in Rust, a lite
 //!   atom and then a codex atom;
-//! - `parked`: a workflow file whose budget has no room for its first model
-//!   call, so it parks.
+//! - `parked`: a workflow file whose budget has room for one model call:
+//!   its first step's call settles, and its second finds no room, so it
+//!   parks.
 //!
 //! The codex atom's command runs under Codex's Linux sandbox, as in
 //! production, so the suite needs bubblewrap and unprivileged user
@@ -55,6 +56,7 @@ mod support;
 use atomic_app::pipeline::{PIPELINE, Pipeline, PipelineRun, Services, prepare, register_pipeline};
 use atomic_app::workflows::{CHANGE_REQUEST, ChangeRequestRun, register_change_request};
 use atomic_core::artifact::LocalStore;
+use atomic_core::budget::BudgetSettings;
 use atomic_core::codex::{CodexPaths, ModelEndpoint, StateGuard};
 use atomic_core::git::Git;
 use atomic_core::lite::LiteRuntime;
@@ -364,9 +366,13 @@ steps:
   read:
     atom: read-note
     with: { text: input.text }
+  again:
+    after: [read]
+    atom: read-note
+    with: { text: input.text }
 returns: steps.read.output
 budget:
-  tokens: 10
+  tokens: 150
 ";
 
 const NOTE: &str = "Exporting a file named café.txt crashes the app.";
@@ -496,7 +502,16 @@ async fn engine(scenario: Scenario, dir: &Path, base_url: &str) -> Durare {
                     store: LocalStore::open(dir.join("artifacts")).expect("artifact store"),
                     deployment: local(),
                     worktrees: Some(Arc::new(Worktrees::new(repo, dir.join("state/worktrees")))),
-                    budgets: Arc::default(),
+                    budgets: Arc::new(if scenario == Scenario::Parked {
+                        // Each call reserves 150 tokens: the workflow's cap
+                        // has room for one at a time.
+                        let mut small = BudgetSettings::default();
+                        small.call.input_tokens = 100;
+                        small.call.output_tokens = 50;
+                        small
+                    } else {
+                        BudgetSettings::default()
+                    }),
                     context: None,
                 },
             );
@@ -928,7 +943,11 @@ async fn kill_and_recover(
             return failed;
         }
     };
-    if scenario.comparable(&result) != expected {
+    // A budget keeps a call a kill left unsettled charged at its bound, so
+    // a parked run killed before its call settled may park sooner than the
+    // uninterrupted one: at the step whose re-run finds no room.
+    let parked_sooner = scenario == Scenario::Parked && result.get("parked").is_some();
+    if scenario.comparable(&result) != expected && !parked_sooner {
         fail!("the recovered run returned {result}, not {expected}");
     }
 
@@ -989,7 +1008,10 @@ async fn kill_and_recover(
         } else {
             once
         };
-        if killed > once || recovered != expected {
+        // A parked run's re-run may find no room for the call a kill left
+        // charged, and make none.
+        let short = scenario == Scenario::Parked && recovered < expected;
+        if killed > once || (recovered != expected && !short) {
             fail!(
                 "{step} called the model {killed} times before the kill and {recovered} after; \
                  one run calls it {once} times"
@@ -1083,21 +1105,26 @@ async fn kill_and_recover(
     let unsettled = attempts.iter().filter(|a| a.state != "settled").count();
     let settled = attempts.len() - unsettled;
     let once = reference.attempts;
-    if unsettled > 1 || settled < once || attempts.len() > 2 * once {
+    // A parked run has room for one call. Killed after that call and before
+    // it settled, the call stays charged at its bound, which leaves no room
+    // for its re-run: the run parks with nothing settled, as a budget must.
+    let short = settled < once && scenario != Scenario::Parked;
+    if unsettled > 1 || short || attempts.len() > 2 * once {
         fail!(
             "{} ledger attempts, {unsettled} unsettled; an uninterrupted run settles {once}",
             attempts.len()
         );
     }
 
-    // A parked run parked once, and made no model call.
+    // A parked run parked once, with at most its one call made, and once
+    // more if a kill left it unsettled.
     if scenario == Scenario::Parked {
         let n = parks(&rt, RUN).await.expect("parks").len();
         if n != 1 {
             fail!("{n} parks recorded, not one");
         }
-        if model.calls() != 0 {
-            fail!("{} model calls with no room for one", model.calls());
+        if model.calls() > 2 {
+            fail!("{} model calls, with room for one", model.calls());
         }
     }
     if failed.is_empty() {
