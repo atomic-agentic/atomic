@@ -401,6 +401,38 @@ fn an_input_that_breaks_the_workflow_contract_fails_before_any_model_call() {
     });
 }
 
+// An input that fits its contract but holds a number CEL cannot read as the
+// contract types it is refused before any step, not in the first mapping.
+#[test]
+fn an_input_cel_cannot_read_fails_before_any_model_call() {
+    on_codex_runtime(async {
+        let dir = scratch("cel-input");
+        let project = project(&dir);
+        let mut pipeline = load(&project, "triage.workflow.yaml", TRIAGE);
+        pipeline.input["properties"]["count"] = json!({"type": "integer"});
+        let model = FakeModel::start(vec![Reply::Text(READ.into())])
+            .await
+            .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        let input: Value =
+            serde_json::from_str(r#"{"text": "n", "count": 1.0000000000000000000001}"#)
+                .expect("parses");
+        rt.start(PIPELINE, "cel-1", PipelineRun { pipeline, input })
+            .await
+            .expect("start");
+        let error = rt
+            .result::<Value>("cel-1")
+            .await
+            .expect_err("refused")
+            .to_string();
+        assert!(error.contains("cannot be read in CEL"), "{error}");
+        assert_eq!(model.calls(), 0);
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
 /// The triage workflow with a gate between ranking and summarizing.
 fn gated() -> String {
     TRIAGE.replace(

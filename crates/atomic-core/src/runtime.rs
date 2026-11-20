@@ -739,6 +739,7 @@ pub async fn run_exec(
     // of the right type.
     atomic_schema::artifact::check_refs(contract("Output")?, &output, artifacts.0.as_ref())
         .map_err(|e| schema_error(e.to_string()))?;
+    atomic_schema::expr::convertible(&output, contract("Output")?).map_err(schema_error)?;
     let has_checks = atom
         .frontmatter
         .get("validate")
@@ -940,6 +941,10 @@ fn accept(
     // schema can only check its spelling.
     atomic_schema::artifact::check_refs(contract, &value, artifacts)
         .map_err(|e| schema_error(e.to_string()))?;
+    // Every later CEL expression reads the value as its contract types it, so
+    // a number that conversion refuses is refused here, where it can be
+    // repaired, and is never checkpointed.
+    atomic_schema::expr::convertible(&value, contract).map_err(schema_error)?;
     match check(&value) {
         // A deserialization failure in the typed check is about this answer.
         Err(AtomError::Schema { message, .. }) => Err(schema_error(message)),

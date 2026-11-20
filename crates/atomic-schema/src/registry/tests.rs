@@ -362,3 +362,32 @@ fn references_that_double_at_each_level_stop_at_the_expansion_budget() {
         .to_string();
     assert!(error.contains("subschemas"), "{error}");
 }
+
+#[test]
+fn aliases_of_the_artifact_schema_inline_as_the_artifact_reference() {
+    let mut registry = Registry::new();
+    for alias in [
+        "atomic:artifact",
+        "atomic:artifact#",
+        "ATOMIC:artifact",
+        "atomic:%61rtifact",
+    ] {
+        let schema = serde_json::json!({"type": "object", "properties": {
+            "file": {"$ref": alias, "mediaType": "text/x-diff"},
+            "more": {"$ref": alias, "allOf": [{"$ref": "#/$defs/s"}]}
+        }, "$defs": {"s": {"type": "string"}}});
+        let inlined = registry
+            .inline_value(&schema, std::path::Path::new("/aliases.schema.json"))
+            .unwrap_or_else(|e| panic!("{alias}: {e}"));
+        assert_eq!(
+            inlined["properties"]["file"],
+            serde_json::json!({"$ref": "atomic:artifact", "mediaType": "text/x-diff"}),
+            "{alias}"
+        );
+        assert_eq!(
+            inlined["properties"]["more"],
+            serde_json::json!({"$ref": "atomic:artifact", "allOf": [{"type": "string"}]}),
+            "{alias}"
+        );
+    }
+}

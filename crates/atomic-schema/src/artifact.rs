@@ -973,7 +973,7 @@ mod tests {
             {"type": "array", "items": {"$ref": "#/$defs/tree"}}
         ]}}});
         let mut value = reference('c');
-        for _ in 0..40 {
+        for _ in 0..100 {
             value = serde_json::json!([value]);
         }
         assert_eq!(verdict(&schema, &value), "missing");
@@ -1111,6 +1111,8 @@ mod tests {
             serde_json::json!({"type": "object", "unevaluatedProperties": art()}),
             serde_json::json!({"type": "array", "unevaluatedItems": art()}),
             serde_json::json!({"type": "array", "additionalItems": art()}),
+            serde_json::json!({"type": "array", "items": [art()]}),
+            serde_json::json!({"type": "string", "contentSchema": art()}),
             serde_json::json!({"type": "object", "dependencies": {"file": {"properties": {"file": art()}}}}),
             // Reached through an unfollowed keyword by a reference.
             serde_json::json!({"type": "array", "contains": {"$ref": "#/$defs/f"}, "$defs": {"f": art()}}),
@@ -1197,6 +1199,175 @@ mod tests {
             ),
             "ok"
         );
+    }
+
+    #[test]
+    fn a_dependent_schema_applies_only_when_its_key_is_present() {
+        let schema = serde_json::json!({"type": "object", "dependentSchemas": {
+            "file": {"properties": {"other": {"$ref": "atomic:artifact", "mediaType": "text/x-diff"}}}},
+            "properties": {"other": {"$ref": "atomic:artifact"}}});
+        assert_eq!(
+            verdict(&schema, &serde_json::json!({"other": reference('b')})),
+            "ok"
+        );
+        assert_eq!(
+            verdict(
+                &schema,
+                &serde_json::json!({"file": "x", "other": reference('b')})
+            ),
+            "wrong"
+        );
+    }
+
+    #[test]
+    fn a_branching_reference_cycle_is_refused_at_once() {
+        let schema = serde_json::json!({
+            "allOf": [{"$ref": "#"}, {"$ref": "#"}],
+            "properties": {"file": {"$ref": "atomic:artifact"}}
+        });
+        let started = std::time::Instant::now();
+        assert_eq!(
+            verdict(&schema, &serde_json::json!({"file": reference('a')})),
+            "too deep"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_long_run_of_references_without_progress_is_refused() {
+        // 130 references in a row before the value is entered.
+        let mut defs = serde_json::Map::new();
+        for i in 0..130 {
+            let next = if i == 129 {
+                serde_json::json!({"properties": {"file": {"$ref": "atomic:artifact"}}})
+            } else {
+                serde_json::json!({"$ref": format!("#/$defs/h{}", i + 1)})
+            };
+            defs.insert(format!("h{i}"), next);
+        }
+        let schema = serde_json::json!({"$ref": "#/$defs/h0", "$defs": defs});
+        assert_eq!(
+            verdict(&schema, &serde_json::json!({"file": reference('a')})),
+            "too deep"
+        );
+        // Fifty is fine.
+        let mut defs = serde_json::Map::new();
+        for i in 0..50 {
+            let next = if i == 49 {
+                serde_json::json!({"properties": {"file": {"$ref": "atomic:artifact"}}})
+            } else {
+                serde_json::json!({"$ref": format!("#/$defs/h{}", i + 1)})
+            };
+            defs.insert(format!("h{i}"), next);
+        }
+        let schema = serde_json::json!({"$ref": "#/$defs/h0", "$defs": defs});
+        assert_eq!(
+            verdict(&schema, &serde_json::json!({"file": reference('c')})),
+            "missing"
+        );
+    }
+
+    #[test]
+    fn aliases_of_the_artifact_schema_are_refused() {
+        for alias in [
+            "atomic:artifact#",
+            "ATOMIC:artifact",
+            "atomic:%61rtifact",
+            "atomic:artifact?",
+            "atomic:artifact#/",
+        ] {
+            let schema =
+                serde_json::json!({"type": "object", "properties": {"file": {"$ref": alias}}});
+            assert_eq!(
+                verdict(&schema, &serde_json::json!({"file": reference('c')})),
+                "unsupported",
+                "{alias}"
+            );
+            assert!(check_contract(&schema).is_err(), "{alias}");
+            // Beside a canonical reference, too.
+            let schema = serde_json::json!({"type": "object", "properties": {
+                "file": {"$ref": alias}, "other": {"$ref": "atomic:artifact"}}});
+            assert_eq!(
+                verdict(&schema, &serde_json::json!({"file": reference('c')})),
+                "unsupported",
+                "{alias}"
+            );
+        }
+        // An alias reached only by a pointer into an unknown keyword.
+        let schema = serde_json::json!({"type": "object",
+            "properties": {"file": {"$ref": "#/x-hidden/f"}},
+            "x-hidden": {"f": {"$ref": "atomic:artifact#"}}});
+        assert_eq!(
+            verdict(&schema, &serde_json::json!({"file": reference('c')})),
+            "unsupported"
+        );
+    }
+
+    #[test]
+    fn nodes_reached_only_by_reference_are_held_to_the_rules() {
+        // The structural walk does not enter `x-hidden`; the reference does.
+        for hidden in [
+            serde_json::json!({"type": "array", "contains": {"$ref": "atomic:artifact"}}),
+            serde_json::json!({"$schema": "http://json-schema.org/draft-07/schema#", "$ref": "atomic:artifact"}),
+            serde_json::json!({"type": "string", "mediaType": "text/x-diff"}),
+        ] {
+            let schema = serde_json::json!({"type": "object",
+                "properties": {"file": {"$ref": "#/x-hidden/f"}, "art": {"$ref": "atomic:artifact"}},
+                "x-hidden": {"f": hidden}});
+            assert!(check_contract(&schema).is_err(), "{schema}");
+        }
+    }
+
+    #[test]
+    fn applicators_beside_an_artifact_reference_apply() {
+        for keyword in ["allOf", "anyOf", "oneOf"] {
+            let schema = serde_json::json!({"type": "object", "properties": {"file": {
+                "$ref": "atomic:artifact",
+                keyword: [{"$ref": "atomic:artifact", "mediaType": "text/x-diff"}]}}});
+            assert_eq!(
+                verdict(&schema, &serde_json::json!({"file": reference('a')})),
+                "ok",
+                "{keyword}"
+            );
+            assert_eq!(
+                verdict(&schema, &serde_json::json!({"file": reference('b')})),
+                "wrong",
+                "{keyword}"
+            );
+            assert_eq!(
+                verdict(&schema, &serde_json::json!({"file": reference('c')})),
+                "missing",
+                "{keyword}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_value_as_deep_as_json_allows_is_checked_on_a_small_stack() {
+        let schema = recursive_file();
+        // serde_json parses at most 128 levels; this is 126 objects deep.
+        let text = serde_json::to_string(&chain(125, 'c')).expect("serializes");
+        let value: serde_json::Value = serde_json::from_str(&text).expect("parses");
+        let verdict = std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(move || verdict(&schema, &value))
+            .expect("spawns")
+            .join()
+            .expect("does not overflow");
+        assert_eq!(verdict, "missing");
+    }
+
+    #[test]
+    fn a_value_deeper_than_parsing_allows_fails_closed() {
+        // Built in code, not parsed, so as deep as it likes; the check stops
+        // at its nesting cap rather than walking on.
+        let verdict = std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(|| verdict(&recursive_file(), &chain(1000, 'a')))
+            .expect("spawns")
+            .join()
+            .expect("does not overflow");
+        assert_eq!(verdict, "too deep");
     }
 
     #[test]
@@ -1319,17 +1490,39 @@ pub enum ArtifactCheckError {
 ///
 /// A contract with no artifact references passes at once. One whose
 /// references [`check_contract`] refuses fails every check.
+///
+/// The walk runs on a thread of its own with a large stack, so a value as
+/// deeply nested as JSON parsing allows is checked whatever thread calls.
 pub fn check_refs(
     schema: &serde_json::Value,
     value: &serde_json::Value,
-    store: &dyn ArtifactLookup,
+    store: &(dyn ArtifactLookup + Sync),
 ) -> Result<(), ArtifactCheckError> {
     check_contract(schema)?;
     if !holds_artifact_refs(schema) {
         return Ok(());
     }
-    Checker::new(schema, store).check(value).0
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name("artifact-check".into())
+            .stack_size(CHECK_STACK)
+            .spawn_scoped(scope, || Checker::new(schema, store).check(value).0)
+            .map_err(|e| ArtifactCheckError::Unsupported {
+                at: "/".into(),
+                reason: format!("cannot start the check: {e}"),
+            })?
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
 }
+
+/// The stack the check walks on. Only what the walk touches is committed.
+const CHECK_STACK: usize = 256 << 20;
+
+/// How deeply the walk may nest, value and schema together, before it fails
+/// closed; far more than a JSON value parsed with serde_json's default limit
+/// needs.
+const MAX_NESTING: usize = 2048;
 
 /// Keywords whose subschemas the reference check follows into the value.
 const FOLLOWED_ONE: &[&str] = &["items", "additionalProperties"];
@@ -1405,7 +1598,8 @@ fn local_pointer(r: &str) -> Option<String> {
 /// A contract that has no artifact reference but uses `mediaType` is
 /// checked too, since that `mediaType` would never be enforced.
 pub fn check_contract(schema: &serde_json::Value) -> Result<(), ArtifactCheckError> {
-    if !holds_artifact_refs(schema) && !mentions(schema, "mediaType") {
+    if !holds_artifact_refs(schema) && !mentions(schema, "mediaType") && !holds_foreign_refs(schema)
+    {
         return Ok(());
     }
     lint(schema, schema, "", false)?;
@@ -1468,14 +1662,29 @@ fn lint(
     at: &str,
     embedded: bool,
 ) -> Result<(), ArtifactCheckError> {
-    use serde_json::Value;
     let Some(map) = node.as_object() else {
         return Ok(());
     };
+    let embedded = embedded || (!at.is_empty() && map.contains_key("$id"));
+    lint_node(root, map, at, embedded)?;
+    for (sub, _, s) in subschemas(node, at) {
+        lint(root, s, &sub, embedded)?;
+    }
+    Ok(())
+}
+
+/// The structural rules for one subschema. `embedded` is whether it is, or
+/// is inside, a resource with its own `$id`.
+fn lint_node(
+    root: &serde_json::Value,
+    map: &serde_json::Map<String, serde_json::Value>,
+    at: &str,
+    embedded: bool,
+) -> Result<(), ArtifactCheckError> {
+    use serde_json::Value;
     if !at.is_empty() && map.contains_key("$schema") {
         return Err(unsupported(at, "a subschema with its own `$schema`"));
     }
-    let embedded = embedded || (!at.is_empty() && map.contains_key("$id"));
     for k in ["$dynamicRef", "$recursiveRef"] {
         if map.contains_key(k) {
             return Err(unsupported(
@@ -1518,10 +1727,40 @@ fn lint(
         }
         Some(_) => return Err(unsupported(at, "a `mediaType` that is not a string")),
     }
-    for (sub, _, s) in subschemas(node, at) {
-        lint(root, s, &sub, embedded)?;
-    }
     Ok(())
+}
+
+/// Whether the subschema at `at`, or one that holds it, has its own `$id`.
+fn embedded_at(root: &serde_json::Value, at: &str) -> bool {
+    let mut prefix = String::new();
+    for part in at.split('/').skip(1) {
+        prefix.push('/');
+        prefix.push_str(part);
+        if root
+            .pointer(&prefix)
+            .is_some_and(|n| n.get("$id").is_some())
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether `value` holds, anywhere, a `$ref` to another resource than the
+/// contract that is not written `atomic:artifact`: an alias of the artifact
+/// schema (`atomic:artifact#`, `ATOMIC:artifact`) would otherwise go
+/// unchecked.
+fn holds_foreign_refs(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.get("$ref")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|r| r != ARTIFACT_SCHEMA_ID && !r.is_empty() && !r.starts_with('#'))
+                || map.values().any(holds_foreign_refs)
+        }
+        serde_json::Value::Array(items) => items.iter().any(holds_foreign_refs),
+        _ => false,
+    }
 }
 
 /// Walk what the check walks, from `at`, and refuse an artifact reference
@@ -1539,6 +1778,11 @@ fn reach(
     let Some(node) = root.pointer(at) else {
         return Ok(());
     };
+    // A reference can name a node the structural walk does not visit (one
+    // under a keyword it does not know); hold that node to the same rules.
+    if let Some(map) = node.as_object() {
+        lint_node(root, map, at, embedded_at(root, at))?;
+    }
     match node.get("$ref").and_then(Value::as_str) {
         Some(ARTIFACT_SCHEMA_ID) => {
             if let Some(keyword) = under {
@@ -1635,7 +1879,7 @@ const BRANCH_URI: &str = "urn:atomic:branch";
 /// validator, compiled the first time it is needed.
 struct Checker<'a> {
     root: &'a serde_json::Value,
-    store: &'a dyn ArtifactLookup,
+    store: &'a (dyn ArtifactLookup + Sync),
     base: String,
     registry: Option<jsonschema::Registry<'a>>,
     branches: std::collections::HashMap<String, Option<jsonschema::Validator>>,
@@ -1650,6 +1894,8 @@ struct Checker<'a> {
     done: std::collections::HashMap<(String, String), Result<(), ArtifactCheckError>>,
     /// The (schema pointer, value pointer) pairs being walked.
     walking: std::collections::HashSet<(String, String)>,
+    /// How many check_at calls are open.
+    nesting: usize,
 }
 
 /// How many schema nodes, summed over the branch validators one check
@@ -1680,7 +1926,7 @@ fn token(key: &str) -> String {
 }
 
 impl<'a> Checker<'a> {
-    fn new(root: &'a serde_json::Value, store: &'a dyn ArtifactLookup) -> Self {
+    fn new(root: &'a serde_json::Value, store: &'a (dyn ArtifactLookup + Sync)) -> Self {
         // The URI the answer's validator gives the contract: its `$id`, or
         // "" when it has none, resolved against jsonschema's default base
         // (json-schema:///) and normalised as jsonschema does it. Relative
@@ -1731,6 +1977,7 @@ impl<'a> Checker<'a> {
             exhausted: false,
             done: std::collections::HashMap::new(),
             walking: std::collections::HashSet::new(),
+            nesting: 0,
         }
     }
 
@@ -1781,10 +2028,12 @@ impl<'a> Checker<'a> {
         }
         // Back at a pair still being walked, or too long without progress:
         // the references go round.
-        if hops > MAX_HOPS || !self.walking.insert(key.clone()) {
+        if hops > MAX_HOPS || self.nesting >= MAX_NESTING || !self.walking.insert(key.clone()) {
             return Err(ArtifactCheckError::TooDeep { at: at.to_owned() });
         }
+        self.nesting += 1;
         let result = self.walk(pointer, value, at, hops);
+        self.nesting -= 1;
         self.walking.remove(&key);
         self.done.insert(key, result.clone());
         result
@@ -1807,15 +2056,15 @@ impl<'a> Checker<'a> {
         };
         match schema.get("$ref").and_then(Value::as_str) {
             Some(ARTIFACT_SCHEMA_ID) => {
-                return match value.as_str() {
-                    Some(text) => check_one(
+                if let Some(text) = value.as_str() {
+                    check_one(
                         text,
                         at,
                         schema.get("mediaType").and_then(Value::as_str),
                         self.store,
-                    ),
-                    None => Ok(()),
-                };
+                    )?;
+                }
+                // allOf, anyOf and oneOf beside the reference apply too.
             }
             Some(local) => {
                 // check_contract has made every other reference a pointer

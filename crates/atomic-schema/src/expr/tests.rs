@@ -197,7 +197,7 @@ fn an_integer_field_is_an_int_however_it_is_spelled() {
 }
 
 #[test]
-fn number_and_untyped_fields_are_doubles_however_they_are_spelled() {
+fn number_fields_are_doubles_and_untyped_integers_stay_integers() {
     let schema = json!({"type": "object", "properties": {"x": {"type": "number"}}});
     let shape = Shape::Schema(&schema);
     for spelling in ["1", "1.0", "1e0"] {
@@ -207,30 +207,226 @@ fn number_and_untyped_fields_are_doubles_however_they_are_spelled() {
             Ok(json!(true)),
             "{spelling}"
         );
-        // `y` is not in the schema: untyped, so a double too.
+        // `y` is not in the schema: an untyped integer stays an int.
         assert_same!(
-            evaluate("output.y * 2.0 == 2.0", &[("output", &value, &shape)]),
+            evaluate("output.y + 1 == 2", &[("output", &value, &shape)]),
             Ok(json!(true)),
             "{spelling}"
         );
         assert_same!(
             cel_value(&number(spelling), &Shape::Untyped),
-            Ok(cel::Value::Float(1.0))
+            Ok(cel::Value::Int(1))
         );
     }
+    // Passed through untyped, an integer comes back as one.
+    let open = json!({"type": "object"});
+    assert_eq!(
+        serde_json::to_string(
+            &with_schema("output", &open, &json!({"count": number("1.0"), "n": 3}))
+                .expect("evaluates")
+        )
+        .expect("serializes"),
+        r#"{"count":1,"n":3}"#
+    );
+    assert_same!(
+        cel_value(&number("0.5"), &Shape::Untyped),
+        Ok(cel::Value::Float(0.5))
+    );
+    assert_same!(
+        cel_value(&json!(u64::MAX), &Shape::Untyped),
+        Ok(cel::Value::UInt(u64::MAX))
+    );
+    // Past uint, an exact double, or refused.
     assert_same!(
         cel_value(&number("100000000000000000000"), &Shape::Untyped),
         Ok(cel::Value::Float(1e20))
     );
+    assert!(cel_value(&number("100000000000000000001"), &Shape::Untyped).is_err());
+    // A number field never rounds an integer: one a double cannot hold is
+    // refused, with advice.
+    let field = json!({"type": "number"});
+    let field = Shape::Schema(&field);
+    assert_same!(
+        cel_value(&number("9007199254740992"), &field),
+        Ok(cel::Value::Float(9007199254740992.0))
+    );
+    let error = cel_value(&number("9007199254740993"), &field).expect_err("not exact");
+    assert!(error.contains("type the field `integer`"), "{error}");
+    assert_same!(
+        cel_value(&number("9007199254740993"), &Shape::Untyped),
+        Ok(cel::Value::Int(9007199254740993))
+    );
     // A number f64 cannot hold is refused, not turned into infinity or NaN.
     assert!(cel_value(&number("1e400"), &Shape::Untyped).is_err());
-    assert!(
-        cel_value(
-            &number("-1e400"),
-            &Shape::Schema(&json!({"type": "number"}))
-        )
-        .is_err()
+    assert!(cel_value(&number("-1e400"), &field).is_err());
+}
+
+#[test]
+fn integers_through_nullable_alternatives_stay_integers() {
+    let schema = json!({"type": "object", "properties": {
+        "limits": {"anyOf": [{"type": "object", "properties": {"retries": {"type": "integer"}}}, {"type": "null"}]},
+        "listed": {"anyOf": [{"type": "array", "items": {"type": "integer"}}, {"type": "null"}]},
+        "maybe": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+        "one": {"oneOf": [{"type": "integer"}, {"type": "null"}]},
+        "array_type": {"type": ["integer", "null"]},
+        "either": {"type": ["integer", "number"]},
+        "branches": {"anyOf": [
+            {"type": "object", "properties": {"n": {"type": "integer"}}},
+            {"type": "object", "properties": {"n": {"type": "number"}}}
+        ]},
+        "one_of": {"oneOf": [
+            {"type": "object", "properties": {"n": {"type": "number"}}},
+            {"type": "string"}
+        ]},
+        "by_ref": {"$ref": "#/$defs/measured"},
+        "by_all": {"allOf": [{"$ref": "#/$defs/measured"}]}
+    }, "$defs": {"measured": {"type": "object", "properties": {"n": {"type": "number"}}}}});
+    let value = json!({
+        "limits": {"retries": 3}, "listed": [1, 2], "maybe": 4, "one": 5, "array_type": 6,
+        "either": 7, "branches": {"n": 8}, "one_of": {"n": 9}, "by_ref": {"n": 10}, "by_all": {"n": 11}
+    });
+    let shape = Shape::Schema(&schema);
+    for (source, want) in [
+        ("output.limits.retries", "Int(3)"),
+        ("output.listed[1]", "Int(2)"),
+        ("output.maybe", "Int(4)"),
+        ("output.one", "Int(5)"),
+        ("output.array_type", "Int(6)"),
+        ("output.either", "Float(7.0)"),
+        ("output.branches.n", "Float(8.0)"),
+        ("output.one_of.n", "Float(9.0)"),
+        ("output.by_ref.n", "Float(10.0)"),
+        ("output.by_all.n", "Float(11.0)"),
+    ] {
+        let program = cel::Program::compile(source).expect("compiles");
+        let mut context = cel::Context::default();
+        context.add_variable_from_value("output", cel_value(&value, &shape).expect("converts"));
+        assert_eq!(
+            format!("{:?}", program.execute(&context).expect("runs")),
+            want,
+            "{source}"
+        );
+    }
+    assert_eq!(
+        evaluate("output.limits.retries + 1", &[("output", &value, &shape)]),
+        Ok(json!(4))
     );
+    // They are integer fields, not untyped ones: a fraction there is refused
+    // rather than read as a double.
+    for (field, fraction) in [
+        ("limits", json!({"retries": 1.5})),
+        ("listed", json!([1.5])),
+        ("maybe", json!(1.5)),
+        ("one", json!(1.5)),
+        ("array_type", json!(1.5)),
+    ] {
+        let mut value = value.clone();
+        value[field] = fraction;
+        assert!(cel_value(&value, &shape).is_err(), "{field}");
+    }
+}
+
+#[test]
+fn deep_and_recursive_schemas_type_their_leaves() {
+    // A leaf forty objects down is still typed by its schema.
+    let schema = json!({"type": "object", "properties": {
+        "x": {"type": "number"},
+        "child": {"anyOf": [{"type": "null"}, {"$ref": "#"}]}
+    }});
+    let mut value = json!({"x": 1, "child": null});
+    for _ in 0..40 {
+        value = json!({"x": 1, "child": value});
+    }
+    let mut source = "output".to_owned();
+    for _ in 0..40 {
+        source.push_str(".child");
+    }
+    source.push_str(".x");
+    assert_same!(
+        evaluate(
+            &format!("{source} * 2.0"),
+            &[("output", &value, &Shape::Schema(&schema))]
+        ),
+        Ok(json!(2.0))
+    );
+    // Unions of references that would multiply finish, untyped where they
+    // run out of budget.
+    let mut defs = serde_json::Map::new();
+    for i in 0..40 {
+        let next = if i == 39 {
+            json!({"type": "integer"})
+        } else {
+            json!({"anyOf": [{"$ref": format!("#/$defs/d{}", i + 1)}, {"$ref": format!("#/$defs/d{}", i + 1)}]})
+        };
+        defs.insert(format!("d{i}"), next);
+    }
+    let schema = json!({"$ref": "#/$defs/d0", "$defs": defs});
+    let started = std::time::Instant::now();
+    assert!(cel_value(&json!(1), &Shape::Schema(&schema)).is_ok());
+    let looping = json!({"anyOf": [{"$ref": "#"}, {"$ref": "#"}, {"type": "integer"}]});
+    assert!(cel_value(&json!(1), &Shape::Schema(&looping)).is_ok());
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+}
+
+#[test]
+fn integer_text_is_read_exactly() {
+    let field = json!({"type": "integer"});
+    let field = Shape::Schema(&field);
+    for (text, want) in [
+        ("0e40", "Ok(Int(0))"),
+        ("0e-5", "Ok(Int(0))"),
+        ("0.000", "Ok(Int(0))"),
+        ("-0.0e-400", "Ok(Int(0))"),
+        ("12e-1", "Err"),
+        ("120e-1", "Ok(Int(12))"),
+        ("1e38", "Err"),
+        ("1e999999999", "Err"),
+        ("1e99999999999", "Err"),
+        ("1e-9223372036854775808", "Err"),
+        ("1.0000000000000000000001", "Err"),
+        ("1e-400", "Err"),
+    ] {
+        let started = std::time::Instant::now();
+        let got = format!("{:?}", cel_value(&number(text), &field));
+        assert!(got.starts_with(want), "{text}: {got}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(200),
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn additional_properties_beside_pattern_properties_do_not_type_a_field() {
+    // `n1` matches the pattern, so `additionalProperties` does not apply to it.
+    let schema = json!({"type": "object",
+        "patternProperties": {"^n": {"type": "number"}},
+        "additionalProperties": {"type": "integer"}});
+    let value = json!({"n1": 1.5});
+    assert_same!(
+        evaluate("output.n1", &[("output", &value, &Shape::Schema(&schema))]),
+        Ok(json!(1.5))
+    );
+}
+
+#[test]
+fn map_keys_in_a_result_are_strings() {
+    let none = Value::Null;
+    let bind = [("output", &none, &Shape::Untyped)];
+    for source in ["{1: 'a'}", "{true: 1}", "{1u: 2}"] {
+        assert!(evaluate(source, &bind).is_err(), "{source}");
+    }
+    assert_eq!(evaluate("{'1': 'a'}", &bind), Ok(json!({"1": "a"})));
+}
+
+#[test]
+fn a_value_is_checked_for_conversion_where_it_is_accepted() {
+    let schema = json!({"type": "object", "properties": {"count": {"type": "integer"}}});
+    assert_eq!(convertible(&json!({"count": 3}), &schema), Ok(()));
+    for text in ["1e20", "1.0000000000000000000001", "1e-400"] {
+        let value = json!({"count": number(text)});
+        assert!(convertible(&value, &schema).is_err(), "{text}");
+    }
 }
 
 #[test]
@@ -303,7 +499,7 @@ fn types_follow_references_combinators_and_containers() {
     let value = json!({"n": 1.0, "m": 1});
     assert_same!(
         evaluate(
-            "output.n + 1 == 2 && output.m + 1.0 == 2.0",
+            "output.n + 1 == 2 && output.m + 1 == 2",
             &[("output", &value, &shape)]
         ),
         Ok(json!(true))
@@ -336,7 +532,7 @@ fn results_are_finite_json_with_sorted_keys() {
         let result = evaluate("output", &[("output", &value, &Shape::Untyped)]).expect("evaluates");
         assert_eq!(
             serde_json::to_string(&result).expect("serializes"),
-            r#"{"alpha":2.0,"mid":[{"p":2.0,"q":1.0}],"zeta":1.0}"#
+            r#"{"alpha":2,"mid":[{"p":2,"q":1}],"zeta":1}"#
         );
     }
     // Integers and uints come back as integers.

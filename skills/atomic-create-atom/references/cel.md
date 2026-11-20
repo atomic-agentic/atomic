@@ -36,4 +36,4 @@ Each expression below is true for an output `{category: 'bug', summary: 'Export 
 
 CEL is not JavaScript: strings use `size()`, not `.length`; lists use `exists`, `all`, `filter` and `map` with a variable name as the first argument; `has(output.field)` tests an optional field; strings are single- or double-quoted; `==` compares values and there is no `===`.
 
-Numbers take their type from the schema: an `integer` field is a CEL `int`, and a `number` field, or a field the schema does not type, is a `double`, however the value is written. Comparisons mix the two (`output.score >= 1`), arithmetic does not: write `output.score * 2.0` for a `number` field.
+Numbers take their type from the schema: an `integer` field is a CEL `int` and a `number` field a `double`, however the value is written; a field the schema does not type keeps an integer as an `int`. Comparisons mix the two (`output.score >= 1`), arithmetic does not: write `output.score * 2.0` for a `number` field.

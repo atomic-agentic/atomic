@@ -1321,3 +1321,33 @@ fn an_exec_atom_output_names_only_artifacts_the_store_holds() {
         }
     });
 }
+
+// A number that validates but that CEL cannot read as its contract types it
+// is a schema error at acceptance: repaired, and never checkpointed.
+#[test]
+fn an_answer_cel_cannot_read_is_repaired() {
+    on_codex_runtime(async {
+        let wedging = Reply::Text(
+            r#"{"category": "bug", "summary": "s", "line": 1.0000000000000000000001}"#.into(),
+        );
+        let good = Reply::Text(r#"{"category": "bug", "summary": "s", "line": 1}"#.into());
+        let model = FakeModel::start(vec![wedging.clone(), good])
+            .await
+            .expect("fake model");
+        let rt = runtime(&model, "cel-repair");
+        let (out, _) = run_codex_atom(&Classify, &Note { text: "n".into() }, &rt)
+            .await
+            .expect("repaired");
+        assert_eq!(out.line, Some(1));
+        assert_eq!(model.calls(), 2, "one repair");
+        let model = FakeModel::start(vec![wedging.clone(), wedging])
+            .await
+            .expect("fake model");
+        let rt = runtime(&model, "cel-repair-fails");
+        let r = run_codex_atom(&Classify, &Note { text: "n".into() }, &rt).await;
+        assert!(
+            matches!(&r, Err(AtomError::Schema { message, .. }) if message.contains("integer")),
+            "{r:?}"
+        );
+    });
+}

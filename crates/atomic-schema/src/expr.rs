@@ -475,12 +475,17 @@ pub fn evaluate(source: &str, values: &[(&str, &Value, &Shape<'_>)]) -> Result<V
 /// serde_json's `arbitrary_precision` feature is on in this workspace, and
 /// under it a number serializes as a private one-entry map.
 ///
-/// A number the schema types `integer` becomes an `int`, or a `uint` above
-/// `i64::MAX`, whether it was written `1`, `1.0` or `1e0`; one neither can
-/// hold is refused. Any other number, typed `number` or not typed at all,
-/// becomes a `double`; one `f64` cannot hold (`1e400`) is refused. A field
-/// counts as an integer when its schema says so through `type`, a local
-/// `$ref`, any `allOf` member, or every `anyOf` or `oneOf` branch.
+/// The type depends on the schema, never on how the number was written:
+///
+/// - a field only integers can fill (its `type`, a local `$ref`, any `allOf`
+///   member, or every `anyOf` or `oneOf` branch that allows a number says
+///   `integer`) is an `int`, or a `uint` above `i64::MAX`, whether written
+///   `1`, `1.0` or `1e0`; one neither can hold is refused;
+/// - a field typed `number` is a `double`; an integer a double cannot hold
+///   exactly is refused, with advice to type the field `integer`;
+/// - a field the schema does not type keeps an integer as an `int` (or a
+///   `uint`), and anything else as a `double`;
+/// - a number `f64` cannot hold (`1e400`) is refused.
 pub fn cel_value(value: &Value, shape: &Shape<'_>) -> Result<cel::Value, String> {
     to_cel(value, &Ty::from_shape(shape), &mut String::new())
 }
@@ -509,13 +514,11 @@ pub fn json_value(value: &cel::Value) -> Result<Value, String> {
                 .map
                 .iter()
                 .map(|(key, item)| {
-                    let key = match key {
-                        Key::String(s) => s.to_string(),
-                        Key::Int(i) => i.to_string(),
-                        Key::Uint(u) => u.to_string(),
-                        Key::Bool(b) => b.to_string(),
+                    // JSON keys are strings; `{1: 'a', '1': 'b'}` has two.
+                    let Key::String(key) = key else {
+                        return Err(format!("a map key `{key:?}` is not a string"));
                     };
-                    Ok((key, json_value(item)?))
+                    Ok((key.to_string(), json_value(item)?))
                 })
                 .collect::<Result<Vec<_>, String>>()?;
             entries.sort_by(|a, b| a.0.cmp(&b.0));
@@ -525,8 +528,21 @@ pub fn json_value(value: &cel::Value) -> Result<Value, String> {
     })
 }
 
-/// How far `$ref`s and combinators are followed when typing a number.
-const TYPE_DEPTH: usize = 32;
+/// How many schema nodes typing one number may visit before it gives up and
+/// treats the number as untyped. Bounds unions of references that would
+/// otherwise multiply.
+const TYPE_BUDGET: usize = 4096;
+
+/// What a schema says a number at one position is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    /// Every number valid there is an integer.
+    Integer,
+    /// The schema types it `number`.
+    Number,
+    /// The schema does not say.
+    Unknown,
+}
 
 /// A shape narrowed to one position in a value: the schemas that all apply
 /// there (`All`), or that one of applies (`Any`).
@@ -539,6 +555,111 @@ enum Ty<'a> {
     Any(Vec<Ty<'a>>),
 }
 
+/// One step into a value.
+#[derive(Clone, Copy)]
+enum Step<'k> {
+    Field(&'k str),
+    Item(usize),
+}
+
+impl Step<'_> {
+    /// The JSON type a value must have to take this step.
+    fn container(self) -> &'static str {
+        match self {
+            Step::Field(_) => "object",
+            Step::Item(_) => "array",
+        }
+    }
+}
+
+/// The work one typing question may do: a budget of nodes, and the
+/// references being followed, so a reference cycle stops rather than repeats.
+struct Walk {
+    budget: usize,
+    path: Vec<*const Value>,
+}
+
+impl Walk {
+    fn new() -> Self {
+        Self {
+            budget: TYPE_BUDGET,
+            path: Vec::new(),
+        }
+    }
+
+    fn spend(&mut self) -> bool {
+        if self.budget == 0 {
+            return false;
+        }
+        self.budget -= 1;
+        true
+    }
+
+    /// Follow a reference to `target`, unless it is already being followed.
+    fn enter(&mut self, target: &Value) -> bool {
+        let ptr = std::ptr::from_ref(target);
+        if self.path.contains(&ptr) {
+            return false;
+        }
+        self.path.push(ptr);
+        true
+    }
+
+    fn leave(&mut self) {
+        self.path.pop();
+    }
+}
+
+/// `parts` that must all hold, with nested conjunctions flattened.
+fn all_of(parts: Vec<Ty<'_>>) -> Ty<'_> {
+    let mut flat = Vec::with_capacity(parts.len());
+    for part in parts {
+        match part {
+            Ty::All(inner) => flat.extend(inner),
+            other => flat.push(other),
+        }
+    }
+    if flat.len() == 1 {
+        flat.pop().expect("one part")
+    } else {
+        Ty::All(flat)
+    }
+}
+
+/// `parts` one of which holds, with nested alternatives flattened.
+fn any_of(parts: Vec<Ty<'_>>) -> Ty<'_> {
+    let mut flat = Vec::with_capacity(parts.len());
+    for part in parts {
+        match part {
+            Ty::Any(inner) => flat.extend(inner),
+            other => flat.push(other),
+        }
+    }
+    if flat.len() == 1 {
+        flat.pop().expect("one part")
+    } else {
+        Ty::Any(flat)
+    }
+}
+
+/// The JSON types `node` allows, following a chain of local references, or
+/// `None` when it does not say.
+fn types_of<'a>(root: &'a Value, node: &'a Value, walk: &mut Walk) -> Option<Vec<&'a str>> {
+    match node.get("type") {
+        Some(Value::String(t)) => Some(vec![t.as_str()]),
+        Some(Value::Array(ts)) => Some(ts.iter().filter_map(Value::as_str).collect()),
+        _ => {
+            let target = local_ref(root, node)?;
+            if !walk.spend() || !walk.enter(target) {
+                return None;
+            }
+            let types = types_of(root, target, walk);
+            walk.leave();
+            types
+        }
+    }
+}
+
 impl<'a> Ty<'a> {
     fn from_shape(shape: &'a Shape<'a>) -> Self {
         match shape {
@@ -548,116 +669,158 @@ impl<'a> Ty<'a> {
         }
     }
 
-    /// Whether every value at this position is an integer.
-    fn integer(&self, depth: usize) -> bool {
-        if depth > TYPE_DEPTH {
+    /// What a number here is.
+    fn kind(&self) -> Kind {
+        if self.integer(&mut Walk::new()) {
+            Kind::Integer
+        } else if self.number(&mut Walk::new()) {
+            Kind::Number
+        } else {
+            Kind::Unknown
+        }
+    }
+
+    /// Whether no number but an integer can be valid here. A schema whose
+    /// `type` allows no number at all (`null`, `object`) says so vacuously, so
+    /// `anyOf: [{type: integer}, {type: null}]` is an integer.
+    fn integer(&self, walk: &mut Walk) -> bool {
+        if !walk.spend() {
             return false;
         }
         match self {
             Ty::Untyped | Ty::Fields(_) => false,
-            Ty::All(parts) => parts.iter().any(|t| t.integer(depth + 1)),
-            Ty::Any(parts) => !parts.is_empty() && parts.iter().all(|t| t.integer(depth + 1)),
+            Ty::All(parts) => parts.iter().any(|t| t.integer(walk)),
+            Ty::Any(parts) => !parts.is_empty() && parts.iter().all(|t| t.integer(walk)),
             Ty::Node(root, node) => {
                 let typed = match node.get("type") {
-                    Some(Value::String(t)) => t == "integer",
-                    Some(Value::Array(ts)) => {
-                        ts.iter().any(|t| t == "integer") && !ts.iter().any(|t| t == "number")
-                    }
+                    Some(Value::String(t)) => t != "number",
+                    Some(Value::Array(ts)) => !ts.iter().any(|t| t == "number"),
                     _ => false,
                 };
                 typed
-                    || local_ref(root, node).is_some_and(|t| Ty::Node(root, t).integer(depth + 1))
+                    || local_ref(root, node).is_some_and(|t| {
+                        walk.enter(t) && {
+                            let integer = Ty::Node(root, t).integer(walk);
+                            walk.leave();
+                            integer
+                        }
+                    })
                     || node
                         .get("allOf")
                         .and_then(Value::as_array)
-                        .is_some_and(|ms| ms.iter().any(|m| Ty::Node(root, m).integer(depth + 1)))
+                        .is_some_and(|ms| ms.iter().any(|m| Ty::Node(root, m).integer(walk)))
                     || ["anyOf", "oneOf"].iter().any(|k| {
                         node.get(*k).and_then(Value::as_array).is_some_and(|bs| {
-                            !bs.is_empty()
-                                && bs.iter().all(|b| Ty::Node(root, b).integer(depth + 1))
+                            !bs.is_empty() && bs.iter().all(|b| Ty::Node(root, b).integer(walk))
                         })
                     })
             }
         }
     }
 
-    /// The type at field `key` of an object here.
-    fn field(&self, key: &str, depth: usize) -> Ty<'a> {
-        self.child(
-            depth,
-            &|root, node| match node.get("properties").and_then(|p| p.get(key)) {
-                Some(s) => Some(Ty::Node(root, s)),
-                None => node
-                    .get("additionalProperties")
-                    .filter(|s| s.is_object())
-                    .map(|s| Ty::Node(root, s)),
-            },
-            &|fields| fields.get(key).map(Ty::from_shape).unwrap_or(Ty::Untyped),
-        )
+    /// Whether some schema here types a number `number`.
+    fn number(&self, walk: &mut Walk) -> bool {
+        if !walk.spend() {
+            return false;
+        }
+        match self {
+            Ty::Untyped | Ty::Fields(_) => false,
+            Ty::All(parts) | Ty::Any(parts) => parts.iter().any(|t| t.number(walk)),
+            Ty::Node(root, node) => {
+                let typed = match node.get("type") {
+                    Some(Value::String(t)) => t == "number",
+                    Some(Value::Array(ts)) => ts.iter().any(|t| t == "number"),
+                    _ => false,
+                };
+                typed
+                    || local_ref(root, node).is_some_and(|t| {
+                        walk.enter(t) && {
+                            let number = Ty::Node(root, t).number(walk);
+                            walk.leave();
+                            number
+                        }
+                    })
+                    || ["allOf", "anyOf", "oneOf"].iter().any(|k| {
+                        node.get(*k)
+                            .and_then(Value::as_array)
+                            .is_some_and(|ms| ms.iter().any(|m| Ty::Node(root, m).number(walk)))
+                    })
+            }
+        }
     }
 
-    /// The type at item `index` of a list here.
-    fn item(&self, index: usize, depth: usize) -> Ty<'a> {
-        self.child(
-            depth,
-            &|root, node| match node.get("prefixItems").and_then(|p| p.get(index)) {
-                Some(s) => Some(Ty::Node(root, s)),
-                None => node
-                    .get("items")
-                    .filter(|s| s.is_object())
-                    .map(|s| Ty::Node(root, s)),
-            },
-            &|_| Ty::Untyped,
-        )
+    /// Whether a value here may be of JSON type `container`.
+    fn may_be(&self, container: &str, walk: &mut Walk) -> bool {
+        match self {
+            Ty::Node(root, node) => {
+                types_of(root, node, walk).is_none_or(|types| types.contains(&container))
+            }
+            _ => true,
+        }
     }
 
-    fn child(
-        &self,
-        depth: usize,
-        direct: &dyn Fn(&'a Value, &'a Value) -> Option<Ty<'a>>,
-        fields: &dyn Fn(&'a BTreeMap<String, Shape<'a>>) -> Ty<'a>,
-    ) -> Ty<'a> {
-        if depth > TYPE_DEPTH {
+    /// The type one step into a value here.
+    fn child(&self, step: Step<'_>) -> Ty<'a> {
+        self.step(step, &mut Walk::new())
+    }
+
+    fn step(&self, step: Step<'_>, walk: &mut Walk) -> Ty<'a> {
+        if !walk.spend() {
             return Ty::Untyped;
         }
         match self {
             Ty::Untyped => Ty::Untyped,
-            Ty::Fields(map) => fields(map),
-            Ty::All(parts) => Ty::All(
-                parts
-                    .iter()
-                    .map(|t| t.child(depth + 1, direct, fields))
-                    .collect(),
-            ),
-            Ty::Any(parts) => Ty::Any(
-                parts
-                    .iter()
-                    .map(|t| t.child(depth + 1, direct, fields))
-                    .collect(),
-            ),
+            Ty::Fields(map) => match step {
+                Step::Field(key) => map.get(key).map(Ty::from_shape).unwrap_or(Ty::Untyped),
+                Step::Item(_) => Ty::Untyped,
+            },
+            Ty::All(parts) => all_of(parts.iter().map(|t| t.step(step, walk)).collect()),
+            Ty::Any(parts) => {
+                let mut children = Vec::new();
+                for part in parts {
+                    // An alternative that cannot be an object (or a list) says
+                    // nothing about a field (or an item).
+                    if part.may_be(step.container(), walk) {
+                        children.push(part.step(step, walk));
+                    }
+                }
+                any_of(children)
+            }
             Ty::Node(root, node) => {
-                let mut parts: Vec<Ty<'a>> = direct(root, node).into_iter().collect();
-                if let Some(target) = local_ref(root, node) {
-                    parts.push(Ty::Node(root, target).child(depth + 1, direct, fields));
+                let mut parts: Vec<Ty<'a>> = Vec::new();
+                let direct = match step {
+                    Step::Field(key) => match node.get("properties").and_then(|p| p.get(key)) {
+                        Some(s) => Some(s),
+                        // Beside patternProperties, additionalProperties may
+                        // not be what applies to `key`.
+                        None => node
+                            .get("additionalProperties")
+                            .filter(|s| s.is_object() && node.get("patternProperties").is_none()),
+                    },
+                    Step::Item(index) => match node.get("prefixItems").and_then(|p| p.get(index)) {
+                        Some(s) => Some(s),
+                        None => node.get("items").filter(|s| s.is_object()),
+                    },
+                };
+                parts.extend(direct.map(|s| Ty::Node(root, s)));
+                if let Some(target) = local_ref(root, node)
+                    && walk.enter(target)
+                {
+                    parts.push(Ty::Node(root, target).step(step, walk));
+                    walk.leave();
                 }
                 if let Some(members) = node.get("allOf").and_then(Value::as_array) {
-                    parts.extend(
-                        members
-                            .iter()
-                            .map(|m| Ty::Node(root, m).child(depth + 1, direct, fields)),
-                    );
+                    for m in members {
+                        parts.push(Ty::Node(root, m).step(step, walk));
+                    }
                 }
                 for k in ["anyOf", "oneOf"] {
                     if let Some(branches) = node.get(k).and_then(Value::as_array) {
-                        parts.push(Ty::Any(
-                            branches
-                                .iter()
-                                .map(|b| Ty::Node(root, b).child(depth + 1, direct, fields))
-                                .collect(),
-                        ));
+                        let branches = branches.iter().map(|b| Ty::Node(root, b)).collect();
+                        parts.push(Ty::Any(branches).step(step, walk));
                     }
                 }
-                Ty::All(parts)
+                all_of(parts)
             }
         }
     }
@@ -669,30 +832,34 @@ fn local_ref<'a>(root: &'a Value, node: &Value) -> Option<&'a Value> {
     root.pointer(r.strip_prefix('#')?)
 }
 
+/// Whether `value` converts to CEL under `schema`, as every expression that
+/// later reads it will convert it. Run where a value is accepted, so that one
+/// the conversion refuses is an error there, not in every later expression.
+pub fn convertible(value: &Value, schema: &Value) -> Result<(), String> {
+    cel_value(value, &Shape::Schema(schema)).map(drop)
+}
+
 fn to_cel(value: &Value, ty: &Ty<'_>, at: &mut String) -> Result<cel::Value, String> {
     Ok(match value {
         Value::Null => cel::Value::Null,
         Value::Bool(b) => cel::Value::Bool(*b),
-        Value::Number(n) => {
-            if ty.integer(0) {
-                integer(n).ok_or_else(|| {
-                    format!("{at}: {n} is an integer field, but not an integer CEL can hold")
-                })?
-            } else {
-                cel::Value::Float(
-                    n.as_f64()
-                        .filter(|f| f.is_finite())
-                        .ok_or_else(|| format!("{at}: {n} is not a finite number"))?,
-                )
-            }
-        }
+        Value::Number(n) => number(n, ty.kind()).map_err(|e| {
+            format!(
+                "{}: {e}",
+                if at.is_empty() {
+                    "the value"
+                } else {
+                    at.as_str()
+                }
+            )
+        })?,
         Value::String(s) => cel::Value::String(std::sync::Arc::new(s.clone())),
         Value::Array(items) => {
             let mut out = Vec::with_capacity(items.len());
             for (i, item) in items.iter().enumerate() {
                 let len = at.len();
                 at.push_str(&format!("[{i}]"));
-                out.push(to_cel(item, &ty.item(i, 0), at)?);
+                out.push(to_cel(item, &ty.child(Step::Item(i)), at)?);
                 at.truncate(len);
             }
             cel::Value::List(std::sync::Arc::new(out))
@@ -703,7 +870,7 @@ fn to_cel(value: &Value, ty: &Ty<'_>, at: &mut String) -> Result<cel::Value, Str
                 let len = at.len();
                 at.push('.');
                 at.push_str(key);
-                out.insert(key.clone(), to_cel(item, &ty.field(key, 0), at)?);
+                out.insert(key.clone(), to_cel(item, &ty.child(Step::Field(key)), at)?);
                 at.truncate(len);
             }
             out.into()
@@ -711,19 +878,54 @@ fn to_cel(value: &Value, ty: &Ty<'_>, at: &mut String) -> Result<cel::Value, Str
     })
 }
 
-/// `n` as a CEL `int` or `uint`, if it is an integer one of them holds.
-/// Read exactly from the number's decimal text, so `1.0`, `1e0` and `10e-1`
-/// are all `1`, and nothing is rounded through `f64` on the way.
-fn integer(n: &serde_json::Number) -> Option<cel::Value> {
-    let value = exact_integer(&n.to_string())?;
-    i64::try_from(value)
-        .map(cel::Value::Int)
-        .or_else(|_| u64::try_from(value).map(cel::Value::UInt))
-        .ok()
+/// A number as CEL, by what its schema says it is.
+fn number(n: &serde_json::Number, kind: Kind) -> Result<cel::Value, String> {
+    let exact = exact_integer(&n.to_string());
+    let as_int = |value: i128| {
+        i64::try_from(value)
+            .map(cel::Value::Int)
+            .or_else(|_| u64::try_from(value).map(cel::Value::UInt))
+            .ok()
+    };
+    let double = || {
+        n.as_f64()
+            .filter(|f| f.is_finite())
+            .map(cel::Value::Float)
+            .ok_or_else(|| format!("{n} is not a finite number"))
+    };
+    match (kind, exact) {
+        (Kind::Integer, Some(value)) => {
+            as_int(value).ok_or_else(|| format!("{n} is an integer neither int nor uint can hold"))
+        }
+        (Kind::Integer, None) => Err(format!("{n} is not an integer CEL can hold")),
+        // An integer the schema does not type stays an integer, as it was
+        // written; one too large for int or uint is a double if it is exact.
+        (Kind::Unknown, Some(value)) => match as_int(value) {
+            Some(v) => Ok(v),
+            None => exact_double(n, value),
+        },
+        (Kind::Number, Some(value)) => exact_double(n, value),
+        (_, None) => double(),
+    }
+}
+
+/// An integer as a CEL double, only if the double is exactly that integer.
+fn exact_double(n: &serde_json::Number, value: i128) -> Result<cel::Value, String> {
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+    let f = value as f64;
+    #[allow(clippy::cast_possible_truncation)]
+    if f.is_finite() && f as i128 == value {
+        Ok(cel::Value::Float(f))
+    } else {
+        Err(format!(
+            "{n} is an integer a double cannot hold exactly; type the field `integer`"
+        ))
+    }
 }
 
 /// The integer a JSON number's text denotes, if it denotes one that fits in
-/// an `i128`.
+/// an `i128`. Read exactly from the text, so `1.0`, `1e0` and `10e-1` are all
+/// `1`, and nothing is rounded through `f64` on the way.
 fn exact_integer(text: &str) -> Option<i128> {
     let (negative, rest) = match text.strip_prefix('-') {
         Some(rest) => (true, rest),
@@ -735,18 +937,23 @@ fn exact_integer(text: &str) -> Option<i128> {
     };
     let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
     let mut digits = format!("{whole}{fraction}");
+    // Zero is zero whatever its exponent: `0e40`, `0.0e-400`.
+    if digits.bytes().all(|b| b == b'0') {
+        return Some(0);
+    }
     let shift = exponent.checked_sub(i64::try_from(fraction.len()).ok()?)?;
     if shift >= 0 {
         // More than 39 digits cannot fit in an i128 anyway.
-        if digits.trim_start_matches('0').len() as i64 + shift > 39 {
+        let significant = i64::try_from(digits.trim_start_matches('0').len()).ok()?;
+        if significant.checked_add(shift)? > 39 {
             return None;
         }
         digits.extend(std::iter::repeat_n('0', usize::try_from(shift).ok()?));
     } else {
-        let cut = usize::try_from(-shift).ok()?;
+        let cut = usize::try_from(shift.unsigned_abs()).ok()?;
+        // Only zeros may be shifted out, and the digits are not all zeros.
         if cut > digits.len() {
-            // Only zeros can be shifted out entirely.
-            return digits.bytes().all(|b| b == b'0').then_some(0);
+            return None;
         }
         let (kept, dropped) = digits.split_at(digits.len() - cut);
         if !dropped.bytes().all(|b| b == b'0') {

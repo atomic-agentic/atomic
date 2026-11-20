@@ -356,14 +356,15 @@ fn fits(what: &str, contract: &Value, value: &Value) -> Result<()> {
             format!("{}: {e}", if at.is_empty() { "/" } else { &at })
         })
         .collect();
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(failed(format!(
+    if !errors.is_empty() {
+        return Err(failed(format!(
             "{what} does not fit its contract: {}",
             errors.join("; ")
-        )))
+        )));
     }
+    // CEL reads it as its contract types it; refuse here what it cannot read.
+    atomic_schema::expr::convertible(value, contract)
+        .map_err(|e| failed(format!("{what} cannot be read in CEL: {e}")))
 }
 
 /// The model a declarative atom's calls go to, as its runtime picks it: the
@@ -466,6 +467,12 @@ async fn run_pipeline<C: WorkflowContext>(
     // What each finished step's output is typed by, for CEL.
     let mut shapes = BTreeMap::new();
     let input_shape = Shape::Schema(&pipeline.input);
+    // What atomic itself records beside each step.
+    let metadata_schema = json!({"type": "object", "properties": {
+        "input_tokens": {"type": "integer"}, "output_tokens": {"type": "integer"},
+        "total_tokens": {"type": "integer"}, "turns": {"type": "integer"}
+    }});
+    let decision_schema = json!({"type": "object", "properties": {"at": {"type": "integer"}}});
     let mut used_worktrees = false;
     let mut accepted = Vec::new();
     for step in &pipeline.steps {
@@ -482,6 +489,10 @@ async fn run_pipeline<C: WorkflowContext>(
                     run_gate(&ctx, &pipeline.name, g, &values, &services.deployment).await?;
                 failpoint(&format!("pipeline:after:{}", g.id));
                 steps.insert(g.id.clone(), json!({ "decision": decision }));
+                shapes.insert(
+                    g.id.clone(),
+                    Shape::fields([("decision", Shape::Schema(&decision_schema))]),
+                );
                 continue;
             }
         };
@@ -666,7 +677,13 @@ async fn run_pipeline<C: WorkflowContext>(
             Some(contract) => Shape::Schema(contract),
             None => Shape::Untyped,
         };
-        shapes.insert(step.id.clone(), Shape::fields([("output", output)]));
+        shapes.insert(
+            step.id.clone(),
+            Shape::fields([
+                ("output", output),
+                ("metadata", Shape::Schema(&metadata_schema)),
+            ]),
+        );
     }
     let scope = json!(steps);
     let steps_shape = Shape::Fields(shapes);

@@ -166,15 +166,18 @@ anyOf:
      properties: {kind: {const: text}, text: {type: string, maxLength: 2000}}}
 ```
 
-`atomic check` refuses an output schema whose references the check could not
+`atomic check` inlines references to other schema files and `$anchor`s first,
+and writes any spelling of `atomic:artifact` (`atomic:artifact#`) the canonical
+way. It then refuses an output schema whose references the check could not
 follow: one reached through `contains`, `if`, `then`, `else`, `not`,
 `patternProperties` or another keyword besides `properties`, `items`,
 `prefixItems`, `additionalProperties`, `dependentSchemas`, `allOf`, `anyOf` and
-`oneOf`; a `$ref` that is not a `#/...` pointer into the schema (an `$anchor`,
-`$dynamicRef` or another file); a local `$ref` inside a subschema with its own
-`$id`; a nested `$schema`; and a `mediaType` anywhere but beside
-`$ref: 'atomic:artifact'`. A schema whose alternatives would take too
-long to decide fails the check at run time rather than passing unchecked.
+`oneOf`; a nested `$schema`; and a `mediaType` anywhere but beside
+`$ref: 'atomic:artifact'`. A contract written in code is not inlined, so for it
+any `$ref` other than `atomic:artifact` or a `#/...` pointer into the contract
+is refused too, when its output is checked. A schema whose alternatives would
+take too long to decide fails the check at run time rather than passing
+unchecked.
 
 ## Configuration
 
