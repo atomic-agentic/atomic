@@ -26,11 +26,12 @@
 
 use crate::gates;
 use crate::shown;
+use atomic_core::redact::Line;
 use atomic_core::state::ProjectState;
 use atomic_durable::Durare;
 use atomic_durable::gate::{self, DecideError, Gate, GateFilter, Verdict};
 use std::collections::BTreeSet;
-use std::io::{IsTerminal, Write};
+use std::io::IsTerminal;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -215,50 +216,97 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// Show gate `g` and what to type, every part of it made safe.
+/// `v` for a person: redacted, then made safe for the terminal, and
+/// whether redaction changed it.
+fn redacted(v: &serde_json::Value) -> (String, bool) {
+    let mut shown_value = v.clone();
+    atomic_core::redact::value(&mut shown_value);
+    let changed = shown_value != *v;
+    (shown::value(&shown_value), changed)
+}
+
+/// [`redacted`], for text.
+fn redacted_text(text: &str) -> (String, bool) {
+    redacted(&serde_json::Value::String(text.to_owned()))
+}
+
+/// Show gate `g` and what to type, every part of it made safe. Each line is
+/// written by itself, and each value in it redacted on its own: what the
+/// title or one value holds, such as the start of a private key, hides
+/// nothing else. atomic's own words and the gate's id are written as they
+/// are.
 fn describe(g: &Gate) {
-    let mut e = atomic_core::redact::stderr_lines();
-    let _ = writeln!(e, "\ngate {} is waiting for you", shown::line(&g.id));
+    let mut hidden = false;
+    Line::new()
+        .plain("\ngate ")
+        .plain(&shown::line(&g.id))
+        .plain(" is waiting for you")
+        .log();
     let label = if g.question.is_some() {
         "question: "
     } else {
         ""
     };
-    let _ = writeln!(e, "  {label}{}", shown::line(&g.title));
+    let (title, cut) = redacted_text(&g.title);
+    hidden |= cut;
+    Line::new().plain("  ").plain(label).plain(&title).log();
     if !g.show.is_null() {
-        let shows = serde_json::to_string_pretty(&g.show).unwrap_or_default();
-        let _ = writeln!(e, "  shows: {}", shown::block(&shows).replace('\n', "\n  "));
+        let mut show = g.show.clone();
+        atomic_core::redact::value(&mut show);
+        hidden |= show != g.show;
+        let shows = serde_json::to_string_pretty(&show).unwrap_or_default();
+        for (i, l) in shows.split('\n').enumerate() {
+            Line::new()
+                .plain(if i == 0 { "  shows: " } else { "  " })
+                .plain(&shown::line(l))
+                .log();
+        }
     }
     if let Some(q) = &g.question {
         if let Some(choices) = q.choices() {
             for (i, c) in choices.iter().enumerate() {
-                let _ = writeln!(e, "  {}) {}", shown::label(i), shown::value(c));
+                let (choice, cut) = redacted(c);
+                hidden |= cut;
+                Line::new()
+                    .plain("  ")
+                    .plain(&shown::label(i))
+                    .plain(") ")
+                    .plain(&choice)
+                    .log();
             }
         }
         if let (Some(default), Some(_)) = (&q.default, g.deadline) {
-            let _ = writeln!(e, "  silence selects {}", shown::value(default));
+            let (default, cut) = redacted(default);
+            hidden |= cut;
+            Line::new()
+                .plain("  silence selects ")
+                .plain(&default)
+                .log();
         }
+    }
+    if hidden {
+        Line::new()
+            .plain(&format!(
+                "  something here is shown as {}; `atomic gates list` shows it in full",
+                atomic_core::redact::REDACTED
+            ))
+            .log();
     }
     if let Some(deadline) = g.deadline {
         let left = (deadline - now_ms()).max(0) / 1000;
-        let _ = writeln!(e, "  it waits {left}s more");
+        Line::new().plain(&format!("  it waits {left}s more")).log();
     }
 }
 
+/// Ask for a decision on `g`, the cursor left after the prompt.
 fn ask(g: &Gate) {
-    let mut e = atomic_core::redact::stderr_lines();
-    let _ = if g.question.is_some() {
-        write!(
-            e,
+    Line::new()
+        .plain(if g.question.is_some() {
             "answer with a value or its letter (/reject to refuse) > "
-        )
-    } else {
-        write!(
-            e,
+        } else {
             "approve or reject: `a` or `r`, then a comment if you like > "
-        )
-    };
-    let _ = e.flush();
+        })
+        .prompt();
 }
 
 /// Why the prompt for a gate ended.
@@ -292,14 +340,22 @@ async fn prompt(rt: &Durare, state: &ProjectState, g: &Gate, lines: &Lines) -> D
             // the person looks at it.
             match gate::find(rt, &g.id).await {
                 Ok(Some(now)) if now.resolution.is_some() => {
-                    atomic_core::log_line!("\ngate {} was resolved meanwhile", shown::line(&g.id));
+                    Line::new()
+                        .plain("\ngate ")
+                        .plain(&shown::line(&g.id))
+                        .plain(" was resolved meanwhile")
+                        .log();
                     return Done::Settled;
                 }
                 Err(e) => atomic_core::log_line!("\nthe gate store: {e}"),
                 _ => {}
             }
             if g.deadline.is_some_and(|d| now_ms() >= d) {
-                atomic_core::log_line!("\ngate {}: its deadline passed", shown::line(&g.id));
+                Line::new()
+                    .plain("\ngate ")
+                    .plain(&shown::line(&g.id))
+                    .plain(": its deadline passed")
+                    .log();
                 return Done::Settled;
             }
             if !interactive() {
@@ -319,15 +375,25 @@ async fn prompt(rt: &Durare, state: &ProjectState, g: &Gate, lines: &Lines) -> D
         {
             Ok(d) => {
                 let what = match &d.answer {
-                    Some(a) => format!("answered {}", shown::value(a)),
+                    Some(a) => format!("answered {}", redacted(a).0),
                     None if d.verdict == Verdict::Approve => "approved".into(),
                     None => "rejected".into(),
                 };
-                atomic_core::log_line!("gate {}: {what} by {}", shown::line(&g.id), d.by);
+                Line::new()
+                    .plain("gate ")
+                    .plain(&shown::line(&g.id))
+                    .plain(": ")
+                    .plain(&what)
+                    .plain(" by ")
+                    .plain(&shown::line(&d.by.to_string()))
+                    .log();
                 return Done::Settled;
             }
             Err(e) => {
-                atomic_core::log_line!("not recorded: {}", shown::line(&format!("{e:#}")));
+                Line::new()
+                    .plain("not recorded: ")
+                    .plain(&redacted_text(&format!("{e:#}")).0)
+                    .log();
                 match e.downcast_ref::<DecideError>() {
                     Some(DecideError::Conflict { .. }) => return Done::Settled,
                     // Nothing typed here can change that.
@@ -389,12 +455,18 @@ pub async fn at_gates(rt: &Durare, state: &ProjectState, run_id: &str) {
                         id = shown::line(&g.id)
                     )
                 };
-                atomic_core::log_line!(
-                    "run {} waits at gate {} ({}): decide it from a terminal with {how}",
-                    shown::line(run_id),
-                    shown::line(&g.id),
-                    shown::line(&g.title)
-                );
+                // The title last, and redacted on its own: nothing in it can
+                // hide how to decide the gate.
+                Line::new()
+                    .plain("run ")
+                    .plain(&shown::line(run_id))
+                    .plain(" waits at gate ")
+                    .plain(&shown::line(&g.id))
+                    .plain(": decide it from a terminal with ")
+                    .plain(&how)
+                    .plain("; it asks: ")
+                    .plain(&redacted_text(&g.title).0)
+                    .log();
             }
         }
         tokio::time::sleep(POLL).await;

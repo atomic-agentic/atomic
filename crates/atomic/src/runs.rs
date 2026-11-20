@@ -135,10 +135,14 @@ async fn finish(
     let outcome = tokio::select! {
         outcome = follow => Some(outcome),
         signal = signals.next() => {
-            atomic_core::log_line!(
-                "{who}: {signal}: run {run_id} stays unfinished; continue it with \
-                 `atomic runs resume {run_id}`"
-            );
+            // Names and atomic's words only, written as they are: a run id
+            // such as `rotate-secret` is not a secret.
+            atomic_core::redact::Line::new()
+                .plain(&format!(
+                    "{who}: {signal}: run {run_id} stays unfinished; continue it with \
+                     `atomic runs resume {run_id}`"
+                ))
+                .log();
             None
         }
     };
@@ -239,11 +243,14 @@ pub async fn run(
     }
     engine.launch().await?;
     // Before anything runs, so a run cut short can be resumed by its id.
-    atomic_core::log_line!(
-        "run {run_id}: {} in project {}",
-        run.pipeline.name,
-        found.name
-    );
+    // Names only, written as they are: a run id such as `rotate-secret` is
+    // not a secret.
+    atomic_core::redact::Line::new()
+        .plain(&format!(
+            "run {run_id}: {} in project {}",
+            run.pipeline.name, found.name
+        ))
+        .log();
     engine.rt.start(PIPELINE, &run_id, run).await?;
     finish(&engine, &state, &run_id, json, &mut signals, "atomic run").await
 }
@@ -357,7 +364,9 @@ pub async fn resume(
                 )
                 .into());
             }
-            atomic_core::log_line!("run {id}: resuming");
+            atomic_core::redact::Line::new()
+                .plain(&format!("run {id}: resuming"))
+                .log();
             // Queued before this engine dispatches, so it takes the run once.
             engine.rt.resume(id).await?;
             atomic_durable::failpoint("resume:queued");

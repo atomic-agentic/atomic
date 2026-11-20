@@ -664,6 +664,107 @@ fn an_exec_command_cannot_type_into_the_prompt() {
     assert_eq!(p.gate("typed-in:deploy").resolution, None, "the gate waits");
 }
 
+/// What starts a private key block, which a model can put in a gate's
+/// title or in what it shows.
+const KEY_START: &str = "-----BEGIN PRIVATE KEY-----";
+
+#[test]
+fn the_start_of_a_private_key_in_a_gate_hides_nothing_else_it_shows() {
+    let p = Project::new("keyed");
+    p.enroll();
+    let data = json!({ "text": KEY_START }).to_string();
+    // A run id with a secret's word in it is a name, not a secret.
+    let out = p.at_terminal(
+        &[
+            "run",
+            "approval",
+            "--run-id",
+            "rotate-secret",
+            "--data",
+            &data,
+        ],
+        &["a"],
+    );
+    let t = text(&out);
+    assert!(out.status.success(), "{t}");
+    // The title is redacted, and the shows: block after it is all there.
+    assert!(t.contains("  Ship got [REDACTED]"), "{t}");
+    assert!(t.contains("  shows: {"), "the show was hidden: {t}");
+    assert!(
+        t.contains("\"line\": \"got [REDACTED]\""),
+        "the show was hidden: {t}"
+    );
+    assert!(
+        t.lines().any(|l| l.trim_end() == "  }"),
+        "the show was cut: {t}"
+    );
+    assert!(t.contains("`atomic gates list` shows it in full"), "{t}");
+    let errors = String::from_utf8_lossy(&out.stderr);
+    assert!(!errors.contains(KEY_START), "{errors}");
+    // atomic's own words and the names in them are not redacted.
+    assert!(
+        t.contains("gate rotate-secret:pick is waiting for you"),
+        "{t}"
+    );
+    assert!(t.contains("run rotate-secret: approval in project"), "{t}");
+    assert!(
+        t.contains("gate rotate-secret:pick: approved by local:dev"),
+        "{t}"
+    );
+    // A question's choices, after a title holding the same.
+    let out = p.at_terminal(
+        &[
+            "run",
+            "question",
+            "--run-id",
+            "keyed-question",
+            "--data",
+            &data,
+        ],
+        &["b"],
+    );
+    let t = text(&out);
+    assert!(out.status.success(), "{t}");
+    assert!(
+        t.contains("question: Which channel for got [REDACTED]"),
+        "{t}"
+    );
+    assert!(
+        t.contains("a) stable") && t.contains("b) beta"),
+        "the choices were hidden: {t}"
+    );
+    assert!(t.contains("answered beta by local:dev"), "{t}");
+}
+
+#[test]
+fn without_a_terminal_the_start_of_a_private_key_in_a_title_hides_how_to_decide_nothing() {
+    use std::io::BufRead;
+    let p = Project::new("keyed-no-tty");
+    p.enroll();
+    let data = json!({ "text": KEY_START }).to_string();
+    let mut run = p.spawn(&[
+        "run",
+        "approval",
+        "--run-id",
+        "rotate-secret",
+        "--data",
+        &data,
+    ]);
+    let stderr = run.0.as_mut().unwrap().stderr.take().unwrap();
+    let told = std::io::BufReader::new(stderr)
+        .lines()
+        .map_while(Result::ok)
+        .find(|l| l.contains("waits at gate"))
+        .expect("the run said it waits");
+    assert!(
+        told.contains(
+            "`atomic gates approve rotate-secret:pick` or `atomic gates reject rotate-secret:pick`"
+        ),
+        "{told}"
+    );
+    assert!(!told.contains(KEY_START), "{told}");
+}
+
 #[test]
 fn a_hostile_title_reaches_the_terminal_escaped() {
     let p = Project::new("hostile");

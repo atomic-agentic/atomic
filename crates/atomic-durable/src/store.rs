@@ -673,8 +673,8 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
-    /// Question gates' tables reach a store at 5, and one at 6 (another
-    /// branch's migration, which this binary does not have).
+    /// Question gates' tables (migration 7) reach a store at 5, which gets
+    /// the executions table (6) on the way, and one at 6.
     #[tokio::test]
     async fn question_gates_migrate_onto_a_store_at_5_or_6() {
         for from in [5, 6] {

@@ -8,9 +8,9 @@
 //! they are untrusted text: printed as they are, control sequences in them
 //! could move the cursor, rewrite or hide the lines around them, set the
 //! window title or make the terminal answer back into the prompt's input.
-//! Everything printed from a gate goes through [`line`] or [`block`], which
-//! replace C0 and C1 controls, DEL, and Unicode format and bidirectional
-//! controls with visible escapes.
+//! Everything printed from a gate goes through [`line`], which replaces C0
+//! and C1 controls, DEL, and Unicode format and bidirectional controls with
+//! visible escapes, one line at a time.
 
 use atomic_durable::gate::Question;
 use serde_json::Value;
@@ -45,12 +45,6 @@ pub fn line(text: &str) -> String {
         }
     }
     out
-}
-
-/// `text` as lines, keeping its line breaks and escaping everything else
-/// that is unsafe.
-pub fn block(text: &str) -> String {
-    text.split('\n').map(line).collect::<Vec<_>>().join("\n")
 }
 
 /// A JSON value for a person: a string as its text, anything else as JSON,
@@ -117,7 +111,6 @@ mod tests {
             safe,
             "Ship\\u{001b}[2J\\u{001b}]0;owned\\u{0007}\\u{009b}31m\\u{202e}txt.exe\\u{200b}\\r\\nnow\\u{007f}"
         );
-        assert_eq!(block("one\ntwo\u{1b}"), "one\ntwo\\u{001b}");
         assert_eq!(
             line("café · 日本"),
             "café · 日本",
