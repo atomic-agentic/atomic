@@ -118,6 +118,10 @@ pub struct StepRecord {
     pub output: Option<Value>,
     /// Its error, if it failed.
     pub error: Option<String>,
+    /// When it started, in milliseconds since the Unix epoch, if recorded.
+    pub started_at: Option<i64>,
+    /// When it completed, in milliseconds since the Unix epoch, if recorded.
+    pub completed_at: Option<i64>,
 }
 
 /// Which model thread a published step ran on.
@@ -156,7 +160,7 @@ pub enum RunStatus {
 }
 
 /// What the store records about a run beside its steps.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RunRecord {
     /// Its id.
     pub id: String,
@@ -169,6 +173,34 @@ pub struct RunRecord {
     pub version: String,
     /// The queue it waits on, or was last taken from, if any.
     pub queue: Option<String>,
+    /// The workflow it runs, as registered.
+    pub workflow: String,
+    /// What it was started with.
+    pub input: Value,
+}
+
+/// Where a run stands in [`Durare::runs_after`]'s order: when it was
+/// created, in milliseconds since the epoch, and its id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunKey {
+    /// When the run was created.
+    pub created_at: i64,
+    /// Its id.
+    pub id: String,
+}
+
+/// A run with what it was given and what it returned or failed with, as
+/// [`Durare::runs_after`] reads it.
+#[derive(Clone, Debug)]
+pub struct RunContents {
+    /// The run.
+    pub record: RunRecord,
+    /// Its input, as stored.
+    pub input: Value,
+    /// What it returned, once it succeeded.
+    pub output: Option<Value>,
+    /// Its error, once it failed.
+    pub error: Option<String>,
 }
 
 /// What every resume queue's name starts with.
@@ -197,6 +229,8 @@ impl From<durare::WorkflowStatus> for RunRecord {
             executor: w.executor_id,
             version: w.app_version,
             queue: w.queue_name,
+            workflow: w.name,
+            input: w.input,
         }
     }
 }
@@ -569,6 +603,14 @@ pub trait DurableRuntime: Send + Sync + Sized {
         T: Send + 'static,
         F: for<'t, 'c> Fn(Tx<'t, 'c>) -> TxFuture<'t, T> + Send + Sync + 'static;
 
+    /// Read atomic's tables in one transaction, outside any workflow, that
+    /// takes no write lock, so it answers while a writer holds one; it is
+    /// rolled back. The body only reads.
+    fn read_transaction<T, F>(&self, body: F) -> impl Future<Output = Result<T>> + Send
+    where
+        T: Send + 'static,
+        F: for<'t, 'c> Fn(Tx<'t, 'c>) -> TxFuture<'t, T> + Send + Sync + 'static;
+
     /// The usage ledger in this runtime's database (see [`crate::usage`]):
     /// budget accounting, apart from step outputs and telemetry.
     fn ledger(&self) -> Ledger;
@@ -927,6 +969,29 @@ impl Reads {
         }
     }
 
+    /// Run read-only `body` in a transaction on atomic's tables that takes no
+    /// write lock, so it answers while a writer holds one, and roll it back.
+    pub(crate) async fn read<T, F>(&self, body: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: for<'t, 'c> Fn(Tx<'t, 'c>) -> TxFuture<'t, T> + Send + Sync + 'static,
+    {
+        match self {
+            Reads::Sqlite(pool) => {
+                let mut tx = pool.begin().await.map_err(db)?;
+                let out = body(Tx(TxInner::Sqlite(&mut tx))).await;
+                tx.rollback().await.map_err(db)?;
+                out
+            }
+            Reads::Postgres(pool) => {
+                let mut tx = pool.begin().await.map_err(db)?;
+                let out = body(Tx(TxInner::Postgres(&mut tx))).await;
+                tx.rollback().await.map_err(db)?;
+                out
+            }
+        }
+    }
+
     /// Run `body` in one short transaction on atomic's tables, committing or
     /// rolling back as it says; an error rolls back. On SQLite the write lock
     /// is taken up front, so a read followed by a write in the body cannot
@@ -1117,6 +1182,88 @@ impl Durare {
             .await
             .map_err(from_durare)?;
         Ok(found.into_iter().map(RunRecord::from).collect())
+    }
+
+    /// A page of the store's runs, finished or not, whoever owns them: at
+    /// most `limit` of them, in order of creation and then of id, after the
+    /// run `after` names, each with what it was given and what it returned
+    /// or failed with. Paging by that key misses no run however many share a
+    /// creation time, and a run removed between pages shifts nothing.
+    pub async fn runs_after(
+        &self,
+        after: Option<&RunKey>,
+        limit: i64,
+    ) -> Result<Vec<(RunKey, RunContents)>> {
+        let after = after.cloned();
+        let keys: Vec<RunKey> = self
+            .control_transaction(move |mut tx| {
+                let after = after.clone();
+                Box::pin(async move {
+                    let rows = match &after {
+                        None => {
+                            tx.query_all(
+                                "SELECT workflow_uuid AS id, created_at FROM workflow_status \
+                                 ORDER BY created_at, workflow_uuid LIMIT ?",
+                                &[Param::Int(limit)],
+                            )
+                            .await?
+                        }
+                        Some(key) => {
+                            tx.query_all(
+                                "SELECT workflow_uuid AS id, created_at FROM workflow_status \
+                                 WHERE created_at > ? OR (created_at = ? AND workflow_uuid > ?) \
+                                 ORDER BY created_at, workflow_uuid LIMIT ?",
+                                &[
+                                    Param::Int(key.created_at),
+                                    Param::Int(key.created_at),
+                                    Param::Text(key.id.clone()),
+                                    Param::Int(limit),
+                                ],
+                            )
+                            .await?
+                        }
+                    };
+                    rows.iter()
+                        .map(|r| {
+                            Ok(RunKey {
+                                id: r.text("id")?,
+                                created_at: r.int("created_at")?,
+                            })
+                        })
+                        .collect()
+                })
+            })
+            .await?;
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut found: std::collections::BTreeMap<String, durare::WorkflowStatus> = self
+            .engine
+            .list_workflows(&durare::ListFilter {
+                workflow_ids: keys.iter().map(|k| k.id.clone()).collect(),
+                ..durare::ListFilter::default()
+            })
+            .await
+            .map_err(from_durare)?
+            .into_iter()
+            .map(|w| (w.id.clone(), w))
+            .collect();
+        // A run removed since its key was read is passed over.
+        Ok(keys
+            .into_iter()
+            .filter_map(|key| {
+                let w = found.remove(&key.id)?;
+                Some((
+                    key,
+                    RunContents {
+                        input: w.input.clone(),
+                        output: w.output.clone(),
+                        error: w.error.clone(),
+                        record: RunRecord::from(w),
+                    },
+                ))
+            })
+            .collect())
     }
 
     /// Every unfinished run in the store, whoever owns it and whatever its
@@ -1362,6 +1509,8 @@ impl DurableRuntime for Durare {
                     name: s.name,
                     output: s.output,
                     error: s.error,
+                    started_at: s.started_at.map(|t| t.timestamp_millis()),
+                    completed_at: s.completed_at.map(|t| t.timestamp_millis()),
                 })
                 .collect())
         }
@@ -1435,6 +1584,14 @@ impl DurableRuntime for Durare {
         F: for<'t, 'c> Fn(Tx<'t, 'c>) -> TxFuture<'t, T> + Send + Sync + 'static,
     {
         self.reads.control_transaction(body).await
+    }
+
+    async fn read_transaction<T, F>(&self, body: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: for<'t, 'c> Fn(Tx<'t, 'c>) -> TxFuture<'t, T> + Send + Sync + 'static,
+    {
+        self.reads.read(body).await
     }
 
     fn ledger(&self) -> Ledger {

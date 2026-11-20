@@ -237,7 +237,7 @@ pub async fn run(
 }
 
 /// The state of the project a command that names no target works on.
-fn state(project: Option<&Path>) -> anyhow::Result<ProjectState> {
+pub(crate) fn state(project: Option<&Path>) -> anyhow::Result<ProjectState> {
     let cwd = std::env::current_dir()?;
     let found = target::project_for(project, None, &cwd)?;
     Ok(ProjectState::resolve(found.root())?)

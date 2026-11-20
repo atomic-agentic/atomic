@@ -81,6 +81,9 @@ fn every_v0_1_example_passes_the_real_load_and_check() {
             .arg("check")
             .current_dir(&dir)
             .env("ATOMIC_HOME", dir.join(".state"))
+            .env("ATOMIC_DETECT_OLLAMA_ADDR", "127.0.0.1:9")
+            .env_remove("OPENAI_API_KEY")
+            .env("XDG_CONFIG_HOME", dir.join(".state/config"))
             .output()
             .expect("atomic check");
         assert!(
@@ -239,6 +242,9 @@ fn a_workspace_member_resolves_shared_schemas_from_anywhere() {
             .arg(dir.join("services/billing"))
             .current_dir(cwd)
             .env("ATOMIC_HOME", dir.join(".state"))
+            .env("ATOMIC_DETECT_OLLAMA_ADDR", "127.0.0.1:9")
+            .env_remove("OPENAI_API_KEY")
+            .env("XDG_CONFIG_HOME", dir.join(".state/config"))
             .output()
             .expect("atomic check")
     };
@@ -315,6 +321,9 @@ fn compact_sidecars_expand_to_the_example_long_forms() {
             .args(args)
             .current_dir(&dir)
             .env("ATOMIC_HOME", dir.join(".state"))
+            .env("ATOMIC_DETECT_OLLAMA_ADDR", "127.0.0.1:9")
+            .env_remove("OPENAI_API_KEY")
+            .env("XDG_CONFIG_HOME", dir.join(".state/config"))
             .output()
             .expect("atomic")
     };
@@ -372,6 +381,9 @@ fn atomic_check_reads_openapi_toolsets() {
             .arg("check")
             .current_dir(&dir)
             .env("ATOMIC_HOME", dir.join(".state"))
+            .env("ATOMIC_DETECT_OLLAMA_ADDR", "127.0.0.1:9")
+            .env_remove("OPENAI_API_KEY")
+            .env("XDG_CONFIG_HOME", dir.join(".state/config"))
             .output()
             .expect("atomic check")
     };

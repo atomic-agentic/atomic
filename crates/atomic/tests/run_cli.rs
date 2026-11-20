@@ -340,6 +340,8 @@ fn command_as(
     for name in [
         "CODEX_HOME",
         "XDG_DATA_HOME",
+        // The person's own configuration is under the throwaway home.
+        "XDG_CONFIG_HOME",
         "ATOMIC_DATABASE_URL",
         "ATOMIC_DATABASE_SCHEMA",
         "ATOMIC_EXECUTOR_ID",
@@ -351,9 +353,14 @@ fn command_as(
         "ATOMIC_MODEL_API_KEY_ENV",
         "ATOMIC_RUNNER",
         "ATOMIC_BACKEND_WAIT",
+        "OPENAI_API_KEY",
+        "DATABASE_URL",
     ] {
         cmd.env_remove(name);
     }
+    // No Ollama, whatever runs on this machine: a test that wants one points
+    // this at a fake.
+    cmd.env("ATOMIC_DETECT_OLLAMA_ADDR", "127.0.0.1:9");
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -636,6 +643,550 @@ fn a_name_a_path_and_the_project_flag_run_the_same_atom_on_the_same_input() {
     );
 }
 
+#[test]
+fn a_misspelled_atom_fails_check_with_the_fix() {
+    let dir = scratch("misspelled");
+    let project = project(&dir);
+    std::fs::write(
+        project.join("workflows/triage.workflow.yaml"),
+        TRIAGE.replace("atom: rank-note", "atom: rank-notes"),
+    )
+    .expect("workflow");
+    let out = atomic(&dir, &project, &["--json", "check"], &[], "");
+    assert!(!out.status.success(), "{}", text(&out));
+    let error = &stdout_json(&out)["error"];
+    assert_eq!(error["kind"], "workflow.invalid", "{error}");
+    assert!(
+        error["description"]
+            .as_str()
+            .is_some_and(|d| d.contains("no atom named `rank-notes`")),
+        "{error}"
+    );
+    assert_eq!(
+        error["action"], "change `atom: rank-notes` to `atom: rank-note`",
+        "{error}"
+    );
+    // And running it by a misspelled name says which was meant.
+    let out = atomic(
+        &dir,
+        &project,
+        &["--json", "run", "rank-notes", "--data", NOTE],
+        &[],
+        "",
+    );
+    let error = &stdout_json(&out)["error"];
+    assert_eq!(error["kind"], "target.unknown", "{error}");
+    assert!(
+        error["action"]
+            .as_str()
+            .is_some_and(|a| a.starts_with("did you mean `rank-note`?")),
+        "{error}"
+    );
+}
+
+/// Where `model` listens, as an address: its base URL without `/v1`.
+fn address_of(model: &FakeModel) -> String {
+    model
+        .base_url()
+        .trim_start_matches("http://")
+        .trim_end_matches("/v1")
+        .to_owned()
+}
+
+#[test]
+fn with_only_a_local_ollama_a_model_atom_runs_and_explain_says_why() {
+    on_codex_runtime(async {
+        // The fake model stands in for Ollama: it lists one model, synthetic.
+        let model = FakeModel::start(vec![Reply::Text(RANK.into())])
+            .await
+            .expect("fake model");
+        let dir = scratch("ollama");
+        let project = project(&dir);
+        let addr = address_of(&model);
+        let (d, p, a) = (dir.clone(), project.clone(), addr.clone());
+        let out = tokio::task::spawn_blocking(move || {
+            atomic(
+                &d,
+                &p,
+                &[
+                    "run",
+                    "rank-note",
+                    "--data",
+                    r#"{"title": "Export crashes", "words": 2}"#,
+                ],
+                &[("ATOMIC_DETECT_OLLAMA_ADDR", a.as_str())],
+                "",
+            )
+        })
+        .await
+        .expect("child");
+        assert!(out.status.success(), "{}", text(&out));
+        assert_eq!(stdout_json(&out), json!({"priority": 1}));
+        assert_eq!(
+            model.calls(),
+            1,
+            "the model atom called the detected Ollama"
+        );
+        // Said once, so a detected endpoint is never used silently.
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let said: Vec<&str> = stderr
+            .lines()
+            .filter(|l| l.starts_with("atomic: model "))
+            .collect();
+        assert_eq!(
+            said,
+            [format!(
+                "atomic: model synthetic at http://{addr}/v1 (detected: Ollama answered at \
+                 {addr}); `atomic config --explain` says why"
+            )],
+            "{stderr}"
+        );
+
+        let (d, p, a) = (dir.clone(), project.clone(), addr.clone());
+        let out = tokio::task::spawn_blocking(move || {
+            atomic(
+                &d,
+                &p,
+                &["--json", "config", "--explain"],
+                &[("ATOMIC_DETECT_OLLAMA_ADDR", a.as_str())],
+                "",
+            )
+        })
+        .await
+        .expect("child");
+        assert!(out.status.success(), "{}", text(&out));
+        let doc = stdout_json(&out);
+        let source = |setting: &str| -> String {
+            doc["settings"]
+                .as_array()
+                .and_then(|all| all.iter().find(|s| s["setting"] == setting))
+                .and_then(|s| s["source"].as_str())
+                .unwrap_or_else(|| panic!("no {setting}: {doc}"))
+                .to_owned()
+        };
+        assert_eq!(
+            source("model.base_url"),
+            format!("detected: Ollama answered at {addr}")
+        );
+        assert!(
+            source("model.name").contains("first model it lists"),
+            "{doc}"
+        );
+        assert_eq!(source("runner"), "default");
+        // Every setting says where it came from.
+        assert!(
+            doc["settings"].as_array().is_some_and(|all| all.len() > 10
+                && all
+                    .iter()
+                    .all(|s| s["source"].as_str().is_some_and(|s| !s.is_empty()))),
+            "{doc}"
+        );
+    });
+}
+
+#[test]
+fn with_only_an_api_key_explain_names_openai_and_never_the_key() {
+    let dir = scratch("api-key");
+    let project = project(&dir);
+    let out = atomic(
+        &dir,
+        &project,
+        &["config", "--explain"],
+        &[("OPENAI_API_KEY", "sk-test-not-for-printing")],
+        "",
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(!said.contains("sk-test-not-for-printing"), "{said}");
+    let line = |setting: &str| -> String {
+        said.lines()
+            .find(|l| l.split_whitespace().next() == Some(setting))
+            .unwrap_or_else(|| panic!("no {setting} in {said}"))
+            .to_owned()
+    };
+    assert!(
+        line("model.base_url").contains("https://api.openai.com/v1")
+            && line("model.base_url").contains("detected: OPENAI_API_KEY is set"),
+        "{said}"
+    );
+    assert!(
+        line("model.api_key_env").contains("OPENAI_API_KEY (set"),
+        "{said}"
+    );
+    assert!(line("database.url").contains("default"), "{said}");
+    // An explicit setting wins, and says so.
+    let out = atomic(
+        &dir,
+        &project,
+        &["config", "--explain", "--model", "my-model"],
+        &[
+            ("OPENAI_API_KEY", "sk-test-not-for-printing"),
+            ("ATOMIC_RUNNER", "process"),
+        ],
+        "",
+    );
+    let said = String::from_utf8_lossy(&out.stdout);
+    let line = |setting: &str| -> String {
+        said.lines()
+            .find(|l| l.split_whitespace().next() == Some(setting))
+            .unwrap_or_else(|| panic!("no {setting} in {said}"))
+            .to_owned()
+    };
+    assert!(
+        line("model.name").contains("my-model") && line("model.name").contains("flag --model"),
+        "{said}"
+    );
+    assert!(
+        line("runner").contains("environment variable ATOMIC_RUNNER"),
+        "{said}"
+    );
+}
+
+#[test]
+fn no_secret_reaches_stderr_or_json_whatever_atomic_is_given() {
+    let dir = scratch("secrets");
+    let project = project(&dir);
+    let secrets = [
+        ("OPENAI_API_KEY", "sk-leak-openai"),
+        (
+            "ATOMIC_DATABASE_URL",
+            "postgres://atomic:leak-dbpass@127.0.0.1:9/atomic?sslpassword=leak-query",
+        ),
+        (
+            "ATOMIC_MODEL_BASE_URL",
+            "https://me:leak-token@127.0.0.1:9/v1",
+        ),
+        ("ATOMIC_MODEL", "m"),
+        // A key put where its variable's name belongs.
+        ("ATOMIC_MODEL_API_KEY_ENV", "sk-leak-in-the-name"),
+        ("ATOMIC_EXECUTOR_ID", "leak-free-id"),
+    ];
+    let bad_budget = [("ATOMIC_BUDGET_WORKFLOW_TOKENS", "leak-not-a-number")];
+    /// A command and the variables it runs with.
+    type Case<'a> = (&'a [&'a str], Vec<(&'a str, &'a str)>);
+    let runs: [Case; 5] = [
+        (&["config", "--explain"], secrets.to_vec()),
+        (&["--json", "config", "--explain"], secrets.to_vec()),
+        // A setting atomic refuses, from the variables and as JSON.
+        (
+            &["--json", "run", "count-only", "--data", NOTE],
+            [&secrets[..], &bad_budget[..]].concat(),
+        ),
+        (
+            &["run", "count-only", "--data", NOTE],
+            [&secrets[..], &bad_budget[..]].concat(),
+        ),
+        // A store that cannot be reached.
+        (
+            &["--json", "run", "count-only", "--data", NOTE],
+            secrets.to_vec(),
+        ),
+    ];
+    for (args, env) in runs {
+        let out = atomic(&dir, &project, args, &env, "");
+        let all = text(&out).replace("leak-free-id", "");
+        assert!(!all.contains("leak"), "{args:?}: {all}");
+    }
+}
+
+/// Run git in `dir` for a test's setup, with no user or system config.
+fn git_in(dir: &Path, args: &[&str]) {
+    let ok = Command::new(atomic_core::git::Git::find().expect("git").program())
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .status()
+        .expect("git")
+        .success();
+    assert!(ok, "git {args:?}");
+}
+
+#[test]
+fn the_projects_files_cannot_route_a_key_and_the_persons_own_configuration_can() {
+    let dir = scratch("person-config");
+    let project = project(&dir);
+    let routing = "model:\n  base_url: https://example.com/v1\n  name: m\n  api_key_env: MY_KEY\n";
+    // In the project, whether git tracks it or not.
+    std::fs::write(project.join("atomic.local.yaml"), routing).expect("local");
+    for tracked in [false, true] {
+        if tracked {
+            git_in(&project, &["init", "-q"]);
+            git_in(&project, &["add", "atomic.local.yaml"]);
+        }
+        let out = atomic(
+            &dir,
+            &project,
+            &["--json", "run", "count-only", "--data", NOTE],
+            &[],
+            "",
+        );
+        assert!(!out.status.success(), "{}", text(&out));
+        let error = &stdout_json(&out)["error"];
+        assert_eq!(error["kind"], "config.invalid", "{error}");
+        let said = error["description"].as_str().unwrap_or_default();
+        assert!(said.contains("atomic.local.yaml:4"), "{said}");
+        assert!(said.contains(".config/atomic/config.yaml"), "{said}");
+    }
+    // In the person's own configuration, under their home.
+    std::fs::remove_file(project.join("atomic.local.yaml")).expect("remove");
+    let config = dir.join("home/.config/atomic");
+    std::fs::create_dir_all(&config).expect("config dir");
+    std::fs::write(config.join("config.yaml"), routing).expect("config");
+    let out = atomic(&dir, &project, &["--json", "config", "--explain"], &[], "");
+    assert!(out.status.success(), "{}", text(&out));
+    let doc = stdout_json(&out);
+    let row = doc["settings"]
+        .as_array()
+        .and_then(|all| all.iter().find(|s| s["setting"] == "model.api_key_env"))
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        row["source"]
+            .as_str()
+            .is_some_and(|s| s.contains(".config/atomic/config.yaml")),
+        "{doc}"
+    );
+}
+
+#[test]
+fn a_key_for_an_endpoint_the_project_chose_is_withheld_and_a_model_run_refused() {
+    let dir = scratch("withheld-key");
+    let project = project(&dir);
+    std::fs::write(
+        project.join("atomic.yaml"),
+        "atomic: 1\nname: notes\nmodel:\n  base_url: https://example.com/v1\n  name: m\n",
+    )
+    .expect("manifest");
+    let key = [("ATOMIC_MODEL_API_KEY_ENV", "MY_KEY"), ("MY_KEY", "k")];
+    // Commands that call no model are not refused.
+    for args in [&["--json", "config"][..], &["--json", "check"][..]] {
+        let out = atomic(&dir, &project, args, &key, "");
+        assert!(out.status.success(), "{args:?}: {}", text(&out));
+    }
+    let out = atomic(
+        &dir,
+        &project,
+        &[
+            "--json",
+            "run",
+            "rank-note",
+            "--data",
+            r#"{"title": "Export crashes", "words": 2}"#,
+        ],
+        &key,
+        "",
+    );
+    assert!(!out.status.success(), "{}", text(&out));
+    let error = &stdout_json(&out)["error"];
+    assert_eq!(error["kind"], "config.model", "{error}");
+    assert!(
+        error["description"]
+            .as_str()
+            .is_some_and(|d| d.contains("atomic.yaml:4") && d.contains("is not used")),
+        "{error}"
+    );
+}
+
+#[test]
+fn config_runs_from_any_directory_above_the_persons_own_configuration() {
+    let dir = scratch("config-from-home");
+    let home = dir.join("home");
+    std::fs::create_dir_all(home.join(".config/atomic")).expect("config dir");
+    std::fs::write(home.join(".config/atomic/config.yaml"), "runner: process\n").expect("config");
+    // The home directory and the one above it, neither in a project.
+    for cwd in [home.clone(), dir.clone()] {
+        let out = atomic(&dir, &cwd, &["--json", "config", "--explain"], &[], "");
+        assert!(out.status.success(), "{}: {}", cwd.display(), text(&out));
+        let doc = stdout_json(&out);
+        assert!(
+            doc["settings"].as_array().is_some_and(|all| all
+                .iter()
+                .any(|s| s["setting"] == "runner" && s["value"] == "process")),
+            "{doc}"
+        );
+    }
+}
+
+#[test]
+fn config_output_is_redacted_like_every_line_atomic_writes() {
+    let dir = scratch("config-redacted");
+    let project = project(&dir);
+    // A key, put where a model's name belongs.
+    let key = concat!("sk-proj-", "abcdefghijklmnop1234");
+    let env = [("ATOMIC_MODEL", key)];
+    for args in [
+        &["config", "--explain"][..],
+        &["--json", "config", "--explain"][..],
+    ] {
+        let out = atomic(&dir, &project, args, &env, "");
+        assert!(out.status.success(), "{args:?}: {}", text(&out));
+        let said = text(&out);
+        assert!(!said.contains(key), "{args:?}: {said}");
+        assert!(said.contains("[REDACTED]"), "{args:?}: {said}");
+    }
+}
+
+#[test]
+fn check_reads_the_settings_of_every_manifest() {
+    let dir = scratch("check-settings");
+    let project = project(&dir);
+    let member = project.join("member");
+    std::fs::create_dir_all(&member).expect("member");
+    std::fs::write(
+        project.join("atomic.yaml"),
+        "atomic: 1\nname: notes\nworkspace:\n  members: [member]\n",
+    )
+    .expect("manifest");
+    let check = || atomic(&dir, &project, &["--json", "check"], &[], "");
+    // A misspelled setting in a member's manifest.
+    std::fs::write(
+        member.join("atomic.yaml"),
+        "atomic: 1\nname: member\nmodel:\n  bse_url: http://127.0.0.1:9/v1\n",
+    )
+    .expect("member manifest");
+    let out = check();
+    assert!(!out.status.success(), "{}", text(&out));
+    let error = &stdout_json(&out)["error"];
+    assert_eq!(error["kind"], "config.invalid", "{error}");
+    assert!(
+        error["description"]
+            .as_str()
+            .is_some_and(|d| d.contains("member/atomic.yaml:4") && d.contains("bse_url")),
+        "{error}"
+    );
+    // A runner that run would refuse, in the workspace's own manifest.
+    std::fs::write(member.join("atomic.yaml"), "atomic: 1\nname: member\n").expect("member");
+    std::fs::write(
+        project.join("atomic.yaml"),
+        "atomic: 1\nname: notes\nrunner: proces\nworkspace:\n  members: [member]\n",
+    )
+    .expect("manifest");
+    let out = check();
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(
+        stdout_json(&out)["error"]["description"]
+            .as_str()
+            .is_some_and(|d| d.contains("must be local or process")),
+        "{}",
+        text(&out)
+    );
+    std::fs::write(
+        project.join("atomic.yaml"),
+        "atomic: 1\nname: notes\nrunner: process\nworkspace:\n  members: [member]\n",
+    )
+    .expect("manifest");
+    let out = check();
+    assert!(out.status.success(), "{}", text(&out));
+}
+
+#[test]
+fn init_in_an_empty_directory_makes_a_project_that_checks_and_runs() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![
+            Reply::Text(r#"{"summary": "Export crashes on accented file names."}"#.into()),
+            Reply::Text(r#"{"summary": "Export crashes on accented file names."}"#.into()),
+        ])
+        .await
+        .expect("fake model");
+        let dir = scratch("init");
+        let fresh = dir.join("note-tools");
+        std::fs::create_dir_all(&fresh).expect("dir");
+        let out = atomic(&dir, &fresh, &["init"], &[], "");
+        assert!(out.status.success(), "{}", text(&out));
+        for file in [
+            "atomic.yaml",
+            ".gitignore",
+            "atoms/summarize-note.atom.astro",
+            "atoms/summarize-note.input.schema.yaml",
+            "atoms/summarize-note.output.schema.yaml",
+            "workflows/summarize.workflow.yaml",
+            "evals/summarize-note/export-crash.yaml",
+        ] {
+            assert!(fresh.join(file).is_file(), "{file} was written");
+        }
+        let manifest = std::fs::read_to_string(fresh.join("atomic.yaml")).expect("manifest");
+        assert!(manifest.contains("name: \"note-tools\""), "{manifest}");
+        let out = atomic(&dir, &fresh, &["--json", "check"], &[], "");
+        assert!(
+            out.status.success(),
+            "the new project checks: {}",
+            text(&out)
+        );
+        assert_eq!(stdout_json(&out)["checked"]["atoms"], 1);
+        assert_eq!(stdout_json(&out)["checked"]["workflows"], 1);
+
+        // With nothing configured but a local Ollama, its atom and its
+        // workflow run.
+        let addr = address_of(&model);
+        for target in ["summarize-note", "summarize"] {
+            let (d, f, a) = (dir.clone(), fresh.clone(), addr.clone());
+            let out = tokio::task::spawn_blocking(move || {
+                atomic(
+                    &d,
+                    &f,
+                    &[
+                        "run",
+                        target,
+                        "--data",
+                        r#"{"text": "Exporting café.txt crashes the app."}"#,
+                    ],
+                    &[("ATOMIC_DETECT_OLLAMA_ADDR", a.as_str())],
+                    "",
+                )
+            })
+            .await
+            .expect("child");
+            assert!(out.status.success(), "{target}: {}", text(&out));
+            assert_eq!(
+                stdout_json(&out),
+                json!({"summary": "Export crashes on accented file names."})
+            );
+        }
+
+        // A second init leaves the project as it is.
+        let before = std::fs::read_to_string(fresh.join("atomic.yaml")).expect("manifest");
+        let out = atomic(&dir, &fresh, &["--json", "init"], &[], "");
+        assert!(!out.status.success());
+        assert_eq!(stdout_json(&out)["error"]["kind"], "init.exists");
+        assert_eq!(
+            std::fs::read_to_string(fresh.join("atomic.yaml")).expect("manifest"),
+            before
+        );
+    });
+}
+
+#[test]
+fn init_in_a_repository_with_code_embeds_the_project_in_dot_atomic() {
+    let dir = scratch("init-embedded");
+    let repo = dir.join("app");
+    std::fs::create_dir_all(repo.join("src")).expect("dir");
+    std::fs::write(repo.join("src/main.rs"), "fn main() {}\n").expect("code");
+    std::fs::write(repo.join("README.md"), "# app\n").expect("readme");
+    let out = atomic(&dir, &repo, &["init"], &[], "");
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(repo.join(".atomic/atomic.yaml").is_file());
+    assert!(
+        repo.join(".atomic/atoms/summarize-note.atom.astro")
+            .is_file()
+    );
+    assert!(
+        !repo.join("atomic.yaml").exists(),
+        "nothing at the repository's top"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join("src/main.rs")).expect("code"),
+        "fn main() {}\n",
+        "the code is untouched"
+    );
+    let out = atomic(&dir, &repo, &["--json", "check"], &[], "");
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(stdout_json(&out)["checked"]["atoms"], 1);
+    // From below the repository's top too.
+    let out = atomic(&dir, &repo.join("src"), &["--json", "check"], &[], "");
+    assert!(out.status.success(), "{}", text(&out));
+}
+
 // needs_sandbox
 #[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
@@ -668,6 +1219,16 @@ fn a_workflow_runs_by_name_and_by_file() {
         stdout_json(&by_name),
         json!({"title": "Exporting a file named ca", "words": 8})
     );
+    // The run's artifact store took its lock where no atom can open it.
+    let state = state_dir(&dir, &project);
+    let private = state
+        .parent()
+        .and_then(Path::parent)
+        .expect("the atomic home")
+        .join("private")
+        .join(state.file_name().expect("the project's id"));
+    assert!(private.join("artifacts.lock").is_file());
+    assert!(!state.join("artifacts/lock").exists());
 }
 
 #[test]
@@ -3545,6 +4106,285 @@ fn a_run_that_gets_further_each_time_is_not_dead_lettered() {
     for i in 0..n {
         assert_eq!(lines(&dir.join(format!("bump-{i}.log"))), 2, "step {i}");
     }
+}
+
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[test]
+fn runs_show_says_which_steps_came_from_checkpoints_and_which_attempt_ran_them() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
+            .await
+            .expect("fake model");
+        let dir = scratch("show");
+        let project = project(&dir);
+        let env = model_env(&model.base_url());
+        let (d, p, e) = (dir.clone(), project.clone(), env.clone());
+        tokio::task::spawn_blocking(move || killed_after_rank(&d, &p, &e, "shown-1"))
+            .await
+            .expect("child");
+        let (d, p, e) = (dir.clone(), project.clone(), env.clone());
+        let out = tokio::task::spawn_blocking(move || {
+            atomic(&d, &p, &["runs", "resume", "shown-1"], &with(&e, &[]), "")
+        })
+        .await
+        .expect("child");
+        assert!(out.status.success(), "{}", text(&out));
+
+        // Read from the store alone: no model, no lock.
+        let out = atomic(
+            &dir,
+            &project,
+            &["--json", "runs", "show", "shown-1"],
+            &[],
+            "",
+        );
+        assert!(out.status.success(), "{}", text(&out));
+        let doc = stdout_json(&out);
+        assert_eq!(doc["run"], "shown-1", "{doc}");
+        assert_eq!(doc["workflow"], "triage");
+        assert_eq!(doc["status"], "succeeded");
+        assert_eq!(
+            doc["input"],
+            serde_json::from_str::<Value>(NOTE).expect("note")
+        );
+        assert_eq!(
+            doc["output"],
+            json!({"line": "P1: Export crashes on accents"})
+        );
+        let attempts = doc["attempts"].as_array().expect("attempts");
+        assert_eq!(attempts.len(), 2, "the killed run and its resume: {doc}");
+        let steps = doc["steps"].as_array().expect("steps");
+        let attempt_of = |prefix: &str| -> Vec<i64> {
+            steps
+                .iter()
+                .filter(|s| s["name"].as_str().is_some_and(|n| n.starts_with(prefix)))
+                .map(|s| s["attempt"].as_i64().expect("attempt"))
+                .collect()
+        };
+        // What finished before the kill came from checkpoints on resume.
+        for prefix in ["pin", "count.", "rank."] {
+            let seen = attempt_of(prefix);
+            assert!(
+                !seen.is_empty() && seen.iter().all(|a| *a == 1),
+                "{prefix}: {seen:?}"
+            );
+        }
+        // What the resume ran itself.
+        let seen = attempt_of("summarize.");
+        assert!(
+            !seen.is_empty() && seen.iter().all(|a| *a == 2),
+            "summarize: {seen:?}"
+        );
+        assert_eq!(
+            attempts[0]["ran"],
+            json!(attempt_of("").iter().filter(|a| **a == 1).count())
+        );
+        assert_eq!(attempts[1]["replayed"], attempts[0]["ran"]);
+        assert!(attempts[1]["ran"].as_u64().is_some_and(|n| n > 0), "{doc}");
+        assert_eq!(doc["usage"]["calls"], 2, "rank and summarize: {doc}");
+
+        // The same for a person.
+        let out = atomic(&dir, &project, &["runs", "show", "shown-1"], &[], "");
+        assert!(out.status.success(), "{}", text(&out));
+        let said = String::from_utf8_lossy(&out.stdout);
+        assert!(said.contains("2 attempts"), "{said}");
+        assert!(said.contains("from checkpoints"), "{said}");
+        let summarize = said
+            .lines()
+            .find(|l| l.contains("summarize.publish"))
+            .unwrap_or_else(|| panic!("{said}"));
+        assert!(summarize.contains("attempt 2"), "{summarize}");
+        let rank = said
+            .lines()
+            .find(|l| l.contains("rank.publish"))
+            .unwrap_or_else(|| panic!("{said}"));
+        assert!(rank.contains("attempt 1"), "{rank}");
+
+        // An id the store does not know.
+        let out = atomic(
+            &dir,
+            &project,
+            &["--json", "runs", "show", "no-such-run"],
+            &[],
+            "",
+        );
+        assert!(!out.status.success());
+        assert_eq!(stdout_json(&out)["error"]["kind"], "run.not_found");
+    });
+}
+
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[test]
+fn a_budget_in_the_projects_configuration_reaches_its_runs() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
+            .await
+            .expect("fake model");
+        let dir = scratch("configured-budget");
+        let project = project(&dir);
+        // One call's whole bound (80,000 tokens by default) and one token
+        // more, for every workflow run: rank fits, and summarize does not.
+        std::fs::write(
+            project.join("atomic.yaml"),
+            "atomic: 1\nname: notes\nbudget:\n  workflow:\n    tokens: 80001\n",
+        )
+        .expect("manifest");
+        let state = state_dir(&dir, &project);
+        let env = model_env(&model.base_url());
+        let mut run = spawn(
+            &dir,
+            &project,
+            &["run", "triage", "--run-id", "configured-1", "--data", NOTE],
+            &with(&env, &[]),
+            &dir.join("run.log"),
+        );
+        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        let started = Instant::now();
+        let park = loop {
+            if let Some(p) = atomic_durable::parks(&rt, "configured-1")
+                .await
+                .expect("parks")
+                .into_iter()
+                .next()
+            {
+                break p;
+            }
+            let ended = run.try_wait().expect("the run");
+            assert!(
+                ended.is_none() && started.elapsed() < Duration::from_secs(60),
+                "the run did not park on the configured budget ({ended:?}): {} model calls; {}",
+                model.calls(),
+                std::fs::read_to_string(dir.join("run.log")).unwrap_or_default()
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert!(park.reason.contains("run:configured-1"), "{}", park.reason);
+        assert_eq!(model.calls(), 1, "summarize was not called");
+        run.kill().expect("stop the run");
+        run.wait().expect("reap");
+    });
+}
+
+/// Run `body` on a runtime of its own, for a test that is not async.
+fn block_on<T>(body: impl std::future::Future<Output = T>) -> T {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(body)
+}
+
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[test]
+fn a_run_whose_execution_cannot_be_recorded_still_runs() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
+    let dir = scratch("unrecorded");
+    let project = project(&dir);
+    let state = state_dir(&dir, &project);
+    let out = atomic(
+        &dir,
+        &project,
+        &["run", "count-only", "--data", NOTE],
+        &UNUSED_MODEL,
+        "",
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    // The record of executions is gone: only `runs show` needs it.
+    block_on(async {
+        use sqlx::Connection;
+        let url = format!("sqlite://{}", database(&state).display());
+        let mut db = sqlx::SqliteConnection::connect(&url).await.expect("store");
+        sqlx::query("DROP TABLE atomic_executions")
+            .execute(&mut db)
+            .await
+            .expect("drop");
+        db.close().await.expect("close");
+    });
+    let out = atomic(
+        &dir,
+        &project,
+        &["run", "count-only", "--data", NOTE],
+        &UNUSED_MODEL,
+        "",
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("could not be recorded"),
+        "{}",
+        text(&out)
+    );
+    assert_eq!(count_log(&dir).len(), 2);
+}
+
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[test]
+fn runs_show_answers_while_a_run_holds_the_lock_and_a_writer_the_store() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
+    let dir = scratch("show-locked");
+    let project = project(&dir);
+    write_slow(&project, &dir);
+    let state = state_dir(&dir, &project);
+    let mut run = spawn(
+        &dir,
+        &project,
+        &["run", "slow", "--run-id", "held-1", "--data", NOTE],
+        &[],
+        &dir.join("run.log"),
+    );
+    wait_until("the command to start", || slow_starts(&dir) == 1);
+    assert!(lock_held(&state), "the run holds the runtime lock");
+    let out = block_on(async {
+        use sqlx::Connection;
+        let url = format!("sqlite://{}", database(&state).display());
+        let mut db = sqlx::SqliteConnection::connect(&url).await.expect("store");
+        // Another process in the middle of a write.
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut db)
+            .await
+            .expect("write lock");
+        let started = Instant::now();
+        let out = atomic(
+            &dir,
+            &project,
+            &["--json", "runs", "show", "held-1"],
+            &[],
+            "",
+        );
+        let took = started.elapsed();
+        sqlx::query("ROLLBACK")
+            .execute(&mut db)
+            .await
+            .expect("rollback");
+        db.close().await.expect("close");
+        (out, took)
+    });
+    let (out, took) = out;
+    run.kill().expect("SIGKILL atomic run");
+    run.wait().expect("reap");
+    let pids = slow_pids(&dir);
+    if !pids.is_empty() {
+        let _ = Command::new("/bin/sh")
+            .args(["-c", &format!("kill -KILL {} 2>/dev/null", pids.join(" "))])
+            .status();
+    }
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        took < Duration::from_secs(3),
+        "runs show waited for the writer: {took:?}"
+    );
+    let doc = stdout_json(&out);
+    assert_eq!(doc["status"], "unfinished", "{doc}");
+    assert_eq!(doc["attempts"].as_array().map(Vec::len), Some(1), "{doc}");
 }
 
 #[test]
