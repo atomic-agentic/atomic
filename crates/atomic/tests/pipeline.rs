@@ -3407,16 +3407,20 @@ fn another_run_gets_another_effect_key_and_atoms_cannot_set_it() {
 
         let atom = project.join("atoms/send-note.atom.astro");
         let source = std::fs::read_to_string(&atom).expect("atom");
-        std::fs::write(
-            &atom,
-            source.replace(
-                "env: { SENT_LOG:",
-                "env: { ATOMIC_EFFECT_KEY: 'mine', SENT_LOG:",
-            ),
-        )
-        .expect("atom");
-        let error = atomic_core::atom::load(&atom, &mut Registry::new()).expect_err("refused");
-        assert!(error.message.contains("set by atomic"), "{error}");
+        // Nor the directories its command hands files over in and reads its
+        // artifacts from.
+        for name in ["ATOMIC_EFFECT_KEY", "ATOMIC_OUTPUTS", "ATOMIC_INPUTS"] {
+            std::fs::write(
+                &atom,
+                source.replace(
+                    "env: { SENT_LOG:",
+                    &format!("env: {{ {name}: 'mine', SENT_LOG:"),
+                ),
+            )
+            .expect("atom");
+            let error = atomic_core::atom::load(&atom, &mut Registry::new()).expect_err("refused");
+            assert!(error.message.contains("set by atomic"), "{name}: {error}");
+        }
     });
 }
 
@@ -4080,6 +4084,90 @@ fn a_replay_takes_no_lock_on_the_store() {
         assert_eq!(replayed, recorded);
         assert_eq!(atomic_app::pipeline::store_waits("replayed-unlocked"), 0);
         drop(holder);
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[test]
+fn a_replayed_run_reuses_its_checkpoints_and_spends_nothing() {
+    on_codex_runtime(async {
+        let dir = scratch("replay-spend");
+        let project = project(&dir);
+        // Answers for a second run too, so a replay that ran live would
+        // finish and be caught by what it spent.
+        let answers = [READ, RANK, SUMMARY, READ, RANK, SUMMARY];
+        let model = FakeModel::start(answers.iter().map(|a| Reply::Text((*a).into())).collect())
+            .await
+            .expect("fake model");
+        let rt = engine_with(&dir, &model.base_url(), small_calls()).await;
+        let pipeline = load(
+            &project,
+            "spend.workflow.yaml",
+            &format!("{TRIAGE}budget:\n  tokens: 10000\n"),
+        );
+        let input = json!({"text": "Exporting a file named café.txt crashes the app."});
+        rt.start(PIPELINE, "recorded", PipelineRun { pipeline, input })
+            .await
+            .expect("start");
+        let recorded: Value = rt.result("recorded").await.expect("finishes");
+        let ledger = rt.ledger();
+        let charged = |scope: String| {
+            let ledger = ledger.clone();
+            async move {
+                ledger
+                    .allowance(&scope)
+                    .await
+                    .expect("allowance")
+                    .map_or_else(atomic_durable::usage::Charge::default, |a| a.charged)
+            }
+        };
+
+        // The recorded run made and paid for its three calls.
+        assert_eq!(model.calls(), 3);
+        let attempts = rt.ledger().attempts("recorded").await.expect("attempts");
+        assert_eq!(attempts.len(), 3, "{attempts:?}");
+        let spent = charged("run:recorded".into()).await;
+        assert_eq!(
+            spent.tokens, 6,
+            "three calls of one input and one output token"
+        );
+
+        // Its replay is served each step's checkpoint: the same result, no
+        // attempt, nothing charged anywhere, and no model call.
+        let replay = replay_of(&rt, "recorded").await.expect("a replay");
+        rt.start(REPLAY, "replayed", replay).await.expect("start");
+        let replayed: Value = rt.result("replayed").await.expect("the replay finishes");
+        assert_eq!(replayed, recorded);
+        let none = atomic_durable::usage::Charge::default();
+        let replay_attempts = rt.ledger().attempts("replayed").await.expect("attempts");
+        assert!(
+            replay_attempts.is_empty(),
+            "the replay was admitted: {replay_attempts:?}"
+        );
+        assert_eq!(charged("run:replayed".into()).await, none);
+        // Each recorded call's atom allowance, `atom:<run>:<position>`, has
+        // no counterpart charged in the replay.
+        for a in &attempts {
+            let position = a
+                .request
+                .rsplit(':')
+                .nth(1)
+                .expect("<run>:<position>:<call>");
+            assert_ne!(charged(format!("atom:recorded:{position}")).await, none);
+            assert_eq!(
+                charged(format!("atom:replayed:{position}")).await,
+                none,
+                "position {position}"
+            );
+        }
+        assert_eq!(
+            charged("run:recorded".into()).await,
+            spent,
+            "the replay charged the run it replays"
+        );
+        assert_eq!(model.calls(), 3, "the replay made no model call");
         rt.shutdown(std::time::Duration::from_secs(5))
             .await
             .expect("shutdown");

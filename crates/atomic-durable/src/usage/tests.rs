@@ -833,7 +833,7 @@ async fn a_partly_known_attempt_is_charged_its_reported_usage_and_one_more_bound
         Settled::Uncertain
     );
     let a = &ledger.attempts(&run).await.expect("attempts")[0];
-    assert_eq!(a.state, "reserved", "open to a usage query");
+    assert_eq!(a.state, "reserved", "open to reconciliation");
     assert_eq!(a.usage, Some((400, 50)));
     assert_eq!((a.charged.tokens, a.charged.micro_usd), (480, 90));
     assert_eq!(a.overshoot(), 480 - BOUND.tokens);
@@ -872,7 +872,7 @@ async fn a_partly_known_attempt_is_charged_its_reported_usage_and_one_more_bound
         ledger.attempts(&small).await.expect("attempts")[0].state,
         "reserved"
     );
-    // A usage query that learns the whole of it replaces the charge.
+    // Its whole usage, entered once learned, replaces the charge.
     ledger
         .settle(
             &format!("{run}:1:0"),

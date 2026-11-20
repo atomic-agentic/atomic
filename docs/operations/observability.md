@@ -75,25 +75,33 @@ own span still carries its whole failure as its status message. A process that s
 runs are still going, such as one stopped while it waits at a gate, ends the
 spans still open with `atomic.stopped` set and exports them before it exits.
 
-A stopping process sends its last spans before it exits. A collector that
-accepts the connection and never answers holds the exit up for the
-exporter's timeout (`OTEL_EXPORTER_OTLP_TIMEOUT`, 10 seconds by default) and
-a short shutdown after it; send the signal again to exit at once, without
-those spans.
+A process sends its last spans before it exits, waiting at most two seconds
+for them: spans not sent by then are dropped, and atomic says so on stderr. So a collector that accepts the
+connection and never answers holds up a command's exit by about two seconds,
+whatever the exporter's own timeout (`OTEL_EXPORTER_OTLP_TIMEOUT`). A signal
+during that wait stops it at once, without those spans.
 
 A step that replays from its checkpoint after a restart makes no span: only
 work that runs does. Each span's strings are redacted before they are
 exported, as atomic's log lines and error reports are: values in the formats
 of well-known keys and tokens, values given to a secret's name (`password`,
 `api_key`, `AWS_SECRET_KEY`, `DB_PASS`), and credential-looking values given to
-a name such as `token` or `pass`, become `[REDACTED]`. Each string is cut to
-4,096 characters before it is redacted. Redaction over-matches rather
-than under-matches, but it does let some things through: a short or
-word-like value after a name that only hints at a secret (`pass: 12`,
-`token: expired`), a `session=` value, a password given with `curl -u` or
-`mysql -p`, and a value that runs onto further lines. A webhook URL that
-carries its secret in its path (Slack, Discord, Microsoft Teams) is
-redacted after its host. One message is not redacted: a
+a name such as `token` or `pass`, become `[REDACTED]`; a count or a kind of
+token (`max_token`, `prompt_token`) only hints. Each string is cut to 4,096
+characters before it is redacted, and a cut string ends, or a cut tail of a
+command's output starts, with `…`. A token the cut splits is dropped whole,
+so a line that is one token longer than the cut shows only `…`; and when
+redacting what comes before a cut shrinks the text enough to bring the cut
+into view, the line at the cut is dropped too, since a secret there may have
+lost the part its rule needs. Redaction over-matches rather than
+under-matches, but it does let some things through: a short or word-like
+value after a name that only hints at a secret (`pass: 12`, `token: expired`),
+a `session=` value, a password given with `curl -u` or `mysql -p`, and a value
+that runs onto further lines. A webhook URL that carries its secret in its
+path (Slack, Discord, Microsoft Teams, a Telegram bot's) is redacted after its
+host. If redacting a panic's message fails or does not finish within five
+seconds, a fixed message is written in its place. One message is not
+redacted: a
 command-line usage error, such as an invalid value for a flag, repeats the
 argument as you typed it, since it is your own command line.
 

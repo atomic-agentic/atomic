@@ -189,6 +189,26 @@ file it edits back, even when interrupted, and `scripts/controls-check-test.sh`
 A control added later gets a row in the script. A row whose code has moved
 fails until it is updated.
 
+## Milestone acceptance
+
+A milestone's acceptance clauses, from [the milestones](design/milestones.md),
+are listed in `scripts/acceptance/<milestone>.txt`, each with the tests that show
+it, and `scripts/acceptance.py` runs them as one check. CI runs it after the
+test step, with the same features, so nothing rebuilds:
+
+```bash
+ATOMIC_DEV_SANDBOX=on scripts/dev.sh scripts/acceptance.py m12
+```
+
+Each clause is written as the milestones state it, and the check fails when
+the list's clauses and the milestone's differ, when a listed test fails, is
+ignored or does not run (renamed, removed, or built out by a feature), when a
+clause lists no test, or when cargo fails. A clause its tests do not yet show in
+full is marked `pending:` with the reason, and the verdict names it. The
+Postgres and sandbox tests it lists need their backends, as in the test step,
+hence `ATOMIC_DEV_SANDBOX=on`. `scripts/acceptance-test.sh` (in CI) tests the
+check itself.
+
 ## The crash suite
 
 atomic's crash tests kill the process at named failpoints. A failpoint is

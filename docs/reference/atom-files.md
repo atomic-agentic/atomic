@@ -50,7 +50,9 @@ On Linux the command runs under the same sandbox as a Codex atom's commands. It
 can read the project and the rest of the filesystem except atomic's private
 state (every project's database and gate store under the atomic home's
 `private/`, the current project's Codex records, the credential and key
-directories). It can write only its own scratch directory (its `HOME`
+directories) and the places in your home directory where credentials are
+kept, the same ones a Codex atom's commands cannot read (see
+[configuration](#configuration)). It can write only its own scratch directory (its `HOME`
 and `TMPDIR`) and the project's build caches; a command that writes anywhere
 else fails. It has no network and cannot use sockets, until atoms can declare
 the network they need. It also:
@@ -68,7 +70,8 @@ may declare `env` too, for the commands its turn runs, such as the tool homes
 (`RUSTUP_HOME`, `CARGO_HOME`, `PYENV_ROOT`) they no longer find through `HOME`;
 it cannot set `HOME`, `ZDOTDIR` or `TMPDIR`, nor a variable the dynamic loader
 reads (`LD_*`, `DYLD_*`, `GCONV_PATH`, `GLIBC_TUNABLES`), which would load code
-into the sandbox helper.
+into the sandbox helper, nor one that makes a shell run a file or command as
+it starts (`BASH_ENV`, `ENV`, `PROMPT_COMMAND`).
 
 On Linux, an atom that runs commands, an exec atom or a codex atom, needs
 bubblewrap and unprivileged user namespaces. Where the sandbox cannot start,
@@ -93,8 +96,55 @@ create-only write or a check for its own earlier write. Atomic gives every exec
 command one in its environment: `ATOMIC_EFFECT_KEY` is the same on every attempt
 of a step and differs for any other step or run, beside `ATOMIC_RUN_ID` and
 `ATOMIC_STEP_ID`. Send it as an idempotency key, or put it in what the command
-writes so a repeated write is recognisable. An atom's `env` cannot set these
-three names.
+writes so a repeated write is recognisable.
+
+### Large results go by reference
+
+A command hands over a file too big for its stdout, such as a patch, a report
+or a log, by writing it to the directory in `ATOMIC_OUTPUTS` and naming it in
+its output, where the contract expects an
+[artifact reference](#artifact-references), with an object:
+
+```json
+{"patch": {"$file": "change.diff", "mediaType": "text/x-diff"}}
+```
+
+Atomic stores the file in the artifact store and puts its reference,
+`artifact://sha256/<digest>`, in the object's place before it checks the
+output, so the step's output, and every checkpoint, holds only the reference.
+Only an object where the contract expects a reference is taken; one anywhere
+else is the output's own. The name is one file name in the directory, with no
+`/`; the file must be a regular file of the command's own (not a link, a
+FIFO, a directory, or a file with another hard link), and is read up to the
+size it had when atomic opened it. `mediaType` defaults to
+`application/octet-stream`, and must be one the contract accepts. The output
+is checked against its contract, with stand-in references, and every file it
+names is opened and checked against the limits before anything is stored, so a
+rejected output leaves nothing in the store; files are read aside first, one at
+a time, and stored together. Each name is read and stored once, however often
+the output names it; named under more than one media type, it is stored with a
+manifest for each.
+
+A file may be 1 GiB at most, and the files one step hands over 4 GiB
+together; `ATOMIC_EXEC_MAX_FILE_BYTES` and `ATOMIC_EXEC_MAX_STEP_BYTES` change
+those limits, in bytes. An output may name 256 different files at most, with
+at most 10,000 `$file` objects where its contract expects references; objects
+anywhere else are the output's own and do not count.
+
+A later step's command finds each artifact its input references, where its
+input contract expects a reference, in the directory in `ATOMIC_INPUTS`,
+named by its digest: `$ATOMIC_INPUTS/<digest>` for `artifact://sha256/<digest>`.
+Each is a copy, checked against its digest as it is made, and the directory
+and the copies are read-only: on Linux, where the command is confined, it
+cannot change what it was given, nor, through it, the store; on macOS, where it
+is not, the copies are only marked read-only, and changing one changes only
+the copy. Handing files over is supported on Linux and macOS; on Windows an
+output that names a file is refused.
+
+Both directories are inside the command's scratch directory, in the project's
+state directory, and go when the step ends; what a killed process left is
+removed when atomic next starts. An atom's `env` cannot set `ATOMIC_RUN_ID`,
+`ATOMIC_STEP_ID`, `ATOMIC_EFFECT_KEY`, `ATOMIC_OUTPUTS` or `ATOMIC_INPUTS`.
 
 ## Schema locations
 
@@ -235,10 +285,38 @@ A Codex atom's shell inherits only the platform's core variables, such as
 `PG*`, `DATABASE_URL` or any `*_API_KEY`. Its `HOME` and `ZDOTDIR` are its
 attempt's own scratch directory, or a directory that does not exist where
 no attempt gives it one, and it is not a login shell, so none of your shell
-startup files run, and your own atomic configuration directory is denied to
-it. The model chooses its commands, so this keeps your inherited
-environment from the model; it does not yet cover credentials in files
-elsewhere in your home directory.
+startup files run, and no functions or aliases from them are replayed into
+it.
+
+On Linux, atomic has verified that its commands cannot read your own atomic
+configuration directory, nor the file behind a link in it, nor the places in
+your real home directory where credentials are kept: `.ssh`, `.aws`, `.netrc`, `.codex`, `.config/gcloud`,
+`.azure`, `.kube`, `.docker/config.json`, `.gnupg`, `.npmrc`, `.pypirc`,
+`.git-credentials`, `.config/gh`, cargo's `credentials` files,
+`.password-store`, `.local/share/keyrings`, and the shell startup, logout
+and history files of bash, zsh and fish, among others. They are denied
+under `$HOME` and under the home directory the system records for your user,
+wherever the variables that move them (`XDG_CONFIG_HOME`, `ZDOTDIR`,
+`HISTFILE`, `GNUPGHOME`, `CARGO_HOME`, `DOCKER_CONFIG`, the AWS file
+variables, `KUBECONFIG` and others) put them, and a link among them, up to
+four directory levels inside a denied directory, is denied as the file or
+directory it points at, when that is yours and outside the system's
+directories: a history file linked to `/dev/null`, or a tool linked to the
+system's `python3`, stays usable. A turn does not start when a denial would
+cover its working directory or a directory it may write, or when a linked
+secret lies inside a directory it may write. The model chooses the
+commands, so none of these reach it through them. atomic makes the list
+when the turn starts: a place on it that appears while a command runs is
+denied only to later commands, and a link made after the list is not
+followed until the next turn. Credentials kept anywhere else are not
+covered.
+
+Cargo's own configuration (`.cargo/config.toml`) is not denied, since cargo
+reads it in every directory above a project: a registry token kept there,
+rather than in `credentials.toml` where `cargo login` writes it, is not
+protected. `.npmrc`, Maven's `settings.xml` and Gradle's
+`gradle.properties` are denied, so npm, Maven or Gradle pointed at your real
+home directory fails to read them.
 
 Anything that finds its files through your home directory does not find
 them: rustup's and cargo's homes (`~/.rustup`, `~/.cargo`), the Go module
