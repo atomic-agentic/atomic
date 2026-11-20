@@ -93,12 +93,15 @@ refuse a step whose atom declares a context.
 On Linux, atomic has verified that no atom's commands can reach the gate store
 or the credential: a Codex turn's commands and an exec atom's alike run under
 Codex's sandbox, which denies them the atomic home's `private/` directory, where
-every project keeps its database and context checkpoints; the current project's
+every project keeps its database, its execution lock and its context
+checkpoints; the current project's
 Codex records; the credential and key directories; the default atomic home's
 data and configuration when `ATOMIC_HOME` points elsewhere; the kernel keyrings;
 the network; and sockets. Other projects' Codex records are not denied yet. An
 exec atom's command may write only its scratch directory and the project's
-caches; `--runner process` confines it the same way. A step that runs commands
+caches; `--runner process` confines it the same way. It runs in a process
+namespace of its own, so it can neither see nor signal atomic, its runner or
+any other process outside. A step that runs commands
 needs bubblewrap and unprivileged user namespaces there: where the sandbox
 cannot start, atomic stops, saying what it needs, before the step runs and
 without recording an outcome, and the run continues when resumed where the
