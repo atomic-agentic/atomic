@@ -1073,7 +1073,8 @@ async fn recorded_candidates_are_the_published_ones_on_sqlite() -> Result<()> {
 #[cfg(feature = "postgres-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn recorded_candidates_are_the_published_ones_on_postgres() -> Result<()> {
-    recorded_candidates_are_the_published_ones(postgres().await?).await
+    let (rt, _schema) = postgres().await?;
+    recorded_candidates_are_the_published_ones(rt).await
 }
 
 #[cfg(feature = "postgres-tests")]
