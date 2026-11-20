@@ -1,0 +1,18 @@
+{
+  "number": "INV-2207",
+  "date": "2026-10-03",
+  "currency": "EUR",
+  "customer": {"id": "C-118", "name": "Halvard Joinery"},
+  "lines": [
+    {"sku": "OAK-12", "description": "Oak dowel, 12 mm", "quantity": "3", "unit_price": "4.115", "tax": "std"},
+    {"sku": "GLUE-PVA", "description": "Wood glue, 500 ml", "quantity": "1", "unit_price": "2.675", "tax": "std"},
+    {"sku": "LAB-H", "description": "Bench time, per hour", "quantity": "1.5", "unit_price": "85", "discount": "15", "tax": "std"},
+    {"sku": "SCR-4X30", "description": "Screws 4x30, per 100", "quantity": "7", "unit_price": "1.335", "tax": "std"},
+    {"sku": "CLP-150", "description": "Bar clamp, 150 mm", "quantity": "6", "unit_price": "3.3325", "tax": "std"},
+    {"sku": "SND-120", "description": "Sanding sheet, P120", "quantity": "12", "unit_price": "0.4165", "tax": "std"},
+    {"sku": "SND-240", "description": "Sanding sheet, P240", "quantity": "8", "unit_price": "0.6245", "tax": "std"},
+    {"sku": "MAN-03", "description": "Finishing manual", "quantity": "1", "unit_price": "18.90", "tax": "reduced"},
+    {"sku": "PIN-BR", "description": "Brass pins", "quantity": "250", "unit_price": "0.0125", "discount": "10", "tax": "std"}
+  ],
+  "notes": "Payable within 30 days."
+}
