@@ -92,7 +92,7 @@ pub struct Ticket {
 
 /// An admission: the ticket to settle, if the call is metered, and the
 /// limit to hold it to.
-pub(crate) type Admitted = (Option<Ticket>, Limit);
+pub type Admitted = (Option<Ticket>, Limit);
 
 /// How a call ended, for its settlement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,8 +101,23 @@ pub enum Outcome {
     /// answer still spent it.
     Reported(Usage),
     /// The call may have reached the provider, but no usage is known: it
-    /// stays charged at its bound until a usage query reconciles it.
+    /// stays charged at its bound until a usage query reconciles it (none is
+    /// built yet, so it stays charged at its bound).
     Unknown,
+    /// Part of what the call spent is known: it reported `reported`, and
+    /// was then stopped with a provider request in flight, which reported
+    /// nothing. The request in flight is taken to be as large as one
+    /// request's bound, or as `last`, the last request that reported, if
+    /// that was larger: a turn's requests grow as it goes. It is charged the
+    /// reported usage and that estimate, at least its reservation, and stays
+    /// open for a usage query, which is not built yet: until one is, the
+    /// charge keeps that value.
+    Partial {
+        /// What it reported.
+        reported: Usage,
+        /// What its last request that reported used, if any did.
+        last: Option<Usage>,
+    },
     /// The call certainly never reached the provider, so nothing was spent.
     NotDispatched,
 }
@@ -163,7 +178,7 @@ impl Metering {
     }
 
     /// Admit `call`; with no meter, no ticket and no limit.
-    pub(crate) async fn admit(&self, call: Call) -> Result<Admitted, MeterError> {
+    pub async fn admit(&self, call: Call) -> Result<Admitted, MeterError> {
         match &self.0 {
             Some(meter) => meter.admit(call).await.map(|t| {
                 let limit = t.limit;
@@ -174,11 +189,7 @@ impl Metering {
     }
 
     /// Settle `ticket`, if there is one.
-    pub(crate) async fn settle(
-        &self,
-        ticket: Option<Ticket>,
-        outcome: Outcome,
-    ) -> Result<(), MeterError> {
+    pub async fn settle(&self, ticket: Option<Ticket>, outcome: Outcome) -> Result<(), MeterError> {
         match (&self.0, ticket) {
             (Some(meter), Some(ticket)) => meter.settle(ticket, outcome).await,
             _ => Ok(()),

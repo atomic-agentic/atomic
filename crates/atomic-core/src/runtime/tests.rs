@@ -2196,3 +2196,280 @@ async fn a_worktree_steps_turn_finds_the_shared_caches_and_only_it_may_write_the
     assert!(open.env.contains_key("CARGO_HOME"));
     assert!(open.writable_roots.is_empty(), "{open:?}");
 }
+
+/// A store that, when `at` is reached (`"open"` as an input is copied in,
+/// `"stage"` as a handed-over file is read), says so and waits until it is
+/// let go.
+#[cfg(unix)]
+#[derive(Clone)]
+struct Stalling {
+    inner: crate::artifact::LocalStore,
+    at: &'static str,
+    state: Arc<(std::sync::Mutex<(bool, bool)>, std::sync::Condvar)>,
+}
+
+#[cfg(unix)]
+impl Stalling {
+    fn stall(&self, at: &str) {
+        if at != self.at {
+            return;
+        }
+        let (lock, wake) = &*self.state;
+        let mut state = lock.lock().expect("state");
+        state.0 = true;
+        wake.notify_all();
+        while !state.1 {
+            state = wake.wait(state).expect("state");
+        }
+    }
+
+    fn reached(&self) -> bool {
+        self.state.0.lock().expect("state").0
+    }
+
+    fn let_go(&self) {
+        let (lock, wake) = &*self.state;
+        if let Ok(mut state) = lock.lock() {
+            state.1 = true;
+        }
+        wake.notify_all();
+    }
+}
+
+/// Lets a [`Stalling`] store go when dropped, as when a test fails, so the
+/// runtime does not wait forever on the thread it holds.
+#[cfg(unix)]
+struct LetGo(Stalling);
+
+#[cfg(unix)]
+impl Drop for LetGo {
+    fn drop(&mut self) {
+        self.0.let_go();
+    }
+}
+
+#[cfg(unix)]
+impl crate::artifact::ArtifactStore for Stalling {
+    fn stage(
+        &self,
+        content: &mut dyn std::io::Read,
+    ) -> Result<crate::artifact::Staged, crate::artifact::ArtifactError> {
+        self.stall("stage");
+        self.inner.stage(content)
+    }
+    fn commit(
+        &self,
+        staged: crate::artifact::Staged,
+        provenance: &[crate::artifact::Provenance],
+    ) -> Result<Vec<crate::artifact::Manifest>, crate::artifact::ArtifactError> {
+        self.inner.commit(staged, provenance)
+    }
+    fn discard(&self, staged: crate::artifact::Staged) {
+        self.inner.discard(staged)
+    }
+    fn contains(
+        &self,
+        artifact: &crate::artifact::ArtifactRef,
+    ) -> Result<bool, crate::artifact::ArtifactError> {
+        self.inner.contains(artifact)
+    }
+    fn open(
+        &self,
+        artifact: &crate::artifact::ArtifactRef,
+    ) -> Result<Box<dyn std::io::Read + Send>, crate::artifact::ArtifactError> {
+        self.stall("open");
+        self.inner.open(artifact)
+    }
+    fn manifests(
+        &self,
+        artifact: &crate::artifact::ArtifactRef,
+    ) -> Result<Vec<crate::artifact::Manifest>, crate::artifact::ArtifactError> {
+        self.inner.manifests(artifact)
+    }
+}
+
+/// A run cancelled while its command's input files are copied in, or while
+/// the files it handed over are read, keeps its workspace open until that
+/// ends.
+#[cfg(unix)]
+#[test]
+fn a_cancelled_run_waits_for_its_files_to_be_copied_and_read() {
+    use crate::artifact::{ArtifactStore, LocalStore, Provenance};
+    use crate::{atom, compile};
+    on_codex_runtime(async {
+        for (at, before) in [
+            ("open", &["open total"][..]),
+            ("stage", &["open total", "run python3"][..]),
+        ] {
+            let store = LocalStore::open(scratch("exec-stall-store")).expect("store");
+            let given = store
+                .put(
+                    &mut &b"--- a\n+++ b\n"[..],
+                    Provenance {
+                        media_type: "text/x-diff".into(),
+                        ..Default::default()
+                    },
+                )
+                .expect("put")
+                .artifact
+                .uri();
+            let script = "import json, os, sys\njson.load(sys.stdin)\n\
+                 open(os.path.join(os.environ['ATOMIC_OUTPUTS'], 'out.diff'), 'w').write('x')\n\
+                 json.dump({'total': 1, 'patch': {'$file': 'out.diff', 'mediaType': 'text/x-diff'}}, sys.stdout)\n";
+            let (dir, _, _) = exec_project("exec-stall", script, "");
+            std::fs::write(
+                dir.join("atoms/total.input.schema.yaml"),
+                "type: object\nadditionalProperties: false\nrequired: [cents, patch]\nproperties:\n  cents: {type: array, items: {type: integer}}\n  patch: {$ref: 'atomic:artifact', mediaType: text/x-diff}\n",
+            )
+            .expect("input");
+            std::fs::write(
+                dir.join("atoms/total.output.schema.yaml"),
+                "type: object\nadditionalProperties: false\nrequired: [total, patch]\nproperties:\n  total: {type: integer}\n  patch: {$ref: 'atomic:artifact', mediaType: text/x-diff}\n",
+            )
+            .expect("output");
+            let mut registry = Registry::new();
+            let a = atom::load(&dir.join("atoms/total.atom.astro"), &mut registry).expect("loads");
+            let compiled = compile::compile(&a, &registry).expect("compiles");
+            let stalling = Stalling {
+                inner: store.clone(),
+                at,
+                state: Default::default(),
+            };
+            let artifacts = Artifacts(
+                Arc::new(store.clone()),
+                Some(Arc::new(stalling.clone())),
+                Default::default(),
+            );
+            let _let_go = LetGo(stalling.clone());
+            let recorded = Recording::default();
+            let backend: Arc<dyn atomic_exec::ExecutionBackend> = Arc::new(recorded.clone());
+            let task = tokio::spawn(async move {
+                run_exec(
+                    &a,
+                    &compiled,
+                    &json!({"cents": [1], "patch": given}),
+                    &EffectIdentity {
+                        run_id: "run-1".into(),
+                        step_id: "total".into(),
+                    },
+                    backend,
+                    None,
+                    &artifacts,
+                )
+                .await
+            });
+            for _ in 0..1000 {
+                if stalling.reached() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(stalling.reached(), "{at}: never reached the store");
+            task.abort();
+            assert!(task.await.expect_err("cancelled").is_cancelled());
+            // The copy or the read still goes on, so the workspace stays...
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let scratch = recorded.opened()[0].1.scratch.clone().expect("scratch");
+            assert_eq!(recorded.calls(), before, "{at}");
+            assert!(scratch.is_dir(), "{at}: closed under the store");
+            // ...until it ends.
+            stalling.let_go();
+            for _ in 0..1000 {
+                if recorded.calls().len() == before.len() + 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_eq!(
+                recorded.calls().last().map(String::as_str),
+                Some("close total")
+            );
+            for _ in 0..200 {
+                if !scratch.exists() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(!scratch.exists(), "{at}");
+        }
+    });
+}
+
+/// A store held by a sweep while a command's files are stored is waited
+/// out a few times; held past them, it leaves the step's outcome unknown,
+/// as a crash there would, not failed, for recovery to take up through the
+/// step's attempt guard.
+#[cfg(unix)]
+#[test]
+fn a_store_held_while_files_are_stored_leaves_the_outcome_unknown() {
+    use crate::artifact::LocalStore;
+    use crate::{atom, compile};
+    on_codex_runtime(async {
+        let root = scratch("exec-locked-store");
+        let store = LocalStore::open(&root)
+            .expect("store")
+            .waiting_at_most(std::time::Duration::from_millis(100));
+        let script = "import json, os, sys\njson.load(sys.stdin)\n\
+             open(os.path.join(os.environ['ATOMIC_OUTPUTS'], 'out.diff'), 'w').write('x')\n\
+             json.dump({'total': 1, 'patch': {'$file': 'out.diff', 'mediaType': 'text/x-diff'}}, sys.stdout)\n";
+        let (dir, _, _) = exec_project("exec-locked", script, "");
+        std::fs::write(
+            dir.join("atoms/total.output.schema.yaml"),
+            "type: object\nadditionalProperties: false\nrequired: [total, patch]\nproperties:\n  total: {type: integer}\n  patch: {$ref: 'atomic:artifact', mediaType: text/x-diff}\n",
+        )
+        .expect("output");
+        let mut registry = Registry::new();
+        let a = atom::load(&dir.join("atoms/total.atom.astro"), &mut registry).expect("loads");
+        let compiled = compile::compile(&a, &registry).expect("compiles");
+        let artifacts = Artifacts::store(store, Default::default());
+        // A sweep's hold on the store.
+        let hold = || {
+            let held = std::fs::File::options()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(root.join("lock"))
+                .expect("the store's lock");
+            held.lock().expect("held");
+            held
+        };
+        let identity = EffectIdentity {
+            run_id: "run-1".into(),
+            step_id: "total".into(),
+        };
+        let input = json!({"cents": [1]});
+        let run = || {
+            run_exec(
+                &a,
+                &compiled,
+                &input,
+                &identity,
+                Arc::new(atomic_exec::LocalBackend::default()),
+                None,
+                &artifacts,
+            )
+        };
+        let held = hold();
+        let r = run().await;
+        assert!(
+            matches!(&r, Err(AtomError::OutcomeUnknown(m)) if m.contains("lock")),
+            "{r:?}"
+        );
+        drop(held);
+        // A sweep that lets go while the gather waits.
+        let held = hold();
+        let sweep = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            drop(held);
+        });
+        let (out, _) = run().await.expect("stored once the sweep let go");
+        assert!(
+            out["patch"]
+                .as_str()
+                .is_some_and(|r| r.starts_with("artifact://sha256/")),
+            "{out}"
+        );
+        sweep.join().expect("sweep");
+    });
+}

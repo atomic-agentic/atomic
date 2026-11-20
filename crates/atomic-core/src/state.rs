@@ -478,7 +478,7 @@ pub fn user_config_dir() -> Option<PathBuf> {
 /// This process's effective user id.
 #[cfg(unix)]
 #[allow(unsafe_code)]
-fn effective_uid() -> u32 {
+pub(crate) fn effective_uid() -> u32 {
     // SAFETY: geteuid takes no arguments, touches no memory and cannot fail.
     unsafe { libc::geteuid() }
 }

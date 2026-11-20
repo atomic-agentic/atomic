@@ -113,15 +113,21 @@ configuration directory; the places in your home directory where credentials,
 shell startup files and history are kept (under both `$HOME` and the home
 directory the system records for your user, and wherever the variables that
 move them, such as `XDG_CONFIG_HOME`, `GNUPGHOME`, `CARGO_HOME` or
-`KUBECONFIG`, put them), and what a link among them points at, followed up to
-four links deep; the kernel keyrings; the network; and sockets. Other
-projects' Codex records are not denied yet. atomic makes the list when a
+`KUBECONFIG`, put them), and the file or directory of yours that a link
+among them points at, up to four directory levels inside a denied directory;
+the kernel keyrings; the network; and sockets. Cargo's own configuration is
+not among them, so a registry token kept there rather than in
+`credentials.toml` is not protected. A link to something outside your own
+files, such as a history file linked to `/dev/null`, is left alone, and a
+command does not start when a denial would cover its working directory or a
+directory it may write, or a linked secret lies inside one. Other projects'
+Codex records are not denied yet. atomic makes the list when a
 turn or an exec step starts: a place on it that appears while a command runs
 is denied only to the commands that start after it, and a link made after
 the list is not followed until the next turn or step. Credentials kept
 anywhere else are not covered. An
 exec atom's command may write only its scratch directory and the project's
-caches; `--runner process` confines it the same way. It runs in a process
+caches, and only read the artifacts it is given there; `--runner process` confines it the same way. It runs in a process
 namespace of its own, so it can neither see nor signal atomic, its runner or
 any other process outside, and in a session of its own, with no controlling
 terminal and a `/dev` and `/proc` of its own, so it cannot type into, read or
@@ -137,6 +143,14 @@ on a full disk, makes the step wait, as a backend with no room does. Atoms that 
 Windows this has not been verified: exec atoms' commands run unconfined there,
 so atomic keeps no operator credential and refuses credentialed gate decisions.
 
+An exec atom's command hands large results over by reference: it writes a
+file to its outputs directory and names it in its output, and the next step's
+command reads it from its inputs directory, a read-only copy (see
+[atom files](atom-files.md#large-results-go-by-reference)). A file may be 1 GiB
+and a step's files 4 GiB, unless `ATOMIC_EXEC_MAX_FILE_BYTES` and
+`ATOMIC_EXEC_MAX_STEP_BYTES` say otherwise. Only exec atoms hand files over;
+a Codex atom's turn does not yet.
+
 A `workspace-write` atom cannot write `/tmp`, `/var/tmp` or `$TMPDIR` as atomic
 found them: its commands' `TMPDIR` is the project's private one above. A tool
 that ignores `TMPDIR` and writes to `/tmp` directly, such as a JVM's default
@@ -146,7 +160,15 @@ that ignores `TMPDIR` and writes to `/tmp` directly, such as a JVM's default
 Several authoring aids arrive in stages. Eval cases, in YAML and in JSONL files,
 are loaded and checked, and the eval runner reports pass rates against each
 atom's threshold and scorer means against their minimums and a baseline; the
-`atomic eval` command that runs it from the terminal is not built yet. A
+`atomic eval` command runs it from the terminal, from cassettes or `--live`, and
+fails CI below an atom's threshold. It has no judge to run scorers with yet, so an
+atom with scorers fails unless `--allow-unscored` is given, and `--baseline` is
+refused. Its live calls are metered in the usage ledger under each atom's budget.
+Until fixture worktrees exist it refuses an atom that could write: a Codex atom
+with a `workspace-write` sandbox, and an exec atom that does not declare
+`effects: { external: 'read-only' }`, whether it declares `idempotent` or
+nothing. It runs Codex atoms only live, with `--no-cassettes`. It lists what it
+refuses, runs the rest, and fails unless `--skip-refused` is given. A
 recorded workflow-file run can be replayed from its checkpoints as a new run:
 each atom step is served the result it published, with no model call and no
 command run, while gates open again, titled as a replay's, and wait. A replay

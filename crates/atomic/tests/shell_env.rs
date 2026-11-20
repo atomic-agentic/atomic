@@ -431,7 +431,7 @@ fn an_atoms_shell_sees_none_of_the_persons_secrets() {
 
 /// Run `look` once through `atomic run` with home `home`, its command
 /// `command`, and return what the command printed.
-async fn look_once(dir: &Path, home: &Path, command: &str) -> String {
+async fn look_once(dir: &Path, home: &Path, command: &str, env: &[(&str, &str)]) -> String {
     let model = FakeModel::start(vec![
         Reply::Tool {
             name: "exec_command".into(),
@@ -463,6 +463,9 @@ async fn look_once(dir: &Path, home: &Path, command: &str) -> String {
         "ATOMIC_EXECUTOR_ID",
     ] {
         run.env_remove(name);
+    }
+    for (name, value) in env {
+        run.env(name, value);
     }
     let out = tokio::task::spawn_blocking(move || run.output().unwrap())
         .await
@@ -507,18 +510,51 @@ fn a_secret_kept_behind_a_link_stays_denied_and_commands_still_run() {
             home.join(".aws/deep/credentials"),
         )
         .unwrap();
+        // The person's own Codex home, moved, which atomic replaces with
+        // its own for the turn.
+        std::fs::create_dir_all(dir.join("their-codex")).unwrap();
+        std::fs::write(dir.join("their-codex/auth.json"), "canary-codex-auth\n").unwrap();
         let command = format!(
             "cat {h}/.bashrc {h}/dotfiles/bashrc {h}/.ssh/id_ed25519 {d}/keys/id_ed25519 \
-             {h}/.aws/deep/credentials {d}/elsewhere/credentials; echo looked",
+             {h}/.aws/deep/credentials {d}/elsewhere/credentials {d}/their-codex/auth.json; \
+             echo looked",
             h = home.display(),
             d = dir.display()
         );
-        let printed = look_once(&dir, &home, &command).await;
+        let theirs = dir.join("their-codex").display().to_string();
+        let printed = look_once(&dir, &home, &command, &[("CODEX_HOME", &theirs)]).await;
         assert!(printed.contains("looked"), "the command ran: {printed}");
         assert!(
             !printed.contains("canary"),
             "a linked secret was read: {printed}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+#[test]
+fn a_secret_place_linked_to_a_device_or_a_system_program_leaves_both_usable() {
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let dir = std::env::temp_dir().join(format!("atomic-unlinked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::create_dir_all(home.join(".config/fish/bin")).unwrap();
+        // History kept nowhere, hosts thrown away, a variable naming
+        // /dev/null, and a tool in a denied directory linked to the
+        // system's python.
+        let null = Path::new("/dev/null");
+        std::os::unix::fs::symlink(null, home.join(".bash_history")).unwrap();
+        std::os::unix::fs::symlink(null, home.join(".ssh/known_hosts")).unwrap();
+        let python = std::fs::canonicalize("/usr/bin/python3").unwrap();
+        std::os::unix::fs::symlink(&python, home.join(".config/fish/bin/python3")).unwrap();
+        let command = "echo x > /dev/null && echo null-written; cat /dev/null && echo null-read; \
+                       /usr/bin/python3 -c 'print(\"python-ran\")'; echo looked";
+        let printed = look_once(&dir, &home, command, &[("HISTFILE", "/dev/null")]).await;
+        for ran in ["null-written", "null-read", "python-ran", "looked"] {
+            assert!(printed.contains(ran), "{ran}: {printed}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     });
 }
