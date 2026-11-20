@@ -149,7 +149,7 @@ pub enum RunStatus {
 }
 
 /// What the store records about a run beside its steps.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RunRecord {
     /// Its id.
     pub id: String,
@@ -162,6 +162,10 @@ pub struct RunRecord {
     pub version: String,
     /// The queue it waits on, or was last taken from, if any.
     pub queue: Option<String>,
+    /// The workflow it runs, as registered.
+    pub workflow: String,
+    /// What it was started with.
+    pub input: Value,
 }
 
 /// What every resume queue's name starts with.
@@ -190,6 +194,8 @@ impl From<durare::WorkflowStatus> for RunRecord {
             executor: w.executor_id,
             version: w.app_version,
             queue: w.queue_name,
+            workflow: w.name,
+            input: w.input,
         }
     }
 }

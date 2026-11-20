@@ -214,6 +214,17 @@ impl Git {
         }
     }
 
+    /// Make an empty bare repository at `path`, from no template, so no
+    /// sample hook or other file comes with it.
+    pub fn init_bare(&self, path: &Path) -> Result<Repo, GitError> {
+        let mut command = self.base();
+        command
+            .args(["init", "--bare", "--quiet", "--template="])
+            .arg(path);
+        self.run(command, "init", None, MAX_OUTPUT_BYTES)?;
+        Ok(self.repo(path))
+    }
+
     /// The repository whose git directory is `git_dir`, checked out at
     /// `work_tree`. Commands never look in `work_tree` for a git directory.
     pub fn worktree(&self, git_dir: impl Into<PathBuf>, work_tree: impl Into<PathBuf>) -> Repo {
@@ -646,6 +657,77 @@ impl Repo {
             }
         })
         .collect()
+    }
+
+    /// Copy every object reachable from commit `sha` into `to`, with no
+    /// transport: this repository writes them as one pack, and `to` indexes
+    /// it. Objects only an alternate holds are copied too.
+    pub fn copy_reachable(&self, sha: &str, to: &Repo) -> Result<(), GitError> {
+        check_sha(sha)?;
+        let mut pack = self.command();
+        pack.args(["pack-objects", "--revs", "--stdout", "--quiet"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut packer = pack.spawn()?;
+        if let Some(mut stdin) = packer.stdin.take() {
+            stdin.write_all(format!("{sha}\n").as_bytes())?;
+        }
+        let Some(stream) = packer.stdout.take() else {
+            stop(&mut packer);
+            return Err(GitError::Unreadable);
+        };
+        let mut index = to.command();
+        index
+            .args(["index-pack", "--stdin"])
+            .stdin(Stdio::from(stream))
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let indexed = index.output()?;
+        let packed = packer.wait()?;
+        if !packed.success() {
+            return Err(GitError::Failed {
+                what: "pack-objects".into(),
+                code: packed.code(),
+                stderr: String::new(),
+            });
+        }
+        if !indexed.status.success() {
+            return Err(GitError::Failed {
+                what: "index-pack".into(),
+                code: indexed.status.code(),
+                stderr: printable(&indexed.stderr),
+            });
+        }
+        Ok(())
+    }
+
+    /// Every entry of commit `sha`'s tree, recursively: its mode, type
+    /// (`blob`, `tree` or `commit`, a submodule) and path.
+    pub fn entries(&self, sha: &str) -> Result<Vec<(String, String, String)>, GitError> {
+        check_sha(sha)?;
+        let out = self.run(&["ls-tree", "-r", "-z", "--full-tree", sha], None)?;
+        out.split(|b| *b == 0)
+            .filter(|e| !e.is_empty())
+            .map(|entry| {
+                let text = std::str::from_utf8(entry).map_err(|_| GitError::Unreadable)?;
+                let (head, path) = text.split_once('\t').ok_or(GitError::Unreadable)?;
+                let mut parts = head.split(' ');
+                let (Some(mode), Some(kind)) = (parts.next(), parts.next()) else {
+                    return Err(GitError::Unreadable);
+                };
+                Ok((mode.to_owned(), kind.to_owned(), path.to_owned()))
+            })
+            .collect()
+    }
+
+    /// The contents of the blob at `path` in commit `sha`'s tree.
+    pub fn blob(&self, sha: &str, path: &str) -> Result<Vec<u8>, GitError> {
+        check_sha(sha)?;
+        if !is_git_path(path) {
+            return Err(GitError::Invalid("a path in the tree"));
+        }
+        self.run(&["cat-file", "blob", &format!("{sha}:{path}")], None)
     }
 
     /// The tree of commit `sha`.

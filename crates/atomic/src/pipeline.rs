@@ -292,6 +292,41 @@ pub struct Pipeline {
     /// every source of every atom, as they were read when the run was
     /// prepared.
     pub pins: BTreeMap<String, String>,
+    /// The fixture repository a coding run is bound to (see
+    /// [`atomic_core::fixture`]): its worktree steps run in worktrees of the
+    /// fixture's snapshot, never of the developer's checkout. Absent for a
+    /// run that changes no code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixture: Option<atomic_core::fixture::FixtureBinding>,
+}
+
+impl Pipeline {
+    /// Whether a step of it changes code, in a worktree.
+    pub fn changes_code(&self) -> bool {
+        self.steps
+            .iter()
+            .any(|s| matches!(s, Step::Atom(a) if a.worktree))
+    }
+}
+
+/// The worktrees a run's worktree steps use: those of its fixture's
+/// snapshot when it is bound to one, else the services' own.
+fn worktrees_for(pipeline: &Pipeline, services: &Services) -> Result<Option<Arc<Worktrees>>> {
+    match &pipeline.fixture {
+        Some(fixture) => {
+            let git = atomic_core::git::Git::find()
+                .map_err(|e| failed(format!("the fixture's snapshot: {e}")))?;
+            let repo = git
+                .repo(&fixture.snapshot)
+                .without_filters()
+                .map_err(|e| failed(format!("the fixture's snapshot: {e}")))?;
+            Ok(Some(Arc::new(Worktrees::new(
+                repo,
+                fixture.worktrees.clone(),
+            ))))
+        }
+        None => Ok(services.worktrees.clone()),
+    }
 }
 
 /// The media type a pipeline snapshot is stored under.
@@ -441,6 +476,7 @@ pub fn prepare(
         budget: workflow.budget,
         budgets: None,
         pins,
+        fixture: None,
     })
 }
 
@@ -745,9 +781,10 @@ async fn run_pipeline<C: WorkflowContext>(
             }
         }
         let tree = if step.worktree {
-            let worktrees = services.worktrees.clone().ok_or_else(|| {
+            let worktrees = worktrees_for(&pipeline, &services)?.ok_or_else(|| {
                 failed(format!(
-                    "step `{}` asks for a worktree, and this project is not in a git repository",
+                    "step `{}` asks for a worktree, and the run is bound to no fixture \
+                     repository",
                     step.id
                 ))
             })?;
@@ -871,7 +908,7 @@ async fn run_pipeline<C: WorkflowContext>(
         atomic_schema::expr::evaluate(&pipeline.returns, &[("input", &input), ("steps", &scope)])
             .map_err(|e| failed(format!("`returns`: {e}")))?;
     fits("the workflow's result", &pipeline.output, &result)?;
-    if used_worktrees && let Some(worktrees) = services.worktrees.clone() {
+    if used_worktrees && let Some(worktrees) = worktrees_for(&pipeline, &services)? {
         // The run's worktrees go; its accepted commits keep their refs. A
         // repeat finds less to remove and removes it.
         let run_id = ctx.workflow_id().to_owned();
