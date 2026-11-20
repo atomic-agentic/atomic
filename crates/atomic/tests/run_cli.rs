@@ -1819,8 +1819,11 @@ fn atomic_run_confines_an_exec_atoms_command() {
 
 /// An exec atom's confined command has no controlling terminal, even when
 /// atomic has one: it cannot open `/dev/tty`, so it cannot type into
-/// atomic's terminal (TIOCSTI) or answer a prompt there. atomic runs here on
-/// a pseudo-terminal of its own, which a command run directly there opens.
+/// atomic's terminal (TIOCSTI) or answer a prompt there. Nor can it reach
+/// that terminal by its path in `/dev/pts`, or through another process's
+/// descriptors in `/proc`, to draw on the screen: its `/dev` and `/proc` are
+/// its own. atomic runs here on a pseudo-terminal of its own, which a
+/// command run directly there opens, by `/dev/tty` and by its path.
 // needs_sandbox
 #[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[cfg(target_os = "linux")]
@@ -1831,12 +1834,29 @@ fn a_confined_command_has_no_controlling_terminal() {
     let project = project(&dir);
     std::fs::write(
         project.join("tools/tty.py"),
-        "import fcntl, json, os, sys, termios\n\
-         json.load(sys.stdin)\n\
-         def attempt(f):\n    try:\n        f()\n        return 'ok'\n    except Exception as e:\n        return type(e).__name__ + ': ' + str(e)\n\
-         def tty():\n    os.close(os.open('/dev/tty', os.O_RDWR))\n\
-         def sti():\n    fd = os.open('/dev/tty', os.O_RDWR)\n    fcntl.ioctl(fd, termios.TIOCSTI, b'x')\n\
-         json.dump({'tty': attempt(tty), 'sti': attempt(sti)}, sys.stdout)\n",
+        format!(
+            "import fcntl, json, os, sys, termios\n\
+             json.load(sys.stdin)\n\
+             def attempt(f):\n    try:\n        f()\n        return 'ok'\n    except Exception as e:\n        return type(e).__name__ + ': ' + str(e)\n\
+             def tty():\n    os.close(os.open('/dev/tty', os.O_RDWR))\n\
+             def sti():\n    fd = os.open('/dev/tty', os.O_RDWR)\n    fcntl.ioctl(fd, termios.TIOCSTI, b'x')\n\
+             def by_path():\n    os.close(os.open(open('{pty}').read().strip(), os.O_WRONLY))\n\
+             def through_proc():\n\
+             \x20   for pid in os.listdir('/proc'):\n\
+             \x20       if not pid.isdigit(): continue\n\
+             \x20       try: fds = os.listdir(f'/proc/{{pid}}/fd')\n\
+             \x20       except OSError: continue\n\
+             \x20       for fd in fds:\n\
+             \x20           try: target = os.readlink(f'/proc/{{pid}}/fd/{{fd}}')\n\
+             \x20           except OSError: continue\n\
+             \x20           if target.startswith('/dev/pts/'):\n\
+             \x20               os.close(os.open(f'/proc/{{pid}}/fd/{{fd}}', os.O_WRONLY))\n\
+             \x20               return\n\
+             \x20   raise OSError('no terminal among the processes it sees')\n\
+             json.dump({{'tty': attempt(tty), 'sti': attempt(sti), 'by_path': attempt(by_path), \
+             'through_proc': attempt(through_proc)}}, sys.stdout)\n",
+            pty = dir.join("pty-path").display()
+        ),
     )
     .expect("script");
     let field = json!({"type": "string"});
@@ -1846,30 +1866,32 @@ fn a_confined_command_has_no_controlling_terminal() {
         "description: 'Probe the terminal.', kind: 'exec', exec: { command: ['python3', 'tools/tty.py'] }",
         "",
         object(json!({})),
-        object(json!({"tty": field, "sti": field})),
+        object(json!({"tty": field, "sti": field, "by_path": field, "through_proc": field})),
     );
     // `pty.spawn` runs its arguments with a new pseudo-terminal as their
-    // controlling terminal.
+    // controlling terminal; `tty` first writes that terminal's path where
+    // the probe reads it.
+    let record = format!(
+        "tty > '{}' && exec \"$0\" \"$@\"",
+        dir.join("pty-path").display()
+    );
     let run = |program: &str, args: &[&str]| -> String {
         let out = command_as(Path::new("/usr/bin/env"), &dir, &project, &[], &[])
-            .args([
-                "python3",
-                "-c",
-                "import pty, sys; pty.spawn(sys.argv[1:])",
-                program,
-            ])
+            .args(["python3", "-c", "import pty, sys; pty.spawn(sys.argv[1:])"])
+            .args(["sh", "-c", record.as_str(), program])
             .args(args)
             .stdin(Stdio::null())
             .output()
             .expect("run on a pseudo-terminal");
         String::from_utf8_lossy(&out.stdout).into_owned()
     };
-    // Directly on the terminal, the same check opens it.
+    // Directly on the terminal, the same checks open it.
     let direct = run(
         "python3",
         &[
             "-c",
-            "import os; os.close(os.open('/dev/tty', os.O_RDWR)); print('opened')",
+            "import os; os.close(os.open('/dev/tty', os.O_RDWR)); \
+             os.close(os.open(os.ttyname(0), os.O_WRONLY)); print('opened')",
         ],
     );
     assert!(
@@ -1886,11 +1908,12 @@ fn a_confined_command_has_no_controlling_terminal() {
             .and_then(|start| out[start..].rfind('}').map(|end| &out[start..=start + end]))
             .unwrap_or_else(|| panic!("{runner}: no result in {out}"));
         let result: Value = serde_json::from_str(json).unwrap_or_else(|e| panic!("{e}: {out}"));
-        for probe in ["tty", "sti"] {
+        // Each fails, as OSError or one of its kinds.
+        for probe in ["tty", "sti", "by_path", "through_proc"] {
             assert!(
                 result[probe]
                     .as_str()
-                    .is_some_and(|r| r.starts_with("OSError")),
+                    .is_some_and(|r| r != "ok" && r.contains("Error")),
                 "{runner}: {probe}: {result}"
             );
         }

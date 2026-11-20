@@ -102,7 +102,9 @@ exec atom's command may write only its scratch directory and the project's
 caches; `--runner process` confines it the same way. It runs in a process
 namespace of its own, so it can neither see nor signal atomic, its runner or
 any other process outside, and in a session of its own, with no controlling
-terminal, so it cannot type into or read the terminal atomic runs in. A step that runs commands
+terminal and a `/dev` and `/proc` of its own, so it cannot type into, read or
+draw on the terminal atomic runs in, whether through `/dev/tty`, the
+terminal's path in `/dev/pts` or another process's descriptors. A step that runs commands
 needs bubblewrap and unprivileged user namespaces there: where the sandbox
 cannot start, `atomic run` and `atomic runs resume` stop, saying what it needs,
 before the step runs and without recording an outcome, and the run continues
