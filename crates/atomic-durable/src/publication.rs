@@ -241,6 +241,13 @@ impl Park {
     pub fn topic(&self) -> String {
         topic(&self.id)
     }
+
+    /// The allowance that refused the parked call, as its reason names it.
+    pub fn scope(&self) -> Option<&str> {
+        self.reason
+            .split_once("allowance ")
+            .and_then(|(_, rest)| rest.split_whitespace().next())
+    }
 }
 
 fn topic(park: &str) -> String {
@@ -369,12 +376,14 @@ async fn park<C: WorkflowContext>(
     }
 }
 
-/// Release `park`: its run runs the parked turn again, admitting its calls
-/// afresh. Releasing does not raise a cap; a release with no more room than
-/// before parks the run again. A person's action, such as raising the cap in
-/// the usage ledger, comes first, from a human credential only. Releasing
-/// the same park twice delivers one wake-up.
-pub async fn release<R: DurableRuntime>(rt: &R, park: &Park) -> Result<()> {
+/// Wake `park`'s run: it runs the parked turn again, admitting its calls
+/// afresh. Waking does not raise a cap; a wake with no more room than before
+/// parks the run again. Waking the same park twice delivers one wake-up.
+///
+/// Not public: a person releases a park through
+/// [`crate::release::release_park`], with a human credential, which records
+/// the release and then wakes the run.
+pub(crate) async fn release<R: DurableRuntime>(rt: &R, park: &Park) -> Result<()> {
     rt.send(
         &park.run,
         &park.topic(),

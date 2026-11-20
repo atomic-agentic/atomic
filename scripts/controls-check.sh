@@ -49,6 +49,7 @@ CONTROLS=(
     "turn-tmp|crates/atomic-core/src/codex.rs|            std::env::set_var(\"TMPDIR\", own);|            let _ = own;|--workspace --features ${FEATURES} --test turn_workspace concurrent_turns_in_one_directory_never_break_each_others_sandbox"
     "helper-stage|crates/atomic-core/src/codex.rs|    arg != \"--\"|    { let _ = arg; true }|--workspace --features ${FEATURES} --test turn_workspace a_command_naming_the_inner_stage_leaves_the_registry_shared"
     "sandbox-network|crates/atomic-core/src/codex.rs|    codex_protocol::permissions::NetworkSandboxPolicy::Restricted;|    codex_protocol::permissions::NetworkSandboxPolicy::Enabled;|--workspace --features ${FEATURES} --test self_approval an_atom_cannot_approve_its_own_gate_through_its_shell"
+    "park-release-credential|crates/atomic-durable/src/release.rs|                    Verified::Mismatch => return Ok(Err(ReleaseError::BadCredential(by))),|                    Verified::Mismatch => {}|-p atomic-agentic-durable --lib only_the_enrolled_credential_releases_and_raises_on_sqlite"
     "exec-confinement|crates/atomic-exec/src/lib.rs|            Some(confine) => confine.confine(command, &self.tmp),|            Some(confine) if std::hint::black_box(false) => confine.confine(command, &self.tmp), Some(_) => Ok(command.clone()),|--workspace --features ${FEATURES} --test exec_private_state --test run_cli -- an_exec_atom_cannot_reach_atomics_private_state atomic_run_confines_an_exec_atoms_command"
 )
 

@@ -47,7 +47,7 @@ use atomic_core::runtime::{Artifacts, CodexRuntime, Runtimes, run_lite_atom};
 use atomic_core::testing::{FakeModel, Reply, on_codex_runtime};
 use atomic_core::usage::Metering;
 use atomic_durable::usage::{Attempt, Caps, Settlement};
-use atomic_durable::{DurableRuntime, Durare, RunStatus, parks, release, run_atom_at};
+use atomic_durable::{DurableRuntime, Durare, RunStatus, parks, run_atom_at};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -82,6 +82,45 @@ fn settings(atom: u64, run: u64) -> BudgetSettings {
     s.atom.tokens = atom;
     s.workflow.tokens = run;
     s
+}
+
+/// Release `park` as the local operator, with their credential, raising
+/// `raise` first if given: the person's action, as `atomic` exposes it.
+async fn release_raising(
+    rt: &Durare,
+    park: &atomic_durable::Park,
+    raise: Option<atomic_durable::release::Raise>,
+) -> Result<atomic_durable::release::Released, atomic_durable::release::ReleaseError> {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let me = atomic_durable::gate::HumanCredential::new(
+        atomic_durable::gate::Principal::local("dev"),
+        "the operator's secret",
+    );
+    let _ = atomic_durable::gate::enroll(rt, &me).await;
+    atomic_durable::release::release_park(
+        rt,
+        &me,
+        atomic_durable::release::ReleaseCommand {
+            command_id: format!(
+                "{}-{}",
+                park.id,
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ),
+            park: park.id.clone(),
+            raise,
+            comment: None,
+        },
+    )
+    .await
+}
+
+/// [`release_raising`] with no raise.
+#[allow(dead_code)]
+async fn release(
+    rt: &Durare,
+    park: &atomic_durable::Park,
+) -> Result<atomic_durable::release::Released, atomic_durable::release::ReleaseError> {
+    release_raising(rt, park, None).await
 }
 
 fn scratch(tag: &str) -> PathBuf {
@@ -342,20 +381,22 @@ fn a_released_park_admits_again_against_the_caps_as_stored() {
 
         // Raised by a person and released: the turn runs again, from its
         // first call, as new attempts at the same requests.
-        rt.ledger()
-            .raise(
-                "atom:released:0",
-                Caps {
+        let second = parks(&rt, "released").await.expect("parks")[1].clone();
+        let released = release_raising(
+            &rt,
+            &second,
+            Some(atomic_durable::release::Raise {
+                scope: "atom:released:0".into(),
+                caps: Caps {
                     tokens: 1_000,
                     millis: 0,
                     micro_usd: None,
                 },
-            )
-            .await
-            .expect("raise")
-            .expect("exists");
-        let second = parks(&rt, "released").await.expect("parks")[1].clone();
-        release(&rt, &second).await.expect("release");
+            }),
+        )
+        .await
+        .expect("release");
+        assert_eq!(released.raised.map(|a| a.caps.tokens), Some(1_000));
         let out: ChangeRequestResult = rt.result("released").await.expect("finishes");
         assert_eq!(out.verdict.summary, "The two-unit criterion holds.");
         assert_eq!(model.calls(), 3);

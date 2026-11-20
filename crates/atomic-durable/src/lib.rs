@@ -10,6 +10,7 @@ pub mod failpoints;
 pub mod gate;
 pub mod history;
 pub mod publication;
+pub mod release;
 pub mod runtime;
 pub mod store;
 #[cfg(feature = "postgres-tests")]
@@ -19,8 +20,7 @@ pub mod usage;
 pub use failpoints::failpoint;
 pub use publication::{
     Acceptance, Candidate, Park, Precondition, Proposal, Published, Write, execute_candidate,
-    execute_candidate_at, parks, publish_candidate, release, review_candidate, run_atom,
-    run_atom_at,
+    execute_candidate_at, parks, publish_candidate, review_candidate, run_atom, run_atom_at,
 };
 pub use runtime::{
     DEFAULT_VERSION, Database, DurableError, DurableRuntime, Durare, DurareContext,
