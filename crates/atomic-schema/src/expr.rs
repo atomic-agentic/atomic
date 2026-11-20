@@ -427,57 +427,343 @@ fn known_fields(doc: &Value, s: &Value) -> Vec<String> {
     out
 }
 
-/// Evaluate `source` with each name in `values` bound to its JSON value, and
-/// return the result as JSON. Evaluation reads only those values: CEL has no
-/// side effects, so a workflow mapping can be evaluated again on replay and
-/// give the same answer.
+/// What is known about the type of a value bound in an expression. It
+/// decides what CEL type each JSON number becomes, so that the type depends
+/// on the contract and never on how the number happened to be written.
+#[derive(Clone, Debug)]
+pub enum Shape<'a> {
+    /// Nothing: every number is a `double`.
+    Untyped,
+    /// A self-contained JSON Schema; its local references resolve within it.
+    Schema(&'a Value),
+    /// An object whose named fields have shapes of their own (a workflow's
+    /// `steps`, say); any other field is untyped.
+    Fields(BTreeMap<String, Shape<'a>>),
+}
+
+impl<'a> Shape<'a> {
+    /// A [`Shape::Fields`] from `(name, shape)` pairs.
+    pub fn fields<K: Into<String>>(fields: impl IntoIterator<Item = (K, Shape<'a>)>) -> Self {
+        Shape::Fields(fields.into_iter().map(|(k, v)| (k.into(), v)).collect())
+    }
+}
+
+/// Evaluate `source` with each name bound to its JSON value, typed by its
+/// shape, and return the result as JSON. Evaluation reads only those values:
+/// CEL has no side effects, so a workflow mapping can be evaluated again on
+/// replay and give the same answer.
 ///
 /// This is the one place atomic evaluates CEL over JSON. Every caller, from
 /// workflow mappings to eval assertions, goes through it, so each sees the
-/// same conversion from JSON to CEL values ([`cel_value`]).
-pub fn evaluate(source: &str, values: &[(&str, &Value)]) -> Result<Value, String> {
+/// same conversions: [`cel_value`] in and [`json_value`] out.
+pub fn evaluate(source: &str, values: &[(&str, &Value, &Shape<'_>)]) -> Result<Value, String> {
     let program = cel::Program::compile(source).map_err(|e| e.to_string())?;
     let mut context = cel::Context::default();
-    for (name, value) in values {
-        context.add_variable_from_value(*name, cel_value(value));
+    for (name, value, shape) in values {
+        let value = cel_value(value, shape).map_err(|e| format!("`{name}`{e}"))?;
+        context.add_variable_from_value(*name, value);
     }
     let result = program
         .execute(&context)
         .map_err(|e| format!("`{source}`: {e}"))?;
-    result
-        .json()
-        .map_err(|e| format!("`{source}` does not give a JSON value: {e}"))
+    json_value(&result).map_err(|e| format!("`{source}` does not give a JSON value: {e}"))
 }
 
-/// `value` as a CEL value.
+/// `value` as a CEL value, its numbers typed by `shape`.
 ///
 /// Built by hand rather than through serde (`Context::add_variable`):
 /// serde_json's `arbitrary_precision` feature is on in this workspace, and
-/// under it a number serializes as a private one-entry map, so `output.n >= 1`
-/// would fail to find an overload for a map and an int.
+/// under it a number serializes as a private one-entry map.
 ///
-/// A number becomes an `int` when it fits in `i64`, else a `uint` when it fits
-/// in `u64`, else a `double`; an integer too large for both is a `double`,
-/// as it is in JavaScript.
-pub fn cel_value(value: &Value) -> cel::Value {
-    match value {
+/// A number the schema types `integer` becomes an `int`, or a `uint` above
+/// `i64::MAX`, whether it was written `1`, `1.0` or `1e0`; one neither can
+/// hold is refused. Any other number, typed `number` or not typed at all,
+/// becomes a `double`; one `f64` cannot hold (`1e400`) is refused. A field
+/// counts as an integer when its schema says so through `type`, a local
+/// `$ref`, any `allOf` member, or every `anyOf` or `oneOf` branch.
+pub fn cel_value(value: &Value, shape: &Shape<'_>) -> Result<cel::Value, String> {
+    to_cel(value, &Ty::from_shape(shape), &mut String::new())
+}
+
+/// A CEL result as JSON. A `double` that is not finite is refused, and an
+/// object's keys come out sorted, so a result is the same on every replay.
+pub fn json_value(value: &cel::Value) -> Result<Value, String> {
+    use cel::objects::Key;
+    Ok(match value {
+        cel::Value::Null => Value::Null,
+        cel::Value::Bool(b) => Value::Bool(*b),
+        cel::Value::Int(i) => Value::from(*i),
+        cel::Value::UInt(u) => Value::from(*u),
+        cel::Value::Float(f) => serde_json::Number::from_f64(*f)
+            .map(Value::Number)
+            .ok_or_else(|| format!("{f} is not a finite number"))?,
+        cel::Value::String(s) => Value::String(s.to_string()),
+        cel::Value::List(items) => Value::Array(
+            items
+                .iter()
+                .map(json_value)
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        cel::Value::Map(map) => {
+            let mut entries = map
+                .map
+                .iter()
+                .map(|(key, item)| {
+                    let key = match key {
+                        Key::String(s) => s.to_string(),
+                        Key::Int(i) => i.to_string(),
+                        Key::Uint(u) => u.to_string(),
+                        Key::Bool(b) => b.to_string(),
+                    };
+                    Ok((key, json_value(item)?))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            Value::Object(entries.into_iter().collect())
+        }
+        other => other.json().map_err(|e| e.to_string())?,
+    })
+}
+
+/// How far `$ref`s and combinators are followed when typing a number.
+const TYPE_DEPTH: usize = 32;
+
+/// A shape narrowed to one position in a value: the schemas that all apply
+/// there (`All`), or that one of applies (`Any`).
+#[derive(Clone)]
+enum Ty<'a> {
+    Untyped,
+    Node(&'a Value, &'a Value),
+    Fields(&'a BTreeMap<String, Shape<'a>>),
+    All(Vec<Ty<'a>>),
+    Any(Vec<Ty<'a>>),
+}
+
+impl<'a> Ty<'a> {
+    fn from_shape(shape: &'a Shape<'a>) -> Self {
+        match shape {
+            Shape::Untyped => Ty::Untyped,
+            Shape::Schema(root) => Ty::Node(root, root),
+            Shape::Fields(fields) => Ty::Fields(fields),
+        }
+    }
+
+    /// Whether every value at this position is an integer.
+    fn integer(&self, depth: usize) -> bool {
+        if depth > TYPE_DEPTH {
+            return false;
+        }
+        match self {
+            Ty::Untyped | Ty::Fields(_) => false,
+            Ty::All(parts) => parts.iter().any(|t| t.integer(depth + 1)),
+            Ty::Any(parts) => !parts.is_empty() && parts.iter().all(|t| t.integer(depth + 1)),
+            Ty::Node(root, node) => {
+                let typed = match node.get("type") {
+                    Some(Value::String(t)) => t == "integer",
+                    Some(Value::Array(ts)) => {
+                        ts.iter().any(|t| t == "integer") && !ts.iter().any(|t| t == "number")
+                    }
+                    _ => false,
+                };
+                typed
+                    || local_ref(root, node).is_some_and(|t| Ty::Node(root, t).integer(depth + 1))
+                    || node
+                        .get("allOf")
+                        .and_then(Value::as_array)
+                        .is_some_and(|ms| ms.iter().any(|m| Ty::Node(root, m).integer(depth + 1)))
+                    || ["anyOf", "oneOf"].iter().any(|k| {
+                        node.get(*k).and_then(Value::as_array).is_some_and(|bs| {
+                            !bs.is_empty()
+                                && bs.iter().all(|b| Ty::Node(root, b).integer(depth + 1))
+                        })
+                    })
+            }
+        }
+    }
+
+    /// The type at field `key` of an object here.
+    fn field(&self, key: &str, depth: usize) -> Ty<'a> {
+        self.child(
+            depth,
+            &|root, node| match node.get("properties").and_then(|p| p.get(key)) {
+                Some(s) => Some(Ty::Node(root, s)),
+                None => node
+                    .get("additionalProperties")
+                    .filter(|s| s.is_object())
+                    .map(|s| Ty::Node(root, s)),
+            },
+            &|fields| fields.get(key).map(Ty::from_shape).unwrap_or(Ty::Untyped),
+        )
+    }
+
+    /// The type at item `index` of a list here.
+    fn item(&self, index: usize, depth: usize) -> Ty<'a> {
+        self.child(
+            depth,
+            &|root, node| match node.get("prefixItems").and_then(|p| p.get(index)) {
+                Some(s) => Some(Ty::Node(root, s)),
+                None => node
+                    .get("items")
+                    .filter(|s| s.is_object())
+                    .map(|s| Ty::Node(root, s)),
+            },
+            &|_| Ty::Untyped,
+        )
+    }
+
+    fn child(
+        &self,
+        depth: usize,
+        direct: &dyn Fn(&'a Value, &'a Value) -> Option<Ty<'a>>,
+        fields: &dyn Fn(&'a BTreeMap<String, Shape<'a>>) -> Ty<'a>,
+    ) -> Ty<'a> {
+        if depth > TYPE_DEPTH {
+            return Ty::Untyped;
+        }
+        match self {
+            Ty::Untyped => Ty::Untyped,
+            Ty::Fields(map) => fields(map),
+            Ty::All(parts) => Ty::All(
+                parts
+                    .iter()
+                    .map(|t| t.child(depth + 1, direct, fields))
+                    .collect(),
+            ),
+            Ty::Any(parts) => Ty::Any(
+                parts
+                    .iter()
+                    .map(|t| t.child(depth + 1, direct, fields))
+                    .collect(),
+            ),
+            Ty::Node(root, node) => {
+                let mut parts: Vec<Ty<'a>> = direct(root, node).into_iter().collect();
+                if let Some(target) = local_ref(root, node) {
+                    parts.push(Ty::Node(root, target).child(depth + 1, direct, fields));
+                }
+                if let Some(members) = node.get("allOf").and_then(Value::as_array) {
+                    parts.extend(
+                        members
+                            .iter()
+                            .map(|m| Ty::Node(root, m).child(depth + 1, direct, fields)),
+                    );
+                }
+                for k in ["anyOf", "oneOf"] {
+                    if let Some(branches) = node.get(k).and_then(Value::as_array) {
+                        parts.push(Ty::Any(
+                            branches
+                                .iter()
+                                .map(|b| Ty::Node(root, b).child(depth + 1, direct, fields))
+                                .collect(),
+                        ));
+                    }
+                }
+                Ty::All(parts)
+            }
+        }
+    }
+}
+
+/// The subschema a local `$ref` (`#` or `#/...`) names.
+fn local_ref<'a>(root: &'a Value, node: &Value) -> Option<&'a Value> {
+    let r = node.get("$ref")?.as_str()?;
+    root.pointer(r.strip_prefix('#')?)
+}
+
+fn to_cel(value: &Value, ty: &Ty<'_>, at: &mut String) -> Result<cel::Value, String> {
+    Ok(match value {
         Value::Null => cel::Value::Null,
         Value::Bool(b) => cel::Value::Bool(*b),
-        Value::Number(n) => n
-            .as_i64()
-            .map(cel::Value::Int)
-            .or_else(|| n.as_u64().map(cel::Value::UInt))
-            .unwrap_or_else(|| cel::Value::Float(n.as_f64().unwrap_or(f64::NAN))),
+        Value::Number(n) => {
+            if ty.integer(0) {
+                integer(n).ok_or_else(|| {
+                    format!("{at}: {n} is an integer field, but not an integer CEL can hold")
+                })?
+            } else {
+                cel::Value::Float(
+                    n.as_f64()
+                        .filter(|f| f.is_finite())
+                        .ok_or_else(|| format!("{at}: {n} is not a finite number"))?,
+                )
+            }
+        }
         Value::String(s) => cel::Value::String(std::sync::Arc::new(s.clone())),
         Value::Array(items) => {
-            cel::Value::List(std::sync::Arc::new(items.iter().map(cel_value).collect()))
+            let mut out = Vec::with_capacity(items.len());
+            for (i, item) in items.iter().enumerate() {
+                let len = at.len();
+                at.push_str(&format!("[{i}]"));
+                out.push(to_cel(item, &ty.item(i, 0), at)?);
+                at.truncate(len);
+            }
+            cel::Value::List(std::sync::Arc::new(out))
         }
-        Value::Object(map) => map
-            .iter()
-            .map(|(key, item)| (key.clone(), cel_value(item)))
-            .collect::<std::collections::HashMap<String, cel::Value>>()
-            .into(),
+        Value::Object(map) => {
+            let mut out = std::collections::HashMap::with_capacity(map.len());
+            for (key, item) in map {
+                let len = at.len();
+                at.push('.');
+                at.push_str(key);
+                out.insert(key.clone(), to_cel(item, &ty.field(key, 0), at)?);
+                at.truncate(len);
+            }
+            out.into()
+        }
+    })
+}
+
+/// `n` as a CEL `int` or `uint`, if it is an integer one of them holds.
+/// Read exactly from the number's decimal text, so `1.0`, `1e0` and `10e-1`
+/// are all `1`, and nothing is rounded through `f64` on the way.
+fn integer(n: &serde_json::Number) -> Option<cel::Value> {
+    let value = exact_integer(&n.to_string())?;
+    i64::try_from(value)
+        .map(cel::Value::Int)
+        .or_else(|_| u64::try_from(value).map(cel::Value::UInt))
+        .ok()
+}
+
+/// The integer a JSON number's text denotes, if it denotes one that fits in
+/// an `i128`.
+fn exact_integer(text: &str) -> Option<i128> {
+    let (negative, rest) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text),
+    };
+    let (mantissa, exponent) = match rest.find(['e', 'E']) {
+        Some(i) => (&rest[..i], rest[i + 1..].parse::<i64>().ok()?),
+        None => (rest, 0),
+    };
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let mut digits = format!("{whole}{fraction}");
+    let shift = exponent.checked_sub(i64::try_from(fraction.len()).ok()?)?;
+    if shift >= 0 {
+        // More than 39 digits cannot fit in an i128 anyway.
+        if digits.trim_start_matches('0').len() as i64 + shift > 39 {
+            return None;
+        }
+        digits.extend(std::iter::repeat_n('0', usize::try_from(shift).ok()?));
+    } else {
+        let cut = usize::try_from(-shift).ok()?;
+        if cut > digits.len() {
+            // Only zeros can be shifted out entirely.
+            return digits.bytes().all(|b| b == b'0').then_some(0);
+        }
+        let (kept, dropped) = digits.split_at(digits.len() - cut);
+        if !dropped.bytes().all(|b| b == b'0') {
+            return None;
+        }
+        digits = kept.to_owned();
     }
+    let digits = digits.trim_start_matches('0');
+    if digits.len() > 39 {
+        return None;
+    }
+    let magnitude: i128 = if digits.is_empty() {
+        0
+    } else {
+        digits.parse().ok()?
+    };
+    Some(if negative { -magnitude } else { magnitude })
 }
 
 #[cfg(test)]

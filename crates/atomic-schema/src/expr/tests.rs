@@ -75,12 +75,34 @@ fn a_syntax_error_fails_at_parse() {
 #[test]
 fn an_expression_evaluates_to_json() {
     let input = json!({"order_id": "A-1", "lines": [{"cents": 125, "units": 2}]});
+    let input_schema = json!({
+        "type": "object",
+        "properties": {
+            "order_id": {"type": "string"},
+            "lines": {"type": "array", "items": {"type": "object", "properties": {
+                "cents": {"type": "integer"}, "units": {"type": "integer"}}}}
+        }
+    });
+    let output_schema =
+        json!({"type": "object", "properties": {"total_cents": {"type": "integer"}}});
     let steps = json!({"total": {"output": {"total_cents": 250}}});
-    let values = [("input", &input), ("steps", &steps)];
+    let steps_shape = Shape::fields([(
+        "total",
+        Shape::fields([("output", Shape::Schema(&output_schema))]),
+    )]);
+    let input_shape = Shape::Schema(&input_schema);
+    let values = [
+        ("input", &input, &input_shape),
+        ("steps", &steps, &steps_shape),
+    ];
     assert_eq!(evaluate("input.order_id", &values), Ok(json!("A-1")));
     assert_eq!(
         evaluate("steps.total.output", &values),
         Ok(json!({"total_cents": 250}))
+    );
+    assert_eq!(
+        evaluate("steps.total.output.total_cents + 1", &values),
+        Ok(json!(251))
     );
     assert_eq!(
         evaluate("'Accept ' + input.order_id", &values),
@@ -93,40 +115,259 @@ fn an_expression_evaluates_to_json() {
     assert!(evaluate("input.missing", &values).is_err());
 }
 
+/// `assert_eq!` on the values' debug forms: CEL's `==` holds between an
+/// `int` and an equal `double`, and these tests are about which one it is.
+macro_rules! assert_same {
+    ($a:expr, $b:expr $(, $($message:tt)*)?) => {{
+        let (a, b) = ($a, $b);
+        // Ties the two types together, as `assert_eq!` would.
+        let _ = || a == b;
+        assert_eq!(format!("{a:?}"), format!("{b:?}") $(, $($message)*)?)
+    }};
+}
+
+/// Evaluate `source` with `output` bound to `value` under `schema`.
+fn with_schema(source: &str, schema: &Value, value: &Value) -> Result<Value, String> {
+    evaluate(source, &[("output", value, &Shape::Schema(schema))])
+}
+
+fn number(text: &str) -> Value {
+    serde_json::from_str(text).expect("a JSON number")
+}
+
 #[test]
 fn numbers_compare_as_numbers() {
-    let output = json!({"n": 2});
+    let schema = json!({"type": "object", "properties": {"n": {"type": "integer"}}});
     assert_eq!(
-        evaluate("output.n >= 1", &[("output", &output)]),
+        with_schema("output.n >= 1", &schema, &json!({"n": 2})),
+        Ok(json!(true))
+    );
+    // Untyped, a number is a double, which still compares with an int.
+    assert_eq!(
+        evaluate(
+            "output.n >= 1",
+            &[("output", &json!({"n": 2}), &Shape::Untyped)]
+        ),
         Ok(json!(true))
     );
 }
 
 #[test]
-fn json_converts_to_cel_values_by_kind() {
-    assert_eq!(cel_value(&json!(2)), cel::Value::Int(2));
-    assert_eq!(cel_value(&json!(-7)), cel::Value::Int(-7));
-    assert_eq!(cel_value(&json!(i64::MAX)), cel::Value::Int(i64::MAX));
-    assert_eq!(cel_value(&json!(u64::MAX)), cel::Value::UInt(u64::MAX));
-    assert_eq!(cel_value(&json!(0.5)), cel::Value::Float(0.5));
-    assert_eq!(cel_value(&json!(2.0)), cel::Value::Float(2.0));
-    assert_eq!(cel_value(&Value::Null), cel::Value::Null);
-    let beyond_u64: Value = serde_json::from_str("100000000000000000000").expect("parses");
-    assert_eq!(cel_value(&beyond_u64), cel::Value::Float(1e20));
+fn an_integer_field_is_an_int_however_it_is_spelled() {
+    let schema = json!({"type": "object", "properties": {"n": {"type": "integer"}}});
+    let shape = Shape::Schema(&schema);
+    for spelling in ["1", "1.0", "1e0", "10e-1"] {
+        let value = json!({"n": number(spelling)});
+        assert_same!(
+            cel_value(&value["n"], &Shape::Schema(&schema["properties"]["n"])),
+            Ok(cel::Value::Int(1)),
+            "{spelling}"
+        );
+        assert_same!(
+            evaluate("output.n + 1 == 2", &[("output", &value, &shape)]),
+            Ok(json!(true)),
+            "{spelling}"
+        );
+    }
+    let field = json!({"type": "integer"});
+    let field = Shape::Schema(&field);
+    assert_same!(cel_value(&json!(-7), &field), Ok(cel::Value::Int(-7)));
+    assert_same!(
+        cel_value(&json!(i64::MAX), &field),
+        Ok(cel::Value::Int(i64::MAX))
+    );
+    // Above i64::MAX, a uint.
+    assert_same!(
+        cel_value(&json!(u64::MAX), &field),
+        Ok(cel::Value::UInt(u64::MAX))
+    );
+    assert_same!(
+        cel_value(&number("9223372036854775808"), &field),
+        Ok(cel::Value::UInt(1 << 63))
+    );
+    // What an int or a uint cannot hold is refused.
+    for text in [
+        "1.5",
+        "18446744073709551616",
+        "-9223372036854775809",
+        "1e400",
+    ] {
+        assert!(cel_value(&number(text), &field).is_err(), "{text}");
+    }
+}
+
+#[test]
+fn number_and_untyped_fields_are_doubles_however_they_are_spelled() {
+    let schema = json!({"type": "object", "properties": {"x": {"type": "number"}}});
+    let shape = Shape::Schema(&schema);
+    for spelling in ["1", "1.0", "1e0"] {
+        let value = json!({"x": number(spelling), "y": number(spelling)});
+        assert_same!(
+            evaluate("output.x * 2.0 == 2.0", &[("output", &value, &shape)]),
+            Ok(json!(true)),
+            "{spelling}"
+        );
+        // `y` is not in the schema: untyped, so a double too.
+        assert_same!(
+            evaluate("output.y * 2.0 == 2.0", &[("output", &value, &shape)]),
+            Ok(json!(true)),
+            "{spelling}"
+        );
+        assert_same!(
+            cel_value(&number(spelling), &Shape::Untyped),
+            Ok(cel::Value::Float(1.0))
+        );
+    }
+    assert_same!(
+        cel_value(&number("100000000000000000000"), &Shape::Untyped),
+        Ok(cel::Value::Float(1e20))
+    );
+    // A number f64 cannot hold is refused, not turned into infinity or NaN.
+    assert!(cel_value(&number("1e400"), &Shape::Untyped).is_err());
+    assert!(
+        cel_value(
+            &number("-1e400"),
+            &Shape::Schema(&json!({"type": "number"}))
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn types_follow_references_combinators_and_containers() {
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "by_ref": {"$ref": "#/$defs/count"},
+            "all": {"allOf": [{"type": "number"}, {"type": "integer"}]},
+            "either_int": {"anyOf": [{"type": "integer"}, {"$ref": "#/$defs/count"}]},
+            "mixed": {"anyOf": [{"type": "integer"}, {"type": "number"}]},
+            "list": {"type": "array", "items": {"type": "integer"}},
+            "tuple": {"type": "array", "prefixItems": [{"type": "integer"}, {"type": "number"}],
+                      "items": {"type": "integer"}},
+            "map": {"type": "object", "additionalProperties": {"type": "integer"}},
+            "nullable": {"type": ["integer", "null"]}
+        },
+        "anyOf": [
+            {"properties": {"tagged": {"type": "integer"}}},
+            {"properties": {"tagged": {"type": "integer"}}}
+        ],
+        "$defs": {"count": {"type": "integer"}}
+    });
+    let value = json!({
+        "by_ref": 1.0, "all": 1.0, "either_int": 1.0, "mixed": 1, "list": [1.0, 2],
+        "tuple": [1.0, 1, 3.0], "map": {"a": 1.0}, "nullable": 2.0, "tagged": 4.0
+    });
+    let shape = Shape::Schema(&schema);
+    let cel = cel_value(&value, &shape).expect("converts");
+    let cel::Value::Map(map) = cel else {
+        panic!("a map: {cel:?}")
+    };
+    let get = |key: &str| {
+        map.map
+            .get(&cel::objects::Key::from(key.to_owned()))
+            .cloned()
+            .expect(key)
+    };
+    assert_same!(get("by_ref"), cel::Value::Int(1));
+    assert_same!(get("all"), cel::Value::Int(1));
+    assert_same!(get("either_int"), cel::Value::Int(1));
+    assert_same!(get("mixed"), cel::Value::Float(1.0));
+    assert_same!(
+        get("list"),
+        cel::Value::List(std::sync::Arc::new(vec![
+            cel::Value::Int(1),
+            cel::Value::Int(2)
+        ]))
+    );
+    assert_same!(
+        get("tuple"),
+        cel::Value::List(std::sync::Arc::new(vec![
+            cel::Value::Int(1),
+            cel::Value::Float(1.0),
+            cel::Value::Int(3)
+        ]))
+    );
+    assert_same!(get("nullable"), cel::Value::Int(2));
+    assert_same!(get("tagged"), cel::Value::Int(4));
+    let cel::Value::Map(inner) = get("map") else {
+        panic!("a map")
+    };
+    assert_same!(
+        inner.map.get(&cel::objects::Key::from("a".to_owned())),
+        Some(&cel::Value::Int(1))
+    );
+    // A field shape types the fields it names and leaves the rest untyped.
+    let field = json!({"type": "integer"});
+    let shape = Shape::fields([("n", Shape::Schema(&field))]);
+    let value = json!({"n": 1.0, "m": 1});
+    assert_same!(
+        evaluate(
+            "output.n + 1 == 2 && output.m + 1.0 == 2.0",
+            &[("output", &value, &shape)]
+        ),
+        Ok(json!(true))
+    );
+}
+
+#[test]
+fn results_are_finite_json_with_sorted_keys() {
+    let none = Value::Null;
+    let bind = [("output", &none, &Shape::Untyped)];
+    for source in [
+        "1.0 / 0.0",
+        "-1.0 / 0.0",
+        "0.0 / 0.0",
+        "[1.0 / 0.0]",
+        "{'a': 0.0 / 0.0}",
+    ] {
+        assert!(evaluate(source, &bind).is_err(), "{source}");
+    }
+    let result = evaluate("{'b': 1, 'a': 2, 'c': {'z': 1, 'y': 2}}", &bind).expect("evaluates");
+    assert_eq!(
+        serde_json::to_string(&result).expect("serializes"),
+        r#"{"a":2,"b":1,"c":{"y":2,"z":1}}"#
+    );
+    // An object bound in comes back with its keys sorted, every time.
+    let value: Value =
+        serde_json::from_str(r#"{"zeta": 1, "alpha": 2, "mid": [{"q": 1, "p": 2}]}"#)
+            .expect("parses");
+    for _ in 0..5 {
+        let result = evaluate("output", &[("output", &value, &Shape::Untyped)]).expect("evaluates");
+        assert_eq!(
+            serde_json::to_string(&result).expect("serializes"),
+            r#"{"alpha":2.0,"mid":[{"p":2.0,"q":1.0}],"zeta":1.0}"#
+        );
+    }
+    // Integers and uints come back as integers.
+    let schema = json!({"type": "object", "properties": {"big": {"type": "integer"}}});
+    assert_eq!(
+        with_schema("output.big", &schema, &json!({"big": u64::MAX})),
+        Ok(json!(u64::MAX))
+    );
 }
 
 #[test]
 fn every_kind_of_json_value_evaluates() {
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "count": {"type": "integer"}, "negative": {"type": "integer"},
+            "big": {"type": "integer"}, "ratio": {"type": "number"},
+            "huge": {"type": "number"},
+            "items": {"type": "array", "items": {"type": "object", "properties": {
+                "meta": {"type": "object", "properties": {"level": {"type": "integer"}}}}}}
+        }
+    });
     let output = json!({
         "count": 3,
         "negative": -4,
         "big": u64::MAX,
         "ratio": 0.25,
-        "huge": serde_json::from_str::<Value>("100000000000000000000").expect("parses"),
+        "huge": number("100000000000000000000"),
         "none": null,
         "items": [{"tags": ["a", "b"], "meta": {"level": 2}}, {"tags": [], "meta": {"level": 5}}],
     });
-    let values = [("output", &output)];
     for source in [
         "output.count + 1 == 4",
         "output.count > 2 && output.count <= 3",
@@ -143,14 +384,16 @@ fn every_kind_of_json_value_evaluates() {
         "output.items.all(i, i.meta.level >= 2)",
         "output.items.map(i, i.meta.level) == [2, 5]",
     ] {
-        assert_eq!(evaluate(source, &values), Ok(json!(true)), "{source}");
+        assert_eq!(
+            with_schema(source, &schema, &output),
+            Ok(json!(true)),
+            "{source}"
+        );
     }
-    // Values come back out as the same JSON.
     assert_eq!(
-        evaluate("output.items", &values),
+        with_schema("output.items", &schema, &output),
         Ok(output["items"].clone())
     );
-    assert_eq!(evaluate("output.big", &values), Ok(json!(u64::MAX)));
 }
 
 /// Why the converter exists: serde_json's `arbitrary_precision` is on in this

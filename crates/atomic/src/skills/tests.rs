@@ -238,7 +238,7 @@ fn every_cel_example_checks_against_the_schemas_and_holds() {
             .check(&scope)
             .unwrap_or_else(|e| panic!("{source}: {e}"));
         assert_eq!(
-            evaluate(source, &input, &output),
+            evaluate(source, (&input, &input_schema), (&output, &output_schema)),
             Value::Bool(true),
             "{meaning}: {source}"
         );
@@ -248,10 +248,22 @@ fn every_cel_example_checks_against_the_schemas_and_holds() {
     assert!(misspelt.check(&scope).is_err());
 }
 
-/// Evaluate `source` the way a workflow does, through the shared converter.
-fn evaluate(source: &str, input: &Value, output: &Value) -> Value {
-    atomic_schema::expr::evaluate(source, &[("input", input), ("output", output)])
-        .unwrap_or_else(|e| panic!("{e}"))
+/// Evaluate `source` the way a workflow does, through the shared converter,
+/// with each value typed by its schema.
+fn evaluate(
+    source: &str,
+    (input, input_schema): (&Value, &Value),
+    (output, output_schema): (&Value, &Value),
+) -> Value {
+    use atomic_schema::expr::Shape;
+    atomic_schema::expr::evaluate(
+        source,
+        &[
+            ("input", input, &Shape::Schema(input_schema)),
+            ("output", output, &Shape::Schema(output_schema)),
+        ],
+    )
+    .unwrap_or_else(|e| panic!("{e}"))
 }
 
 fn jsonschema_valid(schema: &Value, value: &Value) -> bool {
@@ -447,7 +459,11 @@ fn the_worked_example_checks_renders_and_its_cases_hold() {
                 .unwrap_or_else(|e| panic!("{path}: {source}: {e}"));
             if let Some(example) = example {
                 assert_eq!(
-                    evaluate(source, &example.input, &example.output),
+                    evaluate(
+                        source,
+                        (&example.input, &input_schema),
+                        (&example.output, &output_schema)
+                    ),
                     Value::Bool(true),
                     "{path}: {source}"
                 );

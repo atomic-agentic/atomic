@@ -104,6 +104,23 @@ title: "'Accept the reviewed summary'"
 Use CEL for value mappings and validation. Declarative workflows do not execute
 arbitrary shell or JavaScript expressions.
 
+## Numbers in CEL
+
+CEL keeps `int`, `uint` and `double` apart, and its arithmetic does not mix
+them. Atomic chooses each number's CEL type from the schema of the value it
+belongs to, never from how the number is written:
+
+- A field the schema types `integer` is an `int`, or a `uint` above
+  9223372036854775807, whether the value is written `2`, `2.0` or `2e0`.
+  An integer neither type can hold stops the run with an error.
+- A field typed `number`, and any field the schema does not type, is a
+  `double`. A number too large for a `double` stops the run with an error.
+
+Comparisons work across the types, so `input.score >= 1` holds for a `number`
+field. Arithmetic does not: write `input.score * 2.0`, not `input.score * 2`,
+for a `number` field. A result that is not a finite number (`1.0 / 0.0`) is an
+error, and objects in a result have their keys in sorted order.
+
 ## Gate steps
 
 ```yaml
