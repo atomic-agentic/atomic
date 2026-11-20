@@ -213,13 +213,16 @@ fn known(cause: &(dyn std::error::Error + 'static)) -> Option<Failure> {
 }
 
 /// Print `failure` for a person or, with `json`, for a script.
+/// Report `failure`, with any secret its text carries redacted: an error
+/// can quote what a provider or a command said.
 pub fn report(failure: &Failure, json: bool) {
     if json {
-        let doc = serde_json::json!({ "error": failure });
+        let mut doc = serde_json::json!({ "error": failure });
+        atomic_core::redact::value(&mut doc);
         println!("{doc}");
     } else {
-        eprintln!("error: {}", failure.description);
-        eprintln!("  to fix: {}", failure.action);
+        atomic_core::log_line!("error: {}", failure.description);
+        atomic_core::log_line!("  to fix: {}", failure.action);
     }
 }
 

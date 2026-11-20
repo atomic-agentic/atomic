@@ -186,10 +186,11 @@ async fn decide(
     // The decision is recorded; waking the run is not part of it. Say so if
     // it fails, rather than leave the run to its deadline unannounced.
     if let Err(e) = gate::redeliver(rt).await {
-        eprintln!(
+        atomic_core::log_line!(
             "warning: the decision is recorded, but waking run {} failed: {e}; atomic serve or \
              atomic runs resume {} delivers it",
-            found.run, found.run
+            found.run,
+            found.run
         );
     }
     Ok(())
