@@ -52,7 +52,10 @@ workflow and an eval case: at the top of an empty directory, or under
 local Ollama running, the new project runs with no configuration. `atomic run` takes an atom or workflow by name, by file or with
 `--project`, and input from a file, standard input or `--data`; a run cut short
 continues with `atomic runs resume <run-id>`, or under `atomic serve`, from its
-checkpoints. One process at a time executes a project's runs. Errors carry a
+checkpoints. A workflow that changes code runs only bound to a fixture
+repository and revision (`--fixture`, `--fixture-rev`): its worktrees come
+from a snapshot of that commit in the state directory, never from your
+checkout. One process at a time executes a project's runs. Errors carry a
 description and an action, separately in `--json` output. `atomic gates enroll`,
 `list`, `approve` and `reject` decide gates from a second terminal; a gate
 decision counts only with the credential its person enrolled. The terminal

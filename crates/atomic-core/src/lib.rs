@@ -21,6 +21,7 @@ pub mod eval;
 pub mod evaluation;
 pub mod failpoint;
 pub mod failure;
+pub mod fixture;
 pub mod git;
 pub mod helper_runtime;
 pub mod http_tools;
