@@ -371,3 +371,62 @@ async fn a_response_that_breaks_its_schema_is_an_error() {
     let error = tools.call("search", &json!({})).await.expect_err("breaks");
     assert!(matches!(error, CallError::Response { .. }), "{error}");
 }
+
+const JOBS: &str = r##"openapi: 3.1.0
+info: { title: Jobs, version: "1" }
+paths:
+  /jobs:
+    post:
+      operationId: submit
+      responses:
+        "200": { description: done, content: { application/json: { schema: { type: object, required: [result], properties: { result: { type: string } } } } } }
+        "202": { description: queued, content: { application/json: { schema: { type: object, required: [ticket], properties: { ticket: { type: integer } } } } } }
+        "204": { description: nothing to do }
+"##;
+
+fn jobs(host: &str) -> HttpToolset {
+    let spec = atomic_schema::yaml::load(std::path::Path::new("jobs.yaml"), JOBS)
+        .expect("yaml")
+        .value;
+    let mut tools = toolset(host);
+    tools.base_url = format!("http://{host}/").parse().expect("url");
+    tools.operations = atomic_schema::openapi::operations(&spec)
+        .expect("spec")
+        .into_iter()
+        .map(|op| (op.name.clone(), op))
+        .collect();
+    tools
+}
+
+#[tokio::test]
+async fn each_success_is_checked_against_the_response_its_status_declares() {
+    let (host, _) = server(vec![
+        (200, r#"{"result": "ok"}"#),
+        (204, ""),
+        (202, r#"{"ticket": 7}"#),
+        // A queued reply that would pass as done, and a done one as queued.
+        (202, r#"{"result": "ok"}"#),
+        (200, r#"{"ticket": 7}"#),
+        // A success the spec does not declare.
+        (201, r#"{"result": "ok"}"#),
+    ])
+    .await;
+    let tools = jobs(&host);
+    let args = json!({});
+    let call = || tools.call("submit", &args);
+    assert_eq!(call().await.expect("200"), json!({ "result": "ok" }));
+    assert_eq!(call().await.expect("204"), Value::Null);
+    assert_eq!(call().await.expect("202"), json!({ "ticket": 7 }));
+    for status in ["202", "200"] {
+        let error = call().await.expect_err(status);
+        assert!(
+            matches!(error, CallError::Response { .. }),
+            "{status}: {error}"
+        );
+    }
+    let error = call().await.expect_err("201");
+    assert!(
+        matches!(&error, CallError::Response { errors, .. } if errors.contains("201")),
+        "{error}"
+    );
+}

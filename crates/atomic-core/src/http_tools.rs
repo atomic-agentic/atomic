@@ -522,7 +522,7 @@ impl HttpToolset {
                     serde_json::from_slice(&bytes)
                         .map_err(|e| transport(format!("the response is not JSON: {e}")))?
                 };
-                return self.check_response(name, value);
+                return self.check_response(name, status.as_u16(), value);
             }
             let error = CallError::Status {
                 operation: name.to_owned(),
@@ -539,15 +539,31 @@ impl HttpToolset {
 }
 
 impl HttpToolset {
-    /// `value` if it fits the operation's response schema, or has none to
-    /// fit.
-    fn check_response(&self, name: &str, value: Value) -> Result<Value, CallError> {
-        let Some(schema) = self.operations.get(name).and_then(|op| op.output.as_ref()) else {
-            return Ok(value);
-        };
+    /// `value`, the body of a success with `status`, if it fits the schema
+    /// the operation declares for that status (see
+    /// [`atomic_schema::openapi::Operation::response`]), or the operation
+    /// declares none to fit: a response it declares with no JSON body, such
+    /// as a `204`, has nothing to check, and an operation that declares no
+    /// response at all takes any. A success whose status the operation does
+    /// not declare, when it declares others, is refused.
+    fn check_response(&self, name: &str, status: u16, value: Value) -> Result<Value, CallError> {
         let response = |errors: String| CallError::Response {
             operation: name.to_owned(),
             errors,
+        };
+        let Some(operation) = self.operations.get(name) else {
+            return Ok(value);
+        };
+        let schema = match operation.response(status) {
+            Some(Some(schema)) => schema,
+            Some(None) => return Ok(value),
+            None if operation.responses.is_empty() => return Ok(value),
+            None => {
+                return Err(response(format!(
+                    "the API answered {status}, a status the operation's spec declares no \
+                     response for"
+                )));
+            }
         };
         let validator = atomic_schema::registry::Registry::new()
             .validator_for(schema)

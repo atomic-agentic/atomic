@@ -38,11 +38,36 @@ pub struct Operation {
     /// The tool's input: one object, a field per parameter and `body` for a
     /// JSON request body.
     pub input: Value,
-    /// The JSON schema of its success response, when it declares one.
+    /// The JSON schema of its success response, when it declares one: the
+    /// first success code's, else `default`'s. A tool's output, for what
+    /// describes it; a response is checked against [`Operation::response`].
     pub output: Option<Value>,
+    /// Each response it declares for a success, by the status it is
+    /// declared for as the spec writes it: a code such as `200`, a range
+    /// such as `2XX`, or `default`. Its JSON schema, or `None` where it
+    /// declares no JSON body, as a `204` does.
+    pub responses: std::collections::BTreeMap<String, Option<Value>>,
     /// Why atomic cannot call it, when it cannot: a required request body
     /// with no JSON media type.
     pub unsupported: Option<String>,
+}
+
+impl Operation {
+    /// The response it declares for a reply with `status`, as OpenAPI picks
+    /// one: the status's own code, else its range (`2XX`), else `default`.
+    /// `None` when it declares none of them.
+    pub fn response(&self, status: u16) -> Option<&Option<Value>> {
+        let range = format!("{}XX", status / 100);
+        self.responses
+            .get(&status.to_string())
+            .or_else(|| {
+                self.responses
+                    .iter()
+                    .find(|(code, _)| code.eq_ignore_ascii_case(&range))
+                    .map(|(_, schema)| schema)
+            })
+            .or_else(|| self.responses.get("default"))
+    }
 }
 
 /// The styles OpenAPI allows in each location; the first is the default.
@@ -282,30 +307,39 @@ pub fn operations(spec: &Value) -> Result<Vec<Operation>, OpenApiError> {
             if !required.is_empty() {
                 input["required"] = Value::Array(required);
             }
-            let mut output = None;
+            // Every success response it declares, and `default`, each with
+            // its own schema: a reply is checked against the one for its
+            // status, never another's.
+            let mut kept = std::collections::BTreeMap::new();
             if let Some(responses) = operation.get("responses").and_then(Value::as_object) {
-                let mut codes: Vec<&String> = responses
-                    .keys()
-                    .filter(|code| code.starts_with('2'))
-                    .collect();
-                codes.sort();
-                if let Some(code) = codes
-                    .first()
-                    .copied()
-                    .or_else(|| responses.keys().find(|k| *k == "default"))
-                {
-                    let response = resolve(spec, &responses[code], &at)?;
-                    if let Some(schema) = response.get("content").and_then(json_content) {
-                        output = Some(convert(schema, &format!("{at}/responses/{code}"))?);
+                for (code, response) in responses {
+                    if !(code.starts_with('2') || code == "default") {
+                        continue;
                     }
+                    let response = resolve(spec, response, &at)?;
+                    let schema = match response.get("content").and_then(json_content) {
+                        Some(schema) => Some(convert(schema, &format!("{at}/responses/{code}"))?),
+                        None => None,
+                    };
+                    kept.insert(code.clone(), schema);
                 }
             }
             if !defs.is_empty() {
                 input["$defs"] = Value::Object(defs.clone());
-                if let Some(Value::Object(map)) = &mut output {
-                    map.insert("$defs".into(), Value::Object(defs.clone()));
+                for schema in kept.values_mut().flatten() {
+                    if let Value::Object(map) = schema {
+                        map.insert("$defs".into(), Value::Object(defs.clone()));
+                    }
                 }
             }
+            let mut codes: Vec<&String> =
+                kept.keys().filter(|code| code.starts_with('2')).collect();
+            codes.sort();
+            let output = codes
+                .first()
+                .copied()
+                .or_else(|| kept.keys().find(|k| *k == "default"))
+                .and_then(|code| kept[code].clone());
             let description = operation["summary"]
                 .as_str()
                 .or_else(|| operation["description"].as_str())
@@ -319,6 +353,7 @@ pub fn operations(spec: &Value) -> Result<Vec<Operation>, OpenApiError> {
                 styles,
                 input,
                 output,
+                responses: kept,
                 unsupported,
             });
         }

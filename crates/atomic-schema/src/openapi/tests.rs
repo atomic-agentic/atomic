@@ -268,3 +268,53 @@ paths:
             .contains("cannot have style")
     );
 }
+
+#[test]
+fn each_success_response_is_kept_by_its_status() {
+    let spec = yaml(
+        r#"openapi: 3.1.0
+info: { title: Jobs, version: "1" }
+paths:
+  /jobs:
+    post:
+      operationId: submit
+      responses:
+        "200": { description: done, content: { application/json: { schema: { type: object, required: [result], properties: { result: { type: string } } } } } }
+        "202": { description: queued, content: { application/json: { schema: { type: object, required: [ticket], properties: { ticket: { type: integer } } } } } }
+        "204": { description: nothing to do }
+        "2XX": { description: other, content: { application/json: { schema: { type: string } } } }
+        "404": { description: no such job, content: { application/json: { schema: { type: object } } } }
+        default: { description: error, content: { application/json: { schema: { type: number } } } }
+"#,
+    );
+    let ops = operations(&spec).expect("spec");
+    let op = &ops[0];
+    assert_eq!(
+        op.responses.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["200", "202", "204", "2XX", "default"],
+        "a failure's response is not a success's"
+    );
+    let required = |status: u16| {
+        op.response(status)
+            .and_then(Option::as_ref)
+            .map(|s| s["required"].clone())
+    };
+    assert_eq!(required(200), Some(json!(["result"])));
+    assert_eq!(required(202), Some(json!(["ticket"])));
+    assert_eq!(op.response(204), Some(&None), "no content");
+    assert_eq!(
+        op.response(201).cloned().flatten(),
+        Some(json!({ "type": "string" })),
+        "a range"
+    );
+    assert_eq!(
+        op.response(304).cloned().flatten(),
+        Some(json!({ "type": "number" })),
+        "default"
+    );
+    // The tool's output is the first success's, as before.
+    assert_eq!(
+        op.output.as_ref().map(|s| s["required"].clone()),
+        Some(json!(["result"]))
+    );
+}
