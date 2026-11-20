@@ -2316,3 +2316,58 @@ fn a_cancelled_run_waits_for_its_files_to_be_copied_and_read() {
         }
     });
 }
+
+/// A store held by a sweep while a command's files are stored leaves the
+/// step's outcome unknown, as a crash there would, not failed: recovery runs
+/// it again through its attempt guard.
+#[cfg(unix)]
+#[test]
+fn a_store_held_while_files_are_stored_leaves_the_outcome_unknown() {
+    use crate::artifact::LocalStore;
+    use crate::{atom, compile};
+    on_codex_runtime(async {
+        let root = scratch("exec-locked-store");
+        let store = LocalStore::open(&root)
+            .expect("store")
+            .waiting_at_most(std::time::Duration::from_millis(100));
+        let script = "import json, os, sys\njson.load(sys.stdin)\n\
+             open(os.path.join(os.environ['ATOMIC_OUTPUTS'], 'out.diff'), 'w').write('x')\n\
+             json.dump({'total': 1, 'patch': {'$file': 'out.diff', 'mediaType': 'text/x-diff'}}, sys.stdout)\n";
+        let (dir, _, _) = exec_project("exec-locked", script, "");
+        std::fs::write(
+            dir.join("atoms/total.output.schema.yaml"),
+            "type: object\nadditionalProperties: false\nrequired: [total, patch]\nproperties:\n  total: {type: integer}\n  patch: {$ref: 'atomic:artifact', mediaType: text/x-diff}\n",
+        )
+        .expect("output");
+        let mut registry = Registry::new();
+        let a = atom::load(&dir.join("atoms/total.atom.astro"), &mut registry).expect("loads");
+        let compiled = compile::compile(&a, &registry).expect("compiles");
+        // A sweep's hold on the store.
+        let held = std::fs::File::options()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(root.join("lock"))
+            .expect("the store's lock");
+        held.lock().expect("held");
+        let r = run_exec(
+            &a,
+            &compiled,
+            &json!({"cents": [1]}),
+            &EffectIdentity {
+                run_id: "run-1".into(),
+                step_id: "total".into(),
+            },
+            Arc::new(atomic_exec::LocalBackend::default()),
+            None,
+            &Artifacts::store(store, Default::default()),
+        )
+        .await;
+        assert!(
+            matches!(&r, Err(AtomError::OutcomeUnknown(m)) if m.contains("lock")),
+            "{r:?}"
+        );
+        drop(held);
+    });
+}

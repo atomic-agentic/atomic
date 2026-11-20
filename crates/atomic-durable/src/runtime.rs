@@ -56,6 +56,13 @@ pub enum DurableError {
     /// [`crate::publication::execute_candidate`]).
     #[error("parked: {0}")]
     Parked(String),
+    /// Another execution of run `.0` recorded one of its steps first. This
+    /// execution's state is behind the run's, so it stops, records nothing,
+    /// and takes the outcome the winner records. Workflow code passes it on
+    /// unchanged; turning it into a failure would record the loss as the
+    /// run's outcome.
+    #[error("another execution of run {0} recorded its step first")]
+    Conflict(String),
 }
 
 /// The engine's own error behind a [`DurableError::Database`]: opaque, and
@@ -162,6 +169,30 @@ pub struct RunRecord {
     pub version: String,
     /// The queue it waits on, or was last taken from, if any.
     pub queue: Option<String>,
+}
+
+/// Where a run stands in [`Durare::runs_after`]'s order: when it was
+/// created, in milliseconds since the epoch, and its id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunKey {
+    /// When the run was created.
+    pub created_at: i64,
+    /// Its id.
+    pub id: String,
+}
+
+/// A run with what it was given and what it returned or failed with, as
+/// [`Durare::runs_after`] reads it.
+#[derive(Clone, Debug)]
+pub struct RunContents {
+    /// The run.
+    pub record: RunRecord,
+    /// Its input, as stored.
+    pub input: Value,
+    /// What it returned, once it succeeded.
+    pub output: Option<Value>,
+    /// Its error, once it failed.
+    pub error: Option<String>,
 }
 
 /// What every resume queue's name starts with.
@@ -587,6 +618,7 @@ pub(crate) fn from_durare(e: durare::Error) -> DurableError {
         durare::Error::RecoveryRequired(inner) => DurableError::Interrupted(inner.to_string()),
         durare::Error::App { message, .. } => DurableError::Failed(message),
         e @ durare::Error::NestedDurableCall { .. } => DurableError::Nested(e.to_string()),
+        durare::Error::WorkflowConflict(run) => DurableError::Conflict(run),
         e @ durare::Error::Db(_) => DurableError::Database {
             message: e.to_string(),
             origin: Origin::of(e),
@@ -604,10 +636,28 @@ pub(crate) fn to_durare(e: DurableError) -> durare::Error {
         DurableError::Database { message, origin } => {
             origin.take().unwrap_or_else(|| durare::Error::app(message))
         }
+        // Back as the engine's own conflict, which it answers by waiting for
+        // the winner's outcome instead of recording one.
+        DurableError::Conflict(run) => durare::Error::WorkflowConflict(run),
         DurableError::Failed(m)
         | DurableError::Nested(m)
         | DurableError::Engine(m)
         | DurableError::Parked(m) => durare::Error::app(m),
+    }
+}
+
+/// How an error a step's or transaction's body returned reads to durare.
+/// A conflict belongs to the workflow, which lost a race to record a step:
+/// a body that returns one has made it up, or passed on another run's, and
+/// it fails the step like any other error rather than reach the engine as a
+/// typed conflict that it would record as the step's outcome.
+pub(crate) fn body_to_durare(e: DurableError) -> durare::Error {
+    match e {
+        DurableError::Conflict(run) => durare::Error::app(format!(
+            "a step's body returned a workflow conflict (run {run}), which only workflow code \
+             may return"
+        )),
+        e => to_durare(e),
     }
 }
 
@@ -689,7 +739,7 @@ impl WorkflowContext for DurareContext {
                 if out.is_ok() {
                     ran.before();
                 }
-                out.map_err(to_durare)
+                out.map_err(body_to_durare)
             });
         async move {
             let out = pending.await.map_err(from_durare);
@@ -717,7 +767,7 @@ impl WorkflowContext for DurareContext {
                     // commit together after this, or not at all.
                     ran.before();
                 }
-                out.map_err(to_durare)
+                out.map_err(body_to_durare)
             })
         });
         async move {
@@ -1091,6 +1141,88 @@ impl Durare {
             .await
             .map_err(from_durare)?;
         Ok(found.into_iter().map(RunRecord::from).collect())
+    }
+
+    /// A page of the store's runs, finished or not, whoever owns them: at
+    /// most `limit` of them, in order of creation and then of id, after the
+    /// run `after` names, each with what it was given and what it returned
+    /// or failed with. Paging by that key misses no run however many share a
+    /// creation time, and a run removed between pages shifts nothing.
+    pub async fn runs_after(
+        &self,
+        after: Option<&RunKey>,
+        limit: i64,
+    ) -> Result<Vec<(RunKey, RunContents)>> {
+        let after = after.cloned();
+        let keys: Vec<RunKey> = self
+            .control_transaction(move |mut tx| {
+                let after = after.clone();
+                Box::pin(async move {
+                    let rows = match &after {
+                        None => {
+                            tx.query_all(
+                                "SELECT workflow_uuid AS id, created_at FROM workflow_status \
+                                 ORDER BY created_at, workflow_uuid LIMIT ?",
+                                &[Param::Int(limit)],
+                            )
+                            .await?
+                        }
+                        Some(key) => {
+                            tx.query_all(
+                                "SELECT workflow_uuid AS id, created_at FROM workflow_status \
+                                 WHERE created_at > ? OR (created_at = ? AND workflow_uuid > ?) \
+                                 ORDER BY created_at, workflow_uuid LIMIT ?",
+                                &[
+                                    Param::Int(key.created_at),
+                                    Param::Int(key.created_at),
+                                    Param::Text(key.id.clone()),
+                                    Param::Int(limit),
+                                ],
+                            )
+                            .await?
+                        }
+                    };
+                    rows.iter()
+                        .map(|r| {
+                            Ok(RunKey {
+                                id: r.text("id")?,
+                                created_at: r.int("created_at")?,
+                            })
+                        })
+                        .collect()
+                })
+            })
+            .await?;
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut found: std::collections::BTreeMap<String, durare::WorkflowStatus> = self
+            .engine
+            .list_workflows(&durare::ListFilter {
+                workflow_ids: keys.iter().map(|k| k.id.clone()).collect(),
+                ..durare::ListFilter::default()
+            })
+            .await
+            .map_err(from_durare)?
+            .into_iter()
+            .map(|w| (w.id.clone(), w))
+            .collect();
+        // A run removed since its key was read is passed over.
+        Ok(keys
+            .into_iter()
+            .filter_map(|key| {
+                let w = found.remove(&key.id)?;
+                Some((
+                    key,
+                    RunContents {
+                        input: w.input.clone(),
+                        output: w.output.clone(),
+                        error: w.error.clone(),
+                        record: RunRecord::from(w),
+                    },
+                ))
+            })
+            .collect())
     }
 
     /// Every unfinished run in the store, whoever owns it and whatever its

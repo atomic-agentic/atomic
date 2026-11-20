@@ -41,6 +41,23 @@ pub mod quiescence;
 pub mod runner;
 pub mod workspace;
 
+/// Where this crate's log lines go: set once by the binary, to its
+/// redacting log; until then they are dropped. This crate cannot depend on
+/// the one that redacts.
+static LOG: std::sync::OnceLock<fn(&str)> = std::sync::OnceLock::new();
+
+/// Send this crate's log lines to `log`. The first call wins.
+pub fn set_log(log: fn(&str)) {
+    let _ = LOG.set(log);
+}
+
+/// Write one log line through the installed log.
+pub(crate) fn log(line: &str) {
+    if let Some(log) = LOG.get() {
+        log(line);
+    }
+}
+
 pub use workspace::{Open, Sandbox, Shell, Workspace};
 
 use serde::{Deserialize, Serialize};

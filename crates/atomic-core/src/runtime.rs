@@ -297,7 +297,7 @@ pub(crate) async fn open_workspace(
         match opened {
             Ok(workspace) => {
                 if reported.is_some() {
-                    eprintln!(
+                    crate::log_line!(
                         "atomic: {label}: the execution backend can open its workspace again"
                     );
                 }
@@ -308,10 +308,11 @@ pub(crate) async fn open_workspace(
             }
             Err(e @ atomic_exec::ExecError::Unavailable { .. }) => {
                 if reported.is_none_or(|at| at.elapsed() >= OPEN_WAIT_REPORT) {
-                    eprintln!(
+                    crate::log_line!(
                         "atomic: {label} is waiting for the execution backend \
                          (run {}, step {}): {e}",
-                        request.run, request.step
+                        request.run,
+                        request.step
                     );
                     reported = Some(std::time::Instant::now());
                 }
@@ -381,7 +382,9 @@ impl Closer {
         if let Some(workspace) = self.workspace.take()
             && let Err(e) = self.backend.close(&workspace)
         {
-            eprintln!("atomic: could not close a workspace, which its backend reclaims later: {e}");
+            crate::log_line!(
+                "atomic: could not close a workspace, which its backend reclaims later: {e}"
+            );
         }
     }
 }
@@ -1166,6 +1169,12 @@ fn store_error(atom: &str, doing: &str, e: crate::artifact::ArtifactError) -> At
             message,
             answer: String::new(),
         },
+        // Held by a sweep for now: the command ran and its files were not
+        // stored, as if the step had crashed there, so recovery runs it
+        // again through its attempt guard.
+        e @ crate::artifact::ArtifactError::Locked { .. } => {
+            AtomError::OutcomeUnknown(format!("{atom}: {doing}: {e}"))
+        }
         e => AtomError::Runtime(format!("{atom}: {doing}: {e}")),
     }
 }
@@ -1193,15 +1202,8 @@ async fn finish_exec(
     })?;
     if !done.success() {
         let stderr = String::from_utf8_lossy(&done.stderr);
-        let tail: String = stderr
-            .trim()
-            .chars()
-            .rev()
-            .take(2000)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
+        // Redacted, then cut: a secret cut in half is never in the tail.
+        let tail = crate::redact::tail(stderr.trim(), 2000);
         return Err(AtomError::Runtime(format!(
             "{}: {program} {}{}",
             atom.name,
@@ -1438,7 +1440,13 @@ where
     T: Send + 'static,
     F: std::future::Future<Output = Result<T, AtomError>> + Send + 'static,
 {
-    match tokio::spawn(run).await {
+    // The atom's task runs inside the caller's span, for the run and step
+    // the caller runs, so its model calls' spans are children of the step's.
+    let caller = crate::usage::caller();
+    let held = crate::spans::hold(tracing::Span::current());
+    let task = held.run(crate::usage::with_caller(caller, run));
+    drop(held);
+    match tokio::spawn(task).await {
         Ok(result) => result,
         Err(e) if e.is_panic() => {
             let payload = e.into_panic();

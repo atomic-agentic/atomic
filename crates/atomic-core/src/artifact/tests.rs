@@ -212,7 +212,7 @@ fn an_empty_read_of_a_healthy_blob_succeeds() {
 
 /// Each store's id, from the owners it has taken.
 fn owner_ids(dir: &Path) -> Vec<String> {
-    std::fs::read_dir(dir.join("owners"))
+    std::fs::read_dir(dir.join("artifact-owners"))
         .expect("owners")
         .flatten()
         .map(|e| e.file_name().to_string_lossy().into_owned())
@@ -257,7 +257,7 @@ fn opening_a_store_sweeps_only_dead_stores_leftovers() {
     let live_id = live_id.clone();
     // A store that died: its owner file is there, and no one holds it.
     let dead_id = "d".repeat(32);
-    std::fs::write(dir.join("owners").join(&dead_id), b"").expect("dead owner");
+    std::fs::write(dir.join("artifact-owners").join(&dead_id), b"").expect("dead owner");
     let leftovers = [
         format!("{dead_id}-1"),
         format!("{}-7", std::process::id()),
@@ -270,6 +270,10 @@ fn opening_a_store_sweeps_only_dead_stores_leftovers() {
     // Too new to judge: kept.
     let again = LocalStore::open(&dir).expect("open again");
     assert!(leftovers.iter().all(|n| staged(n)), "a new file was swept");
+    assert!(
+        dir.join("artifact-owners").join(&dead_id).exists(),
+        "a new owner was judged"
+    );
     drop(again);
     // Old enough: the dead store's go, with its owner, and the live one's
     // stay.
@@ -277,7 +281,317 @@ fn opening_a_store_sweeps_only_dead_stores_leftovers() {
     assert!(!staged(&leftovers[0]), "the dead store's file was kept");
     assert!(!staged(&leftovers[1]), "an ownerless file was kept");
     assert!(staged(&leftovers[2]), "the live store's file was swept");
-    assert!(!dir.join("owners").join(&dead_id).exists());
-    assert!(dir.join("owners").join(&live_id).exists());
+    assert!(!dir.join("artifact-owners").join(&dead_id).exists());
+    assert!(dir.join("artifact-owners").join(&live_id).exists());
     drop((swept, live));
+}
+
+#[test]
+fn a_sweep_keeps_what_it_is_told_and_what_is_recent_and_clears_stale_partial_writes() {
+    let root = std::env::temp_dir().join(format!("atomic-sweep-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let store = LocalStore::open(&root).expect("open");
+    let put = |bytes: &[u8]| {
+        store
+            .put(&mut &bytes[..], Provenance::default())
+            .expect("put")
+            .artifact
+    };
+    let (kept, loose) = (put(b"kept"), put(b"loose"));
+    // A stale partial write, a stray file, a prefix that is a link and a
+    // prefix that is not two hex digits: none of them is content.
+    std::fs::write(root.join("staging/1234-0"), b"half").expect("partial");
+    let blobs = root.join("blobs/sha256");
+    std::fs::write(blobs.join(&kept.digest()[..2]).join("not-a-digest"), b"x").expect("stray");
+    let elsewhere = root.with_extension("elsewhere");
+    std::fs::create_dir_all(&elsewhere).expect("elsewhere");
+    let hidden = format!("{:0>62}", "1");
+    std::fs::write(elsewhere.join(&hidden), b"outside the store").expect("outside");
+    std::os::unix::fs::symlink(&elsewhere, blobs.join("ff")).expect("link");
+    std::fs::create_dir_all(blobs.join("zz")).expect("odd prefix");
+
+    // A grace of an hour keeps everything just written.
+    let swept = store
+        .sweep(
+            &BTreeSet::new(),
+            Grace::at_least(std::time::Duration::from_secs(3600)),
+            std::time::SystemTime::now(),
+        )
+        .expect("sweep");
+    assert!(swept.removed.is_empty());
+    assert_eq!(swept.partial, 0);
+
+    let swept = store
+        .sweep(
+            &BTreeSet::from_iter([&kept].into_iter().cloned()),
+            Grace::none_for_tests(),
+            std::time::SystemTime::now(),
+        )
+        .expect("sweep");
+    assert_eq!(swept.removed, std::slice::from_ref(&loose));
+    assert_eq!(swept.partial, 1, "the stale partial write is cleared");
+    assert!(!root.join("staging/1234-0").exists());
+    assert!(store.contains(&kept).expect("contains"));
+    assert!(!store.contains(&loose).expect("contains"));
+    assert!(store.manifests(&loose).expect("manifests").is_empty());
+    for skipped in ["not-a-digest", "ff", "zz"] {
+        assert!(
+            swept.skipped.iter().any(|p| p.ends_with(skipped)),
+            "{skipped} not reported: {:?}",
+            swept.skipped
+        );
+    }
+    assert!(
+        elsewhere.join(&hidden).exists(),
+        "the sweep followed a link"
+    );
+    // Below the minimum, a grace is the minimum.
+    assert_eq!(
+        Grace::at_least(std::time::Duration::from_secs(1)),
+        Grace::at_least(MIN_GRACE)
+    );
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&elsewhere);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_stored_blob_is_read_only_and_a_damaged_one_is_replaced_by_the_next_write() {
+    use std::os::unix::fs::PermissionsExt;
+    let (store, dir) = store();
+    let a = store
+        .put(&mut &b"the content"[..], provenance("s1"))
+        .expect("put")
+        .artifact;
+    let blob = store.blob_path(&a);
+    let mode = std::fs::metadata(&blob).expect("blob").permissions().mode() & 0o777;
+    assert_eq!(mode, 0o444, "{mode:o}");
+    // A command handed a link to it cannot append to it.
+    let link = dir.join("link");
+    std::os::unix::fs::symlink(&blob, &link).expect("link");
+    assert!(
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&link)
+            .is_err(),
+        "a stored blob took a write"
+    );
+    // Its owner can still damage it, on purpose: the size, then the bytes.
+    for damage in [&b" and more"[..], &b"THE"[..]] {
+        std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let mut f = if damage.len() > 3 {
+            std::fs::OpenOptions::new().append(true).open(&blob)
+        } else {
+            std::fs::OpenOptions::new().write(true).open(&blob)
+        }
+        .expect("open");
+        f.write_all(damage).expect("damage");
+        drop(f);
+        assert_ne!(std::fs::read(&blob).expect("read"), b"the content");
+        // Written again, the content replaces what was damaged.
+        store
+            .put(&mut &b"the content"[..], provenance("s2"))
+            .expect("put again");
+        assert_eq!(std::fs::read(&blob).expect("read"), b"the content");
+        let mode = std::fs::metadata(&blob).expect("blob").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o444, "{mode:o}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Date `path` `ago` back.
+fn written_ago(path: &Path, ago: std::time::Duration) {
+    std::fs::File::open(path)
+        .expect("open")
+        .set_modified(std::time::SystemTime::now() - ago)
+        .expect("date");
+}
+
+#[test]
+fn the_grace_runs_back_from_when_the_keep_set_was_read() {
+    let (store, dir) = store();
+    let a = store
+        .put(
+            &mut &b"stored while the keep set was read"[..],
+            provenance("s1"),
+        )
+        .expect("put")
+        .artifact;
+    let minute = std::time::Duration::from_secs(60);
+    // Written ten minutes ago; the caller began reading what to keep nine
+    // and a half minutes ago, and took that long to reach the sweep.
+    written_ago(&store.blob_path(&a), 10 * minute);
+    let read_at = std::time::SystemTime::now() - (10 * minute - minute / 2);
+    let swept = store
+        .sweep(&BTreeSet::new(), Grace::at_least(minute), read_at)
+        .expect("sweep");
+    assert!(swept.removed.is_empty(), "{swept:?}");
+    assert!(store.contains(&a).expect("contains"));
+    // Read now, it is past its grace.
+    let swept = store
+        .sweep(
+            &BTreeSet::new(),
+            Grace::at_least(minute),
+            std::time::SystemTime::now(),
+        )
+        .expect("sweep");
+    assert_eq!(swept.removed, [a]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_projects_store_takes_its_lock_in_private_however_it_is_opened() {
+    let (_, dir) = store();
+    // In an atomic home (one with its private/), before the project's
+    // private directory exists as after: the layout says where the lock is.
+    let home = dir.join("home");
+    std::fs::create_dir_all(home.join("private")).expect("home");
+    let state = home.join("projects/p");
+    let private = home.join("private/p");
+    let store = LocalStore::open(state.join("artifacts")).expect("open");
+    assert_eq!(store.lock, private.join("artifacts.lock"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&private)
+            .expect("private")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0, "{mode:o}");
+        // A private directory others may read is refused, and left as it is.
+        let open = home.join("private/q");
+        std::fs::create_dir_all(&open).expect("q");
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        assert!(LocalStore::open(home.join("projects/q/artifacts")).is_err());
+        let mode = std::fs::metadata(&open).expect("q").permissions().mode();
+        assert_eq!(mode & 0o777, 0o755, "{mode:o}");
+    }
+    let again = LocalStore::open(state.join("artifacts")).expect("open");
+    assert_eq!(again.lock, store.lock);
+    // Shaped like one, but in no atomic home: its lock stays in its root, and
+    // nothing is made beside it.
+    let elsewhere = dir.join("not-a-home");
+    let loose = LocalStore::open(elsewhere.join("projects/p/artifacts")).expect("open");
+    assert_eq!(loose.lock, elsewhere.join("projects/p/artifacts/lock"));
+    assert!(!elsewhere.join("private").exists());
+    let loose = LocalStore::open(dir.join("artifacts")).expect("open");
+    assert_eq!(loose.lock, dir.join("artifacts/lock"));
+    let other = LocalStore::open(dir.join("elsewhere")).expect("open");
+    assert_eq!(other.lock, dir.join("elsewhere/lock"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_writable_blob_is_made_read_only_when_written_again_keeping_its_readers() {
+    use std::os::unix::fs::PermissionsExt;
+    let (store, dir) = store();
+    let a = store
+        .put(&mut &b"left writable"[..], provenance("s1"))
+        .expect("put")
+        .artifact;
+    let blob = store.blob_path(&a);
+    std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o640)).expect("chmod");
+    store
+        .put(&mut &b"left writable"[..], provenance("s2"))
+        .expect("put again");
+    let mode = std::fs::metadata(&blob).expect("blob").permissions().mode() & 0o777;
+    assert_eq!(mode, 0o440, "{mode:o}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_write_that_cannot_check_the_stored_blob_leaves_no_partial_write() {
+    use std::os::unix::fs::PermissionsExt;
+    let (store, dir) = store();
+    let a = store
+        .put(&mut &b"unreadable later"[..], provenance("s1"))
+        .expect("put")
+        .artifact;
+    let blob = store.blob_path(&a);
+    std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+    let refused = store.put(&mut &b"unreadable later"[..], provenance("s2"));
+    assert!(refused.is_err(), "{refused:?}");
+    assert_eq!(
+        files_under(&dir.join("staging")),
+        0,
+        "a partial write was left"
+    );
+    std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o444)).expect("chmod");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn listing_what_is_stored_fails_on_an_entry_it_cannot_read() {
+    use std::os::unix::fs::PermissionsExt;
+    let (store, dir) = store();
+    let a = store
+        .put(&mut &b"behind a closed door"[..], provenance("s1"))
+        .expect("put")
+        .artifact;
+    assert_eq!(store.stored().expect("listed"), BTreeSet::from([a.clone()]));
+    let prefix = store.blob_path(&a).parent().expect("prefix").to_owned();
+    std::fs::set_permissions(&prefix, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+    let listed = store.stored();
+    std::fs::set_permissions(&prefix, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    assert!(
+        listed.is_err(),
+        "an unreadable prefix was left out: {listed:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_refresh_says_whether_it_marked_found_nothing_or_was_held_off() {
+    let (store, dir) = store();
+    let a = store
+        .put(&mut &b"refreshed"[..], provenance("s1"))
+        .expect("put")
+        .artifact;
+    assert_eq!(store.refresh(&a).expect("refresh"), Refreshed::Now);
+    let missing = ArtifactRef::from_digest(&"0".repeat(64)).expect("ref");
+    assert_eq!(
+        store.refresh(&missing).expect("refresh"),
+        Refreshed::Missing
+    );
+    let holder = std::fs::File::options()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&store.lock)
+        .expect("lock");
+    holder.lock().expect("hold");
+    assert_eq!(store.refresh(&a).expect("refresh"), Refreshed::Held);
+    drop(holder);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A sweep leaves what an open store has staged, however old, and clears
+/// what a store that is gone left.
+#[test]
+fn a_sweep_leaves_an_open_stores_partial_writes() {
+    let (s, dir) = store();
+    let in_flight = s.stage(&mut &b"in flight"[..]).expect("stage");
+    std::fs::write(
+        dir.join("staging").join(format!("{}-1", "e".repeat(32))),
+        b"half",
+    )
+    .expect("a gone store's partial write");
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3600 * 24);
+    let swept = s
+        .sweep(&BTreeSet::new(), Grace::none_for_tests(), later)
+        .expect("sweep");
+    assert_eq!(swept.partial, 1, "{swept:?}");
+    assert!(
+        in_flight.path.exists(),
+        "an open store's partial write was swept"
+    );
+    let m = s
+        .commit(in_flight, &[provenance("late")])
+        .expect("committed after the sweep");
+    assert!(s.contains(&m[0].artifact).expect("contains"));
+    let _ = std::fs::remove_dir_all(dir);
 }

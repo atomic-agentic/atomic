@@ -54,6 +54,14 @@ description and an action, separately in `--json` output. `atomic gates enroll`,
 decision counts only with the credential its person enrolled. The terminal
 prompt for gates in `atomic run` is not wired up yet.
 
+A project's artifact store takes a lock in its private state while it is
+written or swept. A run that finds it held by another process, such as a sweep,
+says so once, waits and tries again for a bounded time (about 7.4 minutes with
+the store's 30-second wait: 11 tries and the pauses between them), then stops
+and is run again. Each stop spends one
+of durare's recoveries of the run, and once they run out the run waits for
+`atomic runs resume`.
+
 `atomic serve` also runs on PostgreSQL (`ATOMIC_DATABASE_URL`) when the process
 has an executor identity (`ATOMIC_EXECUTOR_ID`). `atomic runner` and
 `--runner process` run exec atoms' commands in a separate process with an
