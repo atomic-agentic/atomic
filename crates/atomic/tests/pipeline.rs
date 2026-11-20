@@ -1452,6 +1452,7 @@ fn replaying_a_recorded_run_makes_no_model_call_and_runs_no_command() {
         .expect("start");
         let recorded: Value = rt.result("recorded").await.expect("finishes");
         assert_eq!((model.calls(), sends(&dir)), (2, 1));
+        assert!(!rt.threads("recorded").await.expect("threads").is_empty());
 
         // Replayed from its checkpoints: the same result, with no model call
         // and no command run.
@@ -1465,11 +1466,64 @@ fn replaying_a_recorded_run_makes_no_model_call_and_runs_no_command() {
                 .collect::<Vec<_>>(),
             ["rank", "read", "summarize"]
         );
-        rt.start(REPLAY, "replayed", replay).await.expect("start");
+        rt.start(REPLAY, "replayed", replay.clone())
+            .await
+            .expect("start");
         let replayed: Value = rt.result("replayed").await.expect("the replay finishes");
         assert_eq!(replayed, recorded);
         assert_eq!(model.calls(), 2, "the replay made no model call");
         assert_eq!(sends(&dir), 1, "the replay ran no command");
+        // A served result keeps no thread of the recorded run's.
+        assert!(
+            rt.threads("replayed").await.expect("threads").is_empty(),
+            "the replay claimed the recorded run's threads"
+        );
+
+        // A step the recording has no result for fails the replay; it never
+        // runs live.
+        let mut partial = replay.clone();
+        partial.recorded.remove("summarize");
+        rt.start(REPLAY, "partial", partial).await.expect("start");
+        let error = rt
+            .result::<Value>("partial")
+            .await
+            .expect_err("no recorded summary");
+        assert!(
+            error
+                .to_string()
+                .contains("no recorded result for step summarize"),
+            "{error}"
+        );
+        // Nor is a result served to an input it was not recorded for.
+        let mut other = replay.clone();
+        other.run.input = json!({"text": "Another note entirely."});
+        rt.start(REPLAY, "other-input", other).await.expect("start");
+        let error = rt
+            .result::<Value>("other-input")
+            .await
+            .expect_err("another input");
+        assert!(
+            error.to_string().contains("step read has another input"),
+            "{error}"
+        );
+        assert_eq!(model.calls(), 2, "no failed replay called the model");
+        assert_eq!(sends(&dir), 1, "no failed replay ran the command");
+
+        // A build of another layout does not replay the run.
+        let foreign = atomic_durable::Durare::open(
+            &atomic_durable::Database::Sqlite(dir.join("atomic.db")),
+            None,
+            "atomic.pipeline.other",
+        )
+        .await
+        .expect("another layout's engine");
+        let error = replay_of(&foreign, "recorded")
+            .await
+            .expect_err("another layout");
+        assert!(
+            error.to_string().contains("recorded under layout"),
+            "{error}"
+        );
         // It is a run of its own, recorded step by step like any other.
         let names: Vec<String> = rt
             .steps("replayed")
@@ -2937,9 +2991,23 @@ fn the_durable_layout_is_the_one_its_version_names() {
         let g = waiting_at_gate(&rt, "layout-2").await;
         decide(&rt, &g, Verdict::Reject, "no").await;
         assert!(rt.result::<Value>("layout-2").await.is_err());
+        // And a replay of the first, through its gate again.
+        let replay = replay_of(&rt, "layout-1").await.expect("a replay");
+        let mut replay_shape = shape(&serde_json::to_value(&replay).expect("encode"));
+        replay_shape["run"] = json!("<the run>");
+        rt.start(REPLAY, "layout-3", replay).await.expect("start");
+        let g = waiting_at_gate(&rt, "layout-3").await;
+        // A replay's gate says it is one.
+        assert!(
+            g.title.starts_with("Replay of run layout-1: "),
+            "{}",
+            g.title
+        );
+        decide(&rt, &g, Verdict::Approve, "fine").await;
+        let _: Value = rt.result("layout-3").await.expect("the replay finishes");
         // Each recorded step's name, and the shape of its checkpoint.
         let mut steps = BTreeMap::new();
-        for run in ["layout-1", "layout-2"] {
+        for run in ["layout-1", "layout-2", "layout-3"] {
             let recorded: Vec<Value> = rt
                 .steps(run)
                 .await
@@ -2958,7 +3026,7 @@ fn the_durable_layout_is_the_one_its_version_names() {
         rt.shutdown(std::time::Duration::from_secs(5))
             .await
             .expect("shutdown");
-        let recorded = json!({"steps": steps, "run": run_shape});
+        let recorded = json!({"steps": steps, "run": run_shape, "replay": replay_shape});
         let file = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/layout")
             .join(format!("{}.json", atomic_app::pipeline::LAYOUT_VERSION));

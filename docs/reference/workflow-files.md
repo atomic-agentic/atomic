@@ -160,7 +160,8 @@ what it is allowed to do, or `--view cost` for its budget. See
 ## Runtime metadata and later composition
 
 `steps.<id>.output` is the typed result. `steps.<id>.metadata` holds runtime facts,
-including a coding candidate's `commit`. Pass that runtime-owned SHA to review;
+including a coding candidate's `commit` and `input_sha256`, the SHA-256 of the
+input the step's atom was given. Pass that runtime-owned SHA to review;
 do not ask the author model to invent it.
 
 From v0.7, `steps.<id>.prepared` holds what the step's atom

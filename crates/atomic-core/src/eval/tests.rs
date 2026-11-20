@@ -44,6 +44,25 @@ fn atom_with(config: &str) -> (PathBuf, Atom) {
     (root, atom)
 }
 
+/// The project at `root`, given a manifest if it has none.
+fn project_at(root: &Path) -> Project {
+    let manifest = root.join("atomic.yaml");
+    if !manifest.exists() {
+        std::fs::write(&manifest, "atomic: 1\n").expect("manifest");
+    }
+    crate::project::load(&manifest).expect("project")
+}
+
+/// Settings reading cases from `dir` under `root`, at `pass_rate`.
+fn at(root: &Path, dir: &str, pass_rate: f64) -> Settings {
+    Settings {
+        dir: root.join(dir),
+        pass_rate,
+        project: project_at(root),
+        declared: true,
+    }
+}
+
 fn write(path: &Path, text: &str) {
     std::fs::create_dir_all(path.parent().expect("dir")).expect("dir");
     std::fs::write(path, text).expect("write");
@@ -109,13 +128,17 @@ async fn cases_in_a_jsonl_file_run_the_same_as_cases_one_to_a_file() {
     write(&root.join("jsonl/cases.jsonl"), &(lines.join("\n") + "\n"));
 
     let mut reports = Vec::new();
+    let mut loaded = Vec::new();
     for dir in ["yaml", "jsonl"] {
-        let settings = Settings {
-            dir: root.join(dir),
-            pass_rate: 0.5,
-        };
+        let settings = at(&root, dir, 0.5);
         let cases = load_cases(&atom, &settings).expect("cases load");
         assert_eq!(cases.len(), 3, "{dir}");
+        loaded.push(
+            cases
+                .iter()
+                .map(|c| (c.input.clone(), c.expect.clone(), c.case.clone()))
+                .collect::<Vec<_>>(),
+        );
         let model = FakeModel::start(answers()).await.expect("fake model");
         let rt = runtimes(&model, &root.join(format!("rt-{dir}")));
         let subject = AtomSubject {
@@ -124,8 +147,19 @@ async fn cases_in_a_jsonl_file_run_the_same_as_cases_one_to_a_file() {
         };
         let report = run(&atom, cases, &settings, &subject, Options::default()).await;
         assert_eq!(model.calls(), 3, "{dir}: one call per case");
+        // A case's input reaches the model as external data.
+        let sent: String = model.requests().iter().map(Value::to_string).collect();
+        assert!(
+            sent.contains(r#"origin=\"external\">Export crashes"#),
+            "{sent}"
+        );
+        assert!(!sent.contains(r#"origin=\"team\""#), "{sent}");
         reports.push(report);
     }
+    // The same cases were loaded from each, input and assertions alike.
+    assert_eq!(loaded[0], loaded[1]);
+    assert_eq!(loaded[0][0].0, json!({"text": "Export crashes"}));
+    assert_eq!(loaded[0][0].1, ["output.ticket == 'BUG-1'"]);
     let ids: Vec<Vec<String>> = reports
         .iter()
         .map(|r| r.cases.iter().map(|c| c.id.clone()).collect())
@@ -152,10 +186,7 @@ async fn cases_in_a_jsonl_file_run_the_same_as_cases_one_to_a_file() {
 #[test]
 fn a_case_that_breaks_the_format_fails_the_load_where_it_is() {
     let (root, atom) = atom_with("{}");
-    let settings = |dir: &str| Settings {
-        dir: root.join(dir),
-        pass_rate: 1.0,
-    };
+    let settings = |dir: &str| at(&root, dir, 1.0);
     for (n, (text, says)) in [
         ("input: {text: hi}\n", "needs `expect`"),
         ("input: {text: hi}\nexpect: []\n", "nonempty list"),
@@ -205,19 +236,23 @@ fn a_case_that_breaks_the_format_fails_the_load_where_it_is() {
 #[test]
 fn an_atoms_evals_field_names_its_directory_and_threshold() {
     let (root, atom) = atom_with("{}");
-    let s = super::settings(&atom, &root).expect("defaults");
+    let s = super::settings(&atom, &project_at(&root)).expect("defaults");
     assert_eq!((s.dir, s.pass_rate), (root.join("evals/test"), 1.0));
     let (root, atom) = atom_with("{evals: {dir: 'cases', pass_rate: 0.8}}");
-    let s = super::settings(&atom, &root).expect("declared");
+    std::fs::create_dir(root.join("cases")).expect("dir");
+    let s = super::settings(&atom, &project_at(&root)).expect("declared");
     assert_eq!((s.dir, s.pass_rate), (root.join("cases"), 0.8));
     let (root, atom) = atom_with("{evals: 'elsewhere'}");
+    std::fs::create_dir(root.join("elsewhere")).expect("dir");
     assert_eq!(
-        super::settings(&atom, &root).expect("a path").dir,
+        super::settings(&atom, &project_at(&root))
+            .expect("a path")
+            .dir,
         root.join("elsewhere")
     );
     for bad in ["{evals: {pass_rate: 2}}", "{evals: {pass_rate: -0.5}}"] {
         let (root, atom) = atom_with(bad);
-        assert!(super::settings(&atom, &root).is_err(), "{bad}");
+        assert!(super::settings(&atom, &project_at(&root)).is_err(), "{bad}");
     }
 }
 
@@ -261,7 +296,7 @@ fn table(outputs: &[(&str, &str)]) -> Table {
 
 #[tokio::test]
 async fn a_pass_rate_below_the_threshold_fails_the_report() {
-    let (_, atom) = atom_with("{}");
+    let (root, atom) = atom_with("{}");
     let cases = vec![
         case("a", "output.ticket == 'A'"),
         case("b", "output.ticket == 'B'"),
@@ -270,14 +305,11 @@ async fn a_pass_rate_below_the_threshold_fails_the_report() {
     ];
     // Three pass; "c" answers wrong and "d" fails to run.
     let subject = table(&[("a", "A"), ("b", "B"), ("c", "X")]);
-    let at = |pass_rate: f64| Settings {
-        dir: PathBuf::new(),
-        pass_rate,
-    };
+    let with = |pass_rate: f64| at(&root, "evals", pass_rate);
     let report = run(
         &atom,
         cases.clone(),
-        &at(0.75),
+        &with(0.75),
         &subject,
         Options::default(),
     )
@@ -293,10 +325,10 @@ async fn a_pass_rate_below_the_threshold_fails_the_report() {
         "{report:?}"
     );
     assert_eq!(report.cases[3].failures, ["the atom failed"]);
-    let report = run(&atom, cases, &at(0.5), &subject, Options::default()).await;
+    let report = run(&atom, cases, &with(0.5), &subject, Options::default()).await;
     assert!(report.passed, "{report:?}");
     // No cases at all never passes.
-    let report = run(&atom, Vec::new(), &at(0.0), &subject, Options::default()).await;
+    let report = run(&atom, Vec::new(), &with(0.0), &subject, Options::default()).await;
     assert!(!report.passed);
 }
 
@@ -324,16 +356,13 @@ impl Judge for Reviewer {
 
 #[tokio::test]
 async fn a_scorer_below_its_minimum_or_past_its_tolerance_fails_the_report() {
-    let (_, atom) = atom_with(SCORED);
+    let (root, atom) = atom_with(SCORED);
     let cases: Vec<Case> = ["a", "b", "c", "d", "e"]
         .iter()
         .map(|id| case(id, "output.ticket.size() > 0"))
         .collect();
     let subject = table(&[("a", "A"), ("b", "B"), ("c", "C"), ("d", "D"), ("e", "E")]);
-    let settings = Settings {
-        dir: PathBuf::new(),
-        pass_rate: 1.0,
-    };
+    let settings = at(&root, "evals", 1.0);
     let scored = |rejects: Vec<&'static str>, baseline: Option<Report>| {
         let (atom, cases, subject, settings) = (&atom, cases.clone(), &subject, &settings);
         async move {
@@ -414,25 +443,32 @@ fn selection_and_seeded_sampling_choose_the_same_cases_every_time() {
     assert_ne!(sampled(7), sampled(8), "another seed, another sample");
 }
 
+/// A subject that fails each case with the message it is given.
+struct Failing(&'static str);
+
+impl Subject for Failing {
+    fn run<'a>(&'a self, _: &'a Case) -> BoxFuture<'a, Result<Value, String>> {
+        Box::pin(async move { Err(self.0.to_owned()) })
+    }
+}
+
 #[tokio::test]
 async fn the_report_reads_as_junit_xml() {
-    let (_, atom) = atom_with("{}");
-    let subject = table(&[("a", "A"), ("b", "<B>")]);
+    let (root, atom) = atom_with("{}");
+    let subject = table(&[("a", "A"), ("b", "B")]);
     let report = run(
         &atom,
         vec![
             case("a", "output.ticket == 'A'"),
-            case("b", "output.ticket == 'B'"),
+            case("b", "output.ticket == 'C'"),
         ],
-        &Settings {
-            dir: PathBuf::new(),
-            pass_rate: 1.0,
-        },
+        &at(&root, "evals", 1.0),
         &subject,
         Options::default(),
     )
     .await;
     let xml = junit(&report);
+    // Two cases and the run's pass rate; the second case and the rate fail.
     assert!(
         xml.contains("<testsuite name=\"test\" tests=\"3\" failures=\"2\">"),
         "{xml}"
@@ -442,8 +478,329 @@ async fn the_report_reads_as_junit_xml() {
         "{xml}"
     );
     assert!(
-        xml.contains("&lt;B&gt;") || xml.contains("gave false"),
+        xml.contains("<failure message=\"`output.ticket == 'C'` gave false, not true\"/>"),
         "{xml}"
     );
-    assert!(xml.contains("name=\"pass-rate\""), "{xml}");
+    assert!(
+        xml.contains("name=\"run\">\n      <failure message=\"pass rate 0.500"),
+        "{xml}"
+    );
+
+    // A failure's text is escaped, its line break kept as a reference and
+    // a control character XML cannot carry dropped.
+    let failing = Failing("bad <b> & \"q\"\nnext\u{1}\u{1b}[0m");
+    let report = run(
+        &atom,
+        vec![case("a", "true")],
+        &at(&root, "evals", 1.0),
+        &failing,
+        Options::default(),
+    )
+    .await;
+    let xml = junit(&report);
+    assert!(
+        xml.contains("<failure message=\"bad &lt;b&gt; &amp; &quot;q&quot;&#10;next[0m\"/>"),
+        "{xml}"
+    );
+    assert!(
+        !xml.chars().any(|c| (c as u32) < 0x20 && c != '\n'),
+        "{xml}"
+    );
+
+    // A run with no cases fails, and its JUnit says so.
+    let report = run(
+        &atom,
+        Vec::new(),
+        &at(&root, "evals", 0.0),
+        &subject,
+        Options::default(),
+    )
+    .await;
+    assert!(!report.passed);
+    let xml = junit(&report);
+    assert!(xml.contains("tests=\"1\" failures=\"1\""), "{xml}");
+    assert!(xml.contains("has no eval cases to run"), "{xml}");
+}
+
+#[test]
+fn a_case_file_is_strict_json_or_yaml_and_errors_point_at_the_field() {
+    let (root, atom) = atom_with("{}");
+    // A JSONL line that repeats a key is refused, not read for its last.
+    write(
+        &root.join("dup/cases.jsonl"),
+        "{\"input\": {\"text\": \"a\"}, \"expect\": [\"true\"], \"expect\": [\"false\"]}\n",
+    );
+    let error = load_cases(&atom, &at(&root, "dup", 1.0)).expect_err("a duplicate key");
+    assert!(
+        error.message.contains("duplicate key \"expect\""),
+        "{error}"
+    );
+    assert_eq!(error.line, Some(1));
+    // A JSONL line that is not JSON is refused, even if YAML would read it.
+    write(&root.join("loose/cases.jsonl"), "input: {text: a}\n");
+    assert!(load_cases(&atom, &at(&root, "loose", 1.0)).is_err());
+    // A YAML case's error is at the field at fault, not the document.
+    write(
+        &root.join("line/case.yaml"),
+        "# a case\ninput:\n  text: ''\nexpect:\n  - \"true\"\n  - \"output.nope\"\n",
+    );
+    let error = load_cases(&atom, &at(&root, "line", 1.0)).expect_err("an empty text");
+    assert_eq!(error.line, Some(3), "{error}");
+    write(
+        &root.join("line/case.yaml"),
+        "input:\n  text: hi\nexpect:\n  - \"true\"\n  - \"output.nope == 1\"\n",
+    );
+    let error = load_cases(&atom, &at(&root, "line", 1.0)).expect_err("no field nope");
+    assert_eq!(error.line, Some(5), "{error}");
+    // A YAML case file ends in .yaml: one ending in .yml is not skipped.
+    write(
+        &root.join("yml/case.yml"),
+        "input: {text: hi}\nexpect: [\"true\"]\n",
+    );
+    let error = load_cases(&atom, &at(&root, "yml", 1.0)).expect_err(".yml");
+    assert!(error.message.contains(".yaml"), "{error}");
+    // A case file has a size limit.
+    std::fs::create_dir_all(root.join("big")).expect("dir");
+    std::fs::File::create(root.join("big/cases.jsonl"))
+        .and_then(|f| f.set_len(MAX_FILE + 1))
+        .expect("a large file");
+    let error = load_cases(&atom, &at(&root, "big", 1.0)).expect_err("too large");
+    assert!(error.message.contains("split it"), "{error}");
+}
+
+#[test]
+fn the_eval_directory_stays_inside_the_project() {
+    let (root, atom) = atom_with("{evals: '../elsewhere'}");
+    let outside = root.parent().expect("parent").join("elsewhere");
+    write(
+        &outside.join("case.yaml"),
+        "input: {text: hi}\nexpect: [\"true\"]\n",
+    );
+    let error = super::settings(&atom, &project_at(&root)).expect_err("outside");
+    assert!(error.message.contains("outside the project"), "{error}");
+    let (root, atom) = atom_with(&format!("{{evals: '{}'}}", outside.display()));
+    let error = super::settings(&atom, &project_at(&root)).expect_err("absolute, outside");
+    assert!(error.message.contains("outside the project"), "{error}");
+    // A link out of the project, as the directory or inside it, leads
+    // nowhere.
+    let (root, atom) = atom_with("{evals: 'linked'}");
+    std::os::unix::fs::symlink(&outside, root.join("linked")).expect("link");
+    assert!(super::settings(&atom, &project_at(&root)).is_err());
+    let (root, atom) = atom_with("{evals: 'cases'}");
+    write(
+        &root.join("cases/own.yaml"),
+        "input: {text: hi}\nexpect: [\"true\"]\n",
+    );
+    std::os::unix::fs::symlink(&outside, root.join("cases/out")).expect("link");
+    std::os::unix::fs::symlink(outside.join("case.yaml"), root.join("cases/one.yaml"))
+        .expect("link");
+    // What git and the manifest ignore is not a case either.
+    write(&root.join("cases/.gitignore"), "scratch/\n");
+    write(&root.join("cases/scratch/a.yaml"), "not: a case\n");
+    write(&root.join("cases/drafts/b.yaml"), "not: a case\n");
+    std::fs::write(
+        root.join("atomic.yaml"),
+        "atomic: 1\nignore: ['cases/drafts/**']\n",
+    )
+    .expect("manifest");
+    let settings = super::settings(&atom, &project_at(&root)).expect("inside");
+    let ids: Vec<String> = load_cases(&atom, &settings)
+        .expect("cases")
+        .into_iter()
+        .map(|c| c.id)
+        .collect();
+    assert_eq!(ids, ["own.yaml"]);
+    // A directory the atom names must exist; the default one need not.
+    let (root, atom) = atom_with("{evals: 'missing'}");
+    let error = super::settings(&atom, &project_at(&root)).expect_err("missing");
+    assert!(error.message.contains("missing"), "{error}");
+    // The atom's types refuse an evals field it does not have.
+    let root = crate::atom::tests::project("x", "{evals: {dir: 'cases', other: 1}}", None);
+    let error = crate::atom::load(&root.join("test.atom.astro"), &mut Registry::new())
+        .expect_err("unknown");
+    assert!(error.message.contains("'other' does not exist"), "{error}");
+}
+
+#[test]
+fn a_case_fits_the_atoms_case_schema_and_an_outside_writer_has_none() {
+    let (root, atom) = atom_with(SCORED);
+    write(
+        &root.join("meta/case.yaml"),
+        "input: {text: hi}\nexpect: [\"true\"]\ncase: {ok: 'yes'}\n",
+    );
+    let error = load_cases(&atom, &at(&root, "meta", 1.0)).expect_err("ok is boolean");
+    assert!(error.message.contains("the case metadata"), "{error}");
+    let (root, atom) =
+        atom_with("{kind: 'exec', exec: {command: ['true']}, effects: {external: 'idempotent'}}");
+    write(
+        &root.join("cases/a.yaml"),
+        "input: {text: hi}\nexpect: [\"true\"]\n",
+    );
+    let error = load_cases(&atom, &at(&root, "cases", 1.0)).expect_err("idempotent");
+    assert!(error.message.contains("never runs such an atom"), "{error}");
+    // An atom with no cases may write outside.
+    assert!(
+        load_cases(&atom, &at(&root, "none", 1.0))
+            .expect("none")
+            .is_empty()
+    );
+    // A scorer's tolerance is a share.
+    for bad in ["2", "-0.1"] {
+        let config = SCORED.replace("max_drop:0.25", &format!("max_drop:{bad}"));
+        let (root, _) = atom_with("{}");
+        std::fs::write(
+            root.join("test.atom.astro"),
+            format!(
+                "---\nimport type {{ Props, Input, Output, Case, Judges }} from './.atomic/types/test';\n\
+                 import type {{ AtomConfig }} from './.atomic/types/authoring';\n\
+                 const {{ input }}: Props = Astro.props;\n\
+                 export const config: AtomConfig<Input, Output, Case, Judges> = {config};\n---\nx\n"
+            ),
+        )
+        .expect("source");
+        let error =
+            crate::atom::load(&root.join("test.atom.astro"), &mut Registry::new()).expect_err(bad);
+        assert!(error.message.contains("max_drop"), "{bad}: {error}");
+    }
+}
+
+#[tokio::test]
+async fn a_selector_that_names_no_case_fails_the_run() {
+    let (root, atom) = atom_with("{}");
+    let cases = vec![case("one.yaml", "true"), case("many.jsonl:1", "true")];
+    let options = || Options {
+        select: vec!["one.yaml".into(), "many.jsonl".into(), "typo.yaml".into()],
+        ..Options::default()
+    };
+    assert_eq!(unmatched(&cases, &options()), ["typo.yaml"]);
+    let subject = table(&[("one.yaml", "A"), ("many.jsonl:1", "B")]);
+    let report = run(&atom, cases, &at(&root, "evals", 1.0), &subject, options()).await;
+    assert_eq!(report.pass_rate, 1.0);
+    assert!(!report.passed, "{report:?}");
+    assert!(
+        report.failures[0].contains("`typo.yaml` selects no case"),
+        "{report:?}"
+    );
+}
+
+/// A judge that approves every text, and records each one it was given.
+struct Recording(Mutex<Vec<String>>);
+
+impl Judge for Recording {
+    fn judge<'a>(&'a self, _: &'a str, input: Value) -> BoxFuture<'a, Result<Value, String>> {
+        Box::pin(async move {
+            let text = input["text"].as_str().unwrap_or_default().to_owned();
+            self.0.lock().expect("calls").push(text);
+            Ok(json!({ "ok": true }))
+        })
+    }
+}
+
+#[tokio::test]
+async fn scorers_score_passing_cases_against_a_comparable_baseline() {
+    let (root, atom) = atom_with(SCORED);
+    let settings = at(&root, "evals", 0.0);
+    let cases: Vec<Case> = ["a", "b", "c"]
+        .iter()
+        .map(|id| case(id, "output.ticket == 'OK'"))
+        .collect();
+    // "b" fails its assertion: it is skipped, and its output never judged.
+    let subject = table(&[("a", "OK"), ("b", "NO"), ("c", "OK")]);
+    let judge = Recording(Mutex::new(Vec::new()));
+    let options = |baseline| Options {
+        judge: Some(&judge),
+        baseline,
+        ..Options::default()
+    };
+    let first = run(&atom, cases.clone(), &settings, &subject, options(None)).await;
+    assert_eq!(first.scorers[0].scored, ["a", "c"]);
+    assert_eq!(first.scorers[0].skipped, ["b"]);
+    assert_eq!(*judge.0.lock().expect("calls"), ["a", "c"]);
+    assert!(first.passed, "{first:?}");
+
+    // A baseline for another atom, or over other cases, is not compared:
+    // the run fails rather than pass a tolerance it never checked.
+    let mut other = first.clone();
+    other.atom = "other".into();
+    let report = run(
+        &atom,
+        cases.clone(),
+        &settings,
+        &subject,
+        options(Some(&other)),
+    )
+    .await;
+    assert!(!report.passed);
+    assert!(
+        report.failures[0].contains("a report for `other`"),
+        "{report:?}"
+    );
+    let mut fewer = first.clone();
+    fewer.cases.pop();
+    let report = run(
+        &atom,
+        cases.clone(),
+        &settings,
+        &subject,
+        options(Some(&fewer)),
+    )
+    .await;
+    assert!(!report.passed);
+    assert!(report.failures[0].contains("ran other cases"), "{report:?}");
+    // A baseline that never scored the scorer cannot check its max_drop.
+    let mut unscored = first.clone();
+    unscored.scorers[0].mean = None;
+    let report = run(
+        &atom,
+        cases.clone(),
+        &settings,
+        &subject,
+        options(Some(&unscored)),
+    )
+    .await;
+    assert!(!report.passed);
+    assert!(
+        report.failures[0].contains("baseline has no mean"),
+        "{report:?}"
+    );
+    // A comparable baseline passes.
+    let report = run(
+        &atom,
+        cases.clone(),
+        &settings,
+        &subject,
+        options(Some(&first)),
+    )
+    .await;
+    assert!(report.passed, "{report:?}");
+
+    // Without a judge the scorers do not run, and the report says so.
+    let report = run(&atom, cases, &settings, &subject, Options::default()).await;
+    assert!(report.scorers.is_empty());
+    assert_eq!(report.not_scored, ["quality"]);
+    assert!(junit(&report).contains("name=\"scorer:quality\">\n      <skipped/>"));
+}
+
+#[tokio::test]
+async fn a_mean_that_misses_its_minimum_by_rounding_reaches_it() {
+    // Three scores of 0.7 sum to slightly under 2.1 in binary.
+    let config = SCORED
+        .replace("judge.ok ? 1 : 0", "0.7")
+        .replace("min_mean:0.5", "min_mean:0.7");
+    let (root, atom) = atom_with(&config);
+    let cases: Vec<Case> = ["a", "b", "c"].iter().map(|id| case(id, "true")).collect();
+    let subject = table(&[("a", "A"), ("b", "B"), ("c", "C")]);
+    let judge = Reviewer(Vec::new());
+    let report = run(
+        &atom,
+        cases,
+        &at(&root, "evals", 1.0),
+        &subject,
+        Options {
+            judge: Some(&judge),
+            ..Options::default()
+        },
+    )
+    .await;
+    assert!(report.passed, "{report:?}");
 }

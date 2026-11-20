@@ -110,9 +110,10 @@ fn every_v0_1_example_passes_the_real_load_and_check() {
             // the golden output beside it: a YAML case `<name>.yaml` against
             // `fixtures/<atom>/<name>.output.json`, line N of a JSONL file
             // `<file>.jsonl` against line N of `<file>.outputs.jsonl`.
-            let settings = eval::settings(&atom, &project.dir).expect("eval settings");
+            let settings = eval::settings(&atom, &project).expect("eval settings");
             let cases =
                 eval::load_cases(&atom, &settings).unwrap_or_else(|e| panic!("{example}: {e}"));
+            let contracts = eval::Contracts::of(&atom).expect("contracts");
             for case in &cases {
                 let golden = match case.id.split_once(".jsonl:") {
                     Some((file, line)) => {
@@ -135,7 +136,7 @@ fn every_v0_1_example_passes_the_real_load_and_check() {
                             .join(format!("{}.output.json", case.id.trim_end_matches(".yaml"))),
                     ),
                 };
-                let failures = eval::check(case, &golden);
+                let failures = eval::check(case, &golden, &contracts);
                 assert!(
                     failures.is_empty(),
                     "{example}/{stem}/{}: {failures:?}",

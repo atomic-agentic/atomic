@@ -28,6 +28,7 @@
 //! defaults to one, every case.
 
 use crate::atom::Atom;
+use crate::project::Project;
 use atomic_schema::expr::{self, Scope};
 use atomic_schema::registry::Registry;
 use serde::{Deserialize, Serialize};
@@ -60,6 +61,11 @@ pub struct Settings {
     pub dir: PathBuf,
     /// The pass rate CI requires, between zero and one.
     pub pass_rate: f64,
+    /// The project the cases belong to: their directory is under its root,
+    /// and they are found as its collections are.
+    pub project: Project,
+    /// Whether the directory was named by the atom, so must exist.
+    pub declared: bool,
 }
 
 /// Why an atom's cases could not be loaded.
@@ -77,20 +83,20 @@ pub struct CaseError {
 /// The keys a case may have.
 const KEYS: &[&str] = &["input", "expect", "case", "prepared"];
 
-/// `atom`'s eval settings, in a project whose manifest is in `project_dir`.
-/// Its `evals` field is either the eval directory, relative to the atom
-/// file, or a mapping of `dir` and `pass_rate`.
-pub fn settings(atom: &Atom, project_dir: &Path) -> Result<Settings, CaseError> {
+/// `atom`'s eval settings in `project`. Its `evals` field is either the
+/// eval directory, relative to the atom file, or a mapping of `dir` and
+/// `pass_rate`. The directory must be inside the project.
+pub fn settings(atom: &Atom, project: &Project) -> Result<Settings, CaseError> {
     let fail = |message: String| CaseError {
         file: atom.file.clone(),
         line: None,
         message,
     };
     let beside = |dir: &str| atom.file.parent().unwrap_or(Path::new("")).join(dir);
-    let default = project_dir.join("evals").join(&atom.name);
-    let (dir, pass_rate) = match atom.frontmatter.get("evals") {
-        None => (default, 1.0),
-        Some(Value::String(dir)) => (beside(dir), 1.0),
+    let default = project.dir.join("evals").join(&atom.name);
+    let (dir, pass_rate, declared) = match atom.frontmatter.get("evals") {
+        None => (default, 1.0, false),
+        Some(Value::String(dir)) => (beside(dir), 1.0, true),
         Some(Value::Object(fields)) => {
             if let Some(other) = fields
                 .keys()
@@ -100,9 +106,9 @@ pub fn settings(atom: &Atom, project_dir: &Path) -> Result<Settings, CaseError> 
                     "evals: unknown field `{other}`: evals has dir and pass_rate"
                 )));
             }
-            let dir = match fields.get("dir") {
-                None => default,
-                Some(Value::String(dir)) => beside(dir),
+            let (dir, declared) = match fields.get("dir") {
+                None => (default, false),
+                Some(Value::String(dir)) => (beside(dir), true),
                 Some(_) => return Err(fail("evals.dir must be a path".into())),
             };
             let pass_rate = match fields.get("pass_rate") {
@@ -112,7 +118,7 @@ pub fn settings(atom: &Atom, project_dir: &Path) -> Result<Settings, CaseError> 
                     .filter(|r| (0.0..=1.0).contains(r))
                     .ok_or_else(|| fail("evals.pass_rate must be between zero and one".into()))?,
             };
-            (dir, pass_rate)
+            (dir, pass_rate, declared)
         }
         Some(_) => {
             return Err(fail(
@@ -120,22 +126,53 @@ pub fn settings(atom: &Atom, project_dir: &Path) -> Result<Settings, CaseError> 
             ));
         }
     };
-    Ok(Settings { dir, pass_rate })
+    // Inside the project, however it is written: no absolute path, `..` or
+    // link leads out of it.
+    let root = std::fs::canonicalize(&project.dir)
+        .map_err(|e| fail(format!("the project directory: {e}")))?;
+    let dir = match std::fs::canonicalize(&dir) {
+        Ok(real) => real,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !declared => dir,
+        Err(e) => {
+            return Err(fail(format!(
+                "the eval directory {} the atom names: {e}",
+                dir.display()
+            )));
+        }
+    };
+    if !dir.starts_with(&root) && dir.exists() {
+        return Err(fail(format!(
+            "the eval directory {} is outside the project at {}",
+            dir.display(),
+            root.display()
+        )));
+    }
+    Ok(Settings {
+        dir,
+        pass_rate,
+        project: project.clone(),
+        declared,
+    })
 }
 
+/// The most cases one atom may have, and the largest case file read.
+const MAX_CASES: usize = 10_000;
+const MAX_FILE: u64 = 16 * 1024 * 1024;
+
 /// Load `atom`'s cases from `settings.dir`, in order of their identities.
-/// A missing directory holds no cases. Every case is checked now: its keys,
-/// its input against the atom's input contract, its `case` against the
-/// atom's case schema, and each assertion parsed and checked against the
-/// input and output contracts.
+/// The directory is walked as the project's collections are, following no
+/// link; a default directory that is missing holds no cases. Every case is
+/// checked now: its keys, its input against the atom's input contract, its
+/// `case` against the atom's case schema, and each assertion parsed and
+/// checked against the input and output contracts.
 pub fn load_cases(atom: &Atom, settings: &Settings) -> Result<Vec<Case>, CaseError> {
-    let mut files = Vec::new();
-    collect(&settings.dir, &mut files).map_err(|e| CaseError {
+    let at_dir = |message: String| CaseError {
         file: settings.dir.clone(),
         line: None,
-        message: format!("read the eval directory: {e}"),
-    })?;
-    files.sort();
+        message,
+    };
+    let files = crate::collections::walk(&settings.project, &settings.dir)
+        .map_err(|e| at_dir(format!("read the eval directory: {e}")))?;
     let contracts = Contracts::of(atom).map_err(|message| CaseError {
         file: atom.file.clone(),
         line: None,
@@ -148,85 +185,82 @@ pub fn load_cases(atom: &Atom, settings: &Settings) -> Result<Vec<Case>, CaseErr
             .unwrap_or(&file)
             .to_string_lossy()
             .replace('\\', "/");
-        let text = std::fs::read_to_string(&file).map_err(|e| CaseError {
+        let at = |line: Option<usize>, message: String| CaseError {
             file: file.clone(),
-            line: None,
-            message: format!("read the case: {e}"),
-        })?;
-        if relative.ends_with(".jsonl") {
+            line,
+            message,
+        };
+        if relative.ends_with(".yml") {
+            return Err(at(None, "a YAML case file ends in .yaml".into()));
+        }
+        let jsonl = relative.ends_with(".jsonl");
+        if !jsonl && !relative.ends_with(".yaml") {
+            continue;
+        }
+        if std::fs::metadata(&file).is_ok_and(|m| m.len() > MAX_FILE) {
+            return Err(at(
+                None,
+                format!("a case file is at most {MAX_FILE} bytes; split it"),
+            ));
+        }
+        let text =
+            std::fs::read_to_string(&file).map_err(|e| at(None, format!("read the case: {e}")))?;
+        if jsonl {
             for (n, line) in text.lines().enumerate() {
                 if line.trim().is_empty() {
                     continue;
                 }
-                let at = |message: String| CaseError {
-                    file: file.clone(),
-                    line: Some(n + 1),
-                    message,
-                };
-                let value: Value = serde_json::from_str(line)
-                    .map_err(|e| at(format!("a case is one JSON object per line: {e}")))?;
+                let line_no = Some(n + 1);
+                let value = strict_json(line)
+                    .map_err(|e| at(line_no, format!("a case is one JSON object per line: {e}")))?;
                 cases.push(
-                    case_from(&value, format!("{relative}:{}", n + 1), &contracts).map_err(at)?,
+                    case_from(&value, format!("{relative}:{}", n + 1), &contracts)
+                        .map_err(|(_, message)| at(line_no, message))?,
                 );
             }
         } else {
-            let doc = atomic_schema::yaml::load(&file, &text).map_err(|e| CaseError {
-                file: file.clone(),
-                line: Some(e.at.line),
-                message: e.message,
-            })?;
-            let at = |message: String| CaseError {
-                file: file.clone(),
-                line: doc.position("").map(|p| p.line),
-                message,
-            };
-            cases.push(case_from(&doc.value, relative.clone(), &contracts).map_err(at)?);
+            let doc = atomic_schema::yaml::load(&file, &text)
+                .map_err(|e| at(Some(e.at.line), e.message))?;
+            cases.push(case_from(&doc.value, relative.clone(), &contracts).map_err(
+                |(pointer, message)| {
+                    let line = doc
+                        .position(&pointer)
+                        .or_else(|| doc.position(""))
+                        .map(|p| p.line);
+                    at(line, message)
+                },
+            )?);
+        }
+        if cases.len() > MAX_CASES {
+            return Err(at_dir(format!(
+                "an atom has at most {MAX_CASES} eval cases"
+            )));
         }
     }
     if !cases.is_empty() && atom.external() == Some(crate::atom::External::Idempotent) {
-        return Err(CaseError {
-            file: settings.dir.clone(),
-            line: None,
-            message: format!(
-                "`{}` writes to an outside system, and atomic never runs such an atom in an eval: \
-                 cover it with code tests instead of eval cases",
-                atom.name
-            ),
-        });
+        return Err(at_dir(format!(
+            "`{}` writes to an outside system, and atomic never runs such an atom in an eval: \
+             cover it with code tests instead of eval cases",
+            atom.name
+        )));
     }
     Ok(cases)
 }
 
-/// Every `.yaml` and `.jsonl` file under `dir`.
-fn collect(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e),
-    };
-    for entry in entries {
-        let path = entry?.path();
-        if path.is_dir() {
-            collect(&path, out)?;
-        } else if path
-            .extension()
-            .is_some_and(|e| e == "yaml" || e == "jsonl")
-        {
-            out.push(path);
-        }
-    }
-    Ok(())
-}
-
-/// The schemas a case is checked against.
-struct Contracts {
-    input: Value,
-    output: Value,
-    case: Value,
+/// The schemas a case is checked against, and its assertions typed by.
+#[derive(Clone, Debug)]
+pub struct Contracts {
+    /// The atom's input contract.
+    pub input: Value,
+    /// The atom's output contract.
+    pub output: Value,
+    /// The atom's case schema.
+    pub case: Value,
 }
 
 impl Contracts {
-    fn of(atom: &Atom) -> Result<Self, String> {
+    /// `atom`'s contracts.
+    pub fn of(atom: &Atom) -> Result<Self, String> {
         let contract = |key: &str| {
             atom.program
                 .contracts
@@ -259,32 +293,49 @@ fn fits(schema: &Value, value: &Value, what: &str) -> Result<(), String> {
     }
 }
 
-fn case_from(value: &Value, id: String, contracts: &Contracts) -> Result<Case, String> {
+/// Why a case was refused: the JSON Pointer of the field at fault, and what
+/// is wrong.
+type Refusal = (String, String);
+
+fn case_from(value: &Value, id: String, contracts: &Contracts) -> Result<Case, Refusal> {
+    let root = |m: &str| (String::new(), m.to_owned());
     let Value::Object(fields) = value else {
-        return Err("a case is a mapping of input and expect".into());
+        return Err(root("a case is a mapping of input and expect"));
     };
     if let Some(other) = fields.keys().find(|k| !KEYS.contains(&k.as_str())) {
-        return Err(format!(
-            "unknown case field `{other}`: a case has input and expect (and, for scorers, case)"
+        return Err((
+            format!("/{}", other.replace('~', "~0").replace('/', "~1")),
+            format!(
+                "unknown case field `{other}`: a case has input and expect (and, for scorers, case)"
+            ),
         ));
     }
     let input = fields
         .get("input")
         .cloned()
-        .ok_or("a case needs `input`, the atom's input")?;
+        .ok_or_else(|| root("a case needs `input`, the atom's input"))?;
+    let at_expect = |m: &str| ("/expect".to_owned(), m.to_owned());
     let expect = match fields.get("expect") {
-        None => return Err("a case needs `expect`, a nonempty list of CEL assertions".into()),
+        None => {
+            return Err(root(
+                "a case needs `expect`, a nonempty list of CEL assertions",
+            ));
+        }
         Some(Value::Array(items)) if !items.is_empty() => items
             .iter()
             .map(|e| e.as_str().map(str::to_owned))
             .collect::<Option<Vec<_>>>()
-            .ok_or("each `expect` entry is a CEL expression, as a string")?,
-        Some(_) => return Err("`expect` must be a nonempty list of CEL assertions".into()),
+            .ok_or_else(|| at_expect("each `expect` entry is a CEL expression, as a string"))?,
+        Some(_) => {
+            return Err(at_expect(
+                "`expect` must be a nonempty list of CEL assertions",
+            ));
+        }
     };
-    fits(&contracts.input, &input, "the input")?;
+    fits(&contracts.input, &input, "the input").map_err(|m| ("/input".to_owned(), m))?;
     let case = fields.get("case").cloned().unwrap_or(Value::Null);
     if fields.contains_key("case") {
-        fits(&contracts.case, &case, "the case metadata")?;
+        fits(&contracts.case, &case, "the case metadata").map_err(|m| ("/case".to_owned(), m))?;
     }
     let scope = Scope::new()
         .with("input", &contracts.input)
@@ -292,7 +343,12 @@ fn case_from(value: &Value, id: String, contracts: &Contracts) -> Result<Case, S
     for (n, source) in expect.iter().enumerate() {
         expr::parse(source)
             .and_then(|e| e.check(&scope))
-            .map_err(|e| format!("expect[{n}] `{source}`: {e}"))?;
+            .map_err(|e| {
+                (
+                    format!("/expect/{n}"),
+                    format!("expect[{n}] `{source}`: {e}"),
+                )
+            })?;
     }
     Ok(Case {
         id,
@@ -301,6 +357,69 @@ fn case_from(value: &Value, id: String, contracts: &Contracts) -> Result<Case, S
         case,
         prepared: fields.get("prepared").cloned(),
     })
+}
+
+/// Parse one JSONL line as JSON, refusing an object that repeats a key: a
+/// plain parse would keep the last one and hide the first.
+fn strict_json(line: &str) -> Result<Value, String> {
+    use serde::de::{Deserializer, MapAccess, SeqAccess, Visitor};
+    struct Strict;
+    impl<'de> serde::de::DeserializeSeed<'de> for Strict {
+        type Value = Value;
+        fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<Value, D::Error> {
+            d.deserialize_any(Strict)
+        }
+    }
+    impl<'de> Visitor<'de> for Strict {
+        type Value = Value;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a JSON value")
+        }
+        fn visit_bool<E>(self, v: bool) -> Result<Value, E> {
+            Ok(Value::Bool(v))
+        }
+        fn visit_i64<E>(self, v: i64) -> Result<Value, E> {
+            Ok(v.into())
+        }
+        fn visit_u64<E>(self, v: u64) -> Result<Value, E> {
+            Ok(v.into())
+        }
+        fn visit_f64<E>(self, v: f64) -> Result<Value, E> {
+            Ok(serde_json::Number::from_f64(v).map_or(Value::Null, Value::Number))
+        }
+        fn visit_str<E>(self, v: &str) -> Result<Value, E> {
+            Ok(Value::String(v.to_owned()))
+        }
+        fn visit_string<E>(self, v: String) -> Result<Value, E> {
+            Ok(Value::String(v))
+        }
+        fn visit_unit<E>(self) -> Result<Value, E> {
+            Ok(Value::Null)
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
+            let mut items = Vec::new();
+            while let Some(item) = seq.next_element_seed(Strict)? {
+                items.push(item);
+            }
+            Ok(Value::Array(items))
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
+            let mut fields = serde_json::Map::new();
+            while let Some(key) = map.next_key::<String>()? {
+                if fields.contains_key(&key) {
+                    return Err(serde::de::Error::custom(format!("duplicate key {key:?}")));
+                }
+                let value = map.next_value_seed(Strict)?;
+                fields.insert(key, value);
+            }
+            Ok(Value::Object(fields))
+        }
+    }
+    let mut d = serde_json::Deserializer::from_str(line);
+    let value =
+        serde::de::DeserializeSeed::deserialize(Strict, &mut d).map_err(|e| e.to_string())?;
+    d.end().map_err(|e| e.to_string())?;
+    Ok(value)
 }
 
 // ---------------------------------------------------------------------------
@@ -354,6 +473,12 @@ pub struct ScorerResult {
     pub passed: bool,
     /// Why not.
     pub reason: Option<String>,
+    /// The cases it scored: those that passed.
+    #[serde(default)]
+    pub scored: Vec<String>,
+    /// The cases it did not score, because they failed.
+    #[serde(default)]
+    pub skipped: Vec<String>,
 }
 
 /// An eval run's result.
@@ -371,6 +496,10 @@ pub struct Report {
     pub threshold: f64,
     /// Each scorer, when a judge was given.
     pub scorers: Vec<ScorerResult>,
+    /// The scorers the atom declares that did not run, because no judge was
+    /// given: the report says nothing of them.
+    #[serde(default)]
+    pub not_scored: Vec<String>,
     /// Whether the run passes: the pass rate reaches the threshold and every
     /// scorer passes.
     pub passed: bool,
@@ -447,9 +576,33 @@ pub fn select(cases: Vec<Case>, options: &Options<'_>) -> Vec<Case> {
     chosen
 }
 
-/// Check `case`'s assertions against `output`: the failures, empty when
-/// every one holds.
-pub fn check(case: &Case, output: &Value) -> Vec<String> {
+/// The selectors in `options` that name none of `cases`.
+pub fn unmatched(cases: &[Case], options: &Options<'_>) -> Vec<String> {
+    options
+        .select
+        .iter()
+        .filter(|s| {
+            !cases.iter().any(|c| {
+                c.id == **s
+                    || c.id
+                        .strip_prefix(s.as_str())
+                        .is_some_and(|r| r.starts_with(':'))
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+/// How far apart two means may be and still count as equal, for sums of
+/// scores that do not add exactly in binary.
+const TOLERANCE: f64 = 1e-9;
+
+/// Check `case`'s assertions against `output`, each value typed by the
+/// atom's `contracts`: the failures, empty when every one holds.
+pub fn check(case: &Case, output: &Value, contracts: &Contracts) -> Vec<String> {
+    // TODO: type the bindings by contracts.input and contracts.output once
+    // expression evaluation takes a shape for each value.
+    let _ = contracts;
     case.expect
         .iter()
         .filter_map(|source| {
@@ -471,7 +624,12 @@ pub async fn run(
     subject: &dyn Subject,
     options: Options<'_>,
 ) -> Report {
+    let mut failures: Vec<String> = unmatched(&cases, &options)
+        .into_iter()
+        .map(|s| format!("`{s}` selects no case of `{}`", atom.name))
+        .collect();
     let cases = select(cases, &options);
+    let contracts = Contracts::of(atom);
     let mut results = Vec::with_capacity(cases.len());
     for case in &cases {
         let result = match subject.run(case).await {
@@ -482,7 +640,10 @@ pub async fn run(
                 output: None,
             },
             Ok(output) => {
-                let failures = check(case, &output);
+                let failures = match &contracts {
+                    Ok(contracts) => check(case, &output, contracts),
+                    Err(e) => vec![e.clone()],
+                };
                 CaseResult {
                     id: case.id.clone(),
                     passed: failures.is_empty(),
@@ -499,7 +660,6 @@ pub async fn run(
     } else {
         passed_cases as f64 / results.len() as f64
     };
-    let mut failures = Vec::new();
     if results.is_empty() {
         failures.push(format!("`{}` has no eval cases to run", atom.name));
     } else if pass_rate < settings.pass_rate {
@@ -510,9 +670,39 @@ pub async fn run(
             settings.pass_rate
         ));
     }
-    let scorers = match options.judge {
-        Some(judge) => score(atom, &cases, &results, judge, options.baseline).await,
-        None => Vec::new(),
+    // A baseline is only compared when it is this atom's, over these cases.
+    let baseline = options.baseline.filter(|b| {
+        let ours: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
+        let theirs: Vec<&str> = b.cases.iter().map(|r| r.id.as_str()).collect();
+        if b.atom != atom.name {
+            failures.push(format!(
+                "the baseline is a report for `{}`, not `{}`",
+                b.atom, atom.name
+            ));
+            false
+        } else if ours != theirs {
+            failures.push(format!(
+                "the baseline ran other cases ({} to this run's {}): run both on the same cases",
+                theirs.len(),
+                ours.len()
+            ));
+            false
+        } else {
+            true
+        }
+    });
+    let declared: Vec<String> = atom
+        .frontmatter
+        .get("scorers")
+        .and_then(Value::as_object)
+        .map(|s| s.keys().cloned().collect())
+        .unwrap_or_default();
+    let (scorers, not_scored) = match options.judge {
+        Some(judge) => (
+            score(atom, &cases, &results, judge, baseline).await,
+            Vec::new(),
+        ),
+        None => (Vec::new(), declared),
     };
     for s in scorers.iter().filter(|s| !s.passed) {
         failures.push(format!(
@@ -528,6 +718,7 @@ pub async fn run(
         pass_rate,
         threshold: settings.pass_rate,
         scorers,
+        not_scored,
         passed: failures.is_empty(),
         failures,
     }
@@ -568,10 +759,13 @@ async fn score(
         });
         let mut scores = Vec::new();
         let mut error = None;
+        let (mut scored, mut skipped) = (Vec::new(), Vec::new());
         for (case, result) in cases.iter().zip(results) {
             let Some(output) = result.output.as_ref().filter(|_| result.passed) else {
+                skipped.push(case.id.clone());
                 continue;
             };
+            scored.push(case.id.clone());
             let run_id = format!("eval:{}:{}", atom.name, case.id);
             let values = crate::evaluation::Evaluation {
                 run_id: &run_id,
@@ -603,6 +797,8 @@ async fn score(
             max_drop,
             passed: false,
             reason: None,
+            scored,
+            skipped,
         };
         if let Some(e) = error {
             result.reason = Some(e);
@@ -614,16 +810,27 @@ async fn score(
                 Ok(aggregate) => {
                     let mean = aggregate.get("mean").and_then(Value::as_f64).unwrap_or(0.0);
                     result.mean = Some(mean);
-                    let reached = aggregate.get("passed") == Some(&Value::Bool(true));
+                    // A mean that misses its minimum by rounding alone
+                    // reaches it: three scores of 0.7 average 0.7.
+                    let reached = aggregate.get("passed") == Some(&Value::Bool(true))
+                        || (mean - min_mean).abs() <= TOLERANCE;
                     let dropped = match (previous, max_drop) {
-                        (Some(before), Some(drop)) if before - mean > drop + f64::EPSILON => {
+                        (Some(before), Some(drop)) if before - mean > drop + TOLERANCE => {
                             Some(before - mean)
                         }
                         _ => None,
                     };
-                    result.passed = reached && dropped.is_none();
+                    // A tolerance with a baseline that never scored this
+                    // scorer cannot be checked, so it does not pass quietly.
+                    let unchecked = baseline.is_some() && max_drop.is_some() && previous.is_none();
+                    result.passed = reached && dropped.is_none() && !unchecked;
                     result.reason = if !reached {
                         Some(format!("mean {mean:.3} is below its minimum {min_mean:.3}"))
+                    } else if unchecked {
+                        Some(
+                            "the baseline has no mean for it, so its max_drop cannot be checked"
+                                .into(),
+                        )
                     } else {
                         dropped.map(|d| {
                             format!(
@@ -643,58 +850,89 @@ async fn score(
 }
 
 /// `report` as JUnit XML: one test suite for the atom, a test case per eval
-/// case and per scorer.
+/// case, per scorer and per failure of the run as a whole, and a skipped
+/// test case per scorer that was not run.
 pub fn junit(report: &Report) -> String {
-    fn escape(text: &str) -> String {
-        text.replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;")
-            .replace('"', "&quot;")
-    }
-    let failed_cases = report.cases.iter().filter(|c| !c.passed).count();
-    let failed_scorers = report.scorers.iter().filter(|s| !s.passed).count();
-    let threshold_failed = usize::from(report.pass_rate < report.threshold);
-    let tests = report.cases.len() + report.scorers.len() + 1;
-    let mut xml = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<testsuites>\n  <testsuite name=\"{}\" \
-         tests=\"{tests}\" failures=\"{}\">\n",
-        escape(&report.atom),
-        failed_cases + failed_scorers + threshold_failed
-    );
-    let mut case = |name: String, failure: Option<String>| {
-        xml.push_str(&format!(
+    let mut body = String::new();
+    let (mut tests, mut failed) = (0, 0);
+    let mut case = |name: &str, failure: Option<&str>, skipped: bool| {
+        tests += 1;
+        body.push_str(&format!(
             "    <testcase classname=\"{}\" name=\"{}\"",
             escape(&report.atom),
-            escape(&name)
+            escape(name)
         ));
-        match failure {
-            None => xml.push_str("/>\n"),
-            Some(message) => xml.push_str(&format!(
-                ">\n      <failure message=\"{}\"/>\n    </testcase>\n",
-                escape(&message)
-            )),
+        match (failure, skipped) {
+            (Some(message), _) => {
+                failed += 1;
+                body.push_str(&format!(
+                    ">\n      <failure message=\"{}\"/>\n    </testcase>\n",
+                    escape(message)
+                ));
+            }
+            (None, true) => body.push_str(">\n      <skipped/>\n    </testcase>\n"),
+            (None, false) => body.push_str("/>\n"),
         }
     };
     for c in &report.cases {
-        case(c.id.clone(), (!c.passed).then(|| c.failures.join("; ")));
+        let failures = c.failures.join("; ");
+        case(&c.id, (!c.passed).then_some(failures.as_str()), false);
     }
     for s in &report.scorers {
+        let reason = s.reason.clone().unwrap_or_else(|| "failed".into());
         case(
-            format!("scorer:{}", s.name),
-            (!s.passed).then(|| s.reason.clone().unwrap_or_default()),
+            &format!("scorer:{}", s.name),
+            (!s.passed).then_some(reason.as_str()),
+            false,
         );
     }
-    case(
-        "pass-rate".into(),
-        (report.pass_rate < report.threshold).then(|| {
-            format!(
-                "pass rate {:.3} is below the threshold {:.3}",
-                report.pass_rate, report.threshold
-            )
-        }),
-    );
-    xml.push_str("  </testsuite>\n</testsuites>\n");
-    xml
+    for name in &report.not_scored {
+        case(&format!("scorer:{name}"), None, true);
+    }
+    // The failures of the run as a whole: no cases, the pass rate, the
+    // baseline, a selector. Scorers' are their own test cases above.
+    let run: Vec<&String> = report
+        .failures
+        .iter()
+        .filter(|f| !f.starts_with("scorer `"))
+        .collect();
+    if run.is_empty() {
+        case("run", None, false);
+    }
+    for (n, failure) in run.iter().enumerate() {
+        let name = if n == 0 {
+            "run".to_owned()
+        } else {
+            format!("run:{}", n + 1)
+        };
+        case(&name, Some(failure), false);
+    }
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<testsuites>\n  <testsuite name=\"{}\" \
+         tests=\"{tests}\" failures=\"{failed}\">\n{body}  </testsuite>\n</testsuites>\n",
+        escape(&report.atom),
+    )
+}
+
+/// `text` as XML attribute text: markup escaped, line breaks kept as
+/// character references, and the characters XML 1.0 cannot carry at all,
+/// such as other control characters a model put in its output, dropped.
+fn escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\n' => out.push_str("&#10;"),
+            '\r' => out.push_str("&#13;"),
+            '\t' => out.push_str("&#9;"),
+            c if (c as u32) < 0x20 || c == '\u{FFFE}' || c == '\u{FFFF}' => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// The atom itself as a [`Subject`]: each case's input run on `runtimes`,
@@ -725,7 +963,9 @@ impl Subject for AtomSubject<'_> {
                 &mut registry,
                 &case.input,
                 &run_id,
-                "team",
+                // A case file is not team-reviewed input: it may hold text
+                // copied from anywhere, so it renders as external.
+                "external",
                 self.runtimes,
             )
             .await
