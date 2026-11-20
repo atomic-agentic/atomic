@@ -39,7 +39,12 @@ impl Terminal {
             .env("ATOMIC_HOME", &self.home)
             .env("ATOMIC_CREDENTIAL_STORE", "file")
             .env("USER", "dev")
-            .env_remove("LOGNAME");
+            .env_remove("LOGNAME")
+            // No model endpoint from this machine: no Ollama, no key.
+            .env("ATOMIC_DETECT_OLLAMA_ADDR", "127.0.0.1:9")
+            .env_remove("OPENAI_API_KEY")
+            // None of the person's own configuration.
+            .env("XDG_CONFIG_HOME", self.home.join("config"));
         c
     }
 
@@ -59,7 +64,10 @@ impl Terminal {
         .env("ATOMIC_HOME", &self.home)
         .env("ATOMIC_CREDENTIAL_STORE", "file")
         .env("USER", "dev")
-        .env_remove("LOGNAME");
+        .env_remove("LOGNAME")
+        .env("ATOMIC_DETECT_OLLAMA_ADDR", "127.0.0.1:9")
+        .env_remove("OPENAI_API_KEY")
+        .env("XDG_CONFIG_HOME", self.home.join("config"));
         c.output().unwrap()
     }
 }

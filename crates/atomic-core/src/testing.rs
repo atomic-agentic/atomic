@@ -8,7 +8,8 @@
 //! call asks instead, for tests whose calls come in no fixed order, such as a
 //! crash suite whose killed steps run again. It speaks the streaming Responses API, which
 //! drives a real Codex thread deterministically, and the non-streaming
-//! Responses and Chat Completions calls a lite atom makes. It counts and
+//! Responses and Chat Completions calls a lite atom makes, and lists one
+//! model, `synthetic`, at Ollama's `GET /api/tags`. It counts and
 //! records every call, so durability and repair tests can assert exactly how
 //! many model calls were made.
 
@@ -178,9 +179,14 @@ async fn serve(socket: &mut tokio::net::TcpStream, state: &Mutex<State>) -> std:
         let path = path.split('?').next().unwrap_or_default();
 
         let chat = path.ends_with("/chat/completions");
-        let (status, content_type, text) = if method == "POST"
-            && (chat || path.ends_with("/responses"))
-        {
+        let (status, content_type, text) = if method == "GET" && path == "/api/tags" {
+            // What a local Ollama lists, so a test can stand it in for one.
+            (
+                "200 OK".to_owned(),
+                "application/json",
+                json!({"models": [{"name": "synthetic", "model": "synthetic"}]}).to_string(),
+            )
+        } else if method == "POST" && (chat || path.ends_with("/responses")) {
             let request: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
             let reply = match state.lock() {
                 Ok(mut s) => {
