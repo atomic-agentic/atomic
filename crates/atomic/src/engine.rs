@@ -65,7 +65,7 @@ pub struct EngineArgs {
 }
 
 impl EngineArgs {
-    fn endpoint(&self, required: bool) -> anyhow::Result<ModelEndpoint> {
+    pub fn endpoint(&self, required: bool) -> anyhow::Result<ModelEndpoint> {
         match (&self.model_base_url, &self.model) {
             (Some(base_url), Some(model)) => Ok(ModelEndpoint {
                 base_url: base_url.clone(),

@@ -857,6 +857,21 @@ async fn score(
 /// case, per scorer and per failure of the run as a whole, and a skipped
 /// test case per scorer that was not run.
 pub fn junit(report: &Report) -> String {
+    junit_all(std::slice::from_ref(report))
+}
+
+/// `reports` as one JUnit XML document, a test suite per atom.
+pub fn junit_all(reports: &[Report]) -> String {
+    let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<testsuites>\n");
+    for report in reports {
+        xml.push_str(&suite(report));
+    }
+    xml.push_str("</testsuites>\n");
+    xml
+}
+
+/// One atom's test suite.
+fn suite(report: &Report) -> String {
     let mut body = String::new();
     let (mut tests, mut failed) = (0, 0);
     let mut case = |name: &str, failure: Option<&str>, skipped: bool| {
@@ -912,8 +927,7 @@ pub fn junit(report: &Report) -> String {
         case(&name, Some(failure), false);
     }
     format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<testsuites>\n  <testsuite name=\"{}\" \
-         tests=\"{tests}\" failures=\"{failed}\">\n{body}  </testsuite>\n</testsuites>\n",
+        "  <testsuite name=\"{}\" tests=\"{tests}\" failures=\"{failed}\">\n{body}  </testsuite>\n",
         escape(&report.atom),
     )
 }

@@ -138,10 +138,37 @@ performance. Use case assertions for the behavior you need to evaluate.
 - A golden fixture is an expected result written or reviewed by a person.
 - A recording stores an actual call/result under its effective execution identity.
 
-Applicable recordings can support regression checks without live model calls.
-Changing prompts, model settings, generation schemas or prepared context can
-invalidate their applicability. The later `--live` and `--compare` development
-commands are v0.5 features. A hand-authored fixture is never a live-model pass.
+`atomic eval` answers model calls from **cassettes**, recordings kept beside the
+cases in `evals/<atom>/cassettes/`, so evals run offline and give the same answers
+every time. A recording is keyed by the request as sent: the endpoint and path,
+and the body, which holds the compiled messages and input, the generation schema,
+the model and its settings and any tool definitions. A recording answers only that
+request: changed instructions, a changed schema, another model or other settings
+miss, and the case fails saying how to record it. A change that sends nothing new,
+such as a `validate` rule, still replays, and the new rule is checked against the
+recorded answers. Results from cassettes are reported as a historical check of
+recorded answers, never as a live pass.
+
+```sh
+atomic eval summarize-note --live   # call the model and record each answer
+atomic eval summarize-note          # replay the recordings, with no model call
+atomic eval --no-cassettes          # call the model and record nothing
+```
+
+Replaying needs the model endpoint and model configured as they were when the
+answers were recorded (`ATOMIC_MODEL_BASE_URL`, `ATOMIC_MODEL`), since both are part
+of what a recording answers; no call reaches them. A recording holds the request
+body and the response, never a header, so not the endpoint's key. The body holds
+what the atom was asked, case inputs included: review a cassette like any other
+test data before you commit it. A hand-authored fixture is never a live-model pass.
+`--compare` is a v0.5 feature.
+
+`atomic eval` exits non-zero when any atom's report fails, so CI fails with it.
+`--case <id>` runs chosen cases, `--sample N --seed S` a seeded sample of them,
+`--junit <file>` writes JUnit XML, `--report <file>` writes the reports as JSON,
+and `--baseline <file>` compares each scorer's mean with an earlier report's.
+Scorers need a judge, and `atomic eval` has none to call yet: it does not run them,
+and says so in its output and as skipped test cases in its JUnit.
 
 ## Coding fixture repositories
 

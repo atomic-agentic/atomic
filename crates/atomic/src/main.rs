@@ -10,6 +10,7 @@ use clap::{Args, Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
 mod engine;
+mod evals;
 mod failure;
 mod gates;
 mod runs;
@@ -47,6 +48,9 @@ enum Command {
     Render(RenderArgs),
     /// Run an atom or a workflow in the foreground and print its output.
     Run(runs::RunArgs),
+    /// Run atoms' eval cases and fail when an atom's pass rate is below its
+    /// threshold; model calls are answered from cassettes unless --live.
+    Eval(evals::EvalArgs),
     /// Continue runs.
     #[command(subcommand)]
     Runs(Runs),
@@ -240,6 +244,7 @@ fn state_root(cli: Option<&Cli>) -> anyhow::Result<PathBuf> {
     let flag = cli.and_then(|c| c.project.as_deref());
     let target = match cli.and_then(|c| c.command.as_ref()) {
         Some(Command::Run(args)) => Some(args.target.as_str()),
+        Some(Command::Eval(args)) => args.atoms.first().map(String::as_str),
         _ => None,
     };
     match target::project_for(flag, target, &cwd) {
@@ -292,6 +297,7 @@ async fn run(cli: Cli, paths: CodexPaths, state: ProjectState) -> anyhow::Result
             tokio::task::spawn_blocking(move || check(path, json)).await?
         }
         Some(Command::Run(args)) => runs::run(args, project, &paths, json).await,
+        Some(Command::Eval(args)) => evals::run(args, project, &paths, json).await,
         Some(Command::Runs(Runs::Resume(args))) => runs::resume(args, project, &paths, json).await,
         Some(Command::Serve(args)) => runs::serve(args, project, &paths).await,
         Some(Command::Runner) => Ok(()),
