@@ -489,19 +489,29 @@ impl ProviderError {
 }
 
 /// The type of error an OpenAI-style body names, `error.type` or else
-/// `error.code`, when it is a short identifier such as
-/// `invalid_request_error`: anything else is the provider's own text.
+/// `error.code`, when it reads as one: see [`is_error_kind`]. Anything
+/// else is the provider's own text.
 fn error_kind(body: &Value) -> Option<String> {
     let error = body.get("error")?;
     ["type", "code"].iter().find_map(|field| {
         let kind = error.get(*field)?.as_str()?;
-        (!kind.is_empty()
-            && kind.len() <= 64
-            && kind
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')))
-        .then(|| kind.to_owned())
+        is_error_kind(kind).then(|| kind.to_owned())
     })
+}
+
+/// Whether `kind` reads as an error's type, such as `invalid_request_error`,
+/// `rate_limit_exceeded` or `overloaded`, and not as a key: a lower-case
+/// letter first, at most 40 lower-case letters, digits and `_`, with an
+/// underscore if it has digits. A key's mixed case, prefix dash or random
+/// digits fail it.
+fn is_error_kind(kind: &str) -> bool {
+    let b = kind.as_bytes();
+    let lower = |c: &u8| c.is_ascii_lowercase();
+    b.first().is_some_and(lower)
+        && b.len() <= 40
+        && b.iter()
+            .all(|c| lower(c) || c.is_ascii_digit() || *c == b'_')
+        && (b.contains(&b'_') || b.iter().all(lower))
 }
 
 /// An answer the provider cut off at its output limit: not an answer that

@@ -309,28 +309,31 @@ pub(crate) fn record_usage(span: &tracing::Span, usage: &Usage) {
     span.record("gen_ai.usage.output_tokens", usage.output_tokens);
 }
 
-/// The most of a failed call's error a span carries. The run's stored error
-/// keeps the whole.
+/// The most characters of a failed call's error a span carries, with the
+/// `…` that ends one that was cut. The run's stored error keeps the whole.
 pub(crate) const MAX_SPAN_ERROR: usize = 200;
 
-/// What a call's span says of why it failed: for a provider's answer, its
-/// status and the type of error it names, with its HTTP status code; else
-/// the error, cut to [`MAX_SPAN_ERROR`] characters and redacted.
+/// What a call's span says of why it failed, redacted and at most
+/// [`MAX_SPAN_ERROR`] characters: for an error a provider answered with,
+/// its status and the type of error it names, with its HTTP status code;
+/// else what failed and its innermost cause, such as a connection's
+/// `Connection refused`, rather than every context between, which can
+/// repeat the URL.
 pub(crate) fn span_error(error: &anyhow::Error) -> (String, Option<u16>) {
+    let bounded = |text: &str| crate::redact::bounded(text, MAX_SPAN_ERROR - 1);
     match error
         .chain()
         .find_map(|e| e.downcast_ref::<crate::lite::ProviderError>())
     {
-        Some(provider) => (provider.summary(), Some(provider.code)),
-        None => (
-            crate::redact::bounded(&format!("{error:#}"), MAX_SPAN_ERROR),
-            None,
-        ),
+        Some(provider) => (bounded(&provider.summary()), Some(provider.code)),
+        None if error.chain().count() > 1 => {
+            (bounded(&format!("{error}: {}", error.root_cause())), None)
+        }
+        None => (bounded(&error.to_string()), None),
     }
 }
 
-/// Record on `span` why a call failed (see [`span_error`]). The exporter
-/// redacts it again.
+/// Record on `span` why a call failed (see [`span_error`]).
 pub(crate) fn record_error(span: &tracing::Span, error: &anyhow::Error) {
     span.record("otel.status_code", "ERROR");
     span.record(

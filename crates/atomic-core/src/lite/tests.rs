@@ -759,22 +759,70 @@ fn a_chat_spans_error_is_the_status_and_type_not_the_body() {
     assert_eq!(message, "401 Unauthorized: invalid_request_error");
     assert_eq!(status, Some(401));
     assert!(format!("{error:#}").contains("the provider's own words"));
-    // A type that is not an identifier is the provider's text, not kept.
-    assert_eq!(
-        error_kind(&json!({"error": {"type": "see the words here"}})),
-        None
-    );
     assert_eq!(
         error_kind(&json!({"error": {"code": "rate_limit_exceeded"}})).as_deref(),
         Some("rate_limit_exceeded")
     );
-    // Any other error is cut to the span's bound.
-    let long = anyhow!("{}", "word ".repeat(1000));
-    let (message, status) = crate::usage::span_error(&long);
+    // A type must read as one; a key, or the provider's words, does not.
+    let kinds_kept = [
+        "invalid_request_error",
+        "overloaded",
+        "server_error",
+        "error_429",
+        &"a".repeat(40),
+    ];
+    let wrong: Vec<&str> = kinds_kept
+        .iter()
+        .copied()
+        .filter(|k| !is_error_kind(k))
+        .collect();
+    assert!(wrong.is_empty(), "refused: {wrong:?}");
+    let kinds_refused = [
+        "",
+        "see the words here",
+        &"a".repeat(41),
+        "Invalid",
+        "4xx_error",
+        "abc123def456",
+        concat!("sk-", "abcdefghijklmnop0123"),
+        concat!("ghp_", "AbCdEfGhIjKlMnOp0123456789"),
+        concat!("AKIA", "1234567890ABCDEF"),
+        "deadbeef00112233",
+    ];
+    let wrong: Vec<usize> = kinds_refused
+        .iter()
+        .enumerate()
+        .filter(|(_, k)| is_error_kind(k))
+        .map(|(i, _)| i)
+        .collect();
+    assert!(wrong.is_empty(), "kept cases {wrong:?}");
+    // With no type, the status alone.
+    let bare = anyhow::Error::from(ProviderError {
+        url: "http://127.0.0.1:9/v1/chat/completions".into(),
+        status: "401 Unauthorized".into(),
+        code: 401,
+        kind: None,
+        excerpt: excerpt("key rejected"),
+    });
+    assert_eq!(crate::usage::span_error(&bare).0, "401 Unauthorized");
+    // Any other error is redacted, then cut to the span's bound, ellipsis
+    // included: a key across the cut shows none of itself.
+    const SAMPLE: &str = concat!("ghp_", "abcdefghijklmnopqrstuvwxyz0123456789");
+    let across = anyhow!("{} {SAMPLE} and more", "x".repeat(190));
+    let (message, status) = crate::usage::span_error(&across);
     assert!(
-        message.chars().count() <= crate::usage::MAX_SPAN_ERROR + 1,
+        message.chars().count() <= crate::usage::MAX_SPAN_ERROR,
         "{} characters",
         message.chars().count()
     );
+    assert!(!message.contains(&SAMPLE[4..10]), "the key showed");
     assert_eq!(status, None);
+    // A connection's failure keeps what failed and its innermost cause.
+    let refused = anyhow!("Connection refused (os error 111)")
+        .context("error sending request for url (http://127.0.0.1:9/v1/chat/completions)")
+        .context("POST http://127.0.0.1:9/v1/chat/completions");
+    assert_eq!(
+        crate::usage::span_error(&refused).0,
+        "POST http://127.0.0.1:9/v1/chat/completions: Connection refused (os error 111)"
+    );
 }
