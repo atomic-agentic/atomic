@@ -342,8 +342,13 @@ async fn admission_refuses_on_time_and_on_dollars<R: DurableRuntime>(rt: R) {
         scope.caps.millis = 1_500;
     }
     admitted(&ledger.admit(timed.clone()).await.expect("admit"));
-    timed.id = format!("{run}:1:1");
-    match ledger.admit(timed).await.expect("admit") {
+    // Another atom's call, while the first is in flight: the run has no
+    // time left for it.
+    let mut other = request(&run, 2, 0, 1_000_000, 1_000_000);
+    for scope in &mut other.chain {
+        scope.caps.millis = 1_500;
+    }
+    match ledger.admit(other).await.expect("admit") {
         Admission::Refused { reason, .. } => {
             assert!(reason.contains("1000 of 1500 ms"), "{reason}");
             assert!(!reason.contains("tokens charged"), "{reason}");

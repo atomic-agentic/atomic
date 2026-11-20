@@ -140,8 +140,8 @@ or an empty answer is charged what it spent. A response that reports no usage is
 settled as unknown: its tokens and dollars stay charged at its reservation, and
 it is never taken as free. Its active time can always be measured, so it is
 charged the time that passed, at most what was reserved. A call whose process
-died before it settled is charged the same way when its request is admitted
-again.
+died before it settled is charged the same way when its atom, run again, admits
+its next call.
 
 A Codex turn can make several provider requests and run tools between them, so
 the `call` time does not bound it. A turn reserves the active time its atom has

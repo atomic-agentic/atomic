@@ -29,8 +29,8 @@
 //! provider was called or the provider reported nothing, stays charged at
 //! its bound in tokens and dollars. Its active time can always be measured:
 //! it is charged as what passed since admission, at most what was reserved,
-//! when it settles as unknown, or when its request is admitted again after
-//! the process that made it died. Recovery never releases it: a re-run of the step is a new
+//! when it settles as unknown, or, after the process that made it died,
+//! when its atom invocation admits its next call. Recovery never releases it: a re-run of the step is a new
 //! attempt at the same request with its own reservation, and when the
 //! allowance runs out admission refuses, and the run parks. Only a call
 //! known never to have been dispatched is released.
@@ -446,18 +446,28 @@ async fn admit_in(tx: &mut Tx<'_, '_>, request: &Request) -> Result<End<Admissio
         .await?;
         parent = Some(&scope.id);
     }
-    // An earlier attempt at the same request still reserved died with its
-    // process: what time it took has passed, so it is charged that much,
-    // at most what it reserved, before the room is read.
-    let earlier = tx
-        .query_all(
-            "SELECT attempt FROM atomic_usage_attempts WHERE request_id = ? \
-             AND state = 'reserved' AND settled_at IS NULL ORDER BY attempt",
-            &[Param::Text(request.id.clone())],
-        )
-        .await?;
-    for row in earlier {
-        settle_time(tx, &request.id, row.int("attempt")?).await?;
+    // An earlier attempt charged to the same atom invocation and still
+    // reserved died with its process: an invocation makes its calls one at
+    // a time, so when it admits another, none of its earlier ones is still
+    // running. Whatever time each took has passed, so it is charged that
+    // much, at most what it reserved, before the room is read; a step that
+    // re-runs from its first call after a crash in a later one finds the
+    // time returned.
+    if let Some(own) = request.chain.last() {
+        let earlier = tx
+            .query_all(
+                "SELECT request_id, attempt, scopes FROM atomic_usage_attempts WHERE run = ? \
+                 AND state = 'reserved' AND settled_at IS NULL ORDER BY request_id, attempt",
+                &[Param::Text(request.run.clone())],
+            )
+            .await?;
+        for row in earlier {
+            let scopes: Vec<String> =
+                serde_json::from_str(&row.text("scopes")?).map_err(corrupt)?;
+            if scopes.last() == Some(&own.id) {
+                settle_time(tx, &row.text("request_id")?, row.int("attempt")?).await?;
+            }
+        }
     }
     // Reserve against each, root first. Each row is locked before it is
     // read (a write that changes nothing), so the room the read finds is
