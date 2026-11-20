@@ -573,6 +573,7 @@ async fn run_pipeline<C: WorkflowContext>(
     run: PipelineRun,
     services: Arc<Services>,
     ledger: Ledger,
+    recorded: Arc<BTreeMap<String, Proposal>>,
 ) -> Result<Value> {
     let PipelineRun { pipeline, input } = run;
     let id = ctx.workflow_id().to_owned();
@@ -778,6 +779,7 @@ async fn run_pipeline<C: WorkflowContext>(
         let origins = step.origins.clone();
         let pinned_helpers = pinned.helper_runtime.clone();
         let (id, ran) = (step.id.clone(), format!("pipeline:ran:{}", step.id));
+        let recorded = recorded.clone();
         let published = run_atom_at(
             &ctx,
             &step.id,
@@ -789,6 +791,9 @@ async fn run_pipeline<C: WorkflowContext>(
                 let (id, ran, run_id) = (id.clone(), ran.clone(), run_id.clone());
                 let (snapshot, tree, guard) = (snapshot.clone(), tree.clone(), guard.clone());
                 let pinned_helpers = pinned_helpers.clone();
+                // In a replay, the step's recorded result, with no model call
+                // and no command run.
+                let served = recorded.get(&id).cloned();
                 // An exec atom calls no model and has no caps to meter.
                 if let Some(atom_caps) = &atom_caps {
                     let meter = budget.meter(&position, atom_caps);
@@ -796,6 +801,9 @@ async fn run_pipeline<C: WorkflowContext>(
                     runtimes.lite.meter = meter;
                 }
                 async move {
+                if let Some(proposal) = served {
+                    return Ok(proposal);
+                }
                 // The run's helpers run only as recorded, on the runtime the
                 // run started on; anything else is refused rather than
                 // recaptured. Checked only when the turn runs: a finished
@@ -1084,7 +1092,78 @@ pub struct Services {
 pub fn register_pipeline<R: DurableRuntime>(rt: &mut R, services: Services) {
     let services = Arc::new(services);
     let ledger = rt.ledger();
+    let none = Arc::new(BTreeMap::new());
+    let (replaying, replay_ledger) = (services.clone(), ledger.clone());
     rt.register(PIPELINE, move |ctx: R::Context, run: PipelineRun| {
-        run_pipeline(ctx, run, services.clone(), ledger.clone())
+        run_pipeline(ctx, run, services.clone(), ledger.clone(), none.clone())
     });
+    rt.register(REPLAY, move |ctx: R::Context, replay: ReplayRun| {
+        run_pipeline(
+            ctx,
+            replay.run,
+            replaying.clone(),
+            replay_ledger.clone(),
+            Arc::new(replay.recorded),
+        )
+    });
+}
+
+/// The name a replay of a recorded run is registered under.
+pub const REPLAY: &str = "atomic.replay";
+
+/// A replay of a recorded run: the same pipeline and input, with each atom
+/// step that finished in the recording served its recorded result instead
+/// of calling a model or running a command. Every other step runs as it
+/// would in a new run: a gate opens and waits for a decision again.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReplayRun {
+    /// The recorded run.
+    pub of: String,
+    /// Its pipeline and input.
+    pub run: PipelineRun,
+    /// Each finished atom step's recorded result, by step id.
+    pub recorded: BTreeMap<String, Proposal>,
+}
+
+/// The replay of run `of` in `rt`'s store: its input, and the result of
+/// each of its atom steps that finished, the last turn's for a step whose
+/// turn ran more than once.
+pub async fn replay_of(rt: &atomic_durable::Durare, of: &str) -> Result<ReplayRun> {
+    let input = rt
+        .run_input(of)
+        .await?
+        .ok_or_else(|| failed(format!("there is no run {of} to replay")))?;
+    let run: PipelineRun = serde_json::from_value(input).map_err(|e| {
+        failed(format!(
+            "run {of} is not a workflow-file run this build can replay: {e}"
+        ))
+    })?;
+    let atom_steps: Vec<&str> = run
+        .pipeline
+        .steps
+        .iter()
+        .filter_map(|s| match s {
+            Step::Atom(a) => Some(a.id.as_str()),
+            Step::Gate(_) => None,
+        })
+        .collect();
+    let mut recorded = BTreeMap::new();
+    for step in rt.steps(of).await? {
+        let Some(id) = step.name.strip_suffix(".turn") else {
+            continue;
+        };
+        if !atom_steps.contains(&id) {
+            continue;
+        }
+        if let Some(candidate) = step.output.as_ref().and_then(|o| o.get("Candidate")) {
+            let candidate: atomic_durable::Candidate = serde_json::from_value(candidate.clone())
+                .map_err(|e| failed(format!("run {of}: step {id}'s recorded turn: {e}")))?;
+            recorded.insert(id.to_owned(), candidate.proposal);
+        }
+    }
+    Ok(ReplayRun {
+        of: of.to_owned(),
+        run,
+        recorded,
+    })
 }

@@ -77,7 +77,11 @@ turn ends (a killed atomic's are removed at its next start). A tool that ignores
 Several authoring aids arrive in stages. Eval cases, in YAML and in JSONL files,
 are loaded and checked, and the eval runner reports pass rates against each
 atom's threshold and scorer means against their minimums and a baseline; the
-`atomic eval` command that runs it from the terminal is not built yet. Compact schemas, variants, the `--plan` cost preview, declared effect caps
+`atomic eval` command that runs it from the terminal is not built yet. A
+recorded workflow-file run can be replayed from its checkpoints as a new run:
+each atom step that finished is served its recorded result, with no model call
+and no command run, while gates open and wait again; the `atomic runs replay`
+command that starts one is not built yet. Compact schemas, variants, the `--plan` cost preview, declared effect caps
 and the staged `--effects preview` mode are planned for v0.5. The `file` tag
 follows with code context in v0.7. The committed `atomic.policy.lock`, and
 `atomic import` and `atomic export`, are planned for v1.0.

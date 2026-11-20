@@ -25,8 +25,8 @@
 #![recursion_limit = "512"]
 
 use atomic_app::pipeline::{
-    PIPELINE, Pinned, Pipeline, PipelineRun, SNAPSHOT_MEDIA_TYPE, Services, Step, pin_budgets,
-    prepare, register_pipeline,
+    PIPELINE, Pinned, Pipeline, PipelineRun, REPLAY, SNAPSHOT_MEDIA_TYPE, Services, Step,
+    pin_budgets, prepare, register_pipeline, replay_of,
 };
 use atomic_core::artifact::{ArtifactRef, ArtifactStore, LocalStore};
 use atomic_core::budget::{BudgetSettings, CallBound, Price};
@@ -1425,6 +1425,72 @@ async fn nth_park(rt: &Durare, run: &str, n: usize) -> atomic_durable::Park {
         assert!(std::time::Instant::now() < until, "the run parked");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
+}
+
+#[test]
+fn replaying_a_recorded_run_makes_no_model_call_and_runs_no_command() {
+    on_codex_runtime(async {
+        let dir = scratch("replay");
+        let project = project(&dir);
+        // An exec step that writes a log line, then two model steps.
+        write_send_note(&dir, Some("idempotent"));
+        let pipeline = load(&project, "sent.workflow.yaml", &sent());
+        let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
+            .await
+            .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        let input = json!({"text": "Exporting a file named café.txt crashes the app."});
+        rt.start(
+            PIPELINE,
+            "recorded",
+            PipelineRun {
+                pipeline,
+                input: input.clone(),
+            },
+        )
+        .await
+        .expect("start");
+        let recorded: Value = rt.result("recorded").await.expect("finishes");
+        assert_eq!((model.calls(), sends(&dir)), (2, 1));
+
+        // Replayed from its checkpoints: the same result, with no model call
+        // and no command run.
+        let replay = replay_of(&rt, "recorded").await.expect("a replay");
+        assert_eq!(replay.run.input, input);
+        assert_eq!(
+            replay
+                .recorded
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["rank", "read", "summarize"]
+        );
+        rt.start(REPLAY, "replayed", replay).await.expect("start");
+        let replayed: Value = rt.result("replayed").await.expect("the replay finishes");
+        assert_eq!(replayed, recorded);
+        assert_eq!(model.calls(), 2, "the replay made no model call");
+        assert_eq!(sends(&dir), 1, "the replay ran no command");
+        // It is a run of its own, recorded step by step like any other.
+        let names: Vec<String> = rt
+            .steps("replayed")
+            .await
+            .expect("steps")
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert!(names.contains(&"summarize.publish".to_owned()), "{names:?}");
+        assert!(
+            rt.ledger()
+                .attempts("replayed")
+                .await
+                .expect("attempts")
+                .is_empty(),
+            "nothing was metered"
+        );
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
 }
 
 #[test]
