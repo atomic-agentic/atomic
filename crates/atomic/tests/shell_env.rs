@@ -189,7 +189,12 @@ async fn run_ending(
     let atomic_home = atomic_home_for(project, target);
     let _ = std::fs::remove_dir_all(&atomic_home);
     let mut run = Command::new(env!("CARGO_BIN_EXE_atomic"));
+    // Every workflow here runs a worktree step, so it is bound to the
+    // project's own repository as its fixture.
     run.args(["run", target, "--data", data])
+        .arg("--fixture")
+        .arg(project)
+        .args(["--fixture-rev", "main"])
         .current_dir(project)
         .env("HOME", home)
         .env("XDG_DATA_HOME", &atomic_home)
@@ -317,10 +322,13 @@ fn a_turn_writes_a_home_of_its_own_and_still_reads_nothing_of_the_persons() {
             .split_once("Output:\n")
             .map_or(printed.as_str(), |(_, o)| o);
         // It starts empty but for the sandbox's own read-only placeholders,
-        // which are empty too, with no link anywhere in it.
+        // which are empty too, and the turn's own temporary directory, with
+        // no link anywhere in it.
         let (listing, rest) = output.split_once("listed\n").expect("listed");
         assert!(
-            listing.lines().all(|name| PROTECTED.contains(&name)),
+            listing
+                .lines()
+                .all(|name| PROTECTED.contains(&name) || name == "tmp"),
             "the turn's home started with: {listing}"
         );
         let (links, rest) = rest.split_once("linked\n").expect("linked");

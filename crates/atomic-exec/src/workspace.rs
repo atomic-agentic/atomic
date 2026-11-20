@@ -94,10 +94,11 @@ pub struct Workspace {
     /// closed; `None` when the request had no source.
     pub scratch: Option<PathBuf>,
     /// A private temporary directory every model turn on this backend
-    /// shares as its commands' `TMPDIR`. Codex's sandbox keeps a registry
-    /// there for the mount points it protects in writable roots, so turns
-    /// that may share a writable root must share it too. `None` when the
-    /// request had no source.
+    /// shares, and none may write: the `TMPDIR` of Codex's sandbox helper,
+    /// which keeps its registry there of the mount points it protects in
+    /// writable roots, so turns that may share a writable root share it too.
+    /// A turn's commands get a `TMPDIR` of their own, inside `scratch`.
+    /// `None` when the request had no source.
     pub tmp: Option<PathBuf>,
     /// Where a model turn's shell and file work runs.
     pub shell: Shell,

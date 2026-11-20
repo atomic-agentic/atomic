@@ -624,10 +624,10 @@ fn resolved(path: &std::path::Path) -> PathBuf {
 /// Set `spec` up to run in `workspace` and return the directory its thread
 /// runs in: the sandbox, the writable roots and the environment are the
 /// workspace's, and its shell must be one this process can drive. Its
-/// commands' `HOME`, `ZDOTDIR` and `TMPDIR` are the workspace's scratch
-/// directory, so no shell reads the developer's startup files and nothing
-/// is left in a shared temporary directory; a `workspace-write` turn may
-/// write there.
+/// commands' `HOME` and `ZDOTDIR` are the workspace's scratch directory and
+/// their `TMPDIR` a directory inside it, so no shell reads the developer's
+/// startup files, and no other turn can write what a turn leaves in its
+/// temporary directory; a `workspace-write` turn may write them.
 fn turn_in(workspace: &Workspace, spec: &mut TurnSpec) -> Result<PathBuf, AtomError> {
     let cwd = workspace
         .require_root()
@@ -664,10 +664,7 @@ fn turn_in(workspace: &Workspace, spec: &mut TurnSpec) -> Result<PathBuf, AtomEr
             .entry("CARGO_HOME".into())
             .or_insert_with(|| scratch.join(".cargo").display().to_string());
     }
-    // Shared by every turn on the backend: Codex's sandbox keeps its
-    // registry of protected mount points in TMPDIR, and turns that share a
-    // writable root must share that registry.
-    private("TMPDIR", &workspace.tmp, spec);
+    turn_tmpdir(workspace, spec, cfg!(target_os = "linux"))?;
     // A cache in the temporary directory every turn of the backend shares
     // would outlive the run and reach the next one.
     if let Some(tmp) = &workspace.tmp {
@@ -705,6 +702,53 @@ fn turn_in(workspace: &Workspace, spec: &mut TurnSpec) -> Result<PathBuf, AtomEr
         }
     }
     Ok(cwd)
+}
+
+/// Give the commands of `spec`'s turn a `TMPDIR` of their own: a directory
+/// inside the workspace's scratch directory, which a `workspace-write` turn
+/// may write since the scratch directory is a writable root.
+///
+/// On Linux (`linux`), Codex's sandbox helper keeps its registry of the
+/// mount points it makes in its own `TMPDIR`, which every turn sharing a
+/// writable root must share: there it is the backend's shared directory,
+/// never a writable root of a turn's, and the turn's own directory goes in
+/// [`codex::TURN_TMPDIR`], which atomic's helper entry hands the command as
+/// its `TMPDIR` just before it runs. Elsewhere there is no such registry and
+/// no such handoff, and the command's `TMPDIR` is the turn's own directly.
+fn turn_tmpdir(workspace: &Workspace, spec: &mut TurnSpec, linux: bool) -> Result<(), AtomError> {
+    let Some(scratch) = &workspace.scratch else {
+        return Ok(());
+    };
+    let own = scratch.join("tmp");
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(&own).map_err(|e| {
+        AtomError::Runtime(format!(
+            "{}: create the turn's temporary directory {}: {e}",
+            workspace.label,
+            own.display()
+        ))
+    })?;
+    if !linux {
+        spec.env.remove(codex::TURN_TMPDIR);
+        spec.env
+            .insert("TMPDIR".to_owned(), own.display().to_string());
+        return Ok(());
+    }
+    let Some(shared) = &workspace.tmp else {
+        return Err(AtomError::Runtime(format!(
+            "the backend gave {}'s turn no shared temporary directory, where Codex's \
+             sandbox keeps its registry of the mount points it makes",
+            workspace.label
+        )));
+    };
+    spec.env
+        .insert("TMPDIR".to_owned(), shared.display().to_string());
+    spec.env
+        .insert(codex::TURN_TMPDIR.to_owned(), own.display().to_string());
+    Ok(())
 }
 
 /// Run `spec` as one turn on a fresh thread of `runtime`, in a workspace its
