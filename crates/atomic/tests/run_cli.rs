@@ -482,6 +482,47 @@ fn a_name_a_path_and_the_project_flag_run_the_same_atom_on_the_same_input() {
 }
 
 #[test]
+fn a_misspelled_atom_fails_check_with_the_fix() {
+    let dir = scratch("misspelled");
+    let project = project(&dir);
+    std::fs::write(
+        project.join("workflows/triage.workflow.yaml"),
+        TRIAGE.replace("atom: rank-note", "atom: rank-notes"),
+    )
+    .expect("workflow");
+    let out = atomic(&dir, &project, &["--json", "check"], &[], "");
+    assert!(!out.status.success(), "{}", text(&out));
+    let error = &stdout_json(&out)["error"];
+    assert_eq!(error["kind"], "workflow.invalid", "{error}");
+    assert!(
+        error["description"]
+            .as_str()
+            .is_some_and(|d| d.contains("no atom named `rank-notes`")),
+        "{error}"
+    );
+    assert_eq!(
+        error["action"], "change `atom: rank-notes` to `atom: rank-note`",
+        "{error}"
+    );
+    // And running it by a misspelled name says which was meant.
+    let out = atomic(
+        &dir,
+        &project,
+        &["--json", "run", "rank-notes", "--data", NOTE],
+        &[],
+        "",
+    );
+    let error = &stdout_json(&out)["error"];
+    assert_eq!(error["kind"], "target.unknown", "{error}");
+    assert!(
+        error["action"]
+            .as_str()
+            .is_some_and(|a| a.starts_with("did you mean `rank-note`?")),
+        "{error}"
+    );
+}
+
+#[test]
 fn a_workflow_runs_by_name_and_by_file() {
     let dir = scratch("workflow");
     let project = project(&dir);
