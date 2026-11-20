@@ -2561,14 +2561,36 @@ fn serve_stopped_mid_command_holds_the_lock_until_it_exits_and_runs_nothing_twic
     );
     let pids = slow_pids(&dir);
     terminate(&serve);
-    // Until serve exits, the lock stays held and the command stays its own.
+    // While any command runs, the lock stays held, and it goes only with
+    // serve. The lock is probed first and the commands checked after: a
+    // command alive after a probe that found the lock free was alive during
+    // it, so the order is checked with no window to time.
     let stopping = Instant::now();
     let status = loop {
         let held = lock_held(&state);
+        let running: Vec<&String> = pids.iter().filter(|pid| alive(pid)).collect();
+        assert!(
+            held || running.is_empty(),
+            "the lock was free while command {running:?} still ran"
+        );
         if let Some(status) = serve.try_wait().expect("wait") {
             break status;
         }
-        assert!(held, "the lock was free while serve still ran");
+        if !held {
+            // Only serve's exit frees it: the kernel releases the lock as the
+            // process ends, a moment before it can be reaped.
+            let freed = Instant::now();
+            break loop {
+                if let Some(status) = serve.try_wait().expect("wait") {
+                    break status;
+                }
+                assert!(
+                    freed.elapsed() < Duration::from_secs(10),
+                    "the lock was free while serve still ran"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            };
+        }
         assert!(
             stopping.elapsed() < Duration::from_secs(30),
             "serve did not stop"
