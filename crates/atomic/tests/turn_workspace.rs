@@ -27,6 +27,7 @@ use atomic_exec::{Backend, ExecError, ExecutionBackend, LocalBackend, Open, Work
 use serde_json::{Value, json};
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 fn scratch(tag: &str) -> PathBuf {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
@@ -305,4 +306,71 @@ fn concurrent_turns_in_one_directory_never_break_each_others_sandbox() {
         }
         assert_eq!(failed, vec![0; TURNS], "commands that failed in each turn");
     });
+}
+
+/// A `/tmp/.codex` that something else creates and removes while a turn runs
+/// does not break the turn's sandbox. Codex keeps a `.codex` read-only in
+/// every writable root, so one that came and went under a writable `/tmp`
+/// failed bubblewrap's remount; `/tmp` is no writable root of a turn's.
+#[test]
+fn a_tmp_codex_that_comes_and_goes_does_not_break_a_turn() {
+    support::require_sandbox();
+    const COMMANDS: usize = 60;
+    let target = Path::new("/tmp/.codex");
+    // Only one this test makes and removes: someone else's stays as it is.
+    assert!(
+        !target.exists(),
+        "/tmp/.codex exists already; remove it to run this test"
+    );
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let toggled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // As fast as it can: with `/tmp` a writable root, this breaks about half
+    // of the turn's commands.
+    let toggler = {
+        let (stop, toggled) = (stop.clone(), toggled.clone());
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                if std::fs::create_dir(target).is_ok() {
+                    let _ = std::fs::remove_dir(target);
+                    toggled.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            let _ = std::fs::remove_dir(target);
+        })
+    };
+    on_codex_runtime(async {
+        let dir = scratch("tmp-codex");
+        let backend = Backend::connect(LocalBackend::in_dir(shared_scratch())).expect("connects");
+        let mut script: Vec<Reply> = (0..COMMANDS)
+            .map(|i| tool(&format!("echo still-ok-{i}")))
+            .collect();
+        script.push(Reply::Text("Done.".into()));
+        let model = FakeModel::start(script).await.expect("fake model");
+        let rt = runtime(&dir, &model, backend);
+        let answer = run_turn(
+            &rt,
+            &TurnSpec {
+                prompt: "Do the work.".into(),
+                sandbox: Sandbox::WorkspaceWrite,
+                ..TurnSpec::default()
+            },
+        )
+        .await
+        .expect("the turn runs");
+        assert_eq!(answer, "Done.");
+        let last = model.requests().last().cloned().expect("requests");
+        let failed: Vec<usize> = (0..COMMANDS)
+            .filter(|i| !last.to_string().contains(&format!("still-ok-{i}\\n")))
+            .collect();
+        assert!(
+            failed.is_empty(),
+            "commands that failed: {failed:?}: {last}"
+        );
+    });
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    toggler.join().expect("toggler");
+    assert!(
+        toggled.load(std::sync::atomic::Ordering::SeqCst) > COMMANDS,
+        "/tmp/.codex came and went during the turn"
+    );
 }
