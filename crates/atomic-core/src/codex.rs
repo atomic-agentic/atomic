@@ -242,6 +242,10 @@ fn denied_paths(private: &PrivateState, codex_home: &Path) -> (Vec<PathBuf>, Vec
     (all, globs)
 }
 
+/// The network every sandbox has: none, local sockets included.
+const SANDBOX_NETWORK: codex_protocol::permissions::NetworkSandboxPolicy =
+    codex_protocol::permissions::NetworkSandboxPolicy::Restricted;
+
 /// Codex's permission profile for a sandbox: read-only, or writes confined
 /// to the workspace; the network is restricted either way. Under
 /// [`StateGuard::Deny`], atomic's private state is denied as well (see
@@ -252,7 +256,7 @@ pub(crate) fn permission_profile(
     codex_home: &Path,
 ) -> anyhow::Result<PermissionProfile> {
     use codex_protocol::permissions::{
-        FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry, NetworkSandboxPolicy,
+        FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry,
     };
     let base = match sandbox {
         crate::typed::Sandbox::ReadOnly => PermissionProfile::read_only(),
@@ -261,7 +265,7 @@ pub(crate) fn permission_profile(
         // own instead (see `TurnTemp`).
         crate::typed::Sandbox::WorkspaceWrite => PermissionProfile::workspace_write_with(
             &[],
-            NetworkSandboxPolicy::Restricted,
+            SANDBOX_NETWORK,
             /*exclude_tmpdir_env_var*/ true,
             /*exclude_slash_tmp*/ true,
         ),
@@ -287,7 +291,7 @@ pub(crate) fn permission_profile(
     }
     Ok(PermissionProfile::from_runtime_permissions(
         &policy,
-        NetworkSandboxPolicy::Restricted,
+        SANDBOX_NETWORK,
     ))
 }
 
