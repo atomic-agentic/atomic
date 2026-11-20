@@ -176,8 +176,8 @@ fn an_operation_becomes_one_input_object_with_its_parameters_and_body() {
             assert!(!validator.is_valid(&json!({ "latitude": 98, "longitude": -9.1 })));
             assert!(!validator.is_valid(&json!({ "latitude": 1, "longitude": 1, "extra": 1 })));
         }
-        if let Some(output) = &op.output {
-            registry.validator_for(output).expect("output schema");
+        for schema in op.output.iter().chain(op.responses.values().flatten()) {
+            registry.validator_for(schema).expect("response schema");
         }
     }
 }
@@ -270,9 +270,9 @@ paths:
 }
 
 #[test]
-fn each_success_response_is_kept_by_its_status() {
+fn each_response_is_kept_by_its_status_and_a_success_picks_its_own() {
     let spec = yaml(
-        r#"openapi: 3.1.0
+        r##"openapi: 3.1.0
 info: { title: Jobs, version: "1" }
 paths:
   /jobs:
@@ -280,38 +280,66 @@ paths:
       operationId: submit
       responses:
         "200": { description: done, content: { application/json: { schema: { type: object, required: [result], properties: { result: { type: string } } } } } }
-        "202": { description: queued, content: { application/json: { schema: { type: object, required: [ticket], properties: { ticket: { type: integer } } } } } }
+        "202": { $ref: "#/components/responses/Queued" }
         "204": { description: nothing to do }
-        "2XX": { description: other, content: { application/json: { schema: { type: string } } } }
+        "2xx": { description: other, content: { application/json: { schema: { type: string } } } }
         "404": { description: no such job, content: { application/json: { schema: { type: object } } } }
         default: { description: error, content: { application/json: { schema: { type: number } } } }
-"#,
+components:
+  schemas:
+    Ticket: { type: object, required: [ticket], properties: { ticket: { type: integer } } }
+  responses:
+    Queued: { description: queued, content: { application/json: { schema: { $ref: "#/components/schemas/Ticket" } } } }
+"##,
     );
     let ops = operations(&spec).expect("spec");
     let op = &ops[0];
+    // Every declared response is kept, a failure's too.
     assert_eq!(
         op.responses.keys().map(String::as_str).collect::<Vec<_>>(),
-        ["200", "202", "204", "2XX", "default"],
-        "a failure's response is not a success's"
+        ["200", "202", "204", "2xx", "404", "default"]
     );
-    let required = |status: u16| {
+    let picked = |status: u16| {
         op.response(status)
-            .and_then(Option::as_ref)
-            .map(|s| s["required"].clone())
+            .map(|(key, schema)| (key, schema.clone()))
     };
-    assert_eq!(required(200), Some(json!(["result"])));
-    assert_eq!(required(202), Some(json!(["ticket"])));
-    assert_eq!(op.response(204), Some(&None), "no content");
     assert_eq!(
-        op.response(201).cloned().flatten(),
-        Some(json!({ "type": "string" })),
-        "a range"
+        picked(200).map(|(k, s)| (k, s.map(|s| s["required"].clone()))),
+        Some(("200", Some(json!(["result"]))))
     );
+    assert_eq!(picked(204), Some(("204", None)), "no content");
     assert_eq!(
-        op.response(304).cloned().flatten(),
-        Some(json!({ "type": "number" })),
-        "default"
+        picked(201).map(|(k, s)| (k, s.map(|s| s["type"].clone()))),
+        Some(("2xx", Some(json!("string")))),
+        "a range, in either case"
     );
+    // A success outside every code and range takes default; a failure is
+    // never picked, whatever it declares.
+    assert_eq!(picked(299).map(|(k, _)| k), Some("2xx"));
+    let only_codes = operations(&yaml(
+        r#"openapi: 3.1.0
+info: { title: Jobs, version: "1" }
+paths:
+  /jobs:
+    get:
+      responses:
+        "200": { description: ok }
+        default: { description: error, content: { application/json: { schema: { type: number } } } }
+"#,
+    ))
+    .expect("spec");
+    assert_eq!(only_codes[0].response(201).map(|(k, _)| k), Some("default"));
+    assert_eq!(op.response(404), None);
+    assert_eq!(op.response(500), None);
+    // A response by reference resolves to its schema, which reaches a
+    // component schema through $defs that the response carries.
+    let (key, queued) = op.response(202).expect("202");
+    assert_eq!(key, "202");
+    let queued = queued.as_ref().expect("a schema");
+    assert!(queued.get("$defs").is_some(), "{queued}");
+    let validator = Registry::new().validator_for(queued).expect("compiles");
+    assert!(validator.is_valid(&json!({ "ticket": 7 })));
+    assert!(!validator.is_valid(&json!({ "result": "done" })));
     // The tool's output is the first success's, as before.
     assert_eq!(
         op.output.as_ref().map(|s| s["required"].clone()),

@@ -16,8 +16,12 @@
 //!   header that frames the request.
 //!
 //! Safe methods (GET, HEAD, OPTIONS) are retried after a connection failure,
-//! a 429 or a 5xx; others are sent once. Responses are bounded, and checked
-//! against the operation's response schema when it declares one.
+//! a 429 or a 5xx; others are sent once. Responses are bounded. A success
+//! is checked against the response the operation declares for its status
+//! (its own code, else its range, else `default`): its schema, if it has
+//! one. A success with a status the operation declares no response for,
+//! when it declares any, is refused; it was answered, so it is not sent
+//! again.
 
 use atomic_schema::openapi::Operation;
 use reqwest::Url;
@@ -96,13 +100,30 @@ pub enum CallError {
         /// What failed.
         message: String,
     },
-    /// The response breaks the operation's declared response schema.
-    #[error("`{operation}` returned a response that does not fit its schema: {errors}")]
+    /// The response breaks the schema the operation declares for its status.
+    #[error(
+        "`{operation}` returned {status}, which does not fit its response `{response}`: {errors}"
+    )]
     Response {
         /// The operation.
         operation: String,
+        /// The HTTP status.
+        status: u16,
+        /// The response it was checked against, as the spec declares it:
+        /// `200`, `2XX` or `default`.
+        response: String,
         /// Each violation, with its path.
         errors: String,
+    },
+    /// The server answered a success with a status the operation declares
+    /// no response for. The request was made and answered, so it is not
+    /// sent again.
+    #[error("`{operation}` returned {status}, a status its spec declares no response for")]
+    Undeclared {
+        /// The operation.
+        operation: String,
+        /// The HTTP status.
+        status: u16,
     },
 }
 
@@ -547,23 +568,25 @@ impl HttpToolset {
     /// response at all takes any. A success whose status the operation does
     /// not declare, when it declares others, is refused.
     fn check_response(&self, name: &str, status: u16, value: Value) -> Result<Value, CallError> {
-        let response = |errors: String| CallError::Response {
-            operation: name.to_owned(),
-            errors,
-        };
         let Some(operation) = self.operations.get(name) else {
             return Ok(value);
         };
-        let schema = match operation.response(status) {
-            Some(Some(schema)) => schema,
-            Some(None) => return Ok(value),
+        let (key, schema) = match operation.response(status) {
+            Some((key, Some(schema))) => (key, schema),
+            Some((_, None)) => return Ok(value),
             None if operation.responses.is_empty() => return Ok(value),
             None => {
-                return Err(response(format!(
-                    "the API answered {status}, a status the operation's spec declares no \
-                     response for"
-                )));
+                return Err(CallError::Undeclared {
+                    operation: name.to_owned(),
+                    status,
+                });
             }
+        };
+        let response = |errors: String| CallError::Response {
+            operation: name.to_owned(),
+            status,
+            response: key.to_owned(),
+            errors,
         };
         let validator = atomic_schema::registry::Registry::new()
             .validator_for(schema)

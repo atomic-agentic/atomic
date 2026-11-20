@@ -531,7 +531,12 @@ fn check(path: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
         let tools = atomic_schema::openapi::operations(&spec)
             .map_err(|e| anyhow::anyhow!("{}: {e}", source.path.display()))?;
         for tool in &tools {
-            for schema in std::iter::once(&tool.input).chain(tool.output.as_ref()) {
+            // The executor checks each response against its own schema, so
+            // each must compile, not only the first.
+            for schema in std::iter::once(&tool.input)
+                .chain(tool.output.as_ref())
+                .chain(tool.responses.values().flatten())
+            {
                 atomic_schema::registry::Registry::new()
                     .validator_for(schema)
                     .map_err(|e| {

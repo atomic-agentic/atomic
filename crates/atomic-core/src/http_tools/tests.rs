@@ -382,6 +382,14 @@ paths:
         "200": { description: done, content: { application/json: { schema: { type: object, required: [result], properties: { result: { type: string } } } } } }
         "202": { description: queued, content: { application/json: { schema: { type: object, required: [ticket], properties: { ticket: { type: integer } } } } } }
         "204": { description: nothing to do }
+  /ping:
+    get:
+      operationId: ping
+  /lookup:
+    get:
+      operationId: lookup
+      responses:
+        "404": { description: no such thing, content: { application/json: { schema: { type: object } } } }
 "##;
 
 fn jobs(host: &str) -> HttpToolset {
@@ -409,6 +417,10 @@ async fn each_success_is_checked_against_the_response_its_status_declares() {
         (200, r#"{"ticket": 7}"#),
         // A success the spec does not declare.
         (201, r#"{"result": "ok"}"#),
+        // An operation that declares no responses takes any success.
+        (200, r#"{"anything": [1, 2]}"#),
+        // One that declares only a failure declares no success.
+        (200, r#"{}"#),
     ])
     .await;
     let tools = jobs(&host);
@@ -417,16 +429,36 @@ async fn each_success_is_checked_against_the_response_its_status_declares() {
     assert_eq!(call().await.expect("200"), json!({ "result": "ok" }));
     assert_eq!(call().await.expect("204"), Value::Null);
     assert_eq!(call().await.expect("202"), json!({ "ticket": 7 }));
-    for status in ["202", "200"] {
-        let error = call().await.expect_err(status);
+    for (status, key) in [(202, "202"), (200, "200")] {
+        let error = call().await.expect_err("does not fit");
         assert!(
-            matches!(error, CallError::Response { .. }),
+            matches!(&error, CallError::Response { status: s, response, .. } if *s == status && response == key),
             "{status}: {error}"
         );
+        // Said with the status and the response it was checked against.
+        let said = format!("returned {status}, which does not fit its response `{key}`");
+        assert!(error.to_string().contains(&said), "{error}");
     }
+    // Answered with a status the operation declares no response for: its
+    // own error, not to be sent again.
     let error = call().await.expect_err("201");
     assert!(
-        matches!(&error, CallError::Response { errors, .. } if errors.contains("201")),
+        matches!(&error, CallError::Undeclared { status: 201, .. }),
+        "{error}"
+    );
+    assert_eq!(
+        tools
+            .call("ping", &args)
+            .await
+            .expect("no responses declared"),
+        json!({ "anything": [1, 2] })
+    );
+    let error = tools
+        .call("lookup", &args)
+        .await
+        .expect_err("only a 404 declared");
+    assert!(
+        matches!(&error, CallError::Undeclared { status: 200, .. }),
         "{error}"
     );
 }
