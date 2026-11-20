@@ -62,6 +62,12 @@ pub struct EngineArgs {
     /// its restarts. Required on PostgreSQL.
     #[arg(long, env = "ATOMIC_EXECUTOR_ID")]
     pub executor_id: Option<String>,
+    /// How many seconds a step waits for the execution backend to have room
+    /// for its workspace before the run stops, unfinished and with nothing
+    /// recorded, for `atomic runs resume`. Without it, a step waits for as
+    /// long as it takes.
+    #[arg(long, env = "ATOMIC_BACKEND_WAIT", value_name = "SECONDS")]
+    pub backend_wait: Option<u64>,
 }
 
 impl EngineArgs {
@@ -176,6 +182,7 @@ pub async fn open(
     // Held until the process exits: dropping the engine while a command it
     // started still runs must not let another process recover that run.
     state.lock_execution(command)?.hold_until_exit();
+    atomic_core::runtime::limit_backend_wait(args.backend_wait.map(std::time::Duration::from_secs));
     let database = database(state);
     let executor = atomic_durable::executor_identity(args.executor_id.as_deref())?;
     if matches!(database, Database::Postgres { .. }) && executor.is_none() {

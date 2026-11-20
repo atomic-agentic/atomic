@@ -258,21 +258,50 @@ const OPEN_WAIT_FIRST: std::time::Duration = std::time::Duration::from_millis(20
 const OPEN_WAIT_MAX: std::time::Duration = std::time::Duration::from_secs(30);
 /// How often a run still waiting says so.
 const OPEN_WAIT_REPORT: std::time::Duration = std::time::Duration::from_secs(600);
+/// How often a waiting run looks whether this process is stopping.
+const OPEN_WAIT_SLICE: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// The longest a step waits for its workspace, in milliseconds; 0 for as
+/// long as it takes. See [`limit_backend_wait`].
+static OPEN_WAIT_LIMIT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Set once this process is stopping: no step waits for a workspace.
+static STOP_WAITING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Wait at most `limit` for the execution backend to open a step's
+/// workspace, then give up with [`AtomError::NoRoom`]; with `None`, wait for
+/// as long as it takes. For this whole process.
+pub fn limit_backend_wait(limit: Option<std::time::Duration>) {
+    let ms = limit.map_or(0, |l| {
+        u64::try_from(l.as_millis()).unwrap_or(u64::MAX).max(1)
+    });
+    OPEN_WAIT_LIMIT_MS.store(ms, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// This process is stopping: every step waiting for a workspace gives up
+/// within [`OPEN_WAIT_SLICE`], with [`AtomError::Stopping`], and none waits
+/// again.
+pub fn stop_waiting_for_backend() {
+    STOP_WAITING.store(true, std::sync::atomic::Ordering::SeqCst);
+}
 
 /// Open a workspace on `backend`, on the blocking pool. While the backend
 /// reports [`atomic_exec::ExecError::Unavailable`] (no room, or a sandbox
 /// that failed in a way that may pass, such as a full disk; nothing was
 /// started) the run waits, trying again with a growing pause, for as long
-/// as it takes: it records nothing and spends none of the durable engine's
-/// recovery attempts, and it says on stderr that it is waiting, then again
-/// every ten minutes. Stopping the run stops the wait.
+/// as it takes, or up to the process's limit ([`limit_backend_wait`]),
+/// after which it gives up with [`AtomError::NoRoom`]. It records nothing
+/// and spends none of the durable engine's recovery attempts, and it says
+/// on stderr that it is waiting, then again every ten minutes. Stopping the
+/// run, or the process ([`stop_waiting_for_backend`]), stops the wait.
 pub(crate) async fn open_workspace(
     backend: Arc<dyn ExecutionBackend>,
     request: Open,
 ) -> Result<WorkspaceGuard, AtomError> {
+    use std::sync::atomic::Ordering;
     let label = request.label.clone();
     let mut wait = OPEN_WAIT_FIRST;
     let mut reported: Option<std::time::Instant> = None;
+    let started = std::time::Instant::now();
     loop {
         let (b, r) = (backend.clone(), request.clone());
         let opened = tokio::task::spawn_blocking(move || b.open(&r))
@@ -299,7 +328,36 @@ pub(crate) async fn open_workspace(
                     );
                     reported = Some(std::time::Instant::now());
                 }
-                tokio::time::sleep(wait).await;
+                let limit = match OPEN_WAIT_LIMIT_MS.load(Ordering::SeqCst) {
+                    0 => None,
+                    ms => Some(std::time::Duration::from_millis(ms)),
+                };
+                if let Some(limit) = limit
+                    && started.elapsed() >= limit
+                {
+                    return Err(AtomError::NoRoom(format!(
+                        "{label}: the execution backend could not open its workspace in {}s, \
+                         the most this process waits (run {}, step {}): {e}",
+                        limit.as_secs_f64().ceil(),
+                        request.run,
+                        request.step
+                    )));
+                }
+                // In slices, to give up as soon as this process stops, and
+                // no longer than the limit leaves.
+                let mut left =
+                    limit.map_or(wait, |l| wait.min(l.saturating_sub(started.elapsed())));
+                while !left.is_zero() {
+                    if STOP_WAITING.load(Ordering::SeqCst) {
+                        return Err(AtomError::Stopping);
+                    }
+                    let slice = left.min(OPEN_WAIT_SLICE);
+                    tokio::time::sleep(slice).await;
+                    left = left.saturating_sub(slice);
+                }
+                if STOP_WAITING.load(Ordering::SeqCst) {
+                    return Err(AtomError::Stopping);
+                }
                 wait = (wait * 2).min(OPEN_WAIT_MAX);
             }
             Err(atomic_exec::ExecError::Unconfinable { message }) => {

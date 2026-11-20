@@ -157,6 +157,8 @@ static STOPPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::
 /// its checkpoint while nothing new begins. Call it when a stop begins.
 pub fn stop_starting_steps() {
     STOPPING.store(true, std::sync::atomic::Ordering::SeqCst);
+    // A step waiting for room on the execution backend gives up its wait.
+    atomic_core::runtime::stop_waiting_for_backend();
 }
 
 /// Before a run's next piece of work: go on counted as working, or wait for

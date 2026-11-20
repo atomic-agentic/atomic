@@ -2011,6 +2011,156 @@ fn a_sandbox_trial_failing_for_want_of_room_makes_the_run_wait_then_finish() {
     assert_eq!(count_log(&dir).len(), 2, "its command ran once");
 }
 
+/// With `--backend-wait`, a run whose step finds no room on the execution
+/// backend for that long stops, unfinished and with nothing recorded, with
+/// the exit code for a failure to try again; `atomic runs resume` continues
+/// it once there is room, and its command runs once.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[test]
+fn a_run_that_waits_too_long_for_room_stops_unfinished_and_resumes() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
+    let dir = scratch("backend-wait");
+    let project = project(&dir);
+    let path = bwrap_in_front(&dir);
+    let env = [("PATH", path.as_str())];
+    let out = atomic(
+        &dir,
+        &project,
+        &["run", "count-only", "--data", NOTE],
+        &env,
+        "",
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(count_log(&dir).len(), 1);
+
+    let full = dir.join("bwrap-full");
+    std::fs::write(&full, "").expect("the disk fills");
+    let log = dir.join("wait.log");
+    let started = Instant::now();
+    let mut run = spawn(
+        &dir,
+        &project,
+        &[
+            "run",
+            "count-only",
+            "--run-id",
+            "room-1",
+            "--backend-wait",
+            "2",
+            "--data",
+            NOTE,
+        ],
+        &env,
+        &log,
+    );
+    let status = wait_child(&mut run, "the waiting run");
+    let waited = started.elapsed();
+    let text_log = std::fs::read_to_string(&log).unwrap_or_default();
+    assert_eq!(
+        status.code(),
+        Some(atomic_app::workflows::NO_ROOM_EXIT),
+        "{text_log}"
+    );
+    assert!(
+        waited >= Duration::from_secs(2),
+        "it waited its limit: {waited:?}"
+    );
+    assert!(
+        waited < Duration::from_secs(30),
+        "and no longer: {waited:?}"
+    );
+    assert!(
+        text_log.contains("the most this process waits"),
+        "{text_log}"
+    );
+    assert!(text_log.contains("atomic runs resume"), "{text_log}");
+    assert_eq!(count_log(&dir).len(), 1, "nothing ran");
+
+    std::fs::remove_file(&full).expect("room again");
+    let out = atomic(
+        &dir,
+        &project,
+        &["runs", "resume", "room-1"],
+        &with_unused(&env),
+        "",
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(count_log(&dir).len(), 2, "its command ran once");
+}
+
+/// A signal stops a run waiting for room on the execution backend at once,
+/// not after the time a running step has to reach its checkpoint: the
+/// waiting step gives up its wait, records nothing, and `atomic runs
+/// resume` continues it.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[test]
+fn a_signal_ends_a_wait_for_room_at_once() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
+    let dir = scratch("wait-stop");
+    let project = project(&dir);
+    let path = bwrap_in_front(&dir);
+    let env = [("PATH", path.as_str())];
+    let out = atomic(
+        &dir,
+        &project,
+        &["run", "count-only", "--data", NOTE],
+        &env,
+        "",
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    let full = dir.join("bwrap-full");
+    std::fs::write(&full, "").expect("the disk fills");
+    let log = dir.join("wait.log");
+    let mut run = spawn(
+        &dir,
+        &project,
+        &["run", "count-only", "--run-id", "room-2", "--data", NOTE],
+        &env,
+        &log,
+    );
+    wait_until("the run to wait", || {
+        std::fs::read_to_string(&log)
+            .is_ok_and(|l| l.contains("is waiting for the execution backend"))
+    });
+    // Into its pauses, which grow towards half a minute.
+    std::thread::sleep(Duration::from_secs(4));
+    let stopping = Instant::now();
+    signal(&run, "TERM");
+    let status = wait_child(&mut run, "the stopped run");
+    let took = stopping.elapsed();
+    let text_log = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        took < Duration::from_secs(3),
+        "it stopped in {took:?}: {text_log}"
+    );
+    assert!(!status.success(), "{text_log}");
+    assert_eq!(count_log(&dir).len(), 1, "nothing ran");
+
+    std::fs::remove_file(&full).expect("room again");
+    let out = atomic(
+        &dir,
+        &project,
+        &["runs", "resume", "room-2"],
+        &with_unused(&env),
+        "",
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(count_log(&dir).len(), 2, "its command ran once");
+}
+
+/// `env` with an unused model endpoint, as `atomic runs resume` needs one.
+fn with_unused<'a>(env: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
+    UNUSED_MODEL
+        .iter()
+        .copied()
+        .chain(env.iter().copied())
+        .collect()
+}
+
 /// Under `atomic serve`, a run whose commands cannot be confined is set
 /// aside, unfinished and with nothing recorded, and serve goes on with the
 /// others and stops at once when asked; where the sandbox starts again the

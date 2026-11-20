@@ -58,6 +58,11 @@ pub struct ChangeRequestResult {
 /// commands: a configuration error, as `atomic runner`'s contract has it.
 pub const UNCONFINABLE_EXIT: i32 = 78;
 
+/// The exit code of a process that stopped because the execution backend
+/// had no room for a step's workspace for as long as it waits: a temporary
+/// failure, to try again (`atomic runs resume`) once there is room.
+pub const NO_ROOM_EXIT: i32 = 75;
+
 /// Set by `atomic serve`: a run whose step cannot confine its commands is
 /// set aside instead of stopping the process (see [`settled`]).
 static SERVING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -83,6 +88,33 @@ pub(crate) async fn settled<T>(
     counted: bool,
 ) -> Result<T> {
     match result {
+        // This process is stopping: the step gives up its wait for a
+        // workspace, records nothing, and is not one a stop waits for.
+        Err(AtomError::Stopping) => {
+            if counted {
+                crate::pipeline::set_aside();
+            }
+            std::future::pending().await
+        }
+        Err(AtomError::NoRoom(why)) if SERVING.load(std::sync::atomic::Ordering::SeqCst) => {
+            eprintln!("atomic serve: {place}: {why}");
+            eprintln!(
+                "atomic serve: {place} stays unfinished, with nothing recorded, until atomic \
+                 serve is started again; other runs go on"
+            );
+            if counted {
+                crate::pipeline::set_aside();
+            }
+            std::future::pending().await
+        }
+        Err(AtomError::NoRoom(why)) => {
+            eprintln!("atomic: {why}");
+            eprintln!(
+                "atomic: {place} stays unfinished, with nothing recorded; continue it with \
+                 `atomic runs resume` once the execution backend has room"
+            );
+            std::process::exit(NO_ROOM_EXIT);
+        }
         Err(AtomError::Unconfinable(why)) if SERVING.load(std::sync::atomic::Ordering::SeqCst) => {
             eprintln!("atomic serve: {place}: {why}");
             eprintln!(
@@ -119,9 +151,21 @@ pub fn atom_failure(e: AtomError) -> DurableError {
             );
             std::process::exit(UNCONFINABLE_EXIT);
         }
+        // As above: a run that waited too long for room stops, recording
+        // nothing ([`settled`] goes first and says which run).
+        AtomError::NoRoom(why) => {
+            eprintln!("atomic: {why}");
+            eprintln!(
+                "atomic: stopping without recording an outcome; continue the run with `atomic \
+                 runs resume` once the execution backend has room"
+            );
+            std::process::exit(NO_ROOM_EXIT);
+        }
         // Like a crash before the checkpoint: recovery runs the step again,
         // through its attempt guard.
-        e @ AtomError::OutcomeUnknown(_) => DurableError::Interrupted(e.to_string()),
+        e @ (AtomError::OutcomeUnknown(_) | AtomError::Stopping) => {
+            DurableError::Interrupted(e.to_string())
+        }
         e => DurableError::Failed(e.to_string()),
     }
 }

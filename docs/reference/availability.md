@@ -65,7 +65,12 @@ rendered, which runs the atom's helpers, it opens a workspace there before any
 model call or command, and closes it however the run ends, including a panic or
 a cancelled run, and only once a command running in it has ended. A backend
 with no room for a workspace makes the run wait, recording nothing and saying
-on stderr that it waits, and the run goes on once there is room. The local backend is the only one with a Codex shell, and
+on stderr that it waits, and the run goes on once there is room. With
+`--backend-wait <seconds>` it waits at most that long: `atomic run` and
+`atomic runs resume` then stop with exit code 75, the run unfinished and nothing
+recorded, for `atomic runs resume` to continue, and `atomic serve` leaves the
+run unfinished until it is started again. A signal ends a wait at once. The
+local backend is the only one with a Codex shell, and
 it states that its workspaces are durable. A backend that states anything else,
 or a value atomic does not recognize, is treated as ephemeral, and a workflow
 with a `worktree: true` step is refused on it before anything runs.

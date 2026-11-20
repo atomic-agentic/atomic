@@ -243,6 +243,7 @@ Atomic refuses to start when the durable engine's own version variable
 | `--owner-stopped` (`runs resume` only) | On PostgreSQL, take over a run another executor owns, asserting that executor has stopped; without it such a resume is refused |
 | `ATOMIC_EXECUTOR_ID` (`--executor-id`) | This process's identity as owner of its runs: unique to the process and the same across its restarts, so a restart recovers its own unfinished runs and no one else's. Required on PostgreSQL |
 | `ATOMIC_RUNNER` (`--runner`) | `local` (the default) runs exec atoms' commands as child processes; `process` runs each in an `atomic runner` process of its own, which sees only `PATH` from its parent |
+| `ATOMIC_BACKEND_WAIT` (`--backend-wait`) | How many seconds a step waits for the execution backend to have room for its workspace; then the run stops unfinished, with nothing recorded and exit code 75, for `atomic runs resume`. Without it a step waits for as long as it takes |
 
 `atomic --remote <url>` and shared/team service access arrive in **v0.5**, with
 identity and transport controls.
