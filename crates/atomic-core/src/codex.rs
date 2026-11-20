@@ -121,13 +121,174 @@ pub struct TurnSpec {
     pub writable_roots: Vec<PathBuf>,
 }
 
-/// Codex's permission profile for a sandbox: read-only, or writes confined
-/// to the workspace; the network is restricted either way.
-pub(crate) fn permission_profile(sandbox: crate::typed::Sandbox) -> PermissionProfile {
-    match sandbox {
-        crate::typed::Sandbox::ReadOnly => PermissionProfile::read_only(),
-        crate::typed::Sandbox::WorkspaceWrite => PermissionProfile::workspace_write(),
+/// What a thread's commands are kept out of. It has no default: every
+/// caller that starts a thread says which.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StateGuard {
+    /// Deny atomic's private state to the thread's commands.
+    Deny(PrivateState),
+    /// The thread belongs to no project state: a test runtime, which has no
+    /// sandbox helper to enforce a denial with (Codex enforces it through
+    /// the helper, even for its own reads). A workspace-write thread whose
+    /// writable roots cover atomic's state is refused, and its temporary
+    /// directory is made in the system temporary directory.
+    NoProjectState,
+}
+
+/// What [`StateGuard::Deny`] denies.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrivateState {
+    /// The project's state directory: its `private/` directory is denied,
+    /// and each thread gets its temporary directory in its `tmp/`.
+    pub state_dir: PathBuf,
+    /// Other directories denied whole: the context key and the credential
+    /// file store.
+    pub also: Vec<PathBuf>,
+}
+
+impl StateGuard {
+    /// The guard for threads of the project whose state is `state`. Creates
+    /// the user-wide private directories it denies, so they are denied from
+    /// the start.
+    pub fn for_project(state: &crate::state::ProjectState) -> anyhow::Result<Self> {
+        Self::deny_state_dir(state.dir())
     }
+
+    /// The guard for a state directory at `state_dir`, with the user-wide
+    /// private directories as configured.
+    pub fn deny_state_dir(state_dir: impl Into<PathBuf>) -> anyhow::Result<Self> {
+        let mut also = vec![crate::state::credentials_dir()?];
+        also.push(crate::context::default_key_dir().map_err(anyhow::Error::msg)?);
+        for dir in &also {
+            crate::state::private_dir(dir)?;
+        }
+        Ok(Self::Deny(PrivateState {
+            state_dir: state_dir.into(),
+            also,
+        }))
+    }
+}
+
+/// Every path a profile denies under `guard`, for a thread whose Codex home
+/// is `codex_home`: the state directory's `private/`, the user-wide private
+/// directories, and everything in Codex's home but the shell snapshots and
+/// helper links its shell needs. Each is denied whole, never re-opened
+/// below, so the sandbox needs no mount inside a denied directory. Both
+/// spellings of a path reached through a link are denied.
+fn denied_paths(private: &PrivateState, codex_home: &Path) -> (Vec<PathBuf>, Vec<String>) {
+    let mut denied = vec![private.state_dir.join("private")];
+    denied.extend(private.also.iter().cloned());
+    let children = |dir: &Path, keep: &str| -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_name() != keep)
+            .map(|e| e.path())
+            .collect()
+    };
+    let arg0 = format!("arg0-{}", std::env::consts::OS);
+    for entry in children(codex_home, "shell_snapshots") {
+        if entry.file_name().is_some_and(|n| n == "tmp") {
+            denied.extend(children(&entry, &arg0));
+        } else {
+            denied.push(entry);
+        }
+    }
+    let mut all = Vec::new();
+    for path in denied {
+        if let Ok(real) = std::fs::canonicalize(&path)
+            && real != path
+        {
+            all.push(real);
+        }
+        all.push(path);
+    }
+    // Codex creates its state database when the first thread starts, after
+    // the list above is made: a pattern, expanded when each command starts,
+    // covers it.
+    let globs = vec![format!("{}/*.sqlite*", codex_home.display())];
+    (all, globs)
+}
+
+/// Codex's permission profile for a sandbox: read-only, or writes confined
+/// to the workspace; the network is restricted either way. Under
+/// [`StateGuard::Deny`], atomic's private state is denied as well (see
+/// [`denied_paths`]).
+pub(crate) fn permission_profile(
+    sandbox: crate::typed::Sandbox,
+    guard: &StateGuard,
+    codex_home: &Path,
+) -> anyhow::Result<PermissionProfile> {
+    use codex_protocol::permissions::{
+        FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry, NetworkSandboxPolicy,
+    };
+    let base = match sandbox {
+        crate::typed::Sandbox::ReadOnly => PermissionProfile::read_only(),
+        // Not /tmp or $TMPDIR: a repository or state directory there would be
+        // writable from the turn. A thread gets a temporary directory of its
+        // own instead (see `TurnTemp`).
+        crate::typed::Sandbox::WorkspaceWrite => PermissionProfile::workspace_write_with(
+            &[],
+            NetworkSandboxPolicy::Restricted,
+            /*exclude_tmpdir_env_var*/ true,
+            /*exclude_slash_tmp*/ true,
+        ),
+    };
+    let StateGuard::Deny(private) = guard else {
+        return Ok(base);
+    };
+    let mut policy = base.file_system_sandbox_policy();
+    let (paths, globs) = denied_paths(private, codex_home);
+    for p in paths {
+        let p = AbsolutePathBuf::from_absolute_path(&p)
+            .with_context(|| format!("resolve the sandbox path {}", p.display()))?;
+        policy.entries.push(FileSystemSandboxEntry::new(
+            FileSystemPath::from(p),
+            FileSystemAccessMode::Deny,
+        ));
+    }
+    for pattern in globs {
+        policy.entries.push(FileSystemSandboxEntry::new(
+            FileSystemPath::GlobPattern { pattern },
+            FileSystemAccessMode::Deny,
+        ));
+    }
+    Ok(PermissionProfile::from_runtime_permissions(
+        &policy,
+        NetworkSandboxPolicy::Restricted,
+    ))
+}
+
+/// Refuse a workspace-write thread under [`StateGuard::NoProjectState`]
+/// whose writable roots cover atomic's state or user-wide private
+/// directories, or lie inside them: nothing would deny them.
+fn refuse_uncovered_store(
+    sandbox: crate::typed::Sandbox,
+    guard: &StateGuard,
+    roots: &[PathBuf],
+) -> anyhow::Result<()> {
+    if sandbox != crate::typed::Sandbox::WorkspaceWrite || guard != &StateGuard::NoProjectState {
+        return Ok(());
+    }
+    let mut stores = vec![crate::state::base_dir()?, crate::state::credentials_dir()?];
+    stores.push(crate::context::default_key_dir().map_err(anyhow::Error::msg)?);
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
+    for root in roots {
+        let root = real(root);
+        for store in &stores {
+            let store = real(store);
+            if store.starts_with(&root) || root.starts_with(&store) {
+                bail!(
+                    "a workspace-write thread with no project state may not write {}: it covers \
+                     atomic's private state at {}, which nothing would deny",
+                    root.display(),
+                    store.display()
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// What a thread did: its id, how many turns it ran and the tokens it used,
@@ -185,6 +346,22 @@ where
     F: FnOnce(CodexPaths) -> Fut + Send + 'static,
     Fut: Future<Output = anyhow::Result<()>>,
 {
+    #[cfg(target_os = "linux")]
+    if invoked_as_linux_sandbox() {
+        // Running the command with the kernel keyrings in reach would let it
+        // read what they hold, or plant a key: refuse instead.
+        let inner = std::env::args_os().any(|a| a == "--apply-seccomp-then-exec");
+        let kept_off = if inner {
+            // Inside the sandbox, just before the command runs.
+            deny_keyrings()
+        } else {
+            leave_session_keyring()
+        };
+        if let Err(e) = kept_off {
+            eprintln!("atomic: cannot keep a sandboxed command off the kernel keyrings: {e}");
+            std::process::exit(1);
+        }
+    }
     // SAFETY: called at the start of main, while the process has one thread,
     // so no other thread can read the environment concurrently.
     #[allow(unsafe_code)]
@@ -192,6 +369,235 @@ where
         std::env::set_var("CODEX_HOME", codex_home);
     }
     arg0_dispatch_or_else(move |paths| main_fn(CodexPaths(paths)))
+}
+
+/// A thread's own temporary directory, `<state>/tmp/turn-…`, writable from
+/// its commands and named by their `TMPDIR`. Removed when dropped.
+struct TurnTemp(PathBuf);
+
+/// The prefix of a turn's temporary directory, followed by the pid of the
+/// process that made it.
+const TURN_TEMP_PREFIX: &str = "turn-";
+
+impl TurnTemp {
+    /// A new temporary directory for one thread: in the state directory's
+    /// `tmp/` under [`StateGuard::Deny`], in the system temporary directory
+    /// otherwise. Readable by its owner only.
+    fn create(guard: &StateGuard) -> anyhow::Result<Self> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let (parent, prefix) = match guard {
+            StateGuard::Deny(private) => (private.state_dir.join("tmp"), TURN_TEMP_PREFIX),
+            StateGuard::NoProjectState => (std::env::temp_dir(), "atomic-turn-"),
+        };
+        std::fs::create_dir_all(&parent).with_context(|| format!("create {}", parent.display()))?;
+        let dir = parent.join(format!("{prefix}{}-{n}-{nanos}", std::process::id()));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder
+            .create(&dir)
+            .with_context(|| format!("create the turn's temporary directory {}", dir.display()))?;
+        Ok(Self(dir))
+    }
+}
+
+impl Drop for TurnTemp {
+    fn drop(&mut self) {
+        // What is left behind is swept at the next start (see
+        // `sweep_turn_temps`).
+        let _ = remove_all(&self.0);
+    }
+}
+
+/// Remove `dir` and everything in it, first making each directory in it
+/// writable and searchable, so a command that left a mode-000 directory
+/// behind cannot keep it.
+fn remove_all(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    fn open_up(dir: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                open_up(&entry.path());
+            }
+        }
+    }
+    #[cfg(unix)]
+    open_up(dir);
+    match std::fs::remove_dir_all(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
+/// Remove the temporary directories that threads of processes no longer
+/// running left in the state directory `state_dir` (a process killed before
+/// its threads ended leaves them). Holds the state directory's lock on
+/// `tmp/` while it sweeps. Returns how many it removed.
+pub fn sweep_turn_temps(state_dir: &Path) -> anyhow::Result<usize> {
+    let tmp = state_dir.join("tmp");
+    std::fs::create_dir_all(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+    let lock = std::fs::File::create(tmp.join(".sweep.lock"))
+        .with_context(|| format!("open the sweep lock in {}", tmp.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: flock on a descriptor this function owns.
+        #[allow(unsafe_code)]
+        let locked = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
+        if locked != 0 {
+            return Err(std::io::Error::last_os_error()).context("lock the turn directories");
+        }
+    }
+    let mut removed = 0;
+    for entry in std::fs::read_dir(&tmp)?.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(pid) = name
+            .strip_prefix(TURN_TEMP_PREFIX)
+            .and_then(|rest| rest.split('-').next())
+            .and_then(|pid| pid.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid != std::process::id() && !process_alive(pid) {
+            remove_all(&entry.path())
+                .with_context(|| format!("remove {}", entry.path().display()))?;
+            removed += 1;
+        }
+    }
+    drop(lock);
+    Ok(removed)
+}
+
+/// Whether a process with this pid is running. One that is but cannot be
+/// signalled counts as running.
+fn process_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return true;
+        };
+        // SAFETY: signal 0 delivers nothing; it only checks the pid.
+        #[allow(unsafe_code)]
+        let r = unsafe { libc::kill(pid, 0) };
+        r == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+/// Whether this process is Codex's Linux sandbox helper: this executable,
+/// run under the helper's name, which [`dispatch`] hands to Codex.
+#[cfg(target_os = "linux")]
+fn invoked_as_linux_sandbox() -> bool {
+    std::env::args_os()
+        .next()
+        .as_deref()
+        .map(Path::new)
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == "codex-linux-sandbox")
+}
+
+/// Join a new, empty session keyring, so the command the helper sandboxes
+/// cannot read the keys of the session that started atomic, such as the
+/// cached operator credential (see [`crate::credential`]).
+///
+/// Codex's sandbox gives a command a new user namespace, and with it a new
+/// user keyring, but the session keyring is inherited, and the user's own
+/// keyring is linked into it. Keys found through a keyring the process holds
+/// are readable to it; an anonymous session keyring holds nothing. Where
+/// `keyctl` itself is refused, as under a container's default seccomp
+/// profile, it is refused to the command too, and there is nothing to leave.
+#[cfg(target_os = "linux")]
+fn leave_session_keyring() -> std::io::Result<()> {
+    const KEYCTL_JOIN_SESSION_KEYRING: libc::c_long = 1;
+    // SAFETY: keyctl(KEYCTL_JOIN_SESSION_KEYRING, NULL) reads no memory: a
+    // null name asks for a new anonymous keyring.
+    #[allow(unsafe_code)]
+    let joined = unsafe {
+        libc::syscall(
+            libc::SYS_keyctl,
+            KEYCTL_JOIN_SESSION_KEYRING,
+            std::ptr::null::<libc::c_char>(),
+        )
+    };
+    if joined >= 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        // keyctl itself is refused here only if reading the session keyring
+        // is refused too; then it is refused to the command as well.
+        Some(libc::ENOSYS | libc::EPERM) if !session_keyring_readable() => Ok(()),
+        _ => Err(error),
+    }
+}
+
+/// Whether this process can find its session keyring at all.
+#[cfg(target_os = "linux")]
+fn session_keyring_readable() -> bool {
+    const KEYCTL_GET_KEYRING_ID: libc::c_long = 0;
+    const KEY_SPEC_SESSION_KEYRING: libc::c_long = -3;
+    // SAFETY: keyctl(KEYCTL_GET_KEYRING_ID, id, create = 0) reads no memory.
+    #[allow(unsafe_code)]
+    let id = unsafe {
+        libc::syscall(
+            libc::SYS_keyctl,
+            KEYCTL_GET_KEYRING_ID,
+            KEY_SPEC_SESSION_KEYRING,
+            0 as libc::c_long,
+        )
+    };
+    id >= 0
+}
+
+/// Deny `keyctl`, `add_key` and `request_key` to this process and what it
+/// runs, with `EPERM`. A key's serial is global and the sandbox maps the
+/// user's uid onto itself, so a command that can call `keyctl` can link any
+/// keyring the user owns, its own session keyring included, into its own,
+/// and read or plant keys there; leaving the session keyring takes away
+/// possession only. Installed in the sandbox's inner stage, under
+/// `no_new_privs` as Codex's own filter is, before Codex installs that.
+#[cfg(target_os = "linux")]
+fn deny_keyrings() -> std::io::Result<()> {
+    use seccompiler::{BpfProgram, SeccompAction, SeccompFilter, TargetArch};
+    #[cfg(target_arch = "x86_64")]
+    let arch = TargetArch::x86_64;
+    #[cfg(target_arch = "aarch64")]
+    let arch = TargetArch::aarch64;
+    #[cfg(target_arch = "riscv64")]
+    let arch = TargetArch::riscv64;
+    let rules = [libc::SYS_keyctl, libc::SYS_add_key, libc::SYS_request_key]
+        .into_iter()
+        .map(|nr| (nr, Vec::new()))
+        .collect();
+    let other = |e: &dyn std::fmt::Display| std::io::Error::other(e.to_string());
+    let filter = SeccompFilter::new(
+        rules,
+        SeccompAction::Allow,
+        SeccompAction::Errno(libc::EPERM as u32),
+        arch,
+    )
+    .map_err(|e| other(&e))?;
+    let program: BpfProgram = filter
+        .try_into()
+        .map_err(|e: seccompiler::BackendError| other(&e))?;
+    // SAFETY: prctl(PR_SET_NO_NEW_PRIVS, 1) takes no pointers.
+    #[allow(unsafe_code)]
+    let set = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+    if set != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    seccompiler::apply_filter(&program).map_err(|e| other(&e))
 }
 
 /// Run one turn on a fresh, ephemeral Codex thread and return the model's
@@ -202,13 +608,14 @@ pub async fn one_turn(
     codex_home: &Path,
     cwd: &Path,
     endpoint: &ModelEndpoint,
+    guard: &StateGuard,
     prompt: &str,
 ) -> anyhow::Result<String> {
     let spec = TurnSpec {
         prompt: prompt.to_owned(),
         ..TurnSpec::default()
     };
-    run(paths, codex_home, cwd, endpoint, &spec).await
+    run(paths, codex_home, cwd, endpoint, guard, &spec).await
 }
 
 /// Run `spec` as one turn on a fresh, ephemeral thread and return the final
@@ -218,9 +625,10 @@ pub async fn run(
     codex_home: &Path,
     cwd: &Path,
     endpoint: &ModelEndpoint,
+    guard: &StateGuard,
     spec: &TurnSpec,
 ) -> anyhow::Result<String> {
-    converse(paths, codex_home, cwd, endpoint, spec, |_| None)
+    converse(paths, codex_home, cwd, endpoint, guard, spec, |_| None)
         .await
         .map(|(answer, _)| answer)
 }
@@ -234,6 +642,7 @@ pub async fn converse<F>(
     codex_home: &Path,
     cwd: &Path,
     endpoint: &ModelEndpoint,
+    guard: &StateGuard,
     first: &TurnSpec,
     mut next: F,
 ) -> anyhow::Result<(String, ThreadReport)>
@@ -246,6 +655,7 @@ where
         cwd,
         endpoint,
         &Metering::none(),
+        guard,
         first,
         |answer| std::future::ready(next(&answer)),
     )
@@ -254,12 +664,14 @@ where
 
 /// Conversation with asynchronous checks between turns. Each turn is
 /// admitted by `meter` before it is submitted and settled once after it.
+#[allow(clippy::too_many_arguments)] // each is one thing every thread needs
 pub async fn converse_async<F, Fut>(
     paths: &CodexPaths,
     codex_home: &Path,
     cwd: &Path,
     endpoint: &ModelEndpoint,
     meter: &Metering,
+    guard: &StateGuard,
     first: &TurnSpec,
     mut next: F,
 ) -> anyhow::Result<(String, ThreadReport)>
@@ -276,11 +688,28 @@ where
     config.developer_instructions = spec.developer_instructions.clone();
     config.permissions = Permissions::from_approval_and_profile(
         Constrained::allow_any(AskForApproval::Never),
-        Constrained::allow_any(permission_profile(spec.sandbox)),
+        Constrained::allow_any(permission_profile(spec.sandbox, guard, codex_home)?),
     )?;
-    if !spec.writable_roots.is_empty() {
+    let mut writable_roots = spec.writable_roots.clone();
+    writable_roots.push(cwd.to_owned());
+    refuse_uncovered_store(spec.sandbox, guard, &writable_roots)?;
+    writable_roots.pop();
+    // Under workspace-write the system temporary directories are not
+    // writable (see `permission_profile`): the thread gets its own, removed
+    // when the thread ends.
+    let temp = match spec.sandbox {
+        crate::typed::Sandbox::WorkspaceWrite => Some(TurnTemp::create(guard)?),
+        crate::typed::Sandbox::ReadOnly => None,
+    };
+    let mut env = spec.env.clone();
+    if let Some(temp) = &temp {
+        writable_roots.push(temp.0.clone());
+        env.entry("TMPDIR".into())
+            .or_insert_with(|| temp.0.display().to_string());
+    }
+    if !writable_roots.is_empty() {
         let mut roots = vec![config.cwd.clone()];
-        for root in &spec.writable_roots {
+        for root in &writable_roots {
             let root = AbsolutePathBuf::from_absolute_path(root)
                 .with_context(|| format!("resolve the writable root {}", root.display()))?;
             if !roots.contains(&root) {
@@ -291,7 +720,7 @@ where
         config.workspace_roots = roots;
         config.workspace_roots_explicit = true;
     }
-    for (name, value) in &spec.env {
+    for (name, value) in &env {
         config
             .permissions
             .shell_environment_policy
@@ -843,6 +1272,7 @@ mod tests {
                 &home,
                 &cwd,
                 &endpoint,
+                &StateGuard::NoProjectState,
                 "ping",
             )
             .await
@@ -878,6 +1308,7 @@ mod tests {
                 &home,
                 &cwd,
                 &endpoint,
+                &StateGuard::NoProjectState,
                 &first,
                 |answer| {
                     seen.push(answer.to_owned());
@@ -898,18 +1329,199 @@ mod tests {
     #[test]
     fn sandboxes_map_to_codex_permission_profiles() {
         use crate::typed::Sandbox;
+        let home = Path::new("/state/codex");
+        let profile = |sandbox| {
+            permission_profile(sandbox, &StateGuard::NoProjectState, home).expect("profile")
+        };
+        assert_eq!(profile(Sandbox::ReadOnly), PermissionProfile::read_only());
         assert_eq!(
-            permission_profile(Sandbox::ReadOnly),
-            PermissionProfile::read_only()
-        );
-        assert_eq!(
-            permission_profile(Sandbox::WorkspaceWrite),
-            PermissionProfile::workspace_write()
+            profile(Sandbox::WorkspaceWrite),
+            PermissionProfile::workspace_write_with(
+                &[],
+                codex_protocol::permissions::NetworkSandboxPolicy::Restricted,
+                true,
+                true
+            )
         );
         assert_ne!(
-            permission_profile(Sandbox::ReadOnly),
-            permission_profile(Sandbox::WorkspaceWrite)
+            profile(Sandbox::WorkspaceWrite),
+            PermissionProfile::workspace_write(),
+            "the system temporary directories are not writable"
         );
+        assert_ne!(profile(Sandbox::ReadOnly), profile(Sandbox::WorkspaceWrite));
+    }
+
+    /// What a profile lets a command at `path` do, with `cwd` and `roots` as
+    /// the thread's working directory and writable roots.
+    fn access(
+        profile: &PermissionProfile,
+        cwd: &str,
+        roots: &[&str],
+        path: &str,
+    ) -> codex_protocol::permissions::FileSystemAccessMode {
+        let mut workspace: Vec<AbsolutePathBuf> =
+            vec![AbsolutePathBuf::from_absolute_path(cwd).expect("cwd")];
+        workspace.extend(
+            roots
+                .iter()
+                .map(|r| AbsolutePathBuf::from_absolute_path(r).expect("root")),
+        );
+        let policy = profile
+            .clone()
+            .materialize_project_roots_with_workspace_roots(&workspace)
+            .file_system_sandbox_policy();
+        let can_read = policy.can_read_local_path_with_cwd(Path::new(path), Path::new(cwd));
+        let can_write = policy.can_write_local_path_with_cwd(Path::new(path), Path::new(cwd));
+        use codex_protocol::permissions::FileSystemAccessMode::*;
+        match (can_read, can_write) {
+            (_, true) => Write,
+            (true, false) => Read,
+            (false, false) => Deny,
+        }
+    }
+
+    #[test]
+    fn private_state_is_denied_and_the_rest_of_the_state_directory_is_not() {
+        use crate::typed::Sandbox;
+        use codex_protocol::permissions::FileSystemAccessMode::*;
+        let dir = scratch("private");
+        let state = dir.join("state");
+        let home = state.join("codex");
+        for sub in [
+            "private",
+            "codex/shell_snapshots",
+            "codex/tmp/arg0-linux",
+            "codex/log",
+        ] {
+            std::fs::create_dir_all(state.join(sub)).expect("layout");
+        }
+        std::fs::write(home.join("auth.json"), "{}").expect("codex file");
+        std::fs::create_dir_all(home.join("tmp/other")).expect("codex tmp");
+        let guard = StateGuard::Deny(PrivateState {
+            state_dir: state.clone(),
+            also: vec![dir.join("keys"), dir.join("credentials")],
+        });
+        let write = permission_profile(Sandbox::WorkspaceWrite, &guard, &home).expect("rw");
+        let read = permission_profile(Sandbox::ReadOnly, &guard, &home).expect("ro");
+        let p = |rel: &str| state.join(rel).display().to_string();
+        let worktree = p("worktrees/run/step");
+        let cache = p("cache");
+        for (profile, own) in [(&write, Write), (&read, Read)] {
+            let at = |path: &str| access(profile, &worktree, &[&cache], path);
+            assert_eq!(at(&p("private/atomic.db")), Deny);
+            assert_eq!(at(&p("private")), Deny);
+            assert_eq!(
+                at(&dir.join("keys/context.key").display().to_string()),
+                Deny
+            );
+            assert_eq!(at(&dir.join("credentials/x").display().to_string()), Deny);
+            assert_eq!(at(&p("codex/auth.json")), Deny);
+            assert_eq!(at(&p("codex/log/x")), Deny);
+            assert_eq!(at(&p("codex/tmp/other/x")), Deny);
+            // What Codex's shell needs, and the thread's own checkout.
+            assert_eq!(at(&p("codex/shell_snapshots/t.sh")), Read);
+            assert_eq!(at(&p("codex/tmp/arg0-linux/codex-linux-sandbox")), Read);
+            assert_eq!(at(&format!("{worktree}/src/lib.rs")), own);
+            assert_eq!(at("/usr/bin/git"), Read);
+            // The system temporary directory is not writable, nor a project in it.
+            assert_eq!(at("/tmp/x"), Read);
+            assert_eq!(at("/tmp/project/.git/HEAD"), Read);
+        }
+        assert_eq!(
+            access(
+                &write,
+                &worktree,
+                &[&cache],
+                &format!("{cache}/cargo-target/x")
+            ),
+            Write
+        );
+        // Every denied path is denied whole: nothing below one is re-opened,
+        // so the sandbox needs no mount inside a denied directory.
+        let policy = write
+            .clone()
+            .materialize_project_roots_with_workspace_roots(&[AbsolutePathBuf::from_absolute_path(
+                &worktree,
+            )
+            .expect("cwd")])
+            .file_system_sandbox_policy();
+        let denied: Vec<_> = policy
+            .entries
+            .iter()
+            .filter(|e| e.access == Deny)
+            .filter_map(|e| match &e.path {
+                codex_protocol::permissions::FileSystemPath::Path { path } => {
+                    path.to_abs_path().ok()
+                }
+                _ => None,
+            })
+            .collect();
+        for entry in policy.entries.iter().filter(|e| e.access != Deny) {
+            if let codex_protocol::permissions::FileSystemPath::Path { path } = &entry.path
+                && let Ok(path) = path.to_abs_path()
+            {
+                assert!(
+                    !denied
+                        .iter()
+                        .any(|d| path.as_path().starts_with(d.as_path())),
+                    "{} re-opens a denied path",
+                    path.display()
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_writing_thread_with_no_project_state_may_not_cover_atomic_state() {
+        use crate::typed::Sandbox;
+        let base = crate::state::base_dir().expect("base");
+        let inside = base.join("projects/p");
+        let refused = |roots: &[PathBuf]| {
+            refuse_uncovered_store(Sandbox::WorkspaceWrite, &StateGuard::NoProjectState, roots)
+        };
+        assert!(refused(std::slice::from_ref(&inside)).is_err());
+        assert!(
+            refused(&[PathBuf::from("/")]).is_err(),
+            "a root above the store"
+        );
+        assert!(refused(&[PathBuf::from("/nowhere/project")]).is_ok());
+        assert!(
+            refuse_uncovered_store(Sandbox::ReadOnly, &StateGuard::NoProjectState, &[inside])
+                .is_ok(),
+            "a read-only thread writes nothing"
+        );
+    }
+
+    #[test]
+    fn turn_directories_of_dead_processes_are_swept() {
+        let state = scratch("sweep");
+        let tmp = state.join("tmp");
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        // A pid that no process has: above the kernel's pid limit.
+        let dead = tmp.join("turn-4194305-0-1");
+        std::fs::create_dir_all(dead.join("locked/inner")).expect("dead");
+        std::fs::write(dead.join("locked/inner/f"), "x").expect("file");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dead.join("locked"), std::fs::Permissions::from_mode(0o000))
+                .expect("mode 000");
+        }
+        let mine = TurnTemp::create(&StateGuard::Deny(PrivateState {
+            state_dir: state.clone(),
+            also: Vec::new(),
+        }))
+        .expect("live");
+        std::fs::write(tmp.join("unrelated"), "x").expect("other");
+        assert_eq!(sweep_turn_temps(&state).expect("sweep"), 1);
+        assert!(!dead.exists());
+        assert!(mine.0.exists(), "a live process's directory stays");
+        assert!(tmp.join("unrelated").exists());
+        let kept = mine.0.clone();
+        drop(mine);
+        assert!(!kept.exists());
+        let _ = std::fs::remove_dir_all(&state);
     }
 
     #[test]
@@ -930,9 +1542,16 @@ mod tests {
                 model: "synthetic".into(),
                 api_key_env: None,
             };
-            let answer = one_turn(&CodexPaths::without_helpers(), &home, &cwd, &endpoint, "go")
-                .await
-                .expect("one turn");
+            let answer = one_turn(
+                &CodexPaths::without_helpers(),
+                &home,
+                &cwd,
+                &endpoint,
+                &StateGuard::NoProjectState,
+                "go",
+            )
+            .await
+            .expect("one turn");
             assert_eq!(answer, "done");
             assert_eq!(model.calls(), 2);
             // The second call carries the failed tool call's result.

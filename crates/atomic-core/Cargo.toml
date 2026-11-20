@@ -44,6 +44,11 @@ codex-app-server = { workspace = true }
 codex-core-api = { workspace = true }
 codex-extension-api = { workspace = true }
 deno_core = { workspace = true }
+codex-keyring-store = { workspace = true }
+codex-protocol = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+seccompiler = { workspace = true }
 
 [build-dependencies]
 sha2 = { workspace = true }

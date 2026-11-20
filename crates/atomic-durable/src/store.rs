@@ -115,10 +115,20 @@ const MIGRATIONS: &[Migration] = &[
             "CREATE INDEX IF NOT EXISTS atomic_parks_by_run ON atomic_parks (run)",
         ],
     },
+    Migration {
+        version: 4,
+        // The people who may decide gates (see `gate::credential`): each
+        // principal and the verifier of the credential it enrolled.
+        sql: &["CREATE TABLE IF NOT EXISTS atomic_operators (
+                principal TEXT PRIMARY KEY,
+                verifier TEXT NOT NULL,
+                enrolled_at BIGINT NOT NULL
+            )"],
+    },
 ];
 
 /// The store version this binary writes and understands.
-pub const STORE_VERSION: i64 = 3;
+pub const STORE_VERSION: i64 = 4;
 
 /// Why the store could not be opened.
 #[derive(Debug, thiserror::Error)]

@@ -18,11 +18,14 @@
 //! the store row, read by this run's own gate id and checked against this
 //! run and the proposal digest the workflow computes from what it shows, so
 //! a recorded receive (forged, imported or copied from another run) cannot
-//! approve anything.
+//! approve anything. A completed decision checkpoint is revalidated against
+//! the store outside checkpoint replay before the workflow can proceed.
 //!
 //! [`decide`] is the person's side: an idempotent command with a client-made
 //! command id, committed in one short transaction before it is
-//! acknowledged. The first durable resolution wins; a replayed command gets
+//! acknowledged. It carries a [`HumanCredential`], checked against the
+//! verifier the person enrolled (see [`credential`]): who decided is who
+//! proved it, never a name the command gives. The first durable resolution wins; a replayed command gets
 //! its original result back, and any other command on a resolved gate gets a
 //! [`DecideError::Conflict`] carrying the resolution that won. Only after the
 //! commit does it send the wake-up, keyed by the gate id so a repeat sends
@@ -35,8 +38,12 @@
 //! and a decision that arrives after it gets the expiry as its conflict.
 
 pub mod approvers;
+pub mod credential;
 
 pub use approvers::{ApproverError, Approvers, Deployment, Principal, resolve};
+pub use credential::{
+    EnrollError, Enrollment, HumanCredential, enroll, enrolled, replace_enrollment,
+};
 
 use crate::failpoint;
 use crate::runtime::{
@@ -245,6 +252,13 @@ pub enum DecideError {
     /// There is no such gate.
     #[error("no gate {0}")]
     NoSuchGate(String),
+    /// The principal has no credential enrolled, so nothing it sends is a
+    /// decision.
+    #[error("{0} has no operator credential enrolled")]
+    NotEnrolled(Principal),
+    /// The credential is not the one the principal enrolled.
+    #[error("the credential presented for {0} is not the one it enrolled")]
+    BadCredential(Principal),
     /// The person is not one of the gate's approvers.
     #[error("{who} is not an approver of gate {gate}")]
     NotAnApprover {
@@ -427,6 +441,29 @@ async fn read_gate(tx: &mut Tx<'_, '_>, id: &str) -> Result<Option<Gate>> {
     }
 }
 
+// The same identity/proposal fence applies inside the durable decision step
+// and after replay. Never infer authorization from a copied step output.
+async fn checked_gate(tx: &mut Tx<'_, '_>, id: &str, run: &str, proposal: &str) -> Result<Gate> {
+    let gate = read_gate(tx, id).await?.ok_or_else(|| {
+        DurableError::Failed(format!(
+            "gate {id} is not in the gate store, so nothing approved it"
+        ))
+    })?;
+    if gate.run != run {
+        return Err(DurableError::Failed(format!(
+            "gate {id} in the gate store belongs to run {}, not {run}",
+            gate.run
+        )));
+    }
+    if gate.proposal != proposal {
+        return Err(DurableError::Failed(format!(
+            "gate {id} was opened on proposal {}, but this run now shows {proposal}: changed content needs a new gate",
+            gate.proposal
+        )));
+    }
+    Ok(gate)
+}
+
 /// Record that `gate` expired at `now`, if it is still open. Returns the
 /// gate as the store now has it.
 async fn expire(tx: &mut Tx<'_, '_>, gate: &Gate, now: i64) -> Result<Gate> {
@@ -543,24 +580,7 @@ pub async fn gate<C: WorkflowContext>(ctx: &C, step: &str, spec: GateSpec) -> Re
                 let (id, run, proposal) =
                     (check_id.clone(), check_run.clone(), check_proposal.clone());
                 Box::pin(async move {
-                    let Some(gate) = read_gate(&mut tx, &id).await? else {
-                        return Err(DurableError::Failed(format!(
-                            "gate {id} is not in the gate store, so nothing approved it"
-                        )));
-                    };
-                    if gate.run != run {
-                        return Err(DurableError::Failed(format!(
-                            "gate {id} in the gate store belongs to run {}, not {run}",
-                            gate.run
-                        )));
-                    }
-                    if gate.proposal != proposal {
-                        return Err(DurableError::Failed(format!(
-                            "gate {id} was opened on proposal {}, but this run now shows \
-                             {proposal}: changed content needs a new gate",
-                            gate.proposal
-                        )));
-                    }
+                    let gate = checked_gate(&mut tx, &id, &run, &proposal).await?;
                     let now = now_ms();
                     let gate = if past_deadline(&gate, now) {
                         expire(&mut tx, &gate, now).await?
@@ -577,7 +597,27 @@ pub async fn gate<C: WorkflowContext>(ctx: &C, step: &str, spec: GateSpec) -> Re
             })
             .await?;
         match check {
-            Check::Resolved(resolution) => return Ok(resolution),
+            Check::Resolved(_) => {
+                // A transaction checkpoint can be copied or forged just like a
+                // receive checkpoint. Recheck the authoritative row outside
+                // every replayed operation, and return its actual resolution.
+                let (id, run, proposal) = (id.clone(), run.clone(), proposal.clone());
+                return ctx
+                    .control_transaction(move |mut tx| {
+                        let (id, run, proposal) = (id.clone(), run.clone(), proposal.clone());
+                        Box::pin(async move {
+                            checked_gate(&mut tx, &id, &run, &proposal)
+                                .await?
+                                .resolution
+                                .ok_or_else(|| {
+                                    DurableError::Failed(format!(
+                                        "gate {id} is not resolved in the gate store"
+                                    ))
+                                })
+                        })
+                    })
+                    .await;
+            }
             Check::Open { deadline: d } => deadline = d,
         }
     }
@@ -643,23 +683,37 @@ async fn journaled(
     Ok(Some(Ok(decode(&row.text("result")?)?)))
 }
 
-/// Record `by`'s decision `cmd`, durably, and wake the gate's run.
+/// Record the decision `cmd` of the person `credential` proves, durably,
+/// and wake the gate's run.
 ///
-/// `by` must be the authenticated person making the decision; nothing in
-/// the command names them. Returns the recorded decision, the same one for a
-/// replayed command, or why it was not recorded.
+/// The credential is checked against the gate store in the same
+/// transaction: a principal with none enrolled, or a credential that does
+/// not match, records nothing. Nothing in the command names who decides.
+/// Returns the recorded decision, the same one for a replayed command, or
+/// why it was not recorded.
 pub async fn decide<R: DurableRuntime>(
     rt: &R,
-    by: &Principal,
+    credential: &HumanCredential,
     cmd: DecisionCommand,
 ) -> std::result::Result<Decision, DecideError> {
-    let request = request_digest(by, &cmd);
+    let by = credential.principal().clone();
+    let request = request_digest(&by, &cmd);
     let gate_id = cmd.gate.clone();
-    let by = by.clone();
+    let credential = credential.clone();
     let (recorded, run) = rt
         .control_transaction(move |mut tx| {
-            let (cmd, by, request) = (cmd.clone(), by.clone(), request.clone());
+            let (cmd, by, request, credential) =
+                (cmd.clone(), by.clone(), request.clone(), credential.clone());
             Box::pin(async move {
+                match credential::verify(&mut tx, &credential).await? {
+                    credential::Verified::Yes => {}
+                    credential::Verified::NotEnrolled => {
+                        return Ok((Err(DecideError::NotEnrolled(by)), None));
+                    }
+                    credential::Verified::Mismatch => {
+                        return Ok((Err(DecideError::BadCredential(by)), None));
+                    }
+                }
                 if let Some(found) = journaled(&mut tx, &cmd.command_id, &request).await? {
                     // A replay: wake the run again, in case the first time
                     // stopped before it did.
@@ -678,6 +732,10 @@ pub async fn decide<R: DurableRuntime>(
                         None,
                     ));
                 }
+                // A competing command may win its journal key after we have
+                // updated this gate. Keep those writes reversible until the
+                // command identity has also been admitted.
+                tx.execute("SAVEPOINT atomic_gate_decision", &[]).await?;
                 let now = now_ms();
                 let gate = if past_deadline(&gate, now) {
                     expire(&mut tx, &gate, now).await?
@@ -737,10 +795,14 @@ pub async fn decide<R: DurableRuntime>(
                     )
                     .await?;
                 if inserted == 0 {
-                    // The same id raced in from another client and won.
-                    if let Some(found) = journaled(&mut tx, &cmd.command_id, &request).await? {
-                        return Ok((found, Some(gate.run)));
-                    }
+                    // Undo this transaction's gate changes before returning
+                    // the winner (or refusing a different request on its key).
+                    tx.execute("ROLLBACK TO SAVEPOINT atomic_gate_decision", &[])
+                        .await?;
+                    let found = journaled(&mut tx, &cmd.command_id, &request)
+                        .await?
+                        .ok_or_else(|| corrupt("a conflicting command journal entry vanished"))?;
+                    return Ok((found, Some(gate.run)));
                 }
                 Ok((Ok(recorded), Some(gate.run)))
             })

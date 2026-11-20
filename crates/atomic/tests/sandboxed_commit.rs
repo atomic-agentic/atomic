@@ -10,6 +10,12 @@
 //!   the edit on the base.
 //! - build caches live outside worktrees, shared per project: a second step,
 //!   in a fresh worktree, finds what the first step's build left in them.
+//! - a read-only step in a worktree inside the state directory sees its
+//!   checkout, and not the state directory's private part.
+//! - a project and its state under the system temporary directory stay out
+//!   of reach: the turn cannot write `/tmp`, the project's git directory or
+//!   the state directory, and writes its temporary files to a directory of
+//!   its own.
 //!
 //! Needs bubblewrap and unprivileged user namespaces, so it runs with the
 //! `sandbox-tests` feature; with the feature on, a sandbox that cannot start
@@ -20,7 +26,7 @@
 #![allow(clippy::unwrap_used)]
 
 use atomic_core::Sandbox;
-use atomic_core::codex::{self, CodexPaths, ModelEndpoint, TurnSpec};
+use atomic_core::codex::{self, CodexPaths, ModelEndpoint, PrivateState, StateGuard, TurnSpec};
 use atomic_core::git::{Git, Signature};
 use atomic_core::testing::{FakeModel, Reply, on_codex_runtime};
 use atomic_core::worktree::{Caches, Worktrees};
@@ -50,9 +56,7 @@ fn plain_git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap()
 }
 
-/// A project with one commit, in a scratch directory outside the system
-/// temporary directory (which the workspace-write sandbox leaves writable),
-/// and its worktrees.
+/// A project with one commit, in a scratch directory, and its worktrees.
 struct Fixture {
     dir: PathBuf,
     project: PathBuf,
@@ -67,8 +71,11 @@ impl Drop for Fixture {
 }
 
 fn fixture(tag: &str) -> Fixture {
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("atomic-sandboxed-{tag}-{}", std::process::id()));
+    fixture_in(Path::new(env!("CARGO_TARGET_TMPDIR")), tag)
+}
+
+fn fixture_in(parent: &Path, tag: &str) -> Fixture {
+    let dir = parent.join(format!("atomic-sandboxed-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     for sub in ["project", "state", "codex-home", "bin"] {
         std::fs::create_dir_all(dir.join(sub)).unwrap();
@@ -98,6 +105,28 @@ fn fixture(tag: &str) -> Fixture {
 /// Run one workspace-write turn in `cwd` whose model runs `command` once,
 /// and return what the command printed, as Codex reported it to the model.
 async fn sandboxed(f: &Fixture, cwd: &Path, command: &str, extra: TurnSpec) -> String {
+    sandboxed_with(
+        f,
+        cwd,
+        command,
+        &StateGuard::NoProjectState,
+        TurnSpec {
+            sandbox: Sandbox::WorkspaceWrite,
+            ..extra
+        },
+    )
+    .await
+}
+
+/// Run one turn of `spec` under `guard` in `cwd` whose model runs `command`
+/// once, and return what the command printed.
+async fn sandboxed_with(
+    f: &Fixture,
+    cwd: &Path,
+    command: &str,
+    guard: &StateGuard,
+    spec: TurnSpec,
+) -> String {
     let model = FakeModel::start(vec![
         Reply::Tool {
             name: "exec_command".into(),
@@ -120,10 +149,10 @@ async fn sandboxed(f: &Fixture, cwd: &Path, command: &str, extra: TurnSpec) -> S
             model: "synthetic".into(),
             api_key_env: None,
         },
+        guard,
         &TurnSpec {
             prompt: "Do the work.".into(),
-            sandbox: Sandbox::WorkspaceWrite,
-            ..extra
+            ..spec
         },
     )
     .await
@@ -232,5 +261,118 @@ fn a_fresh_worktree_reuses_the_shared_cache() {
         let output = sandboxed(&f, &second.path, build, spec).await;
         assert!(output.contains("build=warm"), "{output}");
         assert!(!second.path.join("target").exists());
+    });
+}
+
+#[test]
+fn a_project_under_the_system_temporary_directory_stays_out_of_reach() {
+    on_codex_runtime(async {
+        let f = fixture_in(&std::env::temp_dir(), "tmp");
+        assert!(
+            f.dir
+                .starts_with(std::env::temp_dir().canonicalize().unwrap())
+        );
+        let state = f.dir.join("state");
+        let wt = f
+            .worktrees
+            .prepare("sandboxed", "implement", &f.base)
+            .unwrap();
+        assert!(wt.path.starts_with(&state));
+        let common = f.project.join(".git");
+        let command = format!(
+            "printf 'changed\\n' > a.txt; echo wrote-exit=$?; \
+             echo x > /tmp/atomic-sandbox-probe-$$; echo tmp-exit=$?; \
+             echo x > {common}/forged; echo common-exit=$?; \
+             git update-ref refs/heads/forged HEAD; echo ref-exit=$?; \
+             echo x > {state}/private/forged; echo state-exit=$?; \
+             t=$(mktemp) && echo temp=$t; echo mktemp-exit=$?",
+            common = common.display(),
+            state = state.display(),
+        );
+        let guard = StateGuard::Deny(PrivateState {
+            state_dir: state.clone(),
+            also: Vec::new(),
+        });
+        let spec = TurnSpec {
+            sandbox: Sandbox::WorkspaceWrite,
+            ..TurnSpec::default()
+        };
+        let output = sandboxed_with(&f, &wt.path, &command, &guard, spec).await;
+
+        assert!(output.contains("wrote-exit=0"), "{output}");
+        for refused in ["tmp", "common", "ref", "state"] {
+            assert!(output.contains(&format!("{refused}-exit=")), "{output}");
+            assert!(
+                !output.contains(&format!("{refused}-exit=0")),
+                "{refused} was writable: {output}"
+            );
+        }
+        assert!(!common.join("forged").exists());
+        assert!(!state.join("private/forged").exists());
+        assert_eq!(f.worktrees.repo().refs("refs/heads/").unwrap().len(), 1);
+        // Its temporary files go to a directory of its own, removed after.
+        assert!(output.contains("mktemp-exit=0"), "{output}");
+        // The output is the JSON text of what the command printed.
+        let temp = output
+            .split("temp=")
+            .nth(1)
+            .and_then(|rest| rest.split("\\n").next())
+            .expect("mktemp printed its file")
+            .to_owned();
+        assert!(
+            Path::new(&temp).starts_with(state.join("tmp")),
+            "{temp} is not in the turn's own temporary directory"
+        );
+        assert!(
+            !Path::new(&temp).exists(),
+            "the turn's temporary directory was removed"
+        );
+    });
+}
+
+#[test]
+fn a_read_only_turn_in_a_worktree_sees_its_checkout() {
+    on_codex_runtime(async {
+        let f = fixture("read-only");
+        let state = f.dir.join("state");
+        std::fs::create_dir_all(state.join("private")).unwrap();
+        std::fs::write(state.join("private/atomic.db"), "store").unwrap();
+        let wt = f.worktrees.prepare("sandboxed", "review", &f.base).unwrap();
+        assert!(wt.path.starts_with(&state));
+        let guard = StateGuard::Deny(PrivateState {
+            state_dir: state.clone(),
+            also: Vec::new(),
+        });
+        let command = format!(
+            "echo cwd=$(pwd); cat a.txt; echo read-exit=$?; cat {}/private/atomic.db; \
+             echo private-exit=$?; echo x > a.txt; echo write-exit=$?",
+            state.display()
+        );
+        let output = sandboxed_with(
+            &f,
+            &wt.path,
+            &command,
+            &guard,
+            TurnSpec {
+                sandbox: Sandbox::ReadOnly,
+                ..TurnSpec::default()
+            },
+        )
+        .await;
+        assert!(
+            output.contains(&format!("cwd={}", wt.path.display())),
+            "the turn did not run in its worktree: {output}"
+        );
+        assert!(output.contains("base\\nread-exit=0"), "{output}");
+        assert!(
+            !output.contains("store"),
+            "the private state leaked: {output}"
+        );
+        assert!(!output.contains("private-exit=0"), "{output}");
+        assert!(!output.contains("write-exit=0"), "{output}");
+        assert_eq!(
+            std::fs::read_to_string(wt.path.join("a.txt")).unwrap(),
+            "base\n"
+        );
     });
 }
