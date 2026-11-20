@@ -52,6 +52,7 @@
 use crate::failpoint;
 use crate::runtime::{DurableError, End, Param, Reads, Result, Row, Tx, TxFuture};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The most any cap, reservation or reported amount may be: 2^53. Larger
@@ -274,6 +275,9 @@ fn corrupt(what: impl std::fmt::Display) -> DurableError {
 #[derive(Clone)]
 pub struct Ledger {
     db: Reads,
+    /// Milliseconds since the Unix epoch, for admission, heartbeats and
+    /// settlement times.
+    clock: Arc<dyn Fn() -> i64 + Send + Sync>,
 }
 
 impl std::fmt::Debug for Ledger {
@@ -396,7 +400,7 @@ fn shortfall(a: &Allowance, r: Charge) -> Vec<String> {
     short
 }
 
-async fn admit_in(tx: &mut Tx<'_, '_>, request: &Request) -> Result<End<Admission>> {
+async fn admit_in(tx: &mut Tx<'_, '_>, request: &Request, now: i64) -> Result<End<Admission>> {
     let refuse = |scope: &str, reason: String| {
         Ok(End::Rollback(Admission::Refused {
             scope: scope.to_owned(),
@@ -445,29 +449,6 @@ async fn admit_in(tx: &mut Tx<'_, '_>, request: &Request) -> Result<End<Admissio
         )
         .await?;
         parent = Some(&scope.id);
-    }
-    // An earlier attempt charged to the same atom invocation and still
-    // reserved died with its process: an invocation makes its calls one at
-    // a time, so when it admits another, none of its earlier ones is still
-    // running. Whatever time each took has passed, so it is charged that
-    // much, at most what it reserved, before the room is read; a step that
-    // re-runs from its first call after a crash in a later one finds the
-    // time returned.
-    if let Some(own) = request.chain.last() {
-        let earlier = tx
-            .query_all(
-                "SELECT request_id, attempt, scopes FROM atomic_usage_attempts WHERE run = ? \
-                 AND state = 'reserved' AND settled_at IS NULL ORDER BY request_id, attempt",
-                &[Param::Text(request.run.clone())],
-            )
-            .await?;
-        for row in earlier {
-            let scopes: Vec<String> =
-                serde_json::from_str(&row.text("scopes")?).map_err(corrupt)?;
-            if scopes.last() == Some(&own.id) {
-                settle_time(tx, &row.text("request_id")?, row.int("attempt")?).await?;
-            }
-        }
     }
     // Reserve against each, root first. Each row is locked before it is
     // read (a write that changes nothing), so the room the read finds is
@@ -574,7 +555,7 @@ async fn admit_in(tx: &mut Tx<'_, '_>, request: &Request) -> Result<End<Admissio
             Param::Int(r.tokens),
             Param::Int(r.millis),
             Param::Int(r.micro_usd),
-            Param::Int(now_ms()),
+            Param::Int(now),
         ],
     )
     .await?;
@@ -586,52 +567,146 @@ async fn admit_in(tx: &mut Tx<'_, '_>, request: &Request) -> Result<End<Admissio
     }))
 }
 
-/// Settle the active time of attempt `attempt` at `request`, if it is
-/// still reserved and its time is not settled yet: time can always be
-/// measured, so it is charged as what passed since admission, at most what
-/// was reserved, while its tokens and dollars stay charged at their bound.
-/// Returns the attempt's charged time after.
-async fn settle_time(tx: &mut Tx<'_, '_>, request: &str, attempt: i64) -> Result<Option<i64>> {
+/// How often a running call's meter records that it is still alive: a
+/// tenth of what it reserved, between 100 ms and 5 s.
+pub fn heartbeat_every(reserved_millis: i64) -> i64 {
+    (reserved_millis / 10).clamp(100, 5_000)
+}
+
+/// Whose measure of an attempt's active time settles it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Measure {
+    /// The process that made the call, as the call ends: what passed since
+    /// admission. A time settled before, by someone who took the call for
+    /// dead, gives way to it if it is larger.
+    Owner,
+    /// Anyone else, for a call whose process died: what passed until a
+    /// heartbeat after the last one it recorded, so time the process was
+    /// down is never charged.
+    Dead,
+}
+
+/// Settle the active time of attempt `attempt` at `request`, while it is
+/// still reserved: time can always be measured, so it is charged as
+/// `measure` says, at most what was reserved, while its tokens and dollars
+/// stay charged at their bound. The row is locked first, and nothing is
+/// charged unless the update changed it, so two settlements cannot both
+/// apply. Returns the attempt's charged time after, or `None` if it is not
+/// reserved.
+async fn settle_time(
+    tx: &mut Tx<'_, '_>,
+    request: &str,
+    attempt: i64,
+    now: i64,
+    measure: Measure,
+) -> Result<Option<i64>> {
     let key = [Param::Text(request.to_owned()), Param::Int(attempt)];
-    let Some(row) = tx
-        .query_opt(
-            "SELECT state, scopes, reserved_millis, charged_millis, admitted_at, settled_at \
-             FROM atomic_usage_attempts WHERE request_id = ? AND attempt = ?",
+    let locked = tx
+        .execute(
+            "UPDATE atomic_usage_attempts SET attempt = attempt \
+             WHERE request_id = ? AND attempt = ? AND state = 'reserved'",
             &key,
         )
-        .await?
-    else {
+        .await?;
+    if locked != 1 {
         return Ok(None);
+    }
+    let row = tx
+        .query_one(
+            "SELECT a.scopes, a.reserved_millis, a.charged_millis, a.admitted_at, a.settled_at, \
+             h.seen_at FROM atomic_usage_attempts a LEFT JOIN atomic_usage_heartbeats h \
+             ON h.request_id = a.request_id AND h.attempt = a.attempt \
+             WHERE a.request_id = ? AND a.attempt = ?",
+            &key,
+        )
+        .await?;
+    let (charged, reserved, admitted) = (
+        row.int("charged_millis")?,
+        row.int("reserved_millis")?,
+        row.int("admitted_at")?,
+    );
+    let settled = row.int_opt("settled_at")?.is_some();
+    let measured = match measure {
+        Measure::Owner => {
+            let took = (now - admitted).clamp(0, reserved);
+            if settled { took.max(charged) } else { took }
+        }
+        Measure::Dead if settled => return Ok(Some(charged)),
+        Measure::Dead => {
+            let seen = row.int_opt("seen_at")?.unwrap_or(admitted);
+            let until = (seen + heartbeat_every(reserved)).min(now);
+            (until - admitted).clamp(0, reserved)
+        }
     };
-    let charged = row.int("charged_millis")?;
-    if row.text("state")? != "reserved" || row.int_opt("settled_at")?.is_some() {
+    if settled && measured == charged {
         return Ok(Some(charged));
     }
-    let now = now_ms();
-    let elapsed = (now - row.int("admitted_at")?).clamp(0, row.int("reserved_millis")?);
-    tx.execute(
-        "UPDATE atomic_usage_attempts SET charged_millis = ?, settled_at = ? \
-         WHERE request_id = ? AND attempt = ? AND state = 'reserved' AND settled_at IS NULL",
-        &[
-            Param::Int(elapsed),
-            Param::Int(now),
-            Param::Text(request.to_owned()),
-            Param::Int(attempt),
-        ],
-    )
-    .await?;
+    let changed = tx
+        .execute(
+            "UPDATE atomic_usage_attempts SET charged_millis = ?, settled_at = ? \
+             WHERE request_id = ? AND attempt = ? AND state = 'reserved' AND charged_millis = ?",
+            &[
+                Param::Int(measured),
+                Param::Int(now),
+                Param::Text(request.to_owned()),
+                Param::Int(attempt),
+                Param::Int(charged),
+            ],
+        )
+        .await?;
+    if changed != 1 {
+        return Ok(Some(charged));
+    }
     let scopes: Vec<String> = serde_json::from_str(&row.text("scopes")?).map_err(corrupt)?;
     add_charge(
         tx,
         &scopes,
         Charge {
             tokens: 0,
-            millis: elapsed - charged,
+            millis: measured - charged,
             micro_usd: 0,
         },
     )
     .await?;
-    Ok(Some(elapsed))
+    Ok(Some(measured))
+}
+
+/// Settle the time of every attempt that died charged to `request`'s own
+/// atom invocation (the last scope of its chain): an invocation makes its
+/// calls one at a time, so when it admits another, none of its earlier
+/// ones still reserved is running. Each is charged until a heartbeat after
+/// the last it recorded, at most what it reserved.
+async fn settle_dead_in(tx: &mut Tx<'_, '_>, request: &Request, now: i64) -> Result<End<()>> {
+    let Some(own) = request.chain.last() else {
+        return Ok(End::Rollback(()));
+    };
+    let earlier = tx
+        .query_all(
+            "SELECT request_id, attempt, scopes FROM atomic_usage_attempts WHERE run = ? \
+             AND state = 'reserved' AND settled_at IS NULL ORDER BY request_id, attempt",
+            &[Param::Text(request.run.clone())],
+        )
+        .await?;
+    let mut settled = false;
+    for row in earlier {
+        let scopes: Vec<String> = serde_json::from_str(&row.text("scopes")?).map_err(corrupt)?;
+        if scopes.last() == Some(&own.id) {
+            settle_time(
+                tx,
+                &row.text("request_id")?,
+                row.int("attempt")?,
+                now,
+                Measure::Dead,
+            )
+            .await?;
+            settled = true;
+        }
+    }
+    Ok(if settled {
+        End::Commit(())
+    } else {
+        End::Rollback(())
+    })
 }
 
 async fn settle_in(
@@ -639,6 +714,7 @@ async fn settle_in(
     request: &str,
     attempt: i64,
     how: Settlement,
+    now: i64,
 ) -> Result<End<Settled>> {
     let key = [Param::Text(request.to_owned()), Param::Int(attempt)];
     let Some(row) = tx
@@ -658,7 +734,13 @@ async fn settle_in(
     }
     // Usage that is not reported still took time: settle that much now.
     if matches!(how, Settlement::Unknown | Settlement::Reconciled { .. }) {
-        settle_time(tx, request, attempt).await?;
+        // The owner settles an unknown call as it ends; a reconciliation
+        // comes after, for a call whose process may be long gone.
+        let measure = match how {
+            Settlement::Unknown => Measure::Owner,
+            _ => Measure::Dead,
+        };
+        settle_time(tx, request, attempt, now, measure).await?;
         if matches!(how, Settlement::Unknown) {
             return Ok(End::Commit(Settled::Uncertain));
         }
@@ -724,7 +806,7 @@ async fn settle_in(
                 Param::Int(actual.tokens),
                 Param::Int(actual.millis),
                 Param::Int(actual.micro_usd),
-                Param::Int(now_ms()),
+                Param::Int(now),
                 Param::Text(request.to_owned()),
                 Param::Int(attempt),
             ],
@@ -748,7 +830,17 @@ async fn settle_in(
 
 impl Ledger {
     pub(crate) fn new(db: Reads) -> Self {
-        Self { db }
+        Self {
+            db,
+            clock: Arc::new(now_ms),
+        }
+    }
+
+    /// The same ledger reading the time from `clock`, in milliseconds since
+    /// the Unix epoch: for tests that need time to pass.
+    pub fn with_clock(mut self, clock: impl Fn() -> i64 + Send + Sync + 'static) -> Self {
+        self.clock = Arc::new(clock);
+        self
     }
 
     /// Run `body` in one short transaction, committing or rolling back as
@@ -767,12 +859,52 @@ impl Ledger {
     /// and reserve its bound against every allowance in its chain, or refuse
     /// it and write nothing.
     pub async fn admit(&self, request: Request) -> Result<Admission> {
-        let request = std::sync::Arc::new(request);
+        let request = Arc::new(request);
+        // The time of the invocation's dead calls first, in a transaction of
+        // its own: it stands whether or not this call is admitted.
+        let (dead, clock) = (request.clone(), self.clock.clone());
         self.transact(move |mut tx| {
-            let request = request.clone();
-            Box::pin(async move { admit_in(&mut tx, &request).await })
+            let (request, now) = (dead.clone(), clock());
+            Box::pin(async move { settle_dead_in(&mut tx, &request, now).await })
+        })
+        .await?;
+        let clock = self.clock.clone();
+        self.transact(move |mut tx| {
+            let (request, now) = (request.clone(), clock());
+            Box::pin(async move { admit_in(&mut tx, &request, now).await })
         })
         .await
+    }
+
+    /// Record that the call of attempt `attempt` at `request` is still
+    /// running, so that if its process dies, the time charged for it stops
+    /// here rather than when someone finds it dead. A running call's meter
+    /// calls it every [`heartbeat_every`] of its reservation.
+    pub async fn heartbeat(&self, request: &str, attempt: i64) -> Result<()> {
+        let (request, clock) = (request.to_owned(), self.clock.clone());
+        self.transact(move |mut tx| {
+            let (request, now) = (request.clone(), clock());
+            Box::pin(async move {
+                tx.execute(
+                    "INSERT INTO atomic_usage_heartbeats (request_id, attempt, seen_at) \
+                     VALUES (?, ?, ?) ON CONFLICT (request_id, attempt) \
+                     DO UPDATE SET seen_at = excluded.seen_at",
+                    &[Param::Text(request), Param::Int(attempt), Param::Int(now)],
+                )
+                .await?;
+                Ok(End::Commit(()))
+            })
+        })
+        .await
+    }
+
+    /// Settle attempt `attempt` at `request` as unknown because its process
+    /// is stopping before the call ended: its tokens and dollars stay
+    /// charged at their bound, its time is what passed. As
+    /// [`Settlement::Unknown`], without the crash tests' failpoint.
+    pub async fn interrupt(&self, request: &str, attempt: i64) -> Result<Settled> {
+        self.settle_once(request, attempt, Settlement::Unknown)
+            .await
     }
 
     /// Settle attempt `attempt` at `request` once. Settling it again, or
@@ -860,10 +992,10 @@ impl Ledger {
     }
 
     async fn settle_once(&self, request: &str, attempt: i64, how: Settlement) -> Result<Settled> {
-        let request = request.to_owned();
+        let (request, clock) = (request.to_owned(), self.clock.clone());
         self.transact(move |mut tx| {
-            let request = request.clone();
-            Box::pin(async move { settle_in(&mut tx, &request, attempt, how).await })
+            let (request, now) = (request.clone(), clock());
+            Box::pin(async move { settle_in(&mut tx, &request, attempt, how, now).await })
         })
         .await
     }

@@ -130,8 +130,9 @@ with the bound's output tokens as its output limit, in the field its endpoint
 reads (`max_completion_tokens` on OpenAI's and Azure OpenAI's Chat Completions,
 in any region or cloud, `max_tokens` on other OpenAI-compatible servers,
 `max_output_tokens` on the Responses API), and is cut off when its reserved time
-runs out. The field is told from the endpoint's URL unless the runtime sets it,
-as it must for a gateway the URL does not identify. An answer cut off
+runs out. The field is told from the endpoint's URL. A lite runtime can name the
+field itself, as one must for a gateway the URL does not identify, but no
+configuration setting or command-line flag exposes that yet. An answer cut off
 at its output limit fails as such, without a repair turn. A lite request larger
 than the bound's input tokens is recorded in the attempt's declared maximum.
 
@@ -139,9 +140,12 @@ The usage a response reports is settled before its answer is judged, so a refusa
 or an empty answer is charged what it spent. A response that reports no usage is
 settled as unknown: its tokens and dollars stay charged at its reservation, and
 it is never taken as free. Its active time can always be measured, so it is
-charged the time that passed, at most what was reserved. A call whose process
-died before it settled is charged the same way when its atom, run again, admits
-its next call.
+charged the time that passed, at most what was reserved. A call still running
+when its process is stopped by a signal is settled this way as the process
+stops. While a call runs, its meter records every few seconds that it is still
+alive, so a call whose process was killed outright is charged only until shortly
+after the last such record, however long the process stayed down, once its atom,
+run again, admits its next call.
 
 A Codex turn can make several provider requests and run tools between them, so
 the `call` time does not bound it. A turn reserves the active time its atom has

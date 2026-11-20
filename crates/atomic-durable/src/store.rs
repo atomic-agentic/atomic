@@ -125,10 +125,21 @@ const MIGRATIONS: &[Migration] = &[
                 enrolled_at BIGINT NOT NULL
             )"],
     },
+    Migration {
+        version: 5,
+        // When each running call last said it was alive (see `usage`), so
+        // a call whose process died is charged no time past it.
+        sql: &["CREATE TABLE IF NOT EXISTS atomic_usage_heartbeats (
+                request_id TEXT NOT NULL,
+                attempt BIGINT NOT NULL,
+                seen_at BIGINT NOT NULL,
+                PRIMARY KEY (request_id, attempt)
+            )"],
+    },
 ];
 
 /// The store version this binary writes and understands.
-pub const STORE_VERSION: i64 = 4;
+pub const STORE_VERSION: i64 = 5;
 
 /// Why the store could not be opened.
 #[derive(Debug, thiserror::Error)]

@@ -412,6 +412,8 @@ const ENV_URL: &str = "ATOMIC_BUDGETS_URL";
 const ENV_RUN: &str = "ATOMIC_BUDGETS_RUN";
 const ENV_CAPS: &str = "ATOMIC_BUDGETS_CAPS";
 const ENV_PARKS: &str = "ATOMIC_BUDGETS_PARKS";
+/// `<call minutes>,<atom minutes>`, for a child with those time caps.
+const ENV_TIMES: &str = "ATOMIC_BUDGETS_TIMES";
 
 /// Not a test on its own: the crash tests run it in a child process.
 #[test]
@@ -427,10 +429,17 @@ fn budgets_child() {
         return;
     };
     let (atom, total) = caps.split_once(',').expect("caps");
-    let budgets = settings(
+    let mut budgets = settings(
         atom.parse().expect("atom cap"),
         total.parse().expect("run cap"),
     );
+    if let Some((call, atom)) = std::env::var(ENV_TIMES)
+        .ok()
+        .and_then(|t| t.split_once(',').map(|(c, a)| (c.to_owned(), a.to_owned())))
+    {
+        budgets.call.minutes = call.parse().expect("call minutes");
+        budgets.atom.minutes = atom.parse().expect("atom minutes");
+    }
     on_codex_runtime(async move {
         let dir = PathBuf::from(dir);
         let rt = engine(&dir, &url, budgets).await;
@@ -472,9 +481,24 @@ async fn child(
 /// The child as `role` on run `run` with caps `atom,run`, started and left
 /// running, for a test to kill when it chooses.
 fn spawn_child(dir: &Path, url: &str, run: &str, role: &str, caps: &str) -> std::process::Child {
+    spawn_child_with(dir, url, run, role, caps, "")
+}
+
+/// As [`spawn_child`], with time caps `times` (see [`ENV_TIMES`]), if any.
+fn spawn_child_with(
+    dir: &Path,
+    url: &str,
+    run: &str,
+    role: &str,
+    caps: &str,
+    times: &str,
+) -> std::process::Child {
     let _ = std::fs::remove_file(dir.join("outcome"));
-    Command::new(std::env::current_exe().expect("this test binary"))
-        .args(["--exact", "budgets_child", "--ignored", "--nocapture"])
+    let mut cmd = Command::new(std::env::current_exe().expect("this test binary"));
+    if !times.is_empty() {
+        cmd.env(ENV_TIMES, times);
+    }
+    cmd.args(["--exact", "budgets_child", "--ignored", "--nocapture"])
         .env(ENV_ROLE, role)
         .env(ENV_DIR, dir)
         .env(ENV_URL, url)
@@ -487,6 +511,27 @@ fn spawn_child(dir: &Path, url: &str, run: &str, role: &str, caps: &str) -> std:
         .stderr(Stdio::null())
         .spawn()
         .expect("start the child")
+}
+
+/// Run the child as `role` with time caps `times` to its end, and return
+/// what it saw, if it exited cleanly.
+async fn child_timed(
+    dir: &Path,
+    url: &str,
+    run: &str,
+    role: &str,
+    caps: &str,
+    times: &str,
+) -> Option<String> {
+    let mut process = spawn_child_with(dir, url, run, role, caps, times);
+    let status = tokio::task::spawn_blocking(move || process.wait().expect("the child"))
+        .await
+        .expect("child");
+    if status.success() {
+        Some(std::fs::read_to_string(dir.join("outcome")).expect("the child's outcome"))
+    } else {
+        None
+    }
 }
 
 /// As [`child`], watching for the `parks`th park.
@@ -714,6 +759,63 @@ fn killing_the_process_during_a_codex_turn_lets_the_recovered_run_finish() {
         assert_eq!(dead.charged.tokens, BOUND, "its tokens stay at the bound");
         assert!(dead.charged.millis < 60_000, "{dead:?}");
         assert!(dead.reserved.millis >= 29 * 60_000, "{dead:?}");
+    });
+}
+
+#[test]
+fn a_run_recovered_after_its_dead_turn_would_have_lapsed_is_charged_only_its_run_time() {
+    on_codex_runtime(async {
+        // Scaled down: the review's turn reserves its atom's 3 s and beats
+        // every 300 ms. Killed about 0.9 s in and recovered after the 3 s
+        // have passed, the dead turn is charged the time it ran, up to a
+        // beat after its last heartbeat, and the review has the rest of its
+        // time to run again.
+        let model = FakeModel::start(vec![
+            Reply::Text(DRAFT.into()),
+            Reply::Delayed {
+                after: Duration::from_secs(120),
+                reply: Box::new(Reply::Text(REVIEW.into())),
+            },
+            Reply::Text(REVIEW.into()),
+        ])
+        .await
+        .expect("fake model");
+        let dir = scratch("lapsed");
+        let url = model.base_url();
+        let caps = "10000,100000";
+        let mut process = spawn_child_with(&dir, &url, "lapsed", "start", caps, "0.01,0.05");
+        let until = Instant::now() + Duration::from_secs(60);
+        while model.calls() < 2 {
+            assert!(
+                Instant::now() < until,
+                "the review's turn reached the model"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        process.kill().expect("kill the child");
+        let _ = process.wait();
+        // Down past the whole reservation.
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        let seen = child_timed(&dir, &url, "lapsed", "recover", caps, "0.01,0.05")
+            .await
+            .expect("the recovered run");
+        assert_eq!(seen, "finished");
+        let rt = reader(&dir).await;
+        let review = attempts(&rt, "lapsed").await;
+        let dead = &review[1];
+        assert_eq!(dead.state, "reserved");
+        assert_eq!(dead.reserved.millis, 3_000, "{dead:?}");
+        assert!(
+            dead.charged.millis < 2_000,
+            "the downtime was not charged: {dead:?}"
+        );
+        // Its heartbeats carried it past the first beat: it is charged the
+        // time it ran.
+        assert!(
+            dead.charged.millis >= 600,
+            "the time it ran was charged: {dead:?}"
+        );
     });
 }
 

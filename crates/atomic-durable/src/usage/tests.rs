@@ -19,6 +19,7 @@
 
 use super::*;
 use crate::runtime::{DurableRuntime, Durare};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn unique(tag: &str) -> String {
@@ -189,9 +190,15 @@ async fn an_unsettled_attempt_stays_charged_until_admission_refuses<R: DurableRu
         }
         other => panic!("expected a refusal, got {other:?}"),
     }
-    // The refusal wrote nothing.
+    // The refusal reserved nothing; the dead attempts' time it found, in a
+    // transaction of its own, stands.
     assert_eq!(ledger.attempts(&run).await.expect("attempts").len(), 3);
-    assert_eq!(charged(&ledger, &format!("run:{run}")).await, full);
+    let after = charged(&ledger, &format!("run:{run}")).await;
+    assert_eq!(
+        (after.tokens, after.micro_usd),
+        (full.tokens, full.micro_usd)
+    );
+    assert!(after.millis <= full.millis, "{after:?} after {full:?}");
 }
 
 async fn caps_hold_as_first_created<R: DurableRuntime>(rt: R) {
@@ -620,17 +627,23 @@ async fn unreported_and_dead_attempts_are_charged_the_time_they_took<R: DurableR
     assert_eq!(a.state, "reserved");
     assert_eq!(a.charged.tokens, BOUND.tokens);
     assert!(a.charged.millis < 60_000, "{a:?}");
-    // A second unknown settlement leaves the time as settled.
+    // A second unknown settlement measures again and keeps the larger,
+    // charged once.
     let settled_once = a.charged.millis;
     ledger
         .settle(&format!("{run}:1:0"), 1, Settlement::Unknown)
         .await
         .expect("settle");
+    let again = ledger.attempts(&run).await.expect("attempts")[0]
+        .charged
+        .millis;
+    assert!(
+        again >= settled_once && again < 60_000,
+        "{again} after {settled_once}"
+    );
     assert_eq!(
-        ledger.attempts(&run).await.expect("attempts")[0]
-            .charged
-            .millis,
-        settled_once
+        charged(&ledger, &format!("atom:{run}:1")).await.millis,
+        again
     );
     // An attempt whose process died is never settled; when its request is
     // admitted again, it is charged the time it took, so the new attempt
@@ -712,6 +725,75 @@ async fn amounts_out_of_range_are_refused_and_reported_usage_is_held<R: DurableR
     );
 }
 
+async fn a_dead_call_is_never_charged_its_processs_downtime<R: DurableRuntime>(rt: R) {
+    use std::sync::atomic::AtomicI64;
+    const MINUTE: i64 = 60_000;
+    let t = Arc::new(AtomicI64::new(1_000_000_000));
+    let clock = t.clone();
+    let ledger = rt.ledger().with_clock(move || clock.load(Ordering::SeqCst));
+    let run = unique("downtime");
+    // A turn that reserves its atom's whole half hour, under a run with
+    // room for one call's tokens.
+    let mut turn = request(&run, 1, 0, 100, 1_000_000);
+    turn.chain[0].caps.millis = 60 * MINUTE;
+    turn.chain[1].caps.millis = 30 * MINUTE;
+    turn.turn = true;
+    admitted(&ledger.admit(turn.clone()).await.expect("admit"));
+    // It runs two minutes, saying so, and its process dies.
+    t.fetch_add(2 * MINUTE, Ordering::SeqCst);
+    ledger
+        .heartbeat(&format!("{run}:1:0"), 1)
+        .await
+        .expect("heartbeat");
+    // Recovered 25 minutes later, its atom admits its next call: the dead
+    // turn is charged until a heartbeat after its last, not the downtime.
+    t.fetch_add(25 * MINUTE, Ordering::SeqCst);
+    turn.id = format!("{run}:1:1");
+    let refused = ledger.admit(turn.clone()).await.expect("admit");
+    // The run has no tokens left for it, so it is refused; the time the
+    // dead turn was found to have taken stands all the same.
+    assert!(matches!(refused, Admission::Refused { .. }), "{refused:?}");
+    let dead = |attempts: Vec<Attempt>| {
+        attempts
+            .into_iter()
+            .find(|a| a.request.ends_with(":1:0"))
+            .expect("the dead turn")
+    };
+    let every = heartbeat_every(30 * MINUTE);
+    let held = dead(ledger.attempts(&run).await.expect("attempts")).charged;
+    assert_eq!(held.millis, 2 * MINUTE + every, "{held:?}");
+    assert_eq!(held.tokens, BOUND.tokens, "its tokens stay at the bound");
+    assert_eq!(
+        charged(&ledger, &format!("atom:{run}:1")).await.millis,
+        2 * MINUTE + every
+    );
+    // Found dead again, it is charged no more.
+    ledger.admit(turn.clone()).await.expect("admit");
+    assert_eq!(
+        dead(ledger.attempts(&run).await.expect("attempts"))
+            .charged
+            .millis,
+        2 * MINUTE + every
+    );
+    // Its owner was alive after all, and settles it as unknown at 28
+    // minutes: the larger measure stands, charged once.
+    t.fetch_add(MINUTE, Ordering::SeqCst);
+    ledger
+        .settle(&format!("{run}:1:0"), 1, Settlement::Unknown)
+        .await
+        .expect("settle");
+    assert_eq!(
+        dead(ledger.attempts(&run).await.expect("attempts"))
+            .charged
+            .millis,
+        28 * MINUTE
+    );
+    assert_eq!(
+        charged(&ledger, &format!("atom:{run}:1")).await.millis,
+        28 * MINUTE
+    );
+}
+
 macro_rules! on_sqlite {
     ($($name:ident),* $(,)?) => {
         mod on_sqlite {
@@ -741,6 +823,7 @@ macro_rules! on_postgres {
 
 on_sqlite!(
     a_call_is_reserved_before_dispatch_and_settled_once,
+    a_dead_call_is_never_charged_its_processs_downtime,
     unreported_and_dead_attempts_are_charged_the_time_they_took,
     a_turn_reserves_the_active_time_left,
     amounts_out_of_range_are_refused_and_reported_usage_is_held,
@@ -758,6 +841,7 @@ on_sqlite!(
 #[cfg(feature = "postgres-tests")]
 on_postgres!(
     a_call_is_reserved_before_dispatch_and_settled_once,
+    a_dead_call_is_never_charged_its_processs_downtime,
     unreported_and_dead_attempts_are_charged_the_time_they_took,
     a_turn_reserves_the_active_time_left,
     amounts_out_of_range_are_refused_and_reported_usage_is_held,

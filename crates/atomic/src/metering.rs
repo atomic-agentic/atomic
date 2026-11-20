@@ -24,10 +24,12 @@ use atomic_core::usage::{
     Call, Exhausted, Limit, Meter, MeterError, MeterFuture, Metering, Outcome, Ticket,
 };
 use atomic_durable::StepInfo;
-use atomic_durable::usage::{Admission, Caps, Charge, Ledger, Request, Scope, Settlement};
+use atomic_durable::usage::{
+    Admission, Caps, Charge, Ledger, Request, Scope, Settlement, heartbeat_every,
+};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 /// A run's budgets, resolved once: the run's caps, each model atom's caps
@@ -356,6 +358,9 @@ impl Meter for LedgerMeter {
                     millis,
                     bounded_by,
                 } => {
+                    // While the call runs, it says so, so a call whose process
+                    // dies is charged no time past its last word.
+                    beat(&self.ledger, &request, attempt, millis);
                     // Admitted and reserved, and not yet dispatched.
                     if atomic_durable::failpoints::armed() {
                         atomic_durable::failpoint(&format!("atom:after-admit:{request}"));
@@ -381,6 +386,7 @@ impl Meter for LedgerMeter {
 
     fn settle(&self, ticket: Ticket, outcome: Outcome) -> MeterFuture<'_, ()> {
         Box::pin(async move {
+            ended(&ticket.request, ticket.attempt);
             let how = match outcome {
                 Outcome::Reported(usage) => {
                     let tokens = |v: i64| u64::try_from(v).unwrap_or(0);
@@ -412,4 +418,62 @@ impl Meter for LedgerMeter {
             Ok(())
         })
     }
+}
+
+/// The calls this process has admitted and not yet settled, by request and
+/// attempt: the ledger each is journaled in, and its heartbeat.
+type InFlight = HashMap<(String, i64), (Ledger, tokio::task::AbortHandle)>;
+
+static IN_FLIGHT: LazyLock<Mutex<InFlight>> = LazyLock::new(Mutex::default);
+
+/// Start the heartbeat of attempt `attempt` at `request`, which reserved
+/// `millis`: every [`heartbeat_every`] of it until it settles, and never
+/// past its reservation.
+fn beat(ledger: &Ledger, request: &str, attempt: i64, millis: i64) {
+    let every = Duration::from_millis(u64::try_from(heartbeat_every(millis)).unwrap_or(5_000));
+    let until = Instant::now() + Duration::from_millis(u64::try_from(millis).unwrap_or(0)) + every;
+    let (beating, id) = (ledger.clone(), request.to_owned());
+    let task = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(every).await;
+            if Instant::now() > until {
+                return;
+            }
+            // A missed heartbeat only charges more time, never less.
+            let _ = beating.heartbeat(&id, attempt).await;
+        }
+    });
+    if let Ok(mut calls) = IN_FLIGHT.lock() {
+        calls.insert(
+            (request.to_owned(), attempt),
+            (ledger.clone(), task.abort_handle()),
+        );
+    }
+}
+
+/// The call of attempt `attempt` at `request` ended: stop its heartbeat.
+fn ended(request: &str, attempt: i64) {
+    let call = IN_FLIGHT
+        .lock()
+        .ok()
+        .and_then(|mut calls| calls.remove(&(request.to_owned(), attempt)));
+    if let Some((_, heartbeat)) = call {
+        heartbeat.abort();
+    }
+}
+
+/// Settle every call this process has in flight as interrupted, for a
+/// process that is stopping: each is charged the time it ran, and its tokens
+/// and dollars stay at their bound. Returns how many there were.
+pub async fn interrupt_in_flight() -> usize {
+    let calls: Vec<_> = IN_FLIGHT
+        .lock()
+        .map(|mut calls| calls.drain().collect())
+        .unwrap_or_default();
+    let n = calls.len();
+    for ((request, attempt), (ledger, heartbeat)) in calls {
+        heartbeat.abort();
+        let _ = ledger.interrupt(&request, attempt).await;
+    }
+    n
 }
