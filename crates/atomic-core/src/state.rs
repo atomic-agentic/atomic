@@ -65,6 +65,15 @@ pub enum StateError {
         /// The underlying error.
         source: std::io::Error,
     },
+    /// A private directory is open to other users, or reached through a
+    /// link to one, and cannot be made private.
+    #[error("{path} {why}")]
+    Unsafe {
+        /// The directory.
+        path: PathBuf,
+        /// What is wrong, and what to do.
+        why: String,
+    },
 }
 
 impl ProjectState {
@@ -299,23 +308,70 @@ pub fn user_config_dir() -> Option<PathBuf> {
     user_config_dir_in(&|name| std::env::var(name).ok())
 }
 
-/// Create `dir` if needed, readable by its owner only.
+/// This process's effective user id.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn effective_uid() -> u32 {
+    // SAFETY: geteuid takes no arguments, touches no memory and cannot fail.
+    unsafe { libc::geteuid() }
+}
+
+/// Make sure `dir` is readable by its owner only: create it so if it is
+/// missing, and close it if it is open to others. A directory already closed
+/// is left as it is, so one mounted read-only, such as a Kubernetes secret,
+/// still works. A symbolic link is never followed to change what it points
+/// to: it is accepted only when its target is a directory the user owns and
+/// no one else can enter.
 pub(crate) fn private_dir(dir: &Path) -> Result<(), StateError> {
     let fail = |source| StateError::Create {
         path: dir.to_owned(),
         source,
     };
-    if !dir.exists() {
-        let mut builder = std::fs::DirBuilder::new();
-        builder.recursive(true);
-        #[cfg(unix)]
-        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-        builder.create(dir).map_err(fail)?;
-    }
+    let refuse = |why: String| StateError::Unsafe {
+        path: dir.to_owned(),
+        why,
+    };
+    let meta = match std::fs::symlink_metadata(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(true);
+            #[cfg(unix)]
+            std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+            return builder.create(dir).map_err(fail);
+        }
+        Err(e) => return Err(fail(e)),
+        Ok(meta) => meta,
+    };
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(fail)?;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if meta.file_type().is_symlink() {
+            let target = std::fs::metadata(dir).map_err(fail)?;
+            if target.is_dir() && target.uid() == effective_uid() && target.mode() & 0o077 == 0 {
+                return Ok(());
+            }
+            return Err(refuse(
+                "is a symbolic link to a directory that is not yours alone: make the target \
+                 a directory you own with mode 0700, or replace the link with one"
+                    .into(),
+            ));
+        }
+        if !meta.is_dir() {
+            return Err(refuse("is not a directory".into()));
+        }
+        let mode = meta.mode() & 0o777;
+        if mode & 0o077 != 0 {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
+                refuse(format!(
+                    "is open to other users (mode {mode:o}) and cannot be made private: {e}; \
+                     make it mode 0700"
+                ))
+            })?;
+        }
+    }
+    #[cfg(not(unix))]
+    if !meta.is_dir() {
+        return Err(refuse("is not a directory".into()));
     }
     Ok(())
 }
@@ -343,6 +399,56 @@ fn project_id(root: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_private_directory_is_closed_once_and_a_link_is_never_followed_open() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("atomic-private-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let mode = |p: &Path| {
+            std::fs::symlink_metadata(p)
+                .expect("meta")
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        let set = |p: &Path, m: u32| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).expect("chmod")
+        };
+        // Missing: made private.
+        private_dir(&dir.join("new/inner")).expect("made");
+        assert_eq!(mode(&dir.join("new/inner")), 0o700);
+        // Open to others: closed.
+        std::fs::create_dir(dir.join("open")).expect("open");
+        set(&dir.join("open"), 0o755);
+        private_dir(&dir.join("open")).expect("closed");
+        assert_eq!(mode(&dir.join("open")), 0o700);
+        // Already closed, as a read-only mount would be: left alone.
+        std::fs::create_dir(dir.join("mounted")).expect("mounted");
+        set(&dir.join("mounted"), 0o500);
+        private_dir(&dir.join("mounted")).expect("accepted");
+        assert_eq!(mode(&dir.join("mounted")), 0o500, "not touched");
+        // A link to a private directory of one's own is accepted.
+        std::os::unix::fs::symlink(dir.join("open"), dir.join("to-private")).expect("link");
+        private_dir(&dir.join("to-private")).expect("a private target");
+        // A link to an open one is refused, and the target left as it is.
+        std::fs::create_dir(dir.join("shared")).expect("shared");
+        set(&dir.join("shared"), 0o755);
+        std::os::unix::fs::symlink(dir.join("shared"), dir.join("to-shared")).expect("link");
+        assert!(matches!(
+            private_dir(&dir.join("to-shared")),
+            Err(StateError::Unsafe { .. })
+        ));
+        assert_eq!(
+            mode(&dir.join("shared")),
+            0o755,
+            "never chmodded through the link"
+        );
+        set(&dir.join("mounted"), 0o700);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn one_process_at_a_time_holds_the_execution_lock() {

@@ -834,6 +834,26 @@ fn a_key_for_an_endpoint_the_project_chose_is_withheld_and_a_model_run_refused()
 }
 
 #[test]
+fn config_runs_from_any_directory_above_the_persons_own_configuration() {
+    let dir = scratch("config-from-home");
+    let home = dir.join("home");
+    std::fs::create_dir_all(home.join(".config/atomic")).expect("config dir");
+    std::fs::write(home.join(".config/atomic/config.yaml"), "runner: process\n").expect("config");
+    // The home directory and the one above it, neither in a project.
+    for cwd in [home.clone(), dir.clone()] {
+        let out = atomic(&dir, &cwd, &["--json", "config", "--explain"], &[], "");
+        assert!(out.status.success(), "{}: {}", cwd.display(), text(&out));
+        let doc = stdout_json(&out);
+        assert!(
+            doc["settings"].as_array().is_some_and(|all| all
+                .iter()
+                .any(|s| s["setting"] == "runner" && s["value"] == "process")),
+            "{doc}"
+        );
+    }
+}
+
+#[test]
 fn check_reads_the_settings_of_every_manifest() {
     let dir = scratch("check-settings");
     let project = project(&dir);

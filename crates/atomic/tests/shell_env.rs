@@ -87,8 +87,9 @@ const PROFILES: &[&str] = &[".profile", ".bash_profile", ".bashrc", ".zshenv"];
 fn an_atoms_shell_sees_none_of_the_persons_secrets() {
     support::require_sandbox();
     on_codex_runtime(async {
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-            .join(format!("atomic-shell-env-{}", std::process::id()));
+        // Outside any checkout: a personal configuration inside the
+        // checkout holding the project is refused.
+        let dir = std::env::temp_dir().join(format!("atomic-shell-env-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let home = dir.join("home");
         std::fs::create_dir_all(home.join(".config/atomic")).unwrap();

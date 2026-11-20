@@ -664,6 +664,45 @@ fn a_personal_configuration_inside_the_project_is_refused() {
 }
 
 #[test]
+fn outside_a_project_the_personal_configuration_below_is_simply_read() {
+    // `atomic config` from the home directory, which holds the file.
+    let home = dir(&[]);
+    std::fs::create_dir_all(home.join(".config/atomic")).expect("config dir");
+    std::fs::write(home.join(".config/atomic/config.yaml"), "runner: process\n").expect("config");
+    let r = resolved(
+        &home,
+        &EngineArgs::default(),
+        &[("HOME", &home.display().to_string())],
+        &nobody,
+    );
+    assert_eq!(r.settings.runner, "process");
+}
+
+#[test]
+fn a_personal_configuration_in_the_checkout_holding_the_project_is_refused() {
+    // The home directory is the repository's root; the project is below it.
+    let checkout = dir(&[]);
+    std::fs::create_dir_all(checkout.join(".git")).expect("git dir");
+    std::fs::create_dir_all(checkout.join("services/notes")).expect("project dir");
+    std::fs::write(checkout.join("services/notes/atomic.yaml"), MANIFEST_ONLY).expect("manifest");
+    std::fs::create_dir_all(checkout.join(".config/atomic")).expect("config dir");
+    std::fs::write(
+        checkout.join(".config/atomic/config.yaml"),
+        "runner: local\n",
+    )
+    .expect("config");
+    let said = resolved_where(
+        &checkout.join("services/notes"),
+        &EngineArgs::default(),
+        &[("HOME", &checkout.display().to_string())],
+        &nobody,
+    )
+    .expect_err("refused")
+    .to_string();
+    assert!(said.contains("checkout holding the project"), "{said}");
+}
+
+#[test]
 fn an_endpoint_the_person_configured_is_not_announced() {
     let d = dir(&[("atomic.yaml", MANIFEST_ONLY)]);
     let (_home, home) = person("model:\n  base_url: http://127.0.0.1:8000/v1\n  name: m\n");

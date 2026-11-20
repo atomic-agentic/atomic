@@ -163,6 +163,12 @@ files run, and your own atomic configuration directory is denied to it. The mode
 environment from the model; it does not yet cover credentials in files
 elsewhere in your home directory.
 
+`HOME` is `/nonexistent` for these commands, so anything that finds its
+files through the home directory does not find them: rustup's and cargo's
+homes (`~/.rustup`, `~/.cargo`), the Go module cache, pyenv and asdf shims,
+`~/.gitconfig` and `~/.npmrc`. A tool the atom's commands need has to be on
+`PATH` without them, and settings it needs passed in the atom's `env`.
+
 Some integrations shown in the catalog remain staged. Unavailable permissions,
 remote atoms, credentials, skills and runtime declarations fail explicitly in the
 production loader. See [availability](availability.md); metadata does not grant a

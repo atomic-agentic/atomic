@@ -272,9 +272,12 @@ pub fn resolve(
     around: &Surroundings<'_>,
 ) -> Result<Resolved, ConfigError> {
     let user = user_config(around.env);
-    // A project could supply a "personal" file inside itself, as when the
-    // home directory is where the project is mounted.
-    if let Some(file) = &user
+    // A project could supply a "personal" file inside itself, or inside the
+    // checkout that holds it, as when the home directory is where the
+    // repository is mounted. Only for a project: outside one, such as
+    // `atomic config` run from the home directory, nothing supplies it.
+    if dir.join("atomic.yaml").is_file()
+        && let Some(file) = &user
         && let Ok(file) = std::fs::canonicalize(file)
     {
         let root = if dir.file_name().is_some_and(|n| n == ".atomic") {
@@ -282,15 +285,20 @@ pub fn resolve(
         } else {
             dir
         };
-        if let Ok(root) = std::fs::canonicalize(root)
-            && file.starts_with(&root)
-        {
-            return Err(ConfigError::Invalid(format!(
-                "your own configuration, {}, is inside the project at {}, so the project could \
-                 have supplied it; point XDG_CONFIG_HOME, or HOME, outside the project",
-                file.display(),
-                root.display()
-            )));
+        if let Ok(root) = std::fs::canonicalize(root) {
+            let checkout = root.ancestors().find(|d| d.join(".git").exists());
+            for (what, enclosing) in std::iter::once(("project", root.as_path()))
+                .chain(checkout.map(|c| ("checkout holding the project", c)))
+            {
+                if file.starts_with(enclosing) {
+                    return Err(ConfigError::Invalid(format!(
+                        "your own configuration, {}, is inside the {what} at {}, so the project \
+                         could have supplied it; point XDG_CONFIG_HOME, or HOME, outside it",
+                        file.display(),
+                        enclosing.display()
+                    )));
+                }
+            }
         }
     }
     let resolved = config::resolve::<Settings>(&Layers {
