@@ -230,6 +230,65 @@ pub fn collect(project: &Project) -> Result<BTreeMap<String, Vec<SourceFile>>, C
     Ok(out)
 }
 
+/// Every file under `dir`, a directory of `project`, found as the
+/// collections are: honouring `.gitignore`, the manifest's `ignore` globs and
+/// the generated directory, stopping at another project's manifest, and
+/// following no symbolic link. Sorted by path; a missing `dir` holds none.
+pub fn walk(project: &Project, dir: &Path) -> Result<Vec<PathBuf>, CollectError> {
+    let walk_error = |dir: &Path, e: &dyn std::fmt::Display| CollectError::Walk {
+        dir: dir.to_owned(),
+        message: e.to_string(),
+    };
+    let root = std::fs::canonicalize(&project.dir).map_err(|e| walk_error(&project.dir, &e))?;
+    let dir = match std::fs::canonicalize(dir) {
+        Ok(dir) => dir,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(walk_error(dir, &e)),
+    };
+    if !dir.starts_with(&root) {
+        return Err(walk_error(
+            &dir,
+            &format!("it is outside the project at {}", root.display()),
+        ));
+    }
+    let ignored = globset("ignore", &project.ignore)?;
+    let generated = root.join(&project.generated);
+    let start = dir.clone();
+    let walker = ignore::WalkBuilder::new(&dir)
+        .require_git(false)
+        .follow_links(false)
+        .filter_entry(move |e| {
+            let p = e.path();
+            if p == start {
+                return true;
+            }
+            let is_dir = e.file_type().is_some_and(|t| t.is_dir());
+            !(is_dir
+                && (p.join("atomic.yaml").is_file() || p.join(".atomic/atomic.yaml").is_file()))
+        })
+        .build();
+    let mut out = Vec::new();
+    for entry in walker {
+        let entry = entry.map_err(|e| walk_error(&dir, &e))?;
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        let path = entry.path();
+        if path.starts_with(&generated) {
+            continue;
+        }
+        if path
+            .strip_prefix(&root)
+            .is_ok_and(|relative| ignored.is_match(relative))
+        {
+            continue;
+        }
+        out.push(path.to_owned());
+    }
+    out.sort();
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests;
 

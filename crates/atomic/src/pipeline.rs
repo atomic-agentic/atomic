@@ -83,13 +83,15 @@ pub const PIPELINE: &str = "atomic.pipeline";
 /// version, so any build of atomic with the same layout continues the same
 /// runs, and one with another layout leaves them alone. Change it exactly
 /// when a run started under the old layout would replay differently under
-/// the new one: a step added, removed, renamed or moved, or a checkpoint's
-/// or the [`PipelineRun`]'s shape changed. The pipeline tests hold the
+/// the new one: a step added, removed, renamed or moved, a checkpoint's or
+/// the [`PipelineRun`]'s shape changed, or the conversion of recorded values
+/// to CEL changed, so that a mapping over them could give another answer.
+/// The pipeline tests hold the
 /// golden layout of each version, under `tests/layout/`: the steps two runs
 /// record, through an approved and a rejected gate, with the shape of each
 /// checkpoint, and the run's own shape. They fail when the layout no longer
 /// matches this version's, whose file is never rewritten.
-pub const LAYOUT_VERSION: &str = "atomic.pipeline.2";
+pub const LAYOUT_VERSION: &str = "atomic.pipeline.3";
 
 /// How many times one process recovers one run of `run_pipeline` at the
 /// same step before it fails the run as dead-lettered: enough for a crash
@@ -575,6 +577,7 @@ async fn run_pipeline<C: WorkflowContext>(
     run: PipelineRun,
     services: Arc<Services>,
     ledger: Ledger,
+    replay: Option<Arc<Replay>>,
 ) -> Result<Value> {
     let PipelineRun { pipeline, input } = run;
     let id = ctx.workflow_id().to_owned();
@@ -668,8 +671,16 @@ async fn run_pipeline<C: WorkflowContext>(
             Step::Gate(g) => {
                 // Waiting for a person is not work a stop waits for.
                 working = None;
-                let decision =
-                    run_gate(&ctx, &pipeline.name, g, &values, &services.deployment).await?;
+                let replaying = replay.as_ref().map(|r| r.of.as_str());
+                let decision = run_gate(
+                    &ctx,
+                    &pipeline.name,
+                    g,
+                    &values,
+                    &services.deployment,
+                    replaying,
+                )
+                .await?;
                 failpoint(&format!("pipeline:after:{}", g.id));
                 steps.insert(g.id.clone(), json!({ "decision": decision }));
                 shapes.insert(
@@ -738,6 +749,12 @@ async fn run_pipeline<C: WorkflowContext>(
             None
         };
         let atom_input = Value::Object(mapped);
+        // Recorded with the step's result, so a replay serves it only to the
+        // same input.
+        let input_sha256 = sha256(
+            &serde_json::to_vec(&atom_input)
+                .map_err(|e| failed(format!("step `{}`: encode its input: {e}", step.id)))?,
+        );
         let (budget, atom_caps) = (budget.clone(), caps.get(&step.atom).cloned());
         // A model atom runs on the model its budget was resolved for, and
         // only with caps: never unmetered, never at another model's price.
@@ -788,6 +805,9 @@ async fn run_pipeline<C: WorkflowContext>(
         } else {
             None
         };
+        // replay: no workspace. A replayed step runs no command, so whatever
+        // the attempt step comes to prepare for one (an exec workspace, say)
+        // stays unprepared when `replay` is set.
         let guard = if atom.kind == "exec" {
             let begun = attempt::begin(&ctx, &format!("{}.attempt", step.id)).await?;
             Some((begun, atom.external().is_some()))
@@ -797,6 +817,7 @@ async fn run_pipeline<C: WorkflowContext>(
         let origins = step.origins.clone();
         let pinned_helpers = pinned.helper_runtime.clone();
         let (id, ran) = (step.id.clone(), format!("pipeline:ran:{}", step.id));
+        let serving = replay.clone();
         let published = run_atom_at(
             &ctx,
             &step.id,
@@ -808,6 +829,11 @@ async fn run_pipeline<C: WorkflowContext>(
                 let (id, ran, run_id) = (id.clone(), ran.clone(), run_id.clone());
                 let (snapshot, tree, guard) = (snapshot.clone(), tree.clone(), guard.clone());
                 let pinned_helpers = pinned_helpers.clone();
+                // In a replay, the step's recorded result, with no model call
+                // and no command run; a step with none fails rather than run
+                // live.
+                let served = serving.as_ref().map(|r| r.serve(&id, &input_sha256));
+                let input_sha256 = input_sha256.clone();
                 // An exec atom calls no model and has no caps to meter.
                 if let Some(atom_caps) = &atom_caps {
                     let meter = budget.meter(&position, atom_caps);
@@ -815,6 +841,9 @@ async fn run_pipeline<C: WorkflowContext>(
                     runtimes.lite.meter = meter;
                 }
                 async move {
+                if let Some(served) = served {
+                    return served;
+                }
                 // The run's helpers run only as recorded, on the runtime the
                 // run started on; anything else is refused rather than
                 // recaptured. Checked only when the turn runs: a finished
@@ -866,6 +895,11 @@ async fn run_pipeline<C: WorkflowContext>(
                         in_worktree(worktrees, request, call, runtimes).await
                     }
                 }?;
+                let mut proposal = proposal;
+                let Value::Object(metadata) = &mut proposal.metadata else {
+                    return Err(failed("an atom step's metadata is not an object".into()));
+                };
+                metadata.insert("input_sha256".into(), Value::String(input_sha256));
                 failpoint(&ran);
                 Ok(proposal)
                 }
@@ -879,9 +913,16 @@ async fn run_pipeline<C: WorkflowContext>(
             accepted.push(commit.to_owned());
         }
         failpoint(&format!("pipeline:after:{}", step.id));
+        // A replay keeps the recorded metadata in `steps`, thread and all, so
+        // a later step that maps it is given what it was recorded with; only
+        // what is published here leaves the thread out.
+        let metadata = replay
+            .as_ref()
+            .and_then(|r| r.recorded.get(&step.id))
+            .map_or(published.metadata, |r| r.proposal.metadata.clone());
         steps.insert(
             step.id.clone(),
-            json!({"output": published.output, "metadata": published.metadata}),
+            json!({"output": published.output, "metadata": metadata}),
         );
         let output = match pipeline
             .atoms
@@ -1053,12 +1094,18 @@ async fn run_gate<C: WorkflowContext>(
     step: &GateStep,
     values: &[(&str, &Value, &Shape<'_>)],
     deployment: &Deployment,
+    replay_of: Option<&str>,
 ) -> Result<Value> {
     let at = |e: String| failed(format!("gate `{}`: {e}", step.id));
     let title = match atomic_schema::expr::evaluate(&step.title, values)
         .map_err(|e| at(format!("`title`: {e}")))?
     {
-        Value::String(title) => title,
+        // A replay's gate says so: its steps' results were served from a
+        // recording, not made now.
+        Value::String(title) => match replay_of {
+            Some(of) => format!("Replay of run {of}: {title}"),
+            None => title,
+        },
         other => return Err(at(format!("`title` gave {other}, not a string"))),
     };
     let show = match &step.show {
@@ -1124,7 +1171,237 @@ pub struct Services {
 pub fn register_pipeline<R: DurableRuntime>(rt: &mut R, services: Services) {
     let services = Arc::new(services);
     let ledger = rt.ledger();
+    let (replaying, replay_ledger) = (services.clone(), ledger.clone());
     rt.register(PIPELINE, move |ctx: R::Context, run: PipelineRun| {
-        run_pipeline(ctx, run, services.clone(), ledger.clone())
+        run_pipeline(ctx, run, services.clone(), ledger.clone(), None)
     });
+    rt.register(REPLAY, move |ctx: R::Context, replay: ReplayRun| {
+        let ReplayRun { of, run, recorded } = replay;
+        run_pipeline(
+            ctx,
+            run,
+            replaying.clone(),
+            replay_ledger.clone(),
+            Some(Arc::new(Replay { of, recorded })),
+        )
+    });
+}
+
+/// The name a replay of a recorded run is registered under.
+pub const REPLAY: &str = "atomic.replay";
+
+/// A replay of a recorded run: the same pipeline and input, with each atom
+/// step served the result it published in the recording instead of calling
+/// a model or running a command. An atom step the recording has no result
+/// for fails the replay; nothing runs live. Every other step runs as it
+/// would in a new run: a gate opens again, marked as a replay's, and waits
+/// for a decision.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReplayRun {
+    /// The recorded run.
+    pub of: String,
+    /// Its pipeline and input.
+    pub run: PipelineRun,
+    /// Each published atom step's recorded result, by step id.
+    pub recorded: BTreeMap<String, Recorded>,
+}
+
+/// One atom step's recorded result, as a replay serves it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Recorded {
+    /// What the step published: its output and metadata, with no writes.
+    pub proposal: Proposal,
+    /// The SHA-256 of the input the step was given, which the replayed
+    /// step's must match.
+    pub input_sha256: String,
+}
+
+/// A replay as `run_pipeline` serves it.
+struct Replay {
+    of: String,
+    recorded: BTreeMap<String, Recorded>,
+}
+
+impl Replay {
+    /// Step `id`'s recorded result for the input whose SHA-256 is `input`:
+    /// its output and metadata, without the model thread it ran on, which
+    /// belongs to the recorded run and not to this one.
+    fn serve(&self, id: &str, input: &str) -> Result<Proposal> {
+        let of = &self.of;
+        let recorded = self.recorded.get(id).ok_or_else(|| {
+            failed(format!(
+                "no recorded result for step {id}: run {of} did not publish one, and a replay                  never runs an atom live"
+            ))
+        })?;
+        if recorded.input_sha256 != input {
+            return Err(failed(format!(
+                "step {id} has another input than it had in run {of}, so its recorded result                  does not answer it"
+            )));
+        }
+        let mut proposal = recorded.proposal.clone();
+        if let Value::Object(metadata) = &mut proposal.metadata {
+            metadata.remove("thread_id");
+        }
+        Ok(proposal)
+    }
+}
+
+/// The replay of run `of` in `rt`'s store: its pipeline and input, and the
+/// result each of its atom steps published, with the input it was given.
+/// Refused for a run recorded under another layout than `rt`'s, and for one
+/// whose recorded results propose writes, which a replay never makes.
+pub async fn replay_of(rt: &atomic_durable::Durare, of: &str) -> Result<ReplayRun> {
+    let record = rt
+        .run_record(of)
+        .await?
+        .ok_or_else(|| failed(format!("there is no run {of} to replay")))?;
+    if record.version != rt.version() {
+        return Err(failed(format!(
+            "run {of} was recorded under layout {}, and this build replays only {}",
+            record.version,
+            rt.version()
+        )));
+    }
+    let input = rt
+        .run_input(of)
+        .await?
+        .ok_or_else(|| failed(format!("there is no run {of} to replay")))?;
+    let run: PipelineRun = serde_json::from_value(input).map_err(|e| {
+        failed(format!(
+            "run {of} is not a workflow-file run this build can replay: {e}"
+        ))
+    })?;
+    let recorded = recorded_results(of, &run, rt.recorded_candidates(of).await?)?;
+    Ok(ReplayRun {
+        of: of.to_owned(),
+        run,
+        recorded,
+    })
+}
+
+/// What a replay of run `of`, a run of `run`, serves each atom step, from
+/// the `candidates` the run published.
+fn recorded_results(
+    of: &str,
+    run: &PipelineRun,
+    mut candidates: BTreeMap<String, atomic_durable::Candidate>,
+) -> Result<BTreeMap<String, Recorded>> {
+    let mut recorded = BTreeMap::new();
+    for step in &run.pipeline.steps {
+        let Step::Atom(step) = step else { continue };
+        let Some(candidate) = candidates.remove(&step.id) else {
+            continue;
+        };
+        let id = &step.id;
+        if !candidate.proposal.writes.is_empty() {
+            return Err(failed(format!(
+                "run {of}: step {id}'s recorded result makes writes when it is published, and a                  replay never makes them again"
+            )));
+        }
+        let input_sha256 = candidate
+            .proposal
+            .metadata
+            .get("input_sha256")
+            .and_then(Value::as_str)
+            .ok_or_else(|| failed(format!("run {of}: step {id} recorded no input digest")))?
+            .to_owned();
+        recorded.insert(
+            id.clone(),
+            Recorded {
+                proposal: candidate.proposal,
+                input_sha256,
+            },
+        );
+    }
+    Ok(recorded)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run() -> PipelineRun {
+        serde_json::from_value(json!({
+            "pipeline": {
+                "name": "notes",
+                "steps": [
+                    {"kind": "atom", "id": "read", "atom": "read-note", "with": {}},
+                    {"kind": "atom", "id": "rank", "atom": "rank-note", "with": {}},
+                ],
+                "returns": "steps",
+                "input": {},
+                "output": {},
+                "atoms": {},
+                "pins": {},
+            },
+            "input": {},
+        }))
+        .expect("a run")
+    }
+
+    fn candidate(writes: Vec<atomic_durable::Write>) -> atomic_durable::Candidate {
+        atomic_durable::Candidate {
+            id: "recorded:3".into(),
+            proposal: Proposal {
+                output: json!({"title": "x"}),
+                metadata: json!({"thread_id": "t-1", "input_sha256": "abc"}),
+                writes,
+            },
+            digest: String::new(),
+        }
+    }
+
+    #[test]
+    fn a_replay_serves_only_what_was_recorded_for_the_same_input() {
+        let recorded = recorded_results(
+            "recorded",
+            &run(),
+            BTreeMap::from([
+                ("read".to_owned(), candidate(Vec::new())),
+                ("gone".to_owned(), candidate(Vec::new())),
+            ]),
+        )
+        .expect("recorded");
+        assert_eq!(recorded.keys().collect::<Vec<_>>(), ["read"]);
+        let replay = Replay {
+            of: "recorded".into(),
+            recorded,
+        };
+        // The recorded output, without the recorded run's thread.
+        let served = replay.serve("read", "abc").expect("served");
+        assert_eq!(served.output, json!({"title": "x"}));
+        assert_eq!(served.metadata, json!({"input_sha256": "abc"}));
+        // Another input, or a step with no result, is refused.
+        let e = replay.serve("read", "abd").expect_err("another input");
+        assert!(e.to_string().contains("another input"), "{e}");
+        let e = replay.serve("rank", "abc").expect_err("unrecorded");
+        assert!(
+            e.to_string().contains("no recorded result for step rank"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn a_recorded_result_that_writes_is_not_replayed() {
+        let writes = vec![atomic_durable::Write {
+            sql: "UPDATE t SET n = 1".into(),
+            params: Vec::new(),
+        }];
+        let e = recorded_results(
+            "recorded",
+            &run(),
+            BTreeMap::from([("read".to_owned(), candidate(writes))]),
+        )
+        .expect_err("writes");
+        assert!(e.to_string().contains("never makes them again"), "{e}");
+        let mut unhashed = candidate(Vec::new());
+        unhashed.proposal.metadata = json!({});
+        let e = recorded_results(
+            "recorded",
+            &run(),
+            BTreeMap::from([("read".to_owned(), unhashed)]),
+        )
+        .expect_err("no digest");
+        assert!(e.to_string().contains("no input digest"), "{e}");
+    }
 }
