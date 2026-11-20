@@ -55,8 +55,10 @@ pub struct ChangeRequestResult {
 }
 
 /// Turn an atom's failure into its step's failure, recorded as the outcome;
-/// a cap that left no room for its next call parks the run instead.
-fn failed(e: AtomError) -> DurableError {
+/// a cap that left no room for its next call parks the run instead. Every
+/// workflow converts an atom's error through this one function, so a budget
+/// refusal parks the run wherever the atom ran.
+pub fn atom_failure(e: AtomError) -> DurableError {
     match e {
         AtomError::Budget(why) => DurableError::Parked(why),
         // Like a crash before the checkpoint: recovery runs the step again,
@@ -80,7 +82,7 @@ where
     O: Serialize + Send + 'static,
     F: Future<Output = std::result::Result<(O, RunMetadata), AtomError>> + Send + 'static,
 {
-    let (out, metadata) = contained(run).await.map_err(failed)?;
+    let (out, metadata) = contained(run).await.map_err(atom_failure)?;
     let encode = |v: serde_json::Result<serde_json::Value>| {
         v.map_err(|e| DurableError::Failed(format!("encode the atom's result: {e}")))
     };
@@ -134,7 +136,7 @@ pub fn register_change_request<R: DurableRuntime>(
             let (budget, draft_caps, review_caps) =
                 (budget.clone(), draft_caps.clone(), review_caps.clone());
             async move {
-                let mut lite = runtimes.lite.clone();
+                let lite = runtimes.lite.clone();
                 let request = ChangeRequest {
                     request: input.request.clone(),
                 };
@@ -143,7 +145,9 @@ pub fn register_change_request<R: DurableRuntime>(
                     &ctx,
                     "draft",
                     move |step| {
+                        let mut lite = lite.clone();
                         lite.meter = meter.meter(&step, &draft_caps);
+                        let request = request.clone();
                         propose(async move { run_lite_atom(&DraftTask, &request, &lite).await })
                     },
                     Vec::new(),
@@ -152,7 +156,7 @@ pub fn register_change_request<R: DurableRuntime>(
                 failpoint("change-request:after-draft");
                 let task: DraftedTask = decode(&draft)?;
 
-                let mut codex = runtimes.codex.clone();
+                let codex = runtimes.codex.clone();
                 let review_request = ReviewRequest {
                     item: WorkItem {
                         id: format!("{}:draft", ctx.workflow_id()),
@@ -167,7 +171,9 @@ pub fn register_change_request<R: DurableRuntime>(
                     &ctx,
                     "review",
                     move |step| {
+                        let mut codex = codex.clone();
                         codex.meter = budget.meter(&step, &review_caps);
+                        let review_request = review_request.clone();
                         propose(async move {
                             run_codex_atom(&ReviewPatch, &review_request, &codex).await
                         })

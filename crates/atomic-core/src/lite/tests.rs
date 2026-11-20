@@ -323,3 +323,416 @@ fn long_error_bodies_are_cut_on_a_character_boundary() {
     assert!(cut.ends_with('…'));
     assert_eq!(excerpt("short"), "short");
 }
+
+// ---------------------------------------------------------------------------
+// Metering: what each call settles as, and the limit it is held to.
+
+use crate::usage::{Call, Limit, Meter, MeterFuture, Metering, Outcome, Ticket, Usage};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// A meter that admits every call with `limit` and records what each was
+/// admitted with and settled as.
+#[derive(Default)]
+struct Recorder {
+    limit: Limit,
+    calls: Mutex<Vec<Call>>,
+    settled: Mutex<Vec<Outcome>>,
+}
+
+impl Meter for Recorder {
+    fn admit(&self, call: Call) -> MeterFuture<'_, Ticket> {
+        Box::pin(async move {
+            let ticket = Ticket {
+                request: format!("r:{}", call.index),
+                attempt: 1,
+                model: call.model.clone(),
+                admitted: Instant::now(),
+                limit: self.limit,
+                bounded_by: None,
+            };
+            self.calls.lock().expect("calls").push(call);
+            Ok(ticket)
+        })
+    }
+
+    fn settle(&self, _: Ticket, outcome: Outcome) -> MeterFuture<'_, ()> {
+        Box::pin(async move {
+            self.settled.lock().expect("settled").push(outcome);
+            Ok(())
+        })
+    }
+}
+
+fn metered(rt: &mut LiteRuntime, limit: Limit) -> Arc<Recorder> {
+    let recorder = Arc::new(Recorder {
+        limit,
+        ..Recorder::default()
+    });
+    rt.meter = Metering::new(recorder.clone());
+    recorder
+}
+
+fn settled(recorder: &Recorder) -> Vec<Outcome> {
+    recorder.settled.lock().expect("settled").clone()
+}
+
+#[tokio::test]
+async fn a_reply_without_usage_settles_as_unknown_never_as_free() {
+    for wire in [Wire::ChatCompletions, Wire::Responses] {
+        let model = FakeModel::start(vec![Reply::WithoutUsage(GOOD.into())])
+            .await
+            .expect("fake model");
+        let mut rt = runtime(&model, wire);
+        let recorder = metered(&mut rt, Limit::default());
+        let (_, meta) = run_lite_atom(&Classify, &note(), &rt).await.expect("runs");
+        assert_eq!(settled(&recorder), [Outcome::Unknown], "{wire:?}");
+        assert_eq!((meta.input_tokens, meta.output_tokens), (0, 0));
+        // With usage, it settles as reported.
+        let model = FakeModel::start(vec![Reply::Text(GOOD.into())])
+            .await
+            .expect("fake model");
+        let mut rt = runtime(&model, wire);
+        let recorder = metered(&mut rt, Limit::default());
+        run_lite_atom(&Classify, &note(), &rt).await.expect("runs");
+        assert_eq!(
+            settled(&recorder),
+            [Outcome::Reported(Usage {
+                input_tokens: 1,
+                output_tokens: 1
+            })]
+        );
+    }
+}
+
+#[test]
+fn usage_with_a_missing_or_malformed_count_is_unknown() {
+    let read = |v: Value| usage_of(&v, "prompt_tokens", "completion_tokens");
+    assert_eq!(read(json!({})), None);
+    assert_eq!(read(json!({"usage": null})), None);
+    assert_eq!(read(json!({"usage": {"prompt_tokens": 5}})), None);
+    assert_eq!(
+        read(json!({"usage": {"input_tokens": 5, "output_tokens": 2}})),
+        None,
+        "another wire's names"
+    );
+    assert_eq!(
+        read(json!({"usage": {"prompt_tokens": -1, "completion_tokens": 2}})),
+        None
+    );
+    assert_eq!(
+        read(json!({"usage": {"prompt_tokens": 5, "completion_tokens": 2}})),
+        Some(Usage {
+            input_tokens: 5,
+            output_tokens: 2
+        })
+    );
+}
+
+#[tokio::test]
+async fn a_call_is_sent_with_its_reserved_output_limit() {
+    // The fake model is a local server: `max_tokens` on Chat Completions.
+    for (wire, field) in [
+        (Wire::ChatCompletions, "max_tokens"),
+        (Wire::Responses, "max_output_tokens"),
+    ] {
+        let model = FakeModel::start(vec![Reply::Text(GOOD.into())])
+            .await
+            .expect("fake model");
+        let mut rt = runtime(&model, wire);
+        let recorder = metered(
+            &mut rt,
+            Limit {
+                output_tokens: Some(321),
+                time: None,
+            },
+        );
+        run_lite_atom(&Classify, &note(), &rt).await.expect("runs");
+        assert_eq!(model.requests()[0][field], json!(321), "{wire:?}");
+        // The request's size bounds its input tokens.
+        let calls = recorder.calls.lock().expect("calls").clone();
+        let size = serde_json::to_vec(&model.requests()[0])
+            .expect("encode")
+            .len() as u64;
+        assert!(
+            calls[0].input_bound.is_some_and(|b| b >= size),
+            "{:?} for a {size}-byte request",
+            calls[0].input_bound
+        );
+    }
+    // Unmetered, no limit is sent.
+    let model = FakeModel::start(vec![Reply::Text(GOOD.into())])
+        .await
+        .expect("fake model");
+    run_lite_atom(&Classify, &note(), &runtime(&model, Wire::ChatCompletions))
+        .await
+        .expect("runs");
+    assert!(model.requests()[0].get("max_tokens").is_none());
+}
+
+#[tokio::test]
+async fn a_call_is_cut_off_when_its_reserved_time_runs_out() {
+    let model = FakeModel::start(vec![Reply::Delayed {
+        after: Duration::from_secs(5),
+        reply: Box::new(Reply::Text(GOOD.into())),
+    }])
+    .await
+    .expect("fake model");
+    let mut rt = runtime(&model, Wire::ChatCompletions);
+    let recorder = metered(
+        &mut rt,
+        Limit {
+            output_tokens: None,
+            time: Some(Duration::from_millis(300)),
+        },
+    );
+    let began = Instant::now();
+    match run_lite_atom(&Classify, &note(), &rt).await {
+        Err(AtomError::Model(message)) => assert!(message.contains("cut off"), "{message}"),
+        other => panic!("expected the call to be cut off, got {other:?}"),
+    }
+    assert!(began.elapsed() < Duration::from_secs(4), "cut off in time");
+    // It may have reached the provider: charged at its reservation.
+    assert_eq!(settled(&recorder), [Outcome::Unknown]);
+}
+
+#[tokio::test]
+async fn a_failed_call_settles_by_whether_it_could_have_been_sent() {
+    // An error from the provider: it was sent, and what it spent is unknown.
+    let model = FakeModel::start(vec![Reply::Http {
+        status: 500,
+        body: "{}".into(),
+    }])
+    .await
+    .expect("fake model");
+    let mut rt = runtime(&model, Wire::ChatCompletions);
+    let recorder = metered(&mut rt, Limit::default());
+    assert!(run_lite_atom(&Classify, &note(), &rt).await.is_err());
+    assert_eq!(settled(&recorder), [Outcome::Unknown]);
+    // No connection was ever made: nothing was sent.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = closed.local_addr().expect("addr").port();
+    drop(closed);
+    let mut rt = LiteRuntime::new(
+        ModelEndpoint {
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            model: "synthetic".into(),
+            api_key_env: None,
+        },
+        AtomConfig::default(),
+    );
+    let recorder = metered(&mut rt, Limit::default());
+    assert!(run_lite_atom(&Classify, &note(), &rt).await.is_err());
+    assert_eq!(settled(&recorder), [Outcome::NotDispatched]);
+}
+
+#[test]
+fn the_output_limit_goes_in_the_field_its_endpoint_reads() {
+    use LimitField::*;
+    for (wire, base, field) in [
+        (Wire::ChatCompletions, "http://127.0.0.1:8080/v1", MaxTokens),
+        (
+            Wire::ChatCompletions,
+            "http://localhost:11434/v1",
+            MaxTokens,
+        ),
+        (
+            Wire::ChatCompletions,
+            "https://api.openai.com/v1",
+            MaxCompletionTokens,
+        ),
+        (
+            Wire::ChatCompletions,
+            "https://example.openai.azure.com/openai/v1",
+            MaxCompletionTokens,
+        ),
+        (
+            Wire::ChatCompletions,
+            "https://example.cognitiveservices.azure.com/openai/v1",
+            MaxCompletionTokens,
+        ),
+        (
+            Wire::ChatCompletions,
+            "https://eu.api.openai.com/v1",
+            MaxCompletionTokens,
+        ),
+        (
+            Wire::ChatCompletions,
+            "https://us.api.openai.com/v1",
+            MaxCompletionTokens,
+        ),
+        (
+            Wire::ChatCompletions,
+            "https://example.services.ai.azure.com/openai/v1",
+            MaxCompletionTokens,
+        ),
+        (
+            Wire::ChatCompletions,
+            "https://example.openai.azure.us/openai/v1",
+            MaxCompletionTokens,
+        ),
+        (
+            Wire::ChatCompletions,
+            "https://example.openai.azure.cn/openai/v1",
+            MaxCompletionTokens,
+        ),
+        (
+            Wire::ChatCompletions,
+            "https://notapi.openai.com.example/v1",
+            MaxTokens,
+        ),
+        (
+            Wire::Responses,
+            "https://api.openai.com/v1",
+            MaxOutputTokens,
+        ),
+        (Wire::Responses, "http://127.0.0.1:8080/v1", MaxOutputTokens),
+    ] {
+        assert_eq!(
+            LimitField::for_endpoint(wire, base),
+            field,
+            "{wire:?} {base}"
+        );
+    }
+    assert_eq!(MaxCompletionTokens.name(), "max_completion_tokens");
+}
+
+#[tokio::test]
+async fn a_judged_answer_still_settles_the_usage_it_reported() {
+    let usage = json!({"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10});
+    for body in [
+        // A refusal.
+        json!({"id": "c", "choices": [{"index": 0, "finish_reason": "stop",
+            "message": {"role": "assistant", "content": null, "refusal": "No."}}], "usage": usage}),
+        // No content.
+        json!({"id": "c", "choices": [{"index": 0, "finish_reason": "stop",
+            "message": {"role": "assistant", "content": null}}], "usage": usage}),
+    ] {
+        let model = FakeModel::start(vec![Reply::Json(body.clone())])
+            .await
+            .expect("fake model");
+        let mut rt = runtime(&model, Wire::ChatCompletions);
+        let recorder = metered(&mut rt, Limit::default());
+        assert!(
+            run_lite_atom(&Classify, &note(), &rt).await.is_err(),
+            "{body}"
+        );
+        assert_eq!(
+            settled(&recorder),
+            [Outcome::Reported(Usage {
+                input_tokens: 7,
+                output_tokens: 3
+            })],
+            "{body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_answer_cut_off_at_its_output_limit_is_its_own_error_with_no_repair() {
+    for (wire, body) in [
+        (
+            Wire::ChatCompletions,
+            json!({"id": "c", "choices": [{"index": 0, "finish_reason": "length",
+                "message": {"role": "assistant", "content": "{\"category\": \"bu"}}],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 50, "total_tokens": 57}}),
+        ),
+        (
+            Wire::Responses,
+            json!({"id": "r", "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "output": [{"type": "message", "role": "assistant", "content": [
+                    {"type": "output_text", "text": "{\"category\": \"bu"}]}],
+                "usage": {"input_tokens": 7, "output_tokens": 50, "total_tokens": 57}}),
+        ),
+    ] {
+        let model = FakeModel::start(vec![Reply::Json(body), Reply::Text(GOOD.into())])
+            .await
+            .expect("fake model");
+        let mut rt = runtime(&model, wire);
+        let recorder = metered(&mut rt, Limit::default());
+        match run_lite_atom(&Classify, &note(), &rt).await {
+            Err(AtomError::Model(message)) => {
+                assert!(
+                    message.contains("cut off at the call's output limit"),
+                    "{message}"
+                );
+            }
+            other => panic!("{wire:?}: expected a truncation error, got {other:?}"),
+        }
+        assert_eq!(model.calls(), 1, "{wire:?}: no repair turn");
+        assert_eq!(
+            settled(&recorder),
+            [Outcome::Reported(Usage {
+                input_tokens: 7,
+                output_tokens: 50
+            })]
+        );
+    }
+}
+
+/// A runtime on `base_url` speaking Chat Completions.
+fn chat_at(base_url: &str) -> LiteRuntime {
+    let mut rt = LiteRuntime::new(
+        ModelEndpoint {
+            base_url: base_url.into(),
+            model: "m".into(),
+            api_key_env: None,
+        },
+        AtomConfig::default(),
+    );
+    rt.wire = Wire::ChatCompletions;
+    rt
+}
+
+#[test]
+fn a_request_body_carries_its_limit_in_the_endpoints_field_or_the_one_set() {
+    let exchange = [(Role::User, "hi".to_owned())];
+    let body = |rt: &LiteRuntime| request_body(rt, "m", None, &exchange, None, Some(99));
+    for base in [
+        "https://api.openai.com/v1",
+        "https://example.openai.azure.com/openai/v1",
+    ] {
+        let sent = body(&chat_at(base));
+        assert_eq!(sent["max_completion_tokens"], json!(99), "{base}");
+        assert!(sent.get("max_tokens").is_none(), "{base}");
+    }
+    let sent = body(&chat_at("http://127.0.0.1:8080/v1"));
+    assert_eq!(sent["max_tokens"], json!(99));
+    // A gateway the URL does not identify: the setting chooses.
+    let mut gateway = chat_at("https://llm-gateway.example/v1");
+    assert_eq!(body(&gateway)["max_tokens"], json!(99));
+    gateway.limit_field = Some(LimitField::MaxCompletionTokens);
+    let sent = body(&gateway);
+    assert_eq!(sent["max_completion_tokens"], json!(99));
+    assert!(sent.get("max_tokens").is_none());
+}
+
+#[tokio::test]
+async fn an_answer_a_content_filter_stopped_is_not_a_truncation() {
+    let body = json!({"id": "r", "status": "incomplete",
+        "incomplete_details": {"reason": "content_filter"},
+        "output": [{"type": "message", "role": "assistant", "content": [
+            {"type": "output_text", "text": "{"}]}],
+        "usage": {"input_tokens": 7, "output_tokens": 1, "total_tokens": 8}});
+    let model = FakeModel::start(vec![Reply::Json(body), Reply::Text(GOOD.into())])
+        .await
+        .expect("fake model");
+    let mut rt = runtime(&model, Wire::Responses);
+    let recorder = metered(&mut rt, Limit::default());
+    match run_lite_atom(&Classify, &note(), &rt).await {
+        Err(AtomError::Model(message)) => {
+            assert!(message.contains("content_filter"), "{message}");
+            assert!(!message.contains("output limit"), "{message}");
+        }
+        other => panic!("expected the provider's stop, got {other:?}"),
+    }
+    assert_eq!(model.calls(), 1, "no repair turn");
+    assert_eq!(
+        settled(&recorder),
+        [Outcome::Reported(Usage {
+            input_tokens: 7,
+            output_tokens: 1
+        })]
+    );
+}

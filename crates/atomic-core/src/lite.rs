@@ -22,7 +22,7 @@
 
 use crate::codex::{ModelEndpoint, ThreadReport, TurnSpec};
 use crate::typed::AtomConfig;
-use crate::usage::{Call, Outcome, Usage, meter_error};
+use crate::usage::{Call, Limit, Outcome, Usage, meter_error};
 use anyhow::{Context, anyhow, bail};
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -87,6 +87,10 @@ pub struct LiteRuntime {
     pub artifacts: crate::runtime::Artifacts,
     /// What admits and settles each call (see [`crate::usage`]).
     pub meter: crate::usage::Metering,
+    /// The request field the endpoint reads a call's output limit from, or
+    /// `None` to tell from the endpoint's URL ([`LimitField::for_endpoint`]).
+    /// Set it for a gateway or a server the URL does not identify.
+    pub limit_field: Option<LimitField>,
 }
 
 impl LiteRuntime {
@@ -100,6 +104,7 @@ impl LiteRuntime {
             timeout: DEFAULT_TIMEOUT,
             artifacts: crate::runtime::Artifacts::none(),
             meter: crate::usage::Metering::none(),
+            limit_field: None,
         }
     }
 }
@@ -124,9 +129,75 @@ impl Role {
 struct Answer {
     text: String,
     id: String,
-    input_tokens: i64,
-    output_tokens: i64,
-    total_tokens: i64,
+}
+
+/// How one call ended: its answer or why there is none, and the usage the
+/// provider reported, read before the answer is judged, so a refusal or a
+/// cut-off answer still settles what it spent. `None` when nothing that can
+/// be read was reported: such a call is settled as unknown, never as free.
+struct Called {
+    answer: anyhow::Result<Answer>,
+    usage: Option<Usage>,
+}
+
+/// The request field a call's output limit is sent in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LimitField {
+    /// `max_tokens`: Chat Completions on llama.cpp, vLLM, Ollama and other
+    /// OpenAI-compatible servers.
+    MaxTokens,
+    /// `max_completion_tokens`: Chat Completions on OpenAI's and Azure
+    /// OpenAI's own APIs, where reasoning models refuse `max_tokens`.
+    MaxCompletionTokens,
+    /// `max_output_tokens`: the Responses API.
+    MaxOutputTokens,
+}
+
+impl LimitField {
+    /// The field for `wire` at `base_url`.
+    pub fn for_endpoint(wire: Wire, base_url: &str) -> Self {
+        match wire {
+            Wire::Responses => Self::MaxOutputTokens,
+            Wire::ChatCompletions if reads_max_completion_tokens(base_url) => {
+                Self::MaxCompletionTokens
+            }
+            Wire::ChatCompletions => Self::MaxTokens,
+        }
+    }
+
+    /// Its name in the request body.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::MaxTokens => "max_tokens",
+            Self::MaxCompletionTokens => "max_completion_tokens",
+            Self::MaxOutputTokens => "max_output_tokens",
+        }
+    }
+}
+
+/// Whether `base_url` is OpenAI's own API, in any region, or an Azure
+/// OpenAI or Azure AI resource, in any cloud: the endpoints whose Chat
+/// Completions read `max_completion_tokens`, and whose reasoning models
+/// refuse `max_tokens`.
+fn reads_max_completion_tokens(base_url: &str) -> bool {
+    let host = base_url
+        .split_once("://")
+        .map_or(base_url, |(_, rest)| rest)
+        .split(['/', ':'])
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    host == "api.openai.com"
+        || host.ends_with(".api.openai.com")
+        || [
+            ".openai.azure.com",
+            ".openai.azure.us",
+            ".openai.azure.cn",
+            ".cognitiveservices.azure.com",
+            ".services.ai.azure.com",
+        ]
+        .iter()
+        .any(|suffix| host.ends_with(suffix))
 }
 
 /// Call the model with `first`, then, after each answer, with the follow-up
@@ -183,17 +254,32 @@ where
     };
     let mut index = 0;
     loop {
+        // The request without its output limit, for an upper bound on its
+        // input tokens; the limit adds a few bytes the slack covers.
+        let unlimited = request_body(
+            runtime,
+            &model,
+            first.developer_instructions.as_deref(),
+            &exchange,
+            schema.as_ref(),
+            None,
+        );
+        let input_bound = serde_json::to_vec(&unlimited)
+            .map(|b| b.len() as u64 + 64)
+            .ok();
         // Admitted before it is dispatched, settled once after.
-        let ticket = runtime
+        let (ticket, limit) = runtime
             .meter
             .admit(Call {
                 index,
                 model: model.clone(),
+                input_bound,
+                turn: false,
             })
             .await
             .map_err(meter_error)?;
         index += 1;
-        let answer = call(
+        let called = call(
             &client,
             runtime,
             key.as_deref(),
@@ -201,28 +287,31 @@ where
             first.developer_instructions.as_deref(),
             &exchange,
             schema.as_ref(),
+            &limit,
         )
         .await;
-        let outcome = match &answer {
-            Ok(a) => Outcome::Reported(Usage {
-                input_tokens: a.input_tokens,
-                output_tokens: a.output_tokens,
-            }),
+        let outcome = match (&called.answer, called.usage) {
+            // What the provider reported, whatever it answered.
+            (_, Some(usage)) => Outcome::Reported(usage),
             // A connection that was never made sent nothing.
-            Err(e) if never_sent(e) => Outcome::NotDispatched,
-            Err(_) => Outcome::Unknown,
+            (Err(e), None) if never_sent(e) => Outcome::NotDispatched,
+            // Anything else spent something unknown: it stays charged at its
+            // reservation.
+            (_, None) => Outcome::Unknown,
         };
         runtime
             .meter
             .settle(ticket, outcome)
             .await
             .map_err(meter_error)?;
-        let answer = answer?;
+        let answer = called.answer?;
         report.thread_id = answer.id;
         report.turns += 1;
-        report.input_tokens += answer.input_tokens;
-        report.output_tokens += answer.output_tokens;
-        report.total_tokens += answer.total_tokens;
+        if let Some(usage) = called.usage {
+            report.input_tokens += usage.input_tokens;
+            report.output_tokens += usage.output_tokens;
+            report.total_tokens += usage.total();
+        }
         match next(answer.text.clone()).await {
             Some(follow_up) => {
                 exchange.push((Role::Assistant, answer.text));
@@ -242,7 +331,32 @@ fn never_sent(e: &anyhow::Error) -> bool {
         .any(reqwest::Error::is_connect)
 }
 
-/// Make one call on the runtime's wire.
+/// The body of one call on `runtime`'s wire, with `output_limit` as its
+/// output limit, in the field its endpoint reads, if one is given.
+fn request_body(
+    runtime: &LiteRuntime,
+    model: &str,
+    developer: Option<&str>,
+    exchange: &[(Role, String)],
+    schema: Option<&Value>,
+    output_limit: Option<u64>,
+) -> Value {
+    let mut body = match runtime.wire {
+        Wire::ChatCompletions => chat_request(model, developer, exchange, schema),
+        Wire::Responses => responses_request(model, developer, exchange, schema),
+    };
+    if let Some(limit) = output_limit {
+        let field = runtime
+            .limit_field
+            .unwrap_or_else(|| LimitField::for_endpoint(runtime.wire, &runtime.endpoint.base_url));
+        body[field.name()] = json!(limit);
+    }
+    body
+}
+
+/// Make one call on the runtime's wire, held to `limit`: its output limit is
+/// sent with it, and it is cut off when its time runs out.
+#[allow(clippy::too_many_arguments)]
 async fn call(
     client: &reqwest::Client,
     runtime: &LiteRuntime,
@@ -251,42 +365,86 @@ async fn call(
     developer: Option<&str>,
     exchange: &[(Role, String)],
     schema: Option<&Value>,
-) -> anyhow::Result<Answer> {
+    limit: &Limit,
+) -> Called {
     let base = runtime.endpoint.base_url.trim_end_matches('/');
-    let (url, body) = match runtime.wire {
-        Wire::ChatCompletions => (
-            format!("{base}/chat/completions"),
-            chat_request(model, developer, exchange, schema),
-        ),
-        Wire::Responses => (
-            format!("{base}/responses"),
-            responses_request(model, developer, exchange, schema),
-        ),
+    let url = match runtime.wire {
+        Wire::ChatCompletions => format!("{base}/chat/completions"),
+        Wire::Responses => format!("{base}/responses"),
     };
+    let body = request_body(
+        runtime,
+        model,
+        developer,
+        exchange,
+        schema,
+        limit.output_tokens,
+    );
+    let time = limit.time_within(runtime.timeout);
     let mut request = client.post(&url).json(&body);
     if let Some(key) = key {
         request = request.bearer_auth(key);
     }
-    let response = request
-        .send()
-        .await
-        .with_context(|| format!("POST {url}"))?;
-    let status = response.status();
-    let text = response
-        .text()
-        .await
-        .with_context(|| format!("read the response from {url}"))?;
-    if !status.is_success() {
-        bail!("POST {url}: {status}: {}", excerpt(&text));
-    }
-    let value: Value = serde_json::from_str(&text)
-        .with_context(|| format!("POST {url}: the response is not JSON: {}", excerpt(&text)))?;
-    match runtime.wire {
-        Wire::ChatCompletions => chat_answer(&value),
-        Wire::Responses => responses_answer(&value),
-    }
-    .with_context(|| format!("POST {url}"))
+    // The whole exchange, the body's read included, is held to the time.
+    let exchanged = tokio::time::timeout(time, async {
+        let response = request
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))?;
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .with_context(|| format!("read the response from {url}"))?;
+        anyhow::Ok((status, text))
+    })
+    .await;
+    let failed = |answer: anyhow::Error| Called {
+        answer: Err(answer),
+        usage: None,
+    };
+    let (status, text) = match exchanged {
+        Ok(Ok(done)) => done,
+        Ok(Err(e)) => return failed(e),
+        Err(_) => {
+            return failed(anyhow!(
+                "POST {url}: cut off after {} ms, the call's reserved time",
+                time.as_millis()
+            ));
+        }
+    };
+    let value: Option<Value> = serde_json::from_str(&text).ok();
+    // The usage first: whatever the answer is, what it spent is settled.
+    let usage = value.as_ref().and_then(|v| match runtime.wire {
+        Wire::ChatCompletions => usage_of(v, "prompt_tokens", "completion_tokens"),
+        Wire::Responses => usage_of(v, "input_tokens", "output_tokens"),
+    });
+    let answer = if !status.is_success() {
+        Err(anyhow!("POST {url}: {status}: {}", excerpt(&text)))
+    } else {
+        match &value {
+            None => Err(anyhow!(
+                "POST {url}: the response is not JSON: {}",
+                excerpt(&text)
+            )),
+            Some(value) => match runtime.wire {
+                Wire::ChatCompletions => chat_answer(value),
+                Wire::Responses => responses_answer(value),
+            }
+            .with_context(|| format!("POST {url}")),
+        }
+    };
+    Called { answer, usage }
 }
+
+/// An answer the provider cut off at its output limit: not an answer that
+/// misfits its schema, so it gets no repair turn.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "the answer was cut off at the call's output limit ({0}); raise the call bound's \
+     output tokens, or ask for less"
+)]
+pub struct Truncated(String);
 
 fn chat_request(
     model: &str,
@@ -336,11 +494,26 @@ fn responses_request(
     body
 }
 
-fn tokens(usage: &Value, field: &str) -> i64 {
-    usage.get(field).and_then(Value::as_i64).unwrap_or(0)
+/// The usage in a response's `usage` object, read through its `input` and
+/// `output` fields; `None` when the object or either field is missing or
+/// not a count.
+fn usage_of(value: &Value, input: &str, output: &str) -> Option<Usage> {
+    let usage = value.get("usage")?;
+    let count = |field: &str| usage.get(field).and_then(Value::as_i64).filter(|n| *n >= 0);
+    Some(Usage {
+        input_tokens: count(input)?,
+        output_tokens: count(output)?,
+    })
 }
 
 fn chat_answer(value: &Value) -> anyhow::Result<Answer> {
+    if let Some(reason) = value
+        .pointer("/choices/0/finish_reason")
+        .and_then(Value::as_str)
+        .filter(|r| *r == "length")
+    {
+        return Err(Truncated(format!("finish_reason {reason}")).into());
+    }
     let message = value
         .pointer("/choices/0/message")
         .ok_or_else(|| anyhow!("the response has no choices[0].message"))?;
@@ -351,7 +524,6 @@ fn chat_answer(value: &Value) -> anyhow::Result<Answer> {
         .get("content")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("choices[0].message has no text content"))?;
-    let usage = value.get("usage").cloned().unwrap_or(Value::Null);
     Ok(Answer {
         text: text.to_owned(),
         id: value
@@ -359,13 +531,22 @@ fn chat_answer(value: &Value) -> anyhow::Result<Answer> {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned(),
-        input_tokens: tokens(&usage, "prompt_tokens"),
-        output_tokens: tokens(&usage, "completion_tokens"),
-        total_tokens: tokens(&usage, "total_tokens"),
     })
 }
 
 fn responses_answer(value: &Value) -> anyhow::Result<Answer> {
+    if value.get("status").and_then(Value::as_str) == Some("incomplete") {
+        let why = value
+            .pointer("/incomplete_details/reason")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        // Only an answer stopped at its output limit is truncated; any
+        // other stop, such as a content filter, is the provider's own.
+        if why == "max_output_tokens" {
+            return Err(Truncated(format!("status incomplete: {why}")).into());
+        }
+        bail!("the provider stopped the answer before it was complete: {why}");
+    }
     let mut text = String::new();
     let mut messages = 0;
     for item in value
@@ -405,7 +586,6 @@ fn responses_answer(value: &Value) -> anyhow::Result<Answer> {
                 .unwrap_or("unknown")
         );
     }
-    let usage = value.get("usage").cloned().unwrap_or(Value::Null);
     Ok(Answer {
         text,
         id: value
@@ -413,9 +593,6 @@ fn responses_answer(value: &Value) -> anyhow::Result<Answer> {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned(),
-        input_tokens: tokens(&usage, "input_tokens"),
-        output_tokens: tokens(&usage, "output_tokens"),
-        total_tokens: tokens(&usage, "total_tokens"),
     })
 }
 

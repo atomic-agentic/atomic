@@ -10,7 +10,7 @@
 //! read from the user's Codex configuration: Codex's home is the project's
 //! state directory (see [`crate::state`]).
 
-use crate::usage::{Call, Metering, Outcome, Usage, meter_error};
+use crate::usage::{Call, Exhausted, MeterError, Metering, Outcome, Usage, meter_error};
 use anyhow::Context;
 use anyhow::bail;
 use codex_core_api::AbsolutePathBuf;
@@ -46,6 +46,7 @@ use codex_core_api::NewThread;
 use codex_core_api::NotSubmittedReason;
 use codex_core_api::Notice;
 use codex_core_api::OPENAI_PROVIDER_ID;
+use codex_core_api::Op;
 use codex_core_api::OtelConfig;
 use codex_core_api::PermissionProfile;
 use codex_core_api::Permissions;
@@ -785,45 +786,64 @@ where
         thread_id: thread_id.to_string(),
         ..ThreadReport::default()
     };
+    // The thread's running totals as last reported: each turn's usage is
+    // what they grew by, so each reported token is charged once.
+    let mut seen = (0_i64, 0_i64);
     let outcome = loop {
         // Admitted before the turn is submitted, settled once after it.
-        let ticket = match meter
+        let (ticket, limit) = match meter
             .admit(Call {
                 index: report.turns,
                 model: endpoint.model.clone(),
+                input_bound: None,
+                turn: true,
             })
             .await
         {
-            Ok(ticket) => ticket,
+            Ok(admitted) => admitted,
             Err(e) => break Err(meter_error(e)),
         };
         report.turns += 1;
-        let turn = run_turn(&thread, &current).await;
-        // The provider reports the thread's running totals; the turn's own
-        // usage is what they grew by.
-        let outcome = match &turn {
-            Ok((_, Some((input, output, _)))) => Outcome::Reported(Usage {
-                input_tokens: input - report.input_tokens,
-                output_tokens: output - report.output_tokens,
-            }),
-            _ => Outcome::Unknown,
+        let bounded_by = ticket.as_ref().and_then(|t| t.bounded_by.clone());
+        // A turn is cut off when its reserved time runs out; a failed or cut
+        // off turn still reports the usage seen before it stopped.
+        let (turn, totals) = run_turn(&thread, &current, limit.time).await;
+        // Codex repeats the last totals in every token count, so a turn
+        // whose requests reported nothing shows them unchanged; a request
+        // that reports usage always grows them. A turn with nothing reported
+        // spent something unknown and stays charged at its reservation.
+        let fresh = totals.filter(|(input, output, _)| *input > seen.0 || *output > seen.1);
+        let outcome = match fresh {
+            Some((input, output, total)) => {
+                let grown = Usage {
+                    input_tokens: (input - seen.0).max(0),
+                    output_tokens: (output - seen.1).max(0),
+                };
+                seen = (input, output);
+                report.input_tokens = input;
+                report.output_tokens = output;
+                report.total_tokens = total;
+                Outcome::Reported(grown)
+            }
+            None => Outcome::Unknown,
         };
         if let Err(e) = meter.settle(ticket, outcome).await {
             break Err(meter_error(e));
         }
         match turn {
-            Err(e) => break Err(e),
-            Ok((answer, usage)) => {
-                if let Some((input, output, total)) = usage {
-                    report.input_tokens = input;
-                    report.output_tokens = output;
-                    report.total_tokens = total;
-                }
-                match next(answer.clone()).await {
-                    Some(follow_up) => current = follow_up,
-                    None => break Ok((answer, report.clone())),
-                }
+            // A turn cut off at its reserved time used up the active time
+            // its atom had left: the run parks, as at any other cap.
+            Err(e) if e.downcast_ref::<CutOff>().is_some() => {
+                break Err(meter_error(MeterError::Exhausted(Exhausted(format!(
+                    "{e}: all the active time the allowance {} had left",
+                    bounded_by.as_deref().unwrap_or("of its atom")
+                )))));
             }
+            Err(e) => break Err(e),
+            Ok(answer) => match next(answer.clone()).await {
+                Some(follow_up) => current = follow_up,
+                None => break Ok((answer, report.clone())),
+            },
         }
     };
     let shutdown_result = thread.shutdown_and_wait().await;
@@ -1096,10 +1116,64 @@ const NOT_IDLE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(10
 
 /// Run one turn; return its final message and the thread's token totals
 /// (input, output, total) as last reported.
+/// A turn cut off when its reserved time ran out.
+#[derive(Debug, thiserror::Error)]
+#[error("the turn was cut off after {} ms, its reserved time", .0.as_millis())]
+struct CutOff(std::time::Duration);
+
+/// How long an interrupted turn has to wind down.
+const INTERRUPT_PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Run one turn, cut off after `time` if one is given. Returns how it ended
+/// and the thread's running totals (input, output, total) as last reported,
+/// whether or not it succeeded.
 async fn run_turn(
     thread: &CodexThread,
     spec: &TurnSpec,
-) -> anyhow::Result<(String, Option<(i64, i64, i64)>)> {
+    time: Option<std::time::Duration>,
+) -> (anyhow::Result<String>, Option<(i64, i64, i64)>) {
+    let mut usage = None;
+    let ended = match time {
+        None => turn(thread, spec, &mut usage).await,
+        Some(time) => match tokio::time::timeout(time, turn(thread, spec, &mut usage)).await {
+            Ok(ended) => ended,
+            Err(_) => {
+                interrupt(thread, &mut usage).await;
+                Err(anyhow::Error::new(CutOff(time)))
+            }
+        },
+    };
+    (ended, usage)
+}
+
+/// Interrupt the running turn and wait, briefly, for it to stop, keeping
+/// any usage it reports on the way.
+async fn interrupt(thread: &CodexThread, usage: &mut Option<(i64, i64, i64)>) {
+    if thread.submit(Op::Interrupt).await.is_err() {
+        return;
+    }
+    let _ = tokio::time::timeout(INTERRUPT_PATIENCE, async {
+        while let Ok(event) = thread.next_event().await {
+            match event.msg {
+                EventMsg::TokenCount(count) => {
+                    if let Some(info) = count.info {
+                        let t = info.total_token_usage;
+                        *usage = Some((t.input_tokens, t.output_tokens, t.total_tokens));
+                    }
+                }
+                EventMsg::TurnAborted(_) | EventMsg::TurnComplete(_) => break,
+                _ => {}
+            }
+        }
+    })
+    .await;
+}
+
+async fn turn(
+    thread: &CodexThread,
+    spec: &TurnSpec,
+    usage: &mut Option<(i64, i64, i64)>,
+) -> anyhow::Result<String> {
     // Codex sends TurnComplete before it marks the thread idle, so a follow-up
     // turn submitted straight after one can be declined as NotIdle. That
     // window is short: retry for a bounded time, and only for that reason.
@@ -1127,21 +1201,19 @@ async fn run_turn(
         }
     }
 
-    let mut usage = None;
     loop {
         let event = thread.next_event().await.context("read Codex event")?;
         match event.msg {
             EventMsg::TokenCount(count) => {
                 if let Some(info) = count.info {
                     let t = info.total_token_usage;
-                    usage = Some((t.input_tokens, t.output_tokens, t.total_tokens));
+                    *usage = Some((t.input_tokens, t.output_tokens, t.total_tokens));
                 }
             }
             EventMsg::TurnComplete(done) => {
-                let message = done
+                return done
                     .last_agent_message
-                    .context("the turn completed without a message")?;
-                return Ok((message, usage));
+                    .context("the turn completed without a message");
             }
             EventMsg::Error(event) => bail!(event.message),
             EventMsg::TurnAborted(_) => bail!("turn aborted"),
@@ -1486,6 +1558,171 @@ mod tests {
             assert_eq!(model.calls(), 2);
             // The second call carries the failed tool call's result.
             assert!(model.requests()[1].to_string().contains("call_synthetic"));
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // Metering: each turn admitted first and settled once, each reported
+    // token charged once.
+
+    use crate::usage::{Limit, Meter, MeterFuture, Ticket};
+    use std::sync::Mutex;
+
+    /// Admits every turn with `limit` and records each settlement.
+    #[derive(Default)]
+    struct Recorder {
+        limit: Limit,
+        settled: Mutex<Vec<Outcome>>,
+    }
+
+    impl Meter for Recorder {
+        fn admit(&self, call: Call) -> MeterFuture<'_, Ticket> {
+            Box::pin(async move {
+                Ok(Ticket {
+                    request: format!("r:{}", call.index),
+                    attempt: 1,
+                    model: call.model,
+                    admitted: std::time::Instant::now(),
+                    limit: self.limit,
+                    bounded_by: None,
+                })
+            })
+        }
+
+        fn settle(&self, _: Ticket, outcome: Outcome) -> MeterFuture<'_, ()> {
+            Box::pin(async move {
+                self.settled.lock().expect("settled").push(outcome);
+                Ok(())
+            })
+        }
+    }
+
+    async fn metered_conversation(
+        tag: &str,
+        replies: Vec<Reply>,
+        turns: usize,
+        limit: Limit,
+    ) -> (anyhow::Result<(String, ThreadReport)>, Vec<Outcome>, usize) {
+        let model = FakeModel::start(replies).await.expect("fake model");
+        let (home, cwd) = (
+            scratch(&format!("home-{tag}")),
+            scratch(&format!("cwd-{tag}")),
+        );
+        let endpoint = ModelEndpoint {
+            base_url: model.base_url(),
+            model: "synthetic".into(),
+            api_key_env: None,
+        };
+        let recorder = Arc::new(Recorder {
+            limit,
+            ..Recorder::default()
+        });
+        let meter = Metering::new(recorder.clone());
+        let mut asked = 1;
+        let ended = converse_async(
+            &CodexPaths::without_helpers(),
+            &home,
+            &cwd,
+            &endpoint,
+            &meter,
+            &StateGuard::NoProjectState,
+            &TurnSpec {
+                prompt: "t0".into(),
+                ..TurnSpec::default()
+            },
+            |_| {
+                let more = asked < turns;
+                asked += 1;
+                std::future::ready(more.then(|| TurnSpec {
+                    prompt: format!("t{asked}"),
+                    ..TurnSpec::default()
+                }))
+            },
+        )
+        .await;
+        let settled = recorder.settled.lock().expect("settled").clone();
+        (ended, settled, model.calls())
+    }
+
+    const ONE: Outcome = Outcome::Reported(Usage {
+        input_tokens: 1,
+        output_tokens: 1,
+    });
+
+    #[test]
+    fn each_turn_settles_with_what_the_thread_grew_by_and_a_silent_turn_as_unknown() {
+        on_codex_runtime(async {
+            let (ended, settled, calls) = metered_conversation(
+                "meter",
+                vec![
+                    Reply::Text("a".into()),
+                    Reply::WithoutUsage("b".into()),
+                    Reply::Text("c".into()),
+                ],
+                3,
+                Limit::default(),
+            )
+            .await;
+            let (_, report) = ended.expect("three turns");
+            assert_eq!(calls, 3);
+            // The thread's totals grow by one and one per reported turn; the
+            // turn that reported nothing is unknown, never free, and the
+            // next turn is charged only its own growth.
+            assert_eq!(settled, [ONE, Outcome::Unknown, ONE]);
+            assert_eq!((report.input_tokens, report.output_tokens), (2, 2));
+        });
+    }
+
+    #[test]
+    fn a_failed_turn_settles_with_the_usage_seen_before_it_failed() {
+        on_codex_runtime(async {
+            // The turn's first request reports its usage and calls a tool;
+            // the second is refused, and the turn fails.
+            let (ended, settled, calls) = metered_conversation(
+                "failed",
+                vec![
+                    Reply::Tool {
+                        name: "no_such_tool".into(),
+                        arguments: serde_json::json!({}),
+                    },
+                    Reply::Http {
+                        status: 400,
+                        body:
+                            r#"{"error": {"message": "refused", "type": "invalid_request_error"}}"#
+                                .into(),
+                    },
+                ],
+                1,
+                Limit::default(),
+            )
+            .await;
+            assert!(ended.is_err(), "the turn failed");
+            assert!(calls >= 2, "{calls}");
+            assert_eq!(settled, [ONE], "the failed turn kept the usage it reported");
+        });
+    }
+
+    #[test]
+    fn a_turn_is_cut_off_when_its_reserved_time_runs_out() {
+        on_codex_runtime(async {
+            let began = std::time::Instant::now();
+            let (ended, settled, _) = metered_conversation(
+                "slow",
+                vec![Reply::Delayed {
+                    after: std::time::Duration::from_secs(30),
+                    reply: Box::new(Reply::Text("late".into())),
+                }],
+                1,
+                Limit {
+                    output_tokens: None,
+                    time: Some(std::time::Duration::from_millis(500)),
+                },
+            )
+            .await;
+            let e = ended.expect_err("cut off");
+            assert!(format!("{e:#}").contains("cut off"), "{e:#}");
+            assert!(began.elapsed() < std::time::Duration::from_secs(20));
+            assert_eq!(settled, [Outcome::Unknown]);
         });
     }
 }
