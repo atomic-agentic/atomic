@@ -46,9 +46,7 @@ pub use credential::{
 };
 
 use crate::failpoint;
-use crate::runtime::{
-    DurableError, DurableRuntime, Param, Result, Row, RunStatus, Tx, WorkflowContext,
-};
+use crate::runtime::{DurableError, DurableRuntime, Param, Result, Row, Tx, WorkflowContext};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -864,19 +862,29 @@ pub async fn find<R: DurableRuntime>(rt: &R, id: &str) -> Result<Option<Gate>> {
 /// that run waiting until this, or its own deadline. Returns how many it
 /// sent; a repeat for a run that already woke changes nothing.
 pub async fn redeliver<R: DurableRuntime>(rt: &R) -> Result<usize> {
-    let resolved: Vec<Gate> = gates(rt, GateFilter::default())
-        .await?
-        .into_iter()
-        .filter(|g| g.resolution.is_some())
-        .collect();
-    let mut sent = 0;
-    for g in resolved {
-        if rt.status(&g.run).await? == Some(RunStatus::Pending) {
-            wake(rt, &g.run, &g.id).await?;
-            sent += 1;
-        }
+    // Only resolved gates of unfinished runs, chosen in one query: a
+    // server asks every few seconds, and finished runs' gates pile up.
+    let waiting: Vec<(String, String)> = rt
+        .control_transaction(|mut tx| {
+            Box::pin(async move {
+                let rows = tx
+                    .query_all(
+                        "SELECT g.gate_id AS gate_id, g.run AS run FROM atomic_gates g \
+                         JOIN workflow_status w ON w.workflow_uuid = g.run \
+                         WHERE g.state <> 'open' AND w.status IN ('PENDING', 'ENQUEUED')",
+                        &[],
+                    )
+                    .await?;
+                rows.iter()
+                    .map(|r| Ok((r.text("gate_id")?, r.text("run")?)))
+                    .collect()
+            })
+        })
+        .await?;
+    for (gate, run) in &waiting {
+        wake(rt, run, gate).await?;
     }
-    Ok(sent)
+    Ok(waiting.len())
 }
 
 /// Every evidence digest a gate in the store refers to. Retention keeps

@@ -951,7 +951,11 @@ impl Durare {
             }
         };
         for name in &queues {
-            let mut queue = durare::WorkflowQueue::new(name);
+            // Prompt while its run waits, and backing off to a poll every
+            // few seconds once it has been taken: the engine cannot stop
+            // one queue's dispatcher, and the run may come back to it.
+            let mut queue = durare::WorkflowQueue::new(name)
+                .max_polling_interval(std::time::Duration::from_secs(5));
             queue.base_polling_interval = std::time::Duration::from_millis(100);
             self.engine.register_queue(queue);
         }
