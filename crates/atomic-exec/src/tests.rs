@@ -85,7 +85,44 @@ fn a_missing_program_cannot_start() {
     assert!(matches!(error, ExecError::Start { .. }), "{error}");
 }
 
-#[cfg(unix)]
+/// Whether process `pid` still runs: `kill -0` reaches it, and on Linux it
+/// is not a zombie waiting to be reaped.
+fn alive(pid: &str) -> bool {
+    let reached = std::process::Command::new("/bin/sh")
+        .args(["-c", &format!("kill -0 {pid} 2>/dev/null")])
+        .status()
+        .expect("kill")
+        .success();
+    let zombie = || {
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+            stat.rsplit(')')
+                .next()
+                .unwrap_or("")
+                .trim_start()
+                .starts_with('Z')
+        })
+    };
+    reached && !(cfg!(target_os = "linux") && zombie())
+}
+
+/// Wait until `pid` is gone, or fail with `what`.
+fn gone(pid: &str, what: &str) {
+    let started = std::time::Instant::now();
+    while alive(pid) {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{what}: {pid} survived"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn scratch_file(tag: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("atomic-exec-{tag}-{}", std::process::id()))
+}
+
+/// /proc/<pid>/stat gives the process group on Linux only.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_command_runs_in_a_process_group_of_its_own() {
     // Fields 1 and 5 of /proc/<pid>/stat: the process and its group.
@@ -98,36 +135,53 @@ fn a_command_runs_in_a_process_group_of_its_own() {
     let text = String::from_utf8_lossy(&done.stdout).into_owned();
     let (pid, group) = text.split_once(' ').expect("two fields");
     assert_eq!(pid, group, "{text}");
-    assert_ne!(
-        group,
-        std::process::id().to_string(),
-        "not this process's group"
-    );
 }
 
-#[cfg(unix)]
 #[test]
 fn a_command_past_its_time_limit_is_stopped_with_everything_it_started() {
-    let file = std::env::temp_dir().join(format!("atomic-exec-group-{}", std::process::id()));
+    let file = scratch_file("group");
     let script = format!("sleep 30 & printf '%s' \"$!\" > '{}'; wait", file.display());
     let error = shell(&script, b"", Duration::from_millis(500)).expect_err("times out");
     assert!(matches!(error, ExecError::TimedOut { .. }), "{error}");
     let pid = std::fs::read_to_string(&file).expect("the background pid");
     let _ = std::fs::remove_file(&file);
-    let started = std::time::Instant::now();
-    // Gone, or a zombie waiting for init to reap it.
-    while std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
-        !stat
-            .rsplit(')')
-            .next()
-            .unwrap_or("")
-            .trim_start()
-            .starts_with('Z')
-    }) {
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "the command's own child {pid} outlived it"
+    gone(&pid, "the command's own child outlived it");
+}
+
+#[test]
+fn a_reaped_group_ends_with_its_process_and_an_own_one_does_not() {
+    for (group, survives) in [
+        (process::Group::OwnReaped, false),
+        (process::Group::Own, true),
+    ] {
+        let file = scratch_file(&format!("reaped-{survives}"));
+        let script = format!(
+            "sleep 30 </dev/null >/dev/null 2>&1 & printf '%s' \"$!\" > '{}'",
+            file.display()
         );
-        std::thread::sleep(Duration::from_millis(20));
+        process::run_in(
+            group,
+            std::path::Path::new("/bin/sh"),
+            &["-c".to_owned(), script],
+            None,
+            &[],
+            b"",
+            process::Limits {
+                time: Duration::from_secs(10),
+                stdout: 1024,
+                stderr: 1024,
+            },
+        )
+        .expect("runs");
+        let pid = std::fs::read_to_string(&file).expect("the background pid");
+        let _ = std::fs::remove_file(&file);
+        if survives {
+            assert!(alive(&pid), "{group:?}: what it left keeps running");
+            let _ = std::process::Command::new("/bin/sh")
+                .args(["-c", &format!("kill -KILL {pid}")])
+                .status();
+        } else {
+            gone(&pid, &format!("{group:?}: what it left"));
+        }
     }
 }

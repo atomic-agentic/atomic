@@ -46,17 +46,42 @@ fn kill_group(group: u32) {
 /// Call it, then exit. The steps that were running stay unfinished, and
 /// their attempt guards decide whether their commands may run again.
 pub fn stop_all() -> usize {
+    // Under the lock that spawning holds, so a process is either killed
+    // here or never started.
+    let running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
     STOPPING.store(true, Ordering::SeqCst);
-    let running = RUNNING.lock().map(|r| r.clone()).unwrap_or_default();
-    for group in &running {
+    for group in running.iter() {
         kill_group(*group);
     }
     running.len()
 }
 
+/// Which process group a process [`run_in`] starts runs in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Group {
+    /// One of its own, which its time limit and [`stop_all`] kill, with
+    /// everything it started.
+    Own,
+    /// One of its own, and whatever is left in it is killed when the
+    /// process ends: for a runner, whose command shares its group.
+    OwnReaped,
+    /// This process's own: for the command of a runner, so that stopping
+    /// the runner's group stops the command and everything it started. Its
+    /// time limit kills the command alone; the rest goes with the runner's
+    /// group.
+    Inherit,
+}
+
 /// Wait here for good if the process is stopping: its exit ends the wait.
 fn unless_stopping() {
-    while STOPPING.load(Ordering::SeqCst) {
+    if STOPPING.load(Ordering::SeqCst) {
+        stopped();
+    }
+}
+
+/// Wait for the exit of a process that is stopping.
+fn stopped() -> ! {
+    loop {
         std::thread::park();
     }
 }
@@ -104,6 +129,19 @@ pub fn run(
     stdin: &[u8],
     limits: Limits,
 ) -> Result<Completed, ExecError> {
+    run_in(Group::Own, program, args, cwd, env, stdin, limits)
+}
+
+/// [`run`], in the process group `group` says.
+pub fn run_in(
+    group: Group,
+    program: &Path,
+    args: &[String],
+    cwd: Option<&Path>,
+    env: &[(String, String)],
+    stdin: &[u8],
+    limits: Limits,
+) -> Result<Completed, ExecError> {
     let name = program.display().to_string();
     let mut command = std::process::Command::new(program);
     command
@@ -117,7 +155,9 @@ pub fn run(
         command.current_dir(cwd);
     }
     #[cfg(unix)]
-    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    if group != Group::Inherit {
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    }
     #[cfg(target_os = "linux")]
     {
         let parent = libc::pid_t::try_from(std::process::id()).unwrap_or(0);
@@ -138,19 +178,27 @@ pub fn run(
             });
         }
     }
-    // A process that is stopping starts nothing more.
-    unless_stopping();
+    // Checked, started and registered under one lock, which stop_all takes
+    // too: a process that is stopping starts nothing more.
+    let mut running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
+    if STOPPING.load(Ordering::SeqCst) {
+        drop(running);
+        stopped();
+    }
     let child = command.spawn().map_err(|e| ExecError::Start {
         program: name.clone(),
         message: e.to_string(),
     })?;
-    let group = child.id();
-    if let Ok(mut running) = RUNNING.lock() {
-        running.push(group);
-    }
-    let done = finish(child, &name, stdin, limits);
-    if let Ok(mut running) = RUNNING.lock() {
-        running.retain(|g| *g != group);
+    // A process in this one's group is stopped with this process.
+    let own = (group != Group::Inherit).then(|| child.id());
+    running.extend(own);
+    drop(running);
+    let done = finish(child, &name, stdin, limits, own, group == Group::OwnReaped);
+    if let Some(own) = own {
+        RUNNING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|g| *g != own);
     }
     // A process that is stopping killed it: how it ended is not its result.
     unless_stopping();
@@ -162,8 +210,9 @@ fn finish(
     name: &str,
     stdin: &[u8],
     limits: Limits,
+    group: Option<u32>,
+    reap: bool,
 ) -> Result<Completed, ExecError> {
-    let group = child.id();
     let name = name.to_owned();
     let io = |e: std::io::Error| ExecError::Io {
         program: name.clone(),
@@ -206,7 +255,9 @@ fn finish(
             Some(status) => break status,
             None if started.elapsed() > limits.time => {
                 // Everything it started, not only the process itself.
-                kill_group(group);
+                if let Some(group) = group {
+                    kill_group(group);
+                }
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(ExecError::TimedOut {
@@ -217,6 +268,11 @@ fn finish(
             None => std::thread::sleep(Duration::from_millis(10)),
         }
     };
+    // Before its output is read to the end, which what it left could hold
+    // open.
+    if reap && let Some(group) = group {
+        kill_group(group);
+    }
     let stdout = reader
         .join()
         .map_err(|_| io(std::io::Error::other("stdout reader panicked")))?

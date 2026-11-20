@@ -260,14 +260,25 @@ pub fn serve(
 }
 
 /// The runner's side on this process's stdin, stdout and stderr, running
-/// commands as child processes.
+/// commands as child processes in the runner's own process group, so that
+/// the control plane stops a command, with everything it started, by
+/// stopping its runner's group.
 pub fn serve_stdio() -> i32 {
     serve(
         &mut std::io::stdin().lock(),
         &mut std::io::stdout().lock(),
         &mut std::io::stderr().lock(),
-        &LocalBackend,
+        &InRunnerGroup,
     )
+}
+
+/// [`LocalBackend`], with each command in the runner's process group.
+struct InRunnerGroup;
+
+impl ExecutionBackend for InRunnerGroup {
+    fn run(&self, command: &Command) -> Result<Completed, ExecError> {
+        LocalBackend::run_in(process::Group::Inherit, command)
+    }
 }
 
 /// The control plane's side: an [`ExecutionBackend`] that runs each command
@@ -307,7 +318,10 @@ impl ProcessRunner {
 
     /// Start one runner on `request` and classify how it ended.
     fn attempt(&self, command: &Command, request: &[u8]) -> Result<(Exit, Completed), ExecError> {
-        let done = process::run(
+        // The runner's group holds its command too: whatever is left in it
+        // when the runner ends goes with it.
+        let done = process::run_in(
+            process::Group::OwnReaped,
             &self.program,
             &self.args,
             None,

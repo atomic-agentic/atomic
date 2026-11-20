@@ -189,13 +189,15 @@ impl ExecutionBackend for Backend {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LocalBackend;
 
-impl ExecutionBackend for LocalBackend {
-    fn run(&self, command: &Command) -> Result<Completed, ExecError> {
+impl LocalBackend {
+    /// Run `command` as [`ExecutionBackend::run`] does, in `group`.
+    pub fn run_in(group: process::Group, command: &Command) -> Result<Completed, ExecError> {
         let program = process::resolve(&command.program).map_err(|message| ExecError::Start {
             program: command.program.clone(),
             message,
         })?;
-        process::run(
+        process::run_in(
+            group,
             &program,
             &command.args,
             Some(&command.cwd),
@@ -207,6 +209,12 @@ impl ExecutionBackend for LocalBackend {
                 stderr: process::STDERR_LIMIT,
             },
         )
+    }
+}
+
+impl ExecutionBackend for LocalBackend {
+    fn run(&self, command: &Command) -> Result<Completed, ExecError> {
+        Self::run_in(process::Group::Own, command)
     }
 }
 

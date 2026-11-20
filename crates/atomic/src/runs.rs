@@ -93,14 +93,40 @@ fn print_result(run_id: &str, output: &Value, json: bool) -> anyhow::Result<()> 
 }
 
 /// Wait for run `run_id` and turn its outcome into the command's.
-async fn finish(engine: &engine::Engine, run_id: &str, json: bool) -> anyhow::Result<()> {
-    let mut outcome = engine.rt.result::<Value>(run_id).await;
-    if matches!(outcome, Err(DurableError::Interrupted(_))) {
-        // This execution stopped without an outcome, as one whose exec
-        // command's result was lost does, and the engine recovers it in this
-        // process; follow the run by its id to the outcome recovery reaches.
-        outcome = engine.rt.result::<Value>(run_id).await;
-    }
+///
+/// A signal stops the command as one stops `atomic serve` (see [`stop`]):
+/// the run stays unfinished, for `atomic runs resume`.
+async fn finish(
+    engine: &engine::Engine,
+    run_id: &str,
+    json: bool,
+    signals: &mut Signals,
+    who: &str,
+) -> anyhow::Result<()> {
+    let follow = async {
+        let outcome = engine.rt.result::<Value>(run_id).await;
+        if matches!(outcome, Err(DurableError::Interrupted(_))) {
+            // This execution stopped without an outcome, as one whose exec
+            // command's result was lost does, and the engine recovers it in
+            // this process; follow the run by its id to the outcome recovery
+            // reaches.
+            return engine.rt.result::<Value>(run_id).await;
+        }
+        outcome
+    };
+    let outcome = tokio::select! {
+        outcome = follow => Some(outcome),
+        signal = signals.next() => {
+            eprintln!(
+                "{who}: {signal}: run {run_id} stays unfinished; continue it with \
+                 `atomic runs resume {run_id}`"
+            );
+            None
+        }
+    };
+    let Some(outcome) = outcome else {
+        stop(engine, signals, who, Exit::Signalled).await
+    };
     let _ = engine.rt.shutdown(SHUTDOWN).await;
     match outcome {
         Ok(output) => print_result(run_id, &output, json),
@@ -127,6 +153,7 @@ pub async fn run(
     paths: &CodexPaths,
     json: bool,
 ) -> anyhow::Result<()> {
+    let mut signals = Signals::new()?;
     let cwd = std::env::current_dir()?;
     let found = target::project_for(project, Some(&args.target), &cwd)?;
     let state = ProjectState::resolve(found.root())?;
@@ -172,7 +199,7 @@ pub async fn run(
         run.pipeline.name, found.name
     );
     engine.rt.start(PIPELINE, &run_id, run).await?;
-    finish(&engine, &run_id, json).await
+    finish(&engine, &run_id, json, &mut signals, "atomic run").await
 }
 
 /// The state of the project a command that names no target works on.
@@ -189,6 +216,7 @@ pub async fn resume(
     paths: &CodexPaths,
     json: bool,
 ) -> anyhow::Result<()> {
+    let mut signals = Signals::new()?;
     let state = state(project)?;
     let engine = engine::open(
         &state,
@@ -221,7 +249,9 @@ pub async fn resume(
             )
             .into())
         }
-        Some(RunStatus::Succeeded) => finish(&engine, id, json).await,
+        Some(RunStatus::Succeeded) => {
+            finish(&engine, id, json, &mut signals, "atomic runs resume").await
+        }
         Some(RunStatus::Other(state)) => {
             let _ = engine.rt.shutdown(SHUTDOWN).await;
             Err(Failure::new(
@@ -273,7 +303,7 @@ pub async fn resume(
             eprintln!("run {id}: resuming");
             engine.rt.resume(id).await?;
             atomic_durable::failpoint("resume:queued");
-            finish(&engine, id, json).await
+            finish(&engine, id, json, &mut signals, "atomic runs resume").await
         }
     }
 }
@@ -318,16 +348,56 @@ impl Signals {
     }
 }
 
-/// `atomic serve`.
-///
-/// It runs until a signal stops it. Running steps then have [`SHUTDOWN`] to
-/// reach a checkpoint, or until a second signal. Whatever command is still
-/// running after that is killed, with everything it started, and the
-/// process exits without recording how it ended; only its exit releases the
+/// How a stopped process exits.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Exit {
+    /// `atomic serve`: 0 if everything reached a checkpoint, else 1.
+    Served,
+    /// A command stopped short of its result: 130, as for an interrupt.
+    Signalled,
+}
+
+/// Stop this process after a signal: running steps have [`SHUTDOWN`] to
+/// reach a checkpoint, or until another signal. Whatever command is still
+/// running then is killed, with everything it started, and the process
+/// exits without recording how it ended; only its exit releases the
 /// execution lock, so no other process can recover a run while a command of
-/// this one still runs. Unfinished work stays recorded for the next serve
-/// or resume, and each interrupted command's attempt guard decides whether
-/// it may run again.
+/// this one still runs. Each interrupted command's attempt guard decides
+/// whether it may run again.
+async fn stop(engine: &engine::Engine, signals: &mut Signals, who: &str, exit: Exit) -> ! {
+    eprintln!(
+        "{who}: stopping; running steps have {} seconds to reach a checkpoint (send another \
+         signal to stop now)",
+        SHUTDOWN.as_secs()
+    );
+    let forced = tokio::select! {
+        _ = engine.rt.shutdown(SHUTDOWN) => None,
+        again = signals.next() => Some(again),
+    };
+    if let Some(again) = forced {
+        eprintln!("{who}: {again}: stopping now");
+    }
+    // The engine's drain ends at its time limit whether or not its steps
+    // did, so whatever still runs is stopped here, and its end is never
+    // recorded: this process exits first.
+    let stopped = atomic_exec::process::stop_all();
+    if stopped > 0 {
+        eprintln!(
+            "{who}: stopped {stopped} command(s) that had not finished; their runs continue with \
+             the next `atomic serve` or `atomic runs resume`"
+        );
+    }
+    // Exit here, not by returning: the runtime would wait for the blocked
+    // threads of the stopped commands, which never return.
+    std::process::exit(match exit {
+        Exit::Served if forced.is_none() && stopped == 0 => 0,
+        Exit::Served => 1,
+        Exit::Signalled => 130,
+    })
+}
+
+/// `atomic serve`. It runs until a signal [`stop`]s it. Unfinished work
+/// stays recorded for the next serve or resume.
 pub async fn serve(
     args: ServeArgs,
     project: Option<&Path>,
@@ -373,33 +443,6 @@ pub async fn serve(
     }
     eprintln!("atomic serve: recovered {recovered} unfinished run(s); serving until stopped");
     let signal = signals.next().await;
-    eprintln!(
-        "atomic serve: {signal}: stopping; running steps have {} seconds to reach a checkpoint \
-         (send another signal to stop now)",
-        SHUTDOWN.as_secs()
-    );
-    let forced = tokio::select! {
-        _ = engine.rt.shutdown(SHUTDOWN) => None,
-        again = signals.next() => Some(again),
-    };
-    if let Some(again) = forced {
-        eprintln!("atomic serve: {again}: stopping now");
-    }
-    // The engine's drain ends at its time limit whether or not its steps
-    // did, so whatever still runs is stopped here, and its end is never
-    // recorded: this process exits first.
-    let stopped = atomic_exec::process::stop_all();
-    if stopped > 0 {
-        eprintln!(
-            "atomic serve: stopped {stopped} command(s) that had not finished; their runs continue \
-             with the next `atomic serve` or `atomic runs resume`"
-        );
-    }
-    // Exit here, not by returning: the runtime would wait for the blocked
-    // threads of the stopped commands, which never return.
-    std::process::exit(if forced.is_some() || stopped > 0 {
-        1
-    } else {
-        0
-    })
+    eprintln!("atomic serve: {signal}");
+    stop(&engine, &mut signals, "atomic serve", Exit::Served).await
 }
