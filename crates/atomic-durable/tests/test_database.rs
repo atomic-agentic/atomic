@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 /// Where tests may use the test database, under crates/: a directory, with
 /// its slash, or a file. scripts/backends-check.sh checks each of these.
-const USERS: &[&str] = &["atomic-durable/"];
+const USERS: &[&str] = &["atomic-durable/", "atomic/tests/run_cli.rs"];
 
 fn sources(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).expect("read the source tree") {
@@ -30,7 +30,7 @@ fn sources(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 #[test]
-fn only_the_testing_module_reads_the_database_variable_and_only_this_package_uses_it() {
+fn only_the_testing_module_reads_the_database_variable_and_only_listed_tests_use_it() {
     let crates = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("the crates directory")

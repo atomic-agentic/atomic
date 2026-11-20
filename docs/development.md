@@ -99,11 +99,14 @@ Set `ATOMIC_DEV_DB=off` to run a command without starting the database.
 
 A test suite that needs Postgres fails when `ATOMIC_TEST_DATABASE_URL` is not
 set, or when the database it names does not answer, with a message naming it.
-It never skips silently. `scripts/backends-check.sh postgres` shows this: it
+It never skips silently. `scripts/backends-check.sh postgres` shows this. It
 runs every `atomic-agentic-durable` test without the database, and requires
 the ones that fail to be exactly its Postgres variants, each naming the
 database in its own output, with none of them ignored, and every test binary
-to report its result.
+to report its result. It then runs the workspace's tests whose names say
+postgres, which adds the command-line tests in
+`crates/atomic/tests/run_cli.rs`, and requires every one to fail so, with the
+database unset and with it unreachable.
 
 Every checkout's tests share the one database, so each test reaches it only
 through `atomic_durable::testing::schema`, which gives it a schema of its own
@@ -114,8 +117,8 @@ was killed leaves its schemas behind; the first schema each test process asks
 for also sweeps those more than an hour old, and those older tests named under
 a known prefix with the time last. A test in
 `crates/atomic-durable/tests/test_database.rs` fails if anything else reads
-`ATOMIC_TEST_DATABASE_URL`, or if a test the check does not cover uses the
-database.
+`ATOMIC_TEST_DATABASE_URL`, or if anything outside `atomic-agentic-durable`
+and `run_cli.rs`, the two places the check covers, uses the database.
 
 The database keeps its data on a 1 GB tmpfs under a 1.5 GB memory limit, with
 a small write-ahead log; a container started before that change keeps its old

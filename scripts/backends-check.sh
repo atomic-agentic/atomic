@@ -12,8 +12,10 @@
 # sandbox check needs an environment without the sandbox; under scripts/dev.sh
 # that is the default (ATOMIC_DEV_SANDBOX unset), and CI turns user namespaces
 # off for the step. It refuses to run where the sandbox works, since it could
-# then show nothing. The sandbox half uses CI's test step's cargo flags, so
-# nothing rebuilds; the Postgres half rebuilds atomic-agentic-durable alone.
+# then show nothing. The sandbox half and the Postgres half's workspace pass
+# use CI's test step's cargo flags, so nothing rebuilds for them; the
+# Postgres half's pass over atomic-agentic-durable alone rebuilds that
+# package with its own features.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -45,10 +47,9 @@ check() {
 
 case "${1:-}" in
 postgres)
-    # The Postgres tests are found by what they do, not by their names: run
-    # every atomic-agentic-durable test (the package whose tests reach the
-    # database, as crates/atomic-durable/tests/test_database.rs checks) with
-    # no database. The tests that fail are the Postgres tests: each must fail
+    # In atomic-agentic-durable, the Postgres tests are found by what they
+    # do, not by their names: run every test of that package with no
+    # database. The tests that fail are the Postgres tests: each must fail
     # naming the database, and they must be exactly the Postgres variants,
     # whose names say postgres; none of those may pass or be ignored.
     ATOMIC_TEST_DATABASE_URL="" cargo test --locked --no-fail-fast -p atomic-agentic-durable \
@@ -68,6 +69,18 @@ postgres)
         grep -m3 -E "^error" "${LOG}" >&2
         status=1
     fi
+    # The command-line tests in crates/atomic/tests/run_cli.rs also use the
+    # database. That package's tests are too many and too slow to run
+    # wholesale without it, so its Postgres tests are selected by name, as
+    # their names say postgres; test_database.rs keeps the users of the
+    # database to these two places.
+    ATOMIC_TEST_DATABASE_URL="" check "Postgres tests across the workspace, by name, with no database configured" \
+        "ATOMIC_TEST_DATABASE_URL is not set" \
+        --workspace --features "${FEATURES}" -- postgres
+    ATOMIC_TEST_DATABASE_URL="postgres://atomic:atomic@127.0.0.1:9/atomic" \
+        check "Postgres tests across the workspace, by name, with the database unreachable" \
+        "test database postgres://***@127.0.0.1:9/atomic (ATOMIC_TEST_DATABASE_URL) cannot be reached" \
+        --workspace --features "${FEATURES}" -- postgres
     ;;
 sandbox)
     if bwrap --unshare-user --unshare-pid --ro-bind / / --proc /proc --dev /dev true 2>/dev/null; then
