@@ -24,7 +24,10 @@
 //!   the one refused goes on once its park is released;
 //! - a lite call that failed is charged at its bound if it could have been
 //!   sent, as is an answer with no usage, and released if it never was;
-//! - a dollar cap on an unpriced model fails configuration.
+//! - a dollar cap on an unpriced model fails configuration, and a call to
+//!   a model the budget does not price is not made under one;
+//! - a Codex turn reserves the active time its atom has left, not one
+//!   request's bound, and a turn that runs out of it parks the run.
 
 // Codex's turn futures nest deeply inside the workflow's; proving them Send
 // needs more than the default query depth.
@@ -789,6 +792,10 @@ fn pair_child<C: atomic_durable::WorkflowContext>(
     })
 }
 
+// The two children run as parallel sibling atoms in one workflow, which
+// shows the ledger's race but is not a recoverable shape: positions claimed
+// in join order are not stable across a replay. A recoverable run would
+// model them as child workflows.
 #[test]
 fn parallel_children_cannot_both_take_the_last_reservation() {
     on_codex_runtime(async {
@@ -922,6 +929,126 @@ fn a_lite_call_that_fails_is_charged_by_whether_it_could_have_been_sent() {
             [("0:0".to_owned(), 1, "released".to_owned())]
         );
         assert_eq!(charged(&rt, "atom:unsent:0").await, 0);
+    });
+}
+
+/// Settings whose lite requests are bounded at `call` minutes, under an
+/// atom cap of `atom` minutes.
+fn timed(call: f64, atom: f64) -> BudgetSettings {
+    let mut s = settings(10_000, 100_000);
+    s.call.minutes = call;
+    s.atom.minutes = atom;
+    s
+}
+
+#[test]
+fn a_codex_turn_longer_than_a_request_bound_runs_within_its_atoms_time() {
+    on_codex_runtime(async {
+        // Scaled down: a request is bounded at 0.6 s and the atom at 3 s, so
+        // a 1.5 s review turn is a 12-minute build turn under a 10-minute
+        // request bound and a 30-minute atom cap.
+        let model = FakeModel::start(vec![
+            Reply::Text(DRAFT.into()),
+            Reply::Delayed {
+                after: Duration::from_millis(1_500),
+                reply: Box::new(Reply::Text(REVIEW.into())),
+            },
+        ])
+        .await
+        .expect("fake model");
+        let dir = scratch("longturn");
+        let rt = engine(&dir, &model.base_url(), timed(0.01, 0.05)).await;
+        rt.launch().await.expect("launch");
+        rt.start(CHANGE_REQUEST, "longturn", input())
+            .await
+            .expect("start");
+        assert_eq!(outcome(&rt, "longturn").await, Outcome::Finished);
+        let journal = attempts(&rt, "longturn").await;
+        // The lite request reserved its own bound; the turn, all its atom's
+        // time.
+        assert_eq!(journal[0].reserved.millis, 600);
+        assert_eq!(journal[1].reserved.millis, 3_000, "{:?}", journal[1]);
+        assert!(journal[1].charged.millis >= 1_500, "{:?}", journal[1]);
+        rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+    });
+}
+
+#[test]
+fn a_codex_turn_that_runs_out_of_its_atoms_time_parks_the_run() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![
+            Reply::Text(DRAFT.into()),
+            Reply::Delayed {
+                after: Duration::from_secs(20),
+                reply: Box::new(Reply::Text(REVIEW.into())),
+            },
+        ])
+        .await
+        .expect("fake model");
+        let dir = scratch("outoftime");
+        let rt = engine(&dir, &model.base_url(), timed(0.01, 0.02)).await;
+        rt.launch().await.expect("launch");
+        rt.start(CHANGE_REQUEST, "outoftime", input())
+            .await
+            .expect("start");
+        let Outcome::Parked(reason) = outcome(&rt, "outoftime").await else {
+            panic!("the run should park");
+        };
+        assert!(reason.contains("cut off"), "{reason}");
+        let park = parks(&rt, "outoftime").await.expect("parks")[0].clone();
+        assert_eq!(park.step, "review.park");
+        rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+    });
+}
+
+#[test]
+fn a_call_to_a_model_the_budget_does_not_price_is_not_made_under_a_dollar_cap() {
+    on_codex_runtime(async {
+        let dir = scratch("unpricedcall");
+        let rt = Durare::sqlite(&dir.join("atomic.db"))
+            .await
+            .expect("engine");
+        let mut priced = settings(10_000, 100_000);
+        priced.workflow.cost_usd = Some(1.0);
+        priced.pricing.insert(
+            "synthetic".into(),
+            Price {
+                input_usd_per_mtok: 1.0,
+                output_usd_per_mtok: 1.0,
+                max_input_tokens: None,
+                max_output_tokens: None,
+            },
+        );
+        let budget = RunBudget::new(
+            rt.ledger(),
+            Arc::new(priced),
+            &Budget::default(),
+            &["synthetic"],
+        )
+        .expect("budget");
+        let caps = budget.atom(&Budget::default(), "synthetic").expect("caps");
+        let model = FakeModel::start(vec![Reply::Text(DRAFT.into())])
+            .await
+            .expect("fake model");
+        // The atom asks for another model than the budget was resolved for.
+        let mut lite = runtimes(&dir, &model.base_url()).lite.clone();
+        lite.endpoint.model = "unpriced".into();
+        lite.meter = budget.meter(
+            &atomic_durable::StepInfo {
+                workflow_id: "unpricedcall".into(),
+                step_id: 0,
+            },
+            &caps,
+        );
+        let request = ChangeRequest {
+            request: "Two units at 1.25 should cost 2.50.".into(),
+        };
+        let refused = run_lite_atom(&DraftTask, &request, &lite)
+            .await
+            .expect_err("refused");
+        assert!(refused.to_string().contains("has no price"), "{refused}");
+        assert_eq!(model.calls(), 0, "the call was not made");
+        assert!(attempts(&rt, "unpricedcall").await.is_empty());
     });
 }
 

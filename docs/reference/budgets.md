@@ -126,14 +126,28 @@ billing deviations still require reconciliation, so this is not an invoice ceili
 Admission reserves the call's whole bound: the model's `max_input_tokens` and
 `max_output_tokens` from `pricing`, else the `call` defaults, priced at the model's
 rate, and the `call` time. The call is held to that bound: a lite call is sent
-with the bound's output tokens as its output limit (`max_tokens`, or
-`max_output_tokens` on the Responses API), and any call is cut off when its
-reserved time runs out. A lite request larger than the bound's input tokens is
-recorded in the attempt's declared maximum. A response that reports no usage is
+with the bound's output tokens as its output limit, in the field its endpoint
+reads (`max_completion_tokens` on OpenAI's and Azure OpenAI's Chat Completions,
+`max_tokens` on other OpenAI-compatible servers, `max_output_tokens` on the
+Responses API), and is cut off when its reserved time runs out. An answer cut off
+at its output limit fails as such, without a repair turn. A lite request larger
+than the bound's input tokens is recorded in the attempt's declared maximum.
+
+The usage a response reports is settled before its answer is judged, so a refusal
+or an empty answer is charged what it spent. A response that reports no usage is
 settled as unknown and stays charged at its reservation; it is never taken as
-free. A failed or cut-off Codex turn is settled with the usage it reported before
-it stopped. A Codex turn can make several provider requests, so its reported usage
-can exceed the bound; the ledger records any such overshoot.
+free.
+
+A Codex turn can make several provider requests and run tools between them, so
+the `call` time does not bound it. A turn reserves the active time its atom has
+left (or less, if the run has less), and is interrupted when that runs out; the
+run then parks, as at any other cap. A failed or interrupted turn is settled with
+the usage it reported before it stopped. Its reported tokens can exceed the
+bound; the ledger records any such overshoot.
+
+A run resolves the model each atom calls with its budget, and the atom runs on
+that model for the whole run. Under a dollar cap, a call to a model the run's
+budget does not price is not made.
 
 When a cap prevents more work, the run parks for inspection rather than silently
 starting another attempt. The call is not made, the park is recorded with its

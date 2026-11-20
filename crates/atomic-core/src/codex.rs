@@ -1622,6 +1622,7 @@ mod tests {
             &cwd,
             &endpoint,
             &meter,
+            &StateGuard::NoProjectState,
             &TurnSpec {
                 prompt: "t0".into(),
                 ..TurnSpec::default()
