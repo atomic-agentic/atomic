@@ -82,8 +82,9 @@ const WEAK_PARTS: &[&str] = &[
     "cookie",
     "authorization",
 ];
-/// Words that make `token` a count of tokens or a kind of token rather than
-/// a credential: `max_token`, `prompt_token`, `error_token`, `next_token`.
+/// Words that make the `token` right after them a count of tokens or a kind
+/// of token rather than a credential: `max_token`, `prompt_token`,
+/// `error_token`, `next_token`.
 const TOKEN_KINDS: &[&str] = &[
     "max",
     "min",
@@ -94,16 +95,17 @@ const TOKEN_KINDS: &[&str] = &[
     "used",
     "prompt",
     "completion",
-    "input",
-    "output",
     "reasoning",
-    "cached",
     "error",
     "next",
     "eos",
     "bos",
     "special",
 ];
+/// Words that make the `tokens` right after them a count, though `token`
+/// alone after them may be a credential: `input_tokens`, but
+/// `--input-token`.
+const COUNTED_KINDS: &[&str] = &["input", "output", "cached"];
 /// What makes `key` a secret's name: `api_key`, `AccountKey`,
 /// `Ocp-Apim-Subscription-Key`. `key` alone, `primary_key` or `KeyError`
 /// are not.
@@ -403,13 +405,21 @@ fn strength(name: &str) -> Strength {
     }
     let weak =
         parts.iter().any(|part| WEAK_PARTS.contains(&part.as_str())) || joined.ends_with("token");
-    // `max_token`, `prompt_token`, `error_token`: a count or a kind of
-    // token, which only hints. Only `token` is so qualified: `INPUT_PASS`
-    // and `PROVIDER_TOKEN` are secrets' names.
-    let about = parts.iter().any(|part| part == "token" || part == "tokens")
-        && parts
-            .iter()
-            .any(|part| TOKEN_KINDS.contains(&part.as_str()));
+    // `max_token`, `prompt_token`, `input_tokens`, `nextToken`: a count or a
+    // kind of token, which only hints, said by the word right before
+    // `token`. Never in an all-upper-case name, an environment variable's,
+    // where `INPUT_TOKEN` is how GitHub Actions passes a token, and never
+    // for `pass` or `auth`: `INPUT_PASS` and `PROVIDER_TOKEN` are secrets'
+    // names.
+    let upper = !last.bytes().any(|b| b.is_ascii_lowercase());
+    let about = !upper
+        && parts.windows(2).any(|pair| match pair[1].as_str() {
+            "token" => TOKEN_KINDS.contains(&pair[0].as_str()),
+            "tokens" => {
+                TOKEN_KINDS.contains(&pair[0].as_str()) || COUNTED_KINDS.contains(&pair[0].as_str())
+            }
+            _ => false,
+        });
     match (weak, parts.len()) {
         (false, _) => Strength::None,
         (true, 2..) if about => Strength::Weak,
@@ -598,9 +608,8 @@ fn shapes(input: &str) -> Option<String> {
             .flatten()
         {
             let end = format!("-----END {}-----", &found[1]);
-            let ends = rest.find(&end);
-            step(ends.map_or(rest.len(), |i| i + end.len()));
-            let len = ends.map_or(rest.len(), |i| i + end.len());
+            let len = rest.find(&end).map_or(rest.len(), |i| i + end.len());
+            step(len);
             out.push_str(&input[copied..at]);
             out.push_str(REDACTED);
             at += len;
@@ -1165,7 +1174,9 @@ fn cut(input: &str, chars: usize) -> Cow<'_, str> {
 }
 
 /// How much of a text to redact so that `chars` of it survive: enough to
-/// spare that what redaction shrinks never brings the cut into view.
+/// spare that the cut stays out of view unless redaction shrinks the window
+/// a great deal, when the line at the cut is dropped (see
+/// [`cut_came_into_view`]).
 fn margin(chars: usize) -> usize {
     chars.saturating_mul(2).saturating_add(16 * 1024)
 }
@@ -1229,8 +1240,9 @@ fn window_end(input: &str, chars: usize) -> &str {
 }
 
 /// How far before a window's cut, in characters, a secret whose rule needs
-/// what lies across the cut may start: as long as a realistic secret.
-const REACH: usize = 4 * 1024;
+/// what lies across the cut may start: as long as a realistic secret, or a
+/// header line at a common cap.
+const REACH: usize = 8 * 1024;
 
 /// Whether redacting a window of `window` characters into `redacted`
 /// brought its cut into view: the window was longer than `chars` and the

@@ -1225,5 +1225,38 @@ fn only_a_count_or_kind_of_token_is_a_hint() {
         ("INPUT_PASS=hunter2", "INPUT_PASS=[REDACTED]"),
         ("PROVIDER_TOKEN=abc123", "PROVIDER_TOKEN=[REDACTED]"),
         ("ERROR_AUTH=abc", "ERROR_AUTH=[REDACTED]"),
+        ("INPUT_TOKEN=hunter2", "INPUT_TOKEN=[REDACTED]"),
+        ("CACHED_TOKEN=12345678", "CACHED_TOKEN=[REDACTED]"),
+        (
+            "NEXT_PUBLIC_API_TOKEN=x",
+            "NEXT_PUBLIC_API_TOKEN=[REDACTED]",
+        ),
+        ("input_token=hunter2", "input_token=[REDACTED]"),
+        // A kind word right before `TOKEN`, in an environment variable.
+        ("NEXT_TOKEN=hunter2", "NEXT_TOKEN=[REDACTED]"),
+        ("ERROR_TOKEN=hunter2", "ERROR_TOKEN=[REDACTED]"),
     ]);
+    // Counts and pagination fields, in snake or camel case, still only hint.
+    assert_kept(&[
+        "input_tokens: 12",
+        "nextToken: page2",
+        "max_tokens_used=4096",
+        "cachedTokens: 120",
+    ]);
+}
+
+/// A header line as long as a common cap, cut at a tail's start: once the
+/// window shrinks to bring the cut into view, the rest of the line, a
+/// cookie's values here, is not shown.
+#[test]
+fn a_cookie_line_cut_at_a_tails_start_is_not_shown() {
+    let chars = 2000;
+    let pair = "sid=SEEDEDabc123; ";
+    let rest_of_line = pair.repeat(7000 / pair.len());
+    let end = "\nend\n";
+    let block = key_block(margin(chars) - rest_of_line.len() - 1 - end.len());
+    let input = format!("Cookie: {}{rest_of_line}\n{block}{end}", pair.repeat(30));
+    let out = tail(&input, chars);
+    assert!(!out.contains("SEEDED"), "the cookie's values were shown");
+    assert!(out.starts_with('…'), "the tail does not say it was cut");
 }
