@@ -1657,7 +1657,9 @@ fn a_pinned_budget_is_checked_before_the_run_uses_it() {
         }
         let mut modelless = pinned();
         if let Some(plan) = modelless.budgets.as_mut() {
-            plan.models.clear();
+            // A later step's, so a gap found only when it is reached would
+            // come after the first step's call.
+            plan.models.remove("rank-note");
         }
         // A dollar cap over a model the plan does not price.
         let mut unpriced = pinned();
