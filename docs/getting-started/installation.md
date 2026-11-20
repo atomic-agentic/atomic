@@ -33,10 +33,10 @@ See [availability](../reference/availability.md) before trying a feature.
   [Deno](../guides/atom-code-runtime.md) the first time a project needs it,
   and this step goes away.
 
-Read [subscriptions and authentication](authentication.md) for the verified
-upstream login paths and the planned Atomic integration. Keep credentials out of
-atom files and committed configuration. Exact Atomic login commands and local-model
-setup instructions will accompany the matching release.
+Read [subscriptions and authentication](authentication.md) for model access:
+`atomic login` signs Codex atoms in with ChatGPT, and an endpoint with an API key
+serves any atom. Keep credentials out of atom files and committed configuration.
+Local-model setup instructions will accompany the matching release.
 
 ## After installation
 

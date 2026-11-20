@@ -98,6 +98,10 @@ pub struct ModelEndpoint {
     pub model: String,
     /// Environment variable holding the API key, if the endpoint needs one.
     pub api_key_env: Option<String>,
+    /// A ChatGPT sign-in (see [`crate::signin`]): Codex atoms call ChatGPT's
+    /// Codex backend with it, and `base_url` and `api_key_env` are not
+    /// used. Lite atoms cannot use it.
+    pub sign_in: Option<crate::signin::SignIn>,
 }
 
 /// One turn to run on a fresh thread.
@@ -729,8 +733,28 @@ where
     }
     let state_db = init_state_db(&config).await;
 
-    let auth_manager =
-        AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false).await?;
+    let auth_manager = match &endpoint.sign_in {
+        // The developer's own sign-in, kept apart from every project (see
+        // `crate::signin`); never a key from the environment.
+        Some(sign_in) => Arc::new(
+            AuthManager::new(
+                sign_in.auth_home.clone(),
+                /*enable_codex_api_key_env*/ false,
+                sign_in.store,
+                /*forced_chatgpt_workspace_id*/ None,
+                Some(config.chatgpt_base_url.clone()),
+                sign_in.keyring_kind(),
+                config.auth_route_config(),
+            )
+            .await,
+        ),
+        None => {
+            AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false).await?
+        }
+    };
+    if endpoint.sign_in.is_some() && auth_manager.auth().await.is_none() {
+        bail!("no one is signed in: sign in with `atomic login`, or configure a model endpoint");
+    }
     let local_runtime_paths = ExecServerRuntimeOptions::from_optional_paths(
         config.codex_self_exe.clone(),
         config.codex_linux_sandbox_exe.clone(),
@@ -906,19 +930,31 @@ async fn new_config(
             .feature_requirements
             .as_ref(),
     )?;
-    // An OpenAI-compatible Responses endpoint: the built-in OpenAI provider,
-    // pointed at another base URL, with no OpenAI sign-in and no websockets.
-    let model_provider_id = ENDPOINT_PROVIDER_ID.to_string();
     let mut model_providers = built_in_model_providers(/*openai_base_url*/ None);
     let mut model_provider = model_providers
         .get(OPENAI_PROVIDER_ID)
         .context("OpenAI model provider should be available")?
         .clone();
-    model_provider.name = "atomic endpoint".to_string();
-    model_provider.base_url = Some(endpoint.base_url.clone());
-    model_provider.env_key = endpoint.api_key_env.clone();
-    model_provider.requires_openai_auth = false;
-    model_provider.supports_websockets = false;
+    let model_provider_id = match &endpoint.sign_in {
+        // The built-in OpenAI provider as it is, with the sign-in's tokens:
+        // ChatGPT's Codex backend.
+        Some(sign_in) => {
+            model_provider.base_url = sign_in.backend.clone();
+            model_provider.supports_websockets = false;
+            OPENAI_PROVIDER_ID.to_string()
+        }
+        // An OpenAI-compatible Responses endpoint: the built-in OpenAI
+        // provider, pointed at another base URL, with no OpenAI sign-in and
+        // no websockets.
+        None => {
+            model_provider.name = "atomic endpoint".to_string();
+            model_provider.base_url = Some(endpoint.base_url.clone());
+            model_provider.env_key = endpoint.api_key_env.clone();
+            model_provider.requires_openai_auth = false;
+            model_provider.supports_websockets = false;
+            ENDPOINT_PROVIDER_ID.to_string()
+        }
+    };
     model_providers.insert(model_provider_id.clone(), model_provider.clone());
 
     let mut config = Config {
@@ -1111,6 +1147,26 @@ async fn new_config(
     Ok(config)
 }
 
+/// How Codex's login reaches the network, as a thread's configuration would.
+pub(crate) async fn auth_route_config(
+    codex_home: &Path,
+) -> anyhow::Result<codex_login::AuthRouteConfig> {
+    let endpoint = ModelEndpoint {
+        base_url: "http://127.0.0.1:9/unused".into(),
+        model: "unused".into(),
+        api_key_env: None,
+        sign_in: None,
+    };
+    let config = new_config(
+        &endpoint,
+        codex_home,
+        codex_home,
+        Arg0DispatchPaths::default(),
+    )
+    .await?;
+    Ok(config.auth_route_config())
+}
+
 /// How long a turn waits for the thread to finish settling the previous one.
 const NOT_IDLE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -1268,6 +1324,7 @@ mod tests {
                 base_url: model.base_url(),
                 model: "synthetic".into(),
                 api_key_env: None,
+                sign_in: None,
             };
             let answer = one_turn(
                 &CodexPaths::without_helpers(),
@@ -1299,6 +1356,7 @@ mod tests {
                 base_url: model.base_url(),
                 model: "synthetic".into(),
                 api_key_env: None,
+                sign_in: None,
             };
             let first = TurnSpec {
                 prompt: "t0".into(),
@@ -1543,6 +1601,7 @@ mod tests {
                 base_url: model.base_url(),
                 model: "synthetic".into(),
                 api_key_env: None,
+                sign_in: None,
             };
             let answer = one_turn(
                 &CodexPaths::without_helpers(),
@@ -1612,6 +1671,7 @@ mod tests {
             base_url: model.base_url(),
             model: "synthetic".into(),
             api_key_env: None,
+            sign_in: None,
         };
         let recorder = Arc::new(Recorder {
             limit,

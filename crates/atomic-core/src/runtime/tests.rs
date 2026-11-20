@@ -72,6 +72,7 @@ fn runtime(model: &FakeModel, tag: &str) -> CodexRuntime {
             base_url: model.base_url(),
             model: "synthetic".into(),
             api_key_env: None,
+            sign_in: None,
         },
         defaults: AtomConfig::default(),
         artifacts: Artifacts::none(),
@@ -825,6 +826,7 @@ fn an_output_must_reference_artifacts_that_exist_with_the_right_type() {
                     base_url: model.base_url(),
                     model: "synthetic".into(),
                     api_key_env: None,
+                    sign_in: None,
                 },
                 AtomConfig::default(),
             );
@@ -1410,5 +1412,161 @@ fn an_exec_output_cel_cannot_read_fails() {
             matches!(&r, Err(AtomError::Schema { message, .. }) if message.contains("integer")),
             "{r:?}"
         );
+    });
+}
+
+/// Unpadded base64url, for a test token.
+fn b64url(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let n = chunk.iter().fold(0u32, |n, b| (n << 8) | u32::from(*b)) << (8 * (3 - chunk.len()));
+        for i in 0..=chunk.len() {
+            out.push(char::from(ALPHABET[((n >> (18 - 6 * i)) & 63) as usize]));
+        }
+    }
+    out
+}
+
+/// A ChatGPT sign-in, as Codex's login keeps it in a file store, with a
+/// token no real backend would take.
+fn signed_in(dir: &std::path::Path, backend: &str) -> crate::signin::SignIn {
+    std::fs::create_dir_all(dir).expect("auth home");
+    let id_token = format!(
+        "{}.{}.sig",
+        b64url(br#"{"alg":"none","typ":"JWT"}"#),
+        b64url(
+            json!({
+                "email": "dev@example.invalid",
+                "https://api.openai.com/auth": {
+                    "chatgpt_plan_type": "plus",
+                    "chatgpt_account_id": "account-1",
+                    "chatgpt_user_id": "user-1",
+                },
+            })
+            .to_string()
+            .as_bytes()
+        )
+    );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("time")
+        .as_secs();
+    std::fs::write(
+        dir.join("auth.json"),
+        json!({
+            "auth_mode": "chatgpt",
+            "OPENAI_API_KEY": null,
+            "tokens": {
+                "id_token": id_token,
+                "access_token": "synthetic-access-token",
+                "refresh_token": "synthetic-refresh-token",
+                "account_id": "account-1",
+            },
+            "last_refresh": chrono_like(now),
+        })
+        .to_string(),
+    )
+    .expect("auth.json");
+    let mut sign_in = crate::signin::SignIn::in_files(dir);
+    sign_in.backend = Some(backend.to_owned());
+    sign_in
+}
+
+/// `secs` since the epoch as an RFC 3339 UTC time.
+fn chrono_like(secs: u64) -> String {
+    let days = secs / 86_400;
+    let rem = secs % 86_400;
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}
+
+#[test]
+fn a_codex_atom_runs_on_a_chatgpt_sign_in_with_no_api_key() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(
+            r#"{"category": "bug", "summary": "Export crashes.", "line": null}"#.into(),
+        )])
+        .await
+        .expect("fake model");
+        let mut rt = runtime(&model, "signed-in");
+        let backend = model.base_url().replace("/v1", "/backend-api/codex");
+        let auth = rt.codex_home.with_file_name("auth");
+        rt.endpoint = ModelEndpoint {
+            base_url: "unused".into(),
+            model: "synthetic".into(),
+            api_key_env: None,
+            sign_in: Some(signed_in(&auth, &backend)),
+        };
+        for key in ["OPENAI_API_KEY", "CODEX_API_KEY"] {
+            assert!(std::env::var_os(key).is_none(), "{key} is set in the test");
+        }
+        let (out, _) = run_codex_atom(
+            &Classify,
+            &Note {
+                text: "Export crashes on é.".into(),
+            },
+            &rt,
+        )
+        .await
+        .expect("runs on the sign-in");
+        assert_eq!(out.category, "bug");
+        assert_eq!(model.calls(), 1);
+        assert_eq!(model.paths(), ["/backend-api/codex/responses"]);
+        let headers = &model.headers()[0];
+        let header = |name: &str| {
+            headers
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(
+            header("authorization"),
+            Some("Bearer synthetic-access-token")
+        );
+        assert_eq!(header("chatgpt-account-id"), Some("account-1"));
+    });
+}
+
+#[test]
+fn a_lite_atom_says_a_sign_in_is_not_for_it() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(Vec::new()).await.expect("fake model");
+        let codex = runtime(&model, "lite-signed-in");
+        let auth = codex.codex_home.with_file_name("auth");
+        let endpoint = ModelEndpoint {
+            base_url: model.base_url(),
+            model: "synthetic".into(),
+            api_key_env: None,
+            sign_in: Some(signed_in(&auth, &model.base_url())),
+        };
+        let lite = crate::lite::LiteRuntime::new(endpoint, AtomConfig::default());
+        let refused = run_lite_atom(
+            &Patch,
+            &Note {
+                text: "Export crashes.".into(),
+            },
+            &lite,
+        )
+        .await
+        .expect_err("refused");
+        let said = refused.to_string();
+        assert!(said.contains("serves Codex atoms only"), "{said}");
+        assert!(said.contains("ATOMIC_MODEL_BASE_URL"), "{said}");
+        assert_eq!(model.calls(), 0);
     });
 }

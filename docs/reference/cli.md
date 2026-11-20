@@ -93,6 +93,18 @@ See [fixture repositories](eval-cases.md#coding-fixture-repositories) for setup 
 an example that works from an unrelated directory. These flags do not change the
 minimal lite-atom quickstart.
 
+## Model access
+
+| Command | Purpose | Planned stage |
+| --- | --- | --- |
+| `atomic login` | Sign in with ChatGPT through Codex's login, for Codex atoms; `--device-auth` on a machine with no browser | v0.1 local, Linux |
+| `atomic login status` | Say who is signed in and on which plan, never a token | v0.1 local, Linux |
+| `atomic logout` | Forget the sign-in | v0.1 local, Linux |
+
+With no `ATOMIC_MODEL_BASE_URL`, Codex atoms use the sign-in and `ATOMIC_MODEL`.
+Lite atoms need an endpoint. See [subscriptions and
+authentication](../getting-started/authentication.md).
+
 ## Gates and supervision
 
 | Command or surface | Purpose | Planned stage |

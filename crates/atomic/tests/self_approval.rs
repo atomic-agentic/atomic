@@ -301,6 +301,7 @@ async fn sandboxed(
             base_url: model.base_url(),
             model: "synthetic".into(),
             api_key_env: None,
+            sign_in: None,
         },
         guard,
         &TurnSpec {

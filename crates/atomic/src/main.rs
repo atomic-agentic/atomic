@@ -68,6 +68,10 @@ enum Command {
     /// Enroll your operator credential, list gates and decide them.
     #[command(subcommand)]
     Gates(gates::GatesCommand),
+    /// Sign in with ChatGPT, through Codex, so Codex atoms run on your plan.
+    Login(LoginArgs),
+    /// Forget the ChatGPT sign-in.
+    Logout,
     /// Install atomic's authoring skills for a coding agent.
     Setup(setup::SetupArgs),
     /// Developer diagnostics.
@@ -145,6 +149,7 @@ impl PromptArgs {
             base_url: self.base_url.clone(),
             model: self.model.clone(),
             api_key_env: self.api_key_env.clone(),
+            sign_in: None,
         }
     }
 }
@@ -288,6 +293,16 @@ async fn run(cli: Cli, paths: CodexPaths, state: ProjectState) -> anyhow::Result
     let project = project.as_deref();
     match cli.command {
         Some(Command::Gates(command)) => gates::run(command, &state).await,
+        Some(Command::Login(args)) => login(args).await,
+        Some(Command::Logout) => {
+            let sign_in = atomic_core::signin::SignIn::configured()?;
+            if sign_in.logout()? {
+                println!("signed out");
+            } else {
+                println!("no one was signed in");
+            }
+            Ok(())
+        }
         Some(Command::Check { path }) => {
             tokio::task::spawn_blocking(move || check(path, json)).await?
         }
@@ -667,4 +682,48 @@ async fn prompt(
         &args.prompt.join(" "),
     )
     .await
+}
+
+/// `atomic login`.
+#[derive(Debug, Args)]
+struct LoginArgs {
+    /// Sign in with a code on another device, for a machine with no browser.
+    #[arg(long)]
+    device_auth: bool,
+    #[command(subcommand)]
+    command: Option<LoginCommand>,
+}
+
+#[derive(Debug, Subcommand)]
+enum LoginCommand {
+    /// Say who is signed in, without any token.
+    Status,
+}
+
+async fn login(args: LoginArgs) -> anyhow::Result<()> {
+    let sign_in = atomic_core::signin::SignIn::configured()?;
+    if let Some(LoginCommand::Status) = args.command {
+        return match sign_in.account()? {
+            Some(a) => {
+                let mut said = format!("signed in with {}", a.mode);
+                if let Some(email) = a.email {
+                    said.push_str(&format!(" as {email}"));
+                }
+                if let Some(plan) = a.plan {
+                    said.push_str(&format!(" ({plan} plan)"));
+                }
+                println!("{said}; Codex atoms use it when no model endpoint is configured");
+                Ok(())
+            }
+            None => Err(failure::Failure::new(
+                "login.none",
+                "no one is signed in",
+                "sign in with `atomic login` (or `atomic login --device-auth`)",
+            )
+            .into()),
+        };
+    }
+    sign_in.login(args.device_auth).await?;
+    println!("signed in; Codex atoms use it when no model endpoint is configured");
+    Ok(())
 }

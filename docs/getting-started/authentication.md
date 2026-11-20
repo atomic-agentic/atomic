@@ -1,41 +1,66 @@
 # Subscriptions and authentication
 
-**Subscription sign-in is implemented in upstream Codex.** Atomic plans to offer
-that path for eligible local Codex-backed use, alongside API keys. This repository
-does not yet implement Atomic login, so the commands below run **Codex**, not Atomic.
+Codex atoms can run on an eligible ChatGPT subscription, signed in through
+Codex's own login, or on an API key at any OpenAI-compatible endpoint. Lite
+atoms call a model API themselves and always need an endpoint.
 
-## Use an eligible subscription with Codex today
-
-Start the upstream CLI and choose **Sign in with ChatGPT**, or run:
+## Sign in with ChatGPT for Codex atoms
 
 ```sh
-codex login
-codex login status
+atomic login                 # sign in in your browser
+atomic login --device-auth   # on a machine with no browser: a code to enter elsewhere
+atomic login status          # who is signed in, and on which plan
+atomic logout
 ```
 
-This uses your account's Codex entitlement and limits. API-key authentication uses
+The sign-in uses your account's Codex entitlement and limits; API keys use
 separate API billing. Check current eligibility in
-[OpenAI's authentication guide](https://learn.chatgpt.com/docs/auth).
+[OpenAI's authentication guide](https://learn.chatgpt.com/docs/auth). Device
+login must be enabled for the account or workspace.
 
-For a machine where browser callbacks are unavailable:
+When no model endpoint is configured (`ATOMIC_MODEL_BASE_URL` unset), Codex
+atoms use the sign-in, with no API key. Set `ATOMIC_MODEL` to a model your plan
+offers for Codex. A configured endpoint always takes precedence.
+
+The sign-in is yours, for local use. atomic keeps it once per user, apart from
+every project and from your personal Codex sessions:
+
+- in the OS keyring by default (on Linux, the Secret Service);
+- with `ATOMIC_CREDENTIAL_STORE=file`, for a machine with no keyring, in a
+  directory readable by you only (`$ATOMIC_HOME/credentials/codex-auth`, or
+  `~/.config/atomic/credentials/codex-auth`).
+
+atomic never prints the token, and atoms never see it: Codex sends it to the
+model from atomic's own process, the credential directory is denied to every
+atom's sandbox, and atoms' commands can neither use the kernel keyrings nor
+reach the Secret Service. As with the operator credential, this has been
+verified on Linux only, so `atomic login` is refused on macOS and Windows for
+now. atomic does not reuse an existing `codex login`.
+
+## API keys
+
+Point atomic at an OpenAI-compatible Responses endpoint and name the variable
+that holds its key:
 
 ```sh
-codex login --device-auth
+export ATOMIC_MODEL_BASE_URL=https://api.openai.com/v1
+export ATOMIC_MODEL=<model>
+export ATOMIC_MODEL_API_KEY_ENV=OPENAI_API_KEY
 ```
 
-Device login must be enabled for the account/workspace. These commands do not
-establish an Atomic login or promise automatic credential reuse.
+Keep the key's value out of committed files. atomic reads it from the
+environment and never passes it, or any other variable whose name contains
+KEY, SECRET or TOKEN, to atoms' commands.
 
-## The planned Atomic experience
+## Lite atoms
 
-For local Codex-backed use, choose subscription sign-in or API-key access, finish
-login and begin work. The exact Atomic login commands are not specified yet.
-The API-key path detects `OPENAI_API_KEY`; keep its value out of committed files.
-
-Atomic keeps workflow state and transcripts separate from personal Codex sessions.
-Automatic reuse of an existing Codex login is not yet specified. Subscription
-access for Codex-backed sessions does not establish support for lite atoms,
-embeddings or other provider paths; those need their own supported model access.
+A lite atom calls its endpoint directly, so a ChatGPT sign-in does not cover
+it. With only a sign-in configured, a run that reaches a lite atom stops with a
+message that says so and names the settings it needs: `ATOMIC_MODEL_BASE_URL`,
+`ATOMIC_MODEL`, and `ATOMIC_MODEL_API_KEY_ENV` if the endpoint asks for a key.
+Subscription access for Codex atoms does not establish support for lite atoms,
+embeddings or other provider paths; those need their own supported model
+access.
 
 ## Automation and team deployment
 

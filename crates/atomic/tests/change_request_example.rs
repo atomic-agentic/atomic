@@ -166,6 +166,7 @@ async fn engine(dir: &Path, project: &Path, base_url: &str) -> Durare {
         base_url: base_url.to_owned(),
         model: "synthetic".into(),
         api_key_env: None,
+        sign_in: None,
     };
     std::os::unix::fs::symlink(
         env!("CARGO_BIN_EXE_atomic"),

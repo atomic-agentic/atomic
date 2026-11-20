@@ -26,6 +26,7 @@ pub mod lite;
 pub mod project;
 pub mod render;
 pub mod runtime;
+pub mod signin;
 pub mod state;
 #[cfg(any(test, feature = "fake-model"))]
 pub mod testing;

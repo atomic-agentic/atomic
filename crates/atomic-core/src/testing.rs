@@ -59,6 +59,7 @@ struct State {
     responder: Option<Responder>,
     requests: Vec<Value>,
     paths: Vec<String>,
+    headers: Vec<Vec<(String, String)>>,
 }
 
 /// A running fake model. It stops when dropped.
@@ -126,6 +127,14 @@ impl FakeModel {
             .unwrap_or_default()
     }
 
+    /// The request headers of every model call, in order, names lowercased.
+    pub fn headers(&self) -> Vec<Vec<(String, String)>> {
+        self.state
+            .lock()
+            .map(|s| s.headers.clone())
+            .unwrap_or_default()
+    }
+
     /// The path of every model call, in order, such as `/v1/responses`.
     pub fn paths(&self) -> Vec<String> {
         self.state
@@ -155,6 +164,12 @@ async fn serve(socket: &mut tokio::net::TcpStream, state: &Mutex<State>) -> std:
         let head = String::from_utf8_lossy(&head).into_owned();
         let mut lines = head.lines();
         let request_line = lines.next().unwrap_or_default().to_owned();
+        let headers: Vec<(String, String)> = head
+            .lines()
+            .skip(1)
+            .filter_map(|l| l.split_once(':'))
+            .map(|(k, v)| (k.trim().to_lowercase(), v.trim().to_owned()))
+            .collect();
         let length: usize = lines
             .filter_map(|l| l.split_once(':'))
             .find(|(k, _)| k.trim().eq_ignore_ascii_case("content-length"))
@@ -179,6 +194,7 @@ async fn serve(socket: &mut tokio::net::TcpStream, state: &Mutex<State>) -> std:
                     let index = s.requests.len();
                     s.requests.push(request.clone());
                     s.paths.push(path.to_owned());
+                    s.headers.push(headers.clone());
                     match &s.responder {
                         Some(respond) => Some(respond(&request)),
                         None => s.script.get(index).cloned(),

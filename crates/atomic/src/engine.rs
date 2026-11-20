@@ -66,17 +66,47 @@ pub struct EngineArgs {
 
 impl EngineArgs {
     fn endpoint(&self, required: bool) -> anyhow::Result<ModelEndpoint> {
+        // A configured endpoint wins; with none, a ChatGPT sign-in serves
+        // Codex atoms (see atomic_core::signin).
+        let signed_in = || {
+            atomic_core::signin::SignIn::configured()
+                .ok()
+                .filter(|s| s.account().ok().flatten().is_some())
+        };
+        let sign_in = match (&self.model_base_url, required) {
+            (None, true) => signed_in(),
+            _ => None,
+        };
         match (&self.model_base_url, &self.model) {
             (Some(base_url), Some(model)) => Ok(ModelEndpoint {
                 base_url: base_url.clone(),
                 model: model.clone(),
                 api_key_env: self.model_api_key_env.clone(),
+                sign_in: None,
             }),
+            (None, model) if sign_in.is_some() => {
+                let sign_in = sign_in.clone();
+                let model = model.clone().ok_or_else(|| {
+                    Failure::new(
+                        "config.model",
+                        "you are signed in with ChatGPT, and no model is configured",
+                        "set ATOMIC_MODEL (or pass --model) to a model your plan offers for \
+                         Codex",
+                    )
+                })?;
+                Ok(ModelEndpoint {
+                    base_url: "https://chatgpt.com/backend-api/codex".into(),
+                    model,
+                    api_key_env: None,
+                    sign_in,
+                })
+            }
             _ if required => Err(Failure::new(
                 "config.model",
-                "no model endpoint is configured, and model atoms need one",
-                "set ATOMIC_MODEL_BASE_URL and ATOMIC_MODEL (or pass --model-base-url and \
-                 --model), and ATOMIC_MODEL_API_KEY_ENV if the endpoint needs a key",
+                "no model is configured, and model atoms need one",
+                "sign in with `atomic login` (Codex atoms only), or set ATOMIC_MODEL_BASE_URL \
+                 and ATOMIC_MODEL (or pass --model-base-url and --model), and \
+                 ATOMIC_MODEL_API_KEY_ENV if the endpoint needs a key",
             )
             .into()),
             // Nothing will call a model; an endpoint that cannot be reached
@@ -85,6 +115,7 @@ impl EngineArgs {
                 base_url: "http://127.0.0.1:9/unconfigured".into(),
                 model: "unconfigured".into(),
                 api_key_env: None,
+                sign_in: None,
             }),
         }
     }
