@@ -55,6 +55,8 @@ jobs:
       # cannot do safely; tested with a stand-in for cargo.
       - run: scripts/controls-check-test.sh
       - run: scripts/backends-check-audit-test.sh
+      # acceptance.py fails on a listed test that failed or did not run.
+      - run: scripts/acceptance-test.sh
       # release-package.sh refuses a binary with failpoints compiled in.
       - run: scripts/release-package-test.sh
 
@@ -240,13 +242,20 @@ jobs:
         env:
           ATOMIC_TEST_PRIVATE_TMP: "1"
         run: cargo test --workspace --locked --no-fail-fast --features atomic-agentic/postgres-tests,atomic-agentic/sandbox-tests -- --skip every_failpoint_triggered_in_turn
+      # Each milestone's acceptance clauses, the tests that show each listed in
+      # scripts/acceptance/; a listed test that fails, is ignored or no longer
+      # runs fails the step. The same features as the test step, so nothing
+      # rebuilds.
+      # This step and the two after it also run when the test step failed,
+      # but not when it never ran because the build did not.
+      - name: M12 acceptance (Linux)
+        if: runner.os == 'Linux' && !cancelled() && steps.test.conclusion != 'skipped'
+        run: python3 scripts/acceptance.py m12
       # The crash suite: every failpoint, triggered in turn, against real
       # workflows and the scripted fake model; each run killed there must
       # finish when recovered, with no completed step repeated. Its codex atom
       # runs under the sandbox, hence sandbox-tests. The same features as the
-      # step above, so nothing rebuilds. Linux only.
-      # These two also run when the test step failed, but not when it never
-      # ran because the build did not.
+      # test step, so nothing rebuilds. Linux only.
       - name: Crash suite (Linux)
         if: runner.os == 'Linux' && !cancelled() && steps.test.conclusion != 'skipped'
         run: cargo test --workspace --locked --features atomic-agentic/postgres-tests,atomic-agentic/sandbox-tests --test crash

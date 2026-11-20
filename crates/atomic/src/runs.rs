@@ -49,8 +49,89 @@ pub struct RunArgs {
     /// The id to give the run; by default a new one.
     #[arg(long)]
     pub run_id: Option<String>,
+    /// For a workflow that changes code: the repository, already on disk,
+    /// its worktrees are made from. The run never writes to it.
+    #[arg(long, value_name = "REPO", requires = "fixture_rev")]
+    pub fixture: Option<PathBuf>,
+    /// The revision of `--fixture` the run starts from: a commit ID or a
+    /// branch or tag name, pinned to its commit when the run is admitted.
+    #[arg(long, value_name = "REV", requires = "fixture")]
+    pub fixture_rev: Option<String>,
     #[command(flatten)]
     pub engine: EngineArgs,
+}
+
+/// Bind `run` to its fixture, as `args` name one, before anything runs:
+/// a run that changes code needs one, and every git-commit input must fit
+/// it.
+fn bind_fixture(
+    run: &mut atomic_app::pipeline::PipelineRun,
+    args: &RunArgs,
+    state: &ProjectState,
+    cwd: &Path,
+) -> anyhow::Result<()> {
+    use atomic_core::fixture::{self, FixtureError};
+    let (Some(repo), Some(rev)) = (&args.fixture, &args.fixture_rev) else {
+        if run.pipeline.changes_code() {
+            return Err(Failure::new(
+                "fixture.required",
+                format!(
+                    "workflow `{}` changes code in a worktree, and no fixture repository is \
+                     named; atomic never works in your own checkout",
+                    run.pipeline.name
+                ),
+                "name the repository and the revision to start from: --fixture <repo> \
+                 --fixture-rev <commit or branch>",
+            )
+            .into());
+        }
+        return Ok(());
+    };
+    let repo = if repo.is_absolute() {
+        repo.clone()
+    } else {
+        cwd.join(repo)
+    };
+    let fail = |e: FixtureError| -> anyhow::Error {
+        let (kind, action) = match &e {
+            FixtureError::Path { .. } => (
+                "fixture.path",
+                "give --fixture the path of a git repository on this machine",
+            ),
+            FixtureError::Revision { .. } => (
+                "fixture.revision",
+                "give --fixture-rev a commit ID, or a branch or tag name, of that repository",
+            ),
+            FixtureError::Unsupported(_) => (
+                "fixture.unsupported",
+                "prepare the fixture so its commit holds everything as files, then bind it again",
+            ),
+            FixtureError::Schema(_) => (
+                "fixture.schema",
+                "fix the workflow's input schema: type each commit field through `properties` \
+                 and `items` only",
+            ),
+            FixtureError::Occupied(_) => (
+                "fixture.snapshot",
+                "move what is there out of the way, after checking no run is working in it, \
+                 then run again",
+            ),
+            FixtureError::Input { .. } => (
+                "fixture.input",
+                "give each git-commit field of the input a commit of the fixture, and its base \
+                 the fixture's revision",
+            ),
+            FixtureError::Git(_) | FixtureError::Io { .. } => (
+                "fixture.snapshot",
+                "fix what the description names, then run again",
+            ),
+        };
+        Failure::new(kind, e.to_string(), action).into()
+    };
+    let binding = fixture::bind(state, &repo, rev).map_err(fail)?;
+    fixture::check_commits(&binding, &run.pipeline.input, &run.input).map_err(fail)?;
+    run.pipeline.fixture = Some(binding);
+    Ok(())
 }
 
 /// `atomic runs resume`.
@@ -188,9 +269,13 @@ pub async fn run(
     let found = target::project_for(project, Some(&args.target), &cwd)?;
     let state = ProjectState::resolve(found.root())?;
     let input = target::input(args.input.as_deref(), args.data.as_deref(), &cwd)?;
-    // After the input is read: until then a signal stops atomic as usual.
+    let mut run = target::load(&found, &args.target, &cwd, input, &engine::deployment())?;
+    // Before any model is called, and before the run is recorded.
+    state.create()?;
+    bind_fixture(&mut run, &args, &state, &cwd)?;
+    // Once the input is read and the run admitted: until then, a fixture's
+    // copy included, a signal stops atomic as usual.
     let mut signals = Signals::new()?;
-    let run = target::load(&found, &args.target, &cwd, input, &engine::deployment())?;
     let engine = engine::open(
         &state,
         paths,
@@ -232,6 +317,14 @@ pub async fn run(
         run.pipeline.name,
         found.name
     );
+    if let Some(f) = &run.pipeline.fixture {
+        atomic_core::log_line!(
+            "run {run_id}: fixture {} at {} pinned to commit {}",
+            f.source.display(),
+            f.rev,
+            f.commit
+        );
+    }
     engine.rt.start(PIPELINE, &run_id, run).await?;
     finish(&engine, &run_id, json, &mut signals, "atomic run").await
 }
@@ -465,7 +558,8 @@ async fn stop(signals: &mut Signals, who: &str, exit: Exit) -> ! {
         atomic_core::log_line!("{who}: settled {interrupted} model call(s) that had not finished");
     }
     // Spans still open end and are sent; a collector that does not answer
-    // holds this up only until another signal.
+    // holds this up until another signal or the flush's deadline, whichever
+    // is first.
     let flushing = tokio::task::spawn_blocking(atomic_app::telemetry::flush_blocking);
     tokio::select! {
         _ = flushing => {}

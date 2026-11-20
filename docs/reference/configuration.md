@@ -153,6 +153,13 @@ on. Application data sources are separately declared capabilities.
 For upstream subscription support and Atomic login status, see
 [subscriptions and authentication](../getting-started/authentication.md).
 
+## Limit what exec atoms hand over
+
+`ATOMIC_EXEC_MAX_FILE_BYTES` and `ATOMIC_EXEC_MAX_STEP_BYTES` bound the files an
+exec atom's command hands over by reference: 1 GiB a file and 4 GiB a step by
+default, in bytes. See
+[large results go by reference](atom-files.md#large-results-go-by-reference).
+
 ## Keep credentials out of definitions
 
 Use environment variables, a login flow or an approved secret backend. Shared

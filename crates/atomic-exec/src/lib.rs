@@ -136,6 +136,10 @@ pub struct Command {
     /// directory, when its backend confines it (see [`Confine`]). A backend
     /// that does not confine its commands ignores it.
     pub writable: Vec<PathBuf>,
+    /// Directories inside [`writable`](Self::writable) ones that it may only
+    /// read, such as the inputs atomic hands it, when its backend confines
+    /// it. A backend that does not confine its commands ignores it.
+    pub read_only: Vec<PathBuf>,
 }
 
 /// Puts a command under a sandbox before a backend runs it: what it may
@@ -145,7 +149,8 @@ pub struct Command {
 pub trait Confine: Send + Sync {
     /// The command that runs `command` confined. It must run `command` with
     /// exactly its environment and in its directory, and let it write only
-    /// [`Command::writable`]. `tmp` is the backend's private temporary
+    /// [`Command::writable`], except [`Command::read_only`] inside them,
+    /// which it may only read. `tmp` is the backend's private temporary
     /// directory, where the sandbox may keep records of its own.
     fn confine(&self, command: &Command, tmp: &std::path::Path) -> Result<Command, ExecError>;
 

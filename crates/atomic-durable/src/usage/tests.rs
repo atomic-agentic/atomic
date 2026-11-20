@@ -796,6 +796,100 @@ async fn a_dead_call_is_never_charged_its_processs_downtime<R: DurableRuntime>(r
     );
 }
 
+async fn a_partly_known_attempt_is_charged_its_reported_usage_and_one_more_bound<
+    R: DurableRuntime,
+>(
+    rt: R,
+) {
+    let ledger = rt.ledger();
+    let run = unique("partial");
+    admitted(
+        &ledger
+            .admit(request(&run, 1, 0, 1_000_000, 1_000_000))
+            .await
+            .expect("admit"),
+    );
+    let in_flight = Charge {
+        tokens: 30,
+        millis: 0,
+        micro_usd: 20,
+    };
+    // Reported past its reservation, before a request in flight: the
+    // reported usage and the in-flight bound, recorded, and still open.
+    assert_eq!(
+        ledger
+            .settle(
+                &format!("{run}:1:0"),
+                1,
+                Settlement::Partial {
+                    input_tokens: 400,
+                    output_tokens: 50,
+                    micro_usd: 70,
+                    in_flight,
+                },
+            )
+            .await
+            .expect("settle"),
+        Settled::Uncertain
+    );
+    let a = &ledger.attempts(&run).await.expect("attempts")[0];
+    assert_eq!(a.state, "reserved", "open to reconciliation");
+    assert_eq!(a.usage, Some((400, 50)));
+    assert_eq!((a.charged.tokens, a.charged.micro_usd), (480, 90));
+    assert_eq!(a.overshoot(), 480 - BOUND.tokens);
+    assert_eq!(charged(&ledger, &format!("atom:{run}:1")).await.tokens, 480);
+    assert_eq!(charged(&ledger, &format!("run:{run}")).await.tokens, 480);
+    // Reported below its reservation: the reservation, at least.
+    let small = unique("partial-small");
+    admitted(
+        &ledger
+            .admit(request(&small, 1, 0, 1_000_000, 1_000_000))
+            .await
+            .expect("admit"),
+    );
+    ledger
+        .settle(
+            &format!("{small}:1:0"),
+            1,
+            Settlement::Partial {
+                input_tokens: 5,
+                output_tokens: 5,
+                micro_usd: 1,
+                in_flight,
+            },
+        )
+        .await
+        .expect("settle");
+    let a = &ledger.attempts(&small).await.expect("attempts")[0];
+    assert_eq!(
+        (a.charged.tokens, a.charged.micro_usd),
+        (BOUND.tokens, BOUND.micro_usd)
+    );
+    assert_eq!(a.usage, Some((5, 5)));
+    // It reported usage, so it spent something: it cannot be released.
+    assert!(ledger.release(&format!("{small}:1:0"), 1).await.is_err());
+    assert_eq!(
+        ledger.attempts(&small).await.expect("attempts")[0].state,
+        "reserved"
+    );
+    // Its whole usage, entered once learned, replaces the charge.
+    ledger
+        .settle(
+            &format!("{run}:1:0"),
+            1,
+            Settlement::Reconciled {
+                input_tokens: 420,
+                output_tokens: 55,
+                micro_usd: 80,
+            },
+        )
+        .await
+        .expect("reconcile");
+    let a = &ledger.attempts(&run).await.expect("attempts")[0];
+    assert_eq!((a.state.as_str(), a.charged.tokens), ("settled", 475));
+    assert_eq!(charged(&ledger, &format!("atom:{run}:1")).await.tokens, 475);
+}
+
 macro_rules! on_sqlite {
     ($($name:ident),* $(,)?) => {
         mod on_sqlite {
@@ -829,6 +923,7 @@ on_sqlite!(
     a_call_is_reserved_before_dispatch_and_settled_once,
     a_dead_call_is_never_charged_its_processs_downtime,
     unreported_and_dead_attempts_are_charged_the_time_they_took,
+    a_partly_known_attempt_is_charged_its_reported_usage_and_one_more_bound,
     a_turn_reserves_the_active_time_left,
     amounts_out_of_range_are_refused_and_reported_usage_is_held,
     admission_refuses_on_time_and_on_dollars,
@@ -847,6 +942,7 @@ on_postgres!(
     a_call_is_reserved_before_dispatch_and_settled_once,
     a_dead_call_is_never_charged_its_processs_downtime,
     unreported_and_dead_attempts_are_charged_the_time_they_took,
+    a_partly_known_attempt_is_charged_its_reported_usage_and_one_more_bound,
     a_turn_reserves_the_active_time_left,
     amounts_out_of_range_are_refused_and_reported_usage_is_held,
     admission_refuses_on_time_and_on_dollars,

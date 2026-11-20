@@ -54,14 +54,30 @@ use std::sync::Arc;
 
 use atomic_exec::{ExecutionBackend, Open, Shell, Workspace};
 
-/// Where a runtime looks up the artifacts an output references.
+/// Where a runtime looks up the artifacts an output references, and, when
+/// it has a store, where an exec atom's command hands files over and reads
+/// the artifacts it is given (see [`crate::artifact::files`]).
 #[derive(Clone)]
-pub struct Artifacts(Arc<dyn ArtifactLookup + Send + Sync>);
+pub struct Artifacts(
+    Arc<dyn ArtifactLookup + Send + Sync>,
+    Option<Arc<dyn crate::artifact::ArtifactStore + Send + Sync>>,
+    crate::artifact::files::Limits,
+);
 
 impl Artifacts {
     /// Look artifacts up in `lookup`, such as a [`crate::artifact::LocalStore`].
+    /// Commands can hand no files over.
     pub fn new(lookup: impl ArtifactLookup + Send + Sync + 'static) -> Self {
-        Self(Arc::new(lookup))
+        Self(Arc::new(lookup), None, Default::default())
+    }
+
+    /// Look artifacts up in `store`, and store the files commands hand over
+    /// there, within `limits`.
+    pub fn store(
+        store: crate::artifact::LocalStore,
+        limits: crate::artifact::files::Limits,
+    ) -> Self {
+        Self(Arc::new(store.clone()), Some(Arc::new(store)), limits)
     }
 
     /// No store: every reference fails (see [`NoArtifacts`]).
@@ -704,10 +720,10 @@ async fn run_contract(
 /// Set `spec` up to run in `workspace` and return the directory its thread
 /// runs in: the sandbox, the writable roots and the environment are the
 /// workspace's, and its shell must be one this process can drive. Its
-/// commands' `HOME`, `ZDOTDIR` and `TMPDIR` are the workspace's scratch
-/// directory, so no shell reads the developer's startup files and nothing
-/// is left in a shared temporary directory; a `workspace-write` turn may
-/// write there.
+/// commands' `HOME` and `ZDOTDIR` are the workspace's scratch directory and
+/// their `TMPDIR` a directory inside it, so no shell reads the developer's
+/// startup files, and no other turn can write what a turn leaves in its
+/// temporary directory; a `workspace-write` turn may write them.
 fn turn_in(workspace: &Workspace, spec: &mut TurnSpec) -> Result<PathBuf, AtomError> {
     let cwd = workspace
         .require_root()
@@ -737,11 +753,55 @@ fn turn_in(workspace: &Workspace, spec: &mut TurnSpec) -> Result<PathBuf, AtomEr
     };
     private("HOME", &workspace.scratch, spec);
     private("ZDOTDIR", &workspace.scratch, spec);
-    // Shared by every turn on the backend: Codex's sandbox keeps its
-    // registry of protected mount points in TMPDIR, and turns that share a
-    // writable root must share that registry.
-    private("TMPDIR", &workspace.tmp, spec);
+    turn_tmpdir(workspace, spec, cfg!(target_os = "linux"))?;
     Ok(cwd)
+}
+
+/// Give the commands of `spec`'s turn a `TMPDIR` of their own: a directory
+/// inside the workspace's scratch directory, which a `workspace-write` turn
+/// may write since the scratch directory is a writable root.
+///
+/// On Linux (`linux`), Codex's sandbox helper keeps its registry of the
+/// mount points it makes in its own `TMPDIR`, which every turn sharing a
+/// writable root must share: there it is the backend's shared directory,
+/// never a writable root of a turn's, and the turn's own directory goes in
+/// [`codex::TURN_TMPDIR`], which atomic's helper entry hands the command as
+/// its `TMPDIR` just before it runs. Elsewhere there is no such registry and
+/// no such handoff, and the command's `TMPDIR` is the turn's own directly.
+fn turn_tmpdir(workspace: &Workspace, spec: &mut TurnSpec, linux: bool) -> Result<(), AtomError> {
+    let Some(scratch) = &workspace.scratch else {
+        return Ok(());
+    };
+    let own = scratch.join("tmp");
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(&own).map_err(|e| {
+        AtomError::Runtime(format!(
+            "{}: create the turn's temporary directory {}: {e}",
+            workspace.label,
+            own.display()
+        ))
+    })?;
+    if !linux {
+        spec.env.remove(codex::TURN_TMPDIR);
+        spec.env
+            .insert("TMPDIR".to_owned(), own.display().to_string());
+        return Ok(());
+    }
+    let Some(shared) = &workspace.tmp else {
+        return Err(AtomError::Runtime(format!(
+            "the backend gave {}'s turn no shared temporary directory, where Codex's \
+             sandbox keeps its registry of the mount points it makes",
+            workspace.label
+        )));
+    };
+    spec.env
+        .insert("TMPDIR".to_owned(), shared.display().to_string());
+    spec.env
+        .insert(codex::TURN_TMPDIR.to_owned(), own.display().to_string());
+    Ok(())
 }
 
 /// Run `spec` as one turn on a fresh thread of `runtime`, in a workspace its
@@ -1047,6 +1107,11 @@ pub async fn run_declarative_with_context(
 /// `env` may not declare.
 pub const EFFECT_VARIABLES: [&str; 3] = ["ATOMIC_RUN_ID", "ATOMIC_STEP_ID", "ATOMIC_EFFECT_KEY"];
 
+/// The names of an exec command's outputs and inputs directories in its
+/// environment (see [`crate::artifact::files`]), which an atom's `env` may
+/// not declare either.
+pub const EXCHANGE_VARIABLES: [&str; 2] = ["ATOMIC_OUTPUTS", "ATOMIC_INPUTS"];
+
 /// Who an exec command acts for: its run and step. The effect key is the
 /// same on every attempt of that step and differs for any other step or run,
 /// so a command that writes can make a retried write recognisable, by
@@ -1188,15 +1253,141 @@ pub async fn run_exec_opened(
     }
     h.update(&stdin);
     let prompt_hash = format!("{:x}", h.finalize());
+    // With a store, the command gets its exchange: an outputs directory to
+    // hand files over in, and the artifacts its input references, read-only.
+    // Unix only: elsewhere a command hands no files over, and an output
+    // that names one is refused (see `finish_exec`).
+    let exchange = match (&artifacts.1, workspace.workspace().scratch.clone()) {
+        (Some(store), Some(scratch)) if cfg!(unix) => {
+            let (store, input, contract) =
+                (store.clone(), input.clone(), contract("Input")?.clone());
+            let lookup = artifacts.0.clone();
+            // The workspace stays open while its inputs are copied in, even
+            // when the run is cancelled meanwhile.
+            let held = workspace.hold();
+            let made = tokio::task::spawn_blocking(move || {
+                let _held = held;
+                let exchange = crate::artifact::files::Exchange::create(&scratch)?;
+                let given = crate::artifact::files::referenced(&contract, &input, lookup.as_ref());
+                exchange.mount(store.as_ref(), &given)?;
+                Ok::<_, crate::artifact::ArtifactError>(exchange)
+            })
+            .await
+            .map_err(|e| AtomError::Runtime(format!("{}: prepare its files: {e}", atom.name)))?
+            .map_err(|e| store_error(&atom.name, "give the command its input files", e))?;
+            Some(Arc::new(made))
+        }
+        _ => None,
+    };
+    let (exchange_env, read_only) = match &exchange {
+        Some(x) => (
+            vec![
+                ("ATOMIC_OUTPUTS".to_owned(), x.outputs.display().to_string()),
+                ("ATOMIC_INPUTS".to_owned(), x.inputs.display().to_string()),
+            ],
+            vec![x.inputs.clone()],
+        ),
+        None => (Vec::new(), Vec::new()),
+    };
     let done = run_command(
         &workspace,
         program.clone(),
         args,
         stdin,
         identity.environment(),
+        exchange_env,
+        read_only,
+    )
+    .await;
+    let finished = finish_exec(
+        atom,
+        &program,
+        done,
+        exchange,
+        artifacts,
+        identity,
+        contract("Output")?,
+        &workspace,
     )
     .await;
     workspace.close().await;
+    let (output, text) = finished?;
+    let schema_error = |message: String| AtomError::Schema {
+        message,
+        answer: text.chars().take(2000).collect(),
+    };
+    // As for a model's answer: a reference must name an artifact that exists,
+    // of the right type.
+    atomic_schema::artifact::check_refs(contract("Output")?, &output, artifacts.0.as_ref())
+        .map_err(|e| schema_error(e.to_string()))?;
+    atomic_schema::expr::convertible(&output, contract("Output")?).map_err(schema_error)?;
+    let has_checks = atom
+        .frontmatter
+        .get("validate")
+        .and_then(Value::as_array)
+        .is_some_and(|checks| !checks.is_empty());
+    let values = serde_json::json!({"values":{"input":input,"output":output}});
+    // One validation round, the same operation on every attempt.
+    let clock = clock.map(|clock| (clock.clone(), "validate:0".to_owned()));
+    validate_output(&compiled.program, has_checks, values, clock).await?;
+    Ok((
+        output,
+        RunMetadata {
+            thread_id: String::new(),
+            model: "exec".into(),
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
+            human_actions: Vec::new(),
+            prompt_hash,
+            turns: 0,
+        },
+    ))
+}
+
+/// How many times a gather that found the artifact store held by a sweep
+/// tries again, each after waiting for the store's lock, before the step's
+/// outcome is unknown.
+const GATHER_LOCKED_RETRIES: u32 = 3;
+/// The first wait between a gather's tries, doubled each time up to
+/// [`GATHER_LOCKED_BACKOFF_MAX`].
+const GATHER_LOCKED_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
+/// The longest wait between a gather's tries.
+const GATHER_LOCKED_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// An artifact store's failure, as an atom's error: a refusal is the
+/// command's output's fault, anything else the store's.
+fn store_error(atom: &str, doing: &str, e: crate::artifact::ArtifactError) -> AtomError {
+    match e {
+        crate::artifact::ArtifactError::Refused(message) => AtomError::Schema {
+            message,
+            answer: String::new(),
+        },
+        // Held by a sweep for now, past the gather's tries: the command ran
+        // and its files were not stored, as if the step had crashed there.
+        // Recovery takes it up through its attempt guard: an idempotent
+        // command runs again, any other parks the run as outcome unknown.
+        e @ crate::artifact::ArtifactError::Locked { .. } => {
+            AtomError::OutcomeUnknown(format!("{atom}: {doing}: {e}"))
+        }
+        e => AtomError::Runtime(format!("{atom}: {doing}: {e}")),
+    }
+}
+
+/// What an exec command's run came to, while its workspace is still open:
+/// its output, with the files it handed over stored and referenced, and
+/// its stdout as text.
+#[allow(clippy::too_many_arguments)] // each is one thing the check needs
+async fn finish_exec(
+    atom: &AtomFile,
+    program: &str,
+    done: Result<atomic_exec::Completed, CommandError>,
+    exchange: Option<Arc<crate::artifact::files::Exchange>>,
+    artifacts: &Artifacts,
+    identity: &EffectIdentity,
+    output_contract: &Value,
+    workspace: &WorkspaceGuard,
+) -> Result<(Value, String), AtomError> {
     let done = done.map_err(|e| {
         let message = format!("{}: {e}", atom.name);
         match e {
@@ -1227,10 +1418,85 @@ pub async fn run_exec_opened(
         message,
         answer: text.chars().take(2000).collect(),
     };
-    let output: Value = serde_json::from_str(text.trim())
+    let mut output: Value = serde_json::from_str(text.trim())
         .map_err(|e| schema_error(format!("stdout is not one JSON value: {e}")))?;
+    let output_contract = output_contract.clone();
+    // The files it handed over go into the store, and their references into
+    // the output, before the output is checked; off the async workers.
+    if let (Some(exchange), Some(store)) = (exchange, artifacts.1.clone()) {
+        let provenance = crate::artifact::Provenance {
+            media_type: crate::artifact::files::DEFAULT_MEDIA_TYPE.into(),
+            workflow: Some(identity.run_id.clone()),
+            step: Some(identity.step_id.clone()),
+            origin: Some(atom.name.clone()),
+            labels: Default::default(),
+        };
+        let (limits, contract) = (artifacts.2, output_contract.clone());
+        let lookup = artifacts.0.clone();
+        // The workspace stays open while its files are read, even when the
+        // run is cancelled meanwhile.
+        let held = workspace.hold();
+        let gathered = tokio::task::spawn_blocking(move || {
+            let _held = held;
+            let validator = Registry::new()
+                .validator_for(&contract)
+                .map_err(|e| crate::artifact::ArtifactError::Refused(e.to_string()))?;
+            let validate = |value: &Value| -> Result<(), String> {
+                let errors: Vec<String> = validator
+                    .iter_errors(value)
+                    .map(|e| {
+                        let at = e.instance_path().to_string();
+                        format!("{}: {e}", if at.is_empty() { "/".to_owned() } else { at })
+                    })
+                    .collect();
+                if errors.is_empty() {
+                    Ok(())
+                } else {
+                    Err(errors.join("; "))
+                }
+            };
+            // A store held by a sweep is waited out a few times: a gather
+            // that found it held stored nothing it needs, so it can start
+            // again.
+            let mut wait = GATHER_LOCKED_BACKOFF;
+            let mut retries = 0;
+            loop {
+                match exchange.gather(
+                    store.as_ref(),
+                    lookup.as_ref(),
+                    &mut output,
+                    &contract,
+                    &validate,
+                    &provenance,
+                    limits,
+                ) {
+                    Err(crate::artifact::ArtifactError::Locked { .. })
+                        if retries < GATHER_LOCKED_RETRIES =>
+                    {
+                        retries += 1;
+                        std::thread::sleep(wait);
+                        wait = (wait * 2).min(GATHER_LOCKED_BACKOFF_MAX);
+                    }
+                    gathered => break gathered.map(|()| output),
+                }
+            }
+        })
+        .await
+        .map_err(|e| AtomError::Runtime(format!("{}: store its files: {e}", atom.name)))?;
+        output = gathered.map_err(|e| match e {
+            crate::artifact::ArtifactError::Refused(message) => schema_error(message),
+            e => store_error(&atom.name, "store its files", e),
+        })?;
+    }
+    if !cfg!(unix) && crate::artifact::files::names_a_file(&output) {
+        return Err(schema_error(format!(
+            "the output names a file with `{}`: handing files over is supported on Linux and \
+             macOS only",
+            crate::artifact::files::FILE_KEY
+        )));
+    }
     let validator = Registry::new()
-        .validator_for(contract("Output")?)
+        .validator_for(&output_contract)
         .map_err(|e| AtomError::Runtime(e.to_string()))?;
     let errors: Vec<String> = validator
         .iter_errors(&output)
@@ -1242,33 +1508,7 @@ pub async fn run_exec_opened(
     if !errors.is_empty() {
         return Err(schema_error(errors.join("; ")));
     }
-    // As for a model's answer: a reference must name an artifact that exists,
-    // of the right type.
-    atomic_schema::artifact::check_refs(contract("Output")?, &output, artifacts.0.as_ref())
-        .map_err(|e| schema_error(e.to_string()))?;
-    atomic_schema::expr::convertible(&output, contract("Output")?).map_err(schema_error)?;
-    let has_checks = atom
-        .frontmatter
-        .get("validate")
-        .and_then(Value::as_array)
-        .is_some_and(|checks| !checks.is_empty());
-    let values = serde_json::json!({"values":{"input":input,"output":output}});
-    // One validation round, the same operation on every attempt.
-    let clock = clock.map(|clock| (clock.clone(), "validate:0".to_owned()));
-    validate_output(&compiled.program, has_checks, values, clock).await?;
-    Ok((
-        output,
-        RunMetadata {
-            thread_id: String::new(),
-            model: "exec".into(),
-            input_tokens: 0,
-            output_tokens: 0,
-            total_tokens: 0,
-            human_actions: Vec::new(),
-            prompt_hash,
-            turns: 0,
-        },
-    ))
+    Ok((output, text))
 }
 
 /// Run an exec atom's command in `workspace`: in its root, with its
@@ -1281,6 +1521,8 @@ async fn run_command(
     args: Vec<String>,
     stdin: Vec<u8>,
     effect: [(String, String); 3],
+    exchange: Vec<(String, String)>,
+    read_only: Vec<PathBuf>,
 ) -> Result<atomic_exec::Completed, CommandError> {
     let workspace = guard.workspace();
     let cwd = workspace.require_root()?.clone();
@@ -1288,12 +1530,18 @@ async fn run_command(
     let mut env: Vec<(String, String)> = workspace
         .env
         .iter()
-        .filter(|(k, _)| *k != "HOME" && *k != "TMPDIR" && !EFFECT_VARIABLES.contains(&k.as_str()))
+        .filter(|(k, _)| {
+            *k != "HOME"
+                && *k != "TMPDIR"
+                && !EFFECT_VARIABLES.contains(&k.as_str())
+                && !EXCHANGE_VARIABLES.contains(&k.as_str())
+        })
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     env.push(("HOME".into(), scratch.clone()));
     env.push(("TMPDIR".into(), scratch));
     env.extend(effect);
+    env.extend(exchange);
     let request = atomic_exec::Command {
         program,
         args,
@@ -1304,6 +1552,8 @@ async fn run_command(
         output_limit: EXEC_OUTPUT_LIMIT,
         // A confining backend lets it write its scratch directory only.
         writable: workspace.scratch.iter().cloned().collect(),
+        // Inside it, the inputs it is given, which it only reads.
+        read_only,
     };
     // The command holds its workspace open until it ends, even when the run
     // that started it is cancelled and drops its guard.

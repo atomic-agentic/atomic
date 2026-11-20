@@ -899,3 +899,91 @@ fn the_manifest_accepts_every_setting() {
     atomic_core::project::load(&d.join("atomic.yaml"))
         .unwrap_or_else(|e| panic!("the manifest refuses a setting of {settings:?}: {e}"));
 }
+
+#[test]
+fn the_budget_layers_like_every_other_setting_and_says_where_each_limit_came_from() {
+    // Each layer sets the atom's tokens; each lower one also sets a limit
+    // the layers above leave alone.
+    let (_home, home) = person("budget:\n  atom:\n    tokens: 100\n  call:\n    minutes: 3\n");
+    let d = dir(&[
+        (
+            "atomic.yaml",
+            "atomic: 1\nname: notes\nbudget:\n  atom:\n    tokens: 200\n  workflow:\n    \
+             minutes: 45\n  pricing:\n    m:\n      input_usd_per_mtok: 1\n      \
+             output_usd_per_mtok: 2\n",
+        ),
+        (
+            "atomic.local.yaml",
+            "budget:\n  atom:\n    tokens: 300\n  workflow:\n    tokens: 9000\n",
+        ),
+    ]);
+    let vars = [
+        ("HOME", home.as_str()),
+        ("ATOMIC_BUDGET_ATOM_TOKENS", "400"),
+        ("ATOMIC_BUDGET_CALL_INPUT_TOKENS", "5000"),
+        ("ATOMIC_BUDGET_WORKFLOW_COST_USD", "1.5"),
+    ];
+    let r = resolved(&d, &EngineArgs::default(), &vars, &nobody);
+    let budget = &r.settings.budget;
+    let defaults = BudgetSettings::default();
+    assert_eq!(budget.atom.tokens, 400);
+    assert_eq!(budget.call.input_tokens, 5000);
+    assert_eq!(budget.workflow.cost_usd, Some(1.5));
+    assert_eq!(budget.workflow.tokens, 9000);
+    assert_eq!(budget.workflow.minutes, 45.0);
+    assert_eq!(budget.call.minutes, 3.0);
+    assert_eq!(budget.call.output_tokens, defaults.call.output_tokens);
+    assert_eq!(budget.atom.minutes, defaults.atom.minutes);
+    assert_eq!(budget.pricing["m"].output_usd_per_mtok, 2.0);
+    let file = |r: &Resolved, path: &str| match source(r, path) {
+        Source::File { path, .. } => path.file_name().expect("name").to_owned(),
+        other => panic!("{path} came from {other:?}"),
+    };
+    assert_eq!(
+        source(&r, "budget.atom.tokens"),
+        &Source::Env("ATOMIC_BUDGET_ATOM_TOKENS".into())
+    );
+    assert_eq!(
+        source(&r, "budget.call.input_tokens"),
+        &Source::Env("ATOMIC_BUDGET_CALL_INPUT_TOKENS".into())
+    );
+    assert_eq!(file(&r, "budget.workflow.tokens"), "atomic.local.yaml");
+    assert_eq!(file(&r, "budget.workflow.minutes"), "atomic.yaml");
+    assert_eq!(file(&r, "budget.call.minutes"), "config.yaml");
+    assert_eq!(source(&r, "budget.atom.minutes"), &Source::Default);
+    assert_eq!(
+        source(&r, "budget.workflow.cost_usd"),
+        &Source::Env("ATOMIC_BUDGET_WORKFLOW_COST_USD".into())
+    );
+
+    // Without the variable, the local file wins; without that, the
+    // project's; without that, the person's own.
+    let r = resolved(&d, &EngineArgs::default(), &vars[..1], &nobody);
+    assert_eq!(r.settings.budget.atom.tokens, 300);
+    assert_eq!(file(&r, "budget.atom.tokens"), "atomic.local.yaml");
+    std::fs::remove_file(d.join("atomic.local.yaml")).expect("remove");
+    let r = resolved(&d, &EngineArgs::default(), &vars[..1], &nobody);
+    assert_eq!(r.settings.budget.atom.tokens, 200);
+    assert_eq!(file(&r, "budget.atom.tokens"), "atomic.yaml");
+    std::fs::write(d.join("atomic.yaml"), MANIFEST_ONLY).expect("manifest");
+    let r = resolved(&d, &EngineArgs::default(), &vars[..1], &nobody);
+    assert_eq!(r.settings.budget.atom.tokens, 100);
+    assert_eq!(file(&r, "budget.atom.tokens"), "config.yaml");
+
+    // A variable that does not read as its limit is refused, by name and
+    // without its value: a word, a negative count, and a word for a dollar
+    // cap, which has no default to read it by.
+    for (name, value) in [
+        ("ATOMIC_BUDGET_ATOM_TOKENS", "lots"),
+        ("ATOMIC_BUDGET_ATOM_TOKENS", "-5"),
+        ("ATOMIC_BUDGET_CALL_MINUTES", "soon"),
+        ("ATOMIC_BUDGET_ATOM_COST_USD", "lots"),
+        ("ATOMIC_BUDGET_WORKFLOW_COST_USD", "plenty"),
+    ] {
+        let said = resolved_where(&d, &EngineArgs::default(), &[(name, value)], &nobody)
+            .expect_err("refused")
+            .to_string();
+        assert!(said.contains(name), "{name}={value}: {said}");
+        assert!(!said.contains(value), "{name}={value}: {said}");
+    }
+}

@@ -14,6 +14,7 @@ use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
 mod engine;
+mod evals;
 mod failure;
 mod gates;
 mod init;
@@ -61,6 +62,9 @@ enum Command {
     Init(init::InitArgs),
     /// Run an atom or a workflow in the foreground and print its output.
     Run(runs::RunArgs),
+    /// Run atoms' eval cases and fail when an atom's pass rate is below its
+    /// threshold; model calls are answered from cassettes unless --live.
+    Eval(evals::EvalArgs),
     /// Continue runs.
     #[command(subcommand)]
     Runs(Runs),
@@ -295,6 +299,7 @@ fn state_root(cli: Option<&Cli>) -> anyhow::Result<PathBuf> {
     let flag = cli.and_then(|c| c.project.as_deref());
     let target = match cli.and_then(|c| c.command.as_ref()) {
         Some(Command::Run(args)) => Some(args.target.as_str()),
+        Some(Command::Eval(args)) => args.atoms.first().map(String::as_str),
         _ => None,
     };
     match target::project_for(flag, target, &cwd) {
@@ -349,6 +354,7 @@ async fn run(cli: Cli, paths: CodexPaths, state: ProjectState) -> anyhow::Result
             tokio::task::spawn_blocking(move || check(path, json)).await?
         }
         Some(Command::Run(args)) => runs::run(args, project, &paths, json).await,
+        Some(Command::Eval(args)) => evals::run(args, project, &paths, json).await,
         Some(Command::Runs(Runs::Resume(args))) => runs::resume(args, project, &paths, json).await,
         Some(Command::Runs(Runs::Show(args))) => show::show(args, project, json).await,
         Some(Command::Serve(args)) => runs::serve(args, project, &paths).await,
@@ -734,11 +740,18 @@ fn render(args: RenderArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What `atomic debug codex-prompt` and `atomic debug probe` say on stderr:
+/// their turn is not metered.
+const UNMETERED: &str = "atomic debug: this turn is not metered: no budget caps it and the \
+                         usage ledger does not record it";
+
 async fn prompt(
     paths: &CodexPaths,
     state: &ProjectState,
     args: &PromptArgs,
 ) -> anyhow::Result<String> {
+    // The only model call atomic makes without a meter: said, never silent.
+    atomic_core::log_line!("{UNMETERED}");
     // A backend of its own, beside the one `atomic run` and `atomic serve`
     // use: this command takes no execution lock, and connecting empties a
     // backend's shared temporary directory, which their turns may be using.
