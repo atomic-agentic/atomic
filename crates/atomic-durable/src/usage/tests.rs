@@ -890,6 +890,148 @@ async fn a_partly_known_attempt_is_charged_its_reported_usage_and_one_more_bound
     assert_eq!(charged(&ledger, &format!("atom:{run}:1")).await.tokens, 475);
 }
 
+/// A turn's record of what it reported so far: `input` and `output`
+/// tokens costing `micro` micro-dollars, and a request in flight of
+/// `in_flight` tokens and ten micro-dollars.
+fn so_far(input: i64, output: i64, micro: i64, in_flight: i64) -> Settlement {
+    Settlement::Partial {
+        input_tokens: input,
+        output_tokens: output,
+        micro_usd: micro,
+        in_flight: Charge {
+            tokens: in_flight,
+            millis: 0,
+            micro_usd: 10,
+        },
+    }
+}
+
+async fn progress_is_charged_until_the_settlement_replaces_it<R: DurableRuntime>(rt: R) {
+    let ledger = rt.ledger();
+    let run = unique("progress");
+    let (req, attempt) = admitted(
+        &ledger
+            .admit(request(&run, 1, 0, 10_000, 10_000))
+            .await
+            .expect("admit"),
+    );
+    let (run_scope, atom_scope) = (format!("run:{run}"), format!("atom:{run}:1"));
+    // Past its 100-token reservation: what it reported and the request in
+    // flight, and the attempt stays open.
+    assert_eq!(
+        ledger
+            .progress(&req, attempt, so_far(100, 50, 60, 100))
+            .await
+            .expect("progress"),
+        Settled::Uncertain
+    );
+    let a = &ledger.attempts(&run).await.expect("attempts")[0];
+    assert_eq!(a.state, "reserved");
+    assert_eq!(a.usage, Some((100, 50)));
+    assert_eq!((a.charged.tokens, a.charged.micro_usd), (250, 70));
+    for scope in [&run_scope, &atom_scope] {
+        let c = charged(&ledger, scope).await;
+        assert_eq!((c.tokens, c.micro_usd), (250, 70), "{scope}");
+    }
+    // A smaller record, as a late one would be, lowers nothing.
+    ledger
+        .progress(&req, attempt, so_far(10, 5, 1, 0))
+        .await
+        .expect("progress");
+    let a = &ledger.attempts(&run).await.expect("attempts")[0];
+    assert_eq!(a.usage, Some((100, 50)));
+    assert_eq!((a.charged.tokens, a.charged.micro_usd), (250, 70));
+    assert_eq!(charged(&ledger, &run_scope).await.tokens, 250);
+    // It cannot be released: it reported usage.
+    assert!(ledger.release(&req, attempt).await.is_err());
+    // The settlement replaces the record with what it used.
+    let used = Settlement::Reported {
+        input_tokens: 120,
+        output_tokens: 60,
+        millis: 10,
+        micro_usd: 80,
+    };
+    assert_eq!(
+        ledger.settle(&req, attempt, used).await.expect("settle"),
+        Settled::Now
+    );
+    for scope in [&run_scope, &atom_scope] {
+        let c = charged(&ledger, scope).await;
+        assert_eq!((c.tokens, c.micro_usd), (180, 80), "{scope}");
+    }
+    // A record after the settlement changes nothing.
+    assert_eq!(
+        ledger
+            .progress(&req, attempt, so_far(500, 500, 500, 100))
+            .await
+            .expect("progress"),
+        Settled::Already
+    );
+    assert_eq!(charged(&ledger, &run_scope).await.tokens, 180);
+    // Progress is only ever a partial settlement.
+    let (other, attempt) = admitted(
+        &ledger
+            .admit(request(&run, 2, 0, 10_000, 10_000))
+            .await
+            .expect("admit"),
+    );
+    assert!(
+        ledger
+            .progress(&other, attempt, Settlement::Unknown)
+            .await
+            .is_err()
+    );
+}
+
+async fn progress_racing_its_settlement_leaves_what_was_used<R: DurableRuntime>(rt: R) {
+    let ledger = rt.ledger();
+    let run = unique("race_progress");
+    for call in 0..10 {
+        let (req, attempt) = admitted(
+            &ledger
+                .admit(request(&run, 1, call, 1_000_000, 1_000_000))
+                .await
+                .expect("admit"),
+        );
+        let (recording, settling) = (ledger.clone(), ledger.clone());
+        let (r1, r2) = (req.clone(), req.clone());
+        let record = tokio::spawn(async move {
+            recording
+                .progress(&r1, attempt, so_far(300, 300, 300, 100))
+                .await
+        });
+        let settle = tokio::spawn(async move {
+            settling
+                .settle(
+                    &r2,
+                    attempt,
+                    Settlement::Reported {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        millis: 1,
+                        micro_usd: 1,
+                    },
+                )
+                .await
+        });
+        record.await.expect("task").expect("progress");
+        settle.await.expect("task").expect("settle");
+    }
+    // Whichever came first, each call is charged what it used: a record
+    // after the settlement is refused, and a settlement after a record
+    // replaces it.
+    let c = charged(&ledger, &format!("run:{run}")).await;
+    assert_eq!((c.tokens, c.micro_usd), (20, 10));
+    assert!(
+        ledger
+            .attempts(&run)
+            .await
+            .expect("attempts")
+            .iter()
+            .all(|a| a.state == "settled" && a.usage == Some((1, 1)))
+    );
+}
+
 macro_rules! on_sqlite {
     ($($name:ident),* $(,)?) => {
         mod on_sqlite {
@@ -920,6 +1062,8 @@ macro_rules! on_postgres {
 }
 
 on_sqlite!(
+    progress_is_charged_until_the_settlement_replaces_it,
+    progress_racing_its_settlement_leaves_what_was_used,
     a_call_is_reserved_before_dispatch_and_settled_once,
     a_dead_call_is_never_charged_its_processs_downtime,
     unreported_and_dead_attempts_are_charged_the_time_they_took,
@@ -939,6 +1083,8 @@ on_sqlite!(
 
 #[cfg(feature = "postgres-tests")]
 on_postgres!(
+    progress_is_charged_until_the_settlement_replaces_it,
+    progress_racing_its_settlement_leaves_what_was_used,
     a_call_is_reserved_before_dispatch_and_settled_once,
     a_dead_call_is_never_charged_its_processs_downtime,
     unreported_and_dead_attempts_are_charged_the_time_they_took,

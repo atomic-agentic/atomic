@@ -1464,9 +1464,14 @@ fn reporting_turn(third: Reply) -> Vec<Reply> {
 
 /// The child, starting run `run` with a call bound of two tokens.
 fn reporting_child(dir: &Path, url: &str, run: &str) -> Command {
+    reporting_child_as(dir, url, run, "start")
+}
+
+/// [`reporting_child`], as `role`.
+fn reporting_child_as(dir: &Path, url: &str, run: &str, role: &str) -> Command {
     let mut cmd = Command::new(std::env::current_exe().expect("this test binary"));
     cmd.args(["--exact", "budgets_child", "--ignored", "--nocapture"])
-        .env(ENV_ROLE, "start")
+        .env(ENV_ROLE, role)
         .env(ENV_DIR, dir)
         .env(ENV_URL, url)
         .env(ENV_RUN, run)
@@ -1544,9 +1549,11 @@ fn a_codex_turn_stopped_by_a_signal_is_charged_what_it_reported() {
 #[test]
 fn a_codex_turn_killed_mid_turn_is_charged_what_it_reported() {
     on_codex_runtime(async {
-        let model = FakeModel::start(reporting_turn(Reply::Text(REVIEW.into())))
-            .await
-            .expect("fake model");
+        // The turn's third request, if the killed process made it, and the
+        // recovered turn's answer.
+        let mut replies = reporting_turn(Reply::Text(REVIEW.into()));
+        replies.push(Reply::Text(REVIEW.into()));
+        let model = FakeModel::start(replies).await.expect("fake model");
         let dir = scratch("killed-mid-turn");
         let url = model.base_url();
         // Killed as the turn records what its second request reported.
@@ -1568,5 +1575,43 @@ fn a_codex_turn_killed_mid_turn_is_charged_what_it_reported() {
         assert_eq!(turn.usage, Some((2, 2)), "{turn:?}");
         assert_eq!(turn.charged.tokens, 4 + 2, "{turn:?}");
         assert_eq!(turn.state, "reserved", "{turn:?}");
+        drop(rt);
+
+        // Recovered, the review runs again as a second attempt with its own
+        // reservation; the dead one keeps what it recorded.
+        let mut cmd = reporting_child_as(&dir, &url, run, "recover");
+        cmd.stdout(Stdio::null());
+        let status = bounded(cmd).await;
+        assert!(
+            status.is_some_and(|s| s.success()),
+            "the recovered run: {status:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("outcome")).expect("outcome"),
+            "finished"
+        );
+        let rt = reader(&dir).await;
+        let review: Vec<Attempt> = attempts(&rt, run)
+            .await
+            .into_iter()
+            .filter(|a| a.request == format!("{run}:2:0"))
+            .collect();
+        assert_eq!(review.len(), 2, "{review:?}");
+        let (dead, again) = (&review[0], &review[1]);
+        assert_eq!(
+            (dead.attempt, dead.state.as_str()),
+            (1, "reserved"),
+            "{dead:?}"
+        );
+        assert_eq!(dead.charged.tokens, 4 + 2, "{dead:?}");
+        assert_eq!(
+            (again.attempt, again.state.as_str()),
+            (2, "settled"),
+            "{again:?}"
+        );
+        assert_eq!(again.usage, Some((1, 1)), "{again:?}");
+        // The draft's two tokens, the dead turn's six, the new turn's two.
+        assert_eq!(charged(&rt, &format!("run:{run}")).await, 2 + 6 + 2);
+        assert_eq!(charged(&rt, &format!("atom:{run}:2")).await, 6 + 2);
     });
 }

@@ -21,13 +21,18 @@
 //!    its charge, and on SQLite every write transaction runs alone. Two
 //!    parallel children can therefore never both take the last of their
 //!    parent's allowance.
-//! 2. **Settlement**, after the call, once per attempt: the reservation is
-//!    replaced by what the provider reported. A second settlement of the same
-//!    attempt changes nothing.
+//! 2. **Progress**, while a Codex turn runs, as often as what it reported
+//!    grows ([`Ledger::progress`]): the attempt is charged what it reported
+//!    and one request taken to be in flight, at least what it was charged
+//!    already, and stays reserved.
+//! 3. **Settlement**, after the call, once per attempt: the reservation, or
+//!    the last progress, is replaced by what the provider reported. A second
+//!    settlement of the same attempt changes nothing.
 //!
 //! An attempt that is never settled, because the process died after the
 //! provider was called or the provider reported nothing, stays charged at
-//! its bound in tokens and dollars. Its active time can always be measured:
+//! its bound in tokens and dollars, or at what its last progress or partial
+//! settlement charged, if that is more. Its active time can always be measured:
 //! it is charged as what passed since admission, at most what was reserved,
 //! when it settles as unknown, or, after the process that made it died,
 //! when its atom invocation admits its next call. Recovery never releases it: a re-run of the step is a new
@@ -262,12 +267,14 @@ pub struct Attempt {
     pub reserved: Charge,
     /// The provider's documented maximum.
     pub maximum: Charge,
-    /// The usage it reported: once settled, or, for an attempt known only
-    /// in part, what it reported before it was stopped.
+    /// The usage it reported: once settled; for an attempt known only in
+    /// part, what it reported before it was stopped; for a turn still
+    /// running, or one whose process died, what it last recorded.
     pub usage: Option<(i64, i64)>,
     /// What is charged for it now: its reservation until settled, then what
-    /// it used; for an attempt known only in part, what it reported and the
-    /// request in flight, at least its reservation.
+    /// it used; for an attempt known only in part, or a turn that recorded
+    /// its progress, what it reported and the request in flight, at least
+    /// its reservation.
     pub charged: Charge,
 }
 
@@ -746,10 +753,23 @@ async fn partly(
     in_flight: Charge,
 ) -> Result<End<Settled>> {
     let key = [Param::Text(request.to_owned()), Param::Int(attempt)];
+    // The row is locked before it is read, as in settle_time: a settlement
+    // or record that overlaps this one waits, then reads what it leaves, so
+    // neither can lower the other's charge or apply on a stale one.
+    let locked = tx
+        .execute(
+            "UPDATE atomic_usage_attempts SET attempt = attempt \
+             WHERE request_id = ? AND attempt = ? AND state = 'reserved'",
+            &key,
+        )
+        .await?;
+    if locked != 1 {
+        return Ok(End::Rollback(Settled::Already));
+    }
     let row = tx
         .query_one(
-            "SELECT state, scopes, charged_tokens, charged_micro_usd \
-             FROM atomic_usage_attempts WHERE request_id = ? AND attempt = ?",
+            "SELECT state, scopes, charged_tokens, charged_micro_usd, input_tokens, \
+             output_tokens FROM atomic_usage_attempts WHERE request_id = ? AND attempt = ?",
             &key,
         )
         .await?;
@@ -760,7 +780,13 @@ async fn partly(
     let (charged_tokens, charged_micro) =
         (row.int("charged_tokens")?, row.int("charged_micro_usd")?);
     let held = |n: i64| n.clamp(0, MOST);
-    let (input, output, micro) = (held(reported.0), held(reported.1), held(reported.2));
+    // What it reported only grows: a smaller record, such as one that
+    // arrives late, keeps what an earlier one recorded.
+    let (input, output, micro) = (
+        held(reported.0).max(row.int_opt("input_tokens")?.unwrap_or(0)),
+        held(reported.1).max(row.int_opt("output_tokens")?.unwrap_or(0)),
+        held(reported.2),
+    );
     let tokens = (input + output + held(in_flight.tokens))
         .min(MOST)
         .max(charged_tokens);
@@ -806,6 +832,14 @@ async fn settle_in(
     now: i64,
 ) -> Result<End<Settled>> {
     let key = [Param::Text(request.to_owned()), Param::Int(attempt)];
+    // Locked before it is read, whatever its state, so an overlapping
+    // record or settlement of the same attempt waits for this one.
+    tx.execute(
+        "UPDATE atomic_usage_attempts SET attempt = attempt \
+         WHERE request_id = ? AND attempt = ?",
+        &key,
+    )
+    .await?;
     let Some(row) = tx
         .query_opt(
             "SELECT state, scopes, charged_tokens, charged_millis, charged_micro_usd \
@@ -1092,7 +1126,9 @@ impl Ledger {
     }
 
     /// The attempts journaled for run `run` that are still `reserved`: each
-    /// charged at its bound until it is settled, reconciled or released.
+    /// charged at its bound, or at what its last progress or partial
+    /// settlement charged if that is more, until it is settled, reconciled
+    /// or released.
     pub async fn unsettled(&self, run: &str) -> Result<Vec<Attempt>> {
         Ok(self
             .attempts(run)

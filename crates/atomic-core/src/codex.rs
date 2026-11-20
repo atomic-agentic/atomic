@@ -1194,12 +1194,13 @@ where
         let bounded_by = ticket.as_ref().and_then(|t| t.bounded_by.clone());
         // A turn is cut off when its reserved time runs out; a failed or cut
         // off turn still reports the usage seen before it stopped.
-        let mut recorder = Recorder {
+        let mut recorder = ProgressLog {
             meter,
             ticket: ticket.as_ref(),
             seen,
             recorded: seen,
             records: 0,
+            warned: false,
         };
         let (turn, progress) = span
             .run(run_turn(&thread, &current, limit.time, &mut recorder))
@@ -1673,7 +1674,7 @@ impl Progress {
 /// Where a running turn's reported usage is recorded as it grows, so that a
 /// turn whose process is stopped or killed before it settles stays charged
 /// at least what it reported (see [`crate::usage::Meter::progress`]).
-struct Recorder<'a> {
+struct ProgressLog<'a> {
     meter: &'a Metering,
     ticket: Option<&'a Ticket>,
     /// The thread's totals before the turn.
@@ -1682,13 +1683,20 @@ struct Recorder<'a> {
     recorded: (i64, i64),
     /// How many times it recorded.
     records: u32,
+    /// Whether a record failed, and was said to.
+    warned: bool,
 }
 
-impl Recorder<'_> {
-    /// Record `progress` if the turn reported more since it last did: what
-    /// it reported, and one request in flight, since it may be making one.
-    /// A record that fails only leaves the turn charged as it was, at its
-    /// reservation or the last record.
+/// How long a turn waits on one record of its progress before it goes on
+/// without it: a store held by another writer must not hold up the turn.
+const PROGRESS_PATIENCE: std::time::Duration = std::time::Duration::from_secs(1);
+
+impl ProgressLog<'_> {
+    /// Record `progress` if the turn reported more since it last recorded:
+    /// what it reported, and one request in flight, since it may be making
+    /// one. A record that fails, or takes longer than [`PROGRESS_PATIENCE`],
+    /// leaves the turn charged as it was, at its reservation or its last
+    /// record, is tried again at the next growth, and is said once a turn.
     async fn note(&mut self, progress: &Progress) {
         let Some((input, output, _)) = progress.totals(self.seen) else {
             return;
@@ -1696,8 +1704,6 @@ impl Recorder<'_> {
         if input <= self.recorded.0 && output <= self.recorded.1 {
             return;
         }
-        self.recorded = (input, output);
-        self.records += 1;
         let outcome = Outcome::Partial {
             reported: Usage {
                 input_tokens: (input - self.seen.0).max(0),
@@ -1708,15 +1714,35 @@ impl Recorder<'_> {
                 output_tokens,
             }),
         };
-        if self.meter.progress(self.ticket, outcome).await.is_ok()
-            && crate::failpoint::armed()
-            && let Some(ticket) = self.ticket
-        {
-            // A crash here leaves the turn charged what it recorded.
-            crate::failpoint::failpoint(&format!(
-                "usage:after-progress:{}:{}",
-                ticket.request, self.records
-            ));
+        let recorded =
+            tokio::time::timeout(PROGRESS_PATIENCE, self.meter.progress(self.ticket, outcome))
+                .await;
+        match recorded {
+            Ok(Ok(())) => {
+                self.recorded = (input, output);
+                self.records += 1;
+                if crate::failpoint::armed()
+                    && let Some(ticket) = self.ticket
+                {
+                    // A crash here leaves the turn charged what it recorded.
+                    crate::failpoint::failpoint(&format!(
+                        "usage:after-progress:{}:{}",
+                        ticket.request, self.records
+                    ));
+                }
+            }
+            failed if !self.warned => {
+                self.warned = true;
+                let why = match failed {
+                    Ok(Err(e)) => e.to_string(),
+                    _ => format!("the store did not answer within {PROGRESS_PATIENCE:?}"),
+                };
+                crate::log_line!(
+                    "a Codex turn's usage so far was not recorded ({why}); until it is, a stop \
+                     before the turn settles leaves it charged at its last record"
+                );
+            }
+            _ => {}
         }
     }
 }
@@ -1729,7 +1755,7 @@ async fn run_turn(
     thread: &CodexThread,
     spec: &TurnSpec,
     time: Option<std::time::Duration>,
-    recorder: &mut Recorder<'_>,
+    recorder: &mut ProgressLog<'_>,
 ) -> (anyhow::Result<String>, Progress) {
     let mut progress = Progress::default();
     let ended = match time {
@@ -1777,7 +1803,7 @@ async fn turn(
     thread: &CodexThread,
     spec: &TurnSpec,
     progress: &mut Progress,
-    recorder: &mut Recorder<'_>,
+    recorder: &mut ProgressLog<'_>,
 ) -> anyhow::Result<String> {
     // Codex sends TurnComplete before it marks the thread idle, so a follow-up
     // turn submitted straight after one can be declined as NotIdle. That
