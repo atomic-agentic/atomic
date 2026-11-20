@@ -1205,15 +1205,18 @@ fn a_codex_turn_cut_off_with_a_request_in_flight_is_charged_what_it_reported_and
             Reply::Text(DRAFT.into()),
             tool(),
             tool(),
+            // Held well past the cut-off, so the turn is always stopped
+            // waiting on it, however slow the runner.
             Reply::Delayed {
-                after: Duration::from_secs(20),
+                after: Duration::from_secs(120),
                 reply: Box::new(Reply::Text(REVIEW.into())),
             },
         ])
         .await
         .expect("fake model");
         let dir = scratch("inflight");
-        let mut budgets = timed(0.01, 0.05);
+        // Nine seconds for the turn: ample for its first two requests.
+        let mut budgets = timed(0.01, 0.15);
         budgets.call.input_tokens = 1;
         budgets.call.output_tokens = 1;
         let rt = engine(&dir, &model.base_url(), budgets).await;

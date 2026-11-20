@@ -104,12 +104,20 @@ pub enum Outcome {
     /// stays charged at its bound until a usage query reconciles it (none is
     /// built yet, so it stays charged at its bound).
     Unknown,
-    /// Part of what the call spent is known: it reported this usage, and
+    /// Part of what the call spent is known: it reported `reported`, and
     /// was then stopped with a provider request in flight, which reported
-    /// nothing. It is charged this usage and one more request's bound, at
-    /// least its reservation, and stays open for a usage query, which is not
-    /// built yet: until one is, the charge keeps that value.
-    Partial(Usage),
+    /// nothing. The request in flight is taken to be as large as one
+    /// request's bound, or as `last`, the last request that reported, if
+    /// that was larger: a turn's requests grow as it goes. It is charged the
+    /// reported usage and that estimate, at least its reservation, and stays
+    /// open for a usage query, which is not built yet: until one is, the
+    /// charge keeps that value.
+    Partial {
+        /// What it reported.
+        reported: Usage,
+        /// What its last request that reported used, if any did.
+        last: Option<Usage>,
+    },
     /// The call certainly never reached the provider, so nothing was spent.
     NotDispatched,
 }

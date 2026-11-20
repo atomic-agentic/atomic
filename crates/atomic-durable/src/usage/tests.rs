@@ -866,6 +866,12 @@ async fn a_partly_known_attempt_is_charged_its_reported_usage_and_one_more_bound
         (BOUND.tokens, BOUND.micro_usd)
     );
     assert_eq!(a.usage, Some((5, 5)));
+    // It reported usage, so it spent something: it cannot be released.
+    assert!(ledger.release(&format!("{small}:1:0"), 1).await.is_err());
+    assert_eq!(
+        ledger.attempts(&small).await.expect("attempts")[0].state,
+        "reserved"
+    );
     // A usage query that learns the whole of it replaces the charge.
     ledger
         .settle(

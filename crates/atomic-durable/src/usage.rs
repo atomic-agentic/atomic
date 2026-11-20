@@ -184,12 +184,15 @@ pub enum Settlement {
     /// The call was never dispatched: the reservation is released.
     NotDispatched,
     /// Part of the call's usage is known: it reported this much, and was
-    /// then stopped with a request in flight that reported nothing, whose
-    /// most is `in_flight`. Its tokens and dollars are charged the reported
-    /// amounts plus `in_flight`, and at least what was reserved; its time,
-    /// as for [`Settlement::Unknown`]. The reported usage is recorded, and
-    /// the attempt stays open, as an unknown one does, for a usage query to
-    /// correct.
+    /// then stopped with a request in flight that reported nothing, taken
+    /// to have spent `in_flight`. That is an estimate, not a bound: one
+    /// request's reservation, or the size of the last request that reported
+    /// if that was larger, since a turn's requests grow and can pass the
+    /// configured maximum input. Its tokens and dollars are charged the
+    /// reported amounts plus `in_flight`, and at least what was reserved;
+    /// its time, as for [`Settlement::Unknown`]. The reported usage is
+    /// recorded, and the attempt stays open, as an unknown one does, for a
+    /// usage query to correct.
     Partial {
         /// Input tokens reported.
         input_tokens: i64,
@@ -197,7 +200,7 @@ pub enum Settlement {
         output_tokens: i64,
         /// What the reported usage cost, in micro-dollars.
         micro_usd: i64,
-        /// The most one more request could have spent.
+        /// What the request in flight is taken to have spent.
         in_flight: Charge,
     },
     /// Its usage, learned after the fact from a usage query or a person,
@@ -221,7 +224,9 @@ pub enum Settled {
     Now,
     /// The attempt was settled or released already; nothing changed.
     Already,
-    /// Nothing was known, so the attempt stays charged at its bound.
+    /// Not all of it was known, so the attempt stays open: charged at its
+    /// bound when nothing was reported, or at what it reported and the
+    /// request it was stopped in (see [`Settlement::Partial`]).
     Uncertain,
 }
 
@@ -257,10 +262,12 @@ pub struct Attempt {
     pub reserved: Charge,
     /// The provider's documented maximum.
     pub maximum: Charge,
-    /// The reported usage, once settled.
+    /// The usage it reported: once settled, or, for an attempt known only
+    /// in part, what it reported before it was stopped.
     pub usage: Option<(i64, i64)>,
     /// What is charged for it now: its reservation until settled, then what
-    /// it actually used.
+    /// it used; for an attempt known only in part, what it reported and the
+    /// request in flight, at least its reservation.
     pub charged: Charge,
 }
 
@@ -814,6 +821,22 @@ async fn settle_in(
     if row.text("state")? != "reserved" {
         return Ok(End::Rollback(Settled::Already));
     }
+    if matches!(how, Settlement::NotDispatched) {
+        let reported = tx
+            .query_one(
+                "SELECT input_tokens FROM atomic_usage_attempts \
+                 WHERE request_id = ? AND attempt = ?",
+                &key,
+            )
+            .await?
+            .int_opt("input_tokens")?;
+        if reported.is_some() {
+            return Err(DurableError::Failed(format!(
+                "attempt {attempt} at request {request} reported usage, so it spent something \
+                 and cannot be released"
+            )));
+        }
+    }
     // Usage that is not reported still took time: settle that much now.
     if matches!(
         how,
@@ -1023,7 +1046,8 @@ impl Ledger {
 
     /// Release attempt `attempt` at `request`, left `reserved`, once it is
     /// confirmed that it spent nothing: its reservation is no longer
-    /// charged. Releasing a settled or released attempt changes nothing.
+    /// charged. Releasing a settled or released attempt changes nothing; an
+    /// attempt that reported usage spent something, and is refused.
     pub async fn release(&self, request: &str, attempt: i64) -> Result<Settled> {
         self.settle_once(request, attempt, Settlement::NotDispatched)
             .await
