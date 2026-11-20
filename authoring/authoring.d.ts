@@ -39,7 +39,6 @@ export interface AtomConfig<I, O, C = unknown, J extends { [K in keyof J]: Judge
   context?: unknown;
   case?: unknown;
   judges?: unknown;
-  /** The eval directory, relative to this file, or `{dir, pass_rate}`: the share of cases that must pass, 1 by default. */
   evals?: string | {dir?: string; pass_rate?: number};
   examples?: {name: string; input: I; output: O}[];
   description?: string;
