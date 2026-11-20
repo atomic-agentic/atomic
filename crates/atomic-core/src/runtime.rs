@@ -595,13 +595,6 @@ async fn run_contract(
     }
 }
 
-/// Set `spec` up to run in `workspace` and return the directory its thread
-/// runs in: the sandbox, the writable roots and the environment are the
-/// workspace's, and its shell must be one this process can drive. Its
-/// commands' `HOME`, `ZDOTDIR` and `TMPDIR` are the workspace's scratch
-/// directory, so no shell reads the developer's startup files and nothing
-/// is left in a shared temporary directory; a `workspace-write` turn may
-/// write there.
 /// The build cache variables a turn's `env` may not point into the
 /// temporary directory its backend's turns share.
 const SHARED_TMP_REFUSED: &[&str] = &[
@@ -615,6 +608,26 @@ const SHARED_TMP_REFUSED: &[&str] = &[
     "GOMODCACHE",
 ];
 
+/// `path` with links resolved as far as it exists, the rest as written, so
+/// a path not made yet is compared where it would be.
+fn resolved(path: &std::path::Path) -> PathBuf {
+    for ancestor in path.ancestors() {
+        if let Ok(real) = std::fs::canonicalize(ancestor) {
+            return path
+                .strip_prefix(ancestor)
+                .map_or_else(|_| real.clone(), |rest| real.join(rest));
+        }
+    }
+    path.to_owned()
+}
+
+/// Set `spec` up to run in `workspace` and return the directory its thread
+/// runs in: the sandbox, the writable roots and the environment are the
+/// workspace's, and its shell must be one this process can drive. Its
+/// commands' `HOME`, `ZDOTDIR` and `TMPDIR` are the workspace's scratch
+/// directory, so no shell reads the developer's startup files and nothing
+/// is left in a shared temporary directory; a `workspace-write` turn may
+/// write there.
 fn turn_in(workspace: &Workspace, spec: &mut TurnSpec) -> Result<PathBuf, AtomError> {
     let cwd = workspace
         .require_root()
@@ -658,9 +671,10 @@ fn turn_in(workspace: &Workspace, spec: &mut TurnSpec) -> Result<PathBuf, AtomEr
     // A cache in the temporary directory every turn of the backend shares
     // would outlive the run and reach the next one.
     if let Some(tmp) = &workspace.tmp {
+        let tmp = resolved(tmp);
         for name in SHARED_TMP_REFUSED {
             if let Some(value) = spec.env.get(*name)
-                && std::path::Path::new(value).starts_with(tmp)
+                && resolved(std::path::Path::new(value)).starts_with(&tmp)
             {
                 return Err(AtomError::Runtime(format!(
                     "{name}={value} is in the temporary directory every turn shares, so what is \

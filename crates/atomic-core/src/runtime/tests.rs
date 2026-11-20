@@ -2240,6 +2240,18 @@ fn a_turns_cargo_home_is_its_own_and_its_toolchains_are_only_read() {
     );
     let refused = turn_in(&shared, &mut TurnSpec::default()).expect_err("shared");
     assert!(refused.to_string().contains("GOMODCACHE"), "{refused}");
+    // Through a link to it, too.
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(dir.join("tmp"), dir.join("alias")).expect("link");
+        let mut linked = workspace(&dir.join("toolchains"));
+        linked.env.insert(
+            "XDG_CACHE_HOME".into(),
+            dir.join("alias/xdg").display().to_string(),
+        );
+        let refused = turn_in(&linked, &mut TurnSpec::default()).expect_err("linked");
+        assert!(refused.to_string().contains("XDG_CACHE_HOME"), "{refused}");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 

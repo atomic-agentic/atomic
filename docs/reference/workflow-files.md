@@ -61,8 +61,9 @@ their refs, so it can be inspected and resumed.
 
 No build cache an atom writes outlives its run. A worktree step's commands
 get build caches of the run's own, which they may write and which are
-removed when the run ends, whether it finishes or fails (a run stopped to be
-resumed keeps them; one resumed after they went builds cold):
+removed when the run ends, whether it finishes or fails. A run stopped to
+be resumed, parked, or taken over by another process keeps them; one
+resumed after they went builds cold:
 `XDG_CACHE_HOME`, npm's, pip's and Go's caches
 (`GOCACHE`, `GOMODCACHE`) and `ATOMIC_CACHE_DIR` all point into one private
 directory in the state directory, shared by the run's worktree steps.

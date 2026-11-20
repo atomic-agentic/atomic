@@ -683,15 +683,22 @@ async fn run_pipeline<C: WorkflowContext>(
     let id = ctx.workflow_id().to_owned();
     let mut caches = None;
     let result = run_pipeline_in(ctx, run, services, ledger, replay, &mut caches).await;
-    // A run that ended, finished or failed, leaves no build caches: one
-    // resumed builds cold. One that only stopped, for recovery or another
-    // owner to go on with, keeps them.
-    if !matches!(result, Err(DurableError::Interrupted(_)))
-        && let Some(caches) = caches
-    {
-        remove_caches(&id, caches).await;
+    if let Some(caches) = caches {
+        settle_caches(&id, caches, &result).await;
     }
     result
+}
+
+/// Remove run `id`'s build caches if the run ended as `result` says: only
+/// a run that finished or failed, whose outcome is recorded, leaves none
+/// (one resumed builds cold). Any other end keeps them: a run stopped for
+/// recovery, parked for a person, or one whose outcome was not recorded,
+/// such as an execution that lost a race to another still building in the
+/// same caches.
+async fn settle_caches(id: &str, caches: atomic_core::worktree::Caches, result: &Result<Value>) {
+    if matches!(result, Ok(_) | Err(DurableError::Failed(_))) {
+        remove_caches(id, caches).await;
+    }
 }
 
 /// Remove run `id`'s build caches, saying so if they cannot be: what is
@@ -837,6 +844,23 @@ async fn run_pipeline_in<C: WorkflowContext>(
             })
         })
         .await?;
+    // The run's build caches, named once for all its worktree steps from
+    // what its first step recorded, with the person's rustup toolchains
+    // found once; named before any step, so a run that ends before its
+    // first worktree step still removes what an earlier execution left.
+    if pipeline
+        .steps
+        .iter()
+        .any(|s| matches!(s, Step::Atom(step) if step.worktree))
+        && let Some(worktrees) = &services.worktrees
+    {
+        let rustup = atomic_core::worktree::rustup_home(&|n| std::env::var(n).ok());
+        *run_caches = Some(
+            worktrees
+                .caches(ctx.workflow_id(), pinned.caches.as_deref(), rustup)
+                .map_err(|e| failed(format!("the run's build caches: {e}")))?,
+        );
+    }
     let plan = pinned.budgets.clone();
     let budget = RunBudget::pinned(ledger, &plan);
     let (caps, models) = (plan.atoms, plan.models);
@@ -992,18 +1016,9 @@ async fn run_pipeline_in<C: WorkflowContext>(
                 .and_then(Value::as_str)
                 .ok_or_else(|| failed(format!("step `{}`: `base` is not a commit", step.id)))?;
             used_worktrees = true;
-            // The run's build caches, named once for all its worktree steps,
-            // with the person's rustup toolchains found once.
-            let caches = match &run_caches {
-                Some(caches) => caches.clone(),
-                None => {
-                    let rustup = atomic_core::worktree::rustup_home(&|n| std::env::var(n).ok());
-                    let caches = worktrees
-                        .caches(&run_id, pinned.caches.as_deref(), rustup)
-                        .map_err(|e| failed(format!("the run's build caches: {e}")))?;
-                    run_caches.insert(caches).clone()
-                }
-            };
+            let caches = run_caches
+                .clone()
+                .ok_or_else(|| failed("the run's build caches were never named".into()))?;
             Some((
                 worktrees,
                 caches,
@@ -1648,6 +1663,35 @@ fn recorded_results(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only a recorded outcome, finished or failed, removes a run's caches:
+    /// an execution that lost a race, or whose outcome went unrecorded,
+    /// leaves them to the one still building there.
+    #[test]
+    fn a_runs_caches_go_only_with_an_outcome_that_was_recorded() {
+        let ends: Vec<(Result<Value>, bool)> = vec![
+            (Ok(json!({})), true),
+            (Err(DurableError::Failed("a step failed".into())), true),
+            (Err(DurableError::Conflict("raced".into())), false),
+            (Err(DurableError::Interrupted("stopping".into())), false),
+            (Err(DurableError::Parked("a cap".into())), false),
+            (Err(DurableError::Engine("the store".into())), false),
+            (Err(DurableError::Nested("a step".into())), false),
+        ];
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        for (i, (end, removed)) in ends.into_iter().enumerate() {
+            let dir =
+                std::env::temp_dir().join(format!("atomic-settle-{}-{i}", std::process::id()));
+            let caches = atomic_core::worktree::Caches::new(dir.clone());
+            caches.create().expect("create");
+            std::fs::write(dir.join("built"), "x").expect("write");
+            runtime.block_on(settle_caches("run-1", caches, &end));
+            assert_eq!(!dir.exists(), removed, "{end:?}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
 
     fn run() -> PipelineRun {
         serde_json::from_value(json!({
