@@ -1,0 +1,4 @@
+DRAFT: new terminal rollout
+
+Draft plan for replacing every point of sale terminal in the shops next spring. Not
+reviewed yet. Refund handling on the new terminal is still an open question.

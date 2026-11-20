@@ -192,6 +192,9 @@ pub fn load(path: &Path) -> Result<Project, ProjectError> {
         let pointer = format!("/{key}");
         match key.as_str() {
             "atomic" | "name" | "collections" | "ignore" | "generated" | "workspace" => {}
+            // Settings, which share the file: the configuration layers read
+            // and check them (see `config`).
+            "model" | "database" | "runner" | "executor_id" | "budget" => {}
             "packages" | "exports" | "package" | "models" => {
                 return Err(invalid(
                     &pointer,

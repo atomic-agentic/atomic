@@ -1,0 +1,6 @@
+{
+  "harbour": {"offset": "-03:30", "name": "Harbour Street"},
+  "delta": {"offset": "+05:30", "name": "Delta Market"},
+  "depot": {"offset": "+00:00", "name": "Central Depot"},
+  "ridge": {"offset": "-05:00", "name": "Ridge Road"}
+}

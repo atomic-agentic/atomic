@@ -472,9 +472,10 @@ fn make_writable(path: &Path) {
     }
 }
 
-/// Say on stderr what the backend could not do and is carrying on without.
+/// Say on stderr what the backend could not do and is carrying on without,
+/// through the log the binary installs (see [`crate::set_log`]).
 fn warn(message: &str) {
-    eprintln!("atomic: {message}");
+    crate::log(&format!("atomic: {message}"));
 }
 
 /// Whether process `pid` may still run. Where that cannot be told, it may.

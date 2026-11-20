@@ -175,8 +175,26 @@ fn an_exec_atom_cannot_reach_atomics_private_state() {
         std::fs::write(&other_db, "SQLite format 3").expect("other db");
         // A socket a confined command must not reach, such as a bus, and a
         // TCP port.
-        let socket = dir.join("bus.sock");
+        // Its path goes through a short link in /tmp: a Unix socket's path
+        // must fit in 108 bytes, and a deep checkout's target directory
+        // need not.
+        let short = Path::new("/tmp").join(format!(
+            "atomic-eps-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        std::os::unix::fs::symlink(&dir, &short).expect("short link");
+        let socket = short.join("bus.sock");
         let _bus = std::os::unix::net::UnixListener::bind(&socket).expect("unix socket");
+        assert!(
+            dir.join("bus.sock").exists(),
+            "the socket is in the test's directory"
+        );
+        // The positive control: outside the sandbox, the socket answers.
+        let _reached = std::os::unix::net::UnixStream::connect(&socket).expect("reached");
         let tcp = std::net::TcpListener::bind("127.0.0.1:0").expect("tcp");
         let port = tcp.local_addr().expect("port").port();
         let project = dir.join("project");
@@ -271,6 +289,7 @@ fn an_exec_atom_cannot_reach_atomics_private_state() {
             .output()
             .expect("count");
         assert_eq!(String::from_utf8_lossy(&forged.stdout).trim(), "0");
+        let _ = std::fs::remove_file(&short);
         let _ = std::fs::remove_dir_all(&dir);
     });
 }

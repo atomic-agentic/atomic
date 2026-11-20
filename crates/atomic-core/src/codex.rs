@@ -147,7 +147,9 @@ pub struct PrivateState {
     /// while a thread runs is covered too.
     pub private: PathBuf,
     /// Other directories denied whole: the context key, the credential file
-    /// store, and another atomic home's state.
+    /// store, another atomic home's state, and the person's own
+    /// configuration, which can name a store with its password or an
+    /// endpoint with its credential.
     pub also: Vec<PathBuf>,
 }
 
@@ -166,6 +168,9 @@ impl StateGuard {
         crate::state::private_dir(&private)?;
         let mut also = vec![crate::state::credentials_dir()?];
         also.push(crate::context::default_key_dir().map_err(anyhow::Error::msg)?);
+        // Made if missing, like the others, so it is denied from the start
+        // and a file put there later is denied too.
+        also.extend(crate::state::user_config_dir());
         for dir in &also {
             crate::state::private_dir(dir)?;
         }
@@ -223,6 +228,13 @@ fn denied_paths(private: &PrivateState, codex_home: &Path) -> (Vec<PathBuf>, Vec
         }
         all.push(path);
     }
+    // A path inside another denied path is denied with it, and the sandbox
+    // cannot mount a denial inside one: such as the credential store inside
+    // the person's own configuration directory.
+    all.sort();
+    all.dedup();
+    let inside_another = |p: &PathBuf| all.iter().any(|q| q != p && p.starts_with(q));
+    let all: Vec<PathBuf> = all.iter().filter(|p| !inside_another(p)).cloned().collect();
     // Codex creates its state database when the first thread starts, after
     // the list above is made: a pattern, expanded when each command starts,
     // covers it.
@@ -311,15 +323,18 @@ fn refuse_uncovered_store(
 }
 
 /// atomic's own variables: its configuration and the credentials it holds,
-/// such as its database URL, project secrets and telemetry headers.
-const ATOMIC_OWN: [&str; 3] = ["ATOMIC_*", "DBOS__*", "OTEL_EXPORTER_OTLP_HEADERS"];
+/// such as its database URL, project secrets and telemetry settings. The
+/// core inheritance already leaves them out; this keeps them out if it ever
+/// widens.
+const ATOMIC_OWN: [&str; 3] = ["ATOMIC_*", "DBOS__*", "OTEL_*"];
 
 /// The environment of every command a thread runs: the platform's core
-/// variables from this process (`PATH`, `HOME`, `USER` and the like),
-/// except any whose name holds `KEY`, `SECRET` or `TOKEN` and any of
-/// atomic's own, and then exactly what the atom declares (`declared`).
-/// Nothing else of atomic's environment reaches the command, and through
-/// its output, the model.
+/// variables from this process (`PATH`, `USER` and the like), except any
+/// whose name holds `KEY`, `SECRET` or `TOKEN`, any of atomic's own and any
+/// in [`SHELL_EXCLUDES`], with `HOME` at [`SHELL_HOME`], and then exactly
+/// what the atom declares (`declared`), which the runtime gives the
+/// attempt's own `HOME`. Nothing else of atomic's environment reaches the
+/// command, and through its output, the model.
 pub(crate) fn command_environment(declared: &BTreeMap<String, String>) -> ShellEnvironmentPolicy {
     use codex_protocol::config_types::{EnvironmentVariablePattern, ShellEnvironmentPolicyInherit};
     ShellEnvironmentPolicy {
@@ -327,11 +342,15 @@ pub(crate) fn command_environment(declared: &BTreeMap<String, String>) -> ShellE
         ignore_default_excludes: false,
         exclude: ATOMIC_OWN
             .iter()
+            .chain(SHELL_EXCLUDES)
             .map(|pattern| EnvironmentVariablePattern::new_case_insensitive(pattern))
             .collect(),
-        r#set: declared
-            .iter()
-            .map(|(name, value)| (name.clone(), value.clone()))
+        r#set: std::iter::once(("HOME".to_owned(), SHELL_HOME.to_owned()))
+            .chain(
+                declared
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone())),
+            )
             .collect(),
         include_only: Vec::new(),
         use_profile: false,
@@ -490,7 +509,9 @@ fn keep_sandbox_off_keyrings() {
             leave_session_keyring()
         };
         if let Err(e) = kept_off {
-            eprintln!("atomic: cannot keep a sandboxed command off the kernel keyrings: {e}");
+            crate::log_line!(
+                "atomic: cannot keep a sandboxed command off the kernel keyrings: {e}"
+            );
             std::process::exit(1);
         }
     }
@@ -1145,10 +1166,19 @@ where
             Err(e) => break Err(meter_error(e)),
         };
         report.turns += 1;
+        // One span per turn, which may make several requests; it ends before
+        // the turn is settled.
+        let span = crate::spans::hold(crate::usage::call_span(
+            &endpoint.model,
+            crate::usage::provider_name(&endpoint.base_url),
+        ));
         let bounded_by = ticket.as_ref().and_then(|t| t.bounded_by.clone());
         // A turn is cut off when its reserved time runs out; a failed or cut
         // off turn still reports the usage seen before it stopped.
-        let (turn, totals) = run_turn(&thread, &current, limit.time).await;
+        let (turn, totals) = span.run(run_turn(&thread, &current, limit.time)).await;
+        if let (Err(e), Some(span)) = (&turn, span.span()) {
+            crate::usage::record_error(&span, e);
+        }
         // Codex repeats the last totals in every token count, so a turn
         // whose requests reported nothing shows them unchanged; a request
         // that reports usage always grows them. A turn with nothing reported
@@ -1161,6 +1191,9 @@ where
                     output_tokens: (output - seen.1).max(0),
                 };
                 seen = (input, output);
+                if let Some(span) = span.span() {
+                    crate::usage::record_usage(&span, &grown);
+                }
                 report.input_tokens = input;
                 report.output_tokens = output;
                 report.total_tokens = total;
@@ -1168,6 +1201,7 @@ where
             }
             None => Outcome::Unknown,
         };
+        span.end();
         if let Err(e) = meter.settle(ticket, outcome).await {
             break Err(meter_error(e));
         }
@@ -1260,6 +1294,7 @@ async fn new_config(
     model_provider.env_key = endpoint.api_key_env.clone();
     model_provider.requires_openai_auth = false;
     model_provider.supports_websockets = false;
+    env_headers_for(&endpoint.base_url, &mut model_provider.env_http_headers);
     model_providers.insert(model_provider_id.clone(), model_provider.clone());
 
     let mut config = Config {
@@ -1452,6 +1487,46 @@ async fn new_config(
     Ok(config)
 }
 
+/// OpenAI's API, the one endpoint the OpenAI provider's organization and
+/// project headers are for.
+const OPENAI_DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
+
+/// Whether `base_url` is exactly OpenAI's API.
+fn is_openai_default(base_url: &str) -> bool {
+    base_url.trim_end_matches('/') == OPENAI_DEFAULT_BASE_URL
+}
+
+/// The OpenAI provider sends `OPENAI_ORGANIZATION` and `OPENAI_PROJECT` as
+/// headers: kept for OpenAI's own API only, never sent to another endpoint.
+fn env_headers_for(
+    base_url: &str,
+    headers: &mut Option<std::collections::HashMap<String, String>>,
+) {
+    if !is_openai_default(base_url) {
+        *headers = None;
+    }
+}
+
+/// Variables an atom's shell never sees, whatever else it inherits: atomic's
+/// and Codex's own settings, model and cloud credentials, and database
+/// connections. Matched without regard to case.
+pub const SHELL_EXCLUDES: &[&str] = &[
+    "ATOMIC_*",
+    "OPENAI_*",
+    "CODEX_*",
+    "DATABASE_URL",
+    "PG*",
+    "AWS_*",
+    "*_API_KEY",
+];
+
+/// The home directory an atom's shell is given: one that does not exist.
+/// Codex runs commands in the person's own shell, which reads startup files
+/// from the home directory even when it is not a login shell (bash's
+/// `.bashrc` when its input is a socket, zsh's `.zshenv` always), and those
+/// can export anything.
+pub const SHELL_HOME: &str = "/nonexistent";
+
 /// How long a turn waits for the thread to finish settling the previous one.
 const NOT_IDLE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -1556,7 +1631,8 @@ async fn turn(
                     .last_agent_message
                     .context("the turn completed without a message");
             }
-            EventMsg::Error(event) => bail!(event.message),
+            // A provider's error can echo what it was sent.
+            EventMsg::Error(event) => bail!("{}", crate::redact::excerpt(&event.message, 4096)),
             EventMsg::TurnAborted(_) => bail!("turn aborted"),
             EventMsg::ExecApprovalRequest(_) => bail!("turn requested exec approval"),
             EventMsg::ApplyPatchApprovalRequest(_) => bail!("turn requested patch approval"),
@@ -1572,6 +1648,103 @@ async fn turn(
 mod tests {
     use super::*;
     use crate::testing::{FakeModel, Reply};
+
+    #[test]
+    fn a_denied_path_inside_another_is_left_to_it() {
+        let dir = scratch("nested-deny");
+        let config = dir.join("config/atomic");
+        let credentials = config.join("credentials");
+        std::fs::create_dir_all(&credentials).expect("dirs");
+        std::fs::create_dir_all(dir.join("codex")).expect("codex home");
+        let private = PrivateState {
+            state_dir: dir.join("state"),
+            private: dir.join("private"),
+            also: vec![credentials.clone(), dir.join("key"), config.clone()],
+        };
+        let (denied, _) = denied_paths(&private, &dir.join("codex"));
+        assert!(denied.contains(&config), "{denied:?}");
+        assert!(denied.contains(&dir.join("key")), "{denied:?}");
+        assert!(
+            !denied.iter().any(|p| p.starts_with(&credentials)),
+            "the sandbox cannot deny inside a denied directory: {denied:?}"
+        );
+    }
+
+    #[test]
+    fn an_atoms_shell_inherits_no_secret() {
+        let policy = command_environment(&BTreeMap::from([(
+            "NOTE_DIR".to_owned(),
+            "/w/notes".to_owned(),
+        )]));
+        let around = [
+            ("PATH", "/usr/bin"),
+            ("HOME", "/home/dev"),
+            ("LANG", "C.UTF-8"),
+            ("OPENAI_API_KEY", "canary"),
+            ("OPENAI_ORGANIZATION", "canary"),
+            ("ATOMIC_DATABASE_URL", "canary"),
+            ("CODEX_HOME", "canary"),
+            ("DATABASE_URL", "canary"),
+            ("PGPASSWORD", "canary"),
+            ("AWS_ACCESS_KEY_ID", "canary"),
+            ("ANTHROPIC_API_KEY", "canary"),
+            ("GITHUB_TOKEN", "canary"),
+            ("MY_SECRET", "canary"),
+            ("UNRELATED", "canary"),
+        ]
+        .map(|(k, v)| (k.to_owned(), v.to_owned()));
+        let env = codex_protocol::shell_environment::populate_env(around.clone(), &policy, None);
+        let mut kept: Vec<&str> = env.keys().map(String::as_str).collect();
+        kept.sort_unstable();
+        assert_eq!(kept, ["HOME", "LANG", "NOTE_DIR", "PATH"], "{env:?}");
+        assert_eq!(env["HOME"], SHELL_HOME, "never the person's home");
+        // The exclusions hold even for what the platform's core list might
+        // one day include.
+        let mut wide = policy.clone();
+        wide.inherit = codex_protocol::config_types::ShellEnvironmentPolicyInherit::All;
+        let env = codex_protocol::shell_environment::populate_env(around, &wide, None);
+        for name in [
+            "OPENAI_ORGANIZATION",
+            "CODEX_HOME",
+            "DATABASE_URL",
+            "PGPASSWORD",
+            "AWS_ACCESS_KEY_ID",
+            "ANTHROPIC_API_KEY",
+        ] {
+            assert!(!env.contains_key(name), "{name}: {env:?}");
+        }
+    }
+
+    #[test]
+    fn only_openais_api_gets_the_organization_headers() {
+        let built_in = built_in_model_providers(None)
+            .get(OPENAI_PROVIDER_ID)
+            .expect("the OpenAI provider")
+            .env_http_headers
+            .clone();
+        let names = |h: &Option<std::collections::HashMap<String, String>>| {
+            h.as_ref()
+                .map(|h| h.values().cloned().collect::<Vec<_>>())
+                .unwrap_or_default()
+        };
+        assert!(names(&built_in).contains(&"OPENAI_ORGANIZATION".to_owned()));
+        let mut kept = built_in.clone();
+        env_headers_for("https://api.openai.com/v1", &mut kept);
+        assert_eq!(kept, built_in);
+        let mut elsewhere = built_in.clone();
+        env_headers_for("https://example.com/v1", &mut elsewhere);
+        assert_eq!(elsewhere, None);
+        assert!(is_openai_default("https://api.openai.com/v1"));
+        assert!(is_openai_default("https://api.openai.com/v1/"));
+        for other in [
+            "http://127.0.0.1:11434/v1",
+            "https://api.openai.com.example/v1",
+            "https://api.openai.com@example.com/v1",
+            "https://example.com/v1",
+        ] {
+            assert!(!is_openai_default(other), "{other}");
+        }
+    }
 
     fn scratch(tag: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("atomic-codex-{tag}-{}", std::process::id()));
@@ -1846,6 +2019,34 @@ mod tests {
             "{env:?}"
         );
         assert_eq!(env["CARGO_TARGET_DIR"], "/cache/target");
+    }
+
+    /// Should the inheritance ever widen, atomic's own variables still stay
+    /// out: the exporter's settings among them.
+    #[test]
+    fn atomics_own_variables_stay_out_whatever_is_inherited() {
+        use codex_protocol::config_types::ShellEnvironmentPolicyInherit;
+        let inherited = [
+            ("PATH", "/usr/bin"),
+            ("ATOMIC_DATABASE_URL", "postgres://atomic:pw@db/atomic"),
+            ("DBOS__APPVERSION", "1"),
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4318"),
+            ("OTEL_EXPORTER_OTLP_HEADERS", "authorization=Bearer x"),
+            ("SOME_TOOL_SETTING", "x"),
+        ]
+        .map(|(k, v)| (k.to_owned(), v.to_owned()));
+        let mut policy = command_environment(&BTreeMap::new());
+        policy.inherit = ShellEnvironmentPolicyInherit::All;
+        let env = codex_protocol::shell_environment::create_env_from_vars(inherited, &policy, None);
+        let names: std::collections::BTreeSet<&str> = env.keys().map(String::as_str).collect();
+        // HOME is atomic's own, a directory that does not exist, never one
+        // inherited.
+        assert_eq!(
+            names,
+            ["HOME", "PATH", "SOME_TOOL_SETTING"].into(),
+            "{env:?}"
+        );
+        assert_eq!(env["HOME"], SHELL_HOME);
     }
 
     #[test]

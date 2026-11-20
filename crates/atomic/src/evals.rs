@@ -33,7 +33,7 @@ use atomic_app::pipeline::LAYOUT_VERSION;
 use atomic_core::AtomConfig;
 use atomic_core::artifact::LocalStore;
 use atomic_core::atom::{self, Atom};
-use atomic_core::budget::{Budget, BudgetSettings, Resolved};
+use atomic_core::budget::{Budget, Resolved};
 use atomic_core::cassette::{Cassette, Mode, Tally};
 use atomic_core::codex::{CodexPaths, ModelEndpoint};
 use atomic_core::collections;
@@ -293,19 +293,28 @@ pub async fn run(
     state.create()?;
     let _lock = state.lock_execution("atomic eval")?;
     let needs_model = chosen.atoms.iter().any(|(a, _, _)| calls_model(a));
+    // The settings `atomic run` resolves: files, variables and flags.
+    let resolved = crate::engine::settings(&state, &args.engine)?;
     // A recording answers only the request it was made for, endpoint and
     // model included, so replaying needs them configured as they were; it
-    // needs no key, so none is read.
-    let mut endpoint = args.engine.endpoint(needs_model)?;
-    if source == Source::Recorded {
-        endpoint.api_key_env = None;
+    // needs no key, so none is read. A live eval calls the endpoint as a
+    // run would.
+    let endpoint = match (source, needs_model) {
+        (Source::Recorded, true) => crate::engine::identity(&resolved)?,
+        _ => crate::engine::endpoint(&resolved, needs_model)?,
+    };
+    if source != Source::Recorded
+        && needs_model
+        && let Some(line) = resolved.announcement()
+    {
+        atomic_core::log_line!("{line}");
     }
-    // TODO: share the project store's lock with runs (`LocalStore::for_project`).
-    let store = LocalStore::open(state.dir().join("artifacts")).context("the artifact store")?;
+    // The project's artifact store, under the same lock as runs'.
+    let store = LocalStore::for_project(&state).context("the artifact store")?;
     // A live call is metered: without the ledger, none is made.
     let ledger = if source != Source::Recorded && needs_model {
-        let database = crate::engine::database(&state);
-        let executor = atomic_durable::executor_identity(args.engine.executor_id.as_deref())?;
+        let database = crate::engine::store_of(&state, &resolved.settings);
+        let executor = atomic_durable::executor_identity(resolved.settings.executor_id.as_deref())?;
         let rt = Durare::open(&database, executor.as_deref(), LAYOUT_VERSION)
             .await
             .map_err(|e| {
@@ -323,7 +332,8 @@ pub async fn run(
     } else {
         None
     };
-    let budgets = BudgetSettings::default();
+    // The budget caps and prices a run is metered under.
+    let budgets = resolved.settings.budget.clone();
     // Every live atom's budget is resolved before any call, so one that
     // cannot be stops the eval before it spends anything.
     let mut plans = std::collections::BTreeMap::new();
@@ -345,7 +355,7 @@ pub async fn run(
             plans.insert(atom.name.clone(), plan);
         }
     }
-    let exec = crate::engine::exec_backend(&state, paths, &args.engine)?;
+    let exec = crate::engine::exec_backend(&state, paths, crate::engine::runner_of(&resolved)?)?;
     let unique = format!(
         "{}-{}",
         std::time::SystemTime::now()

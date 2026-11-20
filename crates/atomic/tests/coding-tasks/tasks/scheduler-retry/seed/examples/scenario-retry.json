@@ -1,0 +1,9 @@
+{
+  "retry": {"base": 5, "factor": 2, "max_delay": 60},
+  "jobs": [
+    {"name": "sync-ledger", "at": 0, "priority": 1, "duration": 4, "outcomes": ["fail", "fail", "ok"]},
+    {"name": "build-index", "at": 2, "duration": 3},
+    {"name": "mail-digest", "at": 10, "duration": 2, "outcomes": ["fail"], "max_attempts": 2},
+    {"name": "purge-tmp", "at": 13, "duration": 1}
+  ]
+}

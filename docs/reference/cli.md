@@ -9,12 +9,12 @@ Angle brackets below mean a value you supply, not literal shell syntax.
 | Command | Purpose | Planned stage |
 | --- | --- | --- |
 | `atomic` | Open the interactive coding client; attach to an existing runtime or start locally | v0.5 interactive CLI |
-| `atomic init` | Create a manifest and starter definitions | v0.1 |
+| `atomic init` | Create a manifest and starter definitions | v0.1, built |
 | `atomic run <name-or-file> --input <file.json>` | Run an atom or workflow with typed input, by its name or by the path to its file | v0.1 |
 | `atomic curl <name> -d '<json>'` | Send JSON to an atom or workflow on a running runtime and print the typed result | v0.5 |
 | `atomic check` | Validate project definitions and references | v0.1 |
 | `atomic eval [<atom>…]` | Evaluate atoms against their cases, from cassettes unless `--live` or `--no-cassettes`; exits non-zero below an atom's threshold. `--case`, `--sample`/`--seed`, `--junit`, `--report`, `--revision`, `--allow-unscored`. See [eval cases](eval-cases.md#cases-golden-fixtures-and-recordings) | v0.1 |
-| `atomic config --explain` | Inspect resolved values, sources and detected defaults | v0.1 |
+| `atomic config --explain` | Inspect resolved values, sources and detected defaults | v0.1, built |
 | `atomic runs show <run-id>` | Inspect saved results, metadata and run state | v0.1 |
 | `atomic runs resume <run-id>` | Continue the same unfinished local run in the foreground | v0.1 |
 | `atomic serve` | Run the local headless runtime and recover eligible unfinished runs | v0.1 local; team service v0.5 |
@@ -31,6 +31,16 @@ and state store. It uses saved inputs and definitions; there is no replacement
 `--input`. If another local runtime owns the project, it reports that owner
 and does not start a competing executor. See [recovery](../concepts/durable-execution.md#resume-existing-work)
 for gate deadlines, budgets and recovery limits.
+
+`atomic runs show <run-id>` prints what the store recorded about a run: its
+workflow, status, input and output; each attempt, which is each time the run
+executed, from its start or from its checkpoints; each recorded step with the
+attempt that ran it, so after a kill and a resume it shows which steps the
+resume found checkpointed and which it ran again; its model calls and tokens;
+its gates; and the Codex threads that hold its transcripts. `--json` gives the
+same as one document, with each step's output. It reads the store alone, and
+runs nothing: it needs no model, does not take the project's execution lock,
+and answers while a run holds it.
 
 ## Choose what to run and what to send
 
