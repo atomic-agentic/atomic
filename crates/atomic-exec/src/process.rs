@@ -43,17 +43,151 @@ fn kill_group(group: u32) {
 /// never report how any of them ended, so no step records an outcome its
 /// own process did not reach. Returns how many were running.
 ///
+/// On Linux it returns only once every process this one started, directly
+/// or not, has ended: one in another process group or session, as a
+/// sandbox's command is, included. Each is stopped where it is, so none
+/// starts another while the rest are found, then killed, and waited for.
+/// While some outlive their kill, `report` is given their process ids
+/// after ten seconds and every thirty after that, and the wait goes on:
+/// the process, and any lock it holds, outlasts every command it stopped.
+///
 /// Call it, then exit. The steps that were running stay unfinished, and
 /// their attempt guards decide whether their commands may run again.
-pub fn stop_all() -> usize {
+pub fn stop_all(report: &mut dyn FnMut(&[u32])) -> usize {
     // Under the lock that spawning holds, so a process is either killed
     // here or never started.
     let running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
     STOPPING.store(true, Ordering::SeqCst);
+    #[cfg(target_os = "linux")]
+    let stopped = descendants::stop();
     for group in running.iter() {
         kill_group(*group);
     }
+    #[cfg(target_os = "linux")]
+    descendants::kill_and_wait(&stopped, report);
+    #[cfg(not(target_os = "linux"))]
+    let _ = report;
     running.len()
+}
+
+/// The processes this one started, directly or not, found through
+/// `/proc`: each known by its process id and when it started, which tells
+/// it from a later process given the same id.
+#[cfg(target_os = "linux")]
+mod descendants {
+    use std::collections::{HashMap, HashSet};
+    use std::time::{Duration, Instant};
+
+    /// A process, by its id and its start time in clock ticks after boot.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub(super) struct Process {
+        pid: libc::pid_t,
+        started: u64,
+    }
+
+    /// Its state, parent and start time, from `/proc/<pid>/stat`.
+    fn stat(pid: libc::pid_t) -> Option<(char, libc::pid_t, u64)> {
+        let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // After the command name, which may hold spaces and parentheses.
+        let fields: Vec<&str> = text.rsplit_once(')')?.1.split_whitespace().collect();
+        let state = fields.first()?.chars().next()?;
+        let parent = fields.get(1)?.parse().ok()?;
+        // Field 22 of the whole line; the 20th after the name.
+        let started = fields.get(19)?.parse().ok()?;
+        Some((state, parent, started))
+    }
+
+    /// Whether `process` still runs: there, the same process, and neither
+    /// a zombie nor dead.
+    fn alive(process: &Process) -> bool {
+        stat(process.pid).is_some_and(|(state, _, started)| {
+            started == process.started && !matches!(state, 'Z' | 'X' | 'x')
+        })
+    }
+
+    /// Every process now running whose parents lead to this one.
+    fn found() -> Vec<Process> {
+        let mut children: HashMap<libc::pid_t, Vec<Process>> = HashMap::new();
+        for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+            let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse().ok()) else {
+                continue;
+            };
+            if let Some((state, parent, started)) = stat(pid)
+                && !matches!(state, 'Z' | 'X' | 'x')
+            {
+                children
+                    .entry(parent)
+                    .or_default()
+                    .push(Process { pid, started });
+            }
+        }
+        let mut out = Vec::new();
+        let mut next = vec![libc::pid_t::try_from(std::process::id()).unwrap_or(0)];
+        while let Some(parent) = next.pop() {
+            for child in children.remove(&parent).unwrap_or_default() {
+                next.push(child.pid);
+                out.push(child);
+            }
+        }
+        out
+    }
+
+    /// Send `signal` to `process` if it is still the same process.
+    fn signal(process: &Process, signal: libc::c_int) {
+        if stat(process.pid).is_some_and(|(_, _, started)| started == process.started) {
+            // SAFETY: kill only sends a signal.
+            #[allow(unsafe_code)]
+            unsafe {
+                libc::kill(process.pid, signal);
+            }
+        }
+    }
+
+    /// Stop every process this one started, directly or not, where it is,
+    /// looking again until no new one appears: a stopped process starts
+    /// nothing more.
+    pub(super) fn stop() -> Vec<Process> {
+        let mut stopped: HashSet<Process> = HashSet::new();
+        loop {
+            let new: Vec<Process> = found()
+                .into_iter()
+                .filter(|p| !stopped.contains(p))
+                .collect();
+            if new.is_empty() {
+                break;
+            }
+            for process in new {
+                signal(&process, libc::SIGSTOP);
+                stopped.insert(process);
+            }
+        }
+        stopped.into_iter().collect()
+    }
+
+    /// Kill each of `stopped` and wait until none runs, giving `report` the
+    /// ids of those still running after ten seconds and every thirty after.
+    pub(super) fn kill_and_wait(stopped: &[Process], report: &mut dyn FnMut(&[u32])) {
+        for process in stopped {
+            signal(process, libc::SIGKILL);
+        }
+        let begun = Instant::now();
+        let mut next = Duration::from_secs(10);
+        loop {
+            let left: Vec<u32> = stopped
+                .iter()
+                .filter(|p| alive(p))
+                .filter_map(|p| u32::try_from(p.pid).ok())
+                .collect();
+            if left.is_empty() {
+                return;
+            }
+            if begun.elapsed() >= next {
+                report(&left);
+                next += Duration::from_secs(30);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 }
 
 /// Which process group a process [`run_in`] starts runs in.

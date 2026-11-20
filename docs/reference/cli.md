@@ -216,7 +216,10 @@ as a shell's background job, which they keep ignoring. No step starts after the 
 up to 10 seconds to reach a checkpoint; a second signal stops the process at
 once. A command still running then is killed, with everything it
 started, also under `--runner process`, and the process exits without recording
-how the command ended: `atomic serve` with status 1, `atomic run` and
+how the command ended. On Linux it exits, freeing the project's execution lock,
+only once every process its commands started has ended, one in another
+process group or session included, and it names any still running after ten
+seconds while it waits: `atomic serve` with status 1, `atomic run` and
 `atomic runs resume` with status 130, leaving the run for `atomic runs resume`. Unfinished work stays recorded for the
 next `serve` or `runs resume`, and an interrupted command runs again only if it
 declares `effects.external` as `read-only` or `idempotent`; any other is parked
@@ -226,7 +229,7 @@ Whatever a command leaves running in its group when it ends is stopped then
 (under `--runner process`, when its runner ends). Output that arrives more than
 two seconds after a command exits is not its output, so a process that left
 its group, such as one started with `setsid`, cannot hold the step open,
-though atomic cannot stop it. A runner
+though atomic stops it only when it stops itself. A runner
 ignores the stop signals a command in its group might send it.
 
 One process recovers a run at most five times at the same step before it fails

@@ -446,7 +446,14 @@ async fn stop(signals: &mut Signals, who: &str, exit: Exit) -> ! {
     // The engine's drain ends at its time limit whether or not its steps
     // did, so whatever still runs is stopped here, and its end is never
     // recorded: this process exits first.
-    let stopped = atomic_exec::process::stop_all();
+    // It returns once every process this one started has ended, so the
+    // execution lock, which goes with this process, outlasts them all.
+    let stopped = atomic_exec::process::stop_all(&mut |left| {
+        atomic_core::log_line!(
+            "{who}: processes {left:?} of stopped commands have not ended yet; the execution lock \
+             stays held until they do"
+        );
+    });
     if stopped > 0 {
         atomic_core::log_line!(
             "{who}: stopped {stopped} command(s) that had not finished; their runs continue with \
