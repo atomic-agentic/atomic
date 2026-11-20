@@ -22,6 +22,7 @@
 //! scripted fake model.
 
 use atomic_durable::failpoints::site_of;
+use atomic_durable::gate;
 use atomic_durable::{DurableRuntime, Durare, DurareContext, Proposal, WorkflowContext, run_atom};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -129,6 +130,40 @@ async fn engine(dir: &Path) -> Durare {
             Ok(json!(n))
         }
     });
+    // Two operations of one name.
+    rt.register("twice", |ctx: DurareContext, (): ()| async move {
+        for _ in 0..2 {
+            let _: i64 = ctx
+                .transaction("x", |mut tx| {
+                    Box::pin(async move { tx.query_one("SELECT 1 AS one", &[]).await?.int("one") })
+                })
+                .await?;
+        }
+        Ok(json!(2))
+    });
+    // A run that waits at a gate the local operator decides.
+    rt.register("gated", |ctx: DurareContext, (): ()| async move {
+        let approvers = gate::resolve(
+            "check",
+            None,
+            &gate::Deployment::Local {
+                operator: gate::Principal::local("dev"),
+            },
+        )
+        .map_err(|e| atomic_durable::DurableError::Failed(e.to_string()))?;
+        let spec = gate::GateSpec {
+            workflow: "gated".into(),
+            title: "Ship it".into(),
+            show: Value::Null,
+            evidence: Vec::new(),
+            approvers,
+            tier: gate::Tier::High,
+            timeout: None,
+            on_timeout: Default::default(),
+        };
+        let resolution = gate::gate(&ctx, "check", spec).await?;
+        Ok(json!(resolution.approved()))
+    });
     rt.launch().await.expect("launch");
     rt
 }
@@ -169,6 +204,10 @@ fn failpoints_child() {
                 rt.start("probe", RUN, ()).await.expect("start");
             } else if role == "retried" {
                 rt.start("retried", RUN, ()).await.expect("start");
+            } else if role == "gated" {
+                rt.start("gated", RUN, ()).await.expect("start");
+            } else if role == "twice" {
+                rt.start("twice", RUN, ()).await.expect("start");
             } else {
                 rt.recover().await.expect("recover");
             }
@@ -419,5 +458,112 @@ fn a_transaction_body_the_engine_retries_is_one_operation_to_its_failpoints() {
     assert_eq!(
         lines(&dir.join("first.log")),
         ["checkpoint:before:race", "checkpoint:after:race"]
+    );
+}
+
+/// The wake-ups queued for `run`, read or not: the engine keeps a message
+/// it delivered.
+fn notifications(db: &Path, run: &str) -> i64 {
+    use sqlx::Connection;
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(async {
+            let mut c = sqlx::SqliteConnection::connect(&format!("sqlite://{}", db.display()))
+                .await
+                .expect("connect");
+            let (n,): (i64,) =
+                sqlx::query_as("SELECT COUNT(*) FROM notifications WHERE destination_uuid = ?")
+                    .bind(run)
+                    .fetch_one(&mut c)
+                    .await
+                    .expect("count");
+            n
+        })
+}
+
+#[test]
+fn a_redelivered_wake_up_is_the_same_wake_up() {
+    let dir = scratch("redelivered");
+    // The run opens its gate and dies before it waits.
+    let (status, _) = child(&dir, "gated", Some("gate:after-open"), "first.log");
+    assert!(!status.success(), "killed after the gate opened");
+
+    // While no process runs it, the operator decides, which wakes it, and a
+    // resumer redelivers the wake-up, as one does on start.
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(async {
+            let terminal = Durare::sqlite(&dir.join("atomic.db")).await.expect("store");
+            let open = gate::gates(
+                &terminal,
+                gate::GateFilter {
+                    open_only: true,
+                    run: Some(RUN.to_owned()),
+                },
+            )
+            .await
+            .expect("gates");
+            let g = open.first().expect("the open gate").clone();
+            let credential =
+                gate::HumanCredential::new(gate::Principal::local("dev"), "the operator's secret");
+            gate::enroll(&terminal, &credential).await.expect("enroll");
+            gate::decide(
+                &terminal,
+                &credential,
+                gate::DecisionCommand {
+                    command_id: "approve-1".into(),
+                    gate: g.id.clone(),
+                    verdict: gate::Verdict::Approve,
+                    comment: None,
+                    proposal: g.proposal.clone(),
+                },
+            )
+            .await
+            .expect("decided");
+            assert_eq!(gate::redeliver(&terminal).await.expect("redeliver"), 1);
+        });
+    // A wake-up is keyed by its gate, so the redelivery was the same one: a
+    // gate wakes its run at most once.
+    assert_eq!(notifications(&dir.join("atomic.db"), RUN), 1);
+
+    // The recovered run takes that wake-up, reads the decision once, and
+    // finishes.
+    let (status, stderr) = child(&dir, "recover", None, "second.log");
+    assert!(status.success(), "recovered: {status}\n{stderr}");
+    assert_eq!(result(&dir), json!(true));
+    let second = lines(&dir.join("second.log"));
+    let count = |name: &str| second.iter().filter(|l| *l == name).count();
+    assert_eq!(count("checkpoint:before:check.decision"), 1, "{second:?}");
+    assert_eq!(count("checkpoint:after:check.decision"), 1, "{second:?}");
+    assert_eq!(
+        second
+            .iter()
+            .filter(|l| l.starts_with("recv:after:"))
+            .count(),
+        1,
+        "{second:?}"
+    );
+    assert_eq!(notifications(&dir.join("atomic.db"), RUN), 1);
+}
+
+#[test]
+fn two_operations_of_one_name_each_reach_their_failpoints() {
+    let dir = scratch("twice");
+    let (status, stderr) = child(&dir, "twice", None, "first.log");
+    assert!(status.success(), "the run finished: {status}\n{stderr}");
+    // Two calls, two durable operations: a real repeat stays visible.
+    assert_eq!(
+        lines(&dir.join("first.log")),
+        [
+            "checkpoint:before:x",
+            "checkpoint:after:x",
+            "checkpoint:before:x",
+            "checkpoint:after:x"
+        ]
     );
 }
