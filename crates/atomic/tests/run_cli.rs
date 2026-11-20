@@ -4653,3 +4653,98 @@ fn the_debug_prompt_says_its_turn_is_not_metered() {
         assert_eq!(model.calls(), 1);
     });
 }
+
+/// A copy of `rank-note` named `name`, declaring `trust` if one is given.
+fn ranking_atom(project: &Path, name: &str, trust: Option<&str>) {
+    let config = match trust {
+        Some(trust) => format!("description: '{name}', trust: '{trust}'"),
+        None => format!("description: '{name}'"),
+    };
+    write_atom(
+        project,
+        name,
+        &config,
+        "Rank the note from 1 (urgent) to 3.\nTitle: {input.title}\nWords: {input.words}",
+        object(json!({"title": {"type": "string"}, "words": {"type": "integer"}})),
+        object(json!({"priority": {"type": "integer", "minimum": 1, "maximum": 3}})),
+    );
+}
+
+const RANK_INPUT: &str = r#"{"title": "Export crashes on accents", "words": 7}"#;
+
+#[test]
+fn a_direct_run_refuses_input_its_atom_does_not_trust_before_anything_runs() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(RANK.into())])
+            .await
+            .expect("fake model");
+        let dir = scratch("untrusted-input");
+        let project = project(&dir);
+        ranking_atom(&project, "rank-for-team", Some("team"));
+        ranking_atom(&project, "rank-for-agents", Some("agent"));
+        let env = model_env(&model.base_url());
+        for atom in ["rank-for-team", "rank-for-agents"] {
+            let (dir, project, env) = (dir.clone(), project.clone(), env.clone());
+            let out = tokio::task::spawn_blocking(move || {
+                atomic(
+                    &dir,
+                    &project,
+                    &["--json", "run", atom, "--data", RANK_INPUT],
+                    &with(&env, &[]),
+                    "",
+                )
+            })
+            .await
+            .expect("atomic");
+            assert!(!out.status.success(), "{atom}: {}", text(&out));
+            let error = &stdout_json(&out)["error"];
+            assert_eq!(error["kind"], "input.untrusted", "{atom}: {}", text(&out));
+            let message = error["description"].as_str().unwrap_or_default();
+            assert!(message.contains("external data"), "{atom}: {message}");
+            assert!(
+                message.contains(&format!("atom `{atom}`")),
+                "{atom}: {message}"
+            );
+            // Refused as the run was loaded: no durable run was started,
+            // which would name itself first on stderr.
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(!stderr.contains("run-"), "{atom}: a run started: {stderr}");
+        }
+        assert_eq!(model.calls(), 0, "a model was called");
+    });
+}
+
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[test]
+fn a_direct_run_takes_external_input_into_an_atom_that_accepts_it() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(RANK.into())])
+            .await
+            .expect("fake model");
+        let dir = scratch("external-input");
+        let project = project(&dir);
+        ranking_atom(&project, "rank-anything", Some("external"));
+        let env = model_env(&model.base_url());
+        // No trust declared, and external declared, both take the run's input.
+        for atom in ["rank-note", "rank-anything"] {
+            let (dir, project, env) = (dir.clone(), project.clone(), env.clone());
+            let out = tokio::task::spawn_blocking(move || {
+                atomic(
+                    &dir,
+                    &project,
+                    &["run", atom, "--data", RANK_INPUT],
+                    &with(&env, &[]),
+                    "",
+                )
+            })
+            .await
+            .expect("atomic");
+            assert!(out.status.success(), "{atom}: {}", text(&out));
+            assert_eq!(stdout_json(&out), json!({"priority": 1}), "{atom}");
+        }
+        assert_eq!(model.calls(), 2);
+    });
+}
