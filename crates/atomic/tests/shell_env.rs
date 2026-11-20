@@ -131,8 +131,10 @@ fn atomic_home_for(project: &Path, target: &str) -> PathBuf {
         .and_then(Path::file_name)
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("atomic-shell-env-{}-{target}-{test}", std::process::id()))
+    Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "atomic-shell-env-{}-{target}-{test}",
+        std::process::id()
+    ))
 }
 
 /// Run `target` of `project` through `atomic run` as a person with home

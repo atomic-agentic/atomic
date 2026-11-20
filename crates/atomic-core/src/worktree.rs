@@ -778,10 +778,7 @@ mod tests {
         assert_ne!(one["CARGO_TARGET_DIR"], two["CARGO_TARGET_DIR"]);
         for (name, value) in &one {
             if name != "RUSTUP_HOME" {
-                assert!(
-                    Path::new(value).starts_with(caches.dir()),
-                    "{name}={value}"
-                );
+                assert!(Path::new(value).starts_with(caches.dir()), "{name}={value}");
             }
         }
     }
