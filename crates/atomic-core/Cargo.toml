@@ -23,7 +23,6 @@ fake-model = []
 
 [dependencies]
 anyhow = { workspace = true }
-cel = { workspace = true }
 dirs = { workspace = true }
 globset = { workspace = true }
 ignore = { workspace = true }

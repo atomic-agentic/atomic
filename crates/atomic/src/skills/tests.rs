@@ -239,7 +239,7 @@ fn every_cel_example_checks_against_the_schemas_and_holds() {
             .unwrap_or_else(|e| panic!("{source}: {e}"));
         assert_eq!(
             evaluate(source, &input, &output),
-            cel::Value::Bool(true),
+            Value::Bool(true),
             "{meaning}: {source}"
         );
     }
@@ -248,37 +248,10 @@ fn every_cel_example_checks_against_the_schemas_and_holds() {
     assert!(misspelt.check(&scope).is_err());
 }
 
-fn evaluate(source: &str, input: &Value, output: &Value) -> cel::Value {
-    let program = cel::Program::compile(source).expect(source);
-    let mut context = cel::Context::default();
-    context.add_variable_from_value("input", cel_value(input));
-    context.add_variable_from_value("output", cel_value(output));
-    program.execute(&context).expect(source)
-}
-
-/// JSON as CEL values. Not through serde: with serde_json's
-/// `arbitrary_precision`, which the dependency graph enables, a number
-/// serializes as a map.
-fn cel_value(value: &Value) -> cel::Value {
-    match value {
-        Value::Null => cel::Value::Null,
-        Value::Bool(b) => cel::Value::Bool(*b),
-        Value::Number(n) => match (n.as_i64(), n.as_u64(), n.as_f64()) {
-            (Some(i), _, _) => cel::Value::Int(i),
-            (None, Some(u), _) => cel::Value::UInt(u),
-            (None, None, f) => cel::Value::Float(f.expect("a finite number")),
-        },
-        Value::String(s) => cel::Value::String(std::sync::Arc::new(s.clone())),
-        Value::Array(items) => {
-            cel::Value::List(std::sync::Arc::new(items.iter().map(cel_value).collect()))
-        }
-        Value::Object(fields) => cel::Value::from(
-            fields
-                .iter()
-                .map(|(k, v)| (k.clone(), cel_value(v)))
-                .collect::<std::collections::HashMap<String, cel::Value>>(),
-        ),
-    }
+/// Evaluate `source` the way a workflow does, through the shared converter.
+fn evaluate(source: &str, input: &Value, output: &Value) -> Value {
+    atomic_schema::expr::evaluate(source, &[("input", input), ("output", output)])
+        .unwrap_or_else(|e| panic!("{e}"))
 }
 
 fn jsonschema_valid(schema: &Value, value: &Value) -> bool {
@@ -475,7 +448,7 @@ fn the_worked_example_checks_renders_and_its_cases_hold() {
             if let Some(example) = example {
                 assert_eq!(
                     evaluate(source, &example.input, &example.output),
-                    cel::Value::Bool(true),
+                    Value::Bool(true),
                     "{path}: {source}"
                 );
                 held += 1;
