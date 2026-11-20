@@ -8,7 +8,8 @@
 //! call asks instead, for tests whose calls come in no fixed order, such as a
 //! crash suite whose killed steps run again. It speaks the streaming Responses API, which
 //! drives a real Codex thread deterministically, and the non-streaming
-//! Responses and Chat Completions calls a lite atom makes. It counts and
+//! Responses and Chat Completions calls a lite atom makes, and lists one
+//! model, `synthetic`, at Ollama's `GET /api/tags`. It counts and
 //! records every call, so durability and repair tests can assert exactly how
 //! many model calls were made.
 
@@ -41,6 +42,14 @@ pub enum Reply {
     /// This JSON as the whole body of a 200 response, for a non-streaming
     /// call.
     Json(Value),
+    /// This reply, held until `file` exists: a test creates it to let the
+    /// answer go, so it orders the call against something else it watches.
+    Gated {
+        /// The file whose existence releases the answer.
+        file: std::path::PathBuf,
+        /// The answer.
+        reply: Box<Reply>,
+    },
     /// This reply, sent once this long has passed.
     Delayed {
         /// How long to wait before answering.
@@ -170,9 +179,14 @@ async fn serve(socket: &mut tokio::net::TcpStream, state: &Mutex<State>) -> std:
         let path = path.split('?').next().unwrap_or_default();
 
         let chat = path.ends_with("/chat/completions");
-        let (status, content_type, text) = if method == "POST"
-            && (chat || path.ends_with("/responses"))
-        {
+        let (status, content_type, text) = if method == "GET" && path == "/api/tags" {
+            // What a local Ollama lists, so a test can stand it in for one.
+            (
+                "200 OK".to_owned(),
+                "application/json",
+                json!({"models": [{"name": "synthetic", "model": "synthetic"}]}).to_string(),
+            )
+        } else if method == "POST" && (chat || path.ends_with("/responses")) {
             let request: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
             let reply = match state.lock() {
                 Ok(mut s) => {
@@ -187,9 +201,23 @@ async fn serve(socket: &mut tokio::net::TcpStream, state: &Mutex<State>) -> std:
                 Err(_) => None,
             };
             let mut reply = reply.unwrap_or_else(|| Reply::Text("Synthetic reply.".into()));
-            while let Reply::Delayed { after, reply: then } = reply {
-                tokio::time::sleep(after).await;
-                reply = *then;
+            loop {
+                match reply {
+                    Reply::Delayed { after, reply: then } => {
+                        tokio::time::sleep(after).await;
+                        reply = *then;
+                    }
+                    Reply::Gated { file, reply: then } => {
+                        while !file.exists() {
+                            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                        }
+                        reply = *then;
+                    }
+                    answer => {
+                        reply = answer;
+                        break;
+                    }
+                }
             }
             let streaming = request.get("stream").and_then(Value::as_bool) != Some(false);
             match &reply {
@@ -247,7 +275,9 @@ fn output_item(reply: &Reply) -> Value {
             "type": "function_call", "id": "fc_synthetic", "call_id": "call_synthetic",
             "name": name, "arguments": arguments.to_string(), "status": "completed"
         }),
-        Reply::Http { .. } | Reply::Delayed { .. } | Reply::Json(_) => Value::Null,
+        Reply::Http { .. } | Reply::Delayed { .. } | Reply::Gated { .. } | Reply::Json(_) => {
+            Value::Null
+        }
     }
 }
 
@@ -276,7 +306,9 @@ fn chat_completion(request: &Value, reply: &Reply) -> Value {
         Reply::Text(text) | Reply::WithoutUsage(text) => {
             json!({"role": "assistant", "content": text})
         }
-        Reply::Http { .. } | Reply::Delayed { .. } | Reply::Json(_) => Value::Null,
+        Reply::Http { .. } | Reply::Delayed { .. } | Reply::Gated { .. } | Reply::Json(_) => {
+            Value::Null
+        }
     };
     let mut done = json!({
         "id": "chatcmpl_synthetic", "object": "chat.completion", "model": model_of(request),
