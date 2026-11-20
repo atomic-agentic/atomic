@@ -148,6 +148,61 @@ pub enum RunStatus {
     Other(String),
 }
 
+/// What the store records about a run beside its steps.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunRecord {
+    /// Its id.
+    pub id: String,
+    /// Where it is.
+    pub status: RunStatus,
+    /// The executor identity that last owned it.
+    pub executor: String,
+    /// The version it was stamped with, which only an engine of the same
+    /// version recovers.
+    pub version: String,
+    /// The queue it waits on, or was last taken from, if any.
+    pub queue: Option<String>,
+}
+
+/// What every resume queue's name starts with.
+pub const RESUME_QUEUES: &str = "atomic.resume.";
+
+impl RunRecord {
+    /// The executor that owns the run: the one that last claimed it, or,
+    /// while it waits on a resume queue unclaimed, the one the queue is for.
+    pub fn owner(&self) -> Option<&str> {
+        if !self.executor.is_empty() {
+            return Some(&self.executor);
+        }
+        self.queue
+            .as_deref()?
+            .strip_prefix(RESUME_QUEUES)?
+            .split_once('/')
+            .map(|(executor, _)| executor)
+    }
+}
+
+impl From<durare::WorkflowStatus> for RunRecord {
+    fn from(w: durare::WorkflowStatus) -> Self {
+        Self {
+            id: w.id,
+            status: run_status(&w.status, w.error),
+            executor: w.executor_id,
+            version: w.app_version,
+            queue: w.queue_name,
+        }
+    }
+}
+
+fn run_status(status: &str, error: Option<String>) -> RunStatus {
+    match status {
+        "PENDING" | "ENQUEUED" => RunStatus::Pending,
+        "SUCCESS" => RunStatus::Succeeded,
+        "ERROR" => RunStatus::Failed(error.unwrap_or_default()),
+        other => RunStatus::Other(other.to_owned()),
+    }
+}
+
 /// A value bound to a `?` placeholder in a transaction step's SQL.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Param {
@@ -471,9 +526,16 @@ pub trait DurableRuntime: Send + Sync + Sized {
     /// The run and step a thread belongs to, if a published step ran on it.
     fn thread(&self, thread_id: &str) -> impl Future<Output = Result<Option<ThreadRecord>>> + Send;
 
-    /// Run again every unfinished workflow this process may recover.
-    /// Returns how many it started.
+    /// Run again every unfinished workflow this process may recover: those
+    /// owned by its executor identity. Returns how many it started.
     fn recover(&self) -> impl Future<Output = Result<usize>> + Send;
+
+    /// Run unfinished workflow `id` again from its checkpoints, whichever
+    /// executor last owned it, so [`result`](Self::result) can follow it.
+    /// Its previous execution must have stopped. A finished workflow is left
+    /// as it is. On [`Durare`], only this executor's engines that take
+    /// resumed runs run it.
+    fn resume(&self, id: &str) -> impl Future<Output = Result<()>> + Send;
 
     /// Send `message` to workflow `run` on `topic`, from outside any
     /// workflow, for its [`recv`](WorkflowContext::recv). Delivered at most
@@ -549,6 +611,42 @@ pub(crate) fn to_durare(e: DurableError) -> durare::Error {
     }
 }
 
+/// The failpoints around one durable operation's checkpoint (see
+/// [`crate::failpoints`]): `checkpoint:before:<op>` once its body succeeded
+/// and before the engine commits its checkpoint, `checkpoint:after:<op>` once
+/// the checkpoint is committed. The second is reached only when this process
+/// ran the body, not when a replay returned the recorded output.
+#[derive(Clone)]
+struct Checkpoint {
+    name: Arc<str>,
+    ran: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Checkpoint {
+    /// The pair for operation `name`: one half for the body, one for the
+    /// caller.
+    fn new(name: &str) -> (Self, Self) {
+        let this = Self {
+            name: name.into(),
+            ran: Arc::default(),
+        };
+        (this.clone(), this)
+    }
+
+    fn before(&self) {
+        self.ran.store(true, std::sync::atomic::Ordering::SeqCst);
+        if crate::failpoints::armed() {
+            crate::failpoint(&format!("checkpoint:before:{}", self.name));
+        }
+    }
+
+    fn after(&self) {
+        if crate::failpoints::armed() && self.ran.load(std::sync::atomic::Ordering::SeqCst) {
+            crate::failpoint(&format!("checkpoint:after:{}", self.name));
+        }
+    }
+}
+
 /// [`WorkflowContext`] on durare.
 #[derive(Clone)]
 pub struct DurareContext {
@@ -570,6 +668,7 @@ impl WorkflowContext for DurareContext {
         // Called now, not when first polled: durare claims the step's
         // position here, so positions follow construction order whatever
         // order the futures are awaited in.
+        let (checkpoint, ran) = Checkpoint::new(name);
         let pending = self
             .engine
             .step(name, move |s: durare::StepCtx| async move {
@@ -577,9 +676,19 @@ impl WorkflowContext for DurareContext {
                     workflow_id: s.workflow_id().to_owned(),
                     step_id: s.step_id(),
                 };
-                body(info).await.map_err(to_durare)
+                let out = body(info).await;
+                if out.is_ok() {
+                    ran.before();
+                }
+                out.map_err(to_durare)
             });
-        async move { pending.await.map_err(from_durare) }
+        async move {
+            let out = pending.await.map_err(from_durare);
+            if out.is_ok() {
+                checkpoint.after();
+            }
+            out
+        }
     }
 
     fn transaction<T, F>(&self, name: &str, body: F) -> impl Future<Output = Result<T>> + Send
@@ -588,11 +697,27 @@ impl WorkflowContext for DurareContext {
         F: for<'t, 'c> Fn(Tx<'t, 'c>) -> TxFuture<'t, T> + Send + Sync + 'static,
     {
         // As for a step, the position is claimed now.
+        let (checkpoint, ran) = Checkpoint::new(name);
         let pending = self.engine.transaction(name, move |tx| {
             let fut = body(Tx(TxInner::Engine(tx)));
-            Box::pin(async move { fut.await.map_err(to_durare) })
+            let ran = ran.clone();
+            Box::pin(async move {
+                let out = fut.await;
+                if out.is_ok() {
+                    // Inside the transaction: its writes and its checkpoint
+                    // commit together after this, or not at all.
+                    ran.before();
+                }
+                out.map_err(to_durare)
+            })
         });
-        async move { pending.await.map_err(from_durare) }
+        async move {
+            let out = pending.await.map_err(from_durare);
+            if out.is_ok() {
+                checkpoint.after();
+            }
+            out
+        }
     }
 
     async fn control_transaction<T, F>(&self, body: F) -> Result<T>
@@ -613,7 +738,16 @@ impl WorkflowContext for DurareContext {
     {
         // As for a step, the position is claimed now.
         let pending = self.engine.recv::<T>(topic, timeout);
-        async move { pending.await.map_err(from_durare) }
+        let topic = topic.to_owned();
+        async move {
+            let out = pending.await.map_err(from_durare);
+            // The message taken, or the timeout, is recorded. A replay that
+            // returns the recorded one reaches this too.
+            if out.is_ok() && crate::failpoints::armed() {
+                crate::failpoint(&format!("recv:after:{topic}"));
+            }
+            out
+        }
     }
 }
 
@@ -624,6 +758,110 @@ impl WorkflowContext for DurareContext {
 pub(crate) enum Reads {
     Sqlite(sqlx::SqlitePool),
     Postgres(sqlx::PgPool),
+}
+
+/// Where atomic's durable store is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Database {
+    /// A SQLite file, created if missing.
+    Sqlite(std::path::PathBuf),
+    /// A PostgreSQL database, in one schema of its own.
+    Postgres {
+        /// The connection URL.
+        url: String,
+        /// The schema atomic's tables live in.
+        schema: String,
+    },
+}
+
+/// The environment variable the engine would otherwise read its executor
+/// identity from, ahead of anything atomic configures.
+pub const ENGINE_IDENTITY_VARIABLE: &str = "DBOS__VMID";
+
+/// The environment variable the engine would otherwise read the version it
+/// stamps on runs from, ahead of anything atomic configures.
+pub const ENGINE_VERSION_VARIABLE: &str = "DBOS__APPVERSION";
+
+/// The version stamped on runs by an engine whose caller names none, as the
+/// plain [`Durare::sqlite`] and [`Durare::postgres`] constructors do. The
+/// engine recovers and dequeues only runs of its own version, so a version
+/// that followed the executable would strand every unfinished run at each
+/// rebuild; atomic always names one.
+pub const DEFAULT_VERSION: &str = "atomic-durable.1";
+
+/// Why an executor identity was refused.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum IdentityError {
+    /// The engine's own variable is set, which would override atomic's
+    /// setting without atomic knowing.
+    #[error(
+        "{variable} is set to {value:?}; atomic takes its executor identity from its own \
+         configuration, never from the engine's variable"
+    )]
+    EngineVariable {
+        /// The variable.
+        variable: &'static str,
+        /// Its value.
+        value: String,
+    },
+    /// The identity is empty, too long or has characters outside
+    /// letters, digits, `.`, `_`, `:` and `-`.
+    #[error("executor identity {0:?} is not 1 to 128 letters, digits, `.`, `_`, `:` or `-`")]
+    Invalid(String),
+    /// The engine's version variable is set, which would stamp runs with a
+    /// version atomic does not choose, and strand them for any atomic that
+    /// does.
+    #[error(
+        "{variable} is set to {value:?}; atomic stamps runs with the version of its own durable \
+         step layout, never with the engine's variable"
+    )]
+    VersionVariable {
+        /// The variable.
+        variable: &'static str,
+        /// Its value.
+        value: String,
+    },
+}
+
+/// Refuse the engine's own identity and version variables, which would
+/// override atomic's settings without atomic knowing.
+fn engine_variables() -> std::result::Result<(), IdentityError> {
+    let set = |name| std::env::var_os(name).filter(|v| !v.is_empty());
+    if let Some(value) = set(ENGINE_IDENTITY_VARIABLE) {
+        return Err(IdentityError::EngineVariable {
+            variable: ENGINE_IDENTITY_VARIABLE,
+            value: value.to_string_lossy().into_owned(),
+        });
+    }
+    if let Some(value) = set(ENGINE_VERSION_VARIABLE) {
+        return Err(IdentityError::VersionVariable {
+            variable: ENGINE_VERSION_VARIABLE,
+            value: value.to_string_lossy().into_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Check the executor identity a process is configured with, and that
+/// nothing outside atomic overrides it or the version runs are stamped with.
+/// `None` means the store's default owner, `local`, which is safe only while
+/// one process uses the store.
+pub fn executor_identity(
+    configured: Option<&str>,
+) -> std::result::Result<Option<String>, IdentityError> {
+    engine_variables()?;
+    let Some(id) = configured else {
+        return Ok(None);
+    };
+    let fine = (1..=128).contains(&id.len())
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-'));
+    if fine {
+        Ok(Some(id.to_owned()))
+    } else {
+        Err(IdentityError::Invalid(id.to_owned()))
+    }
 }
 
 /// Whether a short transaction on atomic's tables commits.
@@ -694,6 +932,9 @@ pub struct Durare {
     /// follows that execution, including a crash, which a lookup by id would
     /// not see.
     started: std::sync::Mutex<std::collections::HashMap<String, durare::WorkflowHandle<Value>>>,
+    /// The resume queues this engine takes runs from (see
+    /// [`Durare::take_resumed_runs`]).
+    resume_queues: std::collections::BTreeSet<String>,
 }
 
 impl Durare {
@@ -709,13 +950,153 @@ impl Durare {
             .await
             .map_err(from_durare)?;
         let reads = sqlx::SqlitePool::connect(&url).await.map_err(db)?;
-        Self::over(Arc::new(provider), Reads::Sqlite(reads)).await
+        Self::over(
+            Arc::new(provider),
+            Reads::Sqlite(reads),
+            None,
+            DEFAULT_VERSION,
+        )
+        .await
+    }
+
+    /// An engine on `database` that owns its runs as `executor`, checked by
+    /// [`executor_identity`]: each process sharing a store needs an identity
+    /// of its own that stays the same across its restarts, so it recovers
+    /// its own unfinished runs and no one else's. `None` is the default
+    /// owner, `local`.
+    ///
+    /// Runs it starts are stamped with `version`, and it recovers and
+    /// dequeues only runs of that version. Name the layout of the durable
+    /// steps the registered workflows record, changed exactly when a run
+    /// started under the old layout could not replay under the new one, so
+    /// any build of the same layout continues the same runs.
+    pub async fn open(database: &Database, executor: Option<&str>, version: &str) -> Result<Self> {
+        let executor =
+            executor_identity(executor).map_err(|e| DurableError::Engine(e.to_string()))?;
+        match database {
+            Database::Sqlite(path) => {
+                crate::store::open_sqlite(path)
+                    .await
+                    .map_err(|e| DurableError::Engine(e.to_string()))?;
+                let url = format!("sqlite://{}?mode=rwc", path.display());
+                let provider = durare::SqliteProvider::connect(&url)
+                    .await
+                    .map_err(from_durare)?;
+                let reads = sqlx::SqlitePool::connect(&url).await.map_err(db)?;
+                Self::over(Arc::new(provider), Reads::Sqlite(reads), executor, version).await
+            }
+            Database::Postgres { url, schema } => {
+                Self::postgres_as(url, schema, executor, version).await
+            }
+        }
+    }
+
+    /// The identity this engine owns its runs as.
+    pub fn executor_id(&self) -> &str {
+        self.engine.executor_id()
+    }
+
+    /// The queue a resumed run `run` of this executor goes on:
+    /// `atomic.resume.<executor>/<run>`, one queue per run. An executor
+    /// identity has no `/`, so the queue names the executor that owns a run
+    /// while it waits there.
+    pub fn resume_queue(&self, run: &str) -> String {
+        format!("{RESUME_QUEUES}{}/{run}", self.engine.executor_id())
+    }
+
+    /// Take resumed runs of this executor: run `only`, or with `None`,
+    /// every run already waiting on one of this executor's resume queues.
+    /// [`DurableRuntime::resume`] puts a run on its queue, which only an
+    /// engine that takes that run dispatches; a run it does not take, it
+    /// leaves alone, and resume refuses it. Call it before
+    /// [`launch`](DurableRuntime::launch).
+    pub async fn take_resumed_runs(&mut self, only: Option<&str>) -> Result<()> {
+        let queues: Vec<String> = match only {
+            Some(run) => vec![self.resume_queue(run)],
+            None => {
+                let mine = format!("{RESUME_QUEUES}{}/", self.engine.executor_id());
+                self.unfinished()
+                    .await?
+                    .into_iter()
+                    .filter_map(|r| r.queue.filter(|q| q.starts_with(&mine)))
+                    .collect()
+            }
+        };
+        for name in &queues {
+            // Prompt while its run waits, and backing off to a poll every
+            // few seconds once it has been taken: the engine cannot stop
+            // one queue's dispatcher, and the run may come back to it.
+            let mut queue = durare::WorkflowQueue::new(name)
+                .max_polling_interval(std::time::Duration::from_secs(5));
+            queue.base_polling_interval = std::time::Duration::from_millis(100);
+            self.engine.register_queue(queue);
+        }
+        self.engine
+            .listen_queues(queues.clone())
+            .map_err(from_durare)?;
+        self.resume_queues = queues.into_iter().collect();
+        Ok(())
+    }
+
+    /// The version this engine stamps on runs, and the only one it recovers.
+    pub fn version(&self) -> &str {
+        self.engine.app_version()
+    }
+
+    /// Run `id`'s status, owner and version, or `None` if there is no such run.
+    pub async fn run_record(&self, id: &str) -> Result<Option<RunRecord>> {
+        let found = self
+            .engine
+            .list_workflows(&durare::ListFilter {
+                workflow_ids: vec![id.to_owned()],
+                ..durare::ListFilter::default()
+            })
+            .await
+            .map_err(from_durare)?;
+        Ok(found.into_iter().next().map(RunRecord::from))
+    }
+
+    /// Every run in the store in engine state `state`, such as
+    /// `MAX_RECOVERY_ATTEMPTS_EXCEEDED`.
+    pub async fn runs_in(&self, state: &str) -> Result<Vec<RunRecord>> {
+        let found = self
+            .engine
+            .list_workflows(&durare::ListFilter {
+                status: vec![state.to_owned()],
+                ..durare::ListFilter::default()
+            })
+            .await
+            .map_err(from_durare)?;
+        Ok(found.into_iter().map(RunRecord::from).collect())
+    }
+
+    /// Every unfinished run in the store, whoever owns it and whatever its
+    /// version.
+    pub async fn unfinished(&self) -> Result<Vec<RunRecord>> {
+        let found = self
+            .engine
+            .list_workflows(&durare::ListFilter {
+                status: vec!["PENDING".into(), "ENQUEUED".into()],
+                ..durare::ListFilter::default()
+            })
+            .await
+            .map_err(from_durare)?;
+        Ok(found.into_iter().map(RunRecord::from).collect())
     }
 
     /// An engine on PostgreSQL at `url`, in `schema`. As on SQLite, the
     /// store's version is checked first, and a schema written by a newer
     /// atomic is refused before anything is created in it.
     pub async fn postgres(url: &str, schema: &str) -> Result<Self> {
+        Self::postgres_as(url, schema, None, DEFAULT_VERSION).await
+    }
+
+    async fn postgres_as(
+        url: &str,
+        schema: &str,
+        executor: Option<String>,
+        version: &str,
+    ) -> Result<Self> {
         crate::store::open_postgres(url, schema)
             .await
             .map_err(|e| DurableError::Engine(e.to_string()))?;
@@ -730,12 +1111,36 @@ impl Durare {
             .connect_with(options)
             .await
             .map_err(db)?;
-        Self::over(Arc::new(provider), Reads::Postgres(reads)).await
+        Self::over(
+            Arc::new(provider),
+            Reads::Postgres(reads),
+            executor,
+            version,
+        )
+        .await
     }
 
-    async fn over(provider: Arc<dyn durare::StateProvider>, reads: Reads) -> Result<Self> {
-        let engine = durare::DurableEngine::new(provider)
+    async fn over(
+        provider: Arc<dyn durare::StateProvider>,
+        reads: Reads,
+        executor: Option<String>,
+        version: &str,
+    ) -> Result<Self> {
+        // The engine would let its variables override both settings.
+        engine_variables().map_err(|e| DurableError::Engine(e.to_string()))?;
+        let config = durare::EngineConfig {
+            executor_id: executor,
+            app_version: Some(version.to_owned()),
+            ..durare::EngineConfig::default()
+        };
+        let mut engine = durare::DurableEngine::with_config(provider, config)
             .await
+            .map_err(from_durare)?;
+        // No queue but the engine's internal one, which atomic puts nothing
+        // on: an engine runs what it starts and recovers, and resumed runs
+        // only once it takes them (see `take_resumed_runs`).
+        engine
+            .listen_queues(Vec::<String>::new())
             .map_err(from_durare)?;
         let index =
             "CREATE INDEX IF NOT EXISTS atomic_threads_by_thread ON atomic_threads (thread_id)";
@@ -761,6 +1166,7 @@ impl Durare {
             engine,
             reads,
             started: std::sync::Mutex::default(),
+            resume_queues: Default::default(),
         })
     }
 
@@ -886,12 +1292,10 @@ impl DurableRuntime for Durare {
                 })
                 .await
                 .map_err(from_durare)?;
-            Ok(found.into_iter().next().map(|w| match w.status.as_str() {
-                "PENDING" | "ENQUEUED" => RunStatus::Pending,
-                "SUCCESS" => RunStatus::Succeeded,
-                "ERROR" => RunStatus::Failed(w.error.unwrap_or_default()),
-                other => RunStatus::Other(other.to_owned()),
-            }))
+            Ok(found
+                .into_iter()
+                .next()
+                .map(|w| run_status(&w.status, w.error)))
         }
     }
 
@@ -927,7 +1331,34 @@ impl DurableRuntime for Durare {
     }
 
     async fn recover(&self) -> Result<usize> {
-        self.engine.recover().await.map_err(from_durare)
+        let own = [self.engine.executor_id().to_owned()];
+        Ok(self
+            .engine
+            .recover_pending_for(&own)
+            .await
+            .map_err(from_durare)?
+            .len())
+    }
+
+    fn resume(&self, id: &str) -> impl Future<Output = Result<()>> + Send {
+        let id = id.to_owned();
+        async move {
+            let queue = self.resume_queue(&id);
+            if !self.resume_queues.contains(&queue) {
+                return Err(DurableError::Engine(format!(
+                    "this engine does not take resumed run {id}; call take_resumed_runs for it"
+                )));
+            }
+            let handle = self
+                .engine
+                .resume_workflow_on::<Value>(&id, &queue)
+                .await
+                .map_err(from_durare)?;
+            if let Ok(mut started) = self.started.lock() {
+                started.insert(id, handle);
+            }
+            Ok(())
+        }
     }
 
     fn send<T>(

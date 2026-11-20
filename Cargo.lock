@@ -512,6 +512,7 @@ dependencies = [
  "atomic-agentic-graph",
  "atomic-agentic-schema",
  "clap",
+ "getrandom 0.3.4",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -567,6 +568,7 @@ version = "0.0.0"
 dependencies = [
  "durare",
  "getrandom 0.3.4",
+ "libc",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -579,6 +581,7 @@ dependencies = [
 name = "atomic-agentic-exec"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "serde",
  "serde_json",
  "thiserror 2.0.21",

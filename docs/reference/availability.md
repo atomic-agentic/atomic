@@ -42,10 +42,23 @@ The workflow interpreter is built: a workflow file runs as one durable run, with
 no rebuild, through sequential atom steps (Codex, lite and exec atoms), local
 gates and `worktree: true` steps, which run a Codex atom in its own worktree at
 the step's `base` and record atomic's commit in `steps.<id>.metadata.commit`.
-A run keeps the definitions it started with. Starting a workflow and deciding
-its gates from the command line (`atomic run`, `atomic gates`) are not wired up
-yet; `atomic gates enroll`, `list`, `approve` and `reject` are. A gate decision
-counts only with the credential its person enrolled.
+A run keeps the definitions it started with.
+
+`atomic run`, `atomic runs resume` and a local foreground `atomic serve` are
+built. `atomic run` takes an atom or workflow by name, by file or with
+`--project`, and input from a file, standard input or `--data`; a run cut short
+continues with `atomic runs resume <run-id>`, or under `atomic serve`, from its
+checkpoints. One process at a time executes a project's runs. Errors carry a
+description and an action, separately in `--json` output. `atomic gates enroll`,
+`list`, `approve` and `reject` decide gates from a second terminal; a gate
+decision counts only with the credential its person enrolled. The terminal
+prompt for gates in `atomic run` is not wired up yet.
+
+`atomic serve` also runs on PostgreSQL (`ATOMIC_DATABASE_URL`) when the process
+has an executor identity (`ATOMIC_EXECUTOR_ID`). `atomic runner` and
+`--runner process` run exec atoms' commands in a separate process with an
+exit-code contract; Codex turns and their shell still run in the control
+plane's process, and a runner reached over the network is not built yet.
 
 On Linux, atomic has verified that an atom's sandbox cannot reach the gate store
 or the credential: the private part of the state directory, Codex's own records
@@ -95,7 +108,7 @@ reaches a cap. The commands that show budgets and spend come with run inspection
 
 The local baseline is saved run inspection and basic spans in v0.1 (M12).
 Full OpenTelemetry correlation/export and the optional `atomic dev --otel` local
-viewer helper belong to M44, assigned to v0.5 in the plan and these docs.
+viewer helper belong to M44, assigned to v0.5.
 Datadog and other compatible backends remain optional. See [observability](../operations/observability.md).
 
 ## Read examples by stage

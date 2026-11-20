@@ -20,6 +20,15 @@ bill of materials.
   Codex's NOTICE credits code derived from Ratatui (MIT, Copyright (c)
   2016-2022 Florian Dehau, Copyright (c) 2023-2025 The Ratatui Developers).
 
+## atomic's fork of Codex
+
+- Fork: <https://github.com/atomic-agentic/codex>
+- Licence: Apache License 2.0, unchanged from upstream
+- Use: the upstream release tag in [`deps/codex.toml`](deps/codex.toml) plus
+  two `utils/pty` commits that make the parent-death signal best effort where
+  `prctl` is refused or unsupported. Codex core is unmodified. The commits are
+  listed in [`deps/README.md`](deps/README.md).
+
 ## durare
 
 - Upstream: <https://github.com/SamuelXing/durare>
