@@ -1,16 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Every test reaches the PostgreSQL test database through
-//! `atomic_durable::testing`, and only this package's tests do.
+//! `atomic_durable::testing`, and only where scripts/backends-check.sh
+//! looks.
 //!
-//! `testing::schema` gives each test a schema it drops afterwards, and
-//! `testing::database` fails a test, naming what is missing, when there is
-//! no database. A test that read `ATOMIC_TEST_DATABASE_URL` itself would do
-//! neither. And scripts/backends-check.sh finds the Postgres tests by running
-//! this package's tests without the database, so a test elsewhere that used
-//! the database would escape it.
+//! `testing::schema` gives each test a schema it drops afterwards, and fails
+//! the test, naming what is missing, when there is no database. A test that
+//! read `ATOMIC_TEST_DATABASE_URL` itself would do neither. The testing
+//! module keeps the variable and its readers private, so the compiler
+//! refuses most such tests; this test catches a test that reads the variable
+//! from the environment itself, and one that uses the database outside the
+//! places in [`USERS`], which backends-check.sh checks.
 
 use std::path::{Path, PathBuf};
+
+/// Where tests may use the test database, under crates/: a directory, with
+/// its slash, or a file. scripts/backends-check.sh checks each of these.
+const USERS: &[&str] = &["atomic-durable/"];
 
 fn sources(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).expect("read the source tree") {
@@ -39,26 +45,33 @@ fn only_the_testing_module_reads_the_database_variable_and_only_this_package_use
         }
     }
     assert!(files.len() > 50, "too few sources found: {}", files.len());
-    let this = file!();
     let mut wrong = Vec::new();
     for file in &files {
-        let shown = file.display().to_string();
-        if shown.ends_with(this.rsplit('/').next().unwrap_or(this)) {
+        // Matched on the path under crates/, not on part of it.
+        let relative = file
+            .strip_prefix(&crates)
+            .expect("under crates/")
+            .to_string_lossy()
+            .replace('\\', "/");
+        if relative == "atomic-durable/tests/test_database.rs" {
             continue;
         }
         let text = std::fs::read_to_string(file).expect("source");
-        let in_testing = shown.ends_with("atomic-durable/src/testing.rs");
-        let in_package = shown.contains("/atomic-durable/");
-        if !in_testing && text.contains("ATOMIC_TEST_DATABASE_URL") {
-            wrong.push(format!(
-                "{shown} reads ATOMIC_TEST_DATABASE_URL; use testing::schema"
-            ));
-        }
-        if !in_package && (text.contains("testing::schema(") || text.contains("testing::database("))
+        if relative != "atomic-durable/src/testing.rs"
+            && (text.contains("ATOMIC_TEST_DATABASE_URL") || text.contains("DATABASE_VAR"))
         {
             wrong.push(format!(
-                "{shown} uses the test database outside atomic-agentic-durable, where \
-                 scripts/backends-check.sh does not look"
+                "{relative} reads the test database's variable; use testing::schema"
+            ));
+        }
+        let allowed = USERS.iter().any(|u| match u.strip_suffix('/') {
+            Some(dir) => relative.starts_with(&format!("{dir}/")),
+            None => relative == *u,
+        });
+        if !allowed && text.contains("atomic_durable::testing") {
+            wrong.push(format!(
+                "{relative} uses the test database, and scripts/backends-check.sh does not \
+                 look there: add it to both"
             ));
         }
     }

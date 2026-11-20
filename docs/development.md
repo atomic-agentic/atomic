@@ -102,15 +102,24 @@ set, or when the database it names does not answer, with a message naming it.
 It never skips silently. `scripts/backends-check.sh postgres` shows this: it
 runs every `atomic-agentic-durable` test without the database, and requires
 the ones that fail to be exactly its Postgres variants, each naming the
-database.
+database in its own output, with none of them ignored, and every test binary
+to report its result.
 
 Every checkout's tests share the one database, so each test reaches it only
 through `atomic_durable::testing::schema`, which gives it a schema of its own
-and drops that schema when the test ends, passed or failed. A test process
-that was killed leaves its schemas behind; the first schema each test process
-asks for also sweeps those more than an hour old. A test in
+and drops that schema when the test ends, passed or failed. A schema's name is
+`atomic_test_<seconds>_<tag>_<process>_<n>_<random>`; the random part keeps
+names apart across containers, whose process IDs repeat. A test process that
+was killed leaves its schemas behind; the first schema each test process asks
+for also sweeps those more than an hour old, and those older tests named under
+a known prefix with the time last. A test in
 `crates/atomic-durable/tests/test_database.rs` fails if anything else reads
-`ATOMIC_TEST_DATABASE_URL`, or if another package's tests use the database.
+`ATOMIC_TEST_DATABASE_URL`, or if a test the check does not cover uses the
+database.
+
+The database keeps its data on a 1 GB tmpfs under a 1.5 GB memory limit, with
+a small write-ahead log; a container started before that change keeps its old
+sizes until `scripts/dev-db.sh down` and `up` restart it.
 
 ## The sandbox tests
 

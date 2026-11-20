@@ -247,7 +247,9 @@ jobs:
         run: cargo test --workspace --locked --features atomic-agentic-durable/postgres-tests,atomic-agentic/sandbox-tests --test crash
       # A suite that cannot reach its backend fails; it never skips. The
       # Postgres and sandbox suites run once more with their backend missing,
-      # and every one of their tests must fail, naming it. Nothing rebuilds.
+      # and every one of their tests must fail, naming it. The sandbox half
+      # reuses the test step's build; the Postgres half rebuilds
+      # atomic-agentic-durable with its own features.
       - name: Suites fail without their backends (Linux)
         if: runner.os == 'Linux' && !cancelled() && steps.test.conclusion != 'skipped'
         run: |
