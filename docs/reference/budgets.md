@@ -181,7 +181,7 @@ budget does not price is not made.
 When a cap prevents more work, the run parks for inspection rather than silently
 starting another attempt. The call is not made, the park is recorded with its
 reason, and the run waits on it; resuming it finds it parked again. Uncertain
-provider usage stays charged at its bound; a configured cap is not a promise of a
+provider usage stays charged; a configured cap is not a promise of a
 perfectly bounded provider bill. Pending usage is not treated as free after a
 crash.
 

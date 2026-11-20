@@ -102,7 +102,8 @@ pub enum Outcome {
     Reported(Usage),
     /// The call may have reached the provider, but no usage is known: it
     /// stays charged at its bound: atomic has no lookup of one call's usage,
-    /// and the providers it calls, as it calls them, offer none.
+    /// and OpenAI, Azure OpenAI and local servers, as atomic calls them,
+    /// offer none.
     Unknown,
     /// Part of what the call spent is known: it reported `reported`, and
     /// was then stopped with a provider request in flight, which reported
