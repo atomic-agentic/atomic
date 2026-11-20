@@ -88,6 +88,13 @@ anything else, or an amount too large to account exactly, fails configuration.
 
 A run resolves its caps, call bounds and prices once, when it starts, and keeps
 them: a run resumed after the configuration changed is metered as it began.
+`atomic config --explain` shows each budget setting with the layer it came
+from.
+
+Every model call a run makes is metered: a step whose atom calls a model and
+that the run has no caps for is refused, never run without a meter. The hidden
+developer diagnostics `atomic debug codex-prompt` and `atomic debug probe` make
+the one model call outside a run; it is not metered, and they say so on stderr.
 
 ## Bound a whole workflow
 
