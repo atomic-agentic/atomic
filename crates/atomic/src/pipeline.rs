@@ -980,12 +980,12 @@ async fn run_pipeline<C: WorkflowContext>(
                 .and_then(Value::as_str)
                 .ok_or_else(|| failed(format!("step `{}`: `base` is not a commit", step.id)))?;
             // A bound run starts each worktree from its fixture's commit or
-            // one made on top of it, never from another commit the snapshot
-            // holds.
+            // one an earlier step of its own made, never from another commit
+            // the snapshot holds, such as another run's.
             if let Some(fixture) = &pipeline.fixture {
-                let (fixture, base) = (fixture.clone(), base.to_owned());
+                let (fixture, base, own) = (fixture.clone(), base.to_owned(), accepted.clone());
                 tokio::task::spawn_blocking(move || {
-                    atomic_core::fixture::check_base(&fixture, &base)
+                    atomic_core::fixture::check_base(&fixture, &base, &own)
                 })
                 .await
                 .map_err(|e| failed(format!("check the step's base: {e}")))?

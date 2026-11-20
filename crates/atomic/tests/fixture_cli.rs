@@ -72,8 +72,9 @@ fn write(path: &Path, text: &str) {
 }
 
 /// A project with one codex atom that may write, run by `coding`, one
-/// worktree step at the mapped base, and `twice`, a second step on the
-/// first's commit.
+/// worktree step at the mapped base, `twice`, a second step on the
+/// first's commit, and `relay`, one step at a base its input gives as a
+/// plain string.
 fn project(at: &Path) -> PathBuf {
     let project = at.to_owned();
     write(&project.join("atomic.yaml"), "atomic: 1\nname: coding\n");
@@ -114,6 +115,20 @@ fn project(at: &Path) -> PathBuf {
          \x20 second:\n    after: [first]\n    atom: fix-code\n    \
          with: { base: steps.first.metadata.commit, task: input.task }\n    worktree: true\n\
          returns: steps.second.output\n",
+    );
+    write(
+        &project.join("schemas/relay.input.schema.json"),
+        &json!({"type": "object", "additionalProperties": false, "required": ["from", "task"],
+            "properties": {"from": {"type": "string"}, "task": {"type": "string"}}})
+        .to_string(),
+    );
+    write(
+        &project.join("workflows/relay.workflow.yaml"),
+        "atomic: 1\nname: relay\n\
+         input: { $ref: ../schemas/relay.input.schema.json }\n\
+         output: { $ref: ../atoms/fix-code.output.schema.json }\n\
+         steps:\n  fix:\n    atom: fix-code\n    with: { base: input.from, task: input.task }\n    worktree: true\n\
+         returns: steps.fix.output\n",
     );
     project
 }
@@ -304,6 +319,56 @@ fn a_project_in_a_subdirectory_of_a_checkout_runs_at_the_top_of_the_fixture() {
 }
 
 #[test]
+fn a_step_never_starts_from_a_commit_another_run_made_on_the_same_fixture() {
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let dir = scratch("other-run");
+        let project = project(&dir.join("project"));
+        let base = fixture(&dir.join("fixture"));
+        coding_run_at_the_top(&dir, &project, &dir.join("fixture"), &base).await;
+        // The first run's commit is on top of the same bound commit, in the
+        // same snapshot, and no git-commit field names it at admission.
+        let theirs = accepted(&snapshots(&dir)[0], "fix-1", "fix");
+        let model = FakeModel::start(vec![Reply::Text(r#"{"done": true}"#.into())])
+            .await
+            .unwrap();
+        let data = json!({"from": theirs, "task": "multiply"}).to_string();
+        let fixture_arg = dir.join("fixture").to_string_lossy().into_owned();
+        let out = atomic(
+            &dir,
+            &project,
+            &[
+                "run",
+                "relay",
+                "--run-id",
+                "relay-1",
+                "--data",
+                &data,
+                "--fixture",
+                &fixture_arg,
+                "--fixture-rev",
+                "main",
+            ],
+            &model.base_url(),
+            &[],
+        )
+        .await;
+        assert!(!out.status.success(), "{}", text(&out));
+        assert!(
+            text(&out).contains("nor a commit an earlier step of this run made"),
+            "{}",
+            text(&out)
+        );
+        assert_eq!(model.calls(), 0, "no turn ran from another run's commit");
+        let refs = git_in(
+            &snapshots(&dir)[0],
+            &["for-each-ref", "refs/atomic/relay-1/"],
+        );
+        assert!(refs.is_empty(), "{refs}");
+    });
+}
+
+#[test]
 fn nothing_a_hostile_fixtures_configuration_names_ever_runs() {
     support::require_sandbox();
     on_codex_runtime(async {
@@ -314,8 +379,13 @@ fn nothing_a_hostile_fixtures_configuration_names_ever_runs() {
         std::fs::create_dir_all(&markers).unwrap();
         let mark =
             |name: &str| format!("#!/bin/sh\ntouch '{}'\ncat\n", markers.join(name).display());
+        fixture(&source);
+        // Committed, so a checkout of the fixture would give every file the
+        // filter.
         write(&source.join(".gitattributes"), "* filter=evil\n");
-        let base = fixture(&source);
+        git_in(&source, &["add", ".gitattributes"]);
+        git_in(&source, &["commit", "-q", "-m", "attributes"]);
+        let base = git_in(&source, &["rev-parse", "HEAD"]);
         for hook in [
             "pre-commit",
             "post-commit",

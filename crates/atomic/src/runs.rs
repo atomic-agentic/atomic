@@ -106,6 +106,16 @@ fn bind_fixture(
                 "fixture.unsupported",
                 "prepare the fixture so its commit holds everything as files, then bind it again",
             ),
+            FixtureError::Schema(_) => (
+                "fixture.schema",
+                "fix the workflow's input schema: type each commit field through `properties` \
+                 and `items` only",
+            ),
+            FixtureError::Occupied(_) => (
+                "fixture.snapshot",
+                "move what is there out of the way, after checking no run is working in it, \
+                 then run again",
+            ),
             FixtureError::Input { .. } => (
                 "fixture.input",
                 "give each git-commit field of the input a commit of the fixture, and its base \

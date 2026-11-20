@@ -12,10 +12,13 @@
 //! such as a branch that moves, cannot alter an admitted run.
 //!
 //! Nothing is fetched: objects are copied as one pack, with no transport,
-//! and a submodule, Git LFS content or a repository borrowing objects from
-//! another (alternates) is refused rather than half copied. Every input
-//! field typed `format: git-commit` must name a commit in the snapshot, and
-//! a field named `base` must name the bound commit itself.
+//! and a submodule, Git LFS content, a repository borrowing objects from
+//! another (alternates), a shallow or grafted history, or one that is not
+//! SHA-1 is refused rather than half copied. Every input field typed
+//! `format: git-commit` must name a commit of the fixture's history at its
+//! bound revision, and a field named `base` the bound commit itself. Each
+//! worktree step starts from the bound commit or from a commit an earlier
+//! step of the same run made, never from another run's.
 
 use crate::git::{Git, GitError, is_sha};
 use crate::state::ProjectState;
@@ -64,6 +67,17 @@ pub enum FixtureError {
     /// The commit needs what atomic does not copy.
     #[error("{0}")]
     Unsupported(String),
+    /// The workflow's input schema types a commit where atomic does not
+    /// check it.
+    #[error("{0}")]
+    Schema(String),
+    /// Something other than a snapshot atomic made is where the snapshot
+    /// goes.
+    #[error(
+        "{} is not a snapshot of the fixture's commit that atomic made",
+        .0.display()
+    )]
+    Occupied(PathBuf),
     /// An input field typed `format: git-commit` does not fit the fixture.
     #[error("input {pointer}: {why}")]
     Input {
@@ -199,10 +213,12 @@ fn uses_lfs(attributes: &[u8]) -> bool {
 }
 
 /// The bare snapshot of `commit` in the state directory, made if missing:
-/// built whole in a directory of this process's own, checked to hold every
+/// built whole in a directory of this admission's own, checked to hold every
 /// object the commit reaches, and only then moved into place, so neither a
 /// kill part way nor another admission of the same commit at once leaves a
-/// snapshot that is not whole.
+/// snapshot that is not whole. One already in place is used once its keep
+/// ref names the commit; anything else there is refused, never removed,
+/// since runs may be working in it.
 fn snapshot(
     state: &ProjectState,
     git: &Git,
@@ -217,19 +233,25 @@ fn snapshot(
     std::fs::create_dir_all(&dir).map_err(io(&dir))?;
     let at = dir.join(format!("{commit}.git"));
     let keep = keep_ref(commit);
-    let whole = |path: &Path| -> Result<bool, FixtureError> {
+    // Only a whole snapshot is ever moved into place, so one there with its
+    // keep ref is whole, and is not walked again on every admission.
+    let placed = |path: &Path| -> Result<bool, FixtureError> {
         if !path.join("HEAD").is_file() {
             return Ok(false);
         }
-        let copy = git.repo(path);
-        Ok(copy.ref_target(&keep)?.as_deref() == Some(commit) && copy.has_everything(commit)?)
+        Ok(git.repo(path).ref_target(&keep)?.as_deref() == Some(commit))
     };
-    if whole(&at)? {
+    if placed(&at)? {
         return Ok(at);
     }
+    if at.symlink_metadata().is_ok() {
+        return Err(FixtureError::Occupied(at));
+    }
+    static BUILDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let building = dir.join(format!(
-        ".{commit}.{}.{}.git",
+        ".{commit}.{}.{}.{}.git",
         std::process::id(),
+        BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -251,20 +273,18 @@ fn snapshot(
         let _ = std::fs::remove_dir_all(&building);
         return Err(e);
     }
-    // One left by a kill part way, or by an older atomic, is replaced.
-    if at.exists() && !whole(&at)? {
-        let _ = std::fs::remove_dir_all(&at);
-    }
     match std::fs::rename(&building, &at) {
         Ok(()) => Ok(at),
-        // Another admission moved its own into place first.
-        Err(_) if whole(&at)? => {
-            let _ = std::fs::remove_dir_all(&building);
-            Ok(at)
-        }
         Err(e) => {
             let _ = std::fs::remove_dir_all(&building);
-            Err(io(&at)(e))
+            // Another admission moved its own into place first.
+            if placed(&at)? {
+                Ok(at)
+            } else if at.symlink_metadata().is_ok() {
+                Err(FixtureError::Occupied(at))
+            } else {
+                Err(io(&at)(e))
+            }
         }
     }
 }
@@ -293,7 +313,7 @@ pub fn check_commits(
     let reachable = commit_schemas(schema);
     let everywhere = count_commit_formats(schema);
     if reachable != everywhere {
-        return Err(FixtureError::Unsupported(format!(
+        return Err(FixtureError::Schema(format!(
             "the workflow's input types {} of its {everywhere} commit fields \
              (`format: git-commit`) under keywords atomic does not check, such as `oneOf`, \
              `allOf`, `prefixItems`, `additionalProperties` or a `$ref`; type each commit \
@@ -305,12 +325,15 @@ pub fn check_commits(
     let snapshot = git.repo(&binding.snapshot);
     let mut found = Vec::new();
     commit_fields(schema, input, "", &mut found);
-    for (pointer, value) in found {
+    for (pointer, value, nullable) in found {
         let fail = |why: String| FixtureError::Input {
             pointer: pointer.clone(),
             why,
         };
         let Some(sha) = value.as_str() else {
+            if value.is_null() && nullable {
+                continue;
+            }
             return Err(fail("a git-commit field holds a commit ID".into()));
         };
         if !is_sha(sha) {
@@ -343,9 +366,15 @@ pub fn check_commits(
 
 /// Check the base a worktree step of a run bound to `binding` starts from:
 /// the bound commit, still holding the tree recorded at admission, or a
-/// commit made on top of it, such as an earlier step's. Anything else the
-/// snapshot holds, such as another run's commit, is refused.
-pub fn check_base(binding: &FixtureBinding, base: &str) -> Result<(), FixtureError> {
+/// commit this run accepted from one of its own earlier steps (`accepted`),
+/// which must also descend from the bound commit. Anything else the
+/// snapshot holds, such as a commit another run made on top of the same
+/// fixture, is refused.
+pub fn check_base(
+    binding: &FixtureBinding,
+    base: &str,
+    accepted: &[String],
+) -> Result<(), FixtureError> {
     let git = Git::find()?;
     let snapshot = git.repo(&binding.snapshot);
     if snapshot.tree_of(&binding.commit)? != binding.tree {
@@ -355,11 +384,13 @@ pub fn check_base(binding: &FixtureBinding, base: &str) -> Result<(), FixtureErr
             binding.commit, binding.tree
         )));
     }
-    if !is_sha(base) || !snapshot.is_ancestor(&binding.commit, base)? {
+    let own = base == binding.commit || accepted.iter().any(|c| c == base);
+    if !is_sha(base) || !own || !snapshot.is_ancestor(&binding.commit, base)? {
         return Err(FixtureError::Input {
             pointer: "/base".into(),
             why: format!(
-                "{base} is neither the fixture's commit {} nor one made on top of it",
+                "{base} is neither the fixture's commit {} nor a commit an earlier step of \
+                 this run made on top of it",
                 binding.commit
             ),
         });
@@ -397,10 +428,21 @@ fn commit_schemas(schema: &Value) -> usize {
 }
 
 /// The fields of `value` that `schema` types `format: git-commit`, with
-/// their pointers, through properties and items.
-fn commit_fields(schema: &Value, value: &Value, pointer: &str, out: &mut Vec<(String, Value)>) {
+/// their pointers and whether their schema's type allows null, through
+/// properties and items.
+fn commit_fields(
+    schema: &Value,
+    value: &Value,
+    pointer: &str,
+    out: &mut Vec<(String, Value, bool)>,
+) {
     if schema.get("format").and_then(Value::as_str) == Some("git-commit") {
-        out.push((pointer.to_owned(), value.clone()));
+        let nullable = match schema.get("type") {
+            Some(Value::String(t)) => t == "null",
+            Some(Value::Array(types)) => types.iter().any(|t| t == "null"),
+            _ => false,
+        };
+        out.push((pointer.to_owned(), value.clone(), nullable));
         return;
     }
     if let (Some(properties), Some(object)) = (
@@ -544,11 +586,98 @@ mod tests {
     }
 
     #[test]
-    fn a_worktree_starts_from_the_bound_commit_or_one_on_top_of_it_only() {
+    #[cfg(unix)]
+    fn a_partial_clone_missing_an_object_is_refused_and_its_promisor_is_never_asked() {
+        let dir =
+            std::env::temp_dir().join(format!("atomic-fixture-promisor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let source = dir.join("source");
+        std::fs::create_dir_all(&source).expect("source");
+        git_at(&source, &["init", "-q"]);
+        std::fs::write(source.join("a.txt"), "a\n").expect("file");
+        git_at(&source, &["add", "a.txt"]);
+        git_at(&source, &["commit", "-q", "-m", "a"]);
+        // The blob goes, and a promisor remote that would run a program
+        // to fetch it, with its transport allowed, takes its place.
+        let blob = git_at(&source, &["rev-parse", "HEAD:a.txt"]);
+        std::fs::remove_file(
+            source
+                .join(".git/objects")
+                .join(&blob[..2])
+                .join(&blob[2..]),
+        )
+        .expect("loose blob");
+        let marker = dir.join("fetched");
+        let fetch = dir.join("fetch.sh");
+        std::fs::write(&fetch, format!("#!/bin/sh\ntouch '{}'\n", marker.display()))
+            .expect("fetch");
+        std::fs::set_permissions(&fetch, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .expect("mode");
+        for (key, value) in [
+            ("core.repositoryFormatVersion", "1".to_owned()),
+            ("extensions.partialClone", "origin".to_owned()),
+            ("remote.origin.promisor", "true".to_owned()),
+            ("remote.origin.url", format!("ext::{} %S", fetch.display())),
+            ("protocol.ext.allow", "always".to_owned()),
+        ] {
+            git_at(&source, &["config", key, &value]);
+        }
+        let state = ProjectState::under(&dir.join("home"), &source);
+        std::fs::create_dir_all(state.dir()).expect("state");
+        bind(&state, &source, "HEAD").expect_err("an object is missing");
+        assert!(!marker.exists(), "the promisor remote was asked");
+        let left: Vec<_> = std::fs::read_dir(state.dir().join("fixtures"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .collect();
+        assert!(left.is_empty(), "no snapshot is left: {left:?}");
+        // The positive control: git as a person runs it does ask.
+        let _ = std::process::Command::new(Git::find().expect("git").program())
+            .args(["cat-file", "-p", &blob])
+            .current_dir(&source)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("git");
+        assert!(marker.exists(), "the marker is seen when git fetches");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn what_is_in_a_snapshots_place_and_is_not_one_is_refused_and_left_alone() {
+        let (dir, binding, _, _) = bound("in-place");
+        let state = ProjectState::under(&dir.join("home"), &dir.join("source"));
+        // Take the snapshot's keep ref away, as a damaged or foreign one
+        // would lack it, with a run's work beside it.
+        git_at(
+            &binding.snapshot,
+            &["update-ref", "-d", &keep_ref(&binding.commit)],
+        );
+        std::fs::write(binding.snapshot.join("work.txt"), "a run's\n").expect("work");
+        let refused = bind(&state, &dir.join("source"), "HEAD").expect_err("not ours");
+        assert!(
+            refused
+                .to_string()
+                .contains(&binding.snapshot.display().to_string()),
+            "{refused}"
+        );
+        assert!(binding.snapshot.join("work.txt").is_file(), "left alone");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_worktree_starts_from_the_bound_commit_or_one_of_its_own_runs_only() {
         let (dir, binding, on_top, beside) = bound("base");
-        check_base(&binding, &binding.commit).expect("the bound commit");
-        check_base(&binding, &on_top).expect("a commit made on top of it");
-        let refused = check_base(&binding, &beside).expect_err("another commit the snapshot holds");
+        check_base(&binding, &binding.commit, &[]).expect("the bound commit");
+        check_base(&binding, &on_top, std::slice::from_ref(&on_top))
+            .expect("a commit an earlier step of the run made on top of it");
+        // On top of the bound commit, but another run's.
+        let refused = check_base(&binding, &on_top, &[]).expect_err("another run's commit");
+        assert!(matches!(refused, FixtureError::Input { .. }), "{refused}");
+        // Accepted, yet not on top of the bound commit.
+        let refused = check_base(&binding, &beside, std::slice::from_ref(&beside))
+            .expect_err("a commit beside the bound one");
         assert!(matches!(refused, FixtureError::Input { .. }), "{refused}");
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -575,7 +704,25 @@ mod tests {
         }});
         let refused = check_commits(&binding, &hidden, &json!({"base": binding.commit}))
             .expect_err("unchecked");
-        assert!(matches!(refused, FixtureError::Unsupported(_)), "{refused}");
+        assert!(matches!(refused, FixtureError::Schema(_)), "{refused}");
+        // A field that may be null may be left null; one that may not, not.
+        let optional = |types: Value| {
+            json!({"type": "object", "properties": {
+                "parent": {"type": types, "format": "git-commit"}
+            }})
+        };
+        check_commits(
+            &binding,
+            &optional(json!(["string", "null"])),
+            &json!({"parent": null}),
+        )
+        .expect("a nullable field left null");
+        check_commits(
+            &binding,
+            &optional(json!("string")),
+            &json!({"parent": null}),
+        )
+        .expect_err("a field that is not nullable");
         // A commit at the top of the input has the root pointer, "".
         let top = json!({"type": "string", "format": "git-commit"});
         match check_commits(&binding, &top, &json!("not-a-sha")) {
@@ -614,7 +761,7 @@ mod tests {
         commit_fields(&schema, &input, "", &mut found);
         // In the schema's key order, which depends on how serde_json is
         // built: compared as a set.
-        let mut pointers: Vec<&str> = found.iter().map(|(p, _)| p.as_str()).collect();
+        let mut pointers: Vec<&str> = found.iter().map(|(p, _, _)| p.as_str()).collect();
         pointers.sort_unstable();
         assert_eq!(
             pointers,

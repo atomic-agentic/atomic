@@ -92,6 +92,19 @@ const HARDENING: &[&str] = &[
     "i18n.logOutputEncoding=UTF-8",
 ];
 
+/// Read a git's stderr on a thread of its own: the start of it is kept for
+/// an error message, and the rest drained so git never blocks on a full pipe.
+fn keep_errors(mut stderr: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = (&mut stderr)
+            .take(STDERR_BYTES as u64)
+            .read_to_end(&mut bytes);
+        let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+        bytes
+    })
+}
+
 /// Why a git command failed or was never run.
 #[derive(Debug, thiserror::Error)]
 pub enum GitError {
@@ -382,20 +395,11 @@ impl Git {
                 let _ = stdin.write_all(&input);
             });
         }
-        let (Some(mut stdout), Some(mut stderr)) = (child.stdout.take(), child.stderr.take())
-        else {
+        let (Some(mut stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
             stop(&mut child);
             return Err(GitError::Unreadable);
         };
-        let errors = std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            let _ = (&mut stderr)
-                .take(STDERR_BYTES as u64)
-                .read_to_end(&mut bytes);
-            // Drain the rest so git never blocks on a full pipe.
-            let _ = std::io::copy(&mut stderr, &mut std::io::sink());
-            bytes
-        });
+        let errors = keep_errors(stderr);
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
             let mut bytes = Vec::new();
@@ -735,17 +739,10 @@ impl Repo {
         if let Err(e) = written {
             return Err(fail(&mut packer, e));
         }
-        let (Some(stream), Some(mut pack_errors)) = (packer.stdout.take(), packer.stderr.take())
-        else {
+        let (Some(stream), Some(pack_errors)) = (packer.stdout.take(), packer.stderr.take()) else {
             return Err(fail(&mut packer, GitError::Unreadable));
         };
-        let pack_errors = std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            let _ = (&mut pack_errors)
-                .take(STDERR_BYTES as u64)
-                .read_to_end(&mut bytes);
-            bytes
-        });
+        let pack_errors = keep_errors(pack_errors);
         let mut index = to.command();
         index
             .args(["index-pack", "--stdin"])
@@ -756,17 +753,11 @@ impl Repo {
             Ok(indexer) => indexer,
             Err(e) => return Err(fail(&mut packer, e.into())),
         };
-        let Some(mut index_errors) = indexer.stderr.take() else {
+        let Some(index_errors) = indexer.stderr.take() else {
             stop(&mut indexer);
             return Err(fail(&mut packer, GitError::Unreadable));
         };
-        let index_errors = std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            let _ = (&mut index_errors)
-                .take(STDERR_BYTES as u64)
-                .read_to_end(&mut bytes);
-            bytes
-        });
+        let index_errors = keep_errors(index_errors);
         let left = || deadline.saturating_duration_since(Instant::now());
         let indexed = wait_for(&mut indexer, left())?;
         let packed = match indexed {
@@ -805,7 +796,11 @@ impl Repo {
         check_sha(sha)?;
         match self.run(&["rev-list", "--objects", "--quiet", sha, "--"], None) {
             Ok(_) => Ok(true),
-            Err(GitError::Failed { .. }) => Ok(false),
+            // A missing object is fatal to the walk; any other failure is
+            // not an answer.
+            Err(GitError::Failed {
+                code: Some(128), ..
+            }) => Ok(false),
             Err(e) => Err(e),
         }
     }

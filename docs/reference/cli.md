@@ -119,8 +119,10 @@ monitor, filter drivers or remotes, ever runs.
 inside one. A revision such as `HEAD` is that checkout's own, so a linked
 worktree binds at its own `HEAD`. The atom works at the top of its worktree of
 the snapshot, wherever the project itself is. Each worktree step starts from
-the bound commit or a commit made on top of it, such as an earlier step's;
-commit fields in the input name commits of the fixture's history.
+the bound commit or from a commit an earlier step of the same run made; a
+step whose base is anything else, such as a commit another run made on the
+same fixture, fails before its turn. Commit fields in the input name commits
+of the fixture's history, and one whose schema allows `null` may be `null`.
 
 Before anything runs, atomic refuses, with the kind of failure in `--json`:
 
@@ -129,9 +131,10 @@ Before anything runs, atomic refuses, with the kind of failure in `--json`:
 | `fixture.required` | The workflow changes code and no fixture is named |
 | `fixture.path` | `--fixture` is not a git repository on this machine, or is a directory inside one rather than its top |
 | `fixture.revision` | `--fixture-rev` is not a commit, branch or tag of it |
-| `fixture.unsupported` | Its commit has submodules or Git LFS content; the repository borrows objects from another (alternates), is shallow or has grafts, or names its objects with SHA-256; or the workflow's input types a commit where atomic does not check it, such as under `oneOf` |
+| `fixture.unsupported` | Its commit has submodules or Git LFS content; the repository borrows objects from another (alternates), is shallow or has grafts, is missing objects its commit reaches (as a partial clone may be), or names its objects with SHA-256 |
+| `fixture.schema` | The workflow's input types a commit where atomic does not check it, such as under `oneOf` |
 | `fixture.input` | An input field typed `format: git-commit` is not in the fixture's history at the revision, or its `base` is not the bound commit |
-| `fixture.snapshot` | The snapshot could not be made |
+| `fixture.snapshot` | The snapshot could not be made, or something atomic did not make is where it goes; atomic never removes it |
 
 Lite atoms and workflows that change no code need neither flag. `atomic eval`
 takes the same pair when it is built.
