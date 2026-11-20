@@ -254,6 +254,7 @@ async fn approve(rt: &Durare, g: &gate::Gate) {
             verdict: Verdict::Approve,
             comment: None,
             proposal: g.proposal.clone(),
+            answer: None,
         },
     )
     .await

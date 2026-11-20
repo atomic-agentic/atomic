@@ -159,6 +159,45 @@ Atomic is offline; resume applies expiry before proceeding.
 `after: [review]` means the review finished, not that its verdict was `approve`.
 Use a review policy or a deliberate human gate to decide what happens next.
 
+`atomic run` and `atomic runs resume` show each gate their run reaches at the
+terminal and take the decision there: `a` or `r`, then a comment if you like.
+The decision carries your enrolled operator credential, as `atomic gates
+approve` does. Only what you type after a gate is shown decides it: input typed
+earlier is discarded, and commands that atoms run have no terminal to type into.
+Titles and what a gate shows can come from a model, so control characters in
+them are shown escaped. When standard input or standard error is not a terminal,
+or the run is in the background, the run prints how to decide the gate from
+another terminal and waits.
+
+### Question gates
+
+A gate can ask a question instead of asking for approval. It has an `ask` in
+place of `title`, and the `answer` it takes: a list of choices, or a JSON Schema
+for a free answer.
+
+```yaml
+  channel:
+    after: [build]
+    gate:
+      ask: "'Which channel should ' + steps.build.output.version + ' ship to?'"
+      answer: [stable, beta]
+      remember: true
+      timeout: 4h
+      on_timeout: { default: beta }
+```
+
+The answer is the gate's decision, and later steps read it as
+`steps.channel.decision.answer`, typed by `answer`. Type a choice by its value
+or by the letter shown beside it, at the prompt and in `atomic gates answer
+<gate-id> <answer>` alike; an answer that `answer` does not allow is refused in
+both. With `remember: true`, the answer is also kept as a dated entry in the
+project's feedback log, in atomic's state. `on_timeout: { default: ... }` needs a
+`timeout`, and is the answer silence selects: when nobody answers in time the
+gate store records the gate as resumed with it (and remembers it, if asked), the
+prompt and `atomic gates list` say so beforehand, and the step resumes with it.
+Without a default (or with `on_timeout: reject`), an unanswered question stops
+the run, as an expired gate does.
+
 ## View a workflow as a diagram
 
 In v0.5, `atomic workflows show <name>` inspects the definition. Add
