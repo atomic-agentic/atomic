@@ -91,7 +91,7 @@ pub const PIPELINE: &str = "atomic.pipeline";
 /// record, through an approved and a rejected gate, with the shape of each
 /// checkpoint, and the run's own shape. They fail when the layout no longer
 /// matches this version's, whose file is never rewritten.
-pub const LAYOUT_VERSION: &str = "atomic.pipeline.3";
+pub const LAYOUT_VERSION: &str = "atomic.pipeline.4";
 
 /// How many times one process recovers one run of `run_pipeline` at the
 /// same step before it fails the run as dead-lettered: enough for a crash
