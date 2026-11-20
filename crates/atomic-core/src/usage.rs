@@ -101,17 +101,17 @@ pub enum Outcome {
     /// answer still spent it.
     Reported(Usage),
     /// The call may have reached the provider, but no usage is known: it
-    /// stays charged at its bound until a usage query reconciles it (none is
-    /// built yet, so it stays charged at its bound).
+    /// stays charged at its bound: atomic has no lookup of one call's usage,
+    /// and OpenAI, Azure OpenAI and local servers, as atomic calls them,
+    /// offer none.
     Unknown,
     /// Part of what the call spent is known: it reported `reported`, and
     /// was then stopped with a provider request in flight, which reported
     /// nothing. The request in flight is taken to be as large as one
     /// request's bound, or as `last`, the last request that reported, if
     /// that was larger: a turn's requests grow as it goes. It is charged the
-    /// reported usage and that estimate, at least its reservation, and stays
-    /// open for a usage query, which is not built yet: until one is, the
-    /// charge keeps that value.
+    /// reported usage and that estimate, at least its reservation, and the
+    /// charge keeps that value, as an unknown one does.
     Partial {
         /// What it reported.
         reported: Usage,
@@ -305,6 +305,7 @@ pub(crate) fn call_span(model: &str, provider: &str) -> tracing::Span {
         gen_ai.usage.input_tokens = tracing::field::Empty,
         gen_ai.usage.output_tokens = tracing::field::Empty,
         error.message = tracing::field::Empty,
+        http.response.status_code = tracing::field::Empty,
         atomic.workflow.id = tracing::field::Empty,
         atomic.step = tracing::field::Empty,
         atomic.stopped = tracing::field::Empty,
@@ -332,7 +333,31 @@ pub(crate) fn record_usage(span: &tracing::Span, usage: &Usage) {
     span.record("gen_ai.usage.output_tokens", usage.output_tokens);
 }
 
-/// Record on `span` why a call failed. The exporter redacts it.
+/// The most characters of a failed call's error a span carries, with the
+/// `…` that ends one that was cut. The run's stored error keeps the whole.
+pub(crate) const MAX_SPAN_ERROR: usize = 200;
+
+/// What a call's span says of why it failed, redacted and at most
+/// [`MAX_SPAN_ERROR`] characters: for an error a provider answered with,
+/// its status and the type of error it names, with its HTTP status code;
+/// else what failed and its innermost cause, such as a connection's
+/// `Connection refused`, rather than every context between, which can
+/// repeat the URL.
+pub(crate) fn span_error(error: &anyhow::Error) -> (String, Option<u16>) {
+    let bounded = |text: &str| crate::redact::bounded(text, MAX_SPAN_ERROR - 1);
+    match error
+        .chain()
+        .find_map(|e| e.downcast_ref::<crate::lite::ProviderError>())
+    {
+        Some(provider) => (bounded(&provider.summary()), Some(provider.code)),
+        None if error.chain().count() > 1 => {
+            (bounded(&format!("{error}: {}", error.root_cause())), None)
+        }
+        None => (bounded(&error.to_string()), None),
+    }
+}
+
+/// Record on `span` why a call failed (see [`span_error`]).
 pub(crate) fn record_error(span: &tracing::Span, error: &anyhow::Error) {
     span.record("otel.status_code", "ERROR");
     span.record(
@@ -343,8 +368,9 @@ pub(crate) fn record_error(span: &tracing::Span, error: &anyhow::Error) {
             "atomic.model_call"
         },
     );
-    span.record(
-        "error.message",
-        tracing::field::display(format!("{error:#}")),
-    );
+    let (message, status) = span_error(error);
+    span.record("error.message", message.as_str());
+    if let Some(status) = status {
+        span.record("http.response.status_code", i64::from(status));
+    }
 }

@@ -45,8 +45,9 @@
 //! nothing, so resuming alone never raises a cap. Only [`Ledger::raise`],
 //! a person's action, raises one.
 //!
-//! An attempt left `reserved` can be reconciled later, once its real usage
-//! is known from a usage query or a person ([`Settlement::Reconciled`]), or
+//! An attempt left `reserved` can be reconciled later, once a person knows
+//! its real usage and enters it ([`Settlement::Reconciled`]; no command does
+//! that yet), or
 //! released once it is confirmed unused ([`Ledger::release`]);
 //! [`Ledger::unsettled`] lists them.
 //!
@@ -182,7 +183,7 @@ pub enum Settlement {
         micro_usd: i64,
     },
     /// No usage is known: the tokens and dollars stay charged at their
-    /// bound until a usage query reconciles them. The active time, which can
+    /// bound unless they are reconciled. The active time, which can
     /// always be measured, is charged as what passed since admission, at
     /// most what was reserved.
     Unknown,
@@ -196,8 +197,8 @@ pub enum Settlement {
     /// configured maximum input. Its tokens and dollars are charged the
     /// reported amounts plus `in_flight`, and at least what was reserved;
     /// its time, as for [`Settlement::Unknown`]. The reported usage is
-    /// recorded, and the attempt stays open, as an unknown one does, for a
-    /// usage query to correct.
+    /// recorded, and the attempt stays open to reconciliation, as an unknown
+    /// one does.
     Partial {
         /// Input tokens reported.
         input_tokens: i64,
@@ -208,8 +209,8 @@ pub enum Settlement {
         /// What the request in flight is taken to have spent.
         in_flight: Charge,
     },
-    /// Its usage, learned after the fact from a usage query or a person,
-    /// for an attempt that was never settled: it replaces the reservation.
+    /// Its usage, as a person learned it after the fact, for an attempt that
+    /// was never settled: it replaces the reservation.
     /// The active time is what passed since admission, at most what was
     /// reserved, unless it was settled already.
     Reconciled {
@@ -744,7 +745,7 @@ async fn settle_dead_in(tx: &mut Tx<'_, '_>, request: &Request, now: i64) -> Res
 /// tokens and micro-dollars) and `in_flight`, the most a request that
 /// reported nothing could have spent, and at least what it was charged
 /// already, its reservation. The reported usage is recorded; the attempt
-/// stays reserved, so it is still open to a usage query.
+/// stays reserved, so it is still open to reconciliation.
 async fn partly(
     tx: &mut Tx<'_, '_>,
     request: &str,

@@ -719,7 +719,7 @@ fn killing_after_the_call_and_before_settlement_ends_parked_at_the_cap() {
         assert!(seen.contains("450 of 450 tokens"), "{seen}");
         assert_eq!(model.calls(), 3);
 
-        // A usage query reconciles the three attempts at what they used;
+        // A person enters the three attempts' real usage;
         // released again, the run goes on.
         let rt = reader(&dir).await;
         for a in rt.ledger().unsettled("unsettled").await.expect("unsettled") {

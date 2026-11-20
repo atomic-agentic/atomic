@@ -3,7 +3,8 @@
 //! An exec atom's command runs under the same sandbox helper as a turn's
 //! commands and is kept out of atomic's private state: it cannot read the
 //! project's database, write a gate decision into it, or read the operator
-//! credential store, on the local backend or through a runner process. It
+//! credential store, nor the person's own secrets in their home directory,
+//! on the local backend or through a runner process. It
 //! can still read the project, write its own scratch directory and open a
 //! network connection.
 //!
@@ -48,6 +49,9 @@ def read_other_db():
 def read_credential():
     with open(credential) as f:
         f.read()
+def read_home_secret():
+    with open(os.environ['HOME_SECRET']) as f:
+        f.read()
 def read_project():
     with open('atomic.yaml') as f:
         f.read()
@@ -65,7 +69,7 @@ def write_home():
     with open(os.path.join(os.environ['HOME'], 'mine'), 'w') as f:
         f.write('x')
 json.dump({name: attempt(f) for name, f in [('read_db', read_db), ('write_gate', write_gate),
-    ('read_credential', read_credential), ('read_other_db', read_other_db), ('read_project', read_project), ('write_home', write_home), ('unix_socket', unix_socket), ('tcp_socket', tcp_socket)]}
+    ('read_credential', read_credential), ('read_home_secret', read_home_secret), ('read_other_db', read_other_db), ('read_project', read_project), ('write_home', write_home), ('unix_socket', unix_socket), ('tcp_socket', tcp_socket)]}
     | {'env': ' '.join(sorted(n for n in os.environ if n != 'LC_CTYPE'))},
     sys.stdout)
 "#;
@@ -109,8 +113,8 @@ fn exec_atom(project: &Path, env: &[(&str, String)]) {
         project.join("atoms/probe.output.schema.yaml"),
         format!(
             "type: object\nadditionalProperties: false\n\
-             required: [read_db, write_gate, read_credential, read_other_db, read_project, write_home, unix_socket, tcp_socket, env]\n\
-             properties:\n  read_db: {field}\n  write_gate: {field}\n  read_credential: {field}\n  read_other_db: {field}\n\
+             required: [read_db, write_gate, read_credential, read_home_secret, read_other_db, read_project, write_home, unix_socket, tcp_socket, env]\n\
+             properties:\n  read_db: {field}\n  write_gate: {field}\n  read_credential: {field}\n  read_home_secret: {field}\n  read_other_db: {field}\n\
              \x20 read_project: {field}\n  write_home: {field}\n  unix_socket: {field}\n  tcp_socket: {field}\n  env: {field}\n"
         ),
     )
@@ -153,7 +157,12 @@ fn an_exec_atom_cannot_reach_atomics_private_state() {
     #[allow(unsafe_code)]
     unsafe {
         std::env::set_var("ATOMIC_HOME", dir.join("home"));
+        // The person's home, with a key in it, as the sandbox finds it.
+        std::env::set_var("HOME", dir.join("person"));
     }
+    let home_secret = dir.join("person/.ssh/id_ed25519");
+    std::fs::create_dir_all(home_secret.parent().expect("ssh")).expect("ssh");
+    std::fs::write(&home_secret, "the person's key").expect("key");
     on_codex_runtime(async move {
         // The layout atomic keeps: state under the home's `projects/`, and
         // every project's private state under its `private/`.
@@ -204,6 +213,7 @@ fn an_exec_atom_cannot_reach_atomics_private_state() {
             &[
                 ("TARGET_DB", text(&db)),
                 ("TARGET_CREDENTIAL", text(&credential)),
+                ("HOME_SECRET", text(&home_secret)),
                 ("OTHER_DB", text(&other_db)),
                 ("TARGET_SOCKET", text(&socket)),
                 ("TARGET_PORT", port.to_string()),
@@ -249,8 +259,8 @@ fn an_exec_atom_cannot_reach_atomics_private_state() {
             // Confined, the command still gets exactly its own environment.
             assert_eq!(
                 out["env"],
-                "ATOMIC_EFFECT_KEY ATOMIC_RUN_ID ATOMIC_STEP_ID HOME OTHER_DB TARGET_CREDENTIAL \
-                 TARGET_DB TARGET_PORT TARGET_SOCKET TMPDIR",
+                "ATOMIC_EFFECT_KEY ATOMIC_RUN_ID ATOMIC_STEP_ID HOME HOME_SECRET OTHER_DB \
+                 TARGET_CREDENTIAL TARGET_DB TARGET_PORT TARGET_SOCKET TMPDIR",
                 "{what}"
             );
             let denied = |path: &Path| {
@@ -265,6 +275,7 @@ fn an_exec_atom_cannot_reach_atomics_private_state() {
                 "{what}"
             );
             assert_eq!(out["read_credential"], denied(&credential), "{what}");
+            assert_eq!(out["read_home_secret"], denied(&home_secret), "{what}");
             assert_eq!(out["read_other_db"], denied(&other_db), "{what}");
             // No network and no sockets, until atoms can declare what they
             // need.

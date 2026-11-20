@@ -1229,9 +1229,37 @@ fn exec_declarations_are_checked_at_load() {
         ),
         ("kind: 'codex', env: { LD_LIBRARY_PATH: '/x' }", "load code"),
         ("kind: 'codex', env: { GCONV_PATH: '/x' }", "load code"),
+        (
+            "kind: 'codex', env: { BASH_ENV: '/home/dev/.bashrc' }",
+            "as it starts",
+        ),
+        (
+            "kind: 'codex', env: { ENV: '/home/dev/.profile' }",
+            "as it starts",
+        ),
+        (
+            "kind: 'codex', env: { SHELLOPTS: 'xtrace' }",
+            "as it starts",
+        ),
+        (
+            "kind: 'codex', env: { PS4: '$(cat /home/dev/.netrc)' }",
+            "as it starts",
+        ),
+        (
+            "kind: 'codex', env: { PROMPT_COMMAND: 'cat /home/dev/.netrc' }",
+            "as it starts",
+        ),
         ("kind: 'codex', env: { HOME: '/x' }", "set by atomic"),
         ("kind: 'codex', env: { ZDOTDIR: '/x' }", "set by atomic"),
         ("kind: 'codex', env: { TMPDIR: '/x' }", "set by atomic"),
+        (
+            "kind: 'codex', env: { ATOMIC_TURN_TMPDIR: '/x' }",
+            "set by atomic",
+        ),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, env: { ATOMIC_TURN_TMPDIR: '/x' }",
+            "set by atomic",
+        ),
         (
             "kind: 'exec', exec: { command: ['x'] }, env: { HOME: '/x' }",
             "set by atomic",
@@ -1376,12 +1404,16 @@ impl ExecutionBackend for Recording {
         atomic_exec::LocalBackend::default().run(command)
     }
 
+    /// Recorded once the close has done its work, so a test that sees it
+    /// sees what the close left; one that failed is recorded as failed.
     fn close(&self, workspace: &Workspace) -> Result<(), atomic_exec::ExecError> {
-        self.calls
-            .lock()
-            .expect("calls")
-            .push(format!("close {}", workspace.label));
-        atomic_exec::LocalBackend::default().close(workspace)
+        let closed = atomic_exec::LocalBackend::default().close(workspace);
+        let call = match &closed {
+            Ok(()) => format!("close {}", workspace.label),
+            Err(e) => format!("close {} failed: {e}", workspace.label),
+        };
+        self.calls.lock().expect("calls").push(call);
+        closed
     }
 }
 
@@ -2117,6 +2149,69 @@ fn an_exec_output_cel_cannot_read_fails() {
             "{r:?}"
         );
     });
+}
+
+// A turn's commands get a TMPDIR of their own turn's on every platform: on
+// Linux by way of atomic's sandbox helper, which takes it from
+// ATOMIC_TURN_TMPDIR while Codex's helper keeps the backend's shared
+// directory for its registry; elsewhere directly, with no handoff variable
+// left for the command to see. The shared directory is never a turn's
+// writable root, and a Linux turn without one is refused.
+#[test]
+fn a_turns_tmpdir_is_its_own_on_every_platform() {
+    let base = std::env::temp_dir().join(format!("atomic-turn-tmpdir-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let (scratch, shared) = (base.join("attempt"), base.join(".tmp"));
+    std::fs::create_dir_all(&scratch).expect("scratch");
+    std::fs::create_dir_all(&shared).expect("shared");
+    let mut declared = std::collections::BTreeMap::new();
+    declared.insert(codex::TURN_TMPDIR.to_owned(), "/elsewhere".to_owned());
+    let workspace = Workspace {
+        label: "t".into(),
+        root: Some(base.clone()),
+        scratch: Some(scratch.clone()),
+        tmp: Some(shared.clone()),
+        sandbox: crate::typed::Sandbox::WorkspaceWrite,
+        env: declared,
+        ..Workspace::default()
+    };
+    let own = scratch.join("tmp").display().to_string();
+    let built = |linux: bool, workspace: &Workspace| {
+        let mut spec = TurnSpec {
+            env: workspace.env.clone(),
+            writable_roots: vec![scratch.clone()],
+            ..TurnSpec::default()
+        };
+        turn_tmpdir(workspace, &mut spec, linux).map(|()| spec)
+    };
+
+    let linux = built(true, &workspace).expect("linux");
+    assert_eq!(linux.env["TMPDIR"], shared.display().to_string());
+    assert_eq!(linux.env[codex::TURN_TMPDIR], own);
+    assert!(!linux.writable_roots.contains(&shared));
+
+    let other = built(false, &workspace).expect("elsewhere");
+    assert_eq!(other.env["TMPDIR"], own);
+    assert!(
+        !other.env.contains_key(codex::TURN_TMPDIR),
+        "{:?}",
+        other.env
+    );
+    assert!(!other.writable_roots.contains(&shared));
+
+    assert!(std::path::Path::new(&own).is_dir(), "{own} was not made");
+    let without = Workspace {
+        tmp: None,
+        ..workspace.clone()
+    };
+    assert!(
+        matches!(built(true, &without), Err(AtomError::Runtime(m)) if m.contains("shared temporary directory"))
+    );
+    assert_eq!(
+        built(false, &without).expect("elsewhere").env["TMPDIR"],
+        own
+    );
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// A store that, when `at` is reached (`"open"` as an input is copied in,
