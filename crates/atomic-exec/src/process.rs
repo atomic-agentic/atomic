@@ -60,16 +60,35 @@ pub fn stop_all() -> usize {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Group {
     /// One of its own, which its time limit and [`stop_all`] kill, with
-    /// everything it started.
+    /// everything it started; whatever is left in it when the process ends
+    /// is killed then, so nothing it left behind outlives it or holds its
+    /// output open.
     Own,
-    /// One of its own, and whatever is left in it is killed when the
-    /// process ends: for a runner, whose command shares its group.
-    OwnReaped,
     /// This process's own: for the command of a runner, so that stopping
     /// the runner's group stops the command and everything it started. Its
     /// time limit kills the command alone; the rest goes with the runner's
     /// group.
     Inherit,
+}
+
+/// The signals that stop a process from a terminal or a supervisor.
+#[cfg(unix)]
+const STOP_SIGNALS: [libc::c_int; 4] = [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT];
+
+/// Ignore the stop signals in this process, as a runner does: a command in
+/// its process group may signal the whole group, and the runner must live
+/// to report how the command ended. The commands it starts get them back,
+/// and SIGKILL, which stopping a runner uses, cannot be ignored.
+pub fn ignore_stop_signals() {
+    #[cfg(unix)]
+    for signal in STOP_SIGNALS {
+        // SAFETY: setting a signal's disposition to ignore has no
+        // handler to run.
+        #[allow(unsafe_code)]
+        unsafe {
+            libc::signal(signal, libc::SIG_IGN);
+        }
+    }
 }
 
 /// Wait here for good if the process is stopping: its exit ends the wait.
@@ -158,22 +177,32 @@ pub fn run_in(
     if group != Group::Inherit {
         std::os::unix::process::CommandExt::process_group(&mut command, 0);
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     {
         let parent = libc::pid_t::try_from(std::process::id()).unwrap_or(0);
         // SAFETY: between fork and exec the closure makes only
-        // async-signal-safe calls (prctl, getppid, _exit) and allocates
-        // nothing.
+        // async-signal-safe calls (signal, prctl, getppid, _exit) and
+        // allocates nothing.
         #[allow(unsafe_code)]
         unsafe {
             std::os::unix::process::CommandExt::pre_exec(&mut command, move || {
-                // Best effort: where prctl is refused, the process group
-                // still lets atomic stop it.
-                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0);
-                // atomic died before the signal was set.
-                if libc::getppid() != parent {
-                    libc::_exit(137);
+                // A runner ignores the stop signals, which its command,
+                // in its group, could send it; the command gets them back.
+                for signal in STOP_SIGNALS {
+                    libc::signal(signal, libc::SIG_DFL);
                 }
+                #[cfg(target_os = "linux")]
+                {
+                    // Best effort: where prctl is refused, the process
+                    // group still lets atomic stop it.
+                    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0);
+                    // atomic died before the signal was set.
+                    if libc::getppid() != parent {
+                        libc::_exit(137);
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                let _ = parent;
                 Ok(())
             });
         }
@@ -193,7 +222,7 @@ pub fn run_in(
     let own = (group != Group::Inherit).then(|| child.id());
     running.extend(own);
     drop(running);
-    let done = finish(child, &name, stdin, limits, own, group == Group::OwnReaped);
+    let done = finish(child, &name, stdin, limits, own);
     if let Some(own) = own {
         RUNNING
             .lock()
@@ -205,13 +234,43 @@ pub fn run_in(
     done
 }
 
+/// Whether `child` has exited: `Some(true)` if it has and is not yet
+/// reaped, `Some(false)` where that cannot be told apart from reaping, and
+/// `None` if it still runs.
+fn exited(child: &mut std::process::Child) -> std::io::Result<Option<bool>> {
+    #[cfg(target_os = "linux")]
+    {
+        let pid = libc::id_t::from(child.id());
+        // SAFETY: an all-zero siginfo_t is valid; waitid with WNOWAIT only
+        // reads the child's state and leaves it to be reaped.
+        #[allow(unsafe_code)]
+        let found = unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            let r = libc::waitid(
+                libc::P_PID,
+                pid,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            );
+            if r != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            info.si_pid() != 0
+        };
+        Ok(found.then_some(true))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(child.try_wait()?.map(|_| false))
+    }
+}
+
 fn finish(
     mut child: std::process::Child,
     name: &str,
     stdin: &[u8],
     limits: Limits,
     group: Option<u32>,
-    reap: bool,
 ) -> Result<Completed, ExecError> {
     let name = name.to_owned();
     let io = |e: std::io::Error| ExecError::Io {
@@ -251,8 +310,24 @@ fn finish(
     });
     let started = Instant::now();
     let status = loop {
-        match child.try_wait().map_err(io)? {
-            Some(status) => break status,
+        match exited(&mut child).map_err(io)? {
+            Some(true) => {
+                // Its group is killed while the process is a zombie, so the
+                // group's id cannot yet belong to anyone else; then reaped.
+                if let Some(group) = group {
+                    kill_group(group);
+                }
+                break child.wait().map_err(io)?;
+            }
+            Some(false) => {
+                // Reaped already: its group goes after it, best effort.
+                if let Some(group) = group {
+                    kill_group(group);
+                }
+                if let Some(status) = child.try_wait().map_err(io)? {
+                    break status;
+                }
+            }
             None if started.elapsed() > limits.time => {
                 // Everything it started, not only the process itself.
                 if let Some(group) = group {
@@ -268,11 +343,6 @@ fn finish(
             None => std::thread::sleep(Duration::from_millis(10)),
         }
     };
-    // Before its output is read to the end, which what it left could hold
-    // open.
-    if reap && let Some(group) = group {
-        kill_group(group);
-    }
     let stdout = reader
         .join()
         .map_err(|_| io(std::io::Error::other("stdout reader panicked")))?

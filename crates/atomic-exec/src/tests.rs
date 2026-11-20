@@ -149,39 +149,22 @@ fn a_command_past_its_time_limit_is_stopped_with_everything_it_started() {
 }
 
 #[test]
-fn a_reaped_group_ends_with_its_process_and_an_own_one_does_not() {
-    for (group, survives) in [
-        (process::Group::OwnReaped, false),
-        (process::Group::Own, true),
-    ] {
-        let file = scratch_file(&format!("reaped-{survives}"));
-        let script = format!(
-            "sleep 30 </dev/null >/dev/null 2>&1 & printf '%s' \"$!\" > '{}'",
-            file.display()
-        );
-        process::run_in(
-            group,
-            std::path::Path::new("/bin/sh"),
-            &["-c".to_owned(), script],
-            None,
-            &[],
-            b"",
-            process::Limits {
-                time: Duration::from_secs(10),
-                stdout: 1024,
-                stderr: 1024,
-            },
-        )
-        .expect("runs");
-        let pid = std::fs::read_to_string(&file).expect("the background pid");
-        let _ = std::fs::remove_file(&file);
-        if survives {
-            assert!(alive(&pid), "{group:?}: what it left keeps running");
-            let _ = std::process::Command::new("/bin/sh")
-                .args(["-c", &format!("kill -KILL {pid}")])
-                .status();
-        } else {
-            gone(&pid, &format!("{group:?}: what it left"));
-        }
-    }
+fn what_a_command_leaves_behind_ends_with_it_and_holds_nothing_open() {
+    // The child keeps the command's stdout: unless it is stopped too, the
+    // command's output never ends.
+    let file = scratch_file("left");
+    let script = format!(
+        "sleep 30 & printf '%s' \"$!\" > '{}'; printf done",
+        file.display()
+    );
+    let started = std::time::Instant::now();
+    let done = shell(&script, b"", Duration::from_secs(20)).expect("runs");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the step waited for what the command left"
+    );
+    assert_eq!(done.stdout, b"done");
+    let pid = std::fs::read_to_string(&file).expect("the background pid");
+    let _ = std::fs::remove_file(&file);
+    gone(&pid, "what it left");
 }

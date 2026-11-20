@@ -2165,6 +2165,35 @@ fn serve_restarts_do_not_park_a_healthy_run() {
 }
 
 #[test]
+fn a_command_that_signals_its_own_group_does_not_kill_its_runner() {
+    let dir = scratch("group-signal");
+    let project = project(&dir);
+    // The command shares its runner's process group, and sends the whole
+    // group SIGTERM, which it ignores itself.
+    write_atom(
+        &project,
+        "group-signal",
+        r#"description: 'Signal the group.', kind: 'exec', exec: { command: ['sh', '-c', "trap '' TERM; kill -TERM 0; cat > /dev/null; printf '{\"title\": \"t\", \"words\": 1}'"] }"#,
+        "",
+        object(json!({"text": {"type": "string"}})),
+        object(json!({"title": {"type": "string"}, "words": {"type": "integer"}})),
+    );
+    let out = atomic(
+        &dir,
+        &project,
+        &["run", "group-signal", "--runner", "process", "--data", NOTE],
+        &[],
+        "",
+    );
+    assert!(
+        out.status.success(),
+        "the runner reported it: {}",
+        text(&out)
+    );
+    assert_eq!(stdout_json(&out), json!({"title": "t", "words": 1}));
+}
+
+#[test]
 fn the_runner_role_keeps_its_exit_code_contract() {
     let dir = scratch("runner-codes");
     // A request it cannot read is a usage error, and nothing is written.

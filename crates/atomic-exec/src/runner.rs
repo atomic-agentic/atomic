@@ -264,6 +264,7 @@ pub fn serve(
 /// the control plane stops a command, with everything it started, by
 /// stopping its runner's group.
 pub fn serve_stdio() -> i32 {
+    process::ignore_stop_signals();
     serve(
         &mut std::io::stdin().lock(),
         &mut std::io::stdout().lock(),
@@ -321,7 +322,7 @@ impl ProcessRunner {
         // The runner's group holds its command too: whatever is left in it
         // when the runner ends goes with it.
         let done = process::run_in(
-            process::Group::OwnReaped,
+            process::Group::Own,
             &self.program,
             &self.args,
             None,
