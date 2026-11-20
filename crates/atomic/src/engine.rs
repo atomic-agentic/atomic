@@ -198,6 +198,8 @@ pub async fn open(
             defaults: AtomConfig::default(),
             artifacts: Artifacts::new(store.clone()),
             meter: atomic_core::usage::Metering::none(),
+            // Atoms' commands never reach atomic's private state.
+            guard: atomic_core::codex::StateGuard::for_project(state)?,
         },
         lite: LiteRuntime::new(endpoint, AtomConfig::default()),
         exec,

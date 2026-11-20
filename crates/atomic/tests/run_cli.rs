@@ -362,9 +362,12 @@ async fn open_gate(rt: &Durare, run: &str) -> gate::Gate {
 /// The local operator approves `g`, from outside the run's process: a
 /// second terminal.
 async fn approve(rt: &Durare, g: &gate::Gate) {
+    // The operator's enrolled credential; enrolling again is a no-op.
+    let credential = gate::HumanCredential::new(Principal::local("dev"), "the operator's secret");
+    let _ = gate::enroll(rt, &credential).await;
     gate::decide(
         rt,
-        &Principal::local("dev"),
+        &credential,
         DecisionCommand {
             command_id: format!("{}-approve", g.id),
             gate: g.id.clone(),
@@ -675,7 +678,7 @@ fn a_resumed_run_keeps_the_budget_it_already_spent() {
             &with(&env, &[]),
             &dir.join("resumed.log"),
         );
-        let rt = Durare::sqlite(&state.join("atomic.db"))
+        let rt = Durare::sqlite(&state.join("private/atomic.db"))
             .await
             .expect("store");
         let started = Instant::now();
@@ -757,7 +760,7 @@ fn a_run_killed_at_a_gate_keeps_it_and_its_deadline_and_one_resume_runs_at_a_tim
             &with(&env, &[]),
             &dir.join("first.log"),
         );
-        let rt = Durare::sqlite(&state.join("atomic.db"))
+        let rt = Durare::sqlite(&state.join("private/atomic.db"))
             .await
             .expect("store");
         let opened = open_gate(&rt, "gated-1").await;
@@ -858,7 +861,7 @@ async fn decided_while_down(
         &with(env, &[]),
         &dir.join(format!("{id}.log")),
     );
-    let rt = Durare::sqlite(&state.join("atomic.db"))
+    let rt = Durare::sqlite(&state.join("private/atomic.db"))
         .await
         .expect("store");
     open_gate(&rt, id).await;
@@ -866,7 +869,7 @@ async fn decided_while_down(
     run.wait().expect("reap");
     let decider = Command::new(std::env::current_exe().expect("this test binary"))
         .args(["--exact", "decider_child", "--ignored", "--nocapture"])
-        .env(DECIDER_STORE, state.join("atomic.db"))
+        .env(DECIDER_STORE, state.join("private/atomic.db"))
         .env(DECIDER_RUN, id)
         .env("ATOMIC_FAILPOINT", "gate:before-wake")
         .stdout(Stdio::null())
@@ -943,7 +946,7 @@ fn a_gate_decided_while_its_run_was_down_wakes_it_on_resume() {
             &with(&env, &[]),
             &dir.join("serve.log"),
         );
-        let rt = Durare::sqlite(&state.join("atomic.db"))
+        let rt = Durare::sqlite(&state.join("private/atomic.db"))
             .await
             .expect("store");
         let started = Instant::now();
@@ -999,7 +1002,7 @@ fn serve_started_after_a_kill_recovers_the_run_and_finishes_it() {
             &with(&env, &[]),
             &dir.join("serve.log"),
         );
-        let rt = Durare::sqlite(&state.join("atomic.db"))
+        let rt = Durare::sqlite(&state.join("private/atomic.db"))
             .await
             .expect("store");
         let started = Instant::now();
@@ -1126,7 +1129,7 @@ fn a_run_started_by_one_build_resumes_and_recovers_under_another() {
             &with(&env, &[]),
             &dir.join("serve.log"),
         );
-        let rt = Durare::sqlite(&state.join("atomic.db"))
+        let rt = Durare::sqlite(&state.join("private/atomic.db"))
             .await
             .expect("store");
         let started = Instant::now();
@@ -1163,10 +1166,12 @@ fn a_run_of_another_durable_layout_is_reported_not_resumed() {
             .await
             .expect("child");
         // As if an atomic of an earlier layout had started it.
-        let db =
-            sqlx::SqlitePool::connect(&format!("sqlite://{}", state.join("atomic.db").display()))
-                .await
-                .expect("store");
+        let db = sqlx::SqlitePool::connect(&format!(
+            "sqlite://{}",
+            state.join("private/atomic.db").display()
+        ))
+        .await
+        .expect("store");
         sqlx::query(
             "UPDATE workflow_status SET application_version = 'atomic.pipeline.0' \
              WHERE workflow_uuid = 'old-1'",
@@ -1266,7 +1271,7 @@ fn a_resumed_run_left_queued_is_taken_by_no_other_command() {
         .await
         .expect("child");
         assert!(out.status.success(), "{}", text(&out));
-        let rt = Durare::sqlite(&state.join("atomic.db"))
+        let rt = Durare::sqlite(&state.join("private/atomic.db"))
             .await
             .expect("store");
         assert_eq!(
@@ -1390,7 +1395,7 @@ fn a_cancelled_or_parked_run_is_not_resumed() {
         let project = project(&dir);
         let state = state_dir(&dir, &project);
         let env = model_env(&model.base_url());
-        let db_url = format!("sqlite://{}", state.join("atomic.db").display());
+        let db_url = format!("sqlite://{}", state.join("private/atomic.db").display());
         for (id, status) in [
             ("cancelled-1", "CANCELLED"),
             ("parked-1", "MAX_RECOVERY_ATTEMPTS_EXCEEDED"),
@@ -1674,7 +1679,7 @@ fn lock_held(state: &Path) -> bool {
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open(state.join("runtime.lock"))
+        .open(state.join("private/runtime.lock"))
         .expect("the lock file");
     matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock))
 }

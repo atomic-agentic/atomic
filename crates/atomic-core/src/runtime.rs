@@ -86,6 +86,9 @@ pub struct CodexRuntime {
     pub paths: CodexPaths,
     /// Codex's home for atom threads, inside the project's state directory.
     pub codex_home: PathBuf,
+    /// What atoms' commands are kept out of: atomic's private state, for
+    /// every runtime atoms run on (see [`codex::StateGuard`]).
+    pub guard: codex::StateGuard,
     /// The working directory threads run in.
     pub cwd: PathBuf,
     /// The model endpoint.
@@ -289,6 +292,7 @@ async fn run_contract(
                 &rt.cwd,
                 &rt.endpoint,
                 &rt.meter,
+                &rt.guard,
                 &spec,
                 next,
             )

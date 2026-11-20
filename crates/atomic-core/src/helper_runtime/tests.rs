@@ -332,9 +332,21 @@ fn a_synchronous_loop_is_interrupted_and_the_next_call_succeeds() {
     );
 }
 
+/// Limits for a call that must end at the heap limit: a deadline long enough
+/// that no runner, however slow, reaches it first.
+fn heap_limits() -> Limits {
+    Limits {
+        deadline: Duration::from_secs(30),
+        ..Limits::default()
+    }
+}
+
 #[test]
 fn heap_exhaustion_fails_the_call_and_the_host_survives() {
-    assert_eq!(call("grow", json!([])), Err(Failure::Heap));
+    assert_eq!(
+        invoke(&graph(), "grow", &json!([]), heap_limits(), CLOCK),
+        Err(Failure::Heap)
+    );
     assert_eq!(call("add", json!([2, 3])), Ok(json!(5)));
 }
 
@@ -482,14 +494,18 @@ fn child_process() {
         },
         _ => Controls::default(),
     };
-    let export = if control == "watchdog" {
-        "spin"
+    // The watchdog control spins until the deadline; the heap controls grow
+    // until the heap limit, with a deadline that cannot fire first.
+    let (export, limits) = if control == "watchdog" {
+        (
+            "spin",
+            Limits {
+                deadline: Duration::from_millis(250),
+                ..Limits::default()
+            },
+        )
     } else {
-        "grow"
-    };
-    let limits = Limits {
-        deadline: Duration::from_millis(250),
-        ..Limits::default()
+        ("grow", heap_limits())
     };
     let result = invoke_with(&graph(), export, &json!([]), limits, CLOCK, controls);
     println!("survived: {result:?}");

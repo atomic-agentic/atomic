@@ -21,7 +21,7 @@
 
 use atomic_app::pipeline::{PIPELINE, PipelineRun, Services, prepare, register_pipeline};
 use atomic_core::artifact::LocalStore;
-use atomic_core::codex::{CodexPaths, ModelEndpoint};
+use atomic_core::codex::{CodexPaths, ModelEndpoint, StateGuard};
 use atomic_core::git::Git;
 use atomic_core::lite::LiteRuntime;
 use atomic_core::runtime::{Artifacts, CodexRuntime, Runtimes};
@@ -177,6 +177,7 @@ async fn engine(dir: &Path, project: &Path, base_url: &str) -> Durare {
                 dir.join("bin/codex-linux-sandbox"),
             ),
             codex_home: dir.join("codex-home"),
+            guard: StateGuard::deny_state_dir(dir.join("state")).expect("guard"),
             cwd: project.to_owned(),
             endpoint: endpoint.clone(),
             defaults: AtomConfig::default(),
@@ -235,9 +236,11 @@ async fn open_gate(rt: &Durare, run: &str) -> gate::Gate {
 }
 
 async fn approve(rt: &Durare, g: &gate::Gate) {
+    let credential = gate::HumanCredential::new(Principal::local("dev"), "the operator's secret");
+    gate::enroll(rt, &credential).await.expect("enroll");
     gate::decide(
         rt,
-        &Principal::local("dev"),
+        &credential,
         DecisionCommand {
             command_id: format!("{}-approve", g.id),
             gate: g.id.clone(),

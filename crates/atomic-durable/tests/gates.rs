@@ -12,8 +12,8 @@
 //! selected; the parent kills them with `SIGKILL`.
 
 use atomic_durable::gate::{
-    DecisionCommand, Deployment, Gate, GateSpec, OnTimeout, Principal, Resolution, Tier, Verdict,
-    decide, find, gate, gate_id, resolve,
+    DecisionCommand, Deployment, Gate, GateSpec, HumanCredential, OnTimeout, Principal, Resolution,
+    Tier, Verdict, decide, enroll, find, gate, gate_id, resolve,
 };
 use atomic_durable::{DurableRuntime, Durare, DurareContext};
 use serde::{Deserialize, Serialize};
@@ -227,9 +227,12 @@ async fn a_gate_survives_a_kill_and_is_approved_from_a_second_process(store: Sto
     // Give the recovery time to start waiting again; a decision before then
     // waits in the run's mailbox, so either order works.
     tokio::time::sleep(Duration::from_millis(500)).await;
+    // The second terminal is the operator's, with their credential.
+    let credential = HumanCredential::new(operator(), "the operator's secret");
+    enroll(&second, &credential).await.expect("enroll");
     let decision = decide(
         &second,
-        &operator(),
+        &credential,
         DecisionCommand {
             command_id: unique("cmd"),
             gate: opened.id.clone(),
