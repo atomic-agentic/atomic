@@ -27,7 +27,10 @@
 //!
 //! An attempt that is never settled, because the process died after the
 //! provider was called or the provider reported nothing, stays charged at
-//! its bound. Recovery never releases it: a re-run of the step is a new
+//! its bound in tokens and dollars. Its active time can always be measured:
+//! it is charged as what passed since admission, at most what was reserved,
+//! when it settles as unknown, or when its request is admitted again after
+//! the process that made it died. Recovery never releases it: a re-run of the step is a new
 //! attempt at the same request with its own reservation, and when the
 //! allowance runs out admission refuses, and the run parks. Only a call
 //! known never to have been dispatched is released.
@@ -129,7 +132,8 @@ pub struct Request {
     pub maximum: Charge,
     /// Whether it is a whole agent turn: it reserves all the active time the
     /// chain has left, the least any allowance in it has, in place of
-    /// `reserve.millis`, and is cut off when that runs out.
+    /// `reserve.millis`, and is cut off when that runs out. Less time left
+    /// than `reserve.millis`, one request's bound, refuses it.
     pub turn: bool,
 }
 
@@ -144,6 +148,8 @@ pub enum Admission {
         attempt: i64,
         /// The active milliseconds reserved: the call's time limit.
         millis: i64,
+        /// For a turn, the allowance whose time left set that limit.
+        bounded_by: Option<String>,
     },
     /// Refused: an allowance has no room for the reservation. Nothing was
     /// written.
@@ -169,15 +175,17 @@ pub enum Settlement {
         /// What it cost, in micro-dollars.
         micro_usd: i64,
     },
-    /// Nothing is known: the reservation stays charged at its bound until a
-    /// usage query reconciles it.
+    /// No usage is known: the tokens and dollars stay charged at their
+    /// bound until a usage query reconciles them. The active time, which can
+    /// always be measured, is charged as what passed since admission, at
+    /// most what was reserved.
     Unknown,
     /// The call was never dispatched: the reservation is released.
     NotDispatched,
     /// Its usage, learned after the fact from a usage query or a person,
-    /// for an attempt that was never settled: it replaces the reservation,
-    /// and the active time stays charged as reserved, since how long the
-    /// call took is not known.
+    /// for an attempt that was never settled: it replaces the reservation.
+    /// The active time is what passed since admission, at most what was
+    /// reserved, unless it was settled already.
     Reconciled {
         /// Input tokens.
         input_tokens: i64,
@@ -438,6 +446,19 @@ async fn admit_in(tx: &mut Tx<'_, '_>, request: &Request) -> Result<End<Admissio
         .await?;
         parent = Some(&scope.id);
     }
+    // An earlier attempt at the same request still reserved died with its
+    // process: what time it took has passed, so it is charged that much,
+    // at most what it reserved, before the room is read.
+    let earlier = tx
+        .query_all(
+            "SELECT attempt FROM atomic_usage_attempts WHERE request_id = ? \
+             AND state = 'reserved' AND settled_at IS NULL ORDER BY attempt",
+            &[Param::Text(request.id.clone())],
+        )
+        .await?;
+    for row in earlier {
+        settle_time(tx, &request.id, row.int("attempt")?).await?;
+    }
     // Reserve against each, root first. Each row is locked before it is
     // read (a write that changes nothing), so the room the read finds is
     // the room the reservation takes, and a refusal's reason comes from the
@@ -455,22 +476,26 @@ async fn admit_in(tx: &mut Tx<'_, '_>, request: &Request) -> Result<End<Admissio
         allowances.push(a);
     }
     // A turn takes all the active time left, the least any allowance has.
+    let mut bounded_by = None;
     if request.turn {
         let (least, left) = allowances
             .iter()
             .map(|a| (a, a.caps.millis.saturating_sub(a.charged.millis)))
             .min_by_key(|(_, left)| *left)
             .ok_or_else(|| corrupt("an empty chain"))?;
-        if left <= 0 {
+        // Less time than one request's bound is not worth a turn: it would
+        // be cut off at once and charged its whole token bound.
+        if left < r.millis.max(1) {
             return refuse(
                 &least.scope,
                 format!(
-                    "the allowance {} has no active time left for request {}: {} of {} ms \
-                     charged",
-                    least.scope, request.id, least.charged.millis, least.caps.millis
+                    "the allowance {} has less active time left than one request's bound for \
+                     request {}: {} of {} ms charged, and a request reserves {}",
+                    least.scope, request.id, least.charged.millis, least.caps.millis, r.millis
                 ),
             );
         }
+        bounded_by = Some(least.scope.clone());
         r.millis = left;
     }
     for (scope, a) in request.chain.iter().zip(&allowances) {
@@ -547,7 +572,56 @@ async fn admit_in(tx: &mut Tx<'_, '_>, request: &Request) -> Result<End<Admissio
         request: request.id.clone(),
         attempt,
         millis: r.millis,
+        bounded_by,
     }))
+}
+
+/// Settle the active time of attempt `attempt` at `request`, if it is
+/// still reserved and its time is not settled yet: time can always be
+/// measured, so it is charged as what passed since admission, at most what
+/// was reserved, while its tokens and dollars stay charged at their bound.
+/// Returns the attempt's charged time after.
+async fn settle_time(tx: &mut Tx<'_, '_>, request: &str, attempt: i64) -> Result<Option<i64>> {
+    let key = [Param::Text(request.to_owned()), Param::Int(attempt)];
+    let Some(row) = tx
+        .query_opt(
+            "SELECT state, scopes, reserved_millis, charged_millis, admitted_at, settled_at \
+             FROM atomic_usage_attempts WHERE request_id = ? AND attempt = ?",
+            &key,
+        )
+        .await?
+    else {
+        return Ok(None);
+    };
+    let charged = row.int("charged_millis")?;
+    if row.text("state")? != "reserved" || row.int_opt("settled_at")?.is_some() {
+        return Ok(Some(charged));
+    }
+    let now = now_ms();
+    let elapsed = (now - row.int("admitted_at")?).clamp(0, row.int("reserved_millis")?);
+    tx.execute(
+        "UPDATE atomic_usage_attempts SET charged_millis = ?, settled_at = ? \
+         WHERE request_id = ? AND attempt = ? AND state = 'reserved' AND settled_at IS NULL",
+        &[
+            Param::Int(elapsed),
+            Param::Int(now),
+            Param::Text(request.to_owned()),
+            Param::Int(attempt),
+        ],
+    )
+    .await?;
+    let scopes: Vec<String> = serde_json::from_str(&row.text("scopes")?).map_err(corrupt)?;
+    add_charge(
+        tx,
+        &scopes,
+        Charge {
+            tokens: 0,
+            millis: elapsed - charged,
+            micro_usd: 0,
+        },
+    )
+    .await?;
+    Ok(Some(elapsed))
 }
 
 async fn settle_in(
@@ -572,6 +646,20 @@ async fn settle_in(
     if row.text("state")? != "reserved" {
         return Ok(End::Rollback(Settled::Already));
     }
+    // Usage that is not reported still took time: settle that much now.
+    if matches!(how, Settlement::Unknown | Settlement::Reconciled { .. }) {
+        settle_time(tx, request, attempt).await?;
+        if matches!(how, Settlement::Unknown) {
+            return Ok(End::Commit(Settled::Uncertain));
+        }
+    }
+    let row = tx
+        .query_one(
+            "SELECT state, scopes, charged_tokens, charged_millis, charged_micro_usd \
+             FROM atomic_usage_attempts WHERE request_id = ? AND attempt = ?",
+            &key,
+        )
+        .await?;
     let scopes: Vec<String> = serde_json::from_str(&row.text("scopes")?).map_err(corrupt)?;
     let charged = Charge {
         tokens: row.int("charged_tokens")?,
@@ -582,7 +670,7 @@ async fn settle_in(
     // overflow.
     let held = |n: i64| n.clamp(0, MOST);
     let (state, actual, usage) = match how {
-        Settlement::Unknown => return Ok(End::Rollback(Settled::Uncertain)),
+        Settlement::Unknown => return Ok(End::Commit(Settled::Uncertain)),
         Settlement::NotDispatched => ("released", Charge::default(), None),
         Settlement::Reported {
             input_tokens,

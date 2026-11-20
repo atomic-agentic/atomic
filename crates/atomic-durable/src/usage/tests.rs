@@ -167,7 +167,8 @@ async fn an_unsettled_attempt_stays_charged_until_admission_refuses<R: DurableRu
         );
         assert_eq!(attempt, n, "a new attempt at the same request");
     }
-    // Unknown usage leaves the reservation charged.
+    // Unknown usage leaves the tokens and dollars charged at the bound; the
+    // time is what passed, which is less here than was reserved.
     assert_eq!(
         ledger
             .settle(&format!("{run}:1:0"), 2, Settlement::Unknown)
@@ -175,12 +176,9 @@ async fn an_unsettled_attempt_stays_charged_until_admission_refuses<R: DurableRu
             .expect("settle"),
         Settled::Uncertain
     );
-    let full = Charge {
-        tokens: 300,
-        millis: 3_000,
-        micro_usd: 150,
-    };
-    assert_eq!(charged(&ledger, &format!("run:{run}")).await, full);
+    let full = charged(&ledger, &format!("run:{run}")).await;
+    assert_eq!((full.tokens, full.micro_usd), (300, 150));
+    assert!(full.millis < 3_000, "{full:?}");
 
     match ledger
         .admit(request(&run, 1, 0, 300, 10_000))
@@ -424,14 +422,9 @@ async fn a_reserved_attempt_is_reconciled_or_released_once<R: DurableRuntime>(rt
         Settled::Already
     );
     assert!(ledger.unsettled(&run).await.expect("unsettled").is_empty());
-    assert_eq!(
-        charged(&ledger, &format!("atom:{run}:1")).await,
-        Charge {
-            tokens: 10,
-            millis: BOUND.millis,
-            micro_usd: 2,
-        }
-    );
+    let atom = charged(&ledger, &format!("atom:{run}:1")).await;
+    assert_eq!((atom.tokens, atom.micro_usd), (10, 2));
+    assert!(atom.millis < BOUND.millis, "the time it took: {atom:?}");
 }
 
 async fn a_person_raises_a_cap_and_never_lowers_one<R: DurableRuntime>(rt: R) {
@@ -546,11 +539,14 @@ async fn a_turn_reserves_the_active_time_left<R: DurableRuntime>(rt: R) {
     turn.chain[1].caps.millis = 20_000;
     turn.turn = true;
     // All the time the narrowest allowance has, not the call bound's.
-    let Admission::Admitted { millis, .. } = ledger.admit(turn.clone()).await.expect("admit")
+    let Admission::Admitted {
+        millis, bounded_by, ..
+    } = ledger.admit(turn.clone()).await.expect("admit")
     else {
         panic!("admitted");
     };
     assert_eq!(millis, 20_000);
+    assert_eq!(bounded_by, Some(format!("atom:{run}:1")));
     ledger
         .settle(
             &format!("{run}:1:0"),
@@ -571,15 +567,85 @@ async fn a_turn_reserves_the_active_time_left<R: DurableRuntime>(rt: R) {
         panic!("admitted");
     };
     assert_eq!(millis, 8_000);
-    // With none left, it is refused.
+    ledger
+        .settle(
+            &format!("{run}:1:1"),
+            1,
+            Settlement::Reported {
+                input_tokens: 1,
+                output_tokens: 1,
+                millis: 7_500,
+                micro_usd: 0,
+            },
+        )
+        .await
+        .expect("settle");
+    // 500 ms left, below one request's 1000: refused, with nothing spent.
     turn.id = format!("{run}:1:2");
+    let before = charged(&ledger, &format!("atom:{run}:1")).await;
     match ledger.admit(turn).await.expect("admit") {
         Admission::Refused { scope, reason } => {
             assert_eq!(scope, format!("atom:{run}:1"));
-            assert!(reason.contains("no active time left"), "{reason}");
+            assert!(
+                reason.contains("less active time left than one request's bound"),
+                "{reason}"
+            );
         }
         other => panic!("refused: {other:?}"),
     }
+    assert_eq!(charged(&ledger, &format!("atom:{run}:1")).await, before);
+}
+
+async fn unreported_and_dead_attempts_are_charged_the_time_they_took<R: DurableRuntime>(rt: R) {
+    let ledger = rt.ledger();
+    let run = unique("elapsed");
+    // A turn reserving all of a long allowance reports nothing: its tokens
+    // stay at the bound, its time is what passed, not the hour reserved.
+    let mut turn = request(&run, 1, 0, 1_000_000, 1_000_000);
+    turn.chain[0].caps.millis = 3_600_000;
+    turn.chain[1].caps.millis = 3_600_000;
+    turn.turn = true;
+    admitted(&ledger.admit(turn.clone()).await.expect("admit"));
+    assert_eq!(
+        ledger
+            .settle(&format!("{run}:1:0"), 1, Settlement::Unknown)
+            .await
+            .expect("settle"),
+        Settled::Uncertain
+    );
+    let a = &ledger.attempts(&run).await.expect("attempts")[0];
+    assert_eq!(a.state, "reserved");
+    assert_eq!(a.charged.tokens, BOUND.tokens);
+    assert!(a.charged.millis < 60_000, "{a:?}");
+    // A second unknown settlement leaves the time as settled.
+    let settled_once = a.charged.millis;
+    ledger
+        .settle(&format!("{run}:1:0"), 1, Settlement::Unknown)
+        .await
+        .expect("settle");
+    assert_eq!(
+        ledger.attempts(&run).await.expect("attempts")[0]
+            .charged
+            .millis,
+        settled_once
+    );
+    // An attempt whose process died is never settled; when its request is
+    // admitted again, it is charged the time it took, so the new attempt
+    // has room.
+    turn.id = format!("{run}:1:1");
+    admitted(&ledger.admit(turn.clone()).await.expect("admit"));
+    let Admission::Admitted { millis, .. } = ledger.admit(turn).await.expect("admit") else {
+        panic!("the re-run is admitted");
+    };
+    assert!(millis > 3_000_000, "most of the hour is left: {millis}");
+    let attempts = ledger.attempts(&run).await.expect("attempts");
+    let dead = attempts
+        .iter()
+        .find(|a| a.request.ends_with(":1:1") && a.attempt == 1)
+        .expect("the dead attempt");
+    assert_eq!(dead.state, "reserved");
+    assert!(dead.charged.millis < 60_000, "{dead:?}");
+    assert_eq!(dead.charged.tokens, BOUND.tokens);
 }
 
 async fn amounts_out_of_range_are_refused_and_reported_usage_is_held<R: DurableRuntime>(rt: R) {
@@ -672,6 +738,7 @@ macro_rules! on_postgres {
 
 on_sqlite!(
     a_call_is_reserved_before_dispatch_and_settled_once,
+    unreported_and_dead_attempts_are_charged_the_time_they_took,
     a_turn_reserves_the_active_time_left,
     amounts_out_of_range_are_refused_and_reported_usage_is_held,
     admission_refuses_on_time_and_on_dollars,
@@ -688,6 +755,7 @@ on_sqlite!(
 #[cfg(feature = "postgres-tests")]
 on_postgres!(
     a_call_is_reserved_before_dispatch_and_settled_once,
+    unreported_and_dead_attempts_are_charged_the_time_they_took,
     a_turn_reserves_the_active_time_left,
     amounts_out_of_range_are_refused_and_reported_usage_is_held,
     admission_refuses_on_time_and_on_dollars,

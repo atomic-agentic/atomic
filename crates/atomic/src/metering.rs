@@ -42,7 +42,6 @@ pub struct BudgetPlan {
     /// Each model atom's caps, by atom name.
     pub atoms: BTreeMap<String, Resolved>,
     /// The model each model atom calls, by atom name.
-    #[serde(default)]
     pub models: BTreeMap<String, String>,
     /// The most one call may use, when its model has no maximum of its own.
     pub call: PlannedCall,
@@ -151,6 +150,19 @@ impl BudgetPlan {
                 .collect(),
             ..BudgetSettings::default()
         }
+    }
+
+    /// Check that the plan has caps and a model for each of `atoms`, every
+    /// atom a run calls a model from.
+    pub fn covers(&self, atoms: &[&str]) -> Result<(), String> {
+        for atom in atoms {
+            if !self.atoms.contains_key(*atom) || !self.models.contains_key(*atom) {
+                return Err(format!(
+                    "atom {atom} calls a model, and the plan has no caps or model for it"
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Check a plan that came from outside, such as one pinned in a run's
@@ -324,6 +336,7 @@ impl Meter for LedgerMeter {
                     request,
                     attempt,
                     millis,
+                    bounded_by,
                 } => Ok(Ticket {
                     request,
                     attempt,
@@ -335,6 +348,7 @@ impl Meter for LedgerMeter {
                         // its atom has left.
                         time: Some(Duration::from_millis(u64::try_from(millis).unwrap_or(0))),
                     },
+                    bounded_by,
                 }),
                 Admission::Refused { reason, .. } => Err(Exhausted(reason).into()),
             }

@@ -349,6 +349,7 @@ impl Meter for Recorder {
                 model: call.model.clone(),
                 admitted: Instant::now(),
                 limit: self.limit,
+                bounded_by: None,
             };
             self.calls.lock().expect("calls").push(call);
             Ok(ticket)
@@ -551,6 +552,36 @@ fn the_output_limit_goes_in_the_field_its_endpoint_reads() {
             MaxCompletionTokens,
         ),
         (
+            Wire::ChatCompletions,
+            "https://eu.api.openai.com/v1",
+            MaxCompletionTokens,
+        ),
+        (
+            Wire::ChatCompletions,
+            "https://us.api.openai.com/v1",
+            MaxCompletionTokens,
+        ),
+        (
+            Wire::ChatCompletions,
+            "https://example.services.ai.azure.com/openai/v1",
+            MaxCompletionTokens,
+        ),
+        (
+            Wire::ChatCompletions,
+            "https://example.openai.azure.us/openai/v1",
+            MaxCompletionTokens,
+        ),
+        (
+            Wire::ChatCompletions,
+            "https://example.openai.azure.cn/openai/v1",
+            MaxCompletionTokens,
+        ),
+        (
+            Wire::ChatCompletions,
+            "https://notapi.openai.com.example/v1",
+            MaxTokens,
+        ),
+        (
             Wire::Responses,
             "https://api.openai.com/v1",
             MaxOutputTokens,
@@ -638,4 +669,70 @@ async fn an_answer_cut_off_at_its_output_limit_is_its_own_error_with_no_repair()
             })]
         );
     }
+}
+
+/// A runtime on `base_url` speaking Chat Completions.
+fn chat_at(base_url: &str) -> LiteRuntime {
+    let mut rt = LiteRuntime::new(
+        ModelEndpoint {
+            base_url: base_url.into(),
+            model: "m".into(),
+            api_key_env: None,
+        },
+        AtomConfig::default(),
+    );
+    rt.wire = Wire::ChatCompletions;
+    rt
+}
+
+#[test]
+fn a_request_body_carries_its_limit_in_the_endpoints_field_or_the_one_set() {
+    let exchange = [(Role::User, "hi".to_owned())];
+    let body = |rt: &LiteRuntime| request_body(rt, "m", None, &exchange, None, Some(99));
+    for base in [
+        "https://api.openai.com/v1",
+        "https://example.openai.azure.com/openai/v1",
+    ] {
+        let sent = body(&chat_at(base));
+        assert_eq!(sent["max_completion_tokens"], json!(99), "{base}");
+        assert!(sent.get("max_tokens").is_none(), "{base}");
+    }
+    let sent = body(&chat_at("http://127.0.0.1:8080/v1"));
+    assert_eq!(sent["max_tokens"], json!(99));
+    // A gateway the URL does not identify: the setting chooses.
+    let mut gateway = chat_at("https://llm-gateway.example/v1");
+    assert_eq!(body(&gateway)["max_tokens"], json!(99));
+    gateway.limit_field = Some(LimitField::MaxCompletionTokens);
+    let sent = body(&gateway);
+    assert_eq!(sent["max_completion_tokens"], json!(99));
+    assert!(sent.get("max_tokens").is_none());
+}
+
+#[tokio::test]
+async fn an_answer_a_content_filter_stopped_is_not_a_truncation() {
+    let body = json!({"id": "r", "status": "incomplete",
+        "incomplete_details": {"reason": "content_filter"},
+        "output": [{"type": "message", "role": "assistant", "content": [
+            {"type": "output_text", "text": "{"}]}],
+        "usage": {"input_tokens": 7, "output_tokens": 1, "total_tokens": 8}});
+    let model = FakeModel::start(vec![Reply::Json(body), Reply::Text(GOOD.into())])
+        .await
+        .expect("fake model");
+    let mut rt = runtime(&model, Wire::Responses);
+    let recorder = metered(&mut rt, Limit::default());
+    match run_lite_atom(&Classify, &note(), &rt).await {
+        Err(AtomError::Model(message)) => {
+            assert!(message.contains("content_filter"), "{message}");
+            assert!(!message.contains("output limit"), "{message}");
+        }
+        other => panic!("expected the provider's stop, got {other:?}"),
+    }
+    assert_eq!(model.calls(), 1, "no repair turn");
+    assert_eq!(
+        settled(&recorder),
+        [Outcome::Reported(Usage {
+            input_tokens: 7,
+            output_tokens: 1
+        })]
+    );
 }

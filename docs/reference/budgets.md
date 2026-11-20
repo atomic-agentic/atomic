@@ -128,20 +128,27 @@ Admission reserves the call's whole bound: the model's `max_input_tokens` and
 rate, and the `call` time. The call is held to that bound: a lite call is sent
 with the bound's output tokens as its output limit, in the field its endpoint
 reads (`max_completion_tokens` on OpenAI's and Azure OpenAI's Chat Completions,
-`max_tokens` on other OpenAI-compatible servers, `max_output_tokens` on the
-Responses API), and is cut off when its reserved time runs out. An answer cut off
+in any region or cloud, `max_tokens` on other OpenAI-compatible servers,
+`max_output_tokens` on the Responses API), and is cut off when its reserved time
+runs out. The field is told from the endpoint's URL unless the runtime sets it,
+as it must for a gateway the URL does not identify. An answer cut off
 at its output limit fails as such, without a repair turn. A lite request larger
 than the bound's input tokens is recorded in the attempt's declared maximum.
 
 The usage a response reports is settled before its answer is judged, so a refusal
 or an empty answer is charged what it spent. A response that reports no usage is
-settled as unknown and stays charged at its reservation; it is never taken as
-free.
+settled as unknown: its tokens and dollars stay charged at its reservation, and
+it is never taken as free. Its active time can always be measured, so it is
+charged the time that passed, at most what was reserved. A call whose process
+died before it settled is charged the same way when its request is admitted
+again.
 
 A Codex turn can make several provider requests and run tools between them, so
 the `call` time does not bound it. A turn reserves the active time its atom has
 left (or less, if the run has less), and is interrupted when that runs out; the
-run then parks, as at any other cap. A failed or interrupted turn is settled with
+run then parks, as at any other cap, and the park's reason names the allowance
+that ran out. With less time left than one request's bound, a turn is not
+started at all: the run parks without spending. A failed or interrupted turn is settled with
 the usage it reported before it stopped. Its reported tokens can exceed the
 bound; the ledger records any such overshoot.
 

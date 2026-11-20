@@ -1649,16 +1649,27 @@ fn a_pinned_budget_is_checked_before_the_run_uses_it() {
         if let Some(plan) = broken.budgets.as_mut() {
             plan.call.minutes = -1.0;
         }
-        // A model atom the plan has no caps for is refused, not unmetered.
+        // A model atom the plan has no caps or model for is refused, not
+        // run unmetered, before the run's first call.
         let mut uncapped = pinned();
         if let Some(plan) = uncapped.budgets.as_mut() {
             plan.atoms.remove("rank-note");
-            plan.models.remove("rank-note");
+        }
+        let mut modelless = pinned();
+        if let Some(plan) = modelless.budgets.as_mut() {
+            plan.models.clear();
+        }
+        // A dollar cap over a model the plan does not price.
+        let mut unpriced = pinned();
+        if let Some(plan) = unpriced.budgets.as_mut() {
+            plan.run.micro_usd = Some(1_000_000);
         }
         for (run, pipeline, says) in [
             ("cramped", cramped, "smaller than one call"),
             ("broken", broken, "budget.call.minutes"),
-            ("uncapped", uncapped, "no caps for it"),
+            ("uncapped", uncapped, "has no caps"),
+            ("modelless", modelless, "no caps or model for it"),
+            ("unpriced", unpriced, "cost_usd needs reliable pricing"),
         ] {
             rt.start(
                 PIPELINE,
@@ -1680,8 +1691,62 @@ fn a_pinned_budget_is_checked_before_the_run_uses_it() {
                 "{run}: {failed:?}"
             );
         }
-        // Only the uncapped run's first step called the model.
-        assert_eq!(model.calls(), 1);
+        assert_eq!(model.calls(), 0, "every plan was refused before any call");
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[test]
+fn an_atom_that_calls_another_model_than_its_budget_was_resolved_for_fails() {
+    on_codex_runtime(async {
+        let dir = scratch("budget-model");
+        let project = project(&dir);
+        // The atom names its model itself.
+        let file = project.join("atoms/read-note.atom.astro");
+        let text = std::fs::read_to_string(&file).expect("atom");
+        std::fs::write(
+            &file,
+            text.replace(
+                "description: 'read-note'",
+                "description: 'read-note', model: 'synthetic'",
+            ),
+        )
+        .expect("atom");
+        let model = FakeModel::start(vec![Reply::Text(READ.into())])
+            .await
+            .expect("fake model");
+        let url = model.base_url();
+        let rt = engine_with(&dir, &url, small_calls()).await;
+        let mut pipeline = load(&project, "model.workflow.yaml", TRIAGE);
+        pin_budgets(&mut pipeline, &runtimes(&dir, &url), &small_calls()).expect("pinned");
+        // A plan that says it calls another.
+        if let Some(plan) = pipeline.budgets.as_mut() {
+            plan.models.insert("read-note".into(), "elsewhere".into());
+        }
+        rt.start(
+            PIPELINE,
+            "model",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "Exporting a file named café.txt crashes the app."}),
+            },
+        )
+        .await
+        .expect("start");
+        let failed = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            rt.result::<Value>("model"),
+        )
+        .await
+        .expect("the run ended");
+        assert!(
+            matches!(&failed, Err(atomic_durable::DurableError::Failed(m))
+                if m.contains("calls \"synthetic\"") && m.contains("resolved for \"elsewhere\"")),
+            "{failed:?}"
+        );
+        assert_eq!(model.calls(), 0);
         rt.shutdown(std::time::Duration::from_secs(5))
             .await
             .expect("shutdown");

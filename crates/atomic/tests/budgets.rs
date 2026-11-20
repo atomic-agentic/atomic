@@ -467,6 +467,26 @@ async fn child(
     child_until(dir, url, run, role, caps, failpoint, 1).await
 }
 
+/// The child as `role` on run `run` with caps `atom,run`, started and left
+/// running, for a test to kill when it chooses.
+fn spawn_child(dir: &Path, url: &str, run: &str, role: &str, caps: &str) -> std::process::Child {
+    let _ = std::fs::remove_file(dir.join("outcome"));
+    Command::new(std::env::current_exe().expect("this test binary"))
+        .args(["--exact", "budgets_child", "--ignored", "--nocapture"])
+        .env(ENV_ROLE, role)
+        .env(ENV_DIR, dir)
+        .env(ENV_URL, url)
+        .env(ENV_RUN, run)
+        .env(ENV_CAPS, caps)
+        .env(ENV_PARKS, "1")
+        .env_remove("ATOMIC_FAILPOINT")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start the child")
+}
+
 /// As [`child`], watching for the `parks`th park.
 async fn child_until(
     dir: &Path,
@@ -636,6 +656,62 @@ fn killing_after_the_call_and_before_settlement_ends_parked_at_the_cap() {
         assert_eq!(model.calls(), 5);
         let rt = reader(&dir).await;
         assert_eq!(charged(&rt, "atom:unsettled:0").await, 4 * 2);
+    });
+}
+
+#[test]
+fn killing_the_process_during_a_codex_turn_lets_the_recovered_run_finish() {
+    on_codex_runtime(async {
+        // The review's first turn never answers in time: the process is
+        // killed while it is in flight. The recovered run's turn answers.
+        let model = FakeModel::start(vec![
+            Reply::Text(DRAFT.into()),
+            Reply::Delayed {
+                after: Duration::from_secs(120),
+                reply: Box::new(Reply::Text(REVIEW.into())),
+            },
+            Reply::Text(REVIEW.into()),
+        ])
+        .await
+        .expect("fake model");
+        let dir = scratch("midturn");
+        let url = model.base_url();
+        // Default time caps: the turn reserves the atom's whole 30 minutes.
+        let caps = "10000,100000";
+        let mut process = spawn_child(&dir, &url, "midturn", "start", caps);
+        let until = Instant::now() + Duration::from_secs(60);
+        while model.calls() < 2 {
+            assert!(
+                Instant::now() < until,
+                "the review's turn reached the model"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        process.kill().expect("kill the child");
+        let _ = process.wait();
+
+        // Recovered, the dead turn is charged the time it took, not the 30
+        // minutes it reserved, so the review runs again and the run ends.
+        let seen = child(&dir, &url, "midturn", "recover", caps, None)
+            .await
+            .expect("the recovered run");
+        assert_eq!(seen, "finished");
+        assert_eq!(model.calls(), 3);
+        let rt = reader(&dir).await;
+        assert_eq!(
+            requests("midturn", &attempts(&rt, "midturn").await),
+            [
+                ("0:0".to_owned(), 1, "settled".to_owned()),
+                ("2:0".to_owned(), 1, "reserved".to_owned()),
+                ("2:0".to_owned(), 2, "settled".to_owned()),
+            ]
+        );
+        let review = attempts(&rt, "midturn").await;
+        let dead = &review[1];
+        assert_eq!(dead.charged.tokens, BOUND, "its tokens stay at the bound");
+        assert!(dead.charged.millis < 60_000, "{dead:?}");
+        assert!(dead.reserved.millis >= 29 * 60_000, "{dead:?}");
     });
 }
 
@@ -944,9 +1020,9 @@ fn timed(call: f64, atom: f64) -> BudgetSettings {
 #[test]
 fn a_codex_turn_longer_than_a_request_bound_runs_within_its_atoms_time() {
     on_codex_runtime(async {
-        // Scaled down: a request is bounded at 0.6 s and the atom at 3 s, so
-        // a 1.5 s review turn is a 12-minute build turn under a 10-minute
-        // request bound and a 30-minute atom cap.
+        // Scaled down: a request is bounded at 0.6 s and the atom at 6 s, so
+        // a 1.5 s review turn is a long build turn under a 10-minute request
+        // bound and a 30-minute atom cap, with room to spare.
         let model = FakeModel::start(vec![
             Reply::Text(DRAFT.into()),
             Reply::Delayed {
@@ -957,7 +1033,7 @@ fn a_codex_turn_longer_than_a_request_bound_runs_within_its_atoms_time() {
         .await
         .expect("fake model");
         let dir = scratch("longturn");
-        let rt = engine(&dir, &model.base_url(), timed(0.01, 0.05)).await;
+        let rt = engine(&dir, &model.base_url(), timed(0.01, 0.1)).await;
         rt.launch().await.expect("launch");
         rt.start(CHANGE_REQUEST, "longturn", input())
             .await
@@ -967,7 +1043,7 @@ fn a_codex_turn_longer_than_a_request_bound_runs_within_its_atoms_time() {
         // The lite request reserved its own bound; the turn, all its atom's
         // time.
         assert_eq!(journal[0].reserved.millis, 600);
-        assert_eq!(journal[1].reserved.millis, 3_000, "{:?}", journal[1]);
+        assert_eq!(journal[1].reserved.millis, 6_000, "{:?}", journal[1]);
         assert!(journal[1].charged.millis >= 1_500, "{:?}", journal[1]);
         rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
     });
@@ -995,6 +1071,10 @@ fn a_codex_turn_that_runs_out_of_its_atoms_time_parks_the_run() {
             panic!("the run should park");
         };
         assert!(reason.contains("cut off"), "{reason}");
+        assert!(
+            reason.contains("the allowance atom:outoftime:2"),
+            "{reason}"
+        );
         let park = parks(&rt, "outoftime").await.expect("parks")[0].clone();
         assert_eq!(park.step, "review.park");
         rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");

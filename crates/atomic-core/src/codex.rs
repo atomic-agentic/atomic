@@ -804,6 +804,7 @@ where
             Err(e) => break Err(meter_error(e)),
         };
         report.turns += 1;
+        let bounded_by = ticket.as_ref().and_then(|t| t.bounded_by.clone());
         // A turn is cut off when its reserved time runs out; a failed or cut
         // off turn still reports the usage seen before it stopped.
         let (turn, totals) = run_turn(&thread, &current, limit.time).await;
@@ -834,7 +835,8 @@ where
             // its atom had left: the run parks, as at any other cap.
             Err(e) if e.downcast_ref::<CutOff>().is_some() => {
                 break Err(meter_error(MeterError::Exhausted(Exhausted(format!(
-                    "{e}; the atom's allowance has no active time left for it"
+                    "{e}: all the active time the allowance {} had left",
+                    bounded_by.as_deref().unwrap_or("of its atom")
                 )))));
             }
             Err(e) => break Err(e),
@@ -1582,6 +1584,7 @@ mod tests {
                     model: call.model,
                     admitted: std::time::Instant::now(),
                     limit: self.limit,
+                    bounded_by: None,
                 })
             })
         }

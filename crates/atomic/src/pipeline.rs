@@ -451,10 +451,20 @@ async fn run_pipeline<C: WorkflowContext>(
     let planned = match &pipeline.budgets {
         // A plan in the run's input came from outside: checked as one
         // resolved here would be.
-        Some(plan) => plan
-            .validate()
-            .map(|()| plan.clone())
-            .map_err(|e| format!("workflow {}: its pinned budget: {e}", pipeline.name)),
+        Some(plan) => {
+            // Every atom of the run that calls a model needs its caps and
+            // model in the plan, so a gap fails here, before any call.
+            let model_atoms: Vec<&str> = pipeline
+                .atoms
+                .iter()
+                .filter(|(_, atom)| model_of(atom, &services.runtimes).is_some())
+                .map(|(name, _)| name.as_str())
+                .collect();
+            plan.validate()
+                .and_then(|()| plan.covers(&model_atoms))
+                .map(|()| plan.clone())
+                .map_err(|e| format!("workflow {}: its pinned budget: {e}", pipeline.name))
+        }
         None => plan_budgets(&pipeline, &services.runtimes, &services.budgets),
     };
     // Store the definitions the run uses before anything runs. The snapshot
@@ -576,24 +586,25 @@ async fn run_pipeline<C: WorkflowContext>(
         // A model atom runs on the model its budget was resolved for, and
         // only with caps: never unmetered, never at another model's price.
         if let Some(model) = model_of(&atom, &runtimes) {
-            let pinned = models.get(&step.atom).cloned();
-            if atom_caps.is_none() || (pinned.is_none() && !models.is_empty()) {
-                return Err(failed(format!(
-                    "step `{}`: `{}` calls a model, and the run's budget has no caps for it",
-                    step.id, atom.name
-                )));
-            }
-            if let Some(pinned) = pinned {
-                runtimes.codex.defaults.model = Some(pinned.clone());
-                runtimes.lite.defaults.model = Some(pinned.clone());
-                let now = model_of(&atom, &runtimes).unwrap_or(model);
-                if now != pinned {
+            let pinned = match (&atom_caps, models.get(&step.atom)) {
+                (Some(_), Some(pinned)) => pinned.clone(),
+                _ => {
                     return Err(failed(format!(
-                        "step `{}`: `{}` calls {now:?}, and the run's budget was resolved \
-                         for {pinned:?}",
+                        "step `{}`: `{}` calls a model, and the run's budget has no caps or \
+                         model for it",
                         step.id, atom.name
                     )));
                 }
+            };
+            runtimes.codex.defaults.model = Some(pinned.clone());
+            runtimes.lite.defaults.model = Some(pinned.clone());
+            let now = model_of(&atom, &runtimes).unwrap_or(model);
+            if now != pinned {
+                return Err(failed(format!(
+                    "step `{}`: `{}` calls {now:?}, and the run's budget was resolved for \
+                     {pinned:?}",
+                    step.id, atom.name
+                )));
             }
         }
         let tree = if step.worktree {

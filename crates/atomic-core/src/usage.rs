@@ -85,6 +85,9 @@ pub struct Ticket {
     pub admitted: Instant,
     /// What the call may use: its reservation.
     pub limit: Limit,
+    /// For a turn, the allowance whose time left set its time limit, such
+    /// as `atom:<run>:<step>`.
+    pub bounded_by: Option<String>,
 }
 
 /// An admission: the ticket to settle, if the call is metered, and the

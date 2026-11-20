@@ -87,6 +87,10 @@ pub struct LiteRuntime {
     pub artifacts: crate::runtime::Artifacts,
     /// What admits and settles each call (see [`crate::usage`]).
     pub meter: crate::usage::Metering,
+    /// The request field the endpoint reads a call's output limit from, or
+    /// `None` to tell from the endpoint's URL ([`LimitField::for_endpoint`]).
+    /// Set it for a gateway or a server the URL does not identify.
+    pub limit_field: Option<LimitField>,
 }
 
 impl LiteRuntime {
@@ -100,6 +104,7 @@ impl LiteRuntime {
             timeout: DEFAULT_TIMEOUT,
             artifacts: crate::runtime::Artifacts::none(),
             meter: crate::usage::Metering::none(),
+            limit_field: None,
         }
     }
 }
@@ -153,7 +158,7 @@ impl LimitField {
     pub fn for_endpoint(wire: Wire, base_url: &str) -> Self {
         match wire {
             Wire::Responses => Self::MaxOutputTokens,
-            Wire::ChatCompletions if is_openai_api(base_url) || is_azure_openai(base_url) => {
+            Wire::ChatCompletions if reads_max_completion_tokens(base_url) => {
                 Self::MaxCompletionTokens
             }
             Wire::ChatCompletions => Self::MaxTokens,
@@ -170,8 +175,11 @@ impl LimitField {
     }
 }
 
-/// Whether `base_url` is an Azure OpenAI resource.
-fn is_azure_openai(base_url: &str) -> bool {
+/// Whether `base_url` is OpenAI's own API, in any region, or an Azure
+/// OpenAI or Azure AI resource, in any cloud: the endpoints whose Chat
+/// Completions read `max_completion_tokens`, and whose reasoning models
+/// refuse `max_tokens`.
+fn reads_max_completion_tokens(base_url: &str) -> bool {
     let host = base_url
         .split_once("://")
         .map_or(base_url, |(_, rest)| rest)
@@ -179,7 +187,17 @@ fn is_azure_openai(base_url: &str) -> bool {
         .next()
         .unwrap_or_default()
         .to_ascii_lowercase();
-    host.ends_with(".openai.azure.com") || host.ends_with(".cognitiveservices.azure.com")
+    host == "api.openai.com"
+        || host.ends_with(".api.openai.com")
+        || [
+            ".openai.azure.com",
+            ".openai.azure.us",
+            ".openai.azure.cn",
+            ".cognitiveservices.azure.com",
+            ".services.ai.azure.com",
+        ]
+        .iter()
+        .any(|suffix| host.ends_with(suffix))
 }
 
 /// Call the model with `first`, then, after each answer, with the follow-up
@@ -328,7 +346,9 @@ fn request_body(
         Wire::Responses => responses_request(model, developer, exchange, schema),
     };
     if let Some(limit) = output_limit {
-        let field = LimitField::for_endpoint(runtime.wire, &runtime.endpoint.base_url);
+        let field = runtime
+            .limit_field
+            .unwrap_or_else(|| LimitField::for_endpoint(runtime.wire, &runtime.endpoint.base_url));
         body[field.name()] = json!(limit);
     }
     body
@@ -520,7 +540,12 @@ fn responses_answer(value: &Value) -> anyhow::Result<Answer> {
             .pointer("/incomplete_details/reason")
             .and_then(Value::as_str)
             .unwrap_or("unknown");
-        return Err(Truncated(format!("status incomplete: {why}")).into());
+        // Only an answer stopped at its output limit is truncated; any
+        // other stop, such as a content filter, is the provider's own.
+        if why == "max_output_tokens" {
+            return Err(Truncated(format!("status incomplete: {why}")).into());
+        }
+        bail!("the provider stopped the answer before it was complete: {why}");
     }
     let mut text = String::new();
     let mut messages = 0;
