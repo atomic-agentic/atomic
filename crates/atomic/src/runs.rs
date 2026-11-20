@@ -482,9 +482,13 @@ pub async fn serve(
             .map(|r| r.id)
             .collect()
     };
-    engine.launch().await?;
+    // Recovered before the engine dispatches: a run waiting on a resume
+    // queue is the dispatcher's alone, and one recovery puts back on its
+    // queue is taken there once. Recovering after the dispatcher had taken
+    // a queued run would claim and queue it again, and run it twice.
     let before = parked(engine.rt.runs_in(PARKED).await?);
     let recovered = engine.rt.recover().await?;
+    engine.launch().await?;
     // The engine parks a run it has recovered too often instead of
     // recovering it once more: name each one.
     for id in parked(engine.rt.runs_in(PARKED).await?).difference(&before) {

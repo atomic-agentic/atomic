@@ -2248,6 +2248,123 @@ fn a_command_that_signals_its_own_group_does_not_kill_its_runner() {
     assert_eq!(stdout_json(&out), json!({"title": "t", "words": 1}));
 }
 
+/// A workflow of two exec steps: `mark`, and then `tally`, idempotent,
+/// which logs the run it ran for.
+fn write_tally(project: &Path, dir: &Path) {
+    let log = dir.join("tally.log");
+    for (name, body, effects) in [
+        ("mark", "", ""),
+        (
+            "tally",
+            "open(os.environ['TALLY_LOG'], 'a').write(os.environ['ATOMIC_RUN_ID'] + '\\n')\n",
+            ", effects: { external: 'idempotent' }",
+        ),
+    ] {
+        std::fs::write(
+            project.join(format!("tools/{name}.py")),
+            format!(
+                "import json, os, sys\n\
+                 note = json.load(sys.stdin)\n\
+                 {body}\
+                 json.dump({{'title': note['text'][:25], 'words': len(note['text'].split())}}, sys.stdout)\n"
+            ),
+        )
+        .expect("script");
+        write_atom(
+            project,
+            name,
+            &format!(
+                "description: '{name}', kind: 'exec', exec: {{ command: ['python3', 'tools/{name}.py'] }}, env: {{ TALLY_LOG: '{}' }}{effects}",
+                log.display()
+            ),
+            "",
+            object(json!({"text": {"type": "string"}})),
+            object(json!({"title": {"type": "string"}, "words": {"type": "integer"}})),
+        );
+    }
+    std::fs::write(
+        project.join("workflows/tallied.workflow.yaml"),
+        "atomic: 1\nname: tallied\n\
+         input: { $ref: ../atoms/mark.input.schema.json }\n\
+         output: { $ref: ../atoms/tally.output.schema.json }\n\
+         steps:\n  mark:\n    atom: mark\n    with: { text: input.text }\n\
+         \x20 tally:\n    after: [mark]\n    atom: tally\n    with: { text: steps.mark.output.title }\n\
+         returns: steps.tally.output\n",
+    )
+    .expect("workflow");
+}
+
+#[test]
+fn serve_started_on_many_queued_runs_runs_each_once() {
+    on_codex_runtime(async {
+        let dir = scratch("many-queued");
+        let project = project(&dir);
+        write_tally(&project, &dir);
+        let state = state_dir(&dir, &project);
+        let ids: Vec<String> = (0..12).map(|n| format!("tally-{n}")).collect();
+        for id in &ids {
+            // Killed after `mark`, then resumed onto its queue and killed
+            // again before anything takes it from there.
+            let out = atomic(
+                &dir,
+                &project,
+                &["run", "tallied", "--run-id", id, "--data", NOTE],
+                &[("ATOMIC_FAILPOINT", "pipeline:after:mark")],
+                "",
+            );
+            assert!(!out.status.success(), "{}", text(&out));
+            let out = atomic(
+                &dir,
+                &project,
+                &["runs", "resume", id],
+                &with(
+                    &UNUSED_MODEL.map(|(k, v)| (k, v.to_owned())),
+                    &[("ATOMIC_FAILPOINT", "resume:queued")],
+                ),
+                "",
+            );
+            assert!(!out.status.success(), "{}", text(&out));
+        }
+        let mut serve = spawn(
+            &dir,
+            &project,
+            &["serve"],
+            &UNUSED_MODEL,
+            &dir.join("serve.log"),
+        );
+        let rt = Durare::sqlite(&state.join("private/atomic.db"))
+            .await
+            .expect("store");
+        let started = Instant::now();
+        for id in &ids {
+            while rt.status(id).await.expect("status") != Some(RunStatus::Succeeded) {
+                assert!(
+                    started.elapsed() < Duration::from_secs(90),
+                    "{id} never finished: {}",
+                    std::fs::read_to_string(dir.join("serve.log")).unwrap_or_default()
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        // Give a second execution, if there were one, its time to show.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        terminate(&serve);
+        let status = tokio::task::spawn_blocking(move || wait_child(&mut serve, "serve"))
+            .await
+            .expect("child");
+        assert!(status.success());
+        let mut tallied: Vec<String> = std::fs::read_to_string(dir.join("tally.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        tallied.sort();
+        let mut expected = ids.clone();
+        expected.sort();
+        assert_eq!(tallied, expected, "each run's command ran once");
+    });
+}
+
 #[test]
 fn the_runner_role_keeps_its_exit_code_contract() {
     let dir = scratch("runner-codes");
