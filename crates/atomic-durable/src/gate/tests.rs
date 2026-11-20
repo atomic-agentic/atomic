@@ -1031,3 +1031,12 @@ async fn a_raced_command_id_cannot_decide_another_gate_on_postgres() {
         stored.resolution
     );
 }
+
+#[test]
+fn evidence_is_a_lowercase_content_digest_as_the_store_names_it() {
+    let hex = "ab".repeat(32);
+    assert!(is_digest(&format!("sha256:{hex}")));
+    assert!(!is_digest(&format!("sha256:{}", hex.to_uppercase())));
+    assert!(!is_digest(&format!("sha256:{}", &hex[1..])));
+    assert!(!is_digest(&hex));
+}

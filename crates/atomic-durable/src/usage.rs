@@ -1137,29 +1137,31 @@ impl Ledger {
         .await
     }
 
-    /// Every attempt journaled for run `run`, by request and attempt.
+    /// Every attempt journaled for run `run`, by request and attempt. A
+    /// read: it takes no write lock.
     pub async fn attempts(&self, run: &str) -> Result<Vec<Attempt>> {
         let run = run.to_owned();
-        self.transact(move |mut tx| {
-            let run = run.clone();
-            Box::pin(async move {
-                let rows = tx
-                    .query_all(
-                        &format!(
-                            "SELECT {ATTEMPT_COLUMNS} FROM atomic_usage_attempts WHERE run = ? \
+        self.db
+            .read(move |mut tx| {
+                let run = run.clone();
+                Box::pin(async move {
+                    let rows = tx
+                        .query_all(
+                            &format!(
+                                "SELECT {ATTEMPT_COLUMNS} FROM atomic_usage_attempts WHERE run = ? \
                              ORDER BY request_id, attempt"
-                        ),
-                        &[Param::Text(run)],
-                    )
-                    .await?;
-                let attempts = rows
-                    .iter()
-                    .map(attempt_from_row)
-                    .collect::<Result<Vec<_>>>()?;
-                Ok(End::Rollback(attempts))
+                            ),
+                            &[Param::Text(run)],
+                        )
+                        .await?;
+                    let attempts = rows
+                        .iter()
+                        .map(attempt_from_row)
+                        .collect::<Result<Vec<_>>>()?;
+                    Ok(attempts)
+                })
             })
-        })
-        .await
+            .await
     }
 }
 
