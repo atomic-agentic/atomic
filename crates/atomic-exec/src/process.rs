@@ -333,6 +333,68 @@ fn exited(child: &mut std::process::Child) -> std::io::Result<Option<bool>> {
     }
 }
 
+/// How long after a process exits its output may still arrive.
+const OUTPUT_GRACE: Duration = Duration::from_secs(2);
+
+/// One of a process's output streams, read on a thread of its own.
+struct Output {
+    chunks: std::sync::mpsc::Receiver<std::io::Result<Option<Vec<u8>>>>,
+}
+
+impl Output {
+    /// Read up to `keep` bytes of `stream`, and with `drain` the rest
+    /// unkept, so the process never blocks on a full pipe.
+    fn read(stream: impl Read + Send + 'static, keep: u64, drain: bool) -> Self {
+        let (send, chunks) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut stream = stream;
+            let mut kept = 0u64;
+            let mut buffer = vec![0u8; 65_536];
+            loop {
+                match stream.read(&mut buffer) {
+                    Ok(0) => {
+                        let _ = send.send(Ok(None));
+                        return;
+                    }
+                    Ok(n) => {
+                        let room = usize::try_from(keep.saturating_sub(kept)).unwrap_or(usize::MAX);
+                        let take = n.min(room);
+                        kept += take as u64;
+                        if take > 0 && send.send(Ok(Some(buffer[..take].to_vec()))).is_err() {
+                            return;
+                        }
+                        if kept >= keep && !drain {
+                            let _ = send.send(Ok(None));
+                            return;
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) => {
+                        let _ = send.send(Err(e));
+                        return;
+                    }
+                }
+            }
+        });
+        Self { chunks }
+    }
+
+    /// What arrived by its end, or by `deadline` if it has not ended.
+    fn until(self, deadline: Instant) -> std::io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.chunks.recv_timeout(left) {
+                Ok(Ok(Some(chunk))) => bytes.extend(chunk),
+                Ok(Ok(None)) => return Ok(bytes),
+                Ok(Err(e)) => return Err(e),
+                // Ended without a word, or still held open.
+                Err(_) => return Ok(bytes),
+            }
+        }
+    }
+}
+
 fn finish(
     mut child: std::process::Child,
     name: &str,
@@ -358,24 +420,12 @@ fn finish(
         .take()
         .ok_or_else(|| io(std::io::Error::other("no stderr")))?;
     let request = stdin.to_vec();
-    let writer = std::thread::spawn(move || input.write_all(&request));
-    let stdout_limit = limits.stdout as u64 + 1;
-    let reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stdout
-            .take(stdout_limit)
-            .read_to_end(&mut bytes)
-            .map(|_| bytes)
+    let (wrote, written) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = wrote.send(input.write_all(&request));
     });
-    let stderr_limit = limits.stderr as u64;
-    let errors = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let mut stderr = stderr;
-        (&mut stderr).take(stderr_limit).read_to_end(&mut bytes)?;
-        // Drain the rest so the process never blocks on a full pipe.
-        std::io::copy(&mut stderr, &mut std::io::sink())?;
-        Ok::<_, std::io::Error>(bytes)
-    });
+    let stdout = Output::read(stdout, limits.stdout as u64 + 1, false);
+    let stderr = Output::read(stderr, limits.stderr as u64, true);
     let started = Instant::now();
     let status = loop {
         match exited(&mut child).map_err(io)? {
@@ -411,17 +461,16 @@ fn finish(
             None => std::thread::sleep(Duration::from_millis(10)),
         }
     };
-    let stdout = reader
-        .join()
-        .map_err(|_| io(std::io::Error::other("stdout reader panicked")))?
-        .map_err(io)?;
-    let stderr = errors
-        .join()
-        .map_err(|_| io(std::io::Error::other("stderr reader panicked")))?
-        .map_err(io)?;
-    let written = writer
-        .join()
-        .map_err(|_| io(std::io::Error::other("stdin writer panicked")))?;
+    // Its output ends when every process holding it has let go. One that
+    // left its group, or shares a runner's, may hold it for good: what came
+    // within the grace after the exit is the output.
+    let deadline = Instant::now() + OUTPUT_GRACE;
+    let stdout = stdout.until(deadline).map_err(io)?;
+    let stderr = stderr.until(deadline).map_err(io)?;
+    // Input it never read is no failure once it has exited.
+    let written = written
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .unwrap_or(Ok(()));
     if stdout.len() > limits.stdout {
         return Err(ExecError::TooLarge {
             program: name,

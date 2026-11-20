@@ -212,8 +212,11 @@ next `serve` or `runs resume`, and an interrupted command runs again only if it
 declares `effects.external` as `read-only` or `idempotent`; any other is parked
 as `outcome_unknown`. Each command runs in a process group of its own (under
 `--runner process`, its runner's), and on Linux it is killed if atomic dies.
-Whatever a command leaves running in its group when it ends is stopped then,
-so nothing it started outlives its step or holds its output open. A runner
+Whatever a command leaves running in its group when it ends is stopped then
+(under `--runner process`, when its runner ends). Output that arrives more than
+two seconds after a command exits is not its output, so a process that left
+its group, such as one started with `setsid`, cannot hold the step open,
+though atomic cannot stop it. A runner
 ignores the stop signals a command in its group might send it.
 
 One process recovers a run at most five times before it fails it as

@@ -2407,6 +2407,51 @@ fn signals_ignored_when_serve_starts_stay_ignored() {
 }
 
 #[test]
+fn a_leftover_holding_a_commands_output_does_not_hold_its_step_under_the_runner() {
+    let dir = scratch("runner-leftover");
+    let project = project(&dir);
+    let pid_file = dir.join("leftover.pid");
+    // The command leaves a child that keeps its stdout, in the runner's group.
+    write_atom(
+        &project,
+        "leaves-a-child",
+        &format!(
+            r#"description: 'Leave a child.', kind: 'exec', exec: {{ command: ['sh', '-c', "sleep 30 & echo $! > '{}'; cat > /dev/null; printf '{{\"title\": \"t\", \"words\": 1}}'"] }}"#,
+            pid_file.display()
+        ),
+        "",
+        object(json!({"text": {"type": "string"}})),
+        object(json!({"title": {"type": "string"}, "words": {"type": "integer"}})),
+    );
+    let started = Instant::now();
+    let out = atomic(
+        &dir,
+        &project,
+        &[
+            "run",
+            "leaves-a-child",
+            "--runner",
+            "process",
+            "--data",
+            NOTE,
+        ],
+        &[],
+        "",
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "the step waited {:?} for the child",
+        started.elapsed()
+    );
+    let pid = std::fs::read_to_string(&pid_file)
+        .expect("pid")
+        .trim()
+        .to_owned();
+    all_gone(&[pid], "the child went with its runner's group");
+}
+
+#[test]
 fn the_runner_role_keeps_its_exit_code_contract() {
     let dir = scratch("runner-codes");
     // A request it cannot read is a usage error, and nothing is written.

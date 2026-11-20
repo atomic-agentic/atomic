@@ -168,3 +168,29 @@ fn what_a_command_leaves_behind_ends_with_it_and_holds_nothing_open() {
     let _ = std::fs::remove_file(&file);
     gone(&pid, "what it left");
 }
+
+#[test]
+fn a_leftover_that_left_the_group_holds_the_output_only_briefly() {
+    // A child in a session of its own, beyond the group's reach, keeps the
+    // command's stdout open for half a minute.
+    let file = scratch_file("setsid");
+    let script = format!(
+        "python3 -c 'import os, time; os.setsid(); open(\"{}\", \"w\").write(str(os.getpid())); time.sleep(30)' & \
+         while [ ! -s '{}' ]; do sleep 0.05; done; printf done",
+        file.display(),
+        file.display()
+    );
+    let started = std::time::Instant::now();
+    let done = shell(&script, b"", Duration::from_secs(20)).expect("runs");
+    let pid = std::fs::read_to_string(&file).expect("the leftover's pid");
+    let _ = std::fs::remove_file(&file);
+    let _ = std::process::Command::new("/bin/sh")
+        .args(["-c", &format!("kill -KILL {pid}")])
+        .status();
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the step waited {:?} for the leftover",
+        started.elapsed()
+    );
+    assert_eq!(done.stdout, b"done");
+}
