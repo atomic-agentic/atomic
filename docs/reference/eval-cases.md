@@ -166,8 +166,15 @@ atomic eval --no-cassettes          # call the model and record nothing
 ```
 
 Replaying needs the model endpoint and model configured as they were when the
-answers were recorded (`ATOMIC_MODEL_BASE_URL`, `ATOMIC_MODEL`), since both are part
-of what a recording answers; no call reaches them, and no API key is read or sent.
+answers were recorded, since both are part of what a recording answers; no call
+reaches them, and no API key is read or sent. Set `model.base_url` and
+`model.name` in `atomic.yaml` (or `ATOMIC_MODEL_BASE_URL` and `ATOMIC_MODEL`) to fix
+a replay's endpoint and model wherever it runs. Without them the endpoint is
+detected as for a run: from `OPENAI_API_KEY`, or by probing for a local Ollama, so
+a replay in CI can find another endpoint than the recording did and miss. The
+budget's call bound and price table set the output cap each request carries, so a
+different call bound or price table in CI than when the answers were recorded
+also makes replays miss.
 A recording holds the request body and the response, never a header, so not the
 endpoint's key; an endpoint whose URL holds credentials or a query is refused. A
 recording is written whole, never through a symbolic link, and a cassette

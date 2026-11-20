@@ -197,6 +197,9 @@ fn eval_with(dir: &Path, project: &Path, url: &str, args: &[&str], env: &[(&str,
         .env_remove("OPENAI_API_KEY")
         .env_remove("CODEX_HOME")
         .env_remove("ATOMIC_DATABASE_URL")
+        // Nothing listens on the discard port, so detection never finds a
+        // local Ollama and an endpoint comes only from what a test sets.
+        .env("ATOMIC_DETECT_OLLAMA_ADDR", "127.0.0.1:9")
         .stdin(Stdio::null());
     // With no URL, the endpoint comes from the project's files.
     if url.is_empty() {
