@@ -92,7 +92,7 @@ pub struct Ticket {
 
 /// An admission: the ticket to settle, if the call is metered, and the
 /// limit to hold it to.
-pub(crate) type Admitted = (Option<Ticket>, Limit);
+pub type Admitted = (Option<Ticket>, Limit);
 
 /// How a call ended, for its settlement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -178,7 +178,7 @@ impl Metering {
     }
 
     /// Admit `call`; with no meter, no ticket and no limit.
-    pub(crate) async fn admit(&self, call: Call) -> Result<Admitted, MeterError> {
+    pub async fn admit(&self, call: Call) -> Result<Admitted, MeterError> {
         match &self.0 {
             Some(meter) => meter.admit(call).await.map(|t| {
                 let limit = t.limit;
@@ -189,11 +189,7 @@ impl Metering {
     }
 
     /// Settle `ticket`, if there is one.
-    pub(crate) async fn settle(
-        &self,
-        ticket: Option<Ticket>,
-        outcome: Outcome,
-    ) -> Result<(), MeterError> {
+    pub async fn settle(&self, ticket: Option<Ticket>, outcome: Outcome) -> Result<(), MeterError> {
         match (&self.0, ticket) {
             (Some(meter), Some(ticket)) => meter.settle(ticket, outcome).await,
             _ => Ok(()),

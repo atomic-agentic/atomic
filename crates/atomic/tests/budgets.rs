@@ -1243,6 +1243,75 @@ fn a_codex_turn_cut_off_with_a_request_in_flight_is_charged_what_it_reported_and
 }
 
 #[test]
+fn a_request_in_flight_is_estimated_at_the_larger_of_one_bound_and_the_last_request() {
+    on_codex_runtime(async {
+        let dir = scratch("estimate");
+        let rt = Durare::sqlite(&dir.join("atomic.db"))
+            .await
+            .expect("engine");
+        // One request is bounded at 10 input and 5 output tokens, at one
+        // micro-dollar an input token and two an output token: 15 tokens and
+        // 20 micro-dollars.
+        let mut settings = settings(10_000_000, 100_000_000);
+        settings.call.input_tokens = 10;
+        settings.call.output_tokens = 5;
+        settings.pricing.insert(
+            "synthetic".into(),
+            Price {
+                input_usd_per_mtok: 1.0,
+                output_usd_per_mtok: 2.0,
+                max_input_tokens: None,
+                max_output_tokens: None,
+            },
+        );
+        let plan = atomic_app::metering::BudgetPlan::resolve(
+            &settings,
+            &Budget::default(),
+            &[("turn", &Budget::default(), "synthetic")],
+        )
+        .expect("a plan");
+        let budget = RunBudget::pinned(rt.ledger(), &plan);
+        let meter = budget.meter(
+            &atomic_durable::StepInfo {
+                workflow_id: "estimate".into(),
+                step_id: 1,
+            },
+            &plan.atoms["turn"],
+        );
+        let (ticket, _) = meter
+            .admit(atomic_core::usage::Call {
+                index: 0,
+                model: "synthetic".into(),
+                input_bound: None,
+                turn: true,
+            })
+            .await
+            .expect("admitted");
+        // It reported 100 and 20, and its last request 60 and 30: larger
+        // than one request's bound in tokens (90 to 15) and in dollars (120
+        // to 20 micro-dollars).
+        let usage = |input_tokens, output_tokens| atomic_core::usage::Usage {
+            input_tokens,
+            output_tokens,
+        };
+        meter
+            .settle(
+                ticket,
+                atomic_core::usage::Outcome::Partial {
+                    reported: usage(100, 20),
+                    last: Some(usage(60, 30)),
+                },
+            )
+            .await
+            .expect("settled");
+        let attempt = &rt.ledger().attempts("estimate").await.expect("attempts")[0];
+        assert_eq!(attempt.usage, Some((100, 20)));
+        assert_eq!(attempt.charged.tokens, 120 + 90, "{attempt:?}");
+        assert_eq!(attempt.charged.micro_usd, 140 + 120, "{attempt:?}");
+    });
+}
+
+#[test]
 fn a_call_to_a_model_the_budget_does_not_price_is_not_made_under_a_dollar_cap() {
     on_codex_runtime(async {
         let dir = scratch("unpricedcall");

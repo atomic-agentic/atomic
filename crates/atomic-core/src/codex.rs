@@ -2484,7 +2484,7 @@ mod tests {
     }
 
     #[test]
-    fn a_turn_cut_off_with_a_request_in_flight_stays_at_its_reservation() {
+    fn a_turn_cut_off_with_a_request_in_flight_is_settled_in_part() {
         on_codex_runtime(async {
             // The turn's first request reports its usage and calls a tool;
             // the second is still in flight when its time runs out.
