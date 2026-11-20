@@ -88,7 +88,7 @@ pub const PIPELINE: &str = "atomic.pipeline";
 /// record, through an approved and a rejected gate, with the shape of each
 /// checkpoint, and the run's own shape. They fail when the layout no longer
 /// matches this version's, whose file is never rewritten.
-pub const LAYOUT_VERSION: &str = "atomic.pipeline.1";
+pub const LAYOUT_VERSION: &str = "atomic.pipeline.2";
 
 /// How many times one process recovers one run of `run_pipeline` at the
 /// same step before it fails the run as dead-lettered: enough for a crash
@@ -311,9 +311,7 @@ pub struct Pinned {
     #[serde(default)]
     pub helper_runtime: Option<String>,
     /// The budgets the run is metered under, as resolved when it started.
-    /// `None` in a run recorded before they were kept here.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub budgets: Option<BudgetPlan>,
+    pub budgets: BudgetPlan,
 }
 
 /// One run of a pipeline.
@@ -634,15 +632,11 @@ async fn run_pipeline<C: WorkflowContext>(
                 snapshot: manifest.artifact.to_string(),
                 files,
                 helper_runtime: Some(helper_runtime),
-                budgets: Some(budgets),
+                budgets,
             })
         })
         .await?;
-    // A run recorded before its budgets were kept resolves them as before.
-    let plan = match &pinned.budgets {
-        Some(plan) => plan.clone(),
-        None => plan_budgets(&pipeline, &services.runtimes, &services.budgets).map_err(failed)?,
-    };
+    let plan = pinned.budgets.clone();
     let budget = RunBudget::pinned(ledger, &plan);
     let (caps, models) = (plan.atoms, plan.models);
     let mut steps = Map::new();
