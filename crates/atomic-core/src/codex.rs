@@ -10,7 +10,7 @@
 //! read from the user's Codex configuration: Codex's home is the project's
 //! state directory (see [`crate::state`]).
 
-use crate::usage::{Call, Exhausted, MeterError, Metering, Outcome, Usage, meter_error};
+use crate::usage::{Call, Exhausted, MeterError, Metering, Outcome, Ticket, Usage, meter_error};
 use anyhow::Context;
 use anyhow::bail;
 use codex_core_api::AbsolutePathBuf;
@@ -1194,7 +1194,16 @@ where
         let bounded_by = ticket.as_ref().and_then(|t| t.bounded_by.clone());
         // A turn is cut off when its reserved time runs out; a failed or cut
         // off turn still reports the usage seen before it stopped.
-        let (turn, progress) = span.run(run_turn(&thread, &current, limit.time)).await;
+        let mut recorder = Recorder {
+            meter,
+            ticket: ticket.as_ref(),
+            seen,
+            recorded: seen,
+            records: 0,
+        };
+        let (turn, progress) = span
+            .run(run_turn(&thread, &current, limit.time, &mut recorder))
+            .await;
         if let (Err(e), Some(span)) = (&turn, span.span()) {
             crate::usage::record_error(&span, e);
         }
@@ -1661,24 +1670,79 @@ impl Progress {
     }
 }
 
-/// Run one turn, cut off after `time` if one is given. Returns how it ended
-/// and where it got to, the thread's running totals as last reported among
-/// it, whether or not it succeeded.
+/// Where a running turn's reported usage is recorded as it grows, so that a
+/// turn whose process is stopped or killed before it settles stays charged
+/// at least what it reported (see [`crate::usage::Meter::progress`]).
+struct Recorder<'a> {
+    meter: &'a Metering,
+    ticket: Option<&'a Ticket>,
+    /// The thread's totals before the turn.
+    seen: (i64, i64),
+    /// The totals as last recorded.
+    recorded: (i64, i64),
+    /// How many times it recorded.
+    records: u32,
+}
+
+impl Recorder<'_> {
+    /// Record `progress` if the turn reported more since it last did: what
+    /// it reported, and one request in flight, since it may be making one.
+    /// A record that fails only leaves the turn charged as it was, at its
+    /// reservation or the last record.
+    async fn note(&mut self, progress: &Progress) {
+        let Some((input, output, _)) = progress.totals(self.seen) else {
+            return;
+        };
+        if input <= self.recorded.0 && output <= self.recorded.1 {
+            return;
+        }
+        self.recorded = (input, output);
+        self.records += 1;
+        let outcome = Outcome::Partial {
+            reported: Usage {
+                input_tokens: (input - self.seen.0).max(0),
+                output_tokens: (output - self.seen.1).max(0),
+            },
+            last: progress.last.map(|(input_tokens, output_tokens)| Usage {
+                input_tokens,
+                output_tokens,
+            }),
+        };
+        if self.meter.progress(self.ticket, outcome).await.is_ok()
+            && crate::failpoint::armed()
+            && let Some(ticket) = self.ticket
+        {
+            // A crash here leaves the turn charged what it recorded.
+            crate::failpoint::failpoint(&format!(
+                "usage:after-progress:{}:{}",
+                ticket.request, self.records
+            ));
+        }
+    }
+}
+
+/// Run one turn, cut off after `time` if one is given, recording its
+/// reported usage through `recorder` as it grows. Returns how it ended and
+/// where it got to, the thread's running totals as last reported among it,
+/// whether or not it succeeded.
 async fn run_turn(
     thread: &CodexThread,
     spec: &TurnSpec,
     time: Option<std::time::Duration>,
+    recorder: &mut Recorder<'_>,
 ) -> (anyhow::Result<String>, Progress) {
     let mut progress = Progress::default();
     let ended = match time {
-        None => turn(thread, spec, &mut progress).await,
-        Some(time) => match tokio::time::timeout(time, turn(thread, spec, &mut progress)).await {
-            Ok(ended) => ended,
-            Err(_) => {
-                interrupt(thread, &mut progress).await;
-                Err(anyhow::Error::new(CutOff(time)))
+        None => turn(thread, spec, &mut progress, recorder).await,
+        Some(time) => {
+            match tokio::time::timeout(time, turn(thread, spec, &mut progress, recorder)).await {
+                Ok(ended) => ended,
+                Err(_) => {
+                    interrupt(thread, &mut progress).await;
+                    Err(anyhow::Error::new(CutOff(time)))
+                }
             }
-        },
+        }
     };
     (ended, progress)
 }
@@ -1713,6 +1777,7 @@ async fn turn(
     thread: &CodexThread,
     spec: &TurnSpec,
     progress: &mut Progress,
+    recorder: &mut Recorder<'_>,
 ) -> anyhow::Result<String> {
     // Codex sends TurnComplete before it marks the thread idle, so a follow-up
     // turn submitted straight after one can be declined as NotIdle. That
@@ -1744,6 +1809,12 @@ async fn turn(
     loop {
         let event = thread.next_event().await.context("read Codex event")?;
         progress.observe(&event.msg);
+        if matches!(
+            event.msg,
+            EventMsg::TokenCount(_) | EventMsg::RawResponseCompleted(_)
+        ) {
+            recorder.note(progress).await;
+        }
         match event.msg {
             EventMsg::TurnComplete(done) => {
                 return done

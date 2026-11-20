@@ -1026,11 +1026,49 @@ impl Ledger {
 
     /// Settle attempt `attempt` at `request` as unknown because its process
     /// is stopping before the call ended: its tokens and dollars stay
-    /// charged at their bound, its time is what passed. As
+    /// charged as they are, at their bound or at what [`Ledger::progress`]
+    /// recorded, and its time is what passed. As
     /// [`Settlement::Unknown`], without the crash tests' failpoint.
     pub async fn interrupt(&self, request: &str, attempt: i64) -> Result<Settled> {
         self.settle_once(request, attempt, Settlement::Unknown)
             .await
+    }
+
+    /// Record what attempt `attempt` at `request`, still running, has
+    /// reported so far, given as a [`Settlement::Partial`]: it is charged
+    /// as a partial settlement charges it, the reported usage and a request
+    /// in flight, at least what it was charged already, and stays reserved,
+    /// with its time unsettled, for its own settlement to replace. A turn's
+    /// meter records each growth of what it reported, so that a turn whose
+    /// process stops or dies first stays charged at least that. Anything
+    /// but a partial settlement is refused.
+    pub async fn progress(&self, request: &str, attempt: i64, how: Settlement) -> Result<Settled> {
+        let Settlement::Partial {
+            input_tokens,
+            output_tokens,
+            micro_usd,
+            in_flight,
+        } = how
+        else {
+            return Err(corrupt(format!(
+                "progress of attempt {attempt} at request {request} must be a partial settlement"
+            )));
+        };
+        let request = request.to_owned();
+        self.transact(move |mut tx| {
+            let request = request.clone();
+            Box::pin(async move {
+                partly(
+                    &mut tx,
+                    &request,
+                    attempt,
+                    (input_tokens, output_tokens, micro_usd),
+                    in_flight,
+                )
+                .await
+            })
+        })
+        .await
     }
 
     /// Settle attempt `attempt` at `request` once. Settling it again, or

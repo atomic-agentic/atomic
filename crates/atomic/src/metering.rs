@@ -21,7 +21,7 @@ use atomic_core::budget::{
     Budget, BudgetError, BudgetSettings, CallBound, Level, Price, Resolved, resolve,
 };
 use atomic_core::usage::{
-    Call, Exhausted, Limit, Meter, MeterError, MeterFuture, Metering, Outcome, Ticket,
+    Call, Exhausted, Limit, Meter, MeterError, MeterFuture, Metering, Outcome, Ticket, Usage,
 };
 use atomic_durable::StepInfo;
 use atomic_durable::usage::{
@@ -310,6 +310,38 @@ fn store(e: impl std::fmt::Display) -> MeterError {
     MeterError::Store(e.to_string())
 }
 
+impl LedgerMeter {
+    /// A call to `model` that reported `reported` and may have a request in
+    /// flight: charged the reported usage and that request, taken as one
+    /// request's bound, or as `last`, the last request that reported, if
+    /// that was larger.
+    fn partial(&self, model: &str, reported: Usage, last: Option<Usage>) -> Settlement {
+        let tokens = |v: i64| u64::try_from(v).unwrap_or(0);
+        let bound = self.settings.reservation(model);
+        let (last_tokens, last_micro) = last.map_or((0, 0), |l| {
+            (
+                tokens(l.input_tokens).saturating_add(tokens(l.output_tokens)),
+                self.settings
+                    .cost(model, tokens(l.input_tokens), tokens(l.output_tokens)),
+            )
+        });
+        Settlement::Partial {
+            input_tokens: reported.input_tokens,
+            output_tokens: reported.output_tokens,
+            micro_usd: int(self.settings.cost(
+                model,
+                tokens(reported.input_tokens),
+                tokens(reported.output_tokens),
+            )),
+            in_flight: Charge {
+                tokens: int(bound.tokens.max(last_tokens)),
+                millis: 0,
+                micro_usd: int(bound.micro_usd.max(last_micro)),
+            },
+        }
+    }
+}
+
 impl Meter for LedgerMeter {
     fn admit(&self, call: Call) -> MeterFuture<'_, Ticket> {
         Box::pin(async move {
@@ -384,6 +416,20 @@ impl Meter for LedgerMeter {
         })
     }
 
+    fn progress<'a>(&'a self, ticket: &'a Ticket, outcome: Outcome) -> MeterFuture<'a, ()> {
+        Box::pin(async move {
+            let Outcome::Partial { reported, last } = outcome else {
+                return Ok(());
+            };
+            let how = self.partial(&ticket.model, reported, last);
+            self.ledger
+                .progress(&ticket.request, ticket.attempt, how)
+                .await
+                .map_err(store)?;
+            Ok(())
+        })
+    }
+
     fn settle(&self, ticket: Ticket, outcome: Outcome) -> MeterFuture<'_, ()> {
         Box::pin(async move {
             ended(&ticket.request, ticket.attempt);
@@ -404,36 +450,7 @@ impl Meter for LedgerMeter {
                     }
                 }
                 Outcome::Unknown => Settlement::Unknown,
-                Outcome::Partial { reported, last } => {
-                    let tokens = |v: i64| u64::try_from(v).unwrap_or(0);
-                    // The request in flight: one request's bound, or the
-                    // last request's size if that was larger.
-                    let bound = self.settings.reservation(&ticket.model);
-                    let (last_tokens, last_micro) = last.map_or((0, 0), |l| {
-                        (
-                            tokens(l.input_tokens).saturating_add(tokens(l.output_tokens)),
-                            self.settings.cost(
-                                &ticket.model,
-                                tokens(l.input_tokens),
-                                tokens(l.output_tokens),
-                            ),
-                        )
-                    });
-                    Settlement::Partial {
-                        input_tokens: reported.input_tokens,
-                        output_tokens: reported.output_tokens,
-                        micro_usd: int(self.settings.cost(
-                            &ticket.model,
-                            tokens(reported.input_tokens),
-                            tokens(reported.output_tokens),
-                        )),
-                        in_flight: Charge {
-                            tokens: int(bound.tokens.max(last_tokens)),
-                            millis: 0,
-                            micro_usd: int(bound.micro_usd.max(last_micro)),
-                        },
-                    }
-                }
+                Outcome::Partial { reported, last } => self.partial(&ticket.model, reported, last),
                 Outcome::NotDispatched => Settlement::NotDispatched,
             };
             self.ledger
@@ -494,7 +511,9 @@ fn ended(request: &str, attempt: i64) {
 
 /// Settle every call this process has in flight as interrupted, for a
 /// process that is stopping: each is charged the time it ran, and its tokens
-/// and dollars stay at their bound. Returns how many there were.
+/// and dollars stay at their bound, or at what a turn recorded it had
+/// reported so far and one request in flight, if that is more. Returns how
+/// many there were.
 pub async fn interrupt_in_flight() -> usize {
     let calls: Vec<_> = IN_FLIGHT
         .lock()

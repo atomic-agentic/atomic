@@ -155,6 +155,17 @@ pub trait Meter: Send + Sync {
     /// Settle `ticket` with how its call ended. Settling a ticket again
     /// changes nothing.
     fn settle(&self, ticket: Ticket, outcome: Outcome) -> MeterFuture<'_, ()>;
+
+    /// Record what the call of `ticket`, still running, has reported so far,
+    /// as an [`Outcome::Partial`]: so that a call whose process stops or dies
+    /// before it is settled stays charged at least that, and the request it
+    /// may have in flight. Recording it again with more replaces it; the
+    /// call's settlement replaces it in turn. A meter that keeps nothing
+    /// between admission and settlement records nothing.
+    fn progress<'a>(&'a self, ticket: &'a Ticket, outcome: Outcome) -> MeterFuture<'a, ()> {
+        let _ = (ticket, outcome);
+        Box::pin(async { Ok(()) })
+    }
 }
 
 /// The meter a runtime's calls go through, if any.
@@ -185,6 +196,19 @@ impl Metering {
                 (Some(t), limit)
             }),
             None => Ok((None, Limit::default())),
+        }
+    }
+
+    /// Record what the call of `ticket` has reported so far, if it is
+    /// metered (see [`Meter::progress`]).
+    pub async fn progress(
+        &self,
+        ticket: Option<&Ticket>,
+        outcome: Outcome,
+    ) -> Result<(), MeterError> {
+        match (&self.0, ticket) {
+            (Some(meter), Some(ticket)) => meter.progress(ticket, outcome).await,
+            _ => Ok(()),
         }
     }
 
