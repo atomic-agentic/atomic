@@ -355,19 +355,25 @@ impl Meter for LedgerMeter {
                     attempt,
                     millis,
                     bounded_by,
-                } => Ok(Ticket {
-                    request,
-                    attempt,
-                    model: call.model,
-                    admitted: Instant::now(),
-                    limit: Limit {
-                        output_tokens: Some(bound.output_tokens),
-                        // A request's own bound; for a turn, the active time
-                        // its atom has left.
-                        time: Some(Duration::from_millis(u64::try_from(millis).unwrap_or(0))),
-                    },
-                    bounded_by,
-                }),
+                } => {
+                    // Admitted and reserved, and not yet dispatched.
+                    if atomic_durable::failpoints::armed() {
+                        atomic_durable::failpoint(&format!("atom:after-admit:{request}"));
+                    }
+                    Ok(Ticket {
+                        request,
+                        attempt,
+                        model: call.model,
+                        admitted: Instant::now(),
+                        limit: Limit {
+                            output_tokens: Some(bound.output_tokens),
+                            // A request's own bound; for a turn, the active
+                            // time its atom has left.
+                            time: Some(Duration::from_millis(u64::try_from(millis).unwrap_or(0))),
+                        },
+                        bounded_by,
+                    })
+                }
                 Admission::Refused { reason, .. } => Err(Exhausted(reason).into()),
             }
         })
@@ -398,6 +404,11 @@ impl Meter for LedgerMeter {
                 .settle(&ticket.request, ticket.attempt, how)
                 .await
                 .map_err(store)?;
+            // Mid-atom: the call is made and settled, and the atom's turn
+            // goes on.
+            if atomic_durable::failpoints::armed() {
+                atomic_durable::failpoint(&format!("atom:after-call:{}", ticket.request));
+            }
             Ok(())
         })
     }

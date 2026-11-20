@@ -92,3 +92,117 @@ fn an_expression_evaluates_to_json() {
     );
     assert!(evaluate("input.missing", &values).is_err());
 }
+
+#[test]
+fn numbers_compare_as_numbers() {
+    let output = json!({"n": 2});
+    assert_eq!(
+        evaluate("output.n >= 1", &[("output", &output)]),
+        Ok(json!(true))
+    );
+}
+
+#[test]
+fn json_converts_to_cel_values_by_kind() {
+    assert_eq!(cel_value(&json!(2)), cel::Value::Int(2));
+    assert_eq!(cel_value(&json!(-7)), cel::Value::Int(-7));
+    assert_eq!(cel_value(&json!(i64::MAX)), cel::Value::Int(i64::MAX));
+    assert_eq!(cel_value(&json!(u64::MAX)), cel::Value::UInt(u64::MAX));
+    assert_eq!(cel_value(&json!(0.5)), cel::Value::Float(0.5));
+    assert_eq!(cel_value(&json!(2.0)), cel::Value::Float(2.0));
+    assert_eq!(cel_value(&Value::Null), cel::Value::Null);
+    let beyond_u64: Value = serde_json::from_str("100000000000000000000").expect("parses");
+    assert_eq!(cel_value(&beyond_u64), cel::Value::Float(1e20));
+}
+
+#[test]
+fn every_kind_of_json_value_evaluates() {
+    let output = json!({
+        "count": 3,
+        "negative": -4,
+        "big": u64::MAX,
+        "ratio": 0.25,
+        "huge": serde_json::from_str::<Value>("100000000000000000000").expect("parses"),
+        "none": null,
+        "items": [{"tags": ["a", "b"], "meta": {"level": 2}}, {"tags": [], "meta": {"level": 5}}],
+    });
+    let values = [("output", &output)];
+    for source in [
+        "output.count + 1 == 4",
+        "output.count > 2 && output.count <= 3",
+        "output.negative < 0",
+        "output.big == 18446744073709551615u",
+        "output.big > 0u",
+        "output.ratio > 0.2 && output.ratio < 0.3",
+        "output.ratio * 4.0 == 1.0",
+        "output.huge > 1.0e19",
+        "output.none == null",
+        "output.items.size() == 2",
+        "output.items[0].tags[1] == 'b'",
+        "output.items[1].tags.size() == 0",
+        "output.items.all(i, i.meta.level >= 2)",
+        "output.items.map(i, i.meta.level) == [2, 5]",
+    ] {
+        assert_eq!(evaluate(source, &values), Ok(json!(true)), "{source}");
+    }
+    // Values come back out as the same JSON.
+    assert_eq!(
+        evaluate("output.items", &values),
+        Ok(output["items"].clone())
+    );
+    assert_eq!(evaluate("output.big", &values), Ok(json!(u64::MAX)));
+}
+
+/// Why the converter exists: serde_json's `arbitrary_precision` is on in this
+/// workspace, and through serde a number reaches CEL as a map. If this starts
+/// passing, the feature has gone from the dependency graph; the hand-built
+/// converter is still correct and this test can go.
+#[test]
+fn serde_conversion_turns_numbers_into_maps() {
+    let program = cel::Program::compile("output.n >= 1").expect("compiles");
+    let mut context = cel::Context::default();
+    context
+        .add_variable("output", json!({"n": 2}))
+        .expect("serializes");
+    let error = program
+        .execute(&context)
+        .expect_err("a map is not a number");
+    assert!(error.to_string().contains("map"), "{error}");
+}
+
+/// Every CEL evaluation over JSON goes through [`evaluate`]: no other source
+/// file in the workspace builds its own CEL context.
+#[test]
+fn only_this_module_builds_a_cel_context() {
+    let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("the crates directory");
+    let here = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let allowed = [here.join("expr.rs"), here.join("expr").join("tests.rs")];
+    let needles = [
+        concat!("cel::", "Context"),
+        concat!("add_", "variable"),
+        concat!("Program::", "compile"),
+    ];
+    let mut offenders = Vec::new();
+    let mut stack = vec![crates.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("reads") {
+            let path = entry.expect("an entry").path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|n| n != "target") {
+                    stack.push(path);
+                }
+            } else if path.extension().is_some_and(|e| e == "rs") && !allowed.contains(&path) {
+                let text = std::fs::read_to_string(&path).expect("reads");
+                if needles.iter().any(|n| text.contains(n)) {
+                    offenders.push(path.display().to_string());
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "evaluate CEL through atomic_schema::expr::evaluate: {offenders:?}"
+    );
+}

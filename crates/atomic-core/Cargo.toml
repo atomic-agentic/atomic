@@ -18,12 +18,15 @@ name = "atomic_core"
 workspace = true
 
 [features]
+# Named failpoints (failpoint::failpoint()) kill the process when
+# ATOMIC_FAILPOINT names them; for crash tests only. Without the feature they
+# do nothing.
+failpoints = []
 # The scripted fake model (atomic_core::testing), for other crates' tests.
 fake-model = []
 
 [dependencies]
 anyhow = { workspace = true }
-cel = { workspace = true }
 dirs = { workspace = true }
 globset = { workspace = true }
 ignore = { workspace = true }

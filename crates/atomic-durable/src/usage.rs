@@ -770,7 +770,9 @@ impl Ledger {
     pub async fn settle(&self, request: &str, attempt: i64, how: Settlement) -> Result<Settled> {
         // Where a crash test kills the process: after the provider was
         // called, before its usage is recorded.
-        failpoint("usage:before-settle");
+        if crate::failpoints::armed() {
+            failpoint(&format!("usage:before-settle:{request}"));
+        }
         self.settle_once(request, attempt, how).await
     }
 

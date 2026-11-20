@@ -4,7 +4,9 @@
 //!
 //! [`FakeModel`] serves an OpenAI-compatible API on a loopback port and
 //! answers each model call with the next entry of its script: a text reply, a
-//! tool call or an HTTP error. It speaks the streaming Responses API, which
+//! tool call or an HTTP error. [`FakeModel::respond`] answers by what each
+//! call asks instead, for tests whose calls come in no fixed order, such as a
+//! crash suite whose killed steps run again. It speaks the streaming Responses API, which
 //! drives a real Codex thread deterministically, and the non-streaming
 //! Responses and Chat Completions calls a lite atom makes. It counts and
 //! records every call, so durability and repair tests can assert exactly how
@@ -48,9 +50,13 @@ pub enum Reply {
     },
 }
 
+/// Picks the reply to one model call from its request body.
+type Responder = Arc<dyn Fn(&Value) -> Reply + Send + Sync>;
+
 #[derive(Default)]
 struct State {
     script: Vec<Reply>,
+    responder: Option<Responder>,
     requests: Vec<Value>,
     paths: Vec<String>,
 }
@@ -66,13 +72,29 @@ impl FakeModel {
     /// Start serving `script` on a free loopback port. Once the script is used
     /// up, every further request gets the text "Synthetic reply.".
     pub async fn start(script: Vec<Reply>) -> std::io::Result<Self> {
+        Self::listen(State {
+            script,
+            ..State::default()
+        })
+        .await
+    }
+
+    /// Start serving on a free loopback port, answering each model call with
+    /// what `responder` returns for its request body.
+    pub async fn respond(
+        responder: impl Fn(&Value) -> Reply + Send + Sync + 'static,
+    ) -> std::io::Result<Self> {
+        Self::listen(State {
+            responder: Some(Arc::new(responder)),
+            ..State::default()
+        })
+        .await
+    }
+
+    async fn listen(state: State) -> std::io::Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let port = listener.local_addr()?.port();
-        let state = Arc::new(Mutex::new(State {
-            script,
-            requests: Vec::new(),
-            paths: Vec::new(),
-        }));
+        let state = Arc::new(Mutex::new(state));
         let shared = state.clone();
         let task = tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
@@ -157,7 +179,10 @@ async fn serve(socket: &mut tokio::net::TcpStream, state: &Mutex<State>) -> std:
                     let index = s.requests.len();
                     s.requests.push(request.clone());
                     s.paths.push(path.to_owned());
-                    s.script.get(index).cloned()
+                    match &s.responder {
+                        Some(respond) => Some(respond(&request)),
+                        None => s.script.get(index).cloned(),
+                    }
                 }
                 Err(_) => None,
             };

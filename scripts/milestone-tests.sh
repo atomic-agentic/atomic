@@ -7,21 +7,22 @@
 #
 #   scripts/milestone-tests.sh            # table on stdout; exit 1 if any row fails
 #
-# The table is also appended to $GITHUB_STEP_SUMMARY when that is set. When
-# ATOMIC_TEST_DATABASE_URL is set, the rows that include atomic-agentic-durable
-# run its Postgres variants too. Every row runs even when an earlier one fails;
+# The table is also appended to $GITHUB_STEP_SUMMARY when that is set. The
+# rows that include atomic-agentic-durable run its Postgres variants too, so
+# they need the test database in ATOMIC_TEST_DATABASE_URL (scripts/dev.sh
+# starts one); without it those rows fail, naming it, rather than passing with
+# the Postgres variants unrun. Every row runs even when an earlier one fails;
 # the last row runs the whole workspace, so a test no row names still counts.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"
-POSTGRES=""
-[ -n "${ATOMIC_TEST_DATABASE_URL:-}" ] && POSTGRES="--features atomic-agentic-durable/postgres-tests"
+POSTGRES="--features atomic-agentic-durable/postgres-tests"
 
 # milestone | what it covers | cargo test arguments
 ROWS=(
     "M0|durable core: kill spike, step positions, executor identity, publication, store|-p atomic-agentic-durable"
-    "M1|the atomic binary and its Codex entry point|-p atomic-agentic"
+    "M1|the atomic binary and its Codex entry point|-p atomic-agentic -- --skip every_failpoint_triggered_in_turn"
     "M2|typed atoms on Codex and lite, repair turn, fake model|-p atomic-agentic-core --lib --features fake-model -- codex:: lite:: runtime:: typed:: testing::"
     "M2|golden test: the built-in atoms on the fake model|-p atomic-agentic-atoms"
     "M3|durable runtime, candidates, publication, run_atom|-p atomic-agentic-durable --lib -- runtime:: publication::"
@@ -31,7 +32,8 @@ ROWS=(
     "M35a|artifact store and typed references|-p atomic-agentic-core --lib -- artifact::"
     "M35a|artifact references in schemas|-p atomic-agentic-schema -- artifact::"
     "-|project, configuration and state|-p atomic-agentic-core --lib -- project:: config:: state::"
-    "all|the whole workspace|--workspace"
+    "M38a|failpoints and the crash suite (needs the sandbox)|-p atomic-agentic --features sandbox-tests --test failpoints --test crash"
+    "all|the whole workspace, but the crash suite (M38a)|--workspace -- --skip every_failpoint_triggered_in_turn"
 )
 
 table="| Milestone | Suite | Result | Passed | Failed |

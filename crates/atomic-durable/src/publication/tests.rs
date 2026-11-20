@@ -89,9 +89,7 @@ async fn sqlite() -> Result<Durare> {
 
 #[cfg(feature = "postgres-tests")]
 async fn postgres() -> Result<Durare> {
-    // A suite that cannot reach its backend fails; it never skips.
-    let url = std::env::var("ATOMIC_TEST_DATABASE_URL")
-        .expect("the postgres-tests feature needs ATOMIC_TEST_DATABASE_URL");
+    let url = crate::testing::database().await;
     Durare::postgres(&url, &unique("atomic_pub")).await
 }
 

@@ -549,6 +549,42 @@ pub(crate) fn to_durare(e: DurableError) -> durare::Error {
     }
 }
 
+/// The failpoints around one durable operation's checkpoint (see
+/// [`crate::failpoints`]): `checkpoint:before:<op>` once its body succeeded
+/// and before the engine commits its checkpoint, `checkpoint:after:<op>` once
+/// the checkpoint is committed. The second is reached only when this process
+/// ran the body, not when a replay returned the recorded output.
+#[derive(Clone)]
+struct Checkpoint {
+    name: Arc<str>,
+    ran: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Checkpoint {
+    /// The pair for operation `name`: one half for the body, one for the
+    /// caller.
+    fn new(name: &str) -> (Self, Self) {
+        let this = Self {
+            name: name.into(),
+            ran: Arc::default(),
+        };
+        (this.clone(), this)
+    }
+
+    fn before(&self) {
+        self.ran.store(true, std::sync::atomic::Ordering::SeqCst);
+        if crate::failpoints::armed() {
+            crate::failpoint(&format!("checkpoint:before:{}", self.name));
+        }
+    }
+
+    fn after(&self) {
+        if crate::failpoints::armed() && self.ran.load(std::sync::atomic::Ordering::SeqCst) {
+            crate::failpoint(&format!("checkpoint:after:{}", self.name));
+        }
+    }
+}
+
 /// [`WorkflowContext`] on durare.
 #[derive(Clone)]
 pub struct DurareContext {
@@ -570,6 +606,7 @@ impl WorkflowContext for DurareContext {
         // Called now, not when first polled: durare claims the step's
         // position here, so positions follow construction order whatever
         // order the futures are awaited in.
+        let (checkpoint, ran) = Checkpoint::new(name);
         let pending = self
             .engine
             .step(name, move |s: durare::StepCtx| async move {
@@ -577,9 +614,19 @@ impl WorkflowContext for DurareContext {
                     workflow_id: s.workflow_id().to_owned(),
                     step_id: s.step_id(),
                 };
-                body(info).await.map_err(to_durare)
+                let out = body(info).await;
+                if out.is_ok() {
+                    ran.before();
+                }
+                out.map_err(to_durare)
             });
-        async move { pending.await.map_err(from_durare) }
+        async move {
+            let out = pending.await.map_err(from_durare);
+            if out.is_ok() {
+                checkpoint.after();
+            }
+            out
+        }
     }
 
     fn transaction<T, F>(&self, name: &str, body: F) -> impl Future<Output = Result<T>> + Send
@@ -588,11 +635,27 @@ impl WorkflowContext for DurareContext {
         F: for<'t, 'c> Fn(Tx<'t, 'c>) -> TxFuture<'t, T> + Send + Sync + 'static,
     {
         // As for a step, the position is claimed now.
+        let (checkpoint, ran) = Checkpoint::new(name);
         let pending = self.engine.transaction(name, move |tx| {
             let fut = body(Tx(TxInner::Engine(tx)));
-            Box::pin(async move { fut.await.map_err(to_durare) })
+            let ran = ran.clone();
+            Box::pin(async move {
+                let out = fut.await;
+                if out.is_ok() {
+                    // Inside the transaction: its writes and its checkpoint
+                    // commit together after this, or not at all.
+                    ran.before();
+                }
+                out.map_err(to_durare)
+            })
         });
-        async move { pending.await.map_err(from_durare) }
+        async move {
+            let out = pending.await.map_err(from_durare);
+            if out.is_ok() {
+                checkpoint.after();
+            }
+            out
+        }
     }
 
     async fn control_transaction<T, F>(&self, body: F) -> Result<T>
@@ -613,7 +676,16 @@ impl WorkflowContext for DurareContext {
     {
         // As for a step, the position is claimed now.
         let pending = self.engine.recv::<T>(topic, timeout);
-        async move { pending.await.map_err(from_durare) }
+        let topic = topic.to_owned();
+        async move {
+            let out = pending.await.map_err(from_durare);
+            // The message taken, or the timeout, is recorded. A replay that
+            // returns the recorded one reaches this too.
+            if out.is_ok() && crate::failpoints::armed() {
+                crate::failpoint(&format!("recv:after:{topic}"));
+            }
+            out
+        }
     }
 }
 
