@@ -62,22 +62,22 @@ planned later; do not treat an agent's list of test names as proof of execution.
 
 Recorded model responses can make regression checks cheaper and faster. When a
 recording is applicable, validation can run again without another model call.
-Changing the effective prompt, prepared context, generation schema or model
-settings needs fresh evaluation rather than an unqualified pass on old output.
-A recording's identity also includes prepared artifacts, generation/lowering profile,
-provider endpoint and tool/mock/seed-repository versions. Validation-only reuse is
-labelled a historical regression check, never a live-model pass.
-
-The later development loop adds:
+`atomic eval` keys each recording by the request as sent: the endpoint, and the
+body, which holds the effective prompt, the generation schema, the model and its
+settings. Changing any of them needs a fresh recording rather than an unqualified
+pass on old output. Prepared context, artifacts and seed repositories count only
+insofar as they change that request. Validation-only reuse is labelled a
+historical regression check, never a live-model pass.
 
 ```sh
-atomic dev
-atomic eval summarize-note --live
-atomic eval summarize-note --compare HEAD~1
+atomic eval summarize-note --live   # call the model, record each answer, meter the spend
+atomic eval summarize-note          # replay the recordings, with no model call
 ```
 
-Live calls consume tokens. The CLI should distinguish live results from checks
-of historical recordings. A golden fixture you wrote by hand is not a recording
+Live calls consume tokens, and `atomic eval` meters them under the atom's budget
+in the project's usage ledger. It labels replayed results as checks of historical
+recordings. The later development loop adds `atomic dev` and
+`atomic eval summarize-note --compare HEAD~1`. A golden fixture you wrote by hand is not a recording
 of what a model returned.
 
 ## Preview the prompt and the cost

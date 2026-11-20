@@ -471,7 +471,9 @@ async fn the_report_reads_as_junit_xml() {
     let xml = junit(&report);
     // Two cases and the run's pass rate; the second case and the rate fail.
     assert!(
-        xml.contains("<testsuite name=\"test\" tests=\"3\" failures=\"2\">"),
+        xml.contains(
+            "<testsuite name=\"test\" tests=\"3\" failures=\"2\" errors=\"0\" skipped=\"0\">"
+        ),
         "{xml}"
     );
     assert!(
@@ -500,13 +502,15 @@ async fn the_report_reads_as_junit_xml() {
     .await;
     let xml = junit(&report);
     assert!(
-        xml.contains("<failure message=\"bad &lt;b&gt; &amp; &quot;q&quot;&#10;next[0m\"/>"),
+        xml.contains("<error message=\"bad &lt;b&gt; &amp; &quot;q&quot;&#10;next[0m\"/>"),
         "{xml}"
     );
     assert!(
         !xml.chars().any(|c| (c as u32) < 0x20 && c != '\n'),
         "{xml}"
     );
+    // A case whose atom gave no output is an error, not a failure.
+    assert!(xml.contains("failures=\"1\" errors=\"1\""), "{xml}");
 
     // A run with no cases fails, and its JUnit says so.
     let report = run(
@@ -519,7 +523,10 @@ async fn the_report_reads_as_junit_xml() {
     .await;
     assert!(!report.passed);
     let xml = junit(&report);
-    assert!(xml.contains("tests=\"1\" failures=\"1\""), "{xml}");
+    assert!(
+        xml.contains("tests=\"1\" failures=\"1\" errors=\"0\""),
+        "{xml}"
+    );
     assert!(xml.contains("has no eval cases to run"), "{xml}");
 }
 
