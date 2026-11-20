@@ -4102,10 +4102,21 @@ fn a_fixture_atomic_cannot_copy_whole_or_that_is_not_its_own_repository_is_refus
                 "{fixture}: {error}"
             );
         };
-        // Not a repository, or a directory inside one.
-        let plain = dir.join("plain");
+        // Not a repository, or a directory inside one. The plain directory
+        // is made under the system's temporary directory, outside every
+        // repository: the test's own scratch directory may sit inside the
+        // checkout atomic is built from.
+        let plain = std::env::temp_dir().join(format!(
+            "atomic-run-cli-plain-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
         std::fs::create_dir_all(&plain).expect("plain");
         refused(&plain, &first, "fixture.path", "not a git repository");
+        std::fs::remove_dir_all(&plain).expect("remove the plain directory");
         std::fs::create_dir_all(fixture.join("sub")).expect("sub");
         refused(
             &fixture.join("sub"),
