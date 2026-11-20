@@ -404,21 +404,56 @@ pub fn load(file: &Path, registry: &mut Registry) -> Result<Atom, AtomError> {
             ));
         }
     }
-    let allows_network = match fm.get("network") {
-        None | Some(Value::Bool(false)) => false,
-        Some(Value::Object(n)) => n
-            .get("allow")
-            .and_then(Value::as_array)
-            .is_some_and(|a| !a.is_empty()),
-        Some(_) => true,
-    };
-    if allows_network {
-        return Err(fail(
-            line_of("/network"),
-            "/network",
-            "network access for atoms is not supported by this version of atomic yet; atoms run with no network"
-                .into(),
-        ));
+    // No network unless declared. An exec atom may name the hosts its
+    // command reaches, within atomic's policy; other atoms run with none.
+    match fm.get("network") {
+        None | Some(Value::Bool(false)) => {}
+        Some(Value::Object(n)) if kind == "exec" => {
+            if let Some(key) = n.keys().find(|k| *k != "allow") {
+                let pointer = format!("/network/{key}");
+                return Err(fail(
+                    line_of(&pointer),
+                    &pointer,
+                    format!("unknown field `{key}`; `network` has only `allow`, a list of hosts"),
+                ));
+            }
+            let hosts: Option<Vec<String>> = match n.get("allow") {
+                None => Some(Vec::new()),
+                Some(Value::Array(a)) => a.iter().map(|h| h.as_str().map(str::to_owned)).collect(),
+                Some(_) => None,
+            };
+            let Some(hosts) = hosts else {
+                return Err(fail(
+                    line_of("/network/allow"),
+                    "/network/allow",
+                    "`network.allow` is a list of host names, such as `['api.example.com']`".into(),
+                ));
+            };
+            if let Err(why) = crate::network::check_hosts(&hosts) {
+                return Err(fail(
+                    line_of("/network/allow"),
+                    "/network/allow",
+                    format!("{why}; an atom may declare only public DNS names"),
+                ));
+            }
+        }
+        Some(Value::Object(n))
+            if n.get("allow")
+                .and_then(Value::as_array)
+                .is_none_or(Vec::is_empty) => {}
+        Some(_) => {
+            return Err(fail(
+                line_of("/network"),
+                "/network",
+                if kind == "exec" {
+                    "`network` is `false` or `{ allow: [hosts] }`".into()
+                } else {
+                    "network access is for exec atoms' commands at this version of atomic; \
+                     this atom runs with no network"
+                        .into()
+                },
+            ));
+        }
     }
     let has_tools = match fm.get("tools") {
         None | Some(Value::Null) => false,

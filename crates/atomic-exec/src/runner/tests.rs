@@ -13,6 +13,7 @@ fn command(program: &str, args: &[&str], stdin: &[u8]) -> Command {
         time_limit: Duration::from_secs(10),
         output_limit: 1024,
         writable: Vec::new(),
+        network: Vec::new(),
     }
 }
 

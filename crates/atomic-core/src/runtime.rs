@@ -1000,6 +1000,18 @@ fn declared_env(atom: &AtomFile) -> std::collections::BTreeMap<String, String> {
         .collect()
 }
 
+/// The hosts an atom declares in `network.allow`, as the atom loaded them:
+/// checked against atomic's policy then ([`crate::network::check_hosts`]).
+fn declared_network(atom: &AtomFile) -> Vec<String> {
+    let hosts: Vec<String> = atom.frontmatter["network"]["allow"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|h| h.as_str().map(str::to_owned))
+        .collect();
+    crate::network::check_hosts(&hosts).unwrap_or_default()
+}
+
 /// [`run_exec`] in a workspace [`open_exec_workspace`] opened, which it
 /// closes when the command has ended.
 pub async fn run_exec_opened(
@@ -1051,6 +1063,7 @@ pub async fn run_exec_opened(
         args,
         stdin,
         identity.environment(),
+        declared_network(atom),
     )
     .await;
     workspace.close().await;
@@ -1138,13 +1151,16 @@ pub async fn run_exec_opened(
 /// Run an exec atom's command in `workspace`: in its root, with its
 /// environment, `HOME` and `TMPDIR` at its scratch directory, and the step's
 /// effect identity (`effect`), which nothing the atom declares can replace.
-/// The command runs on the blocking pool, never on an executor thread.
+/// A confining backend lets it reach `network`, the hosts its atom
+/// declares, and nothing else. The command runs on the blocking pool, never
+/// on an executor thread.
 async fn run_command(
     guard: &WorkspaceGuard,
     program: String,
     args: Vec<String>,
     stdin: Vec<u8>,
     effect: [(String, String); 3],
+    network: Vec<String>,
 ) -> Result<atomic_exec::Completed, CommandError> {
     let workspace = guard.workspace();
     let cwd = workspace.require_root()?.clone();
@@ -1168,6 +1184,7 @@ async fn run_command(
         output_limit: EXEC_OUTPUT_LIMIT,
         // A confining backend lets it write its scratch directory only.
         writable: workspace.scratch.iter().cloned().collect(),
+        network,
     };
     // The command holds its workspace open until it ends, even when the run
     // that started it is cancelled and drops its guard.

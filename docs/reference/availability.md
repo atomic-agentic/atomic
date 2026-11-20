@@ -97,7 +97,8 @@ every project keeps its database, its execution lock and its context
 checkpoints; the current project's
 Codex records; the credential and key directories; the default atomic home's
 data and configuration when `ATOMIC_HOME` points elsewhere; the kernel keyrings;
-the network; and sockets. Other projects' Codex records are not denied yet. An
+the network, unless an exec atom declares the hosts it reaches, and then all but
+those, which it reaches through atomic's proxy; and sockets. Other projects' Codex records are not denied yet. An
 exec atom's command may write only its scratch directory and the project's
 caches; `--runner process` confines it the same way. It runs in a process
 namespace of its own, so it can neither see nor signal atomic, its runner or

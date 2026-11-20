@@ -1908,13 +1908,118 @@ fn a_confined_command_has_no_controlling_terminal() {
             .and_then(|start| out[start..].rfind('}').map(|end| &out[start..=start + end]))
             .unwrap_or_else(|| panic!("{runner}: no result in {out}"));
         let result: Value = serde_json::from_str(json).unwrap_or_else(|e| panic!("{e}: {out}"));
-        // Each fails, as OSError or one of its kinds.
+        // Each fails, as OSError or one of its kinds; opening the terminal
+        // by its path fails on that path, not on a slip in the probe.
         for probe in ["tty", "sti", "by_path", "through_proc"] {
             assert!(
                 result[probe]
                     .as_str()
                     .is_some_and(|r| r != "ok" && r.contains("Error")),
                 "{runner}: {probe}: {result}"
+            );
+        }
+        assert!(
+            result["by_path"]
+                .as_str()
+                .is_some_and(|r| r.contains("'/dev/pts/")),
+            "{runner}: by_path: {result}"
+        );
+    }
+}
+
+/// An exec atom's command has no network unless its atom declares hosts,
+/// and then reaches only those, through atomic's proxy. No test reaches the
+/// outside world. The proxy refuses a host the atom did not declare as not
+/// on its list (`not_allowed`). A declared one, under the reserved
+/// `.example` domain, passes the list and is refused only by the next check,
+/// which resolves it to make sure it is not on a private network, and fails
+/// closed when it does not resolve (`not_allowed_local`). No connection
+/// leaves the command except through the proxy.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[test]
+fn an_exec_atom_reaches_only_the_hosts_it_declares() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
+    let dir = scratch("network");
+    let project = project(&dir);
+    std::fs::write(
+        project.join("tools/net.py"),
+        "import json, os, socket, sys, urllib.request\n\
+         json.load(sys.stdin)\n\
+         proxy = os.environ.get('HTTP_PROXY')\n\
+         opener = urllib.request.build_opener(urllib.request.ProxyHandler({'http': proxy} if proxy else {}))\n\
+         def attempt(f):\n\
+         \x20   try:\n\
+         \x20       f()\n\
+         \x20       return 'ok'\n\
+         \x20   except urllib.error.HTTPError as e:\n\
+         \x20       try: reason = json.loads(e.read()).get('reason', '')\n\
+         \x20       except Exception: reason = ''\n\
+         \x20       return ('HTTP ' + str(e.code) + ' ' + reason).strip()\n\
+         \x20   except Exception as e:\n\
+         \x20       return type(e).__name__\n\
+         def fetch(url):\n    return lambda: opener.open(url, timeout=20).read()\n\
+         def direct():\n    socket.create_connection(('192.0.2.1', 80), timeout=5).close()\n\
+         json.dump({'proxied': proxy is not None, 'declared': attempt(fetch('http://allowed.example/')), \
+         'undeclared': attempt(fetch('http://blocked.example/')), 'direct': attempt(direct)}, sys.stdout)\n",
+    )
+    .expect("script");
+    let schema = object(json!({
+        "proxied": {"type": "boolean"},
+        "declared": {"type": "string"},
+        "undeclared": {"type": "string"},
+        "direct": {"type": "string"},
+    }));
+    write_atom(
+        &project,
+        "declares-network",
+        "description: 'Reach a declared host.', kind: 'exec', exec: { command: ['python3', 'tools/net.py'] }, \
+         network: { allow: ['allowed.example'] }",
+        "",
+        object(json!({})),
+        schema.clone(),
+    );
+    write_atom(
+        &project,
+        "no-network",
+        "description: 'Declare no network.', kind: 'exec', exec: { command: ['python3', 'tools/net.py'] }",
+        "",
+        object(json!({})),
+        schema,
+    );
+    for runner in ["local", "process"] {
+        let run = |atom: &str| {
+            let out = atomic(
+                &dir,
+                &project,
+                &["run", atom, "--runner", runner, "--data", "{}"],
+                &[],
+                "",
+            );
+            assert!(out.status.success(), "{runner} {atom}: {}", text(&out));
+            stdout_json(&out)
+        };
+        let declared = run("declares-network");
+        assert_eq!(declared["proxied"], true, "{runner}: {declared}");
+        assert_eq!(
+            declared["undeclared"], "HTTP 403 not_allowed",
+            "{runner}: {declared}"
+        );
+        assert_eq!(
+            declared["declared"], "HTTP 403 not_allowed_local",
+            "{runner}: a declared host passes the list: {declared}"
+        );
+        assert_ne!(declared["direct"], "ok", "{runner}: {declared}");
+
+        let none = run("no-network");
+        assert_eq!(none["proxied"], false, "{runner}: {none}");
+        for probe in ["declared", "undeclared", "direct"] {
+            assert!(
+                none[probe]
+                    .as_str()
+                    .is_some_and(|r| !r.starts_with("HTTP") && r != "ok"),
+                "{runner}: {probe}: {none}"
             );
         }
     }

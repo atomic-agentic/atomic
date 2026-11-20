@@ -52,8 +52,8 @@ state (every project's database and gate store under the atomic home's
 `private/`, the current project's Codex records, the credential and key
 directories). It can write only its own scratch directory (its `HOME`
 and `TMPDIR`) and the project's build caches; a command that writes anywhere
-else fails. It has no network and cannot use sockets, until atoms can declare
-the network they need. It also:
+else fails. It has no network and cannot use sockets unless the atom declares
+the hosts it reaches (see [Network access](#network-access)). It also:
 
 - finds `.aws`, `.codex`, `.git` and `.agents` in its `HOME` read-only, as the
   sandbox keeps them in every writable directory;
@@ -96,6 +96,42 @@ of a step and differs for any other step or run, beside `ATOMIC_RUN_ID` and
 writes so a repeated write is recognisable. An atom's `env` cannot set these
 three names.
 
+
+### Network access
+
+An exec atom names the hosts its command reaches; with none, the command has no
+network at all.
+
+```astro
+---
+export const config = {
+  description: 'Fetch one operations report.',
+  kind: 'exec',
+  exec: {command: ['python3', 'tools/fetch_report.py']},
+  network: {allow: ['acme-reports.s3.us-east-1.amazonaws.com', '*.example.com']},
+  effects: {external: 'read-only'},
+};
+---
+```
+
+`network.allow` lists DNS names, each a name with at least two labels or `*.`
+and such a name for its subdomains, up to 32 of them. `network: false`, or no
+`network` at all, means none. On Linux the command then gets a network of its
+own whose only way out is a proxy atomic runs for it, which forwards a request
+only to a listed host. The command finds the proxy in `HTTP_PROXY`,
+`HTTPS_PROXY`, `ALL_PROXY` and the like, which most HTTP clients and SDKs read; a
+client that ignores them reaches nothing. It can open no other connection, to
+this machine or anywhere else, and no Unix socket.
+
+What an atom may list is atomic's policy, checked when the atom loads: public
+DNS names only. An IP address, `localhost` or a name under it, a single-label
+name, a name under `.local`, `.internal`, `.lan`, `.home.arpa` or another
+private suffix, a bare `*`, and anything with a scheme, a port, a path or a Unix
+socket are refused. The proxy also refuses a listed name that resolves to an
+address on this machine or a private network, or that does not resolve.
+
+Only exec atoms declare network access at this version; a codex or lite atom
+that declares `network.allow` is refused, and its commands run with none.
 ## Schema locations
 
 Schemas default to

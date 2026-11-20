@@ -180,6 +180,7 @@ impl Request {
             output_limit: self.output_limit,
             // Confined, if at all, before it was sent.
             writable: Vec::new(),
+            network: Vec::new(),
         })
     }
 }

@@ -119,6 +119,10 @@ pub struct Command {
     /// directory, when its backend confines it (see [`Confine`]). A backend
     /// that does not confine its commands ignores it.
     pub writable: Vec<PathBuf>,
+    /// The hosts it may reach, as its atom declares them, when its backend
+    /// confines it; with none, it has no network at all. A backend that does
+    /// not confine its commands ignores it.
+    pub network: Vec<String>,
 }
 
 /// Puts a command under a sandbox before a backend runs it: what it may

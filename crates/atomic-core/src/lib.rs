@@ -24,6 +24,7 @@ pub mod git;
 pub mod helper_runtime;
 pub mod http_tools;
 pub mod lite;
+pub mod network;
 pub mod project;
 pub mod render;
 pub mod runtime;

@@ -75,6 +75,8 @@ codex-extension-api = { git = "https://github.com/atomic-agentic/codex", rev = "
 codex-keyring-store = { git = "https://github.com/atomic-agentic/codex", rev = "f8e52f30a7d56b045b93068c156aae8a4a312ba6" }
 # For the shell environment policy types codex-core-api does not re-export.
 codex-protocol = { git = "https://github.com/atomic-agentic/codex", rev = "f8e52f30a7d56b045b93068c156aae8a4a312ba6" }
+# The proxy that limits an exec command declaring network access to its hosts.
+codex-network-proxy = { git = "https://github.com/atomic-agentic/codex", rev = "f8e52f30a7d56b045b93068c156aae8a4a312ba6" }
 
 # Codex is a large dependency; full debug info for every crate makes a debug
 # build tens of gigabytes. Keep line tables for atomic's own crates (enough for

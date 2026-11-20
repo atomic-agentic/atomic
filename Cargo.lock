@@ -543,6 +543,7 @@ dependencies = [
  "codex-core-api",
  "codex-extension-api",
  "codex-keyring-store",
+ "codex-network-proxy",
  "codex-protocol",
  "deno_core",
  "dirs",

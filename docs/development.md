@@ -172,7 +172,8 @@ command's settings, its neutralized filter drivers and its explicit git
 directory; the sandbox's confinement of writes, which keeps the state
 directory and a worktree's git directory out of a turn's reach, its exclusion
 of `/tmp`, and its denial of atomic's private state, to turns and to exec
-atoms' commands; and the confinement of exec atoms' commands itself), it
+atoms' commands; the confinement of exec atoms' commands itself; and their
+network: none unless declared, and through the proxy only the declared hosts), it
 switches the control off in the source, requires the control's test to fail,
 puts the source back and requires the test to pass. Each control costs a rebuild, so it
 runs by hand rather than in CI:
