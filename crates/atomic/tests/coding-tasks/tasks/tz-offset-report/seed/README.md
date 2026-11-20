@@ -47,9 +47,9 @@ rejected with `ValueError`.
 
 ```
 Harbour Street (UTC-03:30): 5 events
-day          events      sales    refunds        net
-2026-03-01        3      41.50       0.00      41.50
-2026-03-02        2      10.00       2.25       7.75
+day         events      sales    refunds        net
+2026-03-01       3      41.50       0.00      41.50
+2026-03-02       2      10.00       2.25       7.75
 ```
 
 One row for each local day that has events, oldest first. `net` is sales minus refunds.

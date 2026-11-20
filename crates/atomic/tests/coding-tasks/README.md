@@ -21,18 +21,41 @@ Each task under `tasks/<name>/` has:
 | `solution/` | A reference solution: files laid over the seed |
 
 Every checker sources `lib/check-lib.sh`. It grades a copy of the workspace,
-never the workspace itself, and leaves the workspace as it found it. A
-workspace holding a link, a special file or a Python startup hook
-(`sitecustomize.py`, `usercustomize.py`, `conftest.py`, a `.pth` file) fails
-whatever else it holds. The checks grade honest attempts; they are not
-hardened against an agent that sets out to game them.
+never the workspace itself, and leaves the workspace as it found it. Before the
+hidden tests are laid over the copy, the copy is refused if it holds a link or a
+special file (a `.venv` aside, which is dropped), a Python startup hook
+(`sitecustomize.py`, `usercustomize.py`, `conftest.py`, a `.pth` file), a
+top-level name starting `hidden_`, which the hidden files use, or a top-level
+module named like one of Python's standard library, which could stand in for the
+test runner. The checker runs in an environment of its own, with a fixed `PATH`
+and no `HOME`, and runs the tests in Python's isolated mode, without user
+site-packages. `unchanged` compares the seed's own files under a path, so a
+test file an attempt adds is its own.
+
+**A checker runs the attempt's code.** It does so with the privileges of
+whoever runs it, so run it inside a sandbox, with a clean environment, on
+attempts you would run anyway. It grades honest attempts and is not a
+boundary against one that sets out to game it: the hidden tests import the
+attempt's code into their own process, so code that ends that process early
+with a success status passes, and a process the attempt leaves running, as
+`setsid` can, may hold the checker's output open. The contract test reads a
+checker's output from a file, not a pipe, and gives up on it after five
+minutes.
 
 `tests/coding_tasks.rs` holds the contract: every seed fails its checker with
 exit 1 (not some other failure, so a checker that crashes cannot pass for one
-that grades), every seed with its solution laid over it passes, and the checker
-changes nothing it grades. While each task was written, at least one plausible
-wrong fix was also tried and failed its checker; those wrong fixes are not
-kept.
+that grades), every seed with its solution laid over it passes, the checker
+changes nothing it grades, and each refusal above holds. `tasks/<name>/wrong/`
+keeps wrong and partial fixes, each laid over the seed with a `.expect` file
+naming why its checker must fail it: half a fix, an edited visible test, a
+corrected test left wrong, a regression test that passes on the old code,
+tests that ignore the new flag, and a refactor that keeps a loop. The test
+requires each to fail for that reason. The checkers need Linux: the test runs
+there only.
+
+The seed, hidden, solution and wrong-fix files are fixture data: small
+projects an atom works on, kept as they are, without licence headers. They are
+part of atomic and under its licence.
 
 ## The tasks
 

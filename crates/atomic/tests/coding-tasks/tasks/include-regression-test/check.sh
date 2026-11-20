@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 # Fix a bug that shows only from another directory, and add a regression test that fails on the old code.
+set -euo pipefail
 source "$(dirname "$0")/../../lib/check-lib.sh"
 unchanged conf
 hidden_tests

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 # A feature in four places: --since in the CLI, the query, the README and tests that catch a since that is ignored.
+set -euo pipefail
 source "$(dirname "$0")/../../lib/check-lib.sh"
 hidden_tests
 py_test discover -s tests -t . || fail "the visible tests fail"

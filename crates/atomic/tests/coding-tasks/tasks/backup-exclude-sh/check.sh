@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 # A repeatable -x for a POSIX sh tool: options, file list, copy, MANIFEST, help and README all agree.
+set -euo pipefail
 source "$(dirname "$0")/../../lib/check-lib.sh"
 data="$(mktemp -d "${TMPDIR:-/tmp}/atomic-task-data.XXXXXX")"
 trap 'rm -rf "${G}" "${data}"' EXIT
