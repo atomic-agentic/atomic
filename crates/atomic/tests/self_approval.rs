@@ -527,7 +527,10 @@ impl Drop for Removed {
 }
 
 /// A `bwrap` that logs how it was called, and, with `argv0` false, hides
-/// `--argv0` from its help, as bubblewrap before 0.9 has none.
+/// `--argv0` from its help, as bubblewrap before 0.9 has none. Each call
+/// goes to a file of its own in the returned directory: a call's arguments
+/// can pass the size the system writes to one file at once, and calls made
+/// at the same time would interleave in one.
 fn wrapped_bwrap(bin: &Path, argv0: bool) -> PathBuf {
     let real = Command::new("sh")
         .args(["-c", "command -v bwrap"])
@@ -537,10 +540,10 @@ fn wrapped_bwrap(bin: &Path, argv0: bool) -> PathBuf {
     assert!(!real.is_empty(), "no bubblewrap on PATH");
     let filter = if argv0 { "cat" } else { "grep -v -- --argv0" };
     let log = bin.join("bwrap.log");
-    std::fs::create_dir_all(bin).unwrap();
+    std::fs::create_dir_all(&log).unwrap();
     let script = format!(
         "#!/bin/sh\n\
-         echo \"$@\" >> {log}\n\
+         printf '%s ' \"$@\" > {log}/$$\n\
          if [ \"$1\" = --help ]; then {real} --help 2>&1 | {filter}; exit 0; fi\n\
          exec {real} \"$@\"\n",
         log = log.display(),
@@ -629,7 +632,10 @@ fn a_turn_through_atomics_own_entry_point_runs_with_its_helper_in_the_state_dire
                 "argv0 {argv0}: the turn did not see the project: {output}"
             );
             assert!(!output.contains("SQLite format"), "{output}");
-            let calls = std::fs::read_to_string(&log).unwrap_or_default();
+            let calls: String = std::fs::read_dir(&log)
+                .unwrap()
+                .map(|call| std::fs::read_to_string(call.unwrap().path()).unwrap() + "\n")
+                .collect();
             let ran: Vec<&str> = calls
                 .lines()
                 .filter(|l| l.contains("--apply-seccomp-then-exec"))
