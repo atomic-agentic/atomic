@@ -40,8 +40,9 @@
 //! nothing, so resuming alone never raises a cap. Only [`Ledger::raise`],
 //! a person's action, raises one.
 //!
-//! An attempt left `reserved` can be reconciled later, once its real usage
-//! is known ([`Settlement::Reconciled`]), or
+//! An attempt left `reserved` can be reconciled later, once a person knows
+//! its real usage and enters it ([`Settlement::Reconciled`]; no command does
+//! that yet), or
 //! released once it is confirmed unused ([`Ledger::release`]);
 //! [`Ledger::unsettled`] lists them.
 //!
@@ -203,8 +204,8 @@ pub enum Settlement {
         /// What the request in flight is taken to have spent.
         in_flight: Charge,
     },
-    /// Its usage, learned after the fact,
-    /// for an attempt that was never settled: it replaces the reservation.
+    /// Its usage, as a person learned it after the fact, for an attempt that
+    /// was never settled: it replaces the reservation.
     /// The active time is what passed since admission, at most what was
     /// reserved, unless it was settled already.
     Reconciled {

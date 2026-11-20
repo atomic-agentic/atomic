@@ -114,13 +114,14 @@ separate wall-clock deadline and continues during an offline interval.
 Before dispatch, Atomic durably reserves against the atom and every parent budget
 under a stable request/attempt ID, independently of output checkpoints. Settlement
 is idempotent by that ID. Failed or rejected attempts still count; an uncertain
-request keeps its maximum reservation charged. No provider atomic calls can be
-asked afterwards what one request used: atomic has providers store nothing of its
-requests (`store: false` on OpenAI's Responses API), so a response cannot be
-fetched again, Chat Completions keep none to look up, a provider's usage reports
-are totals over time rather than per request, and local servers keep no record.
-An unknown or partly known charge therefore keeps its value. A new actual retry
-needs another reservation rather than reusing uncertain allowance.
+request keeps its maximum reservation charged. atomic has no lookup of what one
+request used, and OpenAI, Azure OpenAI and local servers, as atomic calls them,
+offer none: on the Responses API atomic asks for its responses not to be kept for
+retrieval (`store: false`), it does not ask for Chat Completions to be stored,
+OpenAI's usage reports are totals over time rather than per request, and local
+servers keep no record. An unknown or partly known charge therefore keeps its
+value. A new actual retry needs another reservation rather than reusing uncertain
+allowance.
 
 For a supported bounded request, reserve its whole provider maximum: intentional
 unreserved overshoot is zero. Any declared excess is bounded by `max(0, B - R)`
@@ -179,16 +180,17 @@ budget does not price is not made.
 
 When a cap prevents more work, the run parks for inspection rather than silently
 starting another attempt. The call is not made, the park is recorded with its
-reason, and the run waits on it; resuming it finds it parked again. Already-started work and uncertain provider usage can
-require reconciliation; a configured cap is not a promise of a perfectly bounded
-provider bill. Pending usage is not treated as free after a crash.
+reason, and the run waits on it; resuming it finds it parked again. Uncertain
+provider usage stays charged at its bound; a configured cap is not a promise of a
+perfectly bounded provider bill. Pending usage is not treated as free after a
+crash.
 
 A released park runs the parked atom again, as new attempts at the same requests,
 and admits its calls against the caps as they are stored then. Releasing alone
 raises nothing, so a run released with no more room parks again. Room comes from
-raising the cap in the usage ledger, from an attempt left reserved being
-reconciled with its real usage, or, for a refusal caused by a sibling's
-reservation, from that sibling settling.
+raising the cap in the usage ledger, from a person entering an attempt's real
+usage in the ledger in place of its reservation (no command does that yet), or,
+for a refusal caused by a sibling's reservation, from that sibling settling.
 
 Inspect the run with `atomic runs show <run-id>`. This draft does not yet define
 the command that raises a cap and releases the park; resuming alone cannot bypass
