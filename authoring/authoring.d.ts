@@ -12,6 +12,8 @@ type Scorer<I, O, C, J extends { [K in keyof J]: JudgeSpec }, R> = {
     with: (context: Context<I, O, C, R>) => J[K]['input'];
     score: (context: { judge: J[K]['output'] } & Runtime<R>) => number;
     min_mean: number;
+    /** How far the mean may fall below a baseline revision's, between 0 and 1. */
+    max_drop?: number;
   }
 }[keyof J];
 export interface AtomConfig<I, O, C = unknown, J extends { [K in keyof J]: JudgeSpec } = {}, R = never> {
@@ -37,7 +39,8 @@ export interface AtomConfig<I, O, C = unknown, J extends { [K in keyof J]: Judge
   context?: unknown;
   case?: unknown;
   judges?: unknown;
-  evals?: unknown;
+  /** The eval directory, relative to this file, or `{dir, pass_rate}`: the share of cases that must pass, 1 by default. */
+  evals?: string | {dir?: string; pass_rate?: number};
   examples?: {name: string; input: I; output: O}[];
   description?: string;
   trust?: 'external' | 'team' | 'agent';

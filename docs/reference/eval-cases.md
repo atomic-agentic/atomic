@@ -23,6 +23,12 @@ expect:
 | --- | --- |
 | `input` | Required JSON-compatible value matching the atom's input schema; an object when the schema requires one |
 | `expect` | Required nonempty list of CEL expressions; every expression must evaluate to `true` |
+| `case` | Optional metadata for the atom's [scorers](#scorers-and-baselines), checked against the atom's `case` schema |
+
+A case missing `input` or `expect`, with an empty `expect`, with any other key,
+with an input that does not fit the atom's input schema, or with an assertion
+that reads a field the schemas do not have, fails the load at its file (and, in a
+JSONL file, its line).
 
 An atom whose code declares a write to an outside system has no eval cases:
 Atomic never runs such code in an eval. Cover it with code tests and
@@ -50,6 +56,43 @@ the same directory. Each line is a JSON object with the same two keys:
 A case is identified by its file and line number. YAML and JSONL cases can sit
 side by side, and cases captured from rejected gates can be appended to a JSONL
 file. See [the example](../../examples/09-compact-and-variants/README.md).
+
+## Pass rate and threshold
+
+A run of an atom's cases reports its pass rate, the share of cases whose every
+assertion held. It passes when the pass rate reaches the atom's threshold, which
+is every case unless the atom says otherwise in its `evals` field:
+
+```ts
+evals: { pass_rate: 0.9 },              // the share of cases CI requires
+evals: { dir: 'cases', pass_rate: 0.9 }, // with the cases somewhere else
+evals: 'cases',                          // the directory alone, every case required
+```
+
+The directory is relative to the atom file. A run with no cases does not pass.
+The report can be written as JUnit XML, one test case per eval case and per
+scorer plus one for the pass rate, so CI shows which failed. A run can be limited
+to chosen cases (a file's name selects all its cases) and to a seeded sample of
+them; the same seed picks the same cases.
+
+## Scorers and baselines
+
+A [scorer](atom-files.md) gives each case a number from 0 to 1 through a judge,
+where an assertion gives only pass or fail. Each scorer declares `min_mean`, the
+mean its scores must reach, and may declare `max_drop`, how far its mean may fall
+below the mean of a baseline run, the report of an earlier revision:
+
+```ts
+scorers: {
+  quality: { judge: 'reviewer', with: ({input}) => ({text: input.text}),
+             score: ({judge}) => judge.ok ? 1 : 0, min_mean: 0.75, max_drop: 0.05 },
+},
+```
+
+Only cases whose assertions held are scored. The run fails when a scorer's mean
+is below its `min_mean`, or, given a baseline that scored it, when the mean has
+fallen by more than its `max_drop`, even while it is above the minimum. Calling a
+judge model is the caller's: a run without a judge reports the pass rate alone.
 
 ## What gets checked
 
