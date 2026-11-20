@@ -17,7 +17,7 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"
-FEATURES="atomic-agentic-durable/postgres-tests,atomic-agentic/sandbox-tests"
+FEATURES="atomic-agentic/postgres-tests,atomic-agentic/sandbox-tests"
 LOG="$(mktemp)"
 trap 'rm -f "${LOG}"' EXIT
 status=0

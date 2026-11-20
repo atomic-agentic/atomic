@@ -86,6 +86,7 @@ fn runtimes(model: &FakeModel, tag: &str) -> Runtimes {
     Runtimes {
         codex,
         lite,
+        exec: Default::default(),
         clock: None,
     }
 }

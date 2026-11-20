@@ -109,6 +109,8 @@ pub struct Runtimes {
     pub codex: CodexRuntime,
     /// For `kind: lite`.
     pub lite: LiteRuntime,
+    /// Where `kind: exec` commands run.
+    pub exec: atomic_exec::Backend,
     /// The durable step's recorded clock, for the atom's helper calls (see
     /// [`crate::astro::StepClock`]). Without one, each operation's helpers
     /// see the current time and a fresh seed.
@@ -463,7 +465,7 @@ pub async fn run_declarative_with_context(
             compiled,
             input,
             &identity,
-            Arc::new(atomic_exec::LocalBackend),
+            runtimes.exec.shared(),
             runtimes.clock.as_ref(),
         )
         .await;
@@ -685,7 +687,14 @@ pub async fn run_exec(
         .await
         .map_err(|e| AtomError::Runtime(format!("{}: {e}", atom.name)));
     let _ = std::fs::remove_dir_all(&scratch);
-    let done = done?.map_err(|e| AtomError::Runtime(format!("{}: {e}", atom.name)))?;
+    let done = done?.map_err(|e| {
+        let message = format!("{}: {e}", atom.name);
+        if e.outcome_unknown() {
+            AtomError::OutcomeUnknown(message)
+        } else {
+            AtomError::Runtime(message)
+        }
+    })?;
     if !done.success() {
         let stderr = String::from_utf8_lossy(&done.stderr);
         let tail: String = stderr

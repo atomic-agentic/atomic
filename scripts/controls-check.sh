@@ -32,7 +32,7 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"
-FEATURES="atomic-agentic-durable/postgres-tests,atomic-agentic/sandbox-tests"
+FEATURES="atomic-agentic/postgres-tests,atomic-agentic/sandbox-tests"
 STATE="${ROOT}/target/controls-check"
 LOG="${STATE}/cargo.log"
 

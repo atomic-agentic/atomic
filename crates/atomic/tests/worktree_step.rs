@@ -266,6 +266,10 @@ async fn kill_and_recover(tag: &str, failpoint: &str) -> (PathBuf, String, Publi
         std::fs::read_to_string(dir.join("start.log")).unwrap_or_default()
     );
     assert!(!dir.join("result.json").exists());
+    // A commit's time has one-second resolution, so a retry within the same
+    // second as the killed attempt writes the very same commit, and the
+    // killed attempt's would not be an orphan. Start the retry a second on.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
 
     let (d, u, b) = (dir.clone(), url.clone(), base.clone());
     let finished = tokio::task::spawn_blocking(move || child(&d, &u, &b, "recover", None))

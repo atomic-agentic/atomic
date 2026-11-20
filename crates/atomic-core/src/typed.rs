@@ -105,6 +105,11 @@ pub enum AtomError {
     /// made. Not a failure of the atom: a durable run parks on it.
     #[error("budget: {0}")]
     Budget(String),
+    /// An exec atom's command may have run, but how it ended was lost, so
+    /// what it did is unknown. A durable step treats this as an interrupted
+    /// attempt: its attempt guard decides whether the command may run again.
+    #[error("outcome unknown: {0}")]
+    OutcomeUnknown(String),
     /// Anything else in running the atom.
     #[error("{0}")]
     Runtime(String),

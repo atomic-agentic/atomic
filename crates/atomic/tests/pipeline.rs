@@ -223,6 +223,7 @@ fn runtimes_on(dir: &Path, cwd: &Path, base_url: &str, model: &str) -> Arc<Runti
             meter: atomic_core::usage::Metering::none(),
         },
         lite: LiteRuntime::new(endpoint, AtomConfig::default()),
+        exec: Default::default(),
         clock: None,
     })
 }
@@ -1045,7 +1046,10 @@ fn a_worktree_step_killed_after_its_commit_commits_again_and_keeps_one() {
         );
 
         // The retry starts from the base again and makes a second commit;
-        // that one is accepted, and cleanup drops the orphan's ref.
+        // that one is accepted, and cleanup drops the orphan's ref. A
+        // commit's time has one-second resolution, so a retry within the
+        // same second would write the very same commit: start it a second on.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
         let (d, u) = (dir.clone(), url.clone());
         let status =
             tokio::task::spawn_blocking(move || child(&d, &u, "recover", "fix-killed", None))
@@ -2750,4 +2754,169 @@ fn trust_is_checked_per_binding() {
         &workflow("steps.read.output.title", "'A note.'"),
     )
     .expect("agent accepted");
+}
+
+/// The shape of a serialized value: each object's keys, with the shape of
+/// what each holds, an array's first element, and a scalar's type. The
+/// values under `opaque` keys are data whose keys are not layout, such as a
+/// JSON Schema or a step's mappings.
+fn shape(value: &Value) -> Value {
+    const OPAQUE: &[&str] = &[
+        "input",
+        "output",
+        "with",
+        "origins",
+        "pins",
+        "frontmatter",
+        "contracts",
+        "sources",
+        "helpers",
+        "show",
+        "approvers",
+        "source_paths",
+        "declarations",
+        "judges",
+        "files",
+    ];
+    match value {
+        Value::Object(fields) => Value::Object(
+            fields
+                .iter()
+                .map(|(k, v)| {
+                    let inner = if OPAQUE.contains(&k.as_str()) {
+                        json!(match v {
+                            Value::Object(_) => "object",
+                            Value::Array(_) => "array",
+                            Value::Null => "null",
+                            _ => "scalar",
+                        })
+                    } else {
+                        shape(v)
+                    };
+                    (k.clone(), inner)
+                })
+                .collect(),
+        ),
+        Value::Array(items) => json!(items.iter().map(shape).collect::<Vec<_>>()),
+        Value::Null => json!("null"),
+        Value::Bool(_) => json!("bool"),
+        Value::Number(_) => json!("number"),
+        Value::String(_) => json!("string"),
+    }
+}
+
+/// Run `run`'s open gate, once the run waits at it: a decision that comes
+/// before the wait begins is taken without one, and records fewer steps.
+async fn waiting_at_gate(rt: &Durare, run: &str) -> gate::Gate {
+    let g = open_gate(rt, run).await;
+    for _ in 0..600 {
+        let steps = rt.steps(run).await.expect("steps");
+        if steps.iter().any(|s| s.name == "DBOS.sleep") {
+            return g;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("{run} never waited at its gate");
+}
+
+/// `LAYOUT_VERSION` names the durable step layout `run_pipeline` records
+/// and the shape of the `PipelineRun` it is started with. This run, of an
+/// exec step, a gate and model steps, must record exactly what the golden
+/// file of that version says. A change to either fails here: give the new
+/// layout a new `LAYOUT_VERSION`, and write its golden file with
+/// `ATOMIC_BLESS_LAYOUT=1`, keeping the old one.
+#[test]
+fn the_durable_layout_is_the_one_its_version_names() {
+    on_codex_runtime(async {
+        let dir = scratch("layout");
+        let project = project(&dir);
+        write_send_note(&dir, Some("idempotent"));
+        let pipeline = load(
+            &project,
+            "layout.workflow.yaml",
+            &gated()
+                .replace("name: triage-note", "name: layout")
+                .replace("atom: read-note", "atom: send-note"),
+        );
+        let model = FakeModel::start(vec![
+            Reply::Text(RANK.into()),
+            Reply::Text(SUMMARY.into()),
+            Reply::Text(RANK.into()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        let rejected = PipelineRun {
+            pipeline: pipeline.clone(),
+            input: json!({"text": "Exporting a file named café.txt crashes the app."}),
+        };
+        let run = PipelineRun {
+            pipeline,
+            input: json!({"text": "Exporting a file named café.txt crashes the app."}),
+        };
+        let run_shape = shape(&serde_json::to_value(&run).expect("encode"));
+        // One atom's shape stands for all: their names are data.
+        let mut run_shape = run_shape;
+        if let Some(atoms) = run_shape["pipeline"]["atoms"].as_object().cloned() {
+            run_shape["pipeline"]["atoms"] = json!({"<name>": atoms["send-note"].clone()});
+        }
+        rt.start(PIPELINE, "layout-1", run).await.expect("start");
+        let g = waiting_at_gate(&rt, "layout-1").await;
+        decide(&rt, &g, Verdict::Approve, "fine").await;
+        let _: Value = rt.result("layout-1").await.expect("finishes");
+        // And the path through a rejected gate.
+        rt.start(PIPELINE, "layout-2", rejected)
+            .await
+            .expect("start");
+        let g = waiting_at_gate(&rt, "layout-2").await;
+        decide(&rt, &g, Verdict::Reject, "no").await;
+        assert!(rt.result::<Value>("layout-2").await.is_err());
+        // Each recorded step's name, and the shape of its checkpoint.
+        let mut steps = BTreeMap::new();
+        for run in ["layout-1", "layout-2"] {
+            let recorded: Vec<Value> = rt
+                .steps(run)
+                .await
+                .expect("steps")
+                .into_iter()
+                .map(|s| {
+                    json!({
+                        "name": s.name,
+                        "output": s.output.as_ref().map(shape),
+                        "failed": s.error.is_some(),
+                    })
+                })
+                .collect();
+            steps.insert(run, recorded);
+        }
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+        let recorded = json!({"steps": steps, "run": run_shape});
+        let file = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/layout")
+            .join(format!("{}.json", atomic_app::pipeline::LAYOUT_VERSION));
+        let text = serde_json::to_string_pretty(&recorded).expect("encode") + "\n";
+        // Blessing writes a new version's golden file, never over one that
+        // exists: an existing version's layout does not change.
+        if std::env::var_os("ATOMIC_BLESS_LAYOUT").is_some() && !file.exists() {
+            std::fs::create_dir_all(file.parent().expect("dir")).expect("dir");
+            std::fs::write(&file, &text).expect("bless");
+        }
+        let golden = std::fs::read_to_string(&file).unwrap_or_else(|_| {
+            panic!(
+                "no golden layout {}: if run_pipeline's layout changed, give it a new \
+                 LAYOUT_VERSION, then write its file with ATOMIC_BLESS_LAYOUT=1",
+                file.display()
+            )
+        });
+        assert_eq!(
+            golden,
+            text,
+            "run_pipeline's durable layout is not the one {} names: give the new layout a new \
+             LAYOUT_VERSION and write its golden file with ATOMIC_BLESS_LAYOUT=1, keeping {}",
+            atomic_app::pipeline::LAYOUT_VERSION,
+            file.display()
+        );
+    });
 }
