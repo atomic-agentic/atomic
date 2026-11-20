@@ -672,6 +672,113 @@ fn with_only_an_api_key_explain_names_openai_and_never_the_key() {
 }
 
 #[test]
+fn init_in_an_empty_directory_makes_a_project_that_checks_and_runs() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![
+            Reply::Text(r#"{"summary": "Export crashes on accented file names."}"#.into()),
+            Reply::Text(r#"{"summary": "Export crashes on accented file names."}"#.into()),
+        ])
+        .await
+        .expect("fake model");
+        let dir = scratch("init");
+        let fresh = dir.join("note-tools");
+        std::fs::create_dir_all(&fresh).expect("dir");
+        let out = atomic(&dir, &fresh, &["init"], &[], "");
+        assert!(out.status.success(), "{}", text(&out));
+        for file in [
+            "atomic.yaml",
+            ".gitignore",
+            "atoms/summarize-note.atom.astro",
+            "atoms/summarize-note.input.schema.yaml",
+            "atoms/summarize-note.output.schema.yaml",
+            "workflows/summarize.workflow.yaml",
+            "evals/summarize-note/export-crash.yaml",
+        ] {
+            assert!(fresh.join(file).is_file(), "{file} was written");
+        }
+        let manifest = std::fs::read_to_string(fresh.join("atomic.yaml")).expect("manifest");
+        assert!(manifest.contains("name: note-tools"), "{manifest}");
+        let out = atomic(&dir, &fresh, &["--json", "check"], &[], "");
+        assert!(
+            out.status.success(),
+            "the new project checks: {}",
+            text(&out)
+        );
+        assert_eq!(stdout_json(&out)["checked"]["atoms"], 1);
+        assert_eq!(stdout_json(&out)["checked"]["workflows"], 1);
+
+        // With nothing configured but a local Ollama, its atom and its
+        // workflow run.
+        let addr = address_of(&model);
+        for target in ["summarize-note", "summarize"] {
+            let (d, f, a) = (dir.clone(), fresh.clone(), addr.clone());
+            let out = tokio::task::spawn_blocking(move || {
+                atomic(
+                    &d,
+                    &f,
+                    &[
+                        "run",
+                        target,
+                        "--data",
+                        r#"{"text": "Exporting café.txt crashes the app."}"#,
+                    ],
+                    &[("ATOMIC_DETECT_OLLAMA_ADDR", a.as_str())],
+                    "",
+                )
+            })
+            .await
+            .expect("child");
+            assert!(out.status.success(), "{target}: {}", text(&out));
+            assert_eq!(
+                stdout_json(&out),
+                json!({"summary": "Export crashes on accented file names."})
+            );
+        }
+
+        // A second init leaves the project as it is.
+        let before = std::fs::read_to_string(fresh.join("atomic.yaml")).expect("manifest");
+        let out = atomic(&dir, &fresh, &["--json", "init"], &[], "");
+        assert!(!out.status.success());
+        assert_eq!(stdout_json(&out)["error"]["kind"], "init.exists");
+        assert_eq!(
+            std::fs::read_to_string(fresh.join("atomic.yaml")).expect("manifest"),
+            before
+        );
+    });
+}
+
+#[test]
+fn init_in_a_repository_with_code_embeds_the_project_in_dot_atomic() {
+    let dir = scratch("init-embedded");
+    let repo = dir.join("app");
+    std::fs::create_dir_all(repo.join("src")).expect("dir");
+    std::fs::write(repo.join("src/main.rs"), "fn main() {}\n").expect("code");
+    std::fs::write(repo.join("README.md"), "# app\n").expect("readme");
+    let out = atomic(&dir, &repo, &["init"], &[], "");
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(repo.join(".atomic/atomic.yaml").is_file());
+    assert!(
+        repo.join(".atomic/atoms/summarize-note.atom.astro")
+            .is_file()
+    );
+    assert!(
+        !repo.join("atomic.yaml").exists(),
+        "nothing at the repository's top"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join("src/main.rs")).expect("code"),
+        "fn main() {}\n",
+        "the code is untouched"
+    );
+    let out = atomic(&dir, &repo, &["--json", "check"], &[], "");
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(stdout_json(&out)["checked"]["atoms"], 1);
+    // From below the repository's top too.
+    let out = atomic(&dir, &repo.join("src"), &["--json", "check"], &[], "");
+    assert!(out.status.success(), "{}", text(&out));
+}
+
+#[test]
 fn a_workflow_runs_by_name_and_by_file() {
     let dir = scratch("workflow");
     let project = project(&dir);

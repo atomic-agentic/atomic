@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 mod engine;
 mod failure;
 mod gates;
+mod init;
 mod runs;
 mod settings;
 mod setup;
@@ -50,6 +51,10 @@ enum Command {
     /// Show every setting the project resolves to here; with --explain,
     /// where each came from and why, secrets masked.
     Config(settings::ConfigArgs),
+    /// Make a new project here: a manifest, a sample atom and schemas, a
+    /// workflow and an eval case. In a directory that holds code, under
+    /// `.atomic/`.
+    Init(init::InitArgs),
     /// Run an atom or a workflow in the foreground and print its output.
     Run(runs::RunArgs),
     /// Continue runs.
@@ -307,6 +312,7 @@ async fn run(cli: Cli, paths: CodexPaths, state: ProjectState) -> anyhow::Result
         Some(Command::Runner) => Ok(()),
         Some(Command::Render(args)) => tokio::task::spawn_blocking(move || render(args)).await?,
         Some(Command::Config(args)) => settings::config(&args, project, json),
+        Some(Command::Init(args)) => init::init(args),
         Some(Command::Schemas { path, command }) => match command {
             Some(SchemasCommand::Expand { atom }) => {
                 tokio::task::spawn_blocking(move || expand(&atom)).await?

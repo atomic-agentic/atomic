@@ -44,8 +44,12 @@ gates and `worktree: true` steps, which run a Codex atom in its own worktree at
 the step's `base` and record atomic's commit in `steps.<id>.metadata.commit`.
 A run keeps the definitions it started with.
 
-`atomic run`, `atomic runs resume`, `atomic runs show` and a local foreground
-`atomic serve` are built. `atomic run` takes an atom or workflow by name, by file or with
+`atomic init`, `atomic run`, `atomic runs resume`, `atomic runs show`,
+`atomic config --explain` and a local foreground `atomic serve` are built.
+`atomic init` writes a manifest, a lite atom with its schemas, a one-step
+workflow and an eval case: at the top of an empty directory, or under
+`.atomic/` in one that already holds code. With only `OPENAI_API_KEY` set, or a
+local Ollama running, the new project runs with no configuration. `atomic run` takes an atom or workflow by name, by file or with
 `--project`, and input from a file, standard input or `--data`; a run cut short
 continues with `atomic runs resume <run-id>`, or under `atomic serve`, from its
 checkpoints. One process at a time executes a project's runs. Errors carry a
