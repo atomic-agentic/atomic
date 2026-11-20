@@ -10,6 +10,7 @@
 //! is touched. `--dedicated` and `--embedded` choose either way.
 
 use crate::failure::Failure;
+use anyhow::Context;
 use clap::Args;
 use std::path::{Path, PathBuf};
 
@@ -116,6 +117,33 @@ fn name_from(dir: &Path) -> String {
     }
 }
 
+/// Why `name` cannot be a project's name, if it cannot: it is written into
+/// `atomic.yaml` quoted, so it holds letters, digits, spaces and `-`, `_`
+/// and `.` only, and nothing that could end the quotes or the line.
+fn bad_name(name: &str) -> Option<&'static str> {
+    if name.trim().is_empty() {
+        Some("it is empty")
+    } else if name.chars().count() > 64 {
+        Some("it is longer than 64 characters")
+    } else if name.trim() != name {
+        Some("it starts or ends with a space")
+    } else if !name
+        .chars()
+        .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | ' '))
+    {
+        Some("it holds a character other than a letter, a digit, a space, `-`, `_` or `.`")
+    } else {
+        None
+    }
+}
+
+/// The first of `dirs` that is a symbolic link: init writes into each, and
+/// a link could take its files anywhere.
+fn linked(dirs: &[PathBuf]) -> Option<&PathBuf> {
+    dirs.iter()
+        .find(|d| std::fs::symlink_metadata(d).is_ok_and(|m| m.file_type().is_symlink()))
+}
+
 /// Whether `dir` holds nothing a project would sit beside: nothing at all,
 /// or only an empty repository's `.git`.
 fn is_empty(dir: &Path) -> anyhow::Result<bool> {
@@ -157,6 +185,14 @@ pub fn init(args: InitArgs) -> anyhow::Result<()> {
         !is_empty(&dir)?
     };
     let name = args.name.unwrap_or_else(|| name_from(&dir));
+    if let Some(why) = bad_name(&name) {
+        return Err(Failure::new(
+            "init.name",
+            format!("{name:?} cannot be the project's name: {why}"),
+            "pass --name with letters, digits, spaces, `-`, `_` and `.`, such as --name note-tools",
+        )
+        .into());
+    }
     let (base, types, ignore) = if embedded {
         (
             dir.join(".atomic"),
@@ -173,7 +209,7 @@ pub fn init(args: InitArgs) -> anyhow::Result<()> {
     let files: Vec<(PathBuf, String)> = vec![
         (
             base.join("atomic.yaml"),
-            format!("atomic: 1\nname: {name}\n"),
+            format!("atomic: 1\nname: \"{name}\"\n"),
         ),
         (base.join(".gitignore"), ignore.to_owned()),
         (base.join(format!("atoms/{ATOM}.atom.astro")), atom(types)),
@@ -194,8 +230,33 @@ pub fn init(args: InitArgs) -> anyhow::Result<()> {
             EVAL.to_owned(),
         ),
     ];
+    // Every directory init writes in is a directory here, never a link.
+    let dirs: Vec<PathBuf> = ["", "atoms", "workflows", "evals", &format!("evals/{ATOM}")]
+        .iter()
+        .map(|d| {
+            if d.is_empty() {
+                base.clone()
+            } else {
+                base.join(d)
+            }
+        })
+        .collect();
+    if let Some(link) = linked(&dirs) {
+        return Err(Failure::new(
+            "init.symlink",
+            format!(
+                "{} is a symbolic link, and atomic init writes only into directories of its own",
+                link.display()
+            ),
+            "replace the link with a directory, or run atomic init in another directory",
+        )
+        .into());
+    }
     // Nothing is overwritten: a file in the way stops init before it writes.
-    if let Some((file, _)) = files.iter().find(|(f, _)| f.exists()) {
+    if let Some((file, _)) = files
+        .iter()
+        .find(|(f, _)| std::fs::symlink_metadata(f).is_ok())
+    {
         return Err(Failure::new(
             "init.exists",
             format!(
@@ -210,7 +271,14 @@ pub fn init(args: InitArgs) -> anyhow::Result<()> {
         if let Some(parent) = file.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(file, text)?;
+        // Made new, so a file or link that appeared since is never written
+        // through.
+        let mut out = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(file)
+            .with_context(|| format!("write {}", file.display()))?;
+        std::io::Write::write_all(&mut out, text.as_bytes())?;
     }
     let shown = |p: &Path| p.strip_prefix(&dir).unwrap_or(p).display().to_string();
     println!(
@@ -230,8 +298,93 @@ pub fn init(args: InitArgs) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::name_from;
-    use std::path::Path;
+    use super::{InitArgs, bad_name, init, name_from};
+    use crate::failure::Failure;
+    use std::path::{Path, PathBuf};
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("atomic-init-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        dir
+    }
+
+    fn kind(e: &anyhow::Error) -> String {
+        e.downcast_ref::<Failure>()
+            .map(|f| f.kind.clone())
+            .unwrap_or_else(|| format!("not a failure: {e}"))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_writes_through_no_link() {
+        for linked in [
+            ".atomic",
+            ".atomic/atoms",
+            ".atomic/workflows",
+            ".atomic/evals",
+        ] {
+            let dir = scratch(&format!("link-{}", linked.replace(['.', '/'], "")));
+            let project = dir.join("repo");
+            let outside = dir.join("outside");
+            std::fs::create_dir_all(&outside).expect("outside");
+            std::fs::create_dir_all(project.join(".atomic")).expect("project");
+            std::fs::write(project.join("main.rs"), "fn main() {}\n").expect("code");
+            if linked == ".atomic" {
+                std::fs::remove_dir(project.join(".atomic")).expect("unlink");
+            }
+            std::os::unix::fs::symlink(&outside, project.join(linked)).expect("link");
+            let refused = init(InitArgs {
+                dir: Some(project.clone()),
+                dedicated: false,
+                embedded: true,
+                name: None,
+            })
+            .expect_err("refused");
+            assert_eq!(kind(&refused), "init.symlink", "{linked}: {refused}");
+            assert_eq!(
+                std::fs::read_dir(&outside).expect("outside").count(),
+                0,
+                "{linked}: nothing written through the link"
+            );
+        }
+    }
+
+    #[test]
+    fn a_name_is_quoted_and_one_that_could_not_be_is_refused() {
+        let dir = scratch("name");
+        init(InitArgs {
+            dir: Some(dir.join("ok")),
+            dedicated: true,
+            embedded: false,
+            name: Some("Note Tools 2.0".into()),
+        })
+        .expect("init");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("ok/atomic.yaml")).expect("manifest"),
+            "atomic: 1\nname: \"Note Tools 2.0\"\n"
+        );
+        for name in [
+            "x\nmodel: {}",
+            "a: b",
+            "\"q\"",
+            "",
+            " pad",
+            "#x",
+            "a\u{1b}b",
+        ] {
+            assert!(bad_name(name).is_some(), "{name:?}");
+            let refused = init(InitArgs {
+                dir: Some(dir.join("bad")),
+                dedicated: true,
+                embedded: false,
+                name: Some(name.into()),
+            })
+            .expect_err("refused");
+            assert_eq!(kind(&refused), "init.name", "{name:?}: {refused}");
+            assert!(!dir.join("bad/atomic.yaml").exists());
+        }
+    }
 
     #[test]
     fn a_name_is_made_from_the_directory() {

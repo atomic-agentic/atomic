@@ -38,8 +38,9 @@ executed, from its start or from its checkpoints; each recorded step with the
 attempt that ran it, so after a kill and a resume it shows which steps the
 resume found checkpointed and which it ran again; its model calls and tokens;
 its gates; and the Codex threads that hold its transcripts. `--json` gives the
-same as one document, with each step's output. It reads the store alone: no
-model, no lock, nothing run.
+same as one document, with each step's output. It reads the store alone, and
+runs nothing: it needs no model, does not take the project's execution lock,
+and answers while a run holds it.
 
 ## Choose what to run and what to send
 

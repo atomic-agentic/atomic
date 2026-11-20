@@ -28,7 +28,7 @@ use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// OpenAI's API, when `OPENAI_API_KEY` is set.
 pub const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
@@ -40,15 +40,44 @@ pub const OLLAMA_ADDRESS: &str = "127.0.0.1:11434";
 /// for an Ollama on another local port. A non-loopback address is refused.
 pub const OLLAMA_ADDRESS_VARIABLE: &str = "ATOMIC_DETECT_OLLAMA_ADDR";
 
+/// A string setting with no default. A number or a boolean, as a YAML
+/// scalar such as `executor_id: 1` reads, is the string it is written as;
+/// a variable's value is taken exactly as it was set (see [`resolve`]).
+fn scalar<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    match Option::<Value>::deserialize(d)? {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s)),
+        Some(Value::Number(n)) => Ok(Some(n.to_string())),
+        Some(Value::Bool(b)) => Ok(Some(b.to_string())),
+        Some(_) => Err(serde::de::Error::custom("expected a string")),
+    }
+}
+
+/// The string settings with no default, by path: a variable naming one is
+/// read as the string it holds, never as a number.
+const STRINGS: &[&str] = &[
+    "model.base_url",
+    "model.name",
+    "model.api_key_env",
+    "database.url",
+    "executor_id",
+];
+
 /// The model endpoint.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ModelSettings {
     /// The OpenAI-compatible API's base URL.
+    #[serde(deserialize_with = "scalar")]
     pub base_url: Option<String>,
     /// The model there (also `ATOMIC_MODEL`).
+    #[serde(deserialize_with = "scalar")]
     pub name: Option<String>,
-    /// The environment variable that holds the endpoint's API key.
+    /// The environment variable that holds the endpoint's API key. Never
+    /// from the project's committed `atomic.yaml`: only from
+    /// `atomic.local.yaml`, `ATOMIC_MODEL_API_KEY_ENV` or the flag, so a
+    /// cloned project cannot have a person's secret sent where it chooses.
+    #[serde(deserialize_with = "scalar")]
     pub api_key_env: Option<String>,
 }
 
@@ -57,6 +86,7 @@ pub struct ModelSettings {
 #[serde(default, deny_unknown_fields)]
 pub struct DatabaseSettings {
     /// A PostgreSQL URL, or none for the project's SQLite store.
+    #[serde(deserialize_with = "scalar")]
     pub url: Option<String>,
     /// The schema atomic's tables live in, on PostgreSQL.
     pub schema: String,
@@ -95,6 +125,7 @@ pub struct Settings {
     /// Where exec atoms' commands run: `local` or `process`.
     pub runner: String,
     /// This process's executor identity; required on PostgreSQL.
+    #[serde(deserialize_with = "scalar")]
     pub executor_id: Option<String>,
     /// Budget caps and prices (see [`atomic_core::budget`]).
     pub budget: BudgetSettings,
@@ -231,6 +262,38 @@ pub fn resolve(
             *source = Source::Flag(flag_name(path));
         }
     }
+    // A variable naming a string setting holds that string, whatever it
+    // looks like: `ATOMIC_EXECUTOR_ID=1` is the identity `1`.
+    for path in STRINGS {
+        if let Some(Source::Env(name)) = sources.get(*path)
+            && let Some(raw) = (around.env)(name)
+        {
+            let slot = match *path {
+                "model.base_url" => &mut settings.model.base_url,
+                "model.name" => &mut settings.model.name,
+                "model.api_key_env" => &mut settings.model.api_key_env,
+                "database.url" => &mut settings.database.url,
+                _ => &mut settings.executor_id,
+            };
+            *slot = Some(raw);
+        }
+    }
+    // Which variable's value is sent as the key is the choice of whoever
+    // runs the project, never of the project's committed files.
+    if let Some(Source::File { path, line }) = sources.get("model.api_key_env")
+        && path.file_name().is_some_and(|f| f == "atomic.yaml")
+    {
+        return Err(ConfigError::Setting {
+            path: path.clone(),
+            line: *line,
+            message: "model.api_key_env cannot be set in atomic.yaml, which is committed with \
+                      the project: it names the variable whose value atomic sends to the model \
+                      endpoint as its key, and that is for whoever runs the project to choose. \
+                      Set it in atomic.local.yaml, ATOMIC_MODEL_API_KEY_ENV or \
+                      --model-api-key-env"
+                .into(),
+        });
+    }
     let mut notes = Vec::new();
     let set = |v: Option<String>| v.filter(|v| !v.is_empty());
     let unset = |sources: &BTreeMap<String, Source>, path: &str| {
@@ -289,11 +352,29 @@ pub fn resolve(
                                 Source::Detected(format!("{why}: the first model it lists")),
                             );
                         }
+                        // A key is for an endpoint someone chose, never
+                        // for one atomic found.
+                        if settings.model.api_key_env.take().is_some() {
+                            sources.insert(
+                                "model.api_key_env".into(),
+                                Source::Detected(format!("{why}: no key is sent to it")),
+                            );
+                            notes.push(
+                                "model.api_key_env is set and not used: atomic sends no key to \
+                                 an Ollama it detected; set model.base_url to the endpoint the \
+                                 key is for"
+                                    .into(),
+                            );
+                        }
                     }
                 }
-                _ => notes.push(format!(
-                    "{OLLAMA_ADDRESS_VARIABLE}={address} is not a loopback address, so no \
-                     Ollama was looked for: detection probes this machine only"
+                Ok(addr) => notes.push(format!(
+                    "{OLLAMA_ADDRESS_VARIABLE}={addr} is not a loopback address, so no Ollama \
+                     was looked for: detection probes this machine only"
+                )),
+                Err(_) => notes.push(format!(
+                    "{OLLAMA_ADDRESS_VARIABLE}={address} is not an IP address and port, such as \
+                     {OLLAMA_ADDRESS}, so no Ollama was looked for"
                 )),
             }
         }
@@ -305,53 +386,52 @@ pub fn resolve(
     })
 }
 
-/// The models a local Ollama at `addr` lists: one `GET /api/tags`, with
-/// short timeouts. `None` when nothing answers so.
+/// How long the whole probe for a local Ollama may take, from connecting to
+/// the last byte of its answer.
+const PROBE_DEADLINE: Duration = Duration::from_secs(1);
+
+/// The models a local Ollama at `addr` lists: one `GET /api/tags`, all
+/// within [`PROBE_DEADLINE`]. `None` when nothing answers so in time.
 pub fn probe_ollama(addr: SocketAddr) -> Option<Vec<String>> {
-    let timeout = Duration::from_millis(300);
-    let mut stream = TcpStream::connect_timeout(&addr, timeout).ok()?;
-    stream.set_read_timeout(Some(timeout)).ok()?;
-    stream.set_write_timeout(Some(timeout)).ok()?;
-    write!(
-        stream,
-        "GET /api/tags HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
-    )
-    .ok()?;
-    // The head, then as much body as it says, at most a megabyte.
+    probe_within(addr, PROBE_DEADLINE)
+}
+
+/// [`probe_ollama`], with its deadline `within` from now.
+fn probe_within(addr: SocketAddr, within: Duration) -> Option<Vec<String>> {
+    let deadline = Instant::now() + within;
+    let left = || {
+        deadline
+            .checked_duration_since(Instant::now())
+            .filter(|d| !d.is_zero())
+    };
+    let mut stream = TcpStream::connect_timeout(&addr, left()?).ok()?;
+    stream.set_write_timeout(left()).ok()?;
+    // HTTP/1.0, so the answer comes whole and the connection closes after
+    // it; a chunked answer is decoded all the same.
+    write!(stream, "GET /api/tags HTTP/1.0\r\nHost: {addr}\r\n\r\n").ok()?;
     let mut response = Vec::new();
     let mut chunk = [0u8; 4096];
-    let (head_end, length) = loop {
-        let n = stream.read(&mut chunk).ok()?;
-        if n == 0 {
-            return None;
+    let body = loop {
+        match body_of(&response, false) {
+            Body::Done(body) => break body,
+            Body::Bad => return None,
+            Body::More => {}
         }
-        response.extend_from_slice(&chunk[..n]);
+        // No read waits past the deadline, however slowly bytes trickle.
+        stream.set_read_timeout(Some(left()?)).ok()?;
+        match stream.read(&mut chunk) {
+            Ok(0) => match body_of(&response, true) {
+                Body::Done(body) => break body,
+                _ => return None,
+            },
+            Ok(n) => response.extend_from_slice(&chunk[..n]),
+            Err(_) => return None,
+        }
         if response.len() > 1 << 20 {
             return None;
-        }
-        if let Some(at) = response.windows(4).position(|w| w == b"\r\n\r\n") {
-            let head = String::from_utf8_lossy(&response[..at]).to_lowercase();
-            if !head.starts_with("http/1.1 200") && !head.starts_with("http/1.0 200") {
-                return None;
-            }
-            let length = head
-                .lines()
-                .filter_map(|l| l.split_once(':'))
-                .find(|(k, _)| k.trim() == "content-length")
-                .and_then(|(_, v)| v.trim().parse::<usize>().ok());
-            break (at + 4, length);
         }
     };
-    while length.is_none_or(|l| response.len() < head_end + l) {
-        match stream.read(&mut chunk) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => response.extend_from_slice(&chunk[..n]),
-        }
-        if response.len() > 1 << 20 {
-            return None;
-        }
-    }
-    let body: Value = serde_json::from_slice(&response[head_end..]).ok()?;
+    let body: Value = serde_json::from_slice(&body).ok()?;
     let models = body.get("models")?.as_array()?;
     Some(
         models
@@ -359,6 +439,78 @@ pub fn probe_ollama(addr: SocketAddr) -> Option<Vec<String>> {
             .filter_map(|m| m.get("name").and_then(Value::as_str).map(str::to_owned))
             .collect(),
     )
+}
+
+/// How much of an HTTP answer has arrived.
+enum Body {
+    /// Not all of it: read on.
+    More,
+    /// All of a successful answer's body.
+    Done(Vec<u8>),
+    /// Not a successful answer, or not HTTP.
+    Bad,
+}
+
+/// The body of `response` so far, `closed` when the connection has ended.
+fn body_of(response: &[u8], closed: bool) -> Body {
+    let more = if closed { Body::Bad } else { Body::More };
+    let Some(at) = response.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return more;
+    };
+    let head = String::from_utf8_lossy(&response[..at]).to_ascii_lowercase();
+    let mut lines = head.lines();
+    let status = lines.next().unwrap_or_default();
+    if !(status.starts_with("http/1.1 200") || status.starts_with("http/1.0 200")) {
+        return Body::Bad;
+    }
+    let headers: Vec<(&str, &str)> = lines
+        .filter_map(|l| l.split_once(':'))
+        .map(|(k, v)| (k.trim(), v.trim()))
+        .collect();
+    let header = |name: &str| headers.iter().find(|(k, _)| *k == name).map(|(_, v)| *v);
+    let rest = &response[at + 4..];
+    if header("transfer-encoding").is_some_and(|v| v.contains("chunked")) {
+        return match dechunk(rest) {
+            Some(Some(body)) => Body::Done(body),
+            Some(None) => more,
+            None => Body::Bad,
+        };
+    }
+    match header("content-length").map(str::parse::<usize>) {
+        Some(Ok(length)) if rest.len() >= length => Body::Done(rest[..length].to_vec()),
+        Some(Ok(_)) => more,
+        Some(Err(_)) => Body::Bad,
+        // No length: the body is whatever came before the connection closed.
+        None if closed => Body::Done(rest.to_vec()),
+        None => Body::More,
+    }
+}
+
+/// A chunked body, decoded: `Some(None)` while its last chunk has not
+/// arrived, `None` when it is not chunked as HTTP says.
+fn dechunk(mut rest: &[u8]) -> Option<Option<Vec<u8>>> {
+    let mut body = Vec::new();
+    loop {
+        let Some(eol) = rest.windows(2).position(|w| w == b"\r\n") else {
+            return Some(None);
+        };
+        let line = std::str::from_utf8(&rest[..eol]).ok()?;
+        let size = usize::from_str_radix(line.split(';').next()?.trim(), 16).ok()?;
+        rest = &rest[eol + 2..];
+        if size == 0 {
+            // Trailers, if any, are not needed.
+            return Some(Some(body));
+        }
+        let end = size.checked_add(2)?;
+        if rest.len() < end {
+            return Some(None);
+        }
+        if &rest[size..end] != b"\r\n" {
+            return None;
+        }
+        body.extend_from_slice(&rest[..size]);
+        rest = &rest[end..];
+    }
 }
 
 impl Resolved {
@@ -385,7 +537,7 @@ impl Resolved {
                     .try_fold(&value, |v, k| v.get(k))
                     .cloned()
                     .unwrap_or(Value::Null);
-                if path == "database.url"
+                if (path == "database.url" || path == "model.base_url")
                     && let Some(url) = shown.as_str()
                 {
                     shown = Value::String(mask_url(url));
@@ -393,27 +545,73 @@ impl Resolved {
                 if path == "model.api_key_env"
                     && let Some(name) = shown.as_str()
                 {
-                    let state = if env(name).is_some_and(|v| !v.is_empty()) {
-                        "set"
+                    shown = Value::String(if is_variable_name(name) {
+                        let state = if env(name).is_some_and(|v| !v.is_empty()) {
+                            "set"
+                        } else {
+                            "not set"
+                        };
+                        format!("{name} ({state}; its value is not shown)")
                     } else {
-                        "not set"
-                    };
-                    shown = Value::String(format!("{name} ({state}; its value is not shown)"));
+                        "(set, and not a variable's name; not shown)".into()
+                    });
                 }
                 (path.clone(), shown, describe(source))
             })
             .collect()
     }
+
+    /// The line `atomic run`, `runs resume` and `serve` print when the model
+    /// endpoint was detected or set by the project's files rather than by
+    /// whoever runs it, so where model calls go is never a surprise.
+    pub fn announcement(&self) -> Option<String> {
+        let m = &self.settings.model;
+        let (base_url, name) = (m.base_url.as_deref()?, m.name.as_deref()?);
+        let source = self.sources.get("model.base_url")?;
+        matches!(source, Source::Detected(_) | Source::File { .. }).then(|| {
+            format!(
+                "atomic: model {name} at {} ({}); `atomic config --explain` says why",
+                mask_url(base_url),
+                describe(source)
+            )
+        })
+    }
 }
 
-/// `url` without the credentials it carries.
-fn mask_url(url: &str) -> String {
-    match (url.find("://"), url.rfind('@')) {
-        (Some(scheme), Some(at)) if at > scheme => {
-            format!("{}://***@{}", &url[..scheme], &url[at + 1..])
-        }
-        _ => url.to_owned(),
+/// Whether `name` could be an environment variable's name, and so is safe
+/// to show: what is not may be the secret itself, put in the wrong place.
+fn is_variable_name(name: &str) -> bool {
+    name.len() <= 128
+        && name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// What `atomic config` shows of a URL that cannot be shown safely.
+const NOT_SHOWN: &str = "(set; not shown)";
+
+/// `raw` rebuilt from its scheme, host, port and path only: never its user,
+/// password or query, which may carry credentials. A value that does not
+/// parse as a URL with a host is not shown at all.
+fn mask_url(raw: &str) -> String {
+    let Ok(url) = url::Url::parse(raw) else {
+        return NOT_SHOWN.into();
+    };
+    let Some(host) = url.host_str() else {
+        return NOT_SHOWN.into();
+    };
+    let mut out = format!("{}://", url.scheme());
+    if !url.username().is_empty() || url.password().is_some() {
+        out.push_str("***@");
     }
+    out.push_str(host);
+    if let Some(port) = url.port() {
+        out.push_str(&format!(":{port}"));
+    }
+    out.push_str(url.path());
+    if url.query().is_some() {
+        out.push_str("?***");
+    }
+    out
 }
 
 /// Where a setting came from, for a person.

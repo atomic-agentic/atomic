@@ -231,3 +231,52 @@ fn an_unknown_flag_is_refused() {
         Err(ConfigError::UnknownFlag(_))
     ));
 }
+
+#[test]
+fn an_error_never_repeats_the_value_it_found() {
+    const SECRET: &str = "sk-not-a-number";
+    let errors = [
+        // A variable of the wrong type.
+        load(&dir(&[]), None, &[("ATOMIC_RETRIES", SECRET)], vec![]),
+        // A value where a section belongs.
+        load(
+            &dir(&[("atomic.yaml", &format!("model: {SECRET}\n"))]),
+            None,
+            &[],
+            vec![],
+        ),
+        // A value the type refuses, after the layers merge.
+        load(
+            &dir(&[("atomic.yaml", &format!("verbose: {SECRET}\n"))]),
+            None,
+            &[],
+            vec![],
+        ),
+        load(
+            &dir(&[]),
+            None,
+            &[],
+            vec![("retries".into(), Value::String(SECRET.into()))],
+        ),
+    ];
+    for error in errors {
+        let message = error.expect_err("refused").to_string();
+        assert!(!message.contains(SECRET), "{message}");
+        assert!(!message.is_empty());
+    }
+}
+
+#[test]
+fn a_variable_set_to_nothing_sets_nothing() {
+    let d = dir(&[("atomic.yaml", "model:\n  name: from-the-file\n")]);
+    let r = load(
+        &d,
+        None,
+        &[("ATOMIC_MODEL_NAME", ""), ("ATOMIC_RETRIES", "")],
+        vec![],
+    )
+    .expect("load");
+    assert_eq!(r.config.model.name.as_deref(), Some("from-the-file"));
+    assert_eq!(r.config.retries, 3);
+    assert!(matches!(r.sources["retries"], Source::Default));
+}

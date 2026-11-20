@@ -293,6 +293,17 @@ async fn migrate(conn: &mut SqliteConnection, path: &str) -> Result<i64, StoreEr
         path: path.to_owned(),
         source,
     };
+    // A store already at this version is opened without the write lock, so
+    // a reader such as `atomic runs show` never waits on a writer.
+    let current: Option<i64> =
+        sqlx::query("SELECT COALESCE(MAX(version), 0) AS v FROM atomic_store_version")
+            .fetch_one(&mut *conn)
+            .await
+            .ok()
+            .and_then(|row| row.try_get("v").ok());
+    if current == Some(STORE_VERSION) {
+        return Ok(STORE_VERSION);
+    }
     // One writer at a time: BEGIN IMMEDIATE takes the write lock up front, so
     // two processes opening the store cannot both apply a migration.
     sqlx::query("BEGIN IMMEDIATE")

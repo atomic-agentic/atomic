@@ -577,8 +577,18 @@ async fn run_pipeline<C: WorkflowContext>(
     let PipelineRun { pipeline, input } = run;
     let id = ctx.workflow_id().to_owned();
     // Before anything is recorded: which execution this is, so `runs show`
-    // can tell what each one ran and what it found checkpointed.
-    atomic_durable::history::begin(&ctx).await?;
+    // can tell what each one ran and what it found checkpointed. Only that
+    // view depends on it, so a record that cannot be written costs the run
+    // nothing but the view's accuracy; an execution that no longer owns its
+    // run stops.
+    match atomic_durable::history::begin(&ctx).await {
+        Ok(_) => {}
+        Err(e @ DurableError::Interrupted(_)) => return Err(e),
+        Err(e) => eprintln!(
+            "atomic: run {id}: this execution of it could not be recorded ({e}); `atomic runs \
+             show` may credit its steps to an earlier one"
+        ),
+    }
     // Working from here to its end, but for waits at gates: a stopping
     // process gives it its grace, and begins none of its steps.
     let mut working = Some(begin_work().await);

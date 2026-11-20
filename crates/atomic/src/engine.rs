@@ -226,6 +226,10 @@ pub async fn open(
         .into());
     }
     let endpoint = endpoint(&resolved, needs_model)?;
+    // Where model calls go, when the person running this did not say.
+    if let Some(line) = resolved.announcement() {
+        eprintln!("{line}");
+    }
     let store = LocalStore::open(state.dir().join("artifacts")).context("the artifact store")?;
     let runner = match resolved.settings.runner.as_str() {
         "local" => RunnerKind::Local,

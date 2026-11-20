@@ -22,7 +22,11 @@
 //! `model.base_url` is `ATOMIC_MODEL_BASE_URL`. Names are forgiving: case and
 //! the separators `_`, `-` and `.` are ignored when matching, so
 //! `ATOMIC_MODEL_BASEURL` works too. Variables that match no setting are left
-//! alone; atomic uses other `ATOMIC_*` variables for other purposes.
+//! alone; atomic uses other `ATOMIC_*` variables for other purposes. A
+//! variable set to the empty string sets nothing, as if it were unset.
+//!
+//! An error names the setting, the variable or the file and line, and never
+//! repeats the value it found, which may be a secret put in the wrong place.
 //!
 //! Every resolved value records the layer it came from, for `--explain`.
 
@@ -102,13 +106,12 @@ pub enum ConfigError {
         /// What is wrong.
         message: String,
     },
-    /// An environment variable or flag has a value of the wrong type.
-    #[error("{name}={value:?}: {message}")]
+    /// An environment variable or flag has a value of the wrong type. The
+    /// value itself is not kept.
+    #[error("{name}: {message}")]
     Value {
         /// The variable or flag.
         name: String,
-        /// The value given.
-        value: String,
         /// What was expected.
         message: String,
     },
@@ -170,13 +173,12 @@ where
         let Some(path) = paths.iter().find(|p| normalize(p) == wanted) else {
             continue;
         };
-        let Some(raw) = (layers.env)(&name) else {
+        let Some(raw) = (layers.env)(&name).filter(|raw| !raw.is_empty()) else {
             continue;
         };
         let target = pointer_get(&defaults, path).cloned().unwrap_or(Value::Null);
         let parsed = parse_like(&target, &raw).map_err(|message| ConfigError::Value {
             name: name.clone(),
-            value: raw.clone(),
             message,
         })?;
         pointer_set(&mut value, path, parsed);
@@ -192,7 +194,8 @@ where
         sources.insert(path.clone(), Source::Flag(flag.clone()));
     }
 
-    let config = serde_json::from_value(value).map_err(|e| ConfigError::Invalid(e.to_string()))?;
+    let config = serde_json::from_value(value)
+        .map_err(|e| ConfigError::Invalid(without_values(&e.to_string())))?;
     Ok(Resolved { config, sources })
 }
 
@@ -302,7 +305,7 @@ fn merge_file(
                 return Err(ConfigError::Setting {
                     path: path.to_owned(),
                     line: child_line,
-                    message: format!("{dotted} is a section, not a value (found {other})"),
+                    message: format!("{dotted} is a section, not a value (found {})", kind(other)),
                 });
             }
             _ => {
@@ -321,6 +324,39 @@ fn merge_file(
 }
 
 /// Parse an environment value as the type its default has.
+/// What kind of value `v` is, for an error that must not show it.
+fn kind(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "a list",
+        Value::Object(_) => "a mapping",
+    }
+}
+
+/// `message` with every double-quoted part, where serde puts the value it
+/// found, replaced by `"…"`. Names of fields are quoted with backticks, and
+/// stay.
+fn without_values(message: &str) -> String {
+    let mut out = String::with_capacity(message.len());
+    let mut parts = message.split('"');
+    if let Some(first) = parts.next() {
+        out.push_str(first);
+    }
+    let rest: Vec<&str> = parts.collect();
+    // Pairs of quotes enclose values; an unpaired last quote hides the rest.
+    for (i, part) in rest.iter().enumerate() {
+        if i % 2 == 0 {
+            out.push_str("\"…\"");
+        } else {
+            out.push_str(part);
+        }
+    }
+    out
+}
+
 fn parse_like(target: &Value, raw: &str) -> Result<Value, String> {
     match target {
         Value::Bool(_) => match raw.to_ascii_lowercase().as_str() {

@@ -572,6 +572,14 @@ pub trait DurableRuntime: Send + Sync + Sized {
         T: Send + 'static,
         F: for<'t, 'c> Fn(Tx<'t, 'c>) -> TxFuture<'t, T> + Send + Sync + 'static;
 
+    /// Read atomic's tables in one transaction, outside any workflow, that
+    /// takes no write lock, so it answers while a writer holds one; it is
+    /// rolled back. The body only reads.
+    fn read_transaction<T, F>(&self, body: F) -> impl Future<Output = Result<T>> + Send
+    where
+        T: Send + 'static,
+        F: for<'t, 'c> Fn(Tx<'t, 'c>) -> TxFuture<'t, T> + Send + Sync + 'static;
+
     /// The usage ledger in this runtime's database (see [`crate::usage`]):
     /// budget accounting, apart from step outputs and telemetry.
     fn ledger(&self) -> Ledger;
@@ -908,6 +916,29 @@ impl Reads {
             .await?;
         match out {
             End::Commit(v) | End::Rollback(v) => Ok(v),
+        }
+    }
+
+    /// Run read-only `body` in a transaction on atomic's tables that takes no
+    /// write lock, so it answers while a writer holds one, and roll it back.
+    pub(crate) async fn read<T, F>(&self, body: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: for<'t, 'c> Fn(Tx<'t, 'c>) -> TxFuture<'t, T> + Send + Sync + 'static,
+    {
+        match self {
+            Reads::Sqlite(pool) => {
+                let mut tx = pool.begin().await.map_err(db)?;
+                let out = body(Tx(TxInner::Sqlite(&mut tx))).await;
+                tx.rollback().await.map_err(db)?;
+                out
+            }
+            Reads::Postgres(pool) => {
+                let mut tx = pool.begin().await.map_err(db)?;
+                let out = body(Tx(TxInner::Postgres(&mut tx))).await;
+                tx.rollback().await.map_err(db)?;
+                out
+            }
         }
     }
 
@@ -1407,6 +1438,14 @@ impl DurableRuntime for Durare {
         F: for<'t, 'c> Fn(Tx<'t, 'c>) -> TxFuture<'t, T> + Send + Sync + 'static,
     {
         self.reads.control_transaction(body).await
+    }
+
+    async fn read_transaction<T, F>(&self, body: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: for<'t, 'c> Fn(Tx<'t, 'c>) -> TxFuture<'t, T> + Send + Sync + 'static,
+    {
+        self.reads.read(body).await
     }
 
     fn ledger(&self) -> Ledger {

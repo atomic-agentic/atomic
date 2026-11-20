@@ -153,20 +153,41 @@ async fn gather(rt: &Durare, id: &str) -> anyhow::Result<Option<Value>> {
     })))
 }
 
+/// `text` safe to print to a terminal: control characters, which a step's
+/// error or a gate's title may carry from a model or a command, and the
+/// marks that reorder text, are escaped instead of acted on.
+fn plain(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        let reorders = matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
+        if c.is_control() || reorders {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// A string field of `v`, [`plain`].
+fn field(v: &Value) -> String {
+    plain(v.as_str().unwrap_or(""))
+}
+
 /// The document for a person.
 fn render(doc: &Value) -> String {
     let mut out = String::new();
     let attempts = doc["attempts"].as_array().cloned().unwrap_or_default();
     out.push_str(&format!(
         "run {}: workflow {}, {}, {} attempt{}\n",
-        doc["run"].as_str().unwrap_or(""),
-        doc["workflow"].as_str().unwrap_or(""),
-        doc["status"].as_str().unwrap_or(""),
+        field(&doc["run"]),
+        field(&doc["workflow"]),
+        field(&doc["status"]),
         attempts.len(),
         if attempts.len() == 1 { "" } else { "s" }
     ));
     if let Some(why) = doc["error"].as_str() {
-        out.push_str(&format!("error: {why}\n"));
+        out.push_str(&format!("error: {}\n", plain(why)));
     }
     out.push_str(&format!("input: {}\n", doc["input"]));
     if !doc["output"].is_null() {
@@ -200,12 +221,12 @@ fn render(doc: &Value) -> String {
         };
         let failed = s["error"]
             .as_str()
-            .map(|e| format!("  failed: {e}"))
+            .map(|e| format!("  failed: {}", plain(e)))
             .unwrap_or_default();
         out.push_str(&format!(
             "  {:>3}  {:<28}  {by}{failed}\n",
             s["position"],
-            s["name"].as_str().unwrap_or("")
+            field(&s["name"])
         ));
     }
     let usage = &doc["usage"];
@@ -219,19 +240,19 @@ fn render(doc: &Value) -> String {
     for g in doc["gates"].as_array().into_iter().flatten() {
         let state = match &g["resolution"] {
             Value::Null => "open".to_owned(),
-            r => r.to_string(),
+            r => plain(&r.to_string()),
         };
         out.push_str(&format!(
             "gate {}: {} ({state})\n",
-            g["step"].as_str().unwrap_or(""),
-            g["title"].as_str().unwrap_or("")
+            field(&g["step"]),
+            field(&g["title"])
         ));
     }
     for t in doc["threads"].as_array().into_iter().flatten() {
         out.push_str(&format!(
             "transcript of {}: Codex thread {}\n",
-            t["step"].as_str().unwrap_or(""),
-            t["thread"].as_str().unwrap_or("")
+            field(&t["step"]),
+            field(&t["thread"])
         ));
     }
     out
@@ -270,6 +291,37 @@ pub async fn show(
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
+    #[test]
+    fn what_a_run_recorded_cannot_drive_the_terminal() {
+        let doc = json!({
+            "run": "r1",
+            "workflow": "w\u{1b}]0;owned\u{7}",
+            "status": "failed",
+            "error": "boom\u{1b}[2J\nrun r2: workflow fake, succeeded",
+            "input": {"text": "\u{1b}[31m"},
+            "attempts": [],
+            "steps": [{"position": 1, "name": "s\u{202e}cod", "attempt": 1, "error": "\r\u{9b}x"}],
+            "usage": {"calls": 0, "input_tokens": 0, "output_tokens": 0},
+            "gates": [{"step": "g", "title": "t\u{1b}[1A", "resolution": null}],
+            "threads": [],
+        });
+        let said = super::render(&doc);
+        assert!(
+            !said
+                .chars()
+                .any(|c| c.is_control() && c != '\n' || c == '\u{202e}'),
+            "{said:?}"
+        );
+        assert_eq!(
+            said.lines().filter(|l| l.starts_with("run ")).count(),
+            1,
+            "{said}"
+        );
+        assert!(said.contains("\\u{1b}[2J"), "{said}");
+    }
+
     #[test]
     fn times_read_as_utc() {
         assert_eq!(super::utc(0), "1970-01-01 00:00:00");

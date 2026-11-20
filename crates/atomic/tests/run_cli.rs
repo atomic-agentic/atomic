@@ -570,6 +570,20 @@ fn with_only_a_local_ollama_a_model_atom_runs_and_explain_says_why() {
             1,
             "the model atom called the detected Ollama"
         );
+        // Said once, so a detected endpoint is never used silently.
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let said: Vec<&str> = stderr
+            .lines()
+            .filter(|l| l.starts_with("atomic: model "))
+            .collect();
+        assert_eq!(
+            said,
+            [format!(
+                "atomic: model synthetic at http://{addr}/v1 (detected: Ollama answered at \
+                 {addr}); `atomic config --explain` says why"
+            )],
+            "{stderr}"
+        );
 
         let (d, p, a) = (dir.clone(), project.clone(), addr.clone());
         let out = tokio::task::spawn_blocking(move || {
@@ -672,6 +686,53 @@ fn with_only_an_api_key_explain_names_openai_and_never_the_key() {
 }
 
 #[test]
+fn no_secret_reaches_stderr_or_json_whatever_atomic_is_given() {
+    let dir = scratch("secrets");
+    let project = project(&dir);
+    let secrets = [
+        ("OPENAI_API_KEY", "sk-leak-openai"),
+        (
+            "ATOMIC_DATABASE_URL",
+            "postgres://atomic:leak-dbpass@127.0.0.1:9/atomic?sslpassword=leak-query",
+        ),
+        (
+            "ATOMIC_MODEL_BASE_URL",
+            "https://me:leak-token@127.0.0.1:9/v1",
+        ),
+        ("ATOMIC_MODEL", "m"),
+        // A key put where its variable's name belongs.
+        ("ATOMIC_MODEL_API_KEY_ENV", "sk-leak-in-the-name"),
+        ("ATOMIC_EXECUTOR_ID", "leak-free-id"),
+    ];
+    let bad_budget = [("ATOMIC_BUDGET_WORKFLOW_TOKENS", "leak-not-a-number")];
+    /// A command and the variables it runs with.
+    type Case<'a> = (&'a [&'a str], Vec<(&'a str, &'a str)>);
+    let runs: [Case; 5] = [
+        (&["config", "--explain"], secrets.to_vec()),
+        (&["--json", "config", "--explain"], secrets.to_vec()),
+        // A setting atomic refuses, from the variables and as JSON.
+        (
+            &["--json", "run", "count-only", "--data", NOTE],
+            [&secrets[..], &bad_budget[..]].concat(),
+        ),
+        (
+            &["run", "count-only", "--data", NOTE],
+            [&secrets[..], &bad_budget[..]].concat(),
+        ),
+        // A store that cannot be reached.
+        (
+            &["--json", "run", "count-only", "--data", NOTE],
+            secrets.to_vec(),
+        ),
+    ];
+    for (args, env) in runs {
+        let out = atomic(&dir, &project, args, &env, "");
+        let all = text(&out).replace("leak-free-id", "");
+        assert!(!all.contains("leak"), "{args:?}: {all}");
+    }
+}
+
+#[test]
 fn init_in_an_empty_directory_makes_a_project_that_checks_and_runs() {
     on_codex_runtime(async {
         let model = FakeModel::start(vec![
@@ -697,7 +758,7 @@ fn init_in_an_empty_directory_makes_a_project_that_checks_and_runs() {
             assert!(fresh.join(file).is_file(), "{file} was written");
         }
         let manifest = std::fs::read_to_string(fresh.join("atomic.yaml")).expect("manifest");
-        assert!(manifest.contains("name: note-tools"), "{manifest}");
+        assert!(manifest.contains("name: \"note-tools\""), "{manifest}");
         let out = atomic(&dir, &fresh, &["--json", "check"], &[], "");
         assert!(
             out.status.success(),
@@ -2941,6 +3002,165 @@ fn runs_show_says_which_steps_came_from_checkpoints_and_which_attempt_ran_them()
         assert!(!out.status.success());
         assert_eq!(stdout_json(&out)["error"]["kind"], "run.not_found");
     });
+}
+
+#[test]
+fn a_budget_in_the_projects_configuration_reaches_its_runs() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
+            .await
+            .expect("fake model");
+        let dir = scratch("configured-budget");
+        let project = project(&dir);
+        // One call's whole bound (80,000 tokens by default) and one token
+        // more, for every workflow run: rank fits, and summarize does not.
+        std::fs::write(
+            project.join("atomic.yaml"),
+            "atomic: 1\nname: notes\nbudget:\n  workflow:\n    tokens: 80001\n",
+        )
+        .expect("manifest");
+        let state = state_dir(&dir, &project);
+        let env = model_env(&model.base_url());
+        let mut run = spawn(
+            &dir,
+            &project,
+            &["run", "triage", "--run-id", "configured-1", "--data", NOTE],
+            &with(&env, &[]),
+            &dir.join("run.log"),
+        );
+        let rt = Durare::sqlite(&state.join("private/atomic.db"))
+            .await
+            .expect("store");
+        let started = Instant::now();
+        let park = loop {
+            if let Some(p) = atomic_durable::parks(&rt, "configured-1")
+                .await
+                .expect("parks")
+                .into_iter()
+                .next()
+            {
+                break p;
+            }
+            let ended = run.try_wait().expect("the run");
+            assert!(
+                ended.is_none() && started.elapsed() < Duration::from_secs(60),
+                "the run did not park on the configured budget ({ended:?}): {} model calls; {}",
+                model.calls(),
+                std::fs::read_to_string(dir.join("run.log")).unwrap_or_default()
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert!(park.reason.contains("run:configured-1"), "{}", park.reason);
+        assert_eq!(model.calls(), 1, "summarize was not called");
+        run.kill().expect("stop the run");
+        run.wait().expect("reap");
+    });
+}
+
+/// Run `body` on a runtime of its own, for a test that is not async.
+fn block_on<T>(body: impl std::future::Future<Output = T>) -> T {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(body)
+}
+
+#[test]
+fn a_run_whose_execution_cannot_be_recorded_still_runs() {
+    let dir = scratch("unrecorded");
+    let project = project(&dir);
+    let state = state_dir(&dir, &project);
+    let out = atomic(
+        &dir,
+        &project,
+        &["run", "count-only", "--data", NOTE],
+        &UNUSED_MODEL,
+        "",
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    // The record of executions is gone: only `runs show` needs it.
+    block_on(async {
+        use sqlx::Connection;
+        let url = format!("sqlite://{}", state.join("private/atomic.db").display());
+        let mut db = sqlx::SqliteConnection::connect(&url).await.expect("store");
+        sqlx::query("DROP TABLE atomic_executions")
+            .execute(&mut db)
+            .await
+            .expect("drop");
+        db.close().await.expect("close");
+    });
+    let out = atomic(
+        &dir,
+        &project,
+        &["run", "count-only", "--data", NOTE],
+        &UNUSED_MODEL,
+        "",
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("could not be recorded"),
+        "{}",
+        text(&out)
+    );
+    assert_eq!(count_log(&dir).len(), 2);
+}
+
+#[test]
+fn runs_show_answers_while_a_run_holds_the_lock_and_a_writer_the_store() {
+    let dir = scratch("show-locked");
+    let project = project(&dir);
+    write_slow(&project, &dir);
+    let state = state_dir(&dir, &project);
+    let mut run = spawn(
+        &dir,
+        &project,
+        &["run", "slow", "--run-id", "held-1", "--data", NOTE],
+        &[],
+        &dir.join("run.log"),
+    );
+    wait_until("the command to start", || slow_starts(&dir).len() == 1);
+    assert!(lock_held(&state), "the run holds the runtime lock");
+    let out = block_on(async {
+        use sqlx::Connection;
+        let url = format!("sqlite://{}", state.join("private/atomic.db").display());
+        let mut db = sqlx::SqliteConnection::connect(&url).await.expect("store");
+        // Another process in the middle of a write.
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut db)
+            .await
+            .expect("write lock");
+        let started = Instant::now();
+        let out = atomic(
+            &dir,
+            &project,
+            &["--json", "runs", "show", "held-1"],
+            &[],
+            "",
+        );
+        let took = started.elapsed();
+        sqlx::query("ROLLBACK")
+            .execute(&mut db)
+            .await
+            .expect("rollback");
+        db.close().await.expect("close");
+        (out, took)
+    });
+    let (out, took) = out;
+    run.kill().expect("SIGKILL atomic run");
+    run.wait().expect("reap");
+    let [pid, child] = slow_starts(&dir)[0].clone();
+    let _ = Command::new("/bin/sh")
+        .args(["-c", &format!("kill -KILL {pid} {child} 2>/dev/null")])
+        .status();
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        took < Duration::from_secs(3),
+        "runs show waited for the writer: {took:?}"
+    );
+    let doc = stdout_json(&out);
+    assert_eq!(doc["status"], "unfinished", "{doc}");
+    assert_eq!(doc["attempts"].as_array().map(Vec::len), Some(1), "{doc}");
 }
 
 #[test]
