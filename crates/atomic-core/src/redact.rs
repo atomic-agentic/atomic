@@ -305,7 +305,7 @@ static REFERENCE: LazyLock<Regex> = LazyLock::new(|| {
 /// Microsoft Teams'. The host is kept, the path redacted.
 static WEBHOOK: LazyLock<Regex> = LazyLock::new(|| {
     regex(
-        r"(?i)\b(https?://(?:hooks\.slack\.com/(?:services|workflows|triggers)/|(?:canary\.|ptb\.)?discord(?:app)?\.com/api/webhooks/|[a-z0-9-]+\.webhook\.office\.com/webhookb2/|outlook\.office\.com/webhook/))([A-Za-z0-9@/_.%-]+)",
+        r"(?i)\b(https?://(?:hooks\.slack\.com/(?:services|workflows|triggers)/|(?:canary\.|ptb\.)?discord(?:app)?\.com/api/(?:v[0-9]+/)?webhooks/|[a-z0-9-]+\.webhook\.office\.com/webhookb2/|outlook\.office\.com/webhook/|api\.telegram\.org/(?:file/)?bot))([A-Za-z0-9@/_.%:-]+)",
     )
 });
 static PRIVATE_KEY: LazyLock<Regex> =
@@ -352,10 +352,11 @@ enum Strength {
 fn strength(name: &str) -> Strength {
     let last = name.rsplit('.').next().unwrap_or(name);
     let parts = name_parts(last);
-    if parts.is_empty()
-        || parts
-            .iter()
-            .any(|part| NOT_SECRET_PARTS.contains(&part.as_str()))
+    // `auth_method`, `secret_version`, `token_count`: about a secret, said
+    // by the name's last word. `PROVIDER_API_KEY` is a key.
+    if parts
+        .last()
+        .is_none_or(|part| NOT_SECRET_PARTS.contains(&part.as_str()))
     {
         return Strength::None;
     }
@@ -389,6 +390,15 @@ fn strength(name: &str) -> Strength {
 /// Whether a value under `name` is a secret, whatever it looks like.
 pub fn is_secret_name(name: &str) -> bool {
     strength(name) == Strength::Strong
+}
+
+/// The largest character boundary of `s` at or before byte `at`.
+fn floor_boundary(s: &str, at: usize) -> usize {
+    let mut at = at.min(s.len());
+    while !s.is_char_boundary(at) {
+        at -= 1;
+    }
+    at
 }
 
 fn is_token_char(c: char) -> bool {
@@ -461,25 +471,23 @@ fn escape_len(after: &str) -> usize {
     match b.first() {
         Some(b'u') if hex(1..5) => 5,
         Some(b'x') if hex(1..3) => 3,
-        Some(
-            b'n' | b't' | b'r' | b'b' | b'f' | b'e' | b'a' | b'v' | b'0' | b'"' | b'\'' | b'/',
-        ) => 1,
+        Some(b'n' | b't' | b'r' | b'b' | b'f' | b'a' | b'v' | b'0' | b'"' | b'\'' | b'/') => 1,
         _ => 0,
     }
 }
 
-/// How long the terminal escape sequence starting `rest` is, if a complete
-/// one does: a control sequence (`ESC[1;33m`, `ESC[38:5:196m`, `ESC[1 q`),
-/// a title or link (`ESC]0;title BEL`, ended by BEL or ST), or a character
+/// How long the terminal escape sequence starting `rest` is, if one does: a
+/// control sequence (`ESC[1;33m`, `ESC[38:5:196m`, `ESC[1 q`), the
+/// introducer of a title, link or clipboard write (`ESC]`), or a character
 /// set (`ESC(B`). ESC is the byte, or written out as `\u001b`, `\x1b`, `\e`
-/// or `\033`. Anything short of a whole sequence is not one.
+/// or `\033`. A sequence whose final letter starts a key ends before it:
+/// in `ESC[ghp_…` the `g` is the key's.
 fn escape_sequence_len(rest: &str) -> Option<usize> {
     let introducer = [
         "\x1b", "\\u001b", "\\u001B", "\\x1b", "\\x1B", "\\e", "\\033",
     ]
     .iter()
     .find(|i| rest.starts_with(**i))?;
-    let raw = *introducer == "\x1b";
     let body = &rest[introducer.len()..];
     let bytes = body.as_bytes();
     match bytes.first()? {
@@ -487,7 +495,7 @@ fn escape_sequence_len(rest: &str) -> Option<usize> {
             // Parameters, then intermediates, then one final byte.
             let params = bytes[1..]
                 .iter()
-                .take(32)
+                .take(256)
                 .take_while(|b| matches!(b, b'0'..=b'9' | b';' | b':' | b'?' | b'<' | b'=' | b'>'))
                 .count();
             let inter = bytes[1 + params..]
@@ -500,28 +508,10 @@ fn escape_sequence_len(rest: &str) -> Option<usize> {
                 .contains(&fin)
                 .then_some(introducer.len() + 2 + params + inter)
         }
-        b']' => {
-            // Ended by BEL or ST, raw or written as the introducer was.
-            let ends: &[&str] = if raw {
-                &["\x07", "\x1b\\"]
-            } else {
-                &[
-                    "\\u0007",
-                    "\\x07",
-                    "\\a",
-                    "\\u001b\\\\",
-                    "\\x1b\\\\",
-                    "\\e\\\\",
-                    "\\033\\\\",
-                ]
-            };
-            let window = &body[1..body.len().min(1 + 256)];
-            let window = &window[..window.find('\n').unwrap_or(window.len())];
-            ends.iter()
-                .filter_map(|end| window.find(end).map(|at| at + end.len()))
-                .min()
-                .map(|len| introducer.len() + 1 + len)
-        }
+        // A title, a link or the clipboard: only the introducer is passed
+        // over. The body is scanned like any text, so a key in it is found,
+        // and its terminator, BEL or ST, is a boundary.
+        b']' => Some(introducer.len() + 1),
         b'(' | b')' | b'*' | b'+' | b'-' | b'.' | b'/' => {
             let set = *bytes.get(1)?;
             (0x30..=0x7e).contains(&set).then_some(introducer.len() + 2)
@@ -558,7 +548,12 @@ fn shapes(input: &str) -> Option<String> {
             continue;
         }
         // A terminal escape sequence, kept as it is: a boundary.
-        if let Some(len) = escape_sequence_len(rest) {
+        if let Some(mut len) = escape_sequence_len(rest) {
+            if rest[len - 1..].starts_with(|c: char| c.is_ascii_alphanumeric())
+                && known_shape(&rest[len - 1..]).is_some()
+            {
+                len -= 1;
+            }
             at += len;
             boundary = true;
             continue;
@@ -973,7 +968,8 @@ fn assigned(input: &str) -> Option<String> {
             && name_start > 0
             && bytes[name_start - 1] == b' '
         {
-            let before = &input[name_start.saturating_sub(16)..name_start - 1];
+            let from = floor_boundary(input, name_start.saturating_sub(16));
+            let before = &input[from..name_start - 1];
             let word = before
                 .rsplit(|c: char| !c.is_ascii_alphanumeric())
                 .next()
@@ -1109,53 +1105,62 @@ fn margin(chars: usize) -> usize {
     chars.saturating_mul(2).saturating_add(16 * 1024)
 }
 
-/// The longest token cut off at a bound that is dropped whole, so that
-/// half a key is never kept.
-const MAX_CUT_TOKEN: usize = 1024;
+/// Whether `c` can be part of a key, so a cut there may split one: token
+/// characters, and the `.`, `/`, `+` and `=` of dotted and base64 keys.
+fn may_be_in_key(c: char) -> bool {
+    is_token_char(c) || matches!(c, '.' | '/' | '+' | '=')
+}
+
+/// The start of `input` up to character `chars`, less the token that cut
+/// splits, however long.
+fn window_start_at(input: &str, chars: usize) -> &str {
+    let Some((at, next)) = input.char_indices().nth(chars) else {
+        return input;
+    };
+    let head = &input[..at];
+    if !may_be_in_key(next) {
+        return head;
+    }
+    let keep = head
+        .char_indices()
+        .rev()
+        .find(|(_, c)| !may_be_in_key(*c))
+        .map_or(0, |(i, c)| i + c.len_utf8());
+    &head[..keep]
+}
+
+/// The end of `input` from its last `chars` characters, less the token that
+/// cut splits, however long.
+fn window_end_at(input: &str, chars: usize) -> &str {
+    let count = input.chars().count();
+    if count <= chars {
+        return input;
+    }
+    let Some((at, _)) = input.char_indices().nth(count - chars) else {
+        return input;
+    };
+    let before = input[..at].chars().next_back();
+    let tail = &input[at..];
+    if !before.is_some_and(may_be_in_key) {
+        return tail;
+    }
+    let skip = tail
+        .char_indices()
+        .find(|(_, c)| !may_be_in_key(*c))
+        .map_or(tail.len(), |(i, _)| i);
+    &tail[skip..]
+}
 
 /// The start of `input` to the redaction margin for `chars`, less a token
 /// the margin cuts in half.
 fn window_start(input: &str, chars: usize) -> &str {
-    let Some((at, _)) = input.char_indices().nth(margin(chars)) else {
-        return input;
-    };
-    let head = &input[..at];
-    let keep = head
-        .char_indices()
-        .rev()
-        .take(MAX_CUT_TOKEN)
-        .find(|(_, c)| c.is_whitespace())
-        .map_or(head.len().saturating_sub(MAX_CUT_TOKEN), |(i, _)| i);
-    let keep = (0..=keep)
-        .rev()
-        .find(|i| head.is_char_boundary(*i))
-        .unwrap_or(0);
-    &head[..keep]
+    window_start_at(input, margin(chars))
 }
 
 /// The end of `input` to the redaction margin for `chars`, less a token
 /// the margin cuts in half.
 fn window_end(input: &str, chars: usize) -> &str {
-    let count = input.chars().count();
-    let Some((at, _)) = input
-        .char_indices()
-        .nth(count.saturating_sub(margin(chars)))
-    else {
-        return input;
-    };
-    if at == 0 {
-        return input;
-    }
-    let tail = &input[at..];
-    let skip = tail
-        .char_indices()
-        .take(MAX_CUT_TOKEN)
-        .find(|(_, c)| c.is_whitespace())
-        .map_or(MAX_CUT_TOKEN.min(tail.len()), |(i, _)| i);
-    let skip = (skip..=tail.len())
-        .find(|i| tail.is_char_boundary(*i))
-        .unwrap_or(tail.len());
-    &tail[skip..]
+    window_end_at(input, margin(chars))
 }
 
 /// The start of `input`, at most `chars` characters, redacted. Only a
@@ -1435,9 +1440,10 @@ macro_rules! log_line {
     };
 }
 
-/// What a panic writes, redacted: its thread, where it happened, its message
-/// and, when `RUST_BACKTRACE` asks for one, its backtrace.
-pub fn panic_message(info: &std::panic::PanicHookInfo<'_>) -> String {
+/// What a panic writes, before it is redacted: its thread, where it
+/// happened, its message and, when `RUST_BACKTRACE` asks for one, its
+/// backtrace.
+fn panic_text(info: &std::panic::PanicHookInfo<'_>) -> String {
     let thread = std::thread::current();
     let name = thread.name().unwrap_or("<unnamed>");
     let mut message = format!("thread '{name}' {info}");
@@ -1445,11 +1451,52 @@ pub fn panic_message(info: &std::panic::PanicHookInfo<'_>) -> String {
     if backtrace.status() == std::backtrace::BacktraceStatus::Captured {
         message.push_str(&format!("\nstack backtrace:\n{backtrace}"));
     }
-    bounded(&message, MAX_TEXT)
+    message
 }
 
-/// Make a panic write [`panic_message`] in place of the standard hook's
-/// unredacted text. Call it first thing in `main`.
+/// What a panic writes, redacted (see [`panic_text`]).
+pub fn panic_message(info: &std::panic::PanicHookInfo<'_>) -> String {
+    bounded(&panic_text(info), MAX_TEXT)
+}
+
+/// What a panic writes when its message could not be redacted.
+pub const UNREDACTED_PANIC: &str =
+    "atomic panicked, and its message could not be redacted, so it is not shown";
+
+std::thread_local! {
+    /// Whether this thread redacts a panic's message, whose own panic must
+    /// not be redacted again.
+    static REDACTING_A_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `text` redacted by `redact` on a thread of its own, so a panic in
+/// redaction is that thread's and not one inside this panic's hook; if it
+/// panics, [`UNREDACTED_PANIC`].
+fn redact_panic(text: String, redact: fn(&str) -> String) -> String {
+    std::thread::Builder::new()
+        .name("atomic-panic-redaction".into())
+        .spawn(move || {
+            REDACTING_A_PANIC.with(|r| r.set(true));
+            redact(&text)
+        })
+        .ok()
+        .and_then(|redacting| redacting.join().ok())
+        .unwrap_or_else(|| UNREDACTED_PANIC.to_owned())
+}
+
+/// Make a panic write its message redacted, in place of the standard
+/// hook's unredacted text. Redaction runs on a thread of its own: if it
+/// panics, a fixed message is written instead, and that panic is not
+/// redacted again. Call it first thing in `main`.
 pub fn install_panic_hook() {
-    std::panic::set_hook(Box::new(|info| log(panic_message(info))));
+    std::panic::set_hook(Box::new(|info| {
+        if REDACTING_A_PANIC.with(std::cell::Cell::get) {
+            eprintln!("{UNREDACTED_PANIC}");
+            return;
+        }
+        eprintln!(
+            "{}",
+            redact_panic(panic_text(info), |text| bounded(text, MAX_TEXT))
+        );
+    }));
 }

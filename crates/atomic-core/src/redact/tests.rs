@@ -772,3 +772,233 @@ fn a_panic_message_is_redacted() {
     );
     assert!(!seen.contains(sample), "the sample was written");
 }
+
+/// Text that once made redaction panic: slices at fixed byte offsets.
+#[test]
+fn multibyte_text_near_a_bound_does_not_panic() {
+    let osc = format!("\x1b]0;build\x07{}", "日本語のテキスト".repeat(60));
+    for input in [
+        "la clé est invalide: key: abc",
+        "ééééééééééééé api key: x",
+        osc.as_str(),
+    ] {
+        let _ = text(input);
+        let _ = bounded(input, 10);
+        let _ = excerpt(input, 10);
+        let _ = tail(input, 10);
+    }
+}
+
+/// A key in a terminal title, a clipboard write or a link, raw or written
+/// out: invisible on a terminal, present in what is stored.
+#[test]
+fn a_key_inside_an_osc_is_found() {
+    let shape = SHAPES[0];
+    const HEX: &str = "0123456789abcdef0123456789abcdef";
+    let inputs = [
+        format!("\x1b]0;{shape}\x07"),
+        format!("\x1b]52;c;{shape}\x07"),
+        format!("\x1b]8;;https://h/x?token={HEX}\x1b\\link\x1b]8;;\x1b\\"),
+        format!(r"\u001b]0;{shape}\u0007"),
+        format!(r"\e]2;{shape}\a"),
+    ];
+    let wrong: Vec<usize> = inputs
+        .iter()
+        .enumerate()
+        .filter(|(_, input)| {
+            let out = text(input);
+            out.contains(shape) || out.contains(HEX)
+        })
+        .map(|(index, _)| index)
+        .collect();
+    assert!(wrong.is_empty(), "inputs {wrong:?} kept the key");
+}
+
+/// A sequence that does not end before a key, or whose final letter is the
+/// key's first: the key is found whole.
+#[test]
+fn a_key_after_an_incomplete_or_long_sequence_is_found() {
+    let shape = SHAPES[0];
+    let jwt = SHAPES[11];
+    let inputs = [
+        format!("\x1b[{shape}"),
+        format!("\x1b[1;33{shape}"),
+        format!("\x1b({shape}"),
+        format!("\x1b[38;2;255;255;255;48;2;255;255;255;1;3;4m{shape}"),
+        format!(r"C:\{jwt}"),
+    ];
+    let wrong: Vec<usize> = inputs
+        .iter()
+        .enumerate()
+        .filter(|(_, input)| {
+            let out = text(input);
+            out.contains(&shape[4..]) || out.contains(&jwt[3..]) || !out.contains(REDACTED)
+        })
+        .map(|(index, _)| index)
+        .collect();
+    assert!(wrong.is_empty(), "inputs {wrong:?} kept part of the key");
+}
+
+/// A word about a secret counts only as a name's last word.
+#[test]
+fn a_word_about_a_secret_counts_only_at_the_end_of_a_name() {
+    assert_cases(&[
+        ("PROVIDER_API_KEY=abc123", "PROVIDER_API_KEY=[REDACTED]"),
+        (
+            "DATA_SOURCE_PASSWORD=hunter2",
+            "DATA_SOURCE_PASSWORD=[REDACTED]",
+        ),
+        ("STATE_SECRET=hunter2", "STATE_SECRET=[REDACTED]"),
+    ]);
+    assert_kept(&[
+        "auth_method: password",
+        "secret_version: 3",
+        "token_count: 12",
+    ]);
+}
+
+#[test]
+fn versioned_discord_and_telegram_webhooks_are_found() {
+    assert_cases(&[
+        (
+            concat!(
+                "https://discord.com/api/v10/webhooks/",
+                "123456789012345678/abcDEF-ghi_JKL0123"
+            ),
+            "https://discord.com/api/v10/webhooks/[REDACTED]",
+        ),
+        (
+            concat!(
+                "https://api.telegram.org/bot",
+                "123456789:AAbcDEF-ghi_JKL0123/sendMessage"
+            ),
+            "https://api.telegram.org/bot[REDACTED]",
+        ),
+    ]);
+}
+
+/// The token a window's cut splits is dropped whole, however long.
+#[test]
+fn a_long_token_split_by_a_window_is_dropped_whole() {
+    let long = "k".repeat(2000);
+    let head = format!("kept {long} after");
+    assert_eq!(window_start_at(&head, 1500), "kept ");
+    let end = format!("before {long} kept");
+    assert_eq!(window_end_at(&end, 1500), " kept");
+    // A cut at a boundary drops nothing.
+    assert_eq!(window_start_at("abc def", 3), "abc");
+    assert_eq!(window_end_at("abc def", 4), " def");
+}
+
+/// If redacting a panic's message panics, the hook writes a fixed message
+/// rather than panic inside itself.
+#[test]
+fn a_panic_in_redaction_writes_a_fixed_message() {
+    fn panics(_: &str) -> String {
+        std::panic::panic_any("redaction failed")
+    }
+    assert_eq!(redact_panic("anything".into(), panics), UNREDACTED_PANIC);
+    assert_eq!(
+        redact_panic("the provider said nothing".into(), |t| bounded(t, MAX_TEXT)),
+        "the provider said nothing"
+    );
+}
+
+/// Random text mixing ASCII, characters of every width, escapes, colours
+/// and secret-shaped tokens: redaction never panics, at any bound.
+#[test]
+fn redaction_never_panics_on_random_text() {
+    let fragments: Vec<String> = [
+        "a",
+        "Z",
+        "0",
+        " ",
+        "\n",
+        "\t",
+        "é",
+        "—",
+        "✓",
+        "日",
+        "😀",
+        "’",
+        "…",
+        "\\",
+        "\\n",
+        "\\\\n",
+        "\\u001b[1m",
+        "\\e]0;",
+        "\\a",
+        "\\u0007",
+        "\x1b[",
+        "\x1b[1;33m",
+        "\x1b]0;",
+        "\x1b]52;c;",
+        "\x07",
+        "\x1b\\",
+        "\x1b(",
+        "key: ",
+        "api key: ",
+        "password=",
+        "token=",
+        "Cookie: ",
+        "Authorization: Bearer ",
+        "https://u:p@h/",
+        "{\"password\":\"",
+        "\"",
+        "=",
+        ":",
+        ";",
+        ",",
+        "&",
+        "{",
+        "}",
+        "[",
+        "]",
+        "(",
+        ")",
+        "<",
+        ">",
+        "$",
+        "%",
+        "{{",
+        "}}",
+        concat!("-----BEGIN RSA PRIVATE", " KEY-----\n"),
+        concat!("-----END RSA PRIVATE", " KEY-----"),
+        "ghp_",
+        "sk-",
+        "eyJ",
+        "SG.",
+        "ya29.",
+        "AKIA",
+    ]
+    .iter()
+    .map(|f| (*f).to_owned())
+    .chain(SHAPES.iter().map(|s| (*s).to_owned()))
+    .collect();
+    let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    for case in 0..4000 {
+        let len = (next() % 120) as usize;
+        let input: String = (0..len)
+            .map(|_| fragments[(next() % fragments.len() as u64) as usize].as_str())
+            .collect();
+        let bound = (next() % 64) as usize;
+        let survived = std::panic::catch_unwind(|| {
+            let _ = text(&input);
+            let _ = bounded(&input, bound);
+            let _ = excerpt(&input, bound);
+            let _ = tail(&input, bound);
+            let _ = window_start_at(&input, bound);
+            let _ = window_end_at(&input, bound);
+            let mut doc =
+                json!({"k": input, "list": [input, {"password": input}], input.clone(): 1});
+            value(&mut doc);
+        });
+        assert!(survived.is_ok(), "case {case} panicked");
+    }
+}

@@ -311,8 +311,10 @@ fn refuse_uncovered_store(
 }
 
 /// atomic's own variables: its configuration and the credentials it holds,
-/// such as its database URL, project secrets and telemetry headers.
-const ATOMIC_OWN: [&str; 3] = ["ATOMIC_*", "DBOS__*", "OTEL_EXPORTER_OTLP_HEADERS"];
+/// such as its database URL, project secrets and telemetry settings. The
+/// core inheritance already leaves them out; this keeps them out if it ever
+/// widens.
+const ATOMIC_OWN: [&str; 3] = ["ATOMIC_*", "DBOS__*", "OTEL_*"];
 
 /// The environment of every command a thread runs: the platform's core
 /// variables from this process (`PATH`, `HOME`, `USER` and the like),
@@ -1862,6 +1864,27 @@ mod tests {
             "{env:?}"
         );
         assert_eq!(env["CARGO_TARGET_DIR"], "/cache/target");
+    }
+
+    /// Should the inheritance ever widen, atomic's own variables still stay
+    /// out: the exporter's settings among them.
+    #[test]
+    fn atomics_own_variables_stay_out_whatever_is_inherited() {
+        use codex_protocol::config_types::ShellEnvironmentPolicyInherit;
+        let inherited = [
+            ("PATH", "/usr/bin"),
+            ("ATOMIC_DATABASE_URL", "postgres://atomic:pw@db/atomic"),
+            ("DBOS__APPVERSION", "1"),
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4318"),
+            ("OTEL_EXPORTER_OTLP_HEADERS", "authorization=Bearer x"),
+            ("SOME_TOOL_SETTING", "x"),
+        ]
+        .map(|(k, v)| (k.to_owned(), v.to_owned()));
+        let mut policy = command_environment(&BTreeMap::new());
+        policy.inherit = ShellEnvironmentPolicyInherit::All;
+        let env = codex_protocol::shell_environment::create_env_from_vars(inherited, &policy, None);
+        let names: std::collections::BTreeSet<&str> = env.keys().map(String::as_str).collect();
+        assert_eq!(names, ["PATH", "SOME_TOOL_SETTING"].into(), "{env:?}");
     }
 
     #[test]
