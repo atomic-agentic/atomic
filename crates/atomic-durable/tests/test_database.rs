@@ -18,6 +18,79 @@ use std::path::{Path, PathBuf};
 /// its slash, or a file. scripts/backends-check.sh checks each of these.
 const USERS: &[&str] = &["atomic-durable/", "atomic/tests/run_cli.rs"];
 
+/// Why `text`, a source outside [`USERS`], reaches the test database's
+/// helpers, if it does: by naming `atomic_durable::testing`, in a path or
+/// inside a `use atomic_durable::{...}` group, through a renamed
+/// `atomic_durable`, or by naming what the module gives (`testing::schema`,
+/// `TestSchema`).
+fn reaches_testing(text: &str) -> Option<String> {
+    for token in ["testing::schema", "TestSchema"] {
+        if text.contains(token) {
+            return Some(format!("names `{token}`"));
+        }
+    }
+    let squashed: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    if squashed.contains("atomic_durable::testing") {
+        return Some("names `atomic_durable::testing`".into());
+    }
+    // `use atomic_durable::{Durare, testing};`, nested groups included.
+    let mut rest = squashed.as_str();
+    while let Some(at) = rest.find("atomic_durable::{") {
+        let group = &rest[at + "atomic_durable::".len()..];
+        let mut depth = 0;
+        let mut end = group.len();
+        for (i, c) in group.char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let names = &group[..end];
+        if names
+            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .any(|n| n == "testing")
+        {
+            return Some("imports `testing` from atomic_durable".into());
+        }
+        rest = &group[end..];
+    }
+    // A renamed crate hides its paths from the checks above.
+    let spaced = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if spaced.contains("atomic_durable as ") {
+        return Some("renames atomic_durable; name it as it is".into());
+    }
+    None
+}
+
+#[test]
+fn the_scan_sees_every_way_to_reach_the_testing_module() {
+    for text in [
+        "use atomic_durable::testing;",
+        "let s = atomic_durable :: testing :: schema(\"x\");",
+        "use atomic_durable::{Durare, testing};",
+        "use atomic_durable::{gate::{self, Gate}, testing::TestSchema as S};",
+        "use atomic_durable as ad;",
+        "let schema = testing::schema(\"t\").await;",
+        "fn f(_: TestSchema) {}",
+    ] {
+        assert!(reaches_testing(text).is_some(), "missed: {text}");
+    }
+    for text in [
+        "use atomic_durable::{Durare, gate};",
+        "use atomic_core::testing::{FakeModel, Reply};",
+        "use atomic_durable::Durare;",
+    ] {
+        assert_eq!(reaches_testing(text), None, "{text}");
+    }
+}
+
 fn sources(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).expect("read the source tree") {
         let path = entry.expect("entry").path();
@@ -68,10 +141,10 @@ fn only_the_testing_module_reads_the_database_variable_and_only_listed_tests_use
             Some(dir) => relative.starts_with(&format!("{dir}/")),
             None => relative == *u,
         });
-        if !allowed && text.contains("atomic_durable::testing") {
+        if !allowed && let Some(how) = reaches_testing(&text) {
             wrong.push(format!(
-                "{relative} uses the test database, and scripts/backends-check.sh does not \
-                 look there: add it to both"
+                "{relative} uses the test database ({how}), and scripts/backends-check.sh does \
+                 not look there: add it to both"
             ));
         }
     }
