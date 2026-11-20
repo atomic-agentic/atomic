@@ -183,9 +183,12 @@ fn find(
                 if names.is_empty() {
                     "add an atom or a workflow to the project, or give the path of one".to_owned()
                 } else {
+                    let near = atomic_core::names::nearest(target, names.iter().copied())
+                        .map(|n| format!("did you mean `{n}`? "))
+                        .unwrap_or_default();
                     format!(
-                        "name one of {}, or give the path of an .atom.astro or .workflow.yaml \
-                         file",
+                        "{near}name one of {}, or give the path of an .atom.astro or \
+                         .workflow.yaml file",
                         names.join(", ")
                     )
                 },

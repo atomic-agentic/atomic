@@ -8,6 +8,7 @@
 pub mod attempt;
 pub mod failpoints;
 pub mod gate;
+pub mod history;
 pub mod publication;
 pub mod runtime;
 pub mod store;

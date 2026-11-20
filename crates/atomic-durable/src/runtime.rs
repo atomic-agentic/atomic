@@ -118,6 +118,10 @@ pub struct StepRecord {
     pub output: Option<Value>,
     /// Its error, if it failed.
     pub error: Option<String>,
+    /// When it started, in milliseconds since the Unix epoch, if recorded.
+    pub started_at: Option<i64>,
+    /// When it completed, in milliseconds since the Unix epoch, if recorded.
+    pub completed_at: Option<i64>,
 }
 
 /// Which model thread a published step ran on.
@@ -156,7 +160,7 @@ pub enum RunStatus {
 }
 
 /// What the store records about a run beside its steps.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RunRecord {
     /// Its id.
     pub id: String,
@@ -169,6 +173,10 @@ pub struct RunRecord {
     pub version: String,
     /// The queue it waits on, or was last taken from, if any.
     pub queue: Option<String>,
+    /// The workflow it runs, as registered.
+    pub workflow: String,
+    /// What it was started with.
+    pub input: Value,
 }
 
 /// Where a run stands in [`Durare::runs_after`]'s order: when it was
@@ -221,6 +229,8 @@ impl From<durare::WorkflowStatus> for RunRecord {
             executor: w.executor_id,
             version: w.app_version,
             queue: w.queue_name,
+            workflow: w.name,
+            input: w.input,
         }
     }
 }
@@ -593,6 +603,14 @@ pub trait DurableRuntime: Send + Sync + Sized {
         T: Send + 'static,
         F: for<'t, 'c> Fn(Tx<'t, 'c>) -> TxFuture<'t, T> + Send + Sync + 'static;
 
+    /// Read atomic's tables in one transaction, outside any workflow, that
+    /// takes no write lock, so it answers while a writer holds one; it is
+    /// rolled back. The body only reads.
+    fn read_transaction<T, F>(&self, body: F) -> impl Future<Output = Result<T>> + Send
+    where
+        T: Send + 'static,
+        F: for<'t, 'c> Fn(Tx<'t, 'c>) -> TxFuture<'t, T> + Send + Sync + 'static;
+
     /// The usage ledger in this runtime's database (see [`crate::usage`]):
     /// budget accounting, apart from step outputs and telemetry.
     fn ledger(&self) -> Ledger;
@@ -948,6 +966,29 @@ impl Reads {
             .await?;
         match out {
             End::Commit(v) | End::Rollback(v) => Ok(v),
+        }
+    }
+
+    /// Run read-only `body` in a transaction on atomic's tables that takes no
+    /// write lock, so it answers while a writer holds one, and roll it back.
+    pub(crate) async fn read<T, F>(&self, body: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: for<'t, 'c> Fn(Tx<'t, 'c>) -> TxFuture<'t, T> + Send + Sync + 'static,
+    {
+        match self {
+            Reads::Sqlite(pool) => {
+                let mut tx = pool.begin().await.map_err(db)?;
+                let out = body(Tx(TxInner::Sqlite(&mut tx))).await;
+                tx.rollback().await.map_err(db)?;
+                out
+            }
+            Reads::Postgres(pool) => {
+                let mut tx = pool.begin().await.map_err(db)?;
+                let out = body(Tx(TxInner::Postgres(&mut tx))).await;
+                tx.rollback().await.map_err(db)?;
+                out
+            }
         }
     }
 
@@ -1468,6 +1509,8 @@ impl DurableRuntime for Durare {
                     name: s.name,
                     output: s.output,
                     error: s.error,
+                    started_at: s.started_at.map(|t| t.timestamp_millis()),
+                    completed_at: s.completed_at.map(|t| t.timestamp_millis()),
                 })
                 .collect())
         }
@@ -1541,6 +1584,14 @@ impl DurableRuntime for Durare {
         F: for<'t, 'c> Fn(Tx<'t, 'c>) -> TxFuture<'t, T> + Send + Sync + 'static,
     {
         self.reads.control_transaction(body).await
+    }
+
+    async fn read_transaction<T, F>(&self, body: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: for<'t, 'c> Fn(Tx<'t, 'c>) -> TxFuture<'t, T> + Send + Sync + 'static,
+    {
+        self.reads.read(body).await
     }
 
     fn ledger(&self) -> Ledger {
