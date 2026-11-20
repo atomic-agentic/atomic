@@ -13,7 +13,7 @@ Angle brackets below mean a value you supply, not literal shell syntax.
 | `atomic run <name-or-file> --input <file.json>` | Run an atom or workflow with typed input, by its name or by the path to its file | v0.1 |
 | `atomic curl <name> -d '<json>'` | Send JSON to an atom or workflow on a running runtime and print the typed result | v0.5 |
 | `atomic check` | Validate project definitions and references | v0.1 |
-| `atomic eval <atom>` | Evaluate an atom against its cases | v0.1 |
+| `atomic eval [<atom>…]` | Evaluate atoms against their cases, from cassettes unless `--live` or `--no-cassettes`; exits non-zero below an atom's threshold. `--case`, `--sample`/`--seed`, `--junit`, `--report`, `--revision`, `--allow-unscored`. See [eval cases](eval-cases.md#cases-golden-fixtures-and-recordings) | v0.1 |
 | `atomic config --explain` | Inspect resolved values, sources and detected defaults | v0.1, built |
 | `atomic runs show <run-id>` | Inspect saved results, metadata and run state | v0.1 |
 | `atomic runs resume <run-id>` | Continue the same unfinished local run in the foreground | v0.1 |
@@ -137,7 +137,7 @@ remain unspecified. Run recovery uses the v0.1 command above. The
 | --- | --- | --- |
 | `atomic dev` | Watch definitions and run affected checks/evals | v0.5 |
 | `atomic dev --otel` | Start the optional local observability setup with Jaeger or Langfuse | v0.5 / M44 |
-| `atomic eval <atom> --live` | Evaluate with live calls and record applicable responses | v0.5 development loop |
+| `atomic eval <atom> --live` | Evaluate with live calls, metered under the atom's budget, and record each answer in the atom's cassettes | v0.1 |
 | `atomic eval <atom> --compare <revision>` | Compare behavior, cost and output across definitions | v0.5 |
 | `atomic render <file.atom.astro> --input <file.json>` | Print developer/user prompt parts without a model; optional `--context-settings`, `--profile`, `--run-id`, `--step-id` | Implemented direct invocation |
 | `atomic eval <atom> --plan`, `atomic run <workflow> --plan` | Print the expected model calls and a cost range, then exit without calling a model | v0.5 |

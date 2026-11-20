@@ -136,7 +136,15 @@ that ignores `TMPDIR` and writes to `/tmp` directly, such as a JVM's default
 Several authoring aids arrive in stages. Eval cases, in YAML and in JSONL files,
 are loaded and checked, and the eval runner reports pass rates against each
 atom's threshold and scorer means against their minimums and a baseline; the
-`atomic eval` command that runs it from the terminal is not built yet. A
+`atomic eval` command runs it from the terminal, from cassettes or `--live`, and
+fails CI below an atom's threshold. It has no judge to run scorers with yet, so an
+atom with scorers fails unless `--allow-unscored` is given, and `--baseline` is
+refused. Its live calls are metered in the usage ledger under each atom's budget.
+Until fixture worktrees exist it refuses an atom that could write: a Codex atom
+with a `workspace-write` sandbox, and an exec atom that does not declare
+`effects: { external: 'read-only' }`, whether it declares `idempotent` or
+nothing. It runs Codex atoms only live, with `--no-cassettes`. It lists what it
+refuses, runs the rest, and fails unless `--skip-refused` is given. A
 recorded workflow-file run can be replayed from its checkpoints as a new run:
 each atom step is served the result it published, with no model call and no
 command run, while gates open again, titled as a replay's, and wait. A replay

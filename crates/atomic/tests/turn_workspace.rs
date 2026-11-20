@@ -306,3 +306,94 @@ fn concurrent_turns_in_one_directory_never_break_each_others_sandbox() {
         assert_eq!(failed, vec![0; TURNS], "commands that failed in each turn");
     });
 }
+
+/// Admits every call with `limit` and records each settlement.
+struct Recorder {
+    limit: atomic_core::usage::Limit,
+    settled: std::sync::Mutex<Vec<atomic_core::usage::Outcome>>,
+}
+
+impl atomic_core::usage::Meter for Recorder {
+    fn admit(
+        &self,
+        call: atomic_core::usage::Call,
+    ) -> atomic_core::usage::MeterFuture<'_, atomic_core::usage::Ticket> {
+        Box::pin(async move {
+            Ok(atomic_core::usage::Ticket {
+                request: format!("r:{}", call.index),
+                attempt: 1,
+                model: call.model,
+                admitted: std::time::Instant::now(),
+                limit: self.limit,
+                bounded_by: None,
+            })
+        })
+    }
+
+    fn settle(
+        &self,
+        _: atomic_core::usage::Ticket,
+        outcome: atomic_core::usage::Outcome,
+    ) -> atomic_core::usage::MeterFuture<'_, ()> {
+        Box::pin(async move {
+            self.settled.lock().expect("settled").push(outcome);
+            Ok(())
+        })
+    }
+}
+
+#[test]
+fn a_turn_cut_off_while_a_command_keeps_running_is_charged_as_one_in_flight() {
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let dir = scratch("yielding");
+        // The model starts a command that keeps running and yields back at
+        // once, so Codex reports its start and not its end; the turn's next
+        // request is then in flight when its time runs out.
+        let model = FakeModel::start(vec![
+            Reply::Tool {
+                name: "exec_command".into(),
+                arguments: json!({"cmd": "sleep 60", "yield_time_ms": 300}),
+            },
+            Reply::Delayed {
+                after: std::time::Duration::from_secs(120),
+                reply: Box::new(Reply::Text(r#"{"done": true}"#.into())),
+            },
+        ])
+        .await
+        .expect("fake model");
+        let recorder = std::sync::Arc::new(Recorder {
+            limit: atomic_core::usage::Limit {
+                output_tokens: None,
+                time: Some(std::time::Duration::from_secs(8)),
+            },
+            settled: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut rt = runtime(
+            &dir,
+            &model,
+            Backend::connect(LocalBackend::in_dir(shared_scratch())).expect("connects"),
+        );
+        rt.meter = Metering::new(recorder.clone());
+        let spec = TurnSpec {
+            prompt: "build it".into(),
+            ..TurnSpec::default()
+        };
+        let ended = run_turn(&rt, &spec).await;
+        let e = ended.expect_err("cut off");
+        assert!(format!("{e}").contains("cut off"), "{e}");
+        assert_eq!(model.calls(), 2, "the request after the command was made");
+        let one = atomic_core::usage::Usage {
+            input_tokens: 1,
+            output_tokens: 1,
+        };
+        assert_eq!(
+            *recorder.settled.lock().expect("settled"),
+            [atomic_core::usage::Outcome::Partial {
+                reported: one,
+                last: Some(one),
+            }],
+            "the request in flight while the command ran is charged"
+        );
+    });
+}
