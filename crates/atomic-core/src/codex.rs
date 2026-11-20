@@ -150,7 +150,9 @@ pub struct PrivateState {
     /// while a thread runs is covered too.
     pub private: PathBuf,
     /// Other directories denied whole: the context key, the credential file
-    /// store, and another atomic home's state.
+    /// store, another atomic home's state, and the person's own
+    /// configuration, which can name a store with its password or an
+    /// endpoint with its credential.
     pub also: Vec<PathBuf>,
 }
 
@@ -169,6 +171,9 @@ impl StateGuard {
         crate::state::private_dir(&private)?;
         let mut also = vec![crate::state::credentials_dir()?];
         also.push(crate::context::default_key_dir().map_err(anyhow::Error::msg)?);
+        // Made if missing, like the others, so it is denied from the start
+        // and a file put there later is denied too.
+        also.extend(crate::state::user_config_dir());
         for dir in &also {
             crate::state::private_dir(dir)?;
         }
@@ -226,6 +231,13 @@ fn denied_paths(private: &PrivateState, codex_home: &Path) -> (Vec<PathBuf>, Vec
         }
         all.push(path);
     }
+    // A path inside another denied path is denied with it, and the sandbox
+    // cannot mount a denial inside one: such as the credential store inside
+    // the person's own configuration directory.
+    all.sort();
+    all.dedup();
+    let inside_another = |p: &PathBuf| all.iter().any(|q| q != p && p.starts_with(q));
+    let all: Vec<PathBuf> = all.iter().filter(|p| !inside_another(p)).cloned().collect();
     // Codex creates its state database when the first thread starts, after
     // the list above is made: a pattern, expanded when each command starts,
     // covers it.
@@ -253,6 +265,10 @@ fn planted_never(path: &Path) -> anyhow::Result<()> {
     }
 }
 
+/// The network every sandbox has: none, local sockets included.
+const SANDBOX_NETWORK: codex_protocol::permissions::NetworkSandboxPolicy =
+    codex_protocol::permissions::NetworkSandboxPolicy::Restricted;
+
 /// Codex's permission profile for a sandbox: read-only, or writes confined
 /// to the workspace; the network is restricted either way. Under
 /// [`StateGuard::Deny`], atomic's private state is denied as well (see
@@ -263,7 +279,7 @@ pub(crate) fn permission_profile(
     codex_home: &Path,
 ) -> anyhow::Result<PermissionProfile> {
     use codex_protocol::permissions::{
-        FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry, NetworkSandboxPolicy,
+        FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry,
     };
     let base = match sandbox {
         crate::typed::Sandbox::ReadOnly => PermissionProfile::read_only(),
@@ -272,7 +288,7 @@ pub(crate) fn permission_profile(
         // own instead (see `TurnTemp`).
         crate::typed::Sandbox::WorkspaceWrite => PermissionProfile::workspace_write_with(
             &[],
-            NetworkSandboxPolicy::Restricted,
+            SANDBOX_NETWORK,
             /*exclude_tmpdir_env_var*/ true,
             /*exclude_slash_tmp*/ true,
         ),
@@ -320,7 +336,7 @@ pub(crate) fn permission_profile(
     }
     Ok(PermissionProfile::from_runtime_permissions(
         &policy,
-        NetworkSandboxPolicy::Restricted,
+        SANDBOX_NETWORK,
     ))
 }
 
@@ -356,15 +372,18 @@ fn refuse_uncovered_store(
 }
 
 /// atomic's own variables: its configuration and the credentials it holds,
-/// such as its database URL, project secrets and telemetry headers.
-const ATOMIC_OWN: [&str; 3] = ["ATOMIC_*", "DBOS__*", "OTEL_EXPORTER_OTLP_HEADERS"];
+/// such as its database URL, project secrets and telemetry settings. The
+/// core inheritance already leaves them out; this keeps them out if it ever
+/// widens.
+const ATOMIC_OWN: [&str; 3] = ["ATOMIC_*", "DBOS__*", "OTEL_*"];
 
 /// The environment of every command a thread runs: the platform's core
-/// variables from this process (`PATH`, `HOME`, `USER` and the like),
-/// except any whose name holds `KEY`, `SECRET` or `TOKEN` and any of
-/// atomic's own, and then exactly what the atom declares (`declared`).
-/// Nothing else of atomic's environment reaches the command, and through
-/// its output, the model.
+/// variables from this process (`PATH`, `USER` and the like), except any
+/// whose name holds `KEY`, `SECRET` or `TOKEN`, any of atomic's own and any
+/// in [`SHELL_EXCLUDES`], with `HOME` at [`SHELL_HOME`], and then exactly
+/// what the atom declares (`declared`), which the runtime gives the
+/// attempt's own `HOME`. Nothing else of atomic's environment reaches the
+/// command, and through its output, the model.
 pub(crate) fn command_environment(declared: &BTreeMap<String, String>) -> ShellEnvironmentPolicy {
     use codex_protocol::config_types::{EnvironmentVariablePattern, ShellEnvironmentPolicyInherit};
     ShellEnvironmentPolicy {
@@ -372,11 +391,15 @@ pub(crate) fn command_environment(declared: &BTreeMap<String, String>) -> ShellE
         ignore_default_excludes: false,
         exclude: ATOMIC_OWN
             .iter()
+            .chain(SHELL_EXCLUDES)
             .map(|pattern| EnvironmentVariablePattern::new_case_insensitive(pattern))
             .collect(),
-        r#set: declared
-            .iter()
-            .map(|(name, value)| (name.clone(), value.clone()))
+        r#set: std::iter::once(("HOME".to_owned(), SHELL_HOME.to_owned()))
+            .chain(
+                declared
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone())),
+            )
             .collect(),
         include_only: Vec::new(),
         use_profile: false,
@@ -575,7 +598,9 @@ fn keep_sandbox_off_keyrings() {
             leave_session_keyring()
         };
         if let Err(e) = kept_off {
-            eprintln!("atomic: cannot keep a sandboxed command off the kernel keyrings: {e}");
+            crate::log_line!(
+                "atomic: cannot keep a sandboxed command off the kernel keyrings: {e}"
+            );
             std::process::exit(1);
         }
     }
@@ -1286,15 +1311,31 @@ where
             Err(e) => break Err(meter_error(e)),
         };
         report.turns += 1;
+        // One span per turn, which may make several requests; it ends before
+        // the turn is settled.
+        let span = crate::spans::hold(crate::usage::call_span(
+            &endpoint.model,
+            crate::usage::provider_name(&endpoint.base_url),
+        ));
         let bounded_by = ticket.as_ref().and_then(|t| t.bounded_by.clone());
         // A turn is cut off when its reserved time runs out; a failed or cut
         // off turn still reports the usage seen before it stopped.
-        let (turn, totals) = run_turn(&thread, &current, limit.time).await;
+        let (turn, progress) = span.run(run_turn(&thread, &current, limit.time)).await;
+        if let (Err(e), Some(span)) = (&turn, span.span()) {
+            crate::usage::record_error(&span, e);
+        }
+        let totals = progress.totals(seen);
         // Codex repeats the last totals in every token count, so a turn
         // whose requests reported nothing shows them unchanged; a request
         // that reports usage always grows them. A turn with nothing reported
         // spent something unknown and stays charged at its reservation.
         let fresh = totals.filter(|(input, output, _)| *input > seen.0 || *output > seen.1);
+        // A turn stopped with a provider request in flight, which has
+        // reported nothing yet, spent more than the thread grew by: it is
+        // charged the growth and one more request's bound (see
+        // [`Progress::in_flight`]).
+        let cut_off = matches!(&turn, Err(e) if e.downcast_ref::<CutOff>().is_some());
+        let in_flight = progress.in_flight(cut_off, turn.is_err());
         let outcome = match fresh {
             Some((input, output, total)) => {
                 let grown = Usage {
@@ -1302,13 +1343,27 @@ where
                     output_tokens: (output - seen.1).max(0),
                 };
                 seen = (input, output);
+                if let Some(span) = span.span() {
+                    crate::usage::record_usage(&span, &grown);
+                }
                 report.input_tokens = input;
                 report.output_tokens = output;
                 report.total_tokens = total;
-                Outcome::Reported(grown)
+                if in_flight {
+                    Outcome::Partial {
+                        reported: grown,
+                        last: progress.last.map(|(input_tokens, output_tokens)| Usage {
+                            input_tokens,
+                            output_tokens,
+                        }),
+                    }
+                } else {
+                    Outcome::Reported(grown)
+                }
             }
             None => Outcome::Unknown,
         };
+        span.end();
         if let Err(e) = meter.settle(ticket, outcome).await {
             break Err(meter_error(e));
         }
@@ -1411,6 +1466,7 @@ async fn new_config(
             model_provider.env_key = endpoint.api_key_env.clone();
             model_provider.requires_openai_auth = false;
             model_provider.supports_websockets = false;
+            env_headers_for(&endpoint.base_url, &mut model_provider.env_http_headers);
             ENDPOINT_PROVIDER_ID.to_string()
         }
     };
@@ -1679,6 +1735,46 @@ const ATOMIC_OFF: &[Feature] = &[
     Feature::StandaloneWebSearch,
 ];
 
+/// OpenAI's API, the one endpoint the OpenAI provider's organization and
+/// project headers are for.
+const OPENAI_DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
+
+/// Whether `base_url` is exactly OpenAI's API.
+fn is_openai_default(base_url: &str) -> bool {
+    base_url.trim_end_matches('/') == OPENAI_DEFAULT_BASE_URL
+}
+
+/// The OpenAI provider sends `OPENAI_ORGANIZATION` and `OPENAI_PROJECT` as
+/// headers: kept for OpenAI's own API only, never sent to another endpoint.
+fn env_headers_for(
+    base_url: &str,
+    headers: &mut Option<std::collections::HashMap<String, String>>,
+) {
+    if !is_openai_default(base_url) {
+        *headers = None;
+    }
+}
+
+/// Variables an atom's shell never sees, whatever else it inherits: atomic's
+/// and Codex's own settings, model and cloud credentials, and database
+/// connections. Matched without regard to case.
+pub const SHELL_EXCLUDES: &[&str] = &[
+    "ATOMIC_*",
+    "OPENAI_*",
+    "CODEX_*",
+    "DATABASE_URL",
+    "PG*",
+    "AWS_*",
+    "*_API_KEY",
+];
+
+/// The home directory an atom's shell is given: one that does not exist.
+/// Codex runs commands in the person's own shell, which reads startup files
+/// from the home directory even when it is not a login shell (bash's
+/// `.bashrc` when its input is a socket, zsh's `.zshenv` always), and those
+/// can export anything.
+pub const SHELL_HOME: &str = "/nonexistent";
+
 /// How long a turn waits for the thread to finish settling the previous one.
 const NOT_IDLE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -1692,45 +1788,133 @@ struct CutOff(std::time::Duration);
 /// How long an interrupted turn has to wind down.
 const INTERRUPT_PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Where a turn got to, as its events show.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Progress {
+    /// The thread's running token totals (input, output, total), as last
+    /// reported.
+    usage: Option<(i64, i64, i64)>,
+    /// What this turn's completed responses reported, input and output,
+    /// summed: Codex sends a response's totals only after its tools drain,
+    /// so a turn stopped before then has them only here.
+    responses: (i64, i64),
+    /// What the last completed response reported, input and output: the
+    /// size of the turn's requests at its end.
+    last: Option<(i64, i64)>,
+    /// Whether a provider response has begun streaming and not completed.
+    streaming: bool,
+    /// Whether the turn completed.
+    completed: bool,
+}
+
+impl Progress {
+    /// Follow one event of the turn.
+    fn observe(&mut self, msg: &EventMsg) {
+        match msg {
+            EventMsg::TokenCount(count) => {
+                // Sent after every response, broken ones too, repeating the
+                // totals when nothing new was reported.
+                if let Some(info) = &count.info {
+                    let t = &info.total_token_usage;
+                    self.usage = Some((t.input_tokens, t.output_tokens, t.total_tokens));
+                }
+            }
+            // A response completed, with its own usage.
+            EventMsg::RawResponseCompleted(done) => {
+                self.streaming = false;
+                if let Some(u) = &done.token_usage {
+                    self.responses.0 += u.input_tokens.max(0);
+                    self.responses.1 += u.output_tokens.max(0);
+                    self.last = Some((u.input_tokens.max(0), u.output_tokens.max(0)));
+                }
+            }
+            EventMsg::AgentMessageContentDelta(_)
+            | EventMsg::ReasoningContentDelta(_)
+            | EventMsg::ReasoningRawContentDelta(_)
+            | EventMsg::PlanDelta(_)
+            | EventMsg::StreamError(_) => self.streaming = true,
+            EventMsg::TurnComplete(_) => self.completed = true,
+            _ => {}
+        }
+    }
+
+    /// The thread's input and output totals, the larger of what its token
+    /// counts said and what the turn's responses reported on top of `seen`,
+    /// the totals before the turn.
+    fn totals(&self, seen: (i64, i64)) -> Option<(i64, i64, i64)> {
+        let from_responses = (seen.0 + self.responses.0, seen.1 + self.responses.1);
+        match self.usage {
+            Some((input, output, _)) => {
+                let (input, output) = (input.max(from_responses.0), output.max(from_responses.1));
+                Some((input, output, input + output))
+            }
+            None if self.responses != (0, 0) => Some((
+                from_responses.0,
+                from_responses.1,
+                from_responses.0 + from_responses.1,
+            )),
+            None => None,
+        }
+    }
+
+    /// Whether the turn stopped with a provider request in flight: one sent
+    /// whose usage is not in the totals. A turn cut off at its time is taken
+    /// to be waiting on one unless it had completed: a tool that yields to
+    /// the model while it runs, as a unified exec session does, leaves no
+    /// sign of the requests made meanwhile, so a turn cut off while a tool
+    /// ran may be charged one request too many, never one too few. A turn
+    /// that failed was, only if a response had begun streaming and broke
+    /// off, not if the provider refused the request outright.
+    fn in_flight(&self, cut_off: bool, failed: bool) -> bool {
+        if self.completed {
+            return false;
+        }
+        cut_off || (failed && self.streaming)
+    }
+}
+
 /// Run one turn, cut off after `time` if one is given. Returns how it ended
-/// and the thread's running totals (input, output, total) as last reported,
-/// whether or not it succeeded.
+/// and where it got to, the thread's running totals as last reported among
+/// it, whether or not it succeeded.
 async fn run_turn(
     thread: &CodexThread,
     spec: &TurnSpec,
     time: Option<std::time::Duration>,
-) -> (anyhow::Result<String>, Option<(i64, i64, i64)>) {
-    let mut usage = None;
+) -> (anyhow::Result<String>, Progress) {
+    let mut progress = Progress::default();
     let ended = match time {
-        None => turn(thread, spec, &mut usage).await,
-        Some(time) => match tokio::time::timeout(time, turn(thread, spec, &mut usage)).await {
+        None => turn(thread, spec, &mut progress).await,
+        Some(time) => match tokio::time::timeout(time, turn(thread, spec, &mut progress)).await {
             Ok(ended) => ended,
             Err(_) => {
-                interrupt(thread, &mut usage).await;
+                interrupt(thread, &mut progress).await;
                 Err(anyhow::Error::new(CutOff(time)))
             }
         },
     };
-    (ended, usage)
+    (ended, progress)
 }
 
 /// Interrupt the running turn and wait, briefly, for it to stop, keeping
-/// any usage it reports on the way.
-async fn interrupt(thread: &CodexThread, usage: &mut Option<(i64, i64, i64)>) {
+/// any usage it reports on the way. A turn that completed before the
+/// interrupt took says so; one aborted keeps where it was when stopped.
+async fn interrupt(thread: &CodexThread, progress: &mut Progress) {
     if thread.submit(Op::Interrupt).await.is_err() {
         return;
     }
     let _ = tokio::time::timeout(INTERRUPT_PATIENCE, async {
         while let Ok(event) = thread.next_event().await {
-            match event.msg {
-                EventMsg::TokenCount(count) => {
-                    if let Some(info) = count.info {
-                        let t = info.total_token_usage;
-                        *usage = Some((t.input_tokens, t.output_tokens, t.total_tokens));
-                    }
-                }
-                EventMsg::TurnAborted(_) | EventMsg::TurnComplete(_) => break,
+            match &event.msg {
+                EventMsg::TokenCount(_)
+                | EventMsg::RawResponseCompleted(_)
+                | EventMsg::TurnComplete(_) => progress.observe(&event.msg),
                 _ => {}
+            }
+            if matches!(
+                event.msg,
+                EventMsg::TurnAborted(_) | EventMsg::TurnComplete(_)
+            ) {
+                break;
             }
         }
     })
@@ -1740,7 +1924,7 @@ async fn interrupt(thread: &CodexThread, usage: &mut Option<(i64, i64, i64)>) {
 async fn turn(
     thread: &CodexThread,
     spec: &TurnSpec,
-    usage: &mut Option<(i64, i64, i64)>,
+    progress: &mut Progress,
 ) -> anyhow::Result<String> {
     // Codex sends TurnComplete before it marks the thread idle, so a follow-up
     // turn submitted straight after one can be declined as NotIdle. That
@@ -1771,19 +1955,15 @@ async fn turn(
 
     loop {
         let event = thread.next_event().await.context("read Codex event")?;
+        progress.observe(&event.msg);
         match event.msg {
-            EventMsg::TokenCount(count) => {
-                if let Some(info) = count.info {
-                    let t = info.total_token_usage;
-                    *usage = Some((t.input_tokens, t.output_tokens, t.total_tokens));
-                }
-            }
             EventMsg::TurnComplete(done) => {
                 return done
                     .last_agent_message
                     .context("the turn completed without a message");
             }
-            EventMsg::Error(event) => bail!(event.message),
+            // A provider's error can echo what it was sent.
+            EventMsg::Error(event) => bail!("{}", crate::redact::excerpt(&event.message, 4096)),
             EventMsg::TurnAborted(_) => bail!("turn aborted"),
             EventMsg::ExecApprovalRequest(_) => bail!("turn requested exec approval"),
             EventMsg::ApplyPatchApprovalRequest(_) => bail!("turn requested patch approval"),
@@ -1799,6 +1979,103 @@ async fn turn(
 mod tests {
     use super::*;
     use crate::testing::{FakeModel, Reply};
+
+    #[test]
+    fn a_denied_path_inside_another_is_left_to_it() {
+        let dir = scratch("nested-deny");
+        let config = dir.join("config/atomic");
+        let credentials = config.join("credentials");
+        std::fs::create_dir_all(&credentials).expect("dirs");
+        std::fs::create_dir_all(dir.join("codex")).expect("codex home");
+        let private = PrivateState {
+            state_dir: dir.join("state"),
+            private: dir.join("private"),
+            also: vec![credentials.clone(), dir.join("key"), config.clone()],
+        };
+        let (denied, _) = denied_paths(&private, &dir.join("codex"));
+        assert!(denied.contains(&config), "{denied:?}");
+        assert!(denied.contains(&dir.join("key")), "{denied:?}");
+        assert!(
+            !denied.iter().any(|p| p.starts_with(&credentials)),
+            "the sandbox cannot deny inside a denied directory: {denied:?}"
+        );
+    }
+
+    #[test]
+    fn an_atoms_shell_inherits_no_secret() {
+        let policy = command_environment(&BTreeMap::from([(
+            "NOTE_DIR".to_owned(),
+            "/w/notes".to_owned(),
+        )]));
+        let around = [
+            ("PATH", "/usr/bin"),
+            ("HOME", "/home/dev"),
+            ("LANG", "C.UTF-8"),
+            ("OPENAI_API_KEY", "canary"),
+            ("OPENAI_ORGANIZATION", "canary"),
+            ("ATOMIC_DATABASE_URL", "canary"),
+            ("CODEX_HOME", "canary"),
+            ("DATABASE_URL", "canary"),
+            ("PGPASSWORD", "canary"),
+            ("AWS_ACCESS_KEY_ID", "canary"),
+            ("ANTHROPIC_API_KEY", "canary"),
+            ("GITHUB_TOKEN", "canary"),
+            ("MY_SECRET", "canary"),
+            ("UNRELATED", "canary"),
+        ]
+        .map(|(k, v)| (k.to_owned(), v.to_owned()));
+        let env = codex_protocol::shell_environment::populate_env(around.clone(), &policy, None);
+        let mut kept: Vec<&str> = env.keys().map(String::as_str).collect();
+        kept.sort_unstable();
+        assert_eq!(kept, ["HOME", "LANG", "NOTE_DIR", "PATH"], "{env:?}");
+        assert_eq!(env["HOME"], SHELL_HOME, "never the person's home");
+        // The exclusions hold even for what the platform's core list might
+        // one day include.
+        let mut wide = policy.clone();
+        wide.inherit = codex_protocol::config_types::ShellEnvironmentPolicyInherit::All;
+        let env = codex_protocol::shell_environment::populate_env(around, &wide, None);
+        for name in [
+            "OPENAI_ORGANIZATION",
+            "CODEX_HOME",
+            "DATABASE_URL",
+            "PGPASSWORD",
+            "AWS_ACCESS_KEY_ID",
+            "ANTHROPIC_API_KEY",
+        ] {
+            assert!(!env.contains_key(name), "{name}: {env:?}");
+        }
+    }
+
+    #[test]
+    fn only_openais_api_gets_the_organization_headers() {
+        let built_in = built_in_model_providers(None)
+            .get(OPENAI_PROVIDER_ID)
+            .expect("the OpenAI provider")
+            .env_http_headers
+            .clone();
+        let names = |h: &Option<std::collections::HashMap<String, String>>| {
+            h.as_ref()
+                .map(|h| h.values().cloned().collect::<Vec<_>>())
+                .unwrap_or_default()
+        };
+        assert!(names(&built_in).contains(&"OPENAI_ORGANIZATION".to_owned()));
+        let mut kept = built_in.clone();
+        env_headers_for("https://api.openai.com/v1", &mut kept);
+        assert_eq!(kept, built_in);
+        let mut elsewhere = built_in.clone();
+        env_headers_for("https://example.com/v1", &mut elsewhere);
+        assert_eq!(elsewhere, None);
+        assert!(is_openai_default("https://api.openai.com/v1"));
+        assert!(is_openai_default("https://api.openai.com/v1/"));
+        for other in [
+            "http://127.0.0.1:11434/v1",
+            "https://api.openai.com.example/v1",
+            "https://api.openai.com@example.com/v1",
+            "https://example.com/v1",
+        ] {
+            assert!(!is_openai_default(other), "{other}");
+        }
+    }
 
     fn scratch(tag: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("atomic-codex-{tag}-{}", std::process::id()));
@@ -2075,6 +2352,34 @@ mod tests {
             "{env:?}"
         );
         assert_eq!(env["CARGO_TARGET_DIR"], "/cache/target");
+    }
+
+    /// Should the inheritance ever widen, atomic's own variables still stay
+    /// out: the exporter's settings among them.
+    #[test]
+    fn atomics_own_variables_stay_out_whatever_is_inherited() {
+        use codex_protocol::config_types::ShellEnvironmentPolicyInherit;
+        let inherited = [
+            ("PATH", "/usr/bin"),
+            ("ATOMIC_DATABASE_URL", "postgres://atomic:pw@db/atomic"),
+            ("DBOS__APPVERSION", "1"),
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4318"),
+            ("OTEL_EXPORTER_OTLP_HEADERS", "authorization=Bearer x"),
+            ("SOME_TOOL_SETTING", "x"),
+        ]
+        .map(|(k, v)| (k.to_owned(), v.to_owned()));
+        let mut policy = command_environment(&BTreeMap::new());
+        policy.inherit = ShellEnvironmentPolicyInherit::All;
+        let env = codex_protocol::shell_environment::create_env_from_vars(inherited, &policy, None);
+        let names: std::collections::BTreeSet<&str> = env.keys().map(String::as_str).collect();
+        // HOME is atomic's own, a directory that does not exist, never one
+        // inherited.
+        assert_eq!(
+            names,
+            ["HOME", "PATH", "SOME_TOOL_SETTING"].into(),
+            "{env:?}"
+        );
+        assert_eq!(env["HOME"], SHELL_HOME);
     }
 
     #[test]
@@ -2464,10 +2769,11 @@ mod tests {
         (ended, settled, model.calls())
     }
 
-    const ONE: Outcome = Outcome::Reported(Usage {
+    const ONE_USAGE: Usage = Usage {
         input_tokens: 1,
         output_tokens: 1,
-    });
+    };
+    const ONE: Outcome = Outcome::Reported(ONE_USAGE);
 
     #[test]
     fn each_turn_settles_with_what_the_thread_grew_by_and_a_silent_turn_as_unknown() {
@@ -2543,6 +2849,109 @@ mod tests {
             assert!(format!("{e:#}").contains("cut off"), "{e:#}");
             assert!(began.elapsed() < std::time::Duration::from_secs(20));
             assert_eq!(settled, [Outcome::Unknown]);
+        });
+    }
+
+    #[test]
+    fn a_turn_whose_last_response_breaks_off_is_charged_as_one_in_flight() {
+        on_codex_runtime(async {
+            // The first request reports its usage and calls a tool; every
+            // later response begins and breaks off, Codex's retries too.
+            let mut replies = vec![Reply::Tool {
+                name: "no_such_tool".into(),
+                arguments: serde_json::json!({}),
+            }];
+            replies.extend((0..12).map(|_| Reply::Broken("par".into())));
+            let (ended, settled, calls) =
+                metered_conversation("broken", replies, 1, Limit::default()).await;
+            assert!(ended.is_err(), "the turn failed");
+            assert!((3..=13).contains(&calls), "{calls}");
+            assert_eq!(
+                settled,
+                [Outcome::Partial {
+                    reported: ONE_USAGE,
+                    last: Some(ONE_USAGE),
+                }]
+            );
+        });
+    }
+
+    #[test]
+    fn a_request_is_in_flight_unless_the_turn_completed_or_was_refused() {
+        let at = |streaming, completed| Progress {
+            streaming,
+            completed,
+            ..Progress::default()
+        };
+        // Cut off at any point but after completing: waiting on a request,
+        // as a response streamed, or while a tool ran, which may have
+        // yielded to further requests.
+        assert!(at(false, false).in_flight(true, true));
+        assert!(at(true, false).in_flight(true, true));
+        assert!(!at(false, true).in_flight(true, true));
+        // A failure is in flight only if a response broke off midway, not
+        // when a request was refused outright.
+        assert!(at(true, false).in_flight(false, true));
+        assert!(!at(false, false).in_flight(false, true));
+        // A completed turn never is.
+        assert!(!at(false, true).in_flight(false, false));
+    }
+
+    #[test]
+    fn a_turns_totals_count_responses_whose_token_count_never_came() {
+        // A response completed, and the turn stopped before its totals.
+        let p = Progress {
+            usage: Some((10, 4, 14)),
+            responses: (30, 9),
+            ..Progress::default()
+        };
+        assert_eq!(p.totals((10, 4)), Some((40, 13, 53)));
+        // The totals already count it: nothing twice.
+        let p = Progress {
+            usage: Some((40, 13, 53)),
+            responses: (30, 9),
+            ..Progress::default()
+        };
+        assert_eq!(p.totals((10, 4)), Some((40, 13, 53)));
+        assert_eq!(Progress::default().totals((10, 4)), None);
+    }
+
+    #[test]
+    fn a_turn_cut_off_with_a_request_in_flight_is_settled_in_part() {
+        on_codex_runtime(async {
+            // The turn's first request reports its usage and calls a tool;
+            // the second is still in flight when its time runs out.
+            let (ended, settled, calls) = metered_conversation(
+                "inflight",
+                vec![
+                    Reply::Tool {
+                        name: "no_such_tool".into(),
+                        arguments: serde_json::json!({}),
+                    },
+                    Reply::Delayed {
+                        after: std::time::Duration::from_secs(30),
+                        reply: Box::new(Reply::Text("late".into())),
+                    },
+                ],
+                1,
+                Limit {
+                    output_tokens: None,
+                    time: Some(std::time::Duration::from_secs(3)),
+                },
+            )
+            .await;
+            let e = ended.expect_err("cut off");
+            assert!(format!("{e:#}").contains("cut off"), "{e:#}");
+            assert_eq!(calls, 2, "the second request was made");
+            // The first request's usage and one more request's bound: the
+            // second spent something no one has reported.
+            assert_eq!(
+                settled,
+                [Outcome::Partial {
+                    reported: ONE_USAGE,
+                    last: Some(ONE_USAGE),
+                }]
+            );
         });
     }
 }

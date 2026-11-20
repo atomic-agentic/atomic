@@ -396,6 +396,8 @@ fn an_atom_cannot_approve_its_own_gate_through_its_shell() {
                 .unwrap_or(0)
         ));
         std::os::unix::fs::symlink(&dir, &short).unwrap();
+        // Gone however the test ends, a panic included.
+        let _short = Removed(short.clone());
         let sock = short.join("admin.sock");
         let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
         assert!(
@@ -455,7 +457,6 @@ fn an_atom_cannot_approve_its_own_gate_through_its_shell() {
             .unwrap();
         unlink_from_session_keyring(&key);
         drop(listener);
-        let _ = std::fs::remove_file(&short);
 
         // The step still works in its worktree...
         assert!(output.contains("wrote-exit=0"), "{output}");
@@ -478,6 +479,12 @@ fn an_atom_cannot_approve_its_own_gate_through_its_shell() {
                 "{attempt} was not refused: {output}"
             );
         }
+        // Refused by the sandbox's filter, not by a path the sandbox hid:
+        // a missing path or a denied file would be another error.
+        assert!(
+            output.contains("connect=refused:PermissionError: [Errno 1]"),
+            "the socket was not refused by the sandbox: {output}"
+        );
         assert!(!output.contains(&secret), "the secret leaked: {output}");
         assert!(
             !String::from_utf8_lossy(&planted.stdout).contains("atomic:planted"),
@@ -508,6 +515,15 @@ fn an_atom_cannot_approve_its_own_gate_through_its_shell() {
         rt.shutdown(Duration::from_secs(5)).await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     });
+}
+
+/// A path removed when dropped.
+struct Removed(PathBuf);
+
+impl Drop for Removed {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 /// A `bwrap` that logs how it was called, and, with `argv0` false, hides
@@ -597,6 +613,7 @@ fn a_turn_through_atomics_own_entry_point_runs_with_its_helper_in_the_state_dire
                     .args(["debug", "codex-prompt", "--base-url", &base_url])
                     .args(["--model", "synthetic", "Do", "the", "work."])
                     .current_dir(&project_dir)
+                    .env("XDG_CONFIG_HOME", home.join("config"))
                     .env("ATOMIC_HOME", home)
                     .env("PATH", path)
                     .output()

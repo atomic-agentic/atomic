@@ -8,6 +8,10 @@
 //! - a transaction step commits its writes with its checkpoint, or nothing;
 //! - an interrupted execution records nothing and stays pending;
 //! - a failure is recorded as the workflow's outcome;
+//! - of two executions of one run that race to record the same step, the
+//!   one that loses records nothing, and the run ends with the winner's
+//!   outcome; a step or transaction body that returns a conflict fails the
+//!   run instead;
 //! - steps are recorded as siblings, in order, and a step inside a step is
 //!   refused;
 //! - starting a workflow id twice runs it once;
@@ -60,30 +64,30 @@ mod backends {
     }
 }
 
-/// Wait until `id` is no longer running in this process: pending with no
-/// progress for a moment, or finished.
-async fn settle<R: DurableRuntime>(rt: &R, id: &str) -> Option<RunStatus> {
-    let until = Instant::now() + Duration::from_secs(10);
-    let mut last = None;
+/// The engine parks a run whose workflow panicked, shortly after the panic,
+/// for an explicit resume: never an automatic retry, which could repeat
+/// effects that have no checkpoint. Wait for the park, then resume it.
+async fn resume_after_its_panic(rt: &Durare, id: &str) {
+    let until = Instant::now() + Duration::from_secs(20);
     loop {
         let status = rt.status(id).await.expect("status");
-        if matches!(status, Some(RunStatus::Succeeded | RunStatus::Failed(_))) {
-            return status;
+        if matches!(&status, Some(RunStatus::Other(s)) if s == "MAX_RECOVERY_ATTEMPTS_EXCEEDED") {
+            break;
         }
-        let steps = rt.steps(id).await.expect("steps").len();
-        if last == Some(steps) || Instant::now() > until {
-            return status;
-        }
-        last = Some(steps);
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            Instant::now() < until,
+            "the panicked run was never parked: {status:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    rt.resume(id).await.expect("resume");
 }
 
-async fn a_step_runs_once_and_is_replayed_after_a_crash<R: DurableRuntime>(mut rt: R) {
+async fn a_step_runs_once_and_is_replayed_after_a_crash(mut rt: Durare) {
     let bodies = Arc::new(AtomicUsize::new(0));
     let executions = Arc::new(AtomicUsize::new(0));
     let (b, e) = (bodies.clone(), executions.clone());
-    rt.register("once", move |ctx: R::Context, (): ()| {
+    rt.register("once", move |ctx: DurareContext, (): ()| {
         let (b, e) = (b.clone(), e.clone());
         async move {
             let v: i64 = ctx
@@ -98,14 +102,15 @@ async fn a_step_runs_once_and_is_replayed_after_a_crash<R: DurableRuntime>(mut r
             Ok(v)
         }
     });
-    rt.launch().await.expect("launch");
     let id = unique("once");
+    rt.take_resumed_runs(Some(&id)).await.expect("take");
+    rt.launch().await.expect("launch");
     rt.start("once", &id, ()).await.expect("start");
     assert!(
         rt.result::<i64>(&id).await.is_err(),
         "the first execution crashed"
     );
-    rt.recover().await.expect("recover");
+    resume_after_its_panic(&rt, &id).await;
     assert_eq!(rt.result::<i64>(&id).await, Ok(42));
     assert_eq!(bodies.load(Ordering::SeqCst), 1, "the step body ran once");
     assert_eq!(executions.load(Ordering::SeqCst), 2);
@@ -206,7 +211,14 @@ async fn an_interrupted_execution_records_nothing_and_stays_pending<R: DurableRu
     rt.launch().await.expect("launch");
     let id = unique("interrupted");
     rt.start("interrupted", &id, ()).await.expect("start");
-    assert_eq!(settle(&rt, &id).await, Some(RunStatus::Pending));
+    // The first execution's own result: it has stopped, so what it recorded
+    // is all it will.
+    let stopped = rt.result::<()>(&id).await;
+    assert!(
+        matches!(&stopped, Err(DurableError::Interrupted(_))),
+        "{stopped:?}"
+    );
+    assert_eq!(rt.status(&id).await, Ok(Some(RunStatus::Pending)));
     let names: Vec<String> = rt
         .steps(&id)
         .await
@@ -339,10 +351,10 @@ async fn positions_follow_construction_not_polling_order<R: DurableRuntime>(mut 
     rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
 }
 
-async fn a_message_is_received_once_and_replayed_after_a_crash<R: DurableRuntime>(mut rt: R) {
+async fn a_message_is_received_once_and_replayed_after_a_crash(mut rt: Durare) {
     let executions = Arc::new(AtomicUsize::new(0));
     let e = executions.clone();
-    rt.register("receive", move |ctx: R::Context, (): ()| {
+    rt.register("receive", move |ctx: DurareContext, (): ()| {
         let e = e.clone();
         async move {
             let first: Option<String> = ctx.recv("topic", Duration::from_secs(30)).await?;
@@ -354,8 +366,9 @@ async fn a_message_is_received_once_and_replayed_after_a_crash<R: DurableRuntime
             Ok((first, second))
         }
     });
-    rt.launch().await.expect("launch");
     let id = unique("receive");
+    rt.take_resumed_runs(Some(&id)).await.expect("take");
+    rt.launch().await.expect("launch");
     rt.start("receive", &id, ()).await.expect("start");
     for _ in 0..2 {
         rt.send(&id, "topic", "hello", "key-1").await.expect("send");
@@ -366,7 +379,7 @@ async fn a_message_is_received_once_and_replayed_after_a_crash<R: DurableRuntime
             .is_err(),
         "the first execution crashed"
     );
-    rt.recover().await.expect("recover");
+    resume_after_its_panic(&rt, &id).await;
     assert_eq!(
         rt.result::<(Option<String>, Option<String>)>(&id).await,
         Ok((Some("hello".to_owned()), None)),
@@ -488,6 +501,229 @@ async fn control_authorization_is_rechecked_on_workflow_replay<R: DurableRuntime
     rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
 }
 
+/// Paging by creation time and then id reads every run once, however many
+/// share a millisecond: here, all of them.
+async fn runs_sharing_a_millisecond_are_each_paged_once(mut rt: Durare) {
+    rt.register("named", |_ctx: DurareContext, named: String| async move {
+        Ok::<_, DurableError>(named)
+    });
+    rt.launch().await.expect("launch");
+    let mut ids: Vec<String> = (0..25).map(|i| unique(&format!("tied-{i}"))).collect();
+    for id in &ids {
+        rt.start("named", id, id.clone()).await.expect("start");
+        let _: String = rt.result(id).await.expect("finishes");
+    }
+    rt.control_transaction(|mut tx| {
+        Box::pin(async move {
+            tx.execute("UPDATE workflow_status SET created_at = 1", &[])
+                .await
+                .map(|_| ())
+        })
+    })
+    .await
+    .expect("tie every run");
+    let mut read = Vec::new();
+    let mut after = None;
+    loop {
+        let page = rt.runs_after(after.as_ref(), 4).await.expect("page");
+        read.extend(page.iter().map(|(_, run)| run.record.id.clone()));
+        match page.last() {
+            Some((key, _)) if page.len() == 4 => after = Some(key.clone()),
+            _ => break,
+        }
+    }
+    // Each once, in the store's own order of ids (its collation's).
+    let mut sorted = read.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted.len(), read.len(), "a run was read twice: {read:?}");
+    ids.sort();
+    assert_eq!(sorted, ids);
+    rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+}
+
+async fn the_loser_of_a_checkpoint_race_takes_the_winners_outcome<R: DurableRuntime>(rt: R) {
+    checkpoint_race(rt, false).await;
+}
+
+/// As above, with workflow code that turns the lost step's conflict into a
+/// failure of its own: the execution's outcome is still the conflict.
+async fn a_conflict_made_into_a_failure_still_takes_the_winners_outcome<R: DurableRuntime>(rt: R) {
+    checkpoint_race(rt, true).await;
+}
+
+/// Two executions of one run race to record the same step; with `swallow`,
+/// workflow code turns the loser's conflict into a failure.
+async fn checkpoint_race<R: DurableRuntime>(mut rt: R, swallow: bool) {
+    let entered = Arc::new(AtomicUsize::new(0));
+    let meet = Arc::new(tokio::sync::Barrier::new(2));
+    let lost = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (e, m, l, r) = (entered.clone(), meet.clone(), lost.clone(), release.clone());
+    rt.register("raced", move |ctx: R::Context, (): ()| {
+        let (entered, meet, lost, release) = (e.clone(), m.clone(), l.clone(), r.clone());
+        async move {
+            let contested = ctx
+                .step("contested", move |_| {
+                    let (entered, meet) = (entered.clone(), meet.clone());
+                    async move {
+                        // The first execution stops short, which schedules
+                        // its settlement; the next two meet here, so both
+                        // have run the body before either records it.
+                        let ordinal = entered.fetch_add(1, Ordering::SeqCst);
+                        if ordinal == 0 {
+                            return Err(DurableError::Interrupted("stopped short".into()));
+                        }
+                        // Each racer's own output: two writes of the same
+                        // output at the same moment would be the same write,
+                        // and neither would lose.
+                        let met = tokio::time::timeout(Duration::from_secs(20), meet.wait()).await;
+                        Ok(met.is_ok().then_some(ordinal))
+                    }
+                })
+                .await;
+            // The execution that lost the race to record the step.
+            if matches!(&contested, Err(DurableError::Conflict(_))) {
+                lost.fetch_add(1, Ordering::SeqCst);
+            }
+            let met = if swallow {
+                contested.map_err(|e| DurableError::Failed(format!("made a failure of: {e}")))?
+            } else {
+                contested?
+            };
+            // The winner goes on only once the test has seen what the loser
+            // did with its loss.
+            ctx.step("after", move |_| {
+                let release = release.clone();
+                async move {
+                    let _ = tokio::time::timeout(Duration::from_secs(20), release.notified()).await;
+                    Ok(())
+                }
+            })
+            .await?;
+            Ok(met)
+        }
+    });
+    rt.launch().await.expect("launch");
+    let id = unique("raced");
+    rt.start("raced", &id, ()).await.expect("start");
+    // The settlement durare scheduled is in the step; a recovery now runs
+    // the run a second time, alongside it.
+    let until = Instant::now() + Duration::from_secs(20);
+    while entered.load(Ordering::SeqCst) < 2 {
+        assert!(Instant::now() < until, "the settlement never ran the step");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    rt.recover().await.expect("recover");
+    while lost.load(Ordering::SeqCst) < 1 {
+        assert!(Instant::now() < until, "neither execution lost the race");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // While the winner waits, the loser has lost: it must record nothing.
+    // Recording takes it milliseconds; three seconds is ample.
+    let watch = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < watch {
+        let status = rt.status(&id).await.expect("status");
+        assert_eq!(
+            status,
+            Some(RunStatus::Pending),
+            "the execution that lost the race recorded an outcome"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    release.notify_one();
+    let until = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        let status = rt.status(&id).await.expect("status");
+        if matches!(status, Some(RunStatus::Succeeded | RunStatus::Failed(_)))
+            || Instant::now() > until
+        {
+            break status;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(entered.load(Ordering::SeqCst), 3, "two executions raced");
+    assert_eq!(
+        status,
+        Some(RunStatus::Succeeded),
+        "the run takes the outcome of the execution that recorded the step"
+    );
+    let steps = rt.steps(&id).await.expect("steps");
+    assert_eq!(steps.len(), 2, "{steps:?}");
+    // The step's output is one racer's own, and that racer met the other.
+    assert!(
+        [Some(serde_json::json!(1)), Some(serde_json::json!(2))].contains(&steps[0].output),
+        "{:?}",
+        steps[0].output
+    );
+    rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+}
+
+/// Workflow code that makes up a conflict, with no step having lost a race,
+/// fails its run: it does not wait for a winner that does not exist.
+async fn a_conflict_no_step_reported_fails_its_run<R: DurableRuntime>(mut rt: R) {
+    rt.register("made-up", |ctx: R::Context, (): ()| async move {
+        ctx.step("fine", |_| async { Ok(1_i64) }).await?;
+        Err::<(), _>(DurableError::Conflict("nobody".into()))
+    });
+    rt.launch().await.expect("launch");
+    let id = unique("made-up");
+    rt.start("made-up", &id, ()).await.expect("start");
+    let until = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        let status = rt.status(&id).await.expect("status");
+        if matches!(status, Some(RunStatus::Succeeded | RunStatus::Failed(_)))
+            || Instant::now() > until
+        {
+            break status;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(
+        matches!(&status, Some(RunStatus::Failed(m)) if m.contains("no step reported")),
+        "{status:?}"
+    );
+    rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+}
+
+async fn a_body_that_returns_a_conflict_fails_its_run<R: DurableRuntime>(mut rt: R) {
+    rt.register("step-conflict", |ctx: R::Context, (): ()| async move {
+        ctx.step("made up", |_| async {
+            Err::<(), _>(DurableError::Conflict("another".into()))
+        })
+        .await
+    });
+    rt.register(
+        "transaction-conflict",
+        |ctx: R::Context, (): ()| async move {
+            ctx.transaction("made up", |_tx| {
+                Box::pin(async { Err::<(), _>(DurableError::Conflict("another".into())) })
+            })
+            .await
+        },
+    );
+    rt.launch().await.expect("launch");
+    for name in ["step-conflict", "transaction-conflict"] {
+        let id = unique(name);
+        rt.start(name, &id, ()).await.expect("start");
+        let until = Instant::now() + Duration::from_secs(20);
+        let status = loop {
+            let status = rt.status(&id).await.expect("status");
+            if matches!(status, Some(RunStatus::Succeeded | RunStatus::Failed(_)))
+                || Instant::now() > until
+            {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert!(
+            matches!(&status, Some(RunStatus::Failed(m)) if m.contains("only workflow code")),
+            "{name}: {status:?}"
+        );
+    }
+    rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+}
+
 macro_rules! on_backend {
     ($backend:ident, $($name:ident),+ $(,)?) => {
         mod $backend {
@@ -511,11 +747,16 @@ on_backend!(
     a_transaction_commits_its_writes_with_its_checkpoint_or_nothing,
     an_interrupted_execution_records_nothing_and_stays_pending,
     a_failure_is_recorded_as_the_outcome,
+    the_loser_of_a_checkpoint_race_takes_the_winners_outcome,
+    a_conflict_made_into_a_failure_still_takes_the_winners_outcome,
+    a_conflict_no_step_reported_fails_its_run,
+    a_body_that_returns_a_conflict_fails_its_run,
     steps_are_siblings_in_order_and_cannot_nest,
     a_workflow_id_started_twice_runs_once,
     a_message_is_received_once_and_replayed_after_a_crash,
     a_receive_times_out_at_its_deadline,
     a_control_transaction_commits_its_writes_or_nothing,
+    runs_sharing_a_millisecond_are_each_paged_once,
 );
 
 #[cfg(feature = "postgres-tests")]
@@ -527,11 +768,16 @@ on_backend!(
     a_transaction_commits_its_writes_with_its_checkpoint_or_nothing,
     an_interrupted_execution_records_nothing_and_stays_pending,
     a_failure_is_recorded_as_the_outcome,
+    the_loser_of_a_checkpoint_race_takes_the_winners_outcome,
+    a_conflict_made_into_a_failure_still_takes_the_winners_outcome,
+    a_conflict_no_step_reported_fails_its_run,
+    a_body_that_returns_a_conflict_fails_its_run,
     steps_are_siblings_in_order_and_cannot_nest,
     a_workflow_id_started_twice_runs_once,
     a_message_is_received_once_and_replayed_after_a_crash,
     a_receive_times_out_at_its_deadline,
     a_control_transaction_commits_its_writes_or_nothing,
+    runs_sharing_a_millisecond_are_each_paged_once,
 );
 
 /// A serialization conflict raised once in a transaction step is retried by
