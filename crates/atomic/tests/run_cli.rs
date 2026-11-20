@@ -867,6 +867,15 @@ async fn decided_while_down(
     open_gate(&rt, id).await;
     run.kill().expect("SIGKILL the run");
     run.wait().expect("reap");
+    decide_without_waking(state, id).await;
+}
+
+/// Approve run `id`'s gate from a decider that stops after recording its
+/// decision and before waking the run.
+async fn decide_without_waking(state: &Path, id: &str) {
+    let rt = Durare::sqlite(&state.join("private/atomic.db"))
+        .await
+        .expect("store");
     let decider = Command::new(std::env::current_exe().expect("this test binary"))
         .args(["--exact", "decider_child", "--ignored", "--nocapture"])
         .env(DECIDER_STORE, state.join("private/atomic.db"))
@@ -908,6 +917,8 @@ fn a_gate_decided_while_its_run_was_down_wakes_it_on_resume() {
             Reply::Text(RANK.into()),
             Reply::Text(SUMMARY.into()),
             Reply::Text(RANK.into()),
+            Reply::Text(RANK.into()),
+            Reply::Text(SUMMARY.into()),
             Reply::Text(SUMMARY.into()),
         ])
         .await
@@ -937,8 +948,24 @@ fn a_gate_decided_while_its_run_was_down_wakes_it_on_resume() {
             json!({"line": "P1: Export crashes on accents"})
         );
 
-        // Recovered by serve: the same.
+        // Recovered by serve: the same. A third run waits at its gate, not
+        // yet decided, when serve starts.
         decided_while_down(&dir, &project, &state, &env, "decided-2").await;
+        let mut third = spawn(
+            &dir,
+            &project,
+            &["run", "gated", "--run-id", "decided-3", "--data", NOTE],
+            &with(&env, &[]),
+            &dir.join("decided-3.log"),
+        );
+        {
+            let rt = Durare::sqlite(&state.join("private/atomic.db"))
+                .await
+                .expect("store");
+            open_gate(&rt, "decided-3").await;
+        }
+        third.kill().expect("SIGKILL the run");
+        third.wait().expect("reap");
         let mut serve = spawn(
             &dir,
             &project,
@@ -958,7 +985,22 @@ fn a_gate_decided_while_its_run_was_down_wakes_it_on_resume() {
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        assert_eq!(model.calls(), 4, "each run ranked and summarized once");
+        // Decided while serve runs, by a decider that never woke it: serve
+        // catches up on its own.
+        wait_until("serve to start", || {
+            std::fs::read_to_string(dir.join("serve.log"))
+                .is_ok_and(|l| l.contains("serving until stopped"))
+        });
+        decide_without_waking(&state, "decided-3").await;
+        let started = Instant::now();
+        while rt.status("decided-3").await.expect("status") != Some(RunStatus::Succeeded) {
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "serve never woke the run decided while it ran"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(model.calls(), 6, "each run ranked and summarized once");
         terminate(&serve);
         let status = tokio::task::spawn_blocking(move || wait_child(&mut serve, "serve"))
             .await
@@ -2455,6 +2497,83 @@ fn a_resumed_run_is_taken_only_by_its_resumer_on_postgres() {
         );
         assert_eq!(model.calls(), 2);
         assert_eq!(count_log(&dir).len(), 2);
+    });
+}
+
+/// `atomic gates` on PostgreSQL: a second terminal enrolls, lists the gate
+/// a live run waits at, and approves it, all in the runs' own store.
+#[cfg(all(feature = "postgres-tests", target_os = "linux"))]
+#[test]
+fn gates_are_listed_and_decided_in_the_postgres_store() {
+    let url = std::env::var("ATOMIC_TEST_DATABASE_URL")
+        .expect("postgres-tests needs ATOMIC_TEST_DATABASE_URL");
+    on_codex_runtime(async move {
+        let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
+            .await
+            .expect("fake model");
+        let dir = scratch("pg-gates");
+        let project = project(&dir);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let schema = format!("atomic_gates_{}_{nanos}", std::process::id());
+        let mut env = model_env(&model.base_url()).to_vec();
+        env.extend(executor_env(&dir, &url, &schema, "worker-a"));
+        env.push(("ATOMIC_CREDENTIAL_STORE", "file".into()));
+        let mut run = spawn(
+            &dir,
+            &project,
+            &["run", "gated", "--run-id", "pg-gate-1", "--data", NOTE],
+            &with(&env, &[]),
+            &dir.join("run.log"),
+        );
+        let rt = Durare::postgres(&url, &schema).await.expect("store");
+        let g = open_gate(&rt, "pg-gate-1").await;
+        let gates = |args: &'static [&'static str]| {
+            let (d, p, e) = (dir.clone(), project.clone(), env.clone());
+            tokio::task::spawn_blocking(move || atomic(&d, &p, args, &with(&e, &[]), ""))
+        };
+        // Enrolling is a person's command, so it runs on a pseudo-terminal.
+        let (d, p, e) = (dir.clone(), project.clone(), env.clone());
+        let enrolled = tokio::task::spawn_blocking(move || {
+            let mut script = command_as(Path::new("/usr/bin/script"), &d, &p, &[], &with(&e, &[]));
+            script
+                .args(["-qec", &format!("{ATOMIC} gates enroll"), "/dev/null"])
+                .output()
+                .expect("script")
+        })
+        .await
+        .expect("child");
+        assert!(enrolled.status.success(), "{}", text(&enrolled));
+        assert!(
+            text(&enrolled).contains("enrolled local:dev"),
+            "{}",
+            text(&enrolled)
+        );
+
+        let listed = gates(&["gates", "list", "--json"]).await.expect("child");
+        assert!(listed.status.success(), "{}", text(&listed));
+        let listed = stdout_json(&listed);
+        assert_eq!(listed[0]["id"], json!(g.id), "{listed}");
+
+        let id = g.id.clone();
+        let (d, p, e) = (dir.clone(), project.clone(), env.clone());
+        let approved = tokio::task::spawn_blocking(move || {
+            atomic(&d, &p, &["gates", "approve", &id], &with(&e, &[]), "")
+        })
+        .await
+        .expect("child");
+        assert!(approved.status.success(), "{}", text(&approved));
+        let status = tokio::task::spawn_blocking(move || wait_child(&mut run, "the run"))
+            .await
+            .expect("child");
+        assert!(
+            status.success(),
+            "{}",
+            std::fs::read_to_string(dir.join("run.log")).unwrap_or_default()
+        );
+        assert_eq!(model.calls(), 2);
     });
 }
 

@@ -25,6 +25,9 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+/// How often `atomic serve` wakes runs whose gates were decided.
+const REDELIVERY: Duration = Duration::from_secs(5);
+
 /// The state of a run the engine parked for its recovery count.
 const PARKED: &str = "MAX_RECOVERY_ATTEMPTS_EXCEEDED";
 
@@ -507,7 +510,18 @@ pub async fn serve(
         );
     }
     eprintln!("atomic serve: recovered {recovered} unfinished run(s); serving until stopped");
-    let signal = signals.next().await;
+    // A decider that stopped before waking its run is caught up within a
+    // few seconds, not only at the next start.
+    let signal = loop {
+        tokio::select! {
+            signal = signals.next() => break signal,
+            _ = tokio::time::sleep(REDELIVERY) => {
+                if let Err(e) = atomic_durable::gate::redeliver(&engine.rt).await {
+                    eprintln!("atomic serve: waking runs whose gates were decided: {e}");
+                }
+            }
+        }
+    };
     eprintln!("atomic serve: {signal}");
     stop(&mut signals, "atomic serve", Exit::Served).await
 }

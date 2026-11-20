@@ -65,9 +65,17 @@ fn operator() -> anyhow::Result<(String, Principal)> {
 }
 
 pub async fn run(command: GatesCommand, state: &ProjectState) -> anyhow::Result<()> {
-    let rt = Durare::sqlite(&state.database())
+    // The store the project's runs use: its SQLite database, or PostgreSQL
+    // when ATOMIC_DATABASE_URL names one.
+    let database = crate::engine::database(state);
+    let rt = Durare::open(&database, None, atomic_app::pipeline::LAYOUT_VERSION)
         .await
-        .context("open the gate store")?;
+        .with_context(|| {
+            format!(
+                "open the gate store at {}",
+                crate::engine::describe(&database)
+            )
+        })?;
     match command {
         GatesCommand::Enroll { replace } => enroll(&rt, state, replace).await,
         GatesCommand::List { all, json } => list(&rt, all, json).await,
@@ -175,5 +183,14 @@ async fn decide(
         "{} {:?} by {} ({})",
         found.id, decision.verdict, decision.by, decision.command
     );
+    // The decision is recorded; waking the run is not part of it. Say so if
+    // it fails, rather than leave the run to its deadline unannounced.
+    if let Err(e) = gate::redeliver(rt).await {
+        eprintln!(
+            "warning: the decision is recorded, but waking run {} failed: {e}; atomic serve or \
+             atomic runs resume {} delivers it",
+            found.run, found.run
+        );
+    }
     Ok(())
 }
