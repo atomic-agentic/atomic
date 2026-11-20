@@ -54,8 +54,13 @@ pub enum DurableError {
     /// for the next model call. An atom's author returns it, and the atom's
     /// turn parks the run instead of recording a failure (see
     /// [`crate::publication::execute_candidate`]).
-    #[error("parked: {0}")]
-    Parked(String),
+    #[error("parked: {reason}")]
+    Parked {
+        /// Why, for a person.
+        reason: String,
+        /// The allowance that had no room, when the refusal names one.
+        scope: Option<String>,
+    },
     /// Another execution of run `.0` recorded one of its steps first. This
     /// execution's state is behind the run's, so it stops, records nothing,
     /// and takes the outcome the winner records. Workflow code passes it on
@@ -618,7 +623,7 @@ pub(crate) fn to_durare(e: DurableError) -> durare::Error {
         DurableError::Failed(m)
         | DurableError::Nested(m)
         | DurableError::Engine(m)
-        | DurableError::Parked(m) => durare::Error::app(m),
+        | DurableError::Parked { reason: m, .. } => durare::Error::app(m),
     }
 }
 

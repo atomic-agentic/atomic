@@ -138,14 +138,21 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 8,
-        // Releasing a park (see `release`): the release of each park, and
-        // the journal of every person's admin action, by command id.
+        // Releasing a park (see `release`): the release of each park, the
+        // allowance that refused each parked call, and the journal of every
+        // person's admin action, by command id.
         sql: &[
             "CREATE TABLE IF NOT EXISTS atomic_park_releases (
                 park_id TEXT PRIMARY KEY,
                 released_by TEXT NOT NULL,
                 released_at BIGINT NOT NULL,
                 command_id TEXT NOT NULL
+            )",
+            // The allowance that refused a parked call, as the refusal
+            // recorded it.
+            "CREATE TABLE IF NOT EXISTS atomic_park_scopes (
+                park_id TEXT PRIMARY KEY,
+                scope TEXT NOT NULL
             )",
             "CREATE TABLE IF NOT EXISTS atomic_admin_actions (
                 command_id TEXT PRIMARY KEY,

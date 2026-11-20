@@ -536,7 +536,7 @@ async fn run_contract(
     workspace.close().await;
     let (_, report) = conversation.map_err(|e| match crate::usage::meter_failure(&e) {
         // The meter refused the next call: nothing was sent for it.
-        Some(MeterError::Exhausted(refusal)) => AtomError::Budget(refusal.to_string()),
+        Some(MeterError::Exhausted(refusal)) => AtomError::Budget(refusal.clone()),
         Some(failure) => AtomError::Runtime(failure.to_string()),
         None => AtomError::Model(format!("{e:#}")),
     })?;

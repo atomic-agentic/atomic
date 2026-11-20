@@ -193,5 +193,9 @@ async fn decide(
             found.run
         );
     }
+    // A park released while its run was down is delivered here too.
+    if let Err(e) = atomic_durable::release::redeliver(rt).await {
+        atomic_core::log_line!("warning: waking runs whose parks were released failed: {e}");
+    }
     Ok(())
 }

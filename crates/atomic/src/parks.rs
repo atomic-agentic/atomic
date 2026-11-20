@@ -60,6 +60,15 @@ fn operator_credential(state: &ProjectState) -> anyhow::Result<HumanCredential> 
     Ok(HumanCredential::new(principal, secret))
 }
 
+/// `value`, rounded to a whole number, for the flag `flag`: refused when it
+/// is not a number, below zero or too large.
+fn whole(value: f64, flag: &str) -> anyhow::Result<i64> {
+    if !value.is_finite() || value < 0.0 || value > i64::MAX as f64 {
+        anyhow::bail!("{flag} must be a number, zero or more");
+    }
+    Ok(value.round() as i64)
+}
+
 pub async fn run(command: ParksCommand, state: &ProjectState) -> anyhow::Result<()> {
     let database = crate::engine::database(state);
     let rt = Durare::open(&database, None, atomic_app::pipeline::LAYOUT_VERSION)
@@ -73,32 +82,42 @@ pub async fn run(command: ParksCommand, state: &ProjectState) -> anyhow::Result<
             Ok(())
         }
         ParksCommand::Release(args) => {
+            let raising =
+                args.tokens.is_some() || args.minutes.is_some() || args.cost_usd.is_some();
+            if args.scope.is_some() && !raising {
+                anyhow::bail!(
+                    "--scope names an allowance to raise, and no cap was given: add --tokens, \
+                     --minutes or --cost-usd"
+                );
+            }
+            let caps = Caps {
+                tokens: args.tokens.unwrap_or(0),
+                millis: match args.minutes {
+                    Some(m) => whole(m * 60_000.0, "--minutes")?,
+                    None => 0,
+                },
+                micro_usd: match args.cost_usd {
+                    Some(d) => Some(whole(d * 1_000_000.0, "--cost-usd")?),
+                    None => None,
+                },
+            };
             let credential = operator_credential(state)?;
-            let park = release::waiting(&rt)
-                .await?
-                .into_iter()
-                .find(|p| p.id == args.park);
-            let raise =
-                if args.tokens.is_some() || args.minutes.is_some() || args.cost_usd.is_some() {
-                    let scope = match (&args.scope, park.as_ref().and_then(|p| p.scope())) {
-                        (Some(scope), _) => scope.clone(),
-                        (None, Some(scope)) => scope.to_owned(),
-                        (None, None) => anyhow::bail!(
-                            "park {} names no allowance; say which to raise with --scope",
-                            args.park
-                        ),
-                    };
-                    Some(Raise {
-                        scope,
-                        caps: Caps {
-                            tokens: args.tokens.unwrap_or(0),
-                            millis: args.minutes.map_or(0, |m| (m * 60_000.0) as i64),
-                            micro_usd: args.cost_usd.map(|d| (d * 1_000_000.0) as i64),
-                        },
-                    })
-                } else {
-                    None
+            // The park as recorded, released or not, so a repeat of the
+            // command raises what the first one did.
+            let park = release::park(&rt, &args.park).await?;
+            let raise = if raising {
+                let scope = match (&args.scope, park.as_ref().and_then(|p| p.scope())) {
+                    (Some(scope), _) => scope.clone(),
+                    (None, Some(scope)) => scope.to_owned(),
+                    (None, None) => anyhow::bail!(
+                        "park {} names no allowance; say which of its run's to raise with --scope",
+                        args.park
+                    ),
                 };
+                Some(Raise { scope, caps })
+            } else {
+                None
+            };
             let command_id = match args.command_id {
                 Some(id) => id,
                 None => format!(
@@ -106,25 +125,68 @@ pub async fn run(command: ParksCommand, state: &ProjectState) -> anyhow::Result<
                     credential::fresh_secret()?.get(..32).unwrap_or_default()
                 ),
             };
-            let released = release::release_park(
+            let release = release::release_park(
                 &rt,
                 &credential,
                 ReleaseCommand {
-                    command_id,
+                    command_id: command_id.clone(),
                     park: args.park,
                     raise,
                     comment: args.comment,
                 },
             )
             .await?;
+            let released = &release.released;
             match &released.raised {
                 Some(a) => println!(
-                    "{} released by {}; {} now allows {} tokens",
-                    released.park.id, released.by, a.scope, a.caps.tokens
+                    "{} released by {} ({}); {} now allows {} tokens",
+                    released.park.id, released.by, command_id, a.scope, a.caps.tokens
                 ),
-                None => println!("{} released by {}", released.park.id, released.by),
+                None => println!(
+                    "{} released by {} ({})",
+                    released.park.id, released.by, command_id
+                ),
+            }
+            if release.raised_nothing {
+                atomic_core::log_line!(
+                    "warning: the caps given are no higher than {}'s; it was not raised, and the \
+                     run may park again",
+                    released
+                        .raised
+                        .as_ref()
+                        .map_or("the allowance", |a| a.scope.as_str())
+                );
+            }
+            if let Some(why) = &release.wake_failed {
+                atomic_core::log_line!(
+                    "warning: the release is recorded, but waking run {} failed: {why}; atomic \
+                     serve or atomic runs resume {} delivers it",
+                    released.park.run,
+                    released.park.run
+                );
             }
             Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::whole;
+
+    #[test]
+    fn a_cap_flag_is_a_number_rounded_to_whole_units() {
+        assert_eq!(
+            whole(1.5 * 60_000.0, "--minutes").expect("a whole number"),
+            90_000
+        );
+        assert_eq!(
+            whole(0.0000015 * 1_000_000.0, "--cost-usd").expect("a whole number"),
+            2
+        );
+        assert_eq!(whole(0.4, "--cost-usd").expect("a whole number"), 0);
+        for bad in [f64::NAN, f64::INFINITY, -1.0, 1e300] {
+            assert!(whole(bad, "--minutes").is_err(), "{bad}");
         }
     }
 }

@@ -182,12 +182,20 @@ atomic parks release run-1a2b:3 --tokens 200000 --comment "one more draft"
 ```
 
 The release needs the operator credential you enrolled with
-`atomic gates enroll`, as a gate decision does. It raises the allowance the
-park names (or the one `--scope` names) to at least the caps given, marks the
-park released and records who released it, with what and when, in one
-transaction, then wakes the run. A model's tool call or an atom's shell cannot
-release a park or raise a cap: neither can reach the store or the credential.
-Resuming alone cannot bypass a cap.
+`atomic gates enroll`, as a gate decision does. It raises the allowance that
+refused the call (or the one `--scope` names) to at least the caps given, marks
+the park released and records who released it, with what and when, in one
+transaction, then wakes the run. Only the parked run's own allowances may be
+raised: its atoms', its own, and those above it, such as its workflow's; another
+run's is refused. A raise that changes nothing, a park whose run has finished,
+and a park already released are said so. The command prints its command id; sent
+again with `--command-id`, it returns what it did. If waking the run fails, or
+the person's process stops before it, the release stands and the next
+`atomic runs resume` or `atomic serve` wakes the run.
+
+A model's tool call or an atom's shell cannot release a park or raise a cap:
+neither can reach the store or the credential. Resuming alone cannot bypass a
+cap.
 
 See [atom fields](atom-files.md), [workflow fields](workflow-files.md#top-level-fields)
 and [observability](../operations/observability.md).

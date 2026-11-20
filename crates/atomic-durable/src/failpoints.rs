@@ -125,13 +125,19 @@ pub const SITES: &[Site] = &[
 ];
 
 /// Failpoint sites in atomic's commands rather than in the workflows the
-/// crash suite runs, such as `atomic runs resume`: the command-line tests
-/// drive them.
-pub const COMMAND_SITES: &[Site] = &[Site {
-    name: "resume:queued",
-    what: "runs resume put the run on its resume queue and its engine has not started \
-           dispatching it",
-}];
+/// crash suite runs, such as `atomic runs resume` and a park's release:
+/// their own tests drive them.
+pub const COMMAND_SITES: &[Site] = &[
+    Site {
+        name: "resume:queued",
+        what: "runs resume put the run on its resume queue and its engine has not started \
+               dispatching it",
+    },
+    Site {
+        name: "release:before-wake",
+        what: "a park's release is committed and its run has not been woken",
+    },
+];
 
 /// The site `name` comes from, if it is one of [`SITES`] or
 /// [`COMMAND_SITES`].
