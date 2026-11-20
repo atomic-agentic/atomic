@@ -94,6 +94,9 @@ const SECRET_DIRS: &[&str] = &[
     ".local/share/keyrings",
     ".config/fish",
     ".local/share/fish",
+    ".claude",
+    ".bashrc.d",
+    ".zsh_sessions",
 ];
 
 /// The person's shell profiles, each exporting a variable whose name no
@@ -254,5 +257,99 @@ fn an_atoms_shell_sees_none_of_the_persons_secrets() {
                 "{name} reached the atom's shell: {printed}"
             );
         }
+    });
+}
+
+/// Run `look` once through `atomic run` with home `home`, its command
+/// `command`, and return what the command printed.
+async fn look_once(dir: &Path, home: &Path, command: &str) -> String {
+    let model = FakeModel::start(vec![
+        Reply::Tool {
+            name: "exec_command".into(),
+            arguments: json!({"cmd": command, "yield_time_ms": 20000}),
+        },
+        Reply::Text(r#"{"done": true}"#.into()),
+    ])
+    .await
+    .unwrap();
+    let project = dir.join("project");
+    write_project(&project);
+    let atomic_home = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("atomic-shell-env-linked-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&atomic_home);
+    let mut run = Command::new(env!("CARGO_BIN_EXE_atomic"));
+    run.args(["run", "look", "--data", r#"{"text": "the note"}"#])
+        .current_dir(&project)
+        .env("HOME", home)
+        .env("XDG_DATA_HOME", &atomic_home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("ATOMIC_DETECT_OLLAMA_ADDR", "127.0.0.1:9")
+        .env("ATOMIC_MODEL_BASE_URL", model.base_url())
+        .env("ATOMIC_MODEL", "synthetic")
+        .stdin(Stdio::null());
+    for name in [
+        "CODEX_HOME",
+        "ATOMIC_HOME",
+        "ATOMIC_DATABASE_URL",
+        "ATOMIC_EXECUTOR_ID",
+    ] {
+        run.env_remove(name);
+    }
+    let out = tokio::task::spawn_blocking(move || run.output().unwrap())
+        .await
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    model.requests()[1]["input"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| item["type"] == "function_call_output")
+        .map(|item| item["output"].as_str().unwrap_or_default().to_owned())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn a_secret_kept_behind_a_link_stays_denied_and_commands_still_run() {
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let dir = std::env::temp_dir().join(format!("atomic-linked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
+        // A startup file kept with the person's dotfiles, a key directory
+        // linked from elsewhere, and a credential two levels inside a
+        // denied directory that is a link to a file outside it.
+        std::fs::create_dir_all(home.join("dotfiles")).unwrap();
+        std::fs::write(home.join("dotfiles/bashrc"), "canary-linked-file\n").unwrap();
+        std::os::unix::fs::symlink(home.join("dotfiles/bashrc"), home.join(".bashrc")).unwrap();
+        std::fs::create_dir_all(dir.join("keys")).unwrap();
+        std::fs::write(dir.join("keys/id_ed25519"), "canary-linked-dir\n").unwrap();
+        std::os::unix::fs::symlink(dir.join("keys"), home.join(".ssh")).unwrap();
+        std::fs::create_dir_all(home.join(".aws/deep")).unwrap();
+        std::fs::create_dir_all(dir.join("elsewhere")).unwrap();
+        std::fs::write(dir.join("elsewhere/credentials"), "canary-deep-link\n").unwrap();
+        std::os::unix::fs::symlink(
+            dir.join("elsewhere/credentials"),
+            home.join(".aws/deep/credentials"),
+        )
+        .unwrap();
+        let command = format!(
+            "cat {h}/.bashrc {h}/dotfiles/bashrc {h}/.ssh/id_ed25519 {d}/keys/id_ed25519 \
+             {h}/.aws/deep/credentials {d}/elsewhere/credentials; echo looked",
+            h = home.display(),
+            d = dir.display()
+        );
+        let printed = look_once(&dir, &home, &command).await;
+        assert!(printed.contains("looked"), "the command ran: {printed}");
+        assert!(
+            !printed.contains("canary"),
+            "a linked secret was read: {printed}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     });
 }

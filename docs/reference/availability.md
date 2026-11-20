@@ -108,8 +108,18 @@ Codex's sandbox, which denies them the atomic home's `private/` directory, where
 every project keeps its database, its execution lock and its context
 checkpoints; the current project's
 Codex records; the credential and key directories; the default atomic home's
-data and configuration when `ATOMIC_HOME` points elsewhere; the kernel keyrings;
-the network; and sockets. Other projects' Codex records are not denied yet. An
+data and configuration when `ATOMIC_HOME` points elsewhere; your own atomic
+configuration directory; the places in your home directory where credentials,
+shell startup files and history are kept (under both `$HOME` and the home
+directory the system records for your user, and wherever the variables that
+move them, such as `XDG_CONFIG_HOME`, `GNUPGHOME`, `CARGO_HOME` or
+`KUBECONFIG`, put them), and what a link among them points at, followed up to
+four links deep; the kernel keyrings; the network; and sockets. Other
+projects' Codex records are not denied yet. atomic makes the list when a
+turn or an exec step starts: a place on it that appears while a command runs
+is denied only to the commands that start after it, and a link made after
+the list is not followed until the next turn or step. Credentials kept
+anywhere else are not covered. An
 exec atom's command may write only its scratch directory and the project's
 caches; `--runner process` confines it the same way. It runs in a process
 namespace of its own, so it can neither see nor signal atomic, its runner or

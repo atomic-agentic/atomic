@@ -150,37 +150,58 @@ pub struct PrivateState {
     /// store, another atomic home's state, the person's own configuration,
     /// which can name a store with its password or an endpoint with its
     /// credential, and the well-known places in the home directory that
-    /// hold credentials ([`HOME_SECRETS`]). A path that does not exist is
-    /// denied all the same, and is never created.
+    /// hold credentials ([`HOME_SECRETS`]). A path that does not exist when
+    /// a command starts has nothing to deny, and is never created; one made
+    /// while the command runs is denied to the commands that start after.
+    /// Links among them are followed when the list is made, not later.
     pub also: Vec<PathBuf>,
 }
 
 /// Where, under the home directory, people and their tools keep
 /// credentials: denied to every atom's commands, which a model chooses.
 /// Shell startup files and history are among them, since they often export
-/// a token or hold one typed at the prompt.
+/// a token or hold one typed at the prompt. Entries under `.config/`,
+/// `.local/share/` and `.cache/` are denied where `XDG_CONFIG_HOME`,
+/// `XDG_DATA_HOME` and `XDG_CACHE_HOME` move them as well.
 pub const HOME_SECRETS: &[&str] = &[
     ".ssh",
     ".aws",
     ".netrc",
     ".codex",
+    ".claude",
+    ".claude.json",
     ".config/gcloud",
     ".azure",
     ".kube",
     ".docker/config.json",
+    ".config/containers/auth.json",
     ".gnupg",
     ".npmrc",
     ".pypirc",
     ".git-credentials",
+    ".config/git/credentials",
     ".config/gh",
     ".cargo/credentials",
     ".cargo/credentials.toml",
+    ".cargo/config",
+    ".cargo/config.toml",
+    ".m2/settings.xml",
+    ".gradle/gradle.properties",
+    ".gem/credentials",
+    ".pgpass",
+    ".vault-token",
+    ".terraform.d/credentials.tfrc.json",
+    ".cache/huggingface/token",
+    ".config/sops/age/keys.txt",
+    ".config/rclone/rclone.conf",
     ".password-store",
     ".local/share/keyrings",
     ".profile",
     ".bash_profile",
     ".bash_login",
     ".bashrc",
+    ".bashrc.d",
+    ".bash_aliases",
     ".bash_logout",
     ".bash_history",
     ".zshenv",
@@ -189,13 +210,118 @@ pub const HOME_SECRETS: &[&str] = &[
     ".zlogin",
     ".zlogout",
     ".zsh_history",
+    ".zsh_sessions",
+    ".python_history",
+    ".psql_history",
     ".config/fish",
     ".local/share/fish",
 ];
 
-/// [`HOME_SECRETS`] under the home directory `home`.
-pub fn home_secrets(home: &Path) -> Vec<PathBuf> {
-    HOME_SECRETS.iter().map(|p| home.join(p)).collect()
+/// Variables that move a credential file or directory elsewhere, each with
+/// what of the place it names is denied: `""` for the place itself.
+const MOVED_SECRETS: &[(&str, &[&str])] = &[
+    (
+        "ZDOTDIR",
+        &[
+            ".zshenv",
+            ".zprofile",
+            ".zshrc",
+            ".zlogin",
+            ".zlogout",
+            ".zsh_history",
+            ".zsh_sessions",
+        ],
+    ),
+    ("HISTFILE", &[""]),
+    ("GNUPGHOME", &[""]),
+    (
+        "CARGO_HOME",
+        &["credentials", "credentials.toml", "config", "config.toml"],
+    ),
+    ("DOCKER_CONFIG", &["config.json"]),
+    ("AWS_SHARED_CREDENTIALS_FILE", &[""]),
+    ("AWS_CONFIG_FILE", &[""]),
+    ("NETRC", &[""]),
+    ("NPM_CONFIG_USERCONFIG", &[""]),
+    ("npm_config_userconfig", &[""]),
+    ("PASSWORD_STORE_DIR", &[""]),
+    ("CODEX_HOME", &[""]),
+];
+
+/// The home directories whose credential places are denied, as `env` reads
+/// `HOME` and with `passwd` the password database's home for this user:
+/// both, when they differ, so overriding `HOME` hides nothing. An error,
+/// so nothing runs, when neither is an absolute path.
+pub fn real_homes(
+    env: &dyn Fn(&str) -> Option<String>,
+    passwd: Option<PathBuf>,
+) -> Result<Vec<PathBuf>, String> {
+    let mut homes: Vec<PathBuf> = env("HOME")
+        .map(PathBuf::from)
+        .filter(|h| h.is_absolute())
+        .into_iter()
+        .collect();
+    if let Some(passwd) = passwd.filter(|p| p.is_absolute())
+        && !homes.contains(&passwd)
+    {
+        homes.push(passwd);
+    }
+    if homes.is_empty() {
+        return Err(
+            "the home directory is unknown (HOME is unset or not an absolute path, and the user \
+             has no home in the password database), so the credentials kept there could not be \
+             denied to atoms' commands; set HOME"
+                .into(),
+        );
+    }
+    Ok(homes)
+}
+
+/// Every credential place denied to atoms' commands, as `env` reads the
+/// variables: [`HOME_SECRETS`] under each of [`real_homes`], those under
+/// `.config/`, `.local/share/` and `.cache/` where the XDG variables move
+/// them too, and what the variables that move a credential name.
+pub fn home_secrets(
+    env: &dyn Fn(&str) -> Option<String>,
+    passwd: Option<PathBuf>,
+) -> Result<Vec<PathBuf>, String> {
+    let absolute = |name: &str| env(name).map(PathBuf::from).filter(|p| p.is_absolute());
+    let mut out = Vec::new();
+    for home in real_homes(env, passwd)? {
+        out.extend(HOME_SECRETS.iter().map(|p| home.join(p)));
+    }
+    for (prefix, variable) in [
+        (".config/", "XDG_CONFIG_HOME"),
+        (".local/share/", "XDG_DATA_HOME"),
+        (".cache/", "XDG_CACHE_HOME"),
+    ] {
+        if let Some(moved) = absolute(variable) {
+            out.extend(
+                HOME_SECRETS
+                    .iter()
+                    .filter_map(|p| p.strip_prefix(prefix))
+                    .map(|rest| moved.join(rest)),
+            );
+        }
+    }
+    for (variable, inside) in MOVED_SECRETS {
+        if let Some(place) = absolute(variable) {
+            out.extend(inside.iter().map(|p| {
+                if p.is_empty() {
+                    place.clone()
+                } else {
+                    place.join(p)
+                }
+            }));
+        }
+    }
+    // KUBECONFIG names a list of files.
+    if let Some(list) = env("KUBECONFIG") {
+        out.extend(std::env::split_paths(&list).filter(|p| p.is_absolute()));
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
 }
 
 impl StateGuard {
@@ -219,13 +345,16 @@ impl StateGuard {
         for dir in &also {
             crate::state::private_dir(dir)?;
         }
-        // The person's real home, whatever the shell is given as its own.
-        if let Some(home) = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .filter(|h| h.is_absolute())
-        {
-            also.extend(home_secrets(&home));
-        }
+        // The person's real home, whatever the shell is given as its own,
+        // and the credential places atomic's own environment moves; none is
+        // made, and with no home known nothing runs.
+        also.extend(
+            home_secrets(
+                &|name| std::env::var(name).ok(),
+                crate::state::passwd_home(),
+            )
+            .map_err(anyhow::Error::msg)?,
+        );
         // With ATOMIC_HOME set, the default home's state, credentials and
         // keys are another atomic's: denied too, where they exist.
         if std::env::var_os("ATOMIC_HOME").is_some_and(|h| !h.is_empty()) {
@@ -243,27 +372,61 @@ impl StateGuard {
     }
 }
 
+/// How deep inside a denied directory links are followed to the files and
+/// directories they point at, which are denied too.
+const LINK_DEPTH: usize = 4;
+
+/// The real files and directories that links up to [`LINK_DEPTH`] levels
+/// inside `dir` point at. Links to directories are not walked into.
+fn link_targets(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    if depth == 0 {
+        return;
+    }
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_symlink() {
+            if let Ok(target) = std::fs::canonicalize(entry.path()) {
+                out.push(target);
+            }
+        } else if kind.is_dir() {
+            link_targets(&entry.path(), depth - 1, out);
+        }
+    }
+}
+
 /// Every path a profile denies under `guard`, for a thread whose Codex home
 /// is `codex_home`: the state directory's `private/`, the paths in
 /// [`PrivateState::also`], and everything in Codex's home but the helper
 /// links its shell needs. Each is denied whole, never re-opened below, so
-/// the sandbox needs no mount inside a denied directory. Both spellings of
-/// a path reached through a link are denied, and so is the real file or
-/// directory behind each link directly inside a denied directory, such as
-/// a `config.yaml` linked to one kept elsewhere.
+/// the sandbox needs no mount inside a denied directory. A path reached
+/// through a linked directory is denied under both spellings; one that is
+/// itself a link, such as a `~/.bashrc` kept with a person's dotfiles, is
+/// denied as the file or directory it points at, since the sandbox cannot
+/// mount on a link, and a read through the link lands on the denied target.
+/// The real file or directory behind each link up to [`LINK_DEPTH`] levels
+/// inside a denied directory is denied too, such as a `config.yaml` linked
+/// to one kept elsewhere.
+///
+/// The list is made when a thread starts. A path that does not exist then
+/// is denied only once it does, when a later command starts: one made while
+/// a command runs can be read by that command.
 fn denied_paths(private: &PrivateState, codex_home: &Path) -> (Vec<PathBuf>, Vec<String>) {
     // Every project's private state, by one entry, however many projects
     // the home holds.
     let mut denied = vec![private.private.clone()];
-    denied.extend(private.also.iter().cloned());
-    for dir in &private.also {
-        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-            if entry.file_type().is_ok_and(|t| t.is_symlink())
-                && let Ok(target) = std::fs::canonicalize(entry.path())
-            {
-                denied.push(target);
-            }
-        }
+    // Never the thread's own Codex home whole, which its shell needs a part
+    // of, even if a variable such as CODEX_HOME names it as a credential
+    // directory; nor what its helper links point at, atomic's own program.
+    let also: Vec<&PathBuf> = private
+        .also
+        .iter()
+        .filter(|p| !codex_home.starts_with(p))
+        .collect();
+    denied.extend(also.iter().map(|p| (*p).clone()));
+    for dir in also {
+        link_targets(dir, LINK_DEPTH, &mut denied);
     }
     let children = |dir: &Path, keep: &str| -> Vec<PathBuf> {
         std::fs::read_dir(dir)
@@ -275,7 +438,7 @@ fn denied_paths(private: &PrivateState, codex_home: &Path) -> (Vec<PathBuf>, Vec
             .collect()
     };
     let arg0 = format!("arg0-{}", std::env::consts::OS);
-    // Shell snapshots are off (see `new_config`): none is kept open.
+    // Shell snapshots are off (see `converse_async`): none is kept open.
     for entry in children(codex_home, "") {
         if entry.file_name().is_some_and(|n| n == "tmp") {
             denied.extend(children(&entry, &arg0));
@@ -285,7 +448,14 @@ fn denied_paths(private: &PrivateState, codex_home: &Path) -> (Vec<PathBuf>, Vec
     }
     let mut all = Vec::new();
     for path in denied {
-        if let Ok(real) = std::fs::canonicalize(&path)
+        let real = std::fs::canonicalize(&path).ok();
+        let linked = std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink());
+        if linked {
+            // The sandbox cannot mount on a link: the target alone.
+            all.extend(real);
+            continue;
+        }
+        if let Some(real) = real
             && real != path
         {
             all.push(real);
@@ -777,12 +947,13 @@ pub(crate) fn sandbox_refused(stderr: &str) -> bool {
         "retained effective or permitted capabilities",
         "error applying Linux sandbox restrictions",
     ];
-    const BWRAP: [&str; 5] = [
+    const BWRAP: [&str; 6] = [
         "namespace",
         "uid map",
         "gid map",
         "Operation not permitted",
         "Permission denied",
+        "Can't mount on symlink destination",
     ];
     stderr.lines().any(|line| {
         HELPER.iter().any(|s| line.contains(s))
@@ -1740,13 +1911,111 @@ mod tests {
     }
 
     #[test]
-    fn every_well_known_credential_place_in_the_home_directory_is_denied() {
-        let home = Path::new("/home/someone");
-        let secrets = home_secrets(home);
-        for path in [".ssh", ".aws", ".netrc", ".codex", ".bashrc", ".config/gh"] {
-            assert!(secrets.contains(&home.join(path)), "{path}");
+    fn the_credential_places_are_found_wherever_the_environment_moves_them() {
+        let env = |vars: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                vars.iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, v)| (*v).to_owned())
+            }
+        };
+        let has = |secrets: &[PathBuf], path: &str| secrets.contains(&PathBuf::from(path));
+        // HOME and the password database's home, when they differ.
+        let secrets =
+            home_secrets(&env(&[("HOME", "/srv/home")]), Some("/home/dev".into())).expect("homes");
+        for path in [
+            "/srv/home/.ssh",
+            "/home/dev/.ssh",
+            "/home/dev/.cargo/config.toml",
+        ] {
+            assert!(has(&secrets, path), "{path}: {secrets:?}");
         }
-        assert!(secrets.iter().all(|p| p.starts_with(home)));
+        // With no home at all, nothing runs.
+        assert!(home_secrets(&env(&[]), None).is_err());
+        assert!(home_secrets(&env(&[("HOME", "relative")]), None).is_err());
+        // What the variables move.
+        let secrets = home_secrets(
+            &env(&[
+                ("HOME", "/home/dev"),
+                ("XDG_CONFIG_HOME", "/cfg"),
+                ("XDG_CACHE_HOME", "/cch"),
+                ("CARGO_HOME", "/opt/cargo"),
+                ("ZDOTDIR", "/zdot"),
+                ("HISTFILE", "/hist/bash"),
+                ("GNUPGHOME", "/gpg"),
+                ("KUBECONFIG", "/k/a:/k/b:relative"),
+                ("DOCKER_CONFIG", "/dock"),
+                ("AWS_SHARED_CREDENTIALS_FILE", "/aws/creds"),
+                ("NETRC", "/n/netrc"),
+                ("PASSWORD_STORE_DIR", "/pass"),
+            ]),
+            None,
+        )
+        .expect("homes");
+        for path in [
+            "/cfg/gh",
+            "/cfg/git/credentials",
+            "/cch/huggingface/token",
+            "/opt/cargo/credentials.toml",
+            "/opt/cargo/config.toml",
+            "/zdot/.zshrc",
+            "/hist/bash",
+            "/gpg",
+            "/k/a",
+            "/k/b",
+            "/dock/config.json",
+            "/aws/creds",
+            "/n/netrc",
+            "/pass",
+        ] {
+            assert!(has(&secrets, path), "{path}: {secrets:?}");
+        }
+        assert!(!has(&secrets, "relative"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_secret_is_denied_as_what_it_points_at_and_links_are_followed_deep() {
+        let dir = scratch("linked-secrets");
+        let home = dir.join("home");
+        std::fs::create_dir_all(home.join("dotfiles")).expect("dotfiles");
+        std::fs::create_dir_all(home.join("keys")).expect("keys");
+        std::fs::create_dir_all(home.join(".aws/deep")).expect("aws");
+        std::fs::create_dir_all(dir.join("elsewhere")).expect("elsewhere");
+        std::fs::create_dir_all(dir.join("codex")).expect("codex home");
+        std::fs::write(home.join("dotfiles/bashrc"), "x").expect("bashrc");
+        std::fs::write(dir.join("elsewhere/credentials"), "x").expect("creds");
+        let _ = std::fs::remove_file(home.join(".bashrc"));
+        std::os::unix::fs::symlink(home.join("dotfiles/bashrc"), home.join(".bashrc"))
+            .expect("link");
+        let _ = std::fs::remove_file(home.join(".ssh"));
+        std::os::unix::fs::symlink(home.join("keys"), home.join(".ssh")).expect("link");
+        let _ = std::fs::remove_file(home.join(".aws/deep/credentials"));
+        std::os::unix::fs::symlink(
+            dir.join("elsewhere/credentials"),
+            home.join(".aws/deep/credentials"),
+        )
+        .expect("link");
+        let private = PrivateState {
+            state_dir: dir.join("state"),
+            private: dir.join("private"),
+            also: vec![home.join(".bashrc"), home.join(".ssh"), home.join(".aws")],
+        };
+        let (denied, _) = denied_paths(&private, &dir.join("codex"));
+        let real = |p: &Path| std::fs::canonicalize(p).expect("real");
+        assert!(
+            denied.contains(&real(&home.join("dotfiles/bashrc"))),
+            "{denied:?}"
+        );
+        assert!(denied.contains(&real(&home.join("keys"))), "{denied:?}");
+        // No mount on a link: the links themselves are not in the list.
+        assert!(!denied.contains(&home.join(".bashrc")), "{denied:?}");
+        assert!(!denied.contains(&home.join(".ssh")), "{denied:?}");
+        // A link two levels down, to a file outside the denied directory.
+        assert!(
+            denied.contains(&real(&dir.join("elsewhere/credentials"))),
+            "{denied:?}"
+        );
     }
 
     #[test]
@@ -2395,6 +2664,7 @@ mod tests {
             "bwrap: Creating new namespace failed: Operation not permitted",
             "bwrap: Can't mount proc on /newroot/proc: Operation not permitted",
             "bwrap: setting up uid map: Permission denied",
+            "bwrap: Can't mount on symlink destination /home/dev/.bashrc: Invalid argument",
             "thread 'main' panicked at linux-sandbox/src/launcher.rs:60:13:\nbubblewrap is \
              unavailable: no system bwrap was found on PATH",
             "thread 'main' panicked at x.rs:1:1:\nfailed to exec system bubblewrap /usr/bin/bwrap: \

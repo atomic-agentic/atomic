@@ -483,6 +483,45 @@ fn effective_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
+/// The home directory the password database gives this process's user,
+/// whatever `HOME` says; `None` when the user has no entry or its home is
+/// not an absolute path.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+pub fn passwd_home() -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut buffer = vec![0 as libc::c_char; 16 * 1024];
+    // SAFETY: an all-zero `passwd` is a valid value of the plain C struct.
+    let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut found: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: getpwuid_r writes only into `entry` and `buffer`, both of the
+    // sizes given and alive for the call, and sets `found` to null or to
+    // `entry`.
+    let code = unsafe {
+        libc::getpwuid_r(
+            effective_uid(),
+            &mut entry,
+            buffer.as_mut_ptr(),
+            buffer.len(),
+            &mut found,
+        )
+    };
+    if code != 0 || found.is_null() || entry.pw_dir.is_null() {
+        return None;
+    }
+    // SAFETY: on success `pw_dir` points at a NUL-terminated string inside
+    // `buffer`, which is still alive.
+    let dir = unsafe { std::ffi::CStr::from_ptr(entry.pw_dir) };
+    let home = PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes()));
+    home.is_absolute().then_some(home)
+}
+
+/// See the Unix version: there is no password database to read here.
+#[cfg(not(unix))]
+pub fn passwd_home() -> Option<PathBuf> {
+    None
+}
+
 /// Make sure `dir` is readable by its owner only: create it so if it is
 /// missing, and close it if it is open to others. A directory already closed
 /// is left as it is, so one mounted read-only, such as a Kubernetes secret,
