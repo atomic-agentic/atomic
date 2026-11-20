@@ -101,8 +101,51 @@ async fn engine(dir: &Path) -> Durare {
             Ok(json!([one, two, three.output]))
         }
     });
+    // A transaction whose first attempt the engine must retry: its body
+    // reads, then another connection writes before the body's checkpoint
+    // does, so the checkpoint's write finds the snapshot stale (SQLite's
+    // BUSY_SNAPSHOT) and the engine rolls back and runs the body again.
+    let at = dir.to_owned();
+    rt.register("retried", move |ctx: DurareContext, (): ()| {
+        let dir = at.clone();
+        async move {
+            let n: i64 = ctx
+                .transaction("race", move |mut tx| {
+                    let dir = dir.clone();
+                    Box::pin(async move {
+                        let row = tx
+                            .query_one("SELECT COUNT(*) AS n FROM atomic_parks", &[])
+                            .await?;
+                        note(&dir, "race");
+                        let first = !dir.join("raced").exists();
+                        if first {
+                            std::fs::write(dir.join("raced"), "").expect("marker");
+                            write_beside(&dir.join("atomic.db")).await;
+                        }
+                        row.int("n")
+                    })
+                })
+                .await?;
+            Ok(json!(n))
+        }
+    });
     rt.launch().await.expect("launch");
     rt
+}
+
+/// Write to the store from a connection of its own.
+async fn write_beside(db: &Path) {
+    use sqlx::Connection;
+    let mut other = sqlx::SqliteConnection::connect(&format!("sqlite://{}", db.display()))
+        .await
+        .expect("a second connection");
+    sqlx::query(
+        "INSERT INTO atomic_parks (park_id, run, step, reason, parked_at) \
+         VALUES ('beside', 'beside', 'beside', 'beside', 0)",
+    )
+    .execute(&mut other)
+    .await
+    .expect("the write beside");
 }
 
 /// Not a test on its own: the parent runs it in a child process, which
@@ -124,6 +167,8 @@ fn failpoints_child() {
             let rt = engine(&dir).await;
             if role == "start" {
                 rt.start("probe", RUN, ()).await.expect("start");
+            } else if role == "retried" {
+                rt.start("retried", RUN, ()).await.expect("start");
             } else {
                 rt.recover().await.expect("recover");
             }
@@ -355,4 +400,24 @@ fn every_failpoint_in_the_source_is_in_the_inventory_and_back() {
             site.name
         );
     }
+}
+
+#[test]
+fn a_transaction_body_the_engine_retries_is_one_operation_to_its_failpoints() {
+    let dir = scratch("retried");
+    let (status, stderr) = child(&dir, "retried", None, "first.log");
+    assert!(status.success(), "the run finished: {status}\n{stderr}");
+    // The engine ran the body twice: its first attempt's snapshot was stale.
+    assert_eq!(
+        lines(&dir.join("ran.log")),
+        ["race", "race"],
+        "the body was retried"
+    );
+    // Yet it is one durable operation, whose writes and checkpoint committed
+    // once: its failpoints are reached once each, so a crash test counting
+    // them does not take the retry for a second run.
+    assert_eq!(
+        lines(&dir.join("first.log")),
+        ["checkpoint:before:race", "checkpoint:after:race"]
+    );
 }
