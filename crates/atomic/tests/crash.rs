@@ -6,19 +6,23 @@
 //! Each scenario is a workflow atomic runs. One uninterrupted run, in a child
 //! process with `ATOMIC_FAILPOINT_LOG` set, records every failpoint the
 //! workflow passes. Then, for each of those failpoints, a fresh run is
-//! started in a child process that aborts there, and a second process
+//! started in a child process that is killed there, and a second process
 //! recovers it. Each must end with:
 //!
 //! - the workflow complete, with the result an uninterrupted run returns (a
 //!   run that parked on its budget parked again, once);
-//! - no completed step repeated: no durable operation whose checkpoint
-//!   committed before the kill runs again, as the failpoints the recovering
-//!   process reaches show; no atom whose turn committed calls the model
-//!   again, as the fake model counts; and an exec command whose step
-//!   committed does not run again, as its own log shows;
+//! - no completed step repeated: walking both processes' failpoints in
+//!   order, no durable operation runs again once its checkpoint has
+//!   committed, none commits twice, and none runs twice within one process;
+//!   each atom makes, by the fake model's count, one run's worth of model
+//!   calls at most before the kill and, after it, none if its turn had
+//!   committed and one run's worth if not; an exec command whose step
+//!   committed does not run again, as its own log shows; and the ledger and
+//!   the gate store agree;
 //! - one accepted durable candidate commit per code-changing step: the
-//!   commit the step published, on the step's base, and no other attempt
-//!   ref left for the step.
+//!   step's only attempt ref, numbered as the kill allows, on the step's
+//!   base, changing exactly what an uninterrupted run's commit changes, with
+//!   no worktree left.
 //!
 //! Across the scenarios the failpoints reached cover every site in the
 //! inventory (`atomic_durable::failpoints::SITES`), and none is outside it.
@@ -932,6 +936,18 @@ async fn kill_and_recover(
     // checkpoint:before after its checkpoint:after, or a second
     // checkpoint:after, is a repeat.
     let mut done: BTreeSet<&str> = BTreeSet::new();
+    // And within one process, no operation's body finishes twice.
+    for (process, log) in [("killed", &first.reached), ("recovering", &second.reached)] {
+        let mut ran = BTreeSet::new();
+        for op in log
+            .iter()
+            .filter_map(|n| n.strip_prefix("checkpoint:before:"))
+        {
+            if !ran.insert(op) {
+                fail!("{op} ran twice in the {process} process");
+            }
+        }
+    }
     for name in first.reached.iter().chain(&second.reached) {
         if let Some(op) = name.strip_prefix("checkpoint:before:")
             && done.contains(op)

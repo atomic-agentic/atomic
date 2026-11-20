@@ -63,10 +63,20 @@ sandbox)
         echo "scripts/backends-check.sh: the sandbox can start here, so its absence cannot be checked" >&2
         exit 2
     fi
-    check "sandbox suites with no sandbox" \
+    # Every test file behind sandbox-tests, found by its cfg.
+    suites=()
+    found=()
+    for file in crates/*/tests/*.rs; do
+        if grep -q 'feature = "sandbox-tests"' "${file}"; then
+            name="$(basename "${file}" .rs)"
+            suites+=(--test "${name}")
+            found+=("${name}")
+        fi
+    done
+    [ "${#suites[@]}" -gt 0 ] || { echo "scripts/backends-check.sh: no sandbox suite found" >&2; exit 1; }
+    check "sandbox suites (${found[*]}) with no sandbox" \
         "the sandbox tests need Codex's Linux sandbox" \
-        --workspace --features "${FEATURES}" \
-        --test sandboxed_commit --test change_request_example --test crash
+        --workspace --features "${FEATURES}" "${suites[@]}"
     ;;
 *)
     echo "usage: scripts/backends-check.sh postgres|sandbox" >&2

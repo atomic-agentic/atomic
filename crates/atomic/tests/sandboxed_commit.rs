@@ -346,9 +346,11 @@ fn a_read_only_turn_in_a_worktree_sees_its_checkout() {
             state_dir: state.clone(),
             also: Vec::new(),
         });
+        // One stream, so what the commands print arrives in order: Codex
+        // reports stdout and stderr separately, in no fixed order.
         let command = format!(
-            "echo cwd=$(pwd); cat a.txt; echo read-exit=$?; cat {}/private/atomic.db; \
-             echo private-exit=$?; echo x > a.txt; echo write-exit=$?",
+            "exec 2>&1; echo cwd=$(pwd); cat a.txt; echo read-exit=$?; \
+             cat {}/private/atomic.db; echo private-exit=$?; echo x > a.txt; echo write-exit=$?",
             state.display()
         );
         let output = sandboxed_with(
