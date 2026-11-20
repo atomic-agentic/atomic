@@ -192,15 +192,19 @@ pub fn endpoint(
     if resolved.on_sign_in() {
         match (personal_refused, required) {
             (Some(why), true) => {
+                // Refused, never passed over for a key or a detected
+                // endpoint: the person learns why model calls do not go
+                // where they would at their own desk.
                 return Err(Failure::new(
                     "config.model",
                     format!(
-                        "your ChatGPT sign-in is yours, for local use, and {why}, so no model \
-                         is configured here"
+                        "you are signed in with ChatGPT, and a sign-in is personal: {why}, so \
+                         it is not used here, and nothing else is used in its place"
                     ),
-                    "configure a model endpoint: set ATOMIC_MODEL_BASE_URL and ATOMIC_MODEL (or \
-                     pass --model-base-url and --model), and ATOMIC_MODEL_API_KEY_ENV to the \
-                     variable holding its key if it needs one",
+                    "configure model.base_url (ATOMIC_MODEL_BASE_URL, or --model-base-url) and \
+                     model.name (ATOMIC_MODEL), with model.api_key_env naming the variable that \
+                     holds the endpoint's key (OPENAI_API_KEY for OpenAI's API); or run `atomic \
+                     model logout`, and atomic detects OPENAI_API_KEY or a local Ollama again",
                 )
                 .into());
             }

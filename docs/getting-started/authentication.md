@@ -33,8 +33,11 @@ where it is kept, never a token or an email, and whether it is used.
 
 The sign-in is yours, for local use. atomic refuses it on a shared
 (PostgreSQL) store, whether a variable or your configuration file names it, and
-for `atomic serve`, and asks for a configured endpoint there instead. On a project's own store it serves `atomic run`, and
-`atomic runs resume` for whichever run in that store you resume.
+for `atomic serve`. Nothing takes its place there, neither `OPENAI_API_KEY` nor
+a local Ollama: configure `model.base_url` (with `model.api_key_env` naming the
+key's variable), or run `atomic model logout` to have atomic detect them again.
+On a project's own store it serves `atomic run`, and `atomic runs resume` for
+whichever run in that store you resume.
 
 Codex's managed login restrictions hold for the sign-in as they do for Codex's
 own: `forced_login_method`, `forced_chatgpt_workspace_id`, and a machine's

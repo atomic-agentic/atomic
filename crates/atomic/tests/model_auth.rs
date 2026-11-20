@@ -160,6 +160,31 @@ fn a_shared_store_or_serve_refuses_the_personal_sign_in() {
 }
 
 #[test]
+fn where_the_sign_in_is_refused_nothing_takes_its_place_and_it_says_what_to_do() {
+    let f = Fixture::new("refused-key");
+    f.sign_in();
+    // A key that detection would take, were no one signed in.
+    let env = [
+        ("ATOMIC_MODEL", "synthetic"),
+        ("OPENAI_API_KEY", "sk-not-used"),
+    ];
+    let out = f
+        .atomic_within(&["serve"], &env, 60)
+        .expect("serve stopped");
+    let t = text(&out);
+    assert!(!out.status.success(), "it fell back to the key: {t}");
+    assert!(
+        t.contains("you are signed in with ChatGPT, and a sign-in is personal"),
+        "{t}"
+    );
+    assert!(t.contains("nothing else is used in its place"), "{t}");
+    assert!(t.contains("configure model.base_url"), "{t}");
+    assert!(t.contains("OPENAI_API_KEY for OpenAI's API"), "{t}");
+    assert!(t.contains("run `atomic model logout`"), "{t}");
+    assert!(!t.contains("serving until stopped"), "{t}");
+}
+
+#[test]
 fn a_configured_endpoint_comes_before_the_sign_in_and_the_sign_in_before_detection() {
     let f = Fixture::new("ranked");
     f.sign_in();
