@@ -886,19 +886,6 @@ fn no_secret_reaches_stderr_or_json_whatever_atomic_is_given() {
     }
 }
 
-/// Run git in `dir` for a test's setup, with no user or system config.
-fn git_in(dir: &Path, args: &[&str]) {
-    let ok = Command::new(atomic_core::git::Git::find().expect("git").program())
-        .args(args)
-        .current_dir(dir)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .status()
-        .expect("git")
-        .success();
-    assert!(ok, "git {args:?}");
-}
-
 #[test]
 fn the_projects_files_cannot_route_a_key_and_the_persons_own_configuration_can() {
     let dir = scratch("person-config");
@@ -3828,6 +3815,407 @@ fn a_run_that_gets_further_each_time_is_not_dead_lettered() {
     for i in 0..n {
         assert_eq!(lines(&dir.join(format!("bump-{i}.log"))), 2, "step {i}");
     }
+}
+
+/// git in `dir`, as a person runs it, with an identity of its own.
+fn git_in(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .args([
+            "-c",
+            "user.name=dev",
+            "-c",
+            "user.email=dev@example.com",
+            "-c",
+            "init.defaultBranch=main",
+        ])
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .expect("git");
+    assert!(out.status.success(), "git {args:?}: {}", text(&out));
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+/// A commit of `file` with `text` in the repository at `dir`, returning it.
+fn commit_file(dir: &Path, file: &str, text: &str) -> String {
+    std::fs::write(dir.join(file), text).expect("file");
+    git_in(dir, &["add", file]);
+    git_in(dir, &["commit", "-q", "-m", text]);
+    git_in(dir, &["rev-parse", "HEAD"])
+}
+
+/// Everything git records about a repository's refs and worktrees.
+fn git_state(dir: &Path) -> String {
+    format!(
+        "{}\n{}",
+        git_in(dir, &["for-each-ref"]),
+        git_in(dir, &["worktree", "list", "--porcelain"])
+    )
+}
+
+/// A workflow whose second step changes code in a worktree, after a gate.
+fn write_coding(project: &Path) {
+    write_atom(
+        project,
+        "fix-code",
+        "description: 'Fix the code.', kind: 'codex', sandbox: 'workspace-write'",
+        "Fix this: {input.task}",
+        object(
+            json!({"base": {"type": "string", "format": "git-commit"}, "task": {"type": "string"}}),
+        ),
+        object(json!({"done": {"type": "boolean"}})),
+    );
+    std::fs::write(
+        project.join("workflows/coding.workflow.yaml"),
+        "atomic: 1\nname: coding\n\
+         input: { $ref: ../atoms/fix-code.input.schema.json }\n\
+         output: { $ref: ../atoms/fix-code.output.schema.json }\n\
+         steps:\n  check:\n    gate:\n      title: \"'Start on ' + input.task\"\n      timeout: 24h\n\
+         \x20 fix:\n    after: [check]\n    atom: fix-code\n    with: { base: input.base, task: input.task }\n    worktree: true\n\
+         returns: steps.fix.output\n",
+    )
+    .expect("workflow");
+}
+
+#[test]
+fn a_coding_run_is_bound_to_its_fixture_and_never_touches_a_checkout() {
+    on_codex_runtime(async {
+        let dir = scratch("fixture");
+        let project = project(&dir);
+        write_coding(&project);
+        // The developer's checkout holds the project.
+        git_in(&project, &["init", "-q"]);
+        git_in(&project, &["add", "."]);
+        git_in(&project, &["commit", "-q", "-m", "project"]);
+        // The fixture the operator prepared.
+        let fixture = dir.join("fixture");
+        std::fs::create_dir_all(&fixture).expect("fixture");
+        git_in(&fixture, &["init", "-q"]);
+        let first = commit_file(&fixture, "price.txt", "125");
+        let second = commit_file(&fixture, "price.txt", "250");
+        let (checkout, source) = (git_state(&project), git_state(&fixture));
+        let state = state_dir(&dir, &project);
+
+        let data = |base: &str| json!({"base": base, "task": "multiply by quantity"}).to_string();
+        let fixture_arg = fixture.to_string_lossy().into_owned();
+        // Each of these fails before anything runs.
+        let refused = |args: Vec<String>, kind: &str| {
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let out = atomic(&dir, &project, &args, &UNUSED_MODEL, "");
+            assert!(!out.status.success(), "{args:?}: {}", text(&out));
+            let error = stdout_json(&out)["error"].clone();
+            assert_eq!(error["kind"], kind, "{args:?}: {error}");
+            assert!(
+                !String::from_utf8_lossy(&out.stderr).contains("run run-"),
+                "{args:?}: no run was started"
+            );
+            error
+        };
+        let args = |rest: &[&str]| -> Vec<String> {
+            ["--json", "run", "coding"]
+                .iter()
+                .chain(rest)
+                .map(|s| (*s).to_owned())
+                .collect()
+        };
+        let good = data(&second);
+        refused(args(&["--data", &good]), "fixture.required");
+        refused(
+            args(&[
+                "--data",
+                &good,
+                "--fixture",
+                "/no/such/repo",
+                "--fixture-rev",
+                "main",
+            ]),
+            "fixture.path",
+        );
+        refused(
+            args(&[
+                "--data",
+                &good,
+                "--fixture",
+                &fixture_arg,
+                "--fixture-rev",
+                "no-such-branch",
+            ]),
+            "fixture.revision",
+        );
+        let placeholder = data("1111111111111111111111111111111111111111");
+        let error = refused(
+            args(&[
+                "--data",
+                &placeholder,
+                "--fixture",
+                &fixture_arg,
+                "--fixture-rev",
+                "main",
+            ]),
+            "fixture.input",
+        );
+        assert!(
+            error["description"]
+                .as_str()
+                .is_some_and(|d| d.contains("placeholder")),
+            "{error}"
+        );
+        let stale = data(&first);
+        let error = refused(
+            args(&[
+                "--data",
+                &stale,
+                "--fixture",
+                &fixture_arg,
+                "--fixture-rev",
+                "main",
+            ]),
+            "fixture.input",
+        );
+        assert!(
+            error["description"]
+                .as_str()
+                .is_some_and(|d| d.contains("is not the fixture's revision")),
+            "{error}"
+        );
+
+        // Admitted from the project, and from an unrelated directory with
+        // --project and a relative fixture path: the same pinned commit.
+        let project_arg = project.to_string_lossy().into_owned();
+        let runs = [
+            (
+                "from-project",
+                project.clone(),
+                vec![
+                    "run",
+                    "coding",
+                    "--run-id",
+                    "fix-1",
+                    "--data",
+                    &good,
+                    "--fixture",
+                    &fixture_arg,
+                    "--fixture-rev",
+                    "main",
+                ],
+            ),
+            (
+                "from-elsewhere",
+                dir.join("elsewhere"),
+                vec![
+                    "--project",
+                    &project_arg,
+                    "run",
+                    "coding",
+                    "--run-id",
+                    "fix-2",
+                    "--data",
+                    &good,
+                    "--fixture",
+                    "../fixture",
+                    "--fixture-rev",
+                    "main",
+                ],
+            ),
+        ];
+        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        for (tag, cwd, args) in &runs {
+            let id = args[args.iter().position(|a| *a == "--run-id").expect("id") + 1];
+            let mut child = spawn(
+                &dir,
+                cwd,
+                args,
+                &UNUSED_MODEL,
+                &dir.join(format!("{tag}.log")),
+            );
+            open_gate(&rt, id).await;
+            child.kill().expect("stop the run at its gate");
+            child.wait().expect("reap");
+            let record = rt.run_record(id).await.expect("record").expect("run");
+            let bound = &record.input["pipeline"]["fixture"];
+            assert_eq!(bound["commit"], second, "{tag}: {bound}");
+            assert_eq!(bound["rev"], "main", "{tag}");
+            assert_eq!(
+                bound["source"].as_str().map(PathBuf::from),
+                Some(std::fs::canonicalize(&fixture).expect("fixture")),
+                "{tag}"
+            );
+            let snapshot = PathBuf::from(bound["snapshot"].as_str().expect("snapshot"));
+            assert!(
+                snapshot.starts_with(&state),
+                "{tag}: the snapshot is atomic's own"
+            );
+        }
+        // Neither the developer's checkout nor the fixture gained a ref or a
+        // worktree.
+        assert_eq!(git_state(&project), checkout, "the checkout is as it was");
+        assert_eq!(git_state(&fixture), source, "the fixture is as it was");
+    });
+}
+
+#[test]
+fn a_fixture_atomic_cannot_copy_whole_or_that_is_not_its_own_repository_is_refused() {
+    on_codex_runtime(async {
+        let dir = scratch("fixture-refused");
+        let project = project(&dir);
+        write_coding(&project);
+        let repo = |name: &str, extra: &[&str]| -> (PathBuf, String) {
+            let at = dir.join(name);
+            std::fs::create_dir_all(&at).expect("repo");
+            let mut init = vec!["init", "-q"];
+            init.extend_from_slice(extra);
+            git_in(&at, &init);
+            let commit = commit_file(&at, "price.txt", "125");
+            (at, commit)
+        };
+        let (fixture, first) = repo("fixture", &[]);
+        let second = commit_file(&fixture, "price.txt", "250");
+        let refused = |fixture: &Path, base: &str, kind: &str, says: &str| {
+            let data = json!({"base": base, "task": "multiply"}).to_string();
+            let fixture = fixture.to_string_lossy().into_owned();
+            let out = atomic(
+                &dir,
+                &project,
+                &[
+                    "--json",
+                    "run",
+                    "coding",
+                    "--data",
+                    &data,
+                    "--fixture",
+                    &fixture,
+                    "--fixture-rev",
+                    "HEAD",
+                ],
+                &UNUSED_MODEL,
+                "",
+            );
+            assert!(!out.status.success(), "{fixture}: {}", text(&out));
+            let error = stdout_json(&out)["error"].clone();
+            assert_eq!(error["kind"], kind, "{fixture}: {error}");
+            assert!(
+                error["description"]
+                    .as_str()
+                    .is_some_and(|d| d.contains(says)),
+                "{fixture}: {error}"
+            );
+        };
+        // Not a repository, or a directory inside one. The plain directory
+        // is made under the system's temporary directory, outside every
+        // repository: the test's own scratch directory may sit inside the
+        // checkout atomic is built from.
+        let plain = std::env::temp_dir().join(format!(
+            "atomic-run-cli-plain-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&plain).expect("plain");
+        refused(&plain, &first, "fixture.path", "not a git repository");
+        std::fs::remove_dir_all(&plain).expect("remove the plain directory");
+        std::fs::create_dir_all(fixture.join("sub")).expect("sub");
+        refused(
+            &fixture.join("sub"),
+            &second,
+            "fixture.path",
+            "inside the git repository",
+        );
+        // What atomic does not copy whole.
+        let (submodule, _) = repo("submodule", &[]);
+        git_in(
+            &submodule,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{first},vendor"),
+            ],
+        );
+        git_in(&submodule, &["commit", "-q", "-m", "vendor"]);
+        let head = git_in(&submodule, &["rev-parse", "HEAD"]);
+        refused(&submodule, &head, "fixture.unsupported", "submodule");
+        let (lfs, _) = repo("lfs", &[]);
+        let head = commit_file(&lfs, ".gitattributes", "*.bin filter=lfs diff=lfs -text\n");
+        refused(&lfs, &head, "fixture.unsupported", "Git LFS");
+        git_in(&dir, &["clone", "-q", "--shared", "fixture", "borrowing"]);
+        refused(
+            &dir.join("borrowing"),
+            &second,
+            "fixture.unsupported",
+            "borrows objects",
+        );
+        git_in(
+            &dir,
+            &[
+                "clone",
+                "-q",
+                "--depth",
+                "1",
+                &format!("file://{}", fixture.display()),
+                "shallow",
+            ],
+        );
+        refused(
+            &dir.join("shallow"),
+            &second,
+            "fixture.unsupported",
+            "cut-short",
+        );
+        let (grafted, head) = repo("grafted", &[]);
+        std::fs::create_dir_all(grafted.join(".git/info")).expect("info");
+        std::fs::write(grafted.join(".git/info/grafts"), format!("{head}\n")).expect("grafts");
+        refused(&grafted, &head, "fixture.unsupported", "cut-short");
+        let (sha256, _) = repo("sha256", &["--object-format=sha256"]);
+        refused(&sha256, &first, "fixture.unsupported", "SHA-1");
+        // A base that is not in the fixture's history.
+        git_in(&fixture, &["checkout", "-q", "-b", "elsewhere", &first]);
+        let elsewhere = commit_file(&fixture, "price.txt", "999");
+        git_in(&fixture, &["checkout", "-q", "main"]);
+        refused(&fixture, &elsewhere, "fixture.input", "not in the history");
+
+        // A linked worktree is bound at its own HEAD, not its repository's.
+        git_in(
+            &fixture,
+            &["worktree", "add", "-q", "-b", "linked", "../linked", &first],
+        );
+        let linked = dir.join("linked");
+        let own = commit_file(&linked, "price.txt", "500");
+        let state = state_dir(&dir, &project);
+        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        let data = json!({"base": own, "task": "multiply"}).to_string();
+        let linked_arg = linked.to_string_lossy().into_owned();
+        let mut child = spawn(
+            &dir,
+            &project,
+            &[
+                "run",
+                "coding",
+                "--run-id",
+                "linked-1",
+                "--data",
+                &data,
+                "--fixture",
+                &linked_arg,
+                "--fixture-rev",
+                "HEAD",
+            ],
+            &UNUSED_MODEL,
+            &dir.join("linked.log"),
+        );
+        open_gate(&rt, "linked-1").await;
+        child.kill().expect("stop the run at its gate");
+        child.wait().expect("reap");
+        let record = rt
+            .run_record("linked-1")
+            .await
+            .expect("record")
+            .expect("run");
+        assert_eq!(record.input["pipeline"]["fixture"]["commit"], own);
+    });
 }
 
 // needs_sandbox

@@ -52,7 +52,10 @@ workflow and an eval case: at the top of an empty directory, or under
 local Ollama running, the new project runs with no configuration. `atomic run` takes an atom or workflow by name, by file or with
 `--project`, and input from a file, standard input or `--data`; a run cut short
 continues with `atomic runs resume <run-id>`, or under `atomic serve`, from its
-checkpoints. One process at a time executes a project's runs. Errors carry a
+checkpoints. A workflow that changes code runs only bound to a fixture
+repository and revision (`--fixture`, `--fixture-rev`): its worktrees come
+from a snapshot of that commit in the state directory, never from your
+checkout. One process at a time executes a project's runs. Errors carry a
 description and an action, separately in `--json` output. `atomic gates enroll`,
 `list`, `approve` and `reject` decide gates from a second terminal; a gate
 decision counts only with the credential its person enrolled. The terminal
@@ -86,10 +89,13 @@ A command an atom runs, whether an exec atom's or one a model runs in a Codex
 turn, gets the platform's core variables and what the atom declares, never
 atomic's own environment or its credentials. A turn's commands run with no
 login shell; their `HOME` (and `ZDOTDIR`) is a private scratch directory of the
-attempt's own, and their `TMPDIR` is one private directory every turn of the
-project shares (Codex's sandbox keeps a registry there that turns sharing a
-writable root must share), so no shell startup file runs. Tools found through `HOME` are
-therefore not found: rustup, cargo, pyenv, nvm, Maven's `~/.m2` and the like.
+attempt's own, and their `TMPDIR` a directory inside it, so no shell startup
+file runs and no other turn can add, change or remove what a turn keeps in its
+temporary directory. Another turn of the project can still read it, by its path
+under the project's scratch directory: do not rely on it for secrets. (Codex's
+sandbox keeps its registry of the mount points it makes in a directory every
+turn of the project shares, which no turn's command may write.) Tools found
+through `HOME` are therefore not found: rustup, cargo, pyenv, nvm, Maven's `~/.m2` and the like.
 A codex or exec atom names them in its `env`, as in
 `env: { RUSTUP_HOME: '/home/me/.rustup', CARGO_HOME: '/home/me/.cargo' }`. An
 exec atom's command gets its own scratch directory as `HOME` and `TMPDIR`.
@@ -153,7 +159,7 @@ and a step's files 4 GiB, unless `ATOMIC_EXEC_MAX_FILE_BYTES` and
 a Codex atom's turn does not yet.
 
 A `workspace-write` atom cannot write `/tmp`, `/var/tmp` or `$TMPDIR` as atomic
-found them: its commands' `TMPDIR` is the project's private one above. A tool
+found them: its commands' `TMPDIR` is the turn's own one above. A tool
 that ignores `TMPDIR` and writes to `/tmp` directly, such as a JVM's default
 `java.io.tmpdir`, fails there; point it at `$TMPDIR` (for the JVM,
 `-Djava.io.tmpdir=$TMPDIR`).
