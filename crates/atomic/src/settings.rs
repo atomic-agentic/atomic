@@ -873,14 +873,14 @@ pub fn config(args: &ConfigArgs, project: Option<&Path>, json: bool) -> anyhow::
                 serde_json::json!({"setting": path, "value": value, "source": source})
             })
             .collect();
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "project": root,
-                "settings": settings,
-                "notes": resolved.notes,
-            }))?
-        );
+        // Masked already, and redacted besides, as everything atomic prints.
+        let mut doc = serde_json::json!({
+            "project": root,
+            "settings": settings,
+            "notes": resolved.notes,
+        });
+        atomic_core::redact::value(&mut doc);
+        println!("{}", serde_json::to_string_pretty(&doc)?);
         return Ok(());
     }
     let width = rows.iter().map(|(p, _, _)| p.len()).max().unwrap_or(0);
@@ -893,15 +893,16 @@ pub fn config(args: &ConfigArgs, project: Option<&Path>, json: bool) -> anyhow::
         })
         .collect();
     let value_width = shown.iter().map(String::len).max().unwrap_or(0);
+    let say = |line: String| println!("{}", atomic_core::redact::text(&line));
     for ((path, _, source), value) in rows.iter().zip(&shown) {
         if args.explain {
-            println!("{path:<width$}  {value:<value_width$}  {source}");
+            say(format!("{path:<width$}  {value:<value_width$}  {source}"));
         } else {
-            println!("{path:<width$}  {value}");
+            say(format!("{path:<width$}  {value}"));
         }
     }
     for note in &resolved.notes {
-        println!("note: {note}");
+        say(format!("note: {note}"));
     }
     Ok(())
 }

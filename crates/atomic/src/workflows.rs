@@ -84,8 +84,8 @@ pub(crate) async fn settled<T>(
 ) -> Result<T> {
     match result {
         Err(AtomError::Unconfinable(why)) if SERVING.load(std::sync::atomic::Ordering::SeqCst) => {
-            eprintln!("atomic serve: {place}: {why}");
-            eprintln!(
+            atomic_core::log_line!("atomic serve: {place}: {why}");
+            atomic_core::log_line!(
                 "atomic serve: {place} stays unfinished, with nothing recorded, until atomic \
                  serve is started where the sandbox can start; other runs go on"
             );
@@ -112,8 +112,8 @@ pub fn atom_failure(e: AtomError) -> DurableError {
         // the process stops, recording nothing, and the run waits to be
         // resumed where atoms' commands can be confined.
         AtomError::Unconfinable(why) => {
-            eprintln!("atomic: {why}");
-            eprintln!(
+            atomic_core::log_line!("atomic: {why}");
+            atomic_core::log_line!(
                 "atomic: stopping without recording an outcome; resume the run where the sandbox \
                  can start"
             );
@@ -203,7 +203,9 @@ pub fn register_change_request<R: DurableRuntime>(
             let runtimes = runtimes.clone();
             let (budget, draft_caps, review_caps) =
                 (budget.clone(), draft_caps.clone(), review_caps.clone());
-            async move {
+            let run = ctx.workflow_id().to_owned();
+            let span = crate::telemetry::workflow_span(CHANGE_REQUEST, &run);
+            let work = async move {
                 let lite = runtimes.lite.clone();
                 let request = ChangeRequest {
                     request: input.request.clone(),
@@ -216,7 +218,18 @@ pub fn register_change_request<R: DurableRuntime>(
                         let mut lite = lite.clone();
                         lite.meter = meter.meter(&step, &draft_caps);
                         let request = request.clone();
-                        propose(async move { run_lite_atom(&DraftTask, &request, &lite).await })
+                        let span =
+                            crate::telemetry::step_span("draft-task", "draft", &step.workflow_id);
+                        let step_id = step.workflow_id.clone();
+                        crate::telemetry::traced(
+                            span,
+                            atomic_core::usage::for_step(step_id, "draft", async move {
+                                propose(
+                                    async move { run_lite_atom(&DraftTask, &request, &lite).await },
+                                )
+                                .await
+                            }),
+                        )
                     },
                     Vec::new(),
                 )
@@ -242,9 +255,21 @@ pub fn register_change_request<R: DurableRuntime>(
                         let mut codex = codex.clone();
                         codex.meter = budget.meter(&step, &review_caps);
                         let review_request = review_request.clone();
-                        propose(async move {
-                            run_codex_atom(&ReviewPatch, &review_request, &codex).await
-                        })
+                        let span = crate::telemetry::step_span(
+                            "review-patch",
+                            "review",
+                            &step.workflow_id,
+                        );
+                        let step_id = step.workflow_id.clone();
+                        crate::telemetry::traced(
+                            span,
+                            atomic_core::usage::for_step(step_id, "review", async move {
+                                propose(async move {
+                                    run_codex_atom(&ReviewPatch, &review_request, &codex).await
+                                })
+                                .await
+                            }),
+                        )
                     },
                     Vec::new(),
                 )
@@ -255,7 +280,8 @@ pub fn register_change_request<R: DurableRuntime>(
                     verdict,
                     steps: vec![draft, review],
                 })
-            }
+            };
+            crate::telemetry::traced(span, work)
         },
     );
     Ok(())
