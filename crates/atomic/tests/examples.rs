@@ -194,7 +194,7 @@ fn every_v0_1_example_passes_the_real_load_and_check() {
                                 run_id: "examples".into(),
                                 step_id: atom.name.clone(),
                             },
-                            Arc::new(atomic_exec::LocalBackend),
+                            Arc::new(atomic_exec::LocalBackend::default()),
                             None,
                             &runtime::Artifacts::none(),
                         ))

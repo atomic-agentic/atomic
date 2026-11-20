@@ -129,7 +129,11 @@ fn a_store_written_by_a_newer_atomic_stops_it_from_starting() {
         .expect("one project")
         .expect("entry")
         .path();
-    let db = state.join("private/atomic.db");
+    // Every project's private state is in the home's `private/`.
+    let db = home
+        .join("atomic-home/private")
+        .join(state.file_name().expect("a project id"))
+        .join("atomic.db");
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

@@ -7,7 +7,7 @@ use atomic_core::codex::{self, CodexPaths, ModelEndpoint};
 use atomic_core::project;
 use atomic_core::state::ProjectState;
 use clap::{Args, Parser, Subcommand};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 mod engine;
 mod evals;
@@ -153,10 +153,13 @@ impl PromptArgs {
     }
 }
 
-/// The names Codex starts this executable under to run one of its helpers.
-const CODEX_HELPER_NAMES: &[&str] = &["codex-linux-sandbox", "apply_patch", "applypatch"];
-
 fn main() -> anyhow::Result<()> {
+    // A Codex helper, such as the Linux sandbox inside a turn, runs before
+    // anything else: no state directory is resolved or created, since its
+    // HOME is the turn's own scratch directory.
+    if codex::is_helper(std::env::args_os()) {
+        return codex::run_helper();
+    }
     // A helper child serves one call and exits, before anything else starts:
     // no state directory, no Codex dispatch.
     if std::env::args_os().nth(1).as_deref()
@@ -171,8 +174,7 @@ fn main() -> anyhow::Result<()> {
     }
     let parsed = Cli::try_parse();
     // Help and the version create nothing on disk, and print only themselves:
-    // they need no Codex either, unless this process was started under the
-    // name of one of Codex's helpers, which read their own arguments.
+    // they need no Codex either (Codex's helpers were dispatched above).
     let quiet = parsed.as_ref().err().is_some_and(|e| {
         use clap::error::ErrorKind;
         matches!(
@@ -182,18 +184,7 @@ fn main() -> anyhow::Result<()> {
                 | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
         )
     });
-    let not_a_helper = std::env::args_os()
-        .next()
-        .and_then(|arg0| {
-            Path::new(&arg0)
-                .file_name()
-                .map(|name| !CODEX_HELPER_NAMES.contains(&name.to_string_lossy().as_ref()))
-        })
-        .unwrap_or(true);
-    if quiet
-        && not_a_helper
-        && let Err(e) = &parsed
-    {
+    if quiet && let Err(e) = &parsed {
         e.exit();
     }
     // The runner role after global flags, such as `atomic --json runner`.
@@ -408,7 +399,10 @@ fn check(path: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
         if json {
             println!(
                 "{}",
-                serde_json::json!({"checked": {"atoms": 1, "workflows": 0}, "warnings": []})
+                serde_json::json!({
+                    "checked": {"atoms": 1, "workflows": 0, "toolset_operations": 0},
+                    "warnings": []
+                })
             );
         } else {
             println!("checked {}", atom.file.display());
@@ -457,6 +451,13 @@ fn check(path: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
             }
         }
         operations += tools.len();
+    }
+    let mut warnings = Vec::new();
+    for source in &files["workflows"] {
+        let loaded = workflow::load(&source.path, &atoms, &mut registry)?;
+        for w in loaded.warnings {
+            warnings.push(format!("{}: {w}", loaded.file.display()));
+        }
     }
     if json {
         println!(
@@ -662,15 +663,27 @@ async fn prompt(
     state: &ProjectState,
     args: &PromptArgs,
 ) -> anyhow::Result<String> {
-    let cwd: PathBuf = state.root().to_owned();
-    let guard = codex::StateGuard::for_project(state)?;
-    codex::one_turn(
-        paths,
-        &state.codex_home(),
-        &cwd,
-        &args.endpoint(),
-        &guard,
-        &args.prompt.join(" "),
-    )
-    .await
+    // A backend of its own, beside the one `atomic run` and `atomic serve`
+    // use: this command takes no execution lock, and connecting empties a
+    // backend's shared temporary directory, which their turns may be using.
+    let backend = atomic_exec::Backend::connect(atomic_exec::LocalBackend::in_dir(
+        state.dir().join("scratch-debug"),
+    ))
+    .context("connect to the execution backend")?;
+    let runtime = atomic_core::runtime::CodexRuntime {
+        paths: paths.clone(),
+        codex_home: state.codex_home(),
+        cwd: state.root().to_owned(),
+        endpoint: args.endpoint(),
+        defaults: atomic_core::AtomConfig::default(),
+        artifacts: atomic_core::runtime::Artifacts::none(),
+        meter: atomic_core::usage::Metering::none(),
+        guard: codex::StateGuard::for_project(state)?,
+        backend,
+    };
+    let spec = codex::TurnSpec {
+        prompt: args.prompt.join(" "),
+        ..codex::TurnSpec::default()
+    };
+    Ok(atomic_core::runtime::run_turn(&runtime, &spec).await?)
 }

@@ -91,9 +91,13 @@ fn a_gate_is_approved_from_a_second_terminal_while_the_run_waits() {
         let state = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
 
         // The first terminal: a run waiting at its gate.
-        let mut rt = Durare::sqlite(&state.join("private/atomic.db"))
-            .await
-            .unwrap();
+        // Every project's private state is in the home's `private/`.
+        let db = t
+            .home
+            .join("private")
+            .join(state.file_name().unwrap())
+            .join("atomic.db");
+        let mut rt = Durare::sqlite(&db).await.unwrap();
         rt.register("gated", |ctx: DurareContext, (): ()| async move {
             let spec = GateSpec {
                 workflow: "gated".into(),
