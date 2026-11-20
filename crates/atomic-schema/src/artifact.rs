@@ -506,6 +506,11 @@ mod tests {
             "https://example.com/a/../b",
             "https://example.com/%7euser/a",
             "https://example.com/a#",
+            "schemas/v1/answer.schema.json",
+            "./a/b",
+            "https://example.com/a?b=c",
+            "a?b",
+            "HTTPS://EXAMPLE.COM/A/./B/../C?Q",
             "urn:example:answer",
             "URN:atomic:contract",
             "",
@@ -593,6 +598,160 @@ mod tests {
                 .map(|c| verdict(&schema, &serde_json::json!({"file": reference(c)})));
             assert_eq!(got, ["ok", "missing", "wrong"], "{schema}");
         }
+    }
+
+    /// The text branch of `tagged`, alone.
+    fn note() -> serde_json::Value {
+        tagged("anyOf")["$defs"]["note"].clone()
+    }
+
+    /// `tagged`, with the text branch replaced and other `$defs` added.
+    fn tagged_with(second: serde_json::Value, defs: serde_json::Value) -> serde_json::Value {
+        let mut schema = tagged("anyOf");
+        schema["properties"]["payload"]["anyOf"][1] = second;
+        for (k, v) in defs.as_object().expect("an object") {
+            schema["$defs"][k] = v.clone();
+        }
+        schema
+    }
+
+    #[test]
+    fn relative_ids_and_refs_in_a_contract_without_an_id() {
+        let mut relative = note();
+        relative["$id"] = serde_json::json!("note.json");
+        let cases = [
+            // An embedded resource with a relative id, reached by pointer or by its id.
+            tagged_with(
+                serde_json::json!({"$ref": "#/$defs/note"}),
+                serde_json::json!({"note": relative.clone()}),
+            ),
+            tagged_with(
+                serde_json::json!({"$ref": "note.json"}),
+                serde_json::json!({"note": relative}),
+            ),
+            // A relative id nowhere near the union.
+            tagged_with(
+                serde_json::json!({"$ref": "#/$defs/note"}),
+                serde_json::json!({"other": {"$id": "other.json", "type": "string"}}),
+            ),
+            tagged_with(
+                serde_json::json!({"$ref": "#/$defs/note"}),
+                serde_json::json!({"other": {"$id": "x/y/z.json", "type": "string"}}),
+            ),
+        ];
+        for schema in cases {
+            assert_eq!(four(&schema), FOUR, "{schema}");
+        }
+        // A relative reference to the contract itself.
+        let mut schema = tagged("anyOf");
+        schema["properties"]["again"] = serde_json::json!({"$ref": ""});
+        assert_eq!(four(&schema), FOUR);
+    }
+
+    #[test]
+    fn a_schema_keyword_that_names_no_known_draft() {
+        for meta in [
+            serde_json::json!("not a uri"),
+            serde_json::json!("%%%"),
+            serde_json::json!("custom-meta.json"),
+            serde_json::json!("https://example.com/custom-meta"),
+            serde_json::json!("urn:x:meta"),
+            serde_json::json!("http://[bad"),
+            serde_json::json!(""),
+            serde_json::json!(7),
+        ] {
+            let mut schema = tagged("anyOf");
+            schema["$schema"] = meta.clone();
+            assert_eq!(four(&schema), FOUR, "{meta}");
+        }
+    }
+
+    #[test]
+    fn a_contract_that_cannot_be_indexed_fails_closed() {
+        // `a b` is no URI reference, so the contract cannot be indexed and no
+        // branch is decided. The open first branch must not then accept.
+        let schema = serde_json::json!({
+            "$id": "a b",
+            "anyOf": [
+                {"type": "object", "properties": {"note": {"type": "string"}}},
+                {"type": "object", "required": ["file"],
+                 "properties": {"file": {"$ref": "atomic:artifact", "mediaType": "text/x-diff"}}}
+            ]
+        });
+        assert!(Checker::new(&schema, &Store).registry.is_none());
+        let file = |c| serde_json::json!({"file": reference(c)});
+        assert_eq!(verdict(&schema, &file('c')), "missing");
+        assert_eq!(verdict(&schema, &file('b')), "wrong");
+        assert_eq!(verdict(&schema, &file('a')), "ok");
+    }
+
+    #[test]
+    fn nested_decoys_and_the_wrapper_uri_cannot_stand_in() {
+        let file = serde_json::json!({"anyOf": [
+            {"type": "null"},
+            {"$ref": "atomic:artifact", "mediaType": "text/x-diff"}
+        ]});
+        let decoy = |id: &str| serde_json::json!({"$id": id, "properties": {"file": {"anyOf": [true, true]}}});
+        for (root_id, defs) in [
+            (
+                None,
+                serde_json::json!({"a": {"$id": "urn:other:x", "$defs": {"b": decoy("urn:atomic:contract")}}}),
+            ),
+            (
+                None,
+                serde_json::json!({"a": {"$id": "urn:other:x", "$defs": {"b": decoy("json-schema:///")}}}),
+            ),
+            (
+                Some("https://example.com/c"),
+                serde_json::json!({"a": {"$id": "https://example.com/other", "$defs": {"b": decoy("https://example.com/c")}}}),
+            ),
+            (
+                Some("https://example.com/c"),
+                serde_json::json!({"a": {"$id": "https://example.com/x/y", "$defs": {"b": decoy("../c")}}}),
+            ),
+            (
+                Some("answer.json"),
+                serde_json::json!({"a": {"$id": "urn:other:x", "$defs": {"b": decoy("json-schema:///answer.json")}}}),
+            ),
+            (None, serde_json::json!({"a": decoy("urn:atomic:branch")})),
+        ] {
+            let mut schema = serde_json::json!({
+                "type": "object", "properties": {"file": file.clone()}, "$defs": defs
+            });
+            if let Some(id) = root_id {
+                schema["$id"] = serde_json::json!(id);
+            }
+            let got =
+                ['c', 'b'].map(|c| verdict(&schema, &serde_json::json!({"file": reference(c)})));
+            assert_eq!(got, ["missing", "wrong"], "{schema}");
+        }
+        // A branch that refers to an embedded resource claiming the wrapper's URI.
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"result": {"anyOf": [
+                {"$ref": "urn:atomic:branch"},
+                {"type": "object", "required": ["kind", "file"],
+                 "properties": {"kind": {"const": "diff"},
+                                "file": {"$ref": "atomic:artifact", "mediaType": "text/x-diff"}}}
+            ]}},
+            "$defs": {"x": {"$id": "urn:atomic:branch", "type": "object", "required": ["kind"],
+                            "properties": {"kind": {"const": "none"}}}}
+        });
+        let result = |c| serde_json::json!({"result": {"kind": "diff", "file": reference(c)}});
+        assert_eq!(
+            ['a', 'c', 'b'].map(|c| verdict(&schema, &result(c))),
+            ["ok", "missing", "wrong"]
+        );
+        // A contract named by the wrapper's URI fails closed.
+        let mut schema = tagged("anyOf");
+        schema["$id"] = serde_json::json!("urn:atomic:branch");
+        assert_eq!(
+            [
+                verdict(&schema, &payload("diff", 'b')),
+                verdict(&schema, &payload("diff", 'c'))
+            ],
+            ["wrong", "missing"]
+        );
     }
 
     #[test]
@@ -906,9 +1065,14 @@ fn check_one(
     Ok(())
 }
 
-/// The URI the contract is indexed under while branch fits are decided, when
-/// it has no `$id` of its own.
+/// The URI the contract is indexed under when its `$id` is not a URI
+/// reference at all. Such a contract cannot be indexed, so every branch is
+/// undecided and the check fails closed.
 const CONTRACT_URI: &str = "urn:atomic:contract";
+
+/// The base URI the branch wrappers are compiled under. A contract that
+/// claims it is refused, so a branch can never refer to its own wrapper.
+const BRANCH_URI: &str = "urn:atomic:branch";
 
 /// One `check_refs` call: the contract, the store, and each branch's
 /// validator, compiled the first time it is needed.
@@ -942,29 +1106,45 @@ fn token(key: &str) -> String {
 
 impl<'a> Checker<'a> {
     fn new(root: &'a serde_json::Value, store: &'a dyn ArtifactLookup) -> Self {
-        // The URI the answer's validator gives the contract: its `$id`,
-        // resolved against jsonschema's default base and normalised as
-        // jsonschema does it, or a fixed URN when it has none. Its references
-        // then resolve as they do when the whole answer is validated.
+        // The URI the answer's validator gives the contract: its `$id`, or
+        // "" when it has none, resolved against jsonschema's default base
+        // (json-schema:///) and normalised as jsonschema does it. Relative
+        // `$id`s and `$ref`s inside it then resolve as they do when the whole
+        // answer is validated.
         let base = root
             .get("$id")
             .and_then(serde_json::Value::as_str)
-            .and_then(|id| jsonschema::uri::from_str(id.trim_end_matches('#')).ok())
+            .unwrap_or_default();
+        let base = jsonschema::uri::from_str(base.trim_end_matches('#'))
             .map(|uri| uri.as_str().to_owned())
-            .unwrap_or_else(|| CONTRACT_URI.to_owned());
+            .unwrap_or_else(|_| CONTRACT_URI.to_owned());
         // Indexed once per check, as Draft 2020-12 whatever its `$schema`
-        // says, because that is the draft the answer's validator forces. A
-        // contract that cannot be indexed leaves every branch undecided, so
-        // the check fails closed.
+        // says, because that is the draft the answer's validator forces, and
+        // without fetching meta-schemas a `$schema` names. A contract that
+        // cannot be indexed leaves every branch undecided, so the check fails
+        // closed.
         let registry = jsonschema::Registry::new()
             .draft(jsonschema::Draft::Draft202012)
+            .retrieve_known_draft_meta_schemas(false)
             .add(
                 &base,
                 jsonschema::Draft::Draft202012.create_resource_ref(root),
             )
             .and_then(|b| b.add(ARTIFACT_SCHEMA_ID, artifact_schema()))
             .and_then(jsonschema::RegistryBuilder::prepare)
-            .ok();
+            .ok()
+            // The contract must be what its URI names (an embedded resource
+            // claiming the same URI must not replace it), and nothing in it
+            // may claim the URI the branch wrappers are compiled under.
+            .filter(|registry| {
+                !registry.contains_resource(BRANCH_URI)
+                    && jsonschema::uri::from_str(&base).is_ok_and(|uri| {
+                        registry
+                            .resolver(uri)
+                            .lookup("")
+                            .is_ok_and(|found| std::ptr::eq(found.contents(), root))
+                    })
+            });
         Self {
             root,
             store,
@@ -991,7 +1171,7 @@ impl<'a> Checker<'a> {
             let validator = self.registry.as_ref().and_then(|registry| {
                 jsonschema::options()
                     .with_draft(jsonschema::Draft::Draft202012)
-                    .with_base_uri("urn:atomic:branch")
+                    .with_base_uri(BRANCH_URI)
                     .with_registry(registry)
                     .build(&wrapper)
                     .ok()
