@@ -261,18 +261,21 @@ pub fn serve(
     }
 }
 
-/// The runner's side on this process's stdin, stdout and stderr, running
-/// commands as child processes in the runner's own process group, so that
-/// the control plane stops a command, with everything it started, by
-/// stopping its runner's group.
-pub fn serve_stdio() -> i32 {
+/// The runner's side on this process's stdin and stdout, with its own
+/// errors written to `errors` (the binary passes a writer that redacts them
+/// on their way to stderr), running commands as child processes in the
+/// runner's own process group, so that the control plane stops a command,
+/// with everything it started, by stopping its runner's group.
+pub fn serve_stdio(errors: &mut dyn Write) -> i32 {
     process::ignore_stop_signals();
-    serve(
+    let code = serve(
         &mut std::io::stdin().lock(),
         &mut std::io::stdout().lock(),
-        &mut std::io::stderr().lock(),
+        errors,
         &InRunnerGroup(LocalBackend::default()),
-    )
+    );
+    let _ = errors.flush();
+    code
 }
 
 /// [`LocalBackend`], with each command in the runner's process group. The

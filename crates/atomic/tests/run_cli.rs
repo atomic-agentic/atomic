@@ -1006,6 +1006,25 @@ fn config_runs_from_any_directory_above_the_persons_own_configuration() {
 }
 
 #[test]
+fn config_output_is_redacted_like_every_line_atomic_writes() {
+    let dir = scratch("config-redacted");
+    let project = project(&dir);
+    // A key, put where a model's name belongs.
+    let key = concat!("sk-proj-", "abcdefghijklmnop1234");
+    let env = [("ATOMIC_MODEL", key)];
+    for args in [
+        &["config", "--explain"][..],
+        &["--json", "config", "--explain"][..],
+    ] {
+        let out = atomic(&dir, &project, args, &env, "");
+        assert!(out.status.success(), "{args:?}: {}", text(&out));
+        let said = text(&out);
+        assert!(!said.contains(key), "{args:?}: {said}");
+        assert!(said.contains("[REDACTED]"), "{args:?}: {said}");
+    }
+}
+
+#[test]
 fn check_reads_the_settings_of_every_manifest() {
     let dir = scratch("check-settings");
     let project = project(&dir);
