@@ -702,10 +702,11 @@ fn worst_cases(size: usize) -> Vec<(&'static str, String)> {
 
 /// A megabyte of each, in a debug build on a shared machine, within a
 /// bound a quadratic scan could not meet. A linear pass over a megabyte
-/// takes well under a second, but a loaded CI runner running other tests
-/// alongside has stretched one past three; a quadratic one takes about
-/// 25 s for 64 KB and so hours for a megabyte. Thirty seconds keeps the
-/// two far apart.
+/// takes about a second a case on a loaded CI runner running other tests
+/// alongside, and has taken past three; a quadratic one takes about 25 s
+/// for 64 KB and so hours for a megabyte. Thirty seconds keeps the two far
+/// apart. Two cases whose slower growth this bound could hide have their
+/// own check (see `escaped_quotes_and_open_key_blocks_grow_linearly`).
 #[test]
 fn worst_cases_finish_quickly() {
     let slow: Vec<(&str, std::time::Duration)> = worst_cases(1024 * 1024)
@@ -1005,4 +1006,257 @@ fn redaction_never_panics_on_random_text() {
         });
         assert!(survived.is_ok(), "case {case} panicked");
     }
+}
+
+/// How many steps redacting `input` takes (see `STEPS`).
+fn steps_of(input: &str) -> u64 {
+    STEPS.with(|steps| steps.set(0));
+    let _ = text(input);
+    STEPS.with(std::cell::Cell::get)
+}
+
+/// Two worst cases whose slower growth the megabyte bound could hide: quotes
+/// escaped ever deeper, whose cap keeps each depth's scan to one pass, and
+/// key blocks with no end, each consumed whole. At sixteen times the size,
+/// a linear scan takes about sixteen times the steps, one that grows as the
+/// 1.5th power 64 times, a quadratic one 256 times. Steps are counted, not
+/// timed, so no machine's load changes the answer.
+#[test]
+fn escaped_quotes_and_open_key_blocks_grow_linearly() {
+    let quotes = |depths: usize| -> String {
+        (1..depths)
+            .map(|depth| format!("password={}\"x ", "\\".repeat(depth)))
+            .collect()
+    };
+    let blocks = |size: usize| concat!("-----BEGIN RSA PRIVATE", " KEY-----\n").repeat(size / 32);
+    for (name, small, large) in [
+        ("escaped quotes", quotes(350), quotes(1400)),
+        ("open key blocks", blocks(64 * 1024), blocks(1024 * 1024)),
+    ] {
+        let (small, large) = (steps_of(&small), steps_of(&large));
+        assert!(
+            large < 32 * small,
+            "{name}: {large} steps at sixteen times the size of {small}"
+        );
+    }
+}
+
+/// A private key block of `chars` characters in all, with its end.
+fn key_block(chars: usize) -> String {
+    let begin = concat!("-----BEGIN RSA PRIVATE", " KEY-----\n");
+    let end = concat!("\n-----END RSA PRIVATE", " KEY-----\n");
+    format!(
+        "{begin}{}{end}",
+        "A".repeat(chars - begin.len() - end.len())
+    )
+}
+
+/// A secret whose rule needs what a window's cut took, the `@` after a
+/// URL's password, the quote that ends a JSON value or the `Bearer ` before
+/// a token, is not shown when redacting what comes before it shrinks the
+/// window enough to bring the cut into view.
+#[test]
+fn a_secret_the_cut_parted_from_its_neighbour_is_not_shown() {
+    const SEEDED: &str = "hunter2-seeded-passphrase";
+    let chars = 100;
+    let window = margin(chars);
+    let at_end = |line: String, after: &str| {
+        let block = key_block(window - line.len());
+        format!("{block}{line}{after}")
+    };
+    let url = at_end(
+        format!("connect postgres://app:{SEEDED}"),
+        "@db.internal/x\n",
+    );
+    let json = at_end(format!("{{\"password\": \"{SEEDED}"), "\"}\n");
+    let shown = [
+        bounded(&url, chars),
+        excerpt(&url, chars),
+        bounded(&json, chars),
+    ];
+    for (i, out) in shown.iter().enumerate() {
+        assert!(!out.contains(SEEDED), "case {i} showed the secret");
+        assert!(out.ends_with('…'), "case {i} does not say it was cut");
+    }
+    let token = concat!("abcdef0123456789", "abcdef0123456789");
+    let block = key_block(window - token.len() - 1);
+    let header = format!("Authorization: Bearer {token}\n{block}");
+    let out = tail(&header, chars);
+    assert!(!out.contains(token), "the tail showed the token");
+    assert!(out.starts_with('…'), "the tail does not say it was cut");
+    // With nothing shrunk, the cut is far out of view and nothing more is
+    // dropped; so with a little shrunk, as one-line text with a key or two.
+    let plain = format!("{}\n{}", "word ".repeat(window), "more");
+    assert_eq!(bounded(&plain, chars), format!("{}…", &plain[..chars]));
+}
+
+/// A window that left everything out says so, rather than show nothing:
+/// one unbroken token longer than the window, say.
+#[test]
+fn a_window_that_leaves_everything_out_says_so() {
+    let long = "k".repeat(50_000);
+    assert_eq!(bounded(&long, 100), "…");
+    assert_eq!(excerpt(&long, 100), "…");
+    assert_eq!(tail(&long, 100), "…");
+    // What fits is shown whole, unmarked.
+    assert_eq!(bounded("short", 100), "short");
+    assert_eq!(tail("short", 100), "short");
+}
+
+/// A redaction that never ends, as one waiting on a rule its panicking
+/// thread was building would, does not hold the hook: it writes the fixed
+/// message.
+#[test]
+fn a_panic_redaction_that_never_ends_writes_the_fixed_message() {
+    fn hangs(_: &str) -> String {
+        loop {
+            std::thread::park();
+        }
+    }
+    let (done, written) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done.send(redact_panic_within(
+            "anything".into(),
+            hangs,
+            std::time::Duration::from_millis(200),
+        ));
+    });
+    let written = written
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("the hook waited on redaction for good");
+    assert_eq!(written, UNREDACTED_PANIC);
+}
+
+/// A panic in redaction writes nothing of its own: the hook that waited on
+/// it writes the fixed message, once.
+#[test]
+fn a_panic_in_redaction_is_written_once() {
+    assert_eq!(hook_line(true, || UNREDACTED_PANIC.to_owned()), None);
+    assert_eq!(
+        hook_line(false, || "message".into()),
+        Some("message".into())
+    );
+}
+
+/// A sequence cut short by an escape, `ESC[` then `\n`, does not take the
+/// escape's letter: the key after it is found whole.
+#[test]
+fn a_key_after_an_open_sequence_and_an_escape_is_found() {
+    let shape = SHAPES[0];
+    let inputs = [
+        format!("\x1b[\\n{shape}"),
+        format!("\x1b[1;33\\n{shape}"),
+        format!("\x1b[\\t{shape}"),
+        format!("\\u001b[\\n{shape}"),
+        format!("\\x1b[\\u0007{shape}"),
+        format!("\x1b(\\n{shape}"),
+        format!("\\x1b(\\n{shape}"),
+    ];
+    let wrong: Vec<usize> = inputs
+        .iter()
+        .enumerate()
+        .filter(|(_, input)| {
+            let out = text(input);
+            out.contains(&shape[4..]) || !out.contains(REDACTED)
+        })
+        .map(|(index, _)| index)
+        .collect();
+    assert!(wrong.is_empty(), "inputs {wrong:?} kept part of the key");
+}
+
+/// Names of a count or a kind of token, and Telegram URLs that hold no
+/// bot token, are not secrets.
+#[test]
+fn counts_and_kinds_of_tokens_are_not_secrets() {
+    assert_kept(&[
+        "max_token=4096",
+        "prompt_token: 12",
+        "error_token: abc",
+        "next_token: page2",
+        "https://api.telegram.org/botinfo",
+    ]);
+    assert_cases(&[
+        ("GH_TOKEN=abc123", "GH_TOKEN=[REDACTED]"),
+        ("access_token: Zx81kQ0pL2mN4bV6", "access_token: [REDACTED]"),
+    ]);
+}
+
+/// One-line text that redaction shrinks a little, or whose cut dropped a
+/// long token, keeps its leading text: the cut is still out of view.
+#[test]
+fn one_line_text_keeps_its_start_when_the_cut_stays_out_of_view() {
+    // A provider's JSON body, on one line, echoing keys.
+    let keys = vec![SAMPLE; 30].join(" ");
+    let body = format!(
+        "{{\"error\":{{\"message\":\"Incorrect API key provided: {keys}\",\"detail\":\"{}\"}}}}",
+        "lorem ipsum ".repeat(19 * 1024 / 12)
+    );
+    let out = excerpt(&body, 500);
+    assert!(
+        out.starts_with("{\"error\":{\"message\":\"Incorrect API key provided: [REDACTED]"),
+        "the body's start was dropped"
+    );
+    assert!(!out.contains(SAMPLE), "the body showed a key");
+    // A command's stderr on one line, with keys redacted along it.
+    let keys = vec![SAMPLE; 90].join(" ");
+    let stderr = format!(
+        "{} {keys} {} final words",
+        "warning ".repeat(15 * 1024 / 8),
+        "detail ".repeat(10 * 1024 / 7)
+    );
+    let out = tail(&stderr, 2000);
+    assert!(out.ends_with("final words"), "the tail's end was dropped");
+    assert!(out.starts_with('…'), "the tail does not say it was cut");
+    // A long base64 payload, dropped whole where the cut splits it, with
+    // its `payload=`, since `=` may be part of a key.
+    let upload = format!(
+        "error: upload failed for payload={}",
+        "QUJD".repeat(47 * 1024)
+    );
+    let out = bounded(&upload, 4096);
+    assert_eq!(out, "error: upload failed for …");
+}
+
+/// Hint words qualified by a word that is not a count or a kind of token
+/// still name secrets.
+#[test]
+fn only_a_count_or_kind_of_token_is_a_hint() {
+    assert_cases(&[
+        ("INPUT_PASS=hunter2", "INPUT_PASS=[REDACTED]"),
+        ("PROVIDER_TOKEN=abc123", "PROVIDER_TOKEN=[REDACTED]"),
+        ("ERROR_AUTH=abc", "ERROR_AUTH=[REDACTED]"),
+        ("INPUT_TOKEN=hunter2", "INPUT_TOKEN=[REDACTED]"),
+        ("CACHED_TOKEN=12345678", "CACHED_TOKEN=[REDACTED]"),
+        (
+            "NEXT_PUBLIC_API_TOKEN=x",
+            "NEXT_PUBLIC_API_TOKEN=[REDACTED]",
+        ),
+        ("input_token=hunter2", "input_token=[REDACTED]"),
+        // A kind word right before `TOKEN`, in an environment variable.
+        ("NEXT_TOKEN=hunter2", "NEXT_TOKEN=[REDACTED]"),
+        ("ERROR_TOKEN=hunter2", "ERROR_TOKEN=[REDACTED]"),
+    ]);
+    // Counts and pagination fields, in snake or camel case, still only hint.
+    assert_kept(&[
+        "input_tokens: 12",
+        "nextToken: page2",
+        "max_tokens_used=4096",
+        "cachedTokens: 120",
+    ]);
+}
+
+/// A header line as long as a common cap, cut at a tail's start: once the
+/// window shrinks to bring the cut into view, the rest of the line, a
+/// cookie's values here, is not shown.
+#[test]
+fn a_cookie_line_cut_at_a_tails_start_is_not_shown() {
+    let chars = 2000;
+    let pair = "sid=SEEDEDabc123; ";
+    let rest_of_line = pair.repeat(7000 / pair.len());
+    let end = "\nend\n";
+    let block = key_block(margin(chars) - rest_of_line.len() - 1 - end.len());
+    let input = format!("Cookie: {}{rest_of_line}\n{block}{end}", pair.repeat(30));
+    let out = tail(&input, chars);
+    assert!(!out.contains("SEEDED"), "the cookie's values were shown");
+    assert!(out.starts_with('…'), "the tail does not say it was cut");
 }
