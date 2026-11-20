@@ -710,15 +710,8 @@ pub async fn run_exec(
     })?;
     if !done.success() {
         let stderr = String::from_utf8_lossy(&done.stderr);
-        let tail: String = stderr
-            .trim()
-            .chars()
-            .rev()
-            .take(2000)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
+        // Redacted, then cut: a secret cut in half is never in the tail.
+        let tail = crate::redact::tail(stderr.trim(), 2000);
         return Err(AtomError::Runtime(format!(
             "{}: {program} {}{}",
             atom.name,
@@ -866,9 +859,10 @@ where
 {
     // The atom's task runs inside the caller's span, for the run and step
     // the caller runs, so its model calls' spans are children of the step's.
-    use tracing::Instrument;
     let caller = crate::usage::caller();
-    let task = crate::usage::with_caller(caller, run).in_current_span();
+    let held = crate::spans::hold(tracing::Span::current());
+    let task = held.run(crate::usage::with_caller(caller, run));
+    drop(held);
     match tokio::spawn(task).await {
         Ok(result) => result,
         Err(e) if e.is_panic() => {

@@ -27,8 +27,8 @@ mod telemetry_common;
 use atomic_core::testing::Reply;
 use serde_json::{Value, json};
 use std::io::Write;
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
+
+use std::process::Stdio;
 use telemetry_common::*;
 
 #[test]
@@ -129,13 +129,13 @@ fn spans_over_http_protobuf_carry_the_exporters_headers_which_no_atom_sees() {
     assert!(headers.contains("/v1/traces"), "{headers}");
     assert!(headers.contains("application/x-protobuf"), "{headers}");
     assert!(
-        headers.contains(COLLECTOR_TOKEN),
+        headers.contains(COLLECTOR_SEED),
         "the collector got its credential"
     );
     // Which no log line and no atom's command saw.
-    assert!(!text(&out).contains(COLLECTOR_TOKEN), "{}", text(&out));
+    assert!(!text(&out).contains(COLLECTOR_SEED), "{}", text(&out));
     let env = std::fs::read_to_string(dir.join("env.json")).unwrap();
-    assert!(!env.contains(COLLECTOR_TOKEN), "{env}");
+    assert!(!env.contains(COLLECTOR_SEED), "{env}");
     assert!(!env.contains("OTEL_EXPORTER_OTLP_HEADERS"), "{env}");
 }
 
@@ -207,32 +207,8 @@ fn a_run_stopped_at_a_gate_ends_and_exports_its_spans() {
     .stderr(Stdio::piped())
     .spawn()
     .unwrap();
-    // Waiting at the gate once `atomic gates list` shows it.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-    loop {
-        let listed = command(&dir, &model.base_url(), &["gates", "list", "--json"], &[])
-            .output()
-            .unwrap();
-        let open: Value = serde_json::from_slice(&listed.stdout).unwrap_or(json!([]));
-        if open.as_array().is_some_and(|g| !g.is_empty()) {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "no gate opened: {}",
-            text(&listed)
-        );
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "the run ended before its gate"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(200));
-    }
-    let killed = Command::new("/bin/sh")
-        .args(["-c", &format!("kill -TERM {}", child.id())])
-        .status()
-        .unwrap();
-    assert!(killed.success());
+    wait_for_gate(&dir, &model.base_url(), &mut child);
+    signal(&child, "TERM");
     let out = child.wait_with_output().unwrap();
     assert!(!out.status.success(), "{}", text(&out));
 
@@ -252,129 +228,293 @@ fn a_run_stopped_at_a_gate_ends_and_exports_its_spans() {
 }
 
 /// A lite provider's error: its excerpt is redacted where it is made, so
-/// the run's stored error never holds the secret, nor does anything shown.
+/// the run's stored error never holds the key, nor does anything shown.
+/// Each body puts its key right after an escape or a colour.
 #[test]
-fn a_secret_a_lite_provider_echoes_is_redacted_in_its_excerpt() {
-    const SECRET: &str = concat!("sk-ant-", "api03-LITEexcerptSECRET0123456789abcdef");
-    let dir = scratch("lite-secret");
-    project(&dir);
-    let (model, _rt) = model(vec![echoing(SECRET)]);
-    let (url, received) = collector();
-    let out = run(
-        &dir,
-        &model.base_url(),
-        "triage",
-        NOTE,
-        &exporting(&url, "http/json"),
-    );
-    assert!(!out.status.success(), "the call failed: {}", text(&out));
-    let shown = text(&out);
-    assert!(shown.contains("401"), "the error is reported: {shown}");
-    assert!(!shown.contains(SECRET), "the secret was shown: {shown}");
-    assert!(shown.contains("[REDACTED]"), "{shown}");
-    assert_eq!(
-        stored(&dir.join("atomic-home"), SECRET),
-        Vec::<PathBuf>::new()
-    );
-
-    // Its spans say it failed, and why, redacted.
-    let spans = received.spans();
-    assert!(
-        !received.bodies().contains(SECRET),
-        "the secret was exported"
-    );
-    let call = named(&spans, "chat synthetic");
-    assert!(failed(call), "{call}");
-    assert_eq!(
-        attribute(call, "error.type").as_deref(),
-        Some("atomic.model_call")
-    );
-    assert!(
-        attribute(call, "error.message")
-            .unwrap()
-            .contains("[REDACTED]")
-    );
-    for name in ["invoke_agent rank-note", "invoke_workflow triage"] {
-        let span = named(&spans, name);
-        assert!(failed(span), "{span}");
-        assert_eq!(
-            attribute(span, "error.type").as_deref(),
-            Some("atomic.failed"),
-            "{span}"
+fn a_key_a_lite_provider_echoes_is_redacted_in_its_excerpt() {
+    let bodies = [
+        (
+            concat!("sk-ant-", "api03-LITEjsonSEEDED0123456789abcdef"),
+            "{\"error\":{\"message\":\"Incorrect API key provided:\\nSEED\",\"type\":\"invalid_request_error\"}}",
+        ),
+        (
+            concat!("ghp_", "LITEtabSEEDED0123456789abcdefghijkl"),
+            "key rejected:\\tSEED",
+        ),
+        (
+            concat!("ghp_", "LITEansiSEEDED0123456789abcdefghijk"),
+            "\x1b[1;33mSEED\x1b[0m",
+        ),
+    ];
+    for (index, (seeded, body)) in bodies.iter().enumerate() {
+        let dir = scratch(&format!("lite-seeded-{index}"));
+        project(&dir);
+        let (model, _rt) = model(vec![Reply::Http {
+            status: 401,
+            body: body.replace("SEED", seeded),
+        }]);
+        let (url, received) = collector();
+        let out = run(
+            &dir,
+            &model.base_url(),
+            "triage",
+            NOTE,
+            &exporting(&url, "http/json"),
         );
+        assert!(!out.status.success(), "the call failed: {}", text(&out));
+        let shown = text(&out);
+        assert!(shown.contains("401"), "the error is reported: {shown}");
+        assert!(!shown.contains(seeded), "body {index} was shown");
+        assert!(shown.contains("[REDACTED]"), "{shown}");
+        assert!(
+            stored(&dir.join("atomic-home"), seeded).is_empty(),
+            "body {index} was stored"
+        );
+        assert!(
+            !received.bodies().contains(seeded),
+            "body {index} was exported"
+        );
+        if index > 0 {
+            continue;
+        }
+        // Its spans say it failed, and why, redacted.
+        let spans = received.spans();
+        let call = named(&spans, "chat synthetic");
+        assert!(failed(call), "{call}");
+        assert_eq!(
+            attribute(call, "error.type").as_deref(),
+            Some("atomic.model_call")
+        );
+        assert!(
+            attribute(call, "error.message")
+                .unwrap()
+                .contains("[REDACTED]")
+        );
+        for name in ["invoke_agent rank-note", "invoke_workflow triage"] {
+            let span = named(&spans, name);
+            assert!(failed(span), "{span}");
+            assert_eq!(
+                attribute(span, "error.type").as_deref(),
+                Some("atomic.failed"),
+                "{span}"
+            );
+        }
     }
 }
 
-/// A command's stderr is part of its step's error as it was: the report
-/// redacts it, as text and as JSON, and so does the exporter.
+/// A command's stderr is redacted, then cut to its tail, where the step's
+/// error is made: the run's stored error never holds it.
 #[test]
-fn a_secret_in_a_commands_stderr_is_redacted_in_the_text_report() {
-    const SECRET: &str = concat!("glpat-", "TEXTreportSECRET0123456789");
-    let dir = scratch("text-report");
+fn a_key_in_a_commands_stderr_is_redacted_in_its_tail() {
+    const SEEDED: &str = concat!("glpat-", "STDERRtailSEEDED0123456789");
+    let dir = scratch("stderr-tail");
     project(&dir);
-    let out = run(&dir, "http://127.0.0.1:9/v1", "leaky", &note(SECRET), &[]);
+    let out = run(&dir, "http://127.0.0.1:9/v1", "leaky", &note(SEEDED), &[]);
     assert!(!out.status.success(), "{}", text(&out));
     let shown = text(&out);
     assert!(shown.contains("the provider said [REDACTED]"), "{shown}");
-    assert!(!shown.contains(SECRET), "{shown}");
+    assert!(!shown.contains(SEEDED), "the key was shown");
+    assert!(
+        stored(&dir.join("atomic-home"), SEEDED).is_empty(),
+        "the key was stored"
+    );
+}
+
+/// An output that does not fit its schema is quoted in the step's error as
+/// it was: the report redacts it, as text and as JSON, and so does the
+/// exporter.
+#[test]
+fn a_key_in_a_steps_error_is_redacted_in_the_text_report() {
+    const SEEDED: &str = concat!("glpat-", "TEXTreportSEEDED0123456789");
+    let dir = scratch("text-report");
+    project(&dir);
+    let out = run(&dir, "http://127.0.0.1:9/v1", "misfit", &note(SEEDED), &[]);
+    assert!(!out.status.success(), "{}", text(&out));
+    let shown = text(&out);
+    assert!(shown.contains("[REDACTED]"), "{shown}");
+    assert!(!shown.contains(SEEDED), "the key was shown");
 }
 
 #[test]
-fn a_secret_in_a_commands_stderr_is_redacted_in_the_json_report() {
-    const SECRET: &str = concat!("glpat-", "JSONreportSECRET0123456789");
+fn a_key_in_a_steps_error_is_redacted_in_the_json_report() {
+    const SEEDED: &str = concat!("glpat-", "JSONreportSEEDED0123456789");
     let dir = scratch("json-report");
     project(&dir);
     let out = command(
         &dir,
         "http://127.0.0.1:9/v1",
-        &["--json", "run", "leaky", "--data", &note(SECRET)],
+        &["--json", "run", "misfit", "--data", &note(SEEDED)],
         &[],
     )
     .output()
     .unwrap();
     assert!(!out.status.success(), "{}", text(&out));
     let report: Value = serde_json::from_slice(&out.stdout).expect("a JSON report");
-    assert!(
-        report.to_string().contains("the provider said [REDACTED]"),
-        "{report}"
-    );
-    assert!(!text(&out).contains(SECRET), "{}", text(&out));
+    assert!(report.to_string().contains("[REDACTED]"), "{report}");
+    assert!(!text(&out).contains(SEEDED), "the key was shown");
 }
 
 #[test]
-fn a_secret_in_a_commands_stderr_is_redacted_in_its_spans() {
-    const SECRET: &str = concat!("glpat-", "SPANstatusSECRET0123456789");
+fn a_key_in_a_steps_error_is_redacted_in_its_spans() {
+    const SEEDED: &str = concat!("glpat-", "SPANstatusSEEDED0123456789");
     let dir = scratch("span-status");
     project(&dir);
     let (url, received) = collector();
     let out = run(
         &dir,
         "http://127.0.0.1:9/v1",
-        "leaky",
-        &note(SECRET),
+        "misfit",
+        &note(SEEDED),
         &exporting(&url, "http/json"),
     );
     assert!(!out.status.success(), "{}", text(&out));
     let spans = received.spans();
-    let step = named(&spans, "invoke_agent leak-note");
+    let step = named(&spans, "invoke_agent misfit-note");
     assert!(failed(step), "{step}");
     let why = step["status"]["message"].as_str().unwrap_or_default();
-    assert!(why.contains("the provider said [REDACTED]"), "{step}");
+    assert!(why.contains("[REDACTED]"), "{step}");
+    assert!(!received.bodies().contains(SEEDED), "the key was exported");
+}
+
+/// A panic's message, through the hook `main` installs.
+#[test]
+fn a_key_in_a_panic_is_redacted() {
+    const SEEDED: &str = concat!("glpat-", "PANICmessageSEEDED0123456789");
+    let dir = scratch("panic");
+    let out = command(
+        &dir,
+        "http://127.0.0.1:9/v1",
+        &["debug", "panic", &format!("the provider said {SEEDED}")],
+        &[],
+    )
+    .output()
+    .unwrap();
+    assert!(!out.status.success(), "{}", text(&out));
+    let shown = text(&out);
+    assert!(shown.contains("the provider said [REDACTED]"), "{shown}");
+    assert!(!shown.contains(SEEDED), "the key was shown");
+}
+
+/// `atomic check --json` reports its warnings redacted, as its log lines are.
+#[test]
+fn a_key_in_a_check_warning_is_redacted() {
+    const SEEDED: &str = concat!("glpat-", "CHECKwarningSEEDED0123456789");
+    let dir = scratch("check");
+    let project = project(&dir);
+    std::fs::write(
+        project.join("workflows/warned.workflow.yaml"),
+        format!(
+            "atomic: 1\nname: warned\n\
+             input: {{ $ref: ../atoms/count-note.input.schema.json }}\n\
+             output: {{ $ref: ../atoms/count-note.output.schema.json }}\n\
+             steps:\n\
+             \x20 count:\n    atom: count-note\n    with: {{ text: \"input.text + ' {SEEDED}'\" }}\n\
+             returns: steps.count.output\n"
+        ),
+    )
+    .unwrap();
+    let out = command(&dir, "http://127.0.0.1:9/v1", &["--json", "check"], &[])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    let report: Value = serde_json::from_slice(&out.stdout).expect("a JSON report");
+    let warnings = report["warnings"].to_string();
+    assert!(warnings.contains("[REDACTED]"), "{warnings}");
+    assert!(!text(&out).contains(SEEDED), "the key was shown");
+}
+
+/// A stop while a model call is in flight ends the run's spans, the call's
+/// among them, and exports them before the process exits.
+#[test]
+fn a_stop_during_a_model_call_exports_the_runs_open_spans() {
+    let dir = scratch("stop-call");
+    project(&dir);
+    let (model, _rt) = model(vec![Reply::Delayed {
+        after: std::time::Duration::from_secs(60),
+        reply: Box::new(Reply::Text(RANK.into())),
+    }]);
+    let (url, received) = collector();
+    let mut child = command(
+        &dir,
+        &model.base_url(),
+        &["run", "triage", "--data", NOTE],
+        &exporting(&url, "http/json"),
+    )
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while model.calls() == 0 {
+        assert!(std::time::Instant::now() < deadline, "no model call began");
+        assert!(child.try_wait().unwrap().is_none(), "the run ended first");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    // Ctrl-C, and again, since the call would not reach a checkpoint.
+    for _ in 0..2 {
+        signal(&child, "INT");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    let out = child.wait_with_output().unwrap();
+    assert!(!out.status.success(), "{}", text(&out));
+
+    let spans = received.spans();
+    let workflow = named(&spans, "invoke_workflow triage");
+    let step = named(&spans, "invoke_agent rank-note");
+    let call = named(&spans, "chat synthetic");
+    assert_eq!(call["parentSpanId"], step["spanId"]);
+    assert_eq!(step["parentSpanId"], workflow["spanId"]);
+    for span in [workflow, step, call] {
+        assert_eq!(
+            attribute(span, "atomic.stopped").as_deref(),
+            Some("true"),
+            "{span}"
+        );
+    }
+}
+
+/// A collector that never answers holds up a stopping process only until
+/// the next signal.
+#[test]
+fn a_second_signal_stops_at_once_while_spans_are_sent() {
+    let dir = scratch("hung");
+    project(&dir);
+    let (model, _rt) = model(vec![Reply::Text(RANK.into())]);
+    let url = hung_collector();
+    let mut child = command(
+        &dir,
+        &model.base_url(),
+        &["run", "gated", "--data", NOTE],
+        &exporting(&url, "http/json"),
+    )
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+    wait_for_gate(&dir, &model.base_url(), &mut child);
+    signal(&child, "TERM");
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let second = std::time::Instant::now();
+    signal(&child, "TERM");
+    let out = child.wait_with_output().unwrap();
+    let taken = second.elapsed();
+    assert!(!out.status.success(), "{}", text(&out));
     assert!(
-        !received.bodies().contains(SECRET),
-        "the secret was exported"
+        taken < std::time::Duration::from_secs(3),
+        "took {taken:?} after the second signal: {}",
+        text(&out)
     );
 }
 
 /// A warning line, here about a setting that quotes what it was given.
 #[test]
 fn a_secret_in_a_warning_line_is_redacted() {
-    const SECRET: &str = concat!("glpat-", "WARNINGlineSECRET0123456789");
+    const SEEDED: &str = concat!("glpat-", "WARNINGlineSEEDED0123456789");
     let dir = scratch("warning");
     project(&dir);
     let (url, _received) = collector();
     let mut env = exporting(&url, "http/json");
-    env.push(("OTEL_EXPORTER_OTLP_PROTOCOL", format!("bogus {SECRET}")));
+    env.push(("OTEL_EXPORTER_OTLP_PROTOCOL", format!("bogus {SEEDED}")));
     let out = command(&dir, "http://127.0.0.1:9/v1", &["debug", "state-dir"], &env)
         .output()
         .unwrap();
@@ -382,13 +522,13 @@ fn a_secret_in_a_warning_line_is_redacted() {
     let shown = text(&out);
     assert!(shown.contains("telemetry is off"), "{shown}");
     assert!(shown.contains("[REDACTED]"), "{shown}");
-    assert!(!shown.contains(SECRET), "{shown}");
+    assert!(!shown.contains(SEEDED), "{shown}");
 }
 
 /// The runner role's own errors, which quote the request they refuse.
 #[test]
 fn a_secret_in_a_runners_error_is_redacted() {
-    const SECRET: &str = concat!("glpat-", "RUNNERerrorSECRET0123456789");
+    const SEEDED: &str = concat!("glpat-", "RUNNERerrorSEEDED0123456789");
     let dir = scratch("runner");
     let mut child = command(&dir, "http://127.0.0.1:9/v1", &["runner"], &[])
         .stdin(Stdio::piped())
@@ -400,12 +540,12 @@ fn a_secret_in_a_runners_error_is_redacted() {
         .stdin
         .take()
         .unwrap()
-        .write_all(json!({"protocol": SECRET}).to_string().as_bytes())
+        .write_all(json!({"protocol": SEEDED}).to_string().as_bytes())
         .unwrap();
     let out = child.wait_with_output().unwrap();
     assert_eq!(out.status.code(), Some(64), "{}", text(&out));
     let shown = text(&out);
     assert!(shown.contains("atomic runner:"), "{shown}");
     assert!(shown.contains("[REDACTED]"), "{shown}");
-    assert!(!shown.contains(SECRET), "{shown}");
+    assert!(!shown.contains(SEEDED), "{shown}");
 }

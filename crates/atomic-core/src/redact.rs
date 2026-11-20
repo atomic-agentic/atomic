@@ -4,16 +4,20 @@
 //! attributes, and error messages that may carry a provider's response.
 //!
 //! A secret is found by its shape (the formats of well-known API keys and
-//! tokens, JSON Web Tokens, private key blocks) or by a name beside it: a
-//! value assigned to a name with a secret word in it (`key`, `secret`,
-//! `token`, `pass`, `pat`, `signature` and the like, as a part of the name
-//! such as `AWS_SECRET_KEY` or `AccountKey`), an authorization or cookie
-//! header, a password or token in a URL, a value after a secret-named
-//! command-line flag, a secret-named field in JSON whatever its value, and a
-//! header given as a name and value pair.
+//! tokens, JSON Web Tokens, private key blocks), even right after an escape
+//! or a terminal colour, or by a name beside it: a value assigned to a
+//! secret's name (`password`, `api_key`, `AWS_SECRET_KEY`, `AccountKey`,
+//! `DB_PASS`), or a credential-looking value assigned to a name that hints
+//! at one (`token`, `pass`); an authorization or cookie header; a password
+//! or token in a URL; a value after a secret-named command-line flag; a
+//! secret-named field in JSON; and a header given as a name and value pair.
+//! Every rule is one pass over the text, and callers bound what they redact
+//! ([`excerpt`], [`bounded`], [`tail`]).
 //!
-//! The known-format finder and its table of prefixes are adapted from
-//! rig-core's redaction module (MIT); see THIRD-PARTY-NOTICES.md.
+//! The known-format finder (its table of prefixes, the JSON Web Token scan,
+//! the AWS access key ID check, the private key block finder and the rule
+//! for where a token may start) is adapted from rig-core's redaction module
+//! (MIT); see THIRD-PARTY-NOTICES.md.
 //!
 //! This is best effort, and it over-matches on purpose: a password in prose, a
 //! bare random string or anything encoded is not found, and a wrong match only
@@ -24,6 +28,7 @@
 use regex::{Captures, Regex};
 use serde_json::Value;
 use std::borrow::Cow;
+use std::io::Write as _;
 use std::sync::LazyLock;
 
 #[cfg(test)]
@@ -32,40 +37,75 @@ mod tests;
 /// What a secret is replaced with.
 pub const REDACTED: &str = "[REDACTED]";
 
-/// Parts of a name that say its value is secret. A name is split into parts
-/// at punctuation and at a change from lower to upper case.
-const SECRET_PARTS: &[&str] = &[
-    "key",
+/// Parts of a name that make it a secret's name on their own: `password`,
+/// `DB_PASSWORD`, `client_secret`.
+const STRONG_PARTS: &[&str] = &[
+    "password",
+    "passwd",
+    "passphrase",
+    "passcode",
+    "pwd",
     "secret",
     "secrets",
-    "token",
-    "pass",
-    "passwd",
-    "password",
-    "passphrase",
-    "pwd",
-    "pat",
-    "signature",
-    "sig",
     "credential",
     "credentials",
-    "authorization",
-    "cookie",
+    "apikey",
 ];
-/// Endings of a part that run secret words together, such as `apikey` or
-/// `accesstoken`.
-const SECRET_ENDINGS: &[&str] = &[
+/// Endings of a name's parts run together that make it a secret's name:
+/// `apikey`, `MyPassWord`, `clientsecret`.
+const STRONG_ENDINGS: &[&str] = &[
+    "password",
+    "passwd",
+    "passphrase",
+    "secret",
     "apikey",
     "accesskey",
     "secretkey",
     "privatekey",
-    "authkey",
     "accountkey",
     "subscriptionkey",
+    "authkey",
+    "accesstoken",
+    "authtoken",
+    "refreshtoken",
+];
+/// Parts that name a secret when another part qualifies them (`DB_PASS`,
+/// `GH_PAT`, `accessToken`, `X-Amz-Signature`), and only hint at one alone
+/// (`pass`, `token`).
+const WEAK_PARTS: &[&str] = &[
     "token",
+    "pass",
+    "pat",
+    "signature",
+    "sig",
+    "auth",
+    "cookie",
+    "authorization",
+];
+/// What makes `key` a secret's name: `api_key`, `AccountKey`,
+/// `Ocp-Apim-Subscription-Key`. `key` alone, `primary_key` or `KeyError`
+/// are not.
+const KEY_QUALIFIERS: &[&str] = &[
+    "api",
+    "access",
     "secret",
-    "password",
-    "passwd",
+    "private",
+    "auth",
+    "account",
+    "subscription",
+    "client",
+    "master",
+    "encryption",
+    "signing",
+    "sas",
+    "storage",
+    "app",
+    "service",
+    "license",
+    "ssh",
+    "deploy",
+    "webhook",
+    "session",
 ];
 /// Parts that say a name is about a secret rather than one: its size, its
 /// kind, where it is kept. `max_tokens`, `token_count`, `api_key_env` and
@@ -90,7 +130,6 @@ const NOT_SECRET_PARTS: &[&str] = &[
     "type",
     "kind",
     "name",
-    "id",
     "url",
     "uri",
     "endpoint",
@@ -102,7 +141,78 @@ const NOT_SECRET_PARTS: &[&str] = &[
     "ttl",
     "timeout",
     "header",
+    "error",
 ];
+/// Values that are words, not secrets, even beside a secret's name:
+/// `token: expired`, `password: required`, `ExpiredToken: The token…`.
+const STOPWORDS: &[&str] = &[
+    "a",
+    "an",
+    "the",
+    "is",
+    "are",
+    "was",
+    "were",
+    "be",
+    "been",
+    "not",
+    "no",
+    "yes",
+    "ok",
+    "on",
+    "off",
+    "to",
+    "of",
+    "for",
+    "in",
+    "and",
+    "or",
+    "it",
+    "this",
+    "that",
+    "set",
+    "unset",
+    "none",
+    "null",
+    "nil",
+    "true",
+    "false",
+    "undefined",
+    "required",
+    "optional",
+    "missing",
+    "invalid",
+    "expired",
+    "revoked",
+    "denied",
+    "refused",
+    "rejected",
+    "failed",
+    "empty",
+    "unknown",
+    "error",
+    "provided",
+    "present",
+    "absent",
+    "hidden",
+    "redacted",
+    "masked",
+    "string",
+    "str",
+    "boolean",
+    "bool",
+    "number",
+    "int",
+    "integer",
+    "object",
+    "array",
+    "any",
+    "value",
+    "default",
+];
+/// The most of any input atomic redacts in one piece: longer text is cut
+/// first (see [`excerpt`]), so a huge provider body or stderr costs little.
+pub const MAX_TEXT: usize = 64 * 1024;
 /// How deep JSON text inside JSON strings is opened. Each level doubles its
 /// escaping, and opening without a bound could overflow the stack.
 const MAX_NESTED_JSON: usize = 4;
@@ -149,37 +259,42 @@ fn regex(pattern: &str) -> Regex {
     Regex::new(pattern).expect("these patterns are fixed, and a test compiles them all")
 }
 
-/// `name = value` or `name: value`, with the value quoted or not, including
-/// JSON whose quotes are escaped because it sits inside another string, and
-/// Rust's `Some(value)`. Whether the name is a secret one is decided in code.
-static ASSIGNED: LazyLock<Regex> = LazyLock::new(|| {
+/// A command-line flag and its value: `--password x`, at the start of the
+/// text or after a space, a quote, a bracket or a comma, and as two items of
+/// an argument list, `"--token", "abc"`.
+static FLAG: LazyLock<Regex> = LazyLock::new(|| {
     regex(
-        r#"([A-Za-z0-9_.-]+)(\\*["']?[ \t]*[=:][ \t]*(?:Some\()?)(?:(\\*")([^"\n]*?)(\\*")|(\\*')([^'\n]*?)(\\*')|([^\s"'`\\]+))"#,
+        r#"(?:^|[\s"'\[,])(--?([A-Za-z0-9][A-Za-z0-9-]*)(?:\s+|["']\s*,\s*["']))("[^"\n]*"|'[^'\n]*'|\[REDACTED\]|[^\s"',\]-][^\s"',\]]*)"#,
     )
 });
-static FLAG: LazyLock<Regex> = LazyLock::new(|| {
-    regex(r#"(\s--?([A-Za-z0-9][A-Za-z0-9-]*)\s+)("[^"\n]*"|'[^'\n]*'|[^\s"'-][^\s"']*)"#)
-});
+/// An authorization, cookie or API key header and its value, to the end of
+/// the line or the quote around it.
 static HEADER: LazyLock<Regex> = LazyLock::new(|| {
     regex(
-        r#"(?i)((?:proxy-)?authorization|(?:set-)?cookie|x-api-key|x-auth-token)(\\*["']?\s*:\s*\\*["']?)([^\n"'\\]+)"#,
+        r#"(?i)\b((?:proxy-)?authorization|(?:set-)?cookie|x-api-key|x-auth-token)(\\*["']?[ \t]*:[ \t]*\\*["']?)([^\n"'\\]+)"#,
     )
 });
 static SCHEME: LazyLock<Regex> =
     LazyLock::new(|| regex(r"(?i)\b(bearer|basic)(\s+)([a-z0-9._~+/=-]{8,})"));
+/// A URL's password, to the last `@` before its host.
 static URL_PASSWORD: LazyLock<Regex> =
-    LazyLock::new(|| regex(r#"(?i)\b([a-z][a-z0-9+.-]*://[^\s/:@'"]*:)([^\s/@'"]+)(@)"#));
+    LazyLock::new(|| regex(r#"(?i)\b([a-z][a-z0-9+.-]*://[^\s/:@'"]*:)([^\s/'"]+)(@)"#));
 /// A URL whose user is a token, as `https://TOKEN@host` gives one to git.
 static URL_USERINFO: LazyLock<Regex> =
     LazyLock::new(|| regex(r#"(?i)\b([a-z][a-z0-9+.-]*://)([^\s/:@'"]+)(@)"#));
-/// The next assignment in a run of them, such as `&page=2` in a query.
-static NEXT_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| regex(r"^[A-Za-z_][A-Za-z0-9_.-]*[=:]"));
 /// References to a secret rather than the secret: `$NAME`, `${NAME}`,
 /// `${{ expression }}`, `%NAME%`, `{{ template }}`, `<placeholder>` and
 /// masks such as `***`.
 static REFERENCE: LazyLock<Regex> = LazyLock::new(|| {
     regex(
-        r"^(?:\$\{?[A-Z_][A-Z0-9_]*\}?|\$\{\{[^{}]*\}\}|%[A-Za-z_][A-Za-z0-9_]*%|\{\{[^{}]*\}\}|<[A-Za-z _-]+>|\*{3,})$",
+        r"^(?:\$\{?[A-Z_][A-Z0-9_]*\}?|\$\{\{[^{}]*\}\}|%[A-Za-z_][A-Za-z0-9_]*%|\{\{[^{}]*\}\}|<[^<>\n]{1,64}>|\*{3,}|x{3,}|X{3,})$",
+    )
+});
+/// Terminal escape sequences, as bytes or written out as JSON or C escapes:
+/// colours (`ESC[1;33m`) and titles (`ESC]0;…BEL`).
+static ANSI: LazyLock<Regex> = LazyLock::new(|| {
+    regex(
+        r"(?:\x1b|\\u001[bB]|\\x1[bB]|\\e|\\033)(?:\[[0-9;?]*[@-~]|\][^\x07\x1b\n]*(?:\x07|\x1b\\|\\u0007|\\x07|\\a)?)",
     )
 });
 static PRIVATE_KEY: LazyLock<Regex> =
@@ -208,15 +323,56 @@ fn name_parts(name: &str) -> Vec<String> {
     parts
 }
 
+/// How surely a name says its value is a secret.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Strength {
+    /// Not a secret's name.
+    None,
+    /// A hint, such as `token` or `pass` alone: the value is a secret only
+    /// if it looks like a credential.
+    Weak,
+    /// A secret's name, such as `password` or `api_key`: any value that is
+    /// not a reference, a placeholder or a word is a secret.
+    Strong,
+}
+
+/// How surely `name` names a secret. A dotted path is judged by its last
+/// segment: `input.password` names a password, `process.env.API_KEY` a key.
+fn strength(name: &str) -> Strength {
+    let last = name.rsplit('.').next().unwrap_or(name);
+    let parts = name_parts(last);
+    if parts.is_empty()
+        || parts
+            .iter()
+            .any(|part| NOT_SECRET_PARTS.contains(&part.as_str()))
+    {
+        return Strength::None;
+    }
+    let joined = parts.concat();
+    let qualified_key = parts
+        .windows(2)
+        .any(|pair| pair[1] == "key" && KEY_QUALIFIERS.contains(&pair[0].as_str()));
+    if qualified_key
+        || parts
+            .iter()
+            .any(|part| STRONG_PARTS.contains(&part.as_str()))
+        || STRONG_ENDINGS.iter().any(|end| joined.ends_with(end))
+    {
+        return Strength::Strong;
+    }
+    let weak =
+        parts.iter().any(|part| WEAK_PARTS.contains(&part.as_str())) || joined.ends_with("token");
+    match (weak, parts.len()) {
+        (false, _) => Strength::None,
+        // `DB_PASS`, `GH_PAT`, `accessToken`: qualified.
+        (true, 2..) => Strength::Strong,
+        (true, _) => Strength::Weak,
+    }
+}
+
 /// Whether a value under `name` is a secret, whatever it looks like.
 pub fn is_secret_name(name: &str) -> bool {
-    let parts = name_parts(name);
-    parts.iter().any(|part| {
-        SECRET_PARTS.contains(&part.as_str())
-            || SECRET_ENDINGS.iter().any(|end| part.ends_with(end))
-    }) && !parts
-        .iter()
-        .any(|part| NOT_SECRET_PARTS.contains(&part.as_str()))
+    strength(name) == Strength::Strong
 }
 
 fn is_token_char(c: char) -> bool {
@@ -276,13 +432,35 @@ fn known_shape(rest: &str) -> Option<usize> {
     Some(at + token_len(&rest[at..]))
 }
 
+/// How many bytes after a backslash make one escape: `\n`, `\t`, `\"`,
+/// `\uXXXX`, `\x1b`. What an escape stands for is never part of a token, so
+/// a key right after `\n` still starts one.
+fn escape_len(after: &str) -> usize {
+    let b = after.as_bytes();
+    let hex = |range: std::ops::Range<usize>| {
+        b.len() >= range.end && b[range].iter().all(u8::is_ascii_hexdigit)
+    };
+    match b.first() {
+        Some(b'u') if hex(1..5) => 5,
+        Some(b'x') if hex(1..3) => 3,
+        Some(
+            b'n' | b't' | b'r' | b'b' | b'f' | b'e' | b'a' | b'v' | b'0' | b'"' | b'\'' | b'\\'
+            | b'/',
+        ) => 1,
+        _ => 0,
+    }
+}
+
 /// Replace each private key block, and each token of a known format, with
-/// [`REDACTED`]. A key block with no end runs to the end of the text.
-fn shapes(input: &str) -> Cow<'_, str> {
+/// [`REDACTED`]. A key block with no end runs to the end of the text. Each
+/// character is looked at a bounded number of times.
+fn shapes(input: &str) -> Option<String> {
     let mut out = String::new();
     let mut copied = 0;
     let mut at = 0;
-    let mut previous: Option<char> = None;
+    // Whether a token may start at `at`: not inside a longer word, a path
+    // or base64 text, such as after `/` or `+`.
+    let mut boundary = true;
     while at < input.len() {
         let rest = &input[at..];
         // Checked only where a block starts, so the scan stays linear.
@@ -297,147 +475,412 @@ fn shapes(input: &str) -> Cow<'_, str> {
             out.push_str(REDACTED);
             at += len;
             copied = at;
-            previous = None;
+            boundary = true;
             continue;
         }
         let c = rest.chars().next().unwrap_or_default();
-        // A token starts where the character before it cannot be part of one
-        // (nor of a path or base64 text, such as `/` or `+`).
-        let starts = previous.is_none_or(|p| !is_token_char(p) && p != '/' && p != '+');
-        if starts && is_token_char(c) {
+        if c == '\\' {
+            at += 1 + escape_len(&rest[1..]);
+            boundary = true;
+            continue;
+        }
+        if boundary && is_token_char(c) {
             if let Some(len) = known_shape(rest) {
                 out.push_str(&input[copied..at]);
                 out.push_str(REDACTED);
                 at += len;
                 copied = at;
-                previous = input[..at].chars().next_back();
-                continue;
+            } else {
+                // Not a secret: move past the whole token.
+                at += token_len(rest).max(c.len_utf8());
             }
-            // Not a secret: move past the whole token.
-            let len = token_len(rest).max(c.len_utf8());
-            previous = rest[..len].chars().next_back();
-            at += len;
+            boundary = false;
             continue;
         }
-        previous = Some(c);
+        boundary = !is_token_char(c) && c != '/' && c != '+';
         at += c.len_utf8();
     }
     if copied == 0 {
-        return Cow::Borrowed(input);
+        return None;
     }
     out.push_str(&input[copied..]);
-    Cow::Owned(out)
+    Some(out)
 }
 
 /// A value next to a secret name that is plainly not the secret: a reference
-/// to one, a type, or a placeholder.
+/// to one, a placeholder, a type, or a word.
 fn is_not_a_secret(value: &str) -> bool {
-    const WORDS: [&str; 13] = [
-        "string",
-        "str",
-        "boolean",
-        "bool",
-        "number",
-        "int",
-        "null",
-        "none",
-        "true",
-        "false",
-        "undefined",
-        "required",
-        "optional",
-    ];
     value.is_empty()
         || value == REDACTED
+        || value.contains(REDACTED) && value.len() <= REDACTED.len() + 2
         || REFERENCE.is_match(value)
-        || WORDS.iter().any(|word| value.eq_ignore_ascii_case(word))
+        || STOPWORDS
+            .iter()
+            .any(|word| value.eq_ignore_ascii_case(word))
 }
 
 /// Text that is code rather than a value, which is common beside a word like
 /// `token`: a call, a path, a generic type or a reference.
 fn looks_like_code(value: &str) -> bool {
     value.ends_with("()")
+        || value.ends_with("();")
         || value.contains("::")
         || value.contains("->")
         || value.starts_with('&')
         || value.starts_with("self.")
+        || value.starts_with(['=', '>', ':'])
         || (value.contains('<') && value.ends_with('>'))
 }
 
-/// Where a bare value ends: at a `,`, `;` or `&` that ends the text or
-/// starts the next assignment (so a query's next parameter is kept), and
+/// Whether a value looks like a credential rather than a word or a number:
+/// a known format, or eight or more characters, no spaces, of at least two
+/// kinds (lower case, upper case, digits, symbols), and not a capitalised
+/// word.
+fn looks_like_credential(value: &str) -> bool {
+    if known_shape(value).is_some() {
+        return true;
+    }
+    if value.chars().count() < 8 || value.contains(char::is_whitespace) {
+        return false;
+    }
+    let mut kinds = [false; 4];
+    for c in value.chars() {
+        let kind = if c.is_ascii_lowercase() {
+            0
+        } else if c.is_ascii_uppercase() {
+            1
+        } else if c.is_ascii_digit() {
+            2
+        } else {
+            3
+        };
+        kinds[kind] = true;
+    }
+    let word = {
+        let mut chars = value.chars();
+        chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+            && chars.all(|c| c.is_ascii_lowercase())
+    };
+    !word && kinds.iter().filter(|k| **k).count() >= 2
+}
+
+/// Whether a value beside a name of this strength is the secret.
+fn is_secret_value(strength: Strength, value: &str) -> bool {
+    match strength {
+        Strength::None => false,
+        _ if is_not_a_secret(value) => false,
+        Strength::Strong => true,
+        Strength::Weak => looks_like_credential(value),
+    }
+}
+
+/// Basic credentials: base64 of `user:password`.
+fn is_basic_credential(value: &str) -> bool {
+    let value = value.trim_end_matches('=');
+    let mut bits = 0u32;
+    let mut count = 0;
+    let mut decoded = Vec::new();
+    for c in value.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            _ => return false,
+        };
+        bits = (bits << 6) | u32::from(v);
+        count += 6;
+        if count >= 8 {
+            count -= 8;
+            decoded.push((bits >> count) as u8);
+        }
+    }
+    decoded.contains(&b':') && decoded.iter().all(|b| b.is_ascii_graphic() || *b == b' ')
+}
+
+/// The schemes of an `Authorization` header's value.
+const SCHEMES: &[&str] = &[
+    "bearer",
+    "basic",
+    "token",
+    "digest",
+    "negotiate",
+    "ntlm",
+    "apikey",
+    "sharedkey",
+    "signature",
+    "aws4-hmac-sha256",
+];
+
+/// Whether a header's value is a credential: a scheme and what follows it,
+/// a cookie's `name=value`, or a value that looks like a key. Not
+/// `authorization: denied for user bob`.
+fn is_header_secret(header: &str, value: &str) -> bool {
+    let value = value.trim();
+    let first = value.split_whitespace().next().unwrap_or_default();
+    if header.to_ascii_lowercase().ends_with("cookie") {
+        return value.contains('=');
+    }
+    let scheme = SCHEMES.iter().any(|s| first.eq_ignore_ascii_case(s));
+    (scheme && value.len() > first.len()) || looks_like_credential(first)
+}
+
+/// A bracket in `value` closed but never opened in it, at its end.
+fn trim_unopened(value: &str) -> &str {
+    let mut depth = [0i64; 3];
+    for c in value.chars() {
+        match c {
+            '(' => depth[0] += 1,
+            ')' => depth[0] -= 1,
+            '[' => depth[1] += 1,
+            ']' => depth[1] -= 1,
+            '{' => depth[2] += 1,
+            '}' => depth[2] -= 1,
+            _ => {}
+        }
+    }
+    let mut value = value;
+    loop {
+        let slot = match value.chars().next_back() {
+            Some(')') => 0,
+            Some(']') => 1,
+            Some('}') => 2,
+            _ => return value,
+        };
+        if depth[slot] >= 0 {
+            return value;
+        }
+        depth[slot] += 1;
+        value = &value[..value.len() - 1];
+    }
+}
+
+/// Whether `rest` starts another assignment, as `page=2` does after `&`.
+/// Looks at most a name's length ahead.
+fn starts_assignment(rest: &str) -> bool {
+    let name = rest
+        .bytes()
+        .take(128)
+        .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+        .count();
+    name > 0
+        && rest.as_bytes()[0].is_ascii_alphabetic()
+        && matches!(rest.as_bytes().get(name), Some(b'=' | b':'))
+}
+
+/// The end of a bare value starting `rest`: at white space, a quote, a
+/// backtick or an escaped quote; at a `,`, `;` or `&` that ends the text or
+/// starts the next assignment (so a query's next parameter is kept); and
 /// before closing brackets it did not open.
-fn bare_value_len(value: &str) -> usize {
-    let mut end = value.len();
-    for (i, c) in value.char_indices() {
-        if matches!(c, ',' | ';' | '&') {
-            let after = &value[i + 1..];
-            if after.is_empty() || NEXT_ASSIGNMENT.is_match(after) {
+fn bare_value_len(rest: &str) -> usize {
+    let bytes = rest.as_bytes();
+    let mut end = rest.len();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'\'' | b'`' => {
                 end = i;
                 break;
             }
+            b'\\' if matches!(bytes.get(i + 1), Some(b'"' | b'n' | b'r' | b't')) => {
+                end = i;
+                break;
+            }
+            b',' | b';' | b'&' if i + 1 == bytes.len() || starts_assignment(&rest[i + 1..]) => {
+                end = i;
+                break;
+            }
+            b',' | b';' if matches!(bytes.get(i + 1), Some(b' ' | b'\t' | b'\n')) => {
+                end = i;
+                break;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    trim_unopened(&rest[..end]).len()
+}
+
+/// The end of a quoted value whose opening quote, `quote`, follows `level`
+/// backslashes (JSON inside a string escapes its quotes): the first such
+/// quote after it at the same level, so `\"` inside `"…"` does not end it.
+fn quoted_len(rest: &str, quote: u8, level: usize) -> Option<usize> {
+    let bytes = rest.as_bytes();
+    let mut backslashes = 0;
+    for (i, b) in bytes.iter().enumerate() {
+        match *b {
+            b'\n' => return None,
+            b'\\' => backslashes += 1,
+            q if q == quote => {
+                let closes = if level == 0 {
+                    backslashes % 2 == 0
+                } else {
+                    backslashes == level
+                };
+                if closes {
+                    return Some(i - backslashes);
+                }
+                backslashes = 0;
+            }
+            _ => backslashes = 0,
         }
     }
-    let mut value = &value[..end];
-    loop {
-        let unopened = |close: char, open: char| {
-            value.ends_with(close) && value.matches(close).count() > value.matches(open).count()
-        };
-        if unopened(')', '(') || unopened(']', '[') || unopened('}', '{') {
-            value = &value[..value.len() - 1];
+    None
+}
+
+/// Where the value after a separator at `at` starts, past white space and
+/// Rust's Debug wrappers (`Some(`, `Secret(`), whose pretty form, `{:#?}`,
+/// puts the value on the next line.
+fn value_start(input: &str, mut at: usize) -> usize {
+    let skip_blanks = |at: usize, newlines: bool| {
+        at + input[at..]
+            .bytes()
+            .take_while(|b| matches!(b, b' ' | b'\t') || newlines && matches!(b, b'\n' | b'\r'))
+            .count()
+    };
+    at = skip_blanks(at, false);
+    for _ in 0..3 {
+        let rest = &input[at..];
+        let ident = rest
+            .bytes()
+            .take(64)
+            .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
+            .count();
+        if ident > 0
+            && rest.as_bytes()[0].is_ascii_uppercase()
+            && rest.as_bytes().get(ident) == Some(&b'(')
+        {
+            at = skip_blanks(at + ident + 1, true);
         } else {
-            return value.len();
+            break;
+        }
+    }
+    at
+}
+
+/// The name before a separator ending at `sep`: back past blanks and a
+/// closing quote (escaped or not), then name characters, at most 128.
+fn name_before(input: &str, sep: usize) -> Option<(usize, usize)> {
+    let bytes = input.as_bytes();
+    let mut end = sep;
+    while end > 0 && matches!(bytes[end - 1], b' ' | b'\t') {
+        end -= 1;
+    }
+    if end > 0 && matches!(bytes[end - 1], b'"' | b'\'') {
+        end -= 1;
+        while end > 0 && bytes[end - 1] == b'\\' {
+            end -= 1;
+        }
+    }
+    let mut start = end;
+    while start > 0
+        && end - start < 128
+        && (bytes[start - 1].is_ascii_alphanumeric()
+            || matches!(bytes[start - 1], b'_' | b'.' | b'-'))
+    {
+        start -= 1;
+    }
+    // Not the letter of an escape, as the `n` of `\npassword`.
+    if start > 0 && bytes[start - 1] == b'\\' && start < end {
+        start += 1;
+    }
+    (start < end).then_some((start, end))
+}
+
+/// The value after a separator: its span and whether it was quoted.
+fn value_after(input: &str, at: usize) -> Option<(usize, usize)> {
+    let rest = &input[at..];
+    let bytes = rest.as_bytes();
+    let level = bytes.iter().take_while(|b| **b == b'\\').count();
+    match bytes.get(level) {
+        // Quotes escaped at most eight deep: each depth's quotes are scanned
+        // once, so the scan stays linear.
+        Some(q @ (b'"' | b'\'')) if level <= 8 => {
+            let start = at + level + 1;
+            let len = quoted_len(&input[start..], *q, level)?;
+            Some((start, start + len))
+        }
+        None => None,
+        // A placeholder, `<your key>`, or a template, `{{ x }}`, may hold
+        // spaces.
+        Some(b'<') => {
+            let len = rest
+                .bytes()
+                .take(66)
+                .position(|b| b == b'>' || b == b'\n')?;
+            (bytes[len] == b'>').then_some((at, at + len + 1))
+        }
+        Some(_)
+            if (rest.starts_with("{{") || rest.starts_with("${{"))
+                && rest[..rest.find('\n').unwrap_or(rest.len())].contains("}}") =>
+        {
+            let end = rest.find("}}").map_or(rest.len(), |end| end + 2);
+            Some((at, at + end))
+        }
+        Some(_) => {
+            let len = bare_value_len(rest);
+            (len > 0).then_some((at, at + len))
         }
     }
 }
 
-/// Redact the values assigned to secret names in `input`. The search goes on
-/// after each value, or after each name that is not a secret one, so a value
-/// that holds another assignment is searched too.
+/// Redact the values assigned to secret names in `input`: `name=value`,
+/// `name: value`, `name := value`, `'name' => 'value'`. One pass: each
+/// separator is looked at once, a name at most 128 characters back, and a
+/// value once, after which the search goes on past it.
 fn assigned(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
     let mut out = String::new();
     let mut copied = 0;
     let mut at = 0;
-    while let Some(captures) = ASSIGNED.captures_at(input, at) {
-        let (Some(name), Some(prefix)) = (captures.get(1), captures.get(2)) else {
-            break;
-        };
-        let mut resume = prefix.end();
-        if is_secret_name(name.as_str()) {
-            let quoted = [(3, 4, 5), (6, 7, 8)]
-                .into_iter()
-                .find_map(|(open, value, close)| {
-                    captures.get(open)?;
-                    captures.get(close)?;
-                    captures.get(value)
-                });
-            let value = match (quoted, captures.get(9)) {
-                (Some(value), _) => Some((value.start(), value.as_str())),
-                (None, Some(bare)) => {
-                    // A template, `{{ x }}` or `${{ x }}`, may hold spaces.
-                    let rest = &input[bare.start()..];
-                    let template = (rest.starts_with("{{") || rest.starts_with("${{"))
-                        .then(|| rest.find("}}").map(|end| &rest[..end + 2]))
-                        .flatten()
-                        .filter(|t| !t.contains('\n'));
-                    let value =
-                        template.unwrap_or_else(|| &bare.as_str()[..bare_value_len(bare.as_str())]);
-                    Some((bare.start(), value))
-                }
-                (None, None) => None,
-            };
-            if let Some((start, value)) = value {
-                let plain = quoted.is_some()
-                    || !(value.starts_with([':', '=', '>']) || looks_like_code(value));
-                if plain && !is_not_a_secret(value) {
-                    out.push_str(&input[copied..start]);
-                    out.push_str(REDACTED);
-                    copied = start + value.len();
-                }
-                resume = resume.max(start + value.len());
+    while let Some(found) = input[at..].find(['=', ':']) {
+        let sep = at + found;
+        let next = bytes.get(sep + 1).copied();
+        let sep_len = match (bytes[sep], next) {
+            // A path, a comparison, a URL: no assignment.
+            (b':', Some(b':')) | (b'=', Some(b'=')) | (b'=', Some(b'~')) => {
+                at = sep + 2;
+                continue;
             }
+            (b':', Some(b'/')) => {
+                at = sep + 1;
+                continue;
+            }
+            (b':', Some(b'=')) | (b'=', Some(b'>')) => 2,
+            _ => 1,
+        };
+        at = sep + sep_len;
+        let Some((name_start, name_end)) = name_before(input, sep) else {
+            continue;
+        };
+        let strength = strength(&input[name_start..name_end]);
+        if strength == Strength::None {
+            continue;
         }
-        at = resume;
+        let start = value_start(input, sep + sep_len);
+        let Some((value_from, mut value_to)) = value_after(input, start) else {
+            continue;
+        };
+        // `authorization=Bearer abc`: the scheme and its credential.
+        let value = &input[value_from..value_to];
+        let mut strength = strength;
+        if SCHEMES.iter().any(|s| value.eq_ignore_ascii_case(s))
+            && input[value_to..].starts_with(' ')
+            && let Some((credential_from, credential_to)) = value_after(input, value_to + 1)
+            && !is_not_a_secret(&input[credential_from..credential_to])
+        {
+            value_to = credential_to;
+            strength = Strength::Strong;
+        }
+        let value = &input[value_from..value_to];
+        let quoted = value_from > start;
+        if (quoted || !looks_like_code(value)) && is_secret_value(strength, value) {
+            out.push_str(&input[copied..value_from]);
+            out.push_str(REDACTED);
+            copied = value_to;
+        }
+        at = at.max(value_to);
     }
     if copied == 0 {
         return None;
@@ -448,19 +891,20 @@ fn assigned(input: &str) -> Option<String> {
 
 fn redact_flag(captures: &Captures<'_>) -> String {
     let value = captures[3].trim_matches(['"', '\'']);
-    if !is_secret_name(&captures[2]) || is_not_a_secret(value) {
+    if !is_secret_value(strength(&captures[2]), value) {
         return captures[0].to_string();
     }
-    format!("{}{REDACTED}", &captures[1])
+    let whole = captures.get(0).map_or(0, |m| m.start());
+    let value_at = captures.get(3).map_or(0, |m| m.start());
+    format!("{}{REDACTED}", &captures[0][..value_at - whole])
 }
 
 /// "bearer authentication" is prose: a bearer token has a digit or is long,
-/// and Basic credentials are base64, padded to a multiple of four.
+/// and Basic credentials are base64 of `user:password`.
 fn redact_scheme(captures: &Captures<'_>) -> String {
     let value = &captures[3];
     let tokenish = if captures[1].eq_ignore_ascii_case("basic") {
-        (value.len().is_multiple_of(4) || value.ends_with('='))
-            && !value.bytes().all(|byte| byte.is_ascii_lowercase())
+        is_basic_credential(value)
     } else {
         value.bytes().any(|byte| byte.is_ascii_digit()) || value.len() >= 20
     };
@@ -483,9 +927,16 @@ fn redact_userinfo(captures: &Captures<'_>) -> String {
     format!("{}{REDACTED}{}", &captures[1], &captures[3])
 }
 
-/// Replaces secrets in text.
+/// Replaces secrets in text. Linear in the length of `input`; callers
+/// with text of unknown length bound it first (see [`excerpt`]).
 pub fn text(input: &str) -> Cow<'_, str> {
-    let mut output = shapes(input);
+    let mut output = match ANSI.replace_all(input, "") {
+        Cow::Borrowed(_) => Cow::Borrowed(input),
+        Cow::Owned(stripped) => Cow::Owned(stripped),
+    };
+    if let Some(shaped) = shapes(&output) {
+        output = Cow::Owned(shaped);
+    }
     let mut apply = |rule: &Regex, replace: &dyn Fn(&Captures<'_>) -> String| {
         // Most text has nothing, so this avoids building a new string for
         // each rule.
@@ -504,13 +955,76 @@ pub fn text(input: &str) -> Cow<'_, str> {
     apply(&URL_USERINFO, &redact_userinfo);
     // The whole value, even when part of it was redacted already: the rest
     // of a cookie is as secret as its first part.
-    apply(&HEADER, &|c| format!("{}{}{REDACTED}", &c[1], &c[2]));
+    apply(&HEADER, &|c| {
+        if is_header_secret(&c[1], &c[3]) {
+            format!("{}{}{REDACTED}", &c[1], &c[2])
+        } else {
+            c[0].to_string()
+        }
+    });
     apply(&SCHEME, &redact_scheme);
     apply(&FLAG, &redact_flag);
     if let Some(replaced) = assigned(&output) {
         output = Cow::Owned(replaced);
     }
     output
+}
+
+/// `input` cut to `chars` characters, ending `…` if it was longer.
+fn cut(input: &str, chars: usize) -> Cow<'_, str> {
+    match input.char_indices().nth(chars) {
+        Some((at, _)) => Cow::Owned(format!("{}…", &input[..at])),
+        None => Cow::Borrowed(input),
+    }
+}
+
+/// How much of a text to redact so that `chars` of it survive: enough to
+/// spare, so a secret cut in half at the bound is never in what is kept.
+fn margin(chars: usize) -> usize {
+    chars.saturating_mul(2).saturating_add(16 * 1024)
+}
+
+/// The start of `input`, at most `chars` characters, redacted. The text is
+/// bounded before it is redacted, so a huge input costs little, with room to
+/// spare, so a secret cut in half there is never in the excerpt. JSON is
+/// redacted as JSON (see [`value`]), so its escapes hide no secret.
+pub fn excerpt(input: &str, chars: usize) -> String {
+    let bounded = cut(input, margin(chars));
+    let trimmed = bounded.trim_start();
+    let redacted = match serde_json::from_str::<Value>(trimmed) {
+        Ok(mut doc) if trimmed.starts_with(['{', '[']) => {
+            let before = doc.clone();
+            value(&mut doc);
+            if doc == before {
+                text(&bounded).into_owned()
+            } else {
+                doc.to_string()
+            }
+        }
+        _ => text(&bounded).into_owned(),
+    };
+    cut(&redacted, chars).into_owned()
+}
+
+/// The start of `input`, at most `chars` characters, redacted as text: as
+/// [`excerpt`], for a log line or a span's attribute.
+pub fn bounded(input: &str, chars: usize) -> String {
+    let bounded = cut(input, margin(chars));
+    let redacted = text(&bounded);
+    cut(&redacted, chars).into_owned()
+}
+
+/// The end of `input`, at most `chars` characters, redacted: as
+/// [`excerpt`], for the tail of a command's stderr.
+pub fn tail(input: &str, chars: usize) -> String {
+    let count = input.chars().count();
+    let from = input
+        .char_indices()
+        .nth(count.saturating_sub(margin(chars)))
+        .map_or(input.len(), |(at, _)| at);
+    let redacted = text(&input[from..]);
+    let count = redacted.chars().count();
+    redacted.chars().skip(count.saturating_sub(chars)).collect()
 }
 
 fn redact_string(string: &mut String, nested: usize) {
@@ -532,33 +1046,67 @@ fn redact_string(string: &mut String, nested: usize) {
     }
 }
 
-/// Redact every string and number in a value held under a secret name,
-/// keeping its shape.
-fn redact_all(value: &mut Value) {
+/// Redact what a value held under a name of this strength holds, keeping
+/// its shape: under `password`, every string and number; under `token`,
+/// strings that look like credentials.
+fn redact_held(strength: Strength, value: &mut Value, nested: usize) {
     match value {
-        Value::String(string) if is_not_a_secret(string) => {}
-        Value::String(_) | Value::Number(_) => *value = Value::String(REDACTED.into()),
-        Value::Array(items) => items.iter_mut().for_each(redact_all),
-        Value::Object(fields) => fields.values_mut().for_each(redact_all),
-        Value::Null | Value::Bool(_) => {}
+        Value::String(string) if is_secret_value(strength, string) => {
+            *string = REDACTED.into();
+        }
+        Value::String(string) => redact_string(string, nested),
+        Value::Number(_) if strength == Strength::Strong => *value = Value::String(REDACTED.into()),
+        Value::Array(items) => items
+            .iter_mut()
+            .for_each(|item| redact_held(strength, item, nested)),
+        Value::Object(fields) => fields
+            .values_mut()
+            .for_each(|field| redact_held(strength, field, nested)),
+        Value::Number(_) | Value::Null | Value::Bool(_) => {}
     }
 }
 
+/// Header names whose values are credentials.
+const HEADERS: &[&str] = &[
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+    "x-api-key",
+    "x-auth-token",
+];
+
+/// Whether `secret` is the credential of a name and value pair named `name`:
+/// a header's credential, or a credential under a secret's name. Not
+/// `["password", "email"]`.
+fn pair_holds_secret(name: &str, secret: &Value) -> bool {
+    let Some(secret) = secret.as_str() else {
+        return false;
+    };
+    if HEADERS.iter().any(|h| name.eq_ignore_ascii_case(h)) {
+        return is_header_secret(name, secret);
+    }
+    strength(name) == Strength::Strong && looks_like_credential(secret)
+}
+
 /// A header as a pair, `["Authorization", "..."]`, or as an object,
-/// `{"name": "Authorization", "value": "..."}`: the value whose name is a
-/// secret one.
+/// `{"name": "Authorization", "value": "..."}`: the value, when it is the
+/// pair's secret.
 fn header_pair(value: &mut Value) -> Option<&mut Value> {
     match value {
         Value::Array(items) if items.len() == 2 => {
-            let named = items[0].as_str().is_some_and(is_secret_name);
+            let named = items[0]
+                .as_str()
+                .is_some_and(|name| pair_holds_secret(name, &items[1]));
             named.then(|| &mut items[1])
         }
         Value::Object(fields) => {
+            let secret = fields.get("value")?;
             let named = ["name", "key", "header"].iter().any(|field| {
                 fields
                     .get(*field)
                     .and_then(Value::as_str)
-                    .is_some_and(is_secret_name)
+                    .is_some_and(|name| pair_holds_secret(name, secret))
             });
             if named { fields.get_mut("value") } else { None }
         }
@@ -568,7 +1116,7 @@ fn header_pair(value: &mut Value) -> Option<&mut Value> {
 
 fn redact_nested(value: &mut Value, nested: usize) {
     if let Some(secret) = header_pair(value) {
-        redact_all(secret);
+        *secret = Value::String(REDACTED.into());
     }
     match value {
         Value::String(string) => redact_string(string, nested),
@@ -589,10 +1137,16 @@ fn redact_nested(value: &mut Value, nested: usize) {
                 }
             }
             for (key, field) in fields.iter_mut() {
-                if is_secret_name(key) {
-                    redact_all(field);
-                } else {
-                    redact_nested(field, nested);
+                // A header's value, such as `"Authorization": "Bearer …"`.
+                if HEADERS.iter().any(|h| key.eq_ignore_ascii_case(h))
+                    && field.as_str().is_some_and(|v| is_header_secret(key, v))
+                {
+                    *field = Value::String(REDACTED.into());
+                    continue;
+                }
+                match strength(key) {
+                    Strength::None => redact_nested(field, nested),
+                    held => redact_held(held, field, nested),
                 }
             }
         }
@@ -605,23 +1159,34 @@ pub fn value(value: &mut Value) {
     redact_nested(value, 0);
 }
 
-/// Write one log line to stderr, redacted. atomic's own log lines go
-/// through this, never straight to `eprintln!`.
+/// Write one log line to stderr, redacted and bounded to [`MAX_TEXT`]
+/// characters. atomic's own log lines go through this, never straight to
+/// `eprintln!`.
 pub fn log(line: impl AsRef<str>) {
-    eprintln!("{}", text(line.as_ref()));
+    eprintln!("{}", bounded(line.as_ref(), MAX_TEXT));
 }
 
 /// A writer that redacts each line before it reaches stderr, for code that
 /// writes its log lines to a `Write` it is given. A line is written once
-/// it ends, or when the writer is flushed or dropped.
+/// it ends, or when the writer is flushed or dropped. The lines inside a
+/// private key block that one line opens are not written at all.
 pub struct Lines {
     pending: Vec<u8>,
+    in_key: bool,
+    out: Box<dyn std::io::Write + Send>,
 }
 
 /// A [`Lines`] writer to this process's stderr.
 pub fn stderr_lines() -> Lines {
+    lines_to(Box::new(std::io::stderr()))
+}
+
+/// A [`Lines`] writer to `out`.
+pub fn lines_to(out: Box<dyn std::io::Write + Send>) -> Lines {
     Lines {
         pending: Vec::new(),
+        in_key: false,
+        out,
     }
 }
 
@@ -630,8 +1195,15 @@ impl Lines {
         let line: Vec<u8> = self.pending.drain(..upto).collect();
         let line = String::from_utf8_lossy(&line);
         let line = line.strip_suffix('\n').unwrap_or(&line);
-        use std::io::Write;
-        writeln!(std::io::stderr().lock(), "{}", text(line))
+        if self.in_key {
+            self.in_key = !line.contains("-----END ");
+            return Ok(());
+        }
+        let opens = line
+            .find("-----BEGIN ")
+            .is_some_and(|at| PRIVATE_KEY.is_match(&line[at..]));
+        self.in_key = opens && !line.contains("-----END ");
+        writeln!(self.out, "{}", bounded(line, MAX_TEXT))
     }
 }
 
@@ -648,14 +1220,13 @@ impl std::io::Write for Lines {
         if !self.pending.is_empty() {
             self.emit(self.pending.len())?;
         }
-        Ok(())
+        self.out.flush()
     }
 }
 
 impl Drop for Lines {
     fn drop(&mut self) {
-        use std::io::Write;
-        let _ = self.flush();
+        let _ = std::io::Write::flush(self);
     }
 }
 

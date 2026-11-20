@@ -815,20 +815,15 @@ where
         report.turns += 1;
         // One span per turn, which may make several requests; it ends before
         // the turn is settled.
-        let span = crate::usage::call_span(
+        let span = crate::spans::hold(crate::usage::call_span(
             &endpoint.model,
             crate::usage::provider_name(&endpoint.base_url),
-        );
+        ));
         let bounded_by = ticket.as_ref().and_then(|t| t.bounded_by.clone());
         // A turn is cut off when its reserved time runs out; a failed or cut
         // off turn still reports the usage seen before it stopped.
-        let (turn, totals) = {
-            use tracing::Instrument;
-            run_turn(&thread, &current, limit.time)
-                .instrument(span.clone())
-                .await
-        };
-        if let Err(e) = &turn {
+        let (turn, totals) = span.run(run_turn(&thread, &current, limit.time)).await;
+        if let (Err(e), Some(span)) = (&turn, span.span()) {
             crate::usage::record_error(&span, e);
         }
         // Codex repeats the last totals in every token count, so a turn
@@ -843,7 +838,9 @@ where
                     output_tokens: (output - seen.1).max(0),
                 };
                 seen = (input, output);
-                crate::usage::record_usage(&span, &grown);
+                if let Some(span) = span.span() {
+                    crate::usage::record_usage(&span, &grown);
+                }
                 report.input_tokens = input;
                 report.output_tokens = output;
                 report.total_tokens = total;
@@ -851,7 +848,7 @@ where
             }
             None => Outcome::Unknown,
         };
-        drop(span);
+        span.end();
         if let Err(e) = meter.settle(ticket, outcome).await {
             break Err(meter_error(e));
         }
@@ -1241,7 +1238,7 @@ async fn turn(
                     .context("the turn completed without a message");
             }
             // A provider's error can echo what it was sent.
-            EventMsg::Error(event) => bail!("{}", crate::redact::text(&event.message)),
+            EventMsg::Error(event) => bail!("{}", crate::redact::excerpt(&event.message, 4096)),
             EventMsg::TurnAborted(_) => bail!("turn aborted"),
             EventMsg::ExecApprovalRequest(_) => bail!("turn requested exec approval"),
             EventMsg::ApplyPatchApprovalRequest(_) => bail!("turn requested patch approval"),

@@ -69,9 +69,11 @@ bill of materials.
 - Use: part of atomic's redaction module,
   [`crates/atomic-core/src/redact.rs`](crates/atomic-core/src/redact.rs), is
   adapted from rig-core's `src/redact.rs`: the finder for secrets of a known
-  format (its table of provider key prefixes, in its order, and its JSON Web
-  Token scan) and the check that a value beside a secret name is plausibly
-  the secret. atomic does not depend on rig-core.
+  format, that is its table of provider key prefixes (in its order, which
+  atomic extends), its JSON Web Token scan, its AWS access key ID check, its
+  private key block finder and its rule for where a token may start. Some of
+  the fixtures in atomic's redaction tests come from rig-core's tests.
+  atomic does not depend on rig-core.
 
 The MIT License, as it applies to the projects above that use it:
 

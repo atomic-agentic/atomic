@@ -464,9 +464,17 @@ async fn stop(signals: &mut Signals, who: &str, exit: Exit) -> ! {
     if interrupted > 0 {
         atomic_core::log_line!("{who}: settled {interrupted} model call(s) that had not finished");
     }
+    // Spans still open end and are sent; a collector that does not answer
+    // holds this up only until another signal.
+    let flushing = tokio::task::spawn_blocking(atomic_app::telemetry::flush_blocking);
+    tokio::select! {
+        _ = flushing => {}
+        again = signals.next() => {
+            atomic_core::log_line!("{who}: {again}: stopping now, without sending the last spans");
+        }
+    }
     // Exit here, not by returning: the runtime would wait for the blocked
     // threads of the stopped commands, which never return.
-    atomic_app::telemetry::flush();
     std::process::exit(match exit {
         Exit::Served if forced.is_none() && stopped == 0 => 0,
         Exit::Served => 1,

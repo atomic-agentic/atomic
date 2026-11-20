@@ -272,6 +272,7 @@ pub(crate) fn call_span(model: &str, provider: &str) -> tracing::Span {
         error.message = tracing::field::Empty,
         atomic.workflow.id = tracing::field::Empty,
         atomic.step = tracing::field::Empty,
+        atomic.stopped = tracing::field::Empty,
     );
     if let Some(caller) = caller {
         span.record("atomic.workflow.id", caller.run.as_str());

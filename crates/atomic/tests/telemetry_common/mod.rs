@@ -19,7 +19,7 @@ pub const NOTE: &str = r#"{"text": "Exporting a file named café.txt crashes the
 pub const RANK: &str = r#"{"priority": 1}"#;
 pub const SUMMARY: &str = r#"{"line": "P1: Export crashes on accents"}"#;
 /// A collector credential, in the exporter's headers.
-pub const COLLECTOR_TOKEN: &str = concat!("glpat-", "COLLECTORcredential0123456789");
+pub const COLLECTOR_SEED: &str = concat!("glpat-", "COLLECTORcredential0123456789");
 
 /// A scratch directory, removed when the test ends.
 pub struct Scratch(pub PathBuf);
@@ -109,6 +109,13 @@ pub fn project(dir: &Path) -> PathBuf {
          sys.exit(3)\n",
     )
     .unwrap();
+    std::fs::write(
+        project.join("tools/misfit.py"),
+        "import json, sys\n\
+         note = json.load(sys.stdin)\n\
+         json.dump({'title': 'misfit', 'words': note['text']}, sys.stdout)\n",
+    )
+    .unwrap();
     let note = || object(json!({"text": {"type": "string"}}));
     write_atom(
         &project,
@@ -125,6 +132,14 @@ pub fn project(dir: &Path) -> PathBuf {
         &project,
         "leak-note",
         "description: 'Fail loudly.', kind: 'exec', exec: { command: ['python3', 'tools/leak.py'] }",
+        "",
+        note(),
+        object(json!({"title": {"type": "string"}, "words": {"type": "integer"}})),
+    );
+    write_atom(
+        &project,
+        "misfit-note",
+        "description: 'Answer out of shape.', kind: 'exec', exec: { command: ['python3', 'tools/misfit.py'] }",
         "",
         note(),
         object(json!({"title": {"type": "string"}, "words": {"type": "integer"}})),
@@ -175,6 +190,7 @@ pub fn project(dir: &Path) -> PathBuf {
         ("triage", workflow("triage", "count-note", "")),
         ("gated", workflow("gated", "count-note", gate)),
         ("leaky", workflow("leaky", "leak-note", "")),
+        ("misfit", workflow("misfit", "misfit-note", "")),
         (
             "review",
             "atomic: 1\nname: review\n\
@@ -436,7 +452,7 @@ pub fn exporting(collector: &str, protocol: &str) -> Vec<(&'static str, String)>
         ("OTEL_EXPORTER_OTLP_PROTOCOL", protocol.to_owned()),
         (
             "OTEL_EXPORTER_OTLP_HEADERS",
-            format!("authorization=Bearer {COLLECTOR_TOKEN}"),
+            format!("authorization=Bearer {COLLECTOR_SEED}"),
         ),
     ]
 }
@@ -499,5 +515,52 @@ pub fn echoing(secret: &str) -> Reply {
         body: format!(
             r#"{{"error": {{"message": "Incorrect API key provided: {secret}", "type": "invalid_request_error"}}}}"#
         ),
+    }
+}
+
+/// A collector that accepts connections and never answers.
+pub fn hung_collector() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in listener.incoming() {
+            held.extend(stream.ok());
+        }
+    });
+    url
+}
+
+/// Send `child` the signal named `name`, as `kill -<name>` does.
+pub fn signal(child: &std::process::Child, name: &str) {
+    let sent = Command::new("/bin/sh")
+        .args(["-c", &format!("kill -{name} {}", child.id())])
+        .status()
+        .unwrap();
+    assert!(sent.success(), "kill -{name}");
+}
+
+/// Wait until the run `child` runs in `dir`'s project waits at a gate, as
+/// `atomic gates list` shows.
+pub fn wait_for_gate(dir: &Path, model: &str, child: &mut std::process::Child) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        let listed = command(dir, model, &["gates", "list", "--json"], &[])
+            .output()
+            .unwrap();
+        let open: Value = serde_json::from_slice(&listed.stdout).unwrap_or(json!([]));
+        if open.as_array().is_some_and(|g| !g.is_empty()) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no gate opened: {}",
+            text(&listed)
+        );
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the run ended before its gate"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
     }
 }

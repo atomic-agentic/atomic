@@ -125,6 +125,11 @@ enum Debug {
     Probe(PromptArgs),
     /// Print the project's state directory.
     StateDir,
+    /// Panic with this message, to see what a panic writes.
+    Panic {
+        /// The message.
+        message: String,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -165,10 +170,16 @@ fn main() -> std::process::ExitCode {
         // Reported here, redacted, rather than by the default `{:?}` of a
         // returned error.
         Err(e) => {
-            atomic_core::log_line!("error: {e:#}");
+            atomic_core::redact::log(error_line(&e));
             std::process::ExitCode::FAILURE
         }
     }
+}
+
+/// The line `main` reports an error that reached it with, redacted: an
+/// error's chain, never its `Debug` form.
+fn error_line(e: &anyhow::Error) -> String {
+    atomic_core::redact::bounded(&format!("error: {e:#}"), atomic_core::redact::MAX_TEXT)
 }
 
 fn real_main() -> anyhow::Result<()> {
@@ -339,6 +350,7 @@ async fn run(cli: Cli, paths: CodexPaths, state: ProjectState) -> anyhow::Result
             println!("atomic {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
+        Some(Command::Debug(Debug::Panic { message })) => panic!("{message}"),
         Some(Command::Debug(Debug::StateDir)) => {
             println!("{}", state.dir().display());
             Ok(())
@@ -701,4 +713,20 @@ async fn prompt(
         &args.prompt.join(" "),
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mains_error_line_is_redacted() {
+        let sample = concat!("glpat-", "MAINerrorLINEsample0123");
+        let e = anyhow::anyhow!("the provider said {sample}").context("start Codex");
+        let line = error_line(&e);
+        assert!(
+            line == "error: start Codex: the provider said [REDACTED]",
+            "the line was not redacted as expected"
+        );
+    }
 }

@@ -65,12 +65,19 @@ model call `atomic.model_call` or `atomic.meter`). A process that stops while
 runs are still going, such as one stopped while it waits at a gate, ends the
 spans still open with `atomic.stopped` set and exports them before it exits.
 
+A stopping process sends its last spans before it exits. A collector that
+accepts the connection and never answers holds the exit up for the
+exporter's timeout (`OTEL_EXPORTER_OTLP_TIMEOUT`, 10 seconds by default) and
+a short shutdown after it; send the signal again to exit at once, without
+those spans.
+
 A step that replays from its checkpoint after a restart makes no span: only
 work that runs does. Each span's strings are redacted before they are
-exported, as atomic's log lines and error reports are: values that look like
-keys, tokens, passwords or credentials, and values given to a name with a word
-such as `key`, `secret`, `token`, `pass` or `signature` in it, become
-`[REDACTED]`.
+exported, as atomic's log lines and error reports are: values in the formats
+of well-known keys and tokens, values given to a secret's name (`password`,
+`api_key`, `AWS_SECRET_KEY`, `DB_PASS`), and credential-looking values given to
+a name such as `token` or `pass`, become `[REDACTED]`. Each string is cut to
+4,096 characters before it is redacted.
 
 ## Add an optional local trace viewer
 

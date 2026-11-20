@@ -26,7 +26,6 @@ use crate::usage::{Call, Limit, Outcome, Usage, meter_error};
 use anyhow::{Context, anyhow, bail};
 use serde_json::{Value, json};
 use std::time::Duration;
-use tracing::Instrument;
 
 /// How long one call may take before it fails, unless the runtime says
 /// otherwise. Reasoning models on local hardware can think for minutes.
@@ -281,29 +280,29 @@ where
             .map_err(meter_error)?;
         index += 1;
         // Opened once the call is admitted, so a refused call exports none.
-        let span = crate::usage::call_span(
+        let span = crate::spans::hold(crate::usage::call_span(
             &model,
             crate::usage::provider_name(&runtime.endpoint.base_url),
-        );
-        let called = call(
-            &client,
-            runtime,
-            key.as_deref(),
-            &model,
-            first.developer_instructions.as_deref(),
-            &exchange,
-            schema.as_ref(),
-            &limit,
-        )
-        .instrument(span.clone())
-        .await;
-        if let Some(usage) = &called.usage {
+        ));
+        let called = span
+            .run(call(
+                &client,
+                runtime,
+                key.as_deref(),
+                &model,
+                first.developer_instructions.as_deref(),
+                &exchange,
+                schema.as_ref(),
+                &limit,
+            ))
+            .await;
+        if let (Some(usage), Some(span)) = (&called.usage, span.span()) {
             crate::usage::record_usage(&span, usage);
         }
-        if let Err(e) = &called.answer {
+        if let (Err(e), Some(span)) = (&called.answer, span.span()) {
             crate::usage::record_error(&span, e);
         }
-        drop(span);
+        span.end();
         let outcome = match (&called.answer, called.usage) {
             // What the provider reported, whatever it answered.
             (_, Some(usage)) => Outcome::Reported(usage),
@@ -614,18 +613,8 @@ fn responses_answer(value: &Value) -> anyhow::Result<Answer> {
 /// The start of a provider's response, for an error message, with any
 /// secret it echoes redacted first, so the cut cannot hide one.
 fn excerpt(text: &str) -> String {
-    const MAX: usize = 500;
-    // Bounded before it is redacted, so a huge body costs little; with room
-    // to spare, so a secret cut in half there is never in the excerpt.
-    const BOUND: usize = 64 * 1024;
-    let cut = |text: &str, max: usize| text.char_indices().nth(max).map(|(at, _)| at);
-    let bounded = &text[..cut(text, BOUND).unwrap_or(text.len())];
-    let text = crate::redact::text(bounded);
-    let text = text.as_ref();
-    match cut(text, MAX) {
-        Some(at) => format!("{}…", &text[..at]),
-        None => text.to_owned(),
-    }
+    // Bounded, redacted (as JSON when it is JSON), then cut.
+    crate::redact::excerpt(text, 500)
 }
 
 #[cfg(test)]

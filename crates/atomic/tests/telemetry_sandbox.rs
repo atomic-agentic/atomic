@@ -28,7 +28,7 @@ use telemetry_common::*;
 /// sandbox helper even for a turn that runs no command.
 #[test]
 fn a_secret_a_codex_provider_echoes_is_redacted_from_its_error_event() {
-    const SECRET: &str = concat!("sk-ant-", "api03-CODEXeventSECRET0123456789abcdef");
+    const SEEDED: &str = concat!("sk-ant-", "api03-CODEXeventSEEDED0123456789abcdef");
     support::require_sandbox();
     let dir = scratch("codex-secret");
     project(&dir);
@@ -36,7 +36,7 @@ fn a_secret_a_codex_provider_echoes_is_redacted_from_its_error_event() {
     let refused = Reply::Http {
         status: 400,
         body: format!(
-            r#"{{"error": {{"message": "Refused the key {SECRET}", "type": "invalid_request_error"}}}}"#
+            r#"{{"error": {{"message": "Refused the key {SEEDED}", "type": "invalid_request_error"}}}}"#
         ),
     };
     let (model, _rt) = model(vec![refused; 8]);
@@ -47,9 +47,9 @@ fn a_secret_a_codex_provider_echoes_is_redacted_from_its_error_event() {
         shown.contains("Refused the key [REDACTED]"),
         "the error is reported: {shown}"
     );
-    assert!(!shown.contains(SECRET), "the secret was shown: {shown}");
+    assert!(!shown.contains(SEEDED), "the secret was shown: {shown}");
     assert_eq!(
-        stored(&dir.join("atomic-home"), SECRET),
+        stored(&dir.join("atomic-home"), SEEDED),
         Vec::<PathBuf>::new()
     );
 }
@@ -91,7 +91,7 @@ fn a_codex_atoms_commands_see_none_of_the_exporters_settings() {
         "and printed its environment: {follow_up}"
     );
     for unseen in [
-        COLLECTOR_TOKEN,
+        COLLECTOR_SEED,
         "OTEL_EXPORTER_OTLP_HEADERS",
         "OTEL_EXPORTER_OTLP_ENDPOINT",
     ] {

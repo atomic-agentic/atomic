@@ -30,10 +30,9 @@ use opentelemetry::{KeyValue, Value};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::error::OTelSdkResult;
 use opentelemetry_sdk::trace::{SdkTracerProvider, SpanData, SpanExporter};
-use std::borrow::Cow;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::OnceLock;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tracing::field::Empty;
@@ -113,34 +112,18 @@ pub fn mark_failed(span: &tracing::Span, e: &DurableError) {
     }
 }
 
-/// The spans still open in this process, so that a process that stops while
-/// a run waits, at a gate say, can end and export them first (see
-/// [`flush`]).
-static OPEN: Mutex<Vec<Weak<Mutex<Option<tracing::Span>>>>> = Mutex::new(Vec::new());
-
-/// A future run inside `span`, which ends when the future does, when the
+/// A future run inside a span, which ends when the future does, when the
 /// future is dropped, or when the process [`flush`]es before it exits,
-/// whichever comes first. A failure the future returns marks the span
-/// failed.
-pub struct Traced<F> {
-    inner: Pin<Box<F>>,
-    slot: Arc<Mutex<Option<tracing::Span>>>,
-}
+/// whichever comes first (see [`atomic_core::spans`]). A failure the future
+/// returns marks the span failed.
+pub struct Traced<F>(atomic_core::spans::InHeld<F>);
 
 /// Run `future` inside `span` (see [`Traced`]).
 pub fn traced<F, T>(span: tracing::Span, future: F) -> Traced<F>
 where
     F: Future<Output = Result<T, DurableError>>,
 {
-    let slot = Arc::new(Mutex::new(Some(span)));
-    if let Ok(mut open) = OPEN.lock() {
-        open.retain(|w| w.strong_count() > 0);
-        open.push(Arc::downgrade(&slot));
-    }
-    Traced {
-        inner: Box::pin(future),
-        slot,
-    }
+    Traced(atomic_core::spans::hold(span).run(future))
 }
 
 impl<F, T> Future for Traced<F>
@@ -150,39 +133,16 @@ where
     type Output = F::Output;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let span = self.slot.lock().ok().and_then(|s| s.clone());
-        let polled = match &span {
-            Some(span) => {
-                let _entered = span.enter();
-                self.inner.as_mut().poll(cx)
-            }
-            None => self.inner.as_mut().poll(cx),
-        };
+        let polled = Pin::new(&mut self.0).poll(cx);
         if let Poll::Ready(out) = &polled {
-            if let (Some(span), Err(e)) = (&span, out) {
-                mark_failed(span, e);
+            let held = self.0.held();
+            if let (Some(span), Err(e)) = (held.span(), out) {
+                mark_failed(&span, e);
             }
-            drop(span);
             // Ended now, not when the future's owner drops it.
-            if let Ok(mut slot) = self.slot.lock() {
-                slot.take();
-            }
+            held.end();
         }
         polled
-    }
-}
-
-/// End every span still open, marking each stopped: they are exported with
-/// what they recorded so far.
-fn end_open() {
-    let open: Vec<_> = OPEN
-        .lock()
-        .map(|mut o| std::mem::take(&mut *o))
-        .unwrap_or_default();
-    for slot in open.iter().filter_map(Weak::upgrade) {
-        if let Some(span) = slot.lock().ok().and_then(|mut s| s.take()) {
-            span.record("atomic.stopped", true);
-        }
     }
 }
 
@@ -284,20 +244,24 @@ pub fn subscriber(provider: &SdkTracerProvider) -> impl tracing::Subscriber + Se
 /// End the spans still open, send what is buffered and stop exporting. Call
 /// it before the process exits; afterwards nothing is exported.
 pub fn flush() {
-    end_open();
-    if let Some(provider) = PROVIDER.get() {
-        let finish = || {
-            let _ = provider.force_flush();
-            let _ = provider.shutdown_with_timeout(Duration::from_secs(5));
-        };
-        // The gRPC processor's task runs on this runtime: wait for it on a
-        // thread that may block.
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-                tokio::task::block_in_place(finish)
-            }
-            _ => finish(),
+    // The gRPC processor's task runs on this runtime: wait for it on a
+    // thread that may block.
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(flush_blocking)
         }
+        _ => flush_blocking(),
+    }
+}
+
+/// As [`flush`], on a thread that may block, such as one of
+/// `spawn_blocking`'s: a stopping process runs it there so that another
+/// signal can still stop it at once (see `runs::stop`).
+pub fn flush_blocking() {
+    atomic_core::spans::end_all();
+    if let Some(provider) = PROVIDER.get() {
+        let _ = provider.force_flush();
+        let _ = provider.shutdown_with_timeout(Duration::from_secs(5));
     }
 }
 
@@ -305,16 +269,26 @@ pub fn flush() {
 #[derive(Debug)]
 pub struct Redacting<E>(pub E);
 
+/// The most of one span string exported: longer ones are cut before they
+/// are redacted, so redaction stays quick before the export's deadline.
+pub const MAX_SPAN_TEXT: usize = 4096;
+
+/// `s` bounded and redacted, if that changes it.
+fn scrub(s: &str) -> Option<String> {
+    let out = atomic_core::redact::bounded(s, MAX_SPAN_TEXT);
+    (out != s).then_some(out)
+}
+
 fn redact_value(value: &mut Value) {
     match value {
         Value::String(s) => {
-            if let Cow::Owned(r) = atomic_core::redact::text(s.as_str()) {
+            if let Some(r) = scrub(s.as_str()) {
                 *value = Value::String(r.into());
             }
         }
         Value::Array(opentelemetry::Array::String(items)) => {
             for item in items {
-                if let Cow::Owned(r) = atomic_core::redact::text(item.as_str()) {
+                if let Some(r) = scrub(item.as_str()) {
                     *item = r.into();
                 }
             }
@@ -329,20 +303,20 @@ fn redact_attributes(attributes: &mut [KeyValue]) {
     }
 }
 
-/// `span` with every string it carries redacted.
+/// `span` with every string it carries bounded and redacted.
 pub fn redact_span(span: &mut SpanData) {
-    if let Cow::Owned(r) = atomic_core::redact::text(&span.name) {
+    if let Some(r) = scrub(&span.name) {
         span.name = r.into();
     }
     redact_attributes(&mut span.attributes);
     for event in &mut span.events.events {
-        if let Cow::Owned(r) = atomic_core::redact::text(&event.name) {
+        if let Some(r) = scrub(&event.name) {
             event.name = r.into();
         }
         redact_attributes(&mut event.attributes);
     }
     if let Status::Error { description } = &mut span.status
-        && let Cow::Owned(r) = atomic_core::redact::text(description)
+        && let Some(r) = scrub(description)
     {
         *description = r.into();
     }

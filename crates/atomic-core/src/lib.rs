@@ -27,6 +27,7 @@ pub mod project;
 pub mod redact;
 pub mod render;
 pub mod runtime;
+pub mod spans;
 pub mod state;
 #[cfg(any(test, feature = "fake-model"))]
 pub mod testing;
