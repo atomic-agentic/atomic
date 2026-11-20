@@ -36,13 +36,22 @@ fn file(dir: &Path, run: &str) -> PathBuf {
     dir.join(format!("{:x}.json", sha2::Sha256::digest(run.as_bytes())))
 }
 
-/// The redacted message of the panic run `run`'s workflow code raised, if
-/// one was noted: in this process, or kept in the project's private state.
+/// The redacted message of the panic run `run`'s workflow code raised in
+/// this process, if it did: what `atomic run` and `atomic runs resume`
+/// report as the cause of the run they followed.
+pub fn noted(run: &str) -> Option<String> {
+    NOTED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(run)
+        .cloned()
+}
+
+/// [`noted`], or else the panic kept in the project's private state by an
+/// earlier process: what `atomic serve` names when it starts, and what
+/// `atomic runs resume` warns of before it resumes.
 pub fn of(run: &str) -> Option<String> {
-    if let Some(m) = NOTED.lock().unwrap_or_else(|e| e.into_inner()).get(run) {
-        return Some(m.clone());
-    }
-    KEPT_IN.get().and_then(|dir| kept(dir, run))
+    noted(run).or_else(|| KEPT_IN.get().and_then(|dir| kept(dir, run)))
 }
 
 /// The panic of run `run` kept under `dir`, the project's panics directory.
@@ -55,27 +64,69 @@ pub fn kept(dir: &Path, run: &str) -> Option<String> {
 }
 
 /// Forget run `run`'s noted panic, here and in the project's private state:
-/// it is being resumed, and what it does now is noted afresh.
+/// it was resumed, or it finished.
 pub fn forget(run: &str) {
+    forget_in(KEPT_IN.get().map(PathBuf::as_path), run);
+}
+
+/// [`forget`], with the panics kept under `dir`, if anywhere.
+fn forget_in(dir: Option<&Path>, run: &str) {
     NOTED.lock().unwrap_or_else(|e| e.into_inner()).remove(run);
-    if let Some(dir) = KEPT_IN.get() {
+    if let Some(dir) = dir {
         let _ = std::fs::remove_file(file(dir, run));
     }
 }
 
-/// Note that run `run`'s workflow code panicked with `payload`.
-fn note(run: &str, payload: &(dyn std::any::Any + Send)) -> String {
+/// The message a panic carries, with where it happened when the panic hook
+/// saw it, bounded and then redacted.
+fn message(payload: &(dyn std::any::Any + Send)) -> String {
     let raw = payload
         .downcast_ref::<&str>()
         .map(|s| (*s).to_owned())
         .or_else(|| payload.downcast_ref::<String>().cloned())
         .unwrap_or_else(|| "a panic with no message".to_owned());
-    let message = atomic_core::redact::bounded(&atomic_core::redact::text(&raw), 2_000);
+    let raw = match atomic_core::redact::take_panic_location() {
+        Some(at) => format!("{raw}, at {at}"),
+        None => raw,
+    };
+    // Bounded, then redacted within the bound, so a huge message costs no
+    // more to redact than a short one.
+    atomic_core::redact::bounded(&raw, 2_000)
+}
+
+/// Keep `kept` as run `run`'s note under `dir`: written whole to a file of
+/// its own, readable by its owner only, synced, then renamed into place.
+fn keep(dir: &Path, run: &str, kept: &serde_json::Value) -> std::io::Result<()> {
+    use std::io::Write;
+    std::fs::create_dir_all(dir)?;
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!(".{}-{n}.tmp", std::process::id()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut f = options.open(&tmp)?;
+    f.write_all(kept.to_string().as_bytes())?;
+    f.sync_all()?;
+    drop(f);
+    std::fs::rename(&tmp, file(dir, run))?;
+    std::fs::File::open(dir)?.sync_all()
+}
+
+/// Note that run `run`'s workflow code panicked with `payload`.
+fn note(run: &str, payload: &(dyn std::any::Any + Send)) -> String {
+    note_in(KEPT_IN.get().map(PathBuf::as_path), run, payload)
+}
+
+/// [`note`], keeping it under `dir`, if anywhere.
+fn note_in(dir: Option<&Path>, run: &str, payload: &(dyn std::any::Any + Send)) -> String {
+    let message = message(payload);
     NOTED
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(run.to_owned(), message.clone());
-    if let Some(dir) = KEPT_IN.get() {
+    if let Some(dir) = dir {
         let kept = serde_json::json!({
             "run": run,
             "message": message,
@@ -84,10 +135,13 @@ fn note(run: &str, payload: &(dyn std::any::Any + Send)) -> String {
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0),
         });
-        // Best effort: the run is parked either way, and this process says
-        // why; a later one may not.
-        let _ = std::fs::create_dir_all(dir)
-            .and_then(|()| std::fs::write(file(dir, run), kept.to_string()));
+        // The run is parked either way, and this process says why; a later
+        // one cannot, so say that too.
+        if let Err(e) = keep(dir, run, &kept) {
+            atomic_core::log_line!(
+                "atomic: run {run}'s panic is not kept for later processes: {e}"
+            );
+        }
     }
     message
 }
@@ -133,7 +187,13 @@ impl<F: Future> Future for Caught<F> {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             this.workflow.as_mut().poll(cx)
         })) {
-            Ok(polled) => polled,
+            // The run's workflow ended without a panic: any panic noted
+            // for it before is behind it.
+            Ok(Poll::Ready(output)) => {
+                forget(&this.run);
+                Poll::Ready(output)
+            }
+            Ok(Poll::Pending) => Poll::Pending,
             Err(payload) => {
                 let message = note(&this.run, payload.as_ref());
                 if crate::workflows::serving() {
@@ -142,9 +202,63 @@ impl<F: Future> Future for Caught<F> {
                         cause(&this.run, &message),
                         hint(&this.run)
                     );
+                    // Said; a server keeps no note of every run it served.
+                    NOTED
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&this.run);
                 }
                 std::panic::resume_unwind(payload)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("atomic-panics-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn a_noted_panic_is_redacted_kept_privately_and_forgotten() {
+        let dir = scratch("noted");
+        let key = concat!("ghp_", "abcdefghijklmnopqrstuvwxyz0123456789").to_owned();
+        let payload: Box<dyn std::any::Any + Send> = Box::new(format!("the key {key} leaked"));
+        let message = note_in(Some(&dir), "noted-run", payload.as_ref());
+        assert!(!message.contains(&key), "{message}");
+        assert_eq!(noted("noted-run").as_deref(), Some(message.as_str()));
+        assert_eq!(kept(&dir, "noted-run").as_deref(), Some(message.as_str()));
+        let text = std::fs::read_to_string(file(&dir, "noted-run")).expect("kept");
+        assert!(!text.contains(&key), "{text}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(file(&dir, "noted-run"))
+                .expect("kept")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o077, 0, "{mode:o}");
+        }
+        // Another run's note under the same name is not this run's.
+        assert_eq!(kept(&dir, "another-run"), None);
+        forget_in(Some(&dir), "noted-run");
+        assert_eq!(noted("noted-run"), None);
+        assert_eq!(kept(&dir, "noted-run"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_long_message_is_bounded_and_redacted() {
+        let key = concat!("sk-", "abcdefghijklmnopqrstuvwxyz0123456789ABCD").to_owned();
+        let raw = format!("{key} {}", "x".repeat(1_000_000));
+        let payload: Box<dyn std::any::Any + Send> = Box::new(raw);
+        let message = message(payload.as_ref());
+        assert!(message.chars().count() <= 2_100, "{}", message.len());
+        assert!(!message.contains(&key), "{message}");
     }
 }

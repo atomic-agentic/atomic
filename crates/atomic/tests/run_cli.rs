@@ -346,6 +346,7 @@ fn command_as(
         "DBOS__VMID",
         "DBOS__APPVERSION",
         "ATOMIC_FAILPOINT",
+        "ATOMIC_FAILPOINT_PANIC",
         "ATOMIC_MODEL_BASE_URL",
         "ATOMIC_MODEL",
         "ATOMIC_MODEL_API_KEY_ENV",
@@ -3781,6 +3782,10 @@ fn help_and_the_version_create_nothing_even_from_a_deleted_directory() {
 fn a_run_whose_workflow_code_panics_is_reported_as_a_panic() {
     #[cfg(target_os = "linux")]
     support::require_sandbox();
+    on_codex_runtime(a_run_whose_workflow_code_panics());
+}
+
+async fn a_run_whose_workflow_code_panics() {
     let dir = scratch("panicked");
     let project = project(&dir);
     // An exec atom only: the endpoint is never called, but resuming and
@@ -3799,7 +3804,7 @@ fn a_run_whose_workflow_code_panics_is_reported_as_a_panic() {
             "the panic's message: {t}"
         );
         assert!(t.contains("will likely happen again"), "{t}");
-        assert!(!t.contains("recovered more times"), "{t}");
+        assert!(!t.contains("more times than the engine allows"), "{t}");
         t
     };
     let out = atomic(
@@ -3810,8 +3815,18 @@ fn a_run_whose_workflow_code_panics_is_reported_as_a_panic() {
         "",
     );
     said(&out);
-    // Kept where a later process, or the run's inspection, finds it.
+    // Parked by the engine before `atomic run` stopped, not left pending for
+    // a server to run again.
     let state = state_dir(&dir, &project);
+    {
+        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        assert_eq!(
+            rt.status("panicky").await.expect("status"),
+            Some(RunStatus::Other("MAX_RECOVERY_ATTEMPTS_EXCEEDED".into()))
+        );
+    }
+    assert_eq!(count_log(&dir).len(), 1, "the count ran once");
+    // Kept where a later process, or the run's inspection, finds it.
     let private = state
         .parent()
         .and_then(Path::parent)
@@ -3840,6 +3855,8 @@ fn a_run_whose_workflow_code_panics_is_reported_as_a_panic() {
     });
     terminate(&serve);
     let _ = wait_child(&mut serve, "serve");
+    // The server ran nothing of the parked run.
+    assert_eq!(count_log(&dir).len(), 1, "serve ran the parked run again");
 
     // One that panics while serving: killed where it would panic, then
     // recovered by a server, which says so as it happens.

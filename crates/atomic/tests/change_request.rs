@@ -156,6 +156,17 @@ fn change_request_child() {
         let dir = PathBuf::from(dir);
         let rt = engine(&dir, &url).await;
         rt.launch().await.expect("launch");
+        if role == "panic" {
+            // A run whose workflow code panics: the panic is noted where the
+            // parent looks, and the run gives no result.
+            atomic_app::panics::keep_in(dir.join("panics"));
+            rt.start(CHANGE_REQUEST, "cr-panics", input())
+                .await
+                .expect("start");
+            let _ = rt.result::<ChangeRequestResult>("cr-panics").await;
+            rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+            return;
+        }
         if role == "start" {
             rt.start(CHANGE_REQUEST, "cr-killed", input())
                 .await
@@ -188,6 +199,7 @@ fn child(dir: &Path, url: &str, role: &str, failpoint: Option<&str>) -> std::pro
     .stdout(Stdio::null())
     .stderr(Stdio::null());
     match failpoint {
+        Some(f) if role == "panic" => cmd.env("ATOMIC_FAILPOINT_PANIC", f),
         Some(f) => cmd.env("ATOMIC_FAILPOINT", f),
         None => cmd.env_remove("ATOMIC_FAILPOINT"),
     };
@@ -297,5 +309,30 @@ fn a_panicking_atom_fails_its_step_and_spares_the_other_workflows() {
         assert_eq!(beside.verdict.summary, "The two-unit criterion holds.");
         rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
         let _ = json!(null);
+    });
+}
+
+/// A change request whose workflow code panics has its panic noted, as a
+/// pipeline run's is.
+#[test]
+fn a_change_request_whose_workflow_code_panics_is_noted() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(DRAFT.into()), Reply::Text(REVIEW.into())])
+            .await
+            .expect("fake model");
+        let dir = scratch("panics");
+        let url = model.base_url();
+        let d = dir.clone();
+        tokio::task::spawn_blocking(move || {
+            child(&d, &url, "panic", Some("change-request:after-draft"))
+        })
+        .await
+        .expect("child");
+        let kept = atomic_app::panics::kept(&dir.join("panics"), "cr-panics")
+            .expect("the change request's panic was noted");
+        assert!(
+            kept.contains("failpoint change-request:after-draft"),
+            "{kept}"
+        );
     });
 }

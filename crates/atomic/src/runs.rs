@@ -31,6 +31,10 @@ const REDELIVERY: Duration = Duration::from_secs(5);
 /// The state of a run the engine parked for its recovery count.
 const PARKED: &str = "MAX_RECOVERY_ATTEMPTS_EXCEEDED";
 
+/// How long a command follows a run whose workflow code panicked until the
+/// engine has parked it.
+const PARKING: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// How long a stopping process gives running work to reach a checkpoint.
 const SHUTDOWN: Duration = Duration::from_secs(10);
 
@@ -112,8 +116,18 @@ async fn finish(
     let follow = async {
         let outcome = engine.rt.result::<Value>(run_id).await;
         // A panic in atomic's own workflow code parks the run: there is no
-        // outcome to wait for.
-        if outcome.is_err() && atomic_app::panics::of(run_id).is_some() {
+        // outcome to wait for, but the engine parks it a moment later, and
+        // stopping first would leave it to run again. Follow it there.
+        if outcome.is_err() && atomic_app::panics::noted(run_id).is_some() {
+            let until = std::time::Instant::now() + PARKING;
+            while std::time::Instant::now() < until
+                && !matches!(
+                    engine.rt.status(run_id).await,
+                    Ok(Some(RunStatus::Other(ref state))) if state == PARKED
+                )
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
             return outcome;
         }
         if matches!(outcome, Err(DurableError::Interrupted(_))) {
@@ -139,8 +153,10 @@ async fn finish(
         stop(signals, who, Exit::Signalled).await
     };
     let _ = engine.rt.shutdown(SHUTDOWN).await;
+    // Only a panic this process saw: a note kept from an earlier run of the
+    // same id is not this outcome's cause.
     let panicked = match &outcome {
-        Err(_) => atomic_app::panics::of(run_id),
+        Err(_) => atomic_app::panics::noted(run_id),
         Ok(_) => None,
     };
     match outcome {
@@ -345,7 +361,6 @@ pub async fn resume(
                      ({message}); resuming it, the panic will likely happen again unless this \
                      atomic has it fixed"
                 );
-                atomic_app::panics::forget(id);
             }
             // The execution lock covers this host only. On a shared store
             // another live process may own the run, and nothing fences it.
@@ -372,6 +387,8 @@ pub async fn resume(
             atomic_core::log_line!("run {id}: resuming");
             // Queued before this engine dispatches, so it takes the run once.
             engine.rt.resume(id).await?;
+            // Resumed: what it does now is noted afresh.
+            atomic_app::panics::forget(id);
             atomic_durable::failpoint("resume:queued");
             engine.launch().await?;
             // A gate decided while the run was down may never have woken it.
