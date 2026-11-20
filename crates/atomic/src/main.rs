@@ -740,11 +740,18 @@ fn render(args: RenderArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What `atomic debug codex-prompt` and `atomic debug probe` say on stderr:
+/// their turn is not metered.
+const UNMETERED: &str = "atomic debug: this turn is not metered: no budget caps it and the \
+                         usage ledger does not record it";
+
 async fn prompt(
     paths: &CodexPaths,
     state: &ProjectState,
     args: &PromptArgs,
 ) -> anyhow::Result<String> {
+    // The only model call atomic makes without a meter: said, never silent.
+    atomic_core::log_line!("{UNMETERED}");
     // A backend of its own, beside the one `atomic run` and `atomic serve`
     // use: this command takes no execution lock, and connecting empties a
     // backend's shared temporary directory, which their turns may be using.
