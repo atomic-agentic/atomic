@@ -41,6 +41,8 @@ replay_spend a_replayed_run_reuses_its_checkpoints_and_spends_nothing
 
 ## When an atom's eval pass rate falls under its threshold, CI goes red.
 atomic_core eval::tests::a_pass_rate_below_the_threshold_fails_the_report
+eval_cli atomic_eval_records_replays_offline_and_fails_ci_on_a_pass_rate_drop
+eval_cli a_pass_rate_exactly_at_its_threshold_passes
 
 ## Each fixture's seed fails its checker and each reference solution passes it.
 coding_tasks every_seed_fails_its_checker_and_every_solution_passes
@@ -64,6 +66,13 @@ atomic_core lite::tests::a_call_is_sent_with_its_reserved_output_limit
 atomic_core lite::tests::a_call_is_cut_off_when_its_reserved_time_runs_out
 atomic_durable usage::tests::on_sqlite::usage_past_the_reservation_is_recorded_against_its_bound
 atomic_durable usage::tests::on_postgres::usage_past_the_reservation_is_recorded_against_its_bound
+budgets a_codex_turn_cut_off_with_a_request_in_flight_is_charged_what_it_reported_and_one_bound
+budgets a_request_in_flight_is_estimated_at_the_larger_of_one_bound_and_the_last_request
+turn_workspace a_turn_cut_off_while_a_command_keeps_running_is_charged_as_one_in_flight
+atomic_core codex::tests::a_turn_cut_off_with_a_request_in_flight_is_settled_in_part
+atomic_core codex::tests::a_turn_whose_last_response_breaks_off_is_charged_as_one_in_flight
+atomic_durable usage::tests::on_sqlite::a_partly_known_attempt_is_charged_its_reported_usage_and_one_more_bound
+atomic_durable usage::tests::on_postgres::a_partly_known_attempt_is_charged_its_reported_usage_and_one_more_bound
 
 ## CI fails when a scorer's mean drops below its declared floor, or falls further than its allowed tolerance relative to a baseline revision.
 atomic_core eval::tests::a_scorer_below_its_minimum_or_past_its_tolerance_fails_the_report
