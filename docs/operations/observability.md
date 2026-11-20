@@ -66,7 +66,8 @@ model call `atomic.model_call` or `atomic.meter`). A model call's
 cut. When the provider answered a lite atom's call with an error status, it
 holds only that status and the type of error the provider named, such as
 `401 Unauthorized: invalid_request_error`, and `http.response.status_code`
-holds the code. Any other failure is what failed and its innermost cause,
+holds the code. A type that does not read as one, such as `BadRequestError`,
+`DeploymentNotFound` or `"429"`, gives the status alone. Any other failure is what failed and its innermost cause,
 which can quote the provider or the model: a Codex atom's provider error, a
 lite answer that is not JSON, a refusal or an answer the provider stopped.
 The run's stored error keeps the whole, redacted. A failed step's or run's

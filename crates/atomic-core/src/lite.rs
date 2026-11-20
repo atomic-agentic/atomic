@@ -501,17 +501,21 @@ fn error_kind(body: &Value) -> Option<String> {
 
 /// Whether `kind` reads as an error's type, such as `invalid_request_error`,
 /// `rate_limit_exceeded` or `overloaded`, and not as a key: a lower-case
-/// letter first, at most 40 lower-case letters, digits and `_`, with an
-/// underscore if it has digits. A key's mixed case, prefix dash or random
-/// digits fail it.
+/// letter first, at most 40 lower-case letters, digits and `_`, an
+/// underscore if it has digits, and at most three digits. A key's mixed
+/// case, dashed prefix or run of digits fails it; one of letters alone
+/// passes any test of shape, and the redaction of the span's summary is
+/// what catches it.
 fn is_error_kind(kind: &str) -> bool {
     let b = kind.as_bytes();
     let lower = |c: &u8| c.is_ascii_lowercase();
+    let digits = b.iter().filter(|c| c.is_ascii_digit()).count();
     b.first().is_some_and(lower)
         && b.len() <= 40
         && b.iter()
             .all(|c| lower(c) || c.is_ascii_digit() || *c == b'_')
-        && (b.contains(&b'_') || b.iter().all(lower))
+        && (b.contains(&b'_') || digits == 0)
+        && digits <= 3
 }
 
 /// An answer the provider cut off at its output limit: not an answer that
