@@ -96,6 +96,7 @@ minimal lite-atom quickstart.
 
 | Command or surface | Purpose | Planned stage |
 | --- | --- | --- |
+| `atomic gates enroll` | Enroll your operator credential for the project, from a terminal; `--replace` rotates it or replaces a lost one | v0.1 local, Linux |
 | `atomic gates list` | Inspect durable gates | v0.1 local |
 | `atomic gates approve <gate-id>` | Approve a recorded proposal as the local operator | v0.1 local |
 | `atomic gates reject <gate-id>` | Reject a recorded proposal as the local operator | v0.1 local |
@@ -104,6 +105,16 @@ minimal lite-atom quickstart.
 | Live thread controls | Answer, steer, stop and take over work | v0.5 CLI |
 | Workflow and graph commands with `--json` | Use the supervision surface from scripts | v0.5 |
 | Dedicated workflow/graph/gate panes | Navigate larger sets of work in the terminal | v1.0 TUI extensions |
+
+A gate decision carries your operator credential, a secret atomic keeps in the
+OS keyring (the Secret Service on Linux) and checks against the gate store.
+Nothing enrolls it for you: run `atomic gates enroll` once per project. On a
+machine with no OS keyring, such as a headless server or a container, atomic
+refuses with an error rather than store the secret elsewhere; to keep it in a
+directory readable by you only (`$ATOMIC_HOME/credentials`, or
+`~/.config/atomic/credentials`), opt in with `ATOMIC_CREDENTIAL_STORE=file`.
+Credentialed decisions are available on Linux only for now (see
+[availability](availability.md)).
 
 Live-thread cancel, pause and take-over command spellings and keyboard shortcuts
 remain unspecified. Run recovery uses the v0.1 command above. The

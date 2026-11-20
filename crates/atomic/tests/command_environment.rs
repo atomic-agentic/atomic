@@ -242,6 +242,7 @@ async fn codex_turn() {
         defaults: Default::default(),
         artifacts: Artifacts::none(),
         meter: atomic_core::usage::Metering::none(),
+        guard: atomic_core::codex::StateGuard::NoProjectState,
         backend: atomic_exec::Backend::connect(atomic_exec::LocalBackend::in_dir(
             scratch_root.clone(),
         ))

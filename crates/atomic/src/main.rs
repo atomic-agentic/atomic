@@ -11,6 +11,7 @@ use std::path::PathBuf;
 
 mod engine;
 mod failure;
+mod gates;
 mod runs;
 mod setup;
 mod skills;
@@ -64,6 +65,9 @@ enum Command {
         #[command(subcommand)]
         command: Option<SchemasCommand>,
     },
+    /// Enroll your operator credential, list gates and decide them.
+    #[command(subcommand)]
+    Gates(gates::GatesCommand),
     /// Install atomic's authoring skills for a coding agent.
     Setup(setup::SetupArgs),
     /// Developer diagnostics.
@@ -260,9 +264,12 @@ async fn run(cli: Cli, paths: CodexPaths, state: ProjectState) -> anyhow::Result
     }
     // Before anything else: a store written by a newer atomic is refused.
     atomic_durable::store::open_sqlite(&state.database()).await?;
+    // Turn directories a killed atomic left behind.
+    codex::sweep_turn_temps(state.dir())?;
     let (json, project) = (cli.json, cli.project);
     let project = project.as_deref();
     match cli.command {
+        Some(Command::Gates(command)) => gates::run(command, &state).await,
         Some(Command::Check { path }) => {
             tokio::task::spawn_blocking(move || check(path, json)).await?
         }
@@ -597,7 +604,7 @@ fn render(args: RenderArgs) -> anyhow::Result<()> {
         Some(
             if args.run_id.is_some() {
                 context::default_key_dir().and_then(|keys| {
-                    context::checkpoint(&atom, &state.dir().join("context"), &keys, run_id, resolve)
+                    context::checkpoint(&atom, &state.context_dir(), &keys, run_id, resolve)
                 })
             } else {
                 context::resolve_fresh(&atom, run_id, resolve)
@@ -647,6 +654,7 @@ async fn prompt(
         defaults: atomic_core::AtomConfig::default(),
         artifacts: atomic_core::runtime::Artifacts::none(),
         meter: atomic_core::usage::Metering::none(),
+        guard: codex::StateGuard::for_project(state)?,
         backend,
     };
     let spec = codex::TurnSpec {

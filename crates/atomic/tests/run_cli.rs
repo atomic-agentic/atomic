@@ -323,9 +323,11 @@ async fn open_gate(rt: &Durare, run: &str) -> gate::Gate {
 /// The local operator approves `g`, from outside the run's process: a
 /// second terminal.
 async fn approve(rt: &Durare, g: &gate::Gate) {
+    let credential = gate::HumanCredential::new(Principal::local("dev"), "the operator's secret");
+    gate::enroll(rt, &credential).await.expect("enroll");
     gate::decide(
         rt,
-        &Principal::local("dev"),
+        &credential,
         DecisionCommand {
             command_id: format!("{}-approve", g.id),
             gate: g.id.clone(),

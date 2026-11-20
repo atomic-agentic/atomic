@@ -49,9 +49,10 @@ built. `atomic run` takes an atom or workflow by name, by file or with
 `--project`, and input from a file, standard input or `--data`; a run cut short
 continues with `atomic runs resume <run-id>`, or under `atomic serve`, from its
 checkpoints. One process at a time executes a project's runs. Errors carry a
-description and an action, separately in `--json` output. Deciding gates from
-the command line (`atomic gates`) waits on the local human credential and is
-not wired up yet, nor is the terminal prompt for gates in `atomic run`.
+description and an action, separately in `--json` output. `atomic gates enroll`,
+`list`, `approve` and `reject` are built, and a gate decision counts only with
+the credential its person enrolled; the terminal prompt for gates in
+`atomic run` is not wired up yet.
 
 `atomic serve` also runs on PostgreSQL (`ATOMIC_DATABASE_URL`) when the process
 has an executor identity (`ATOMIC_EXECUTOR_ID`). `atomic runner` and
@@ -75,7 +76,8 @@ turn, gets the platform's core variables and what the atom declares, never
 atomic's own environment or its credentials. A turn's commands run with no
 login shell; their `HOME` (and `ZDOTDIR`) is a private scratch directory of the
 attempt's own, and their `TMPDIR` is one private directory every turn of the
-project shares, so no shell startup file runs. Tools found through `HOME` are
+project shares (Codex's sandbox keeps a registry there that turns sharing a
+writable root must share), so no shell startup file runs. Tools found through `HOME` are
 therefore not found: rustup, cargo, pyenv, nvm, Maven's `~/.m2` and the like.
 A codex or exec atom names them in its `env`, as in
 `env: { RUSTUP_HOME: '/home/me/.rustup', CARGO_HOME: '/home/me/.cargo' }`. An
@@ -88,6 +90,19 @@ no effect.
 
 `atomic run` and `atomic serve` do not read public context settings yet, so they
 refuse a step whose atom declares a context.
+
+On Linux, atomic has verified that an atom's sandbox cannot reach the gate store
+or the credential: the private part of the state directory, Codex's own records
+and the credential and key directories are denied to its commands, which also
+cannot use the kernel keyrings or connect to a socket. On macOS and Windows this
+has not been verified, so atomic keeps no operator credential there and refuses
+credentialed gate decisions.
+
+A `workspace-write` atom cannot write `/tmp`, `/var/tmp` or `$TMPDIR` as atomic
+found them: its commands' `TMPDIR` is the project's private one above. A tool
+that ignores `TMPDIR` and writes to `/tmp` directly, such as a JVM's default
+`java.io.tmpdir`, fails there; point it at `$TMPDIR` (for the JVM,
+`-Djava.io.tmpdir=$TMPDIR`).
 
 Several authoring aids arrive in stages. Eval cases in JSONL files are part of
 v0.1. Compact schemas, variants, the `--plan` cost preview, declared effect caps

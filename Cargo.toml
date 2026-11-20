@@ -58,6 +58,8 @@ sha2 = "0.10"
 hmac = "0.12.1"
 getrandom = "0.3.4"
 libc = "0.2.186"
+# The filter that keeps a sandboxed command off the kernel keyrings; Codex's version.
+seccompiler = "0.5.0"
 # The same sqlx Codex and the durare fork use (the patch block pins its source).
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite-bundled"] }
 tokio = { version = "1", default-features = false }
@@ -70,6 +72,7 @@ deno_core = { version = "=0.413.0", features = ["v8", "v8_use_custom_libcxx"] }
 codex-app-server = { git = "https://github.com/atomic-agentic/codex", rev = "f8e52f30a7d56b045b93068c156aae8a4a312ba6" }
 codex-core-api = { git = "https://github.com/atomic-agentic/codex", rev = "f8e52f30a7d56b045b93068c156aae8a4a312ba6" }
 codex-extension-api = { git = "https://github.com/atomic-agentic/codex", rev = "f8e52f30a7d56b045b93068c156aae8a4a312ba6" }
+codex-keyring-store = { git = "https://github.com/atomic-agentic/codex", rev = "f8e52f30a7d56b045b93068c156aae8a4a312ba6" }
 # For the shell environment policy types codex-core-api does not re-export.
 codex-protocol = { git = "https://github.com/atomic-agentic/codex", rev = "f8e52f30a7d56b045b93068c156aae8a4a312ba6" }
 
