@@ -76,7 +76,7 @@ atomic_durable usage::tests::on_postgres::a_partly_known_attempt_is_charged_its_
 # For v0.1 this clause is shown by the eval runner, which fails a report on a
 # scorer below its floor or past its tolerance, and by atomic eval, which exits
 # non-zero on a failed report and fails an atom whose scorers it cannot run. A
-# judged run through atomic eval comes with model-judged scorers in v0.5.
+# judged run through atomic eval comes with model-judged scorers.
 atomic_core eval::tests::a_scorer_below_its_minimum_or_past_its_tolerance_fails_the_report
 atomic_core eval::tests::scorers_score_passing_cases_against_a_comparable_baseline
 eval_cli atomic_eval_records_replays_offline_and_fails_ci_on_a_pass_rate_drop
