@@ -622,6 +622,21 @@ pub(crate) fn to_durare(e: DurableError) -> durare::Error {
     }
 }
 
+/// How an error a step's or transaction's body returned reads to durare.
+/// A conflict belongs to the workflow, which lost a race to record a step:
+/// a body that returns one has made it up, or passed on another run's, and
+/// it fails the step like any other error rather than reach the engine as a
+/// typed conflict that it would record as the step's outcome.
+pub(crate) fn body_to_durare(e: DurableError) -> durare::Error {
+    match e {
+        DurableError::Conflict(run) => durare::Error::app(format!(
+            "a step's body returned a workflow conflict (run {run}), which only workflow code \
+             may return"
+        )),
+        e => to_durare(e),
+    }
+}
+
 /// The failpoints around one durable operation's checkpoint (see
 /// [`crate::failpoints`]): `checkpoint:before:<op>` once its body succeeded
 /// and before the engine commits its checkpoint, `checkpoint:after:<op>` once
@@ -700,7 +715,7 @@ impl WorkflowContext for DurareContext {
                 if out.is_ok() {
                     ran.before();
                 }
-                out.map_err(to_durare)
+                out.map_err(body_to_durare)
             });
         async move {
             let out = pending.await.map_err(from_durare);
@@ -728,7 +743,7 @@ impl WorkflowContext for DurareContext {
                     // commit together after this, or not at all.
                     ran.before();
                 }
-                out.map_err(to_durare)
+                out.map_err(body_to_durare)
             })
         });
         async move {

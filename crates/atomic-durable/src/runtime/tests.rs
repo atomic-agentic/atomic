@@ -10,7 +10,8 @@
 //! - a failure is recorded as the workflow's outcome;
 //! - of two executions of one run that race to record the same step, the
 //!   one that loses records nothing, and the run ends with the winner's
-//!   outcome;
+//!   outcome; a step or transaction body that returns a conflict fails the
+//!   run instead;
 //! - steps are recorded as siblings, in order, and a step inside a step is
 //!   refused;
 //! - starting a workflow id twice runs it once;
@@ -507,18 +508,20 @@ async fn the_loser_of_a_checkpoint_race_takes_the_winners_outcome<R: DurableRunt
                         // The first execution stops short, which schedules
                         // its settlement; the next two meet here, so both
                         // have run the body before either records it.
-                        if entered.fetch_add(1, Ordering::SeqCst) == 0 {
+                        let ordinal = entered.fetch_add(1, Ordering::SeqCst);
+                        if ordinal == 0 {
                             return Err(DurableError::Interrupted("stopped short".into()));
                         }
-                        let met =
-                            tokio::time::timeout(Duration::from_secs(20), meet.wait()).await;
-                        Ok(met.is_ok())
+                        // Each racer's own output: two writes of the same
+                        // output at the same moment would be the same write,
+                        // and neither would lose.
+                        let met = tokio::time::timeout(Duration::from_secs(20), meet.wait()).await;
+                        Ok(met.is_ok().then_some(ordinal))
                     }
                 })
                 .await;
             // The execution that lost the race to record the step.
-            if matches!(&contested, Err(e) if !matches!(e, DurableError::Interrupted(m) if m == "stopped short"))
-            {
+            if matches!(&contested, Err(DurableError::Conflict(_))) {
                 lost.fetch_add(1, Ordering::SeqCst);
             }
             let met = contested?;
@@ -581,11 +584,50 @@ async fn the_loser_of_a_checkpoint_race_takes_the_winners_outcome<R: DurableRunt
     );
     let steps = rt.steps(&id).await.expect("steps");
     assert_eq!(steps.len(), 2, "{steps:?}");
-    assert_eq!(
-        steps[0].output,
-        Some(serde_json::json!(true)),
-        "the winner met the loser"
+    // The step's output is one racer's own, and that racer met the other.
+    assert!(
+        [Some(serde_json::json!(1)), Some(serde_json::json!(2))].contains(&steps[0].output),
+        "{:?}",
+        steps[0].output
     );
+    rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+}
+
+async fn a_body_that_returns_a_conflict_fails_its_run<R: DurableRuntime>(mut rt: R) {
+    rt.register("step-conflict", |ctx: R::Context, (): ()| async move {
+        ctx.step("made up", |_| async {
+            Err::<(), _>(DurableError::Conflict("another".into()))
+        })
+        .await
+    });
+    rt.register(
+        "transaction-conflict",
+        |ctx: R::Context, (): ()| async move {
+            ctx.transaction("made up", |_tx| {
+                Box::pin(async { Err::<(), _>(DurableError::Conflict("another".into())) })
+            })
+            .await
+        },
+    );
+    rt.launch().await.expect("launch");
+    for name in ["step-conflict", "transaction-conflict"] {
+        let id = unique(name);
+        rt.start(name, &id, ()).await.expect("start");
+        let until = Instant::now() + Duration::from_secs(20);
+        let status = loop {
+            let status = rt.status(&id).await.expect("status");
+            if matches!(status, Some(RunStatus::Succeeded | RunStatus::Failed(_)))
+                || Instant::now() > until
+            {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert!(
+            matches!(&status, Some(RunStatus::Failed(m)) if m.contains("only workflow code")),
+            "{name}: {status:?}"
+        );
+    }
     rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
 }
 
@@ -613,6 +655,7 @@ on_backend!(
     an_interrupted_execution_records_nothing_and_stays_pending,
     a_failure_is_recorded_as_the_outcome,
     the_loser_of_a_checkpoint_race_takes_the_winners_outcome,
+    a_body_that_returns_a_conflict_fails_its_run,
     steps_are_siblings_in_order_and_cannot_nest,
     a_workflow_id_started_twice_runs_once,
     a_message_is_received_once_and_replayed_after_a_crash,
@@ -630,6 +673,7 @@ on_backend!(
     an_interrupted_execution_records_nothing_and_stays_pending,
     a_failure_is_recorded_as_the_outcome,
     the_loser_of_a_checkpoint_race_takes_the_winners_outcome,
+    a_body_that_returns_a_conflict_fails_its_run,
     steps_are_siblings_in_order_and_cannot_nest,
     a_workflow_id_started_twice_runs_once,
     a_message_is_received_once_and_replayed_after_a_crash,
