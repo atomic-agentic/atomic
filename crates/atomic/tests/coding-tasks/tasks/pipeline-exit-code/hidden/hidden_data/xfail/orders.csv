@@ -1,0 +1,4 @@
+order_id,customer_id,date,amount,currency
+3001,C1,2026-11-07,10.00,EUR
+3002,C2,2026-11-07,200.00,NOK
+3003,C3,2026-11-07,30.00,GBP
