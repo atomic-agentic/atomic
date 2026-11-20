@@ -1817,6 +1817,86 @@ fn atomic_run_confines_an_exec_atoms_command() {
     }
 }
 
+/// An exec atom's confined command has no controlling terminal, even when
+/// atomic has one: it cannot open `/dev/tty`, so it cannot type into
+/// atomic's terminal (TIOCSTI) or answer a prompt there. atomic runs here on
+/// a pseudo-terminal of its own, which a command run directly there opens.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[cfg(target_os = "linux")]
+#[test]
+fn a_confined_command_has_no_controlling_terminal() {
+    support::require_sandbox();
+    let dir = scratch("tty");
+    let project = project(&dir);
+    std::fs::write(
+        project.join("tools/tty.py"),
+        "import fcntl, json, os, sys, termios\n\
+         json.load(sys.stdin)\n\
+         def attempt(f):\n    try:\n        f()\n        return 'ok'\n    except Exception as e:\n        return type(e).__name__ + ': ' + str(e)\n\
+         def tty():\n    os.close(os.open('/dev/tty', os.O_RDWR))\n\
+         def sti():\n    fd = os.open('/dev/tty', os.O_RDWR)\n    fcntl.ioctl(fd, termios.TIOCSTI, b'x')\n\
+         json.dump({'tty': attempt(tty), 'sti': attempt(sti)}, sys.stdout)\n",
+    )
+    .expect("script");
+    let field = json!({"type": "string"});
+    write_atom(
+        &project,
+        "tty-probe",
+        "description: 'Probe the terminal.', kind: 'exec', exec: { command: ['python3', 'tools/tty.py'] }",
+        "",
+        object(json!({})),
+        object(json!({"tty": field, "sti": field})),
+    );
+    // `pty.spawn` runs its arguments with a new pseudo-terminal as their
+    // controlling terminal.
+    let run = |program: &str, args: &[&str]| -> String {
+        let out = command_as(Path::new("/usr/bin/env"), &dir, &project, &[], &[])
+            .args([
+                "python3",
+                "-c",
+                "import pty, sys; pty.spawn(sys.argv[1:])",
+                program,
+            ])
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run on a pseudo-terminal");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    // Directly on the terminal, the same check opens it.
+    let direct = run(
+        "python3",
+        &[
+            "-c",
+            "import os; os.close(os.open('/dev/tty', os.O_RDWR)); print('opened')",
+        ],
+    );
+    assert!(
+        direct.contains("opened"),
+        "the test has a terminal: {direct}"
+    );
+    for runner in ["local", "process"] {
+        let out = run(
+            ATOMIC,
+            &["run", "tty-probe", "--runner", runner, "--data", "{}"],
+        );
+        let json = out
+            .find('{')
+            .and_then(|start| out[start..].rfind('}').map(|end| &out[start..=start + end]))
+            .unwrap_or_else(|| panic!("{runner}: no result in {out}"));
+        let result: Value = serde_json::from_str(json).unwrap_or_else(|e| panic!("{e}: {out}"));
+        for probe in ["tty", "sti"] {
+            assert!(
+                result[probe]
+                    .as_str()
+                    .is_some_and(|r| r.starts_with("OSError")),
+                "{runner}: {probe}: {result}"
+            );
+        }
+    }
+}
+
 /// A `bwrap` in front of the real one, in `dir/bwrap-bin`: while
 /// `dir/bwrap-full` exists it fails as bubblewrap does on a full disk, and
 /// while `dir/bwrap-refuse` exists as it does where user namespaces are not
