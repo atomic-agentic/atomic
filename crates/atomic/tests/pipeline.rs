@@ -2526,6 +2526,35 @@ fn a_stored_budget_plan_reads_past_fields_a_later_version_adds() {
     assert_eq!(read, plan);
 }
 
+/// A plan pinned under `atomic.pipeline.3`, before exec atoms were metered,
+/// has no exec caps. It still reads, as a plan with none: a run of that
+/// layout is not recovered by this build, which says so when asked to
+/// replay it, but its stored plan is still read back.
+#[test]
+fn a_budget_plan_pinned_before_exec_atoms_were_metered_still_reads() {
+    let dir = scratch("plan-earlier");
+    let project = project(&dir);
+    let mut pipeline = load(&project, "earlier.workflow.yaml", TRIAGE);
+    pin_budgets(
+        &mut pipeline,
+        &runtimes(&dir, "http://127.0.0.1:9/v1"),
+        &small_calls(),
+    )
+    .expect("pinned");
+    let mut plan = pipeline.budgets.expect("a plan");
+    let mut stored = serde_json::to_value(&plan).expect("encode");
+    stored
+        .as_object_mut()
+        .expect("an object")
+        .remove("exec")
+        .expect("this version pins exec caps");
+    let read: atomic_app::metering::BudgetPlan =
+        serde_json::from_value(stored).expect("an earlier plan still reads");
+    assert!(read.exec.is_empty(), "{read:?}");
+    plan.exec.clear();
+    assert_eq!(read, plan);
+}
+
 #[test]
 fn a_budget_refusal_in_a_worktree_step_parks_the_run() {
     on_codex_runtime(async {
