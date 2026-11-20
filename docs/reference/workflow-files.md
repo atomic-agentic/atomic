@@ -130,6 +130,37 @@ Atomic is offline; resume applies expiry before proceeding.
 `after: [review]` means the review finished, not that its verdict was `approve`.
 Use a review policy or a deliberate human gate to decide what happens next.
 
+`atomic run` and `atomic runs resume` show each gate their run reaches at the
+terminal and take the decision there: `a` or `r`, then a comment if you like.
+The decision carries your enrolled operator credential, as `atomic gates
+approve` does. With no terminal on standard input, the run prints how to decide
+the gate from another terminal and waits.
+
+### Question gates
+
+A gate can ask a question instead of asking for approval. It has an `ask` in
+place of `title`, and the `answer` it takes: a list of choices, or a JSON Schema
+for a free answer.
+
+```yaml
+  channel:
+    after: [build]
+    gate:
+      ask: "'Which channel should ' + steps.build.output.version + ' ship to?'"
+      answer: [stable, beta]
+      remember: true
+      timeout: 4h
+      on_timeout: { default: beta }
+```
+
+The answer is the gate's decision, and later steps read it as
+`steps.channel.decision.answer`, typed by `answer`. An answer that `answer` does
+not allow is refused, at the prompt and from `atomic gates answer <gate-id>
+<answer>` alike. With `remember: true`, the answer is also kept as a dated entry
+in the project's feedback log, in atomic's state. `on_timeout: { default: ... }`
+gives the answer the step resumes with when nobody answers in time; without it,
+an unanswered question stops the run, as an expired gate does.
+
 ## View a workflow as a diagram
 
 In v0.5, `atomic workflows show <name>` inspects the definition. Add

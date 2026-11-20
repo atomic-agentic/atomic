@@ -102,8 +102,12 @@ fn print_result(run_id: &str, output: &Value, json: bool) -> anyhow::Result<()> 
 ///
 /// A signal stops the command as one stops `atomic serve` (see [`stop`]):
 /// the run stays unfinished, for `atomic runs resume`.
+///
+/// While it waits, the terminal prompt shows each gate the run opens, so the
+/// person running the command can decide it there (see [`crate::prompt`]).
 async fn finish(
     engine: &engine::Engine,
+    state: &ProjectState,
     run_id: &str,
     json: bool,
     signals: &mut Signals,
@@ -119,6 +123,14 @@ async fn finish(
             return engine.rt.result::<Value>(run_id).await;
         }
         outcome
+    };
+    let follow = async {
+        tokio::select! {
+            outcome = follow => outcome,
+            () = crate::prompt::at_gates(&engine.rt, state, run_id) => {
+                unreachable!("the prompt runs until the run ends")
+            }
+        }
     };
     let outcome = tokio::select! {
         outcome = follow => Some(outcome),
@@ -232,7 +244,7 @@ pub async fn run(
         run.pipeline.name, found.name
     );
     engine.rt.start(PIPELINE, &run_id, run).await?;
-    finish(&engine, &run_id, json, &mut signals, "atomic run").await
+    finish(&engine, &state, &run_id, json, &mut signals, "atomic run").await
 }
 
 /// The state of the project a command that names no target works on.
@@ -284,7 +296,15 @@ pub async fn resume(
         }
         Some(RunStatus::Succeeded) => {
             engine.launch().await?;
-            finish(&engine, id, json, &mut signals, "atomic runs resume").await
+            finish(
+                &engine,
+                &state,
+                id,
+                json,
+                &mut signals,
+                "atomic runs resume",
+            )
+            .await
         }
         Some(RunStatus::Other(state)) if state != PARKED => {
             let _ = engine.rt.shutdown(SHUTDOWN).await;
@@ -343,7 +363,15 @@ pub async fn resume(
             engine.launch().await?;
             // A gate decided while the run was down may never have woken it.
             atomic_durable::gate::redeliver(&engine.rt).await?;
-            finish(&engine, id, json, &mut signals, "atomic runs resume").await
+            finish(
+                &engine,
+                &state,
+                id,
+                json,
+                &mut signals,
+                "atomic runs resume",
+            )
+            .await
         }
     }
 }

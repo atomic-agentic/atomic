@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 mod engine;
 mod failure;
 mod gates;
+mod prompt;
 mod runs;
 mod setup;
 mod skills;
