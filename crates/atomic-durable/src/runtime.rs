@@ -58,9 +58,10 @@ pub enum DurableError {
     Parked(String),
     /// Another execution of run `.0` recorded one of its steps first. This
     /// execution's state is behind the run's, so it stops, records nothing,
-    /// and takes the outcome the winner records. Workflow code passes it on
-    /// unchanged; turning it into a failure would record the loss as the
-    /// run's outcome.
+    /// and takes the outcome the winner records. The workflow context keeps
+    /// the loss when the step reports it, so the execution's outcome is the
+    /// conflict whatever workflow code makes of it; a conflict that no step
+    /// reported is not a lost race, and fails the run.
     #[error("another execution of run {0} recorded its step first")]
     Conflict(String),
 }
@@ -636,9 +637,13 @@ pub(crate) fn to_durare(e: DurableError) -> durare::Error {
         DurableError::Database { message, origin } => {
             origin.take().unwrap_or_else(|| durare::Error::app(message))
         }
-        // Back as the engine's own conflict, which it answers by waiting for
-        // the winner's outcome instead of recording one.
-        DurableError::Conflict(run) => durare::Error::WorkflowConflict(run),
+        // A lost race reaches the engine through the context's latch (see
+        // `Lost`), never through here: a conflict that no step reported was
+        // made up, and fails like any other error rather than leave the run
+        // waiting for a winner that does not exist.
+        DurableError::Conflict(run) => durare::Error::app(format!(
+            "workflow code returned a workflow conflict (run {run}) that no step reported"
+        )),
         DurableError::Failed(m)
         | DurableError::Nested(m)
         | DurableError::Engine(m)
@@ -724,9 +729,9 @@ struct Lost(Arc<std::sync::Mutex<Option<String>>>);
 impl Lost {
     /// Keep `out`'s conflict, if it is one, and pass `out` on.
     fn keep<T>(&self, out: Result<T>) -> Result<T> {
-        if let Err(DurableError::Conflict(run)) = &out
-            && let Ok(mut lost) = self.0.lock()
-        {
+        if let Err(DurableError::Conflict(run)) = &out {
+            // A poisoned lock still holds the value: a loss is never skipped.
+            let mut lost = self.0.lock().unwrap_or_else(|e| e.into_inner());
             lost.get_or_insert_with(|| run.clone());
         }
         out
@@ -734,7 +739,7 @@ impl Lost {
 
     /// The conflict this execution lost, if it lost one.
     fn conflict(&self) -> Option<String> {
-        self.0.lock().ok().and_then(|lost| lost.clone())
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
 
