@@ -113,21 +113,26 @@ async fn finish(
     signals: &mut Signals,
     who: &str,
 ) -> anyhow::Result<()> {
+    // Whether the engine was seen to park a run whose workflow code
+    // panicked, before this command stopped.
+    let parked_seen = std::cell::Cell::new(false);
     let follow = async {
         let outcome = engine.rt.result::<Value>(run_id).await;
         // A panic in atomic's own workflow code parks the run: there is no
         // outcome to wait for, but the engine parks it a moment later, and
-        // stopping first would leave it to run again. Follow it there.
+        // stopping first would leave it to run again. Follow it there, for a
+        // bounded time even if the store stops answering.
         if outcome.is_err() && atomic_app::panics::noted(run_id).is_some() {
-            let until = std::time::Instant::now() + PARKING;
-            while std::time::Instant::now() < until
-                && !matches!(
+            let parked = tokio::time::timeout(PARKING, async {
+                while !matches!(
                     engine.rt.status(run_id).await,
                     Ok(Some(RunStatus::Other(ref state))) if state == PARKED
-                )
-            {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
+                ) {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            })
+            .await;
+            parked_seen.set(parked.is_ok());
             return outcome;
         }
         if matches!(outcome, Err(DurableError::Interrupted(_))) {
@@ -163,12 +168,12 @@ async fn finish(
         Ok(output) => print_result(run_id, &output, json),
         Err(_) if panicked.is_some() => {
             let message = panicked.unwrap_or_default();
-            Err(Failure::new(
-                "run.panicked",
-                atomic_app::panics::cause(run_id, &message),
-                atomic_app::panics::hint(run_id),
-            )
-            .into())
+            let cause = if parked_seen.get() {
+                atomic_app::panics::cause(run_id, &message)
+            } else {
+                atomic_app::panics::unparked(run_id, &message)
+            };
+            Err(Failure::new("run.panicked", cause, atomic_app::panics::hint(run_id)).into())
         }
         Err(DurableError::Failed(why)) if atomic_app::pipeline::dead_lettered(run_id) => {
             Err(Failure::new(

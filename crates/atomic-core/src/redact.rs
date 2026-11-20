@@ -1490,7 +1490,10 @@ fn redact_panic(text: String, redact: fn(&str) -> String) -> String {
 /// the hook [`install_panic_hook`] installs saw it: for code that catches
 /// the panic and reports it.
 pub fn take_panic_location() -> Option<String> {
-    PANICKED_AT.with(|at| at.borrow_mut().take())
+    PANICKED_AT
+        .try_with(|at| at.borrow_mut().take())
+        .ok()
+        .flatten()
 }
 
 /// Make a panic write its message redacted, in place of the standard
@@ -1501,7 +1504,7 @@ pub fn take_panic_location() -> Option<String> {
 pub fn install_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
         if let Some(at) = info.location() {
-            PANICKED_AT.with(|p| *p.borrow_mut() = Some(at.to_string()));
+            let _ = PANICKED_AT.try_with(|p| *p.borrow_mut() = Some(at.to_string()));
         }
         if REDACTING_A_PANIC.with(std::cell::Cell::get) {
             eprintln!("{UNREDACTED_PANIC}");

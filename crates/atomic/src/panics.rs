@@ -155,6 +155,15 @@ pub fn cause(run: &str, message: &str) -> String {
     )
 }
 
+/// What a person is told about run `run`, whose workflow code panicked with
+/// `message` when this command could not see the engine park it.
+pub fn unparked(run: &str, message: &str) -> String {
+    format!(
+        "run {run} stopped: atomic's own workflow code panicked ({message}), and the engine has \
+         not parked it yet, so a later `atomic serve` may run it again"
+    )
+}
+
 /// What a person can do about it.
 pub fn hint(run: &str) -> String {
     format!(
@@ -184,6 +193,8 @@ impl<F: Future> Future for Caught<F> {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
         let this = &mut *self;
+        // Only a location recorded during this poll is this panic's.
+        let _ = atomic_core::redact::take_panic_location();
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             this.workflow.as_mut().poll(cx)
         })) {

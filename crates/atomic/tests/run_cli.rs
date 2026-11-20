@@ -3805,6 +3805,7 @@ async fn a_run_whose_workflow_code_panics() {
         );
         assert!(t.contains("will likely happen again"), "{t}");
         assert!(!t.contains("more times than the engine allows"), "{t}");
+        assert!(t.contains("so the run is parked, not retried"), "{t}");
         t
     };
     let out = atomic(
@@ -3855,8 +3856,12 @@ async fn a_run_whose_workflow_code_panics() {
     });
     terminate(&serve);
     let _ = wait_child(&mut serve, "serve");
-    // The server ran nothing of the parked run.
-    assert_eq!(count_log(&dir).len(), 1, "serve ran the parked run again");
+    // The server recovered nothing: the run was parked, not left pending.
+    let served = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        served.contains("recovered 0 unfinished run(s)"),
+        "serve recovered the panicked run: {served}"
+    );
 
     // One that panics while serving: killed where it would panic, then
     // recovered by a server, which says so as it happens.
@@ -3894,4 +3899,51 @@ async fn a_run_whose_workflow_code_panics() {
     );
     terminate(&serve);
     let _ = wait_child(&mut serve, "serve");
+}
+
+/// A panic noted by an earlier process is not the cause of a later run's
+/// own failure under the same id: it fails as any run does.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[test]
+fn a_note_kept_from_before_is_not_a_later_failures_cause() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
+    let dir = scratch("stale-note");
+    let project = project(&dir);
+    let state = state_dir(&dir, &project);
+    let panics = state
+        .parent()
+        .and_then(Path::parent)
+        .expect("the atomic home")
+        .join("private")
+        .join(state.file_name().expect("the project's id"))
+        .join("panics");
+    std::fs::create_dir_all(&panics).expect("panics");
+    let name = {
+        use sha2::Digest;
+        format!("{:x}.json", sha2::Sha256::digest(b"reused"))
+    };
+    std::fs::write(
+        panics.join(name),
+        json!({"run": "reused", "message": "a panic long ago", "at": 1}).to_string(),
+    )
+    .expect("an old note");
+    // A command that fails: an ordinary failure of the run.
+    std::fs::write(project.join("tools/count.py"), "import sys\nsys.exit(3)\n")
+        .expect("a failing command");
+    let out = atomic(
+        &dir,
+        &project,
+        &["run", "count-only", "--run-id", "reused", "--data", NOTE],
+        &[],
+        "",
+    );
+    let t = text(&out);
+    assert!(!out.status.success(), "{t}");
+    assert!(
+        !t.contains("panicked"),
+        "an old note was taken for the cause: {t}"
+    );
+    assert!(t.contains("run reused failed"), "{t}");
 }
