@@ -152,13 +152,38 @@ on_signal() {
 trap on_signal INT TERM HUP
 run_cargo() {
     # shellcheck disable=SC2086
-    cargo test --locked ${1} >"${LOG}" 2>&1 &
+    # Every test binary runs, however an earlier one ends: a row may name
+    # tests in several, and each must be seen to fail.
+    cargo test --locked --no-fail-fast ${1} >"${LOG}" 2>&1 &
     cargo_pid=$!
     wait "${cargo_pid}"
     local code=$?
     cargo_pid=""
     return "${code}"
 }
+# The tests a row's cargo arguments name: those after `--`, or else its
+# positional filters.
+named_tests() {
+    local after=0 skip=0 a
+    # shellcheck disable=SC2086
+    for a in ${1}; do
+        if [ "${skip}" -eq 1 ]; then
+            skip=0
+            continue
+        fi
+        if [ "${after}" -eq 1 ]; then
+            echo "${a}"
+            continue
+        fi
+        case "${a}" in
+        --) after=1 ;;
+        -p | --package | --features | --test | --bin | --example) skip=1 ;;
+        -*) ;;
+        *) echo "${a}" ;;
+        esac
+    done
+}
+
 # Keep a failing control's cargo output, which the exit would delete.
 keep_log() {
     cp -- "${LOG}" "${ROOT}/target/controls-check-$1.log" 2>/dev/null &&
@@ -205,6 +230,18 @@ for row in "${selected[@]}"; do
     passed="$(awk '/^test result:/ { p += $4 } END { print p + 0 }' "${LOG}")"
     if [ "${removed}" -eq 0 ] || [ "${passed}" -ne 0 ] || ! grep -q "^test .* FAILED$" "${LOG}"; then
         echo "FAIL ${name}: its test passed with the control off" >&2
+        keep_log "${name}"
+        status=1
+        continue
+    fi
+    # And each one it names is seen failing: one that matched no test, or
+    # was never run, is not a test that caught the control's removal.
+    unfailed=""
+    while read -r test; do
+        grep -qE "^test [^ ]*${test}[^ ]* \.\.\. FAILED$" "${LOG}" || unfailed="${unfailed} ${test}"
+    done < <(named_tests "${args}")
+    if [ -n "${unfailed}" ]; then
+        echo "FAIL ${name}: with the control off, these tests were not seen failing:${unfailed}" >&2
         keep_log "${name}"
         status=1
         continue
