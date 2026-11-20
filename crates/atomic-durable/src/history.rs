@@ -221,9 +221,11 @@ mod tests {
     #[cfg(feature = "postgres-tests")]
     #[tokio::test(flavor = "multi_thread")]
     async fn postgres_executions_beginning_together_are_numbered_apart() {
-        let url = crate::testing::database().await;
+        let schema = crate::testing::schema("history").await;
         executions_beginning_together_are_numbered_apart(
-            Durare::postgres(&url, &unique()).await.expect("postgres"),
+            Durare::postgres(schema.url(), schema.name())
+                .await
+                .expect("postgres"),
         )
         .await;
     }

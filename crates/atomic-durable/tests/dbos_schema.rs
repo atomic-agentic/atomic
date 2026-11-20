@@ -47,12 +47,11 @@ async fn the_sqlite_schema_matches_upstream() -> durare::Result<()> {
 #[cfg(feature = "postgres-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_postgres_schema_matches_upstream() -> durare::Result<()> {
-    let url = atomic_durable::testing::database().await;
-    let schema = format!("dbos_fork_{}", std::process::id());
-    let provider = Arc::new(durare::PostgresProvider::connect_with_schema(&url, &schema).await?);
-    assert_eq!(
-        fork_dump(provider, "postgres", &schema).await?,
-        expected("postgres.schema")
-    );
+    let guard = atomic_durable::testing::schema("dbos_fork").await;
+    let schema = guard.name().to_owned();
+    let provider =
+        Arc::new(durare::PostgresProvider::connect_with_schema(guard.url(), &schema).await?);
+    let dumped = fork_dump(provider, "postgres", &schema).await;
+    assert_eq!(dumped?, expected("postgres.schema"));
     Ok(())
 }

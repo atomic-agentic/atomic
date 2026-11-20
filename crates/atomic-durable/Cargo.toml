@@ -37,8 +37,8 @@ thiserror = { workspace = true }
 # How a failpoint kills its process (failpoints only).
 libc = { workspace = true, optional = true }
 # Waits between tries of a control record, and the test database probe's
-# time limit (postgres-tests only).
-tokio = { workspace = true, features = ["time"] }
+# time limit and dropping test schemas (postgres-tests only).
+tokio = { workspace = true, features = ["time", "rt"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

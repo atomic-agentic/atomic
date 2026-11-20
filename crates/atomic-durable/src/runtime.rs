@@ -1106,6 +1106,20 @@ impl Durare {
         Ok(found.into_iter().next().map(RunRecord::from))
     }
 
+    /// The input run `id` was started with, as stored, or `None` if there
+    /// is no such run.
+    pub async fn run_input(&self, id: &str) -> Result<Option<Value>> {
+        let found = self
+            .engine
+            .list_workflows(&durare::ListFilter {
+                workflow_ids: vec![id.to_owned()],
+                ..durare::ListFilter::default()
+            })
+            .await
+            .map_err(from_durare)?;
+        Ok(found.into_iter().next().map(|w| w.input))
+    }
+
     /// Every run in the store in engine state `state`, such as
     /// `MAX_RECOVERY_ATTEMPTS_EXCEEDED`.
     pub async fn runs_in(&self, state: &str) -> Result<Vec<RunRecord>> {

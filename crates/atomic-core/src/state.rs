@@ -8,17 +8,21 @@
 //! when `ATOMIC_HOME` is set:
 //!
 //! ```text
-//! <state>/
-//!   private/      what is atomic's alone, denied to every atom's commands:
+//! <home>/private/<project>/   what is atomic's alone, denied to every atom's
+//!                             commands, with every other project's, by one
+//!                             entry for the whole of `<home>/private`:
 //!     atomic.db     atomic's own database (durable workflows, the gate store)
 //!     context/      context checkpoints
 //!     runtime.lock  held by the one process that executes the project's runs
+//! <state>/ = <home>/projects/<project>/
 //!   codex/        Codex's home for atom threads, with its own state database
 //!                 (denied to atoms too, apart from the shell snapshots and
 //!                 helper links Codex's shell needs)
 //!   worktrees/    one worktree per code-changing step
 //!   cache/        build caches shared by a project's steps
 //!   tmp/          each turn's own temporary directory
+//!   scratch/      each atom attempt's scratch directory, and the
+//!                 temporary directory its backend's turns share
 //! ```
 //!
 //! Atom threads therefore never mix with the user's own Codex sessions.
@@ -29,7 +33,7 @@
 //!
 //! One process at a time executes a project's runs: `atomic run`,
 //! `atomic runs resume` and `atomic serve` each take the [`ExecutionLock`]
-//! (`private/runtime.lock`) first, so two of them never recover or run the
+//! (`<home>/private/<project>/runtime.lock`) first, so two of them never recover or run the
 //! same work. The operating system releases it when its holder exits,
 //! however it exits.
 
@@ -41,6 +45,7 @@ use std::path::{Path, PathBuf};
 pub struct ProjectState {
     root: PathBuf,
     dir: PathBuf,
+    private: PathBuf,
 }
 
 /// Why the state directory could not be resolved or created.
@@ -74,6 +79,31 @@ pub enum StateError {
         /// What is wrong, and what to do.
         why: String,
     },
+    /// State an older atomic left is still in use, so it cannot move yet.
+    #[error(
+        "{path} is in use by another atomic process, so its state cannot move to {to} yet; \
+         stop that process, then run atomic again"
+    )]
+    InUse {
+        /// The database, or execution lock, in use.
+        path: PathBuf,
+        /// Where it would move.
+        to: PathBuf,
+    },
+    /// State an older atomic left is there, and so is the current layout's,
+    /// as after running an older atomic again: which one holds the project's
+    /// runs is the operator's to say.
+    #[error(
+        "{old} is left from an older atomic, and {current} exists too, so neither is used; \
+         keep the one that holds this project's runs at {current} and move the other out of \
+         the way, then run atomic again"
+    )]
+    Both {
+        /// The older layout's file or directory.
+        old: PathBuf,
+        /// The current layout's.
+        current: PathBuf,
+    },
 }
 
 impl ProjectState {
@@ -84,14 +114,24 @@ impl ProjectState {
             path: root.to_owned(),
             source,
         })?;
-        let dir = base_dir()?.join("projects").join(project_id(&root));
-        Ok(Self { root, dir })
+        let home = base_dir()?;
+        let id = project_id(&root);
+        Ok(Self {
+            dir: home.join("projects").join(&id),
+            private: home.join("private").join(&id),
+            root,
+        })
     }
 
-    /// Create the state directory and its fixed subdirectories, the private
-    /// one readable by its owner only. A database or context directory an
-    /// older atomic left at the top of the state directory moves into
-    /// `private/`.
+    /// Create the state directory and its fixed subdirectories, and the
+    /// project's private directory, readable by its owner only, as is the
+    /// home's `private/` above it.
+    ///
+    /// A database or context directory an older atomic left in the state
+    /// directory, at its top or in its `private/`, moves into the private
+    /// directory: only while this process holds the state directory's
+    /// migration lock, and never while another process has that database
+    /// open ([`StateError::InUse`]).
     pub fn create(&self) -> Result<(), StateError> {
         let create = |d: &Path| {
             std::fs::create_dir_all(d).map_err(|source| StateError::Create {
@@ -101,16 +141,77 @@ impl ProjectState {
         };
         create(&self.dir)?;
         create(&self.codex_home())?;
-        private_dir(&self.private_dir())?;
-        for name in ["atomic.db", "atomic.db-wal", "atomic.db-shm", "context"] {
-            let (old, new) = (self.dir.join(name), self.private_dir().join(name));
-            if old.exists() && !new.exists() {
-                std::fs::rename(&old, &new).map_err(|source| StateError::Create {
-                    path: new.clone(),
-                    source,
-                })?;
+        private_dir(&self.private_root())?;
+        private_dir(&self.private)?;
+        let legacy: Vec<PathBuf> = [self.dir.join("private"), self.dir.clone()]
+            .into_iter()
+            .filter(|dir| LEGACY.iter().any(|name| dir.join(name).exists()))
+            .collect();
+        if legacy.is_empty() {
+            return Ok(());
+        }
+        let fail = |path: &Path| {
+            let path = path.to_owned();
+            move |source| StateError::Create { path, source }
+        };
+        // One process migrates at a time.
+        let lock_path = self.dir.join("migrate.lock");
+        let lock = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(fail(&lock_path))?;
+        lock.lock().map_err(fail(&lock_path))?;
+        for dir in legacy {
+            // Both layouts at once: moving would lose one of them, and
+            // ignoring the old one could hide the project's runs.
+            for name in LEGACY {
+                let (old, current) = (dir.join(name), self.private.join(name));
+                if old.exists() && current.exists() {
+                    return Err(StateError::Both { old, current });
+                }
+            }
+            let database = dir.join("atomic.db");
+            if database_in_use(&database) {
+                return Err(StateError::InUse {
+                    path: database,
+                    to: self.database(),
+                });
+            }
+            // An older atomic kept its execution lock in `<state>/private`: a
+            // process holding it may still run the project's work. It is
+            // held here until the state has moved, so no older atomic starts
+            // on it meanwhile.
+            let old_lock = dir.join("runtime.lock");
+            let old_layout_lock = dir != self.dir && old_lock.exists();
+            let held = if old_layout_lock {
+                let Some(held) = hold_lock(&old_lock) else {
+                    return Err(StateError::InUse {
+                        path: old_lock,
+                        to: self.lock_file(),
+                    });
+                };
+                held
+            } else {
+                None
+            };
+            for name in LEGACY {
+                let (old, new) = (dir.join(name), self.private.join(name));
+                if old.exists() {
+                    std::fs::rename(&old, &new).map_err(fail(&new))?;
+                }
+            }
+            if old_layout_lock {
+                let _ = std::fs::remove_file(&old_lock);
+            }
+            drop(held);
+            if dir != self.dir {
+                // The old `<state>/private`, now empty.
+                let _ = std::fs::remove_dir(&dir);
             }
         }
+        drop(lock);
         Ok(())
     }
 
@@ -124,9 +225,18 @@ impl ProjectState {
         &self.dir
     }
 
-    /// What is atomic's alone: denied to every atom's commands.
+    /// What is this project's alone: denied to every atom's commands.
     pub fn private_dir(&self) -> PathBuf {
-        self.dir.join("private")
+        self.private.clone()
+    }
+
+    /// Where every project of this atomic home keeps its private state, its
+    /// own included: one directory that a sandbox denies whole.
+    pub fn private_root(&self) -> PathBuf {
+        self.private
+            .parent()
+            .map(Path::to_owned)
+            .unwrap_or_else(|| self.private.clone())
     }
 
     /// atomic's own database file.
@@ -266,6 +376,63 @@ pub enum LockError {
         /// The underlying error.
         source: std::io::Error,
     },
+}
+
+/// What an older layout kept in the state directory, at its top or in its
+/// `private/`.
+const LEGACY: [&str; 4] = ["atomic.db", "atomic.db-wal", "atomic.db-shm", "context"];
+
+/// The lock on the file at `path`, held until the file returned is dropped,
+/// or `None` when another process holds it. A file that cannot be opened or
+/// locked at all holds nothing back.
+fn hold_lock(path: &Path) -> Option<Option<std::fs::File>> {
+    let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+    else {
+        return Some(None);
+    };
+    match file.try_lock() {
+        Ok(()) => Some(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => None,
+        Err(std::fs::TryLockError::Error(_)) => Some(None),
+    }
+}
+
+/// Whether another process has the SQLite database at `path` open in WAL
+/// mode: each such connection holds a read lock on its shared-memory file's
+/// "DMS" byte (offset 128) for as long as it is open.
+fn database_in_use(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let mut shm = path.as_os_str().to_owned();
+        shm.push("-shm");
+        let Ok(file) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&shm)
+        else {
+            return false;
+        };
+        // SAFETY: a zeroed flock is a valid value of a plain C struct.
+        #[allow(unsafe_code)]
+        let mut probe: libc::flock = unsafe { std::mem::zeroed() };
+        probe.l_type = libc::F_WRLCK as _;
+        probe.l_whence = libc::SEEK_SET as _;
+        probe.l_start = 128;
+        probe.l_len = 1;
+        // SAFETY: F_GETLK reads and writes only `probe`, a valid flock.
+        #[allow(unsafe_code)]
+        let asked = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &mut probe) };
+        asked == 0 && probe.l_type != libc::F_UNLCK as libc::c_short
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
+    }
 }
 
 /// Where atomic keeps every project's state: `$ATOMIC_HOME`, or `atomic` in
@@ -458,6 +625,7 @@ mod tests {
         let state = ProjectState {
             root: dir.clone(),
             dir: dir.join("state"),
+            private: dir.join("private/p"),
         };
         state.create().expect("state");
         let held = state.lock_execution("atomic serve").expect("free");
@@ -485,6 +653,7 @@ mod tests {
         let state = ProjectState {
             root: dir.clone(),
             dir: dir.join("state"),
+            private: dir.join("private/p"),
         };
         state.create().expect("state");
         // A previous holder's words, left in the file, and a new holder that
@@ -524,6 +693,7 @@ mod tests {
         let state = ProjectState {
             root: dir.join("project"),
             dir: dir.join("state"),
+            private: dir.join("private/p"),
         };
         std::fs::create_dir_all(state.dir().join("context")).expect("old layout");
         std::fs::write(state.dir().join("atomic.db"), "db").expect("old database");
@@ -543,6 +713,106 @@ mod tests {
             assert_eq!(mode.mode() & 0o777, 0o700);
         }
         state.create().expect("again");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The layout before every project's private state moved under the
+    /// home's `private/`: `<state>/private/` moves to `<home>/private/<id>`,
+    /// but not while another process has its database open.
+    #[test]
+    fn a_state_private_directory_moves_once_its_database_is_closed() {
+        let dir = std::env::temp_dir().join(format!("atomic-state-moved-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = ProjectState {
+            root: dir.join("project"),
+            dir: dir.join("home/projects/p"),
+            private: dir.join("home/private/p"),
+        };
+        let old = state.dir().join("private");
+        std::fs::create_dir_all(old.join("context")).expect("old layout");
+        let old_db = old.join("atomic.db");
+        // Another process holds the old database open, in WAL mode.
+        let mut holder = std::process::Command::new("python3")
+            .args([
+                "-c",
+                "import sqlite3, sys, time\n\
+                 c = sqlite3.connect(sys.argv[1]); c.execute('PRAGMA journal_mode=WAL')\n\
+                 c.execute('CREATE TABLE IF NOT EXISTS t (x)'); c.execute('INSERT INTO t VALUES (1)'); c.commit()\n\
+                 print('open', flush=True); time.sleep(60)",
+            ])
+            .arg(&old_db)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("python3");
+        let mut ready = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(holder.stdout.as_mut().expect("stdout")),
+            &mut ready,
+        )
+        .expect("ready");
+        assert_eq!(ready.trim(), "open");
+        match state.create() {
+            Err(StateError::InUse { path, .. }) => assert_eq!(path, old_db),
+            other => panic!("moved under an open database: {other:?}"),
+        }
+        assert!(old_db.exists(), "nothing moved");
+        holder.kill().expect("stop the holder");
+        holder.wait().expect("reaped");
+        // An older atomic's execution lock, still held, stops the move too.
+        let old_lock = old.join("runtime.lock");
+        let held = std::fs::File::create(&old_lock).expect("old lock");
+        held.lock().expect("hold");
+        match state.create() {
+            Err(StateError::InUse { path, to }) => {
+                assert_eq!(path, old_lock);
+                assert_eq!(to, state.lock_file());
+            }
+            other => panic!("moved under a held execution lock: {other:?}"),
+        }
+        assert!(old_db.exists(), "nothing moved");
+        drop(held);
+        state.create().expect("moves once closed");
+        assert!(state.database().is_file());
+        assert!(state.context_dir().is_dir());
+        assert!(!old.exists(), "the old private directory is gone");
+        assert_eq!(state.private_root(), dir.join("home/private"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Both layouts at once, as after running an older atomic again: the
+    /// old state is neither moved over the new nor ignored.
+    #[test]
+    fn an_older_layout_beside_the_current_one_is_refused() {
+        let dir = std::env::temp_dir().join(format!("atomic-state-both-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = ProjectState {
+            root: dir.join("project"),
+            dir: dir.join("home/projects/p"),
+            private: dir.join("home/private/p"),
+        };
+        state.create().expect("the current layout");
+        std::fs::write(state.database(), "current").expect("current database");
+        let old = state.dir().join("private");
+        std::fs::create_dir_all(&old).expect("old layout");
+        std::fs::write(old.join("atomic.db"), "old").expect("old database");
+        match state.create() {
+            Err(StateError::Both { old: o, current }) => {
+                assert_eq!(o, old.join("atomic.db"));
+                assert_eq!(current, state.database());
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(state.database()).expect("db"),
+            "current"
+        );
+        assert_eq!(
+            std::fs::read_to_string(old.join("atomic.db")).expect("db"),
+            "old"
+        );
+        // Once the operator has moved the old one away, atomic runs again.
+        std::fs::remove_file(old.join("atomic.db")).expect("moved away");
+        state.create().expect("one layout");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -480,6 +480,9 @@ pub async fn serve(
     paths: &CodexPaths,
 ) -> anyhow::Result<()> {
     let mut signals = Signals::new()?;
+    // One run whose commands cannot be confined here does not stop the
+    // others: it stays unfinished, and serve goes on.
+    atomic_app::workflows::serve_past_unconfinable_steps();
     let state = state(project)?;
     let engine = engine::open(
         &state,

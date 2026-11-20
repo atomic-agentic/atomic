@@ -46,6 +46,37 @@ project root. The command reads its input as JSON on stdin and writes its output
 as JSON on stdout; a nonzero exit fails the step. It receives only the variables
 in `env`, plus its own `HOME` and `TMPDIR` and the effect variables below.
 
+On Linux the command runs under the same sandbox as a Codex atom's commands. It
+can read the project and the rest of the filesystem except atomic's private
+state (every project's database and gate store under the atomic home's
+`private/`, the current project's Codex records, the credential and key
+directories). It can write only its own scratch directory (its `HOME`
+and `TMPDIR`) and the project's build caches; a command that writes anywhere
+else fails. It has no network and cannot use sockets, until atoms can declare
+the network they need. It also:
+
+- finds `.aws`, `.codex`, `.git` and `.agents` in its `HOME` read-only, as the
+  sandbox keeps them in every writable directory;
+- cannot gain privileges (no `sudo`, no setuid programs) and sees no GPU or
+  other devices beyond the basic ones;
+- is not told where the caches are: name the directory in `env` if a tool needs
+  it;
+- cannot be a program whose path holds `=`.
+
+`env` cannot set `HOME` or `TMPDIR`, which are the command's own. A codex atom
+may declare `env` too, for the commands its turn runs, such as the tool homes
+(`RUSTUP_HOME`, `CARGO_HOME`, `PYENV_ROOT`) they no longer find through `HOME`;
+it cannot set `HOME`, `ZDOTDIR` or `TMPDIR`, nor a variable the dynamic loader
+reads (`LD_*`, `DYLD_*`, `GCONV_PATH`, `GLIBC_TUNABLES`), which would load code
+into the sandbox helper.
+
+On Linux, an atom that runs commands, an exec atom or a codex atom, needs
+bubblewrap and unprivileged user namespaces. Where the sandbox cannot start,
+atomic stops before such a step runs, saying what it needs and recording
+nothing, so the run continues once resumed where the sandbox can start; atoms
+that run no commands, such as lite atoms, run as usual. On macOS and Windows the
+command is not confined yet.
+
 A step runs at least once, and Atomic cannot see what a command does to other
 systems. If execution is interrupted after the command started and before its
 result was saved, `effects.external` decides what recovery does. This includes
@@ -138,6 +169,49 @@ part of the compiled atom, so editing an unrelated schema does not change it. An
 import whose schema file does not exist fails the check. A schema file whose
 declarations would replace an atom's own `.atomic/types/<atom>.d.ts` is an error.
 
+### Artifact references
+
+A field typed `{$ref: 'atomic:artifact'}` holds a reference to a stored
+artifact, `artifact://sha256/<digest>`, never its bytes. A `mediaType` beside
+the `$ref` says what the artifact must be:
+
+```yaml
+properties:
+  patch: {$ref: 'atomic:artifact', mediaType: text/x-diff}
+```
+
+Atomic checks every reference in an output, from a model or an exec command,
+against the artifact store: it must exist and have that media type. A reference
+under `anyOf` or `oneOf` is held to the alternative the value fits. JSON
+Schema's own rule decides which that is, so a plain-string alternative beside an
+artifact accepts any string, a reference to a missing artifact included. Tag the
+alternatives with a required `const` property, or close them with
+`additionalProperties: false`, so that the artifact's alternative is the only
+one a reference fits:
+
+```yaml
+anyOf:
+  - {type: object, additionalProperties: false, required: [kind, file],
+     properties: {kind: {const: diff}, file: {$ref: 'atomic:artifact', mediaType: text/x-diff}}}
+  - {type: object, additionalProperties: false, required: [kind, text],
+     properties: {kind: {const: text}, text: {type: string, maxLength: 2000}}}
+```
+
+`atomic check` inlines references to other schema files and `$anchor`s first,
+and writes any spelling of `atomic:artifact` (`atomic:artifact#`) the canonical
+way. It then refuses an output schema whose references the check could not
+follow: one reached through `contains`, `if`, `then`, `else`, `not`,
+`patternProperties` or another keyword besides `properties`, `items`,
+`prefixItems`, `additionalProperties`, `dependentSchemas`, `allOf`, `anyOf` and
+`oneOf`; and a `mediaType` anywhere but beside `$ref: 'atomic:artifact'`. A
+contract written in code is not inlined. Before its atom calls a model, it is
+refused for a `$ref` to anything outside itself other than `atomic:artifact`
+(another file, or a spelling such as `atomic:artifact#`); if it has such a
+reference or holds artifact references, also for a subschema with its own
+`$schema` and for a reference the check cannot follow, such as an `$anchor`. A
+schema whose alternatives would take too long to decide fails the check at run
+time rather than passing unchecked.
+
 ## Configuration
 
 | Field | Meaning |
@@ -150,24 +224,27 @@ declarations would replace an atom's own `.atomic/types/<atom>.d.ts` is an error
 | `validate` | Expression-bodied typed callbacks over `{input, output}` |
 | `examples` | Named `{input, output}` examples checked against full contracts |
 | `case`, `judges` | Full evaluation-case and judge input/output schema declarations |
-| `scorers` | Interpreted judge bindings, numeric scores and mean thresholds |
+| `scorers` | Interpreted judge bindings, numeric scores, mean thresholds (`min_mean`) and the tolerated drop against a baseline (`max_drop`) |
+| `evals` | The eval-case directory relative to the atom file, or `{dir, pass_rate}`; see [eval cases](eval-cases.md#pass-rate-and-threshold) |
 | `context` | Optional public execution-context schema; a context sidecar is also accepted. See [context schemas](#context-schemas) |
-| `exec`, `effects`, `env` | An exec atom's command, what it does outside Atomic, and its environment. See [exec atoms](#exec-atoms) |
+| `exec`, `effects`, `env` | An exec atom's command, what it does outside Atomic, and its environment. See [exec atoms](#exec-atoms). A codex atom may declare `env` too, for its turn's commands (see [exec atoms](#exec-atoms) for what it cannot set) |
 
 A Codex atom's shell inherits only the platform's core variables, such as
 `PATH`, `HOME`, `USER` and the locale, without any whose name holds `KEY`,
 `SECRET` or `TOKEN`, and never `ATOMIC_*`, `OPENAI_*`, `CODEX_*`, `AWS_*`,
-`PG*`, `DATABASE_URL` or any `*_API_KEY`. Its `HOME` is a directory that
-does not exist and it is not a login shell, so none of your shell startup
-files run, and your own atomic configuration directory is denied to it. The model chooses its commands, so this keeps your inherited
+`PG*`, `DATABASE_URL` or any `*_API_KEY`. Its `HOME` and `ZDOTDIR` are its
+attempt's own scratch directory, or a directory that does not exist where
+no attempt gives it one, and it is not a login shell, so none of your shell
+startup files run, and your own atomic configuration directory is denied to
+it. The model chooses its commands, so this keeps your inherited
 environment from the model; it does not yet cover credentials in files
 elsewhere in your home directory.
 
-`HOME` is `/nonexistent` for these commands, so anything that finds its
-files through the home directory does not find them: rustup's and cargo's
-homes (`~/.rustup`, `~/.cargo`), the Go module cache, pyenv and asdf shims,
-`~/.gitconfig` and `~/.npmrc`. A tool the atom's commands need has to be on
-`PATH` without them, and settings it needs passed in the atom's `env`.
+Anything that finds its files through your home directory does not find
+them: rustup's and cargo's homes (`~/.rustup`, `~/.cargo`), the Go module
+cache, pyenv and asdf shims, `~/.gitconfig` and `~/.npmrc`. A tool the
+atom's commands need has to be on `PATH` without them, and settings it
+needs passed in the atom's `env`.
 
 Some integrations shown in the catalog remain staged. Unavailable permissions,
 remote atoms, credentials, skills and runtime declarations fail explicitly in the

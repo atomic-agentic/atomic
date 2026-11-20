@@ -87,10 +87,16 @@ const PROFILES: &[&str] = &[".profile", ".bash_profile", ".bashrc", ".zshenv"];
 fn an_atoms_shell_sees_none_of_the_persons_secrets() {
     support::require_sandbox();
     on_codex_runtime(async {
-        // Outside any checkout: a personal configuration inside the
-        // checkout holding the project is refused.
+        // The home and the project outside any checkout, since a personal
+        // configuration inside the checkout holding the project is refused;
+        // atomic's state outside the system temporary directory, where a
+        // sandboxed turn may write, and found as a person's is, without
+        // ATOMIC_HOME, which brings denials of its own.
         let dir = std::env::temp_dir().join(format!("atomic-shell-env-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
+        let atomic_home = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("atomic-shell-env-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&atomic_home);
         let home = dir.join("home");
         std::fs::create_dir_all(home.join(".config/atomic")).unwrap();
         for profile in PROFILES {
@@ -125,7 +131,7 @@ fn an_atoms_shell_sees_none_of_the_persons_secrets() {
             .args(["run", "look", "--data", r#"{"text": "the note"}"#])
             .current_dir(&project)
             .env("HOME", dir.join("home"))
-            .env("ATOMIC_HOME", dir.join("atomic-home"))
+            .env("XDG_DATA_HOME", &atomic_home)
             .env("XDG_CONFIG_HOME", dir.join("home/.config"))
             .env("ATOMIC_DETECT_OLLAMA_ADDR", "127.0.0.1:9")
             .env("ATOMIC_MODEL_BASE_URL", model.base_url())
@@ -133,6 +139,7 @@ fn an_atoms_shell_sees_none_of_the_persons_secrets() {
             .stdin(Stdio::null());
         for name in [
             "CODEX_HOME",
+            "ATOMIC_HOME",
             "ATOMIC_DATABASE_URL",
             "ATOMIC_EXECUTOR_ID",
             "ATOMIC_MODEL_API_KEY_ENV",
@@ -171,7 +178,12 @@ fn an_atoms_shell_sees_none_of_the_persons_secrets() {
         );
         // The command ran, and saw the core variables.
         assert!(printed.contains("PATH="), "{printed}");
-        assert!(printed.contains("HOME=/nonexistent"), "{printed}");
+        // A home of its own, never the person's.
+        assert!(printed.contains("HOME="), "{printed}");
+        assert!(
+            !printed.contains(&format!("HOME={}\n", home.display())),
+            "{printed}"
+        );
         assert!(printed.contains("looked"), "{printed}");
         assert!(
             !printed.contains("PROFILE_CANARY"),
