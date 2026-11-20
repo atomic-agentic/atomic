@@ -37,7 +37,7 @@
 mod support;
 
 use atomic_core::Sandbox;
-use atomic_core::codex::{self, CodexPaths, ModelEndpoint, PrivateState, StateGuard, TurnSpec};
+use atomic_core::codex::{CodexPaths, ModelEndpoint, PrivateState, StateGuard, TurnSpec};
 use atomic_core::credential::{self, MemorySecrets};
 use atomic_core::git::Git;
 use atomic_core::testing::{FakeModel, Reply, on_codex_runtime};
@@ -293,16 +293,25 @@ async fn sandboxed(
         PathBuf::from(env!("CARGO_BIN_EXE_atomic")),
         dir.join("bin/codex-linux-sandbox"),
     );
-    let answer = codex::run(
-        &paths,
-        &state.join("codex"),
-        cwd,
-        &ModelEndpoint {
+    // Scratch outside `state`, which this turn may write all of.
+    let scratch = dir.join("scratch-root");
+    let runtime = atomic_core::runtime::CodexRuntime {
+        paths,
+        codex_home: state.join("codex"),
+        cwd: cwd.to_owned(),
+        endpoint: ModelEndpoint {
             base_url: model.base_url(),
             model: "synthetic".into(),
             api_key_env: None,
         },
-        guard,
+        defaults: Default::default(),
+        artifacts: atomic_core::runtime::Artifacts::none(),
+        meter: atomic_core::usage::Metering::none(),
+        guard: guard.clone(),
+        backend: atomic_exec::Backend::connect(atomic_exec::LocalBackend::in_dir(scratch)).unwrap(),
+    };
+    let answer = atomic_core::runtime::run_turn(
+        &runtime,
         &TurnSpec {
             prompt: "Do the work.".into(),
             sandbox: Sandbox::WorkspaceWrite,
@@ -405,6 +414,7 @@ fn an_atom_cannot_approve_its_own_gate_through_its_shell() {
             .unwrap();
         let guard = StateGuard::Deny(PrivateState {
             state_dir: state.clone(),
+            private: state.join("private"),
             also: vec![dir.join("credentials")],
         });
         let command = format!(
@@ -526,11 +536,16 @@ fn a_turn_through_atomics_own_entry_point_runs_with_its_helper_in_the_state_dire
                 assert!(out.status.success(), "{out:?}");
                 PathBuf::from(String::from_utf8(out.stdout).unwrap().trim())
             };
-            assert!(state.join("private/atomic.db").exists());
+            // The project's private state is in the home's `private/`.
+            let db = dir
+                .join("home/private")
+                .join(state.file_name().unwrap())
+                .join("atomic.db");
+            assert!(db.exists());
             let command = format!(
-                "cat a.txt; echo read-exit=$?; head -c 15 {}/private/atomic.db; echo; \
+                "cat a.txt; echo read-exit=$?; head -c 15 {}; echo; \
                  echo db-exit=$?",
-                state.display()
+                db.display()
             );
             let model = FakeModel::start(vec![
                 Reply::Tool {
