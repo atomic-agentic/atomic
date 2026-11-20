@@ -265,7 +265,12 @@ pub fn load(
                 ));
             }
             if !STEP.contains(&key.as_str()) {
-                return Err(fail(&kp, format!("unknown step field `{key}`")));
+                let mut e = fail(&kp, format!("unknown step field `{key}`"));
+                e.action = Some(match crate::names::nearest(key, STEP.iter().copied()) {
+                    Some(field) => format!("change `{key}` to `{field}`"),
+                    None => format!("remove `{key}`; a step's fields are {}", STEP.join(", ")),
+                });
+                return Err(e);
             }
         }
         match (s.get("atom"), s.get("gate")) {
@@ -289,10 +294,27 @@ pub fn load(
                         .as_str()
                         .ok_or_else(|| fail(&dp, "`after` lists step names".into()))?;
                     if !steps.contains_key(d) {
-                        return Err(fail(
+                        let near = crate::names::nearest(d, steps.keys().map(String::as_str));
+                        let mut e = fail(
                             &dp,
-                            format!("`after` names `{d}`, which is not a step here"),
-                        ));
+                            format!(
+                                "`after` names `{d}`, which is not a step here{}",
+                                near.map(|n| format!("; did you mean {n}?"))
+                                    .unwrap_or_default()
+                            ),
+                        );
+                        e.action = Some(match near {
+                            Some(n) => format!("change `{d}` in `after` to `{n}`"),
+                            None => format!(
+                                "name steps of this workflow in `after`: {}",
+                                steps
+                                    .keys()
+                                    .map(String::as_str)
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ),
+                        });
+                        return Err(e);
                     }
                     Ok(d.to_owned())
                 })
@@ -338,17 +360,26 @@ pub fn load(
                 .as_str()
                 .ok_or_else(|| fail(&ap, "`atom` names an atom".into()))?;
             let Some(atom) = atoms.get(atom_name) else {
-                let near: Vec<&str> = atoms
-                    .keys()
-                    .filter(|k| close(k, atom_name))
-                    .map(String::as_str)
-                    .collect();
-                let hint = if near.is_empty() {
-                    String::new()
-                } else {
-                    format!("; did you mean {}?", near.join(" or "))
-                };
-                return Err(fail(&ap, format!("no atom named `{atom_name}`{hint}")));
+                let near = crate::names::nearest(atom_name, atoms.keys().map(String::as_str));
+                let hint = near
+                    .map(|n| format!("; did you mean {n}?"))
+                    .unwrap_or_default();
+                let mut e = fail(&ap, format!("no atom named `{atom_name}`{hint}"));
+                e.action = Some(match near {
+                    Some(n) => format!("change `atom: {atom_name}` to `atom: {n}`"),
+                    None if atoms.is_empty() => {
+                        format!("add an atom named `{atom_name}` under atoms/")
+                    }
+                    None => format!(
+                        "name one of the project's atoms: {}, or add one named `{atom_name}`",
+                        atoms
+                            .keys()
+                            .map(String::as_str)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                });
+                return Err(e);
             };
             let target = atom
                 .program
@@ -790,24 +821,6 @@ fn ancestors(id: &str, after: &BTreeMap<String, Vec<String>>) -> BTreeSet<String
         }
     }
     out
-}
-
-/// Whether two names are one edit apart (for a "did you mean").
-fn close(a: &str, b: &str) -> bool {
-    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
-    if a.len().abs_diff(b.len()) > 1 {
-        return false;
-    }
-    let mut prev: Vec<usize> = (0..=b.len()).collect();
-    for i in 1..=a.len() {
-        let mut cur = vec![i; b.len() + 1];
-        for j in 1..=b.len() {
-            let cost = usize::from(a[i - 1] != b[j - 1]);
-            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
-        }
-        prev = cur;
-    }
-    prev[b.len()] <= 2
 }
 
 /// Replace `$ref`s with what they point at, so a schema can be embedded

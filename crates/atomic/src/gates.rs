@@ -91,7 +91,7 @@ fn operator() -> anyhow::Result<(String, Principal)> {
 pub async fn run(command: GatesCommand, state: &ProjectState) -> anyhow::Result<()> {
     // The store the project's runs use: its SQLite database, or PostgreSQL
     // when ATOMIC_DATABASE_URL names one.
-    let database = crate::engine::database(state);
+    let database = crate::engine::database(state)?;
     let rt = Durare::open(&database, None, atomic_app::pipeline::LAYOUT_VERSION)
         .await
         .with_context(|| {
@@ -255,10 +255,11 @@ pub(crate) async fn decide_as_operator(
     // The decision is recorded; waking the run is not part of it. Say so if
     // it fails, rather than leave the run to its deadline unannounced.
     if let Err(e) = gate::redeliver(rt).await {
-        eprintln!(
+        atomic_core::log_line!(
             "warning: the decision is recorded, but waking run {} failed: {e}; atomic serve or \
              atomic runs resume {} delivers it",
-            found.run, found.run
+            found.run,
+            found.run
         );
     }
     Ok(decision)

@@ -1,0 +1,5 @@
+Monitoring overview
+
+Our monitoring is far from the state of the art, but it is simple. Every service
+reports a heartbeat each minute. A missed heartbeat pages the person on call. Draft
+dashboards live in the sandbox folder until someone reviews them.

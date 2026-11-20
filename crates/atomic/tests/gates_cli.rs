@@ -39,7 +39,12 @@ impl Terminal {
             .env("ATOMIC_HOME", &self.home)
             .env("ATOMIC_CREDENTIAL_STORE", "file")
             .env("USER", "dev")
-            .env_remove("LOGNAME");
+            .env_remove("LOGNAME")
+            // No model endpoint from this machine: no Ollama, no key.
+            .env("ATOMIC_DETECT_OLLAMA_ADDR", "127.0.0.1:9")
+            .env_remove("OPENAI_API_KEY")
+            // None of the person's own configuration.
+            .env("XDG_CONFIG_HOME", self.home.join("config"));
         c
     }
 
@@ -59,7 +64,10 @@ impl Terminal {
         .env("ATOMIC_HOME", &self.home)
         .env("ATOMIC_CREDENTIAL_STORE", "file")
         .env("USER", "dev")
-        .env_remove("LOGNAME");
+        .env_remove("LOGNAME")
+        .env("ATOMIC_DETECT_OLLAMA_ADDR", "127.0.0.1:9")
+        .env_remove("OPENAI_API_KEY")
+        .env("XDG_CONFIG_HOME", self.home.join("config"));
         c.output().unwrap()
     }
 }
@@ -91,9 +99,13 @@ fn a_gate_is_approved_from_a_second_terminal_while_the_run_waits() {
         let state = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
 
         // The first terminal: a run waiting at its gate.
-        let mut rt = Durare::sqlite(&state.join("private/atomic.db"))
-            .await
-            .unwrap();
+        // Every project's private state is in the home's `private/`.
+        let db = t
+            .home
+            .join("private")
+            .join(state.file_name().unwrap())
+            .join("atomic.db");
+        let mut rt = Durare::sqlite(&db).await.unwrap();
         rt.register("gated", |ctx: DurareContext, (): ()| async move {
             let spec = GateSpec {
                 workflow: "gated".into(),

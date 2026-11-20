@@ -104,6 +104,35 @@ title: "'Accept the reviewed summary'"
 Use CEL for value mappings and validation. Declarative workflows do not execute
 arbitrary shell or JavaScript expressions.
 
+## Numbers in CEL
+
+CEL keeps `int`, `uint` and `double` apart, and its arithmetic does not mix
+them. Atomic chooses each number's CEL type from the schema of the value it
+belongs to, never from how the number is written:
+
+- A field only integers can fill is an `int`, or a `uint` above
+  9223372036854775807, whether the value is written `2`, `2.0` or `2e0`. That
+  is a field typed `integer`, including one that is also allowed to be `null`
+  (`type: [integer, "null"]`, or `anyOf` an integer and `null`).
+- A field typed `number` is a `double`. An integer a `double` cannot hold
+  exactly, such as 9007199254740993, is refused: type the field `integer`.
+- A field the schema does not type keeps an integer as an `int` and any
+  other number as a `double`.
+- A number too large for a `double` (`1e400`) is refused.
+
+Atomic converts each value when it is accepted: a model's answer, an exec
+atom's output and the workflow's input. A model's answer with a number CEL
+cannot read is sent back for repair, like any other schema error, so no later
+expression meets it.
+
+Comparisons work across the types, so `input.score >= 1` holds for a `number`
+field. Arithmetic does not: write `input.score * 2.0`, not `input.score * 2`,
+for a `number` field. Type every field you do arithmetic on. An untyped
+number's CEL type follows its value (`2` is an `int`, `2.5` a `double`), so an
+expression that adds to it works for one answer and fails for the next. A result that is not a finite number (`1.0 / 0.0`) is an
+error, a map key in a result must be a string, and objects in a result have
+their keys in sorted order.
+
 ## Gate steps
 
 ```yaml
@@ -199,8 +228,10 @@ what it is allowed to do, or `--view cost` for its budget. See
 ## Runtime metadata and later composition
 
 `steps.<id>.output` is the typed result. `steps.<id>.metadata` holds runtime facts,
-including a coding candidate's `commit`. Pass that runtime-owned SHA to review;
-do not ask the author model to invent it.
+including `input_sha256`, the SHA-256 of the input the step's atom was given, and a
+coding candidate's `commit`. atomic records the commit itself: map
+`steps.<id>.metadata.commit` into a review step rather than asking the author
+model for the commit's SHA.
 
 From v0.7, `steps.<id>.prepared` holds what the step's atom
 [computed in code](atom-files.md) before its model call. Like

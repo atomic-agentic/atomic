@@ -178,6 +178,8 @@ impl Request {
             stdin: unhex(&self.stdin).ok_or("stdin is not hex")?,
             time_limit: Duration::from_millis(self.time_limit_ms),
             output_limit: self.output_limit,
+            // Confined, if at all, before it was sent.
+            writable: Vec::new(),
         })
     }
 }
@@ -259,26 +261,40 @@ pub fn serve(
     }
 }
 
-/// The runner's side on this process's stdin, stdout and stderr, running
-/// commands as child processes in the runner's own process group, so that
-/// the control plane stops a command, with everything it started, by
-/// stopping its runner's group.
-pub fn serve_stdio() -> i32 {
+/// The runner's side on this process's stdin and stdout, with its own
+/// errors written to `errors` (the binary passes a writer that redacts them
+/// on their way to stderr), running commands as child processes in the
+/// runner's own process group, so that the control plane stops a command,
+/// with everything it started, by stopping its runner's group.
+pub fn serve_stdio(errors: &mut dyn Write) -> i32 {
     process::ignore_stop_signals();
-    serve(
+    let code = serve(
         &mut std::io::stdin().lock(),
         &mut std::io::stdout().lock(),
-        &mut std::io::stderr().lock(),
-        &InRunnerGroup,
-    )
+        errors,
+        &InRunnerGroup(LocalBackend::default()),
+    );
+    let _ = errors.flush();
+    code
 }
 
-/// [`LocalBackend`], with each command in the runner's process group.
-struct InRunnerGroup;
+/// [`LocalBackend`], with each command in the runner's process group. The
+/// command comes already confined: the control plane confines it before it
+/// crosses to the runner.
+struct InRunnerGroup(LocalBackend);
 
 impl ExecutionBackend for InRunnerGroup {
+    fn connect(&self) -> Result<crate::Statement, ExecError> {
+        self.0.connect()
+    }
+    fn open(&self, request: &crate::Open) -> Result<crate::Workspace, ExecError> {
+        self.0.open(request)
+    }
     fn run(&self, command: &Command) -> Result<Completed, ExecError> {
         LocalBackend::run_in(process::Group::Inherit, command)
+    }
+    fn close(&self, workspace: &crate::Workspace) -> Result<(), ExecError> {
+        self.0.close(workspace)
     }
 }
 
@@ -297,6 +313,8 @@ pub struct ProcessRunner {
     pub retries: u32,
     /// How long to wait for a held lease before trying again.
     pub lease_wait: Duration,
+    /// Where its workspaces are opened: its runners run on this machine.
+    pub workspaces: LocalBackend,
 }
 
 /// How much longer than its command a runner may take before it is stopped.
@@ -314,6 +332,7 @@ impl ProcessRunner {
                 .unwrap_or_default(),
             retries: 2,
             lease_wait: Duration::from_secs(1),
+            workspaces: LocalBackend::default(),
         }
     }
 
@@ -363,7 +382,25 @@ impl ProcessRunner {
 }
 
 impl ExecutionBackend for ProcessRunner {
+    /// Its workspaces are [`LocalBackend`]'s, so it states what that does.
+    fn connect(&self) -> Result<crate::Statement, ExecError> {
+        self.workspaces.connect()
+    }
+
+    /// Its runners run on this machine, so a workspace is opened here, as
+    /// [`LocalBackend`] opens one, and each command a runner runs finds it.
+    fn open(&self, request: &crate::Open) -> Result<crate::Workspace, ExecError> {
+        self.workspaces.open(request)
+    }
+
+    fn close(&self, workspace: &crate::Workspace) -> Result<(), ExecError> {
+        self.workspaces.close(workspace)
+    }
+
+    /// The command is confined here, before it crosses, as its workspaces'
+    /// backend confines it: the runner runs what it is sent.
     fn run(&self, command: &Command) -> Result<Completed, ExecError> {
+        let command = &self.workspaces.prepare(command)?;
         let request = serde_json::to_vec(&Request::new(command)).map_err(|e| ExecError::Io {
             program: command.program.clone(),
             message: format!("encode the runner request: {e}"),

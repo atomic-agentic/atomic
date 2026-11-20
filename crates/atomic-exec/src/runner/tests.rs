@@ -12,6 +12,7 @@ fn command(program: &str, args: &[&str], stdin: &[u8]) -> Command {
         stdin: stdin.to_vec(),
         time_limit: Duration::from_secs(10),
         output_limit: 1024,
+        writable: Vec::new(),
     }
 }
 
@@ -40,6 +41,7 @@ fn fake(dir: &Path, script: &str) -> ProcessRunner {
         env: Vec::new(),
         retries: 2,
         lease_wait: Duration::from_millis(10),
+        workspaces: LocalBackend::default(),
     }
 }
 
@@ -90,7 +92,12 @@ fn the_runner_side_runs_a_request_and_answers_it() {
     )))
     .expect("encode");
     let (mut out, mut err) = (Vec::new(), Vec::new());
-    let code = serve(&mut request.as_slice(), &mut out, &mut err, &LocalBackend);
+    let code = serve(
+        &mut request.as_slice(),
+        &mut out,
+        &mut err,
+        &LocalBackend::default(),
+    );
     assert_eq!(code, code::CLEAN, "{}", String::from_utf8_lossy(&err));
     let response: Response = serde_json::from_slice(&out).expect("a response");
     assert_eq!(
@@ -106,7 +113,12 @@ fn the_runner_side_runs_a_request_and_answers_it() {
 #[test]
 fn the_runner_side_refuses_what_it_cannot_read_as_a_usage_error() {
     let (mut out, mut err) = (Vec::new(), Vec::new());
-    let code = serve(&mut &b"not json"[..], &mut out, &mut err, &LocalBackend);
+    let code = serve(
+        &mut &b"not json"[..],
+        &mut out,
+        &mut err,
+        &LocalBackend::default(),
+    );
     assert_eq!(code, code::USAGE);
     assert!(out.is_empty());
 
@@ -114,7 +126,12 @@ fn the_runner_side_refuses_what_it_cannot_read_as_a_usage_error() {
     request.protocol = PROTOCOL + 1;
     let bytes = serde_json::to_vec(&request).expect("encode");
     let (mut out, mut err) = (Vec::new(), Vec::new());
-    let code = serve(&mut bytes.as_slice(), &mut out, &mut err, &LocalBackend);
+    let code = serve(
+        &mut bytes.as_slice(),
+        &mut out,
+        &mut err,
+        &LocalBackend::default(),
+    );
     assert_eq!(code, code::USAGE);
     assert!(String::from_utf8_lossy(&err).contains("protocol"));
 }
@@ -125,7 +142,12 @@ fn a_command_that_cannot_start_is_reported_as_the_runner_saw_it() {
         .expect("encode");
     let (mut out, mut err) = (Vec::new(), Vec::new());
     assert_eq!(
-        serve(&mut request.as_slice(), &mut out, &mut err, &LocalBackend),
+        serve(
+            &mut request.as_slice(),
+            &mut out,
+            &mut err,
+            &LocalBackend::default()
+        ),
         code::CLEAN
     );
     let response: Response = serde_json::from_slice(&out).expect("a response");

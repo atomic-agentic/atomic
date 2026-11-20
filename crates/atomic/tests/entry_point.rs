@@ -35,6 +35,11 @@ fn run(exe: &Path, args: &[&str], home: &Path) -> Output {
         .env("ATOMIC_HOME", home.join("atomic-home"))
         .env_remove("CODEX_HOME")
         .env_remove("XDG_DATA_HOME")
+        // The person's own configuration is under the throwaway home; no
+        // model endpoint is found on this machine.
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("ATOMIC_DETECT_OLLAMA_ADDR", "127.0.0.1:9")
+        .env_remove("OPENAI_API_KEY")
         .output()
         .expect("run the executable")
 }
@@ -129,7 +134,11 @@ fn a_store_written_by_a_newer_atomic_stops_it_from_starting() {
         .expect("one project")
         .expect("entry")
         .path();
-    let db = state.join("private/atomic.db");
+    // Every project's private state is in the home's `private/`.
+    let db = home
+        .join("atomic-home/private")
+        .join(state.file_name().expect("a project id"))
+        .join("atomic.db");
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

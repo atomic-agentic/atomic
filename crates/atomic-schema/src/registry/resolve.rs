@@ -443,6 +443,39 @@ fn merge_object_siblings(
     Ok(Some(merged))
 }
 
+/// An artifact reference, `$ref: atomic:artifact` with its siblings
+/// (`mediaType`, and any applicators, expanded).
+fn artifact_reference(
+    object: &serde_json::Map<String, Value>,
+    base: &str,
+    resources: &jsonschema::Registry<'_>,
+    depth: usize,
+    budget: &mut usize,
+) -> Result<Value, SchemaError> {
+    let mut siblings = object.clone();
+    siblings.remove("$ref");
+    let mut out = if siblings.keys().all(|k| k == "mediaType") {
+        siblings
+    } else {
+        expand(
+            &Value::Object(siblings),
+            base,
+            resources,
+            depth + 1,
+            false,
+            budget,
+        )?
+        .as_object()
+        .cloned()
+        .ok_or_else(|| invalid(base, "invalid reference siblings"))?
+    };
+    out.insert(
+        "$ref".into(),
+        Value::String(crate::artifact::ARTIFACT_SCHEMA_ID.into()),
+    );
+    Ok(Value::Object(out))
+}
+
 fn expand(
     schema: &Value,
     base: &str,
@@ -484,13 +517,25 @@ fn expand(
         // lowering inlines it for the model, and the runtime checks the
         // artifact store against it.
         if reference == crate::artifact::ARTIFACT_SCHEMA_ID {
-            return Ok(schema.clone());
+            return artifact_reference(object, &base, resources, depth, budget);
         }
         let resolver =
             resources.resolver(jsonschema::uri::from_str(&base).map_err(|e| invalid(&base, e))?);
         let resolved = resolver
             .lookup(reference)
             .map_err(|e| invalid(reference, e))?;
+        // Decided by the resource it resolves to, not by its spelling: an
+        // alias such as `atomic:artifact#` or `ATOMIC:artifact` is the
+        // artifact reference, and stays one, written the canonical way.
+        if resolved.resolver().base_uri().as_str() == crate::artifact::ARTIFACT_SCHEMA_ID {
+            if resolved.contents() != &crate::artifact::artifact_schema() {
+                return Err(invalid(
+                    reference,
+                    "a reference into atomic:artifact names part of it, not the artifact schema",
+                ));
+            }
+            return artifact_reference(object, &base, resources, depth, budget);
+        }
         let target = expand(
             resolved.contents(),
             resolved.resolver().base_uri().as_str(),

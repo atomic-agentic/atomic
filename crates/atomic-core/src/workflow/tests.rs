@@ -108,6 +108,71 @@ fn a_misspelled_atom_reference_fails() {
         "{}",
         e.message
     );
+    // The fix is a field of its own, naming the nearest atom.
+    assert_eq!(
+        e.action.as_deref(),
+        Some("change `atom: summarise-note` to `atom: summarize-note`"),
+        "{e:?}"
+    );
+}
+
+#[test]
+fn an_atom_reference_like_no_atom_lists_the_atoms_there_are() {
+    let e = err(&WORKFLOW.replace("atom: summarize-note", "atom: translate"));
+    assert!(
+        e.message.contains("no atom named `translate`"),
+        "{}",
+        e.message
+    );
+    assert!(!e.message.contains("did you mean"), "{}", e.message);
+    let action = e.action.as_deref().unwrap_or_default();
+    assert!(
+        action.contains("review-summary") && action.contains("summarize-note"),
+        "{action}"
+    );
+}
+
+#[test]
+fn a_misspelled_step_in_after_suggests_the_step() {
+    let e = err(&WORKFLOW.replace("after: [summarize]", "after: [sumarize]"));
+    assert_eq!(e.path, "/steps/review/after/0");
+    assert!(
+        e.message.contains("did you mean summarize?"),
+        "{}",
+        e.message
+    );
+    assert_eq!(
+        e.action.as_deref(),
+        Some("change `sumarize` in `after` to `summarize`"),
+        "{e:?}"
+    );
+}
+
+#[test]
+fn a_misspelled_step_field_suggests_the_field() {
+    let e = err(&WORKFLOW.replace("    atom: review-summary", "    atmo: review-summary"));
+    assert!(
+        e.message.contains("unknown step field `atmo`"),
+        "{}",
+        e.message
+    );
+    assert_eq!(
+        e.action.as_deref(),
+        Some("change `atmo` to `atom`"),
+        "{e:?}"
+    );
+}
+
+#[test]
+fn the_nearest_name_is_the_one_fewest_edits_away() {
+    use crate::names::nearest;
+    let names = ["summarize-note", "review-summary", "rank-note"];
+    assert_eq!(nearest("summarise-note", names), Some("summarize-note"));
+    assert_eq!(nearest("rnak-note", names), Some("rank-note"));
+    assert_eq!(nearest("review_summary", names), Some("review-summary"));
+    // Too far from all of them to be a slip.
+    assert_eq!(nearest("translate", names), None);
+    assert_eq!(nearest("", names), None);
 }
 
 #[test]

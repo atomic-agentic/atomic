@@ -15,7 +15,9 @@
 //!   takeover commits;
 //! - a turn that parks waits on its park's topic, and once released runs
 //!   again as a new turn told its first turn's position;
-//! - a turn checkpoint written before turns could park still decodes.
+//! - a turn checkpoint written before turns could park still decodes;
+//! - a run's recorded candidates are those its atoms published, decoded in
+//!   either form and checked against their digests.
 //!
 //! The races interleave on PostgreSQL only. On SQLite every write
 //! transaction begins IMMEDIATE and so runs alone: a publication and a
@@ -87,10 +89,12 @@ async fn sqlite() -> Result<Durare> {
     Durare::sqlite(&db).await
 }
 
+/// An engine on a schema of its own, which the returned guard drops.
 #[cfg(feature = "postgres-tests")]
-async fn postgres() -> Result<Durare> {
-    let url = crate::testing::database().await;
-    Durare::postgres(&url, &unique("atomic_pub")).await
+async fn postgres() -> Result<(Durare, crate::testing::TestSchema)> {
+    let schema = crate::testing::schema("pub").await;
+    let rt = Durare::postgres(schema.url(), schema.name()).await?;
+    Ok((rt, schema))
 }
 
 /// Rows in the tables these tests write to, read through a transaction.
@@ -848,6 +852,102 @@ async fn a_pre_upgrade_turn_checkpoint_still_decodes(mut engine: Durare) -> Resu
     engine.shutdown(Duration::from_secs(5)).await
 }
 
+/// A candidate for `output`, at `step`, whose digest is `digest` or, when
+/// `None`, its own.
+fn recorded(step: &StepInfo, output: &str, digest_of: Option<&str>) -> Result<Candidate> {
+    let proposal = Proposal {
+        output: json!(output),
+        metadata: json!({}),
+        writes: Vec::new(),
+    };
+    Ok(Candidate {
+        id: format!("{}:{}", step.workflow_id, step.step_id),
+        digest: match digest_of {
+            Some(d) => d.to_owned(),
+            None => digest(&proposal)?,
+        },
+        proposal,
+    })
+}
+
+async fn recorded_candidates_are_the_published_ones(mut engine: Durare) -> Result<()> {
+    engine.register("recorded", |ctx: DurareContext, tamper: bool| async move {
+        // `a`: a bare candidate, as a store from before parks holds it.
+        let _: Candidate = ctx
+            .step("a.turn", |s| async move { recorded(&s, "a", None) })
+            .await?;
+        let _: Value = ctx.step("a.publish", |_| async { Ok(json!("a")) }).await?;
+        // `b`: a tagged one; with `tamper`, one that does not match its
+        // digest.
+        let _: Turn = ctx
+            .step("b.turn", move |s| async move {
+                let d = tamper.then_some("0000");
+                Ok(Turn::Candidate(recorded(&s, "b", d)?))
+            })
+            .await?;
+        let _: Value = ctx.step("b.publish", |_| async { Ok(json!("b")) }).await?;
+        // `c`: a turn that parked, then one that published.
+        let _: Turn = ctx
+            .step("c.turn", |_| async {
+                Ok(Turn::Parked {
+                    position: 1,
+                    reason: "a cap".into(),
+                })
+            })
+            .await?;
+        let _: Turn = ctx
+            .step("c.turn", |s| async move {
+                Ok(Turn::Candidate(recorded(&s, "c", None)?))
+            })
+            .await?;
+        let _: Value = ctx.step("c.publish", |_| async { Ok(json!("c")) }).await?;
+        // `d`: a candidate never published.
+        let _: Turn = ctx
+            .step("d.turn", |s| async move {
+                Ok(Turn::Candidate(recorded(&s, "d", None)?))
+            })
+            .await?;
+        Ok(())
+    });
+    engine.launch().await?;
+    let run = unique("recorded");
+    engine.start("recorded", &run, false).await?;
+    engine.result::<()>(&run).await?;
+    let found = engine.recorded_candidates(&run).await?;
+    assert_eq!(
+        found.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["a", "b", "c"]
+    );
+    for (name, candidate) in &found {
+        assert_eq!(candidate.proposal.output, json!(name));
+    }
+    let steps = engine.steps(&run).await?;
+    let last_c = steps
+        .iter()
+        .filter(|s| s.name == "c.turn")
+        .map(|s| s.step_id)
+        .max()
+        .expect("c.turn");
+    assert_eq!(
+        found["c"].id,
+        format!("{run}:{last_c}"),
+        "the turn after the park"
+    );
+
+    let tampered = unique("tampered");
+    engine.start("recorded", &tampered, true).await?;
+    engine.result::<()>(&tampered).await?;
+    let error = engine
+        .recorded_candidates(&tampered)
+        .await
+        .expect_err("a candidate that does not match its digest");
+    assert!(
+        error.to_string().contains("does not match its digest"),
+        "{error}"
+    );
+    engine.shutdown(Duration::from_secs(5)).await
+}
+
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -885,35 +985,43 @@ async fn a_publication_meeting_a_takeover_is_refused_on_sqlite() -> Result<()> {
 #[cfg(feature = "postgres-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_survives_a_crash_before_publication_on_postgres() -> Result<()> {
-    candidate_survives_a_crash_before_publication(postgres().await?).await
+    let (rt, _schema) = postgres().await?;
+    candidate_survives_a_crash_before_publication(rt).await
 }
 
 #[cfg(feature = "postgres-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn publication_is_all_or_nothing_on_postgres() -> Result<()> {
-    publication_is_all_or_nothing(postgres().await?).await
+    let (rt, _schema) = postgres().await?;
+    publication_is_all_or_nothing(rt).await
 }
 
 #[cfg(feature = "postgres-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_precondition_commits_nothing_on_postgres() -> Result<()> {
-    assert!(!a_failed_precondition_commits_nothing(postgres().await?, 2, FENCE).await?);
-    assert!(!a_failed_precondition_commits_nothing(postgres().await?, 1, BROKEN).await?);
-    assert!(!a_failed_precondition_commits_nothing(postgres().await?, 1, READ).await?);
-    assert!(a_failed_precondition_commits_nothing(postgres().await?, 1, FENCE).await?);
+    let (rt, _schema) = postgres().await?;
+    assert!(!a_failed_precondition_commits_nothing(rt, 2, FENCE).await?);
+    let (rt, _schema) = postgres().await?;
+    assert!(!a_failed_precondition_commits_nothing(rt, 1, BROKEN).await?);
+    let (rt, _schema) = postgres().await?;
+    assert!(!a_failed_precondition_commits_nothing(rt, 1, READ).await?);
+    let (rt, _schema) = postgres().await?;
+    assert!(a_failed_precondition_commits_nothing(rt, 1, FENCE).await?);
     Ok(())
 }
 
 #[cfg(feature = "postgres-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_takeover_waits_for_a_fenced_publication_on_postgres() -> Result<()> {
-    a_takeover_waits_for_a_fenced_publication(postgres().await?, true).await
+    let (rt, _schema) = postgres().await?;
+    a_takeover_waits_for_a_fenced_publication(rt, true).await
 }
 
 #[cfg(feature = "postgres-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_publication_meeting_a_takeover_is_refused_on_postgres() -> Result<()> {
-    a_publication_meeting_a_takeover_is_refused(postgres().await?, true).await
+    let (rt, _schema) = postgres().await?;
+    a_publication_meeting_a_takeover_is_refused(rt, true).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -929,13 +1037,15 @@ async fn run_atom_records_sibling_steps_in_a_stable_order_on_sqlite() -> Result<
 #[cfg(feature = "postgres-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unaccepted_candidate_is_never_published_on_postgres() -> Result<()> {
-    an_unaccepted_candidate_is_never_published(postgres().await?).await
+    let (rt, _schema) = postgres().await?;
+    an_unaccepted_candidate_is_never_published(rt).await
 }
 
 #[cfg(feature = "postgres-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_atom_records_sibling_steps_in_a_stable_order_on_postgres() -> Result<()> {
-    run_atom_records_sibling_steps_in_a_stable_order(postgres().await?).await
+    let (rt, _schema) = postgres().await?;
+    run_atom_records_sibling_steps_in_a_stable_order(rt).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -951,11 +1061,25 @@ async fn a_pre_upgrade_turn_checkpoint_still_decodes_on_sqlite() -> Result<()> {
 #[cfg(feature = "postgres-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_released_park_runs_the_turn_again_on_postgres() -> Result<()> {
-    a_released_park_runs_the_turn_again(postgres().await?).await
+    let (rt, _schema) = postgres().await?;
+    a_released_park_runs_the_turn_again(rt).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recorded_candidates_are_the_published_ones_on_sqlite() -> Result<()> {
+    recorded_candidates_are_the_published_ones(sqlite().await?).await
+}
+
+#[cfg(feature = "postgres-tests")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recorded_candidates_are_the_published_ones_on_postgres() -> Result<()> {
+    let (rt, _schema) = postgres().await?;
+    recorded_candidates_are_the_published_ones(rt).await
 }
 
 #[cfg(feature = "postgres-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pre_upgrade_turn_checkpoint_still_decodes_on_postgres() -> Result<()> {
-    a_pre_upgrade_turn_checkpoint_still_decodes(postgres().await?).await
+    let (rt, _schema) = postgres().await?;
+    a_pre_upgrade_turn_checkpoint_still_decodes(rt).await
 }

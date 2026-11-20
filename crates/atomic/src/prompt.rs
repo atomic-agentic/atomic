@@ -42,7 +42,7 @@ const POLL: Duration = Duration::from_millis(250);
 /// terminal, and it is in that terminal's foreground process group (one in
 /// the background is stopped when it reads).
 fn interactive() -> bool {
-    if !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
+    if !(std::io::stdin().is_terminal() && atomic_core::redact::stderr_is_terminal()) {
         return false;
     }
     #[cfg(unix)]
@@ -217,7 +217,7 @@ fn now_ms() -> i64 {
 
 /// Show gate `g` and what to type, every part of it made safe.
 fn describe(g: &Gate) {
-    let mut e = std::io::stderr().lock();
+    let mut e = atomic_core::redact::stderr_lines();
     let _ = writeln!(e, "\ngate {} is waiting for you", shown::line(&g.id));
     let label = if g.question.is_some() {
         "question: "
@@ -246,7 +246,7 @@ fn describe(g: &Gate) {
 }
 
 fn ask(g: &Gate) {
-    let mut e = std::io::stderr().lock();
+    let mut e = atomic_core::redact::stderr_lines();
     let _ = if g.question.is_some() {
         write!(
             e,
@@ -283,7 +283,7 @@ async fn prompt(rt: &Durare, state: &ProjectState, g: &Gate, lines: &Lines) -> D
             match lines.next_after(since) {
                 Ok(Some(line)) => break line,
                 Err(()) => {
-                    eprintln!("\nno more input");
+                    atomic_core::log_line!("\nno more input");
                     return Done::Elsewhere;
                 }
                 Ok(None) => {}
@@ -292,14 +292,14 @@ async fn prompt(rt: &Durare, state: &ProjectState, g: &Gate, lines: &Lines) -> D
             // the person looks at it.
             match gate::find(rt, &g.id).await {
                 Ok(Some(now)) if now.resolution.is_some() => {
-                    eprintln!("\ngate {} was resolved meanwhile", shown::line(&g.id));
+                    atomic_core::log_line!("\ngate {} was resolved meanwhile", shown::line(&g.id));
                     return Done::Settled;
                 }
-                Err(e) => eprintln!("\nthe gate store: {e}"),
+                Err(e) => atomic_core::log_line!("\nthe gate store: {e}"),
                 _ => {}
             }
             if g.deadline.is_some_and(|d| now_ms() >= d) {
-                eprintln!("\ngate {}: its deadline passed", shown::line(&g.id));
+                atomic_core::log_line!("\ngate {}: its deadline passed", shown::line(&g.id));
                 return Done::Settled;
             }
             if !interactive() {
@@ -310,7 +310,7 @@ async fn prompt(rt: &Durare, state: &ProjectState, g: &Gate, lines: &Lines) -> D
         let r = match reply(g, &line) {
             Ok(r) => r,
             Err(why) => {
-                eprintln!("{why}");
+                atomic_core::log_line!("{why}");
                 continue;
             }
         };
@@ -323,11 +323,11 @@ async fn prompt(rt: &Durare, state: &ProjectState, g: &Gate, lines: &Lines) -> D
                     None if d.verdict == Verdict::Approve => "approved".into(),
                     None => "rejected".into(),
                 };
-                eprintln!("gate {}: {what} by {}", shown::line(&g.id), d.by);
+                atomic_core::log_line!("gate {}: {what} by {}", shown::line(&g.id), d.by);
                 return Done::Settled;
             }
             Err(e) => {
-                eprintln!("not recorded: {}", shown::line(&format!("{e:#}")));
+                atomic_core::log_line!("not recorded: {}", shown::line(&format!("{e:#}")));
                 match e.downcast_ref::<DecideError>() {
                     Some(DecideError::Conflict { .. }) => return Done::Settled,
                     // Nothing typed here can change that.
@@ -365,7 +365,7 @@ pub async fn at_gates(rt: &Durare, state: &ProjectState, run_id: &str) {
                 // Said once, not every poll.
                 let said = e.to_string();
                 if failing.as_deref() != Some(said.as_str()) {
-                    eprintln!("cannot read the gate store: {said}");
+                    atomic_core::log_line!("cannot read the gate store: {said}");
                     failing = Some(said);
                 }
                 Vec::new()
@@ -389,7 +389,7 @@ pub async fn at_gates(rt: &Durare, state: &ProjectState, run_id: &str) {
                         id = shown::line(&g.id)
                     )
                 };
-                eprintln!(
+                atomic_core::log_line!(
                     "run {} waits at gate {} ({}): decide it from a terminal with {how}",
                     shown::line(run_id),
                     shown::line(&g.id),

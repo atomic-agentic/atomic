@@ -87,6 +87,9 @@ pub struct LiteRuntime {
     pub artifacts: crate::runtime::Artifacts,
     /// What admits and settles each call (see [`crate::usage`]).
     pub meter: crate::usage::Metering,
+    /// The execution backend each run opens its workspace on. A lite atom's
+    /// workspace has no files and no shell.
+    pub backend: atomic_exec::Backend,
     /// The request field the endpoint reads a call's output limit from, or
     /// `None` to tell from the endpoint's URL ([`LimitField::for_endpoint`]).
     /// Set it for a gateway or a server the URL does not identify.
@@ -95,7 +98,7 @@ pub struct LiteRuntime {
 
 impl LiteRuntime {
     /// A runtime on `endpoint`, with the wire [`Wire::for_base_url`] picks,
-    /// the default timeout and no artifact store.
+    /// the default timeout, no artifact store and the local backend.
     pub fn new(endpoint: ModelEndpoint, defaults: AtomConfig) -> Self {
         Self {
             wire: Wire::for_base_url(&endpoint.base_url),
@@ -104,6 +107,7 @@ impl LiteRuntime {
             timeout: DEFAULT_TIMEOUT,
             artifacts: crate::runtime::Artifacts::none(),
             meter: crate::usage::Metering::none(),
+            backend: atomic_exec::Backend::default(),
             limit_field: None,
         }
     }
@@ -279,17 +283,30 @@ where
             .await
             .map_err(meter_error)?;
         index += 1;
-        let called = call(
-            &client,
-            runtime,
-            key.as_deref(),
+        // Opened once the call is admitted, so a refused call exports none.
+        let span = crate::spans::hold(crate::usage::call_span(
             &model,
-            first.developer_instructions.as_deref(),
-            &exchange,
-            schema.as_ref(),
-            &limit,
-        )
-        .await;
+            crate::usage::provider_name(&runtime.endpoint.base_url),
+        ));
+        let called = span
+            .run(call(
+                &client,
+                runtime,
+                key.as_deref(),
+                &model,
+                first.developer_instructions.as_deref(),
+                &exchange,
+                schema.as_ref(),
+                &limit,
+            ))
+            .await;
+        if let (Some(usage), Some(span)) = (&called.usage, span.span()) {
+            crate::usage::record_usage(&span, usage);
+        }
+        if let (Err(e), Some(span)) = (&called.answer, span.span()) {
+            crate::usage::record_error(&span, e);
+        }
+        span.end();
         let outcome = match (&called.answer, called.usage) {
             // What the provider reported, whatever it answered.
             (_, Some(usage)) => Outcome::Reported(usage),
@@ -597,12 +614,11 @@ fn responses_answer(value: &Value) -> anyhow::Result<Answer> {
 }
 
 /// The start of a response body, for an error message.
+/// The start of a provider's response, for an error message, with any
+/// secret it echoes redacted first, so the cut cannot hide one.
 fn excerpt(text: &str) -> String {
-    const MAX: usize = 500;
-    match text.char_indices().nth(MAX) {
-        Some((at, _)) => format!("{}…", &text[..at]),
-        None => text.to_owned(),
-    }
+    // Bounded, redacted (as JSON when it is JSON), then cut.
+    crate::redact::excerpt(text, 500)
 }
 
 #[cfg(test)]

@@ -135,7 +135,7 @@ async fn finish(
     let outcome = tokio::select! {
         outcome = follow => Some(outcome),
         signal = signals.next() => {
-            eprintln!(
+            atomic_core::log_line!(
                 "{who}: {signal}: run {run_id} stays unfinished; continue it with \
                  `atomic runs resume {run_id}`"
             );
@@ -239,16 +239,17 @@ pub async fn run(
     }
     engine.launch().await?;
     // Before anything runs, so a run cut short can be resumed by its id.
-    eprintln!(
+    atomic_core::log_line!(
         "run {run_id}: {} in project {}",
-        run.pipeline.name, found.name
+        run.pipeline.name,
+        found.name
     );
     engine.rt.start(PIPELINE, &run_id, run).await?;
     finish(&engine, &state, &run_id, json, &mut signals, "atomic run").await
 }
 
 /// The state of the project a command that names no target works on.
-fn state(project: Option<&Path>) -> anyhow::Result<ProjectState> {
+pub(crate) fn state(project: Option<&Path>) -> anyhow::Result<ProjectState> {
     let cwd = std::env::current_dir()?;
     let found = target::project_for(project, None, &cwd)?;
     Ok(ProjectState::resolve(found.root())?)
@@ -356,7 +357,7 @@ pub async fn resume(
                 )
                 .into());
             }
-            eprintln!("run {id}: resuming");
+            atomic_core::log_line!("run {id}: resuming");
             // Queued before this engine dispatches, so it takes the run once.
             engine.rt.resume(id).await?;
             atomic_durable::failpoint("resume:queued");
@@ -451,7 +452,7 @@ enum Exit {
 /// this one still runs. Each interrupted command's attempt guard decides
 /// whether it may run again.
 async fn stop(signals: &mut Signals, who: &str, exit: Exit) -> ! {
-    eprintln!(
+    atomic_core::log_line!(
         "{who}: stopping; running steps have {} seconds to reach a checkpoint (send another \
          signal to stop now)",
         SHUTDOWN.as_secs()
@@ -468,14 +469,14 @@ async fn stop(signals: &mut Signals, who: &str, exit: Exit) -> ! {
         again = signals.next() => Some(again),
     };
     if let Some(again) = forced {
-        eprintln!("{who}: {again}: stopping now");
+        atomic_core::log_line!("{who}: {again}: stopping now");
     }
     // The engine's drain ends at its time limit whether or not its steps
     // did, so whatever still runs is stopped here, and its end is never
     // recorded: this process exits first.
     let stopped = atomic_exec::process::stop_all();
     if stopped > 0 {
-        eprintln!(
+        atomic_core::log_line!(
             "{who}: stopped {stopped} command(s) that had not finished; their runs continue with \
              the next `atomic serve` or `atomic runs resume`"
         );
@@ -489,7 +490,16 @@ async fn stop(signals: &mut Signals, who: &str, exit: Exit) -> ! {
     .await
     .unwrap_or(0);
     if interrupted > 0 {
-        eprintln!("{who}: settled {interrupted} model call(s) that had not finished");
+        atomic_core::log_line!("{who}: settled {interrupted} model call(s) that had not finished");
+    }
+    // Spans still open end and are sent; a collector that does not answer
+    // holds this up only until another signal.
+    let flushing = tokio::task::spawn_blocking(atomic_app::telemetry::flush_blocking);
+    tokio::select! {
+        _ = flushing => {}
+        again = signals.next() => {
+            atomic_core::log_line!("{who}: {again}: stopping now, without sending the last spans");
+        }
     }
     // Exit here, not by returning: the runtime would wait for the blocked
     // threads of the stopped commands, which never return.
@@ -508,6 +518,9 @@ pub async fn serve(
     paths: &CodexPaths,
 ) -> anyhow::Result<()> {
     let mut signals = Signals::new()?;
+    // One run whose commands cannot be confined here does not stop the
+    // others: it stays unfinished, and serve goes on.
+    atomic_app::workflows::serve_past_unconfinable_steps();
     let state = state(project)?;
     let engine = engine::open(
         &state,
@@ -518,7 +531,7 @@ pub async fn serve(
         engine::Takes::Waiting,
     )
     .await?;
-    eprintln!(
+    atomic_core::log_line!(
         "atomic serve: project {}, store {}, executor {}",
         state.root().display(),
         engine.store,
@@ -541,7 +554,7 @@ pub async fn serve(
     // The engine parks a run it has recovered too often instead of
     // recovering it once more: name each one.
     for id in parked(engine.rt.runs_in(PARKED).await?).difference(&before) {
-        eprintln!(
+        atomic_core::log_line!(
             "atomic serve: run {id} was recovered more times than the engine allows, so it is \
              parked; continue it with `atomic runs resume {id}`"
         );
@@ -559,7 +572,7 @@ pub async fn serve(
         .map(|r| format!("{} (layout {})", r.id, r.version))
         .collect();
     if !stranded.is_empty() {
-        eprintln!(
+        atomic_core::log_line!(
             "atomic serve: left {} unfinished run(s) started by an atomic of another durable step \
              layout, which this one ({}) cannot continue: {}; continue them with an atomic of \
              their layout",
@@ -568,7 +581,9 @@ pub async fn serve(
             stranded.join(", ")
         );
     }
-    eprintln!("atomic serve: recovered {recovered} unfinished run(s); serving until stopped");
+    atomic_core::log_line!(
+        "atomic serve: recovered {recovered} unfinished run(s); serving until stopped"
+    );
     // A decider that stopped before waking its run is caught up within a
     // few seconds, not only at the next start.
     let signal = loop {
@@ -576,11 +591,11 @@ pub async fn serve(
             signal = signals.next() => break signal,
             _ = tokio::time::sleep(REDELIVERY) => {
                 if let Err(e) = atomic_durable::gate::redeliver(&engine.rt).await {
-                    eprintln!("atomic serve: waking runs whose gates were decided: {e}");
+                    atomic_core::log_line!("atomic serve: waking runs whose gates were decided: {e}");
                 }
             }
         }
     };
-    eprintln!("atomic serve: {signal}");
+    atomic_core::log_line!("atomic serve: {signal}");
     stop(&mut signals, "atomic serve", Exit::Served).await
 }

@@ -90,6 +90,7 @@ command, and passes its address in `ATOMIC_TEST_DATABASE_URL`. The database:
 
 ```bash
 scripts/dev-db.sh status   # is it running?
+scripts/dev-db.sh usage    # how full its in-memory disk is, and its schemas by prefix
 scripts/dev-db.sh down     # stop it and discard its data
 scripts/dev.sh bash -c 'psql "$ATOMIC_TEST_DATABASE_URL"'   # a SQL shell
 ```
@@ -98,8 +99,38 @@ Set `ATOMIC_DEV_DB=off` to run a command without starting the database.
 
 A test suite that needs Postgres fails when `ATOMIC_TEST_DATABASE_URL` is not
 set, or when the database it names does not answer, with a message naming it.
-It never skips silently. `scripts/backends-check.sh postgres` shows this: it
-runs every Postgres test without the database and requires each to fail so.
+It never skips silently. `scripts/backends-check.sh postgres` shows this. It
+runs every `atomic-agentic-durable` test without the database, and requires
+the ones that fail to be exactly its Postgres variants, each naming the
+database in its own output, with none of them ignored, and every test binary
+to report its result. It then runs the workspace's tests whose names say
+postgres, which adds the command-line tests in
+`crates/atomic/tests/run_cli.rs`, and requires every one to fail so, with the
+database unset and with it unreachable: a test that passes or is ignored
+there is a failure of the check. Tests are told apart by binary and name, and
+each binary's own count of passed, failed and ignored tests must match the
+tests it listed. `scripts/backends-check-audit-test.sh` tests the reading of
+cargo's output, plain and coloured.
+
+Every checkout's tests share the one database, so each test reaches it only
+through `atomic_durable::testing::schema`, which gives it a schema of its own
+and drops that schema when the test ends, passed or failed. A schema's name is
+`atomic_test_<seconds>_<tag>_<process>_<n>_<random>`, with a tag of at most 16
+bytes so the name fits PostgreSQL's 63; the random part keeps names apart
+across containers, whose process IDs repeat. A schema a sweep cannot drop,
+because a lock on it is still held, is reported and left for the next sweep. A test process that
+was killed leaves its schemas behind; the first schema each test process asks
+for also sweeps those more than an hour old, and those older tests named under
+a known prefix with the time last. A test in
+`crates/atomic-durable/tests/test_database.rs` fails if anything else reads
+`ATOMIC_TEST_DATABASE_URL`, or if anything outside `atomic-agentic-durable`
+and `run_cli.rs`, the two places the check covers, uses the database: by
+naming `atomic_durable::testing`, importing `testing` from `atomic_durable`,
+renaming `atomic_durable`, or naming `testing::schema` or `TestSchema`.
+
+The database keeps its data on a 1 GB tmpfs under a 1.5 GB memory limit, with
+a small write-ahead log; a container started before that change keeps its old
+sizes until `scripts/dev-db.sh down` and `up` restart it.
 
 The tests that need Postgres are behind the `atomic-agentic` package's
 `postgres-tests` feature, which turns on the durable store's as well; without
@@ -126,6 +157,12 @@ ATOMIC_DEV_SANDBOX=on scripts/dev.sh cargo test --workspace --locked \
 With the feature on, a sandbox that cannot start fails the tests, each with a
 message saying what the sandbox needs. Run without `ATOMIC_DEV_SANDBOX=on`,
 `scripts/dev.sh scripts/backends-check.sh sandbox` requires exactly that.
+atomic itself needs the sandbox on Linux to run exec atoms and codex atoms'
+commands, and stops before such a step without it, so the tests in
+`crates/atomic/tests/run_cli.rs` that run commands are behind the same feature
+there, each marked `// needs_sandbox`; the rest of that file runs in a plain
+`cargo test`. The sandbox check runs each marked test, as it runs every test
+of a file that is behind the feature as a whole.
 
 ## Controls are tested by removing them
 
@@ -134,9 +171,10 @@ Each security control has a test that fails when the control is switched off.
 command's settings, its neutralized filter drivers and its explicit git
 directory; the sandbox's confinement of writes, which keeps the state
 directory and a worktree's git directory out of a turn's reach, its exclusion
-of `/tmp`, and its denial of atomic's private state), it switches
-the control off in the source, requires the control's test to fail, puts the
-source back and requires the test to pass. Each control costs a rebuild, so it
+of `/tmp`, and its denial of atomic's private state, to turns and to exec
+atoms' commands; and the confinement of exec atoms' commands itself), it
+switches the control off in the source, requires the control's test to fail,
+puts the source back and requires the test to pass. Each control costs a rebuild, so it
 runs by hand rather than in CI:
 
 ```bash
@@ -190,6 +228,24 @@ ATOMIC_DEV_SANDBOX=on ATOMIC_TEST_CRASH_ONLY=pipeline:after-commit scripts/dev.s
 ```
 
 CI runs it on Linux, in a step of its own.
+
+## Coding tasks
+
+`crates/atomic/tests/coding-tasks/` holds fourteen coding tasks, eval fixtures
+for atoms that change code. Each is a seed project, a request, a checker,
+hidden tests and a reference solution; [its README](../crates/atomic/tests/coding-tasks/README.md)
+gives the contract and what each task covers. `crates/atomic/tests/coding_tasks.rs`
+holds that contract: every seed fails its checker with exit 1, every reference
+solution passes, every wrong fix kept beside a task fails for its reason, a
+checker changes nothing it grades, and a workspace holding a link, a Python
+startup hook, a hidden test's name or a standard-library module's name fails. A
+checker runs the attempt's code: run it only inside a sandbox. The checkers need
+Linux, `python3` and GNU `timeout`, which the development container has; the
+test runs on Linux only, and fails there without them.
+
+```bash
+scripts/dev.sh cargo test -p atomic-agentic --locked --test coding_tasks
+```
 
 ## Releases
 

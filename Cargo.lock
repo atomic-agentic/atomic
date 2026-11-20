@@ -514,12 +514,19 @@ dependencies = [
  "clap",
  "getrandom 0.3.4",
  "libc",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "sqlx",
  "thiserror 2.0.21",
  "tokio",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
@@ -561,6 +568,7 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror 2.0.21",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -586,6 +594,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.21",
 ]
 

@@ -70,3 +70,23 @@ fn schema_constraint_changes_invalidate_the_compiled_version_even_when_types_sta
         "full contract belongs in the fingerprint"
     );
 }
+
+#[test]
+fn an_output_contract_whose_artifact_references_cannot_be_checked_is_refused() {
+    let dir = project("{input.text}", "{}", None);
+    let registry = Registry::new();
+    let mut atom =
+        crate::atom::load(&dir.join("test.atom.astro"), &mut Registry::new()).expect("loads");
+    compile(&atom, &registry).expect("the plain contract compiles");
+    atom.program.contracts["Output"]["properties"]["files"] = serde_json::json!({
+        "type": "array", "contains": {"$ref": "atomic:artifact", "mediaType": "text/x-diff"}
+    });
+    let error = compile(&atom, &registry).expect_err("refused");
+    assert_eq!(error.path, "/output");
+    assert!(error.message.contains("contains"), "{}", error.message);
+    // Followed the way the check follows it, the same reference compiles.
+    atom.program.contracts["Output"]["properties"]["files"] = serde_json::json!({
+        "type": "array", "items": {"$ref": "atomic:artifact", "mediaType": "text/x-diff"}
+    });
+    compile(&atom, &registry).expect("compiles");
+}

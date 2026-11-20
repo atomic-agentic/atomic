@@ -260,16 +260,23 @@ impl Project {
         for name in [
             "CODEX_HOME",
             "XDG_DATA_HOME",
+            // The person's own configuration is under the throwaway home.
+            "XDG_CONFIG_HOME",
             "ATOMIC_DATABASE_URL",
             "ATOMIC_DATABASE_SCHEMA",
             "ATOMIC_EXECUTOR_ID",
             "ATOMIC_FAILPOINT",
             "ATOMIC_MODEL_BASE_URL",
             "ATOMIC_MODEL",
+            "ATOMIC_MODEL_API_KEY_ENV",
             "ATOMIC_RUNNER",
+            "OPENAI_API_KEY",
+            "DATABASE_URL",
         ] {
             c.env_remove(name);
         }
+        // No Ollama, whatever runs on this machine.
+        c.env("ATOMIC_DETECT_OLLAMA_ADDR", "127.0.0.1:9");
         c
     }
 
@@ -315,7 +322,7 @@ impl Project {
 
     /// Gate `id` as the store has it.
     fn gate(&self, id: &str) -> gate::Gate {
-        let (db, id) = (self.state().join("private/atomic.db"), id.to_owned());
+        let (db, id) = (self.store(), id.to_owned());
         let found = std::sync::Arc::new(std::sync::Mutex::new(None));
         let into = found.clone();
         on_codex_runtime(async move {
@@ -334,6 +341,18 @@ impl Project {
         let out = self.atomic(&["debug", "state-dir"]);
         assert!(out.status.success(), "{}", text(&out));
         PathBuf::from(String::from_utf8_lossy(&out.stdout).trim())
+    }
+
+    /// The project's store, in its private state beside its state directory.
+    fn store(&self) -> PathBuf {
+        let state = self.state();
+        state
+            .parent()
+            .and_then(Path::parent)
+            .expect("the atomic home")
+            .join("private")
+            .join(state.file_name().expect("the project's id"))
+            .join("atomic.db")
     }
 }
 
@@ -399,9 +418,7 @@ fn an_approval_gate_is_approved_at_the_prompt_and_the_workflow_continues() {
     assert!(t.contains("approved by local:dev"), "{t}");
     assert!(t.contains("got got v1"), "the workflow continued: {t}");
     on_codex_runtime(async move {
-        let rt = Durare::sqlite(&p.state().join("private/atomic.db"))
-            .await
-            .unwrap();
+        let rt = Durare::sqlite(&p.store()).await.unwrap();
         let g = gate::find(&rt, "at-prompt:pick").await.unwrap().unwrap();
         let Some(gate::Resolution::Decided(d)) = g.resolution else {
             panic!("{g:?}");
@@ -482,9 +499,7 @@ fn a_question_gate_answered_at_the_prompt_resumes_with_the_typed_answer_and_reme
         "the step after it got the typed answer: {t}"
     );
     on_codex_runtime(async move {
-        let rt = Durare::sqlite(&p.state().join("private/atomic.db"))
-            .await
-            .unwrap();
+        let rt = Durare::sqlite(&p.store()).await.unwrap();
         let log = gate::feedback(&rt).await.unwrap();
         assert_eq!(log.len(), 1, "{log:?}");
         assert_eq!(log[0].gate, "asked:pick");
@@ -530,9 +545,7 @@ fn an_answer_outside_the_enum_is_refused_from_another_terminal_too() {
     assert!(out.status.success(), "{}", text(&out));
     assert!(text(&out).contains("got stable"), "{}", text(&out));
     on_codex_runtime(async move {
-        let rt = Durare::sqlite(&p.state().join("private/atomic.db"))
-            .await
-            .unwrap();
+        let rt = Durare::sqlite(&p.store()).await.unwrap();
         let log = gate::feedback(&rt).await.unwrap();
         assert_eq!(
             log.len(),
@@ -573,9 +586,7 @@ fn a_question_nobody_answers_in_time_resumes_with_its_default_and_remembers_it()
     let listed = text(&p.atomic(&["gates", "list", "--all"]));
     assert!(listed.contains("silence selected beta"), "{listed}");
     on_codex_runtime(async move {
-        let rt = Durare::sqlite(&p.state().join("private/atomic.db"))
-            .await
-            .unwrap();
+        let rt = Durare::sqlite(&p.store()).await.unwrap();
         let log = gate::feedback(&rt).await.unwrap();
         assert_eq!(log.len(), 1, "the remembered default: {log:?}");
         assert_eq!(log[0].answer, json!("beta"));
@@ -634,7 +645,8 @@ fn replies_typed_ahead_decide_no_gate_they_were_not_typed_at() {
 fn an_exec_command_cannot_type_into_the_prompt() {
     let p = Project::new("inject");
     p.enroll();
-    let log = p.dir.join("inject.log");
+    // In the project's caches, which a confined command may write.
+    let log = p.state().join("cache/inject.log");
     let data = json!({"text": log.display().to_string()}).to_string();
     let out = p.at_terminal_with(
         &["run", "injected", "--run-id", "typed-in", "--data", &data],

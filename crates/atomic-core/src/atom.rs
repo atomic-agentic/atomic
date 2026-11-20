@@ -136,7 +136,14 @@ pub struct AtomError {
 fn check_exec(kind: &str, fm: &serde_json::Map<String, Value>) -> Result<(), (String, String)> {
     let refuse = |pointer: &str, message: &str| Err((pointer.to_owned(), message.to_owned()));
     if kind != "exec" {
-        for key in ["exec", "env", "effects"] {
+        // A codex atom's turn runs commands too, so it may declare their
+        // environment, such as the tool homes its build needs.
+        let keys: &[&str] = if kind == "codex" {
+            &["exec", "effects"]
+        } else {
+            &["exec", "env", "effects"]
+        };
+        for &key in keys {
             if fm.contains_key(key) {
                 return refuse(
                     &format!("/{key}"),
@@ -144,7 +151,7 @@ fn check_exec(kind: &str, fm: &serde_json::Map<String, Value>) -> Result<(), (St
                 );
             }
         }
-        return Ok(());
+        return check_env(kind, fm);
     }
     let Some(Value::Object(exec)) = fm.get("exec") else {
         return refuse(
@@ -174,34 +181,7 @@ fn check_exec(kind: &str, fm: &serde_json::Map<String, Value>) -> Result<(), (St
             );
         }
     }
-    match fm.get("env") {
-        None => {}
-        Some(Value::Object(env)) => {
-            for (name, value) in env {
-                let valid = !name.is_empty()
-                    && !name.starts_with(|c: char| c.is_ascii_digit())
-                    && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
-                if !valid {
-                    return refuse(
-                        &format!("/env/{name}"),
-                        "an environment variable name is letters, digits and `_`",
-                    );
-                }
-                if crate::runtime::EFFECT_VARIABLES.contains(&name.as_str()) {
-                    return refuse(
-                        &format!("/env/{name}"),
-                        &format!(
-                            "`{name}` is set by atomic for every exec step; an atom cannot declare it"
-                        ),
-                    );
-                }
-                if !value.is_string() {
-                    return refuse(&format!("/env/{name}"), "an environment value is a string");
-                }
-            }
-        }
-        Some(_) => return refuse("/env", "`env` maps variable names to string values"),
-    }
+    check_env(kind, fm)?;
     match fm.get("effects") {
         None => {}
         Some(Value::Object(effects)) => {
@@ -228,6 +208,75 @@ fn check_exec(kind: &str, fm: &serde_json::Map<String, Value>) -> Result<(), (St
                 "`effects` is a mapping, such as `{ external: 'idempotent' }`",
             );
         }
+    }
+    Ok(())
+}
+
+/// Variables the dynamic loader reads. A codex atom's turn starts Codex's
+/// sandbox helper, outside the sandbox, with the environment its commands
+/// get, so one of these would load code there. (An exec atom's command gets
+/// its environment only inside the sandbox; the helper that starts it gets
+/// none of it.)
+fn loads_code(name: &str) -> bool {
+    name.starts_with("LD_")
+        || name.starts_with("DYLD_")
+        || matches!(name, "GCONV_PATH" | "GLIBC_TUNABLES")
+}
+
+/// Check an atom's `env`: variable names mapped to literal string values,
+/// none that atomic sets itself or, for a codex atom, that loads code.
+fn check_env(kind: &str, fm: &serde_json::Map<String, Value>) -> Result<(), (String, String)> {
+    let refuse = |pointer: &str, message: &str| Err((pointer.to_owned(), message.to_owned()));
+    match fm.get("env") {
+        None => {}
+        Some(Value::Object(env)) => {
+            for (name, value) in env {
+                let valid = !name.is_empty()
+                    && !name.starts_with(|c: char| c.is_ascii_digit())
+                    && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+                if !valid {
+                    return refuse(
+                        &format!("/env/{name}"),
+                        "an environment variable name is letters, digits and `_`",
+                    );
+                }
+                let own: &[&str] = if kind == "codex" {
+                    &["HOME", "ZDOTDIR", "TMPDIR"]
+                } else {
+                    &["HOME", "TMPDIR"]
+                };
+                if own.contains(&name.as_str()) {
+                    return refuse(
+                        &format!("/env/{name}"),
+                        &format!(
+                            "`{name}` is set by atomic: a command's HOME and TMPDIR are its \
+                             workspace's own directories"
+                        ),
+                    );
+                }
+                if kind == "codex" && loads_code(name) {
+                    return refuse(
+                        &format!("/env/{name}"),
+                        &format!(
+                            "`{name}` would load code into Codex's sandbox helper, which runs \
+                             outside the sandbox; a codex atom cannot declare it"
+                        ),
+                    );
+                }
+                if crate::runtime::EFFECT_VARIABLES.contains(&name.as_str()) {
+                    return refuse(
+                        &format!("/env/{name}"),
+                        &format!(
+                            "`{name}` is set by atomic for every exec step; an atom cannot declare it"
+                        ),
+                    );
+                }
+                if !value.is_string() {
+                    return refuse(&format!("/env/{name}"), "an environment value is a string");
+                }
+            }
+        }
+        Some(_) => return refuse("/env", "`env` maps variable names to string values"),
     }
     Ok(())
 }
@@ -597,6 +646,17 @@ pub fn load(file: &Path, registry: &mut Registry) -> Result<Atom, AtomError> {
                     1,
                     "/scorers",
                     "min_mean must be between zero and one".into(),
+                ));
+            }
+            // How far the mean may fall below a baseline revision's.
+            if scorer
+                .get("max_drop")
+                .is_some_and(|v| v.as_f64().is_none_or(|d| !(0.0..=1.0).contains(&d)))
+            {
+                return Err(fail(
+                    1,
+                    "/scorers",
+                    "max_drop must be between zero and one".into(),
                 ));
             }
         }

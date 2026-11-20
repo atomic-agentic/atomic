@@ -7,11 +7,12 @@
 //! | Layer | Source | Required |
 //! | --- | --- | --- |
 //! | 1 | Built-in defaults | always present |
-//! | 2 | `atomic.yaml` | no |
-//! | 3 | `atomic.local.yaml` (personal, not committed) | no |
-//! | 4 | `atomic.<profile>.yaml`, when a profile is selected | yes, if selected |
-//! | 5 | `ATOMIC_*` environment variables | no |
-//! | 6 | Command-line flags | no |
+//! | 2 | The person's own file, such as `~/.config/atomic/config.yaml` | no |
+//! | 3 | `atomic.yaml` | no |
+//! | 4 | `atomic.local.yaml` (personal, not committed) | no |
+//! | 5 | `atomic.<profile>.yaml`, when a profile is selected | yes, if selected |
+//! | 6 | `ATOMIC_*` environment variables | no |
+//! | 7 | Command-line flags | no |
 //!
 //! Files are read with the restricted YAML loader and merged key by key:
 //! mappings merge, anything else replaces. A key the configuration does not
@@ -22,7 +23,11 @@
 //! `model.base_url` is `ATOMIC_MODEL_BASE_URL`. Names are forgiving: case and
 //! the separators `_`, `-` and `.` are ignored when matching, so
 //! `ATOMIC_MODEL_BASEURL` works too. Variables that match no setting are left
-//! alone; atomic uses other `ATOMIC_*` variables for other purposes.
+//! alone; atomic uses other `ATOMIC_*` variables for other purposes. A
+//! variable set to the empty string sets nothing, as if it were unset.
+//!
+//! An error names the setting, the variable or the file and line, and never
+//! repeats the value it found, which may be a secret put in the wrong place.
 //!
 //! Every resolved value records the layer it came from, for `--explain`.
 
@@ -49,12 +54,16 @@ pub enum Source {
     Env(String),
     /// A command-line flag.
     Flag(String),
+    /// Found in the surroundings, for the reason given, where nothing set it.
+    Detected(String),
 }
 
 /// What to read, and from where.
 pub struct Layers<'a> {
     /// The directory holding `atomic.yaml` and its siblings.
     pub dir: &'a Path,
+    /// The person's own configuration file, read first, if any.
+    pub user: Option<&'a Path>,
     /// The selected profile, if any.
     pub profile: Option<&'a str>,
     /// Environment lookup, passed in so tests do not depend on the real one.
@@ -100,13 +109,12 @@ pub enum ConfigError {
         /// What is wrong.
         message: String,
     },
-    /// An environment variable or flag has a value of the wrong type.
-    #[error("{name}={value:?}: {message}")]
+    /// An environment variable or flag has a value of the wrong type. The
+    /// value itself is not kept.
+    #[error("{name}: {message}")]
     Value {
         /// The variable or flag.
         name: String,
-        /// The value given.
-        value: String,
         /// What was expected.
         message: String,
     },
@@ -129,10 +137,14 @@ where
     let mut sources = BTreeMap::new();
     record(&defaults, "", &Source::Default, &mut sources);
 
-    let mut files = vec![
+    let mut files = Vec::new();
+    if let Some(user) = layers.user {
+        files.push((user.to_owned(), false));
+    }
+    files.extend([
         (layers.dir.join("atomic.yaml"), false),
         (layers.dir.join("atomic.local.yaml"), false),
-    ];
+    ]);
     if let Some(profile) = layers.profile {
         files.push((layers.dir.join(format!("atomic.{profile}.yaml")), true));
     }
@@ -168,13 +180,12 @@ where
         let Some(path) = paths.iter().find(|p| normalize(p) == wanted) else {
             continue;
         };
-        let Some(raw) = (layers.env)(&name) else {
+        let Some(raw) = (layers.env)(&name).filter(|raw| !raw.is_empty()) else {
             continue;
         };
         let target = pointer_get(&defaults, path).cloned().unwrap_or(Value::Null);
         let parsed = parse_like(&target, &raw).map_err(|message| ConfigError::Value {
             name: name.clone(),
-            value: raw.clone(),
             message,
         })?;
         pointer_set(&mut value, path, parsed);
@@ -190,7 +201,8 @@ where
         sources.insert(path.clone(), Source::Flag(flag.clone()));
     }
 
-    let config = serde_json::from_value(value).map_err(|e| ConfigError::Invalid(e.to_string()))?;
+    let config = serde_json::from_value(value)
+        .map_err(|e| ConfigError::Invalid(without_values(&e.to_string())))?;
     Ok(Resolved { config, sources })
 }
 
@@ -300,7 +312,7 @@ fn merge_file(
                 return Err(ConfigError::Setting {
                     path: path.to_owned(),
                     line: child_line,
-                    message: format!("{dotted} is a section, not a value (found {other})"),
+                    message: format!("{dotted} is a section, not a value (found {})", kind(other)),
                 });
             }
             _ => {
@@ -319,6 +331,53 @@ fn merge_file(
 }
 
 /// Parse an environment value as the type its default has.
+/// What kind of value `v` is, for an error that must not show it.
+fn kind(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "a list",
+        Value::Object(_) => "a mapping",
+    }
+}
+
+/// `message` with every quoted part, where serde puts the value it found,
+/// replaced by `"…"` or `` `…` ``: double quotes, inside which a quote
+/// escaped with a backslash is part of the value, and backticks, in which
+/// serde quotes a variant or a field. An unclosed quote hides the rest.
+fn without_values(message: &str) -> String {
+    let mut out = String::with_capacity(message.len());
+    let mut chars = message.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                out.push_str("\"…\"");
+                while let Some(c) = chars.next() {
+                    match c {
+                        '\\' => {
+                            chars.next();
+                        }
+                        '"' => break,
+                        _ => {}
+                    }
+                }
+            }
+            '`' => {
+                out.push_str("`…`");
+                for c in chars.by_ref() {
+                    if c == '`' {
+                        break;
+                    }
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn parse_like(target: &Value, raw: &str) -> Result<Value, String> {
     match target {
         Value::Bool(_) => match raw.to_ascii_lowercase().as_str() {
