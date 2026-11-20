@@ -51,7 +51,7 @@ mod support;
 use atomic_app::pipeline::{PIPELINE, Pipeline, PipelineRun, Services, prepare, register_pipeline};
 use atomic_app::workflows::{CHANGE_REQUEST, ChangeRequestRun, register_change_request};
 use atomic_core::artifact::LocalStore;
-use atomic_core::codex::{CodexPaths, ModelEndpoint};
+use atomic_core::codex::{CodexPaths, ModelEndpoint, StateGuard};
 use atomic_core::git::Git;
 use atomic_core::lite::LiteRuntime;
 use atomic_core::runtime::{Artifacts, CodexRuntime, Runtimes};
@@ -452,6 +452,8 @@ fn runtimes(dir: &Path, cwd: &Path, base_url: &str) -> Arc<Runtimes> {
                 dir.join("bin/codex-linux-sandbox"),
             ),
             codex_home: dir.join("home"),
+            // The real sandbox helper enforces the denial of atomic's state.
+            guard: StateGuard::deny_state_dir(dir.join("state")).expect("guard"),
             cwd: cwd.to_owned(),
             endpoint: endpoint.clone(),
             defaults: AtomConfig::default(),
@@ -505,7 +507,8 @@ async fn engine(scenario: Scenario, dir: &Path, base_url: &str) -> Durare {
 /// Approve every gate of the run as the local operator, as a person at the
 /// terminal would, until the process ends.
 async fn approve_gates(rt: Arc<Durare>) {
-    let operator = Principal::local("dev");
+    let operator = gate::HumanCredential::new(Principal::local("dev"), "the operator's secret");
+    gate::enroll(&*rt, &operator).await.expect("enroll the operator");
     loop {
         let filter = GateFilter {
             open_only: true,
