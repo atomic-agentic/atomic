@@ -12,10 +12,17 @@
 //!
 //! The interpreter walks the steps in order. Each atom step evaluates its
 //! mapping against the workflow's `input` and the published outputs of the
-//! steps before it, then runs the atom through [`run_atom_at`]: its turn and its
-//! publication are sibling durable steps, so a step that finished before a
-//! crash is never run again. CEL has no side effects, so mappings evaluated
-//! again on replay give the same values.
+//! steps before it, then runs the atom's turn (`<id>.turn`, which
+//! checkpoints a private candidate) and publishes it (`<id>.publish`) as
+//! sibling durable steps, so a step that finished before a crash is never
+//! run again. CEL has no side effects, so mappings evaluated again on replay
+//! give the same values.
+//!
+//! A step with a `review` has its candidate reviewed before it is
+//! published: each verdict (`<id>.review.<n>`) and each repair round of the
+//! author (`<id>.repair.<n>`) is a sibling step of its own, and a review that
+//! does not approve goes to a person at gate `<id>.review`. What accepted
+//! the candidate is recorded as `<id>.accepted`.
 //!
 //! A run is pinned to what it started with. The pipeline records the
 //! SHA-256 of the workflow file and of every source of every atom it uses,
@@ -92,7 +99,7 @@ pub const PIPELINE: &str = "atomic.pipeline";
 /// record, through an approved and a rejected gate, with the shape of each
 /// checkpoint, and the run's own shape. They fail when the layout no longer
 /// matches this version's, whose file is never rewritten.
-pub const LAYOUT_VERSION: &str = "atomic.pipeline.3";
+pub const LAYOUT_VERSION: &str = "atomic.pipeline.4";
 
 /// How many times one process recovers one run of `run_pipeline` at the
 /// same step before it fails the run as dead-lettered: enough for a crash
@@ -519,7 +526,7 @@ pub fn prepare(
                     })?;
                     // What it reads of the candidate, the author's output,
                     // is taken as external: the least trusted.
-                    let allowed = origin_of(source, &kinds)
+                    let allowed = atomic_core::workflow::review_origin(source, &kinds)
                         .map_err(|e| fail(format!("step `{id}`: `review.with.{field}`: {e}")))?;
                     with.insert(field.clone(), source.to_owned());
                     origins.insert(field.clone(), allowed.to_owned());
@@ -528,6 +535,10 @@ pub fn prepare(
                     pins.insert(source.clone(), sha256(text.as_bytes()));
                 }
                 used.insert(reviewer.to_owned(), atom.clone());
+                // Who decides the review's gate, should it open, resolves now,
+                // before anything runs, as any gate's approvers do.
+                gate::resolve(&format!("{id}.review"), None, deployment)
+                    .map_err(|e| fail(format!("step `{id}`'s review: {e}")))?;
                 Some(ReviewStep {
                     reviewer: reviewer.to_owned(),
                     with,
@@ -967,6 +978,7 @@ async fn run_pipeline<C: WorkflowContext>(
                 origins: step.origins.clone(),
                 worktree: step.worktree,
                 repair: None,
+                charge: None,
             },
         )
         .await?;
@@ -974,7 +986,25 @@ async fn run_pipeline<C: WorkflowContext>(
         // and reviews nothing again.
         let (candidate, acceptance) = match (&step.review, &replay) {
             (Some(review), None) => {
-                reviewed(&ctx, &run, step, review, &values, atom_input, candidate).await?
+                let (candidate, acceptance) = reviewed(
+                    &ctx,
+                    &run,
+                    &mut working,
+                    step,
+                    review,
+                    &values,
+                    atom_input,
+                    candidate,
+                )
+                .await?;
+                // What accepted it, kept with the run's record.
+                let kept = acceptance.clone();
+                let acceptance: Acceptance = ctx
+                    .step(&format!("{}.accepted", step.id), move |_| async move {
+                        Ok(kept)
+                    })
+                    .await?;
+                (candidate, acceptance)
             }
             _ => {
                 let acceptance = review_candidate(&candidate);
@@ -1083,8 +1113,13 @@ struct Turn {
     origins: BTreeMap<String, String>,
     /// Whether it runs in a worktree of its own.
     worktree: bool,
-    /// For a repair round: the rejected output and the verdict's findings.
+    /// For a repair round: the rejected output and the verdict asking for
+    /// changes.
     repair: Option<Value>,
+    /// The position of the turn whose atom allowance this one is charged to,
+    /// if not its own: a repair round's is the author's first turn, a later
+    /// verdict's the first verdict.
+    charge: Option<i32>,
 }
 
 /// Run turn `t` of an atom as a step of `run` would: its clock and context,
@@ -1249,6 +1284,7 @@ async fn turn<C: WorkflowContext>(ctx: &C, run: &RunScope<'_>, t: Turn) -> Resul
     let place = format!("run {run_id}, step {}", t.name);
     let serving = replay.clone();
     let repair = t.repair.clone();
+    let charge = t.charge;
     execute_candidate_at(ctx, &format!("{}.turn", t.name), move |position| {
         // The turn runs again after a park is released, so each run
         // takes its own copies.
@@ -1266,7 +1302,10 @@ async fn turn<C: WorkflowContext>(ctx: &C, run: &RunScope<'_>, t: Turn) -> Resul
         let input_sha256 = input_sha256.clone();
         // An exec atom calls no model and has no caps to meter.
         if let Some(atom_caps) = &atom_caps {
-            let meter = budget.meter(&position, atom_caps);
+            let meter = match charge {
+                Some(allowance) => budget.meter_charged(&position, allowance, atom_caps),
+                None => budget.meter(&position, atom_caps),
+            };
             runtimes.codex.meter = meter.clone();
             runtimes.lite.meter = meter;
         }
@@ -1384,32 +1423,67 @@ async fn turn<C: WorkflowContext>(ctx: &C, run: &RunScope<'_>, t: Turn) -> Resul
     .await
 }
 
+/// The position of the turn that checkpointed `candidate`, from its id
+/// (`<run>:<position>`).
+fn position_of(candidate: &Candidate) -> Option<i32> {
+    candidate.id.rsplit_once(':')?.1.parse().ok()
+}
+
 /// Review `candidate`, the author's turn of `step` on `input`: the reviewer
-/// gives a typed verdict on it (`<id>.review.<n>`); a rejection with rounds
-/// left hands its findings to the author for a repair round
-/// (`<id>.repair.<n>`), whose candidate is reviewed in turn. An escalation,
-/// or a rejection with no rounds left, opens gate `<id>.review` for a
-/// person: an approval accepts the candidate, anything else fails the run.
-/// The candidate stays private until it is accepted; nothing is accepted
-/// without a reviewer's approval or a person's.
+/// gives a typed verdict on it (`<id>.review.<n>`); a request for changes
+/// with rounds left hands the verdict to the author for a repair round
+/// (`<id>.repair.<n>`), whose candidate is reviewed in turn. Any other
+/// verdict but an approval, or a request for changes with no rounds left,
+/// opens gate `<id>.review` for a person: an approval accepts the
+/// candidate, anything else fails the run. The candidate stays private
+/// until it is accepted; nothing is accepted without a reviewer's approval
+/// or a person's.
+///
+/// Each review and repair turn begins only while the process is not
+/// stopping (see [`keep_working`]), and waiting for the person is not work
+/// a stop waits for. Repair rounds are charged to the author's first turn's
+/// atom allowance, later verdicts to the first verdict's, so the rounds
+/// share one allowance each rather than taking a fresh one per round.
+#[allow(clippy::too_many_arguments)]
 async fn reviewed<C: WorkflowContext>(
     ctx: &C,
     run: &RunScope<'_>,
+    working: &mut Option<Running>,
     step: &AtomStep,
     review: &ReviewStep,
     values: &[(&str, &Value, &Shape<'_>); 2],
     input: Value,
     mut candidate: Candidate,
 ) -> Result<(Candidate, Acceptance)> {
+    if review.rounds > atomic_core::workflow::MAX_REVIEW_ROUNDS {
+        return Err(failed(format!(
+            "step `{}`: its review gives {} repair rounds, more than the {} atomic allows",
+            step.id,
+            review.rounds,
+            atomic_core::workflow::MAX_REVIEW_ROUNDS
+        )));
+    }
     let author = run
         .pipeline
         .atoms
         .get(&step.atom)
         .and_then(|a| a.program.contracts.get("Output"));
-    let candidate_shape = Shape::fields([("output", author.map_or(Shape::Untyped, Shape::Schema))]);
+    let mut seen_shape = vec![("output", author.map_or(Shape::Untyped, Shape::Schema))];
+    let commit_schema = json!({"type": "object", "properties": {"commit": {"type": "string"}}});
+    if step.worktree {
+        seen_shape.push(("metadata", Shape::Schema(&commit_schema)));
+    }
+    let candidate_shape = Shape::fields(seen_shape);
+    let author_turn = position_of(&candidate);
+    let mut first_verdict = None;
     let mut round = 0;
-    let (verdict, decision) = loop {
-        let seen = json!({"output": candidate.proposal.output});
+    let (verdict, said) = loop {
+        let mut seen = json!({"output": candidate.proposal.output});
+        if step.worktree {
+            seen["metadata"] = json!({
+                "commit": candidate.proposal.metadata.get("commit").cloned().unwrap_or(Value::Null)
+            });
+        }
         let scope = [values[0], values[1], ("candidate", &seen, &candidate_shape)];
         let mut mapped = Map::new();
         for (field, source) in &review.with {
@@ -1418,6 +1492,7 @@ async fn reviewed<C: WorkflowContext>(
             mapped.insert(field.clone(), value);
         }
         let name = format!("{}.review.{round}", step.id);
+        keep_working(working).await;
         let verdict = turn(
             ctx,
             run,
@@ -1428,9 +1503,11 @@ async fn reviewed<C: WorkflowContext>(
                 origins: review.origins.clone(),
                 worktree: false,
                 repair: None,
+                charge: first_verdict,
             },
         )
         .await?;
+        first_verdict = first_verdict.or_else(|| position_of(&verdict));
         // The verdict is a reviewer's result like any atom's: published,
         // so the record shows what it decided.
         let verdict = publish_candidate(
@@ -1441,13 +1518,13 @@ async fn reviewed<C: WorkflowContext>(
             Vec::new(),
         )
         .await?;
-        let decision = verdict
-            .get("decision")
+        let said = verdict
+            .get("verdict")
             .and_then(Value::as_str)
             .unwrap_or("escalate")
             .to_owned();
-        match decision.as_str() {
-            "approve" => {
+        match atomic_core::workflow::Verdict::of(&said) {
+            atomic_core::workflow::Verdict::Approve => {
                 let acceptance = Acceptance {
                     candidate: candidate.id.clone(),
                     digest: candidate.digest.clone(),
@@ -1459,8 +1536,9 @@ async fn reviewed<C: WorkflowContext>(
                 };
                 return Ok((candidate, acceptance));
             }
-            "reject" if round < review.rounds => {
+            atomic_core::workflow::Verdict::Changes if round < review.rounds => {
                 round += 1;
+                keep_working(working).await;
                 candidate = turn(
                     ctx,
                     run,
@@ -1472,32 +1550,40 @@ async fn reviewed<C: WorkflowContext>(
                         worktree: step.worktree,
                         repair: Some(json!({
                             "output": candidate.proposal.output,
-                            "findings": verdict.get("findings").cloned().unwrap_or(Value::Null),
+                            "review": verdict,
                         })),
+                        charge: author_turn,
                     },
                 )
                 .await?;
             }
-            _ => break (verdict, decision),
+            _ => break (verdict, said),
         }
     };
-    // A person decides: the reviewer escalated, or rejected with no rounds
-    // left. The gate's title is atomic's own words; what the reviewer and
-    // the author said is what it shows.
+    // A person decides. The gate's title is atomic's own words; what the
+    // reviewer and the author said is what it shows.
     let id = format!("{}.review", step.id);
-    let why = match decision.as_str() {
-        "reject" => format!("rejected it after {round} repair round(s), the most this step allows"),
+    let why = match (atomic_core::workflow::Verdict::of(&said), said.as_str()) {
+        (atomic_core::workflow::Verdict::Changes, _) => {
+            format!("asked for changes after {round} repair round(s), the most this step allows")
+        }
+        (_, "reject") => "rejected it".to_owned(),
+        (_, "insufficient_context") => "could not judge it with the context it had".to_owned(),
         _ => "escalated it".to_owned(),
     };
     let approvers = gate::resolve(&id, None, &run.services.deployment)
         .map_err(|e| failed(format!("gate `{id}`: {e}")))?;
+    let mut show = json!({"output": candidate.proposal.output, "verdict": verdict});
+    if let Some(commit) = candidate.proposal.metadata.get("commit") {
+        show["commit"] = commit.clone();
+    }
     let spec = GateSpec {
         workflow: run.pipeline.name.clone(),
         title: format!(
             "Step {} of {}: reviewer {} {why}. Approve its output as it stands, or reject it",
             step.id, run.pipeline.name, review.reviewer
         ),
-        show: json!({"output": candidate.proposal.output, "verdict": verdict}),
+        show,
         evidence: Vec::new(),
         approvers,
         tier: Tier::High,
@@ -1505,7 +1591,16 @@ async fn reviewed<C: WorkflowContext>(
         on_timeout: gate::OnTimeout::Reject,
         question: None,
     };
-    match gate::gate(ctx, &id, spec).await? {
+    // Waiting for a person is not work a stop waits for.
+    *working = None;
+    let resolution = crate::telemetry::traced(
+        crate::telemetry::gate_span(&id, ctx.workflow_id()),
+        gate::gate(ctx, &id, spec),
+    )
+    .await?;
+    failpoint(&format!("pipeline:after:{id}"));
+    keep_working(working).await;
+    match resolution {
         Resolution::Decided(d) if d.verdict == gate::Verdict::Approve => {
             let acceptance = Acceptance {
                 candidate: candidate.id.clone(),
@@ -1516,8 +1611,8 @@ async fn reviewed<C: WorkflowContext>(
             Ok((candidate, acceptance))
         }
         other => Err(failed(format!(
-            "step `{}`: its review escalated to gate `{id}`, which {}; the step's output is \
-             not published",
+            "step `{}`: its review went to gate `{id}`, which {}; the step's output is not \
+             published",
             step.id,
             match other {
                 Resolution::Decided(_) => "was rejected",

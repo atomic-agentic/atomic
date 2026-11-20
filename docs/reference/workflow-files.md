@@ -74,23 +74,42 @@ summarize:
 ```
 
 `review` has a reviewer atom check the step's output before any later step sees
-it. The reviewer is a lite or codex atom other than the author, and its output
-is a verdict: `decision`, one of `approve`, `reject` or `escalate`, and
-`findings`, each with `where`, `what` and `severity`. Its `with` maps its input
-from what the step can see and from `candidate.output`, the output under
-review. `rounds` (0 to 5, default 1) is how many repair rounds the author gets.
+it. The reviewer is a lite or codex atom other than the author, such as the
+`review-summary` atom of [your first workflow](../getting-started/first-workflow.md).
+Its output is a verdict: `verdict`, one of the values atomic's examples use,
+with `approve` among them:
+
+| `verdict` | What happens |
+| --- | --- |
+| `approve` | The output is published. |
+| `request_changes`, `revise` | The author gets a repair round, while any are left; then a person decides. |
+| `reject`, `escalate`, `insufficient_context` | A person decides. |
+
+The rest of the verdict, such as `findings` or a `reason`, is the reviewer's
+own. Its `with` maps its input from what the step can see and from
+`candidate.output`, the output under review, and for a `worktree: true` step
+`candidate.metadata.commit`; each binding must fit the reviewer's input. What
+it reads of the candidate is external data, so a reviewer that accepts only
+more trusted input is refused. `rounds` (0 to 5, default 1) is how many repair
+rounds the author gets; an author that accepts only more trusted input than the
+reviewer's verdict carries gets none, and its review goes to a person.
 
 The author's output stays unpublished while it is reviewed. An approval
-publishes it. A rejection with rounds left runs the author again on the same
-input, given its rejected output and the findings as data; the new output is
-reviewed in turn. An escalation, or a rejection with no rounds left, opens a
-gate, `<step>.review`, that shows the output and the verdict: a person approves
-the output as it stands, or rejects it and the run fails. A review never passes
-silently. The author's turn, each verdict and each repair round are durable
-steps of their own (`<step>.review.<n>`, `<step>.repair.<n>`), so a run resumed
-after a crash repeats none that finished. The reviewer's and the author's model
-calls are metered as any step's are. An exec atom cannot be reviewed: a command
-cannot read findings.
+publishes it. A request for changes with rounds left runs the author again on
+the same input, given its rejected output and the whole verdict as data, in a
+fenced block it cannot close; the new output is reviewed in turn. Any other
+verdict, or a request for changes with no rounds left, opens a gate,
+`<step>.review`, that shows the output, the verdict and any commit: a person
+approves the output as it stands, or rejects it and the run fails. A review
+never passes silently. The author's turn, each verdict and each repair round
+are durable steps of their own (`<step>.review.<n>`, `<step>.repair.<n>`), and
+what accepted the output is recorded as `<step>.accepted`, so a run resumed
+after a crash repeats none that finished; a replay serves what the review
+accepted and reviews nothing again. Repair rounds are charged to the author's
+first turn's atom budget, and later verdicts to the first verdict's, so a step
+spends at most its author's and its reviewer's atom budgets however many rounds
+it takes. An exec atom cannot be reviewed, since a command cannot read a
+verdict; a gate cannot either, and a step's name has no dot in it.
 
 ### Where each input came from
 

@@ -27,7 +27,7 @@ mkdir -p "${WORK}/bin"
 cat >"${WORK}/bin/cargo" <<'SH'
 #!/usr/bin/env bash
 off() {
-    grep -qE 'HARDENING\.iter\(\)\.take\(0\)|ATOMIC_CONTROL_REMOVED|let names: Vec<String> = \{ let _ = names|PermissionProfile::Disabled|exclude_slash_tmp\*/ false|paths\.into_iter\(\)\.take\(0\)|black_box\(false\)|NetworkSandboxPolicy::Enabled;|"reject" => return Ok' \
+    grep -qE 'HARDENING\.iter\(\)\.take\(0\)|ATOMIC_CONTROL_REMOVED|let names: Vec<String> = \{ let _ = names|PermissionProfile::Disabled|exclude_slash_tmp\*/ false|paths\.into_iter\(\)\.take\(0\)|black_box\(false\)|NetworkSandboxPolicy::Enabled;|Verdict::Changes => return Ok' \
         crates/atomic-core/src/git.rs crates/atomic-core/src/codex.rs crates/atomic-exec/src/lib.rs \
         crates/atomic/src/pipeline.rs
 }

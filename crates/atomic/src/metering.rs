@@ -275,6 +275,15 @@ impl RunBudget {
 
     /// The meter for the atom step `step`, with caps `atom`.
     pub fn meter(&self, step: &StepInfo, atom: &Resolved) -> Metering {
+        self.meter_charged(step, step.step_id, atom)
+    }
+
+    /// As [`RunBudget::meter`], charging the atom allowance of the turn at
+    /// `allowance` rather than `step`'s own: a review's repair rounds share
+    /// the author's first turn's allowance, and its later verdicts the
+    /// first verdict's. Each call is still its own ledger request, keyed by
+    /// `step`.
+    pub fn meter_charged(&self, step: &StepInfo, allowance: i32, atom: &Resolved) -> Metering {
         let run = step.workflow_id.as_str();
         Metering::new(Arc::new(LedgerMeter {
             ledger: self.ledger.clone(),
@@ -287,7 +296,7 @@ impl RunBudget {
                 .cloned()
                 .chain([
                     Scope::run(run, caps(&self.run)),
-                    Scope::atom(run, step.step_id, caps(atom)),
+                    Scope::atom(run, allowance, caps(atom)),
                 ])
                 .collect(),
             dollar_capped: self.run.micro_usd.is_some() || atom.micro_usd.is_some(),
