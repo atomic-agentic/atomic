@@ -94,12 +94,13 @@ refuse a step whose atom declares a context.
 On Linux, atomic has verified that no atom's commands can reach the gate store
 or the credential: a Codex turn's commands and an exec atom's alike run under
 Codex's sandbox, which denies them the private part of the state directory,
-Codex's own records and the credential and key directories, the kernel keyrings
-and sockets. An exec atom's command may write only its scratch directory and the
-project's caches, and has no network; `--runner process` confines it the same
-way. On macOS and Windows this has not been verified: exec atoms' commands run
-unconfined there, so atomic keeps no operator credential and refuses
-credentialed gate decisions.
+Codex's own records, the credential and key directories and the kernel
+keyrings. A turn's commands have no network or sockets. An exec atom's command
+may write only its scratch directory and the project's caches, and keeps
+network access until atoms can declare the network they need; `--runner
+process` confines it the same way. On macOS and Windows this has not been
+verified: exec atoms' commands run unconfined there, so atomic keeps no
+operator credential and refuses credentialed gate decisions.
 
 A `workspace-write` atom cannot write `/tmp`, `/var/tmp` or `$TMPDIR` as atomic
 found them: its commands' `TMPDIR` is the project's private one above. A tool

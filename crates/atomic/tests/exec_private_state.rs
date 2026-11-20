@@ -4,7 +4,8 @@
 //! commands and is kept out of atomic's private state: it cannot read the
 //! project's database, write a gate decision into it, or read the operator
 //! credential store, on the local backend or through a runner process. It
-//! can still read the project and write its own scratch directory.
+//! can still read the project, write its own scratch directory and open a
+//! network connection.
 //!
 //! Needs bubblewrap and unprivileged user namespaces, so it runs with the
 //! `sandbox-tests` feature; with the feature on, a sandbox that cannot start
@@ -45,11 +46,22 @@ def read_credential():
 def read_project():
     with open('atomic.yaml') as f:
         f.read()
+def open_socket():
+    import socket
+    a, b = socket.socketpair()
+    a.sendall(b'x')
+    assert b.recv(1) == b'x'
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(('127.0.0.1', 0))
+    s.listen(1)
+    c = socket.create_connection(s.getsockname(), timeout=5)
+    c.close()
+    s.close()
 def write_home():
     with open(os.path.join(os.environ['HOME'], 'mine'), 'w') as f:
         f.write('x')
 json.dump({name: attempt(f) for name, f in [('read_db', read_db), ('write_gate', write_gate),
-    ('read_credential', read_credential), ('read_project', read_project), ('write_home', write_home)]}
+    ('read_credential', read_credential), ('read_project', read_project), ('write_home', write_home), ('open_socket', open_socket)]}
     | {'env': ' '.join(sorted(n for n in os.environ if n != 'LC_CTYPE'))},
     sys.stdout)
 "#;
@@ -88,9 +100,9 @@ fn exec_atom(project: &Path, db: &Path, credential: &Path) {
         project.join("atoms/probe.output.schema.yaml"),
         format!(
             "type: object\nadditionalProperties: false\n\
-             required: [read_db, write_gate, read_credential, read_project, write_home, env]\n\
+             required: [read_db, write_gate, read_credential, read_project, write_home, open_socket, env]\n\
              properties:\n  read_db: {field}\n  write_gate: {field}\n  read_credential: {field}\n\
-             \x20 read_project: {field}\n  write_home: {field}\n  env: {field}\n"
+             \x20 read_project: {field}\n  write_home: {field}\n  open_socket: {field}\n  env: {field}\n"
         ),
     )
     .expect("output");
@@ -191,7 +203,8 @@ fn an_exec_atom_cannot_reach_atomics_private_state() {
             for denied in ["read_db", "write_gate", "read_credential"] {
                 assert_ne!(out[denied], "ok", "{what}: {denied} was allowed: {out}");
             }
-            for allowed in ["read_project", "write_home"] {
+            // It keeps the network, until atoms can declare what they need.
+            for allowed in ["read_project", "write_home", "open_socket"] {
                 assert_eq!(out[allowed], "ok", "{what}: {allowed} was refused: {out}");
             }
         }

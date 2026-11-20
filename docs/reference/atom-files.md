@@ -50,8 +50,9 @@ On Linux the command runs under the same sandbox as a Codex atom's commands. It
 can read the project and the rest of the filesystem except atomic's private
 state (the project's database and gate store, Codex's records, the credential
 and key directories), write only its own scratch directory (its `HOME` and
-`TMPDIR`) and the project's build caches, and has no network: an atom cannot
-declare network access at this version. A command that writes elsewhere fails.
+`TMPDIR`) and the project's build caches; a command that writes anywhere else
+fails. It keeps network access, so a command can still call an outside API,
+until atoms can declare the network they need.
 On macOS and Windows the command is not confined yet.
 
 A step runs at least once, and Atomic cannot see what a command does to other

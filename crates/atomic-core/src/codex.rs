@@ -473,11 +473,12 @@ fn keep_sandbox_off_keyrings() {
 /// turn's commands are confined: the whole filesystem readable except
 /// atomic's private state, which is denied as it is to turns (see
 /// [`denied_paths`]); only the command's own writable directories, such as
-/// its scratch directory, and the project's caches writable; no network. The command still runs
+/// its scratch directory, and the project's caches writable. The command still runs
 /// with exactly its environment, in its directory.
 ///
-/// Exec atoms declare no network at this version (see the atom loader), so
-/// none is given.
+/// It keeps the network an exec command had before it was confined, so an
+/// exec atom that calls an outside API still can, until atoms can declare
+/// the network they need.
 #[derive(Clone, Debug)]
 pub struct ExecSandbox {
     helper: PathBuf,
@@ -531,7 +532,7 @@ impl ExecSandbox {
         }
         Ok(PermissionProfile::from_runtime_permissions(
             &policy,
-            NetworkSandboxPolicy::Restricted,
+            NetworkSandboxPolicy::Enabled,
         ))
     }
 }
@@ -1549,7 +1550,7 @@ mod tests {
                 "{writable:?}: {text}"
             );
         }
-        assert!(text.contains("restricted"), "no network: {text}");
+        assert!(text.contains("enabled"), "the network stays open: {text}");
     }
 
     #[test]
