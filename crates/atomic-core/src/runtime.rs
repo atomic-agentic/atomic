@@ -465,6 +465,8 @@ pub async fn run_declarative_with_context(
             &identity,
             Arc::new(atomic_exec::LocalBackend),
             runtimes.clock.as_ref(),
+            // The store the model runtimes check references against.
+            &runtimes.codex.artifacts,
         )
         .await;
     }
@@ -616,9 +618,10 @@ pub const EXEC_OUTPUT_LIMIT: usize = 8_388_608;
 /// the atom declares, plus `HOME` and `TMPDIR` pointing at a scratch
 /// directory of its own. It reads the input as one JSON value on stdin and
 /// writes one JSON value to stdout; stderr is for diagnostics. A nonzero
-/// exit fails the step, and so does output that breaks the contract or the
-/// atom's validators: there is no model to repair it. The validators' helpers
-/// follow `clock`, the step's recorded clock, when there is one.
+/// exit fails the step, and so does output that breaks the contract, names
+/// an artifact `artifacts` does not hold as the contract requires, or fails
+/// the atom's validators: there is no model to repair it. The validators'
+/// helpers follow `clock`, the step's recorded clock, when there is one.
 pub async fn run_exec(
     atom: &AtomFile,
     compiled: &Compiled,
@@ -626,6 +629,7 @@ pub async fn run_exec(
     identity: &EffectIdentity,
     backend: Arc<dyn atomic_exec::ExecutionBackend>,
     clock: Option<&crate::astro::StepClock>,
+    artifacts: &Artifacts,
 ) -> Result<(Value, RunMetadata), AtomError> {
     let contract = |key: &str| {
         compiled.program.contracts.get(key).ok_or_else(|| {
@@ -731,6 +735,10 @@ pub async fn run_exec(
     if !errors.is_empty() {
         return Err(schema_error(errors.join("; ")));
     }
+    // As for a model's answer: a reference must name an artifact that exists,
+    // of the right type.
+    atomic_schema::artifact::check_refs(contract("Output")?, &output, artifacts.0.as_ref())
+        .map_err(|e| schema_error(e.to_string()))?;
     let has_checks = atom
         .frontmatter
         .get("validate")

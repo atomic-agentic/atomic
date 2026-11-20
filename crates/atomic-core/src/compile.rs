@@ -37,6 +37,16 @@ pub fn compile(atom: &Atom, _registry: &Registry) -> Result<Compiled, AtomError>
         path: "/examples".into(),
         message,
     };
+    // An output contract whose artifact references the runtime check could
+    // not follow is refused here, before any run reaches it.
+    if let Some(output) = atom.program.contracts.get("Output") {
+        atomic_schema::artifact::check_contract(output).map_err(|e| AtomError {
+            file: atom.file.clone(),
+            line: 1,
+            path: "/output".into(),
+            message: format!("the output contract's artifact references: {e}"),
+        })?;
+    }
     let mut examples = Vec::new();
     if let Some(values) = atom.frontmatter.get("examples") {
         let values = values

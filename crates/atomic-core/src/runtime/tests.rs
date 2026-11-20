@@ -1096,6 +1096,7 @@ fn exec_validators_follow_the_steps_clock() {
                 &identity,
                 Arc::new(atomic_exec::LocalBackend),
                 Some(&clock),
+                &Artifacts::none(),
             )
             .await
             .expect("the recorded clock passes");
@@ -1108,6 +1109,7 @@ fn exec_validators_follow_the_steps_clock() {
             &identity,
             Arc::new(atomic_exec::LocalBackend),
             None,
+            &Artifacts::none(),
         )
         .await;
         assert!(matches!(fresh, Err(AtomError::Validation(_))), "{fresh:?}");
@@ -1251,4 +1253,71 @@ fn exec_declarations_are_checked_at_load() {
             atom::load(&dir.join("atoms/x.atom.astro"), &mut Registry::new()).expect_err(problem);
         assert!(error.message.contains(problem), "{config}: {error}");
     }
+}
+
+// An exec atom's output is held to the artifact store like a model's answer.
+#[test]
+fn an_exec_atom_output_names_only_artifacts_the_store_holds() {
+    use crate::artifact::{ArtifactStore, LocalStore, Provenance};
+    use crate::{atom, compile};
+    on_codex_runtime(async {
+        let store = LocalStore::open(scratch("exec-artifacts")).expect("store");
+        let put = |bytes: &[u8], media: &str| {
+            store
+                .put(
+                    &mut &bytes[..],
+                    Provenance {
+                        media_type: media.into(),
+                        workflow: None,
+                        step: None,
+                        origin: None,
+                        labels: Default::default(),
+                    },
+                )
+                .expect("put")
+                .artifact
+                .uri()
+        };
+        let diff = put(b"--- a\n+++ b\n", "text/x-diff");
+        let text = put(b"a note", "text/plain");
+        let missing = format!("artifact://sha256/{}", "0".repeat(64));
+        for (reference, want) in [
+            (&diff, None),
+            (&text, Some("text/x-diff")),
+            (&missing, Some("no artifact")),
+        ] {
+            let script = format!(
+                "import json, sys\njson.load(sys.stdin)\njson.dump({{'total': 1, 'patch': '{reference}'}}, sys.stdout)\n"
+            );
+            let (dir, _, _) = exec_project("exec-artifact", &script, "");
+            std::fs::write(
+                dir.join("atoms/total.output.schema.yaml"),
+                "type: object\nadditionalProperties: false\nrequired: [total, patch]\nproperties:\n  total: {type: integer}\n  patch: {$ref: 'atomic:artifact', mediaType: text/x-diff}\n",
+            )
+            .expect("output");
+            let mut registry = Registry::new();
+            let a = atom::load(&dir.join("atoms/total.atom.astro"), &mut registry).expect("loads");
+            let compiled = compile::compile(&a, &registry).expect("compiles");
+            let r = run_exec(
+                &a,
+                &compiled,
+                &json!({"cents": [1]}),
+                &EffectIdentity {
+                    run_id: "run-1".into(),
+                    step_id: "total".into(),
+                },
+                Arc::new(atomic_exec::LocalBackend),
+                None,
+                &Artifacts::new(store.clone()),
+            )
+            .await;
+            match want {
+                None => assert!(r.is_ok(), "{r:?}"),
+                Some(says) => assert!(
+                    matches!(&r, Err(AtomError::Schema { message, .. }) if message.contains(says)),
+                    "{r:?}"
+                ),
+            }
+        }
+    });
 }
