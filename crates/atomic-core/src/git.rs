@@ -769,9 +769,10 @@ fn printable(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// Stop git, with everything it started: it runs in a process group of
+/// its own (see `atomic_exec::process::spawn_own_tool`).
 fn stop(child: &mut Child) {
-    let _ = child.kill();
-    let _ = child.wait();
+    atomic_exec::process::kill_own_tool(child);
 }
 
 /// The child's exit, if it comes within `limit`.

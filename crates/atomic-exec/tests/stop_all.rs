@@ -11,7 +11,7 @@
 #![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used)]
 
-use atomic_exec::process::{Limits, run, spawn_own_tool, stop_all};
+use atomic_exec::process::{Limits, run, spawn_own_tool, stop_all, stopping};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -30,6 +30,36 @@ fn alive(pid: &str) -> bool {
     })
 }
 
+/// Whether the first thread of `pid` shows as a zombie.
+fn leader_is_zombie(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+        stat.rsplit(')')
+            .next()
+            .unwrap_or("")
+            .trim_start()
+            .starts_with('Z')
+    })
+}
+
+/// Whether any thread of `pid` runs: there, and neither a zombie nor dead.
+fn threads_run(pid: &str) -> bool {
+    std::fs::read_dir(format!("/proc/{pid}/task")).is_ok_and(|tasks| {
+        tasks.flatten().any(|task| {
+            std::fs::read_to_string(task.path().join("stat")).is_ok_and(|stat| {
+                !matches!(
+                    stat.rsplit(')')
+                        .next()
+                        .unwrap_or("")
+                        .trim_start()
+                        .chars()
+                        .next(),
+                    Some('Z' | 'X' | 'x') | None
+                )
+            })
+        })
+    })
+}
+
 #[test]
 fn stopping_ends_every_process_a_command_started_before_it_returns() {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
@@ -39,10 +69,17 @@ fn stopping_ends_every_process_a_command_started_before_it_returns() {
     let pidfile = dir.join("grandchild");
     // The command leaves a grandchild in a session of its own, which a kill
     // of the command's process group does not reach, and which ignores
-    // SIGTERM.
+    // SIGTERM; and another whose first thread has exited while a second
+    // runs, so that its process shows as a zombie.
+    let leaderless = dir.join("leaderless");
     let script = format!(
-        "setsid sh -c 'trap \"\" TERM; echo $$ > {}; exec sleep 300' & sleep 300",
-        pidfile.display()
+        "setsid sh -c 'trap \"\" TERM; echo $$ > {}; exec sleep 300' & \
+         setsid python3 -c 'import ctypes, os, threading, time; \
+         threading.Thread(target=time.sleep, args=(300,)).start(); \
+         open(\"{}\", \"w\").write(str(os.getpid())); \
+         ctypes.CDLL(None).pthread_exit(None)' & sleep 300",
+        pidfile.display(),
+        leaderless.display()
     );
     std::thread::spawn(move || {
         run(
@@ -72,21 +109,46 @@ fn stopping_ends_every_process_a_command_started_before_it_returns() {
         std::thread::sleep(Duration::from_millis(20));
     };
     assert!(alive(&pid), "the grandchild runs before the stop");
-    // One of atomic's own tools, which takes a moment to finish its work.
+    let started = Instant::now();
+    let zombie_leader = loop {
+        if let Ok(text) = std::fs::read_to_string(&leaderless)
+            && let Ok(pid) = text.trim().parse::<u32>()
+            && leader_is_zombie(pid)
+        {
+            break pid.to_string();
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the leaderless process never showed as a zombie"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    // One of atomic's own tools, which finishes its work only once the late
+    // process below has started, so that one starts while the stop waits.
     let done = dir.join("tool-done");
+    let late_started = dir.join("late-started");
     let (mut tool, own) = spawn_own_tool(std::process::Command::new("/bin/sh").args([
         "-c",
-        &format!("trap '' TERM; sleep 1; touch {}", done.display()),
+        &format!(
+            "trap '' TERM; while [ ! -e {} ]; do sleep 0.05; done; touch {}",
+            late_started.display(),
+            done.display()
+        ),
     ]))
     .unwrap();
-    // And a process started while the stop waits for the tool, as a model
-    // turn's command may be: killed on sight.
-    let late = std::thread::spawn(|| {
-        std::thread::sleep(Duration::from_millis(400));
-        std::process::Command::new("/bin/sleep")
+    // And a process started once the stop has begun, as a model turn's
+    // command may be: killed on sight.
+    let marker = late_started.clone();
+    let late = std::thread::spawn(move || {
+        while !stopping() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let child = std::process::Command::new("/bin/sleep")
             .arg("300")
             .spawn()
-            .unwrap()
+            .unwrap();
+        std::fs::write(&marker, "").unwrap();
+        child
     });
     let mut reported = Vec::new();
     let stopped = stop_all(&mut |what| reported.push(what.to_owned()));
@@ -99,6 +161,10 @@ fn stopping_ends_every_process_a_command_started_before_it_returns() {
     );
     assert_eq!(stopped, 1, "one command was running");
     assert!(!alive(&pid), "process {pid} outlived the stop");
+    assert!(
+        !threads_run(&zombie_leader),
+        "process {zombie_leader}, a zombie leader with a running thread, outlived the stop"
+    );
     assert!(tool.wait().unwrap().success());
     drop(own);
     assert!(

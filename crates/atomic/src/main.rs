@@ -292,7 +292,11 @@ fn real_main() -> anyhow::Result<()> {
             std::process::exit(1);
         }
         flush_spans().await;
-        atomic_exec::process::end_all(&mut |what| atomic_core::log_line!("atomic: {what}"));
+        // Exit here, not by returning, when a command was still running:
+        // its thread waits for the exit, and the runtime would wait for it.
+        if atomic_exec::process::end_all(&mut |what| atomic_core::log_line!("atomic: {what}")) > 0 {
+            std::process::exit(0);
+        }
         Ok(())
     })
 }

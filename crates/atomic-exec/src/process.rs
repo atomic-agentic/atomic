@@ -73,23 +73,34 @@ pub fn stop_all(report: &mut dyn FnMut(&str)) -> usize {
 /// descending from this one that runs now or starts while this waits, found
 /// through `/proc`, one in another process group or session, as a sandbox's
 /// command is, included, and return once each has ended. Each found at
-/// first is stopped where it is, for at most a second of looking, so none
-/// starts another while the rest are found; then all are killed, and any
-/// found while this waits is killed on sight. Atomic's own tools, such as
-/// its git, are waited for, never killed. `report` is told what outlives
-/// its kill after ten seconds and every thirty after that, and the wait
-/// goes on, so the process, and any lock it holds, outlasts them all: only
-/// SIGKILL ends it. A process that left this one's descendants, as one that
+/// first is stopped where it is, for at most a second of looking, every
+/// look included, so none starts another while the rest are found; then
+/// the process groups and all found are killed, and any found while this
+/// waits is killed on sight, each look again at most a second. Atomic's own
+/// tools, such as its git, are waited for, never killed: git's own time
+/// limit, ten minutes, bounds that wait. `report` is told what outlives its
+/// kill after ten seconds and every thirty after that, and the wait goes on,
+/// so the process, and any lock it holds, outlasts them all: only SIGKILL
+/// ends it. A process that left this one's descendants, as one that
 /// daemonizes outside a sandbox's process namespace does, is not found.
 /// Elsewhere than Linux it does nothing more than [`stop_all`]'s kill.
-pub fn end_all(report: &mut dyn FnMut(&str)) {
-    let _ = stop_all(report);
+/// Returns how many commands [`run`] had running.
+pub fn end_all(report: &mut dyn FnMut(&str)) -> usize {
+    stop_all(report)
+}
+
+/// Whether this process is stopping ([`stop_all`]): the commands it ran
+/// may have been killed, so no step whose work may have depended on one
+/// should report, or record, how it ended.
+pub fn stopping() -> bool {
+    STOPPING.load(Ordering::SeqCst)
 }
 
 /// The processes of atomic's own tools, such as its git, which stopping
 /// waits for and never kills: a git killed mid-commit could leave its
 /// repository locked.
-static OWN_TOOLS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+/// Each by its process id and start time (see `descendants`).
+static OWN_TOOLS: Mutex<Vec<(u32, u64)>> = Mutex::new(Vec::new());
 
 /// A process [`spawn_own_tool`] started, counted as atomic's own until
 /// this is dropped.
@@ -101,21 +112,36 @@ impl Drop for OwnTool {
         OWN_TOOLS
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .retain(|pid| *pid != self.0);
+            .retain(|(pid, _)| *pid != self.0);
     }
 }
 
 /// Start `command` as one of atomic's own tools: a process that stopping
-/// waits for and never kills (see [`end_all`]). Started and counted under
-/// the lock stopping takes, so it is never found before it is counted.
+/// waits for and never kills (see [`end_all`]), in a process group of its
+/// own, which [`kill_own_tool`] kills. Started and counted under the lock
+/// stopping takes, so it is never found before it is counted.
 pub fn spawn_own_tool(
     command: &mut std::process::Command,
 ) -> std::io::Result<(std::process::Child, OwnTool)> {
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(command, 0);
     let mut own = OWN_TOOLS.lock().unwrap_or_else(|e| e.into_inner());
     let child = command.spawn()?;
     let pid = child.id();
-    own.push(pid);
+    #[cfg(target_os = "linux")]
+    let started = descendants::started(pid).unwrap_or(0);
+    #[cfg(not(target_os = "linux"))]
+    let started = 0;
+    own.push((pid, started));
     Ok((child, OwnTool(pid)))
+}
+
+/// Kill a tool [`spawn_own_tool`] started, with everything in its process
+/// group, as when it has run past its time limit, and reap it.
+pub fn kill_own_tool(child: &mut std::process::Child) {
+    kill_group(child.id());
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// The processes descending from this one, found through `/proc`: each
@@ -126,6 +152,7 @@ mod descendants {
     use super::OWN_TOOLS;
     use std::collections::{HashMap, HashSet};
     use std::io::ErrorKind;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
     /// How long the processes found at first are stopped and looked for
@@ -191,6 +218,32 @@ mod descendants {
         matches!(state, 'Z' | 'X' | 'x')
     }
 
+    /// When process `pid` started, if it is there.
+    pub(super) fn started(pid: u32) -> Option<u64> {
+        stat(libc::pid_t::try_from(pid).ok()?)
+            .ok()
+            .flatten()
+            .map(|s| s.started)
+    }
+
+    /// Whether a process whose leader shows as a zombie has a thread that is
+    /// not: one that cannot be read counts as running.
+    fn threads_run(pid: libc::pid_t) -> bool {
+        match std::fs::read_dir(format!("/proc/{pid}/task")) {
+            Ok(tasks) => tasks.flatten().any(|task| {
+                match std::fs::read_to_string(task.path().join("stat")) {
+                    Ok(text) => text
+                        .rsplit_once(')')
+                        .and_then(|(_, rest)| rest.split_whitespace().next())
+                        .and_then(|f| f.chars().next())
+                        .is_none_or(|state| !ended(state)),
+                    Err(e) => e.kind() != ErrorKind::NotFound,
+                }
+            }),
+            Err(e) => e.kind() != ErrorKind::NotFound,
+        }
+    }
+
     /// Whether `process` may still run: there, the same process, and with a
     /// thread that is neither a zombie nor dead. What cannot be read counts
     /// as running.
@@ -201,28 +254,19 @@ mod descendants {
             Ok(Some(stat)) if !ended(stat.state) => true,
             // A leader that has exited while its other threads run shows as
             // a zombie: look at each thread.
-            Ok(Some(_)) => match std::fs::read_dir(format!("/proc/{}/task", process.pid)) {
-                Ok(tasks) => tasks.flatten().any(|task| {
-                    match std::fs::read_to_string(task.path().join("stat")) {
-                        Ok(text) => text
-                            .rsplit_once(')')
-                            .and_then(|(_, rest)| rest.split_whitespace().next())
-                            .and_then(|f| f.chars().next())
-                            .is_none_or(|state| !ended(state)),
-                        Err(e) => e.kind() != ErrorKind::NotFound,
-                    }
-                }),
-                Err(e) => e.kind() != ErrorKind::NotFound,
-            },
+            Ok(Some(_)) => threads_run(process.pid),
             Err(_) => true,
         }
     }
 
     /// Every process now running whose parents lead to this one, each
-    /// started no earlier than its parent, and those that cannot be read.
+    /// started no earlier than its parent, as far as `/proc` can be read by
+    /// `deadline`: processes that keep starting others cannot hold one look
+    /// past it. Reports those that cannot be read.
     fn found(
         report: &mut dyn FnMut(&str),
         unreadable: &mut HashSet<libc::pid_t>,
+        deadline: Instant,
     ) -> Vec<(Process, libc::pid_t)> {
         let me = libc::pid_t::try_from(std::process::id()).unwrap_or(0);
         let mut children: HashMap<libc::pid_t, Vec<(Process, libc::pid_t)>> = HashMap::new();
@@ -237,6 +281,9 @@ mod descendants {
             }
         };
         for entry in entries.flatten() {
+            if Instant::now() >= deadline {
+                break;
+            }
             let Some(pid) = entry
                 .file_name()
                 .to_str()
@@ -246,7 +293,7 @@ mod descendants {
             };
             match stat(pid) {
                 Ok(Some(stat)) if pid == me => own_start = stat.started,
-                Ok(Some(stat)) if !ended(stat.state) => {
+                Ok(Some(stat)) if !ended(stat.state) || threads_run(pid) => {
                     children.entry(stat.parent).or_default().push((
                         Process {
                             pid,
@@ -283,15 +330,21 @@ mod descendants {
     }
 
     /// The processes of atomic's own tools, and every process they started.
-    fn own(found: &[(Process, libc::pid_t)], tools: &[u32]) -> HashSet<Process> {
-        let mut own: HashSet<libc::pid_t> = tools
+    fn own(found: &[(Process, libc::pid_t)], tools: &[(u32, u64)]) -> HashSet<Process> {
+        let tools: HashSet<Process> = tools
             .iter()
-            .filter_map(|pid| libc::pid_t::try_from(*pid).ok())
+            .filter_map(|(pid, started)| {
+                Some(Process {
+                    pid: libc::pid_t::try_from(*pid).ok()?,
+                    started: *started,
+                })
+            })
             .collect();
+        let mut own: HashSet<libc::pid_t> = HashSet::new();
         let mut out = HashSet::new();
         // `found` lists parents before their children.
         for (process, parent) in found {
-            if own.contains(&process.pid) || own.contains(parent) {
+            if tools.contains(process) || own.contains(parent) {
                 own.insert(process.pid);
                 out.insert(*process);
             }
@@ -325,8 +378,10 @@ mod descendants {
                     );
                 }
                 libc::close(fd as libc::c_int);
-            } else if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOSYS) && same()
+            } else if std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) && same()
             {
+                // No descriptor to be had, as where a seccomp profile refuses
+                // the call or descriptors run out: by id, just checked.
                 libc::kill(process.pid, signal);
             }
         }
@@ -337,25 +392,28 @@ mod descendants {
     /// starting others cannot hold the stop. Returns what was stopped, and
     /// whether nothing new appeared before the limit.
     fn stop_phase<P: Copy + Eq + std::hash::Hash>(
-        find: &mut dyn FnMut() -> Vec<P>,
+        find: &mut dyn FnMut(Instant) -> Vec<P>,
         stop: &mut dyn FnMut(&P),
         limit: Duration,
     ) -> (HashSet<P>, bool) {
-        let begun = Instant::now();
+        let deadline = Instant::now() + limit;
         let mut stopped = HashSet::new();
         loop {
-            let new: Vec<P> = find()
+            let new: Vec<P> = find(deadline)
                 .into_iter()
                 .filter(|p| !stopped.contains(p))
                 .collect();
             if new.is_empty() {
-                return (stopped, true);
+                return (stopped, Instant::now() < deadline);
             }
             for process in new {
+                if Instant::now() >= deadline {
+                    return (stopped, false);
+                }
                 stop(&process);
                 stopped.insert(process);
             }
-            if begun.elapsed() >= limit {
+            if Instant::now() >= deadline {
                 return (stopped, false);
             }
         }
@@ -374,17 +432,20 @@ mod descendants {
             for group in groups {
                 super::kill_group(*group);
             }
-            report(
-                "this process's /proc is not its own, so the processes it started cannot be \
-                 found; only their process groups were killed",
-            );
+            static SAID: AtomicBool = AtomicBool::new(false);
+            if !SAID.swap(true, Ordering::SeqCst) {
+                report(
+                    "this process's /proc is not its own, so the processes it started cannot \
+                     be found; only their process groups were killed",
+                );
+            }
             return;
         }
         let mut unreadable = HashSet::new();
         let begun = Instant::now();
         let (mut watched, settled) = stop_phase(
-            &mut || {
-                let all = found(report, &mut unreadable);
+            &mut |deadline| {
+                let all = found(report, &mut unreadable, deadline);
                 let own = own(&all, &tools);
                 all.into_iter()
                     .map(|(p, _)| p)
@@ -412,7 +473,7 @@ mod descendants {
         // this one runs.
         let mut next = FIRST_REPORT;
         loop {
-            let all = found(report, &mut unreadable);
+            let all = found(report, &mut unreadable, Instant::now() + STOP_PHASE);
             let own = own(&all, &tools);
             for (process, _) in all.iter().filter(|(p, _)| !own.contains(p)) {
                 if watched.insert(*process) {
@@ -444,15 +505,17 @@ mod descendants {
     mod tests {
         use super::*;
 
-        /// Run `stop_phase` with `find`, on a thread, giving it `within`.
+        /// Run `stop_phase` with `find` and `stop`, on a thread, giving it
+        /// `within`.
         fn bounded(
-            mut find: impl FnMut() -> Vec<u32> + Send + 'static,
+            mut find: impl FnMut(Instant) -> Vec<u32> + Send + 'static,
+            mut stop: impl FnMut(&u32) + Send + 'static,
             limit: Duration,
             within: Duration,
         ) -> (HashSet<u32>, bool) {
             let (sender, receiver) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
-                let _ = sender.send(stop_phase(&mut find, &mut |_| {}, limit));
+                let _ = sender.send(stop_phase(&mut find, &mut stop, limit));
             });
             receiver
                 .recv_timeout(within)
@@ -460,24 +523,58 @@ mod descendants {
         }
 
         /// Processes that never stop starting others hold the stop no
-        /// longer than its limit; ones that settle are all stopped.
+        /// longer than its limit: whether each look finds another, a look
+        /// itself never ends, or stopping each one is slow. Ones that
+        /// settle are all stopped.
         #[test]
         fn the_stop_phase_is_bounded() {
+            let limit = Duration::from_millis(200);
+            let within = Duration::from_secs(5);
             let mut next = 0u32;
             let (stopped, settled) = bounded(
-                move || {
+                move |_| {
                     next += 1;
                     vec![next]
                 },
-                Duration::from_millis(200),
-                Duration::from_secs(5),
+                |_| {},
+                limit,
+                within,
             );
             assert!(stopped.len() > 1);
             assert!(!settled, "it gave up looking");
 
+            // A look that would chase new processes for good, but for its
+            // deadline.
+            let mut next = 0u32;
+            let (_, settled) = bounded(
+                move |deadline| {
+                    let mut out = Vec::new();
+                    while Instant::now() < deadline {
+                        next += 1;
+                        out.push(next);
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    out
+                },
+                |_| {},
+                limit,
+                within,
+            );
+            assert!(!settled);
+
+            // Many found at once, each slow to stop.
+            let (stopped, settled) = bounded(
+                |_| (0..10_000).collect(),
+                |_| std::thread::sleep(Duration::from_millis(5)),
+                limit,
+                within,
+            );
+            assert!(stopped.len() < 10_000, "{}", stopped.len());
+            assert!(!settled);
+
             let mut rounds = 0;
             let (stopped, settled) = bounded(
-                move || {
+                move |_| {
                     rounds += 1;
                     if rounds < 3 {
                         vec![1, 2, rounds + 10]
@@ -485,8 +582,9 @@ mod descendants {
                         vec![1, 2]
                     }
                 },
+                |_| {},
                 Duration::from_secs(60),
-                Duration::from_secs(5),
+                within,
             );
             assert_eq!(stopped, HashSet::from([1, 2, 11, 12]));
             assert!(settled);
