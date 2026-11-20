@@ -20,8 +20,9 @@
 //! - killing the process just after the park is recorded keeps one park;
 //! - a run killed and resumed reports the same usage as an uninterrupted
 //!   one, plus only the calls that really ran again;
-//! - two parallel children cannot both take the run's last reservation, and
-//!   the one refused goes on once its park is released;
+//! - two child runs racing for their parent's allowance cannot both take
+//!   its last reservation, and the one refused goes on once its park is
+//!   released;
 //! - a lite call that failed is charged at its bound if it could have been
 //!   sent, as is an answer with no usage, and released if it never was;
 //! - a dollar cap on an unpriced model fails configuration, and a call to
@@ -836,47 +837,16 @@ fn a_killed_and_resumed_run_reports_the_same_usage_plus_only_real_retries() {
 // ---------------------------------------------------------------------------
 // Parent and children.
 
-/// A child's run, boxed. Written over any context, as workflow code is: the
-/// compiler proves the future `Send` from the trait's bounds.
-type Child = std::pin::Pin<
-    Box<dyn Future<Output = atomic_durable::Result<atomic_durable::Published>> + Send>,
->;
+/// The child workflow: one metered lite atom, under the parent allowance
+/// its budget sits in.
+const PAIR_CHILD: &str = "pair-child";
 
-/// One of two children of the `pair` workflow, each a metered lite atom.
-fn pair_child<C: atomic_durable::WorkflowContext>(
-    ctx: C,
-    name: &'static str,
-    budget: RunBudget,
-    caps: atomic_core::budget::Resolved,
-    lite: LiteRuntime,
-) -> Child {
-    Box::pin(async move {
-        run_atom_at(
-            &ctx,
-            name,
-            move |step| {
-                let mut lite = lite.clone();
-                lite.meter = budget.meter(&step, &caps);
-                let request = ChangeRequest {
-                    request: name.into(),
-                };
-                propose(async move { run_lite_atom(&DraftTask, &request, &lite).await })
-            },
-            Vec::new(),
-        )
-        .await
-    })
-}
-
-// The two children run as parallel sibling atoms in one workflow, which
-// shows the ledger's race but is not a recoverable shape: positions claimed
-// in join order are not stable across a replay. A recoverable run would
-// model them as child workflows.
 #[test]
 fn parallel_children_cannot_both_take_the_last_reservation() {
     on_codex_runtime(async {
-        // The first call is slow, so the second child's admission comes
-        // while it is in flight.
+        // Two child runs, each its own workflow, race for the parent's
+        // allowance. The first call is slow, so the second child's
+        // admission comes while it is in flight.
         let model = FakeModel::start(vec![
             Reply::Delayed {
                 after: Duration::from_secs(2),
@@ -890,52 +860,84 @@ fn parallel_children_cannot_both_take_the_last_reservation() {
         let mut rt = Durare::sqlite(&dir.join("atomic.db"))
             .await
             .expect("engine");
-        // The run has room for one whole bound at a time, though not two:
+        // The parent has room for one whole bound at a time, though not two:
         // one after the other, once the first has settled at its two tokens,
-        // both children's calls fit. Each child has room for many.
+        // both children's calls fit. Each child run, and its atom, has room
+        // for many.
+        let parent = atomic_durable::usage::Scope {
+            id: "run:pair".into(),
+            caps: Caps {
+                tokens: 2 * BOUND - 1,
+                millis: 3_600_000,
+                micro_usd: None,
+            },
+        };
         let budget = RunBudget::new(
             rt.ledger(),
-            Arc::new(settings(10_000, 2 * 150 - 1)),
+            Arc::new(settings(10_000, 100_000)),
             &Budget::default(),
             &["synthetic"],
         )
-        .expect("budget");
+        .expect("budget")
+        .under(parent);
+        let caps = budget.atom(&Budget::default(), "synthetic").expect("caps");
         let lite = runtimes(&dir, &model.base_url()).lite.clone();
-        rt.register("pair", move |ctx: atomic_durable::DurareContext, (): ()| {
-            let (budget, lite) = (budget.clone(), lite.clone());
-            async move {
-                let caps = budget.atom(&Budget::default(), "synthetic").expect("caps");
-                let a = pair_child(ctx.clone(), "a", budget.clone(), caps.clone(), lite.clone());
-                let b = pair_child(ctx, "b", budget, caps, lite);
-                let (a, b) = tokio::join!(a, b);
-                Ok(vec![a?, b?])
-            }
-        });
+        rt.register(
+            PAIR_CHILD,
+            move |ctx: atomic_durable::DurareContext, name: String| {
+                let (budget, caps, lite) = (budget.clone(), caps.clone(), lite.clone());
+                async move {
+                    run_atom_at(
+                        &ctx,
+                        "draft",
+                        move |step| {
+                            let mut lite = lite.clone();
+                            lite.meter = budget.meter(&step, &caps);
+                            let request = ChangeRequest {
+                                request: name.clone(),
+                            };
+                            propose(async move { run_lite_atom(&DraftTask, &request, &lite).await })
+                        },
+                        Vec::new(),
+                    )
+                    .await
+                }
+            },
+        );
         rt.launch().await.expect("launch");
-        rt.start("pair", "pair", ()).await.expect("start");
-        assert!(matches!(outcome(&rt, "pair").await, Outcome::Parked(_)));
-        assert_eq!(model.calls(), 1, "only one child's call was dispatched");
-        let journal = attempts(&rt, "pair").await;
-        assert_eq!(journal.len(), 1, "{journal:?}");
-        assert!(charged(&rt, "run:pair").await <= 299);
-        // Let the winner finish its publication.
-        let until = Instant::now() + Duration::from_secs(30);
-        while !rt
-            .steps("pair")
-            .await
-            .expect("steps")
-            .iter()
-            .any(|s| s.name.ends_with(".publish") && s.output.is_some())
-        {
-            assert!(Instant::now() < until, "the admitted child published");
-            tokio::time::sleep(Duration::from_millis(100)).await;
+        for child in ["pair-a", "pair-b"] {
+            rt.start(PAIR_CHILD, child, child.to_owned())
+                .await
+                .expect("start");
         }
+        // One child parks; the other's call is the only one dispatched.
+        let until = Instant::now() + Duration::from_secs(60);
+        let (loser, winner, park) = loop {
+            let mut found = None;
+            for (child, other) in [("pair-a", "pair-b"), ("pair-b", "pair-a")] {
+                if let Some(p) = parks(&rt, child).await.expect("parks").into_iter().next() {
+                    found = Some((child, other, p));
+                }
+            }
+            if let Some(found) = found {
+                break found;
+            }
+            assert!(Instant::now() < until, "a child parked");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert!(park.reason.contains("run:pair"), "{}", park.reason);
+        assert_eq!(model.calls(), 1, "only one child's call was dispatched");
+        assert!(
+            attempts(&rt, loser).await.is_empty(),
+            "the refusal wrote nothing"
+        );
+        assert!(charged(&rt, "run:pair").await < 2 * BOUND);
+        let _: atomic_durable::Published = rt.result(winner).await.expect("the winner finishes");
+        assert_eq!(parks(&rt, winner).await.expect("parks").len(), 0);
         // The refusal was for the moment only: released, the other child's
         // call fits beside the winner's settled spend.
-        let park = parks(&rt, "pair").await.expect("parks")[0].clone();
         release(&rt, &park).await.expect("release");
-        let both: Vec<atomic_durable::Published> = rt.result("pair").await.expect("finishes");
-        assert_eq!(both.len(), 2);
+        let _: atomic_durable::Published = rt.result(loser).await.expect("the loser finishes");
         assert_eq!(model.calls(), 2);
         assert_eq!(charged(&rt, "run:pair").await, 4);
         rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");

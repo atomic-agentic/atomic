@@ -203,6 +203,9 @@ pub struct RunBudget {
     ledger: Ledger,
     settings: Arc<BudgetSettings>,
     run: Resolved,
+    /// The allowances the run sits under, root first, as a child run sits
+    /// under its parent's.
+    parents: Vec<Scope>,
 }
 
 /// A count as the ledger holds it: at most its largest amount.
@@ -236,6 +239,7 @@ impl RunBudget {
             ledger,
             settings,
             run,
+            parents: Vec::new(),
         })
     }
 
@@ -250,7 +254,16 @@ impl RunBudget {
             ledger,
             settings: Arc::new(plan.settings()),
             run: plan.run.clone(),
+            parents: Vec::new(),
         }
+    }
+
+    /// The same caps, for a run that sits under `parent`: every call is also
+    /// charged against it, before the run's own allowance, so children of
+    /// one parent share its room and cannot both take its last reservation.
+    pub fn under(mut self, parent: Scope) -> Self {
+        self.parents.push(parent);
+        self
     }
 
     /// The caps of an atom calling `model` with its own limits `declared`.
@@ -266,10 +279,15 @@ impl RunBudget {
             settings: self.settings.clone(),
             run: run.to_owned(),
             step: step.step_id,
-            chain: vec![
-                Scope::run(run, caps(&self.run)),
-                Scope::atom(run, step.step_id, caps(atom)),
-            ],
+            chain: self
+                .parents
+                .iter()
+                .cloned()
+                .chain([
+                    Scope::run(run, caps(&self.run)),
+                    Scope::atom(run, step.step_id, caps(atom)),
+                ])
+                .collect(),
             dollar_capped: self.run.micro_usd.is_some() || atom.micro_usd.is_some(),
         }))
     }
