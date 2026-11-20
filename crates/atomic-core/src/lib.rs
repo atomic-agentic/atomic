@@ -8,6 +8,7 @@ pub mod artifact;
 pub mod astro;
 pub mod atom;
 pub mod budget;
+pub mod cassette;
 pub mod codex;
 pub mod collections;
 pub mod compile;
