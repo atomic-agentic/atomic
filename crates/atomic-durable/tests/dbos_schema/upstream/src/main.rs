@@ -21,7 +21,13 @@ async fn main() -> durare::Result<()> {
     let _ = std::fs::remove_file(&db);
 
     if let Some(url) = pg {
-        let schema = format!("dbos_upstream_{}", std::process::id());
+        // Ending with the time it was made, so a test process's sweep drops
+        // it once it is stale (see atomic_durable::testing).
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let schema = format!("dbos_upstream_{}_{secs}", std::process::id());
         let provider = Arc::new(durare::PostgresProvider::connect_with_schema(&url, &schema).await?);
         write(&out.join("postgres.schema"), provider, "postgres", &schema).await?;
     }

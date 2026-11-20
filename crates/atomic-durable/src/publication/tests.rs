@@ -89,10 +89,12 @@ async fn sqlite() -> Result<Durare> {
     Durare::sqlite(&db).await
 }
 
+/// An engine on a schema of its own, which the returned guard drops.
 #[cfg(feature = "postgres-tests")]
-async fn postgres() -> Result<Durare> {
-    let url = crate::testing::database().await;
-    Durare::postgres(&url, &unique("atomic_pub")).await
+async fn postgres() -> Result<(Durare, crate::testing::TestSchema)> {
+    let schema = crate::testing::schema("pub").await;
+    let rt = Durare::postgres(schema.url(), schema.name()).await?;
+    Ok((rt, schema))
 }
 
 /// Rows in the tables these tests write to, read through a transaction.
@@ -983,35 +985,43 @@ async fn a_publication_meeting_a_takeover_is_refused_on_sqlite() -> Result<()> {
 #[cfg(feature = "postgres-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn candidate_survives_a_crash_before_publication_on_postgres() -> Result<()> {
-    candidate_survives_a_crash_before_publication(postgres().await?).await
+    let (rt, _schema) = postgres().await?;
+    candidate_survives_a_crash_before_publication(rt).await
 }
 
 #[cfg(feature = "postgres-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn publication_is_all_or_nothing_on_postgres() -> Result<()> {
-    publication_is_all_or_nothing(postgres().await?).await
+    let (rt, _schema) = postgres().await?;
+    publication_is_all_or_nothing(rt).await
 }
 
 #[cfg(feature = "postgres-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_precondition_commits_nothing_on_postgres() -> Result<()> {
-    assert!(!a_failed_precondition_commits_nothing(postgres().await?, 2, FENCE).await?);
-    assert!(!a_failed_precondition_commits_nothing(postgres().await?, 1, BROKEN).await?);
-    assert!(!a_failed_precondition_commits_nothing(postgres().await?, 1, READ).await?);
-    assert!(a_failed_precondition_commits_nothing(postgres().await?, 1, FENCE).await?);
+    let (rt, _schema) = postgres().await?;
+    assert!(!a_failed_precondition_commits_nothing(rt, 2, FENCE).await?);
+    let (rt, _schema) = postgres().await?;
+    assert!(!a_failed_precondition_commits_nothing(rt, 1, BROKEN).await?);
+    let (rt, _schema) = postgres().await?;
+    assert!(!a_failed_precondition_commits_nothing(rt, 1, READ).await?);
+    let (rt, _schema) = postgres().await?;
+    assert!(a_failed_precondition_commits_nothing(rt, 1, FENCE).await?);
     Ok(())
 }
 
 #[cfg(feature = "postgres-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_takeover_waits_for_a_fenced_publication_on_postgres() -> Result<()> {
-    a_takeover_waits_for_a_fenced_publication(postgres().await?, true).await
+    let (rt, _schema) = postgres().await?;
+    a_takeover_waits_for_a_fenced_publication(rt, true).await
 }
 
 #[cfg(feature = "postgres-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_publication_meeting_a_takeover_is_refused_on_postgres() -> Result<()> {
-    a_publication_meeting_a_takeover_is_refused(postgres().await?, true).await
+    let (rt, _schema) = postgres().await?;
+    a_publication_meeting_a_takeover_is_refused(rt, true).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1027,13 +1037,15 @@ async fn run_atom_records_sibling_steps_in_a_stable_order_on_sqlite() -> Result<
 #[cfg(feature = "postgres-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unaccepted_candidate_is_never_published_on_postgres() -> Result<()> {
-    an_unaccepted_candidate_is_never_published(postgres().await?).await
+    let (rt, _schema) = postgres().await?;
+    an_unaccepted_candidate_is_never_published(rt).await
 }
 
 #[cfg(feature = "postgres-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_atom_records_sibling_steps_in_a_stable_order_on_postgres() -> Result<()> {
-    run_atom_records_sibling_steps_in_a_stable_order(postgres().await?).await
+    let (rt, _schema) = postgres().await?;
+    run_atom_records_sibling_steps_in_a_stable_order(rt).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1049,7 +1061,8 @@ async fn a_pre_upgrade_turn_checkpoint_still_decodes_on_sqlite() -> Result<()> {
 #[cfg(feature = "postgres-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_released_park_runs_the_turn_again_on_postgres() -> Result<()> {
-    a_released_park_runs_the_turn_again(postgres().await?).await
+    let (rt, _schema) = postgres().await?;
+    a_released_park_runs_the_turn_again(rt).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1066,5 +1079,6 @@ async fn recorded_candidates_are_the_published_ones_on_postgres() -> Result<()> 
 #[cfg(feature = "postgres-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pre_upgrade_turn_checkpoint_still_decodes_on_postgres() -> Result<()> {
-    a_pre_upgrade_turn_checkpoint_still_decodes(postgres().await?).await
+    let (rt, _schema) = postgres().await?;
+    a_pre_upgrade_turn_checkpoint_still_decodes(rt).await
 }

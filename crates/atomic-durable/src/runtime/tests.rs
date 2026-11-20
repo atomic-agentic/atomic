@@ -36,12 +36,28 @@ async fn sqlite() -> Durare {
     Durare::sqlite(&path).await.expect("sqlite engine")
 }
 
+/// An engine on a schema of its own, which the returned guard drops.
 #[cfg(feature = "postgres-tests")]
-async fn postgres() -> Durare {
-    let url = crate::testing::database().await;
-    Durare::postgres(&url, &unique("atomic_rt"))
+async fn postgres() -> (Durare, crate::testing::TestSchema) {
+    let schema = crate::testing::schema("rt").await;
+    let rt = Durare::postgres(schema.url(), schema.name())
         .await
-        .expect("postgres engine")
+        .expect("postgres engine");
+    (rt, schema)
+}
+
+/// Each backend's engine, and what must outlive it.
+mod backends {
+    use super::Durare;
+
+    pub(super) async fn sqlite() -> (Durare, ()) {
+        (super::sqlite().await, ())
+    }
+
+    #[cfg(feature = "postgres-tests")]
+    pub(super) async fn postgres() -> (Durare, crate::testing::TestSchema) {
+        super::postgres().await
+    }
 }
 
 /// Wait until `id` is no longer running in this process: pending with no
@@ -478,7 +494,9 @@ macro_rules! on_backend {
             $(
                 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
                 async fn $name() {
-                    super::$name(super::$backend().await).await
+                    // The schema, if any, outlives the engine.
+                    let (rt, _schema) = super::backends::$backend().await;
+                    super::$name(rt).await
                 }
             )+
         }
@@ -521,7 +539,7 @@ on_backend!(
 #[cfg(feature = "postgres-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_postgres_serialization_conflict_is_retried() {
-    let mut rt = postgres().await;
+    let (mut rt, _schema) = postgres().await;
     let attempts = Arc::new(AtomicUsize::new(0));
     let a = attempts.clone();
     rt.register("conflict", move |ctx: DurareContext, (): ()| {
@@ -602,8 +620,8 @@ async fn a_newer_store_is_refused_untouched() {
 #[cfg(feature = "postgres-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_newer_postgres_store_is_refused_untouched() {
-    let url = crate::testing::database().await;
-    let schema = unique("atomic_newer");
+    let guard = crate::testing::schema("newer").await;
+    let (url, schema) = (guard.url().to_owned(), guard.name().to_owned());
     let rt = Durare::postgres(&url, &schema)
         .await
         .expect("a current store");
