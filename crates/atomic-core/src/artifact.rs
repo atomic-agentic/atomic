@@ -18,9 +18,14 @@
 //! ```
 //!
 //! Writes are atomic: content is streamed to a staging file while it is
-//! hashed, synced, then renamed into place, so a crash never leaves a blob
-//! under its digest that does not match it. Steps run at least once, and
-//! writing the same content again is a no-op.
+//! hashed, synced, made read-only, then renamed into place, so a crash never
+//! leaves a blob under its digest that does not match it. Steps run at least
+//! once, and writing the same content again stores nothing new, unless the
+//! blob under its digest no longer matches it, which the new content then
+//! replaces. Reading a blob checks its digest as it goes: a reader that
+//! reaches the end of a blob that does not match fails.
+
+pub mod files;
 
 pub use atomic_schema::artifact::ArtifactRef;
 use serde::{Deserialize, Serialize};
@@ -77,6 +82,13 @@ pub enum ArtifactError {
         /// The underlying error.
         source: std::io::Error,
     },
+    /// A command's output names a file atomic will not take, or the file
+    /// breaks a limit.
+    #[error("{0}")]
+    Refused(String),
+    /// A stored blob no longer matches its digest.
+    #[error("artifact {0} does not match its digest: the store is damaged")]
+    Corrupt(ArtifactRef),
     /// A manifest could not be read or written.
     #[error("artifact manifest {path}: {source}")]
     Manifest {
@@ -175,6 +187,65 @@ impl LocalStore {
 
 static STAGING_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Make a stored file read-only: 0444 where modes exist.
+fn set_read_only(path: &Path) -> Result<(), ArtifactError> {
+    let mut permissions = std::fs::metadata(path).map_err(io(path))?.permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(0o444);
+    }
+    #[cfg(not(unix))]
+    permissions.set_readonly(true);
+    std::fs::set_permissions(path, permissions).map_err(io(path))
+}
+
+/// Whether the blob at `path` still holds `size` bytes whose SHA-256 is
+/// `digest`. A blob of the wrong size is not read.
+fn blob_matches(path: &Path, digest: &str, size: u64) -> bool {
+    if std::fs::metadata(path).map(|m| m.len()).ok() != Some(size) {
+        return false;
+    }
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher).is_ok() && format!("{:x}", hasher.finalize()) == digest
+}
+
+/// A blob's reader that checks the blob's digest as it reads: at the end of
+/// one that no longer matches, it fails rather than report the end.
+struct Verified {
+    inner: std::fs::File,
+    hasher: Sha256,
+    artifact: ArtifactRef,
+    /// Whether the end was reached and matched.
+    ended: bool,
+}
+
+impl Read for Verified {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.ended {
+            return Ok(0);
+        }
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            self.hasher.update(&buf[..n]);
+            return Ok(n);
+        }
+        let digest = format!("{:x}", std::mem::take(&mut self.hasher).finalize());
+        if digest == self.artifact.digest() {
+            self.ended = true;
+            Ok(0)
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                ArtifactError::Corrupt(self.artifact.clone()).to_string(),
+            ))
+        }
+    }
+}
+
 fn sync_dir(dir: &Path) -> Result<(), ArtifactError> {
     #[cfg(unix)]
     {
@@ -226,7 +297,9 @@ impl ArtifactStore for LocalStore {
             source: std::io::Error::other(e.to_string()),
         })?;
         let blob = self.blob_path(&artifact);
-        if blob.exists() {
+        // Read-only before it is in place: no one writes a stored blob.
+        set_read_only(&tmp)?;
+        if blob.exists() && blob_matches(&blob, &digest, size) {
             // Already stored: identical content is kept once.
             let _ = std::fs::remove_file(&tmp);
         } else {
@@ -270,7 +343,12 @@ impl ArtifactStore for LocalStore {
     fn open(&self, artifact: &ArtifactRef) -> Result<Box<dyn Read + Send>, ArtifactError> {
         let p = self.blob_path(artifact);
         match std::fs::File::open(&p) {
-            Ok(f) => Ok(Box::new(f)),
+            Ok(f) => Ok(Box::new(Verified {
+                inner: f,
+                hasher: Sha256::new(),
+                artifact: artifact.clone(),
+                ended: false,
+            })),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 Err(ArtifactError::Missing(artifact.clone()))
             }

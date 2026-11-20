@@ -263,7 +263,9 @@ fn check_env(kind: &str, fm: &serde_json::Map<String, Value>) -> Result<(), (Str
                         ),
                     );
                 }
-                if crate::runtime::EFFECT_VARIABLES.contains(&name.as_str()) {
+                if crate::runtime::EFFECT_VARIABLES.contains(&name.as_str())
+                    || crate::runtime::EXCHANGE_VARIABLES.contains(&name.as_str())
+                {
                     return refuse(
                         &format!("/env/{name}"),
                         &format!(

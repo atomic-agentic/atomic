@@ -3241,16 +3241,20 @@ fn another_run_gets_another_effect_key_and_atoms_cannot_set_it() {
 
         let atom = project.join("atoms/send-note.atom.astro");
         let source = std::fs::read_to_string(&atom).expect("atom");
-        std::fs::write(
-            &atom,
-            source.replace(
-                "env: { SENT_LOG:",
-                "env: { ATOMIC_EFFECT_KEY: 'mine', SENT_LOG:",
-            ),
-        )
-        .expect("atom");
-        let error = atomic_core::atom::load(&atom, &mut Registry::new()).expect_err("refused");
-        assert!(error.message.contains("set by atomic"), "{error}");
+        // Nor the directories its command hands files over in and reads its
+        // artifacts from.
+        for name in ["ATOMIC_EFFECT_KEY", "ATOMIC_OUTPUTS", "ATOMIC_INPUTS"] {
+            std::fs::write(
+                &atom,
+                source.replace(
+                    "env: { SENT_LOG:",
+                    &format!("env: {{ {name}: 'mine', SENT_LOG:"),
+                ),
+            )
+            .expect("atom");
+            let error = atomic_core::atom::load(&atom, &mut Registry::new()).expect_err("refused");
+            assert!(error.message.contains("set by atomic"), "{name}: {error}");
+        }
     });
 }
 

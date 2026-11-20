@@ -93,8 +93,47 @@ create-only write or a check for its own earlier write. Atomic gives every exec
 command one in its environment: `ATOMIC_EFFECT_KEY` is the same on every attempt
 of a step and differs for any other step or run, beside `ATOMIC_RUN_ID` and
 `ATOMIC_STEP_ID`. Send it as an idempotency key, or put it in what the command
-writes so a repeated write is recognisable. An atom's `env` cannot set these
-three names.
+writes so a repeated write is recognisable.
+
+### Large results go by reference
+
+A command hands over a file too big for its stdout, such as a patch, a report
+or a log, by writing it to the directory in `ATOMIC_OUTPUTS` and naming it in
+its output, where the contract expects an
+[artifact reference](#artifact-references), with an object:
+
+```json
+{"patch": {"$file": "change.diff", "mediaType": "text/x-diff"}}
+```
+
+Atomic stores the file in the artifact store and puts its reference,
+`artifact://sha256/<digest>`, in the object's place before it checks the
+output, so the step's output, and every checkpoint, holds only the reference.
+Only an object where the contract expects a reference is taken; one anywhere
+else is the output's own. The name is one file name in the directory, with no
+`/`; the file must be a regular file of the command's own (not a link, a
+FIFO, a directory, or a file with another hard link), and is read up to the
+size it had when atomic opened it. `mediaType` defaults to
+`application/octet-stream`, and must be one the contract accepts. The output
+is checked against its contract, with stand-in references, before anything is
+stored, so a rejected output leaves nothing in the store. Each name is stored
+once, however often the output names it.
+
+A file may be 1 GiB at most, and the files one step hands over 4 GiB
+together; `ATOMIC_EXEC_MAX_FILE_BYTES` and `ATOMIC_EXEC_MAX_STEP_BYTES` change
+those limits, in bytes.
+
+A later step's command finds each artifact its input references, where its
+input contract expects a reference, in the directory in `ATOMIC_INPUTS`,
+named by its digest: `$ATOMIC_INPUTS/<digest>` for `artifact://sha256/<digest>`.
+Each is a copy, checked against its digest as it is made, and the directory
+and the copies are read-only: the command cannot change what it was given,
+nor, through it, the store.
+
+Both directories are inside the command's scratch directory, in the project's
+state directory, and go when the step ends; what a killed process left is
+removed when atomic next starts. An atom's `env` cannot set `ATOMIC_RUN_ID`,
+`ATOMIC_STEP_ID`, `ATOMIC_EFFECT_KEY`, `ATOMIC_OUTPUTS` or `ATOMIC_INPUTS`.
 
 ## Schema locations
 

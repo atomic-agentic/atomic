@@ -119,6 +119,10 @@ pub struct Command {
     /// directory, when its backend confines it (see [`Confine`]). A backend
     /// that does not confine its commands ignores it.
     pub writable: Vec<PathBuf>,
+    /// Directories inside [`writable`](Self::writable) ones that it may only
+    /// read, such as the inputs atomic hands it, when its backend confines
+    /// it. A backend that does not confine its commands ignores it.
+    pub read_only: Vec<PathBuf>,
 }
 
 /// Puts a command under a sandbox before a backend runs it: what it may

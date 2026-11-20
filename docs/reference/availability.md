@@ -99,7 +99,7 @@ Codex records; the credential and key directories; the default atomic home's
 data and configuration when `ATOMIC_HOME` points elsewhere; the kernel keyrings;
 the network; and sockets. Other projects' Codex records are not denied yet. An
 exec atom's command may write only its scratch directory and the project's
-caches; `--runner process` confines it the same way. It runs in a process
+caches, and only read the artifacts it is given there; `--runner process` confines it the same way. It runs in a process
 namespace of its own, so it can neither see nor signal atomic, its runner or
 any other process outside, and in a session of its own, with no controlling
 terminal and a `/dev` and `/proc` of its own, so it cannot type into, read or
@@ -114,6 +114,14 @@ later process recovers it. A sandbox that fails in a way that may pass, such as
 on a full disk, makes the step wait, as a backend with no room does. Atoms that run no commands run as usual. On macOS and
 Windows this has not been verified: exec atoms' commands run unconfined there,
 so atomic keeps no operator credential and refuses credentialed gate decisions.
+
+An exec atom's command hands large results over by reference: it writes a
+file to its outputs directory and names it in its output, and the next step's
+command reads it from its inputs directory, a read-only copy (see
+[atom files](atom-files.md#large-results-go-by-reference)). A file may be 1 GiB
+and a step's files 4 GiB, unless `ATOMIC_EXEC_MAX_FILE_BYTES` and
+`ATOMIC_EXEC_MAX_STEP_BYTES` say otherwise. Only exec atoms hand files over;
+a Codex atom's turn does not yet.
 
 A `workspace-write` atom cannot write `/tmp`, `/var/tmp` or `$TMPDIR` as atomic
 found them: its commands' `TMPDIR` is the project's private one above. A tool

@@ -153,3 +153,44 @@ fn a_reference_to_a_missing_artifact_fails_validation() {
     ));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_stored_blob_is_read_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let (s, dir) = store();
+    let m = s.put(&mut &b"content"[..], provenance("a")).expect("put");
+    let mode = std::fs::metadata(s.blob_path(&m.artifact))
+        .expect("blob")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o444);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A blob changed under its digest (through a link a command was given,
+/// say) is replaced by the next honest put, and reading it fails until then.
+#[test]
+fn a_damaged_blob_is_refused_on_read_and_replaced_by_an_honest_put() {
+    use std::os::unix::fs::PermissionsExt;
+    let (s, dir) = store();
+    let m = s.put(&mut &b"content"[..], provenance("a")).expect("put");
+    let blob = s.blob_path(&m.artifact);
+    std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+    std::fs::write(&blob, b"content and more").expect("damage");
+    let mut read = Vec::new();
+    let e = s
+        .open(&m.artifact)
+        .expect("open")
+        .read_to_end(&mut read)
+        .expect_err("a damaged blob fails at its end");
+    assert_eq!(e.kind(), std::io::ErrorKind::InvalidData, "{e}");
+    s.put(&mut &b"content"[..], provenance("b"))
+        .expect("put again");
+    let mut read = Vec::new();
+    s.open(&m.artifact)
+        .expect("open")
+        .read_to_end(&mut read)
+        .expect("whole again");
+    assert_eq!(read, b"content");
+    let _ = std::fs::remove_dir_all(dir);
+}
