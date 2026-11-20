@@ -25,8 +25,8 @@ pub use publication::{
 pub use runtime::{
     DEFAULT_VERSION, Database, DurableError, DurableRuntime, Durare, DurareContext,
     ENGINE_IDENTITY_VARIABLE, ENGINE_VERSION_VARIABLE, IdentityError, Param, RESUME_QUEUES, Result,
-    Row, RunRecord, RunStatus, StepInfo, StepRecord, ThreadRecord, Tx, TxFuture, WorkflowContext,
-    executor_identity,
+    Row, RunContents, RunKey, RunRecord, RunStatus, StepInfo, StepRecord, ThreadRecord, Tx,
+    TxFuture, WorkflowContext, executor_identity,
 };
 
 use std::path::Path;
