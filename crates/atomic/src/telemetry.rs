@@ -255,8 +255,9 @@ pub fn flush() {
 }
 
 /// As [`flush`], unless a signal comes first: then it stops waiting and
-/// returns `true`, so a collector that never answers holds up the exit only
-/// until Ctrl-C. Call it as a command ends normally.
+/// returns `true`, so a collector that never answers holds up the exit
+/// until Ctrl-C or [`FLUSH_DEADLINE`], whichever is first. Call it as a
+/// command ends normally.
 pub async fn flush_unless_signalled() -> bool {
     if PROVIDER.get().is_none() {
         atomic_core::spans::end_all();
@@ -281,15 +282,44 @@ pub async fn flush_unless_signalled() -> bool {
     false
 }
 
+/// How long a process waits, as it exits, for its last spans to be sent.
+/// Spans not sent by then are dropped, so a collector that accepts the
+/// connection and never answers holds up an exit by about this, however long
+/// the exporter's own timeout.
+pub const FLUSH_DEADLINE: Duration = Duration::from_secs(2);
+
 /// As [`flush`], on a thread that may block, such as one of
 /// `spawn_blocking`'s: a stopping process runs it there so that another
-/// signal can still stop it at once (see `runs::stop`).
+/// signal can still stop it at once (see `runs::stop`). It returns by
+/// [`FLUSH_DEADLINE`].
 pub fn flush_blocking() {
     atomic_core::spans::end_all();
-    if let Some(provider) = PROVIDER.get() {
-        let _ = provider.force_flush();
-        let _ = provider.shutdown_with_timeout(Duration::from_secs(5));
+    if let Some(provider) = PROVIDER.get()
+        && !flush_within(provider.clone(), FLUSH_DEADLINE)
+    {
+        atomic_core::log_line!(
+            "atomic: the trace collector did not take the last spans within {} s; they are \
+             dropped",
+            FLUSH_DEADLINE.as_secs()
+        );
     }
+}
+
+/// Send what `provider` holds and shut it down, on a thread of its own that
+/// is left behind if it has not finished within `deadline`. Whether it
+/// finished.
+fn flush_within(provider: SdkTracerProvider, deadline: Duration) -> bool {
+    let started = std::time::Instant::now();
+    let (done, finished) = std::sync::mpsc::channel();
+    let flushing = std::thread::Builder::new()
+        .name("atomic-flush".into())
+        .spawn(move || {
+            let _ = provider.force_flush();
+            let left = deadline.saturating_sub(started.elapsed());
+            let _ = provider.shutdown_with_timeout(left.max(Duration::from_millis(50)));
+            let _ = done.send(());
+        });
+    flushing.is_ok() && finished.recv_timeout(deadline).is_ok()
 }
 
 /// An exporter that redacts every span before `E` exports it.
@@ -375,6 +405,44 @@ impl<E: SpanExporter> SpanExporter for Redacting<E> {
 mod tests {
     use super::*;
     use opentelemetry_sdk::trace::InMemorySpanExporter;
+
+    /// An exporter whose exports never end, as one sending to a collector
+    /// that never answers.
+    #[derive(Debug)]
+    struct Hanging;
+
+    impl SpanExporter for Hanging {
+        fn export(
+            &self,
+            _: Vec<SpanData>,
+        ) -> impl std::future::Future<Output = OTelSdkResult> + Send {
+            std::future::pending()
+        }
+    }
+
+    /// A flush whose export never ends gives up at its deadline.
+    #[test]
+    fn a_flush_to_an_exporter_that_never_answers_ends_at_its_deadline() {
+        use opentelemetry::trace::{Tracer, TracerProvider as _};
+        let provider = SdkTracerProvider::builder()
+            .with_batch_exporter(Hanging)
+            .build();
+        provider.tracer("atomic").in_span("held", |_| {});
+        let (done, flushed) = std::sync::mpsc::channel();
+        let started = std::time::Instant::now();
+        std::thread::spawn(move || {
+            let _ = done.send(flush_within(provider, Duration::from_millis(300)));
+        });
+        let finished = flushed
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the flush waited for the exporter for good");
+        assert!(!finished, "an export that never ends finished");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+    }
 
     #[test]
     fn an_exported_span_carries_no_seeded_key() {

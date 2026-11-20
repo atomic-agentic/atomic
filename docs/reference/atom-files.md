@@ -95,8 +95,55 @@ create-only write or a check for its own earlier write. Atomic gives every exec
 command one in its environment: `ATOMIC_EFFECT_KEY` is the same on every attempt
 of a step and differs for any other step or run, beside `ATOMIC_RUN_ID` and
 `ATOMIC_STEP_ID`. Send it as an idempotency key, or put it in what the command
-writes so a repeated write is recognisable. An atom's `env` cannot set these
-three names.
+writes so a repeated write is recognisable.
+
+### Large results go by reference
+
+A command hands over a file too big for its stdout, such as a patch, a report
+or a log, by writing it to the directory in `ATOMIC_OUTPUTS` and naming it in
+its output, where the contract expects an
+[artifact reference](#artifact-references), with an object:
+
+```json
+{"patch": {"$file": "change.diff", "mediaType": "text/x-diff"}}
+```
+
+Atomic stores the file in the artifact store and puts its reference,
+`artifact://sha256/<digest>`, in the object's place before it checks the
+output, so the step's output, and every checkpoint, holds only the reference.
+Only an object where the contract expects a reference is taken; one anywhere
+else is the output's own. The name is one file name in the directory, with no
+`/`; the file must be a regular file of the command's own (not a link, a
+FIFO, a directory, or a file with another hard link), and is read up to the
+size it had when atomic opened it. `mediaType` defaults to
+`application/octet-stream`, and must be one the contract accepts. The output
+is checked against its contract, with stand-in references, and every file it
+names is opened and checked against the limits before anything is stored, so a
+rejected output leaves nothing in the store; files are read aside first, one at
+a time, and stored together. Each name is read and stored once, however often
+the output names it; named under more than one media type, it is stored with a
+manifest for each.
+
+A file may be 1 GiB at most, and the files one step hands over 4 GiB
+together; `ATOMIC_EXEC_MAX_FILE_BYTES` and `ATOMIC_EXEC_MAX_STEP_BYTES` change
+those limits, in bytes. An output may name 256 different files at most, with
+at most 10,000 `$file` objects where its contract expects references; objects
+anywhere else are the output's own and do not count.
+
+A later step's command finds each artifact its input references, where its
+input contract expects a reference, in the directory in `ATOMIC_INPUTS`,
+named by its digest: `$ATOMIC_INPUTS/<digest>` for `artifact://sha256/<digest>`.
+Each is a copy, checked against its digest as it is made, and the directory
+and the copies are read-only: on Linux, where the command is confined, it
+cannot change what it was given, nor, through it, the store; on macOS, where it
+is not, the copies are only marked read-only, and changing one changes only
+the copy. Handing files over is supported on Linux and macOS; on Windows an
+output that names a file is refused.
+
+Both directories are inside the command's scratch directory, in the project's
+state directory, and go when the step ends; what a killed process left is
+removed when atomic next starts. An atom's `env` cannot set `ATOMIC_RUN_ID`,
+`ATOMIC_STEP_ID`, `ATOMIC_EFFECT_KEY`, `ATOMIC_OUTPUTS` or `ATOMIC_INPUTS`.
 
 ## Schema locations
 
