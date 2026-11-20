@@ -112,6 +112,7 @@ fn runtimes(dir: &Path, base_url: &str) -> Arc<Runtimes> {
             artifacts: Artifacts::none(),
             meter: Metering::none(),
             backend: Default::default(),
+            caches: None,
         },
         lite: LiteRuntime::new(endpoint, AtomConfig::default()),
         exec: Default::default(),

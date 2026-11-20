@@ -110,6 +110,10 @@ pub struct CodexRuntime {
     /// The execution backend each run opens its workspace on, from
     /// [`cwd`](Self::cwd), and runs its turn's shell and file work through.
     pub backend: atomic_exec::Backend,
+    /// The build caches a worktree step's turn shares with the project's
+    /// other worktree steps: its commands are pointed at them, and may
+    /// write them under `workspace-write`. `None` outside worktree steps.
+    pub caches: Option<crate::worktree::Caches>,
 }
 
 /// The runtimes atoms run on, one for each kind of atom that calls a model.
@@ -198,6 +202,23 @@ impl Backend<'_> {
             Self::Codex(rt) => Some(rt.cwd.clone()),
             Self::Lite(_) => None,
         };
+        let (mut env, mut writable_roots) = (std::collections::BTreeMap::new(), Vec::new());
+        // A worktree step's build tools find the shared caches, and its
+        // rustup proxies the person's toolchains; what the atom declares
+        // wins.
+        if let Self::Codex(rt) = self
+            && let Some(caches) = &rt.caches
+        {
+            env.extend(caches.env());
+            if let Some(toolchains) = crate::worktree::rustup_home(&|name| std::env::var(name).ok())
+            {
+                env.insert("RUSTUP_HOME".into(), toolchains.display().to_string());
+            }
+            if request.sandbox == crate::typed::Sandbox::WorkspaceWrite {
+                writable_roots.push(caches.dir().to_owned());
+            }
+        }
+        env.extend(request.env.clone());
         Open {
             label: request.name.to_owned(),
             run: request.place.run.clone(),
@@ -205,8 +226,8 @@ impl Backend<'_> {
             attempt: new_attempt(),
             source,
             sandbox: request.sandbox,
-            env: request.env.clone(),
-            ..Open::default()
+            writable_roots,
+            env,
         }
     }
 }

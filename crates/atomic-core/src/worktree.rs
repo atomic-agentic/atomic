@@ -185,6 +185,16 @@ impl Worktrees {
         &self.dir
     }
 
+    /// The build caches the project's worktree steps share, beside the
+    /// worktrees in the state directory.
+    pub fn caches(&self) -> Caches {
+        Caches::new(
+            self.dir
+                .parent()
+                .map_or_else(|| self.dir.join("cache"), |state| state.join("cache")),
+        )
+    }
+
     /// Pin run `run`'s base: resolve `rev` (a commit ID or a ref name such
     /// as a branch) to a commit and record it under `refs/atomic/<run>/base`.
     /// Once pinned, the pinned commit is returned whatever `rev` now names,
@@ -433,13 +443,16 @@ impl Caches {
     }
 
     /// The environment that points common build tools at the caches: the
-    /// XDG cache home, Cargo's target directory, and npm's, pip's and Go's
-    /// caches, plus `ATOMIC_CACHE_DIR` for anything else.
+    /// XDG cache home, Cargo's home and target directory, and npm's, pip's
+    /// and Go's caches, plus `ATOMIC_CACHE_DIR` for anything else. A
+    /// command's own `HOME` is its attempt's, and empty, so a tool that
+    /// keeps its cache there would start cold every time.
     pub fn env(&self) -> std::collections::BTreeMap<String, String> {
         let at = |sub: &str| self.dir.join(sub).to_string_lossy().into_owned();
         [
             ("ATOMIC_CACHE_DIR", self.dir.to_string_lossy().into_owned()),
             ("XDG_CACHE_HOME", at("xdg")),
+            ("CARGO_HOME", at("cargo-home")),
             ("CARGO_TARGET_DIR", at("cargo-target")),
             ("npm_config_cache", at("npm")),
             ("PIP_CACHE_DIR", at("pip")),
@@ -450,6 +463,18 @@ impl Caches {
         .map(|(k, v)| (k.to_owned(), v))
         .collect()
     }
+}
+
+/// Where rustup keeps its toolchains, as `env` reads the variables: its
+/// `RUSTUP_HOME`, or `.rustup` in the home directory, when that exists. A
+/// command's own `HOME` is not the person's, so without this the rustup
+/// proxies on `PATH` would find no toolchain. Toolchains hold no secrets,
+/// and commands may only read them.
+pub fn rustup_home(env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    let absolute = |name: &str| env(name).map(PathBuf::from).filter(|p| p.is_absolute());
+    absolute("RUSTUP_HOME")
+        .or_else(|| absolute("HOME").map(|h| h.join(".rustup")))
+        .filter(|p| p.is_dir())
 }
 
 /// Run blocking git work off the async workers.
@@ -584,5 +609,42 @@ mod tests {
         let mut empty = Value::Null;
         commit.record(&mut empty);
         assert_eq!(empty["commit_ref"], "refs/atomic/r/steps/s/1");
+    }
+
+    #[test]
+    fn rustup_toolchains_are_found_where_the_person_keeps_them() {
+        let dir = std::env::temp_dir().join(format!("atomic-rustup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("home/.rustup")).expect("rustup home");
+        std::fs::create_dir_all(dir.join("elsewhere")).expect("elsewhere");
+        let home = dir.join("home").display().to_string();
+        let elsewhere = dir.join("elsewhere").display().to_string();
+        let env = |vars: Vec<(&'static str, String)>| {
+            move |name: &str| {
+                vars.iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, v)| v.clone())
+            }
+        };
+        assert_eq!(
+            rustup_home(&env(vec![("HOME", home.clone())])),
+            Some(dir.join("home/.rustup"))
+        );
+        assert_eq!(
+            rustup_home(&env(vec![("HOME", home), ("RUSTUP_HOME", elsewhere)])),
+            Some(dir.join("elsewhere"))
+        );
+        assert_eq!(
+            rustup_home(&env(vec![("HOME", "/nonexistent".into())])),
+            None,
+            "nothing that is not there"
+        );
+    }
+
+    #[test]
+    fn worktree_steps_share_the_caches_beside_their_worktrees() {
+        let git = crate::git::Git::find().expect("git");
+        let worktrees = Worktrees::new(git.repo("/state/repo.git"), "/state/worktrees".into());
+        assert_eq!(worktrees.caches().dir(), Path::new("/state/cache"));
     }
 }

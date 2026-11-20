@@ -168,6 +168,7 @@ async fn sandboxed_with(
         guard: guard.clone(),
         backend: atomic_exec::Backend::connect(atomic_exec::LocalBackend::in_dir(scratch_root()))
             .unwrap(),
+        caches: None,
     };
     let answer = run_turn(
         &runtime,

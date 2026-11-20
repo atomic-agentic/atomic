@@ -83,6 +83,7 @@ fn runtime(dir: &Path, model: &FakeModel, backend: Backend) -> CodexRuntime {
         meter: Metering::none(),
         guard: atomic_core::codex::StateGuard::NoProjectState,
         backend,
+        caches: None,
     }
 }
 

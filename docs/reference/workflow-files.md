@@ -58,6 +58,14 @@ outside the sandbox, and records the commit in `steps.<id>.metadata.commit`,
 beside `base` and `commit_ref`. The worktrees are removed when the run finishes;
 accepted commits keep their refs.
 
+A worktree step's commands share the project's build caches with its other
+worktree steps, and may write them: `XDG_CACHE_HOME`, `CARGO_HOME`,
+`CARGO_TARGET_DIR`, npm's, pip's and Go's caches (`GOCACHE`, `GOMODCACHE`) and
+`ATOMIC_CACHE_DIR` all point there. `RUSTUP_HOME` points at the toolchains
+installed for you, which the commands may only read. Their `HOME` is the
+attempt's own, empty, directory, which they may write. A variable the atom
+declares in `env` wins over these.
+
 ### Where each input came from
 
 Every mapped value reaches the atom's model as data labelled with its origin,

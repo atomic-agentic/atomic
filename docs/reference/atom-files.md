@@ -251,9 +251,11 @@ not covered.
 
 Anything that finds its files through your home directory does not find
 them: rustup's and cargo's homes (`~/.rustup`, `~/.cargo`), the Go module
-cache, pyenv and asdf shims, `~/.gitconfig` and `~/.npmrc`. A tool the
-atom's commands need has to be on `PATH` without them, and settings it
-needs passed in the atom's `env`.
+cache, pyenv and asdf shims, `~/.gitconfig` and `~/.npmrc`. A worktree step
+is pointed at the project's build caches and your rustup toolchains (see
+[worktree steps](workflow-files.md#atom-steps)); for anything else, a tool the
+atom's commands need has to be on `PATH` without them, and settings it needs
+passed in the atom's `env`.
 
 Some integrations shown in the catalog remain staged. Unavailable permissions,
 remote atoms, credentials, skills and runtime declarations fail explicitly in the

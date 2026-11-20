@@ -1160,10 +1160,16 @@ async fn in_worktree(
     let step = request.step.clone();
     let finished = contained(async move {
         let subdirectory = source_subdirectory(runtimes.codex.cwd.clone()).await?;
+        // The build caches the project's worktree steps share.
+        let caches = worktrees.caches();
+        caches
+            .create()
+            .map_err(|e| AtomError::Runtime(format!("the build caches: {e}")))?;
         worktrees
             .run_step(request, |tree| async move {
                 let mut here = (*runtimes).clone();
                 here.codex.cwd = tree.join(subdirectory);
+                here.codex.caches = Some(caches);
                 run_in(
                     &atom,
                     &input,

@@ -77,6 +77,7 @@ fn runtime(model: &FakeModel, tag: &str) -> CodexRuntime {
         artifacts: Artifacts::none(),
         meter: crate::usage::Metering::none(),
         backend: Default::default(),
+        caches: None,
     }
 }
 
@@ -2129,4 +2130,61 @@ fn an_exec_output_cel_cannot_read_fails() {
             "{r:?}"
         );
     });
+}
+
+#[tokio::test]
+async fn a_worktree_steps_turn_finds_the_shared_caches_and_only_it_may_write_them() {
+    let model = FakeModel::start(vec![]).await.expect("model");
+    let mut rt = runtime(&model, "caches");
+    let contract = json!({"type": "object"});
+    let validator = jsonschema::validator_for(&contract).expect("schema");
+    let request = |sandbox, env: &[(&str, &str)]| Request {
+        developer: String::new(),
+        prompt: String::new(),
+        model: None,
+        sandbox,
+        contract: &contract,
+        validator: &validator,
+        name: "fix",
+        place: Place::of("run-1", "fix"),
+        env: env
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect(),
+    };
+    use crate::typed::Sandbox::{ReadOnly, WorkspaceWrite};
+    // Outside a worktree step, nothing of the caches.
+    let open = Backend::Codex(&rt).open(&request(WorkspaceWrite, &[]));
+    assert!(
+        open.env.is_empty() && open.writable_roots.is_empty(),
+        "{open:?}"
+    );
+    let caches = crate::worktree::Caches::new(std::env::temp_dir().join("atomic-caches-x"));
+    rt.caches = Some(caches.clone());
+    let open = Backend::Codex(&rt).open(&request(WorkspaceWrite, &[("CARGO_TARGET_DIR", "/mine")]));
+    for name in [
+        "CARGO_HOME",
+        "GOMODCACHE",
+        "XDG_CACHE_HOME",
+        "ATOMIC_CACHE_DIR",
+    ] {
+        let at = open
+            .env
+            .get(name)
+            .unwrap_or_else(|| panic!("{name}: {open:?}"));
+        assert!(
+            std::path::Path::new(at).starts_with(caches.dir()),
+            "{name}={at}"
+        );
+    }
+    assert!(!open.env.contains_key("HOME"), "HOME is the attempt's own");
+    assert_eq!(
+        open.env["CARGO_TARGET_DIR"], "/mine",
+        "what the atom declares wins"
+    );
+    assert_eq!(open.writable_roots, [caches.dir().to_owned()]);
+    // A read-only turn finds them, and writes nothing.
+    let open = Backend::Codex(&rt).open(&request(ReadOnly, &[]));
+    assert!(open.env.contains_key("CARGO_HOME"));
+    assert!(open.writable_roots.is_empty(), "{open:?}");
 }
