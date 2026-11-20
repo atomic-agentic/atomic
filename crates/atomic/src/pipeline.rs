@@ -825,6 +825,18 @@ async fn run_pipeline<C: WorkflowContext>(
     }});
     let decision_schema = json!({"type": "object", "properties": {"at": {"type": "integer"}}});
     let mut used_worktrees = false;
+    // Whether the run is bound to a fixture repository of its own.
+    let bound = pipeline.fixture.is_some();
+    // The run's worktrees, found once and off the async workers, since
+    // finding them runs git.
+    let run_worktrees = if pipeline.changes_code() {
+        let (p, s) = (pipeline.clone(), services.clone());
+        tokio::task::spawn_blocking(move || worktrees_for(&p, &s))
+            .await
+            .map_err(|e| failed(format!("the run's worktrees: {e}")))??
+    } else {
+        None
+    };
     let mut accepted = Vec::new();
     for (position, step) in pipeline.steps.iter().enumerate() {
         // Before its attempt is recorded: a stopping process begins nothing.
@@ -955,10 +967,11 @@ async fn run_pipeline<C: WorkflowContext>(
             }
         }
         let tree = if step.worktree {
-            let worktrees = worktrees_for(&pipeline, &services)?.ok_or_else(|| {
+            let worktrees = run_worktrees.clone().ok_or_else(|| {
                 failed(format!(
                     "step `{}` asks for a worktree, and the run is bound to no fixture \
-                     repository",
+                     repository: a run started before atomic bound coding runs to one cannot \
+                     continue; start it again with --fixture and --fixture-rev",
                     step.id
                 ))
             })?;
@@ -966,6 +979,18 @@ async fn run_pipeline<C: WorkflowContext>(
                 .get("base")
                 .and_then(Value::as_str)
                 .ok_or_else(|| failed(format!("step `{}`: `base` is not a commit", step.id)))?;
+            // A bound run starts each worktree from its fixture's commit or
+            // one made on top of it, never from another commit the snapshot
+            // holds.
+            if let Some(fixture) = &pipeline.fixture {
+                let (fixture, base) = (fixture.clone(), base.to_owned());
+                tokio::task::spawn_blocking(move || {
+                    atomic_core::fixture::check_base(&fixture, &base)
+                })
+                .await
+                .map_err(|e| failed(format!("check the step's base: {e}")))?
+                .map_err(|e| failed(format!("step `{}`: {e}", step.id)))?;
+            }
             used_worktrees = true;
             Some((
                 worktrees,
@@ -1132,7 +1157,7 @@ async fn run_pipeline<C: WorkflowContext>(
                             snapshot,
                             run_id,
                         };
-                        in_worktree(worktrees, request, call, runtimes, &place).await
+                        in_worktree(worktrees, request, call, runtimes, &place, bound).await
                     }
                 }?;
                 let mut proposal = proposal;
@@ -1194,7 +1219,7 @@ async fn run_pipeline<C: WorkflowContext>(
     )
     .map_err(|e| failed(format!("`returns`: {e}")))?;
     fits("the workflow's result", &pipeline.output, &result)?;
-    if used_worktrees && let Some(worktrees) = worktrees_for(&pipeline, &services)? {
+    if used_worktrees && let Some(worktrees) = run_worktrees.clone() {
         // The run's worktrees go; its accepted commits keep their refs. A
         // repeat finds less to remove and removes it.
         let run_id = ctx.workflow_id().to_owned();
@@ -1295,6 +1320,7 @@ async fn in_worktree(
     call: StepCall,
     runtimes: Arc<Runtimes>,
     place: &str,
+    bound: bool,
 ) -> Result<Proposal> {
     let StepCall {
         atom,
@@ -1305,7 +1331,14 @@ async fn in_worktree(
     } = call;
     let step = request.step.clone();
     let finished = contained(async move {
-        let subdirectory = source_subdirectory(runtimes.codex.cwd.clone()).await?;
+        // A fixture is its own repository: the atom works at the top of its
+        // worktree, wherever the project is. Otherwise the worktree is of
+        // the project's own checkout, at the project's place in it.
+        let subdirectory = if bound {
+            PathBuf::new()
+        } else {
+            source_subdirectory(runtimes.codex.cwd.clone()).await?
+        };
         worktrees
             .run_step(request, |tree| async move {
                 let mut here = (*runtimes).clone();

@@ -164,9 +164,10 @@ it reaches are copied into Atomic state, and each worktree step runs in a
 detached worktree of that snapshot. No source checkout is edited. Inputs marked
 `format: git-commit` must name real commit objects in the snapshot; base fields
 must match the selected revision. Invalid paths, missing objects and
-placeholder hashes fail setup before any model call. Submodules, LFS content
-and external alternates fail setup; there is no implicit network fetch or
-checkout fallback.
+placeholder hashes fail setup before any model call. Submodules, LFS content,
+external alternates, a shallow or grafted history, a SHA-256 repository and a
+directory inside a repository rather than its top fail setup; there is no
+implicit network fetch or checkout fallback.
 
 Trusted setup is performed by the operator before invoking Atomic. The
 [coding example and preparation helper](../../examples/02-change-request/README.md)

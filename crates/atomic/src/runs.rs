@@ -259,12 +259,13 @@ pub async fn run(
     let found = target::project_for(project, Some(&args.target), &cwd)?;
     let state = ProjectState::resolve(found.root())?;
     let input = target::input(args.input.as_deref(), args.data.as_deref(), &cwd)?;
-    // After the input is read: until then a signal stops atomic as usual.
-    let mut signals = Signals::new()?;
     let mut run = target::load(&found, &args.target, &cwd, input, &engine::deployment())?;
     // Before any model is called, and before the run is recorded.
     state.create()?;
     bind_fixture(&mut run, &args, &state, &cwd)?;
+    // Once the input is read and the run admitted: until then, a fixture's
+    // copy included, a signal stops atomic as usual.
+    let mut signals = Signals::new()?;
     let engine = engine::open(
         &state,
         paths,
