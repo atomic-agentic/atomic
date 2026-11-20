@@ -64,30 +64,30 @@ mod backends {
     }
 }
 
-/// Wait until `id` is no longer running in this process: pending with no
-/// progress for a moment, or finished.
-async fn settle<R: DurableRuntime>(rt: &R, id: &str) -> Option<RunStatus> {
-    let until = Instant::now() + Duration::from_secs(10);
-    let mut last = None;
+/// The engine parks a run whose workflow panicked, shortly after the panic,
+/// for an explicit resume: never an automatic retry, which could repeat
+/// effects that have no checkpoint. Wait for the park, then resume it.
+async fn resume_after_its_panic(rt: &Durare, id: &str) {
+    let until = Instant::now() + Duration::from_secs(20);
     loop {
         let status = rt.status(id).await.expect("status");
-        if matches!(status, Some(RunStatus::Succeeded | RunStatus::Failed(_))) {
-            return status;
+        if matches!(&status, Some(RunStatus::Other(s)) if s == "MAX_RECOVERY_ATTEMPTS_EXCEEDED") {
+            break;
         }
-        let steps = rt.steps(id).await.expect("steps").len();
-        if last == Some(steps) || Instant::now() > until {
-            return status;
-        }
-        last = Some(steps);
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            Instant::now() < until,
+            "the panicked run was never parked: {status:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    rt.resume(id).await.expect("resume");
 }
 
-async fn a_step_runs_once_and_is_replayed_after_a_crash<R: DurableRuntime>(mut rt: R) {
+async fn a_step_runs_once_and_is_replayed_after_a_crash(mut rt: Durare) {
     let bodies = Arc::new(AtomicUsize::new(0));
     let executions = Arc::new(AtomicUsize::new(0));
     let (b, e) = (bodies.clone(), executions.clone());
-    rt.register("once", move |ctx: R::Context, (): ()| {
+    rt.register("once", move |ctx: DurareContext, (): ()| {
         let (b, e) = (b.clone(), e.clone());
         async move {
             let v: i64 = ctx
@@ -102,14 +102,15 @@ async fn a_step_runs_once_and_is_replayed_after_a_crash<R: DurableRuntime>(mut r
             Ok(v)
         }
     });
-    rt.launch().await.expect("launch");
     let id = unique("once");
+    rt.take_resumed_runs(Some(&id)).await.expect("take");
+    rt.launch().await.expect("launch");
     rt.start("once", &id, ()).await.expect("start");
     assert!(
         rt.result::<i64>(&id).await.is_err(),
         "the first execution crashed"
     );
-    rt.recover().await.expect("recover");
+    resume_after_its_panic(&rt, &id).await;
     assert_eq!(rt.result::<i64>(&id).await, Ok(42));
     assert_eq!(bodies.load(Ordering::SeqCst), 1, "the step body ran once");
     assert_eq!(executions.load(Ordering::SeqCst), 2);
@@ -210,7 +211,14 @@ async fn an_interrupted_execution_records_nothing_and_stays_pending<R: DurableRu
     rt.launch().await.expect("launch");
     let id = unique("interrupted");
     rt.start("interrupted", &id, ()).await.expect("start");
-    assert_eq!(settle(&rt, &id).await, Some(RunStatus::Pending));
+    // The first execution's own result: it has stopped, so what it recorded
+    // is all it will.
+    let stopped = rt.result::<()>(&id).await;
+    assert!(
+        matches!(&stopped, Err(DurableError::Interrupted(_))),
+        "{stopped:?}"
+    );
+    assert_eq!(rt.status(&id).await, Ok(Some(RunStatus::Pending)));
     let names: Vec<String> = rt
         .steps(&id)
         .await
@@ -343,10 +351,10 @@ async fn positions_follow_construction_not_polling_order<R: DurableRuntime>(mut 
     rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
 }
 
-async fn a_message_is_received_once_and_replayed_after_a_crash<R: DurableRuntime>(mut rt: R) {
+async fn a_message_is_received_once_and_replayed_after_a_crash(mut rt: Durare) {
     let executions = Arc::new(AtomicUsize::new(0));
     let e = executions.clone();
-    rt.register("receive", move |ctx: R::Context, (): ()| {
+    rt.register("receive", move |ctx: DurareContext, (): ()| {
         let e = e.clone();
         async move {
             let first: Option<String> = ctx.recv("topic", Duration::from_secs(30)).await?;
@@ -358,8 +366,9 @@ async fn a_message_is_received_once_and_replayed_after_a_crash<R: DurableRuntime
             Ok((first, second))
         }
     });
-    rt.launch().await.expect("launch");
     let id = unique("receive");
+    rt.take_resumed_runs(Some(&id)).await.expect("take");
+    rt.launch().await.expect("launch");
     rt.start("receive", &id, ()).await.expect("start");
     for _ in 0..2 {
         rt.send(&id, "topic", "hello", "key-1").await.expect("send");
@@ -370,7 +379,7 @@ async fn a_message_is_received_once_and_replayed_after_a_crash<R: DurableRuntime
             .is_err(),
         "the first execution crashed"
     );
-    rt.recover().await.expect("recover");
+    resume_after_its_panic(&rt, &id).await;
     assert_eq!(
         rt.result::<(Option<String>, Option<String>)>(&id).await,
         Ok((Some("hello".to_owned()), None)),
