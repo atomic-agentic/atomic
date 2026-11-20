@@ -561,23 +561,37 @@ impl ExecSandbox {
         self
     }
 
-    /// The profile for a command that may write `writable`.
-    fn profile(&self, writable: &[PathBuf]) -> anyhow::Result<PermissionProfile> {
+    /// The profile for a command that may write `writable`, except the
+    /// directories in `read_only` inside them.
+    fn profile(
+        &self,
+        writable: &[PathBuf],
+        read_only: &[PathBuf],
+    ) -> anyhow::Result<PermissionProfile> {
         use codex_protocol::permissions::{
             FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry, NetworkSandboxPolicy,
         };
-        let read_only = permission_profile(
+        let base = permission_profile(
             crate::typed::Sandbox::ReadOnly,
             &self.guard,
             &self.codex_home,
         )?;
-        let mut policy = read_only.file_system_sandbox_policy();
+        let mut policy = base.file_system_sandbox_policy();
         for dir in writable.iter().chain(&self.also_writable) {
             let dir = AbsolutePathBuf::from_absolute_path(dir)
                 .with_context(|| format!("resolve the writable directory {}", dir.display()))?;
             policy.entries.push(FileSystemSandboxEntry::new(
                 FileSystemPath::from(dir),
                 FileSystemAccessMode::Write,
+            ));
+        }
+        // A narrower entry that only reads carves a writable one out.
+        for dir in read_only {
+            let dir = AbsolutePathBuf::from_absolute_path(dir)
+                .with_context(|| format!("resolve the read-only directory {}", dir.display()))?;
+            policy.entries.push(FileSystemSandboxEntry::new(
+                FileSystemPath::from(dir),
+                FileSystemAccessMode::Read,
             ));
         }
         Ok(PermissionProfile::from_runtime_permissions(
@@ -614,7 +628,7 @@ impl atomic_exec::Confine for ExecSandbox {
             )));
         }
         let profile = self
-            .profile(&command.writable)
+            .profile(&command.writable, &command.read_only)
             .and_then(|p| serde_json::to_string(&p).context("encode the sandbox profile"))
             .map_err(|e| fail(format!("{e:#}")))?;
         let cwd = text(&command.cwd)?;
@@ -646,6 +660,7 @@ impl atomic_exec::Confine for ExecSandbox {
             args,
             env: helper_env,
             writable: Vec::new(),
+            read_only: Vec::new(),
             ..command.clone()
         })
     }
