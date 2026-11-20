@@ -151,6 +151,31 @@ fn scratch(tag: &str) -> PathBuf {
     std::fs::canonicalize(&dir).unwrap()
 }
 
+/// A directory of the test's own outside every git repository: under the
+/// system's temporary directory, since the target directory is inside the
+/// checkout being tested. Checked, so the test fails rather than run inside
+/// a repository if that ever changes.
+fn outside_any_repository(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("atomic-fixture-cli-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir = std::fs::canonicalize(&dir).unwrap();
+    let inside = Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(&dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(
+        !inside.status.success(),
+        "{} is inside a git work tree: {}",
+        dir.display(),
+        text(&inside)
+    );
+    dir
+}
+
 /// `atomic` with `args`, from `cwd`, on the fake model at `url`.
 async fn atomic(dir: &Path, cwd: &Path, args: &[&str], url: &str, env: &[(&str, &str)]) -> Output {
     let (d, cwd, url) = (dir.to_owned(), cwd.to_owned(), url.to_owned());
@@ -295,9 +320,11 @@ fn a_project_outside_any_repository_runs_its_coding_step_in_the_snapshot() {
     support::require_sandbox();
     on_codex_runtime(async {
         let dir = scratch("outside");
-        let project = project(&dir.join("project"));
+        let outside = outside_any_repository("outside-project");
+        let project = project(&outside.join("project"));
         let base = fixture(&dir.join("fixture"));
         coding_run_at_the_top(&dir, &project, &dir.join("fixture"), &base).await;
+        let _ = std::fs::remove_dir_all(&outside);
     });
 }
 
