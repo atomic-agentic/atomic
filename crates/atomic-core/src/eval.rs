@@ -29,7 +29,7 @@
 
 use crate::atom::Atom;
 use crate::project::Project;
-use atomic_schema::expr::{self, Scope};
+use atomic_schema::expr::{self, Scope, Shape};
 use atomic_schema::registry::Registry;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -600,13 +600,20 @@ const TOLERANCE: f64 = 1e-9;
 /// Check `case`'s assertions against `output`, each value typed by the
 /// atom's `contracts`: the failures, empty when every one holds.
 pub fn check(case: &Case, output: &Value, contracts: &Contracts) -> Vec<String> {
-    // TODO: type the bindings by contracts.input and contracts.output once
-    // expression evaluation takes a shape for each value.
-    let _ = contracts;
+    let (input, output_shape) = (
+        Shape::Schema(&contracts.input),
+        Shape::Schema(&contracts.output),
+    );
     case.expect
         .iter()
         .filter_map(|source| {
-            match expr::evaluate(source, &[("input", &case.input), ("output", output)]) {
+            match expr::evaluate(
+                source,
+                &[
+                    ("input", &case.input, &input),
+                    ("output", output, &output_shape),
+                ],
+            ) {
                 Ok(Value::Bool(true)) => None,
                 Ok(other) => Some(format!("`{source}` gave {other}, not true")),
                 Err(e) => Some(format!("`{source}`: {e}")),

@@ -804,3 +804,22 @@ async fn a_mean_that_misses_its_minimum_by_rounding_reaches_it() {
     .await;
     assert!(report.passed, "{report:?}");
 }
+
+#[test]
+fn an_assertion_reads_numbers_as_the_contracts_type_them() {
+    let contracts = Contracts {
+        input: json!({"type": "object", "properties": {"n": {"type": "integer"}}}),
+        output: json!({"type": "object", "properties": {"half": {"type": "number"}}}),
+        case: json!({}),
+    };
+    // `1.0` is an integer to a contract that says so, and `2` a double.
+    let case = Case {
+        id: "typed".into(),
+        input: json!({"n": 1.0}),
+        expect: vec!["input.n / 2 == 0".into(), "output.half / 4.0 == 0.5".into()],
+        case: Value::Null,
+        prepared: None,
+    };
+    let failures = check(&case, &json!({"half": 2}), &contracts);
+    assert!(failures.is_empty(), "{failures:?}");
+}
