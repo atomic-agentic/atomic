@@ -40,6 +40,12 @@
 #   75   ATOMIC_DEV_WAIT_LOCK exists, or the disk is too full, so nothing was started
 #   124  the command hit ATOMIC_DEV_TIMEOUT
 #   137  the command was killed, usually by the memory limit
+#   130, 143, 129  this script was stopped by SIGINT, SIGTERM or SIGHUP
+#
+# Stopping this script, by SIGINT, SIGTERM or SIGHUP, or its dying or its parent's, stops and
+# removes the container it started, within a few seconds. Only that container: each run labels
+# its own with a token of its own, and nothing else is touched. The test Postgres stays up, since
+# every run on the host shares it.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -160,11 +166,54 @@ if [ $# -eq 0 ]; then
     set -- bash
 fi
 
+# The container is this run's alone, found by a label with a token of this run's: stopping it
+# never touches another run's container, or anything else on the host.
+TOKEN="$$-$(od -An -N8 -tx8 /dev/urandom | tr -d ' ')"
+NAME="atomic-dev-${TOKEN}"
+LABEL="org.atomic-agentic.dev-run=${TOKEN}"
+
+# Remove this run's container, if there is one: at once, then waiting for it to go.
+remove_container() {
+    local ids
+    ids="$("${ENGINE}" ps -aq --filter "label=${LABEL}" 2>/dev/null || true)"
+    [ -n "${ids}" ] || return 0
+    # shellcheck disable=SC2086
+    "${ENGINE}" rm -f ${ids} >/dev/null 2>&1 || true
+}
+
+# A watcher of its own, so that the container goes even when this script cannot run a trap, as
+# when it is killed outright, or when the process that started it dies: once either is gone, it
+# removes the container.
+parent="${PPID}"
+(
+    trap '' INT TERM HUP
+    while kill -0 "$$" 2>/dev/null && kill -0 "${parent}" 2>/dev/null; do
+        sleep 1
+    done
+    remove_container
+) </dev/null >/dev/null 2>&1 &
+watcher=$!
+
+client=""
+stopped() {
+    trap '' INT TERM HUP
+    remove_container
+    [ -z "${client}" ] || kill "${client}" 2>/dev/null || true
+    kill "${watcher}" 2>/dev/null || true
+    exit "$1"
+}
+trap 'stopped 130' INT
+trap 'stopped 143' TERM
+trap 'stopped 129' HUP
+
 # --memory-swap equal to --memory means no swap. A low --cpu-shares lets other work on the host
 # win when they compete for a CPU. timeout runs inside the container, because a timeout on the
-# host would only kill the client; --init ends everything left when the command exits.
-exec "${ENGINE}" run --rm --init ${tty_flags[@]+"${tty_flags[@]}"} \
-    --name "atomic-dev-$$" \
+# host would only kill the client; --init ends everything left when the command exits. The
+# client runs in the background, its standard input this script's, so that a signal reaches
+# the traps above while it runs.
+"${ENGINE}" run --rm --init ${tty_flags[@]+"${tty_flags[@]}"} \
+    --name "${NAME}" \
+    --label "${LABEL}" \
     ${net_flags[@]+"${net_flags[@]}"} \
     ${env_flags[@]+"${env_flags[@]}"} \
     "${user_flags[@]}" \
@@ -184,4 +233,10 @@ exec "${ENGINE}" run --rm --init ${tty_flags[@]+"${tty_flags[@]}"} \
     ${mount_flags[@]+"${mount_flags[@]}"} \
     -w "${ROOT}" \
     "${IMAGE}" \
-    timeout --foreground --kill-after=30s "${LIMIT}" "$@"
+    timeout --foreground --kill-after=30s "${LIMIT}" "$@" <&0 &
+client=$!
+status=0
+wait "${client}" || status=$?
+remove_container
+kill "${watcher}" 2>/dev/null || true
+exit "${status}"

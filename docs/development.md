@@ -78,6 +78,13 @@ dependency debug info turned off, so keep that much space free.
 Exit code 124 means the command hit the time limit, and 137 usually means it
 hit the memory limit.
 
+Stopping `scripts/dev.sh`, with Ctrl-C, SIGTERM or SIGHUP, stops and removes
+the container it started within a few seconds, and so does killing it outright
+or killing the process that started it. Only that container: each run labels
+its own with a token of its own (`org.atomic-agentic.dev-run`), and nothing
+else on the host is touched. The test Postgres stays up, since every run shares
+it. `scripts/dev-sh-test.sh` runs on the host and checks each of these.
+
 ## The test database
 
 `scripts/dev.sh` starts a Postgres 18 container for tests before it runs your
