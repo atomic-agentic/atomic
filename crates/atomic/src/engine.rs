@@ -65,16 +65,23 @@ pub struct EngineArgs {
 }
 
 impl EngineArgs {
-    fn endpoint(&self, required: bool) -> anyhow::Result<ModelEndpoint> {
-        // A configured endpoint wins; with none, a ChatGPT sign-in serves
-        // Codex atoms (see atomic_core::signin).
+    /// The model endpoint for a project rooted at `project`. A configured
+    /// endpoint wins; with none, a ChatGPT sign-in serves Codex atoms (see
+    /// atomic_core::signin), unless `personal_refused` says why it may not
+    /// here.
+    fn endpoint(
+        &self,
+        required: bool,
+        project: &std::path::Path,
+        personal_refused: Option<&str>,
+    ) -> anyhow::Result<ModelEndpoint> {
         // An empty base URL is no endpoint.
         let base_url = self.model_base_url.clone().filter(|u| !u.trim().is_empty());
         // Off Linux there is no sign-in to find; any other failure to read
         // one is said, not taken for "signed out".
         let mut unreadable = None;
         let sign_in = match (&base_url, required) {
-            (None, true) => match atomic_core::signin::SignIn::configured() {
+            (None, true) => match atomic_core::signin::SignIn::configured(project) {
                 Ok(s) => match s.account() {
                     Ok(Some(_)) => Some(s),
                     Ok(None) => None,
@@ -98,6 +105,18 @@ impl EngineArgs {
                 api_key_env: self.model_api_key_env.clone(),
                 sign_in: None,
             }),
+            (None, _) if personal_refused.is_some() && sign_in.is_some() => Err(Failure::new(
+                "config.model",
+                format!(
+                    "your ChatGPT sign-in is yours, for local use, and {}, so no model is \
+                     configured here",
+                    personal_refused.unwrap_or_default()
+                ),
+                "configure a model endpoint: set ATOMIC_MODEL_BASE_URL and ATOMIC_MODEL (or pass \
+                 --model-base-url and --model), and ATOMIC_MODEL_API_KEY_ENV to the variable \
+                 holding its key if it needs one",
+            )
+            .into()),
             (None, model) if sign_in.is_some() => {
                 let sign_in = sign_in.clone();
                 let model = model.clone().ok_or_else(|| {
@@ -246,7 +265,16 @@ pub async fn open(
         )
         .into());
     }
-    let endpoint = args.endpoint(needs_model)?;
+    // A personal sign-in serves this process's own runs only, from a store
+    // no one else's executors share.
+    let personal_refused = if matches!(database, Database::Postgres { .. }) {
+        Some("the store is shared (PostgreSQL)")
+    } else if takes == Takes::Waiting {
+        Some("`atomic serve` runs whatever the store's runs need")
+    } else {
+        None
+    };
+    let endpoint = args.endpoint(needs_model, state.root(), personal_refused)?;
     let signed_in = endpoint.sign_in.is_some();
     let store = LocalStore::open(state.dir().join("artifacts")).context("the artifact store")?;
     let exec = match args.runner {

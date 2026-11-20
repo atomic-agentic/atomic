@@ -207,7 +207,15 @@ fn main() -> anyhow::Result<()> {
     // Resolve and create the state directory before Codex starts, so its home
     // is never the user's own. A failure here is reported once the normal entry
     // point runs; Codex's helper invocations never need it.
-    let state = if quiet {
+    // `atomic model` keeps nothing in a project's state, so it creates none.
+    let stateless = matches!(
+        &parsed,
+        Ok(Cli {
+            command: Some(Command::Model(_)),
+            ..
+        })
+    );
+    let state = if quiet || stateless {
         Err(anyhow::anyhow!("no state directory"))
     } else {
         state_root(parsed.as_ref().ok())
@@ -225,9 +233,18 @@ fn main() -> anyhow::Result<()> {
             Err(_) => Cli::parse(),
         };
         let json = cli.json;
-        let outcome = match state {
-            Ok(state) => run(cli, paths, state).await,
-            Err(e) => Err(e),
+        // The project `atomic model` keeps the sign-in apart from.
+        let model_root =
+            matches!(cli.command, Some(Command::Model(_))).then(|| state_root(Some(&cli)));
+        let outcome = match (cli.command, model_root) {
+            (Some(Command::Model(command)), Some(root)) => match root {
+                Ok(project) => model(command, &project, json).await,
+                Err(e) => Err(e),
+            },
+            (command, _) => match state {
+                Ok(state) => run(Cli { command, ..cli }, paths, state).await,
+                Err(e) => Err(e),
+            },
         };
         if let Err(e) = outcome {
             failure::report(&failure::analyze(&e), json);
@@ -292,7 +309,7 @@ async fn run(cli: Cli, paths: CodexPaths, state: ProjectState) -> anyhow::Result
     let project = project.as_deref();
     match cli.command {
         Some(Command::Gates(command)) => gates::run(command, &state).await,
-        Some(Command::Model(command)) => model(command, json).await,
+        Some(Command::Model(_)) => unreachable!("`atomic model` runs without a state directory"),
         Some(Command::Check { path }) => {
             tokio::task::spawn_blocking(move || check(path, json)).await?
         }
@@ -685,14 +702,20 @@ enum ModelCommand {
         #[arg(long)]
         device_auth: bool,
     },
-    /// Say who is signed in, and where the sign-in is kept, never a token.
+    /// Say who is signed in (the email masked), and where the sign-in is
+    /// kept, never a token.
     Status,
     /// Revoke the sign-in where the issuer allows, and forget every copy.
     Logout,
 }
 
-async fn model(command: ModelCommand, json: bool) -> anyhow::Result<()> {
-    let sign_in = atomic_core::signin::SignIn::configured()?;
+async fn model(command: ModelCommand, project: &Path, json: bool) -> anyhow::Result<()> {
+    use atomic_core::signin::SignIn;
+    // Saying who is signed in creates nothing.
+    let sign_in = match command {
+        ModelCommand::Status => SignIn::located(project)?,
+        _ => SignIn::configured(project)?,
+    };
     match command {
         ModelCommand::Status => match sign_in.account()? {
             Some(a) if json => {
@@ -726,10 +749,36 @@ async fn model(command: ModelCommand, json: bool) -> anyhow::Result<()> {
             Ok(())
         }
         ModelCommand::Logout => {
-            if sign_in.logout().await? {
-                println!("signed out");
-            } else {
+            let forgot = sign_in.logout().await?;
+            let mut removed = Vec::new();
+            if forgot.file {
+                removed.push("the credential file store");
+            }
+            if forgot.keyring == Ok(true) {
+                removed.push("the OS keyring");
+            }
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "signed_out": !removed.is_empty(),
+                        "file": forgot.file,
+                        "keyring": forgot.keyring.as_ref().ok(),
+                        "keyring_error": forgot.keyring.as_ref().err(),
+                    })
+                );
+                return Ok(());
+            }
+            if removed.is_empty() {
                 println!("no one was signed in");
+            } else {
+                println!(
+                    "signed out: forgot the sign-in in {}",
+                    removed.join(" and ")
+                );
+            }
+            if let Err(why) = &forgot.keyring {
+                println!("the OS keyring could not be checked: {why}");
             }
             Ok(())
         }

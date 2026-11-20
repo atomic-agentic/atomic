@@ -575,6 +575,7 @@ fn a_turn_through_atomics_own_entry_point_runs_with_its_helper_in_the_state_dire
 /// token to the (test) backend.
 #[test]
 fn a_signed_in_threads_command_cannot_read_the_sign_in() {
+    support::require_sandbox();
     on_codex_runtime(async {
         let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
             .join(format!("atomic-signed-in-sandbox-{}", std::process::id()));
@@ -600,16 +601,23 @@ fn a_signed_in_threads_command_cannot_read_the_sign_in() {
             json!({"auth_mode": "chatgpt", "OPENAI_API_KEY": null, "tokens": {
                 "id_token": atomic_core::testing::fake_id_token("dev@example.invalid", "account-1"),
                 "access_token": "sandbox-hidden-token", "refresh_token": "r",
-                "account_id": "account-1"},
+                "account_id": "account-1",
+                // A refresh fails on loopback and reaches no one.
+                "oauth_provenance": {"issuer": "http://127.0.0.1:9",
+                                     "client_id": "app_EMoamEEZ73f0CkXaXp7hrann"}},
                 "last_refresh": "2099-01-01T00:00:00Z"})
             .to_string(),
         )
         .unwrap();
         let project = dir.join("project");
+        // What it saw goes to a file in the project: the backend's requests
+        // are compressed, so the fake cannot read the output Codex sends back.
+        let seen = dir.join("project/seen.txt");
         let command = format!(
-            "cat {}/auth.json; echo read-exit=$?; ls {}; echo list-exit=$?",
+            "{{ cat {}/auth.json; echo read-exit=$?; ls {}; echo list-exit=$?; }} > {} 2>&1",
             auth.display(),
-            dir.join("credentials").display()
+            dir.join("credentials").display(),
+            seen.display()
         );
         let model = FakeModel::start(vec![
             Reply::Tool {
@@ -648,13 +656,14 @@ fn a_signed_in_threads_command_cannot_read_the_sign_in() {
         .await
         .unwrap();
         assert_eq!(answer, "Done.");
-        let output = command_output(&model);
+        let output = std::fs::read_to_string(&seen).expect("the command ran");
         assert!(
             !output.contains("sandbox-hidden-token"),
             "the token leaked: {output}"
         );
-        assert!(!output.contains("read-exit=0"), "{output}");
-        assert!(!output.contains("list-exit=0"), "{output}");
+        // The command ran, and was refused both: cat fails with 1, ls with 2.
+        assert!(output.contains("read-exit=1"), "{output}");
+        assert!(output.contains("list-exit=2"), "{output}");
         // Codex itself used it, from outside the sandbox.
         assert!(
             model.headers().iter().all(|h| h

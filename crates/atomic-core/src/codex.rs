@@ -214,6 +214,23 @@ fn denied_paths(private: &PrivateState, codex_home: &Path) -> (Vec<PathBuf>, Vec
     (all, globs)
 }
 
+/// What Codex reads from its home at start: `.env` sets variables in
+/// atomic's process (none of Codex's own), and `config.toml` its settings.
+const CODEX_HOME_FILES: &[&str] = &[".env", "config.toml"];
+
+/// Create `path` empty, readable by its owner only, unless it exists.
+fn planted_never(path: &Path) -> anyhow::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    match options.open(path) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(anyhow::Error::new(e).context(format!("create {}", path.display()))),
+    }
+}
+
 /// Codex's permission profile for a sandbox: read-only, or writes confined
 /// to the workspace; the network is restricted either way. Under
 /// [`StateGuard::Deny`], atomic's private state is denied as well (see
@@ -241,6 +258,12 @@ pub(crate) fn permission_profile(
     let StateGuard::Deny(private) = guard else {
         return Ok(base);
     };
+    // Files Codex reads from its home when atomic starts: there from the
+    // start, so they are denied with the rest, and a command can never plant
+    // them for the next run.
+    for name in CODEX_HOME_FILES {
+        planted_never(&codex_home.join(name))?;
+    }
     let mut policy = base.file_system_sandbox_policy();
     let (paths, globs) = denied_paths(private, codex_home);
     for p in paths {
@@ -365,11 +388,14 @@ where
             std::process::exit(1);
         }
     }
-    // atomic itself, not one of Codex's helpers run under their own names:
-    // the process that holds a sign-in's token and the operator credential
-    // cannot be dumped, read through /proc by a same-user process, or leave
-    // a core file (and loses LD_* variables).
-    if !invoked_as_helper() {
+    // atomic itself, not one of Codex's helpers: the process that holds a
+    // sign-in's token and the operator credential cannot be dumped, read
+    // through /proc by a same-user process, or leave a core file. It loses
+    // its LD_* variables, and the commands it starts inherit a core-file
+    // limit of zero (on macOS it also refuses a debugger).
+    let mut args = std::env::args_os();
+    let (arg0, arg1) = (args.next(), args.next());
+    if !is_helper(arg0.as_deref(), arg1.as_deref()) {
         codex_process_hardening::pre_main_hardening();
     }
     // SAFETY: called at the start of main, while the process has one thread,
@@ -377,12 +403,8 @@ where
     #[allow(unsafe_code)]
     unsafe {
         std::env::set_var("CODEX_HOME", codex_home);
-        // Nothing in the environment stands in for, or redirects, a
-        // sign-in's tokens.
-        for name in OVERRIDES {
-            std::env::remove_var(name);
-        }
     }
+    scrub_overrides();
     arg0_dispatch_or_else(move |paths| main_fn(CodexPaths(paths)))
 }
 
@@ -518,17 +540,41 @@ const OVERRIDES: &[&str] = &[
     codex_login::REVOKE_TOKEN_URL_OVERRIDE_ENV_VAR,
 ];
 
-/// Whether this process runs as one of Codex's helpers, by the name it was
-/// started under.
-fn invoked_as_helper() -> bool {
-    std::env::args_os()
-        .next()
-        .as_deref()
+/// Remove [`OVERRIDES`] from the environment: nothing in it stands in for,
+/// or redirects, a sign-in's tokens. Codex's own `.env` loading never sets a
+/// `CODEX_` variable, so none comes back.
+fn scrub_overrides() {
+    // SAFETY: called from `dispatch` at the start of main, while the process
+    // has one thread (and from a test that alone uses these variables).
+    #[allow(unsafe_code)]
+    unsafe {
+        for name in OVERRIDES {
+            std::env::remove_var(name);
+        }
+    }
+}
+
+/// The first arguments Codex's helpers are dispatched by, after the
+/// executable: they run a command or an operation for a thread, inside its
+/// sandbox, and hold nothing to protect.
+const HELPER_ARG1: &[&str] = &[
+    "--codex-run-as-arg0-exec-helper",
+    "--codex-run-as-fs-helper",
+    "--codex-run-as-apply-patch",
+    "--__codex-windows-mxc",
+    "--run-as-windows-sandbox",
+];
+
+/// Whether a process started as `arg0 arg1 ...` is one of Codex's helpers:
+/// by the name it was started under, or by its first argument.
+fn is_helper(arg0: Option<&std::ffi::OsStr>, arg1: Option<&std::ffi::OsStr>) -> bool {
+    let by_name = arg0
         .map(Path::new)
         .and_then(Path::file_name)
         .is_some_and(|name| {
             name == "codex-linux-sandbox" || name == "apply_patch" || name == "applypatch"
-        })
+        });
+    by_name || arg1.is_some_and(|a| HELPER_ARG1.iter().any(|h| a == *h))
 }
 
 /// Whether this process is Codex's Linux sandbox helper: this executable,
@@ -765,18 +811,21 @@ where
     }
     let state_db = init_state_db(&config).await;
 
-    if endpoint.sign_in.is_some() {
+    if let Some(sign_in) = &endpoint.sign_in {
         crate::signin::protected()?;
+        // Codex's login restrictions hold for the sign-in as for its own.
+        sign_in.allowed_by(&config.auth_config())?;
     }
     let auth_manager = match &endpoint.sign_in {
         // The developer's own sign-in, kept apart from every project (see
-        // `crate::signin`); never a key from the environment.
+        // `crate::signin`); never a key from the environment. Codex loads it
+        // only from the workspaces its restrictions allow.
         Some(sign_in) => Arc::new(
             AuthManager::new(
                 sign_in.auth_home().to_path_buf(),
                 /*enable_codex_api_key_env*/ false,
                 sign_in.store(),
-                /*forced_chatgpt_workspace_id*/ None,
+                config.auth_config().effective_chatgpt_workspaces(),
                 Some(config.chatgpt_base_url.clone()),
                 sign_in.keyring_kind(),
                 config.auth_route_config(),
@@ -1200,10 +1249,11 @@ async fn new_config(
     Ok(config)
 }
 
-/// How Codex's login reaches the network, as a thread's configuration would.
-pub(crate) async fn auth_route_config(
-    codex_home: &Path,
-) -> anyhow::Result<codex_login::AuthRouteConfig> {
+/// Codex's login settings for a sign-in kept in `codex_home`, as a
+/// thread's configuration resolves them: how it reaches the network, and
+/// the login restrictions of the machine and of `codex_home`'s own
+/// configuration.
+pub(crate) async fn auth_policy(codex_home: &Path) -> anyhow::Result<codex_login::AuthConfig> {
     let endpoint = ModelEndpoint {
         base_url: "http://127.0.0.1:9/unused".into(),
         model: "unused".into(),
@@ -1217,7 +1267,7 @@ pub(crate) async fn auth_route_config(
         Arg0DispatchPaths::default(),
     )
     .await?;
-    Ok(config.auth_route_config())
+    Ok(config.auth_config())
 }
 
 /// Codex features atomic's threads never have: ChatGPT apps and connectors
@@ -1530,6 +1580,42 @@ mod tests {
     }
 
     #[test]
+    fn codex_helpers_are_known_by_name_or_first_argument() {
+        use std::ffi::OsStr;
+        let helper = |a0: &str, a1: &str| is_helper(Some(OsStr::new(a0)), Some(OsStr::new(a1)));
+        assert!(helper(
+            "/state/codex/tmp/arg0-linux/codex-linux-sandbox",
+            "--"
+        ));
+        assert!(helper("apply_patch", ""));
+        assert!(helper("/usr/bin/atomic", "--codex-run-as-arg0-exec-helper"));
+        assert!(helper("/usr/bin/atomic", "--codex-run-as-fs-helper"));
+        assert!(helper("/usr/bin/atomic", "--codex-run-as-apply-patch"));
+        assert!(!helper("/usr/bin/atomic", "run"));
+        assert!(!helper("/usr/bin/atomic", "--codex-run-as-something-else"));
+        assert!(!is_helper(None, None));
+    }
+
+    #[test]
+    fn the_environment_cannot_stand_in_for_or_redirect_a_sign_ins_tokens() {
+        // SAFETY: no other test reads or writes these variables.
+        #[allow(unsafe_code)]
+        unsafe {
+            for name in OVERRIDES {
+                std::env::set_var(name, "http://127.0.0.1:9/elsewhere");
+            }
+        }
+        scrub_overrides();
+        for name in [
+            "CODEX_ACCESS_TOKEN",
+            "CODEX_REFRESH_TOKEN_URL_OVERRIDE",
+            "CODEX_REVOKE_TOKEN_URL_OVERRIDE",
+        ] {
+            assert!(std::env::var_os(name).is_none(), "{name} is still set");
+        }
+    }
+
+    #[test]
     fn private_state_is_denied_and_the_rest_of_the_state_directory_is_not() {
         use crate::typed::Sandbox;
         use codex_protocol::permissions::FileSystemAccessMode::*;
@@ -1565,6 +1651,9 @@ mod tests {
             );
             assert_eq!(at(&dir.join("credentials/x").display().to_string()), Deny);
             assert_eq!(at(&p("codex/auth.json")), Deny);
+            // There from the start, so a command cannot plant them.
+            assert_eq!(at(&p("codex/.env")), Deny);
+            assert_eq!(at(&p("codex/config.toml")), Deny);
             assert_eq!(at(&p("codex/log/x")), Deny);
             assert_eq!(at(&p("codex/tmp/other/x")), Deny);
             // What Codex's shell needs, and the thread's own checkout.

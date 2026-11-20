@@ -56,7 +56,9 @@ prompt for gates in `atomic run` is not wired up yet.
 
 Codex atoms can run on a ChatGPT sign-in (`atomic model login`, `model status`,
 `model logout`), kept in the OS keyring or the opt-in credential file store, on Linux
-only; lite atoms need a model endpoint and say so.
+only, for the developer's own runs: a shared store and `atomic serve` refuse it.
+Lite atoms need a model endpoint and say so. Exec atoms' commands are not yet
+kept from a sign-in in the file store.
 
 `atomic serve` also runs on PostgreSQL (`ATOMIC_DATABASE_URL`) when the process
 has an executor identity (`ATOMIC_EXECUTOR_ID`). `atomic runner` and

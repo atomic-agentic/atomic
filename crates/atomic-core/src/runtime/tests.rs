@@ -1416,14 +1416,22 @@ fn an_exec_output_cel_cannot_read_fails() {
 }
 
 /// A ChatGPT sign-in, as Codex's login keeps it in a file store, with a
-/// token no real backend would take.
+/// token no real backend would take, refreshed now.
 fn signed_in(dir: &std::path::Path, backend: &str) -> crate::signin::SignIn {
-    std::fs::create_dir_all(dir).expect("auth home");
-    let id_token = crate::testing::fake_id_token("dev@example.invalid", "account-1");
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("time")
         .as_secs();
+    signed_in_at(dir, backend, now)
+}
+
+/// The same, last refreshed `refreshed` seconds after the epoch. Its issuer
+/// is the test backend's host, so a refresh, on a stale sign-in or a 401,
+/// goes there and never to OpenAI's.
+fn signed_in_at(dir: &std::path::Path, backend: &str, refreshed: u64) -> crate::signin::SignIn {
+    std::fs::create_dir_all(dir).expect("auth home");
+    let id_token = crate::testing::fake_id_token("dev@example.invalid", "account-1");
+    let issuer = backend.trim_end_matches("/backend-api");
     std::fs::write(
         dir.join("auth.json"),
         json!({
@@ -1434,8 +1442,9 @@ fn signed_in(dir: &std::path::Path, backend: &str) -> crate::signin::SignIn {
                 "access_token": "synthetic-access-token",
                 "refresh_token": "synthetic-refresh-token",
                 "account_id": "account-1",
+                "oauth_provenance": {"issuer": issuer, "client_id": codex_login::CLIENT_ID},
             },
-            "last_refresh": chrono_like(now),
+            "last_refresh": chrono_like(refreshed),
         })
         .to_string(),
     )
@@ -1465,6 +1474,8 @@ fn chrono_like(secs: u64) -> String {
     )
 }
 
+// Sign-ins are kept, and used, on Linux only.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_codex_atom_runs_on_a_chatgpt_sign_in_with_no_api_key() {
     on_codex_runtime(async {
@@ -1521,6 +1532,76 @@ fn a_codex_atom_runs_on_a_chatgpt_sign_in_with_no_api_key() {
         #[allow(unsafe_code)]
         unsafe {
             std::env::remove_var("CODEX_API_KEY");
+        }
+    });
+}
+
+/// A stale sign-in is refreshed at its own issuer, here the test backend,
+/// before the thread uses it: nothing reaches OpenAI's.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_stale_sign_in_is_refreshed_at_the_test_issuer() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(
+            r#"{"category": "bug", "summary": "Export crashes.", "line": null}"#.into(),
+        )])
+        .await
+        .expect("fake model");
+        let mut rt = runtime(&model, "stale-sign-in");
+        let backend = model.base_url().replace("/v1", "/backend-api");
+        let auth = rt.codex_home.with_file_name("auth");
+        rt.endpoint = ModelEndpoint {
+            base_url: "unused".into(),
+            model: "synthetic".into(),
+            api_key_env: None,
+            sign_in: Some(signed_in_at(&auth, &backend, 0)),
+        };
+        // The fake has no token endpoint, so the refresh fails; whether the
+        // turn then runs on the old token is Codex's to decide.
+        let _ = run_codex_atom(&Classify, &Note { text: "n".into() }, &rt).await;
+        let asked = model.every_request();
+        assert!(
+            asked.contains(&("POST".to_owned(), "/oauth/token".to_owned())),
+            "{asked:?}"
+        );
+    });
+}
+
+/// Codex's login restrictions hold for the sign-in when a thread starts: a
+/// workspace other than the sign-in's, or API keys only, refuse it before
+/// any model call.
+#[cfg(target_os = "linux")]
+#[test]
+fn codex_login_restrictions_refuse_a_sign_in_they_do_not_allow() {
+    on_codex_runtime(async {
+        for (tag, config, said) in [
+            (
+                "workspace",
+                "forced_chatgpt_workspace_id = \"another-workspace\"\n",
+                "allow ChatGPT workspace(s) another-workspace only",
+            ),
+            (
+                "method",
+                "forced_login_method = \"api\"\n",
+                "do not allow a chatgpt sign-in",
+            ),
+        ] {
+            let model = FakeModel::start(Vec::new()).await.expect("fake model");
+            let mut rt = runtime(&model, &format!("restricted-{tag}"));
+            std::fs::write(rt.codex_home.join("config.toml"), config).expect("config");
+            let backend = model.base_url().replace("/v1", "/backend-api");
+            let auth = rt.codex_home.with_file_name("auth");
+            rt.endpoint = ModelEndpoint {
+                base_url: "unused".into(),
+                model: "synthetic".into(),
+                api_key_env: None,
+                sign_in: Some(signed_in(&auth, &backend)),
+            };
+            let refused = run_codex_atom(&Classify, &Note { text: "n".into() }, &rt)
+                .await
+                .expect_err("refused");
+            assert!(refused.to_string().contains(said), "{tag}: {refused}");
+            assert_eq!(model.calls(), 0, "{tag}");
         }
     });
 }

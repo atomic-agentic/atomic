@@ -46,6 +46,12 @@ CONTROLS=(
     "sandbox-writes|crates/atomic-core/src/codex.rs|        crate::typed::Sandbox::WorkspaceWrite => PermissionProfile::workspace_write_with(|        crate::typed::Sandbox::WorkspaceWrite => PermissionProfile::Disabled, _ if false => PermissionProfile::workspace_write_with(|--workspace --features ${FEATURES} --test sandboxed_commit -- the_turn_cannot_commit_and_atomic_commits_after_it a_project_under_the_system_temporary_directory_stays_out_of_reach"
     "sandbox-tmp|crates/atomic-core/src/codex.rs|            /*exclude_slash_tmp*/ true,|            /*exclude_slash_tmp*/ false,|--workspace --features ${FEATURES} --test sandboxed_commit a_project_under_the_system_temporary_directory_stays_out_of_reach"
     "sandbox-private-state|crates/atomic-core/src/codex.rs|    for p in paths {|    for p in paths.into_iter().take(0) {|--workspace --features ${FEATURES} --test sandboxed_commit a_read_only_turn_in_a_worktree_sees_its_checkout"
+    "signin-personal-only|crates/atomic/src/engine.rs|            (None, _) if personal_refused.is_some() && sign_in.is_some() => Err(Failure::new(|            (None, _) if false && sign_in.is_some() => Err(Failure::new(|-p atomic-agentic --test model_auth a_shared_store_or_serve_refuses_the_personal_sign_in"
+    "signin-restrictions|crates/atomic-core/src/codex.rs|        sign_in.allowed_by(&config.auth_config())?;|        let _ = sign_in;|-p atomic-agentic-core --lib --features fake-model codex_login_restrictions_refuse_a_sign_in_they_do_not_allow"
+    "signin-logout-both-stores|crates/atomic-core/src/signin.rs|            AuthCredentialsStoreMode::File,|            AuthCredentialsStoreMode::Keyring,|-p atomic-agentic --test model_auth logout_forgets_the_file_copy_whichever_store_is_chosen"
+    "signin-email-masked|crates/atomic-core/src/signin.rs|.map(mask_email),|.map(str::to_owned),|-p atomic-agentic --test model_auth login_status_says_who_is_signed_in_and_logout_forgets_it"
+    "signin-token-overrides|crates/atomic-core/src/codex.rs|            std::env::remove_var(name);|            let _ = name;|-p atomic-agentic-core --lib the_environment_cannot_stand_in_for_or_redirect_a_sign_ins_tokens"
+    "codex-home-files|crates/atomic-core/src/codex.rs|        planted_never(&codex_home.join(name))?;|        let _ = name;|-p atomic-agentic-core --lib private_state_is_denied_and_the_rest_of_the_state_directory_is_not"
 )
 
 die() {

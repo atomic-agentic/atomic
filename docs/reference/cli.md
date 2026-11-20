@@ -98,8 +98,8 @@ minimal lite-atom quickstart.
 | Command | Purpose | Planned stage |
 | --- | --- | --- |
 | `atomic model login` | Sign in with ChatGPT through Codex's login, for Codex atoms; `--device-auth` on a machine with no browser | v0.1 local, Linux |
-| `atomic model status` | Say who is signed in, on which plan and where it is kept, never a token; `--json` for scripts | v0.1 local, Linux |
-| `atomic model logout` | Revoke the sign-in where the issuer allows, and forget every copy | v0.1 local, Linux |
+| `atomic model status` | Say who is signed in (the email masked), on which plan and where it is kept, never a token; creates nothing; `--json` for scripts | v0.1 local, Linux |
+| `atomic model logout` | Revoke the sign-in where the issuer allows, and forget it in both the keyring and the file store, saying what it found | v0.1 local, Linux |
 
 With no `ATOMIC_MODEL_BASE_URL`, Codex atoms use the sign-in and `ATOMIC_MODEL`.
 Lite atoms need an endpoint. See [subscriptions and
