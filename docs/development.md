@@ -197,13 +197,17 @@ it, and `scripts/acceptance.py` runs them as one check. CI runs it after the
 test step, with the same features, so nothing rebuilds:
 
 ```bash
-scripts/dev.sh scripts/acceptance.py m12
+ATOMIC_DEV_SANDBOX=on scripts/dev.sh scripts/acceptance.py m12
 ```
 
-The check fails when a listed test fails, is ignored or does not run (renamed,
-removed, or built out by a feature), when a clause lists no test, or when cargo
-fails. The Postgres and sandbox tests it lists need their backends, as in the
-test step. `scripts/acceptance-test.sh` (in CI) tests the check itself.
+Each clause is written as the milestones state it, and the check fails when
+the list's clauses and the milestone's differ, when a listed test fails, is
+ignored or does not run (renamed, removed, or built out by a feature), when a
+clause lists no test, or when cargo fails. A clause its tests do not yet show in
+full is marked `pending:` with the reason, and the verdict names it. The
+Postgres and sandbox tests it lists need their backends, as in the test step,
+hence `ATOMIC_DEV_SANDBOX=on`. `scripts/acceptance-test.sh` (in CI) tests the
+check itself.
 
 ## The crash suite
 

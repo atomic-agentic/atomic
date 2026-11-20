@@ -242,6 +242,8 @@ jobs:
       # scripts/acceptance/; a listed test that fails, is ignored or no longer
       # runs fails the step. The same features as the test step, so nothing
       # rebuilds.
+      # This step and the two after it also run when the test step failed,
+      # but not when it never ran because the build did not.
       - name: M12 acceptance (Linux)
         if: runner.os == 'Linux' && !cancelled() && steps.test.conclusion != 'skipped'
         run: python3 scripts/acceptance.py m12
@@ -249,9 +251,7 @@ jobs:
       # workflows and the scripted fake model; each run killed there must
       # finish when recovered, with no completed step repeated. Its codex atom
       # runs under the sandbox, hence sandbox-tests. The same features as the
-      # step above, so nothing rebuilds. Linux only.
-      # These two also run when the test step failed, but not when it never
-      # ran because the build did not.
+      # test step, so nothing rebuilds. Linux only.
       - name: Crash suite (Linux)
         if: runner.os == 'Linux' && !cancelled() && steps.test.conclusion != 'skipped'
         run: cargo test --workspace --locked --features atomic-agentic/postgres-tests,atomic-agentic/sandbox-tests --test crash
