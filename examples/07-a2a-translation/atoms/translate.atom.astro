@@ -13,7 +13,7 @@ export const config: AtomConfig<Input, Output> = {
     "secret": "translator-a2a-token"
   },
   "budget": {
-    "minutes": 5
+    "minutes": 15
   },
   "validate": [({input, output}) => output.target === input.target]
 };

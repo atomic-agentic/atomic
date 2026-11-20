@@ -49,12 +49,12 @@
 //! v0.1 runs its steps in order: model atoms, exec atoms, which run a
 //! command with no model, and gates.
 
-use crate::metering::RunBudget;
+use crate::metering::{BudgetPlan, RunBudget};
 use crate::workflows::propose_at;
 use atomic_core::artifact::{ArtifactStore, LocalStore, Provenance};
 use atomic_core::astro::StepClock;
 use atomic_core::atom::Atom;
-use atomic_core::budget::{Budget, BudgetSettings, Resolved};
+use atomic_core::budget::{Budget, BudgetSettings};
 use atomic_core::git::{Git, Signature};
 use atomic_core::render::RunInput;
 use atomic_core::runtime::{Runtimes, contained, run_declarative_with_context};
@@ -88,7 +88,7 @@ pub const PIPELINE: &str = "atomic.pipeline";
 /// record, through an approved and a rejected gate, with the shape of each
 /// checkpoint, and the run's own shape. They fail when the layout no longer
 /// matches this version's, whose file is never rewritten.
-pub const LAYOUT_VERSION: &str = "atomic.pipeline.1";
+pub const LAYOUT_VERSION: &str = "atomic.pipeline.2";
 
 /// How many times one process recovers one run of `run_pipeline` at the
 /// same step before it fails the run as dead-lettered: enough for a crash
@@ -294,6 +294,11 @@ pub struct Pipeline {
     /// The limits the workflow's `budget` block writes for the whole run.
     #[serde(default)]
     pub budget: Budget,
+    /// The run's budgets, resolved before it starts (see [`pin_budgets`]).
+    /// A run without them resolves them from its services' settings in its
+    /// first step; either way the run keeps what it began with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budgets: Option<BudgetPlan>,
     /// The SHA-256 of each file the run uses, by path: the workflow file and
     /// every source of every atom, as they were read when the run was
     /// prepared.
@@ -305,7 +310,7 @@ pub const SNAPSHOT_MEDIA_TYPE: &str = "application/vnd.atomic.pipeline+json";
 
 /// What a run's first step records: where its definitions were stored, and
 /// the hash of every file they came from.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Pinned {
     /// The artifact holding the pipeline, as JSON.
     pub snapshot: String,
@@ -316,6 +321,8 @@ pub struct Pinned {
     /// captures helpers runs only on the same one.
     #[serde(default)]
     pub helper_runtime: Option<String>,
+    /// The budgets the run is metered under, as resolved when it started.
+    pub budgets: BudgetPlan,
 }
 
 /// One run of a pipeline.
@@ -443,8 +450,26 @@ pub fn prepare(
         output: workflow.output.clone(),
         atoms: used,
         budget: workflow.budget,
+        budgets: None,
         pins,
     })
+}
+
+/// Resolve `pipeline`'s budgets against `settings`, for its atoms on
+/// `runtimes`, and keep them in it, so the run is metered as configured
+/// now and a budget that cannot hold, such as a dollar cap on an unpriced
+/// model or a cap smaller than one call, fails before the run starts.
+pub fn pin_budgets(
+    pipeline: &mut Pipeline,
+    runtimes: &Runtimes,
+    settings: &BudgetSettings,
+) -> std::result::Result<(), PrepareError> {
+    let plan = plan_budgets(pipeline, runtimes, settings).map_err(|message| PrepareError {
+        workflow: pipeline.name.clone(),
+        message,
+    })?;
+    pipeline.budgets = Some(plan);
+    Ok(())
 }
 
 /// A gate step from its definition, which the workflow loader has checked.
@@ -528,32 +553,27 @@ fn model_of(atom: &Atom, runtimes: &Runtimes) -> Option<String> {
     )
 }
 
-/// The run's caps and each model atom's, resolved before anything runs: a
-/// budget that cannot be resolved, such as a dollar cap on an unpriced model,
-/// fails the run here.
-fn budgets(
+/// The run's caps and each model atom's: a budget that cannot be resolved,
+/// such as a dollar cap on an unpriced model, is refused with where it is
+/// written.
+fn plan_budgets(
     pipeline: &Pipeline,
     runtimes: &Runtimes,
-    ledger: Ledger,
-    settings: Arc<BudgetSettings>,
-) -> Result<(RunBudget, BTreeMap<String, Resolved>)> {
-    let models: BTreeMap<&str, String> = pipeline
+    settings: &BudgetSettings,
+) -> std::result::Result<BudgetPlan, String> {
+    let models: Vec<(&str, &Budget, String)> = pipeline
         .atoms
         .iter()
-        .filter_map(|(name, atom)| Some((name.as_str(), model_of(atom, runtimes)?)))
+        .filter_map(|(name, atom)| Some((name.as_str(), &atom.budget, model_of(atom, runtimes)?)))
         .collect();
-    let all: Vec<&str> = models.values().map(String::as_str).collect();
-    let budget = RunBudget::new(ledger, settings, &pipeline.budget, &all)
-        .map_err(|e| failed(format!("workflow {}: budget: {e}", pipeline.name)))?;
-    let mut caps = BTreeMap::new();
-    for (name, model) in &models {
-        let atom = &pipeline.atoms[*name];
-        let resolved = budget
-            .atom(&atom.budget, model)
-            .map_err(|e| failed(format!("atom {name}: budget: {e}")))?;
-        caps.insert((*name).to_owned(), resolved);
-    }
-    Ok((budget, caps))
+    let atoms: Vec<(&str, &Budget, &str)> = models
+        .iter()
+        .map(|(name, budget, model)| (*name, *budget, model.as_str()))
+        .collect();
+    BudgetPlan::resolve(settings, &pipeline.budget, &atoms).map_err(|(atom, e)| match atom {
+        None => format!("workflow {}: budget: {e}", pipeline.name),
+        Some(name) => format!("atom {name}: budget: {e}"),
+    })
 }
 
 /// Run one pipeline. Workflow code: everything that touches a model or the
@@ -574,12 +594,27 @@ async fn run_pipeline<C: WorkflowContext>(
     let store = services.store.clone();
     fits("the workflow's input", &pipeline.input, &input)?;
     plan(&pipeline, services.runtimes.codex.backend.statement())?;
-    let (budget, caps) = budgets(
-        &pipeline,
-        &services.runtimes,
-        ledger,
-        services.budgets.clone(),
-    )?;
+    // The budgets the run keeps: pinned before it started, or resolved now,
+    // once, and recorded with its definitions.
+    let planned = match &pipeline.budgets {
+        // A plan in the run's input came from outside: checked as one
+        // resolved here would be.
+        Some(plan) => {
+            // Every atom of the run that calls a model needs its caps and
+            // model in the plan, so a gap fails here, before any call.
+            let model_atoms: Vec<&str> = pipeline
+                .atoms
+                .iter()
+                .filter(|(_, atom)| model_of(atom, &services.runtimes).is_some())
+                .map(|(name, _)| name.as_str())
+                .collect();
+            plan.validate()
+                .and_then(|()| plan.covers(&model_atoms))
+                .map(|()| plan.clone())
+                .map_err(|e| format!("workflow {}: its pinned budget: {e}", pipeline.name))
+        }
+        None => plan_budgets(&pipeline, &services.runtimes, &services.budgets),
+    };
     // Store the definitions the run uses before anything runs. The snapshot
     // is content-addressed, so a retried step stores the same artifact.
     let snapshot =
@@ -589,6 +624,7 @@ async fn run_pipeline<C: WorkflowContext>(
     let helper_runtime = atomic_core::astro::Program::current_helper_runtime();
     let pinned: Pinned = ctx
         .step("pin", move |_| async move {
+            let budgets = planned.map_err(failed)?;
             let manifest = tokio::task::spawn_blocking(move || {
                 store.put(
                     &mut snapshot.as_slice(),
@@ -608,9 +644,13 @@ async fn run_pipeline<C: WorkflowContext>(
                 snapshot: manifest.artifact.to_string(),
                 files,
                 helper_runtime: Some(helper_runtime),
+                budgets,
             })
         })
         .await?;
+    let plan = pinned.budgets.clone();
+    let budget = RunBudget::pinned(ledger, &plan);
+    let (caps, models) = (plan.atoms, plan.models);
     let mut steps = Map::new();
     let mut used_worktrees = false;
     let mut accepted = Vec::new();
@@ -692,6 +732,30 @@ async fn run_pipeline<C: WorkflowContext>(
         };
         let atom_input = Value::Object(mapped);
         let (budget, atom_caps) = (budget.clone(), caps.get(&step.atom).cloned());
+        // A model atom runs on the model its budget was resolved for, and
+        // only with caps: never unmetered, never at another model's price.
+        if let Some(model) = model_of(&atom, &runtimes) {
+            let pinned = match (&atom_caps, models.get(&step.atom)) {
+                (Some(_), Some(pinned)) => pinned.clone(),
+                _ => {
+                    return Err(failed(format!(
+                        "step `{}`: `{}` calls a model, and the run's budget has no caps or \
+                         model for it",
+                        step.id, atom.name
+                    )));
+                }
+            };
+            runtimes.codex.defaults.model = Some(pinned.clone());
+            runtimes.lite.defaults.model = Some(pinned.clone());
+            let now = model_of(&atom, &runtimes).unwrap_or(model);
+            if now != pinned {
+                return Err(failed(format!(
+                    "step `{}`: `{}` calls {now:?}, and the run's budget was resolved for \
+                     {pinned:?}",
+                    step.id, atom.name
+                )));
+            }
+        }
         let tree = if step.worktree {
             let worktrees = services.worktrees.clone().ok_or_else(|| {
                 failed(format!(
@@ -737,6 +801,9 @@ async fn run_pipeline<C: WorkflowContext>(
                     crate::workflows::settled(opened, &place, true).await
                 })
                 .await?;
+            // The step's body may run again (after a park is released): the
+            // workspace opened with the attempt serves its first run only.
+            let opened = Arc::new(std::sync::Mutex::new(opened));
             Some((begun, atom.external().is_some(), opened, identity))
         } else {
             None
@@ -749,6 +816,14 @@ async fn run_pipeline<C: WorkflowContext>(
             &ctx,
             &step.id,
             move |position| {
+                // The turn runs again after a park is released, so each run
+                // takes its own copies.
+                let mut runtimes = runtimes.clone();
+                let (atom, atom_input, origins) = (atom.clone(), atom_input.clone(), origins.clone());
+                let (id, ran, run_id) = (id.clone(), ran.clone(), run_id.clone());
+                let (snapshot, tree, guard) = (snapshot.clone(), tree.clone(), guard.clone());
+                let pinned_helpers = pinned_helpers.clone();
+                let place = place.clone();
                 // An exec atom calls no model and has no caps to meter.
                 if let Some(atom_caps) = &atom_caps {
                     let meter = budget.meter(&position, atom_caps);
@@ -796,7 +871,8 @@ async fn run_pipeline<C: WorkflowContext>(
                                 .map_err(|e| AtomError::Runtime(e.to_string()))?;
                             // Opened with the attempt, or, when the attempt
                             // was recorded by an earlier execution, now.
-                            let opened = match opened {
+                            let first = opened.lock().ok().and_then(|mut o| o.take());
+                            let opened = match first {
                                 Some(opened) => opened,
                                 None => {
                                     atomic_core::runtime::open_exec_workspace(

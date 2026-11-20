@@ -146,7 +146,9 @@ TypeScript workflows follow in v1.0.
 Budgets are partly built: the `budget` field on atoms and workflows, its
 configured defaults and price table, and the durable usage ledger that reserves
 each model call before it is dispatched, settles it once, and parks a run that
-reaches a cap. The commands that show budgets and spend come with run inspection.
+reaches a cap. A released park admits the call again against the caps as stored;
+the command a person uses to raise a cap and release the park is not built yet.
+The commands that show budgets and spend come with run inspection.
 
 ## Observability stages
 

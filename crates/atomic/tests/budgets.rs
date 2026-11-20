@@ -5,16 +5,30 @@
 //!
 //! - every model call has a ledger attempt, made before the call and settled
 //!   once with what the provider reported, the repair turn's included;
+//! - each call is priced at settlement, and the dollars charged are what the
+//!   calls cost;
 //! - a cap with no room for the next call parks the run before the call is
-//!   made; a rejected answer's spend is kept; a resumed run stays parked, even
-//!   with a larger budget configured;
+//!   made; a rejected answer's spend is kept; releasing the park admits the
+//!   call afresh against the caps as stored, so it parks again until a
+//!   person raises the cap, and then the run goes on;
+//! - a cap smaller than one call's reservation fails configuration;
 //! - killing the process after the provider was called and before the usage
 //!   was settled, again and again, leaves each attempt charged at its bound
-//!   until admission parks the run at the cap;
+//!   until admission parks the run at the cap; a resume with a larger budget
+//!   configured, released, parks again; once the attempts are reconciled the
+//!   run goes on;
+//! - killing the process just after the park is recorded keeps one park;
 //! - a run killed and resumed reports the same usage as an uninterrupted
 //!   one, plus only the calls that really ran again;
-//! - two parallel children cannot both take the run's last reservation;
-//! - a dollar cap on an unpriced model fails configuration.
+//! - two child runs racing for their parent's allowance cannot both take
+//!   its last reservation, and the one refused goes on once its park is
+//!   released;
+//! - a lite call that failed is charged at its bound if it could have been
+//!   sent, as is an answer with no usage, and released if it never was;
+//! - a dollar cap on an unpriced model fails configuration, and a call to
+//!   a model the budget does not price is not made under one;
+//! - a Codex turn reserves the active time its atom has left, not one
+//!   request's bound, and a turn that runs out of it parks the run.
 
 // Codex's turn futures nest deeply inside the workflow's; proving them Send
 // needs more than the default query depth.
@@ -26,14 +40,14 @@ use atomic_app::workflows::{
 };
 use atomic_atoms::{ChangeRequest, DraftTask};
 use atomic_core::AtomConfig;
-use atomic_core::budget::{Budget, BudgetError, BudgetSettings, CallBound, Level, resolve};
+use atomic_core::budget::{Budget, BudgetError, BudgetSettings, CallBound, Level, Price, resolve};
 use atomic_core::codex::{CodexPaths, ModelEndpoint};
 use atomic_core::lite::LiteRuntime;
 use atomic_core::runtime::{Artifacts, CodexRuntime, Runtimes, run_lite_atom};
 use atomic_core::testing::{FakeModel, Reply, on_codex_runtime};
 use atomic_core::usage::Metering;
-use atomic_durable::usage::Attempt;
-use atomic_durable::{DurableRuntime, Durare, RunStatus, parks, run_atom_at};
+use atomic_durable::usage::{Attempt, Caps, Settlement};
+use atomic_durable::{DurableRuntime, Durare, RunStatus, parks, release, run_atom_at};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -123,6 +137,11 @@ enum Outcome {
 
 /// Watch run `id` until it finishes or parks.
 async fn outcome(rt: &Durare, id: &str) -> Outcome {
+    parked(rt, id, 1).await
+}
+
+/// Watch run `id` until it finishes or has parked `n` times.
+async fn parked(rt: &Durare, id: &str, n: usize) -> Outcome {
     let until = Instant::now() + Duration::from_secs(60);
     loop {
         match rt.status(id).await.expect("status") {
@@ -130,7 +149,7 @@ async fn outcome(rt: &Durare, id: &str) -> Outcome {
             Some(RunStatus::Failed(e)) => panic!("run {id} failed: {e}"),
             _ => {}
         }
-        if let Some(p) = parks(rt, id).await.expect("parks").into_iter().next() {
+        if let Some(p) = parks(rt, id).await.expect("parks").into_iter().nth(n - 1) {
             return Outcome::Parked(p.reason);
         }
         assert!(
@@ -182,7 +201,20 @@ fn every_model_call_has_an_attempt_admitted_first_and_settled_once() {
         .await
         .expect("fake model");
         let dir = scratch("every");
-        let rt = engine(&dir, &model.base_url(), settings(10_000, 100_000)).await;
+        // Priced at one and two dollars per million input and output tokens:
+        // one input and one output token cost three micro-dollars, and a
+        // whole bound 100 + 2 * 50.
+        let mut priced = settings(10_000, 100_000);
+        priced.pricing.insert(
+            "synthetic".into(),
+            Price {
+                input_usd_per_mtok: 1.0,
+                output_usd_per_mtok: 2.0,
+                max_input_tokens: None,
+                max_output_tokens: None,
+            },
+        );
+        let rt = engine(&dir, &model.base_url(), priced).await;
         rt.launch().await.expect("launch");
         rt.start(CHANGE_REQUEST, "every", input())
             .await
@@ -206,9 +238,28 @@ fn every_model_call_has_an_attempt_admitted_first_and_settled_once() {
         for a in &journal {
             assert_eq!(a.usage, Some((1, 1)), "{a:?}");
             assert_eq!(a.reserved.tokens, BOUND, "the whole bound was reserved");
-            assert_eq!(a.excess_bound(), 0, "no excess left unreserved");
+            assert_eq!(a.reserved.micro_usd, 200, "priced at the model's rate");
+            assert_eq!(a.charged.micro_usd, 3, "settled at what it cost");
         }
+        // A lite call's request is larger than this tiny call bound's 100
+        // input tokens, and its maximum says so; a Codex turn's input is
+        // not bounded by its caller, so its maximum is the bound.
+        assert!(journal[0].excess_bound() > 0, "{:?}", journal[0]);
+        assert_eq!(journal[2].excess_bound(), 0, "{:?}", journal[2]);
+        // Each call was sent with the bound's output tokens as its limit.
+        assert_eq!(model.requests()[0]["max_tokens"], 50);
         assert_eq!(charged(&rt, "run:every").await, 6);
+        assert_eq!(
+            rt.ledger()
+                .allowance("run:every")
+                .await
+                .expect("allowance")
+                .expect("exists")
+                .charged
+                .micro_usd,
+            9,
+            "three calls at three micro-dollars each"
+        );
         assert_eq!(charged(&rt, "atom:every:0").await, 4);
         assert_eq!(charged(&rt, "atom:every:2").await, 2);
         rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
@@ -259,24 +310,97 @@ fn a_cap_parks_the_run_before_the_call_and_keeps_rejected_spend() {
 }
 
 #[test]
-fn a_cap_smaller_than_one_call_parks_with_no_call_made() {
+fn a_released_park_admits_again_against_the_caps_as_stored() {
     on_codex_runtime(async {
-        let model = FakeModel::start(vec![Reply::Text(DRAFT.into())])
-            .await
-            .expect("fake model");
-        let dir = scratch("none");
-        let rt = engine(&dir, &model.base_url(), settings(100, 100_000)).await;
+        // Room for one call to the draft: its answer does not fit, and the
+        // repair turn finds no room. Released, it finds none again; once a
+        // person raises the cap, the draft and the review run.
+        let model = FakeModel::start(vec![
+            Reply::Text("not json".into()),
+            Reply::Text(DRAFT.into()),
+            Reply::Text(REVIEW.into()),
+        ])
+        .await
+        .expect("fake model");
+        let dir = scratch("release");
+        let rt = engine(&dir, &model.base_url(), settings(150, 100_000)).await;
         rt.launch().await.expect("launch");
-        rt.start(CHANGE_REQUEST, "tiny", input())
+        rt.start(CHANGE_REQUEST, "released", input())
             .await
             .expect("start");
-        assert!(matches!(outcome(&rt, "tiny").await, Outcome::Parked(_)));
-        assert_eq!(model.calls(), 0);
-        assert!(
-            attempts(&rt, "tiny").await.is_empty(),
-            "a refusal writes nothing"
+        assert!(matches!(outcome(&rt, "released").await, Outcome::Parked(_)));
+        assert_eq!(model.calls(), 1);
+
+        // Released with no more room: admission refuses again, with no call.
+        let first = parks(&rt, "released").await.expect("parks")[0].clone();
+        release(&rt, &first).await.expect("release");
+        let Outcome::Parked(again) = parked(&rt, "released", 2).await else {
+            panic!("parks again");
+        };
+        assert!(again.contains("atom:released:0"), "{again}");
+        assert_eq!(model.calls(), 1, "no call without room");
+
+        // Raised by a person and released: the turn runs again, from its
+        // first call, as new attempts at the same requests.
+        rt.ledger()
+            .raise(
+                "atom:released:0",
+                Caps {
+                    tokens: 1_000,
+                    millis: 0,
+                    micro_usd: None,
+                },
+            )
+            .await
+            .expect("raise")
+            .expect("exists");
+        let second = parks(&rt, "released").await.expect("parks")[1].clone();
+        release(&rt, &second).await.expect("release");
+        let out: ChangeRequestResult = rt.result("released").await.expect("finishes");
+        assert_eq!(out.verdict.summary, "The two-unit criterion holds.");
+        assert_eq!(model.calls(), 3);
+        assert_eq!(
+            requests("released", &attempts(&rt, "released").await)[..2],
+            [
+                ("0:0".to_owned(), 1, "settled".to_owned()),
+                ("0:0".to_owned(), 2, "settled".to_owned()),
+            ],
+            "the re-run is a new attempt at the first turn's request"
         );
+        assert_eq!(charged(&rt, "atom:released:0").await, 4);
         rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+    });
+}
+
+#[test]
+fn a_cap_smaller_than_one_call_fails_configuration() {
+    on_codex_runtime(async {
+        let dir = scratch("none");
+        let mut rt = Durare::sqlite(&dir.join("atomic.db"))
+            .await
+            .expect("engine");
+        // Each call reserves 150 tokens; an atom cap of 100 never admits one.
+        let refused = register_change_request(
+            &mut rt,
+            runtimes(&dir, "http://127.0.0.1:9/v1"),
+            Arc::new(settings(100, 100_000)),
+        )
+        .expect_err("a cap below one call");
+        let message = refused.to_string();
+        assert!(matches!(refused, BudgetError::BelowCall(_)), "{refused:?}");
+        assert!(
+            message.contains("budget.call.input_tokens + budget.call.output_tokens"),
+            "{message}"
+        );
+        // The run's cap is held to the same rule.
+        assert!(
+            register_change_request(
+                &mut rt,
+                runtimes(&dir, "http://127.0.0.1:9/v1"),
+                Arc::new(settings(10_000, 149)),
+            )
+            .is_err()
+        );
     });
 }
 
@@ -288,6 +412,9 @@ const ENV_DIR: &str = "ATOMIC_BUDGETS_DIR";
 const ENV_URL: &str = "ATOMIC_BUDGETS_URL";
 const ENV_RUN: &str = "ATOMIC_BUDGETS_RUN";
 const ENV_CAPS: &str = "ATOMIC_BUDGETS_CAPS";
+const ENV_PARKS: &str = "ATOMIC_BUDGETS_PARKS";
+/// `<call minutes>,<atom minutes>`, for a child with those time caps.
+const ENV_TIMES: &str = "ATOMIC_BUDGETS_TIMES";
 
 /// Not a test on its own: the crash tests run it in a child process.
 #[test]
@@ -303,10 +430,17 @@ fn budgets_child() {
         return;
     };
     let (atom, total) = caps.split_once(',').expect("caps");
-    let budgets = settings(
+    let mut budgets = settings(
         atom.parse().expect("atom cap"),
         total.parse().expect("run cap"),
     );
+    if let Some((call, atom)) = std::env::var(ENV_TIMES)
+        .ok()
+        .and_then(|t| t.split_once(',').map(|(c, a)| (c.to_owned(), a.to_owned())))
+    {
+        budgets.call.minutes = call.parse().expect("call minutes");
+        budgets.atom.minutes = atom.parse().expect("atom minutes");
+    }
     on_codex_runtime(async move {
         let dir = PathBuf::from(dir);
         let rt = engine(&dir, &url, budgets).await;
@@ -318,7 +452,11 @@ fn budgets_child() {
         } else {
             rt.recover().await.expect("recover");
         }
-        let seen = match outcome(&rt, &run).await {
+        let n = std::env::var(ENV_PARKS)
+            .ok()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(1);
+        let seen = match parked(&rt, &run, n).await {
             Outcome::Finished => "finished".to_owned(),
             Outcome::Parked(reason) => format!("parked: {reason}"),
         };
@@ -338,6 +476,75 @@ async fn child(
     caps: &str,
     failpoint: Option<&str>,
 ) -> Option<String> {
+    child_until(dir, url, run, role, caps, failpoint, 1).await
+}
+
+/// The child as `role` on run `run` with caps `atom,run`, started and left
+/// running, for a test to kill when it chooses.
+fn spawn_child(dir: &Path, url: &str, run: &str, role: &str, caps: &str) -> std::process::Child {
+    spawn_child_with(dir, url, run, role, caps, "")
+}
+
+/// As [`spawn_child`], with time caps `times` (see [`ENV_TIMES`]), if any.
+fn spawn_child_with(
+    dir: &Path,
+    url: &str,
+    run: &str,
+    role: &str,
+    caps: &str,
+    times: &str,
+) -> std::process::Child {
+    let _ = std::fs::remove_file(dir.join("outcome"));
+    let mut cmd = Command::new(std::env::current_exe().expect("this test binary"));
+    if !times.is_empty() {
+        cmd.env(ENV_TIMES, times);
+    }
+    cmd.args(["--exact", "budgets_child", "--ignored", "--nocapture"])
+        .env(ENV_ROLE, role)
+        .env(ENV_DIR, dir)
+        .env(ENV_URL, url)
+        .env(ENV_RUN, run)
+        .env(ENV_CAPS, caps)
+        .env(ENV_PARKS, "1")
+        .env_remove("ATOMIC_FAILPOINT")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start the child")
+}
+
+/// Run the child as `role` with time caps `times` to its end, and return
+/// what it saw, if it exited cleanly.
+async fn child_timed(
+    dir: &Path,
+    url: &str,
+    run: &str,
+    role: &str,
+    caps: &str,
+    times: &str,
+) -> Option<String> {
+    let mut process = spawn_child_with(dir, url, run, role, caps, times);
+    let status = tokio::task::spawn_blocking(move || process.wait().expect("the child"))
+        .await
+        .expect("child");
+    if status.success() {
+        Some(std::fs::read_to_string(dir.join("outcome")).expect("the child's outcome"))
+    } else {
+        None
+    }
+}
+
+/// As [`child`], watching for the `parks`th park.
+async fn child_until(
+    dir: &Path,
+    url: &str,
+    run: &str,
+    role: &str,
+    caps: &str,
+    failpoint: Option<&str>,
+    parks: usize,
+) -> Option<String> {
     let _ = std::fs::remove_file(dir.join("outcome"));
     let mut cmd = Command::new(std::env::current_exe().expect("this test binary"));
     cmd.args(["--exact", "budgets_child", "--ignored", "--nocapture"])
@@ -346,6 +553,7 @@ async fn child(
         .env(ENV_URL, url)
         .env(ENV_RUN, run)
         .env(ENV_CAPS, caps)
+        .env(ENV_PARKS, parks.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -372,7 +580,16 @@ async fn reader(dir: &Path) -> Durare {
 #[test]
 fn killing_after_the_call_and_before_settlement_ends_parked_at_the_cap() {
     on_codex_runtime(async {
-        let model = FakeModel::start(Vec::new()).await.expect("fake model");
+        // Three drafts for the killed calls, then the run that goes on.
+        let model = FakeModel::start(vec![
+            Reply::Text(DRAFT.into()),
+            Reply::Text(DRAFT.into()),
+            Reply::Text(DRAFT.into()),
+            Reply::Text(DRAFT.into()),
+            Reply::Text(REVIEW.into()),
+        ])
+        .await
+        .expect("fake model");
         let dir = scratch("unsettled");
         let url = model.base_url();
         // The draft's allowance has room for three whole bounds.
@@ -445,6 +662,195 @@ fn killing_after_the_call_and_before_settlement_ends_parked_at_the_cap() {
                 .tokens,
             450,
             "resuming did not raise the cap"
+        );
+
+        // Released, the resumed run with ten times the budget configured
+        // admits its call afresh, against the cap as stored: it parks again,
+        // still with no call.
+        let first = parks(&rt, "unsettled").await.expect("parks")[0].clone();
+        release(&rt, &first).await.expect("release");
+        drop(rt);
+        let seen = child_until(&dir, &url, "unsettled", "recover", "4500,1000000", None, 2)
+            .await
+            .expect("the released run");
+        assert!(seen.contains("450 of 450 tokens"), "{seen}");
+        assert_eq!(model.calls(), 3);
+
+        // A usage query reconciles the three attempts at what they used;
+        // released again, the run goes on.
+        let rt = reader(&dir).await;
+        for a in rt.ledger().unsettled("unsettled").await.expect("unsettled") {
+            rt.ledger()
+                .settle(
+                    &a.request,
+                    a.attempt,
+                    Settlement::Reconciled {
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        micro_usd: 0,
+                    },
+                )
+                .await
+                .expect("reconcile");
+        }
+        let second = parks(&rt, "unsettled").await.expect("parks")[1].clone();
+        release(&rt, &second).await.expect("release");
+        drop(rt);
+        // Watching past the two parks it has, for the run to finish.
+        let seen = child_until(&dir, &url, "unsettled", "recover", caps, None, 3)
+            .await
+            .expect("the reconciled run");
+        assert_eq!(seen, "finished");
+        assert_eq!(model.calls(), 5);
+        let rt = reader(&dir).await;
+        assert_eq!(charged(&rt, "atom:unsettled:0").await, 4 * 2);
+    });
+}
+
+#[test]
+fn killing_the_process_during_a_codex_turn_lets_the_recovered_run_finish() {
+    on_codex_runtime(async {
+        // The review's first turn never answers in time: the process is
+        // killed while it is in flight. The recovered run's turn answers.
+        let model = FakeModel::start(vec![
+            Reply::Text(DRAFT.into()),
+            Reply::Delayed {
+                after: Duration::from_secs(120),
+                reply: Box::new(Reply::Text(REVIEW.into())),
+            },
+            Reply::Text(REVIEW.into()),
+        ])
+        .await
+        .expect("fake model");
+        let dir = scratch("midturn");
+        let url = model.base_url();
+        // Default time caps: the turn reserves the atom's whole 30 minutes.
+        let caps = "10000,100000";
+        let mut process = spawn_child(&dir, &url, "midturn", "start", caps);
+        let until = Instant::now() + Duration::from_secs(60);
+        while model.calls() < 2 {
+            assert!(
+                Instant::now() < until,
+                "the review's turn reached the model"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        process.kill().expect("kill the child");
+        let _ = process.wait();
+
+        // Recovered, the dead turn is charged the time it took, not the 30
+        // minutes it reserved, so the review runs again and the run ends.
+        let seen = child(&dir, &url, "midturn", "recover", caps, None)
+            .await
+            .expect("the recovered run");
+        assert_eq!(seen, "finished");
+        assert_eq!(model.calls(), 3);
+        let rt = reader(&dir).await;
+        assert_eq!(
+            requests("midturn", &attempts(&rt, "midturn").await),
+            [
+                ("0:0".to_owned(), 1, "settled".to_owned()),
+                ("2:0".to_owned(), 1, "reserved".to_owned()),
+                ("2:0".to_owned(), 2, "settled".to_owned()),
+            ]
+        );
+        let review = attempts(&rt, "midturn").await;
+        let dead = &review[1];
+        assert_eq!(dead.charged.tokens, BOUND, "its tokens stay at the bound");
+        assert!(dead.charged.millis < 60_000, "{dead:?}");
+        assert!(dead.reserved.millis >= 29 * 60_000, "{dead:?}");
+    });
+}
+
+#[test]
+fn a_run_recovered_after_its_dead_turn_would_have_lapsed_is_charged_only_its_run_time() {
+    on_codex_runtime(async {
+        // Scaled down: the review's turn reserves its atom's 3 s and beats
+        // every 300 ms. Killed about 0.9 s in and recovered after the 3 s
+        // have passed, the dead turn is charged the time it ran, up to a
+        // beat after its last heartbeat, and the review has the rest of its
+        // time to run again.
+        let model = FakeModel::start(vec![
+            Reply::Text(DRAFT.into()),
+            Reply::Delayed {
+                after: Duration::from_secs(120),
+                reply: Box::new(Reply::Text(REVIEW.into())),
+            },
+            Reply::Text(REVIEW.into()),
+        ])
+        .await
+        .expect("fake model");
+        let dir = scratch("lapsed");
+        let url = model.base_url();
+        let caps = "10000,100000";
+        let mut process = spawn_child_with(&dir, &url, "lapsed", "start", caps, "0.01,0.05");
+        let until = Instant::now() + Duration::from_secs(60);
+        while model.calls() < 2 {
+            assert!(
+                Instant::now() < until,
+                "the review's turn reached the model"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        process.kill().expect("kill the child");
+        let _ = process.wait();
+        // Down past the whole reservation.
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        let seen = child_timed(&dir, &url, "lapsed", "recover", caps, "0.01,0.05")
+            .await
+            .expect("the recovered run");
+        assert_eq!(seen, "finished");
+        let rt = reader(&dir).await;
+        let review = attempts(&rt, "lapsed").await;
+        let dead = &review[1];
+        assert_eq!(dead.state, "reserved");
+        assert_eq!(dead.reserved.millis, 3_000, "{dead:?}");
+        assert!(
+            dead.charged.millis < 2_000,
+            "the downtime was not charged: {dead:?}"
+        );
+        // Its heartbeats carried it past the first beat: it is charged the
+        // time it ran.
+        assert!(
+            dead.charged.millis >= 600,
+            "the time it ran was charged: {dead:?}"
+        );
+    });
+}
+
+#[test]
+fn killing_just_after_the_park_is_recorded_keeps_one_park() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text("not json".into())])
+            .await
+            .expect("fake model");
+        let dir = scratch("afterpark");
+        let url = model.base_url();
+        let caps = "150,100000";
+        let seen = child(
+            &dir,
+            &url,
+            "afterpark",
+            "start",
+            caps,
+            Some("usage:after-park"),
+        )
+        .await;
+        assert_eq!(seen, None, "killed after the park was recorded");
+        let seen = child(&dir, &url, "afterpark", "recover", caps, None)
+            .await
+            .expect("the recovered run");
+        assert!(seen.starts_with("parked: "), "{seen}");
+        let rt = reader(&dir).await;
+        assert_eq!(parks(&rt, "afterpark").await.expect("parks").len(), 1);
+        assert_eq!(model.calls(), 1, "recovery made no call");
+        assert_eq!(attempts(&rt, "afterpark").await.len(), 1);
+        // The recovered run waits on the park it recorded.
+        assert_eq!(
+            rt.status("afterpark").await.expect("status"),
+            Some(RunStatus::Pending)
         );
     });
 }
@@ -535,89 +941,300 @@ fn a_killed_and_resumed_run_reports_the_same_usage_plus_only_real_retries() {
 // ---------------------------------------------------------------------------
 // Parent and children.
 
-/// A child's run, boxed. Written over any context, as workflow code is: the
-/// compiler proves the future `Send` from the trait's bounds.
-type Child = std::pin::Pin<
-    Box<dyn Future<Output = atomic_durable::Result<atomic_durable::Published>> + Send>,
->;
-
-/// One of two children of the `pair` workflow, each a metered lite atom.
-fn pair_child<C: atomic_durable::WorkflowContext>(
-    ctx: C,
-    name: &'static str,
-    budget: RunBudget,
-    caps: atomic_core::budget::Resolved,
-    mut lite: LiteRuntime,
-) -> Child {
-    Box::pin(async move {
-        run_atom_at(
-            &ctx,
-            name,
-            move |step| {
-                lite.meter = budget.meter(&step, &caps);
-                let request = ChangeRequest {
-                    request: name.into(),
-                };
-                propose(async move { run_lite_atom(&DraftTask, &request, &lite).await })
-            },
-            Vec::new(),
-        )
-        .await
-    })
-}
+/// The child workflow: one metered lite atom, under the parent allowance
+/// its budget sits in.
+const PAIR_CHILD: &str = "pair-child";
 
 #[test]
 fn parallel_children_cannot_both_take_the_last_reservation() {
     on_codex_runtime(async {
-        let model = FakeModel::start(vec![Reply::Text(DRAFT.into()), Reply::Text(DRAFT.into())])
-            .await
-            .expect("fake model");
+        // Two child runs, each its own workflow, race for the parent's
+        // allowance. The first call is slow, so the second child's
+        // admission comes while it is in flight.
+        let model = FakeModel::start(vec![
+            Reply::Delayed {
+                after: Duration::from_secs(2),
+                reply: Box::new(Reply::Text(DRAFT.into())),
+            },
+            Reply::Text(DRAFT.into()),
+        ])
+        .await
+        .expect("fake model");
         let dir = scratch("pair");
         let mut rt = Durare::sqlite(&dir.join("atomic.db"))
             .await
             .expect("engine");
-        // The run has room for one call, even once that call has settled at
-        // its two tokens; each child has room for many. (The ledger's own
-        // tests race many admissions at once against one allowance.)
+        // The parent has room for one whole bound at a time, though not two:
+        // one after the other, once the first has settled at its two tokens,
+        // both children's calls fit. Each child run, and its atom, has room
+        // for many.
+        let parent = atomic_durable::usage::Scope {
+            id: "run:pair".into(),
+            caps: Caps {
+                tokens: 2 * BOUND - 1,
+                millis: 3_600_000,
+                micro_usd: None,
+            },
+        };
         let budget = RunBudget::new(
             rt.ledger(),
-            Arc::new(settings(10_000, 151)),
+            Arc::new(settings(10_000, 100_000)),
+            &Budget::default(),
+            &["synthetic"],
+        )
+        .expect("budget")
+        .under(parent);
+        let caps = budget.atom(&Budget::default(), "synthetic").expect("caps");
+        let lite = runtimes(&dir, &model.base_url()).lite.clone();
+        rt.register(
+            PAIR_CHILD,
+            move |ctx: atomic_durable::DurareContext, name: String| {
+                let (budget, caps, lite) = (budget.clone(), caps.clone(), lite.clone());
+                async move {
+                    run_atom_at(
+                        &ctx,
+                        "draft",
+                        move |step| {
+                            let mut lite = lite.clone();
+                            lite.meter = budget.meter(&step, &caps);
+                            let request = ChangeRequest {
+                                request: name.clone(),
+                            };
+                            propose(async move { run_lite_atom(&DraftTask, &request, &lite).await })
+                        },
+                        Vec::new(),
+                    )
+                    .await
+                }
+            },
+        );
+        rt.launch().await.expect("launch");
+        for child in ["pair-a", "pair-b"] {
+            rt.start(PAIR_CHILD, child, child.to_owned())
+                .await
+                .expect("start");
+        }
+        // One child parks; the other's call is the only one dispatched.
+        let until = Instant::now() + Duration::from_secs(60);
+        let (loser, winner, park) = loop {
+            let mut found = None;
+            for (child, other) in [("pair-a", "pair-b"), ("pair-b", "pair-a")] {
+                if let Some(p) = parks(&rt, child).await.expect("parks").into_iter().next() {
+                    found = Some((child, other, p));
+                }
+            }
+            if let Some(found) = found {
+                break found;
+            }
+            assert!(Instant::now() < until, "a child parked");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert!(park.reason.contains("run:pair"), "{}", park.reason);
+        assert_eq!(model.calls(), 1, "only one child's call was dispatched");
+        assert!(
+            attempts(&rt, loser).await.is_empty(),
+            "the refusal wrote nothing"
+        );
+        assert!(charged(&rt, "run:pair").await < 2 * BOUND);
+        let _: atomic_durable::Published = rt.result(winner).await.expect("the winner finishes");
+        assert_eq!(parks(&rt, winner).await.expect("parks").len(), 0);
+        // The refusal was for the moment only: released, the other child's
+        // call fits beside the winner's settled spend.
+        release(&rt, &park).await.expect("release");
+        let _: atomic_durable::Published = rt.result(loser).await.expect("the loser finishes");
+        assert_eq!(model.calls(), 2);
+        assert_eq!(charged(&rt, "run:pair").await, 4);
+        rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+    });
+}
+
+#[test]
+fn a_lite_call_that_fails_is_charged_by_whether_it_could_have_been_sent() {
+    on_codex_runtime(async {
+        let dir = scratch("failed");
+        let rt = Durare::sqlite(&dir.join("atomic.db"))
+            .await
+            .expect("engine");
+        let budget = RunBudget::new(
+            rt.ledger(),
+            Arc::new(settings(10_000, 100_000)),
             &Budget::default(),
             &["synthetic"],
         )
         .expect("budget");
-        let lite = runtimes(&dir, &model.base_url()).lite.clone();
-        rt.register("pair", move |ctx: atomic_durable::DurareContext, (): ()| {
-            let (budget, lite) = (budget.clone(), lite.clone());
-            async move {
-                let caps = budget.atom(&Budget::default(), "synthetic").expect("caps");
-                let a = pair_child(ctx.clone(), "a", budget.clone(), caps.clone(), lite.clone());
-                let b = pair_child(ctx, "b", budget, caps, lite);
-                let (a, b) = tokio::join!(a, b);
-                Ok(vec![a?, b?])
-            }
-        });
-        rt.launch().await.expect("launch");
-        rt.start("pair", "pair", ()).await.expect("start");
-        assert!(matches!(outcome(&rt, "pair").await, Outcome::Parked(_)));
-        // Let the winner finish its publication.
-        let until = Instant::now() + Duration::from_secs(30);
-        while !rt
-            .steps("pair")
+        let caps = budget.atom(&Budget::default(), "synthetic").expect("caps");
+        let step = |run: &str| atomic_durable::StepInfo {
+            workflow_id: run.to_owned(),
+            step_id: 0,
+        };
+        let request = ChangeRequest {
+            request: "Two units at 1.25 should cost 2.50.".into(),
+        };
+        // The provider answered with an error: the call was sent, and what
+        // it spent is unknown, so it stays charged at its bound. An answer
+        // with no usage is held the same way.
+        let model = FakeModel::start(vec![
+            Reply::Http {
+                status: 500,
+                body: "{}".into(),
+            },
+            Reply::WithoutUsage(DRAFT.into()),
+        ])
+        .await
+        .expect("fake model");
+        let mut lite = runtimes(&dir, &model.base_url()).lite.clone();
+        lite.meter = budget.meter(&step("sent"), &caps);
+        assert!(run_lite_atom(&DraftTask, &request, &lite).await.is_err());
+        lite.meter = budget.meter(&step("silent"), &caps);
+        run_lite_atom(&DraftTask, &request, &lite)
             .await
-            .expect("steps")
-            .iter()
-            .any(|s| s.name.ends_with(".publish") && s.output.is_some())
-        {
-            assert!(Instant::now() < until, "the admitted child published");
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            .expect("an answer without usage");
+        for run in ["sent", "silent"] {
+            assert_eq!(
+                requests(run, &attempts(&rt, run).await),
+                [("0:0".to_owned(), 1, "reserved".to_owned())],
+                "{run}"
+            );
+            assert_eq!(charged(&rt, &format!("atom:{run}:0")).await, BOUND);
         }
-        assert_eq!(model.calls(), 1, "only one child's call was dispatched");
-        let journal = attempts(&rt, "pair").await;
-        assert_eq!(journal.len(), 1, "{journal:?}");
-        assert_eq!(parks(&rt, "pair").await.expect("parks").len(), 1);
-        assert!(charged(&rt, "run:pair").await <= 151);
+        // No connection was ever made: nothing was sent, and nothing spent.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = closed.local_addr().expect("addr").port();
+        drop(closed);
+        let mut lite = runtimes(&dir, &format!("http://127.0.0.1:{port}/v1"))
+            .lite
+            .clone();
+        lite.meter = budget.meter(&step("unsent"), &caps);
+        assert!(run_lite_atom(&DraftTask, &request, &lite).await.is_err());
+        assert_eq!(
+            requests("unsent", &attempts(&rt, "unsent").await),
+            [("0:0".to_owned(), 1, "released".to_owned())]
+        );
+        assert_eq!(charged(&rt, "atom:unsent:0").await, 0);
+    });
+}
+
+/// Settings whose lite requests are bounded at `call` minutes, under an
+/// atom cap of `atom` minutes.
+fn timed(call: f64, atom: f64) -> BudgetSettings {
+    let mut s = settings(10_000, 100_000);
+    s.call.minutes = call;
+    s.atom.minutes = atom;
+    s
+}
+
+#[test]
+fn a_codex_turn_longer_than_a_request_bound_runs_within_its_atoms_time() {
+    on_codex_runtime(async {
+        // Scaled down: a request is bounded at 0.6 s and the atom at 6 s, so
+        // a 1.5 s review turn is a long build turn under a 10-minute request
+        // bound and a 30-minute atom cap, with room to spare.
+        let model = FakeModel::start(vec![
+            Reply::Text(DRAFT.into()),
+            Reply::Delayed {
+                after: Duration::from_millis(1_500),
+                reply: Box::new(Reply::Text(REVIEW.into())),
+            },
+        ])
+        .await
+        .expect("fake model");
+        let dir = scratch("longturn");
+        let rt = engine(&dir, &model.base_url(), timed(0.01, 0.1)).await;
+        rt.launch().await.expect("launch");
+        rt.start(CHANGE_REQUEST, "longturn", input())
+            .await
+            .expect("start");
+        assert_eq!(outcome(&rt, "longturn").await, Outcome::Finished);
+        let journal = attempts(&rt, "longturn").await;
+        // The lite request reserved its own bound; the turn, all its atom's
+        // time.
+        assert_eq!(journal[0].reserved.millis, 600);
+        assert_eq!(journal[1].reserved.millis, 6_000, "{:?}", journal[1]);
+        assert!(journal[1].charged.millis >= 1_500, "{:?}", journal[1]);
         rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+    });
+}
+
+#[test]
+fn a_codex_turn_that_runs_out_of_its_atoms_time_parks_the_run() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![
+            Reply::Text(DRAFT.into()),
+            Reply::Delayed {
+                after: Duration::from_secs(20),
+                reply: Box::new(Reply::Text(REVIEW.into())),
+            },
+        ])
+        .await
+        .expect("fake model");
+        let dir = scratch("outoftime");
+        let rt = engine(&dir, &model.base_url(), timed(0.01, 0.02)).await;
+        rt.launch().await.expect("launch");
+        rt.start(CHANGE_REQUEST, "outoftime", input())
+            .await
+            .expect("start");
+        let Outcome::Parked(reason) = outcome(&rt, "outoftime").await else {
+            panic!("the run should park");
+        };
+        assert!(reason.contains("cut off"), "{reason}");
+        assert!(
+            reason.contains("the allowance atom:outoftime:2"),
+            "{reason}"
+        );
+        let park = parks(&rt, "outoftime").await.expect("parks")[0].clone();
+        assert_eq!(park.step, "review.park");
+        rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+    });
+}
+
+#[test]
+fn a_call_to_a_model_the_budget_does_not_price_is_not_made_under_a_dollar_cap() {
+    on_codex_runtime(async {
+        let dir = scratch("unpricedcall");
+        let rt = Durare::sqlite(&dir.join("atomic.db"))
+            .await
+            .expect("engine");
+        let mut priced = settings(10_000, 100_000);
+        priced.workflow.cost_usd = Some(1.0);
+        priced.pricing.insert(
+            "synthetic".into(),
+            Price {
+                input_usd_per_mtok: 1.0,
+                output_usd_per_mtok: 1.0,
+                max_input_tokens: None,
+                max_output_tokens: None,
+            },
+        );
+        let budget = RunBudget::new(
+            rt.ledger(),
+            Arc::new(priced),
+            &Budget::default(),
+            &["synthetic"],
+        )
+        .expect("budget");
+        let caps = budget.atom(&Budget::default(), "synthetic").expect("caps");
+        let model = FakeModel::start(vec![Reply::Text(DRAFT.into())])
+            .await
+            .expect("fake model");
+        // The atom asks for another model than the budget was resolved for.
+        let mut lite = runtimes(&dir, &model.base_url()).lite.clone();
+        lite.endpoint.model = "unpriced".into();
+        lite.meter = budget.meter(
+            &atomic_durable::StepInfo {
+                workflow_id: "unpricedcall".into(),
+                step_id: 0,
+            },
+            &caps,
+        );
+        let request = ChangeRequest {
+            request: "Two units at 1.25 should cost 2.50.".into(),
+        };
+        let refused = run_lite_atom(&DraftTask, &request, &lite)
+            .await
+            .expect_err("refused");
+        assert!(refused.to_string().contains("has no price"), "{refused}");
+        assert_eq!(model.calls(), 0, "the call was not made");
+        assert!(attempts(&rt, "unpricedcall").await.is_empty());
     });
 }
 

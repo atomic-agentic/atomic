@@ -452,6 +452,17 @@ async fn stop(signals: &mut Signals, who: &str, exit: Exit) -> ! {
              the next `atomic serve` or `atomic runs resume`"
         );
     }
+    // A model call still in flight ends with this process: charge it the
+    // time it ran, not the time until a later process finds it dead.
+    let interrupted = tokio::time::timeout(
+        Duration::from_secs(2),
+        atomic_app::metering::interrupt_in_flight(),
+    )
+    .await
+    .unwrap_or(0);
+    if interrupted > 0 {
+        eprintln!("{who}: settled {interrupted} model call(s) that had not finished");
+    }
     // Exit here, not by returning: the runtime would wait for the blocked
     // threads of the stopped commands, which never return.
     std::process::exit(match exit {
