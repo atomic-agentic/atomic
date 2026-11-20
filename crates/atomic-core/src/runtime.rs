@@ -261,6 +261,12 @@ const OPEN_WAIT_MAX: std::time::Duration = std::time::Duration::from_secs(30);
 const OPEN_WAIT_REPORT: std::time::Duration = std::time::Duration::from_secs(600);
 /// How often a waiting run looks whether this process is stopping.
 const OPEN_WAIT_SLICE: std::time::Duration = std::time::Duration::from_millis(100);
+/// How long a set-aside step whose sandbox cannot start waits before it
+/// first tries again, the wait doubling each time up to
+/// [`SANDBOX_RETRY_MAX`]: the machine is fixed by a person, not in seconds.
+const SANDBOX_RETRY_FIRST: std::time::Duration = std::time::Duration::from_secs(5);
+/// The longest wait between a set-aside step's tries of the sandbox.
+const SANDBOX_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The longest a step waits for its workspace, in milliseconds; 0 for as
 /// long as it takes. See [`limit_backend_wait`].
@@ -287,20 +293,25 @@ pub fn stop_waiting_for_backend() {
 
 /// Set by a long-running process, such as `atomic serve`: a step that has
 /// waited its limit is set aside rather than given up, and keeps trying,
-/// at most [`OPEN_WAIT_MAX`] apart, so its run goes on once there is room.
+/// at most [`OPEN_WAIT_MAX`] apart, so its run goes on once there is room;
+/// and a step whose commands cannot be confined is set aside too, trying
+/// the sandbox again at most [`SANDBOX_RETRY_MAX`] apart, so its run goes
+/// on once the machine is fixed.
 static KEEP_TRYING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// The runs whose step is set aside now, past its limit, each once per
-/// such step.
+/// The runs whose step is set aside now, past its limit or waiting for the
+/// sandbox to start, each once per such step.
 static SET_ASIDE_FOR_ROOM: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
-/// Make a step that has waited its limit ([`limit_backend_wait`]) keep
-/// trying, set aside, instead of giving up: for `atomic serve`.
+/// Make a step that has waited its limit ([`limit_backend_wait`]), or whose
+/// sandbox cannot start, keep trying, set aside, instead of giving up: for
+/// `atomic serve`.
 pub fn keep_trying_past_the_limit() {
     KEEP_TRYING.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
-/// The runs whose step is set aside now, waiting past its limit for room:
-/// work a stopping process need not wait for, since it records nothing.
+/// The runs whose step is set aside now, waiting past its limit for room or
+/// for the sandbox to start: work a stopping process need not wait for,
+/// since it records nothing.
 pub fn runs_set_aside_for_room() -> Vec<String> {
     SET_ASIDE_FOR_ROOM
         .lock()
@@ -337,7 +348,10 @@ impl Drop for SetAsideForRoom {
 /// as it takes, or up to the process's limit ([`limit_backend_wait`]),
 /// after which it gives up with [`AtomError::NoRoom`], or, in a process
 /// that keeps trying ([`keep_trying_past_the_limit`]), is set aside and
-/// tries again at most [`OPEN_WAIT_MAX`] apart, saying so each time. It records nothing
+/// tries again at most [`OPEN_WAIT_MAX`] apart, saying so each time. A
+/// backend that cannot confine commands here gives up at once with
+/// [`AtomError::Unconfinable`], or, in a process that keeps trying, sets the
+/// step aside and tries again at most [`SANDBOX_RETRY_MAX`] apart. It records nothing
 /// and spends none of the durable engine's recovery attempts, and it says
 /// on stderr that it is waiting, then again every ten minutes. Stopping the
 /// run, or the process ([`stop_waiting_for_backend`]), stops the wait.
@@ -351,6 +365,9 @@ pub(crate) async fn open_workspace(
     let mut reported: Option<std::time::Instant> = None;
     let started = std::time::Instant::now();
     let mut set_aside: Option<SetAsideForRoom> = None;
+    // When the step began waiting for the sandbox to start, and its pause.
+    let mut unconfinable: Option<std::time::Instant> = None;
+    let mut sandbox_wait = SANDBOX_RETRY_FIRST;
     loop {
         let (b, r) = (backend.clone(), request.clone());
         let opened = tokio::task::spawn_blocking(move || b.open(&r))
@@ -374,6 +391,14 @@ pub(crate) async fn open_workspace(
                 if reported.is_some() {
                     crate::log_line!(
                         "atomic: {label}: the execution backend can open its workspace again"
+                    );
+                }
+                if unconfinable.is_some() {
+                    crate::log_line!(
+                        "atomic: {label} (run {}, step {}): the sandbox starts again, and the \
+                         step goes on",
+                        request.run,
+                        request.step
                     );
                 }
                 return Ok(guard);
@@ -445,7 +470,53 @@ pub(crate) async fn open_workspace(
                 wait = (wait * 2).min(OPEN_WAIT_MAX);
             }
             Err(atomic_exec::ExecError::Unconfinable { message }) => {
-                return Err(AtomError::Unconfinable(message));
+                if !KEEP_TRYING.load(Ordering::SeqCst) {
+                    return Err(AtomError::Unconfinable(message));
+                }
+                // Nothing ran. The step is set aside, recording nothing, and
+                // tries again now and then: the machine may be fixed while
+                // this process runs.
+                match unconfinable {
+                    None => {
+                        if set_aside.is_none() {
+                            set_aside = Some(SetAsideForRoom::start(&request.run));
+                        }
+                        crate::log_line!(
+                            "atomic: {label} (run {}, step {}): {message}",
+                            request.run,
+                            request.step
+                        );
+                        crate::log_line!(
+                            "atomic: {label} (run {}, step {}) is set aside, with nothing \
+                             recorded, until the sandbox can start; it tries again, at most \
+                             {}s apart, and other runs go on",
+                            request.run,
+                            request.step,
+                            SANDBOX_RETRY_MAX.as_secs()
+                        );
+                        unconfinable = Some(std::time::Instant::now());
+                    }
+                    Some(at) if at.elapsed() >= OPEN_WAIT_REPORT => {
+                        crate::log_line!(
+                            "atomic: {label} (run {}, step {}): the sandbox still cannot start: \
+                             {message}",
+                            request.run,
+                            request.step
+                        );
+                        unconfinable = Some(std::time::Instant::now());
+                    }
+                    Some(_) => {}
+                }
+                let mut left = sandbox_wait;
+                while !left.is_zero() {
+                    if STOP_WAITING.load(Ordering::SeqCst) {
+                        return Err(AtomError::Stopping);
+                    }
+                    let slice = left.min(OPEN_WAIT_SLICE);
+                    tokio::time::sleep(slice).await;
+                    left = left.saturating_sub(slice);
+                }
+                sandbox_wait = (sandbox_wait * 2).min(SANDBOX_RETRY_MAX);
             }
             Err(e) => return Err(AtomError::Runtime(format!("{label}: {e}"))),
         }

@@ -2859,8 +2859,9 @@ fn with_unused<'a>(env: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
 
 /// Under `atomic serve`, a run whose commands cannot be confined is set
 /// aside, unfinished and with nothing recorded, and serve goes on with the
-/// others and stops at once when asked; where the sandbox starts again the
-/// run resumes and finishes. `atomic run` stops with its exit code instead.
+/// others and stops at once when asked. It tries the sandbox again now and
+/// then, so once the machine is fixed serve itself finishes the run, its
+/// second step once. `atomic run` stops with its exit code instead.
 // needs_sandbox
 #[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
@@ -2927,7 +2928,7 @@ fn serve_sets_aside_a_run_whose_commands_cannot_be_confined_and_serves_the_rest(
         let log = dir.join("serve.log");
         let mut serve = spawn(&dir, &project, &["serve"], &with_path, &log);
         wait_until("serve to set the run aside", || {
-            std::fs::read_to_string(&log).is_ok_and(|l| l.contains("stays unfinished"))
+            std::fs::read_to_string(&log).is_ok_and(|l| l.contains("until the sandbox can start"))
         });
         approve(&rt, &opened).await;
         let started = Instant::now();
@@ -2962,17 +2963,35 @@ fn serve_sets_aside_a_run_whose_commands_cannot_be_confined_and_serves_the_rest(
             "second never ran"
         );
 
-        // Where the sandbox starts, the run finishes, its second step once.
+        // A serve started while the sandbox still cannot start sets the run
+        // aside again, and once the machine is fixed it finishes the run
+        // itself, its second step once.
+        let log = dir.join("serve-2.log");
+        let mut serve = spawn(&dir, &project, &["serve"], &with_path, &log);
+        wait_until("serve to set the run aside again", || {
+            std::fs::read_to_string(&log).is_ok_and(|l| l.contains("until the sandbox can start"))
+        });
         std::fs::remove_file(dir.join("bwrap-refuse")).expect("fixed");
-        let (d, p, e) = (dir.clone(), project.clone(), path.clone());
-        let out = tokio::task::spawn_blocking(move || {
-            let mut env = UNUSED_MODEL.to_vec();
-            env.push(("PATH", e.as_str()));
-            atomic(&d, &p, &["runs", "resume", "two-1"], &env, "")
-        })
-        .await
-        .expect("child");
-        assert!(out.status.success(), "{}", text(&out));
+        let started = Instant::now();
+        while rt.status("two-1").await.expect("status") != Some(RunStatus::Succeeded) {
+            assert!(
+                started.elapsed() < Duration::from_secs(90),
+                "serve never tried the sandbox again: {}",
+                std::fs::read_to_string(&log).unwrap_or_default()
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        let text_log = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(text_log.contains("the sandbox starts again"), "{text_log}");
+        terminate(&serve);
+        let status = tokio::task::spawn_blocking(move || wait_child(&mut serve, "serve"))
+            .await
+            .expect("child");
+        assert!(
+            status.success(),
+            "{}",
+            std::fs::read_to_string(&log).unwrap_or_default()
+        );
         assert_eq!(steps_log(&dir), ["first start", "first end", "second"]);
     });
 }
