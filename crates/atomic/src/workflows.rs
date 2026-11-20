@@ -117,6 +117,8 @@ pub fn atom_failure(e: AtomError) -> DurableError {
                 "atomic: stopping without recording an outcome; resume the run where the sandbox \
                  can start"
             );
+            // Whatever else this process started ends first.
+            atomic_exec::process::end_all(&mut |what| atomic_core::log_line!("atomic: {what}"));
             std::process::exit(UNCONFINABLE_EXIT);
         }
         // Like a crash before the checkpoint: recovery runs the step again,

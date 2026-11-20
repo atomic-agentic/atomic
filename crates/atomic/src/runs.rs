@@ -448,11 +448,8 @@ async fn stop(signals: &mut Signals, who: &str, exit: Exit) -> ! {
     // recorded: this process exits first.
     // It returns once every process this one started has ended, so the
     // execution lock, which goes with this process, outlasts them all.
-    let stopped = atomic_exec::process::stop_all(&mut |left| {
-        atomic_core::log_line!(
-            "{who}: processes {left:?} of stopped commands have not ended yet; the execution lock \
-             stays held until they do"
-        );
+    let stopped = atomic_exec::process::stop_all(&mut |what| {
+        atomic_core::log_line!("{who}: {what}");
     });
     if stopped > 0 {
         atomic_core::log_line!(
@@ -481,6 +478,8 @@ async fn stop(signals: &mut Signals, who: &str, exit: Exit) -> ! {
             atomic_core::log_line!("{who}: {again}: stopping now, without sending the last spans");
         }
     }
+    // Once more, for what started since, such as a model turn's command.
+    atomic_exec::process::end_all(&mut |what| atomic_core::log_line!("{who}: {what}"));
     // Exit here, not by returning: the runtime would wait for the blocked
     // threads of the stopped commands, which never return.
     std::process::exit(match exit {

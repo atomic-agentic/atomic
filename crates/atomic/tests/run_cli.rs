@@ -3186,12 +3186,14 @@ fn serve_stopped_mid_command_holds_the_lock_until_it_exits_and_runs_nothing_twic
 }
 
 /// The slow command made stubborn: it and the grandchild it starts ignore
-/// SIGTERM, and the grandchild leaves its process group and session.
+/// SIGTERM, and the grandchild leaves its process group and session and
+/// holds a gigabyte it has written, which takes the kernel a while to free
+/// once it is killed, so a process that exits before it has ended is seen.
 const STUBBORN: &str = "import json, os, signal, subprocess, sys, time\n\
     signal.signal(signal.SIGTERM, signal.SIG_IGN)\n\
     note = json.load(sys.stdin)\n\
     log = sys.argv[1]\n\
-    child = subprocess.Popen(['python3', '-c', 'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)', log], start_new_session=True)\n\
+    child = subprocess.Popen(['python3', '-c', 'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); held = bytearray(1 << 30); held[::4096] = b\\'x\\' * (1 << 18); time.sleep(60)', log], start_new_session=True)\n\
     open(log, 'a').write('start\\n')\n\
     time.sleep(60)\n\
     open(log, 'a').write('end\\n')\n\
@@ -3204,10 +3206,9 @@ const STUBBORN: &str = "import json, os, signal, subprocess, sys, time\n\
 /// a process alive after a probe that found the lock free was alive
 /// during it.
 // needs_sandbox
-#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 #[test]
 fn serve_holds_the_lock_until_every_process_of_a_stopped_command_has_ended() {
-    #[cfg(target_os = "linux")]
     support::require_sandbox();
     for runner in ["local", "process"] {
         let dir = scratch(&format!("serve-stubborn-{runner}"));
@@ -3243,6 +3244,7 @@ fn serve_holds_the_lock_until_every_process_of_a_stopped_command_has_ended() {
             std::thread::sleep(Duration::from_millis(50));
         };
         terminate(&serve);
+        let stopping = Instant::now();
         let status = loop {
             let held = lock_held(&state);
             let running: Vec<&String> = pids.iter().filter(|pid| alive(pid)).collect();
@@ -3254,6 +3256,11 @@ fn serve_holds_the_lock_until_every_process_of_a_stopped_command_has_ended() {
             if let Some(status) = serve.try_wait().expect("wait") {
                 break status;
             }
+            assert!(
+                stopping.elapsed() < Duration::from_secs(30),
+                "{runner}: serve did not stop: {}",
+                text()
+            );
             std::thread::sleep(Duration::from_millis(20));
         };
         assert!(

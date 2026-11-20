@@ -314,7 +314,8 @@ impl Git {
             })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = command.spawn()?;
+        // Atomic's own: stopping waits for it rather than kill it mid-commit.
+        let (mut child, _own) = atomic_exec::process::spawn_own_tool(&mut command)?;
         if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
             // On its own thread, so that git filling stdout cannot stall it,
             // nor it git.

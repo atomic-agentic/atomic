@@ -3,14 +3,15 @@
 //! Stopping a process that ran commands ends every process those commands
 //! started before it returns, one that left the command's process group
 //! and session and ignores SIGTERM included, so nothing a stopped command
-//! started outlives the process, or the lock it holds.
+//! started outlives the process, or the lock it holds. One of atomic's own
+//! tools, such as its git, is let finish instead.
 //!
 //! In a test binary of its own: once stopped, this process starts nothing
 //! more.
 #![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used)]
 
-use atomic_exec::process::{Limits, run, stop_all};
+use atomic_exec::process::{Limits, run, spawn_own_tool, stop_all};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -71,10 +72,35 @@ fn stopping_ends_every_process_a_command_started_before_it_returns() {
         std::thread::sleep(Duration::from_millis(20));
     };
     assert!(alive(&pid), "the grandchild runs before the stop");
+    // One of atomic's own tools, which takes a moment to finish its work.
+    let done = dir.join("tool-done");
+    let (mut tool, own) = spawn_own_tool(std::process::Command::new("/bin/sh").args([
+        "-c",
+        &format!("trap '' TERM; sleep 1; touch {}", done.display()),
+    ]))
+    .unwrap();
+    // And a process started while the stop waits for the tool, as a model
+    // turn's command may be: killed on sight.
+    let late = std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_millis(400));
+        std::process::Command::new("/bin/sleep")
+            .arg("300")
+            .spawn()
+            .unwrap()
+    });
     let mut reported = Vec::new();
-    let stopped = stop_all(&mut |left| reported.push(left.to_vec()));
+    let stopped = stop_all(&mut |what| reported.push(what.to_owned()));
+    assert!(done.exists(), "the tool was killed, not let finish");
+    let mut late = late.join().unwrap();
+    let late_pid = late.id().to_string();
+    assert!(
+        !alive(&late_pid) || late.try_wait().unwrap().is_some(),
+        "process {late_pid}, started during the stop, outlived it"
+    );
     assert_eq!(stopped, 1, "one command was running");
     assert!(!alive(&pid), "process {pid} outlived the stop");
+    assert!(tool.wait().unwrap().success());
+    drop(own);
     assert!(
         reported.is_empty(),
         "nothing outlived its kill: {reported:?}"

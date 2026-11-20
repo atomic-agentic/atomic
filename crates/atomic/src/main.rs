@@ -196,6 +196,7 @@ fn main() -> std::process::ExitCode {
 async fn flush_spans() {
     if atomic_app::telemetry::flush_unless_signalled().await {
         atomic_core::log_line!("stopping now, without sending the last spans");
+        atomic_exec::process::end_all(&mut |what| atomic_core::log_line!("atomic: {what}"));
         std::process::exit(130);
     }
 }
@@ -282,12 +283,16 @@ fn real_main() -> anyhow::Result<()> {
             Ok(state) => run(cli, paths, state).await,
             Err(e) => Err(e),
         };
+        // Nothing this process started outlives it, or the execution lock it
+        // may hold, however the command ends.
         if let Err(e) = outcome {
             failure::report(&failure::analyze(&e), json);
             flush_spans().await;
+            atomic_exec::process::end_all(&mut |what| atomic_core::log_line!("atomic: {what}"));
             std::process::exit(1);
         }
         flush_spans().await;
+        atomic_exec::process::end_all(&mut |what| atomic_core::log_line!("atomic: {what}"));
         Ok(())
     })
 }

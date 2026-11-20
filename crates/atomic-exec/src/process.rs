@@ -43,149 +43,453 @@ fn kill_group(group: u32) {
 /// never report how any of them ended, so no step records an outcome its
 /// own process did not reach. Returns how many were running.
 ///
-/// On Linux it returns only once every process this one started, directly
-/// or not, has ended: one in another process group or session, as a
-/// sandbox's command is, included. Each is stopped where it is, so none
-/// starts another while the rest are found, then killed, and waited for.
-/// While some outlive their kill, `report` is given their process ids
-/// after ten seconds and every thirty after that, and the wait goes on:
-/// the process, and any lock it holds, outlasts every command it stopped.
+/// On Linux it then ends every other process descending from this one, as
+/// [`end_all`] does, and returns only once they have ended.
 ///
-/// Call it, then exit. The steps that were running stay unfinished, and
-/// their attempt guards decide whether their commands may run again.
-pub fn stop_all(report: &mut dyn FnMut(&[u32])) -> usize {
+/// Call it, then exit, calling [`end_all`] just before. The steps that were
+/// running stay unfinished, and their attempt guards decide whether their
+/// commands may run again.
+pub fn stop_all(report: &mut dyn FnMut(&str)) -> usize {
     // Under the lock that spawning holds, so a process is either killed
     // here or never started.
     let running = RUNNING.lock().unwrap_or_else(|e| e.into_inner());
     STOPPING.store(true, Ordering::SeqCst);
+    // On Linux, everything is found and stopped before any group is killed:
+    // a process whose parent died first would have left this one's
+    // descendants, and not be found.
     #[cfg(target_os = "linux")]
-    let stopped = descendants::stop();
-    for group in running.iter() {
-        kill_group(*group);
-    }
-    #[cfg(target_os = "linux")]
-    descendants::kill_and_wait(&stopped, report);
+    descendants::end(&running, report);
     #[cfg(not(target_os = "linux"))]
-    let _ = report;
+    {
+        for group in running.iter() {
+            kill_group(*group);
+        }
+        let _ = report;
+    }
     running.len()
 }
 
-/// The processes this one started, directly or not, found through
-/// `/proc`: each known by its process id and when it started, which tells
-/// it from a later process given the same id.
+/// For a process that is about to exit: on Linux, end every process
+/// descending from this one that runs now or starts while this waits, found
+/// through `/proc`, one in another process group or session, as a sandbox's
+/// command is, included, and return once each has ended. Each found at
+/// first is stopped where it is, for at most a second of looking, so none
+/// starts another while the rest are found; then all are killed, and any
+/// found while this waits is killed on sight. Atomic's own tools, such as
+/// its git, are waited for, never killed. `report` is told what outlives
+/// its kill after ten seconds and every thirty after that, and the wait
+/// goes on, so the process, and any lock it holds, outlasts them all: only
+/// SIGKILL ends it. A process that left this one's descendants, as one that
+/// daemonizes outside a sandbox's process namespace does, is not found.
+/// Elsewhere than Linux it does nothing more than [`stop_all`]'s kill.
+pub fn end_all(report: &mut dyn FnMut(&str)) {
+    let _ = stop_all(report);
+}
+
+/// The processes of atomic's own tools, such as its git, which stopping
+/// waits for and never kills: a git killed mid-commit could leave its
+/// repository locked.
+static OWN_TOOLS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+/// A process [`spawn_own_tool`] started, counted as atomic's own until
+/// this is dropped.
+#[derive(Debug)]
+pub struct OwnTool(u32);
+
+impl Drop for OwnTool {
+    fn drop(&mut self) {
+        OWN_TOOLS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|pid| *pid != self.0);
+    }
+}
+
+/// Start `command` as one of atomic's own tools: a process that stopping
+/// waits for and never kills (see [`end_all`]). Started and counted under
+/// the lock stopping takes, so it is never found before it is counted.
+pub fn spawn_own_tool(
+    command: &mut std::process::Command,
+) -> std::io::Result<(std::process::Child, OwnTool)> {
+    let mut own = OWN_TOOLS.lock().unwrap_or_else(|e| e.into_inner());
+    let child = command.spawn()?;
+    let pid = child.id();
+    own.push(pid);
+    Ok((child, OwnTool(pid)))
+}
+
+/// The processes descending from this one, found through `/proc`: each
+/// known by its process id and when it started, which tells it from a
+/// later process given the same id.
 #[cfg(target_os = "linux")]
 mod descendants {
+    use super::OWN_TOOLS;
     use std::collections::{HashMap, HashSet};
+    use std::io::ErrorKind;
     use std::time::{Duration, Instant};
+
+    /// How long the processes found at first are stopped and looked for
+    /// again before all are killed.
+    const STOP_PHASE: Duration = Duration::from_secs(1);
+    /// When those still running are first reported, and how often after.
+    const FIRST_REPORT: Duration = Duration::from_secs(10);
+    const REPORT_EVERY: Duration = Duration::from_secs(30);
 
     /// A process, by its id and its start time in clock ticks after boot.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-    pub(super) struct Process {
+    struct Process {
         pid: libc::pid_t,
         started: u64,
     }
 
-    /// Its state, parent and start time, from `/proc/<pid>/stat`.
-    fn stat(pid: libc::pid_t) -> Option<(char, libc::pid_t, u64)> {
-        let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    /// What `/proc/<pid>/stat` says of a process.
+    struct Stat {
+        state: char,
+        parent: libc::pid_t,
+        started: u64,
+    }
+
+    /// Read `/proc/<pid>/stat`: `Ok(None)` when no such process is there.
+    fn stat(pid: libc::pid_t) -> std::io::Result<Option<Stat>> {
+        let text = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(text) => text,
+            Err(e)
+                if matches!(e.kind(), ErrorKind::NotFound)
+                    || e.raw_os_error() == Some(libc::ESRCH) =>
+            {
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
+        let bad =
+            || std::io::Error::new(ErrorKind::InvalidData, format!("/proc/{pid}/stat: {text}"));
         // After the command name, which may hold spaces and parentheses.
-        let fields: Vec<&str> = text.rsplit_once(')')?.1.split_whitespace().collect();
-        let state = fields.first()?.chars().next()?;
-        let parent = fields.get(1)?.parse().ok()?;
+        let fields: Vec<&str> = text
+            .rsplit_once(')')
+            .ok_or_else(bad)?
+            .1
+            .split_whitespace()
+            .collect();
+        let state = fields
+            .first()
+            .and_then(|f| f.chars().next())
+            .ok_or_else(bad)?;
+        let parent = fields.get(1).and_then(|f| f.parse().ok()).ok_or_else(bad)?;
         // Field 22 of the whole line; the 20th after the name.
-        let started = fields.get(19)?.parse().ok()?;
-        Some((state, parent, started))
+        let started = fields
+            .get(19)
+            .and_then(|f| f.parse().ok())
+            .ok_or_else(bad)?;
+        Ok(Some(Stat {
+            state,
+            parent,
+            started,
+        }))
     }
 
-    /// Whether `process` still runs: there, the same process, and neither
-    /// a zombie nor dead.
+    fn ended(state: char) -> bool {
+        matches!(state, 'Z' | 'X' | 'x')
+    }
+
+    /// Whether `process` may still run: there, the same process, and with a
+    /// thread that is neither a zombie nor dead. What cannot be read counts
+    /// as running.
     fn alive(process: &Process) -> bool {
-        stat(process.pid).is_some_and(|(state, _, started)| {
-            started == process.started && !matches!(state, 'Z' | 'X' | 'x')
-        })
+        match stat(process.pid) {
+            Ok(None) => false,
+            Ok(Some(stat)) if stat.started != process.started => false,
+            Ok(Some(stat)) if !ended(stat.state) => true,
+            // A leader that has exited while its other threads run shows as
+            // a zombie: look at each thread.
+            Ok(Some(_)) => match std::fs::read_dir(format!("/proc/{}/task", process.pid)) {
+                Ok(tasks) => tasks.flatten().any(|task| {
+                    match std::fs::read_to_string(task.path().join("stat")) {
+                        Ok(text) => text
+                            .rsplit_once(')')
+                            .and_then(|(_, rest)| rest.split_whitespace().next())
+                            .and_then(|f| f.chars().next())
+                            .is_none_or(|state| !ended(state)),
+                        Err(e) => e.kind() != ErrorKind::NotFound,
+                    }
+                }),
+                Err(e) => e.kind() != ErrorKind::NotFound,
+            },
+            Err(_) => true,
+        }
     }
 
-    /// Every process now running whose parents lead to this one.
-    fn found() -> Vec<Process> {
-        let mut children: HashMap<libc::pid_t, Vec<Process>> = HashMap::new();
-        for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
-            let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse().ok()) else {
+    /// Every process now running whose parents lead to this one, each
+    /// started no earlier than its parent, and those that cannot be read.
+    fn found(
+        report: &mut dyn FnMut(&str),
+        unreadable: &mut HashSet<libc::pid_t>,
+    ) -> Vec<(Process, libc::pid_t)> {
+        let me = libc::pid_t::try_from(std::process::id()).unwrap_or(0);
+        let mut children: HashMap<libc::pid_t, Vec<(Process, libc::pid_t)>> = HashMap::new();
+        let mut own_start = 0;
+        let entries = match std::fs::read_dir("/proc") {
+            Ok(entries) => entries,
+            Err(e) => {
+                report(&format!(
+                    "cannot list /proc, so the processes this one started cannot be found: {e}"
+                ));
+                return Vec::new();
+            }
+        };
+        for entry in entries.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|n| n.parse::<libc::pid_t>().ok())
+            else {
                 continue;
             };
-            if let Some((state, parent, started)) = stat(pid)
-                && !matches!(state, 'Z' | 'X' | 'x')
-            {
-                children
-                    .entry(parent)
-                    .or_default()
-                    .push(Process { pid, started });
+            match stat(pid) {
+                Ok(Some(stat)) if pid == me => own_start = stat.started,
+                Ok(Some(stat)) if !ended(stat.state) => {
+                    children.entry(stat.parent).or_default().push((
+                        Process {
+                            pid,
+                            started: stat.started,
+                        },
+                        stat.parent,
+                    ))
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    if unreadable.insert(pid) {
+                        report(&format!("cannot read process {pid} in /proc: {e}"));
+                    }
+                }
             }
         }
+        let mut starts: HashMap<libc::pid_t, u64> = HashMap::from([(me, own_start)]);
         let mut out = Vec::new();
-        let mut next = vec![libc::pid_t::try_from(std::process::id()).unwrap_or(0)];
+        let mut next = vec![me];
         while let Some(parent) = next.pop() {
-            for child in children.remove(&parent).unwrap_or_default() {
+            let parent_started = starts.get(&parent).copied().unwrap_or(0);
+            for (child, _) in children.remove(&parent).unwrap_or_default() {
+                // A process older than its parent had a parent once given the
+                // same id: not this one's.
+                if child.started < parent_started {
+                    continue;
+                }
+                starts.insert(child.pid, child.started);
                 next.push(child.pid);
-                out.push(child);
+                out.push((child, parent));
             }
         }
         out
     }
 
-    /// Send `signal` to `process` if it is still the same process.
+    /// The processes of atomic's own tools, and every process they started.
+    fn own(found: &[(Process, libc::pid_t)], tools: &[u32]) -> HashSet<Process> {
+        let mut own: HashSet<libc::pid_t> = tools
+            .iter()
+            .filter_map(|pid| libc::pid_t::try_from(*pid).ok())
+            .collect();
+        let mut out = HashSet::new();
+        // `found` lists parents before their children.
+        for (process, parent) in found {
+            if own.contains(&process.pid) || own.contains(parent) {
+                own.insert(process.pid);
+                out.insert(*process);
+            }
+        }
+        out
+    }
+
+    /// Send `signal` to `process` if it is still the same process, through
+    /// a process file descriptor where there is one, so that a process
+    /// given its id since cannot get it.
     fn signal(process: &Process, signal: libc::c_int) {
-        if stat(process.pid).is_some_and(|(_, _, started)| started == process.started) {
-            // SAFETY: kill only sends a signal.
-            #[allow(unsafe_code)]
-            unsafe {
+        let same = || {
+            stat(process.pid)
+                .ok()
+                .flatten()
+                .is_some_and(|s| s.started == process.started)
+        };
+        // SAFETY: the syscalls take plain integers and a null pointer, and
+        // the descriptor opened is closed here.
+        #[allow(unsafe_code)]
+        unsafe {
+            let fd = libc::syscall(libc::SYS_pidfd_open, process.pid, 0);
+            if fd >= 0 {
+                if same() {
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal,
+                        fd,
+                        signal,
+                        std::ptr::null::<libc::siginfo_t>(),
+                        0,
+                    );
+                }
+                libc::close(fd as libc::c_int);
+            } else if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOSYS) && same()
+            {
                 libc::kill(process.pid, signal);
             }
         }
     }
 
-    /// Stop every process this one started, directly or not, where it is,
-    /// looking again until no new one appears: a stopped process starts
-    /// nothing more.
-    pub(super) fn stop() -> Vec<Process> {
-        let mut stopped: HashSet<Process> = HashSet::new();
+    /// Stop what `find` finds with `stop`, looking again until nothing new
+    /// appears or `limit` is up, whichever is first: processes that keep
+    /// starting others cannot hold the stop. Returns what was stopped, and
+    /// whether nothing new appeared before the limit.
+    fn stop_phase<P: Copy + Eq + std::hash::Hash>(
+        find: &mut dyn FnMut() -> Vec<P>,
+        stop: &mut dyn FnMut(&P),
+        limit: Duration,
+    ) -> (HashSet<P>, bool) {
+        let begun = Instant::now();
+        let mut stopped = HashSet::new();
         loop {
-            let new: Vec<Process> = found()
+            let new: Vec<P> = find()
                 .into_iter()
                 .filter(|p| !stopped.contains(p))
                 .collect();
             if new.is_empty() {
-                break;
+                return (stopped, true);
             }
             for process in new {
-                signal(&process, libc::SIGSTOP);
+                stop(&process);
                 stopped.insert(process);
             }
+            if begun.elapsed() >= limit {
+                return (stopped, false);
+            }
         }
-        stopped.into_iter().collect()
     }
 
-    /// Kill each of `stopped` and wait until none runs, giving `report` the
-    /// ids of those still running after ten seconds and every thirty after.
-    pub(super) fn kill_and_wait(stopped: &[Process], report: &mut dyn FnMut(&[u32])) {
-        for process in stopped {
+    /// See [`super::end_all`].
+    pub(super) fn end(groups: &[u32], report: &mut dyn FnMut(&str)) {
+        // Held throughout: atomic's own tools start before this or after.
+        let tools = OWN_TOOLS.lock().unwrap_or_else(|e| e.into_inner());
+        let me = std::process::id().to_string();
+        if std::fs::read_link("/proc/self")
+            .ok()
+            .and_then(|p| p.to_str().map(str::to_owned))
+            != Some(me)
+        {
+            for group in groups {
+                super::kill_group(*group);
+            }
+            report(
+                "this process's /proc is not its own, so the processes it started cannot be \
+                 found; only their process groups were killed",
+            );
+            return;
+        }
+        let mut unreadable = HashSet::new();
+        let begun = Instant::now();
+        let (mut watched, settled) = stop_phase(
+            &mut || {
+                let all = found(report, &mut unreadable);
+                let own = own(&all, &tools);
+                all.into_iter()
+                    .map(|(p, _)| p)
+                    .filter(|p| !own.contains(p))
+                    .collect()
+            },
+            &mut |process| signal(process, libc::SIGSTOP),
+            STOP_PHASE,
+        );
+        if !settled {
+            report(&format!(
+                "the processes of stopped commands were still starting others after {}s; \
+                 killing the {} found, and any that start, as they are found",
+                STOP_PHASE.as_secs(),
+                watched.len()
+            ));
+        }
+        for group in groups {
+            super::kill_group(*group);
+        }
+        for process in &watched {
             signal(process, libc::SIGKILL);
         }
-        let begun = Instant::now();
-        let mut next = Duration::from_secs(10);
+        // Wait, killing whatever appears, until nothing descending from
+        // this one runs.
+        let mut next = FIRST_REPORT;
         loop {
-            let left: Vec<u32> = stopped
+            let all = found(report, &mut unreadable);
+            let own = own(&all, &tools);
+            for (process, _) in all.iter().filter(|(p, _)| !own.contains(p)) {
+                if watched.insert(*process) {
+                    signal(process, libc::SIGKILL);
+                }
+            }
+            let left: Vec<libc::pid_t> = watched
                 .iter()
+                .chain(&own)
                 .filter(|p| alive(p))
-                .filter_map(|p| u32::try_from(p.pid).ok())
+                .map(|p| p.pid)
                 .collect();
             if left.is_empty() {
                 return;
             }
             if begun.elapsed() >= next {
-                report(&left);
-                next += Duration::from_secs(30);
+                report(&format!(
+                    "processes {left:?} of stopped commands, or of atomic's own tools, have not \
+                     ended yet; the execution lock stays held until they do, and only SIGKILL \
+                     ends this wait"
+                ));
+                next += REPORT_EVERY;
             }
             std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Run `stop_phase` with `find`, on a thread, giving it `within`.
+        fn bounded(
+            mut find: impl FnMut() -> Vec<u32> + Send + 'static,
+            limit: Duration,
+            within: Duration,
+        ) -> (HashSet<u32>, bool) {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = sender.send(stop_phase(&mut find, &mut |_| {}, limit));
+            });
+            receiver
+                .recv_timeout(within)
+                .unwrap_or_else(|_| panic!("the stop phase did not return in {within:?}"))
+        }
+
+        /// Processes that never stop starting others hold the stop no
+        /// longer than its limit; ones that settle are all stopped.
+        #[test]
+        fn the_stop_phase_is_bounded() {
+            let mut next = 0u32;
+            let (stopped, settled) = bounded(
+                move || {
+                    next += 1;
+                    vec![next]
+                },
+                Duration::from_millis(200),
+                Duration::from_secs(5),
+            );
+            assert!(stopped.len() > 1);
+            assert!(!settled, "it gave up looking");
+
+            let mut rounds = 0;
+            let (stopped, settled) = bounded(
+                move || {
+                    rounds += 1;
+                    if rounds < 3 {
+                        vec![1, 2, rounds + 10]
+                    } else {
+                        vec![1, 2]
+                    }
+                },
+                Duration::from_secs(60),
+                Duration::from_secs(5),
+            );
+            assert_eq!(stopped, HashSet::from([1, 2, 11, 12]));
+            assert!(settled);
         }
     }
 }
