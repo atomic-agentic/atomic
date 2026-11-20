@@ -169,10 +169,9 @@ impl BudgetPlan {
             Ok(())
         };
         for (atom, model) in &self.models {
-            let caps = self
-                .atoms
-                .get(atom)
-                .ok_or_else(|| format!("atom {atom} calls {model:?} and the plan has no caps for it"))?;
+            let caps = self.atoms.get(atom).ok_or_else(|| {
+                format!("atom {atom} calls {model:?} and the plan has no caps for it")
+            })?;
             settings
                 .check_room(caps, Level::Atom, model)
                 .map_err(|e| format!("atom {atom}: {e}"))?;

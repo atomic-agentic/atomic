@@ -501,8 +501,8 @@ async fn a_refusal_is_explained_by_the_state_it_refused<R: DurableRuntime>(rt: R
                 tokio::spawn(async move {
                     match ledger.admit(req).await.expect("admit") {
                         Admission::Admitted {
-            request, attempt, ..
-        } => {
+                            request, attempt, ..
+                        } => {
                             ledger
                                 .settle(
                                     &request,
@@ -546,7 +546,8 @@ async fn a_turn_reserves_the_active_time_left<R: DurableRuntime>(rt: R) {
     turn.chain[1].caps.millis = 20_000;
     turn.turn = true;
     // All the time the narrowest allowance has, not the call bound's.
-    let Admission::Admitted { millis, .. } = ledger.admit(turn.clone()).await.expect("admit") else {
+    let Admission::Admitted { millis, .. } = ledger.admit(turn.clone()).await.expect("admit")
+    else {
         panic!("admitted");
     };
     assert_eq!(millis, 20_000);
@@ -565,7 +566,8 @@ async fn a_turn_reserves_the_active_time_left<R: DurableRuntime>(rt: R) {
         .expect("settle");
     // The next turn gets what is left.
     turn.id = format!("{run}:1:1");
-    let Admission::Admitted { millis, .. } = ledger.admit(turn.clone()).await.expect("admit") else {
+    let Admission::Admitted { millis, .. } = ledger.admit(turn.clone()).await.expect("admit")
+    else {
         panic!("admitted");
     };
     assert_eq!(millis, 8_000);
@@ -610,7 +612,10 @@ async fn amounts_out_of_range_are_refused_and_reported_usage_is_held<R: DurableR
             millis: 1,
             micro_usd: None,
         };
-        assert!(ledger.raise(&format!("run:{run}"), caps).await.is_err(), "{bad}");
+        assert!(
+            ledger.raise(&format!("run:{run}"), caps).await.is_err(),
+            "{bad}"
+        );
     }
     // Usage past MOST, or below zero, is held to [0, MOST].
     ledger

@@ -464,7 +464,12 @@ impl BudgetSettings {
     }
 
     /// Refuse `caps` at `level` if one call to `model` cannot fit in them.
-    pub fn check_room(&self, caps: &Resolved, level: Level, model: &str) -> Result<(), BudgetError> {
+    pub fn check_room(
+        &self,
+        caps: &Resolved,
+        level: Level,
+        model: &str,
+    ) -> Result<(), BudgetError> {
         let call = self.reservation(model);
         let priced = self.pricing.get(model);
         let tokens_from = match (

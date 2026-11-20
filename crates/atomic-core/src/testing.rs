@@ -148,52 +148,53 @@ async fn serve(socket: &mut tokio::net::TcpStream, state: &Mutex<State>) -> std:
         let path = path.split('?').next().unwrap_or_default();
 
         let chat = path.ends_with("/chat/completions");
-        let (status, content_type, text) =
-            if method == "POST" && (chat || path.ends_with("/responses")) {
-                let request: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-                let reply = match state.lock() {
-                    Ok(mut s) => {
-                        let index = s.requests.len();
-                        s.requests.push(request.clone());
-                        s.paths.push(path.to_owned());
-                        s.script.get(index).cloned()
-                    }
-                    Err(_) => None,
-                };
-                let mut reply = reply.unwrap_or_else(|| Reply::Text("Synthetic reply.".into()));
-                while let Reply::Delayed { after, reply: then } = reply {
-                    tokio::time::sleep(after).await;
-                    reply = *then;
+        let (status, content_type, text) = if method == "POST"
+            && (chat || path.ends_with("/responses"))
+        {
+            let request: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            let reply = match state.lock() {
+                Ok(mut s) => {
+                    let index = s.requests.len();
+                    s.requests.push(request.clone());
+                    s.paths.push(path.to_owned());
+                    s.script.get(index).cloned()
                 }
-                let streaming = request.get("stream").and_then(Value::as_bool) != Some(false);
-                match &reply {
-                    Reply::Json(body) => ("200 OK".to_owned(), "application/json", body.to_string()),
-                    Reply::Http { status, body } => {
-                        (format!("{status} Error"), "application/json", body.clone())
-                    }
-                    _ if chat => (
-                        "200 OK".to_owned(),
-                        "application/json",
-                        chat_completion(&request, &reply).to_string(),
-                    ),
-                    _ if streaming => (
-                        "200 OK".to_owned(),
-                        "text/event-stream",
-                        stream(&request, &reply),
-                    ),
-                    _ => (
-                        "200 OK".to_owned(),
-                        "application/json",
-                        completed(&request, &reply).to_string(),
-                    ),
-                }
-            } else {
-                (
-                    "404 Not Found".to_owned(),
-                    "application/json",
-                    "{}".to_owned(),
-                )
+                Err(_) => None,
             };
+            let mut reply = reply.unwrap_or_else(|| Reply::Text("Synthetic reply.".into()));
+            while let Reply::Delayed { after, reply: then } = reply {
+                tokio::time::sleep(after).await;
+                reply = *then;
+            }
+            let streaming = request.get("stream").and_then(Value::as_bool) != Some(false);
+            match &reply {
+                Reply::Json(body) => ("200 OK".to_owned(), "application/json", body.to_string()),
+                Reply::Http { status, body } => {
+                    (format!("{status} Error"), "application/json", body.clone())
+                }
+                _ if chat => (
+                    "200 OK".to_owned(),
+                    "application/json",
+                    chat_completion(&request, &reply).to_string(),
+                ),
+                _ if streaming => (
+                    "200 OK".to_owned(),
+                    "text/event-stream",
+                    stream(&request, &reply),
+                ),
+                _ => (
+                    "200 OK".to_owned(),
+                    "application/json",
+                    completed(&request, &reply).to_string(),
+                ),
+            }
+        } else {
+            (
+                "404 Not Found".to_owned(),
+                "application/json",
+                "{}".to_owned(),
+            )
+        };
         let response = format!(
             "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\r\n{text}",
             text.len()

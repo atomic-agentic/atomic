@@ -1660,19 +1660,21 @@ fn a_pinned_budget_is_checked_before_the_run_uses_it() {
             ("broken", broken, "budget.call.minutes"),
             ("uncapped", uncapped, "no caps for it"),
         ] {
-            rt.start(PIPELINE, run, PipelineRun {
-                pipeline,
-                input: input.clone(),
-            })
+            rt.start(
+                PIPELINE,
+                run,
+                PipelineRun {
+                    pipeline,
+                    input: input.clone(),
+                },
+            )
             .await
             .expect("start");
             // Bounded: a plan let through could park the run instead.
-            let failed = tokio::time::timeout(
-                std::time::Duration::from_secs(60),
-                rt.result::<Value>(run),
-            )
-            .await
-            .expect("the run ended");
+            let failed =
+                tokio::time::timeout(std::time::Duration::from_secs(60), rt.result::<Value>(run))
+                    .await
+                    .expect("the run ended");
             assert!(
                 matches!(&failed, Err(atomic_durable::DurableError::Failed(m)) if m.contains(says)),
                 "{run}: {failed:?}"
@@ -1691,8 +1693,12 @@ fn a_stored_budget_plan_reads_past_fields_a_later_version_adds() {
     let dir = scratch("plan-later");
     let project = project(&dir);
     let mut pipeline = load(&project, "later.workflow.yaml", TRIAGE);
-    pin_budgets(&mut pipeline, &runtimes(&dir, "http://127.0.0.1:9/v1"), &small_calls())
-        .expect("pinned");
+    pin_budgets(
+        &mut pipeline,
+        &runtimes(&dir, "http://127.0.0.1:9/v1"),
+        &small_calls(),
+    )
+    .expect("pinned");
     let plan = pipeline.budgets.expect("a plan");
     let mut stored = serde_json::to_value(&plan).expect("encode");
     stored["later"] = json!(1);
@@ -1766,8 +1772,7 @@ fn a_budget_refusal_in_a_worktree_step_parks_the_run() {
             .await
             .expect("steps")
             .into_iter()
-            .filter(|s| s.name == "fix.turn")
-            .last()
+            .rfind(|s| s.name == "fix.turn")
             .and_then(|s| s.output)
             .expect("the re-run turn");
         let commit = turn["Candidate"]["proposal"]["metadata"]["commit"]

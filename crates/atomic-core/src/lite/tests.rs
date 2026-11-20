@@ -530,8 +530,16 @@ fn the_output_limit_goes_in_the_field_its_endpoint_reads() {
     use LimitField::*;
     for (wire, base, field) in [
         (Wire::ChatCompletions, "http://127.0.0.1:8080/v1", MaxTokens),
-        (Wire::ChatCompletions, "http://localhost:11434/v1", MaxTokens),
-        (Wire::ChatCompletions, "https://api.openai.com/v1", MaxCompletionTokens),
+        (
+            Wire::ChatCompletions,
+            "http://localhost:11434/v1",
+            MaxTokens,
+        ),
+        (
+            Wire::ChatCompletions,
+            "https://api.openai.com/v1",
+            MaxCompletionTokens,
+        ),
         (
             Wire::ChatCompletions,
             "https://example.openai.azure.com/openai/v1",
@@ -542,10 +550,18 @@ fn the_output_limit_goes_in_the_field_its_endpoint_reads() {
             "https://example.cognitiveservices.azure.com/openai/v1",
             MaxCompletionTokens,
         ),
-        (Wire::Responses, "https://api.openai.com/v1", MaxOutputTokens),
+        (
+            Wire::Responses,
+            "https://api.openai.com/v1",
+            MaxOutputTokens,
+        ),
         (Wire::Responses, "http://127.0.0.1:8080/v1", MaxOutputTokens),
     ] {
-        assert_eq!(LimitField::for_endpoint(wire, base), field, "{wire:?} {base}");
+        assert_eq!(
+            LimitField::for_endpoint(wire, base),
+            field,
+            "{wire:?} {base}"
+        );
     }
     assert_eq!(MaxCompletionTokens.name(), "max_completion_tokens");
 }
@@ -566,7 +582,10 @@ async fn a_judged_answer_still_settles_the_usage_it_reported() {
             .expect("fake model");
         let mut rt = runtime(&model, Wire::ChatCompletions);
         let recorder = metered(&mut rt, Limit::default());
-        assert!(run_lite_atom(&Classify, &note(), &rt).await.is_err(), "{body}");
+        assert!(
+            run_lite_atom(&Classify, &note(), &rt).await.is_err(),
+            "{body}"
+        );
         assert_eq!(
             settled(&recorder),
             [Outcome::Reported(Usage {
@@ -603,7 +622,10 @@ async fn an_answer_cut_off_at_its_output_limit_is_its_own_error_with_no_repair()
         let recorder = metered(&mut rt, Limit::default());
         match run_lite_atom(&Classify, &note(), &rt).await {
             Err(AtomError::Model(message)) => {
-                assert!(message.contains("cut off at the call's output limit"), "{message}");
+                assert!(
+                    message.contains("cut off at the call's output limit"),
+                    "{message}"
+                );
             }
             other => panic!("{wire:?}: expected a truncation error, got {other:?}"),
         }
