@@ -6,7 +6,7 @@ fn store() -> (LocalStore, PathBuf) {
     let dir = std::env::temp_dir().join(format!(
         "atomic-artifacts-{}-{}-{}",
         std::process::id(),
-        STAGING_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        random_name().expect("a name"),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -152,6 +152,138 @@ fn a_reference_to_a_missing_artifact_fails_validation() {
         Err(ArtifactCheckError::WrongMediaType { ref expected, .. }) if expected == "text/x-diff"
     ));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_stored_blob_is_read_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let (s, dir) = store();
+    let m = s.put(&mut &b"content"[..], provenance("a")).expect("put");
+    let mode = std::fs::metadata(s.blob_path(&m.artifact))
+        .expect("blob")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o444);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A blob changed under its digest (through a link a command was given,
+/// say) is replaced by the next honest put, and reading it fails until then.
+#[cfg(unix)]
+#[test]
+fn a_damaged_blob_is_refused_on_read_and_replaced_by_an_honest_put() {
+    use std::os::unix::fs::PermissionsExt;
+    let (s, dir) = store();
+    let m = s.put(&mut &b"content"[..], provenance("a")).expect("put");
+    let blob = s.blob_path(&m.artifact);
+    std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+    std::fs::write(&blob, b"content and more").expect("damage");
+    let mut read = Vec::new();
+    let e = s
+        .open(&m.artifact)
+        .expect("open")
+        .read_to_end(&mut read)
+        .expect_err("a damaged blob fails at its end");
+    assert_eq!(e.kind(), std::io::ErrorKind::InvalidData, "{e}");
+    s.put(&mut &b"content"[..], provenance("b"))
+        .expect("put again");
+    let mut read = Vec::new();
+    s.open(&m.artifact)
+        .expect("open")
+        .read_to_end(&mut read)
+        .expect("whole again");
+    assert_eq!(read, b"content");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A read into an empty buffer is not the end of a blob.
+#[test]
+fn an_empty_read_of_a_healthy_blob_succeeds() {
+    let (s, dir) = store();
+    let m = s.put(&mut &b"content"[..], provenance("a")).expect("put");
+    let mut reader = s.open(&m.artifact).expect("open");
+    assert_eq!(reader.read(&mut []).expect("an empty read"), 0);
+    let mut read = Vec::new();
+    reader.read_to_end(&mut read).expect("whole");
+    assert_eq!(read, b"content");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Each store's id, from the owners it has taken.
+fn owner_ids(dir: &Path) -> Vec<String> {
+    std::fs::read_dir(dir.join("artifact-owners"))
+        .expect("owners")
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect()
+}
+
+/// A read-only file left in staging, as a process killed mid-write leaves
+/// one, under the name the store would pick next, does not stop later
+/// writes.
+#[cfg(unix)]
+#[test]
+fn a_leftover_in_staging_does_not_stop_later_writes() {
+    use std::os::unix::fs::PermissionsExt;
+    let (s, dir) = store();
+    let [id] = &owner_ids(&dir)[..] else {
+        panic!("one owner")
+    };
+    // Every name the old scheme gave, and a few of this store's own.
+    for name in (0..20)
+        .map(|i| format!("{}-{i}", std::process::id()))
+        .chain((0..20).map(|i| format!("{id}-{i}")))
+        .chain(["0".repeat(32)].into_iter().map(|r| format!("{id}-{r}")))
+    {
+        let path = dir.join("staging").join(name);
+        std::fs::write(&path, b"left").expect("leftover");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).expect("chmod");
+    }
+    for i in 0..20 {
+        s.put(&mut format!("content {i}").as_bytes(), provenance("make"))
+            .expect("a later write");
+    }
+}
+
+/// Opening a store removes what a dead store left in staging once it is
+/// old enough, and nothing of a live store's.
+#[test]
+fn opening_a_store_sweeps_only_dead_stores_leftovers() {
+    let (live, dir) = store();
+    let [live_id] = &owner_ids(&dir)[..] else {
+        panic!("one owner")
+    };
+    let live_id = live_id.clone();
+    // A store that died: its owner file is there, and no one holds it.
+    let dead_id = "d".repeat(32);
+    std::fs::write(dir.join("artifact-owners").join(&dead_id), b"").expect("dead owner");
+    let leftovers = [
+        format!("{dead_id}-1"),
+        format!("{}-7", std::process::id()),
+        format!("{live_id}-1"),
+    ];
+    for name in &leftovers {
+        std::fs::write(dir.join("staging").join(name), b"left").expect("leftover");
+    }
+    let staged = |name: &str| dir.join("staging").join(name).exists();
+    // Too new to judge: kept.
+    let again = LocalStore::open(&dir).expect("open again");
+    assert!(leftovers.iter().all(|n| staged(n)), "a new file was swept");
+    assert!(
+        dir.join("artifact-owners").join(&dead_id).exists(),
+        "a new owner was judged"
+    );
+    drop(again);
+    // Old enough: the dead store's go, with its owner, and the live one's
+    // stay.
+    let swept = LocalStore::open_with_grace(&dir, std::time::Duration::ZERO).expect("sweep");
+    assert!(!staged(&leftovers[0]), "the dead store's file was kept");
+    assert!(!staged(&leftovers[1]), "an ownerless file was kept");
+    assert!(staged(&leftovers[2]), "the live store's file was swept");
+    assert!(!dir.join("artifact-owners").join(&dead_id).exists());
+    assert!(dir.join("artifact-owners").join(&live_id).exists());
+    drop((swept, live));
 }
 
 #[test]
@@ -435,4 +567,56 @@ fn a_refresh_says_whether_it_marked_found_nothing_or_was_held_off() {
     assert_eq!(store.refresh(&a).expect("refresh"), Refreshed::Held);
     drop(holder);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A sweep leaves what an open store has staged, however old, and clears
+/// what a store that is gone left.
+#[test]
+fn a_sweep_leaves_an_open_stores_partial_writes() {
+    let (s, dir) = store();
+    let in_flight = s.stage(&mut &b"in flight"[..]).expect("stage");
+    std::fs::write(
+        dir.join("staging").join(format!("{}-1", "e".repeat(32))),
+        b"half",
+    )
+    .expect("a gone store's partial write");
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3600 * 24);
+    let swept = s
+        .sweep(&BTreeSet::new(), Grace::none_for_tests(), later)
+        .expect("sweep");
+    assert_eq!(swept.partial, 1, "{swept:?}");
+    assert!(
+        in_flight.path.exists(),
+        "an open store's partial write was swept"
+    );
+    let m = s
+        .commit(in_flight, &[provenance("late")])
+        .expect("committed after the sweep");
+    assert!(s.contains(&m[0].artifact).expect("contains"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A blob committed after a sweep began reading what to keep is kept, however
+/// long before it was staged: a gather may stage for a long time before it
+/// commits.
+#[test]
+fn a_blob_committed_after_a_sweep_began_reading_is_kept() {
+    let (s, dir) = store();
+    let staged = s.stage(&mut &b"staged long ago"[..]).expect("stage");
+    let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    std::fs::File::open(&staged.path)
+        .and_then(|f| f.set_modified(long_ago))
+        .expect("backdate");
+    let read_at = std::time::SystemTime::now();
+    let m = s.commit(staged, &[provenance("late")]).expect("commit");
+    let swept = s
+        .sweep(
+            &BTreeSet::new(),
+            Grace::at_least(std::time::Duration::from_secs(60)),
+            read_at,
+        )
+        .expect("sweep");
+    assert!(swept.removed.is_empty(), "{swept:?}");
+    assert!(s.contains(&m[0].artifact).expect("contains"));
+    let _ = std::fs::remove_dir_all(dir);
 }
