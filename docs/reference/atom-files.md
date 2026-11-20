@@ -298,13 +298,25 @@ and history files of bash, zsh and fish, among others. They are denied
 under `$HOME` and under the home directory the system records for your user,
 wherever the variables that move them (`XDG_CONFIG_HOME`, `ZDOTDIR`,
 `HISTFILE`, `GNUPGHOME`, `CARGO_HOME`, `DOCKER_CONFIG`, the AWS file
-variables, `KUBECONFIG` and others) put them, and a link among them is
-denied as what it points at, followed up to four links deep. The model
-chooses the commands, so none of these reach it through them. atomic makes
-the list when the turn starts: a place on it that appears while a command
-runs is denied only to later commands, and a link made after the list is not
+variables, `KUBECONFIG` and others) put them, and a link among them, up to
+four directory levels inside a denied directory, is denied as the file or
+directory it points at, when that is yours and outside the system's
+directories: a history file linked to `/dev/null`, or a tool linked to the
+system's `python3`, stays usable. A turn does not start when a denial would
+cover its working directory or a directory it may write, or when a linked
+secret lies inside a directory it may write. The model chooses the
+commands, so none of these reach it through them. atomic makes the list
+when the turn starts: a place on it that appears while a command runs is
+denied only to later commands, and a link made after the list is not
 followed until the next turn. Credentials kept anywhere else are not
 covered.
+
+Cargo's own configuration (`.cargo/config.toml`) is not denied, since cargo
+reads it in every directory above a project: a registry token kept there,
+rather than in `credentials.toml` where `cargo login` writes it, is not
+protected. `.npmrc`, Maven's `settings.xml` and Gradle's
+`gradle.properties` are denied, so npm, Maven or Gradle pointed at your real
+home directory fails to read them.
 
 Anything that finds its files through your home directory does not find
 them: rustup's and cargo's homes (`~/.rustup`, `~/.cargo`), the Go module

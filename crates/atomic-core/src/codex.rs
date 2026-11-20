@@ -183,8 +183,6 @@ pub const HOME_SECRETS: &[&str] = &[
     ".config/gh",
     ".cargo/credentials",
     ".cargo/credentials.toml",
-    ".cargo/config",
-    ".cargo/config.toml",
     ".m2/settings.xml",
     ".gradle/gradle.properties",
     ".gem/credentials",
@@ -234,10 +232,7 @@ const MOVED_SECRETS: &[(&str, &[&str])] = &[
     ),
     ("HISTFILE", &[""]),
     ("GNUPGHOME", &[""]),
-    (
-        "CARGO_HOME",
-        &["credentials", "credentials.toml", "config", "config.toml"],
-    ),
+    ("CARGO_HOME", &["credentials", "credentials.toml"]),
     ("DOCKER_CONFIG", &["config.json"]),
     ("AWS_SHARED_CREDENTIALS_FILE", &[""]),
     ("AWS_CONFIG_FILE", &[""]),
@@ -253,7 +248,7 @@ const MOVED_SECRETS: &[(&str, &[&str])] = &[
 /// both, when they differ, so overriding `HOME` hides nothing. An error,
 /// so nothing runs, when neither is an absolute path.
 pub fn real_homes(
-    env: &dyn Fn(&str) -> Option<String>,
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
     passwd: Option<PathBuf>,
 ) -> Result<Vec<PathBuf>, String> {
     let mut homes: Vec<PathBuf> = env("HOME")
@@ -282,7 +277,7 @@ pub fn real_homes(
 /// `.config/`, `.local/share/` and `.cache/` where the XDG variables move
 /// them too, and what the variables that move a credential name.
 pub fn home_secrets(
-    env: &dyn Fn(&str) -> Option<String>,
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
     passwd: Option<PathBuf>,
 ) -> Result<Vec<PathBuf>, String> {
     let absolute = |name: &str| env(name).map(PathBuf::from).filter(|p| p.is_absolute());
@@ -349,11 +344,7 @@ impl StateGuard {
         // and the credential places atomic's own environment moves; none is
         // made, and with no home known nothing runs.
         also.extend(
-            home_secrets(
-                &|name| std::env::var(name).ok(),
-                crate::state::passwd_home(),
-            )
-            .map_err(anyhow::Error::msg)?,
+            home_secrets(&person_env, crate::state::passwd_home()).map_err(anyhow::Error::msg)?,
         );
         // With ATOMIC_HOME set, the default home's state, credentials and
         // keys are another atomic's: denied too, where they exist.
@@ -372,13 +363,51 @@ impl StateGuard {
     }
 }
 
-/// How deep inside a denied directory links are followed to the files and
-/// directories they point at, which are denied too.
+/// The person's `CODEX_HOME`, as the process was started with it, before
+/// [`dispatch`] points it at atomic's own.
+static PERSON_CODEX_HOME: std::sync::OnceLock<Option<std::ffi::OsString>> =
+    std::sync::OnceLock::new();
+
+/// The person's environment, as atomic was started with it: `CODEX_HOME`
+/// as it was before [`dispatch`] replaced it.
+fn person_env(name: &str) -> Option<std::ffi::OsString> {
+    match (name, PERSON_CODEX_HOME.get()) {
+        ("CODEX_HOME", Some(theirs)) => theirs.clone(),
+        _ => std::env::var_os(name),
+    }
+}
+
+/// How many directory levels inside a denied directory links are followed
+/// to the files and directories they point at, which are denied too.
 const LINK_DEPTH: usize = 4;
 
-/// The real files and directories that links up to [`LINK_DEPTH`] levels
-/// inside `dir` point at. Links to directories are not walked into.
-fn link_targets(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+/// The most link targets denied besides the fixed places. The whole list
+/// goes to the sandbox helper in one argument, which has a size limit, so
+/// past this nothing runs.
+const MAX_LINK_TARGETS: usize = 512;
+
+/// Where the system keeps what every command needs: a link into one of
+/// these is never followed to deny its target.
+const SYSTEM_PREFIXES: &[&str] = &[
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib32",
+    "/lib64",
+    "/libx32",
+    "/etc",
+    "/opt",
+    "/nix/store",
+    "/dev",
+    "/proc",
+    "/sys",
+    "/run",
+];
+
+/// The links up to [`LINK_DEPTH`] directory levels inside `dir`. Links to
+/// directories are not walked into.
+fn links_in(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     if depth == 0 {
         return;
     }
@@ -387,13 +416,36 @@ fn link_targets(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
             continue;
         };
         if kind.is_symlink() {
-            if let Ok(target) = std::fs::canonicalize(entry.path()) {
-                out.push(target);
-            }
+            out.push(entry.path());
         } else if kind.is_dir() {
-            link_targets(&entry.path(), depth - 1, out);
+            links_in(&entry.path(), depth - 1, out);
         }
     }
+}
+
+/// What a link or a variable resolved to, if it should be denied: only a
+/// regular file or a directory, the person's own, outside the system's
+/// directories. A history file linked to `/dev/null`, or a tool linked to
+/// the system's `python3`, is left alone, since denying it would break
+/// every command.
+fn deniable(target: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(target) else {
+        return false;
+    };
+    if !(meta.is_file() || meta.is_dir()) {
+        return false;
+    }
+    if SYSTEM_PREFIXES.iter().any(|p| target.starts_with(p)) {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.uid() != crate::state::effective_uid() {
+            return false;
+        }
+    }
+    true
 }
 
 /// Every path a profile denies under `guard`, for a thread whose Codex home
@@ -409,25 +461,61 @@ fn link_targets(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
 /// inside a denied directory is denied too, such as a `config.yaml` linked
 /// to one kept elsewhere.
 ///
+/// A resolved target is denied only if [`deniable`]. Nothing runs when a
+/// denied path would cover what the thread needs (its working directory
+/// `cwd`, the directories it may write, `writable`, the state directory,
+/// its Codex home or atomic's own program), or when a link's target lies in
+/// a directory the thread may write, where a command could rename it out
+/// from under its denial.
+///
 /// The list is made when a thread starts. A path that does not exist then
 /// is denied only once it does, when a later command starts: one made while
 /// a command runs can be read by that command.
-fn denied_paths(private: &PrivateState, codex_home: &Path) -> (Vec<PathBuf>, Vec<String>) {
+fn denied_paths(
+    private: &PrivateState,
+    codex_home: &Path,
+    cwd: Option<&Path>,
+    writable: &[PathBuf],
+) -> anyhow::Result<(Vec<PathBuf>, Vec<String>)> {
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
+    let writable: Vec<PathBuf> = writable.iter().map(|p| real(p)).collect();
+    // atomic's state holds what the thread may write (its worktrees,
+    // scratch and temporary directories): no denied link may point there.
+    let mut writable = writable;
+    writable.push(real(&private.state_dir));
+    let mut needed = writable.clone();
+    needed.extend(cwd.map(real));
+    needed.push(real(codex_home));
+    needed.extend(std::env::current_exe().ok().map(|p| real(&p)));
+    let covers = |denied: &Path| needed.iter().find(|n| n.starts_with(denied)).cloned();
     // Every project's private state, by one entry, however many projects
     // the home holds.
     let mut denied = vec![private.private.clone()];
-    // Never the thread's own Codex home whole, which its shell needs a part
-    // of, even if a variable such as CODEX_HOME names it as a credential
-    // directory; nor what its helper links point at, atomic's own program.
-    let also: Vec<&PathBuf> = private
-        .also
-        .iter()
-        .filter(|p| !codex_home.starts_with(p))
-        .collect();
-    denied.extend(also.iter().map(|p| (*p).clone()));
-    for dir in also {
-        link_targets(dir, LINK_DEPTH, &mut denied);
+    denied.extend(private.also.iter().cloned());
+    // Before anything is walked: a place that covers what the thread needs,
+    // such as a variable naming the root.
+    for path in &denied {
+        if let Some(needed) = covers(&real(path)).or_else(|| covers(path)) {
+            bail!(
+                "{} holds {}, which atoms' commands need, so atomic cannot deny it; check \
+                 the variables that name credential places, such as HISTFILE or CODEX_HOME",
+                path.display(),
+                needed.display()
+            );
+        }
     }
+    let mut links = Vec::new();
+    for dir in &private.also {
+        links_in(dir, LINK_DEPTH, &mut links);
+    }
+    if links.len() > MAX_LINK_TARGETS {
+        bail!(
+            "the places denied to atoms' commands hold {} links, more than the {MAX_LINK_TARGETS} \
+             atomic follows; remove some, or keep the files they point at inside those places",
+            links.len()
+        );
+    }
+    denied.extend(links);
     let children = |dir: &Path, keep: &str| -> Vec<PathBuf> {
         std::fs::read_dir(dir)
             .into_iter()
@@ -438,27 +526,74 @@ fn denied_paths(private: &PrivateState, codex_home: &Path) -> (Vec<PathBuf>, Vec
             .collect()
     };
     let arg0 = format!("arg0-{}", std::env::consts::OS);
+    let mut all = Vec::new();
     // Shell snapshots are off (see `converse_async`): none is kept open.
+    // The Codex home is atomic's own, so what is in it is denied as it is,
+    // a link as what it points at.
+    let mut own = Vec::new();
     for entry in children(codex_home, "") {
         if entry.file_name().is_some_and(|n| n == "tmp") {
-            denied.extend(children(&entry, &arg0));
+            own.extend(children(&entry, &arg0));
         } else {
-            denied.push(entry);
+            own.push(entry);
         }
     }
-    let mut all = Vec::new();
+    for entry in own {
+        if std::fs::symlink_metadata(&entry).is_ok_and(|m| m.file_type().is_symlink()) {
+            all.extend(std::fs::canonicalize(&entry).ok());
+        } else {
+            all.push(entry);
+        }
+    }
     for path in denied {
-        let real = std::fs::canonicalize(&path).ok();
-        let linked = std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink());
-        if linked {
-            // The sandbox cannot mount on a link: the target alone.
-            all.extend(real);
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            // Nothing there yet: denied once it is.
+            all.push(path);
+            continue;
+        };
+        let target = std::fs::canonicalize(&path).ok();
+        if meta.file_type().is_symlink() || target.as_ref().is_some_and(|t| *t != path) {
+            // A link, or a path through one: what it resolves to, if that
+            // is a file or directory of the person's, and never what the
+            // thread needs or may write.
+            let Some(target) = target.filter(|t| deniable(t)) else {
+                continue;
+            };
+            if let Some(needed) = covers(&target) {
+                bail!(
+                    "{} resolves to {}, which holds {}, which atoms' commands need; atomic \
+                     cannot deny it",
+                    path.display(),
+                    target.display(),
+                    needed.display()
+                );
+            }
+            if let Some(root) = writable.iter().find(|w| target.starts_with(w)) {
+                bail!(
+                    "{} resolves to {}, inside {}, which atoms' commands may write, so a command \
+                     could move it out from under its denial; keep it elsewhere",
+                    path.display(),
+                    target.display(),
+                    root.display()
+                );
+            }
+            all.push(target.clone());
+            if !meta.file_type().is_symlink() {
+                all.push(path);
+            }
             continue;
         }
-        if let Some(real) = real
-            && real != path
-        {
-            all.push(real);
+        if !(meta.is_file() || meta.is_dir()) {
+            // A device or socket, such as a variable naming /dev/null.
+            continue;
+        }
+        if let Some(needed) = covers(&path) {
+            bail!(
+                "{} holds {}, which atoms' commands need, so atomic cannot deny it; check \
+                 the variables that name credential places, such as HISTFILE or CODEX_HOME",
+                path.display(),
+                needed.display()
+            );
         }
         all.push(path);
     }
@@ -473,7 +608,7 @@ fn denied_paths(private: &PrivateState, codex_home: &Path) -> (Vec<PathBuf>, Vec
     // the list above is made: a pattern, expanded when each command starts,
     // covers it.
     let globs = vec![format!("{}/*.sqlite*", codex_home.display())];
-    (all, globs)
+    Ok((all, globs))
 }
 
 /// The network every sandbox has: none, local sockets included.
@@ -488,6 +623,8 @@ pub(crate) fn permission_profile(
     sandbox: crate::typed::Sandbox,
     guard: &StateGuard,
     codex_home: &Path,
+    cwd: Option<&Path>,
+    writable: &[PathBuf],
 ) -> anyhow::Result<PermissionProfile> {
     use codex_protocol::permissions::{
         FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry,
@@ -508,7 +645,7 @@ pub(crate) fn permission_profile(
         return Ok(base);
     };
     let mut policy = base.file_system_sandbox_policy();
-    let (paths, globs) = denied_paths(private, codex_home);
+    let (paths, globs) = denied_paths(private, codex_home, cwd, writable)?;
     for p in paths {
         let p = AbsolutePathBuf::from_absolute_path(&p)
             .with_context(|| format!("resolve the sandbox path {}", p.display()))?;
@@ -680,6 +817,8 @@ where
     keep_sandbox_off_keyrings();
     // SAFETY: called at the start of main, while the process has one thread,
     // so no other thread can read the environment concurrently.
+    // The person's own Codex home stays denied to atoms' commands.
+    let _ = PERSON_CODEX_HOME.set(std::env::var_os("CODEX_HOME"));
     #[allow(unsafe_code)]
     unsafe {
         std::env::set_var("CODEX_HOME", codex_home);
@@ -805,10 +944,14 @@ impl ExecSandbox {
         use codex_protocol::permissions::{
             FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry, NetworkSandboxPolicy,
         };
+        let mut writes = writable.to_vec();
+        writes.extend(self.also_writable.iter().cloned());
         let base = permission_profile(
             crate::typed::Sandbox::ReadOnly,
             &self.guard,
             &self.codex_home,
+            None,
+            &writes,
         )?;
         let mut policy = base.file_system_sandbox_policy();
         for dir in writable.iter().chain(&self.also_writable) {
@@ -1304,7 +1447,20 @@ where
     config.developer_instructions = spec.developer_instructions.clone();
     config.permissions = Permissions::from_approval_and_profile(
         Constrained::allow_any(AskForApproval::Never),
-        Constrained::allow_any(permission_profile(spec.sandbox, guard, codex_home)?),
+        Constrained::allow_any(permission_profile(
+            spec.sandbox,
+            guard,
+            codex_home,
+            Some(cwd),
+            &match spec.sandbox {
+                crate::typed::Sandbox::ReadOnly => Vec::new(),
+                crate::typed::Sandbox::WorkspaceWrite => {
+                    let mut roots = spec.writable_roots.clone();
+                    roots.push(cwd.to_owned());
+                    roots
+                }
+            },
+        )?),
     )?;
     let mut writable_roots = spec.writable_roots.clone();
     writable_roots.push(cwd.to_owned());
@@ -2020,7 +2176,7 @@ mod tests {
             private: dir.join("private"),
             also: vec![config.clone()],
         };
-        let (denied, _) = denied_paths(&private, &dir.join("codex"));
+        let (denied, _) = denied_paths(&private, &dir.join("codex"), None, &[]).expect("denied");
         let kept = std::fs::canonicalize(dir.join("kept/config.yaml")).expect("real");
         assert!(denied.contains(&kept), "{denied:?}");
         assert!(
@@ -2035,7 +2191,7 @@ mod tests {
             move |name: &str| {
                 vars.iter()
                     .find(|(k, _)| *k == name)
-                    .map(|(_, v)| (*v).to_owned())
+                    .map(|(_, v)| std::ffi::OsString::from(v))
             }
         };
         let has = |secrets: &[PathBuf], path: &str| secrets.contains(&PathBuf::from(path));
@@ -2045,10 +2201,16 @@ mod tests {
         for path in [
             "/srv/home/.ssh",
             "/home/dev/.ssh",
-            "/home/dev/.cargo/config.toml",
+            "/home/dev/.cargo/credentials.toml",
         ] {
             assert!(has(&secrets, path), "{path}: {secrets:?}");
         }
+        // Cargo reads its config in every directory above a project, so it
+        // stays readable; the tokens are in its credentials.
+        assert!(
+            !has(&secrets, "/home/dev/.cargo/config.toml"),
+            "{secrets:?}"
+        );
         // With no home at all, nothing runs.
         assert!(home_secrets(&env(&[]), None).is_err());
         assert!(home_secrets(&env(&[("HOME", "relative")]), None).is_err());
@@ -2058,6 +2220,10 @@ mod tests {
                 ("HOME", "/home/dev"),
                 ("XDG_CONFIG_HOME", "/cfg"),
                 ("XDG_CACHE_HOME", "/cch"),
+                ("XDG_DATA_HOME", "/dat"),
+                ("CODEX_HOME", "/cdx"),
+                ("AWS_CONFIG_FILE", "/aws/config"),
+                ("npm_config_userconfig", "/npm/rc"),
                 ("CARGO_HOME", "/opt/cargo"),
                 ("ZDOTDIR", "/zdot"),
                 ("HISTFILE", "/hist/bash"),
@@ -2076,7 +2242,11 @@ mod tests {
             "/cfg/git/credentials",
             "/cch/huggingface/token",
             "/opt/cargo/credentials.toml",
-            "/opt/cargo/config.toml",
+            "/dat/keyrings",
+            "/dat/fish",
+            "/cdx",
+            "/aws/config",
+            "/npm/rc",
             "/zdot/.zshrc",
             "/hist/bash",
             "/gpg",
@@ -2090,6 +2260,94 @@ mod tests {
             assert!(has(&secrets, path), "{path}: {secrets:?}");
         }
         assert!(!has(&secrets, "relative"));
+        assert!(!has(&secrets, "/opt/cargo/config.toml"), "{secrets:?}");
+    }
+
+    /// A link at `link` to `target`, replacing what was there.
+    #[cfg(unix)]
+    fn link(target: &Path, link: &Path) {
+        let _ = std::fs::remove_file(link);
+        std::fs::create_dir_all(link.parent().expect("parent")).expect("parent");
+        std::os::unix::fs::symlink(target, link).expect("link");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_the_persons_own_files_and_directories_are_denied_behind_links() {
+        let dir = scratch("deniable");
+        let home = dir.join("home");
+        std::fs::create_dir_all(dir.join("codex")).expect("codex home");
+        std::fs::create_dir_all(home.join(".ssh")).expect("ssh");
+        // A history kept nowhere, a known-hosts file thrown away, and a
+        // tool linked to the system's: denying any would break commands.
+        link(Path::new("/dev/null"), &home.join(".bash_history"));
+        link(Path::new("/dev/null"), &home.join(".ssh/known_hosts"));
+        link(Path::new("/usr/bin/env"), &home.join(".ssh/bin/env"));
+        std::fs::write(home.join(".ssh/kept"), "x").expect("kept");
+        link(&home.join(".ssh/kept"), &home.join(".ssh/deep/key"));
+        let private = PrivateState {
+            state_dir: dir.join("state"),
+            private: dir.join("private"),
+            // A variable naming /dev/null, too.
+            also: vec![
+                home.join(".bash_history"),
+                home.join(".ssh"),
+                PathBuf::from("/dev/null"),
+            ],
+        };
+        let (denied, _) = denied_paths(&private, &dir.join("codex"), None, &[]).expect("denied");
+        for system in ["/dev/null", "/usr/bin/env"] {
+            assert!(
+                !denied.iter().any(|d| Path::new(system).starts_with(d)),
+                "{system}: {denied:?}"
+            );
+        }
+        assert!(denied.contains(&home.join(".ssh")), "{denied:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nothing_runs_when_a_denial_would_cover_what_commands_need_or_may_write() {
+        let dir = scratch("covering");
+        let home = dir.join("home");
+        let codex = dir.join("codex");
+        let work = dir.join("work");
+        for d in [&codex, &work, &home.join(".aws"), &home.join("project")] {
+            std::fs::create_dir_all(d).expect("dir");
+        }
+        let refused = |also: Vec<PathBuf>, cwd: Option<&Path>, writable: &[PathBuf]| {
+            let private = PrivateState {
+                state_dir: dir.join("state"),
+                private: dir.join("private"),
+                also,
+            };
+            denied_paths(&private, &codex, cwd, writable)
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default()
+        };
+        // A variable naming the root, or a directory the thread works in,
+        // or the thread's Codex home.
+        assert!(refused(vec!["/".into()], None, &[]).contains("need"));
+        let project = home.join("project");
+        assert!(refused(vec![home.clone()], Some(&project), &[]).contains("need"));
+        assert!(refused(vec![dir.clone()], None, &[]).contains("need"));
+        // A secret linked into a directory the thread may write.
+        std::fs::write(work.join("creds"), "x").expect("creds");
+        link(&work.join("creds"), &home.join(".aws/credentials"));
+        let message = refused(vec![home.join(".aws")], None, std::slice::from_ref(&work));
+        assert!(message.contains("may write"), "{message}");
+        // Too many links to follow.
+        std::fs::remove_file(home.join(".aws/credentials")).expect("unlink");
+        let many = home.join(".kube");
+        std::fs::create_dir_all(&many).expect("kube");
+        std::fs::write(dir.join("one"), "x").expect("one");
+        for i in 0..=MAX_LINK_TARGETS {
+            link(&dir.join("one"), &many.join(format!("l{i}")));
+        }
+        assert!(refused(vec![many], None, &[]).contains("links"));
+        // And the same places, safely, run.
+        assert_eq!(refused(vec![home.join(".aws")], Some(&project), &[]), "");
     }
 
     #[cfg(unix)]
@@ -2120,7 +2378,7 @@ mod tests {
             private: dir.join("private"),
             also: vec![home.join(".bashrc"), home.join(".ssh"), home.join(".aws")],
         };
-        let (denied, _) = denied_paths(&private, &dir.join("codex"));
+        let (denied, _) = denied_paths(&private, &dir.join("codex"), None, &[]).expect("denied");
         let real = |p: &Path| std::fs::canonicalize(p).expect("real");
         assert!(
             denied.contains(&real(&home.join("dotfiles/bashrc"))),
@@ -2149,7 +2407,7 @@ mod tests {
             private: dir.join("private"),
             also: vec![credentials.clone(), dir.join("key"), config.clone()],
         };
-        let (denied, _) = denied_paths(&private, &dir.join("codex"));
+        let (denied, _) = denied_paths(&private, &dir.join("codex"), None, &[]).expect("denied");
         assert!(denied.contains(&config), "{denied:?}");
         assert!(denied.contains(&dir.join("key")), "{denied:?}");
         assert!(
@@ -2542,7 +2800,8 @@ mod tests {
         use crate::typed::Sandbox;
         let home = Path::new("/state/codex");
         let profile = |sandbox| {
-            permission_profile(sandbox, &StateGuard::NoProjectState, home).expect("profile")
+            permission_profile(sandbox, &StateGuard::NoProjectState, home, None, &[])
+                .expect("profile")
         };
         assert_eq!(profile(Sandbox::ReadOnly), PermissionProfile::read_only());
         assert_eq!(
@@ -2613,8 +2872,9 @@ mod tests {
             private: state.join("private"),
             also: vec![dir.join("keys"), dir.join("credentials")],
         });
-        let write = permission_profile(Sandbox::WorkspaceWrite, &guard, &home).expect("rw");
-        let read = permission_profile(Sandbox::ReadOnly, &guard, &home).expect("ro");
+        let write =
+            permission_profile(Sandbox::WorkspaceWrite, &guard, &home, None, &[]).expect("rw");
+        let read = permission_profile(Sandbox::ReadOnly, &guard, &home, None, &[]).expect("ro");
         let p = |rel: &str| state.join(rel).display().to_string();
         let worktree = p("worktrees/run/step");
         let cache = p("cache");
