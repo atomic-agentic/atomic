@@ -105,7 +105,12 @@ fn every_command_is_hardened() {
             "{setting} is missing: {args:?}"
         );
     }
-    for flag in ["--no-pager", "--no-replace-objects", "--literal-pathspecs"] {
+    for flag in [
+        "--no-pager",
+        "--no-replace-objects",
+        "--literal-pathspecs",
+        "--no-lazy-fetch",
+    ] {
         assert!(args.iter().any(|a| a == flag), "{flag}");
     }
     let env: Vec<(String, Option<String>)> = command
@@ -128,6 +133,8 @@ fn every_command_is_hardened() {
     assert_eq!(get("GIT_CONFIG_GLOBAL").as_deref(), Some("/dev/null"));
     assert_eq!(get("GIT_CONFIG_NOSYSTEM").as_deref(), Some("1"));
     assert_eq!(get("GIT_ALLOW_PROTOCOL").as_deref(), Some("none"));
+    // A missing object is never fetched from a promisor remote.
+    assert_eq!(get("GIT_NO_LAZY_FETCH").as_deref(), Some("1"));
     assert!(get("GIT_CONFIG_PARAMETERS").is_none());
 }
 
