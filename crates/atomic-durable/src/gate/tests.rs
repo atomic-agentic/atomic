@@ -38,12 +38,28 @@ async fn sqlite() -> Durare {
     Durare::sqlite(&path).await.expect("sqlite engine")
 }
 
+/// An engine on a schema of its own, which the returned guard drops.
 #[cfg(feature = "postgres-tests")]
-async fn postgres() -> Durare {
-    let url = crate::testing::database().await;
-    Durare::postgres(&url, &unique("atomic_gates"))
+async fn postgres() -> (Durare, crate::testing::TestSchema) {
+    let schema = crate::testing::schema("gates").await;
+    let rt = Durare::postgres(schema.url(), schema.name())
         .await
-        .expect("postgres engine")
+        .expect("postgres engine");
+    (rt, schema)
+}
+
+/// Each backend's engine, and what must outlive it.
+mod backends {
+    use super::Durare;
+
+    pub(super) async fn sqlite() -> (Durare, ()) {
+        (super::sqlite().await, ())
+    }
+
+    #[cfg(feature = "postgres-tests")]
+    pub(super) async fn postgres() -> (Durare, crate::testing::TestSchema) {
+        super::postgres().await
+    }
 }
 
 fn operator() -> Principal {
@@ -748,7 +764,9 @@ macro_rules! on_backend {
             $(
                 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
                 async fn $name() {
-                    super::$name(super::$backend().await).await
+                    // The schema, if any, outlives the engine.
+                    let (rt, _schema) = super::backends::$backend().await;
+                    super::$name(rt).await
                 }
             )+
         }
@@ -947,8 +965,8 @@ async fn concurrent_replays_return_one_recorded_decision<R: DurableRuntime>(mut 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_raced_command_id_cannot_decide_another_gate() {
     use sqlx::Connection;
-    let url = std::env::var("ATOMIC_TEST_DATABASE_URL").expect("test Postgres");
-    let schema = unique("command_race");
+    let guard = crate::testing::schema("command_race").await;
+    let (url, schema) = (guard.url().to_owned(), guard.name().to_owned());
     let separator = if url.contains('?') { '&' } else { '?' };
     let url = format!("{url}{separator}application_name={schema}");
     let mut rt = Durare::postgres(&url, &schema).await.expect("engine");
