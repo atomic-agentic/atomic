@@ -100,8 +100,8 @@ pub(crate) async fn settled<T>(
         // serve` a step past its limit is set aside and keeps trying
         // (`atomic_core::runtime::keep_trying_past_the_limit`).
         Err(AtomError::NoRoom(why)) => {
-            eprintln!("atomic: {why}");
-            eprintln!(
+            atomic_core::log_line!("atomic: {why}");
+            atomic_core::log_line!(
                 "atomic: {place} stays unfinished, with nothing recorded; continue it with \
                  `atomic runs resume` once the execution backend has room"
             );
@@ -146,8 +146,8 @@ pub fn atom_failure(e: AtomError) -> DurableError {
         // As above: a run that waited too long for room stops, recording
         // nothing ([`settled`] goes first and says which run).
         AtomError::NoRoom(why) => {
-            eprintln!("atomic: {why}");
-            eprintln!(
+            atomic_core::log_line!("atomic: {why}");
+            atomic_core::log_line!(
                 "atomic: stopping without recording an outcome; continue the run with `atomic \
                  runs resume` once the execution backend has room"
             );

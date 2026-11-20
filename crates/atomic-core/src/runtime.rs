@@ -406,7 +406,7 @@ pub(crate) async fn open_workspace(
                 if past {
                     if set_aside.is_none() {
                         set_aside = Some(SetAsideForRoom::start(&request.run));
-                        eprintln!(
+                        crate::log_line!(
                             "atomic: {label} (run {}, step {}) is set aside, with nothing \
                              recorded: no room on the execution backend in the time this \
                              process waits; it keeps trying, at most {}s apart",
@@ -415,7 +415,7 @@ pub(crate) async fn open_workspace(
                             OPEN_WAIT_MAX.as_secs()
                         );
                     } else {
-                        eprintln!(
+                        crate::log_line!(
                             "atomic: {label} (run {}, step {}): still no room on the execution \
                              backend; trying again in {}s",
                             request.run,
