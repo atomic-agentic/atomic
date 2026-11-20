@@ -1,0 +1,5 @@
+Refunds at the point of sale
+
+A refund is issued at the point of sale that took the payment. Card refunds go back to
+the same card; cash refunds need a receipt. Refunds above the limit need a second
+person. The cafe and the shop share one refund log, kept by the finance team.

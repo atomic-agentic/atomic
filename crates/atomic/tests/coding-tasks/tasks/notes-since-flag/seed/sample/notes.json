@@ -1,0 +1,10 @@
+{
+ "version": 1,
+ "notes": [
+  {"id": 1, "title": "Sketch the garden layout", "body": "beds along the south fence", "tags": ["home", "garden"], "created": "2026-02-27T19:05:00Z"},
+  {"id": 2, "title": "Renew the library card", "body": "", "tags": ["errand"], "created": "2026-02-28T23:40:00-03:00"},
+  {"id": 3, "title": "Review the onboarding checklist", "body": "add the badge step", "tags": ["work"], "created": "2026-03-01T08:20:00+01:00"},
+  {"id": 4, "title": "Order seed potatoes", "body": "two kilos", "tags": ["garden", "errand"], "created": "2026-03-02T12:00:00Z"},
+  {"id": 5, "title": "Write the retro notes", "body": "what went well, what to change", "tags": ["work"], "created": "2026-03-03T00:30:00+02:00"}
+ ]
+}

@@ -1,0 +1,9 @@
+us WIDGET-S 3
+eu WIDGET-S 3
+jp LAMP 2
+eu HUB-4 10
+us HUB-4 12
+jp BRACKET 25
+eu CABLE-2M 1
+us LAMP 1
+jp WIDGET-L 19

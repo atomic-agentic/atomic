@@ -1,0 +1,8 @@
+# Monday's quote requests, one a line: PROFILE SKU QUANTITY
+us WIDGET-S 3
+eu WIDGET-S 3
+jp LAMP 2
+us HUB-4 12
+eu CABLE-2M 10
+
+jp BRACKET 25
