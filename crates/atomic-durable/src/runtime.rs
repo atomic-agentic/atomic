@@ -58,9 +58,10 @@ pub enum DurableError {
     Parked(String),
     /// Another execution of run `.0` recorded one of its steps first. This
     /// execution's state is behind the run's, so it stops, records nothing,
-    /// and takes the outcome the winner records. Workflow code passes it on
-    /// unchanged; turning it into a failure would record the loss as the
-    /// run's outcome.
+    /// and takes the outcome the winner records. The workflow context keeps
+    /// the loss when the step reports it, so the execution's outcome is the
+    /// conflict whatever workflow code makes of it; a conflict that no step
+    /// reported is not a lost race, and fails the run.
     #[error("another execution of run {0} recorded its step first")]
     Conflict(String),
 }
@@ -118,6 +119,10 @@ pub struct StepRecord {
     pub output: Option<Value>,
     /// Its error, if it failed.
     pub error: Option<String>,
+    /// When it started, in milliseconds since the Unix epoch, if recorded.
+    pub started_at: Option<i64>,
+    /// When it completed, in milliseconds since the Unix epoch, if recorded.
+    pub completed_at: Option<i64>,
 }
 
 /// Which model thread a published step ran on.
@@ -156,7 +161,7 @@ pub enum RunStatus {
 }
 
 /// What the store records about a run beside its steps.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RunRecord {
     /// Its id.
     pub id: String,
@@ -169,6 +174,34 @@ pub struct RunRecord {
     pub version: String,
     /// The queue it waits on, or was last taken from, if any.
     pub queue: Option<String>,
+    /// The workflow it runs, as registered.
+    pub workflow: String,
+    /// What it was started with.
+    pub input: Value,
+}
+
+/// Where a run stands in [`Durare::runs_after`]'s order: when it was
+/// created, in milliseconds since the epoch, and its id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunKey {
+    /// When the run was created.
+    pub created_at: i64,
+    /// Its id.
+    pub id: String,
+}
+
+/// A run with what it was given and what it returned or failed with, as
+/// [`Durare::runs_after`] reads it.
+#[derive(Clone, Debug)]
+pub struct RunContents {
+    /// The run.
+    pub record: RunRecord,
+    /// Its input, as stored.
+    pub input: Value,
+    /// What it returned, once it succeeded.
+    pub output: Option<Value>,
+    /// Its error, once it failed.
+    pub error: Option<String>,
 }
 
 /// What every resume queue's name starts with.
@@ -197,6 +230,8 @@ impl From<durare::WorkflowStatus> for RunRecord {
             executor: w.executor_id,
             version: w.app_version,
             queue: w.queue_name,
+            workflow: w.name,
+            input: w.input,
         }
     }
 }
@@ -569,6 +604,14 @@ pub trait DurableRuntime: Send + Sync + Sized {
         T: Send + 'static,
         F: for<'t, 'c> Fn(Tx<'t, 'c>) -> TxFuture<'t, T> + Send + Sync + 'static;
 
+    /// Read atomic's tables in one transaction, outside any workflow, that
+    /// takes no write lock, so it answers while a writer holds one; it is
+    /// rolled back. The body only reads.
+    fn read_transaction<T, F>(&self, body: F) -> impl Future<Output = Result<T>> + Send
+    where
+        T: Send + 'static,
+        F: for<'t, 'c> Fn(Tx<'t, 'c>) -> TxFuture<'t, T> + Send + Sync + 'static;
+
     /// The usage ledger in this runtime's database (see [`crate::usage`]):
     /// budget accounting, apart from step outputs and telemetry.
     fn ledger(&self) -> Ledger;
@@ -612,9 +655,13 @@ pub(crate) fn to_durare(e: DurableError) -> durare::Error {
         DurableError::Database { message, origin } => {
             origin.take().unwrap_or_else(|| durare::Error::app(message))
         }
-        // Back as the engine's own conflict, which it answers by waiting for
-        // the winner's outcome instead of recording one.
-        DurableError::Conflict(run) => durare::Error::WorkflowConflict(run),
+        // A lost race reaches the engine through the context's latch (see
+        // `Lost`), never through here: a conflict that no step reported was
+        // made up, and fails like any other error rather than leave the run
+        // waiting for a winner that does not exist.
+        DurableError::Conflict(run) => durare::Error::app(format!(
+            "workflow code returned a workflow conflict (run {run}) that no step reported"
+        )),
         DurableError::Failed(m)
         | DurableError::Nested(m)
         | DurableError::Engine(m)
@@ -687,6 +734,31 @@ impl Checkpoint {
 pub struct DurareContext {
     engine: durare::DurableContext,
     reads: Reads,
+    /// A workflow conflict any operation of this execution returned: once
+    /// the execution has lost a race to record a step, its outcome is the
+    /// conflict, whatever its workflow code goes on to return.
+    lost: Lost,
+}
+
+/// Where an execution keeps the conflict it lost, if it lost one.
+#[derive(Clone, Default)]
+struct Lost(Arc<std::sync::Mutex<Option<String>>>);
+
+impl Lost {
+    /// Keep `out`'s conflict, if it is one, and pass `out` on.
+    fn keep<T>(&self, out: Result<T>) -> Result<T> {
+        if let Err(DurableError::Conflict(run)) = &out {
+            // A poisoned lock still holds the value: a loss is never skipped.
+            let mut lost = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            lost.get_or_insert_with(|| run.clone());
+        }
+        out
+    }
+
+    /// The conflict this execution lost, if it lost one.
+    fn conflict(&self) -> Option<String> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
 }
 
 impl WorkflowContext for DurareContext {
@@ -717,8 +789,9 @@ impl WorkflowContext for DurareContext {
                 }
                 out.map_err(body_to_durare)
             });
+        let lost = self.lost.clone();
         async move {
-            let out = pending.await.map_err(from_durare);
+            let out = lost.keep(pending.await.map_err(from_durare));
             if out.is_ok() {
                 checkpoint.after();
             }
@@ -746,8 +819,9 @@ impl WorkflowContext for DurareContext {
                 out.map_err(body_to_durare)
             })
         });
+        let lost = self.lost.clone();
         async move {
-            let out = pending.await.map_err(from_durare);
+            let out = lost.keep(pending.await.map_err(from_durare));
             if out.is_ok() {
                 checkpoint.after();
             }
@@ -774,8 +848,9 @@ impl WorkflowContext for DurareContext {
         // As for a step, the position is claimed now.
         let pending = self.engine.recv::<T>(topic, timeout);
         let topic = topic.to_owned();
+        let lost = self.lost.clone();
         async move {
-            let out = pending.await.map_err(from_durare);
+            let out = lost.keep(pending.await.map_err(from_durare));
             // The message taken, or the timeout, is recorded. A replay that
             // returns the recorded one reaches this too.
             if out.is_ok() && crate::failpoints::armed() {
@@ -924,6 +999,29 @@ impl Reads {
             .await?;
         match out {
             End::Commit(v) | End::Rollback(v) => Ok(v),
+        }
+    }
+
+    /// Run read-only `body` in a transaction on atomic's tables that takes no
+    /// write lock, so it answers while a writer holds one, and roll it back.
+    pub(crate) async fn read<T, F>(&self, body: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: for<'t, 'c> Fn(Tx<'t, 'c>) -> TxFuture<'t, T> + Send + Sync + 'static,
+    {
+        match self {
+            Reads::Sqlite(pool) => {
+                let mut tx = pool.begin().await.map_err(db)?;
+                let out = body(Tx(TxInner::Sqlite(&mut tx))).await;
+                tx.rollback().await.map_err(db)?;
+                out
+            }
+            Reads::Postgres(pool) => {
+                let mut tx = pool.begin().await.map_err(db)?;
+                let out = body(Tx(TxInner::Postgres(&mut tx))).await;
+                tx.rollback().await.map_err(db)?;
+                out
+            }
         }
     }
 
@@ -1119,6 +1217,88 @@ impl Durare {
         Ok(found.into_iter().map(RunRecord::from).collect())
     }
 
+    /// A page of the store's runs, finished or not, whoever owns them: at
+    /// most `limit` of them, in order of creation and then of id, after the
+    /// run `after` names, each with what it was given and what it returned
+    /// or failed with. Paging by that key misses no run however many share a
+    /// creation time, and a run removed between pages shifts nothing.
+    pub async fn runs_after(
+        &self,
+        after: Option<&RunKey>,
+        limit: i64,
+    ) -> Result<Vec<(RunKey, RunContents)>> {
+        let after = after.cloned();
+        let keys: Vec<RunKey> = self
+            .control_transaction(move |mut tx| {
+                let after = after.clone();
+                Box::pin(async move {
+                    let rows = match &after {
+                        None => {
+                            tx.query_all(
+                                "SELECT workflow_uuid AS id, created_at FROM workflow_status \
+                                 ORDER BY created_at, workflow_uuid LIMIT ?",
+                                &[Param::Int(limit)],
+                            )
+                            .await?
+                        }
+                        Some(key) => {
+                            tx.query_all(
+                                "SELECT workflow_uuid AS id, created_at FROM workflow_status \
+                                 WHERE created_at > ? OR (created_at = ? AND workflow_uuid > ?) \
+                                 ORDER BY created_at, workflow_uuid LIMIT ?",
+                                &[
+                                    Param::Int(key.created_at),
+                                    Param::Int(key.created_at),
+                                    Param::Text(key.id.clone()),
+                                    Param::Int(limit),
+                                ],
+                            )
+                            .await?
+                        }
+                    };
+                    rows.iter()
+                        .map(|r| {
+                            Ok(RunKey {
+                                id: r.text("id")?,
+                                created_at: r.int("created_at")?,
+                            })
+                        })
+                        .collect()
+                })
+            })
+            .await?;
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut found: std::collections::BTreeMap<String, durare::WorkflowStatus> = self
+            .engine
+            .list_workflows(&durare::ListFilter {
+                workflow_ids: keys.iter().map(|k| k.id.clone()).collect(),
+                ..durare::ListFilter::default()
+            })
+            .await
+            .map_err(from_durare)?
+            .into_iter()
+            .map(|w| (w.id.clone(), w))
+            .collect();
+        // A run removed since its key was read is passed over.
+        Ok(keys
+            .into_iter()
+            .filter_map(|key| {
+                let w = found.remove(&key.id)?;
+                Some((
+                    key,
+                    RunContents {
+                        input: w.input.clone(),
+                        output: w.output.clone(),
+                        error: w.error.clone(),
+                        record: RunRecord::from(w),
+                    },
+                ))
+            })
+            .collect())
+    }
+
     /// Every unfinished run in the store, whoever owns it and whatever its
     /// version.
     pub async fn unfinished(&self) -> Result<Vec<RunRecord>> {
@@ -1277,14 +1457,25 @@ impl DurableRuntime for Durare {
         let reads = self.reads.clone();
         self.engine
             .register(name, move |ctx: durare::DurableContext, input: I| {
+                let lost = Lost::default();
                 let run = workflow(
                     DurareContext {
                         engine: ctx,
                         reads: reads.clone(),
+                        lost: lost.clone(),
                     },
                     input,
                 );
-                async move { run.await.map_err(to_durare) }
+                // A lost race is the execution's outcome even if its code
+                // made something else of it, so the engine waits for the
+                // winner's instead of recording this one.
+                async move {
+                    let out = run.await;
+                    match lost.conflict() {
+                        Some(run) => Err(durare::Error::WorkflowConflict(run)),
+                        None => out.map_err(to_durare),
+                    }
+                }
             });
     }
 
@@ -1362,6 +1553,8 @@ impl DurableRuntime for Durare {
                     name: s.name,
                     output: s.output,
                     error: s.error,
+                    started_at: s.started_at.map(|t| t.timestamp_millis()),
+                    completed_at: s.completed_at.map(|t| t.timestamp_millis()),
                 })
                 .collect())
         }
@@ -1435,6 +1628,14 @@ impl DurableRuntime for Durare {
         F: for<'t, 'c> Fn(Tx<'t, 'c>) -> TxFuture<'t, T> + Send + Sync + 'static,
     {
         self.reads.control_transaction(body).await
+    }
+
+    async fn read_transaction<T, F>(&self, body: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: for<'t, 'c> Fn(Tx<'t, 'c>) -> TxFuture<'t, T> + Send + Sync + 'static,
+    {
+        self.reads.read(body).await
     }
 
     fn ledger(&self) -> Ledger {

@@ -10,6 +10,7 @@ use atomic_core::render::{self, RunInput};
 use atomic_core::{atom, collections, compile, eval, project, runtime};
 use atomic_schema::registry::Registry;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -81,6 +82,9 @@ fn every_v0_1_example_passes_the_real_load_and_check() {
             .arg("check")
             .current_dir(&dir)
             .env("ATOMIC_HOME", dir.join(".state"))
+            .env("ATOMIC_DETECT_OLLAMA_ADDR", "127.0.0.1:9")
+            .env_remove("OPENAI_API_KEY")
+            .env("XDG_CONFIG_HOME", dir.join(".state/config"))
             .output()
             .expect("atomic check");
         assert!(
@@ -113,6 +117,8 @@ fn every_v0_1_example_passes_the_real_load_and_check() {
             let settings = eval::settings(&atom, &project).expect("eval settings");
             let cases =
                 eval::load_cases(&atom, &settings).unwrap_or_else(|e| panic!("{example}: {e}"));
+            let drifted = drift(&project.dir.join("fixtures").join(stem), &cases);
+            assert!(drifted.is_empty(), "{example}/{stem}: {drifted:?}");
             let contracts = eval::Contracts::of(&atom).expect("contracts");
             for case in &cases {
                 let golden = match case.id.split_once(".jsonl:") {
@@ -239,6 +245,9 @@ fn a_workspace_member_resolves_shared_schemas_from_anywhere() {
             .arg(dir.join("services/billing"))
             .current_dir(cwd)
             .env("ATOMIC_HOME", dir.join(".state"))
+            .env("ATOMIC_DETECT_OLLAMA_ADDR", "127.0.0.1:9")
+            .env_remove("OPENAI_API_KEY")
+            .env("XDG_CONFIG_HOME", dir.join(".state/config"))
             .output()
             .expect("atomic check")
     };
@@ -315,6 +324,9 @@ fn compact_sidecars_expand_to_the_example_long_forms() {
             .args(args)
             .current_dir(&dir)
             .env("ATOMIC_HOME", dir.join(".state"))
+            .env("ATOMIC_DETECT_OLLAMA_ADDR", "127.0.0.1:9")
+            .env_remove("OPENAI_API_KEY")
+            .env("XDG_CONFIG_HOME", dir.join(".state/config"))
             .output()
             .expect("atomic")
     };
@@ -372,6 +384,9 @@ fn atomic_check_reads_openapi_toolsets() {
             .arg("check")
             .current_dir(&dir)
             .env("ATOMIC_HOME", dir.join(".state"))
+            .env("ATOMIC_DETECT_OLLAMA_ADDR", "127.0.0.1:9")
+            .env_remove("OPENAI_API_KEY")
+            .env("XDG_CONFIG_HOME", dir.join(".state/config"))
             .output()
             .expect("atomic check")
     };
@@ -394,4 +409,96 @@ fn atomic_check_reads_openapi_toolsets() {
         error.contains("broken.openapi.yaml") && error.contains("Swagger 2.0"),
         "{error}"
     );
+}
+
+/// Where an atom's eval cases and the fixtures in `fixtures` beside them
+/// have drifted apart: a YAML case whose input is not its fixture's input, a
+/// case whose `prepared` values are not its fixture's (or that has none
+/// while its fixture does), or a JSONL file with not one golden output per
+/// case.
+fn drift(fixtures: &Path, cases: &[eval::Case]) -> Vec<String> {
+    let mut drifted = Vec::new();
+    let mut rows: BTreeMap<String, usize> = BTreeMap::new();
+    for case in cases {
+        if let Some((file, _)) = case.id.split_once(".jsonl:") {
+            *rows.entry(file.to_owned()).or_default() += 1;
+            continue;
+        }
+        let name = case.id.trim_end_matches(".yaml");
+        let fixture = |suffix: &str| fixtures.join(format!("{name}.{suffix}.json"));
+        match std::fs::read_to_string(fixture("input")) {
+            Ok(text) if serde_json::from_str::<Value>(&text).ok() == Some(case.input.clone()) => {}
+            _ => drifted.push(format!(
+                "{}: the case's input is not its fixture's",
+                case.id
+            )),
+        }
+        let prepared = std::fs::read_to_string(fixture("prepared"))
+            .ok()
+            .and_then(|t| serde_json::from_str::<Value>(&t).ok());
+        if prepared != case.prepared {
+            drifted.push(format!(
+                "{}: the case's prepared values are not its fixture's",
+                case.id
+            ));
+        }
+    }
+    for (file, count) in rows {
+        let golden = std::fs::read_to_string(fixtures.join(format!("{file}.outputs.jsonl")))
+            .map(|t| t.lines().filter(|l| !l.trim().is_empty()).count())
+            .unwrap_or(0);
+        if golden != count {
+            drifted.push(format!(
+                "{file}.jsonl: {count} cases, and {golden} golden outputs"
+            ));
+        }
+    }
+    drifted
+}
+
+#[test]
+fn the_drift_check_sees_inputs_prepared_values_and_jsonl_rows() {
+    let fixtures = std::env::temp_dir().join(format!("atomic-drift-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&fixtures);
+    std::fs::create_dir_all(&fixtures).expect("fixtures");
+    let case = |id: &str, input: Value, prepared: Option<Value>| eval::Case {
+        id: id.into(),
+        input,
+        expect: vec!["true".into()],
+        case: Value::Null,
+        prepared,
+    };
+    let write = |name: &str, text: &str| std::fs::write(fixtures.join(name), text).expect("write");
+    write("one.input.json", r#"{"text": "a"}"#);
+    write("two.input.json", r#"{"text": "b"}"#);
+    write("two.prepared.json", r#"{"total": 3}"#);
+    write(
+        "cases.outputs.jsonl",
+        "{\"ticket\": \"A\"}\n{\"ticket\": \"B\"}\n",
+    );
+    let cases = vec![
+        case("one.yaml", json!({"text": "a"}), None),
+        case("two.yaml", json!({"text": "b"}), Some(json!({"total": 3}))),
+        case("cases.jsonl:1", json!({"text": "c"}), None),
+        case("cases.jsonl:2", json!({"text": "d"}), None),
+    ];
+    assert!(
+        drift(&fixtures, &cases).is_empty(),
+        "{:?}",
+        drift(&fixtures, &cases)
+    );
+    // Each drift, one at a time.
+    let mut input = cases.clone();
+    input[0].input = json!({"text": "changed"});
+    assert_eq!(drift(&fixtures, &input).len(), 1);
+    let mut prepared = cases.clone();
+    prepared[1].prepared = Some(json!({"total": 4}));
+    assert_eq!(drift(&fixtures, &prepared).len(), 1);
+    let mut unprepared = cases.clone();
+    unprepared[1].prepared = None;
+    assert_eq!(drift(&fixtures, &unprepared).len(), 1);
+    let mut extra = cases.clone();
+    extra.push(case("cases.jsonl:3", json!({"text": "e"}), None));
+    assert!(drift(&fixtures, &extra)[0].contains("3 cases, and 2 golden outputs"));
+    let _ = std::fs::remove_dir_all(&fixtures);
 }

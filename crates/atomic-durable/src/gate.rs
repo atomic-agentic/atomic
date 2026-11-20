@@ -358,7 +358,9 @@ fn canonical(value: &Value, out: &mut Vec<u8>) {
 
 fn is_digest(s: &str) -> bool {
     s.strip_prefix("sha256:")
-        .is_some_and(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+        // Lowercase only, as the artifact store names content, so a pin always
+        // matches what it pins.
+        .is_some_and(|h| h.len() == 64 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
 }
 
 /// Milliseconds since the Unix epoch, now.
@@ -823,7 +825,7 @@ async fn wake<R: DurableRuntime>(rt: &R, run: &str, gate: &str) -> Result<()> {
 
 /// Every gate the filter selects, oldest first.
 pub async fn gates<R: DurableRuntime>(rt: &R, filter: GateFilter) -> Result<Vec<Gate>> {
-    rt.control_transaction(move |mut tx| {
+    rt.read_transaction(move |mut tx| {
         let filter = filter.clone();
         Box::pin(async move {
             let mut sql = format!("SELECT {COLUMNS} FROM atomic_gates WHERE 1 = 1");

@@ -14,10 +14,14 @@ use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
 mod engine;
+mod evals;
 mod failure;
 mod gates;
+mod init;
 mod runs;
+mod settings;
 mod setup;
+mod show;
 mod skills;
 mod target;
 
@@ -49,8 +53,18 @@ enum Command {
     },
     /// Render an Astro prompt without calling a model or running scripts.
     Render(RenderArgs),
+    /// Show every setting the project resolves to here; with --explain,
+    /// where each came from and why, secrets masked.
+    Config(settings::ConfigArgs),
+    /// Make a new project here: a manifest, a sample atom and schemas, a
+    /// workflow and an eval case. In a directory that holds code, under
+    /// `.atomic/`.
+    Init(init::InitArgs),
     /// Run an atom or a workflow in the foreground and print its output.
     Run(runs::RunArgs),
+    /// Run atoms' eval cases and fail when an atom's pass rate is below its
+    /// threshold; model calls are answered from cassettes unless --live.
+    Eval(evals::EvalArgs),
     /// Continue runs.
     #[command(subcommand)]
     Runs(Runs),
@@ -84,6 +98,10 @@ enum Runs {
     /// Continue an unfinished run in the foreground, from its checkpoints,
     /// with the definitions and input it started with.
     Resume(runs::ResumeArgs),
+    /// Show everything the store recorded about a run: its steps, which
+    /// attempt ran each and which came from checkpoints, its input and
+    /// output, its spend, its gates and its transcripts.
+    Show(show::ShowArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -281,6 +299,7 @@ fn state_root(cli: Option<&Cli>) -> anyhow::Result<PathBuf> {
     let flag = cli.and_then(|c| c.project.as_deref());
     let target = match cli.and_then(|c| c.command.as_ref()) {
         Some(Command::Run(args)) => Some(args.target.as_str()),
+        Some(Command::Eval(args)) => args.atoms.first().map(String::as_str),
         _ => None,
     };
     match target::project_for(flag, target, &cwd) {
@@ -335,10 +354,14 @@ async fn run(cli: Cli, paths: CodexPaths, state: ProjectState) -> anyhow::Result
             tokio::task::spawn_blocking(move || check(path, json)).await?
         }
         Some(Command::Run(args)) => runs::run(args, project, &paths, json).await,
+        Some(Command::Eval(args)) => evals::run(args, project, &paths, json).await,
         Some(Command::Runs(Runs::Resume(args))) => runs::resume(args, project, &paths, json).await,
+        Some(Command::Runs(Runs::Show(args))) => show::show(args, project, json).await,
         Some(Command::Serve(args)) => runs::serve(args, project, &paths).await,
         Some(Command::Runner) => Ok(()),
         Some(Command::Render(args)) => tokio::task::spawn_blocking(move || render(args)).await?,
+        Some(Command::Config(args)) => settings::config(&args, project, json),
+        Some(Command::Init(args)) => init::init(args),
         Some(Command::Schemas { path, command }) => match command {
             Some(SchemasCommand::Expand { atom }) => {
                 tokio::task::spawn_blocking(move || expand(&atom)).await?
@@ -457,6 +480,23 @@ fn check(path: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
         return Ok(());
     }
     let project = project::discover(&path)?;
+    // Each manifest's settings, read as `atomic run` from its directory
+    // would read them, contacting nothing: a setting run would refuse fails
+    // here instead.
+    let mut manifests = vec![project.clone()];
+    if project.members.is_some() {
+        manifests.extend(project::members(&project)?);
+    }
+    for manifest in &manifests {
+        settings::check(&manifest.dir).map_err(|e| {
+            failure::Failure::new(
+                "config.invalid",
+                format!("the configuration cannot be read: {e}"),
+                "fix the setting it names; `atomic config --explain` lists every setting and \
+                 where it comes from",
+            )
+        })?;
+    }
     let files = collections::collect(&project)?;
     collections::load_schemas(&project, &mut registry).map_err(anyhow::Error::msg)?;
     let mut atoms = std::collections::BTreeMap::new();

@@ -701,7 +701,11 @@ fn worst_cases(size: usize) -> Vec<(&'static str, String)> {
 }
 
 /// A megabyte of each, in a debug build on a shared machine, within a
-/// bound a quadratic scan could not meet.
+/// bound a quadratic scan could not meet. A linear pass over a megabyte
+/// takes well under a second, but a loaded CI runner running other tests
+/// alongside has stretched one past three; a quadratic one takes about
+/// 25 s for 64 KB and so hours for a megabyte. Thirty seconds keeps the
+/// two far apart.
 #[test]
 fn worst_cases_finish_quickly() {
     let slow: Vec<(&str, std::time::Duration)> = worst_cases(1024 * 1024)
@@ -710,7 +714,7 @@ fn worst_cases_finish_quickly() {
             let start = std::time::Instant::now();
             let _ = text(&input);
             let taken = start.elapsed();
-            (taken > std::time::Duration::from_secs(3)).then_some((name, taken))
+            (taken > std::time::Duration::from_secs(30)).then_some((name, taken))
         })
         .collect();
     assert!(slow.is_empty(), "too slow: {slow:?}");

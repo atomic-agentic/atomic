@@ -27,7 +27,7 @@ mkdir -p "${WORK}/bin"
 cat >"${WORK}/bin/cargo" <<'SH'
 #!/usr/bin/env bash
 off() {
-    grep -qE 'HARDENING\.iter\(\)\.take\(0\)|ATOMIC_CONTROL_REMOVED|let names: Vec<String> = \{ let _ = names|PermissionProfile::Disabled|exclude_slash_tmp\*/ false|paths\.into_iter\(\)\.take\(0\)|black_box\(false\)|let _ = own;|let _ = arg; true' \
+    grep -qE 'HARDENING\.iter\(\)\.take\(0\)|ATOMIC_CONTROL_REMOVED|let names: Vec<String> = \{ let _ = names|PermissionProfile::Disabled|exclude_slash_tmp\*/ false|paths\.into_iter\(\)\.take\(0\)|black_box\(false\)|let _ = own;|let _ = arg; true|NetworkSandboxPolicy::Enabled;' \
         crates/atomic-core/src/git.rs crates/atomic-core/src/codex.rs crates/atomic-exec/src/lib.rs
 }
 case "${FAKE_CARGO}" in
@@ -88,7 +88,7 @@ untouched() {
 repo="$(fresh)"
 run honest
 [ "${code}" -eq 0 ] || fail "honest: exit ${code}: ${out}"
-[ "$(grep -c '^ok ' <<<"${out}")" -eq 9 ] || fail "honest: not nine controls ok: ${out}"
+[ "$(grep -c '^ok ' <<<"${out}")" -eq 10 ] || fail "honest: not ten controls ok: ${out}"
 untouched || fail "honest: the source is left modified"
 [ ! -e "${repo}/target/controls-check" ] || fail "honest: the saved copies are left behind"
 
