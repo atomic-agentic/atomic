@@ -1079,6 +1079,16 @@ impl Durare {
         Ok(found.into_iter().map(RunRecord::from).collect())
     }
 
+    /// Every run in the store, finished or not, whoever owns it.
+    pub async fn every_run(&self) -> Result<Vec<RunRecord>> {
+        let found = self
+            .engine
+            .list_workflows(&durare::ListFilter::default())
+            .await
+            .map_err(from_durare)?;
+        Ok(found.into_iter().map(RunRecord::from).collect())
+    }
+
     /// Every unfinished run in the store, whoever owns it and whatever its
     /// version.
     pub async fn unfinished(&self) -> Result<Vec<RunRecord>> {

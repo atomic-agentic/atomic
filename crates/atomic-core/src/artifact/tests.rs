@@ -153,3 +153,114 @@ fn a_reference_to_a_missing_artifact_fails_validation() {
     ));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_sweep_keeps_what_it_is_told_and_what_is_recent_and_clears_stale_partial_writes() {
+    let root = std::env::temp_dir().join(format!("atomic-sweep-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let store = LocalStore::open(&root).expect("open");
+    let put = |bytes: &[u8]| {
+        store
+            .put(&mut &bytes[..], Provenance::default())
+            .expect("put")
+            .artifact
+    };
+    let (kept, loose) = (put(b"kept"), put(b"loose"));
+    // A stale partial write, a stray file, a prefix that is a link and a
+    // prefix that is not two hex digits: none of them is content.
+    std::fs::write(root.join("staging/1234-0"), b"half").expect("partial");
+    let blobs = root.join("blobs/sha256");
+    std::fs::write(blobs.join(&kept.digest()[..2]).join("not-a-digest"), b"x").expect("stray");
+    let elsewhere = root.with_extension("elsewhere");
+    std::fs::create_dir_all(&elsewhere).expect("elsewhere");
+    let hidden = format!("{:0>62}", "1");
+    std::fs::write(elsewhere.join(&hidden), b"outside the store").expect("outside");
+    std::os::unix::fs::symlink(&elsewhere, blobs.join("ff")).expect("link");
+    std::fs::create_dir_all(blobs.join("zz")).expect("odd prefix");
+
+    // A grace of an hour keeps everything just written.
+    let swept = store
+        .sweep(
+            &BTreeSet::new(),
+            Grace::at_least(std::time::Duration::from_secs(3600)),
+        )
+        .expect("sweep");
+    assert!(swept.removed.is_empty());
+    assert_eq!(swept.partial, 0);
+
+    let swept = store
+        .sweep(
+            &BTreeSet::from_iter([&kept].into_iter().cloned()),
+            Grace::none_for_tests(),
+        )
+        .expect("sweep");
+    assert_eq!(swept.removed, std::slice::from_ref(&loose));
+    assert_eq!(swept.partial, 1, "the stale partial write is cleared");
+    assert!(!root.join("staging/1234-0").exists());
+    assert!(store.contains(&kept).expect("contains"));
+    assert!(!store.contains(&loose).expect("contains"));
+    assert!(store.manifests(&loose).expect("manifests").is_empty());
+    for skipped in ["not-a-digest", "ff", "zz"] {
+        assert!(
+            swept.skipped.iter().any(|p| p.ends_with(skipped)),
+            "{skipped} not reported: {:?}",
+            swept.skipped
+        );
+    }
+    assert!(
+        elsewhere.join(&hidden).exists(),
+        "the sweep followed a link"
+    );
+    // Below the minimum, a grace is the minimum.
+    assert_eq!(
+        Grace::at_least(std::time::Duration::from_secs(1)),
+        Grace::at_least(MIN_GRACE)
+    );
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&elsewhere);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_stored_blob_is_read_only_and_a_damaged_one_is_replaced_by_the_next_write() {
+    use std::os::unix::fs::PermissionsExt;
+    let (store, dir) = store();
+    let a = store
+        .put(&mut &b"the content"[..], provenance("s1"))
+        .expect("put")
+        .artifact;
+    let blob = store.blob_path(&a);
+    let mode = std::fs::metadata(&blob).expect("blob").permissions().mode() & 0o777;
+    assert_eq!(mode, 0o444, "{mode:o}");
+    // A command handed a link to it cannot append to it.
+    let link = dir.join("link");
+    std::os::unix::fs::symlink(&blob, &link).expect("link");
+    assert!(
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&link)
+            .is_err(),
+        "a stored blob took a write"
+    );
+    // Its owner can still damage it, on purpose: the size, then the bytes.
+    for damage in [&b" and more"[..], &b"THE"[..]] {
+        std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let mut f = if damage.len() > 3 {
+            std::fs::OpenOptions::new().append(true).open(&blob)
+        } else {
+            std::fs::OpenOptions::new().write(true).open(&blob)
+        }
+        .expect("open");
+        f.write_all(damage).expect("damage");
+        drop(f);
+        assert_ne!(std::fs::read(&blob).expect("read"), b"the content");
+        // Written again, the content replaces what was damaged.
+        store
+            .put(&mut &b"the content"[..], provenance("s2"))
+            .expect("put again");
+        assert_eq!(std::fs::read(&blob).expect("read"), b"the content");
+        let mode = std::fs::metadata(&blob).expect("blob").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o444, "{mode:o}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

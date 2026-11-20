@@ -84,6 +84,17 @@ pub enum ArtifactError {
         /// The underlying error.
         source: std::io::Error,
     },
+    /// The store's lock was held elsewhere for longer than this waits.
+    #[error(
+        "the artifact store's lock {path} was held elsewhere for {waited:?}; another atomic, or \
+         something holding the file, is in the way"
+    )]
+    Locked {
+        /// The lock file.
+        path: PathBuf,
+        /// How long it waited.
+        waited: std::time::Duration,
+    },
     /// A manifest could not be read or written.
     #[error("artifact manifest {path}: {source}")]
     Manifest {
@@ -119,6 +130,8 @@ pub trait ArtifactStore {
 #[derive(Clone, Debug)]
 pub struct LocalStore {
     root: PathBuf,
+    lock: PathBuf,
+    lock_wait: std::time::Duration,
 }
 
 fn io(path: &Path) -> impl FnOnce(std::io::Error) -> ArtifactError + '_ {
@@ -129,14 +142,44 @@ fn io(path: &Path) -> impl FnOnce(std::io::Error) -> ArtifactError + '_ {
 }
 
 impl LocalStore {
-    /// A store rooted at `root`, creating its directories.
+    /// A store rooted at `root`, creating its directories, with its lock
+    /// file in `root`: for a store no atom's sandbox can read, such as a
+    /// test's. A project's store is [`Self::for_project`].
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, ArtifactError> {
         let root = root.into();
+        let lock = root.join("lock");
+        Self::open_locked_at(root, lock)
+    }
+
+    /// The project's store, `<state>/artifacts`, with its lock file in the
+    /// state directory's `private/`, which atoms' commands cannot open: an
+    /// atom that could take the lock could stall every write.
+    pub fn for_project(state: &crate::state::ProjectState) -> Result<Self, ArtifactError> {
+        Self::open_locked_at(
+            state.dir().join("artifacts"),
+            state.private_dir().join("artifacts.lock"),
+        )
+    }
+
+    fn open_locked_at(root: PathBuf, lock: PathBuf) -> Result<Self, ArtifactError> {
         for d in ["blobs/sha256", "manifests/sha256", "staging"] {
             let p = root.join(d);
             std::fs::create_dir_all(&p).map_err(io(&p))?;
         }
-        Ok(Self { root })
+        if let Some(dir) = lock.parent() {
+            std::fs::create_dir_all(dir).map_err(io(dir))?;
+        }
+        Ok(Self {
+            root,
+            lock,
+            lock_wait: LOCK_WAIT,
+        })
+    }
+
+    /// The same store, waiting at most `wait` for its lock.
+    pub fn waiting_at_most(mut self, wait: std::time::Duration) -> Self {
+        self.lock_wait = wait;
+        self
     }
 
     fn blob_path(&self, a: &ArtifactRef) -> PathBuf {
@@ -182,6 +225,37 @@ impl LocalStore {
 
 static STAGING_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Make `f` readable by everyone and writable by no one.
+fn read_only(f: &std::fs::File) -> std::io::Result<()> {
+    let mut permissions = f.metadata()?.permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(0o444);
+    }
+    #[cfg(not(unix))]
+    permissions.set_readonly(true);
+    f.set_permissions(permissions)
+}
+
+/// Whether the blob at `path` exists and still holds the content named
+/// `digest`, `size` bytes long. A blob of the wrong size, or whose bytes no
+/// longer hash to its name, is not.
+fn intact(path: &Path, digest: &str, size: u64) -> Result<bool, ArtifactError> {
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(io(path)(e)),
+    };
+    let meta = f.metadata().map_err(io(path))?;
+    if !meta.is_file() || meta.len() != size {
+        return Ok(false);
+    }
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut f, &mut hasher).map_err(io(path))?;
+    Ok(format!("{:x}", hasher.finalize()) == digest)
+}
+
 fn sync_dir(dir: &Path) -> Result<(), ArtifactError> {
     #[cfg(unix)]
     {
@@ -201,48 +275,96 @@ pub struct Swept {
     pub removed: Vec<ArtifactRef>,
     /// How many blobs it kept.
     pub kept: usize,
+    /// How many stale partial writes it cleared from staging.
+    pub partial: usize,
+    /// Entries in the blob tree that are not content, left as they are.
+    pub skipped: Vec<PathBuf>,
 }
 
-/// A lock on the store's `lock` file, held until dropped: shared by writers,
-/// exclusive for a sweep, so no write lands between a sweep's look at a blob
-/// and its removal, and sweeps run one at a time.
-struct StoreLock(#[allow(dead_code)] std::fs::File);
+/// How long a sweep keeps what was just written, at the least: a caller's
+/// grace below it is raised to it (see [`Grace`]).
+pub const MIN_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
 
-impl StoreLock {
-    fn take(root: &Path, exclusive: bool) -> Result<Self, ArtifactError> {
-        let path = root.join("lock");
-        let file = std::fs::File::options()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&path)
-            .map_err(io(&path))?;
-        #[cfg(unix)]
-        {
-            use std::os::fd::AsRawFd;
-            let how = if exclusive {
-                libc::LOCK_EX
-            } else {
-                libc::LOCK_SH
-            };
-            // SAFETY: flock on a descriptor this function owns.
-            #[allow(unsafe_code)]
-            let locked = unsafe { libc::flock(file.as_raw_fd(), how) };
-            if locked != 0 {
-                return Err(io(&path)(std::io::Error::last_os_error()));
-            }
-        }
-        #[cfg(not(unix))]
-        let _ = exclusive;
-        Ok(Self(file))
+/// How long [`LocalStore::sweep`] keeps content written recently: at least
+/// [`MIN_GRACE`], so a step that stored a result and has not yet recorded a
+/// reference to it keeps it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Grace(std::time::Duration);
+
+impl Grace {
+    /// `grace`, or [`MIN_GRACE`] if that is longer.
+    pub fn at_least(grace: std::time::Duration) -> Self {
+        Self(grace.max(MIN_GRACE))
+    }
+
+    /// No grace at all: for tests, which date content themselves.
+    #[cfg(any(test, feature = "fake-model"))]
+    pub fn none_for_tests() -> Self {
+        Self(std::time::Duration::ZERO)
     }
 }
 
+/// How long a write or a sweep waits for the store's lock before it gives up
+/// with [`ArtifactError::Locked`].
+pub const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A lock on the store's lock file, held until dropped: shared by writers,
+/// exclusive for a sweep, so no write lands between a sweep's look at a blob
+/// and its removal, and sweeps run one at a time. Taken without blocking,
+/// retried until a deadline, so a process holding it forever stalls nothing
+/// for longer than that.
+struct StoreLock(#[allow(dead_code)] std::fs::File);
+
+impl StoreLock {
+    fn take(
+        path: &Path,
+        exclusive: bool,
+        wait: std::time::Duration,
+    ) -> Result<Self, ArtifactError> {
+        // Read and write: some network filesystems refuse a shared lock on a
+        // descriptor that cannot read.
+        let file = std::fs::File::options()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(io(path))?;
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            let tried = if exclusive {
+                file.try_lock()
+            } else {
+                file.try_lock_shared()
+            };
+            match tried {
+                Ok(()) => return Ok(Self(file)),
+                Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    return Err(ArtifactError::Locked {
+                        path: path.to_owned(),
+                        waited: wait,
+                    });
+                }
+                Err(std::fs::TryLockError::Error(e)) => return Err(io(path)(e)),
+            }
+        }
+    }
+}
+
+/// Whether `name` is a two-hex-digit prefix directory of the blob tree.
+fn is_prefix(name: &str) -> bool {
+    name.len() == 2 && name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 impl LocalStore {
-    /// Remove every blob, and its manifests, whose digest is not in `keep`
-    /// and that was last written longer than `grace` ago. Digests in `keep`
-    /// are lowercase hex, with or without a `sha256:` prefix. Partial writes
-    /// left in staging longer than `grace` go too.
+    /// Remove every blob, and its manifests, that `keep` does not name and
+    /// that was last written longer than `grace` ago, and partial writes
+    /// left in staging as long. Entries in the blob tree that are not
+    /// content (a stray file, a prefix directory that is a link) are left
+    /// alone and reported in [`Swept::skipped`].
     ///
     /// It holds the store's lock while it runs, so a write waits for it and
     /// another sweep runs after it; content a write kept or added is then as
@@ -250,17 +372,14 @@ impl LocalStore {
     /// keeps nothing another caller needs unless that is in `keep` or recent.
     pub fn sweep(
         &self,
-        keep: &BTreeSet<String>,
-        grace: std::time::Duration,
+        keep: &BTreeSet<ArtifactRef>,
+        grace: Grace,
     ) -> Result<Swept, ArtifactError> {
-        let _lock = StoreLock::take(&self.root, true)?;
-        let keep: BTreeSet<&str> = keep
-            .iter()
-            .map(|d| d.strip_prefix("sha256:").unwrap_or(d))
-            .collect();
+        let _lock = StoreLock::take(&self.lock, true, self.lock_wait)?;
+        let grace = grace.0;
         let now = std::time::SystemTime::now();
         let old = |path: &Path| -> Result<bool, ArtifactError> {
-            let written = std::fs::metadata(path)
+            let written = std::fs::symlink_metadata(path)
                 .and_then(|m| m.modified())
                 .map_err(io(path))?;
             Ok(now.duration_since(written).is_ok_and(|age| age > grace))
@@ -270,15 +389,26 @@ impl LocalStore {
         for prefix in std::fs::read_dir(&blobs).map_err(io(&blobs))?.flatten() {
             let prefix_path = prefix.path();
             let prefix_name = prefix.file_name().to_string_lossy().into_owned();
+            // Never through a link, and only the tree's own two-hex prefixes.
+            let is_dir = prefix.file_type().is_ok_and(|t| t.is_dir());
+            if !is_dir || !is_prefix(&prefix_name) {
+                swept.skipped.push(prefix_path);
+                continue;
+            }
             for blob in std::fs::read_dir(&prefix_path)
                 .map_err(io(&prefix_path))?
                 .flatten()
             {
                 let digest = format!("{prefix_name}{}", blob.file_name().to_string_lossy());
-                let Ok(artifact) = ArtifactRef::from_digest(&digest) else {
-                    continue;
+                let is_file = blob.file_type().is_ok_and(|t| t.is_file());
+                let artifact = match ArtifactRef::from_digest(&digest) {
+                    Ok(artifact) if is_file => artifact,
+                    _ => {
+                        swept.skipped.push(blob.path());
+                        continue;
+                    }
                 };
-                if keep.contains(artifact.digest()) || !old(&blob.path())? {
+                if keep.contains(&artifact) || !old(&blob.path())? {
                     swept.kept += 1;
                     continue;
                 }
@@ -299,9 +429,10 @@ impl LocalStore {
         for partial in std::fs::read_dir(&staging).map_err(io(&staging))?.flatten() {
             if old(&partial.path())? {
                 let _ = std::fs::remove_file(partial.path());
+                swept.partial += 1;
             }
         }
-        swept.removed.sort_by(|a, b| a.digest().cmp(b.digest()));
+        swept.removed.sort();
         Ok(swept)
     }
 }
@@ -314,7 +445,7 @@ impl ArtifactStore for LocalStore {
     ) -> Result<Manifest, ArtifactError> {
         // Stream to staging while hashing, then move into place under the
         // digest, with no sweep in between.
-        let _lock = StoreLock::take(&self.root, false)?;
+        let _lock = StoreLock::take(&self.lock, false, self.lock_wait)?;
         let staging = self.root.join("staging");
         let tmp = staging.join(format!(
             "{}-{}",
@@ -335,6 +466,9 @@ impl ArtifactStore for LocalStore {
                 f.write_all(&buf[..n]).map_err(io(&tmp))?;
                 size += n as u64;
             }
+            // Read-only once written: content under its digest is never
+            // changed in place, by atomic or through a link a command holds.
+            read_only(&f).map_err(io(&tmp))?;
             f.sync_all().map_err(io(&tmp))
         })();
         if let Err(e) = staged {
@@ -347,17 +481,20 @@ impl ArtifactStore for LocalStore {
             source: std::io::Error::other(e.to_string()),
         })?;
         let blob = self.blob_path(&artifact);
-        if blob.exists() {
+        let parent = blob.parent().map(Path::to_owned).unwrap_or_default();
+        if intact(&blob, &digest, size)? {
             // Already stored: identical content is kept once, and is now as
-            // recent as this write, so a sweep's grace period covers it.
+            // recent as this write, so a sweep's grace period covers it. The
+            // blob is opened read-only (its owner may set its times). The
+            // time is not synced: after a crash it may be older, and the
+            // content is then only as safe as the caller's keep set.
             let _ = std::fs::remove_file(&tmp);
-            std::fs::File::options()
-                .write(true)
-                .open(&blob)
+            std::fs::File::open(&blob)
                 .and_then(|f| f.set_modified(std::time::SystemTime::now()))
                 .map_err(io(&blob))?;
         } else {
-            let parent = blob.parent().map(Path::to_owned).unwrap_or_default();
+            // New, or a blob that no longer holds its content: the content
+            // just written takes its place.
             std::fs::create_dir_all(&parent).map_err(io(&parent))?;
             std::fs::rename(&tmp, &blob).map_err(io(&blob))?;
             sync_dir(&parent)?;

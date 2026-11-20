@@ -193,7 +193,7 @@ pub async fn open(
         .into());
     }
     let endpoint = args.endpoint(needs_model)?;
-    let store = LocalStore::open(state.dir().join("artifacts")).context("the artifact store")?;
+    let store = LocalStore::for_project(state).context("the artifact store")?;
     let exec = match args.runner {
         RunnerKind::Local => atomic_exec::Backend::default(),
         RunnerKind::Process => atomic_exec::Backend::new(ProcessRunner::atomic(
