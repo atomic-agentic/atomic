@@ -149,6 +149,9 @@ impl PromptArgs {
     }
 }
 
+/// The names Codex starts this executable under to run one of its helpers.
+const CODEX_HELPER_NAMES: &[&str] = &["codex-linux-sandbox", "apply_patch", "applypatch"];
+
 fn main() -> anyhow::Result<()> {
     // A helper child serves one call and exits, before anything else starts:
     // no state directory, no Codex dispatch.
@@ -164,8 +167,8 @@ fn main() -> anyhow::Result<()> {
     }
     let parsed = Cli::try_parse();
     // Help and the version create nothing on disk, and print only themselves:
-    // they need no Codex either, unless this process was started as one of
-    // Codex's helpers, which read their own arguments.
+    // they need no Codex either, unless this process was started under the
+    // name of one of Codex's helpers, which read their own arguments.
     let quiet = parsed.as_ref().err().is_some_and(|e| {
         use clap::error::ErrorKind;
         matches!(
@@ -175,16 +178,16 @@ fn main() -> anyhow::Result<()> {
                 | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
         )
     });
-    let as_atomic = std::env::args_os()
+    let not_a_helper = std::env::args_os()
         .next()
         .and_then(|arg0| {
             Path::new(&arg0)
                 .file_name()
-                .map(|name| name.to_string_lossy().starts_with("atomic"))
+                .map(|name| !CODEX_HELPER_NAMES.contains(&name.to_string_lossy().as_ref()))
         })
-        .unwrap_or(false);
+        .unwrap_or(true);
     if quiet
-        && as_atomic
+        && not_a_helper
         && let Err(e) = &parsed
     {
         e.exit();

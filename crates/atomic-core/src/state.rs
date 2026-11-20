@@ -184,17 +184,35 @@ fn holder(path: &Path) -> String {
         let pid = text
             .strip_prefix("pid ")
             .and_then(|rest| rest.split_whitespace().next());
-        let current = match pid {
-            Some(pid) if cfg!(target_os = "linux") => Path::new("/proc").join(pid).exists(),
-            Some(_) => true,
-            None => false,
-        };
+        let current = pid.is_some_and(running);
         if current {
             return text.to_owned();
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     "another process, which has not yet said which".into()
+}
+
+/// Whether process `pid` exists.
+fn running(pid: &str) -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(pid) = pid.parse::<libc::pid_t>() else {
+            return false;
+        };
+        if pid <= 0 {
+            return false;
+        }
+        // SAFETY: signal 0 sends nothing; it only checks that the process
+        // exists and may be signalled.
+        #[allow(unsafe_code)]
+        let found = unsafe { libc::kill(pid, 0) } == 0;
+        found || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
+    {
+        !pid.is_empty()
+    }
 }
 
 /// The project's execution lock, held until it is dropped or the process
@@ -349,7 +367,7 @@ mod tests {
         state.create().expect("state");
         // A previous holder's words, left in the file, and a new holder that
         // has the lock but has not written yet.
-        std::fs::write(state.lock_file(), "pid 4194304999 (atomic serve)").expect("stale");
+        std::fs::write(state.lock_file(), "pid 2147483000 (atomic serve)").expect("stale");
         let holder = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -358,7 +376,7 @@ mod tests {
         holder.try_lock().expect("hold");
         match state.lock_execution("atomic runs resume") {
             Err(LockError::Held { owner, .. }) => {
-                assert!(!owner.contains("4194304999"), "{owner}");
+                assert!(!owner.contains("2147483000"), "{owner}");
                 assert!(owner.contains("has not yet said"), "{owner}");
             }
             other => panic!("{other:?}"),

@@ -2303,4 +2303,19 @@ fn help_and_the_version_create_nothing_even_from_a_deleted_directory() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("atomic "));
     assert!(out.stderr.is_empty(), "no warnings: {}", text(&out));
     assert!(!dir.join("atomic-home").exists(), "nothing was created");
+
+    // The same under another name.
+    let renamed = dir.join("bin/my-tool");
+    std::fs::create_dir_all(dir.join("bin")).expect("bin");
+    std::fs::copy(ATOMIC, &renamed).expect("copy");
+    let out = Command::new(&renamed)
+        .arg("--version")
+        .current_dir(&dir)
+        .env("HOME", dir.join("home"))
+        .env("ATOMIC_HOME", dir.join("atomic-home"))
+        .output()
+        .expect("run");
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(out.stderr.is_empty(), "no warnings: {}", text(&out));
+    assert!(!dir.join("atomic-home").exists(), "nothing was created");
 }
