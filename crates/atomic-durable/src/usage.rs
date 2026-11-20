@@ -127,6 +127,10 @@ pub struct Request {
     /// reservation can reach at most `max(0, maximum - reserve)`, which is
     /// zero when the whole maximum is reserved.
     pub maximum: Charge,
+    /// Whether it is a whole agent turn: it reserves all the active time the
+    /// chain has left, the least any allowance in it has, in place of
+    /// `reserve.millis`, and is cut off when that runs out.
+    pub turn: bool,
 }
 
 /// What admission decided.
@@ -138,6 +142,8 @@ pub enum Admission {
         request: String,
         /// The attempt, from 1.
         attempt: i64,
+        /// The active milliseconds reserved: the call's time limit.
+        millis: i64,
     },
     /// Refused: an allowance has no room for the reservation. Nothing was
     /// written.
@@ -395,7 +401,7 @@ async fn admit_in(tx: &mut Tx<'_, '_>, request: &Request) -> Result<End<Admissio
             request.id
         )));
     }
-    let r = request.reserve;
+    let mut r = request.reserve;
     let amounts =
         [r.tokens, r.millis, r.micro_usd]
             .into_iter()
@@ -436,6 +442,7 @@ async fn admit_in(tx: &mut Tx<'_, '_>, request: &Request) -> Result<End<Admissio
     // read (a write that changes nothing), so the room the read finds is
     // the room the reservation takes, and a refusal's reason comes from the
     // same state as the refusal itself.
+    let mut allowances = Vec::with_capacity(request.chain.len());
     for scope in &request.chain {
         tx.execute(
             "UPDATE atomic_usage_allowances SET tokens_cap = tokens_cap WHERE scope = ?",
@@ -445,7 +452,29 @@ async fn admit_in(tx: &mut Tx<'_, '_>, request: &Request) -> Result<End<Admissio
         let Some(a) = read_allowance(tx, &scope.id).await? else {
             return Err(corrupt(format!("allowance {} vanished", scope.id)));
         };
-        let short = shortfall(&a, r);
+        allowances.push(a);
+    }
+    // A turn takes all the active time left, the least any allowance has.
+    if request.turn {
+        let (least, left) = allowances
+            .iter()
+            .map(|a| (a, a.caps.millis.saturating_sub(a.charged.millis)))
+            .min_by_key(|(_, left)| *left)
+            .ok_or_else(|| corrupt("an empty chain"))?;
+        if left <= 0 {
+            return refuse(
+                &least.scope,
+                format!(
+                    "the allowance {} has no active time left for request {}: {} of {} ms \
+                     charged",
+                    least.scope, request.id, least.charged.millis, least.caps.millis
+                ),
+            );
+        }
+        r.millis = left;
+    }
+    for (scope, a) in request.chain.iter().zip(&allowances) {
+        let short = shortfall(a, r);
         if !short.is_empty() {
             return refuse(
                 &scope.id,
@@ -517,6 +546,7 @@ async fn admit_in(tx: &mut Tx<'_, '_>, request: &Request) -> Result<End<Admissio
     Ok(End::Commit(Admission::Admitted {
         request: request.id.clone(),
         attempt,
+        millis: r.millis,
     }))
 }
 

@@ -49,6 +49,10 @@ pub struct Call {
     /// size of the request in bytes, since no token is shorter than a byte.
     /// The meter records it in the call's declared maximum.
     pub input_bound: Option<u64>,
+    /// Whether it is a whole agent turn, such as a Codex turn, that may make
+    /// several provider requests and run tools between them: it reserves
+    /// the atom's remaining active time, not one request's.
+    pub turn: bool,
 }
 
 /// What an admitted call may use: the runtime holds the call to it.
@@ -115,6 +119,11 @@ pub enum MeterError {
     /// stays charged at its bound.
     #[error("the usage ledger: {0}")]
     Store(String),
+    /// The meter cannot account for the call as its budget requires, such
+    /// as a call to a model with no price under a dollar cap. The call is
+    /// not dispatched, and the atom fails.
+    #[error("{0}")]
+    Unaccountable(String),
 }
 
 /// A boxed future, for the object-safe [`Meter`].

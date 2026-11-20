@@ -430,6 +430,7 @@ fn usage_with_a_missing_or_malformed_count_is_unknown() {
 
 #[tokio::test]
 async fn a_call_is_sent_with_its_reserved_output_limit() {
+    // The fake model is a local server: `max_tokens` on Chat Completions.
     for (wire, field) in [
         (Wire::ChatCompletions, "max_tokens"),
         (Wire::Responses, "max_output_tokens"),
@@ -522,4 +523,97 @@ async fn a_failed_call_settles_by_whether_it_could_have_been_sent() {
     let recorder = metered(&mut rt, Limit::default());
     assert!(run_lite_atom(&Classify, &note(), &rt).await.is_err());
     assert_eq!(settled(&recorder), [Outcome::NotDispatched]);
+}
+
+#[test]
+fn the_output_limit_goes_in_the_field_its_endpoint_reads() {
+    use LimitField::*;
+    for (wire, base, field) in [
+        (Wire::ChatCompletions, "http://127.0.0.1:8080/v1", MaxTokens),
+        (Wire::ChatCompletions, "http://localhost:11434/v1", MaxTokens),
+        (Wire::ChatCompletions, "https://api.openai.com/v1", MaxCompletionTokens),
+        (
+            Wire::ChatCompletions,
+            "https://example.openai.azure.com/openai/v1",
+            MaxCompletionTokens,
+        ),
+        (
+            Wire::ChatCompletions,
+            "https://example.cognitiveservices.azure.com/openai/v1",
+            MaxCompletionTokens,
+        ),
+        (Wire::Responses, "https://api.openai.com/v1", MaxOutputTokens),
+        (Wire::Responses, "http://127.0.0.1:8080/v1", MaxOutputTokens),
+    ] {
+        assert_eq!(LimitField::for_endpoint(wire, base), field, "{wire:?} {base}");
+    }
+    assert_eq!(MaxCompletionTokens.name(), "max_completion_tokens");
+}
+
+#[tokio::test]
+async fn a_judged_answer_still_settles_the_usage_it_reported() {
+    let usage = json!({"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10});
+    for body in [
+        // A refusal.
+        json!({"id": "c", "choices": [{"index": 0, "finish_reason": "stop",
+            "message": {"role": "assistant", "content": null, "refusal": "No."}}], "usage": usage}),
+        // No content.
+        json!({"id": "c", "choices": [{"index": 0, "finish_reason": "stop",
+            "message": {"role": "assistant", "content": null}}], "usage": usage}),
+    ] {
+        let model = FakeModel::start(vec![Reply::Json(body.clone())])
+            .await
+            .expect("fake model");
+        let mut rt = runtime(&model, Wire::ChatCompletions);
+        let recorder = metered(&mut rt, Limit::default());
+        assert!(run_lite_atom(&Classify, &note(), &rt).await.is_err(), "{body}");
+        assert_eq!(
+            settled(&recorder),
+            [Outcome::Reported(Usage {
+                input_tokens: 7,
+                output_tokens: 3
+            })],
+            "{body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_answer_cut_off_at_its_output_limit_is_its_own_error_with_no_repair() {
+    for (wire, body) in [
+        (
+            Wire::ChatCompletions,
+            json!({"id": "c", "choices": [{"index": 0, "finish_reason": "length",
+                "message": {"role": "assistant", "content": "{\"category\": \"bu"}}],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 50, "total_tokens": 57}}),
+        ),
+        (
+            Wire::Responses,
+            json!({"id": "r", "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "output": [{"type": "message", "role": "assistant", "content": [
+                    {"type": "output_text", "text": "{\"category\": \"bu"}]}],
+                "usage": {"input_tokens": 7, "output_tokens": 50, "total_tokens": 57}}),
+        ),
+    ] {
+        let model = FakeModel::start(vec![Reply::Json(body), Reply::Text(GOOD.into())])
+            .await
+            .expect("fake model");
+        let mut rt = runtime(&model, wire);
+        let recorder = metered(&mut rt, Limit::default());
+        match run_lite_atom(&Classify, &note(), &rt).await {
+            Err(AtomError::Model(message)) => {
+                assert!(message.contains("cut off at the call's output limit"), "{message}");
+            }
+            other => panic!("{wire:?}: expected a truncation error, got {other:?}"),
+        }
+        assert_eq!(model.calls(), 1, "{wire:?}: no repair turn");
+        assert_eq!(
+            settled(&recorder),
+            [Outcome::Reported(Usage {
+                input_tokens: 7,
+                output_tokens: 50
+            })]
+        );
+    }
 }

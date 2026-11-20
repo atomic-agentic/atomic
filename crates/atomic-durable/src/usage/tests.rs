@@ -71,12 +71,15 @@ fn request(run: &str, step: i32, call: u32, run_cap: i64, atom_cap: i64) -> Requ
         ],
         reserve: BOUND,
         maximum: BOUND,
+        turn: false,
     }
 }
 
 fn admitted(a: &Admission) -> (String, i64) {
     match a {
-        Admission::Admitted { request, attempt } => (request.clone(), *attempt),
+        Admission::Admitted {
+            request, attempt, ..
+        } => (request.clone(), *attempt),
         Admission::Refused { reason, .. } => panic!("refused: {reason}"),
     }
 }
@@ -497,7 +500,9 @@ async fn a_refusal_is_explained_by_the_state_it_refused<R: DurableRuntime>(rt: R
                 let req = request(&run, step, 0, 300, 10_000);
                 tokio::spawn(async move {
                     match ledger.admit(req).await.expect("admit") {
-                        Admission::Admitted { request, attempt } => {
+                        Admission::Admitted {
+            request, attempt, ..
+        } => {
                             ledger
                                 .settle(
                                     &request,
@@ -533,6 +538,106 @@ async fn a_refusal_is_explained_by_the_state_it_refused<R: DurableRuntime>(rt: R
     }
 }
 
+async fn a_turn_reserves_the_active_time_left<R: DurableRuntime>(rt: R) {
+    let ledger = rt.ledger();
+    let run = unique("turn");
+    let mut turn = request(&run, 1, 0, 1_000_000, 1_000_000);
+    turn.chain[0].caps.millis = 30_000;
+    turn.chain[1].caps.millis = 20_000;
+    turn.turn = true;
+    // All the time the narrowest allowance has, not the call bound's.
+    let Admission::Admitted { millis, .. } = ledger.admit(turn.clone()).await.expect("admit") else {
+        panic!("admitted");
+    };
+    assert_eq!(millis, 20_000);
+    ledger
+        .settle(
+            &format!("{run}:1:0"),
+            1,
+            Settlement::Reported {
+                input_tokens: 1,
+                output_tokens: 1,
+                millis: 12_000,
+                micro_usd: 0,
+            },
+        )
+        .await
+        .expect("settle");
+    // The next turn gets what is left.
+    turn.id = format!("{run}:1:1");
+    let Admission::Admitted { millis, .. } = ledger.admit(turn.clone()).await.expect("admit") else {
+        panic!("admitted");
+    };
+    assert_eq!(millis, 8_000);
+    // With none left, it is refused.
+    turn.id = format!("{run}:1:2");
+    match ledger.admit(turn).await.expect("admit") {
+        Admission::Refused { scope, reason } => {
+            assert_eq!(scope, format!("atom:{run}:1"));
+            assert!(reason.contains("no active time left"), "{reason}");
+        }
+        other => panic!("refused: {other:?}"),
+    }
+}
+
+async fn amounts_out_of_range_are_refused_and_reported_usage_is_held<R: DurableRuntime>(rt: R) {
+    let ledger = rt.ledger();
+    let run = unique("range");
+    for bad in [-1, MOST + 1] {
+        let mut req = request(&run, 1, 0, 1_000, 1_000);
+        req.reserve.tokens = bad;
+        assert!(ledger.admit(req).await.is_err(), "reserve {bad}");
+        let mut req = request(&run, 1, 0, 1_000, 1_000);
+        req.chain[1].caps.millis = bad;
+        assert!(ledger.admit(req).await.is_err(), "cap {bad}");
+        let mut req = request(&run, 1, 0, 1_000, 1_000);
+        req.chain[0].caps.micro_usd = Some(bad);
+        assert!(ledger.admit(req).await.is_err(), "dollar cap {bad}");
+    }
+    assert!(
+        ledger.attempts(&run).await.expect("attempts").is_empty(),
+        "nothing was written"
+    );
+    admitted(
+        &ledger
+            .admit(request(&run, 1, 0, MOST, MOST))
+            .await
+            .expect("admit"),
+    );
+    for bad in [-1, MOST + 1] {
+        let caps = Caps {
+            tokens: bad,
+            millis: 1,
+            micro_usd: None,
+        };
+        assert!(ledger.raise(&format!("run:{run}"), caps).await.is_err(), "{bad}");
+    }
+    // Usage past MOST, or below zero, is held to [0, MOST].
+    ledger
+        .settle(
+            &format!("{run}:1:0"),
+            1,
+            Settlement::Reported {
+                input_tokens: i64::MAX,
+                output_tokens: -5,
+                millis: -1,
+                micro_usd: i64::MAX,
+            },
+        )
+        .await
+        .expect("settle");
+    let a = &ledger.attempts(&run).await.expect("attempts")[0];
+    assert_eq!(a.usage, Some((MOST, 0)));
+    assert_eq!(
+        a.charged,
+        Charge {
+            tokens: MOST,
+            millis: 0,
+            micro_usd: MOST,
+        }
+    );
+}
+
 macro_rules! on_sqlite {
     ($($name:ident),* $(,)?) => {
         mod on_sqlite {
@@ -562,6 +667,8 @@ macro_rules! on_postgres {
 
 on_sqlite!(
     a_call_is_reserved_before_dispatch_and_settled_once,
+    a_turn_reserves_the_active_time_left,
+    amounts_out_of_range_are_refused_and_reported_usage_is_held,
     admission_refuses_on_time_and_on_dollars,
     a_reserved_attempt_is_reconciled_or_released_once,
     a_person_raises_a_cap_and_never_lowers_one,
@@ -576,6 +683,8 @@ on_sqlite!(
 #[cfg(feature = "postgres-tests")]
 on_postgres!(
     a_call_is_reserved_before_dispatch_and_settled_once,
+    a_turn_reserves_the_active_time_left,
+    amounts_out_of_range_are_refused_and_reported_usage_is_held,
     admission_refuses_on_time_and_on_dollars,
     a_reserved_attempt_is_reconciled_or_released_once,
     a_person_raises_a_cap_and_never_lowers_one,

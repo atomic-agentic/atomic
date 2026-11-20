@@ -297,7 +297,7 @@ async fn run_contract(
     .map_err(|e| match crate::usage::meter_failure(&e) {
         // The meter refused the next call: nothing was sent for it.
         Some(MeterError::Exhausted(refusal)) => AtomError::Budget(refusal.to_string()),
-        Some(failure @ MeterError::Store(_)) => AtomError::Runtime(failure.to_string()),
+        Some(failure) => AtomError::Runtime(failure.to_string()),
         None => AtomError::Model(format!("{e:#}")),
     })?;
     let metadata = RunMetadata {

@@ -10,7 +10,7 @@
 //! read from the user's Codex configuration: Codex's home is the project's
 //! state directory (see [`crate::state`]).
 
-use crate::usage::{Call, Metering, Outcome, Usage, meter_error};
+use crate::usage::{Call, Exhausted, MeterError, Metering, Outcome, Usage, meter_error};
 use anyhow::Context;
 use anyhow::bail;
 use codex_core_api::AbsolutePathBuf;
@@ -367,6 +367,7 @@ where
                 index: report.turns,
                 model: endpoint.model.clone(),
                 input_bound: None,
+                turn: true,
             })
             .await
         {
@@ -400,6 +401,13 @@ where
             break Err(meter_error(e));
         }
         match turn {
+            // A turn cut off at its reserved time used up the active time
+            // its atom had left: the run parks, as at any other cap.
+            Err(e) if e.downcast_ref::<CutOff>().is_some() => {
+                break Err(meter_error(MeterError::Exhausted(Exhausted(format!(
+                    "{e}; the atom's allowance has no active time left for it"
+                )))));
+            }
             Err(e) => break Err(e),
             Ok(answer) => match next(answer.clone()).await {
                 Some(follow_up) => current = follow_up,
@@ -677,6 +685,11 @@ const NOT_IDLE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(10
 
 /// Run one turn; return its final message and the thread's token totals
 /// (input, output, total) as last reported.
+/// A turn cut off when its reserved time ran out.
+#[derive(Debug, thiserror::Error)]
+#[error("the turn was cut off after {} ms, its reserved time", .0.as_millis())]
+struct CutOff(std::time::Duration);
+
 /// How long an interrupted turn has to wind down.
 const INTERRUPT_PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -695,10 +708,7 @@ async fn run_turn(
             Ok(ended) => ended,
             Err(_) => {
                 interrupt(thread, &mut usage).await;
-                Err(anyhow::anyhow!(
-                    "the turn was cut off after {} ms, its reserved time",
-                    time.as_millis()
-                ))
+                Err(anyhow::Error::new(CutOff(time)))
             }
         },
     };

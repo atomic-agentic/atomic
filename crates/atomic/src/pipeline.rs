@@ -449,7 +449,12 @@ async fn run_pipeline<C: WorkflowContext>(
     // The budgets the run keeps: pinned before it started, or resolved now,
     // once, and recorded with its definitions.
     let planned = match &pipeline.budgets {
-        Some(plan) => Ok(plan.clone()),
+        // A plan in the run's input came from outside: checked as one
+        // resolved here would be.
+        Some(plan) => plan
+            .validate()
+            .map(|()| plan.clone())
+            .map_err(|e| format!("workflow {}: its pinned budget: {e}", pipeline.name)),
         None => plan_budgets(&pipeline, &services.runtimes, &services.budgets),
     };
     // Store the definitions the run uses before anything runs. The snapshot
@@ -491,7 +496,7 @@ async fn run_pipeline<C: WorkflowContext>(
         None => plan_budgets(&pipeline, &services.runtimes, &services.budgets).map_err(failed)?,
     };
     let budget = RunBudget::pinned(ledger, &plan);
-    let caps = plan.atoms;
+    let (caps, models) = (plan.atoms, plan.models);
     let mut steps = Map::new();
     let mut used_worktrees = false;
     let mut accepted = Vec::new();
@@ -568,6 +573,29 @@ async fn run_pipeline<C: WorkflowContext>(
         };
         let atom_input = Value::Object(mapped);
         let (budget, atom_caps) = (budget.clone(), caps.get(&step.atom).cloned());
+        // A model atom runs on the model its budget was resolved for, and
+        // only with caps: never unmetered, never at another model's price.
+        if let Some(model) = model_of(&atom, &runtimes) {
+            let pinned = models.get(&step.atom).cloned();
+            if atom_caps.is_none() || (pinned.is_none() && !models.is_empty()) {
+                return Err(failed(format!(
+                    "step `{}`: `{}` calls a model, and the run's budget has no caps for it",
+                    step.id, atom.name
+                )));
+            }
+            if let Some(pinned) = pinned {
+                runtimes.codex.defaults.model = Some(pinned.clone());
+                runtimes.lite.defaults.model = Some(pinned.clone());
+                let now = model_of(&atom, &runtimes).unwrap_or(model);
+                if now != pinned {
+                    return Err(failed(format!(
+                        "step `{}`: `{}` calls {now:?}, and the run's budget was resolved \
+                         for {pinned:?}",
+                        step.id, atom.name
+                    )));
+                }
+            }
+        }
         let tree = if step.worktree {
             let worktrees = services.worktrees.clone().ok_or_else(|| {
                 failed(format!(

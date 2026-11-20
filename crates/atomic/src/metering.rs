@@ -17,7 +17,9 @@
 //! into a [`BudgetPlan`] the run keeps: a resumed run is metered as it began,
 //! whatever the settings say by then.
 
-use atomic_core::budget::{Budget, BudgetError, BudgetSettings, Level, Resolved, resolve};
+use atomic_core::budget::{
+    Budget, BudgetError, BudgetSettings, CallBound, Level, Price, Resolved, resolve,
+};
 use atomic_core::usage::{
     Call, Exhausted, Limit, Meter, MeterError, MeterFuture, Metering, Outcome, Ticket,
 };
@@ -28,17 +30,51 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// A run's budgets, resolved once: the run's caps, each model atom's by
-/// name, and the call bounds and prices of the models the run calls. A run
-/// keeps the plan it started with.
+/// A run's budgets, resolved once: the run's caps, each model atom's caps
+/// and model by name, and the call bound and prices of the models the run
+/// calls. A run keeps the plan it started with, and each atom runs on the
+/// model the plan names for it. Stored with the run, so it reads past fields
+/// a later version adds.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BudgetPlan {
     /// The run's caps, children included.
     pub run: Resolved,
     /// Each model atom's caps, by atom name.
     pub atoms: BTreeMap<String, Resolved>,
-    /// The call bound and the price table, cut to the models the run calls.
-    pub settings: BudgetSettings,
+    /// The model each model atom calls, by atom name.
+    #[serde(default)]
+    pub models: BTreeMap<String, String>,
+    /// The most one call may use, when its model has no maximum of its own.
+    pub call: PlannedCall,
+    /// The price table, cut to the models the run calls.
+    #[serde(default)]
+    pub pricing: BTreeMap<String, PlannedPrice>,
+}
+
+/// [`atomic_core::budget::CallBound`], as a plan keeps it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PlannedCall {
+    /// Input tokens.
+    pub input_tokens: u64,
+    /// Output tokens, including reasoning.
+    pub output_tokens: u64,
+    /// Active minutes.
+    pub minutes: f64,
+}
+
+/// [`Price`], as a plan keeps it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PlannedPrice {
+    /// US dollars per million input tokens.
+    pub input_usd_per_mtok: f64,
+    /// US dollars per million output tokens.
+    pub output_usd_per_mtok: f64,
+    /// The most input tokens one call takes, if not the call bound's.
+    #[serde(default)]
+    pub max_input_tokens: Option<u64>,
+    /// The most output tokens one call returns, if not the call bound's.
+    #[serde(default)]
+    pub max_output_tokens: Option<u64>,
 }
 
 impl BudgetPlan {
@@ -59,14 +95,94 @@ impl BudgetPlan {
                 .map_err(|e| (Some((*name).to_owned()), e))?;
             resolved.insert((*name).to_owned(), caps);
         }
-        let mut kept = settings.clone();
-        kept.pricing
-            .retain(|model, _| models.contains(&model.as_str()));
         Ok(Self {
             run,
             atoms: resolved,
-            settings: kept,
+            models: atoms
+                .iter()
+                .map(|(name, _, model)| ((*name).to_owned(), (*model).to_owned()))
+                .collect(),
+            call: PlannedCall {
+                input_tokens: settings.call.input_tokens,
+                output_tokens: settings.call.output_tokens,
+                minutes: settings.call.minutes,
+            },
+            pricing: settings
+                .pricing
+                .iter()
+                .filter(|(model, _)| models.contains(&model.as_str()))
+                .map(|(model, p)| {
+                    (
+                        model.clone(),
+                        PlannedPrice {
+                            input_usd_per_mtok: p.input_usd_per_mtok,
+                            output_usd_per_mtok: p.output_usd_per_mtok,
+                            max_input_tokens: p.max_input_tokens,
+                            max_output_tokens: p.max_output_tokens,
+                        },
+                    )
+                })
+                .collect(),
         })
+    }
+
+    /// The call bound and prices the plan meters under.
+    pub fn settings(&self) -> BudgetSettings {
+        BudgetSettings {
+            call: CallBound {
+                input_tokens: self.call.input_tokens,
+                output_tokens: self.call.output_tokens,
+                minutes: self.call.minutes,
+            },
+            pricing: self
+                .pricing
+                .iter()
+                .map(|(model, p)| {
+                    (
+                        model.clone(),
+                        Price {
+                            input_usd_per_mtok: p.input_usd_per_mtok,
+                            output_usd_per_mtok: p.output_usd_per_mtok,
+                            max_input_tokens: p.max_input_tokens,
+                            max_output_tokens: p.max_output_tokens,
+                        },
+                    )
+                })
+                .collect(),
+            ..BudgetSettings::default()
+        }
+    }
+
+    /// Check a plan that came from outside, such as one pinned in a run's
+    /// input: its settings in range, every cap leaving room for one call to
+    /// its models, and a dollar cap only over priced models.
+    pub fn validate(&self) -> Result<(), String> {
+        let settings = self.settings();
+        settings.validate().map_err(|e| e.to_string())?;
+        let priced = |model: &str, caps: &Resolved, whose: &str| {
+            if caps.micro_usd.is_some() && !settings.pricing.contains_key(model) {
+                let unpriced = BudgetError::Unpriced {
+                    model: model.to_owned(),
+                };
+                return Err(format!("{whose}: {unpriced}"));
+            }
+            Ok(())
+        };
+        for (atom, model) in &self.models {
+            let caps = self
+                .atoms
+                .get(atom)
+                .ok_or_else(|| format!("atom {atom} calls {model:?} and the plan has no caps for it"))?;
+            settings
+                .check_room(caps, Level::Atom, model)
+                .map_err(|e| format!("atom {atom}: {e}"))?;
+            settings
+                .check_room(&self.run, Level::Workflow, model)
+                .map_err(|e| format!("the run: {e}"))?;
+            priced(model, caps, &format!("atom {atom}"))?;
+            priced(model, &self.run, "the run")?;
+        }
+        Ok(())
     }
 }
 
@@ -121,7 +237,7 @@ impl RunBudget {
     pub fn pinned(ledger: Ledger, plan: &BudgetPlan) -> Self {
         Self {
             ledger,
-            settings: Arc::new(plan.settings.clone()),
+            settings: Arc::new(plan.settings()),
             run: plan.run.clone(),
         }
     }
@@ -143,6 +259,7 @@ impl RunBudget {
                 Scope::run(run, caps(&self.run)),
                 Scope::atom(run, step.step_id, caps(atom)),
             ],
+            dollar_capped: self.run.micro_usd.is_some() || atom.micro_usd.is_some(),
         }))
     }
 }
@@ -154,6 +271,8 @@ struct LedgerMeter {
     run: String,
     step: i32,
     chain: Vec<Scope>,
+    /// Whether a dollar cap applies: then every call must be priced.
+    dollar_capped: bool,
 }
 
 fn store(e: impl std::fmt::Display) -> MeterError {
@@ -163,6 +282,16 @@ fn store(e: impl std::fmt::Display) -> MeterError {
 impl Meter for LedgerMeter {
     fn admit(&self, call: Call) -> MeterFuture<'_, Ticket> {
         Box::pin(async move {
+            // A dollar cap can hold only over priced calls: a call to a model
+            // the plan does not price, as when the model changed since the
+            // budget was resolved, is not made.
+            if self.dollar_capped && !self.settings.pricing.contains_key(&call.model) {
+                return Err(MeterError::Unaccountable(format!(
+                    "a dollar cap applies, and model {:?} has no price in the run's budget; \
+                     the call is not made",
+                    call.model
+                )));
+            }
             let bound = self.settings.reservation(&call.model);
             // The whole bound is reserved, and the call is held to it: its
             // output limit and its time are the bound's. Its input is what
@@ -189,16 +318,23 @@ impl Meter for LedgerMeter {
                 chain: self.chain.clone(),
                 reserve: whole,
                 maximum,
+                turn: call.turn,
             };
             match self.ledger.admit(request).await.map_err(store)? {
-                Admission::Admitted { request, attempt } => Ok(Ticket {
+                Admission::Admitted {
+                    request,
+                    attempt,
+                    millis,
+                } => Ok(Ticket {
                     request,
                     attempt,
                     model: call.model,
                     admitted: Instant::now(),
                     limit: Limit {
                         output_tokens: Some(bound.output_tokens),
-                        time: Some(Duration::from_millis(bound.millis)),
+                        // A request's own bound; for a turn, the active time
+                        // its atom has left.
+                        time: Some(Duration::from_millis(u64::try_from(millis).unwrap_or(0))),
                     },
                 }),
                 Admission::Refused { reason, .. } => Err(Exhausted(reason).into()),

@@ -36,6 +36,9 @@ pub enum Reply {
     },
     /// An assistant message with this text, and no usage reported.
     WithoutUsage(String),
+    /// This JSON as the whole body of a 200 response, for a non-streaming
+    /// call.
+    Json(Value),
     /// This reply, sent once this long has passed.
     Delayed {
         /// How long to wait before answering.
@@ -164,6 +167,7 @@ async fn serve(socket: &mut tokio::net::TcpStream, state: &Mutex<State>) -> std:
                 }
                 let streaming = request.get("stream").and_then(Value::as_bool) != Some(false);
                 match &reply {
+                    Reply::Json(body) => ("200 OK".to_owned(), "application/json", body.to_string()),
                     Reply::Http { status, body } => {
                         (format!("{status} Error"), "application/json", body.clone())
                     }
@@ -217,7 +221,7 @@ fn output_item(reply: &Reply) -> Value {
             "type": "function_call", "id": "fc_synthetic", "call_id": "call_synthetic",
             "name": name, "arguments": arguments.to_string(), "status": "completed"
         }),
-        Reply::Http { .. } | Reply::Delayed { .. } => Value::Null,
+        Reply::Http { .. } | Reply::Delayed { .. } | Reply::Json(_) => Value::Null,
     }
 }
 
@@ -246,7 +250,7 @@ fn chat_completion(request: &Value, reply: &Reply) -> Value {
         Reply::Text(text) | Reply::WithoutUsage(text) => {
             json!({"role": "assistant", "content": text})
         }
-        Reply::Http { .. } | Reply::Delayed { .. } => Value::Null,
+        Reply::Http { .. } | Reply::Delayed { .. } | Reply::Json(_) => Value::Null,
     };
     let mut done = json!({
         "id": "chatcmpl_synthetic", "object": "chat.completion", "model": model_of(request),
