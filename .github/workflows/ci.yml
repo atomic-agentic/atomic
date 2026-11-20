@@ -54,6 +54,7 @@ jobs:
       # controls-check.sh restores the source it edits, and refuses what it
       # cannot do safely; tested with a stand-in for cargo.
       - run: scripts/controls-check-test.sh
+      - run: scripts/backends-check-audit-test.sh
       # release-package.sh refuses a binary with failpoints compiled in.
       - run: scripts/release-package-test.sh
 

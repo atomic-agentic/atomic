@@ -33,7 +33,7 @@ status=0
 check() {
     local what="$1" message="$2"
     shift 2
-    cargo test --locked --no-fail-fast "$@" >"${LOG}" 2>&1
+    cargo test --color never --locked --no-fail-fast "$@" >"${LOG}" 2>&1
     if out="$(python3 "${AUDIT}" all-fail "${LOG}" "${message}")"; then
         echo "ok ${what}:" >&2
         echo "${out}" >&2
@@ -52,7 +52,7 @@ postgres)
     # database. The tests that fail are the Postgres tests: each must fail
     # naming the database, and they must be exactly the Postgres variants,
     # whose names say postgres; none of those may pass or be ignored.
-    ATOMIC_TEST_DATABASE_URL="" cargo test --locked --no-fail-fast -p atomic-agentic-durable \
+    ATOMIC_TEST_DATABASE_URL="" cargo test --color never --locked --no-fail-fast -p atomic-agentic-durable \
         --features postgres-tests >"${LOG}" 2>&1
     if out="$(python3 "${AUDIT}" discover "${LOG}" "ATOMIC_TEST_DATABASE_URL is not set" "${FAILING}")"; then
         echo "ok Postgres tests with no database configured:" >&2

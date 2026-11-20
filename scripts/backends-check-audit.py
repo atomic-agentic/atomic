@@ -5,84 +5,144 @@
 # scripts/backends-check.sh, and say whether it shows what the check needs.
 #
 #   backends-check-audit.py all-fail LOG MESSAGE
-#       every test that ran failed, each with MESSAGE in its own output
+#       every test that was selected failed, each with MESSAGE in its own
+#       output: none passed and none was ignored
 #   backends-check-audit.py discover LOG MESSAGE FAILING
 #       the tests that failed, each with MESSAGE in its own output, are
 #       exactly the Postgres variants (their names say postgres): none of
 #       those passed or was ignored. Their names are written to FAILING.
 #
 # Either way, every test binary must have reported its result (one that
-# aborted or was killed has not) and exited normally or with test failures.
-# Prints what it found; exits 1 if the run does not show it.
+# aborted or was killed has not) and exited normally or with test failures,
+# and each binary's own count of passed, failed and ignored tests must match
+# the tests it listed. Tests are told apart by binary and name, so two
+# binaries' tests of one name are two tests. Colour escapes, as cargo writes
+# them under CARGO_TERM_COLOR=always, are ignored. Prints what it found;
+# exits 1 if the run does not show it.
 import re
 import sys
 
-mode, log_path, message = sys.argv[1:4]
-log = open(log_path, encoding="utf-8", errors="replace").read()
-lines = log.splitlines()
-problems = []
+ESCAPE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+STARTS = re.compile(r"^\s+(Running|Doc-tests) (.+)$")
+OUTCOME = re.compile(r"^test (.+) \.\.\. (ok|FAILED|ignored)\b")
+RESULT = re.compile(
+    r"^test result: \w+\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured;"
+)
+COUNTED = {"ok": 0, "FAILED": 1, "ignored": 2}
 
-binaries = sum(1 for l in lines if re.match(r"\s+(Running|Doc-tests) ", l))
-results = sum(1 for l in lines if l.startswith("test result:"))
-if binaries == 0:
-    problems.append("no test binary ran (did it build?)")
-if results != binaries:
-    problems.append(f"{binaries} test binaries ran and {results} reported a result: one ended early")
-for l in lines:
-    if "process didn't exit successfully" in l and "(exit status: 101)" not in l:
-        problems.append(f"a test binary did not end normally: {l.strip()}")
 
-outcome = {}
-for l in lines:
-    m = re.match(r"^test (.+) \.\.\. (ok|FAILED|ignored)\b", l)
-    if m:
-        outcome[m.group(1)] = m.group(2)
-failed = sorted(n for n, o in outcome.items() if o == "FAILED")
-passed = sorted(n for n, o in outcome.items() if o == "ok")
+def short(started):
+    """A test binary's name: the file in its `(target/.../<file>)`, which
+    tells two `unittests src/lib.rs` apart, or a doc test's crate."""
+    m = re.search(r"\(([^()]*)\)\s*$", started)
+    return m.group(1).rsplit("/", 1)[-1] if m else started.strip()
 
-# Each failing test's own output, between its header and the next one.
-blocks = {}
-name = None
-for l in lines:
-    m = re.match(r"^---- (.+) stdout ----$", l)
-    if m:
-        name = m.group(1)
-        blocks[name] = []
-    elif l == "failures:" or l.startswith("test result:"):
-        name = None
-    elif name is not None:
-        blocks[name].append(l)
-unnamed = [n for n in failed if message not in "\n".join(blocks.get(n, []))]
-if unnamed:
-    problems.append(f"these failed without saying '{message}': " + ", ".join(unnamed))
 
-if mode == "all-fail":
+def audit(mode, log, message):
+    """The problems the log shows, and (failed, passed) keys."""
+    lines = [ESCAPE.sub("", l) for l in log.splitlines()]
+    problems = []
+    binary = None
+    started = []
+    # (binary, test) -> outcome, in the order the binaries ran.
+    outcome = {}
+    # Each failing test's own output, between its header and the next one.
+    blocks = {}
+    block = None
+    reported = {}
+    for l in lines:
+        m = STARTS.match(l)
+        if m:
+            binary = short(m.group(2))
+            started.append(binary)
+            block = None
+            continue
+        m = OUTCOME.match(l)
+        if m:
+            outcome[(binary, m.group(1))] = m.group(2)
+            continue
+        m = re.match(r"^---- (.+) stdout ----$", l)
+        if m:
+            block = (binary, m.group(1))
+            blocks[block] = []
+            continue
+        m = RESULT.match(l)
+        if m:
+            reported[binary] = tuple(int(n) for n in m.groups()[:3])
+            block = None
+            continue
+        if l == "failures:":
+            block = None
+        elif block is not None:
+            blocks[block].append(l)
+        if "process didn't exit successfully" in l and "(exit status: 101)" not in l:
+            problems.append(f"a test binary did not end normally: {l.strip()}")
+
+    if not started:
+        problems.append("no test binary ran (did it build?)")
+    for b in started:
+        if b not in reported:
+            problems.append(f"{b} ran and reported no result: it ended early")
+            continue
+        listed = [0, 0, 0]
+        for (ob, _), o in outcome.items():
+            if ob == b:
+                listed[COUNTED[o]] += 1
+        if tuple(listed) != reported[b]:
+            problems.append(
+                f"{b} reported {reported[b][0]} passed, {reported[b][1]} failed and "
+                f"{reported[b][2]} ignored, and listed {listed[0]}, {listed[1]} and {listed[2]}"
+            )
+
+    def shown(keys):
+        return ", ".join(f"{t} ({b})" for b, t in sorted(keys))
+
+    failed = sorted(k for k, o in outcome.items() if o == "FAILED")
+    passed = sorted(k for k, o in outcome.items() if o == "ok")
+    unnamed = [k for k in failed if message not in "\n".join(blocks.get(k, []))]
+    if unnamed:
+        problems.append(f"these failed without saying '{message}': " + shown(unnamed))
     if not failed:
         problems.append("no test failed")
-    if passed:
-        problems.append("these passed without the backend: " + ", ".join(passed))
-elif mode == "discover":
-    if not failed:
-        problems.append("no test failed")
-    misnamed = [n for n in failed if "postgres" not in n]
-    if misnamed:
-        problems.append(
-            "these failed without the database, and their names do not say postgres: "
-            + ", ".join(misnamed)
-        )
-    unrun = [n for n, o in outcome.items() if "postgres" in n and o != "FAILED"]
-    if unrun:
-        problems.append(
-            "these say postgres, and passed or were ignored without the database: "
-            + ", ".join(sorted(unrun))
-        )
-    with open(sys.argv[4], "w") as out:
-        out.write("".join(n + "\n" for n in failed))
-else:
-    sys.exit(f"unknown mode {mode}")
 
-for p in problems:
-    print(f"  {p}")
-if problems:
-    sys.exit(1)
-print(f"  {len(failed)} tests failed, each saying '{message}'; {len(passed)} passed")
+    if mode == "all-fail":
+        others = [k for k, o in outcome.items() if o != "FAILED"]
+        if others:
+            problems.append(
+                "these did not fail without the backend: "
+                + ", ".join(f"{t} ({b}: {outcome[(b, t)]})" for b, t in sorted(others))
+            )
+    elif mode == "discover":
+        misnamed = [k for k in failed if "postgres" not in k[1]]
+        if misnamed:
+            problems.append(
+                "these failed without the database, and their names do not say postgres: "
+                + shown(misnamed)
+            )
+        unrun = [k for k, o in outcome.items() if "postgres" in k[1] and o != "FAILED"]
+        if unrun:
+            problems.append(
+                "these say postgres, and passed or were ignored without the database: "
+                + shown(unrun)
+            )
+    else:
+        raise SystemExit(f"unknown mode {mode}")
+    return problems, failed, passed
+
+
+def main():
+    mode, log_path, message = sys.argv[1:4]
+    log = open(log_path, encoding="utf-8", errors="replace").read()
+    problems, failed, passed = audit(mode, log, message)
+    if mode == "discover":
+        with open(sys.argv[4], "w") as out:
+            out.write("".join(t + "\n" for _, t in failed))
+    for p in problems:
+        print(f"  {p}")
+    if problems:
+        sys.exit(1)
+    print(f"  {len(failed)} tests failed, each saying '{message}'; {len(passed)} passed")
+
+
+if __name__ == "__main__":
+    main()
