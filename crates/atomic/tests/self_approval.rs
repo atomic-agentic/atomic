@@ -584,6 +584,7 @@ fn a_turn_through_atomics_own_entry_point_runs_with_its_helper_in_the_state_dire
                     .args(["debug", "codex-prompt", "--base-url", &base_url])
                     .args(["--model", "synthetic", "Do", "the", "work."])
                     .current_dir(&project_dir)
+                    .env("XDG_CONFIG_HOME", home.join("config"))
                     .env("ATOMIC_HOME", home)
                     .env("PATH", path)
                     .output()
