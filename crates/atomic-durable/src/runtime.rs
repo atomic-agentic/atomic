@@ -405,6 +405,15 @@ pub trait WorkflowContext: Clone + Send + Sync + 'static {
         T: Serialize + DeserializeOwned + Send + 'static,
         F: for<'t, 'c> Fn(Tx<'t, 'c>) -> TxFuture<'t, T> + Send + Sync + 'static;
 
+    /// Read or update authoritative control records in a short transaction
+    /// without recording a workflow checkpoint. Gate authorization must run
+    /// again on replay: imported step outputs are not authority to proceed.
+    /// Do not use this for ordinary workflow inputs or model execution.
+    fn control_transaction<T, F>(&self, body: F) -> impl Future<Output = Result<T>> + Send
+    where
+        T: Send + 'static,
+        F: for<'t, 'c> Fn(Tx<'t, 'c>) -> TxFuture<'t, T> + Send + Sync + 'static;
+
     /// Wait up to `timeout` for the oldest message sent to this workflow on
     /// `topic` (see [`DurableRuntime::send`]) and take it. The message taken,
     /// or `None` for a timeout, is recorded as this operation's output, so a
@@ -542,11 +551,14 @@ pub(crate) fn to_durare(e: DurableError) -> durare::Error {
 
 /// [`WorkflowContext`] on durare.
 #[derive(Clone)]
-pub struct DurareContext(durare::DurableContext);
+pub struct DurareContext {
+    engine: durare::DurableContext,
+    reads: Reads,
+}
 
 impl WorkflowContext for DurareContext {
     fn workflow_id(&self) -> &str {
-        self.0.workflow_id()
+        self.engine.workflow_id()
     }
 
     fn step<T, F, Fut>(&self, name: &str, body: F) -> impl Future<Output = Result<T>> + Send
@@ -558,13 +570,15 @@ impl WorkflowContext for DurareContext {
         // Called now, not when first polled: durare claims the step's
         // position here, so positions follow construction order whatever
         // order the futures are awaited in.
-        let pending = self.0.step(name, move |s: durare::StepCtx| async move {
-            let info = StepInfo {
-                workflow_id: s.workflow_id().to_owned(),
-                step_id: s.step_id(),
-            };
-            body(info).await.map_err(to_durare)
-        });
+        let pending = self
+            .engine
+            .step(name, move |s: durare::StepCtx| async move {
+                let info = StepInfo {
+                    workflow_id: s.workflow_id().to_owned(),
+                    step_id: s.step_id(),
+                };
+                body(info).await.map_err(to_durare)
+            });
         async move { pending.await.map_err(from_durare) }
     }
 
@@ -574,11 +588,19 @@ impl WorkflowContext for DurareContext {
         F: for<'t, 'c> Fn(Tx<'t, 'c>) -> TxFuture<'t, T> + Send + Sync + 'static,
     {
         // As for a step, the position is claimed now.
-        let pending = self.0.transaction(name, move |tx| {
+        let pending = self.engine.transaction(name, move |tx| {
             let fut = body(Tx(TxInner::Engine(tx)));
             Box::pin(async move { fut.await.map_err(to_durare) })
         });
         async move { pending.await.map_err(from_durare) }
+    }
+
+    async fn control_transaction<T, F>(&self, body: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: for<'t, 'c> Fn(Tx<'t, 'c>) -> TxFuture<'t, T> + Send + Sync + 'static,
+    {
+        self.reads.control_transaction(body).await
     }
 
     fn recv<T>(
@@ -590,13 +612,14 @@ impl WorkflowContext for DurareContext {
         T: DeserializeOwned + Send + 'static,
     {
         // As for a step, the position is claimed now.
-        let pending = self.0.recv::<T>(topic, timeout);
+        let pending = self.engine.recv::<T>(topic, timeout);
         async move { pending.await.map_err(from_durare) }
     }
 }
 
-/// The adapter's own connection for reading atomic's tables outside a
-/// workflow: the same database, and on PostgreSQL the same schema.
+/// Connections for atomic's control records, separate from step checkpoints:
+/// the same database, and on PostgreSQL the same schema. A workflow uses them
+/// only for authorization that must be checked again on replay.
 #[derive(Clone)]
 pub(crate) enum Reads {
     Sqlite(sqlx::SqlitePool),
@@ -612,6 +635,25 @@ pub(crate) enum End<T> {
 }
 
 impl Reads {
+    /// Run `body` in one short transaction on atomic's tables that commits
+    /// unless the body fails.
+    pub(crate) async fn control_transaction<T, F>(&self, body: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: for<'t, 'c> Fn(Tx<'t, 'c>) -> TxFuture<'t, T> + Send + Sync + 'static,
+    {
+        let body = Arc::new(body);
+        let out = self
+            .transaction(move |tx| {
+                let body = body.clone();
+                Box::pin(async move { body(tx).await.map(End::Commit) })
+            })
+            .await?;
+        match out {
+            End::Commit(v) | End::Rollback(v) => Ok(v),
+        }
+    }
+
     /// Run `body` in one short transaction on atomic's tables, committing or
     /// rolling back as it says; an error rolls back. On SQLite the write lock
     /// is taken up front, so a read followed by a write in the body cannot
@@ -777,9 +819,16 @@ impl DurableRuntime for Durare {
         F: Fn(Self::Context, I) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<O>> + Send + 'static,
     {
+        let reads = self.reads.clone();
         self.engine
             .register(name, move |ctx: durare::DurableContext, input: I| {
-                let run = workflow(DurareContext(ctx), input);
+                let run = workflow(
+                    DurareContext {
+                        engine: ctx,
+                        reads: reads.clone(),
+                    },
+                    input,
+                );
                 async move { run.await.map_err(to_durare) }
             });
     }
@@ -905,17 +954,7 @@ impl DurableRuntime for Durare {
         T: Send + 'static,
         F: for<'t, 'c> Fn(Tx<'t, 'c>) -> TxFuture<'t, T> + Send + Sync + 'static,
     {
-        let body = Arc::new(body);
-        let out = self
-            .reads
-            .transaction(move |tx| {
-                let body = body.clone();
-                Box::pin(async move { body(tx).await.map(End::Commit) })
-            })
-            .await?;
-        match out {
-            End::Commit(v) | End::Rollback(v) => Ok(v),
-        }
+        self.reads.control_transaction(body).await
     }
 
     fn ledger(&self) -> Ledger {

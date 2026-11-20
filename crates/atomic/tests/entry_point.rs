@@ -129,7 +129,7 @@ fn a_store_written_by_a_newer_atomic_stops_it_from_starting() {
         .expect("one project")
         .expect("entry")
         .path();
-    let db = state.join("atomic.db");
+    let db = state.join("private/atomic.db");
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

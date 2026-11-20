@@ -9,6 +9,7 @@ use atomic_core::state::ProjectState;
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
+mod gates;
 mod setup;
 mod skills;
 
@@ -41,6 +42,9 @@ enum Command {
         #[command(subcommand)]
         command: Option<SchemasCommand>,
     },
+    /// Enroll your operator credential, list gates and decide them.
+    #[command(subcommand)]
+    Gates(gates::GatesCommand),
     /// Install atomic's authoring skills for a coding agent.
     Setup(setup::SetupArgs),
     /// Developer diagnostics.
@@ -150,7 +154,10 @@ fn main() -> anyhow::Result<()> {
 async fn run(cli: Cli, paths: CodexPaths, state: ProjectState) -> anyhow::Result<()> {
     // Before anything else: a store written by a newer atomic is refused.
     atomic_durable::store::open_sqlite(&state.database()).await?;
+    // Turn directories a killed atomic left behind.
+    codex::sweep_turn_temps(state.dir())?;
     match cli.command {
+        Some(Command::Gates(command)) => gates::run(command, &state).await,
         Some(Command::Check { path }) => tokio::task::spawn_blocking(move || check(path)).await?,
         Some(Command::Render(args)) => tokio::task::spawn_blocking(move || render(args)).await?,
         Some(Command::Schemas { path, command }) => match command {
@@ -448,7 +455,7 @@ fn render(args: RenderArgs) -> anyhow::Result<()> {
         Some(
             if args.run_id.is_some() {
                 context::default_key_dir().and_then(|keys| {
-                    context::checkpoint(&atom, &state.dir().join("context"), &keys, run_id, resolve)
+                    context::checkpoint(&atom, &state.context_dir(), &keys, run_id, resolve)
                 })
             } else {
                 context::resolve_fresh(&atom, run_id, resolve)
@@ -486,11 +493,13 @@ async fn prompt(
     args: &PromptArgs,
 ) -> anyhow::Result<String> {
     let cwd: PathBuf = state.root().to_owned();
+    let guard = codex::StateGuard::for_project(state)?;
     codex::one_turn(
         paths,
         &state.codex_home(),
         &cwd,
         &args.endpoint(),
+        &guard,
         &args.prompt.join(" "),
     )
     .await
