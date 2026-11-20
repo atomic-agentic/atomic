@@ -329,7 +329,7 @@ pub async fn open(
             cwd: state.root().to_owned(),
             endpoint: endpoint.clone(),
             defaults: AtomConfig::default(),
-            artifacts: Artifacts::new(store.clone()),
+            artifacts: Artifacts::store(store.clone(), file_limits()?),
             meter: atomic_core::usage::Metering::none(),
             // Atoms' commands are kept out of atomic's private state.
             guard: atomic_core::codex::StateGuard::for_project(state)?,
@@ -376,4 +376,22 @@ pub async fn open(
         store: describe(&database),
         shared: matches!(database, Database::Postgres { .. }),
     })
+}
+
+/// How much an exec atom's command may hand over: the defaults, or
+/// `ATOMIC_EXEC_MAX_FILE_BYTES` and `ATOMIC_EXEC_MAX_STEP_BYTES`.
+fn file_limits() -> anyhow::Result<atomic_core::artifact::files::Limits> {
+    let mut limits = atomic_core::artifact::files::Limits::default();
+    for (var, slot) in [
+        ("ATOMIC_EXEC_MAX_FILE_BYTES", &mut limits.per_file),
+        ("ATOMIC_EXEC_MAX_STEP_BYTES", &mut limits.per_step),
+    ] {
+        if let Ok(text) = std::env::var(var) {
+            *slot = text
+                .trim()
+                .parse()
+                .with_context(|| format!("{var} is {text:?}, not a number of bytes"))?;
+        }
+    }
+    Ok(limits)
 }
