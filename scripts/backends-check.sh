@@ -12,52 +12,78 @@
 # sandbox check needs an environment without the sandbox; under scripts/dev.sh
 # that is the default (ATOMIC_DEV_SANDBOX unset), and CI turns user namespaces
 # off for the step. It refuses to run where the sandbox works, since it could
-# then show nothing. The cargo flags match CI's test step, so nothing rebuilds.
+# then show nothing. The sandbox half and the Postgres half's workspace pass
+# use CI's test step's cargo flags, so nothing rebuilds for them; the
+# Postgres half's pass over atomic-agentic-durable alone rebuilds that
+# package with its own features.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"
 FEATURES="atomic-agentic/postgres-tests,atomic-agentic/sandbox-tests"
 LOG="$(mktemp)"
-trap 'rm -f "${LOG}"' EXIT
+FAILING="$(mktemp)"
+trap 'rm -f "${LOG}" "${FAILING}"' EXIT
+AUDIT="${ROOT}/scripts/backends-check-audit.py"
 status=0
 
 # check <what> <message> <cargo test arguments...>: the tests the arguments
-# select must all fail, and each failure must carry <message>. With
+# select must all fail, each with <message> in its own output, and every test
+# binary must report its result (see backends-check-audit.py). With
 # `expected` set, exactly that many must fail.
 expected=""
 check() {
     local what="$1" message="$2"
     shift 2
-    cargo test --locked --no-fail-fast "$@" >"${LOG}" 2>&1
-    local code=$?
-    local passed failed named
-    passed="$(awk '/^test result:/ { p += $4 } END { print p + 0 }' "${LOG}")"
-    failed="$(awk '/^test result:/ { f += $6 } END { print f + 0 }' "${LOG}")"
-    # Each failing test prints its panic once: "thread '<test>' ... panicked at".
-    named="$(grep -A3 "panicked at" "${LOG}" | grep -c -F "${message}")"
-    if [ "${code}" -eq 0 ] || [ "${passed}" -ne 0 ] || [ "${failed}" -eq 0 ] ||
-        [ "${named}" -lt "${failed}" ] ||
-        { [ -n "${expected}" ] && [ "${failed}" -ne "${expected}" ]; }; then
-        echo "FAIL ${what}: exit ${code}, ${passed} passed, ${failed} failed${expected:+ of ${expected}}, ${named} naming '${message}'" >&2
-        grep -E "^test .* (ok|FAILED)$|panicked at" "${LOG}" | head -40 >&2
+    cargo test --color never --locked --no-fail-fast "$@" >"${LOG}" 2>&1
+    local failed=""
+    if out="$(python3 "${AUDIT}" all-fail "${LOG}" "${message}")" &&
+        failed="$(sed -n 's/^  \([0-9][0-9]*\) tests failed.*/\1/p' <<<"${out}")" &&
+        { [ -z "${expected}" ] || [ "${failed}" = "${expected}" ]; }; then
+        echo "ok ${what}:" >&2
+        echo "${out}" >&2
+    else
+        echo "FAIL ${what}:${expected:+ ${failed:-no} tests failed of the ${expected} marked}" >&2
+        echo "${out}" >&2
         grep -m3 -E "^error" "${LOG}" >&2
         status=1
-    else
-        echo "ok ${what}: all ${failed} tests failed, naming '${message}'" >&2
     fi
 }
 
 case "${1:-}" in
 postgres)
-    # Every Postgres variant has postgres in its name; the filter selects
-    # them across the workspace.
-    ATOMIC_TEST_DATABASE_URL="" check "Postgres suites with no database configured" \
+    # In atomic-agentic-durable, the Postgres tests are found by what they
+    # do, not by their names: run every test of that package with no
+    # database. The tests that fail are the Postgres tests: each must fail
+    # naming the database, and they must be exactly the Postgres variants,
+    # whose names say postgres; none of those may pass or be ignored.
+    ATOMIC_TEST_DATABASE_URL="" cargo test --color never --locked --no-fail-fast -p atomic-agentic-durable \
+        --features postgres-tests >"${LOG}" 2>&1
+    if out="$(python3 "${AUDIT}" discover "${LOG}" "ATOMIC_TEST_DATABASE_URL is not set" "${FAILING}")"; then
+        echo "ok Postgres tests with no database configured:" >&2
+        echo "${out}" >&2
+        mapfile -t failing <"${FAILING}"
+        # Port 9 (discard) on loopback: nothing listens there.
+        ATOMIC_TEST_DATABASE_URL="postgres://atomic:atomic@127.0.0.1:9/atomic" \
+            check "the same tests with the database unreachable" \
+            "test database postgres://***@127.0.0.1:9/atomic (ATOMIC_TEST_DATABASE_URL) cannot be reached" \
+            -p atomic-agentic-durable --features postgres-tests -- --exact "${failing[@]}"
+    else
+        echo "FAIL Postgres tests with no database configured:" >&2
+        echo "${out}" >&2
+        grep -m3 -E "^error" "${LOG}" >&2
+        status=1
+    fi
+    # The command-line tests in crates/atomic/tests/run_cli.rs also use the
+    # database. That package's tests are too many and too slow to run
+    # wholesale without it, so its Postgres tests are selected by name, as
+    # their names say postgres; test_database.rs keeps the users of the
+    # database to these two places.
+    ATOMIC_TEST_DATABASE_URL="" check "Postgres tests across the workspace, by name, with no database configured" \
         "ATOMIC_TEST_DATABASE_URL is not set" \
         --workspace --features "${FEATURES}" -- postgres
-    # Port 9 (discard) on loopback: nothing listens there.
     ATOMIC_TEST_DATABASE_URL="postgres://atomic:atomic@127.0.0.1:9/atomic" \
-        check "Postgres suites with the database unreachable" \
+        check "Postgres tests across the workspace, by name, with the database unreachable" \
         "test database postgres://***@127.0.0.1:9/atomic (ATOMIC_TEST_DATABASE_URL) cannot be reached" \
         --workspace --features "${FEATURES}" -- postgres
     ;;

@@ -165,7 +165,10 @@ mod tests {
     #[cfg(feature = "postgres-tests")]
     #[tokio::test]
     async fn postgres_recovery_in_the_same_process_does_not_repeat_an_effect() {
-        let url = crate::testing::database().await;
-        same_process_recovery(Durare::postgres(&url, &unique()).await.expect("postgres")).await;
+        let schema = crate::testing::schema("attempt").await;
+        let rt = Durare::postgres(schema.url(), schema.name())
+            .await
+            .expect("postgres");
+        same_process_recovery(rt).await;
     }
 }

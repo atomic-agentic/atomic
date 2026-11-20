@@ -3325,7 +3325,10 @@ fn the_executor_identity_is_atomics_own_and_required_for_a_shared_store() {
 #[test]
 fn a_restarted_server_recovers_only_its_own_runs_on_postgres() {
     on_codex_runtime(async move {
-        let url = atomic_durable::testing::database().await;
+        // Declared before the store and the processes on it, so it is
+        // dropped after them.
+        let guard = atomic_durable::testing::schema("cli").await;
+        let (url, schema) = (guard.url().to_owned(), guard.name().to_owned());
         #[cfg(target_os = "linux")]
         support::require_sandbox();
         let model = FakeModel::start(vec![
@@ -3338,11 +3341,6 @@ fn a_restarted_server_recovers_only_its_own_runs_on_postgres() {
         .expect("fake model");
         let dir = scratch("postgres");
         let project = project(&dir);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let schema = format!("atomic_cli_{}_{nanos}", std::process::id());
         let model_env = model_env(&model.base_url());
         // Each process has a state directory of its own, as on its own host.
         let a_home = dir.join("a-home").to_string_lossy().into_owned();
@@ -3359,33 +3357,33 @@ fn a_restarted_server_recovers_only_its_own_runs_on_postgres() {
             ("ATOMIC_EXECUTOR_ID", "worker-b"),
             ("ATOMIC_HOME", b_home.as_str()),
         ];
-        let mut a = spawn(
+        let mut a = Reaped(spawn(
             &dir,
             &project,
             &["run", "gated", "--run-id", "run-a", "--data", NOTE],
             &with(&model_env, &env_a),
             &dir.join("a.log"),
-        );
+        ));
         let rt = Durare::postgres(&url, &schema).await.expect("store");
         let gate_a = open_gate(&rt, "run-a").await;
-        let mut b = spawn(
+        let mut b = Reaped(spawn(
             &dir,
             &project,
             &["run", "gated", "--run-id", "run-b", "--data", NOTE],
             &with(&model_env, &env_b),
             &dir.join("b.log"),
-        );
+        ));
         let gate_b = open_gate(&rt, "run-b").await;
         a.kill().expect("SIGKILL a");
         a.wait().expect("reap a");
 
-        let mut serve = spawn(
+        let mut serve = Reaped(spawn(
             &dir,
             &project,
             &["serve"],
             &with(&model_env, &env_a),
             &dir.join("serve.log"),
-        );
+        ));
         wait_until("serve to recover", || {
             std::fs::read_to_string(dir.join("serve.log")).is_ok_and(|l| l.contains("recovered"))
         });
@@ -3421,6 +3419,35 @@ fn a_restarted_server_recovers_only_its_own_runs_on_postgres() {
     });
 }
 
+/// A spawned `atomic` process that is killed and reaped when this is
+/// dropped, if it has not ended by then: a test that fails part-way leaves
+/// nothing running on its schema once the schema's guard drops it.
+#[cfg(feature = "postgres-tests")]
+struct Reaped(Child);
+
+#[cfg(feature = "postgres-tests")]
+impl std::ops::Deref for Reaped {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.0
+    }
+}
+
+#[cfg(feature = "postgres-tests")]
+impl std::ops::DerefMut for Reaped {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+
+#[cfg(feature = "postgres-tests")]
+impl Drop for Reaped {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// The environment of executor `name` on schema `schema`, with a state
 /// directory of its own, as on a host of its own.
 #[cfg(feature = "postgres-tests")]
@@ -3447,7 +3474,10 @@ fn executor_env(dir: &Path, url: &str, schema: &str, name: &str) -> Vec<(&'stati
 #[test]
 fn resuming_a_run_another_executor_owns_on_postgres_needs_its_owner_stopped() {
     on_codex_runtime(async move {
-        let url = atomic_durable::testing::database().await;
+        // Declared before the store and the processes on it, so it is
+        // dropped after them.
+        let guard = atomic_durable::testing::schema("owned").await;
+        let (url, schema) = (guard.url().to_owned(), guard.name().to_owned());
         #[cfg(target_os = "linux")]
         support::require_sandbox();
         let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
@@ -3455,22 +3485,17 @@ fn resuming_a_run_another_executor_owns_on_postgres_needs_its_owner_stopped() {
             .expect("fake model");
         let dir = scratch("owned");
         let project = project(&dir);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let schema = format!("atomic_owned_{}_{nanos}", std::process::id());
         let mut a_env = model_env(&model.base_url()).to_vec();
         a_env.extend(executor_env(&dir, &url, &schema, "worker-a"));
         let mut b_env = model_env(&model.base_url()).to_vec();
         b_env.extend(executor_env(&dir, &url, &schema, "worker-b"));
-        let mut a = spawn(
+        let mut a = Reaped(spawn(
             &dir,
             &project,
             &["run", "gated", "--run-id", "owned-1", "--data", NOTE],
             &with(&a_env, &[]),
             &dir.join("a.log"),
-        );
+        ));
         let rt = Durare::postgres(&url, &schema).await.expect("store");
         let opened = open_gate(&rt, "owned-1").await;
 
@@ -3508,13 +3533,13 @@ fn resuming_a_run_another_executor_owns_on_postgres_needs_its_owner_stopped() {
         // the run at the gate it opened.
         a.kill().expect("SIGKILL worker-a");
         a.wait().expect("reap");
-        let mut b = spawn(
+        let mut b = Reaped(spawn(
             &dir,
             &project,
             &["runs", "resume", "owned-1", "--owner-stopped"],
             &with(&b_env, &[]),
             &dir.join("b.log"),
-        );
+        ));
         wait_until("worker-b to resume", || {
             std::fs::read_to_string(dir.join("b.log")).is_ok_and(|l| l.contains("resuming"))
         });
@@ -3542,7 +3567,10 @@ fn resuming_a_run_another_executor_owns_on_postgres_needs_its_owner_stopped() {
 #[test]
 fn a_resumed_run_is_taken_only_by_its_resumer_on_postgres() {
     on_codex_runtime(async move {
-        let url = atomic_durable::testing::database().await;
+        // Declared before the store and the processes on it, so it is
+        // dropped after them.
+        let guard = atomic_durable::testing::schema("queue").await;
+        let (url, schema) = (guard.url().to_owned(), guard.name().to_owned());
         #[cfg(target_os = "linux")]
         support::require_sandbox();
         let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
@@ -3550,11 +3578,6 @@ fn a_resumed_run_is_taken_only_by_its_resumer_on_postgres() {
             .expect("fake model");
         let dir = scratch("private-queue");
         let project = project(&dir);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let schema = format!("atomic_queue_{}_{nanos}", std::process::id());
         let env_of = |name: &str| {
             let mut env = model_env(&model.base_url()).to_vec();
             env.extend(executor_env(&dir, &url, &schema, name));
@@ -3614,7 +3637,10 @@ fn a_resumed_run_is_taken_only_by_its_resumer_on_postgres() {
 #[test]
 fn gates_are_listed_and_decided_in_the_postgres_store() {
     on_codex_runtime(async move {
-        let url = atomic_durable::testing::database().await;
+        // Declared before the store and the processes on it, so it is
+        // dropped after them.
+        let guard = atomic_durable::testing::schema("gates_cli").await;
+        let (url, schema) = (guard.url().to_owned(), guard.name().to_owned());
         #[cfg(target_os = "linux")]
         support::require_sandbox();
         let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
@@ -3622,21 +3648,16 @@ fn gates_are_listed_and_decided_in_the_postgres_store() {
             .expect("fake model");
         let dir = scratch("pg-gates");
         let project = project(&dir);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let schema = format!("atomic_gates_{}_{nanos}", std::process::id());
         let mut env = model_env(&model.base_url()).to_vec();
         env.extend(executor_env(&dir, &url, &schema, "worker-a"));
         env.push(("ATOMIC_CREDENTIAL_STORE", "file".into()));
-        let mut run = spawn(
+        let mut run = Reaped(spawn(
             &dir,
             &project,
             &["run", "gated", "--run-id", "pg-gate-1", "--data", NOTE],
             &with(&env, &[]),
             &dir.join("run.log"),
-        );
+        ));
         let rt = Durare::postgres(&url, &schema).await.expect("store");
         let g = open_gate(&rt, "pg-gate-1").await;
         let gates = |args: &'static [&'static str]| {

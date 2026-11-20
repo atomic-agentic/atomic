@@ -78,11 +78,16 @@ fn sqlite_store() -> Store {
     Store::Sqlite(dir.join("atomic.db"))
 }
 
+/// A store on a schema of its own for the parent and its child processes;
+/// the parent's guard drops it, whatever the children did.
 #[cfg(feature = "postgres-tests")]
-async fn postgres_store() -> Store {
+async fn postgres_store() -> (Store, atomic_durable::testing::TestSchema) {
     // A suite that cannot reach its backend fails; it never skips.
-    let url = atomic_durable::testing::database().await;
-    Store::Postgres(url, unique("atomic_gates_kill"))
+    let schema = atomic_durable::testing::schema("gates_kill").await;
+    (
+        Store::Postgres(schema.url().to_owned(), schema.name().to_owned()),
+        schema,
+    )
 }
 
 fn operator() -> Principal {
@@ -305,11 +310,13 @@ async fn sqlite_a_deadline_that_passes_while_offline_rejects_on_recovery() {
 #[cfg(feature = "postgres-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_a_gate_survives_a_kill_and_is_approved_from_a_second_process() {
-    a_gate_survives_a_kill_and_is_approved_from_a_second_process(postgres_store().await).await;
+    let (store, _schema) = postgres_store().await;
+    a_gate_survives_a_kill_and_is_approved_from_a_second_process(store).await;
 }
 
 #[cfg(feature = "postgres-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_a_deadline_that_passes_while_offline_rejects_on_recovery() {
-    a_deadline_that_passes_while_offline_rejects_on_recovery(postgres_store().await).await;
+    let (store, _schema) = postgres_store().await;
+    a_deadline_that_passes_while_offline_rejects_on_recovery(store).await;
 }
