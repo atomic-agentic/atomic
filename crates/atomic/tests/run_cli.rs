@@ -1927,12 +1927,18 @@ fn a_second_signal_stops_serve_at_once_with_everything_its_command_started() {
 
 #[test]
 fn a_signal_stops_run_and_resume_with_everything_their_command_started() {
-    for (command, sig) in [
-        ("run", "INT"),
-        ("run", "TERM"),
-        ("resume", "INT"),
-        ("resume", "TERM"),
+    // Each stop signal, run and resume, both runners, and both paths: a
+    // second signal at once, or one signal and the ten seconds the running
+    // step has to reach its checkpoint.
+    for (command, sig, runner, twice) in [
+        ("run", "INT", "local", true),
+        ("run", "TERM", "process", true),
+        ("run", "HUP", "local", true),
+        ("run", "QUIT", "process", false),
+        ("resume", "INT", "process", true),
+        ("resume", "TERM", "local", false),
     ] {
+        let case = format!("{command} {sig} {runner}");
         let dir = scratch("stopped");
         let project = project(&dir);
         let log = dir.join("stopped.log");
@@ -1941,7 +1947,9 @@ fn a_signal_stops_run_and_resume_with_everything_their_command_started() {
             let child = spawn(
                 &dir,
                 &project,
-                &["run", "slow", "--run-id", "slow-3", "--data", NOTE],
+                &[
+                    "run", "slow", "--run-id", "slow-3", "--runner", runner, "--data", NOTE,
+                ],
                 &[],
                 &log,
             );
@@ -1951,7 +1959,7 @@ fn a_signal_stops_run_and_resume_with_everything_their_command_started() {
             let child = spawn(
                 &dir,
                 &project,
-                &["runs", "resume", "slow-3"],
+                &["runs", "resume", "slow-3", "--runner", runner],
                 &UNUSED_MODEL,
                 &log,
             );
@@ -1959,12 +1967,59 @@ fn a_signal_stops_run_and_resume_with_everything_their_command_started() {
         };
         wait_until("the command to start", || slow_starts(&dir).len() == starts);
         let pids = slow_starts(&dir)[starts - 1].clone();
-        let text = stop_twice(&mut child, sig, &log, 130);
-        assert!(
-            text.contains("atomic runs resume slow-3"),
-            "{command} {sig}: {text}"
-        );
-        all_gone(&pids, &format!("{command} {sig}"));
+        let text = if twice {
+            stop_twice(&mut child, sig, &log, 130)
+        } else {
+            let stopping = Instant::now();
+            signal(&child, sig);
+            let status = wait_child(&mut child, &case);
+            let text = std::fs::read_to_string(&log).expect("log");
+            assert!(
+                stopping.elapsed() >= Duration::from_secs(9),
+                "{case}: the running step had its time: {text}"
+            );
+            assert_eq!(status.code(), Some(130), "{case}: {text}");
+            assert!(text.contains("stopped 1 command(s)"), "{case}: {text}");
+            text
+        };
+        assert!(text.contains("atomic runs resume slow-3"), "{case}: {text}");
+        all_gone(&pids, &case);
+    }
+}
+
+#[test]
+fn atomic_run_reading_its_input_stops_on_a_signal() {
+    let dir = scratch("reading");
+    let project = project(&dir);
+    for sig in ["INT", "TERM"] {
+        let mut child = command_as(
+            Path::new(ATOMIC),
+            &dir,
+            &project,
+            &["run", "count-note", "--input", "-"],
+            &[],
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start atomic");
+        // Its standard input stays open: it is still reading.
+        std::thread::sleep(Duration::from_millis(500));
+        signal(&child, sig);
+        let started = Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("wait") {
+                break status;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "{sig}: atomic kept reading"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(!status.success(), "{sig}");
+        assert!(count_log(&dir).is_empty(), "{sig}: nothing ran");
     }
 }
 
