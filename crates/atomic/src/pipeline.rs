@@ -67,6 +67,7 @@ use atomic_durable::usage::Ledger;
 use atomic_durable::{
     DurableError, DurableRuntime, Proposal, Result, WorkflowContext, failpoint, run_atom_at,
 };
+use atomic_schema::expr::Shape;
 use atomic_schema::registry::Registry;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -513,14 +514,15 @@ fn fits(what: &str, contract: &Value, value: &Value) -> Result<()> {
             format!("{}: {e}", if at.is_empty() { "/" } else { &at })
         })
         .collect();
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(failed(format!(
+    if !errors.is_empty() {
+        return Err(failed(format!(
             "{what} does not fit its contract: {}",
             errors.join("; ")
-        )))
+        )));
     }
+    // CEL reads it as its contract types it; refuse here what it cannot read.
+    atomic_schema::expr::convertible(value, contract)
+        .map_err(|e| failed(format!("{what} cannot be read in CEL: {e}")))
 }
 
 /// The model a declarative atom's calls go to, as its runtime picks it: the
@@ -641,6 +643,15 @@ async fn run_pipeline<C: WorkflowContext>(
     let budget = RunBudget::pinned(ledger, &plan);
     let (caps, models) = (plan.atoms, plan.models);
     let mut steps = Map::new();
+    // What each finished step's output is typed by, for CEL.
+    let mut shapes = BTreeMap::new();
+    let input_shape = Shape::Schema(&pipeline.input);
+    // What atomic itself records beside each step.
+    let metadata_schema = json!({"type": "object", "properties": {
+        "input_tokens": {"type": "integer"}, "output_tokens": {"type": "integer"},
+        "total_tokens": {"type": "integer"}, "turns": {"type": "integer"}
+    }});
+    let decision_schema = json!({"type": "object", "properties": {"at": {"type": "integer"}}});
     let mut used_worktrees = false;
     let mut accepted = Vec::new();
     for (position, step) in pipeline.steps.iter().enumerate() {
@@ -648,7 +659,11 @@ async fn run_pipeline<C: WorkflowContext>(
         keep_working(&mut working).await;
         reached(&id, position + 1)?;
         let scope = json!(steps);
-        let values = [("input", &input), ("steps", &scope)];
+        let steps_shape = Shape::Fields(shapes.clone());
+        let values = [
+            ("input", &input, &input_shape),
+            ("steps", &scope, &steps_shape),
+        ];
         let step = match step {
             Step::Atom(step) => step,
             Step::Gate(g) => {
@@ -666,6 +681,10 @@ async fn run_pipeline<C: WorkflowContext>(
                 .await?;
                 failpoint(&format!("pipeline:after:{}", g.id));
                 steps.insert(g.id.clone(), json!({ "decision": decision }));
+                shapes.insert(
+                    g.id.clone(),
+                    Shape::fields([("decision", Shape::Schema(&decision_schema))]),
+                );
                 continue;
             }
         };
@@ -893,12 +912,33 @@ async fn run_pipeline<C: WorkflowContext>(
             step.id.clone(),
             json!({"output": published.output, "metadata": published.metadata}),
         );
+        let output = match pipeline
+            .atoms
+            .get(&step.atom)
+            .and_then(|a| a.program.contracts.get("Output"))
+        {
+            Some(contract) => Shape::Schema(contract),
+            None => Shape::Untyped,
+        };
+        shapes.insert(
+            step.id.clone(),
+            Shape::fields([
+                ("output", output),
+                ("metadata", Shape::Schema(&metadata_schema)),
+            ]),
+        );
     }
     keep_working(&mut working).await;
     let scope = json!(steps);
-    let result =
-        atomic_schema::expr::evaluate(&pipeline.returns, &[("input", &input), ("steps", &scope)])
-            .map_err(|e| failed(format!("`returns`: {e}")))?;
+    let steps_shape = Shape::Fields(shapes);
+    let result = atomic_schema::expr::evaluate(
+        &pipeline.returns,
+        &[
+            ("input", &input, &input_shape),
+            ("steps", &scope, &steps_shape),
+        ],
+    )
+    .map_err(|e| failed(format!("`returns`: {e}")))?;
     fits("the workflow's result", &pipeline.output, &result)?;
     if used_worktrees && let Some(worktrees) = services.worktrees.clone() {
         // The run's worktrees go; its accepted commits keep their refs. A
@@ -1040,7 +1080,7 @@ async fn run_gate<C: WorkflowContext>(
     ctx: &C,
     workflow: &str,
     step: &GateStep,
-    values: &[(&str, &Value)],
+    values: &[(&str, &Value, &Shape<'_>)],
     deployment: &Deployment,
     replay_of: Option<&str>,
 ) -> Result<Value> {

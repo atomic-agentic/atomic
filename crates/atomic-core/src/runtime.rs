@@ -376,6 +376,15 @@ async fn run_typed<A: Atom>(
             A::NAME
         ))
     })?;
+    // A contract written in code is never inlined or checked at load: refuse
+    // one whose artifact references could not be checked before any model
+    // call, rather than at every answer.
+    atomic_schema::artifact::check_contract(&contract).map_err(|e| {
+        AtomError::Runtime(format!(
+            "the output schema of {} cannot be checked for artifact references: {e}",
+            A::NAME
+        ))
+    })?;
     let prompt = serde_json::to_string_pretty(input)
         .map_err(|e| AtomError::Runtime(format!("serialize the input: {e}")))?;
     let check = |v: &Value| -> Result<(), AtomError> {
@@ -467,6 +476,8 @@ pub async fn run_declarative_with_context(
             &identity,
             runtimes.exec.shared(),
             runtimes.clock.as_ref(),
+            // The store the model runtimes check references against.
+            &runtimes.codex.artifacts,
         )
         .await;
     }
@@ -618,9 +629,10 @@ pub const EXEC_OUTPUT_LIMIT: usize = 8_388_608;
 /// the atom declares, plus `HOME` and `TMPDIR` pointing at a scratch
 /// directory of its own. It reads the input as one JSON value on stdin and
 /// writes one JSON value to stdout; stderr is for diagnostics. A nonzero
-/// exit fails the step, and so does output that breaks the contract or the
-/// atom's validators: there is no model to repair it. The validators' helpers
-/// follow `clock`, the step's recorded clock, when there is one.
+/// exit fails the step, and so does output that breaks the contract, names
+/// an artifact `artifacts` does not hold as the contract requires, or fails
+/// the atom's validators: there is no model to repair it. The validators'
+/// helpers follow `clock`, the step's recorded clock, when there is one.
 pub async fn run_exec(
     atom: &AtomFile,
     compiled: &Compiled,
@@ -628,6 +640,7 @@ pub async fn run_exec(
     identity: &EffectIdentity,
     backend: Arc<dyn atomic_exec::ExecutionBackend>,
     clock: Option<&crate::astro::StepClock>,
+    artifacts: &Artifacts,
 ) -> Result<(Value, RunMetadata), AtomError> {
     let contract = |key: &str| {
         compiled.program.contracts.get(key).ok_or_else(|| {
@@ -740,6 +753,11 @@ pub async fn run_exec(
     if !errors.is_empty() {
         return Err(schema_error(errors.join("; ")));
     }
+    // As for a model's answer: a reference must name an artifact that exists,
+    // of the right type.
+    atomic_schema::artifact::check_refs(contract("Output")?, &output, artifacts.0.as_ref())
+        .map_err(|e| schema_error(e.to_string()))?;
+    atomic_schema::expr::convertible(&output, contract("Output")?).map_err(schema_error)?;
     let has_checks = atom
         .frontmatter
         .get("validate")
@@ -941,6 +959,10 @@ fn accept(
     // schema can only check its spelling.
     atomic_schema::artifact::check_refs(contract, &value, artifacts)
         .map_err(|e| schema_error(e.to_string()))?;
+    // Every later CEL expression reads the value as its contract types it, so
+    // a number that conversion refuses is refused here, where it can be
+    // repaired, and is never checkpointed.
+    atomic_schema::expr::convertible(&value, contract).map_err(schema_error)?;
     match check(&value) {
         // A deserialization failure in the typed check is about this answer.
         Err(AtomError::Schema { message, .. }) => Err(schema_error(message)),

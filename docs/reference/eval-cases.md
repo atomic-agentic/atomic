@@ -39,6 +39,10 @@ with an input that does not fit the atom's input schema, or with an assertion
 that reads a field the schemas do not have, fails the load at its file and the line
 of the field at fault (in a JSONL file, the case's line).
 
+A number in `input` or `output` takes its CEL type from the atom's schema, as
+[Numbers in CEL](workflow-files.md#numbers-in-cel) describes: an `integer` field
+is an `int`, and a `number` field is a `double`.
+
 An atom whose code declares a write to an outside system has no eval cases:
 Atomic never runs such code in an eval. Cover it with code tests and
 `atomic test`.
