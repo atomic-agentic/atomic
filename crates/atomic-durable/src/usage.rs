@@ -416,6 +416,14 @@ pub(crate) async fn raise_in(
     read_allowance(tx, scope).await
 }
 
+/// The allowance `scope`, if there is one, read in `tx`.
+pub(crate) async fn read_allowance_in(
+    tx: &mut Tx<'_, '_>,
+    scope: &str,
+) -> Result<Option<Allowance>> {
+    read_allowance(tx, scope).await
+}
+
 async fn read_allowance(tx: &mut Tx<'_, '_>, scope: &str) -> Result<Option<Allowance>> {
     match tx
         .query_opt(

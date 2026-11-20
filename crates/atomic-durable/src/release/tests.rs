@@ -109,7 +109,7 @@ async fn only_the_enrolled_credential_releases_and_raises<R: DurableRuntime>(mut
             run_atom_at(
                 &ctx,
                 "plan",
-                move |_| {
+                move |info| {
                     let t = t.clone();
                     async move {
                         let n = {
@@ -118,9 +118,10 @@ async fn only_the_enrolled_credential_releases_and_raises<R: DurableRuntime>(mut
                             *n
                         };
                         if n < 2 {
-                            return Err(DurableError::Parked(format!(
-                                "the allowance run:x has no room, turn {n}"
-                            )));
+                            return Err(DurableError::Parked {
+                                reason: format!("no room, turn {n}"),
+                                scope: Some(format!("run:{}", info.workflow_id)),
+                            });
                         }
                         Ok(Proposal {
                             output: json!("planned"),
@@ -147,7 +148,7 @@ async fn only_the_enrolled_credential_releases_and_raises<R: DurableRuntime>(mut
         assert!(Instant::now() < until, "the run parked");
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
-    assert_eq!(park.scope(), Some("run:x"));
+    assert_eq!(park.scope(), Some(scope.as_str()));
     let raise = || {
         Some(Raise {
             scope: scope.clone(),
@@ -181,25 +182,41 @@ async fn only_the_enrolled_credential_releases_and_raises<R: DurableRuntime>(mut
     assert_eq!(caps_of(&rt, &scope).await, 100, "not raised");
     assert!(releases(&rt).await.expect("releases").is_empty());
 
-    // A raise of an allowance that does not exist releases nothing.
-    let missing = Some(Raise {
-        scope: "run:nowhere".into(),
-        caps: Caps {
-            tokens: 1,
-            millis: 0,
-            micro_usd: None,
-        },
-    });
-    assert!(matches!(
-        release_park(&rt, &mine, command(&park.id, "c0", missing)).await,
-        Err(ReleaseError::NoSuchAllowance(_))
-    ));
+    // Another run's allowance, or one that does not exist, is not this
+    // run's to raise: nothing is released or raised.
+    let other = format!("run:{}", unique("other"));
+    allowance(&rt, &other, 100).await;
+    for scope in [other.clone(), "run:nowhere".to_owned()] {
+        let elsewhere = Some(Raise {
+            scope: scope.clone(),
+            caps: Caps {
+                tokens: 1_000_000,
+                millis: 0,
+                micro_usd: None,
+            },
+        });
+        assert!(
+            matches!(
+                release_park(&rt, &mine, command(&park.id, "c0", elsewhere)).await,
+                Err(ReleaseError::NotTheRunsAllowance { .. })
+            ),
+            "{scope}"
+        );
+    }
+    assert_eq!(
+        caps_of(&rt, &other).await,
+        100,
+        "another run's cap was raised"
+    );
     assert!(!is_released(&rt, &park.id).await.expect("released"));
 
     // The enrolled credential: raised, released, recorded, and run again.
-    let released = release_park(&rt, &mine, command(&park.id, "c1", raise()))
+    let release = release_park(&rt, &mine, command(&park.id, "c1", raise()))
         .await
         .expect("released");
+    assert_eq!(release.wake_failed, None);
+    assert!(!release.raised_nothing);
+    let released = release.released;
     assert_eq!(released.by, operator());
     assert_eq!(released.park, park);
     assert_eq!(released.raised.as_ref().map(|a| a.caps.tokens), Some(1_000));
@@ -219,7 +236,7 @@ async fn only_the_enrolled_credential_releases_and_raises<R: DurableRuntime>(mut
     let again = release_park(&rt, &mine, command(&park.id, "c1", raise()))
         .await
         .expect("replay");
-    assert_eq!(again, released);
+    assert_eq!(again.released, released);
     assert!(matches!(
         release_park(&rt, &mine, command(&park.id, "c2", None)).await,
         Err(ReleaseError::AlreadyReleased { by, .. }) if by == operator()
@@ -229,6 +246,64 @@ async fn only_the_enrolled_credential_releases_and_raises<R: DurableRuntime>(mut
         Err(ReleaseError::CommandReused(_))
     ));
     assert_eq!(releases(&rt).await.expect("releases").len(), 1);
+
+    // A park whose run has finished has nothing to release.
+    let stale = format!("{run}:99");
+    let (stale_id, stale_run) = (stale.clone(), run.clone());
+    rt.control_transaction(move |mut tx| {
+        let (stale, run) = (stale_id.clone(), stale_run.clone());
+        Box::pin(async move {
+            tx.execute(
+                "INSERT INTO atomic_parks (park_id, run, step, reason, parked_at) \
+                 VALUES (?, ?, 'late.park', 'no room', 1)",
+                &[Param::Text(stale), Param::Text(run)],
+            )
+            .await
+            .map(|_| ())
+        })
+    })
+    .await
+    .expect("a stale park");
+    assert!(matches!(
+        release_park(&rt, &mine, command(&stale, "c3", None)).await,
+        Err(ReleaseError::RunFinished { .. })
+    ));
+
+    // Two releases at once: one wins, the other says it was released, and
+    // the same command sent twice at once is one release.
+    for (park, ids) in [("racer:1", ["r1", "r2"]), ("racer:2", ["r3", "r3"])] {
+        rt.control_transaction(move |mut tx| {
+            Box::pin(async move {
+                tx.execute(
+                    "INSERT INTO atomic_parks (park_id, run, step, reason, parked_at) \
+                     VALUES (?, 'racer', 'race.park', 'no room', 1)",
+                    &[Param::Text(park.to_owned())],
+                )
+                .await
+                .map(|_| ())
+            })
+        })
+        .await
+        .expect("a park to race for");
+        let (a, b) = tokio::join!(
+            release_park(&rt, &mine, command(park, ids[0], None)),
+            release_park(&rt, &mine, command(park, ids[1], None)),
+        );
+        if ids[0] == ids[1] {
+            let (a, b) = (a.expect("one release"), b.expect("the same release"));
+            assert_eq!(a.released, b.released);
+        } else {
+            let (won, lost) = match (a, b) {
+                (Ok(w), Err(l)) | (Err(l), Ok(w)) => (w, l),
+                (a, b) => panic!("one release wins: {a:?}, {b:?}"),
+            };
+            assert_eq!(won.released.park.id, park);
+            assert!(
+                matches!(lost, ReleaseError::AlreadyReleased { .. }),
+                "{lost}"
+            );
+        }
+    }
     rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
 }
 

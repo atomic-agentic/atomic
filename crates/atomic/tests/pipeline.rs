@@ -189,14 +189,13 @@ fn try_load(
     prepare(&loaded, &atoms, &local()).map_err(|e| e.to_string())
 }
 
-/// One developer on one machine.
 /// Release `park` as the local operator, with their credential, raising
 /// `raise` first if given: the person's action, as `atomic` exposes it.
 async fn release_raising(
     rt: &Durare,
     park: &atomic_durable::Park,
     raise: Option<atomic_durable::release::Raise>,
-) -> Result<atomic_durable::release::Released, atomic_durable::release::ReleaseError> {
+) -> Result<atomic_durable::release::Release, atomic_durable::release::ReleaseError> {
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let me = atomic_durable::gate::HumanCredential::new(
         atomic_durable::gate::Principal::local("dev"),
@@ -220,15 +219,7 @@ async fn release_raising(
     .await
 }
 
-/// [`release_raising`] with no raise.
-#[allow(dead_code)]
-async fn release(
-    rt: &Durare,
-    park: &atomic_durable::Park,
-) -> Result<atomic_durable::release::Released, atomic_durable::release::ReleaseError> {
-    release_raising(rt, park, None).await
-}
-
+/// One developer on one machine.
 fn local() -> Deployment {
     Deployment::Local {
         operator: Principal::local("dev"),

@@ -98,7 +98,7 @@ pub enum AtomError {
     /// A budget cap left no room for the next model call, so it was not
     /// made. Not a failure of the atom: a durable run parks on it.
     #[error("budget: {0}")]
-    Budget(String),
+    Budget(crate::usage::Exhausted),
     /// The machine cannot confine the atom's commands at all, such as where
     /// user namespaces are not allowed; nothing ran. Not a failure of the
     /// atom: a durable run must stop without recording anything, to run the

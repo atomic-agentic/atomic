@@ -1694,10 +1694,13 @@ where
             // A turn cut off at its reserved time used up the active time
             // its atom had left: the run parks, as at any other cap.
             Err(e) if e.downcast_ref::<CutOff>().is_some() => {
-                break Err(meter_error(MeterError::Exhausted(Exhausted(format!(
-                    "{e}: all the active time the allowance {} had left",
-                    bounded_by.as_deref().unwrap_or("of its atom")
-                )))));
+                break Err(meter_error(MeterError::Exhausted(Exhausted {
+                    reason: format!(
+                        "{e}: all the active time the allowance {} had left",
+                        bounded_by.as_deref().unwrap_or("of its atom")
+                    ),
+                    scope: bounded_by.clone(),
+                })));
             }
             Err(e) => break Err(e),
             Ok(answer) => match next(answer.clone()).await {

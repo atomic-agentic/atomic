@@ -725,7 +725,10 @@ async fn a_released_park_runs_the_turn_again(mut engine: Durare) -> Result<()> {
                             told.len()
                         };
                         if turns < 3 {
-                            return Err(DurableError::Parked(format!("no room, turn {turns}")));
+                            return Err(DurableError::Parked {
+                                reason: format!("no room, turn {turns}"),
+                                scope: None,
+                            });
                         }
                         Ok(Proposal {
                             output: json!("planned"),
@@ -892,6 +895,7 @@ async fn recorded_candidates_are_the_published_ones(mut engine: Durare) -> Resul
                 Ok(Turn::Parked {
                     position: 1,
                     reason: "a cap".into(),
+                    scope: None,
                 })
             })
             .await?;
