@@ -42,6 +42,17 @@ fn core_schema_scalars() {
 }
 
 #[test]
+fn an_integer_too_large_for_64_bits_is_a_number() {
+    let d = ok("a: 123456789012345678901234567890\nb: -98765432109876543210\n");
+    assert!(d.value["a"].is_number(), "{}", d.value);
+    assert_eq!(
+        d.value["a"],
+        serde_json::from_str::<Value>("123456789012345678901234567890").expect("json")
+    );
+    assert!(d.value["b"].is_number(), "{}", d.value);
+}
+
+#[test]
 fn an_empty_file_is_null() {
     assert_eq!(ok("").value, Value::Null);
 }

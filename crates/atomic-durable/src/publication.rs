@@ -159,6 +159,68 @@ impl<'de> Deserialize<'de> for Turn {
     }
 }
 
+impl crate::runtime::Durare {
+    /// Each atom of run `run` whose result was published, by the name its
+    /// operations share (`draft` for `draft.turn` and `draft.publish`): the
+    /// candidate its last turn checkpointed before its publication. Each is
+    /// decoded as the turn recorded it, tagged or bare, and refused if it
+    /// does not match its digest. A turn that parked, or whose candidate was
+    /// never published, has no entry.
+    pub async fn recorded_candidates(
+        &self,
+        run: &str,
+    ) -> Result<std::collections::BTreeMap<String, Candidate>> {
+        let mut steps = DurableRuntime::steps(self, run).await?;
+        steps.sort_by_key(|s| s.step_id);
+        let mut turns = std::collections::BTreeMap::new();
+        let mut published = std::collections::BTreeMap::new();
+        for step in steps {
+            if let Some(name) = step.name.strip_suffix(".turn") {
+                let turn = match &step.output {
+                    Some(output) if step.error.is_none() => {
+                        serde_json::from_value::<Turn>(output.clone()).map_err(|e| {
+                            DurableError::Failed(format!(
+                                "run {run}: {}: not a turn checkpoint: {e}",
+                                step.name
+                            ))
+                        })?
+                    }
+                    _ => {
+                        turns.remove(name);
+                        continue;
+                    }
+                };
+                match turn {
+                    Turn::Candidate(candidate) => {
+                        if digest(&candidate.proposal)? != candidate.digest {
+                            return Err(DurableError::Failed(format!(
+                                "run {run}: {}: candidate {} does not match its digest",
+                                step.name, candidate.id
+                            )));
+                        }
+                        turns.insert(name.to_owned(), candidate);
+                    }
+                    Turn::Parked { .. } => {
+                        turns.remove(name);
+                    }
+                }
+            } else if let Some(name) = step.name.strip_suffix(".publish")
+                && step.error.is_none()
+                && let Some(candidate) = turns.remove(name)
+            {
+                if step.output.as_ref() != Some(&candidate.proposal.output) {
+                    return Err(DurableError::Failed(format!(
+                        "run {run}: {}: the published output is not candidate {}'s",
+                        step.name, candidate.id
+                    )));
+                }
+                published.insert(name.to_owned(), candidate);
+            }
+        }
+        Ok(published)
+    }
+}
+
 /// A parked run's row in `atomic_parks`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Park {
