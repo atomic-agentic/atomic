@@ -364,32 +364,59 @@ mod tests {
         }
     }
 
+    /// What `check_refs` says, in a word.
+    fn verdict(schema: &serde_json::Value, value: &serde_json::Value) -> &'static str {
+        match check_refs(schema, value, &Store) {
+            Ok(()) => "ok",
+            Err(ArtifactCheckError::Missing { .. }) => "missing",
+            Err(ArtifactCheckError::WrongMediaType { .. }) => "wrong",
+            Err(ArtifactCheckError::Malformed { .. }) => "malformed",
+        }
+    }
+
+    /// The four standard answers for a tagged `payload`.
+    fn four(schema: &serde_json::Value) -> [&'static str; 4] {
+        [
+            verdict(schema, &payload("diff", 'a')),
+            verdict(schema, &payload("text", 'b')),
+            verdict(schema, &payload("diff", 'b')),
+            verdict(schema, &payload("diff", 'c')),
+        ]
+    }
+
+    const FOUR: [&str; 4] = ["ok", "ok", "wrong", "missing"];
+
     #[test]
     fn a_branch_whose_fit_cannot_be_decided_is_still_held() {
-        // The second branch refers to a schema outside the contract, so no
-        // validator can be built for it.
+        // The second branch's pattern is not a regular expression, so no
+        // validator can be built for it; the first branch compiles.
         let schema = serde_json::json!({
             "type": "object",
             "properties": {"attachment": {"anyOf": [
                 {"type": "null"},
                 {"type": "object",
                  "properties": {"file": {"$ref": "atomic:artifact", "mediaType": "text/x-diff"},
-                                "extra": {"$ref": "https://example.invalid/other.schema.json"}}}
+                                "note": {"type": "string", "pattern": "("}}}
             ]}}
         });
         let value = |c| serde_json::json!({"attachment": {"file": reference(c)}});
-        assert!(matches!(
-            check_refs(&schema, &value('c'), &Store),
-            Err(ArtifactCheckError::Missing { .. })
-        ));
+        let mut checker = Checker::new(&schema, &Store);
         assert_eq!(
-            expected_type(check_refs(&schema, &value('b'), &Store)).as_deref(),
-            Some("text/x-diff")
+            checker.fits("/properties/attachment/anyOf/0", &value('a')["attachment"]),
+            Some(false),
+            "the null branch is decided"
         );
-        assert_eq!(check_refs(&schema, &value('a'), &Store), Ok(()));
         assert_eq!(
-            check_refs(&schema, &serde_json::json!({"attachment": null}), &Store),
-            Ok(())
+            checker.fits("/properties/attachment/anyOf/1", &value('a')["attachment"]),
+            None,
+            "the pattern branch is not"
+        );
+        assert_eq!(verdict(&schema, &value('c')), "missing");
+        assert_eq!(verdict(&schema, &value('b')), "wrong");
+        assert_eq!(verdict(&schema, &value('a')), "ok");
+        assert_eq!(
+            verdict(&schema, &serde_json::json!({"attachment": null})),
+            "ok"
         );
         // An undecided branch with no references of its own does not accept a
         // value that no branch definitely fits.
@@ -397,16 +424,273 @@ mod tests {
             {"type": "object", "required": ["kind", "file"],
              "properties": {"kind": {"const": "diff"},
                             "file": {"$ref": "atomic:artifact", "mediaType": "text/x-diff"}}},
-            {"$ref": "https://example.invalid/other.schema.json"}
+            {"type": "object", "properties": {"note": {"type": "string", "pattern": "("}}}
         ]});
-        assert!(matches!(
-            check_refs(
-                &schema,
-                &serde_json::json!({"file": reference('c')}),
-                &Store
+        let mut checker = Checker::new(&schema, &Store);
+        let value = serde_json::json!({"file": reference('c')});
+        assert_eq!(checker.fits("/anyOf/0", &value), Some(false));
+        assert_eq!(checker.fits("/anyOf/1", &value), None);
+        assert_eq!(verdict(&schema, &value), "missing");
+    }
+
+    /// A branch tagged by `$ref` siblings, which drafts before 2019-09 ignore.
+    fn sibling_tagged(draft: &str) -> serde_json::Value {
+        serde_json::json!({
+            "$schema": draft,
+            "type": "object",
+            "properties": {"result": {"anyOf": [
+                {"$ref": "#/definitions/Base", "required": ["kind"],
+                 "properties": {"kind": {"const": "none"}}},
+                {"type": "object", "required": ["kind", "file"],
+                 "properties": {"kind": {"const": "diff"},
+                                "file": {"$ref": "atomic:artifact", "mediaType": "text/x-diff"}}}
+            ]}},
+            "definitions": {"Base": {"type": "object"}}
+        })
+    }
+
+    #[test]
+    fn an_older_schema_draft_is_read_as_2020_12() {
+        let result = |c| serde_json::json!({"result": {"kind": "diff", "file": reference(c)}});
+        for draft in [
+            "http://json-schema.org/draft-07/schema#",
+            "http://json-schema.org/draft-06/schema#",
+            "http://json-schema.org/draft-04/schema#",
+            "https://json-schema.org/draft/2019-09/schema",
+            "https://json-schema.org/draft/2020-12/schema",
+        ] {
+            let schema = sibling_tagged(draft);
+            let got = ['a', 'c', 'b'].map(|c| verdict(&schema, &result(c)));
+            assert_eq!(got, ["ok", "missing", "wrong"], "{draft}");
+            let mut plain = tagged("anyOf");
+            plain["$schema"] = serde_json::json!(draft);
+            assert_eq!(four(&plain), FOUR, "{draft}");
+        }
+        // Keywords draft-07 does not know still close a branch.
+        let closed = |branch: serde_json::Value| {
+            serde_json::json!({
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "type": "object",
+                "properties": {"result": {"anyOf": [
+                    branch,
+                    {"type": "object", "required": ["file"],
+                     "properties": {"file": {"$ref": "atomic:artifact", "mediaType": "text/x-diff"}}}
+                ]}}
+            })
+        };
+        for branch in [
+            serde_json::json!({"type": "object", "properties": {"note": {"type": "string"}},
+                               "unevaluatedProperties": false}),
+            serde_json::json!({"type": "object", "dependentRequired": {"file": ["plain"]}}),
+        ] {
+            let schema = closed(branch);
+            let file = |c| serde_json::json!({"result": {"file": reference(c)}});
+            assert_eq!(
+                ['a', 'c', 'b'].map(|c| verdict(&schema, &file(c))),
+                ["ok", "missing", "wrong"],
+                "{schema}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_contract_id_is_read_as_the_validator_reads_it() {
+        for id in [
+            "https://example.com/schemas/answer.json",
+            "answer.schema.json",
+            "/schemas/answer",
+            "../x",
+            "https://Example.COM/a",
+            "HTTP://example.com/a",
+            "https://example.com:443/a",
+            "https://example.com/a/../b",
+            "https://example.com/%7euser/a",
+            "https://example.com/a#",
+            "urn:example:answer",
+            "URN:atomic:contract",
+            "",
+            "#",
+        ] {
+            let mut schema = tagged("anyOf");
+            schema["$id"] = serde_json::json!(id);
+            assert_eq!(four(&schema), FOUR, "{id:?}");
+        }
+    }
+
+    #[test]
+    fn odd_keys_are_escaped_in_pointers_and_fragments() {
+        for key in [
+            "a b",
+            "a/b",
+            "a~b",
+            "a~1b",
+            "a%20b",
+            "a%b",
+            "a#b",
+            "\u{e4}\u{1F600}",
+            "a?b",
+            "a\"b",
+            "",
+            "$ref",
+            "a\\b",
+            "a\nb",
+            "<a>",
+            "0",
+            "anyOf",
+        ] {
+            let schema = serde_json::json!({
+                "type": "object",
+                "properties": {key: {"type": "object",
+                                     "properties": {"payload": tagged("anyOf")["properties"]["payload"]}}},
+                "$defs": tagged("anyOf")["$defs"]
+            });
+            let got = [("diff", 'a'), ("text", 'b'), ("diff", 'b'), ("diff", 'c')]
+                .map(|(kind, c)| verdict(&schema, &serde_json::json!({key: payload(kind, c)})));
+            assert_eq!(got, FOUR, "{key:?}");
+        }
+        // Branches reached by escaped `$defs` names.
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"payload": {"anyOf": [{"$ref": "#/$defs/a~1b"}, {"$ref": "#/$defs/c~0d"}]}},
+            "$defs": {"a/b": tagged("anyOf")["properties"]["payload"]["anyOf"][0],
+                      "c~d": tagged("anyOf")["$defs"]["note"]}
+        });
+        assert_eq!(four(&schema), FOUR);
+    }
+
+    #[test]
+    fn embedded_resources_do_not_stand_in_for_the_contract() {
+        let file = serde_json::json!({"anyOf": [
+            {"type": "null"},
+            {"$ref": "atomic:artifact", "mediaType": "text/x-diff"}
+        ]});
+        let decoy = |id: &str| serde_json::json!({"$id": id, "properties": {"file": {"anyOf": [true, true]}}});
+        for (root_id, defs) in [
+            (
+                None,
+                serde_json::json!({"evil": decoy("urn:atomic:contract")}),
             ),
-            Err(ArtifactCheckError::Missing { .. })
-        ));
+            (
+                Some("https://example.com/c"),
+                serde_json::json!({"evil": decoy("https://example.com/c")}),
+            ),
+            (
+                Some("answer.json"),
+                serde_json::json!({"evil": decoy("urn:atomic:contract")}),
+            ),
+            (
+                None,
+                serde_json::json!({"evil": {"$id": "atomic:artifact", "type": "string"}}),
+            ),
+        ] {
+            let mut schema = serde_json::json!({
+                "type": "object", "properties": {"file": file.clone()}, "$defs": defs
+            });
+            if let Some(id) = root_id {
+                schema["$id"] = serde_json::json!(id);
+            }
+            let got = ['a', 'c', 'b']
+                .map(|c| verdict(&schema, &serde_json::json!({"file": reference(c)})));
+            assert_eq!(got, ["ok", "missing", "wrong"], "{schema}");
+        }
+    }
+
+    #[test]
+    fn nested_and_overlapping_alternatives() {
+        // anyOf inside oneOf.
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"payload": {"oneOf": [
+                {"anyOf": [tagged("anyOf")["properties"]["payload"]["anyOf"][0], {"$ref": "#/$defs/note"}]},
+                {"type": "null"}
+            ]}},
+            "$defs": tagged("anyOf")["$defs"]
+        });
+        assert_eq!(four(&schema), FOUR);
+        assert_eq!(verdict(&schema, &payload("text", 'a')), "wrong");
+        assert_eq!(
+            verdict(&schema, &serde_json::json!({"payload": null})),
+            "ok"
+        );
+        // A value both branches fit: either branch's media type will do.
+        let loose = |media: &str| {
+            serde_json::json!({"type": "object",
+                               "properties": {"file": {"$ref": "atomic:artifact", "mediaType": media}}})
+        };
+        let schema = serde_json::json!({"anyOf": [loose("text/x-diff"), loose("text/plain")]});
+        let file = |c| serde_json::json!({"file": reference(c)});
+        assert_eq!(
+            ['a', 'b', 'c'].map(|c| verdict(&schema, &file(c))),
+            ["ok", "ok", "missing"]
+        );
+        // allOf of two anyOfs: both must accept.
+        let schema = serde_json::json!({"allOf": [
+            {"anyOf": [loose("text/x-diff"), loose("text/plain")]},
+            {"anyOf": [loose("text/plain"), {"type": "null"}]}
+        ]});
+        assert_eq!(
+            ['a', 'b'].map(|c| verdict(&schema, &file(c))),
+            ["wrong", "ok"]
+        );
+    }
+
+    #[test]
+    fn contracts_checked_in_turn_do_not_share_branches() {
+        // The same pointers, opposite tags, both under the fixed URN.
+        let a = serde_json::json!({"type": "object", "properties": {"payload": {"anyOf": [
+            tagged("anyOf")["properties"]["payload"]["anyOf"][0],
+            tagged("anyOf")["$defs"]["note"]]}}});
+        let mut b = a.clone();
+        b["properties"]["payload"]["anyOf"][0]["properties"]["kind"]["const"] =
+            serde_json::json!("text");
+        b["properties"]["payload"]["anyOf"][1]["properties"]["kind"]["const"] =
+            serde_json::json!("diff");
+        for _ in 0..3 {
+            assert_eq!(verdict(&a, &payload("diff", 'a')), "ok");
+            assert_eq!(verdict(&b, &payload("diff", 'a')), "wrong");
+            assert_eq!(verdict(&b, &payload("diff", 'b')), "ok");
+            assert_eq!(verdict(&a, &payload("diff", 'b')), "wrong");
+        }
+    }
+
+    #[test]
+    fn a_root_reference_holds_whatever_the_contract_id() {
+        for id in [
+            None,
+            Some("https://example.com/report"),
+            Some("report.json"),
+            Some("urn:example:report"),
+        ] {
+            let mut schema = serde_json::json!({
+                "type": "object", "additionalProperties": false, "required": ["title", "attachment"],
+                "properties": {
+                    "title": {"type": "string"},
+                    "attachment": {"anyOf": [
+                        {"type": "null"},
+                        {"type": "object", "additionalProperties": false, "required": ["file", "about"],
+                         "properties": {"file": {"$ref": "atomic:artifact", "mediaType": "text/x-diff"},
+                                        "about": {"$ref": "#"}}}
+                    ]}
+                }
+            });
+            if let Some(id) = id {
+                schema["$id"] = serde_json::json!(id);
+            }
+            let leaf = serde_json::json!({"title": "v", "attachment": null});
+            let report = |c, about| serde_json::json!({"title": "t", "attachment": {"file": reference(c), "about": about}});
+            for (c, want) in [('a', "ok"), ('c', "missing"), ('b', "wrong")] {
+                assert_eq!(
+                    verdict(&schema, &report(c, leaf.clone())),
+                    want,
+                    "{id:?} {c}"
+                );
+                assert_eq!(
+                    verdict(&schema, &report('a', report(c, leaf.clone()))),
+                    want,
+                    "{id:?} nested {c}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -622,8 +906,8 @@ fn check_one(
     Ok(())
 }
 
-/// The URI the contract is served under while branch fits are decided, when
-/// it has no absolute `$id` of its own.
+/// The URI the contract is indexed under while branch fits are decided, when
+/// it has no `$id` of its own.
 const CONTRACT_URI: &str = "urn:atomic:contract";
 
 /// One `check_refs` call: the contract, the store, and each branch's
@@ -632,25 +916,9 @@ struct Checker<'a> {
     root: &'a serde_json::Value,
     store: &'a dyn ArtifactLookup,
     base: String,
-    known: std::sync::Arc<std::collections::BTreeMap<String, serde_json::Value>>,
+    registry: Option<jsonschema::Registry<'a>>,
     branches: std::collections::HashMap<String, Option<jsonschema::Validator>>,
     compiled: usize,
-}
-
-/// Serves the contract and the built-in artifact schema, and nothing else.
-struct Contract(std::sync::Arc<std::collections::BTreeMap<String, serde_json::Value>>);
-
-impl jsonschema::Retrieve for Contract {
-    fn retrieve(
-        &self,
-        uri: &jsonschema::Uri<String>,
-    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
-        let key = uri.as_str().split('#').next().unwrap_or_default();
-        self.0
-            .get(key)
-            .cloned()
-            .ok_or_else(|| format!("{key} is not part of the contract").into())
-    }
 }
 
 /// `pointer` as a URI fragment: every byte outside the fragment's safe set
@@ -674,23 +942,34 @@ fn token(key: &str) -> String {
 
 impl<'a> Checker<'a> {
     fn new(root: &'a serde_json::Value, store: &'a dyn ArtifactLookup) -> Self {
-        // The contract keeps its own base URI when it has one, so its
-        // references resolve as they do when the whole answer is validated.
+        // The URI the answer's validator gives the contract: its `$id`,
+        // resolved against jsonschema's default base and normalised as
+        // jsonschema does it, or a fixed URN when it has none. Its references
+        // then resolve as they do when the whole answer is validated.
         let base = root
             .get("$id")
             .and_then(serde_json::Value::as_str)
-            .filter(|id| url::Url::parse(id).is_ok())
-            .map(|id| id.trim_end_matches('#').to_owned())
+            .and_then(|id| jsonschema::uri::from_str(id.trim_end_matches('#')).ok())
+            .map(|uri| uri.as_str().to_owned())
             .unwrap_or_else(|| CONTRACT_URI.to_owned());
-        let known = std::sync::Arc::new(std::collections::BTreeMap::from([
-            (base.clone(), root.clone()),
-            (ARTIFACT_SCHEMA_ID.to_owned(), artifact_schema()),
-        ]));
+        // Indexed once per check, as Draft 2020-12 whatever its `$schema`
+        // says, because that is the draft the answer's validator forces. A
+        // contract that cannot be indexed leaves every branch undecided, so
+        // the check fails closed.
+        let registry = jsonschema::Registry::new()
+            .draft(jsonschema::Draft::Draft202012)
+            .add(
+                &base,
+                jsonschema::Draft::Draft202012.create_resource_ref(root),
+            )
+            .and_then(|b| b.add(ARTIFACT_SCHEMA_ID, artifact_schema()))
+            .and_then(jsonschema::RegistryBuilder::prepare)
+            .ok();
         Self {
             root,
             store,
             base,
-            known,
+            registry,
             branches: std::collections::HashMap::new(),
             compiled: 0,
         }
@@ -709,11 +988,14 @@ impl<'a> Checker<'a> {
             self.compiled += 1;
             let wrapper =
                 serde_json::json!({"$ref": format!("{}#{}", self.base, fragment(pointer))});
-            let validator = jsonschema::options()
-                .with_draft(jsonschema::Draft::Draft202012)
-                .with_retriever(Contract(std::sync::Arc::clone(&self.known)))
-                .build(&wrapper)
-                .ok();
+            let validator = self.registry.as_ref().and_then(|registry| {
+                jsonschema::options()
+                    .with_draft(jsonschema::Draft::Draft202012)
+                    .with_base_uri("urn:atomic:branch")
+                    .with_registry(registry)
+                    .build(&wrapper)
+                    .ok()
+            });
             self.branches.insert(pointer.to_owned(), validator);
         }
         self.branches[pointer].as_ref().map(|v| v.is_valid(value))
