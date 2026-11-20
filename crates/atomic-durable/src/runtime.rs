@@ -56,6 +56,13 @@ pub enum DurableError {
     /// [`crate::publication::execute_candidate`]).
     #[error("parked: {0}")]
     Parked(String),
+    /// Another execution of run `.0` recorded one of its steps first. This
+    /// execution's state is behind the run's, so it stops, records nothing,
+    /// and takes the outcome the winner records. Workflow code passes it on
+    /// unchanged; turning it into a failure would record the loss as the
+    /// run's outcome.
+    #[error("another execution of run {0} recorded its step first")]
+    Conflict(String),
 }
 
 /// The engine's own error behind a [`DurableError::Database`]: opaque, and
@@ -587,6 +594,7 @@ pub(crate) fn from_durare(e: durare::Error) -> DurableError {
         durare::Error::RecoveryRequired(inner) => DurableError::Interrupted(inner.to_string()),
         durare::Error::App { message, .. } => DurableError::Failed(message),
         e @ durare::Error::NestedDurableCall { .. } => DurableError::Nested(e.to_string()),
+        durare::Error::WorkflowConflict(run) => DurableError::Conflict(run),
         e @ durare::Error::Db(_) => DurableError::Database {
             message: e.to_string(),
             origin: Origin::of(e),
@@ -604,6 +612,9 @@ pub(crate) fn to_durare(e: DurableError) -> durare::Error {
         DurableError::Database { message, origin } => {
             origin.take().unwrap_or_else(|| durare::Error::app(message))
         }
+        // Back as the engine's own conflict, which it answers by waiting for
+        // the winner's outcome instead of recording one.
+        DurableError::Conflict(run) => durare::Error::WorkflowConflict(run),
         DurableError::Failed(m)
         | DurableError::Nested(m)
         | DurableError::Engine(m)

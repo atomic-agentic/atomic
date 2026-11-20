@@ -8,6 +8,9 @@
 //! - a transaction step commits its writes with its checkpoint, or nothing;
 //! - an interrupted execution records nothing and stays pending;
 //! - a failure is recorded as the workflow's outcome;
+//! - of two executions of one run that race to record the same step, the
+//!   one that loses records nothing, and the run ends with the winner's
+//!   outcome;
 //! - steps are recorded as siblings, in order, and a step inside a step is
 //!   refused;
 //! - starting a workflow id twice runs it once;
@@ -488,6 +491,104 @@ async fn control_authorization_is_rechecked_on_workflow_replay<R: DurableRuntime
     rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
 }
 
+async fn the_loser_of_a_checkpoint_race_takes_the_winners_outcome<R: DurableRuntime>(mut rt: R) {
+    let entered = Arc::new(AtomicUsize::new(0));
+    let meet = Arc::new(tokio::sync::Barrier::new(2));
+    let lost = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (e, m, l, r) = (entered.clone(), meet.clone(), lost.clone(), release.clone());
+    rt.register("raced", move |ctx: R::Context, (): ()| {
+        let (entered, meet, lost, release) = (e.clone(), m.clone(), l.clone(), r.clone());
+        async move {
+            let contested = ctx
+                .step("contested", move |_| {
+                    let (entered, meet) = (entered.clone(), meet.clone());
+                    async move {
+                        // The first execution stops short, which schedules
+                        // its settlement; the next two meet here, so both
+                        // have run the body before either records it.
+                        if entered.fetch_add(1, Ordering::SeqCst) == 0 {
+                            return Err(DurableError::Interrupted("stopped short".into()));
+                        }
+                        let met =
+                            tokio::time::timeout(Duration::from_secs(20), meet.wait()).await;
+                        Ok(met.is_ok())
+                    }
+                })
+                .await;
+            // The execution that lost the race to record the step.
+            if matches!(&contested, Err(e) if !matches!(e, DurableError::Interrupted(m) if m == "stopped short"))
+            {
+                lost.fetch_add(1, Ordering::SeqCst);
+            }
+            let met = contested?;
+            // The winner goes on only once the test has seen what the loser
+            // did with its loss.
+            ctx.step("after", move |_| {
+                let release = release.clone();
+                async move {
+                    let _ = tokio::time::timeout(Duration::from_secs(20), release.notified()).await;
+                    Ok(())
+                }
+            })
+            .await?;
+            Ok(met)
+        }
+    });
+    rt.launch().await.expect("launch");
+    let id = unique("raced");
+    rt.start("raced", &id, ()).await.expect("start");
+    // The settlement durare scheduled is in the step; a recovery now runs
+    // the run a second time, alongside it.
+    let until = Instant::now() + Duration::from_secs(20);
+    while entered.load(Ordering::SeqCst) < 2 {
+        assert!(Instant::now() < until, "the settlement never ran the step");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    rt.recover().await.expect("recover");
+    while lost.load(Ordering::SeqCst) < 1 {
+        assert!(Instant::now() < until, "neither execution lost the race");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // While the winner waits, the loser has lost: it must record nothing.
+    // Recording takes it milliseconds; three seconds is ample.
+    let watch = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < watch {
+        let status = rt.status(&id).await.expect("status");
+        assert_eq!(
+            status,
+            Some(RunStatus::Pending),
+            "the execution that lost the race recorded an outcome"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    release.notify_one();
+    let until = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        let status = rt.status(&id).await.expect("status");
+        if matches!(status, Some(RunStatus::Succeeded | RunStatus::Failed(_)))
+            || Instant::now() > until
+        {
+            break status;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(entered.load(Ordering::SeqCst), 3, "two executions raced");
+    assert_eq!(
+        status,
+        Some(RunStatus::Succeeded),
+        "the run takes the outcome of the execution that recorded the step"
+    );
+    let steps = rt.steps(&id).await.expect("steps");
+    assert_eq!(steps.len(), 2, "{steps:?}");
+    assert_eq!(
+        steps[0].output,
+        Some(serde_json::json!(true)),
+        "the winner met the loser"
+    );
+    rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+}
+
 macro_rules! on_backend {
     ($backend:ident, $($name:ident),+ $(,)?) => {
         mod $backend {
@@ -511,6 +612,7 @@ on_backend!(
     a_transaction_commits_its_writes_with_its_checkpoint_or_nothing,
     an_interrupted_execution_records_nothing_and_stays_pending,
     a_failure_is_recorded_as_the_outcome,
+    the_loser_of_a_checkpoint_race_takes_the_winners_outcome,
     steps_are_siblings_in_order_and_cannot_nest,
     a_workflow_id_started_twice_runs_once,
     a_message_is_received_once_and_replayed_after_a_crash,
@@ -527,6 +629,7 @@ on_backend!(
     a_transaction_commits_its_writes_with_its_checkpoint_or_nothing,
     an_interrupted_execution_records_nothing_and_stays_pending,
     a_failure_is_recorded_as_the_outcome,
+    the_loser_of_a_checkpoint_race_takes_the_winners_outcome,
     steps_are_siblings_in_order_and_cannot_nest,
     a_workflow_id_started_twice_runs_once,
     a_message_is_received_once_and_replayed_after_a_crash,
