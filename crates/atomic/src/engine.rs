@@ -207,7 +207,7 @@ pub async fn open(
             cwd: state.root().to_owned(),
             endpoint: endpoint.clone(),
             defaults: AtomConfig::default(),
-            artifacts: Artifacts::new(store.clone()),
+            artifacts: Artifacts::store(store.clone()),
             meter: atomic_core::usage::Metering::none(),
             // Atoms' commands never reach atomic's private state.
             guard: atomic_core::codex::StateGuard::for_project(state)?,

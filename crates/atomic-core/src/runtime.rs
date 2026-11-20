@@ -46,14 +46,24 @@ use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// Where a runtime looks up the artifacts an output references.
+/// Where a runtime looks up the artifacts an output references, and, given
+/// a store, where exec atoms' commands hand over files and read the
+/// artifacts they are given (see [`crate::artifact::files`]).
 #[derive(Clone)]
-pub struct Artifacts(Arc<dyn ArtifactLookup + Send + Sync>);
+pub struct Artifacts(
+    Arc<dyn ArtifactLookup + Send + Sync>,
+    Option<Arc<dyn crate::artifact::ArtifactStore + Send + Sync>>,
+);
 
 impl Artifacts {
-    /// Look artifacts up in `lookup`, such as a [`crate::artifact::LocalStore`].
+    /// Look artifacts up in `lookup`, with no store to put files in.
     pub fn new(lookup: impl ArtifactLookup + Send + Sync + 'static) -> Self {
-        Self(Arc::new(lookup))
+        Self(Arc::new(lookup), None)
+    }
+
+    /// Look artifacts up in, and put files into, `store`.
+    pub fn store(store: crate::artifact::LocalStore) -> Self {
+        Self(Arc::new(store.clone()), Some(Arc::new(store)))
     }
 
     /// No store: every reference fails (see [`NoArtifacts`]).
@@ -678,6 +688,15 @@ pub async fn run_exec(
     env.push(("HOME".into(), scratch_text.clone()));
     env.push(("TMPDIR".into(), scratch_text));
     env.extend(identity.environment());
+    // Large results go by reference: the files the command hands over, and
+    // the artifacts its input names, each in a directory of its own.
+    let exchange = match &artifacts.1 {
+        Some(store) => Some(
+            exec_files(store.as_ref(), input, &mut env)
+                .map_err(|e| AtomError::Runtime(format!("{}: {e}", atom.name)))?,
+        ),
+        None => None,
+    };
     let stdin = serde_json::to_vec(input).map_err(|e| AtomError::Runtime(e.to_string()))?;
     let mut h = Sha256::new();
     for part in std::iter::once(&program).chain(&args) {
@@ -738,8 +757,24 @@ pub async fn run_exec(
         message,
         answer: text.chars().take(2000).collect(),
     };
-    let output: Value = serde_json::from_str(text.trim())
+    let mut output: Value = serde_json::from_str(text.trim())
         .map_err(|e| schema_error(format!("stdout is not one JSON value: {e}")))?;
+    if let (Some(store), Some(exchange)) = (&artifacts.1, &exchange) {
+        let provenance = crate::artifact::Provenance {
+            workflow: Some(identity.run_id.clone()),
+            step: Some(identity.step_id.clone()),
+            origin: Some(format!("exec:{}", atom.name)),
+            ..Default::default()
+        };
+        let gathered = crate::artifact::files::gather(
+            store.as_ref(),
+            &exchange.path().join("outputs"),
+            &mut output,
+            &provenance,
+        );
+        gathered.map_err(|e| schema_error(e.to_string()))?;
+    }
+    drop(exchange);
     let validator = Registry::new()
         .validator_for(contract("Output")?)
         .map_err(|e| AtomError::Runtime(e.to_string()))?;
@@ -783,6 +818,43 @@ pub async fn run_exec(
 }
 
 /// A new, empty scratch directory for one exec attempt.
+/// The directories an exec atom's command hands files over in
+/// (`ATOMIC_OUTPUTS`) and reads its input's artifacts from (`ATOMIC_INPUTS`),
+/// removed when this is dropped.
+struct Exchange(PathBuf);
+
+impl Exchange {
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for Exchange {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn exec_files(
+    store: &(dyn crate::artifact::ArtifactStore + Send + Sync),
+    input: &Value,
+    env: &mut Vec<(String, String)>,
+) -> Result<Exchange, crate::artifact::ArtifactError> {
+    let io = |path: &std::path::Path| {
+        let path = path.to_owned();
+        move |source| crate::artifact::ArtifactError::Io { path, source }
+    };
+    let dir = Exchange(scratch_dir().map_err(io(&std::env::temp_dir()))?);
+    for (name, sub) in [("ATOMIC_OUTPUTS", "outputs"), ("ATOMIC_INPUTS", "inputs")] {
+        let path = dir.path().join(sub);
+        std::fs::create_dir(&path).map_err(io(&path))?;
+        env.retain(|(k, _)| k != name);
+        env.push((name.into(), path.display().to_string()));
+    }
+    crate::artifact::files::mount(store, input, &dir.path().join("inputs"))?;
+    Ok(dir)
+}
+
 fn scratch_dir() -> std::io::Result<PathBuf> {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let dir = std::env::temp_dir().join(format!(

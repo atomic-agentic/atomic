@@ -77,6 +77,9 @@ pub enum ArtifactError {
         /// The underlying error.
         source: std::io::Error,
     },
+    /// A command named a file it may not hand over.
+    #[error("{0}")]
+    Refused(String),
     /// A manifest could not be read or written.
     #[error("artifact manifest {path}: {source}")]
     Manifest {
@@ -106,6 +109,12 @@ pub trait ArtifactStore {
 
     /// Every manifest recorded for the content, in a stable order.
     fn manifests(&self, artifact: &ArtifactRef) -> Result<Vec<Manifest>, ArtifactError>;
+
+    /// Where the content is on this machine's filesystem, if the store keeps
+    /// it in one, so a command can read it in place instead of a copy.
+    fn local_path(&self, _artifact: &ArtifactRef) -> Option<PathBuf> {
+        None
+    }
 }
 
 /// An artifact store in a local directory.
@@ -258,6 +267,11 @@ impl ArtifactStore for LocalStore {
         Ok(manifest)
     }
 
+    fn local_path(&self, artifact: &ArtifactRef) -> Option<PathBuf> {
+        let blob = self.blob_path(artifact);
+        blob.is_file().then_some(blob)
+    }
+
     fn contains(&self, artifact: &ArtifactRef) -> Result<bool, ArtifactError> {
         let p = self.blob_path(artifact);
         match std::fs::metadata(&p) {
@@ -318,6 +332,8 @@ impl atomic_schema::artifact::ArtifactLookup for LocalStore {
         Some(types)
     }
 }
+
+pub mod files;
 
 #[cfg(test)]
 mod tests;

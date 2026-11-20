@@ -65,6 +65,30 @@ of a step and differs for any other step or run, beside `ATOMIC_RUN_ID` and
 writes so a repeated write is recognisable. An atom's `env` cannot set these
 three names.
 
+### Large results go by reference
+
+A command hands over a file, such as a patch, report or log too big for its
+stdout, by writing it to the directory in `ATOMIC_OUTPUTS` and naming it in its
+output where the contract expects an
+[artifact reference](#artifact-references):
+
+```json
+{"patch": {"$file": "change.diff", "mediaType": "text/x-diff"}}
+```
+
+Atomic streams the file into the artifact store and puts its reference,
+`artifact://sha256/<digest>`, in the object's place before it checks the
+output. The step's output, and every checkpoint, holds only the reference. A
+name must stay inside the directory and name a regular file there;
+`mediaType` defaults to `application/octet-stream`, and the contract's
+`mediaType` still has to match.
+
+A later step's command reads an artifact its input references from the
+directory in `ATOMIC_INPUTS`, under the artifact's digest:
+`$ATOMIC_INPUTS/<digest>` for `artifact://sha256/<digest>`. Only what the
+input references is there, read in place from the store rather than copied.
+Both directories are removed when the command's step ends.
+
 ## Schema locations
 
 Schemas default to
