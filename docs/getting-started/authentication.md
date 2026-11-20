@@ -29,7 +29,9 @@ with no API key. Set `ATOMIC_MODEL` to a model your plan offers for Codex. A
 configured endpoint always comes first, and the sign-in comes before what atomic
 detects: with someone signed in, `OPENAI_API_KEY` and a local Ollama are not
 used. `atomic config --explain` shows the sign-in as `model.sign_in`, how and
-where it is kept, never a token or an email, and whether it is used.
+where it is kept, never a token or an email, and whether it is used; a run says
+which model goes to ChatGPT. The sign-in is looked for only when a model will
+be called on it: never for a replay or a run with no model atom.
 
 The sign-in is yours, for local use. atomic refuses it on a shared
 (PostgreSQL) store, whether a variable or your configuration file names it, and
@@ -59,9 +61,12 @@ to the model from atomic's own process, which cannot be dumped or read through
 which denies them the credential directory; and they can neither use the
 kernel keyrings nor reach the Secret Service. A signed-in atom has none of
 ChatGPT's connectors, plugins or hosted tools: the token reaches the model and
-nothing else, and an atom's tools are the ones its file declares. As with the operator credential, this has been
-verified on Linux only, so `atomic model login` is refused on macOS and Windows
-for now. atomic does not reuse an existing `codex login`.
+nothing else, and an atom's tools are the ones its file declares. As with the
+operator credential, this has been verified on Linux only, so `atomic model
+login` is refused on macOS and Windows for now. atomic does not reuse an
+existing `codex login`. A sign-in kept inside the checkout that holds the
+project (`ATOMIC_HOME` pointed there) is refused, since the repository could
+have supplied it.
 
 Keeping the token out of reach has side effects on atomic's own process, and so
 on everything it starts:

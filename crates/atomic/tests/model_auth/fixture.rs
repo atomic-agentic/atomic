@@ -2,7 +2,9 @@
 
 //! The project, sign-in and `atomic` invocation the model authentication
 //! suites share: a sign-in is a file store with a token no real backend
-//! would take, under the test's own `ATOMIC_HOME`.
+//! would take, under the test's own configuration directory, outside the
+//! checkout (a sign-in the repository could have supplied is refused), with
+//! project state under the test's data directory, outside /tmp.
 
 #![allow(dead_code)]
 
@@ -14,11 +16,16 @@ pub const ATOMIC: &str = env!("CARGO_BIN_EXE_atomic");
 
 pub struct Fixture {
     pub dir: PathBuf,
+    /// Outside the checkout: the person's configuration directory, where
+    /// atomic keeps a sign-in (one inside the checkout holding the project is
+    /// refused).
+    pub outside: PathBuf,
 }
 
 impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
+        let _ = std::fs::remove_dir_all(&self.outside);
     }
 }
 
@@ -27,6 +34,10 @@ impl Fixture {
         let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
             .join(format!("atomic-model-auth-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
+        let outside =
+            std::env::temp_dir().join(format!("atomic-model-auth-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&outside).unwrap();
         let project = dir.join("project");
         std::fs::create_dir_all(project.join("atoms")).unwrap();
         std::fs::create_dir_all(dir.join("home")).unwrap();
@@ -82,7 +93,22 @@ impl Fixture {
                 .unwrap();
             }
         }
-        Self { dir }
+        Self { dir, outside }
+    }
+
+    /// The person's configuration directory, XDG_CONFIG_HOME.
+    pub fn config_home(&self) -> PathBuf {
+        self.outside.join("config")
+    }
+
+    /// Where atomic keeps credentials, the sign-in's among them.
+    pub fn credentials(&self) -> PathBuf {
+        self.config_home().join("atomic/credentials")
+    }
+
+    /// Where atomic keeps projects' state, under XDG_DATA_HOME.
+    pub fn state_home(&self) -> PathBuf {
+        self.dir.join("data/atomic")
     }
 
     /// Keep a ChatGPT sign-in in the file store, as `atomic model login` would.
@@ -96,7 +122,7 @@ impl Fixture {
     }
 
     pub fn sign_in_with(&self, access: &str, refresh: &str) {
-        let auth = self.dir.join("atomic-home/credentials/codex-auth");
+        let auth = self.credentials().join("codex-auth");
         std::fs::create_dir_all(&auth).unwrap();
         let id_token = atomic_core::testing::fake_id_token("dev@example.invalid", "account-1");
         // Its issuer is the discard port on loopback: a refresh, on a stale
@@ -139,17 +165,11 @@ impl Fixture {
         None
     }
 
-    /// The person's own configuration, `text`, in a directory outside the
-    /// checkout (atomic refuses one a project could have supplied): pass it
-    /// as XDG_CONFIG_HOME, and remove it after.
-    pub fn person_configures(&self, tag: &str, text: &str) -> PathBuf {
-        let home = std::env::temp_dir().join(format!(
-            "atomic-model-auth-config-{tag}-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(home.join("atomic")).unwrap();
-        std::fs::write(home.join("atomic/config.yaml"), text).unwrap();
-        home
+    /// The person's own configuration, `text`, where atomic reads it.
+    pub fn person_configures(&self, text: &str) {
+        let dir = self.config_home().join("atomic");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.yaml"), text).unwrap();
     }
 
     /// `atomic args...`, started, its stderr piped.
@@ -176,17 +196,17 @@ impl Fixture {
             // a test sees.
             .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent/bus")
             .env("HOME", self.dir.join("home"))
-            .env("ATOMIC_HOME", self.dir.join("atomic-home"))
+            .env("XDG_DATA_HOME", self.dir.join("data"))
             .env("ATOMIC_CREDENTIAL_STORE", "file")
             // The person's own configuration is under the throwaway home.
-            .env("XDG_CONFIG_HOME", self.dir.join("home/.config"))
+            .env("XDG_CONFIG_HOME", self.config_home())
             // No Ollama, whatever runs on this machine.
             .env("ATOMIC_DETECT_OLLAMA_ADDR", "127.0.0.1:9")
             .env("USER", "dev")
             .stdin(Stdio::null());
         for name in [
             "CODEX_HOME",
-            "XDG_DATA_HOME",
+            "ATOMIC_HOME",
             "ATOMIC_DATABASE_URL",
             "ATOMIC_DATABASE_SCHEMA",
             "ATOMIC_EXECUTOR_ID",

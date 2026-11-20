@@ -73,20 +73,21 @@ fn login_status_says_who_is_signed_in_and_logout_forgets_it() {
 #[test]
 fn model_status_creates_no_state_directory_and_no_store() {
     let f = Fixture::new("stateless");
-    let home = f.dir.join("atomic-home");
     let out = f.atomic(&["model", "status"], &[]);
     assert!(text(&out).contains("no one is signed in"), "{}", text(&out));
-    assert!(
-        !home.exists(),
-        "status created {:?}",
-        std::fs::read_dir(&home).map(|d| d.flatten().map(|e| e.path()).collect::<Vec<_>>())
-    );
+    for home in [f.state_home(), f.credentials()] {
+        assert!(
+            !home.exists(),
+            "status created {:?}",
+            std::fs::read_dir(&home).map(|d| d.flatten().map(|e| e.path()).collect::<Vec<_>>())
+        );
+    }
 }
 
 #[test]
 fn logout_forgets_the_file_copy_whichever_store_is_chosen() {
     let f = Fixture::new("logout-stores");
-    let kept = f.dir.join("atomic-home/credentials/codex-auth/auth.json");
+    let kept = f.credentials().join("codex-auth/auth.json");
     for store in ["file", "keyring"] {
         f.sign_in_unrevocable();
         assert!(kept.exists());
@@ -137,15 +138,14 @@ fn a_shared_store_or_serve_refuses_the_personal_sign_in() {
     assert!(t.contains("the store is shared"), "{t}");
     assert!(t.contains("ATOMIC_MODEL_BASE_URL"), "{t}");
     // The same store named by the person's own configuration file.
-    let config = f.person_configures(
-        "shared",
+    f.person_configures(
         "database:\n  url: postgres://atomic:atomic@127.0.0.1:9/atomic\nexecutor_id: host-1\n",
     );
     let out = f.atomic(
         &["run", "tidy-codex", "--data", r#"{"text": "a note"}"#],
-        &[model[0], ("XDG_CONFIG_HOME", config.to_str().unwrap())],
+        &model,
     );
-    let _ = std::fs::remove_dir_all(&config);
+    f.person_configures("runner: local\n");
     let t = text(&out);
     assert!(!out.status.success(), "{t}");
     assert!(t.contains("the store is shared"), "{t}");
@@ -210,21 +210,65 @@ fn a_configured_endpoint_comes_before_the_sign_in_and_the_sign_in_before_detecti
         t.contains("not used: a model endpoint is configured"),
         "{t}"
     );
+    // A shared store: the sign-in is shown as not used there.
+    let t = explain(&[(
+        "ATOMIC_DATABASE_URL",
+        "postgres://atomic:atomic@127.0.0.1:9/atomic",
+    )]);
+    assert!(t.contains("not used: the store is shared"), "{t}");
 }
 
 #[test]
-fn a_running_atomic_cannot_be_read_through_proc_by_its_own_user() {
+fn no_one_signed_in_to_a_keyring_that_cannot_be_reached_is_simply_not_signed_in() {
+    let f = Fixture::new("no-keyring");
+    let keyring = [
+        ("ATOMIC_CREDENTIAL_STORE", "keyring"),
+        ("OPENAI_API_KEY", "sk-detected"),
+    ];
+    // Never signed in, and then with the sign-in's directory there (as a
+    // login that did not finish leaves it): the keyring, with no Secret
+    // Service here, is not taken for a sign-in that cannot be read.
+    for made in [false, true] {
+        if made {
+            std::fs::create_dir_all(f.credentials().join("codex-auth")).unwrap();
+        }
+        let out = f.atomic(&["config", "--explain"], &keyring);
+        let t = text(&out);
+        assert!(out.status.success(), "{t}");
+        assert!(!t.contains("could not be read"), "{made}: {t}");
+        assert!(t.contains("detected: OPENAI_API_KEY"), "{made}: {t}");
+    }
+}
+
+#[test]
+fn a_sign_in_inside_the_checkout_holding_the_project_is_refused_and_explain_says_so() {
+    let f = Fixture::new("in-checkout");
+    // The fixture's directory as a checkout, holding the project, and the
+    // sign-in kept inside it.
+    std::fs::create_dir_all(f.dir.join(".git")).unwrap();
+    let inside = f.dir.join("atomic-home");
+    let home = [("ATOMIC_HOME", inside.to_str().unwrap())];
+    let out = f.atomic(&["model", "status"], &home);
+    let t = text(&out);
+    assert!(!out.status.success(), "{t}");
+    assert!(t.contains("inside the checkout holding the project"), "{t}");
+    // `atomic config` still shows the settings, and says why.
+    let out = f.atomic(&["config", "--explain"], &home);
+    let t = text(&out);
+    assert!(out.status.success(), "{t}");
+    assert!(t.contains("the ChatGPT sign-in could not be read"), "{t}");
+    assert!(t.contains("inside the checkout holding the project"), "{t}");
+}
+
+/// Start `atomic args`, wait for a stderr line containing `ready`, then
+/// read its environment through /proc from this test process: the same
+/// user, not sandboxed, and a process whose own environment it can read.
+fn read_while_running(f: &Fixture, args: &[&str], env: &[(&str, &str)], ready: &str) {
     use std::io::BufRead;
-    let f = Fixture::new("hardened");
-    let mut serve = f.spawn(
-        &["serve"],
-        &[
-            ("ATOMIC_MODEL_BASE_URL", "http://127.0.0.1:9/v1"),
-            ("ATOMIC_MODEL", "synthetic"),
-            ("ATOMIC_TEST_CANARY", "canary-in-atomics-environment"),
-        ],
-    );
-    let stderr = serve.stderr.take().unwrap();
+    let mut env = env.to_vec();
+    env.push(("ATOMIC_TEST_CANARY", "canary-in-atomics-environment"));
+    let mut child = f.spawn(args, &env);
+    let stderr = child.stderr.take().unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         for line in std::io::BufReader::new(stderr)
@@ -234,25 +278,21 @@ fn a_running_atomic_cannot_be_read_through_proc_by_its_own_user() {
             let _ = tx.send(line);
         }
     });
-    let serving = rx
+    let started = rx
         .iter()
-        .find(|l| l.contains("serving until stopped") || l.contains("error"));
-    // This test process: the same user, not sandboxed, and a process whose
-    // own environment it can read.
-    let read = std::fs::read(format!("/proc/{}/environ", serve.id()));
-    let _ = serve.kill();
-    let _ = serve.wait();
+        .find(|l| l.contains(ready) || l.starts_with("error"));
+    let read = std::fs::read(format!("/proc/{}/environ", child.id()));
+    let _ = child.kill();
+    let _ = child.wait();
     assert!(
-        serving
-            .as_deref()
-            .is_some_and(|l| l.contains("serving until stopped")),
-        "atomic serve did not start: {serving:?}"
+        started.as_deref().is_some_and(|l| l.contains(ready)),
+        "atomic {args:?} did not start: {started:?}"
     );
     assert!(std::fs::read("/proc/self/environ").is_ok());
     match read {
         Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}"),
         Ok(env) => panic!(
-            "read atomic's environment through /proc ({} bytes, the canary {})",
+            "read atomic {args:?}'s environment through /proc ({} bytes, the canary {})",
             env.len(),
             if String::from_utf8_lossy(&env).contains("canary-in-atomics-environment") {
                 "in it"
@@ -261,6 +301,29 @@ fn a_running_atomic_cannot_be_read_through_proc_by_its_own_user() {
             }
         ),
     }
+}
+
+#[test]
+fn a_running_atomic_cannot_be_read_through_proc_by_its_own_user() {
+    let f = Fixture::new("hardened");
+    // A command that starts Codex: atomic serve.
+    read_while_running(
+        &f,
+        &["serve"],
+        &[
+            ("ATOMIC_MODEL_BASE_URL", "http://127.0.0.1:9/v1"),
+            ("ATOMIC_MODEL", "synthetic"),
+        ],
+        "serving until stopped",
+    );
+    // One that does not, and holds a sign-in while it runs: the login,
+    // waiting for the browser (which opens nothing here).
+    read_while_running(
+        &f,
+        &["model", "login"],
+        &[("BROWSER", "true")],
+        "Sign in in your browser",
+    );
 }
 
 #[test]
@@ -297,7 +360,7 @@ fn model_commands_work_from_above_the_store_outside_any_project() {
     let f = Fixture::new("above");
     f.sign_in_unrevocable();
     // The working directory holds the credential store, and no project.
-    let out = f.atomic_from(&f.dir, &["model", "status"], &[]);
+    let out = f.atomic_from(&f.outside, &["model", "status"], &[]);
     let t = text(&out);
     assert!(out.status.success(), "{t}");
     assert!(t.contains("signed in with chatgpt"), "{t}");

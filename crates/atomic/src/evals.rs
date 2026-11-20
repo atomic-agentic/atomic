@@ -307,16 +307,27 @@ pub async fn run(
     state.create()?;
     let _lock = state.lock_execution("atomic eval")?;
     let needs_model = chosen.atoms.iter().any(|(a, _, _)| calls_model(a));
-    // The settings `atomic run` resolves: files, variables and flags.
-    let resolved = crate::engine::settings(&state, &args.engine)?;
+    // The settings `atomic run` resolves: files, variables and flags; the
+    // sign-in only for a live eval, since a replay reads no credential.
+    let live = source != Source::Recorded && needs_model;
+    let resolved = crate::engine::settings(&state, &args.engine, live)?;
     // A recording answers only the request it was made for, endpoint and
     // model included, so replaying needs them configured as they were; it
     // needs no key, so none is read. A live eval calls the endpoint as a
     // run would.
     let endpoint = match (source, needs_model) {
         (Source::Recorded, true) => crate::engine::identity(&resolved)?,
-        // An eval is the person's own, here, as `atomic run` is.
-        _ => crate::engine::endpoint(&resolved, needs_model, None)?,
+        // An eval is the person's own, as `atomic run` is: its sign-in is
+        // refused when the ledger it is metered in is a shared store.
+        _ => crate::engine::endpoint(
+            &resolved,
+            needs_model,
+            matches!(
+                crate::engine::store_of(&state, &resolved.settings),
+                atomic_durable::Database::Postgres { .. }
+            )
+            .then_some(crate::engine::SHARED_STORE),
+        )?,
     };
     if source != Source::Recorded
         && needs_model

@@ -16,8 +16,8 @@
 //! Codex atoms' sandboxed commands never see it: the credential directory is
 //! denied to their sandbox, their commands cannot use the kernel keyrings or
 //! reach the Secret Service, and Codex sends the token to the model backend
-//! from atomic's own process. Exec atoms' commands run outside that sandbox
-//! and are not yet kept from it. A signed-in thread has none of Codex's ChatGPT
+//! from atomic's own process. Exec atoms' commands run under the same sandbox
+//! and are kept from it alike. A signed-in thread has none of Codex's ChatGPT
 //! connectors, plugins or hosted tools (see `crate::codex`), so the token
 //! reaches the model and nothing else. Lite atoms call a model API directly
 //! and are not covered: they need an endpoint and, if it asks for one, a
@@ -126,6 +126,27 @@ pub enum SignInError {
 
 const KEYRING: AuthKeyringBackendKind = AuthKeyringBackendKind::Direct;
 
+/// Refused when `dir` is inside the checkout holding `project`: a file
+/// there is one the repository could have supplied.
+fn outside_the_checkout(dir: &Path, project: Option<&Path>) -> Result<(), SignInError> {
+    let Some(project) = project else {
+        return Ok(());
+    };
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
+    let (here, project) = (real(dir), real(project));
+    match project.ancestors().find(|d| d.join(".git").exists()) {
+        Some(checkout) if here.starts_with(checkout) => {
+            Err(SignInError::Store(CredentialError::File(format!(
+                "{} is inside the checkout holding the project, at {}, so the repository could \
+                 have supplied it; point ATOMIC_HOME outside it",
+                dir.display(),
+                checkout.display()
+            ))))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// The model endpoint a sign-in's Codex atoms use: ChatGPT's Codex backend.
 pub const CODEX_BACKEND: &str = "https://chatgpt.com/backend-api/codex";
 
@@ -146,14 +167,17 @@ impl SignIn {
     /// Where the sign-in store `ATOMIC_CREDENTIAL_STORE` chooses is, without
     /// creating anything: outside every state directory and, when there is
     /// one, outside and not above `project`, as the operator credential's
-    /// file store is. Outside any project (as from the home directory, above
-    /// the store) there is no project to keep it apart from.
+    /// file store is, and outside the checkout holding it, which the
+    /// project's own files could reach. Outside any project (as from the
+    /// home directory, above the store) there is no project to keep it apart
+    /// from.
     pub fn located(project: Option<&Path>) -> Result<Self, SignInError> {
         protected()?;
         let dir = crate::state::credentials_dir()
             .map_err(|e| CredentialError::File(e.to_string()))?
             .join("codex-auth");
         crate::credential::placed_apart(&dir, project)?;
+        outside_the_checkout(&dir, project)?;
         // One spelling, so the keyring entry Codex keys by it is the same
         // however the directory is reached.
         let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
@@ -223,6 +247,11 @@ impl SignIn {
 
     pub(crate) fn store(&self) -> AuthCredentialsStoreMode {
         self.store
+    }
+
+    /// Whether it is kept in the OS keyring, not the file store.
+    pub fn in_keyring(&self) -> bool {
+        self.store != AuthCredentialsStoreMode::File
     }
 
     /// Where the sign-in is kept, for a person: never a token.
@@ -513,12 +542,16 @@ mod tests {
     /// Log in at the test issuer on `port`, with this test as the browser:
     /// it reads the state from the authorize URL and comes back to the
     /// login server's callback with a code.
+    /// The addresses browser logins were started at, as Codex built them.
+    static LOGIN_URLS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
     async fn browser_login(sign_in: &SignIn) -> anyhow::Result<()> {
         static STARTED: std::sync::Mutex<Option<std::sync::mpsc::Sender<(String, u16)>>> =
             std::sync::Mutex::new(None);
         let (tx, rx) = std::sync::mpsc::channel();
         *STARTED.lock().expect("hook") = Some(tx);
         let _ = LOGIN_STARTED.set(Box::new(|url: &str, port: u16| {
+            LOGIN_URLS.lock().expect("urls").push(url.to_owned());
             if let Some(tx) = STARTED.lock().expect("hook").as_ref() {
                 let _ = tx.send((url.to_owned(), port));
             }
@@ -566,6 +599,21 @@ mod tests {
             let dir = auth_dir("allowed");
             let sign_in = SignIn::in_files(&dir).with_issuer(&at);
             browser_login(&sign_in).await.expect("logged in");
+            // The address the person is shown, as Codex builds it, comes
+            // through atomic's redaction whole.
+            let url = LOGIN_URLS
+                .lock()
+                .expect("urls")
+                .last()
+                .cloned()
+                .expect("a login address");
+            assert!(url.contains("api.connectors.read"), "{url}");
+            assert!(url.contains("code_challenge="), "{url}");
+            assert_eq!(
+                crate::redact::bounded(&url, crate::redact::MAX_TEXT),
+                url,
+                "redaction changed the address to sign in at"
+            );
             let account = sign_in.account().expect("account").expect("signed in");
             assert_eq!(account.mode, "chatgpt");
             assert_eq!(account.email.as_deref(), Some("dev@example.invalid"));
@@ -626,18 +674,5 @@ mod tests {
             );
             assert!(refused.contains(os), "{refused}");
         }
-    }
-
-    #[test]
-    fn the_address_to_sign_in_at_survives_redaction() {
-        let url = "https://auth.openai.com/oauth/authorize?response_type=code\
-                   &client_id=app_EMoamEEZ73f0CkXaXp7hrann\
-                   &redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback\
-                   &scope=openid%20profile%20email%20offline_access\
-                   &code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM\
-                   &code_challenge_method=S256&id_token_add_organizations=true\
-                   &codex_cli_simplified_flow=true\
-                   &state=Y2FkZmY0ZDctNDk5Yi00YzBkLWI3ZWMtZWQ2YmQ2ZDc2NjU0&originator=codex_cli_rs";
-        assert_eq!(crate::redact::bounded(url, crate::redact::MAX_TEXT), url);
     }
 }

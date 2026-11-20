@@ -476,6 +476,17 @@ impl CodexPaths {
     }
 }
 
+/// Harden atomic itself, not one of Codex's helpers: the process that holds
+/// a sign-in's token and the operator credential cannot be dumped, read
+/// through /proc by a same-user process, or leave a core file. It loses its
+/// LD_* variables, and the commands it starts inherit a core-file limit of
+/// zero (on macOS it also refuses a debugger). Both entry points call it.
+fn harden() {
+    if !is_helper(std::env::args_os()) {
+        codex_process_hardening::pre_main_hardening();
+    }
+}
+
 /// The process entry point.
 ///
 /// The same executable re-runs itself as Codex's helpers (the Linux sandbox,
@@ -489,14 +500,7 @@ where
     Fut: Future<Output = anyhow::Result<()>>,
 {
     keep_sandbox_off_keyrings();
-    // atomic itself, not one of Codex's helpers: the process that holds a
-    // sign-in's token and the operator credential cannot be dumped, read
-    // through /proc by a same-user process, or leave a core file. It loses
-    // its LD_* variables, and the commands it starts inherit a core-file
-    // limit of zero (on macOS it also refuses a debugger).
-    if !is_helper(std::env::args_os()) {
-        codex_process_hardening::pre_main_hardening();
-    }
+    harden();
     // SAFETY: called at the start of main, while the process has one thread,
     // so no other thread can read the environment concurrently.
     #[allow(unsafe_code)]
@@ -516,9 +520,7 @@ pub fn without_threads<Fut>(main_fn: Fut) -> anyhow::Result<()>
 where
     Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
 {
-    if !is_helper(std::env::args_os()) {
-        codex_process_hardening::pre_main_hardening();
-    }
+    harden();
     scrub_overrides();
     // Codex's own entry point gives its futures this much stack.
     const STACK: usize = 16 * 1024 * 1024;

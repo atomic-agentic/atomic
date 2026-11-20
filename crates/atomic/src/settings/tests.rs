@@ -152,6 +152,28 @@ fn a_configured_endpoint_comes_first_then_the_sign_in_then_detection() {
         "{:?}",
         r.notes
     );
+    let line = r.announcement().expect("announced");
+    assert!(
+        line.contains("gpt-5-codex on your ChatGPT sign-in"),
+        "{line}"
+    );
+    // A key named beside the sign-in is not sent, and that is said.
+    let r = resolved_signed_in(
+        &d,
+        &EngineArgs::default(),
+        &[("ATOMIC_MODEL_API_KEY_ENV", "MY_KEY"), model],
+        &nobody,
+        &signed_in,
+    )
+    .expect("resolves");
+    assert_eq!(r.endpoint().expect("an endpoint").api_key_env, None);
+    assert!(
+        r.notes
+            .iter()
+            .any(|n| n.contains("model.api_key_env is set and not used")),
+        "{:?}",
+        r.notes
+    );
     // A configured endpoint, from a variable, a flag or a file, comes
     // before the sign-in, which is not even looked for.
     looked.store(0, Ordering::Relaxed);
@@ -219,6 +241,20 @@ fn a_configured_endpoint_comes_first_then_the_sign_in_then_detection() {
         Some("the keyring is locked")
     );
     assert!(r.notes.iter().any(|n| n.contains("the keyring is locked")));
+}
+
+#[test]
+fn a_null_base_url_in_the_persons_own_file_is_unset() {
+    let d = dir(&[("atomic.yaml", MANIFEST_ONLY)]);
+    let (home, home_var) = person("model:\n  base_url: null\n");
+    let r = resolved(
+        &d,
+        &EngineArgs::default(),
+        &[("OPENAI_API_KEY", "sk-secret-value"), ("HOME", &home_var)],
+        &nobody,
+    );
+    let _ = std::fs::remove_dir_all(&home);
+    assert_eq!(r.endpoint().expect("an endpoint").base_url, OPENAI_BASE_URL);
 }
 
 #[test]

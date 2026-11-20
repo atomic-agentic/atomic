@@ -213,6 +213,15 @@ impl Surroundings<'static> {
         }
     }
 
+    /// [`Surroundings::here`], but no sign-in is read: for what calls no
+    /// model on the person's behalf, such as a replay or a run of exec atoms.
+    pub fn here_without_sign_in() -> Self {
+        Self {
+            ollama: &probe_ollama,
+            ..Self::without_probe()
+        }
+    }
+
     /// [`Surroundings::here`], but no Ollama answers and no sign-in is read:
     /// for `atomic check` and for finding the store, which read the settings
     /// and contact nothing.
@@ -232,13 +241,26 @@ impl Surroundings<'static> {
 /// anything. Off Linux, where sign-ins are not kept, there is none.
 pub fn signed_in(project: Option<&Path>) -> SignInFound {
     match SignIn::located(project) {
-        Ok(sign_in) => match sign_in.account() {
-            Ok(Some(_)) => Ok(Some(sign_in)),
-            Ok(None) => Ok(None),
-            Err(e) => Err(format!("{e:#}")),
-        },
+        Ok(sign_in) => found(sign_in),
         Err(atomic_core::signin::SignInError::Unprotected(_)) => Ok(None),
         Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Whether anyone is signed in at `sign_in`. A store that holds nothing is
+/// no one: `atomic model login` creates the sign-in's directory, so with
+/// none no store is read, and a keyring that cannot be reached holds no
+/// sign-in, since login keeps one only where it can. A file store that
+/// cannot be read is said.
+fn found(sign_in: SignIn) -> SignInFound {
+    if !sign_in.auth_home().is_dir() {
+        return Ok(None);
+    }
+    match sign_in.account() {
+        Ok(Some(_)) => Ok(Some(sign_in)),
+        Ok(None) => Ok(None),
+        Err(_) if sign_in.in_keyring() => Ok(None),
+        Err(e) => Err(format!("{e:#}")),
     }
 }
 
@@ -401,12 +423,14 @@ pub fn resolve(
         );
     }
 
-    // An empty base URL is no endpoint.
+    // An empty base URL is no endpoint, and nor is a null one, as a file's
+    // `base_url:` with nothing after it.
     if settings
         .model
         .base_url
         .as_deref()
-        .is_some_and(|u| u.trim().is_empty())
+        .is_none_or(|u| u.trim().is_empty())
+        && !unset(&sources, "model.base_url")
     {
         settings.model.base_url = None;
         sources.insert("model.base_url".into(), Source::Default);
@@ -428,6 +452,13 @@ pub fn resolve(
         notes.push(
             "OPENAI_API_KEY is set and not used: the ChatGPT sign-in comes before detection; \
              set model.base_url to use OpenAI's API"
+                .into(),
+        );
+    }
+    if sign_in.is_some() && settings.model.api_key_env.is_some() {
+        notes.push(
+            "model.api_key_env is set and not used: the ChatGPT sign-in sends no key; set \
+             model.base_url to the endpoint the key is for"
                 .into(),
         );
     }
@@ -848,8 +879,17 @@ impl Resolved {
     /// The line `atomic run`, `runs resume` and `serve` print when the model
     /// endpoint was detected or set by the project's files rather than by
     /// whoever runs it, so where model calls go is never a surprise.
+    /// On the sign-in, it names the model going to ChatGPT's Codex backend.
     pub fn announcement(&self) -> Option<String> {
         let m = &self.settings.model;
+        if self.on_sign_in() {
+            let name = m.name.as_deref()?;
+            return Some(format!(
+                "atomic: model {name} on your ChatGPT sign-in, at {}; `atomic config --explain` \
+                 says why",
+                mask_url(atomic_core::signin::CODEX_BACKEND)
+            ));
+        }
         let (base_url, name) = (m.base_url.as_deref()?, m.name.as_deref()?);
         let source = self.sources.get("model.base_url")?;
         // Not the person's own configuration: that endpoint they chose.
@@ -955,21 +995,40 @@ pub fn config(args: &ConfigArgs, project: Option<&Path>, json: bool) -> anyhow::
     let resolved = resolve(&dir, &args.engine, &Surroundings::here())
         .map_err(|e| anyhow::anyhow!("the configuration cannot be read: {e}"))?;
     let mut rows = resolved.explain(&|name| std::env::var(name).ok());
+    let mut notes = resolved.notes.clone();
     // The sign-in, if anyone is signed in: how and where it is kept, never a
-    // token or an email, and whether model atoms use it here.
+    // token or an email, and whether model atoms use it here. One that
+    // cannot be looked for is said, as resolution says it.
     let signed_in = match SignIn::located(in_project.then_some(root.as_path())) {
         Ok(sign_in) => sign_in.explain(),
         Err(atomic_core::signin::SignInError::Unprotected(_)) => None,
-        Err(e) => return Err(e.into()),
+        Err(e) => {
+            let note = format!("the ChatGPT sign-in could not be read: {e}");
+            if !notes.contains(&note) {
+                notes.push(note);
+            }
+            None
+        }
     };
     if let Some(explained) = signed_in {
-        let source = if resolved.on_sign_in() {
-            explained.source
-        } else {
+        let shared = resolved
+            .settings
+            .database
+            .url
+            .as_deref()
+            .is_some_and(|u| !u.is_empty());
+        let source = if resolved.settings.model.base_url.is_some() {
             format!(
                 "{}; not used: a model endpoint is configured, which comes first",
                 explained.source
             )
+        } else if shared {
+            format!(
+                "{}; not used: the store is shared (PostgreSQL), and a sign-in is personal",
+                explained.source
+            )
+        } else {
+            explained.source
         };
         rows.push((
             "model.sign_in".into(),
@@ -988,7 +1047,7 @@ pub fn config(args: &ConfigArgs, project: Option<&Path>, json: bool) -> anyhow::
         let mut doc = serde_json::json!({
             "project": root,
             "settings": settings,
-            "notes": resolved.notes,
+            "notes": notes,
         });
         atomic_core::redact::value(&mut doc);
         println!("{}", serde_json::to_string_pretty(&doc)?);
@@ -1012,7 +1071,7 @@ pub fn config(args: &ConfigArgs, project: Option<&Path>, json: bool) -> anyhow::
             say(format!("{path:<width$}  {value}"));
         }
     }
-    for note in &resolved.notes {
+    for note in &notes {
         say(format!("note: {note}"));
     }
     Ok(())

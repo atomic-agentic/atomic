@@ -68,14 +68,20 @@ pub struct EngineArgs {
     pub executor_id: Option<String>,
 }
 
-/// The settings for the project at `state`, with `args` on top.
-pub fn settings(state: &ProjectState, args: &EngineArgs) -> anyhow::Result<settings::Resolved> {
-    settings::resolve(
-        &settings::config_dir(state.root()),
-        args,
-        &settings::Surroundings::here(),
-    )
-    .map_err(|e| {
+/// The settings for the project at `state`, with `args` on top. The
+/// person's sign-in is looked for only when `model_calls` says a model will
+/// be called on them: a replay or a run that calls no model never reads it.
+pub fn settings(
+    state: &ProjectState,
+    args: &EngineArgs,
+    model_calls: bool,
+) -> anyhow::Result<settings::Resolved> {
+    let around = if model_calls {
+        settings::Surroundings::here()
+    } else {
+        settings::Surroundings::here_without_sign_in()
+    };
+    settings::resolve(&settings::config_dir(state.root()), args, &around).map_err(|e| {
         Failure::new(
             "config.invalid",
             format!("the configuration cannot be read: {e}"),
@@ -146,7 +152,9 @@ pub fn exec_backend(
 /// The endpoint a replay of recorded model calls names: where the calls
 /// were recorded for, and the model, with no key, since no call reaches it.
 /// A key the project's files may not send is never read either, so a
-/// withheld key does not refuse a replay.
+/// withheld key does not refuse a replay. `resolved` is resolved without
+/// the sign-in (see [`settings`]): lite atoms, which are what replays, are
+/// never recorded on one.
 pub fn identity(resolved: &settings::Resolved) -> anyhow::Result<ModelEndpoint> {
     match resolved.endpoint() {
         // No token is read either.
@@ -166,6 +174,9 @@ pub fn identity(resolved: &settings::Resolved) -> anyhow::Result<ModelEndpoint> 
         .into()),
     }
 }
+
+/// Why a personal sign-in is not used with a PostgreSQL store.
+pub const SHARED_STORE: &str = "the store is shared (PostgreSQL)";
 
 /// The model endpoint, or with `required`, a failure saying how to set one.
 /// A configured endpoint comes first, then the person's ChatGPT sign-in,
@@ -353,7 +364,7 @@ pub async fn open(
     // Held until the process exits: dropping the engine while a command it
     // started still runs must not let another process recover that run.
     state.lock_execution(command)?.hold_until_exit();
-    let resolved = settings(state, args)?;
+    let resolved = settings(state, args, needs_model)?;
     let database = store_of(state, &resolved.settings);
     let executor = atomic_durable::executor_identity(resolved.settings.executor_id.as_deref())?;
     if matches!(database, Database::Postgres { .. }) && executor.is_none() {
@@ -375,7 +386,7 @@ pub async fn open(
     // name, whichever file or variable names it. `atomic runs resume` on
     // such a store uses it for whichever run is resumed.
     let personal_refused = if matches!(database, Database::Postgres { .. }) {
-        Some("the store is shared (PostgreSQL)")
+        Some(SHARED_STORE)
     } else if takes == Takes::Waiting {
         Some("`atomic serve` runs whatever the store's runs need")
     } else {
