@@ -152,7 +152,7 @@ declarations would replace an atom's own `.atomic/types/<atom>.d.ts` is an error
 | `case`, `judges` | Full evaluation-case and judge input/output schema declarations |
 | `scorers` | Interpreted judge bindings, numeric scores and mean thresholds |
 | `context` | Optional public execution-context schema; a context sidecar is also accepted. See [context schemas](#context-schemas) |
-| `exec`, `effects`, `env` | An exec atom's command, what it does outside Atomic, and its environment. See [exec atoms](#exec-atoms) |
+| `exec`, `effects`, `env` | An exec atom's command, what it does outside Atomic, and its environment. See [exec atoms](#exec-atoms). A codex atom may declare `env` too: literal values its turn's commands get, such as the tool homes (`RUSTUP_HOME`, `CARGO_HOME`, `PYENV_ROOT`) they no longer find through `HOME` |
 
 Some integrations shown in the catalog remain staged. Unavailable permissions,
 remote atoms, credentials, skills and runtime declarations fail explicitly in the

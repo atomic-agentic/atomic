@@ -93,13 +93,26 @@ fn source(tag: &str) -> PathBuf {
     dir
 }
 
-/// A backend with scratch directories of its own, under the system's
-/// temporary directory, for one test.
+/// A backend with scratch directories of its own for one test, under the
+/// build's target directory: a scratch root under the system's temporary
+/// directory is refused at connect.
 fn backend(tag: &str) -> LocalBackend {
-    let root =
-        std::env::temp_dir().join(format!("atomic-exec-scratch-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/atomic-exec-tests")
+        .join(format!("scratch-{tag}-{}", std::process::id()));
+    let _ = workspace::remove_tree(&root);
     LocalBackend::in_dir(root)
+}
+
+/// The name this process gives its own attempts' directories.
+fn tagged(pid: u32, attempt: &str) -> String {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+    let start = stat
+        .rsplit_once(')')
+        .and_then(|(_, after)| after.split_whitespace().nth(19))
+        .unwrap_or("0")
+        .to_owned();
+    format!("{pid}.{start}-{attempt}")
 }
 
 fn opening(src: &Path, step: &str, attempt: &str) -> Open {
@@ -210,12 +223,17 @@ fn connecting_sweeps_the_scratch_of_killed_attempts_only() {
         .spawn()
         .expect("a process that will be killed");
     let step = workspace::step_dir(local.scratch_root(), "run-1", "fix");
-    let theirs = step.join(format!("{}-a1", child.id()));
+    let theirs = step.join(tagged(child.id(), "a1"));
     std::fs::create_dir_all(&theirs).expect("its scratch");
     std::fs::write(theirs.join("left"), "behind").expect("write");
     let ours = workspace::step_dir(local.scratch_root(), "run-1", "check")
-        .join(format!("{}-b1", std::process::id()));
+        .join(tagged(std::process::id(), "b1"));
     std::fs::create_dir_all(&ours).expect("our scratch");
+    // A directory naming this process's id with another start time belongs
+    // to an earlier process that had the same id: it goes.
+    let reused = workspace::step_dir(local.scratch_root(), "run-1", "old")
+        .join(format!("{}.1-c1", std::process::id()));
+    std::fs::create_dir_all(&reused).expect("an earlier process's scratch");
 
     local.connect().expect("connects");
     assert!(theirs.is_dir(), "a live attempt's scratch stays");
@@ -226,7 +244,114 @@ fn connecting_sweeps_the_scratch_of_killed_attempts_only() {
     assert!(!theirs.exists(), "a killed attempt's scratch goes");
     assert!(!step.exists(), "and its step's directory with it");
     assert!(ours.is_dir(), "this process's own attempts stay");
-    let _ = std::fs::remove_dir_all(local.scratch_root());
+    #[cfg(target_os = "linux")]
+    assert!(
+        !reused.exists(),
+        "an earlier process with the same id is dead"
+    );
+    let _ = workspace::remove_tree(local.scratch_root());
+}
+
+/// What an attempt left that cannot be written, such as a Go module cache,
+/// is removed all the same, at open and at connect; nothing it leaves stops
+/// a later run.
+#[test]
+fn read_only_trees_are_removed_at_open_and_at_connect() {
+    use std::os::unix::fs::PermissionsExt;
+    let read_only = |dir: &Path| {
+        let cache = dir.join("go/pkg/mod/example.com/m@v1");
+        std::fs::create_dir_all(&cache).expect("cache");
+        std::fs::write(cache.join("go.mod"), "module m").expect("file");
+        for d in [cache.as_path(), cache.parent().expect("parent")] {
+            std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+        }
+    };
+    let src = source("read-only");
+    let local = backend("read-only");
+    let first = local.open(&opening(&src, "fix", "a1")).expect("opens");
+    read_only(first.scratch.as_ref().expect("scratch"));
+    let second = local
+        .open(&opening(&src, "fix", "a2"))
+        .expect("opens over a read-only tree");
+    assert!(!first.scratch.as_ref().expect("scratch").exists());
+    read_only(second.scratch.as_ref().expect("scratch"));
+    local.close(&second).expect("closes a read-only tree");
+    assert!(!second.scratch.as_ref().expect("scratch").exists());
+
+    // A dead attempt's read-only tree goes at connect.
+    let mut child = std::process::Command::new("true").spawn().expect("process");
+    let dead = workspace::step_dir(local.scratch_root(), "run-1", "dead")
+        .join(format!("{}.1-d1", child.id()));
+    child.wait().expect("reaped");
+    std::fs::create_dir_all(&dead).expect("dead scratch");
+    read_only(&dead);
+    local.connect().expect("connects");
+    assert!(!dead.exists());
+    let _ = workspace::remove_tree(local.scratch_root());
+    let _ = std::fs::remove_dir_all(&src);
+}
+
+/// A scratch root where a sandboxed turn may write is refused: under the
+/// system's temporary directory at connect, and under the workspace or one
+/// of its writable roots at open.
+#[test]
+fn a_scratch_root_a_sandboxed_turn_could_write_is_refused() {
+    for root in [
+        PathBuf::from("/tmp/atomic-exec-refused"),
+        std::env::temp_dir().join("atomic-exec-refused"),
+    ] {
+        let error = LocalBackend::in_dir(root.clone())
+            .connect()
+            .expect_err("refused");
+        assert!(
+            error
+                .to_string()
+                .contains("where a sandboxed turn may write"),
+            "{}: {error}",
+            root.display()
+        );
+    }
+    assert!(
+        LocalBackend::default().connect().is_err(),
+        "the default is for tests only"
+    );
+    let src = source("inside");
+    for root in [src.join(".atomic/scratch"), std::env::temp_dir().join("x")] {
+        let error = LocalBackend::in_dir(root.clone())
+            .open(&opening(&src, "fix", "a1"))
+            .expect_err("refused");
+        assert!(
+            error
+                .to_string()
+                .contains("where a sandboxed turn may write"),
+            "{}: {error}",
+            root.display()
+        );
+        assert!(!root.exists(), "nothing was created");
+    }
+    let _ = std::fs::remove_dir_all(&src);
+}
+
+/// Every workspace on a backend shares one private temporary directory,
+/// outside every attempt's scratch.
+#[test]
+fn turns_on_one_backend_share_a_private_temporary_directory() {
+    let src = source("tmp");
+    let local = backend("tmp");
+    let a = local.open(&opening(&src, "fix", "a1")).expect("opens");
+    let b = local.open(&opening(&src, "check", "b1")).expect("opens");
+    let tmp = a.tmp.clone().expect("a temporary directory");
+    assert_eq!(b.tmp.as_ref(), Some(&tmp));
+    assert!(tmp.starts_with(local.scratch_root()));
+    assert!(!tmp.starts_with(a.scratch.as_ref().expect("scratch")));
+    assert_eq!(mode(&tmp), 0o700);
+    local.close(&a).expect("closes");
+    local.close(&b).expect("closes");
+    assert!(tmp.is_dir(), "it outlives the workspaces");
+    local.connect().expect("connects");
+    assert!(tmp.is_dir(), "and the sweep");
+    let _ = workspace::remove_tree(local.scratch_root());
+    let _ = std::fs::remove_dir_all(&src);
 }
 
 #[test]
@@ -252,12 +377,16 @@ fn only_errors_that_may_pass_make_a_workspace_unavailable() {
     // A scratch root that cannot be made because a file is in its way will
     // not change by trying again: the error is permanent.
     let src = source("unavailable");
-    let blocker = std::env::temp_dir().join(format!("atomic-exec-blocker-{}", std::process::id()));
+    let blocker = backend("blocker").scratch_root().to_owned();
+    std::fs::create_dir_all(blocker.parent().expect("parent")).expect("parent");
     std::fs::write(&blocker, "a file").expect("file");
     let error = LocalBackend::in_dir(blocker.join("scratch"))
         .open(&opening(&src, "fix", "a1"))
         .expect_err("refused");
-    assert!(matches!(error, ExecError::Workspace { .. }), "{error}");
+    assert!(
+        matches!(&error, ExecError::Workspace { message, .. } if !message.contains("sandboxed")),
+        "{error}"
+    );
     let _ = std::fs::remove_file(&blocker);
     let _ = std::fs::remove_dir_all(&src);
 }
@@ -408,16 +537,14 @@ fn only_a_durable_statement_is_durable_and_anything_unrecognized_is_ephemeral() 
 
 #[test]
 fn the_local_backend_states_that_its_workspaces_are_durable() {
+    let local = backend("durable");
     assert_eq!(
-        LocalBackend::default()
-            .connect()
-            .expect("connects")
-            .durability,
+        local.connect().expect("connects").durability,
         Durability::Durable
     );
     assert_eq!(Backend::default().durability(), Durability::Durable);
     assert_eq!(
-        Backend::connect(LocalBackend::default())
+        Backend::connect(local.clone())
             .expect("connects")
             .durability(),
         Durability::Durable

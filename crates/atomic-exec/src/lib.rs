@@ -312,6 +312,7 @@ impl ExecutionBackend for Backend {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LocalBackend {
     scratch_root: PathBuf,
+    tmp: PathBuf,
 }
 
 impl LocalBackend {
@@ -324,7 +325,10 @@ impl LocalBackend {
     /// A backend keeping its scratch directories under `scratch_root`,
     /// which it creates, private, when it first needs it.
     pub fn in_dir(scratch_root: PathBuf) -> Self {
-        Self { scratch_root }
+        Self {
+            tmp: scratch_root.join(".tmp"),
+            scratch_root,
+        }
     }
 
     /// Where it keeps its scratch directories.
@@ -334,37 +338,53 @@ impl LocalBackend {
 }
 
 impl Default for LocalBackend {
-    /// Scratch directories under a private directory of this user's in the
-    /// system's temporary directory. Sandboxed turns may write there, so
+    /// Scratch directories of this backend's own under a private directory
+    /// of this user's in the system's temporary directory, and a temporary
+    /// directory every such backend of this user shares. Sandboxed turns may
+    /// write there, so [`connect`](ExecutionBackend::connect) refuses it:
     /// atomic itself always uses [`LocalBackend::in_dir`] with a directory
-    /// in the project's state directory; this one is for tests and tools.
+    /// in the project's state directory, and this one is for tests that
+    /// open workspaces without connecting. Each has its own scratch root,
+    /// since runs of different stores may share a run and step name.
     fn default() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         #[cfg(unix)]
         // SAFETY: getuid cannot fail and touches no memory.
         #[allow(unsafe_code)]
         let user = unsafe { libc::getuid() }.to_string();
         #[cfg(not(unix))]
         let user = std::env::var("USERNAME").unwrap_or_default();
-        Self::in_dir(std::env::temp_dir().join(format!("atomic-scratch-{user}")))
+        let base = std::env::temp_dir().join(format!("atomic-scratch-{user}"));
+        Self {
+            scratch_root: base.join(format!(
+                "{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            )),
+            tmp: base.join(".tmp"),
+        }
     }
 }
 
 impl ExecutionBackend for LocalBackend {
-    /// States durable workspaces, and removes the scratch directories of
-    /// attempts whose processes no longer run.
+    /// States durable workspaces, after checking that its scratch root is
+    /// outside the system's temporary directories, which sandboxed turns may
+    /// write, and removing what attempts of processes that no longer run left
+    /// there. Each workspace it opens is also checked against the turn's own
+    /// writable directories.
     fn connect(&self) -> Result<Statement, ExecError> {
-        workspace::sweep_local(&self.scratch_root).map_err(|e| ExecError::Workspace {
-            label: "connect".into(),
-            message: format!(
-                "remove dead attempts' scratch directories under {}: {e}",
-                self.scratch_root.display()
-            ),
-        })?;
+        workspace::check_outside(&self.scratch_root, &workspace::temporary_roots()).map_err(
+            |message| ExecError::Workspace {
+                label: "connect".into(),
+                message,
+            },
+        )?;
+        workspace::sweep_local(&self.scratch_root);
         Ok(Self::STATEMENT)
     }
 
     fn open(&self, request: &Open) -> Result<Workspace, ExecError> {
-        workspace::open_local(&self.scratch_root, request)
+        workspace::open_local(&self.scratch_root, &self.tmp, request)
     }
 
     fn close(&self, workspace: &Workspace) -> Result<(), ExecError> {

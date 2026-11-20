@@ -1108,77 +1108,152 @@ fn a_worktree_step_is_refused_on_a_backend_that_does_not_state_durable_workspace
     });
 }
 
-/// A backend that never has room for another workspace.
-struct Busy;
+/// A backend that has no room for another workspace until `room` is set.
+#[derive(Clone)]
+struct Busy {
+    room: Arc<std::sync::atomic::AtomicBool>,
+    refused: Arc<std::sync::atomic::AtomicUsize>,
+    local: atomic_exec::LocalBackend,
+}
 
 impl atomic_exec::ExecutionBackend for Busy {
     fn connect(&self) -> Result<atomic_exec::Statement, atomic_exec::ExecError> {
-        atomic_exec::LocalBackend::default().connect()
+        self.local.connect()
     }
     fn open(
         &self,
         request: &atomic_exec::Open,
     ) -> Result<atomic_exec::Workspace, atomic_exec::ExecError> {
-        Err(atomic_exec::ExecError::Unavailable {
-            label: request.label.clone(),
-            message: "no runner is free".into(),
-        })
+        if !self.room.load(std::sync::atomic::Ordering::SeqCst) {
+            self.refused
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return Err(atomic_exec::ExecError::Unavailable {
+                label: request.label.clone(),
+                message: "no runner is free".into(),
+            });
+        }
+        self.local.open(request)
     }
     fn run(
         &self,
         command: &atomic_exec::Command,
     ) -> Result<atomic_exec::Completed, atomic_exec::ExecError> {
-        atomic_exec::LocalBackend::default().run(command)
+        self.local.run(command)
     }
     fn close(&self, workspace: &atomic_exec::Workspace) -> Result<(), atomic_exec::ExecError> {
-        atomic_exec::LocalBackend::default().close(workspace)
+        self.local.close(workspace)
     }
 }
 
-/// A backend with no room parks the run, which `atomic runs resume` can
-/// continue later, instead of failing it.
+/// A backend with no room stops the run without recording anything: it
+/// neither fails nor parks, and once the backend has room, recovery runs
+/// the step and the run finishes. Its first step is an exec atom that
+/// declares no effects, whose attempt would be parked as outcome_unknown
+/// if an attempt whose workspace never opened counted as one that may
+/// have run.
 #[test]
-fn a_run_parks_when_its_backend_has_no_room() {
+fn a_run_whose_backend_has_no_room_runs_again_once_it_has() {
     on_codex_runtime(async {
         let dir = scratch("busy");
         let project = project(&dir);
-        let pipeline = load(&project, "triage.workflow.yaml", TRIAGE);
-        let model = FakeModel::start(vec![Reply::Text(READ.into())])
+        std::fs::create_dir_all(project.join("tools")).expect("tools");
+        std::fs::write(
+            project.join("tools/count.py"),
+            "import json, sys\nnote = json.load(sys.stdin)\njson.dump({'title': note['text'][:20], 'words': len(note['text'].split())}, sys.stdout)\n",
+        )
+        .expect("script");
+        let atoms = project.join("atoms");
+        std::fs::write(
+            atoms.join("count-note.atom.astro"),
+            "---\nimport type { Props, Input, Output } from '../.atomic/types/count-note';\n\
+             import type { AtomConfig } from '../.atomic/types/authoring';\n\
+             const { input }: Props = Astro.props;\n\
+             export const config: AtomConfig<Input, Output> = { description: 'Count words.', kind: 'exec', exec: { command: ['python3', 'tools/count.py'] } };\n---\n",
+        )
+        .expect("atom");
+        for role in ["input", "output"] {
+            std::fs::copy(
+                atoms.join(format!("read-note.{role}.schema.json")),
+                atoms.join(format!("count-note.{role}.schema.json")),
+            )
+            .expect("schema");
+        }
+        let workflow = TRIAGE
+            .replace("name: triage-note", "name: counted-triage")
+            .replace("atom: read-note", "atom: count-note");
+        let pipeline = load(&project, "counted.workflow.yaml", &workflow);
+        let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
             .await
             .expect("fake model");
-        let backend = atomic_exec::Backend::connect(Busy).expect("connects");
+        let busy = Busy {
+            room: Arc::default(),
+            refused: Arc::default(),
+            // Not under /tmp, where this test's other files are: connect
+            // refuses a scratch root a sandboxed turn could write.
+            local: atomic_exec::LocalBackend::in_dir(
+                Path::new(env!("CARGO_TARGET_TMPDIR"))
+                    .join(format!("pipeline-busy-scratch-{}", std::process::id())),
+            ),
+        };
+        let backend = atomic_exec::Backend::connect(busy.clone()).expect("connects");
         let rt = engine_on(&dir, &model.base_url(), Some(backend)).await;
         let run = PipelineRun {
             pipeline,
-            input: json!({"text": "Exporting a file named café.txt crashes the app."}),
+            input: json!({"text": "Export crashes on accented names"}),
         };
         rt.start(PIPELINE, "busy-1", run).await.expect("start");
+        // Refused, more than once: the run is tried again, not recorded.
         let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        let parked = loop {
-            if let Some(p) = atomic_durable::parks(&rt, "busy-1")
+        while busy.refused.load(std::sync::atomic::Ordering::SeqCst) < 4 {
+            assert!(
+                std::time::Instant::now() < until,
+                "the open was not tried again"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            matches!(
+                rt.status("busy-1").await.expect("status"),
+                Some(RunStatus::Pending)
+            ),
+            "the run neither failed nor finished"
+        );
+        assert!(
+            atomic_durable::parks(&rt, "busy-1")
                 .await
                 .expect("parks")
-                .into_iter()
-                .next()
-            {
-                break p;
-            }
-            assert!(
-                !matches!(
-                    rt.status("busy-1").await.expect("status"),
-                    Some(RunStatus::Failed(_))
-                ),
-                "the run failed instead of parking"
-            );
-            assert!(std::time::Instant::now() < until, "the run never parked");
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        };
-        assert!(
-            parked.reason.contains("no runner is free"),
-            "{}",
-            parked.reason
+                .is_empty(),
+            "and did not park"
         );
         assert_eq!(model.calls(), 0, "nothing was sent");
+
+        busy.room.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Recovery, not this process's first execution, finishes it.
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        loop {
+            match rt.status("busy-1").await.expect("status") {
+                Some(RunStatus::Succeeded) => break,
+                Some(RunStatus::Failed(e)) => panic!("the run failed: {e}"),
+                _ => {}
+            }
+            assert!(std::time::Instant::now() < until, "the run never finished");
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        // This process's first handle on the run saw it stop; what the run
+        // recorded once it ran again is in its steps.
+        let summarized = rt
+            .steps("busy-1")
+            .await
+            .expect("steps")
+            .into_iter()
+            .find(|s| s.name == "summarize.turn")
+            .and_then(|s| s.output)
+            .expect("summarize ran");
+        assert_eq!(
+            summarized["Candidate"]["proposal"]["output"],
+            json!({"line": "P1: Export crashes on accents"})
+        );
+        assert_eq!(model.calls(), 2);
         rt.shutdown(std::time::Duration::from_secs(5))
             .await
             .expect("shutdown");

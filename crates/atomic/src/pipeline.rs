@@ -563,9 +563,22 @@ async fn run_pipeline<C: WorkflowContext>(
         } else {
             None
         };
+        // An exec step's workspace opens before its attempt is recorded, so a
+        // backend with no room stops the run before the attempt counts: on
+        // recovery, an attempt whose workspace never opened is not one whose
+        // command may have run. (A step that finished opens one again on
+        // replay, and closes it unused.)
         let guard = if atom.kind == "exec" {
+            let identity = atomic_core::runtime::EffectIdentity {
+                run_id: run_id.clone(),
+                step_id: step.id.clone(),
+            };
+            let opened =
+                atomic_core::runtime::open_exec_workspace(&atom, &identity, runtimes.exec.shared())
+                    .await
+                    .map_err(crate::workflows::failed)?;
             let begun = attempt::begin(&ctx, &format!("{}.attempt", step.id)).await?;
-            Some((begun, atom.external().is_some()))
+            Some((begun, atom.external().is_some(), opened, identity))
         } else {
             None
         };
@@ -601,7 +614,7 @@ async fn run_pipeline<C: WorkflowContext>(
                         )));
                     }
                 }
-                if let Some((begun, declared)) = guard
+                if let Some((begun, declared, _, _)) = &guard
                     && begun.interrupted()
                     && !declared
                 {
@@ -614,15 +627,32 @@ async fn run_pipeline<C: WorkflowContext>(
                         atom.name
                     )));
                 }
-                let proposal = match tree {
-                    None => {
+                let proposal = match (tree, guard) {
+                    (_, Some((_, _, opened, identity))) => {
+                        let clock = runtimes.clock.clone();
+                        propose(async move {
+                            let compiled = compile::compile(&atom, &Registry::new())
+                                .map_err(|e| AtomError::Runtime(e.to_string()))?;
+                            atomic_core::runtime::run_exec_opened(
+                                &atom,
+                                &compiled,
+                                &atom_input,
+                                &identity,
+                                opened,
+                                clock.as_ref(),
+                            )
+                            .await
+                        })
+                        .await
+                    }
+                    (None, None) => {
                         propose(async move {
                             run_in(&atom, &atom_input, &origins, &run_id, &id, snapshot.as_ref(), &runtimes)
                                 .await
                         })
                             .await
                     }
-                    Some((worktrees, request)) => {
+                    (Some((worktrees, request)), None) => {
                         let runtimes = Arc::new(runtimes);
                         let call = StepCall {
                             atom,

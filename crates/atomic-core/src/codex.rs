@@ -243,6 +243,43 @@ where
     arg0_dispatch_or_else(move |paths| main_fn(CodexPaths(paths)))
 }
 
+/// Whether this process was started as one of Codex's helpers rather than
+/// as atomic: under a helper's name (the Linux sandbox, `apply_patch`) or with
+/// a helper's first argument. A helper must run before atomic touches
+/// anything, such as its state directory: it runs inside a turn, where
+/// `HOME` is the turn's scratch directory, which the turn may write.
+pub fn is_helper(mut args: impl Iterator<Item = std::ffi::OsString>) -> bool {
+    let name = args
+        .next()
+        .and_then(|argv0| {
+            Path::new(&argv0)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(str::to_owned)
+        })
+        .unwrap_or_default();
+    if matches!(
+        name.as_str(),
+        "codex-linux-sandbox" | "apply_patch" | "applypatch"
+    ) {
+        return true;
+    }
+    let first = args.next().unwrap_or_default();
+    let first = first.to_string_lossy();
+    first.starts_with("--codex-run-as-")
+        || first.starts_with("--__codex-")
+        || first == "--run-as-windows-sandbox"
+}
+
+/// Run as the Codex helper this process was started as (see [`is_helper`]).
+/// A helper never returns; anything else is an error, and nothing was
+/// touched.
+pub fn run_helper() -> anyhow::Result<()> {
+    arg0_dispatch_or_else(|_| async {
+        bail!("this process was started as a Codex helper Codex does not know")
+    })
+}
+
 /// Run one turn on a fresh, ephemeral Codex thread and return the model's
 /// final message. The thread runs with read-only permissions and never asks
 /// for approval.

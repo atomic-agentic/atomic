@@ -146,6 +146,12 @@ impl PromptArgs {
 }
 
 fn main() -> anyhow::Result<()> {
+    // A Codex helper, such as the Linux sandbox inside a turn, runs before
+    // anything else: no state directory is resolved or created, since its
+    // HOME is the turn's own scratch directory.
+    if codex::is_helper(std::env::args_os()) {
+        return codex::run_helper();
+    }
     // A helper child serves one call and exits, before anything else starts:
     // no state directory, no Codex dispatch.
     if std::env::args_os().nth(1).as_deref()

@@ -62,21 +62,29 @@ plane's process, and a runner reached over the network is not built yet.
 Every atom run goes through the execution backend: once its prompt is
 rendered, which runs the atom's helpers, it opens a workspace there before any
 model call or command, and closes it however the run ends, including a panic or
-a cancelled run. A backend with no room for a workspace parks the run, which
-`atomic runs resume` continues. The local backend is the only one with a Codex
-shell, and it states that its workspaces are durable. A backend that states
-anything else, or a value atomic does not recognize, is treated as ephemeral,
-and a workflow with a `worktree: true` step is refused on it before anything
-runs.
+a cancelled run, and only once a command running in it has ended. A backend
+with no room for a workspace stops the run without recording anything, and the
+run continues when recovery runs the step again: in `atomic serve`, or with
+`atomic runs resume`. The local backend is the only one with a Codex shell, and
+it states that its workspaces are durable. A backend that states anything else,
+or a value atomic does not recognize, is treated as ephemeral, and a workflow
+with a `worktree: true` step is refused on it before anything runs.
 
 A command an atom runs, whether an exec atom's or one a model runs in a Codex
 turn, gets the platform's core variables and what the atom declares, never
 atomic's own environment or its credentials. A turn's commands run with no
-login shell and with `HOME` and `TMPDIR` at a private scratch directory of the
-attempt's own, so no shell startup file runs; an exec atom's command gets its
-own, in the project's state directory, where no sandboxed turn may write. A
-turn's shell always runs on the machine its backend names; `CODEX_EXEC_SERVER_URL`
-and an `environments.toml` in Codex's home have no effect.
+login shell; their `HOME` (and `ZDOTDIR`) is a private scratch directory of the
+attempt's own, and their `TMPDIR` is one private directory every turn of the
+project shares, so no shell startup file runs. Tools found through `HOME` are
+therefore not found: rustup, cargo, pyenv, nvm, Maven's `~/.m2` and the like.
+A codex or exec atom names them in its `env`, as in
+`env: { RUSTUP_HOME: '/home/me/.rustup', CARGO_HOME: '/home/me/.cargo' }`. An
+exec atom's command gets its own scratch directory as `HOME` and `TMPDIR`.
+Scratch directories live in the project's state directory, where no sandboxed
+turn may write; atomic refuses to run when that would be under `/tmp`,
+`$TMPDIR` or the project. A turn's shell always runs on the machine its backend
+names; `CODEX_EXEC_SERVER_URL` and an `environments.toml` in Codex's home have
+no effect.
 
 `atomic run` and `atomic serve` do not read public context settings yet, so they
 refuse a step whose atom declares a context.

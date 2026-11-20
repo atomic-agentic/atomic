@@ -38,7 +38,9 @@ const SUMMARY: &str = r#"{"line": "P1: Export crashes on accents"}"#;
 
 fn scratch(tag: &str) -> PathBuf {
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let dir = std::env::temp_dir().join(format!(
+    // Not under /tmp: atomic refuses scratch directories where sandboxed
+    // turns may write, and its state, scratch included, lives under HOME.
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
         "atomic-run-cli-{tag}-{}-{}",
         std::process::id(),
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -750,6 +752,33 @@ fn serve_started_after_a_kill_recovers_the_run_and_finishes_it() {
             .expect("child");
         assert!(status.success(), "serve stops cleanly on SIGTERM: {status}");
     });
+}
+
+/// State under /tmp would put atom commands' scratch directories where
+/// sandboxed turns may write, so atomic refuses to run there.
+#[test]
+fn state_under_the_temporary_directory_is_refused() {
+    let dir = scratch("tmp-state");
+    let project = project(&dir);
+    let home =
+        std::env::temp_dir().join(format!("atomic-run-cli-tmp-state-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    let home_text = home.to_string_lossy().into_owned();
+    let out = atomic(
+        &dir,
+        &project,
+        &["run", "count-note", "--data", NOTE],
+        &[("ATOMIC_HOME", &home_text)],
+        "",
+    );
+    let _ = std::fs::remove_dir_all(&home);
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(
+        text(&out).contains("where a sandboxed turn may write"),
+        "{}",
+        text(&out)
+    );
+    assert!(count_log(&dir).is_empty(), "nothing ran");
 }
 
 #[test]

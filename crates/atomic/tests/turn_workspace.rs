@@ -44,6 +44,25 @@ fn scratch(tag: &str) -> PathBuf {
     dir
 }
 
+/// One scratch root for every test here, as one project's backend has:
+/// tests run at once, and turns that share a writable root (here `/tmp`,
+/// which `workspace-write` leaves writable at this Codex revision) must
+/// share the TMPDIR where Codex's sandbox keeps its mount-point registry.
+fn shared_scratch() -> PathBuf {
+    static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        let root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!(
+                "atomic-turn-workspace-state-{}",
+                std::process::id()
+            ))
+            .join("scratch");
+        let _ = std::fs::remove_dir_all(&root);
+        root
+    })
+    .clone()
+}
+
 fn runtime(dir: &Path, model: &FakeModel, backend: Backend) -> CodexRuntime {
     CodexRuntime {
         paths: CodexPaths::with_helpers(
@@ -142,7 +161,7 @@ fn a_turn_runs_where_its_workspace_says() {
         .await
         .expect("fake model");
         let backend = Backend::connect(Relocating {
-            local: LocalBackend::in_dir(dir.join("state/scratch")),
+            local: LocalBackend::in_dir(shared_scratch()),
             root: dir.join("elsewhere"),
         })
         .expect("connects");
@@ -219,7 +238,7 @@ fn a_turn_cannot_plant_files_in_a_live_exec_scratch() {
         let dir = scratch("plant");
         // Where atomic keeps scratch directories: the project's state
         // directory, outside every root a sandboxed turn may write.
-        let (landed, output) = plant_in_live_exec_scratch(&dir, dir.join("state/scratch")).await;
+        let (landed, output) = plant_in_live_exec_scratch(&dir, shared_scratch()).await;
         assert!(
             !landed,
             "the turn planted a file in the exec scratch: {output}"
@@ -229,5 +248,55 @@ fn a_turn_cannot_plant_files_in_a_live_exec_scratch() {
             "{output}"
         );
         assert!(!output.contains("planted=0"), "{output}");
+    });
+}
+
+/// Several `workspace-write` turns at once on one backend, in the same
+/// directory, each running many commands: Codex's sandbox creates and
+/// removes mount points for the paths it protects in their shared writable
+/// root, and keeps a registry of them in TMPDIR, so the turns share one
+/// TMPDIR and never remove a mount point the other is using.
+#[test]
+fn concurrent_turns_in_one_directory_never_break_each_others_sandbox() {
+    const TURNS: usize = 4;
+    const COMMANDS: usize = 80;
+    on_codex_runtime(async {
+        let dir = scratch("concurrent");
+        let backend = Backend::connect(LocalBackend::in_dir(shared_scratch())).expect("connects");
+        let turn = |n: usize| {
+            let dir = dir.clone();
+            let backend = backend.clone();
+            async move {
+                let mut script: Vec<Reply> = (0..COMMANDS)
+                    .map(|i| tool(&format!("echo turn{n}-ok-{i}")))
+                    .collect();
+                script.push(Reply::Text("Done.".into()));
+                let model = FakeModel::start(script).await.expect("fake model");
+                let rt = runtime(&dir, &model, backend);
+                let answer = run_turn(
+                    &rt,
+                    &TurnSpec {
+                        prompt: "Do the work.".into(),
+                        sandbox: Sandbox::WorkspaceWrite,
+                        ..TurnSpec::default()
+                    },
+                )
+                .await
+                .expect("the turn runs");
+                assert_eq!(answer, "Done.");
+                // Each request after the first carries every command's output
+                // so far; the last one carries them all.
+                let last = model.requests().last().cloned().expect("requests");
+                (0..COMMANDS)
+                    .filter(|i| !last.to_string().contains(&format!("turn{n}-ok-{i}\\n")))
+                    .count()
+            }
+        };
+        let turns: Vec<_> = (0..TURNS).map(|n| tokio::spawn(turn(n))).collect();
+        let mut failed = Vec::new();
+        for t in turns {
+            failed.push(t.await.expect("the turn"));
+        }
+        assert_eq!(failed, vec![0; TURNS], "commands that failed in each turn");
     });
 }

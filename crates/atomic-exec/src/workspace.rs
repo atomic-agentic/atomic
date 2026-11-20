@@ -90,9 +90,15 @@ pub struct Workspace {
     /// request had no source.
     pub root: Option<PathBuf>,
     /// An empty, private directory of this attempt's own for its commands'
-    /// `HOME` and `TMPDIR`, removed when the workspace is closed; `None` when
-    /// the request had no source.
+    /// `HOME` (and an exec atom's `TMPDIR`), removed when the workspace is
+    /// closed; `None` when the request had no source.
     pub scratch: Option<PathBuf>,
+    /// A private temporary directory every model turn on this backend
+    /// shares as its commands' `TMPDIR`. Codex's sandbox keeps a registry
+    /// there for the mount points it protects in writable roots, so turns
+    /// that may share a writable root must share it too. `None` when the
+    /// request had no source.
+    pub tmp: Option<PathBuf>,
     /// Where a model turn's shell and file work runs.
     pub shell: Shell,
     /// The sandbox it runs in.
@@ -150,11 +156,92 @@ fn slug(text: &str) -> String {
     if slug.is_empty() { "step".into() } else { slug }
 }
 
+/// Refuse a scratch root inside any of `roots`: a sandboxed turn may write
+/// there, and a scratch directory is where an unsandboxed command reads its
+/// startup files.
+pub(crate) fn check_outside(scratch_root: &Path, roots: &[PathBuf]) -> Result<(), String> {
+    let root = resolved(scratch_root);
+    for other in roots {
+        let other = resolved(other);
+        if root.starts_with(&other) {
+            return Err(format!(
+                "scratch directories under {} would be inside {}, where a sandboxed turn may \
+                 write; keep them in the project's state directory, outside the project, /tmp \
+                 and $TMPDIR",
+                scratch_root.display(),
+                other.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `path` with its symlinks resolved as far as it exists.
+fn resolved(path: &Path) -> PathBuf {
+    let mut rest = Vec::new();
+    let mut existing = path;
+    loop {
+        if let Ok(real) = std::fs::canonicalize(existing) {
+            return rest.iter().rev().fold(real, |p, part| p.join(part));
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_owned());
+                existing = parent;
+            }
+            _ => return path.to_owned(),
+        }
+    }
+}
+
+/// Directories no scratch root may be in, whatever the project: the system's
+/// temporary directories, which `workspace-write` turns may write.
+pub(crate) fn temporary_roots() -> Vec<PathBuf> {
+    let mut roots = vec![PathBuf::from("/tmp"), std::env::temp_dir()];
+    if let Some(tmp) = std::env::var_os("TMPDIR").filter(|t| !t.is_empty()) {
+        roots.push(PathBuf::from(tmp));
+    }
+    roots
+}
+
+/// This process, as its scratch directories name it: its id and, where the
+/// system tells it, when it started, so a later process given the same id
+/// is not taken for it.
+fn owner() -> &'static str {
+    static OWNER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    OWNER.get_or_init(|| {
+        let pid = std::process::id();
+        format!("{pid}.{}", started(pid).unwrap_or(0))
+    })
+}
+
+/// When process `pid` started, in the system's own units, where it says.
+fn started(pid: u32) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // The command name, in parentheses, may hold spaces; the fields
+        // after it are plain. The start time is field 22.
+        let after = stat.rsplit_once(')')?.1;
+        after.split_whitespace().nth(19)?.parse().ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
 /// Open `request` on this machine, keeping scratch directories under
-/// `scratch_root`: the source directory is the root, as it is; a fresh
+/// `scratch_root` and sharing `tmp` with every other turn of the backend:
+/// the source directory is the root, as it is; a fresh
 /// scratch directory replaces whatever an earlier attempt of the same run
 /// and step left; a turn's shell runs here, under Codex's own sandbox.
-pub(crate) fn open_local(scratch_root: &Path, request: &Open) -> Result<Workspace, ExecError> {
+pub(crate) fn open_local(
+    scratch_root: &Path,
+    tmp: &Path,
+    request: &Open,
+) -> Result<Workspace, ExecError> {
     let fail = |message: String| ExecError::Workspace {
         label: request.label.clone(),
         message,
@@ -170,6 +257,10 @@ pub(crate) fn open_local(scratch_root: &Path, request: &Open) -> Result<Workspac
     if !source.is_dir() {
         return Err(fail(format!("{} is not a directory", source.display())));
     }
+    let writable: Vec<PathBuf> = std::iter::once(source.clone())
+        .chain(request.writable_roots.iter().cloned())
+        .collect();
+    check_outside(scratch_root, &writable).map_err(fail)?;
     let failed = |what: &str, e: std::io::Error| {
         let message = format!("{what}: {e}");
         if transient(&e) {
@@ -182,20 +273,32 @@ pub(crate) fn open_local(scratch_root: &Path, request: &Open) -> Result<Workspac
         }
     };
     private_dir(scratch_root).map_err(|e| failed("create the scratch directories' parent", e))?;
+    let tmp = tmp.to_owned();
+    private_dir(&tmp).map_err(|e| failed("create the shared temporary directory", e))?;
     let step = step_dir(scratch_root, &request.run, &request.step);
-    // An earlier attempt of this step, finished or not, is replaced.
-    match std::fs::remove_dir_all(&step) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(failed("remove an earlier attempt's scratch directory", e)),
+    // An earlier attempt of this step, finished or not, is replaced. What
+    // cannot be removed is left, with a warning: the new attempt's own
+    // directory is fresh either way.
+    if let Err(e) = remove_tree(&step) {
+        warn(&format!(
+            "could not remove an earlier attempt's scratch under {}: {e}",
+            step.display()
+        ));
     }
     private_dir(&step).map_err(|e| failed("create the step's scratch directory", e))?;
-    let scratch = step.join(format!("{}-{}", std::process::id(), slug(&request.attempt)));
+    let scratch = step.join(format!("{}-{}", owner(), slug(&request.attempt)));
+    if scratch.exists() {
+        return Err(fail(format!(
+            "{} exists already: an attempt is opened only once",
+            scratch.display()
+        )));
+    }
     private_dir(&scratch).map_err(|e| failed("create its scratch directory", e))?;
     Ok(Workspace {
         label: request.label.clone(),
         root: Some(source.clone()),
         scratch: Some(scratch),
+        tmp: Some(tmp),
         shell: Shell::Local,
         sandbox: request.sandbox,
         writable_roots: request.writable_roots.clone(),
@@ -209,17 +312,10 @@ pub(crate) fn close_local(workspace: &Workspace) -> Result<(), ExecError> {
     let Some(scratch) = &workspace.scratch else {
         return Ok(());
     };
-    match std::fs::remove_dir_all(scratch) {
-        Ok(()) => {}
-        // Closed already, or replaced by a later attempt.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            return Err(ExecError::Workspace {
-                label: workspace.label.clone(),
-                message: format!("remove its scratch directory: {e}"),
-            });
-        }
-    }
+    remove_tree(scratch).map_err(|e| ExecError::Workspace {
+        label: workspace.label.clone(),
+        message: format!("remove its scratch directory: {e}"),
+    })?;
     // The step's directory goes once its last attempt has.
     if let Some(step) = scratch.parent() {
         let _ = std::fs::remove_dir(step);
@@ -229,36 +325,120 @@ pub(crate) fn close_local(workspace: &Workspace) -> Result<(), ExecError> {
 
 /// Remove what attempts of processes that no longer run left under
 /// `scratch_root`, and return how many attempts' directories went. A
-/// directory whose owner may still run is kept.
-pub(crate) fn sweep_local(scratch_root: &Path) -> std::io::Result<usize> {
+/// directory whose owner may still run is kept, and one that cannot be
+/// removed is left with a warning: nothing here fails a connect.
+pub(crate) fn sweep_local(scratch_root: &Path) -> usize {
     let mut removed = 0;
-    let steps = match std::fs::read_dir(scratch_root) {
-        Ok(steps) => steps,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(e) => return Err(e),
+    let Ok(steps) = std::fs::read_dir(scratch_root) else {
+        return 0;
     };
-    for step in steps {
-        let step = step?.path();
-        if !step.is_dir() {
+    for step in steps.flatten() {
+        let step = step.path();
+        let hidden = step
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with('.'));
+        if hidden || !step.is_dir() {
             continue;
         }
-        for attempt in std::fs::read_dir(&step)? {
-            let attempt = attempt?.path();
-            let owner = attempt
-                .file_name()
-                .and_then(|n| n.to_str())
-                .and_then(|n| n.split_once('-'))
-                .and_then(|(pid, _)| pid.parse::<u32>().ok());
+        let Ok(attempts) = std::fs::read_dir(&step) else {
+            continue;
+        };
+        for attempt in attempts.flatten() {
+            let attempt = attempt.path();
+            let Some(name) = attempt.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
             // A name that does not say its owner is not ours to judge.
-            let Some(owner) = owner else { continue };
-            if owner != std::process::id() && !alive(owner) {
-                std::fs::remove_dir_all(&attempt)?;
-                removed += 1;
+            let Some((tag, _)) = name.split_once('-') else {
+                continue;
+            };
+            if tag == owner() || owner_may_run(tag) {
+                continue;
+            }
+            match remove_tree(&attempt) {
+                Ok(()) => removed += 1,
+                Err(e) => warn(&format!(
+                    "could not remove a dead attempt's scratch {}: {e}",
+                    attempt.display()
+                )),
             }
         }
         let _ = std::fs::remove_dir(&step);
     }
-    Ok(removed)
+    removed
+}
+
+/// Whether the process an attempt's directory names (`<pid>.<started>`, or
+/// an older `<pid>`) may still run: a process with that id runs, and, where
+/// both are known, it started when the owner did.
+fn owner_may_run(tag: &str) -> bool {
+    let (pid, start) = match tag.split_once('.') {
+        Some((pid, start)) => (pid, start.parse::<u64>().ok()),
+        None => (tag, None),
+    };
+    let Ok(pid) = pid.parse::<u32>() else {
+        return true;
+    };
+    if !alive(pid) {
+        return false;
+    }
+    match (start, started(pid)) {
+        (Some(recorded), Some(now)) if recorded != 0 => recorded == now,
+        _ => true,
+    }
+}
+
+/// Remove `path` and everything under it. A directory that is not writable,
+/// such as a Go module cache's, is made writable and the removal tried
+/// again. Symlinks are removed, never followed.
+pub(crate) fn remove_tree(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            make_writable(path);
+            match std::fs::remove_dir_all(path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                other => other,
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Give this user write access to every directory under `path`, not
+/// following symlinks.
+fn make_writable(path: &Path) {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    if !meta.is_dir() {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode() | 0o700;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+    }
+    #[cfg(not(unix))]
+    {
+        let mut permissions = meta.permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        let _ = std::fs::set_permissions(path, permissions);
+    }
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            make_writable(&entry.path());
+        }
+    }
+}
+
+/// Say on stderr what the backend could not do and is carrying on without.
+fn warn(message: &str) {
+    eprintln!("atomic: {message}");
 }
 
 /// Whether process `pid` may still run. Where that cannot be told, it may.

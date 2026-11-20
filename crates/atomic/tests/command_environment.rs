@@ -156,7 +156,9 @@ fn atom_commands_get_only_core_and_declared_variables_on_every_backend() {
         let backends: [(&str, Arc<dyn atomic_exec::ExecutionBackend>); 2] = [
             (
                 "the local backend",
-                Arc::new(atomic_exec::LocalBackend::in_dir(dir.join("state/scratch"))),
+                Arc::new(atomic_exec::LocalBackend::in_dir(
+                    scratch("exec-state").join("scratch"),
+                )),
             ),
             (
                 "a runner process",
@@ -214,7 +216,8 @@ async fn codex_turn() {
         Reply::Tool {
             name: "exec_command".into(),
             arguments: json!({
-                "cmd": "echo ran-here-$((6*7)); env",
+                "cmd": "echo ran-here-$((6*7)); echo shell=$BASH_VERSION; \
+                        if shopt -q login_shell; then echo login=yes; else echo login=no; fi; env",
                 "workdir": dir.join("cwd"),
                 "yield_time_ms": 10000
             }),
@@ -291,11 +294,23 @@ async fn codex_turn() {
             .unwrap_or_else(|| panic!("no {name} in {output}"))
             .to_owned()
     };
-    let (home, tmp) = (value("HOME"), value("TMPDIR"));
-    assert_eq!(home, tmp);
+    // Not a login shell: the check runs in bash, so it is not vacuous.
     assert!(
-        Path::new(&home).starts_with(&scratch_root),
-        "HOME {home} is not under {}",
-        scratch_root.display()
+        !value("shell").is_empty(),
+        "the command did not run in bash: {output}"
     );
+    assert!(output.contains("login=no"), "a login shell ran: {output}");
+    // HOME and ZDOTDIR are the attempt's own scratch directory, so no
+    // shell, zsh included, finds startup files there; TMPDIR is the
+    // backend's shared one, beside it.
+    let (home, zdotdir, tmp) = (value("HOME"), value("ZDOTDIR"), value("TMPDIR"));
+    assert_eq!(home, zdotdir);
+    assert_ne!(home, tmp);
+    for dir in [&home, &tmp] {
+        assert!(
+            Path::new(dir).starts_with(&scratch_root),
+            "{dir} is not under {}",
+            scratch_root.display()
+        );
+    }
 }

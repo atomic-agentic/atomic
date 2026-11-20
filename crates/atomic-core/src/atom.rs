@@ -136,7 +136,14 @@ pub struct AtomError {
 fn check_exec(kind: &str, fm: &serde_json::Map<String, Value>) -> Result<(), (String, String)> {
     let refuse = |pointer: &str, message: &str| Err((pointer.to_owned(), message.to_owned()));
     if kind != "exec" {
-        for key in ["exec", "env", "effects"] {
+        // A codex atom's turn runs commands too, so it may declare their
+        // environment, such as the tool homes its build needs.
+        let keys: &[&str] = if kind == "codex" {
+            &["exec", "effects"]
+        } else {
+            &["exec", "env", "effects"]
+        };
+        for &key in keys {
             if fm.contains_key(key) {
                 return refuse(
                     &format!("/{key}"),
@@ -144,7 +151,7 @@ fn check_exec(kind: &str, fm: &serde_json::Map<String, Value>) -> Result<(), (St
                 );
             }
         }
-        return Ok(());
+        return check_env(fm);
     }
     let Some(Value::Object(exec)) = fm.get("exec") else {
         return refuse(
@@ -174,6 +181,40 @@ fn check_exec(kind: &str, fm: &serde_json::Map<String, Value>) -> Result<(), (St
             );
         }
     }
+    check_env(fm)?;
+    match fm.get("effects") {
+        None => {}
+        Some(Value::Object(effects)) => {
+            if let Some(key) = effects.keys().find(|key| *key != "external") {
+                return refuse(
+                    &format!("/effects/{key}"),
+                    &format!(
+                        "`effects.{key}` is not supported yet; this version reads only `effects.external`"
+                    ),
+                );
+            }
+            if let Some(external) = effects.get("external")
+                && !matches!(external.as_str(), Some("read-only" | "idempotent"))
+            {
+                return refuse(
+                    "/effects/external",
+                    "`effects.external` is `read-only` (the command only reads) or `idempotent` (it writes, and repeating it is safe)",
+                );
+            }
+        }
+        Some(_) => {
+            return refuse(
+                "/effects",
+                "`effects` is a mapping, such as `{ external: 'idempotent' }`",
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Check an atom's `env`: variable names mapped to literal string values.
+fn check_env(fm: &serde_json::Map<String, Value>) -> Result<(), (String, String)> {
+    let refuse = |pointer: &str, message: &str| Err((pointer.to_owned(), message.to_owned()));
     match fm.get("env") {
         None => {}
         Some(Value::Object(env)) => {
@@ -201,33 +242,6 @@ fn check_exec(kind: &str, fm: &serde_json::Map<String, Value>) -> Result<(), (St
             }
         }
         Some(_) => return refuse("/env", "`env` maps variable names to string values"),
-    }
-    match fm.get("effects") {
-        None => {}
-        Some(Value::Object(effects)) => {
-            if let Some(key) = effects.keys().find(|key| *key != "external") {
-                return refuse(
-                    &format!("/effects/{key}"),
-                    &format!(
-                        "`effects.{key}` is not supported yet; this version reads only `effects.external`"
-                    ),
-                );
-            }
-            if let Some(external) = effects.get("external")
-                && !matches!(external.as_str(), Some("read-only" | "idempotent"))
-            {
-                return refuse(
-                    "/effects/external",
-                    "`effects.external` is `read-only` (the command only reads) or `idempotent` (it writes, and repeating it is safe)",
-                );
-            }
-        }
-        Some(_) => {
-            return refuse(
-                "/effects",
-                "`effects` is a mapping, such as `{ external: 'idempotent' }`",
-            );
-        }
     }
     Ok(())
 }

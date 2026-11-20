@@ -606,6 +606,7 @@ fn compiler_failures_never_spend_a_repair_call() {
                     validator: &validator,
                     name: "infrastructure-test",
                     place: Place::of("run-1", "infrastructure-test"),
+                    env: Default::default(),
                 },
                 &check,
             )
@@ -1217,6 +1218,12 @@ fn exec_declarations_are_checked_at_load() {
             "variable name",
         ),
         ("kind: 'lite', env: { REGION: 'eu' }", "for `kind: 'exec'`"),
+        ("kind: 'codex', env: { 'BAD-NAME': 'x' }", "variable name"),
+        ("kind: 'codex', env: { RUSTUP_HOME: 1 }", "a string"),
+        (
+            "kind: 'codex', exec: { command: ['x'] }",
+            "for `kind: 'exec'`",
+        ),
         (
             "kind: 'exec', exec: { command: ['x'] }, effects: { external: 'sometimes' }",
             "`read-only` (the command only reads) or `idempotent`",
@@ -1303,7 +1310,7 @@ impl Recording {
 
 impl ExecutionBackend for Recording {
     fn connect(&self) -> Result<atomic_exec::Statement, atomic_exec::ExecError> {
-        atomic_exec::LocalBackend::default().connect()
+        Ok(atomic_exec::LocalBackend::STATEMENT)
     }
 
     fn open(&self, request: &atomic_exec::Open) -> Result<Workspace, atomic_exec::ExecError> {
@@ -1654,7 +1661,13 @@ fn a_cancelled_run_closes_its_workspace() {
         let recorded = Recording::default();
         let mut all = runtimes(&model, "seam-cancel");
         all.exec = recorded.backend();
-        let (_, a, compiled) = exec_project("seam-cancel", "import time\ntime.sleep(5)\n", "");
+        // The command writes in its HOME, the scratch directory, after a
+        // while: its workspace must still be there.
+        let (_, a, compiled) = exec_project(
+            "seam-cancel",
+            "import os, time\ntime.sleep(2)\nopen(os.path.join(os.environ['HOME'], 'late'), 'w').write('x')\n",
+            "",
+        );
         let task = tokio::spawn(async move {
             run_declarative(
                 &a,
@@ -1676,7 +1689,13 @@ fn a_cancelled_run_closes_its_workspace() {
         assert_eq!(recorded.calls(), ["open total", "run python3"]);
         task.abort();
         assert!(task.await.expect_err("cancelled").is_cancelled());
-        for _ in 0..200 {
+        // The command still runs, so its workspace stays open...
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let scratch = recorded.opened()[0].1.scratch.clone().expect("scratch");
+        assert_eq!(recorded.calls(), ["open total", "run python3"]);
+        assert!(scratch.is_dir(), "closed under a running command");
+        // ...until it ends.
+        for _ in 0..1000 {
             if recorded.calls().len() == 3 {
                 break;
             }
@@ -1686,7 +1705,63 @@ fn a_cancelled_run_closes_its_workspace() {
             recorded.calls(),
             ["open total", "run python3", "close total"]
         );
-        let scratch = recorded.opened()[0].1.scratch.clone().expect("scratch");
         assert!(!scratch.exists());
+    });
+}
+
+/// A codex atom declares the environment its turn's commands get, such as
+/// the tool homes its build finds through HOME otherwise: it reaches the
+/// workspace the run opens.
+#[test]
+fn a_codex_atom_passes_its_declared_tool_homes_to_its_workspace() {
+    use crate::{atom, compile};
+    on_codex_runtime(async {
+        let dir = scratch("codex-env");
+        std::fs::create_dir_all(dir.join("atoms")).expect("atoms");
+        std::fs::write(
+            dir.join("atoms/build.atom.astro"),
+            "---\nimport type { Props, Input, Output } from './.atomic/types/build';\n\
+             import type { AtomConfig } from './.atomic/types/authoring';\n\
+             const { input }: Props = Astro.props;\n\
+             export const config: AtomConfig<Input, Output> = { description: 'Build.', kind: 'codex', \
+             env: { RUSTUP_HOME: '/opt/rustup', CARGO_HOME: '/opt/cargo', PYENV_ROOT: '/opt/pyenv' } };\n---\nBuild {input.text}\n",
+        )
+        .expect("atom");
+        for role in ["input", "output"] {
+            std::fs::write(
+                dir.join(format!("atoms/build.{role}.schema.yaml")),
+                "type: object\nadditionalProperties: false\nrequired: [text]\nproperties:\n  text: {type: string}\n",
+            )
+            .expect("schema");
+        }
+        let mut registry = Registry::new();
+        let a = atom::load(&dir.join("atoms/build.atom.astro"), &mut registry).expect("loads");
+        let compiled = compile::compile(&a, &registry).expect("compiles");
+        let model = FakeModel::start(vec![Reply::Text(r#"{"text": "built"}"#.into())])
+            .await
+            .expect("fake model");
+        let recorded = Recording::default();
+        let mut all = runtimes(&model, "codex-env");
+        all.codex.backend = recorded.backend();
+        run_declarative(
+            &a,
+            &compiled,
+            &mut registry,
+            &json!({"text": "it"}),
+            "run-1",
+            "external",
+            &all,
+        )
+        .await
+        .expect("runs");
+        let (asked, given) = &recorded.opened()[0];
+        for (name, value) in [
+            ("RUSTUP_HOME", "/opt/rustup"),
+            ("CARGO_HOME", "/opt/cargo"),
+            ("PYENV_ROOT", "/opt/pyenv"),
+        ] {
+            assert_eq!(asked.env.get(name).map(String::as_str), Some(value));
+            assert_eq!(given.env.get(name).map(String::as_str), Some(value));
+        }
     });
 }
