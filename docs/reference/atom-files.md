@@ -43,8 +43,10 @@ export const config = {
 
 `exec.command` is the program and its arguments, run with no shell from the
 project root. The command reads its input as JSON on stdin and writes its output
-as JSON on stdout; a nonzero exit fails the step. It receives only the variables
-in `env`, plus its own `HOME` and `TMPDIR` and the effect variables below.
+as JSON on stdout; a nonzero exit fails the step. It receives the variables in
+`env`, its own `HOME` and `TMPDIR`, the effect variables below and, when the atom
+declares network access, the proxy variables that come with it; nothing else of
+atomic's environment.
 
 On Linux the command runs under the same sandbox as a Codex atom's commands. It
 can read the project and the rest of the filesystem except atomic's private
@@ -96,7 +98,6 @@ of a step and differs for any other step or run, beside `ATOMIC_RUN_ID` and
 writes so a repeated write is recognisable. An atom's `env` cannot set these
 three names.
 
-
 ### Network access
 
 An exec atom names the hosts its command reaches; with none, the command has no
@@ -118,20 +119,50 @@ export const config = {
 and such a name for its subdomains, up to 32 of them. `network: false`, or no
 `network` at all, means none. On Linux the command then gets a network of its
 own whose only way out is a proxy atomic runs for it, which forwards a request
-only to a listed host. The command finds the proxy in `HTTP_PROXY`,
-`HTTPS_PROXY`, `ALL_PROXY` and the like, which most HTTP clients and SDKs read; a
-client that ignores them reaches nothing. It can open no other connection, to
-this machine or anywhere else, and no Unix socket.
+only to a listed host, and only on port 80 or 443: HTTP, and HTTPS through a
+`CONNECT` tunnel. No SOCKS, and no other port, so listing `github.com` does
+not give the command SSH. The command finds the proxy in `HTTP_PROXY`,
+`HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY` and similar variables, which most HTTP
+clients and SDKs read and which come on top of its `env`; a client that ignores
+them reaches nothing. An atom's `env` cannot set any of them. It can open no
+other connection, to this machine or anywhere else, and no Unix socket. The
+proxy never goes through another proxy, even when atomic's own environment
+names one.
 
-What an atom may list is atomic's policy, checked when the atom loads: public
-DNS names only. An IP address, `localhost` or a name under it, a single-label
-name, a name under `.local`, `.internal`, `.lan`, `.home.arpa` or another
-private suffix, a bare `*`, and anything with a scheme, a port, a path or a Unix
-socket are refused. The proxy also refuses a listed name that resolves to an
-address on this machine or a private network, or that does not resolve.
+What an atom may list is atomic's policy, checked when the atom loads and again
+before its command runs: public DNS names only. An IP address in any spelling
+(`127.0.0.1`, `2130706433`, `0x7f.1`), `localhost` or a name under it, a
+single-label name, a name under `.local`, `.internal`, `.lan`, `.home.arpa` or
+another private suffix, a bare `*`, and anything with a scheme, a port, a path
+or a Unix socket are refused. That list of private names is a courtesy. The
+control is the proxy, which resolves each listed name before it connects and
+refuses one that resolves to an address on this machine or a private network,
+or that does not resolve.
+
+Know what a listed host can get:
+
+- **Anything the command can read.** It can send a listed host whatever it
+  reads, which is the project and most of the filesystem, including files such
+  as `~/.ssh` and `~/.aws` reached by absolute path; only atomic's private state
+  is denied to it.
+- **More than the one site.** An HTTPS tunnel is opaque to the proxy, which
+  checks only the name the command asked for. Other sites served from the same
+  CDN edge or load balancer can be reached through it.
+- **Every tenant under a wildcard.** `*.s3.amazonaws.com` or any wildcard over
+  a shared-hosting suffix reaches every customer's buckets and sites there, not
+  only yours. List the exact names.
+- **Other local processes, while it runs.** The proxy listens on this machine's
+  loopback interface without authentication for as long as a command that
+  declared hosts runs, and any process on the machine can use it to reach the
+  same hosts.
+
+The rule is enforced on Linux only. On macOS and Windows exec commands run
+unconfined, with whatever network the machine has, and a declaration restricts
+nothing.
 
 Only exec atoms declare network access at this version; a codex or lite atom
 that declares `network.allow` is refused, and its commands run with none.
+
 ## Schema locations
 
 Schemas default to

@@ -1301,6 +1301,36 @@ fn exec_declarations_are_checked_at_load() {
             "kind: 'exec', exec: { command: ['x'] }, network: true",
             "is `false` or",
         ),
+        ("kind: 'codex', network: true", "is `false` or"),
+        (
+            "kind: 'lite', network: { allow: 'x.example.com' }",
+            "a list of host names",
+        ),
+        (
+            "kind: 'codex', network: { unix: true }",
+            "unknown field `unix`",
+        ),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, network: { allow: ['0x7f.1'] }",
+            "an IP address",
+        ),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, network: { allow: ['8.8.8.0x8'] }",
+            "an IP address",
+        ),
+        // Proxy variables are atomic's to set, in any case.
+        (
+            "kind: 'exec', exec: { command: ['x'] }, env: { https_proxy: 'http://evil.example.com' }",
+            "names a proxy",
+        ),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, env: { NO_PROXY: '*' }",
+            "names a proxy",
+        ),
+        (
+            "kind: 'codex', env: { All_Proxy: 'socks5://x' }",
+            "names a proxy",
+        ),
     ] {
         let dir = scratch("exec-load");
         std::fs::create_dir_all(dir.join("atoms")).expect("atoms");

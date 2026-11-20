@@ -514,6 +514,8 @@ pub struct ExecSandbox {
     /// The proxies that limit commands declaring network access to their
     /// hosts, shared by every command this sandbox confines.
     proxies: crate::network::Proxies,
+    /// Loopback addresses a command may name as a host, for tests only.
+    loopback_for_tests: Vec<String>,
 }
 
 impl ExecSandbox {
@@ -531,7 +533,23 @@ impl ExecSandbox {
             codex_home,
             also_writable: Vec::new(),
             proxies: crate::network::Proxies::default(),
+            loopback_for_tests: Vec::new(),
         })
+    }
+
+    /// The same confinement, letting a command name `addrs`, loopback
+    /// addresses that atomic's policy refuses, as hosts. For tests that
+    /// serve on this machine; atomic never calls it.
+    #[doc(hidden)]
+    pub fn reaching_loopback_for_tests(mut self, addrs: Vec<String>) -> Self {
+        self.loopback_for_tests = addrs
+            .into_iter()
+            .filter(|a| {
+                a.parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+            })
+            .collect();
+        self
     }
 
     /// The same confinement, letting every command also write `dirs`, such
@@ -570,11 +588,22 @@ impl ExecSandbox {
 }
 
 impl atomic_exec::Confine for ExecSandbox {
+    /// As [`confine_held`](atomic_exec::Confine::confine_held), for a
+    /// command that declares no network: one that does needs its proxy
+    /// held while it runs, which this drops.
     fn confine(
         &self,
         command: &atomic_exec::Command,
         tmp: &Path,
     ) -> Result<atomic_exec::Command, atomic_exec::ExecError> {
+        self.confine_held(command, tmp).map(|(command, _)| command)
+    }
+
+    fn confine_held(
+        &self,
+        command: &atomic_exec::Command,
+        tmp: &Path,
+    ) -> Result<(atomic_exec::Command, Option<atomic_exec::Held>), atomic_exec::ExecError> {
         let fail = |message: String| atomic_exec::ExecError::Start {
             program: command.program.clone(),
             message,
@@ -624,16 +653,28 @@ impl atomic_exec::Confine for ExecSandbox {
         // given to the routes it makes inside the command's namespace, so the
         // command keeps those from the helper and loses the helper's others.
         let mut clear = vec!["-i".to_owned()];
+        let mut held = None;
         if !command.network.is_empty() {
-            let prepared = self
+            // Checked again here, whoever built the command: only atomic's
+            // policy decides what a command may reach, and a loopback
+            // address only for a test that asked for it.
+            let (loopback, hosts): (Vec<String>, Vec<String>) = command
+                .network
+                .iter()
+                .cloned()
+                .partition(|h| self.loopback_for_tests.contains(h));
+            let hosts = crate::network::check_hosts(&hosts)
+                .map_err(|e| fail(format!("its network: {e}")))?;
+            let (prepared, lease) = self
                 .proxies
-                .prepare(&command.network, command.env.iter().cloned().collect())
+                .prepare(&hosts, &loopback, command.env.iter().cloned().collect())
                 .map_err(|e| {
                     fail(format!(
                         "start the proxy for the hosts it declares ({}): {e:#}",
                         command.network.join(", ")
                     ))
                 })?;
+            held = Some(lease as atomic_exec::Held);
             let context = serde_json::to_string(&prepared.sandbox_context)
                 .map_err(|e| fail(format!("encode the network context: {e}")))?;
             args.extend(["--managed-network".to_owned(), context]);
@@ -658,14 +699,17 @@ impl atomic_exec::Confine for ExecSandbox {
         args.extend(command.env.iter().map(|(k, v)| format!("{k}={v}")));
         args.push(program);
         args.extend(command.args.iter().cloned());
-        Ok(atomic_exec::Command {
-            program: text(&self.helper)?,
-            args,
-            env: helper_env,
-            writable: Vec::new(),
-            network: Vec::new(),
-            ..command.clone()
-        })
+        Ok((
+            atomic_exec::Command {
+                program: text(&self.helper)?,
+                args,
+                env: helper_env,
+                writable: Vec::new(),
+                network: Vec::new(),
+                ..command.clone()
+            },
+            held,
+        ))
     }
 
     /// Run `true` confined: the helper, bubblewrap and the user namespaces

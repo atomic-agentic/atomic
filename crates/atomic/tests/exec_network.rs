@@ -98,8 +98,11 @@ fn a_confined_command_reaches_only_the_hosts_it_is_given() {
         PathBuf::from(env!("CARGO_BIN_EXE_atomic")),
         dir.join("bin/codex-linux-sandbox"),
     );
+    // The proxy reaches 127.0.0.1 because this test says so: atomic's policy
+    // refuses any address, and a confined command naming another is refused.
     let sandbox = ExecSandbox::new(&paths, StateGuard::NoProjectState, dir.join("codex"))
-        .expect("confinement");
+        .expect("confinement")
+        .reaching_loopback_for_tests(vec!["127.0.0.1".into()]);
     let local = LocalBackend::in_dir(dir.join("scratch")).confined(Arc::new(sandbox));
     local.connect().expect("connects");
     // Opening a workspace makes the backend's private temporary directory,
@@ -118,31 +121,32 @@ fn a_confined_command_reaches_only_the_hosts_it_is_given() {
     let _bus = std::os::unix::net::UnixListener::bind(&socket).expect("unix socket");
     let allowed_host = allowed.split(':').next().expect("host").to_owned();
 
-    let run = |network: Vec<String>| -> Value {
+    let command = |network: Vec<String>| -> Command {
         let scratch = dir.join("cwd");
         std::fs::create_dir_all(&scratch).expect("cwd");
-        let done = local
-            .run(&Command {
-                program: "python3".into(),
-                args: vec![
-                    "-c".into(),
-                    PROBE.into(),
-                    allowed.clone(),
-                    other.clone(),
-                    socket.display().to_string(),
-                ],
-                cwd: scratch.clone(),
-                env: vec![
-                    ("HOME".into(), scratch.display().to_string()),
-                    ("PATH".into(), "/usr/bin:/bin".into()),
-                ],
-                time_limit: Duration::from_secs(60),
-                output_limit: 1 << 16,
-                writable: vec![scratch],
-                network,
-                ..Command::default()
-            })
-            .expect("the command runs");
+        Command {
+            program: "python3".into(),
+            args: vec![
+                "-c".into(),
+                PROBE.into(),
+                allowed.clone(),
+                other.clone(),
+                socket.display().to_string(),
+            ],
+            cwd: scratch.clone(),
+            env: vec![
+                ("HOME".into(), scratch.display().to_string()),
+                ("PATH".into(), "/usr/bin:/bin".into()),
+            ],
+            time_limit: Duration::from_secs(60),
+            output_limit: 1 << 16,
+            writable: vec![scratch],
+            network,
+            ..Command::default()
+        }
+    };
+    let run = |network: Vec<String>| -> Value {
+        let done = local.run(&command(network)).expect("the command runs");
         assert!(done.success(), "{}", String::from_utf8_lossy(&done.stderr));
         serde_json::from_slice(&done.stdout).unwrap_or_else(|e| {
             panic!(
@@ -162,6 +166,18 @@ fn a_confined_command_reaches_only_the_hosts_it_is_given() {
     assert_eq!(given["other"], "HTTP 403", "{given}");
     for probe in ["direct_allowed", "direct_other", "unix"] {
         assert!(refused(&given[probe]), "{probe}: {given}");
+    }
+
+    // A command naming an address the test did not allow, or any host
+    // atomic's policy refuses, does not start.
+    for refused in ["127.0.0.2", "localhost", "printer.local"] {
+        let error = local
+            .run(&command(vec![refused.into()]))
+            .expect_err("refused");
+        assert!(
+            error.to_string().contains("its network"),
+            "{refused}: {error}"
+        );
     }
 
     // Given none, it has no network at all.
