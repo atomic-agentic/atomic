@@ -41,6 +41,14 @@ pub enum Reply {
     /// This JSON as the whole body of a 200 response, for a non-streaming
     /// call.
     Json(Value),
+    /// This reply, held until `file` exists: a test creates it to let the
+    /// answer go, so it orders the call against something else it watches.
+    Gated {
+        /// The file whose existence releases the answer.
+        file: std::path::PathBuf,
+        /// The answer.
+        reply: Box<Reply>,
+    },
     /// This reply, sent once this long has passed.
     Delayed {
         /// How long to wait before answering.
@@ -187,9 +195,23 @@ async fn serve(socket: &mut tokio::net::TcpStream, state: &Mutex<State>) -> std:
                 Err(_) => None,
             };
             let mut reply = reply.unwrap_or_else(|| Reply::Text("Synthetic reply.".into()));
-            while let Reply::Delayed { after, reply: then } = reply {
-                tokio::time::sleep(after).await;
-                reply = *then;
+            loop {
+                match reply {
+                    Reply::Delayed { after, reply: then } => {
+                        tokio::time::sleep(after).await;
+                        reply = *then;
+                    }
+                    Reply::Gated { file, reply: then } => {
+                        while !file.exists() {
+                            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                        }
+                        reply = *then;
+                    }
+                    answer => {
+                        reply = answer;
+                        break;
+                    }
+                }
             }
             let streaming = request.get("stream").and_then(Value::as_bool) != Some(false);
             match &reply {
@@ -247,7 +269,9 @@ fn output_item(reply: &Reply) -> Value {
             "type": "function_call", "id": "fc_synthetic", "call_id": "call_synthetic",
             "name": name, "arguments": arguments.to_string(), "status": "completed"
         }),
-        Reply::Http { .. } | Reply::Delayed { .. } | Reply::Json(_) => Value::Null,
+        Reply::Http { .. } | Reply::Delayed { .. } | Reply::Gated { .. } | Reply::Json(_) => {
+            Value::Null
+        }
     }
 }
 
@@ -276,7 +300,9 @@ fn chat_completion(request: &Value, reply: &Reply) -> Value {
         Reply::Text(text) | Reply::WithoutUsage(text) => {
             json!({"role": "assistant", "content": text})
         }
-        Reply::Http { .. } | Reply::Delayed { .. } | Reply::Json(_) => Value::Null,
+        Reply::Http { .. } | Reply::Delayed { .. } | Reply::Gated { .. } | Reply::Json(_) => {
+            Value::Null
+        }
     };
     let mut done = json!({
         "id": "chatcmpl_synthetic", "object": "chat.completion", "model": model_of(request),

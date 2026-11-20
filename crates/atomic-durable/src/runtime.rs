@@ -687,6 +687,31 @@ impl Checkpoint {
 pub struct DurareContext {
     engine: durare::DurableContext,
     reads: Reads,
+    /// A workflow conflict any operation of this execution returned: once
+    /// the execution has lost a race to record a step, its outcome is the
+    /// conflict, whatever its workflow code goes on to return.
+    lost: Lost,
+}
+
+/// Where an execution keeps the conflict it lost, if it lost one.
+#[derive(Clone, Default)]
+struct Lost(Arc<std::sync::Mutex<Option<String>>>);
+
+impl Lost {
+    /// Keep `out`'s conflict, if it is one, and pass `out` on.
+    fn keep<T>(&self, out: Result<T>) -> Result<T> {
+        if let Err(DurableError::Conflict(run)) = &out
+            && let Ok(mut lost) = self.0.lock()
+        {
+            lost.get_or_insert_with(|| run.clone());
+        }
+        out
+    }
+
+    /// The conflict this execution lost, if it lost one.
+    fn conflict(&self) -> Option<String> {
+        self.0.lock().ok().and_then(|lost| lost.clone())
+    }
 }
 
 impl WorkflowContext for DurareContext {
@@ -717,8 +742,9 @@ impl WorkflowContext for DurareContext {
                 }
                 out.map_err(body_to_durare)
             });
+        let lost = self.lost.clone();
         async move {
-            let out = pending.await.map_err(from_durare);
+            let out = lost.keep(pending.await.map_err(from_durare));
             if out.is_ok() {
                 checkpoint.after();
             }
@@ -746,8 +772,9 @@ impl WorkflowContext for DurareContext {
                 out.map_err(body_to_durare)
             })
         });
+        let lost = self.lost.clone();
         async move {
-            let out = pending.await.map_err(from_durare);
+            let out = lost.keep(pending.await.map_err(from_durare));
             if out.is_ok() {
                 checkpoint.after();
             }
@@ -774,8 +801,9 @@ impl WorkflowContext for DurareContext {
         // As for a step, the position is claimed now.
         let pending = self.engine.recv::<T>(topic, timeout);
         let topic = topic.to_owned();
+        let lost = self.lost.clone();
         async move {
-            let out = pending.await.map_err(from_durare);
+            let out = lost.keep(pending.await.map_err(from_durare));
             // The message taken, or the timeout, is recorded. A replay that
             // returns the recorded one reaches this too.
             if out.is_ok() && crate::failpoints::armed() {
@@ -1277,14 +1305,25 @@ impl DurableRuntime for Durare {
         let reads = self.reads.clone();
         self.engine
             .register(name, move |ctx: durare::DurableContext, input: I| {
+                let lost = Lost::default();
                 let run = workflow(
                     DurareContext {
                         engine: ctx,
                         reads: reads.clone(),
+                        lost: lost.clone(),
                     },
                     input,
                 );
-                async move { run.await.map_err(to_durare) }
+                // A lost race is the execution's outcome even if its code
+                // made something else of it, so the engine waits for the
+                // winner's instead of recording this one.
+                async move {
+                    let out = run.await;
+                    match lost.conflict() {
+                        Some(run) => Err(durare::Error::WorkflowConflict(run)),
+                        None => out.map_err(to_durare),
+                    }
+                }
             });
     }
 

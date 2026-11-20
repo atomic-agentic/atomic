@@ -501,7 +501,19 @@ async fn control_authorization_is_rechecked_on_workflow_replay<R: DurableRuntime
     rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
 }
 
-async fn the_loser_of_a_checkpoint_race_takes_the_winners_outcome<R: DurableRuntime>(mut rt: R) {
+async fn the_loser_of_a_checkpoint_race_takes_the_winners_outcome<R: DurableRuntime>(rt: R) {
+    checkpoint_race(rt, false).await;
+}
+
+/// As above, with workflow code that turns the lost step's conflict into a
+/// failure of its own: the execution's outcome is still the conflict.
+async fn a_conflict_made_into_a_failure_still_takes_the_winners_outcome<R: DurableRuntime>(rt: R) {
+    checkpoint_race(rt, true).await;
+}
+
+/// Two executions of one run race to record the same step; with `swallow`,
+/// workflow code turns the loser's conflict into a failure.
+async fn checkpoint_race<R: DurableRuntime>(mut rt: R, swallow: bool) {
     let entered = Arc::new(AtomicUsize::new(0));
     let meet = Arc::new(tokio::sync::Barrier::new(2));
     let lost = Arc::new(AtomicUsize::new(0));
@@ -533,7 +545,11 @@ async fn the_loser_of_a_checkpoint_race_takes_the_winners_outcome<R: DurableRunt
             if matches!(&contested, Err(DurableError::Conflict(_))) {
                 lost.fetch_add(1, Ordering::SeqCst);
             }
-            let met = contested?;
+            let met = if swallow {
+                contested.map_err(|e| DurableError::Failed(format!("made a failure of: {e}")))?
+            } else {
+                contested?
+            };
             // The winner goes on only once the test has seen what the loser
             // did with its loss.
             ctx.step("after", move |_| {
@@ -664,6 +680,7 @@ on_backend!(
     an_interrupted_execution_records_nothing_and_stays_pending,
     a_failure_is_recorded_as_the_outcome,
     the_loser_of_a_checkpoint_race_takes_the_winners_outcome,
+    a_conflict_made_into_a_failure_still_takes_the_winners_outcome,
     a_body_that_returns_a_conflict_fails_its_run,
     steps_are_siblings_in_order_and_cannot_nest,
     a_workflow_id_started_twice_runs_once,
@@ -682,6 +699,7 @@ on_backend!(
     an_interrupted_execution_records_nothing_and_stays_pending,
     a_failure_is_recorded_as_the_outcome,
     the_loser_of_a_checkpoint_race_takes_the_winners_outcome,
+    a_conflict_made_into_a_failure_still_takes_the_winners_outcome,
     a_body_that_returns_a_conflict_fails_its_run,
     steps_are_siblings_in_order_and_cannot_nest,
     a_workflow_id_started_twice_runs_once,
