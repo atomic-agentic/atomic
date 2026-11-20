@@ -128,13 +128,22 @@ fn every_v0_1_example_passes_the_real_load_and_check() {
                         serde_json::from_str(text.lines().nth(n - 1).expect("a golden row"))
                             .expect("a golden output")
                     }
-                    None => read(
-                        &project
+                    None => {
+                        let fixture = project
                             .dir
                             .join("fixtures")
                             .join(stem)
-                            .join(format!("{}.output.json", case.id.trim_end_matches(".yaml"))),
-                    ),
+                            .join(case.id.trim_end_matches(".yaml"));
+                        // The case's input is its fixture's: the two never
+                        // drift apart.
+                        let input = read(Path::new(&format!("{}.input.json", fixture.display())));
+                        assert_eq!(
+                            case.input, input,
+                            "{example}/{stem}/{}: the case's input and its fixture's drift",
+                            case.id
+                        );
+                        read(Path::new(&format!("{}.output.json", fixture.display())))
+                    }
                 };
                 let failures = eval::check(case, &golden, &contracts);
                 assert!(
