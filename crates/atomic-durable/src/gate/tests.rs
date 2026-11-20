@@ -963,7 +963,7 @@ async fn concurrent_replays_return_one_recorded_decision<R: DurableRuntime>(mut 
 
 #[cfg(feature = "postgres-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_raced_command_id_cannot_decide_another_gate() {
+async fn a_raced_command_id_cannot_decide_another_gate_on_postgres() {
     use sqlx::Connection;
     let guard = crate::testing::schema("command_race").await;
     let (url, schema) = (guard.url().to_owned(), guard.name().to_owned());

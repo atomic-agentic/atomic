@@ -90,6 +90,7 @@ command, and passes its address in `ATOMIC_TEST_DATABASE_URL`. The database:
 
 ```bash
 scripts/dev-db.sh status   # is it running?
+scripts/dev-db.sh usage    # how full its in-memory disk is, and its schemas by prefix
 scripts/dev-db.sh down     # stop it and discard its data
 scripts/dev.sh bash -c 'psql "$ATOMIC_TEST_DATABASE_URL"'   # a SQL shell
 ```
@@ -99,7 +100,17 @@ Set `ATOMIC_DEV_DB=off` to run a command without starting the database.
 A test suite that needs Postgres fails when `ATOMIC_TEST_DATABASE_URL` is not
 set, or when the database it names does not answer, with a message naming it.
 It never skips silently. `scripts/backends-check.sh postgres` shows this: it
-runs every Postgres test without the database and requires each to fail so.
+runs every `atomic-agentic-durable` test without the database, and requires
+the ones that fail to be exactly its Postgres variants, each naming the
+database.
+
+Every checkout's tests share the one database, so each test reaches it only
+through `atomic_durable::testing::schema`, which gives it a schema of its own
+and drops that schema when the test ends, passed or failed. A test process
+that was killed leaves its schemas behind; the first schema each test process
+asks for also sweeps those more than an hour old. A test in
+`crates/atomic-durable/tests/test_database.rs` fails if anything else reads
+`ATOMIC_TEST_DATABASE_URL`, or if another package's tests use the database.
 
 ## The sandbox tests
 

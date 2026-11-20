@@ -12,7 +12,8 @@
 # sandbox check needs an environment without the sandbox; under scripts/dev.sh
 # that is the default (ATOMIC_DEV_SANDBOX unset), and CI turns user namespaces
 # off for the step. It refuses to run where the sandbox works, since it could
-# then show nothing. The cargo flags match CI's test step, so nothing rebuilds.
+# then show nothing. The sandbox half uses CI's test step's cargo flags, so
+# nothing rebuilds; the Postgres half rebuilds atomic-agentic-durable alone.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -47,16 +48,39 @@ check() {
 
 case "${1:-}" in
 postgres)
-    # Every Postgres variant has postgres in its name; the filter selects
-    # them across the workspace.
-    ATOMIC_TEST_DATABASE_URL="" check "Postgres suites with no database configured" \
-        "ATOMIC_TEST_DATABASE_URL is not set" \
-        --workspace --features "${FEATURES}" -- postgres
-    # Port 9 (discard) on loopback: nothing listens there.
-    ATOMIC_TEST_DATABASE_URL="postgres://atomic:atomic@127.0.0.1:9/atomic" \
-        check "Postgres suites with the database unreachable" \
-        "test database postgres://***@127.0.0.1:9/atomic (ATOMIC_TEST_DATABASE_URL) cannot be reached" \
-        --workspace --features "${FEATURES}" -- postgres
+    # The Postgres tests are found by what they do, not by their names: run
+    # every atomic-agentic-durable test (the only package whose tests reach
+    # the database, which crates/atomic-durable/tests/test_database.rs
+    # checks) with no database. The tests that fail are the Postgres tests;
+    # each must fail naming the database, and none may be missing from the
+    # Postgres variants, whose names say postgres.
+    ATOMIC_TEST_DATABASE_URL="" cargo test --locked --no-fail-fast -p atomic-agentic-durable \
+        --features postgres-tests >"${LOG}" 2>&1
+    mapfile -t failing < <(sed -nE 's/^test (.+) \.\.\. FAILED$/\1/p' "${LOG}" | sort -u)
+    misnamed="$(printf '%s\n' "${failing[@]}" | grep -v postgres || true)"
+    unrun="$(sed -nE 's/^test (.*postgres.*) \.\.\. ok$/\1/p' "${LOG}")"
+    named="$(grep -A3 "panicked at" "${LOG}" | grep -c -F "ATOMIC_TEST_DATABASE_URL is not set")"
+    if [ "${#failing[@]}" -eq 0 ] || [ -n "${misnamed}" ] || [ -n "${unrun}" ] ||
+        [ "${named}" -lt "${#failing[@]}" ]; then
+        echo "FAIL Postgres tests with no database configured: ${#failing[@]} failed, ${named} naming the database" >&2
+        if [ -n "${misnamed}" ]; then
+            echo "  these failed without the database, and their names do not say postgres:" >&2
+            sed 's/^/    /' <<<"${misnamed}" >&2
+        fi
+        if [ -n "${unrun}" ]; then
+            echo "  these say postgres, and passed without the database:" >&2
+            sed 's/^/    /' <<<"${unrun}" >&2
+        fi
+        grep -m3 -E "^error" "${LOG}" >&2
+        status=1
+    else
+        echo "ok Postgres tests with no database configured: the ${#failing[@]} that need it failed, naming 'ATOMIC_TEST_DATABASE_URL is not set'; the rest passed" >&2
+        # Port 9 (discard) on loopback: nothing listens there.
+        ATOMIC_TEST_DATABASE_URL="postgres://atomic:atomic@127.0.0.1:9/atomic" \
+            check "Postgres tests with the database unreachable" \
+            "test database postgres://***@127.0.0.1:9/atomic (ATOMIC_TEST_DATABASE_URL) cannot be reached" \
+            -p atomic-agentic-durable --features postgres-tests -- --exact "${failing[@]}"
+    fi
     ;;
 sandbox)
     if bwrap --unshare-user --unshare-pid --ro-bind / / --proc /proc --dev /dev true 2>/dev/null; then
