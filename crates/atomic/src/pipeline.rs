@@ -84,8 +84,10 @@ pub const PIPELINE: &str = "atomic.pipeline";
 /// when a run started under the old layout would replay differently under
 /// the new one: a step added, removed, renamed or moved, or a checkpoint's
 /// or the [`PipelineRun`]'s shape changed. The pipeline tests hold the
-/// golden layout of each version, under `tests/layout/`, and fail when the
-/// layout no longer matches this one's.
+/// golden layout of each version, under `tests/layout/`: the steps two runs
+/// record, through an approved and a rejected gate, with the shape of each
+/// checkpoint, and the run's own shape. They fail when the layout no longer
+/// matches this version's, whose file is never rewritten.
 pub const LAYOUT_VERSION: &str = "atomic.pipeline.1";
 
 /// How many times one process recovers one run of `run_pipeline` before it

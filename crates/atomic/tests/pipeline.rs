@@ -2336,6 +2336,7 @@ fn shape(value: &Value) -> Value {
         "source_paths",
         "declarations",
         "judges",
+        "files",
     ];
     match value {
         Value::Object(fields) => Value::Object(
@@ -2383,10 +2384,18 @@ fn the_durable_layout_is_the_one_its_version_names() {
                 .replace("name: triage-note", "name: layout")
                 .replace("atom: read-note", "atom: send-note"),
         );
-        let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
-            .await
-            .expect("fake model");
+        let model = FakeModel::start(vec![
+            Reply::Text(RANK.into()),
+            Reply::Text(SUMMARY.into()),
+            Reply::Text(RANK.into()),
+        ])
+        .await
+        .expect("fake model");
         let rt = engine(&dir, &model.base_url()).await;
+        let rejected = PipelineRun {
+            pipeline: pipeline.clone(),
+            input: json!({"text": "Exporting a file named café.txt crashes the app."}),
+        };
         let run = PipelineRun {
             pipeline,
             input: json!({"text": "Exporting a file named café.txt crashes the app."}),
@@ -2401,13 +2410,31 @@ fn the_durable_layout_is_the_one_its_version_names() {
         let g = open_gate(&rt, "layout-1").await;
         decide(&rt, &g, Verdict::Approve, "fine").await;
         let _: Value = rt.result("layout-1").await.expect("finishes");
-        let steps: Vec<String> = rt
-            .steps("layout-1")
+        // And the path through a rejected gate.
+        rt.start(PIPELINE, "layout-2", rejected)
             .await
-            .expect("steps")
-            .into_iter()
-            .map(|s| s.name)
-            .collect();
+            .expect("start");
+        let g = open_gate(&rt, "layout-2").await;
+        decide(&rt, &g, Verdict::Reject, "no").await;
+        assert!(rt.result::<Value>("layout-2").await.is_err());
+        // Each recorded step's name, and the shape of its checkpoint.
+        let mut steps = BTreeMap::new();
+        for run in ["layout-1", "layout-2"] {
+            let recorded: Vec<Value> = rt
+                .steps(run)
+                .await
+                .expect("steps")
+                .into_iter()
+                .map(|s| {
+                    json!({
+                        "name": s.name,
+                        "output": s.output.as_ref().map(shape),
+                        "failed": s.error.is_some(),
+                    })
+                })
+                .collect();
+            steps.insert(run, recorded);
+        }
         rt.shutdown(std::time::Duration::from_secs(5))
             .await
             .expect("shutdown");
@@ -2416,7 +2443,9 @@ fn the_durable_layout_is_the_one_its_version_names() {
             .join("tests/layout")
             .join(format!("{}.json", atomic_app::pipeline::LAYOUT_VERSION));
         let text = serde_json::to_string_pretty(&recorded).expect("encode") + "\n";
-        if std::env::var_os("ATOMIC_BLESS_LAYOUT").is_some() {
+        // Blessing writes a new version's golden file, never over one that
+        // exists: an existing version's layout does not change.
+        if std::env::var_os("ATOMIC_BLESS_LAYOUT").is_some() && !file.exists() {
             std::fs::create_dir_all(file.parent().expect("dir")).expect("dir");
             std::fs::write(&file, &text).expect("bless");
         }
