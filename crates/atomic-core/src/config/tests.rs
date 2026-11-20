@@ -70,6 +70,7 @@ fn load(
     let lookup = move |name: &str| map.get(name).cloned();
     resolve(&Layers {
         dir,
+        user: None,
         profile,
         env: &lookup,
         env_names: env.iter().map(|(k, _)| k.to_string()).collect(),
@@ -285,9 +286,43 @@ fn a_variable_set_to_nothing_sets_nothing() {
 fn a_quote_inside_a_value_does_not_let_the_rest_of_it_out() {
     let shown =
         without_values(r#"invalid type: string "a\"sk-secret\" b", expected u32 for `retries`"#);
+    assert_eq!(shown, r#"invalid type: string "…", expected u32 for `…`"#);
     assert_eq!(
-        shown,
-        r#"invalid type: string "…", expected u32 for `retries`"#
+        without_values("unknown variant `sk-secret`, expected `local` or `process`"),
+        "unknown variant `…`, expected `…` or `…`"
     );
     assert_eq!(without_values(r#"unclosed "sk-secret"#), r#"unclosed "…""#);
+}
+
+#[test]
+fn the_persons_own_file_is_below_the_projects() {
+    let user = dir(&[(
+        "config.yaml",
+        "retries: 9\nverbose: true\nmodel:\n  name: mine\n",
+    )]);
+    let d = dir(&[("atomic.yaml", "retries: 5\n")]);
+    let lookup = |_: &str| None;
+    let load_with = |file: &str| {
+        resolve::<TestConfig>(&Layers {
+            dir: &d,
+            user: Some(&user.join(file)),
+            profile: None,
+            env: &lookup,
+            env_names: vec![],
+            flags: vec![],
+        })
+    };
+    let r = load_with("config.yaml").expect("load");
+    assert_eq!(r.config.retries, 5, "the project's file wins");
+    assert!(
+        r.config.verbose,
+        "what the project leaves, the person's file sets"
+    );
+    assert_eq!(r.config.model.name.as_deref(), Some("mine"));
+    assert!(matches!(
+        &r.sources["verbose"],
+        Source::File { path, line: 2 } if path.ends_with("config.yaml")
+    ));
+    // A person's file that is missing is no error.
+    load_with("missing.yaml").expect("load");
 }

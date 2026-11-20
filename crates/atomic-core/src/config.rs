@@ -7,11 +7,12 @@
 //! | Layer | Source | Required |
 //! | --- | --- | --- |
 //! | 1 | Built-in defaults | always present |
-//! | 2 | `atomic.yaml` | no |
-//! | 3 | `atomic.local.yaml` (personal, not committed) | no |
-//! | 4 | `atomic.<profile>.yaml`, when a profile is selected | yes, if selected |
-//! | 5 | `ATOMIC_*` environment variables | no |
-//! | 6 | Command-line flags | no |
+//! | 2 | The person's own file, such as `~/.config/atomic/config.yaml` | no |
+//! | 3 | `atomic.yaml` | no |
+//! | 4 | `atomic.local.yaml` (personal, not committed) | no |
+//! | 5 | `atomic.<profile>.yaml`, when a profile is selected | yes, if selected |
+//! | 6 | `ATOMIC_*` environment variables | no |
+//! | 7 | Command-line flags | no |
 //!
 //! Files are read with the restricted YAML loader and merged key by key:
 //! mappings merge, anything else replaces. A key the configuration does not
@@ -61,6 +62,8 @@ pub enum Source {
 pub struct Layers<'a> {
     /// The directory holding `atomic.yaml` and its siblings.
     pub dir: &'a Path,
+    /// The person's own configuration file, read first, if any.
+    pub user: Option<&'a Path>,
     /// The selected profile, if any.
     pub profile: Option<&'a str>,
     /// Environment lookup, passed in so tests do not depend on the real one.
@@ -134,10 +137,14 @@ where
     let mut sources = BTreeMap::new();
     record(&defaults, "", &Source::Default, &mut sources);
 
-    let mut files = vec![
+    let mut files = Vec::new();
+    if let Some(user) = layers.user {
+        files.push((user.to_owned(), false));
+    }
+    files.extend([
         (layers.dir.join("atomic.yaml"), false),
         (layers.dir.join("atomic.local.yaml"), false),
-    ];
+    ]);
     if let Some(profile) = layers.profile {
         files.push((layers.dir.join(format!("atomic.{profile}.yaml")), true));
     }
@@ -336,27 +343,36 @@ fn kind(v: &Value) -> &'static str {
     }
 }
 
-/// `message` with every double-quoted part, where serde puts the value it
-/// found, replaced by `"…"`. A quote escaped with a backslash inside one is
-/// part of it, and an unclosed one hides the rest. Names of fields are
-/// quoted with backticks, and stay.
+/// `message` with every quoted part, where serde puts the value it found,
+/// replaced by `"…"` or `` `…` ``: double quotes, inside which a quote
+/// escaped with a backslash is part of the value, and backticks, in which
+/// serde quotes a variant or a field. An unclosed quote hides the rest.
 fn without_values(message: &str) -> String {
     let mut out = String::with_capacity(message.len());
     let mut chars = message.chars();
     while let Some(c) = chars.next() {
-        if c != '"' {
-            out.push(c);
-            continue;
-        }
-        out.push_str("\"…\"");
-        while let Some(c) = chars.next() {
-            match c {
-                '\\' => {
-                    chars.next();
+        match c {
+            '"' => {
+                out.push_str("\"…\"");
+                while let Some(c) = chars.next() {
+                    match c {
+                        '\\' => {
+                            chars.next();
+                        }
+                        '"' => break,
+                        _ => {}
+                    }
                 }
-                '"' => break,
-                _ => {}
             }
+            '`' => {
+                out.push_str("`…`");
+                for c in chars.by_ref() {
+                    if c == '`' {
+                        break;
+                    }
+                }
+            }
+            c => out.push(c),
         }
     }
     out

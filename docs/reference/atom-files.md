@@ -154,6 +154,12 @@ declarations would replace an atom's own `.atomic/types/<atom>.d.ts` is an error
 | `context` | Optional public execution-context schema; a context sidecar is also accepted. See [context schemas](#context-schemas) |
 | `exec`, `effects`, `env` | An exec atom's command, what it does outside Atomic, and its environment. See [exec atoms](#exec-atoms) |
 
+A Codex atom's shell starts from the platform's core variables only, such as
+`PATH`, `HOME`, `USER` and the locale, without any whose name holds `KEY`,
+`SECRET` or `TOKEN`, and never sees `ATOMIC_*`, `OPENAI_*`, `CODEX_*`,
+`AWS_*`, `PG*`, `DATABASE_URL` or any `*_API_KEY`. The model chooses its
+commands, so nothing of your environment reaches the model through them.
+
 Some integrations shown in the catalog remain staged. Unavailable permissions,
 remote atoms, credentials, skills and runtime declarations fail explicitly in the
 production loader. See [availability](availability.md); metadata does not grant a

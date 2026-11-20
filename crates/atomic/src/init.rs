@@ -144,11 +144,13 @@ fn linked(dirs: &[PathBuf]) -> Option<&PathBuf> {
         .find(|d| std::fs::symlink_metadata(d).is_ok_and(|m| m.file_type().is_symlink()))
 }
 
-/// Write each of `files`, made new, filling each with `fill`. If any write
-/// fails, everything written and every directory made is removed again, so
-/// a failure leaves no half project behind.
+/// Write each of `files`, made new, making each missing directory with
+/// `mkdir` and filling each file with `fill`. If anything fails, every file
+/// written and every directory made is removed again, so a failure leaves
+/// no half project behind.
 fn write_new(
     files: &[(PathBuf, String)],
+    mut mkdir: impl FnMut(&Path) -> std::io::Result<()>,
     mut fill: impl FnMut(&mut std::fs::File, &str) -> std::io::Result<()>,
 ) -> anyhow::Result<()> {
     let (mut made, mut written): (Vec<PathBuf>, Vec<PathBuf>) = (Vec::new(), Vec::new());
@@ -160,8 +162,12 @@ fn write_new(
                     .take_while(|d| !d.exists())
                     .map(Path::to_path_buf)
                     .collect();
-                std::fs::create_dir_all(parent)?;
-                made.extend(missing.into_iter().rev());
+                // Outermost first, each recorded once made, so a failure
+                // part of the way down removes those above it.
+                for dir in missing.into_iter().rev() {
+                    mkdir(&dir).with_context(|| format!("make {}", dir.display()))?;
+                    made.push(dir);
+                }
             }
             // Made new, so a file or link that appeared since is never
             // written through, nor removed if this fails.
@@ -311,9 +317,11 @@ pub fn init(args: InitArgs) -> anyhow::Result<()> {
         )
         .into());
     }
-    write_new(&files, |out, text| {
-        std::io::Write::write_all(out, text.as_bytes())
-    })?;
+    write_new(
+        &files,
+        |dir| std::fs::create_dir(dir),
+        |out, text| std::io::Write::write_all(out, text.as_bytes()),
+    )?;
     let shown = |p: &Path| p.strip_prefix(&dir).unwrap_or(p).display().to_string();
     println!(
         "made {} project {name} in {}:",
@@ -399,16 +407,35 @@ mod tests {
         .map(|f| (dir.join(f), "x\n".to_owned()))
         .collect();
         let mut n = 0;
-        let failed = write_new(&files, |out, text| {
-            n += 1;
-            if n == 4 {
-                return Err(std::io::Error::other("disk full"));
-            }
-            std::io::Write::write_all(out, text.as_bytes())
-        });
+        let failed = write_new(
+            &files,
+            |d| std::fs::create_dir(d),
+            |out, text| {
+                n += 1;
+                if n == 4 {
+                    return Err(std::io::Error::other("disk full"));
+                }
+                std::io::Write::write_all(out, text.as_bytes())
+            },
+        );
         assert!(failed.is_err());
         let left: Vec<String> = walk(&dir);
         assert_eq!(left, ["keep"], "only what was there before");
+        // A directory that cannot be made, below one that was.
+        let mut n = 0;
+        let failed = write_new(
+            &files,
+            |d| {
+                n += 1;
+                if n == 3 {
+                    return Err(std::io::Error::other("no room"));
+                }
+                std::fs::create_dir(d)
+            },
+            |out, text| std::io::Write::write_all(out, text.as_bytes()),
+        );
+        assert!(failed.is_err());
+        assert_eq!(walk(&dir), ["keep"], "nothing made is left");
     }
 
     /// Every path under `dir`, relative, sorted.

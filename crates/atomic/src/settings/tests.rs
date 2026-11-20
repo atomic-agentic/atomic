@@ -27,16 +27,15 @@ fn resolved(
     vars: &[(&str, &str)],
     ollama: &dyn Fn(SocketAddr) -> Option<Vec<String>>,
 ) -> Resolved {
-    resolved_where(dir, args, vars, ollama, &|_| false).expect("resolves")
+    resolved_where(dir, args, vars, ollama).expect("resolves")
 }
 
-/// [`resolved`], with git tracking what `tracked` says, and its error.
+/// [`resolved`], and its error.
 fn resolved_where(
     dir: &Path,
     args: &EngineArgs,
     vars: &[(&str, &str)],
     ollama: &dyn Fn(SocketAddr) -> Option<Vec<String>>,
-    tracked: &dyn Fn(&Path) -> bool,
 ) -> Result<Resolved, ConfigError> {
     let vars: BTreeMap<String, String> = vars
         .iter()
@@ -50,7 +49,6 @@ fn resolved_where(
             env: &env,
             env_names: vars.keys().cloned().collect(),
             ollama,
-            tracked,
         },
     )
 }
@@ -295,7 +293,7 @@ fn a_url_is_shown_without_its_user_password_or_query_and_never_if_it_does_not_pa
 }
 
 #[test]
-fn explain_masks_the_endpoint_and_shows_the_key_variable_only_by_a_name() {
+fn explain_masks_the_endpoint_and_a_key_put_where_its_name_belongs_is_refused() {
     let d = dir(&[("atomic.yaml", MANIFEST_ONLY)]);
     let r = resolved(
         &d,
@@ -306,8 +304,6 @@ fn explain_masks_the_endpoint_and_shows_the_key_variable_only_by_a_name() {
                 "https://me:tok-secret@api.example.com/v1?key=k-secret",
             ),
             ("ATOMIC_MODEL", "m"),
-            // The key itself, where its variable's name belongs.
-            ("ATOMIC_MODEL_API_KEY_ENV", "sk-live-secret"),
         ],
         &nobody,
     );
@@ -317,31 +313,79 @@ fn explain_masks_the_endpoint_and_shows_the_key_variable_only_by_a_name() {
         shown.contains("https://***@api.example.com/v1?***"),
         "{shown}"
     );
-    assert!(shown.contains("not a variable's name"), "{shown}");
+    // The key itself, where its variable's name belongs.
+    let said = resolved_where(
+        &d,
+        &EngineArgs::default(),
+        &[("ATOMIC_MODEL_API_KEY_ENV", "sk-live-secret")],
+        &nobody,
+    )
+    .expect_err("refused")
+    .to_string();
+    assert!(
+        said.contains("not an environment variable's name"),
+        "{said}"
+    );
+    assert!(!said.contains("secret"), "{said}");
+}
+
+/// A person whose own configuration, at `home/.config/atomic/config.yaml`,
+/// holds `text`: the variables that find it.
+fn person(text: &str) -> (PathBuf, String) {
+    let home = dir(&[]);
+    std::fs::create_dir_all(home.join(".config/atomic")).expect("config dir");
+    std::fs::write(home.join(".config/atomic/config.yaml"), text).expect("config");
+    let home_var = home.display().to_string();
+    (home, home_var)
 }
 
 #[test]
-fn a_committed_manifest_cannot_choose_the_variable_the_key_is_read_from() {
-    let manifest = "atomic: 1\nname: notes\nmodel:\n  base_url: https://example.com/v1\n  \
-                    api_key_env: AWS_SECRET_ACCESS_KEY\n";
-    let d = dir(&[("atomic.yaml", manifest)]);
-    let refused =
-        resolved_where(&d, &EngineArgs::default(), &[], &nobody, &|_| false).expect_err("refused");
-    let said = refused.to_string();
-    assert!(said.contains("atomic.yaml:5"), "{said}");
-    assert!(said.contains("atomic.local.yaml"), "{said}");
-    assert!(said.contains("ATOMIC_MODEL_API_KEY_ENV"), "{said}");
-    // The person's own file, a variable or a flag may.
-    let d = dir(&[
-        ("atomic.yaml", MANIFEST_ONLY),
+fn the_projects_files_cannot_choose_the_variable_the_key_is_read_from() {
+    let local = "model:\n  base_url: https://example.com/v1\n  api_key_env: MY_KEY\n";
+    for (files, line) in [
         (
-            "atomic.local.yaml",
-            "model:\n  base_url: https://example.com/v1\n  api_key_env: MY_KEY\n",
+            vec![(
+                "atomic.yaml",
+                "atomic: 1\nname: notes\nmodel:\n  base_url: https://example.com/v1\n  \
+                 api_key_env: AWS_SECRET_ACCESS_KEY\n",
+            )],
+            "atomic.yaml:5",
         ),
-    ]);
-    let r = resolved(&d, &EngineArgs::default(), &[], &nobody);
-    assert_eq!(r.settings.model.api_key_env.as_deref(), Some("MY_KEY"));
+        // atomic.local.yaml is in the project, tracked by git or not.
+        (
+            vec![("atomic.yaml", MANIFEST_ONLY), ("atomic.local.yaml", local)],
+            "atomic.local.yaml:3",
+        ),
+    ] {
+        let d = dir(&files);
+        let (_home, home) = person("");
+        let said = resolved_where(&d, &EngineArgs::default(), &[("HOME", &home)], &nobody)
+            .expect_err("refused")
+            .to_string();
+        assert!(said.contains(line), "{said}");
+        assert!(said.contains(".config/atomic/config.yaml"), "{said}");
+        assert!(said.contains("ATOMIC_MODEL_API_KEY_ENV"), "{said}");
+    }
+    // The person's own configuration, a variable or a flag may.
     let d = dir(&[("atomic.yaml", MANIFEST_ONLY)]);
+    let (_home, home) = person(local);
+    let r = resolved(&d, &EngineArgs::default(), &[("HOME", &home)], &nobody);
+    assert_eq!(r.settings.model.api_key_env.as_deref(), Some("MY_KEY"));
+    assert_eq!(
+        r.settings.model.base_url.as_deref(),
+        Some("https://example.com/v1")
+    );
+    // Found through XDG_CONFIG_HOME as well.
+    let (xdg, _) = person("");
+    std::fs::create_dir_all(xdg.join("atomic")).expect("xdg");
+    std::fs::write(xdg.join("atomic/config.yaml"), local).expect("xdg config");
+    let r = resolved(
+        &d,
+        &EngineArgs::default(),
+        &[("XDG_CONFIG_HOME", &xdg.display().to_string())],
+        &nobody,
+    );
+    assert_eq!(r.settings.model.api_key_env.as_deref(), Some("MY_KEY"));
     let r = resolved(
         &d,
         &EngineArgs::default(),
@@ -380,11 +424,11 @@ fn a_detected_ollama_is_sent_no_key_and_is_announced() {
 fn an_endpoint_from_the_projects_files_is_announced_and_one_the_runner_chose_is_not() {
     let d = dir(&[(
         "atomic.yaml",
-        "atomic: 1\nname: notes\nmodel:\n  base_url: https://u@example.com/v1\n  name: m\n",
+        "atomic: 1\nname: notes\nmodel:\n  base_url: https://example.com/v1\n  name: m\n",
     )]);
     let r = resolved(&d, &EngineArgs::default(), &[], &nobody);
     let said = r.announcement().expect("announced");
-    assert!(said.contains("https://***@example.com/v1"), "{said}");
+    assert!(said.contains("https://example.com/v1"), "{said}");
     assert!(said.contains("atomic.yaml:4"), "{said}");
     let r = resolved(
         &d,
@@ -513,27 +557,7 @@ fn the_probe_gives_up_at_its_deadline_however_slowly_an_answer_trickles() {
 }
 
 #[test]
-fn a_tracked_local_file_is_the_projects_and_cannot_choose_the_key() {
-    // A repository that commits its "personal" file.
-    let local =
-        "model:\n  base_url: https://example.com/v1\n  api_key_env: AWS_SECRET_ACCESS_KEY\n";
-    let d = dir(&[("atomic.yaml", MANIFEST_ONLY), ("atomic.local.yaml", local)]);
-    let tracked = |p: &Path| p.file_name().is_some_and(|f| f == "atomic.local.yaml");
-    let said = resolved_where(&d, &EngineArgs::default(), &[], &nobody, &tracked)
-        .expect_err("refused")
-        .to_string();
-    assert!(said.contains("atomic.local.yaml:3"), "{said}");
-    assert!(said.contains("does not track"), "{said}");
-    // Untracked, it is the person's own.
-    let r = resolved(&d, &EngineArgs::default(), &[], &nobody);
-    assert_eq!(
-        r.settings.model.api_key_env.as_deref(),
-        Some("AWS_SECRET_ACCESS_KEY")
-    );
-}
-
-#[test]
-fn a_key_is_never_sent_to_an_endpoint_the_project_chose() {
+fn a_key_is_sent_to_an_endpoint_the_project_chose_only_if_the_person_chose_it_too() {
     let d = dir(&[(
         "atomic.yaml",
         "atomic: 1\nname: notes\nmodel:\n  base_url: https://example.com/v1\n  name: m\n",
@@ -544,7 +568,6 @@ fn a_key_is_never_sent_to_an_endpoint_the_project_chose() {
         &EngineArgs::default(),
         &[("ATOMIC_MODEL_API_KEY_ENV", "OPENAI_API_KEY")],
         &nobody,
-        &|_| false,
     )
     .expect_err("refused")
     .to_string();
@@ -553,16 +576,30 @@ fn a_key_is_never_sent_to_an_endpoint_the_project_chose() {
         said.contains("environment variable ATOMIC_MODEL_API_KEY_ENV"),
         "{said}"
     );
-    // So is a flag's.
+    // So is a flag's, and one from the person's own configuration.
     let args = EngineArgs {
         model_api_key_env: Some("MY_KEY".into()),
         ..EngineArgs::default()
     };
-    let said = resolved_where(&d, &args, &[], &nobody, &|_| false)
+    let said = resolved_where(&d, &args, &[], &nobody)
         .expect_err("refused")
         .to_string();
     assert!(said.contains("flag --model-api-key-env"), "{said}");
-    // An endpoint the person chose takes the key.
+    let (_home, home) = person("model:\n  api_key_env: MY_KEY\n");
+    let said = resolved_where(&d, &EngineArgs::default(), &[("HOME", &home)], &nobody)
+        .expect_err("refused")
+        .to_string();
+    assert!(said.contains(".config/atomic/config.yaml:2"), "{said}");
+    // The person's configuration naming the same endpoint takes the key; a
+    // different one does not.
+    let (_home, home) =
+        person("model:\n  base_url: https://example.com/v1/\n  api_key_env: MY_KEY\n");
+    let r = resolved(&d, &EngineArgs::default(), &[("HOME", &home)], &nobody);
+    assert_eq!(r.settings.model.api_key_env.as_deref(), Some("MY_KEY"));
+    let (_home, home) =
+        person("model:\n  base_url: https://other.example.com/v1\n  api_key_env: MY_KEY\n");
+    resolved_where(&d, &EngineArgs::default(), &[("HOME", &home)], &nobody).expect_err("refused");
+    // An endpoint the person sets by variable or flag takes the key.
     let r = resolved(
         &d,
         &EngineArgs::default(),
@@ -579,7 +616,7 @@ fn a_key_is_never_sent_to_an_endpoint_the_project_chose() {
 }
 
 #[test]
-fn the_projects_files_name_no_store_and_no_password() {
+fn the_projects_files_name_no_store_and_no_credential() {
     for (file, text, line) in [
         (
             "atomic.yaml",
@@ -587,13 +624,24 @@ fn the_projects_files_name_no_store_and_no_password() {
             "atomic.yaml:4",
         ),
         (
+            "atomic.local.yaml",
+            "database:\n  url: postgres://db/atomic\n",
+            "atomic.local.yaml:2",
+        ),
+        (
             "atomic.yaml",
             "atomic: 1\nname: notes\nmodel:\n  base_url: https://u:pw@example.com/v1\n",
             "atomic.yaml:4",
         ),
+        // A token as the user, or in the query.
+        (
+            "atomic.yaml",
+            "atomic: 1\nname: notes\nmodel:\n  base_url: https://tok-pw@example.com/v1\n",
+            "atomic.yaml:4",
+        ),
         (
             "atomic.local.yaml",
-            "database:\n  url: postgres://db/atomic\n",
+            "model:\n  base_url: https://example.com/v1?api_key=pw\n",
             "atomic.local.yaml:2",
         ),
     ] {
@@ -603,22 +651,17 @@ fn the_projects_files_name_no_store_and_no_password() {
             vec![("atomic.yaml", MANIFEST_ONLY), (file, text)]
         };
         let d = dir(&files);
-        let said = resolved_where(&d, &EngineArgs::default(), &[], &nobody, &|_| true)
+        let said = resolved_where(&d, &EngineArgs::default(), &[], &nobody)
             .expect_err("refused")
             .to_string();
         assert!(said.contains(line), "{said}");
-        assert!(!said.contains("pw@"), "{said}");
+        assert!(!said.contains("pw"), "{said}");
     }
-    // From the person: an untracked file or the variable.
-    let d = dir(&[
-        ("atomic.yaml", MANIFEST_ONLY),
-        (
-            "atomic.local.yaml",
-            "database:\n  url: postgres://db/atomic\n",
-        ),
-    ]);
-    resolved(&d, &EngineArgs::default(), &[], &nobody);
+    // From the person: their own configuration or the variable.
     let d = dir(&[("atomic.yaml", MANIFEST_ONLY)]);
+    let (_home, home) = person("database:\n  url: postgres://u:pw@db/atomic\n");
+    let r = resolved(&d, &EngineArgs::default(), &[("HOME", &home)], &nobody);
+    assert!(r.settings.database.url.is_some());
     resolved(
         &d,
         &EngineArgs::default(),
@@ -630,7 +673,7 @@ fn the_projects_files_name_no_store_and_no_password() {
 #[test]
 fn a_runner_atomic_does_not_know_is_refused_when_read() {
     let d = dir(&[("atomic.yaml", "atomic: 1\nname: notes\nrunner: proces\n")]);
-    let said = resolved_where(&d, &EngineArgs::default(), &[], &nobody, &|_| false)
+    let said = resolved_where(&d, &EngineArgs::default(), &[], &nobody)
         .expect_err("refused")
         .to_string();
     assert!(said.contains("must be local or process"), "{said}");

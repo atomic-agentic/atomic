@@ -690,6 +690,9 @@ where
         Constrained::allow_any(AskForApproval::Never),
         Constrained::allow_any(permission_profile(spec.sandbox, guard, codex_home)?),
     )?;
+    // Set with the permissions, which start from Codex's defaults, so every
+    // thread's shell gets it.
+    confine_shell_environment(&mut config.permissions.shell_environment_policy);
     let mut writable_roots = spec.writable_roots.clone();
     writable_roots.push(cwd.to_owned());
     refuse_uncovered_store(spec.sandbox, guard, &writable_roots)?;
@@ -919,6 +922,7 @@ async fn new_config(
     model_provider.env_key = endpoint.api_key_env.clone();
     model_provider.requires_openai_auth = false;
     model_provider.supports_websockets = false;
+    env_headers_for(&endpoint.base_url, &mut model_provider.env_http_headers);
     model_providers.insert(model_provider_id.clone(), model_provider.clone());
 
     let mut config = Config {
@@ -1111,6 +1115,57 @@ async fn new_config(
     Ok(config)
 }
 
+/// OpenAI's API, the one endpoint the OpenAI provider's organization and
+/// project headers are for.
+const OPENAI_DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
+
+/// Whether `base_url` is exactly OpenAI's API.
+fn is_openai_default(base_url: &str) -> bool {
+    base_url.trim_end_matches('/') == OPENAI_DEFAULT_BASE_URL
+}
+
+/// The OpenAI provider sends `OPENAI_ORGANIZATION` and `OPENAI_PROJECT` as
+/// headers: kept for OpenAI's own API only, never sent to another endpoint.
+fn env_headers_for(
+    base_url: &str,
+    headers: &mut Option<std::collections::HashMap<String, String>>,
+) {
+    if !is_openai_default(base_url) {
+        *headers = None;
+    }
+}
+
+/// Variables an atom's shell never sees, whatever else it inherits: atomic's
+/// and Codex's own settings, model and cloud credentials, and database
+/// connections. Matched without regard to case.
+pub const SHELL_EXCLUDES: &[&str] = &[
+    "ATOMIC_*",
+    "OPENAI_*",
+    "CODEX_*",
+    "DATABASE_URL",
+    "PG*",
+    "AWS_*",
+    "*_API_KEY",
+];
+
+/// The environment an atom's shell starts from: only the platform's core
+/// variables (`PATH`, `HOME`, `USER`, the locale and the like), less any
+/// whose name holds `KEY`, `SECRET` or `TOKEN`, less [`SHELL_EXCLUDES`].
+/// The model chooses the commands, and it can be any endpoint, so nothing
+/// of the person's environment reaches it by default. A variable an atom
+/// declares is set on top.
+fn confine_shell_environment(policy: &mut codex_protocol::config_types::ShellEnvironmentPolicy) {
+    use codex_protocol::config_types::{EnvironmentVariablePattern, ShellEnvironmentPolicyInherit};
+    policy.inherit = ShellEnvironmentPolicyInherit::Core;
+    policy.ignore_default_excludes = false;
+    for pattern in SHELL_EXCLUDES {
+        policy
+            .exclude
+            .push(EnvironmentVariablePattern::new_case_insensitive(pattern));
+    }
+    policy.use_profile = false;
+}
+
 /// How long a turn waits for the thread to finish settling the previous one.
 const NOT_IDLE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -1231,6 +1286,65 @@ async fn turn(
 mod tests {
     use super::*;
     use crate::testing::{FakeModel, Reply};
+
+    #[test]
+    fn an_atoms_shell_inherits_no_secret() {
+        let mut policy = codex_protocol::config_types::ShellEnvironmentPolicy::default();
+        confine_shell_environment(&mut policy);
+        policy.r#set.insert("NOTE_DIR".into(), "/w/notes".into());
+        let around = [
+            ("PATH", "/usr/bin"),
+            ("HOME", "/home/dev"),
+            ("LANG", "C.UTF-8"),
+            ("OPENAI_API_KEY", "canary"),
+            ("OPENAI_ORGANIZATION", "canary"),
+            ("ATOMIC_DATABASE_URL", "canary"),
+            ("CODEX_HOME", "canary"),
+            ("DATABASE_URL", "canary"),
+            ("PGPASSWORD", "canary"),
+            ("AWS_ACCESS_KEY_ID", "canary"),
+            ("ANTHROPIC_API_KEY", "canary"),
+            ("GITHUB_TOKEN", "canary"),
+            ("MY_SECRET", "canary"),
+            ("UNRELATED", "canary"),
+        ]
+        .map(|(k, v)| (k.to_owned(), v.to_owned()));
+        let env = codex_protocol::shell_environment::populate_env(around, &policy, None);
+        let mut kept: Vec<&str> = env.keys().map(String::as_str).collect();
+        kept.sort_unstable();
+        assert_eq!(kept, ["HOME", "LANG", "NOTE_DIR", "PATH"], "{env:?}");
+    }
+
+    #[test]
+    fn only_openais_api_gets_the_organization_headers() {
+        let built_in = built_in_model_providers(None)
+            .get(OPENAI_PROVIDER_ID)
+            .expect("the OpenAI provider")
+            .env_http_headers
+            .clone();
+        let names = |h: &Option<std::collections::HashMap<String, String>>| {
+            h.as_ref()
+                .map(|h| h.values().cloned().collect::<Vec<_>>())
+                .unwrap_or_default()
+        };
+        assert!(names(&built_in).contains(&"OPENAI_ORGANIZATION".to_owned()));
+        let mut kept = built_in.clone();
+        env_headers_for("https://api.openai.com/v1", &mut kept);
+        assert_eq!(kept, built_in);
+        let mut elsewhere = built_in.clone();
+        env_headers_for("https://example.com/v1", &mut elsewhere);
+        assert_eq!(elsewhere, None);
+        assert!(is_openai_default("https://api.openai.com/v1"));
+        assert!(is_openai_default("https://api.openai.com/v1/"));
+        for other in [
+            "http://127.0.0.1:11434/v1",
+            "https://api.openai.com.example/v1",
+            "https://api.openai.com@example.com/v1",
+            "https://example.com/v1",
+        ] {
+            assert!(!is_openai_default(other), "{other}");
+        }
+    }
 
     fn scratch(tag: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("atomic-codex-{tag}-{}", std::process::id()));

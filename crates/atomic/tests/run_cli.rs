@@ -205,6 +205,8 @@ fn command_as(
     for name in [
         "CODEX_HOME",
         "XDG_DATA_HOME",
+        // The person's own configuration is under the throwaway home.
+        "XDG_CONFIG_HOME",
         "ATOMIC_DATABASE_URL",
         "ATOMIC_DATABASE_SCHEMA",
         "ATOMIC_EXECUTOR_ID",
@@ -746,33 +748,50 @@ fn git_in(dir: &Path, args: &[&str]) {
 }
 
 #[test]
-fn a_local_file_committed_with_the_project_cannot_choose_the_key() {
-    let dir = scratch("tracked-local");
+fn the_projects_files_cannot_route_a_key_and_the_persons_own_configuration_can() {
+    let dir = scratch("person-config");
     let project = project(&dir);
-    std::fs::write(
-        project.join("atomic.local.yaml"),
-        "model:\n  base_url: https://example.com/v1\n  name: m\n  api_key_env: AWS_SECRET_ACCESS_KEY\n",
-    )
-    .expect("local");
-    git_in(&project, &["init", "-q"]);
-    git_in(&project, &["add", "atomic.local.yaml"]);
-    let out = atomic(
-        &dir,
-        &project,
-        &["--json", "run", "count-only", "--data", NOTE],
-        &[],
-        "",
-    );
-    assert!(!out.status.success(), "{}", text(&out));
-    let error = &stdout_json(&out)["error"];
-    assert_eq!(error["kind"], "config.invalid", "{error}");
-    let said = error["description"].as_str().unwrap_or_default();
-    assert!(said.contains("atomic.local.yaml:4"), "{said}");
-    assert!(said.contains("does not track"), "{said}");
-    // Once git no longer tracks it, it is the person's own file.
-    git_in(&project, &["rm", "-q", "--cached", "atomic.local.yaml"]);
-    let out = atomic(&dir, &project, &["--json", "config"], &[], "");
+    let routing = "model:\n  base_url: https://example.com/v1\n  name: m\n  api_key_env: MY_KEY\n";
+    // In the project, whether git tracks it or not.
+    std::fs::write(project.join("atomic.local.yaml"), routing).expect("local");
+    for tracked in [false, true] {
+        if tracked {
+            git_in(&project, &["init", "-q"]);
+            git_in(&project, &["add", "atomic.local.yaml"]);
+        }
+        let out = atomic(
+            &dir,
+            &project,
+            &["--json", "run", "count-only", "--data", NOTE],
+            &[],
+            "",
+        );
+        assert!(!out.status.success(), "{}", text(&out));
+        let error = &stdout_json(&out)["error"];
+        assert_eq!(error["kind"], "config.invalid", "{error}");
+        let said = error["description"].as_str().unwrap_or_default();
+        assert!(said.contains("atomic.local.yaml:4"), "{said}");
+        assert!(said.contains(".config/atomic/config.yaml"), "{said}");
+    }
+    // In the person's own configuration, under their home.
+    std::fs::remove_file(project.join("atomic.local.yaml")).expect("remove");
+    let config = dir.join("home/.config/atomic");
+    std::fs::create_dir_all(&config).expect("config dir");
+    std::fs::write(config.join("config.yaml"), routing).expect("config");
+    let out = atomic(&dir, &project, &["--json", "config", "--explain"], &[], "");
     assert!(out.status.success(), "{}", text(&out));
+    let doc = stdout_json(&out);
+    let row = doc["settings"]
+        .as_array()
+        .and_then(|all| all.iter().find(|s| s["setting"] == "model.api_key_env"))
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        row["source"]
+            .as_str()
+            .is_some_and(|s| s.contains(".config/atomic/config.yaml")),
+        "{doc}"
+    );
 }
 
 #[test]

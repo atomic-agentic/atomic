@@ -179,12 +179,10 @@ pub struct Surroundings<'a> {
     pub env_names: Vec<String>,
     /// The models a local Ollama at an address lists, if one answers.
     pub ollama: &'a dyn Fn(SocketAddr) -> Option<Vec<String>>,
-    /// Whether git tracks a file, so it came with the project.
-    pub tracked: &'a dyn Fn(&Path) -> bool,
 }
 
 impl Surroundings<'static> {
-    /// This process's environment, a real probe and git.
+    /// This process's environment and a real probe.
     pub fn here() -> Self {
         Self {
             ollama: &probe_ollama,
@@ -201,16 +199,19 @@ impl Surroundings<'static> {
                 .filter_map(|(k, _)| k.into_string().ok())
                 .collect(),
             ollama: &|_| None,
-            tracked: &tracked_by_git,
         }
     }
 }
 
-/// Whether git tracks `file`; `false` outside a checkout or without git.
-fn tracked_by_git(file: &Path) -> bool {
-    atomic_core::git::Git::find()
-        .and_then(|git| git.tracks(file))
-        .unwrap_or(false)
+/// The person's own configuration file, which no project supplies:
+/// `$XDG_CONFIG_HOME/atomic/config.yaml`, by default
+/// `~/.config/atomic/config.yaml`. `None` when neither variable names an
+/// absolute directory.
+pub fn user_config(env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
+    let absolute = |name: &str| env(name).map(PathBuf::from).filter(|p| p.is_absolute());
+    absolute("XDG_CONFIG_HOME")
+        .map(|d| d.join("atomic/config.yaml"))
+        .or_else(|| absolute("HOME").map(|h| h.join(".config/atomic/config.yaml")))
 }
 
 /// The directory whose `atomic.yaml` and siblings configure the project at
@@ -268,8 +269,10 @@ pub fn resolve(
     args: &EngineArgs,
     around: &Surroundings<'_>,
 ) -> Result<Resolved, ConfigError> {
+    let user = user_config(around.env);
     let resolved = config::resolve::<Settings>(&Layers {
         dir,
+        user: user.as_deref(),
         profile: None,
         env: around.env,
         env_names: around.env_names.clone(),
@@ -297,7 +300,7 @@ pub fn resolve(
             *slot = Some(raw);
         }
     }
-    refuse_from_project(&settings, &sources, around)?;
+    refuse_from_project(&settings, &sources, user.as_deref())?;
     let mut notes = Vec::new();
     let set = |v: Option<String>| v.filter(|v| !v.is_empty());
     let unset = |sources: &BTreeMap<String, Source>, path: &str| {
@@ -394,88 +397,124 @@ pub fn resolve(
 /// the last byte of its answer.
 const PROBE_DEADLINE: Duration = Duration::from_secs(1);
 
-/// Where `path`'s value came from, when that is one of the project's own
-/// files: `atomic.yaml`, or an `atomic.local.yaml` that git tracks, so it
-/// came with the project rather than from whoever runs it.
+/// Where `path`'s value came from, when that is a file of the project
+/// rather than the person's own configuration: `atomic.yaml` or an
+/// `atomic.local.yaml`, tracked by git or not, since either can arrive with
+/// a project.
 fn project_file<'s>(
     sources: &'s BTreeMap<String, Source>,
     path: &str,
-    around: &Surroundings<'_>,
+    user: Option<&Path>,
 ) -> Option<(&'s Path, usize)> {
     match sources.get(path)? {
-        Source::File { path, line } => {
-            let name = path.file_name()?;
-            (name == "atomic.yaml" || (name == "atomic.local.yaml" && (around.tracked)(path)))
-                .then_some((path.as_path(), *line))
+        Source::File { path, line } if Some(path.as_path()) != user => {
+            Some((path.as_path(), *line))
         }
         _ => None,
     }
 }
 
-/// What a project's own files may not set, because it would send something
-/// of whoever runs the project where the project chooses: the variable whose
-/// value is sent as the model key, a key at all to an endpoint the project
-/// chose, a store for the run records, or a password.
+/// The model endpoint `user`, the person's own configuration, sets.
+fn users_base_url(user: Option<&Path>) -> Option<String> {
+    let user = user?;
+    let text = std::fs::read_to_string(user).ok()?;
+    let doc = atomic_schema::yaml::load(user, &text).ok()?;
+    doc.value
+        .pointer("/model/base_url")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+/// Whether `url` carries a credential: a user name or password, which may
+/// be a token, or a query, which may hold a key. One that does not parse is
+/// taken to carry one.
+fn has_credential(url: &str) -> bool {
+    url::Url::parse(url).map_or(true, |u| {
+        !u.username().is_empty() || u.password().is_some() || u.query().is_some()
+    })
+}
+
+/// What the project's files may not set, because it would send something of
+/// the person who runs the project where the project chooses: the variable
+/// whose value is sent as the model key, a key at all to an endpoint the
+/// project chose, the store for the run records, or a credential in the
+/// endpoint. Those come only from the person's own configuration
+/// ([`user_config`]), `ATOMIC_*` variables and flags.
 fn refuse_from_project(
     settings: &Settings,
     sources: &BTreeMap<String, Source>,
-    around: &Surroundings<'_>,
+    user: Option<&Path>,
 ) -> Result<(), ConfigError> {
-    const YOURS: &str = "an atomic.local.yaml that git does not track";
+    let yours = format!(
+        "your own configuration ({})",
+        user.map_or_else(
+            || "~/.config/atomic/config.yaml".to_owned(),
+            |u| u.display().to_string()
+        )
+    );
     let refuse = |(path, line): (&Path, usize), message: String| ConfigError::Setting {
         path: path.to_owned(),
         line,
         message,
     };
-    if let Some(at) = project_file(sources, "model.api_key_env", around) {
+    if let Some(at) = project_file(sources, "model.api_key_env", user) {
         return Err(refuse(
             at,
             format!(
-                "model.api_key_env cannot be set by the project's own files: it names the \
-                 variable whose value atomic sends to the model endpoint as its key, and that \
-                 is for whoever runs the project to choose. Set it in {YOURS}, \
+                "model.api_key_env cannot be set by the project's files: it names the variable \
+                 whose value atomic sends to the model endpoint as its key, and that is for \
+                 whoever runs the project to choose. Set it in {yours}, \
                  ATOMIC_MODEL_API_KEY_ENV or --model-api-key-env"
             ),
         ));
     }
-    if let Some(at) = project_file(sources, "model.base_url", around) {
+    if let Some(name) = &settings.model.api_key_env
+        && !is_variable_name(name)
+    {
+        let from = sources
+            .get("model.api_key_env")
+            .map_or_else(|| "default".into(), describe);
+        return Err(ConfigError::Invalid(format!(
+            "model.api_key_env, from {from}, is not an environment variable's name; it names \
+             the variable that holds the key, never the key itself"
+        )));
+    }
+    if let Some(at) = project_file(sources, "model.base_url", user) {
+        let url = settings.model.base_url.as_deref().unwrap_or_default();
+        if has_credential(url) {
+            return Err(refuse(
+                at,
+                format!(
+                    "model.base_url carries a credential, a user, password or query, and the \
+                     project's files are shared: set it in {yours}, ATOMIC_MODEL_BASE_URL or \
+                     --model-base-url"
+                ),
+            ));
+        }
+        let same = |other: &str| other.trim_end_matches('/') == url.trim_end_matches('/');
         if settings.model.api_key_env.is_some()
             && let Some(key) = sources.get("model.api_key_env")
+            && !users_base_url(user).is_some_and(|u| same(&u))
         {
             return Err(refuse(
                 at,
                 format!(
                     "model.base_url is set here, by the project, and model.api_key_env by {}: \
-                     atomic sends a key only to an endpoint whoever runs the project chose. Set \
-                     model.base_url yourself, in {YOURS}, ATOMIC_MODEL_BASE_URL or \
-                     --model-base-url, or unset model.api_key_env",
+                     atomic sends a key only to an endpoint the person running the project \
+                     chose. Set the same model.base_url in {yours}, or set it with \
+                     ATOMIC_MODEL_BASE_URL or --model-base-url, or unset model.api_key_env",
                     describe(key)
                 ),
             ));
         }
-        if settings
-            .model
-            .base_url
-            .as_deref()
-            .and_then(|u| url::Url::parse(u).ok())
-            .is_some_and(|u| u.password().is_some())
-        {
-            return Err(refuse(
-                at,
-                format!(
-                    "model.base_url carries a password, and the project's own files are shared: \
-                     set it in {YOURS}, ATOMIC_MODEL_BASE_URL or --model-base-url"
-                ),
-            ));
-        }
     }
-    if let Some(at) = project_file(sources, "database.url", around) {
+    if let Some(at) = project_file(sources, "database.url", user) {
         return Err(refuse(
             at,
             format!(
-                "database.url cannot be set by the project's own files: it would move this \
+                "database.url cannot be set by the project's files: it would move this \
                  machine's run records, and the password it may carry, to whatever store the \
-                 project names. Set it in {YOURS} or ATOMIC_DATABASE_URL"
+                 project names. Set it in {yours} or ATOMIC_DATABASE_URL"
             ),
         ));
     }

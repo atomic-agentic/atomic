@@ -52,20 +52,26 @@ The settings `atomic run`, `atomic runs resume` and `atomic serve` resolve:
 | `executor_id` | `ATOMIC_EXECUTOR_ID` | `--executor-id` |
 | `budget.*` | `ATOMIC_BUDGET_*` | |
 
-Some settings send something of whoever runs the project to wherever the
-project chooses, so the project's own files cannot set them. The project's
-files are `atomic.yaml` and, when git tracks it, `atomic.local.yaml`; an
-`atomic.local.yaml` that git does not track is the person's own.
+Your own configuration is `$XDG_CONFIG_HOME/atomic/config.yaml`, by default
+`~/.config/atomic/config.yaml`. No project supplies it. It holds the same
+settings as `atomic.yaml`, and the project's files override it.
+
+Some settings send something of yours wherever they point, so they come only
+from your own configuration, an `ATOMIC_*` variable or a flag. A file in the
+project that sets one is refused: `atomic.yaml`, and `atomic.local.yaml`
+whether git tracks it or not, since either can arrive with a project.
+`atomic.local.yaml` keeps every other override.
 
 - `model.api_key_env` names the variable whose value is sent to the endpoint
-  as its key. Set it in your own `atomic.local.yaml`, the variable or the
-  flag. When the project's files set `model.base_url`, no key is sent to it
-  at all: a key's variable from any source is refused until you set the
-  endpoint yourself.
-- `database.url` moves the run records, and the password it may carry, to
-  another store. Set it in your own `atomic.local.yaml` or
-  `ATOMIC_DATABASE_URL`.
-- A `model.base_url` that carries a password.
+  as its key. Its value must be a variable's name, never the key itself.
+- A key is sent to a `model.base_url` the project's files set only when you
+  set the same endpoint yourself, in your own configuration, with
+  `ATOMIC_MODEL_BASE_URL` or with `--model-base-url`. Otherwise the run is
+  refused, naming both sources.
+- `database.url` would move your run records, and the password it may carry,
+  to another store.
+- A `model.base_url` with a credential in it, a user, a password or a query,
+  is refused from the project's files.
 
 A variable set to the empty string sets nothing, and a variable for a string
 setting, such as `ATOMIC_EXECUTOR_ID=1`, is taken as the string it holds.
@@ -95,11 +101,12 @@ collection globs, cache paths or a database URL for local use.
 Values are resolved from lower to higher priority:
 
 1. Built-in defaults and detected capabilities.
-2. Committed `atomic.yaml`.
-3. Gitignored `atomic.local.yaml`.
-4. Selected `atomic.<profile>.yaml`.
-5. Supported `ATOMIC_*` environment variables.
-6. Command-line overrides.
+2. Your own configuration, `~/.config/atomic/config.yaml`.
+3. Committed `atomic.yaml`.
+4. Gitignored `atomic.local.yaml`.
+5. Selected `atomic.<profile>.yaml`.
+6. Supported `ATOMIC_*` environment variables.
+7. Command-line overrides.
 
 Managed requirements constrain the final result. No layer can grant a permission
 that managed policy forbids. Detection identifies an available integration; it
