@@ -225,6 +225,7 @@ pub async fn run(
         )
         .into());
     }
+    engine.launch().await?;
     // Before anything runs, so a run cut short can be resumed by its id.
     eprintln!(
         "run {run_id}: {} in project {}",
@@ -256,7 +257,7 @@ pub async fn resume(
         &args.engine,
         "atomic runs resume",
         true,
-        engine::Takes::Resumed,
+        engine::Takes::Run(args.run_id.clone()),
     )
     .await?;
     let id = &args.run_id;
@@ -282,6 +283,7 @@ pub async fn resume(
             .into())
         }
         Some(RunStatus::Succeeded) => {
+            engine.launch().await?;
             finish(&engine, id, json, &mut signals, "atomic runs resume").await
         }
         Some(RunStatus::Other(state)) if state != PARKED => {
@@ -314,28 +316,31 @@ pub async fn resume(
             }
             // The execution lock covers this host only. On a shared store
             // another live process may own the run, and nothing fences it.
-            if engine.shared && record.executor != engine.rt.executor_id() && !args.owner_stopped {
+            let owner = record.owner().unwrap_or_default();
+            if engine.shared && owner != engine.rt.executor_id() && !args.owner_stopped {
                 let _ = engine.rt.shutdown(SHUTDOWN).await;
                 return Err(Failure::new(
                     "run.owned",
                     format!(
                         "run {id} is owned by executor {}, not this one ({}), and may still be \
                          running there",
-                        record.executor,
+                        owner,
                         engine.rt.executor_id()
                     ),
                     format!(
                         "let executor {} finish it, or restart its `atomic serve`; if that \
                          executor has stopped for good, run `atomic runs resume {id} \
                          --owner-stopped`",
-                        record.executor
+                        owner
                     ),
                 )
                 .into());
             }
             eprintln!("run {id}: resuming");
+            // Queued before this engine dispatches, so it takes the run once.
             engine.rt.resume(id).await?;
             atomic_durable::failpoint("resume:queued");
+            engine.launch().await?;
             // A gate decided while the run was down may never have woken it.
             atomic_durable::gate::redeliver(&engine.rt).await?;
             finish(&engine, id, json, &mut signals, "atomic runs resume").await
@@ -461,7 +466,7 @@ pub async fn serve(
         &args.engine,
         "atomic serve",
         true,
-        engine::Takes::Resumed,
+        engine::Takes::Waiting,
     )
     .await?;
     eprintln!(
@@ -477,6 +482,7 @@ pub async fn serve(
             .map(|r| r.id)
             .collect()
     };
+    engine.launch().await?;
     let before = parked(engine.rt.runs_in(PARKED).await?);
     let recovered = engine.rt.recover().await?;
     // The engine parks a run it has recovered too often instead of

@@ -141,18 +141,29 @@ pub struct Engine {
     pub shared: bool,
 }
 
-/// Whether an engine takes resumed runs as well as running its own.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+impl Engine {
+    /// Start running: dispatch the resumed runs it takes, so a run resumed
+    /// before this is taken once, by this engine.
+    pub async fn launch(&self) -> anyhow::Result<()> {
+        self.rt.launch().await.context("launch the durable runtime")
+    }
+}
+
+/// Which resumed runs an engine takes, besides the runs it starts.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Takes {
-    /// Only the runs it starts: `atomic run`.
+    /// None: `atomic run`.
     Own,
-    /// Resumed runs too, from its executor's own queue: `atomic runs resume`
-    /// and `atomic serve`.
-    Resumed,
+    /// This one, from its own queue: `atomic runs resume <run>`.
+    Run(String),
+    /// Every run waiting on one of its executor's resume queues:
+    /// `atomic serve`.
+    Waiting,
 }
 
 /// Take the project's execution lock for `command`, open its store and
-/// launch `run_pipeline` on it, taking the runs `takes` says.
+/// register `run_pipeline` on it, taking the runs `takes` says; then
+/// [`Engine::launch`] it.
 pub async fn open(
     state: &ProjectState,
     paths: &CodexPaths,
@@ -225,11 +236,16 @@ pub async fn open(
             context: None,
         },
     );
-    if takes == Takes::Resumed {
-        rt.take_resumed_runs()
+    let only = match &takes {
+        Takes::Own => None,
+        Takes::Run(run) => Some(Some(run.as_str())),
+        Takes::Waiting => Some(None),
+    };
+    if let Some(only) = only {
+        rt.take_resumed_runs(only)
+            .await
             .context("take resumed runs on the durable runtime")?;
     }
-    rt.launch().await.context("launch the durable runtime")?;
     Ok(Engine {
         rt,
         store: describe(&database),

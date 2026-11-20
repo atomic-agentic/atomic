@@ -1273,15 +1273,24 @@ fn a_run_of_another_durable_layout_is_reported_not_resumed() {
 #[test]
 fn a_resumed_run_left_queued_is_taken_by_no_other_command() {
     on_codex_runtime(async {
-        let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
-            .await
-            .expect("fake model");
+        let model = FakeModel::start(vec![
+            Reply::Text(RANK.into()),
+            Reply::Text(RANK.into()),
+            Reply::Text(SUMMARY.into()),
+            Reply::Text(SUMMARY.into()),
+        ])
+        .await
+        .expect("fake model");
         let dir = scratch("left-queued");
         let project = project(&dir);
         let state = state_dir(&dir, &project);
         let env = model_env(&model.base_url());
         let (d, p, e) = (dir.clone(), project.clone(), env.clone());
         tokio::task::spawn_blocking(move || killed_after_rank(&d, &p, &e, "left-1"))
+            .await
+            .expect("child");
+        let (d, p, e) = (dir.clone(), project.clone(), env.clone());
+        tokio::task::spawn_blocking(move || killed_after_rank(&d, &p, &e, "other-1"))
             .await
             .expect("child");
         // The resume puts the run on its queue and dies before running it.
@@ -1320,7 +1329,21 @@ fn a_resumed_run_left_queued_is_taken_by_no_other_command() {
             rt.status("left-1").await.expect("status"),
             Some(RunStatus::Pending)
         );
-        assert_eq!(model.calls(), 1, "atomic run did not run it");
+        assert_eq!(model.calls(), 2, "atomic run did not run it");
+
+        // Resuming another run of the same executor leaves it alone too.
+        let (d, p, e) = (dir.clone(), project.clone(), env.clone());
+        let out = tokio::task::spawn_blocking(move || {
+            atomic(&d, &p, &["runs", "resume", "other-1"], &with(&e, &[]), "")
+        })
+        .await
+        .expect("child");
+        assert!(out.status.success(), "{}", text(&out));
+        assert_eq!(
+            rt.status("left-1").await.expect("status"),
+            Some(RunStatus::Pending)
+        );
+        assert_eq!(model.calls(), 3, "only other-1's summary");
 
         // serve takes it from the queue and finishes it.
         let mut serve = spawn(
@@ -1339,11 +1362,11 @@ fn a_resumed_run_left_queued_is_taken_by_no_other_command() {
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        assert_eq!(model.calls(), 2);
+        assert_eq!(model.calls(), 4);
         assert_eq!(
             count_log(&dir).len(),
-            2,
-            "triage's count once, count-note once"
+            3,
+            "each triage's count once, count-note once"
         );
         terminate(&serve);
         let status = tokio::task::spawn_blocking(move || wait_child(&mut serve, "serve"))
@@ -2480,22 +2503,19 @@ fn a_resumed_run_is_taken_only_by_its_resumer_on_postgres() {
             .expect("record")
             .expect("run");
         assert_eq!(record.status, RunStatus::Pending);
-        assert_ne!(record.executor, "worker-c");
+        assert_eq!(record.owner(), Some("worker-b"), "{record:?}");
         assert_eq!(model.calls(), 1, "worker-c did not run it");
 
-        // worker-b again, on the same private queue, finishes it.
-        let out = call(
-            b,
-            &["--json", "runs", "resume", "queued-1", "--owner-stopped"],
-        )
-        .await
-        .expect("child");
+        // worker-b again, which owns it now, finishes it from its queue.
+        let out = call(b, &["--json", "runs", "resume", "queued-1"])
+            .await
+            .expect("child");
         assert!(out.status.success(), "{}", text(&out));
         assert_eq!(
             stdout_json(&out)["output"],
             json!({"line": "P1: Export crashes on accents"})
         );
-        assert_eq!(model.calls(), 2);
+        assert_eq!(model.calls(), 2, "summarize ran once: {}", text(&out));
         assert_eq!(count_log(&dir).len(), 2);
     });
 }
