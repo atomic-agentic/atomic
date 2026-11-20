@@ -86,6 +86,12 @@ pub const PIPELINE: &str = "atomic.pipeline";
 /// shape changed.
 pub const LAYOUT_VERSION: &str = "atomic.pipeline.1";
 
+/// How many times the engine recovers one run of `run_pipeline` before it
+/// parks it as `MAX_RECOVERY_ATTEMPTS_EXCEEDED`: enough for a crash or two,
+/// few enough that a step whose process keeps dying, such as an idempotent
+/// command whose runner always dies, stops soon.
+pub const RECOVERY_LIMIT: i32 = 5;
+
 /// One atom step, as the interpreter runs it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AtomStep {

@@ -223,6 +223,10 @@ pub async fn open(
             context: None,
         },
     );
+    rt.cap_recoveries(
+        atomic_app::pipeline::PIPELINE,
+        atomic_app::pipeline::RECOVERY_LIMIT,
+    );
     if takes == Takes::Resumed {
         rt.take_resumed_runs()
             .context("take resumed runs on the durable runtime")?;

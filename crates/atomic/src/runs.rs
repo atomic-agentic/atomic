@@ -137,6 +137,24 @@ async fn finish(
              the store",
         )
         .into()),
+        Err(e)
+            if matches!(
+                engine.rt.status(run_id).await,
+                Ok(Some(RunStatus::Other(ref state))) if state == "MAX_RECOVERY_ATTEMPTS_EXCEEDED"
+            ) =>
+        {
+            Err(Failure::new(
+                "run.dead_lettered",
+                format!(
+                    "run {run_id} stopped and was recovered {} times without finishing, so it is \
+                     parked for good: {e}",
+                    atomic_app::pipeline::RECOVERY_LIMIT
+                ),
+                "find why its step keeps stopping, such as a command whose runner dies under it, \
+                 fix that, and start a new run",
+            )
+            .into())
+        }
         Err(e) => Err(Failure::new(
             "run.interrupted",
             format!("run {run_id} did not finish: {e}"),

@@ -1351,16 +1351,17 @@ fn exec_commands_run_in_a_runner_process_when_asked() {
     assert_eq!(stdout_json(&out), json!({"names": ["PATH"]}));
 }
 
-/// An exec atom whose command logs that it ran, then, the first time,
-/// SIGKILLs the process that started it: with `--runner process`, its runner.
-fn write_runner_killer(project: &Path, dir: &Path, name: &str, effects: &str) {
+/// An exec atom whose command logs that it ran, then, the first time or
+/// `always`, SIGKILLs the process that started it: with `--runner process`,
+/// its runner.
+fn write_runner_killer(project: &Path, dir: &Path, name: &str, effects: &str, always: bool) {
     std::fs::write(
         project.join("tools/kill-runner.py"),
         "import json, os, signal, sys\n\
          note = json.load(sys.stdin)\n\
          log = os.environ['KILL_LOG']\n\
          open(log, 'a').write('ran\\n')\n\
-         if not os.path.exists(log + '.killed'):\n\
+         if os.environ.get('KILL_ALWAYS') or not os.path.exists(log + '.killed'):\n\
          \x20   open(log + '.killed', 'w').close()\n\
          \x20   os.kill(os.getppid(), signal.SIGKILL)\n\
          json.dump({'title': note['text'][:25], 'words': len(note['text'].split())}, sys.stdout)\n",
@@ -1370,8 +1371,9 @@ fn write_runner_killer(project: &Path, dir: &Path, name: &str, effects: &str) {
         project,
         name,
         &format!(
-            "description: 'Kill the runner.', kind: 'exec', exec: {{ command: ['python3', 'tools/kill-runner.py'] }}, env: {{ KILL_LOG: '{}' }}{effects}",
-            dir.join(format!("{name}.log")).display()
+            "description: 'Kill the runner.', kind: 'exec', exec: {{ command: ['python3', 'tools/kill-runner.py'] }}, env: {{ KILL_LOG: '{}'{} }}{effects}",
+            dir.join(format!("{name}.log")).display(),
+            if always { ", KILL_ALWAYS: '1'" } else { "" }
         ),
         "",
         object(json!({"text": {"type": "string"}})),
@@ -1389,12 +1391,13 @@ fn lines(file: &Path) -> usize {
 fn a_command_that_kills_its_runner_is_never_run_again_unless_it_may_be() {
     let dir = scratch("runner-killed");
     let project = project(&dir);
-    write_runner_killer(&project, &dir, "undeclared", "");
+    write_runner_killer(&project, &dir, "undeclared", "", false);
     write_runner_killer(
         &project,
         &dir,
         "idempotent",
         ", effects: { external: 'idempotent' }",
+        false,
     );
     // Undeclared: it may have done what it does, so it parks after one run.
     let out = atomic(
@@ -1739,6 +1742,41 @@ fn a_signal_stops_run_and_resume_with_everything_their_command_started() {
         );
         all_gone(&pids, &format!("{command} {sig}"));
     }
+}
+
+#[test]
+fn a_run_that_keeps_stopping_is_dead_lettered_after_a_few_tries() {
+    let dir = scratch("dead-letter");
+    let project = project(&dir);
+    // Idempotent, so each recovery may run it again, and its runner always
+    // dies under it.
+    write_runner_killer(
+        &project,
+        &dir,
+        "doomed",
+        ", effects: { external: 'idempotent' }",
+        true,
+    );
+    let out = atomic(
+        &dir,
+        &project,
+        &[
+            "--json", "run", "doomed", "--runner", "process", "--data", NOTE,
+        ],
+        &[],
+        "",
+    );
+    assert!(!out.status.success(), "{}", text(&out));
+    let error = &stdout_json(&out)["error"];
+    assert_eq!(error["kind"], "run.dead_lettered", "{error}");
+    let action = error["action"].as_str().unwrap_or_default();
+    assert!(!action.contains("runs resume"), "{error}");
+    let ran = lines(&dir.join("doomed.log"));
+    assert_eq!(
+        ran,
+        1 + atomic_app::pipeline::RECOVERY_LIMIT as usize,
+        "once, then once per recovery"
+    );
 }
 
 #[test]

@@ -882,6 +882,13 @@ impl Durare {
         Ok(())
     }
 
+    /// Park a run of `workflow` as `MAX_RECOVERY_ATTEMPTS_EXCEEDED` once it
+    /// has been recovered `max` times. Call it before
+    /// [`launch`](DurableRuntime::launch).
+    pub fn cap_recoveries(&mut self, workflow: &str, max: i32) {
+        self.engine.max_recovery_attempts_for(workflow, max);
+    }
+
     /// The version this engine stamps on runs, and the only one it recovers.
     pub fn version(&self) -> &str {
         self.engine.app_version()
