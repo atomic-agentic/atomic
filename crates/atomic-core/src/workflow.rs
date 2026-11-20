@@ -110,7 +110,15 @@ pub fn binding_origin(
 pub(crate) const TOP: &[&str] = &[
     "atomic", "name", "version", "input", "output", "steps", "returns", "budget",
 ];
-pub(crate) const STEP: &[&str] = &["atom", "gate", "after", "with", "origins", "worktree"];
+pub(crate) const STEP: &[&str] = &[
+    "atom", "gate", "after", "with", "origins", "worktree", "review",
+];
+/// The fields of an atom step's `review`.
+pub(crate) const REVIEW: &[&str] = &["reviewer", "with", "rounds"];
+/// The most repair rounds a review may give its author.
+pub const MAX_REVIEW_ROUNDS: u64 = 5;
+/// The decisions a reviewer's verdict may give.
+pub const VERDICTS: [&str; 3] = ["approve", "reject", "escalate"];
 pub(crate) const GATE: &[&str] = &[
     "title",
     "ask",
@@ -121,7 +129,7 @@ pub(crate) const GATE: &[&str] = &[
     "on_timeout",
     "approvers",
 ];
-const LATER_STEP: &[&str] = &["foreach", "concurrency", "merge_queue", "review", "retry"];
+const LATER_STEP: &[&str] = &["foreach", "concurrency", "merge_queue", "retry"];
 
 /// Load the workflow at `file`, checking it against `atoms` (by name).
 pub fn load(
@@ -547,6 +555,18 @@ pub fn load(
                         format!("atom `{atom_name}` has no compiled output contract"),
                     )
                 })?;
+            if let Some(review) = s.get("review") {
+                check_review(
+                    review,
+                    &format!("{sp}/review"),
+                    atom_name,
+                    atom,
+                    atoms,
+                    &scope,
+                    &out,
+                    &fail,
+                )?;
+            }
             step_schemas.insert(
                 id.clone(),
                 json!({"type": "object", "properties": {"output": out, "metadata": {"type": "object"}}, "additionalProperties": false}),
@@ -749,6 +769,210 @@ pub fn load(
         ),
         warnings,
     })
+}
+
+/// Check an atom step's `review` (at `rp`): a reviewer atom, not the author,
+/// whose output is a typed verdict; a `with` that maps its input from what
+/// the step sees and the `candidate` under review; and how many repair
+/// rounds the author gets.
+#[allow(clippy::too_many_arguments)]
+fn check_review(
+    review: &Value,
+    rp: &str,
+    author_name: &str,
+    author: &Atom,
+    atoms: &BTreeMap<String, Atom>,
+    scope: &Scope,
+    candidate_output: &Value,
+    fail: &dyn Fn(&str, String) -> WorkflowError,
+) -> Result<(), WorkflowError> {
+    let Value::Object(r) = review else {
+        return Err(fail(
+            rp,
+            "`review` is a mapping: `reviewer`, `with` and `rounds`".into(),
+        ));
+    };
+    for key in r.keys() {
+        if !REVIEW.contains(&key.as_str()) {
+            return Err(fail(
+                &format!("{rp}/{key}"),
+                format!(
+                    "unknown review field `{key}`; a review's fields are {}",
+                    REVIEW.join(", ")
+                ),
+            ));
+        }
+    }
+    if author.kind == "exec" {
+        return Err(fail(
+            rp,
+            format!(
+                "`{author_name}` is an exec atom, and a review's repair rounds run the author \
+                 again with the findings, which a command cannot read; review a model atom"
+            ),
+        ));
+    }
+    let name = r
+        .get("reviewer")
+        .and_then(Value::as_str)
+        .ok_or_else(|| fail(&format!("{rp}/reviewer"), "`reviewer` names an atom".into()))?;
+    if name == author_name {
+        return Err(fail(
+            &format!("{rp}/reviewer"),
+            format!("`{name}` would review its own output; name another atom as the reviewer"),
+        ));
+    }
+    let reviewer = atoms.get(name).ok_or_else(|| {
+        let near = crate::names::nearest(name, atoms.keys().map(String::as_str));
+        fail(
+            &format!("{rp}/reviewer"),
+            format!(
+                "no atom named `{name}`{}",
+                near.map(|n| format!("; did you mean {n}?"))
+                    .unwrap_or_default()
+            ),
+        )
+    })?;
+    if !matches!(reviewer.kind.as_str(), "lite" | "codex") {
+        return Err(fail(
+            &format!("{rp}/reviewer"),
+            format!(
+                "`{name}` is a {} atom; a reviewer is a lite or codex atom",
+                reviewer.kind
+            ),
+        ));
+    }
+    let verdict = reviewer.program.contracts.get("Output").ok_or_else(|| {
+        fail(
+            &format!("{rp}/reviewer"),
+            format!("atom `{name}` has no compiled output contract"),
+        )
+    })?;
+    is_verdict(verdict).map_err(|why| {
+        fail(
+            &format!("{rp}/reviewer"),
+            format!(
+                "`{name}`'s output is not a verdict: {why}. A reviewer outputs `decision` \
+                 (`approve`, `reject` or `escalate`) and `findings`, each with `where`, `what` \
+                 and `severity`"
+            ),
+        )
+    })?;
+    match r.get("rounds") {
+        None => {}
+        Some(n) if n.as_u64().is_some_and(|n| n <= MAX_REVIEW_ROUNDS) => {}
+        Some(_) => {
+            return Err(fail(
+                &format!("{rp}/rounds"),
+                format!("`rounds` is a whole number from 0 to {MAX_REVIEW_ROUNDS}"),
+            ));
+        }
+    }
+    // The reviewer's input, from what the step sees and the candidate.
+    let candidate = json!({"type": "object", "properties": {"output": candidate_output},
+        "additionalProperties": false});
+    let scope = scope.clone().with("candidate", &candidate);
+    let target = reviewer.program.contracts.get("Input").ok_or_else(|| {
+        fail(
+            &format!("{rp}/reviewer"),
+            format!("atom `{name}` has no compiled input contract"),
+        )
+    })?;
+    let fields = target
+        .get("properties")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let with = match r.get("with") {
+        None => Map::new(),
+        Some(Value::Object(w)) => w.clone(),
+        Some(_) => {
+            return Err(fail(
+                &format!("{rp}/with"),
+                "`with` maps the reviewer's input fields to CEL expressions".into(),
+            ));
+        }
+    };
+    for (field, e) in &with {
+        let wp = format!("{rp}/with/{field}");
+        if !fields.contains_key(field) {
+            let known: Vec<&str> = fields.keys().map(String::as_str).collect();
+            return Err(fail(
+                &wp,
+                format!(
+                    "atom `{name}` has no input field `{field}` (fields: {})",
+                    known.join(", ")
+                ),
+            ));
+        }
+        let source = e
+            .as_str()
+            .ok_or_else(|| fail(&wp, "a mapping is a CEL expression in a string".into()))?;
+        expr::parse(source)
+            .and_then(|p| p.check(&scope))
+            .map_err(|e| fail(&wp, e.to_string()))?;
+    }
+    for required in target
+        .get("required")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        if !with.contains_key(required) {
+            return Err(fail(
+                &format!("{rp}/with"),
+                format!(
+                    "atom `{name}` requires input field `{required}`, which `with` does not bind"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `contract` is a reviewer's verdict: an object requiring
+/// `decision`, a string among [`VERDICTS`], and `findings`, an array of
+/// objects with `where`, `what` and `severity`.
+pub fn is_verdict(contract: &Value) -> Result<(), String> {
+    let props = contract
+        .get("properties")
+        .and_then(Value::as_object)
+        .ok_or("it is not an object with properties")?;
+    let required: Vec<&str> = contract
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|r| r.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    for field in ["decision", "findings"] {
+        if !required.contains(&field) {
+            return Err(format!("it does not require `{field}`"));
+        }
+    }
+    let choices = props["decision"]
+        .get("enum")
+        .and_then(Value::as_array)
+        .filter(|c| !c.is_empty())
+        .ok_or("`decision` is not an enum")?;
+    for c in choices {
+        if !c.as_str().is_some_and(|c| VERDICTS.contains(&c)) {
+            return Err(format!("`decision` allows {c}"));
+        }
+    }
+    let item = props["findings"]
+        .get("items")
+        .filter(|_| props["findings"].get("type") == Some(&json!("array")))
+        .ok_or("`findings` is not an array")?;
+    let fields = item
+        .get("properties")
+        .and_then(Value::as_object)
+        .ok_or("a finding is not an object")?;
+    for field in ["where", "what", "severity"] {
+        if !fields.contains_key(field) {
+            return Err(format!("a finding has no `{field}`"));
+        }
+    }
+    Ok(())
 }
 
 /// Steps in an order respecting `after`, or a step on a cycle.

@@ -273,6 +273,7 @@ fn atom_pipeline(atom: Atom, input: &Value) -> anyhow::Result<Pipeline> {
                 .collect(),
             with,
             worktree: false,
+            review: None,
         })],
         returns: "steps.run.output".into(),
         input: input_contract,

@@ -58,6 +58,40 @@ outside the sandbox, and records the commit in `steps.<id>.metadata.commit`,
 beside `base` and `commit_ref`. The worktrees are removed when the run finishes;
 accepted commits keep their refs.
 
+### Review
+
+```yaml
+summarize:
+  atom: summarize-note
+  with:
+    text: input.text
+  review:
+    reviewer: review-summary
+    with:
+      source: input.text
+      draft: candidate.output.summary
+    rounds: 2
+```
+
+`review` has a reviewer atom check the step's output before any later step sees
+it. The reviewer is a lite or codex atom other than the author, and its output
+is a verdict: `decision`, one of `approve`, `reject` or `escalate`, and
+`findings`, each with `where`, `what` and `severity`. Its `with` maps its input
+from what the step can see and from `candidate.output`, the output under
+review. `rounds` (0 to 5, default 1) is how many repair rounds the author gets.
+
+The author's output stays unpublished while it is reviewed. An approval
+publishes it. A rejection with rounds left runs the author again on the same
+input, given its rejected output and the findings as data; the new output is
+reviewed in turn. An escalation, or a rejection with no rounds left, opens a
+gate, `<step>.review`, that shows the output and the verdict: a person approves
+the output as it stands, or rejects it and the run fails. A review never passes
+silently. The author's turn, each verdict and each repair round are durable
+steps of their own (`<step>.review.<n>`, `<step>.repair.<n>`), so a run resumed
+after a crash repeats none that finished. The reviewer's and the author's model
+calls are metered as any step's are. An exec atom cannot be reviewed: a command
+cannot read findings.
+
 ### Where each input came from
 
 Every mapped value reaches the atom's model as data labelled with its origin,
@@ -157,7 +191,8 @@ authorize downstream work. Its original wall-clock deadline continues while
 Atomic is offline; resume applies expiry before proceeding.
 
 `after: [review]` means the review finished, not that its verdict was `approve`.
-Use a review policy or a deliberate human gate to decide what happens next.
+Use a step's [`review`](#review) or a deliberate human gate to decide what
+happens next.
 
 `atomic run` and `atomic runs resume` show each gate their run reaches at the
 terminal and take the decision there: `a` or `r`, then a comment if you like.

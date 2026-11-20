@@ -915,6 +915,10 @@ fn pipeline_child() {
                     pipeline: load(&project, "gated.workflow.yaml", &gated()),
                     input: json!({"text": "Exporting a file named café.txt crashes the app."}),
                 },
+                "start-reviewed" => PipelineRun {
+                    pipeline: reviewed(&project, 1),
+                    input: json!({ "text": NOTE }),
+                },
                 _ => PipelineRun {
                     pipeline: load(&project, "fix.workflow.yaml", FIX),
                     input: json!({"title": "Export crashes on accents", "base": plain_git(&project, &["rev-parse", "HEAD"])}),
@@ -4089,4 +4093,315 @@ fn a_replay_takes_no_lock_on_the_store() {
             .await
             .expect("shutdown");
     });
+}
+
+/// A reviewer atom, `check-title`, whose output is a typed verdict, and a
+/// workflow whose `read` step it reviews, with `rounds` repair rounds.
+fn reviewed(project: &Path, rounds: u64) -> Pipeline {
+    write_atom(
+        project,
+        "check-title",
+        "Find what is wrong with this title for the note. Approve it only if it is right.\n\
+         Note: {input.text}\nTitle: {input.title}",
+        object(json!({"text": {"type": "string"}, "title": {"type": "string"}})),
+        object(json!({
+            "decision": {"type": "string", "enum": ["approve", "reject", "escalate"]},
+            "findings": {"type": "array", "items": object(json!({
+                "where": {"type": "string"},
+                "what": {"type": "string"},
+                "severity": {"type": "string", "enum": ["low", "medium", "high"]},
+            }))},
+        })),
+    );
+    load(
+        project,
+        "reviewed.workflow.yaml",
+        &format!(
+            "atomic: 1
+name: reviewed-note
+input: {{ $ref: ../atoms/read-note.input.schema.json }}
+output: {{ $ref: ../atoms/read-note.output.schema.json }}
+steps:
+  read:
+    atom: read-note
+    with: {{ text: input.text }}
+    review:
+      reviewer: check-title
+      with: {{ text: input.text, title: candidate.output.title }}
+      rounds: {rounds}
+returns: steps.read.output
+"
+        ),
+    )
+}
+
+/// The title a seeded bug gives the note: it says the opposite of the note.
+const WRONG: &str = r#"{"title": "Export works with accents", "words": 7}"#;
+const REJECT: &str = r#"{"decision": "reject", "findings": [{"where": "title", "what": "The note says the export crashes; the title says it works.", "severity": "high"}]}"#;
+const APPROVE: &str = r#"{"decision": "approve", "findings": []}"#;
+const NOTE: &str = "Exporting a file named café.txt crashes the app.";
+
+#[test]
+fn a_reviewer_catches_a_seeded_bug_and_escalates_after_its_repair_rounds() {
+    on_codex_runtime(async {
+        let dir = scratch("review-escalates");
+        let project = project(&dir);
+        let pipeline = reviewed(&project, 2);
+        // The author keeps the bug through both repair rounds; the reviewer
+        // rejects every candidate.
+        let model = FakeModel::start(vec![
+            Reply::Text(WRONG.into()),
+            Reply::Text(REJECT.into()),
+            Reply::Text(WRONG.into()),
+            Reply::Text(REJECT.into()),
+            Reply::Text(WRONG.into()),
+            Reply::Text(REJECT.into()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        let run = PipelineRun {
+            pipeline,
+            input: json!({ "text": NOTE }),
+        };
+        rt.start(PIPELINE, "review-1", run).await.expect("start");
+
+        // A person is asked, with the candidate and the verdict.
+        let g = open_gate(&rt, "review-1").await;
+        assert_eq!(g.id, "review-1:read.review");
+        assert!(
+            g.title
+                .contains("reviewer check-title rejected it after 2 repair round(s)"),
+            "{}",
+            g.title
+        );
+        assert_eq!(g.show["output"]["title"], "Export works with accents");
+        assert_eq!(g.show["verdict"]["decision"], "reject");
+        assert_eq!(g.show["verdict"]["findings"][0]["where"], "title");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            model.calls(),
+            6,
+            "the author three times, the reviewer three times, and nothing more"
+        );
+        // Each repair round was given the findings, as data.
+        let requests = model.requests();
+        for (i, request) in requests.iter().enumerate() {
+            let said = request.to_string();
+            let repair = said.contains("A reviewer rejected your previous output");
+            assert_eq!(repair, i == 2 || i == 4, "request {i}: {said}");
+            if repair {
+                assert!(said.contains("the title says it works"), "{said}");
+            }
+        }
+        // Nothing was published while the review ran.
+        let published = rt
+            .recorded_candidates("review-1")
+            .await
+            .expect("candidates");
+        assert!(!published.contains_key("read"), "{published:?}");
+
+        decide(&rt, &g, Verdict::Reject, "the title is wrong").await;
+        let error = rt
+            .result::<Value>("review-1")
+            .await
+            .expect_err("rejected")
+            .to_string();
+        assert!(
+            error.contains("its review escalated to gate `read.review`"),
+            "{error}"
+        );
+        assert!(error.contains("not published"), "{error}");
+        assert_eq!(model.calls(), 6);
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[test]
+fn a_repair_the_reviewer_approves_is_published_with_no_gate() {
+    on_codex_runtime(async {
+        let dir = scratch("review-approves");
+        let project = project(&dir);
+        let pipeline = reviewed(&project, 2);
+        let model = FakeModel::start(vec![
+            Reply::Text(WRONG.into()),
+            Reply::Text(REJECT.into()),
+            Reply::Text(READ.into()),
+            Reply::Text(APPROVE.into()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        let run = PipelineRun {
+            pipeline,
+            input: json!({ "text": NOTE }),
+        };
+        rt.start(PIPELINE, "review-2", run).await.expect("start");
+        let out: Value = rt.result("review-2").await.expect("finishes");
+        assert_eq!(out, serde_json::from_str::<Value>(READ).expect("json"));
+        assert_eq!(model.calls(), 4);
+        let open = gate::gates(&rt, GateFilter::default())
+            .await
+            .expect("gates");
+        assert!(open.is_empty(), "a gate opened: {open:?}");
+        // The record names the repaired candidate as the step's.
+        let published = rt
+            .recorded_candidates("review-2")
+            .await
+            .expect("candidates");
+        assert_eq!(
+            published["read"].proposal.output["title"],
+            "Export crashes on accents"
+        );
+        assert_eq!(
+            published["read.review.1"].proposal.output["decision"],
+            "approve"
+        );
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[test]
+fn a_reviewer_that_escalates_asks_a_person_at_once() {
+    on_codex_runtime(async {
+        let dir = scratch("review-escalate");
+        let project = project(&dir);
+        let pipeline = reviewed(&project, 2);
+        let model = FakeModel::start(vec![
+            Reply::Text(READ.into()),
+            Reply::Text(
+                r#"{"decision": "escalate", "findings": [{"where": "note", "what": "Is a crash on export urgent here?", "severity": "medium"}]}"#
+                    .into(),
+            ),
+        ])
+        .await
+        .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        let run = PipelineRun {
+            pipeline,
+            input: json!({ "text": NOTE }),
+        };
+        rt.start(PIPELINE, "review-3", run).await.expect("start");
+        let g = open_gate(&rt, "review-3").await;
+        assert!(
+            g.title.contains("reviewer check-title escalated it"),
+            "{}",
+            g.title
+        );
+        assert_eq!(model.calls(), 2, "no repair round on an escalation");
+        decide(&rt, &g, Verdict::Approve, "fine as it is").await;
+        let out: Value = rt.result("review-3").await.expect("finishes");
+        assert_eq!(out, serde_json::from_str::<Value>(READ).expect("json"));
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[test]
+fn a_review_its_author_cannot_be_given_is_refused_when_loaded() {
+    let dir = scratch("review-refused");
+    let project = project(&dir);
+    let _ = reviewed(&project, 1);
+    let workflow = |review: &str| {
+        format!(
+            "atomic: 1
+name: refused
+input: {{ $ref: ../atoms/read-note.input.schema.json }}
+output: {{ $ref: ../atoms/read-note.output.schema.json }}
+steps:
+  read:
+    atom: read-note
+    with: {{ text: input.text }}
+    review: {review}
+returns: steps.read.output
+"
+        )
+    };
+    for (review, said) in [
+        (
+            "{ reviewer: read-note, with: { text: input.text } }",
+            "would review its own output",
+        ),
+        (
+            "{ reviewer: rank-note, with: { title: candidate.output.title, words: 1 } }",
+            "is not a verdict",
+        ),
+        (
+            "{ reviewer: check-title, with: { text: input.text, title: candidate.output.title }, rounds: 9 }",
+            "`rounds` is a whole number from 0 to 5",
+        ),
+        (
+            "{ reviewer: check-title, with: { text: input.text } }",
+            "requires input field `title`",
+        ),
+        (
+            "{ reviewer: check-title, with: { text: input.text, title: candidate.output.nope } }",
+            "nope",
+        ),
+    ] {
+        let refused =
+            try_load(&project, "refused.workflow.yaml", &workflow(review)).expect_err("refused");
+        assert!(refused.contains(said), "{review}: {refused}");
+    }
+}
+
+#[test]
+fn a_process_killed_during_review_repeats_no_finished_turn() {
+    // Killed once the reviewer's rejection is published, and once the
+    // repair round's candidate is checkpointed: either way a new process
+    // goes on from there.
+    for (point, before) in [
+        ("checkpoint:after:read.review.0.publish", 2),
+        ("checkpoint:after:read.repair.1.turn", 3),
+    ] {
+        on_codex_runtime(async move {
+            let model = FakeModel::start(vec![
+                Reply::Text(WRONG.into()),
+                Reply::Text(REJECT.into()),
+                Reply::Text(READ.into()),
+                Reply::Text(APPROVE.into()),
+            ])
+            .await
+            .expect("fake model");
+            let dir = scratch(&format!("review-killed-{before}"));
+            project(&dir);
+            let url = model.base_url();
+            let (d, u) = (dir.clone(), url.clone());
+            let status = tokio::task::spawn_blocking(move || {
+                child(&d, &u, "start-reviewed", "review-killed", Some(point))
+            })
+            .await
+            .expect("child");
+            assert!(
+                !status.success(),
+                "{point}: the first process was killed: {status}"
+            );
+            assert_eq!(model.calls(), before, "{point}");
+            let (d, u) = (dir.clone(), url.clone());
+            let status = tokio::task::spawn_blocking(move || {
+                child(&d, &u, "recover", "review-killed", None)
+            })
+            .await
+            .expect("child");
+            assert!(
+                status.success(),
+                "{point}: the second process finished: {status}"
+            );
+            assert_eq!(model.calls(), 4, "{point}: no finished turn ran again");
+            let out: Value = serde_json::from_str(
+                &std::fs::read_to_string(dir.join("result.json")).expect("result"),
+            )
+            .expect("decode");
+            assert_eq!(
+                out,
+                serde_json::from_str::<Value>(READ).expect("json"),
+                "{point}"
+            );
+        });
+    }
 }

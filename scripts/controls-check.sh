@@ -48,6 +48,7 @@ CONTROLS=(
     "sandbox-private-state|crates/atomic-core/src/codex.rs|    for p in paths {|    for p in paths.into_iter().take(0) {|--workspace --features ${FEATURES} --test sandboxed_commit --test exec_private_state -- a_read_only_turn_in_a_worktree_sees_its_checkout an_exec_atom_cannot_reach_atomics_private_state"
     "sandbox-network|crates/atomic-core/src/codex.rs|    codex_protocol::permissions::NetworkSandboxPolicy::Restricted;|    codex_protocol::permissions::NetworkSandboxPolicy::Enabled;|--workspace --features ${FEATURES} --test self_approval an_atom_cannot_approve_its_own_gate_through_its_shell"
     "exec-confinement|crates/atomic-exec/src/lib.rs|            Some(confine) => confine.confine(command, &self.tmp),|            Some(confine) if std::hint::black_box(false) => confine.confine(command, &self.tmp), Some(_) => Ok(command.clone()),|--workspace --features ${FEATURES} --test exec_private_state --test run_cli -- an_exec_atom_cannot_reach_atomics_private_state atomic_run_confines_an_exec_atoms_command"
+    "review-escalates|crates/atomic/src/pipeline.rs|            _ => break (verdict, decision),|            \"reject\" => return Ok((candidate.clone(), review_candidate(&candidate))), _ => break (verdict, decision),|-p atomic-agentic --test pipeline a_reviewer_catches_a_seeded_bug_and_escalates_after_its_repair_rounds"
 )
 
 die() {

@@ -176,6 +176,10 @@ impl crate::runtime::Durare {
         let mut published = std::collections::BTreeMap::new();
         for step in steps {
             if let Some(name) = step.name.strip_suffix(".turn") {
+                // A repair round's turn (`draft.repair.1.turn`) replaces the
+                // candidate of the atom it repairs, which `draft.publish`
+                // publishes.
+                let name = repaired(name).unwrap_or(name);
                 let turn = match &step.output {
                     Some(output) if step.error.is_none() => {
                         serde_json::from_value::<Turn>(output.clone()).map_err(|e| {
@@ -219,6 +223,13 @@ impl crate::runtime::Durare {
         }
         Ok(published)
     }
+}
+
+/// The atom a repair round's operations name repairs: `draft` for
+/// `draft.repair.2`.
+fn repaired(name: &str) -> Option<&str> {
+    let (base, round) = name.rsplit_once(".repair.")?;
+    (!round.is_empty() && round.bytes().all(|b| b.is_ascii_digit())).then_some(base)
 }
 
 /// A parked run's row in `atomic_parks`.
