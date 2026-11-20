@@ -239,7 +239,7 @@ pub async fn open(
     if let Some(line) = resolved.announcement() {
         atomic_core::log_line!("{line}");
     }
-    let store = LocalStore::open(state.dir().join("artifacts")).context("the artifact store")?;
+    let store = LocalStore::for_project(state).context("the artifact store")?;
     let runner = match resolved.settings.runner.as_str() {
         "local" => RunnerKind::Local,
         "process" => RunnerKind::Process,
