@@ -229,8 +229,31 @@ async fn engine(dir: &Path, base_url: &str) -> Durare {
         })
         .expect("connects")
     });
-    engine_on(dir, base_url, logged).await
+    // A child process on a machine whose sandbox cannot start: a helper
+    // that runs nothing.
+    let unconfinable = std::env::var_os(ENV_UNCONFINABLE).map(|_| {
+        let paths =
+            atomic_core::codex::CodexPaths::with_helpers("/bin/false".into(), "/bin/false".into());
+        let sandbox = atomic_core::codex::ExecSandbox::new(
+            &paths,
+            atomic_core::codex::StateGuard::NoProjectState,
+            dir.join("codex"),
+        )
+        .expect("a helper");
+        atomic_exec::Backend::connect(
+            atomic_exec::LocalBackend::in_dir(
+                Path::new(env!("CARGO_TARGET_TMPDIR"))
+                    .join(format!("pipeline-unconfinable-{}", std::process::id())),
+            )
+            .confined(Arc::new(sandbox)),
+        )
+        .expect("connects")
+    });
+    engine_on(dir, base_url, logged.or(unconfinable)).await
 }
+
+/// Set in a child process whose sandbox cannot start.
+const ENV_UNCONFINABLE: &str = "ATOMIC_PIPELINE_UNCONFINABLE";
 
 /// Where a child process logs the workspaces it opens, when set.
 const ENV_OPEN_LOG: &str = "ATOMIC_PIPELINE_OPEN_LOG";
@@ -1487,6 +1510,64 @@ fn an_interrupted_exec_step_declared_idempotent_runs_again() {
 #[test]
 fn an_interrupted_exec_step_declared_read_only_runs_again() {
     on_codex_runtime(interrupted_declared_exec_runs_again("read-only"));
+}
+
+/// Where the sandbox cannot start, a step that runs commands stops the
+/// process with what the sandbox needs, recording nothing: the run stays
+/// pending, its command never ran, and it finishes when resumed where the
+/// sandbox can start. (A step's failure, recorded, would end it for good.)
+#[test]
+fn a_run_stops_without_an_outcome_where_the_sandbox_cannot_start() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
+            .await
+            .expect("fake model");
+        let dir = scratch("unconfinable");
+        project(&dir);
+        write_send_note(&dir, None);
+        let url = model.base_url();
+        let (d, u) = (dir.clone(), url.clone());
+        let status = tokio::task::spawn_blocking(move || {
+            child_in(
+                &d,
+                &u,
+                "start-sent",
+                "unconfinable-1",
+                None,
+                "UTC",
+                &[(ENV_UNCONFINABLE, "1")],
+            )
+        })
+        .await
+        .expect("child");
+        assert_eq!(
+            status.code(),
+            Some(atomic_app::workflows::UNCONFINABLE_EXIT),
+            "stopped as unconfinable: {status}"
+        );
+        assert_eq!(sends(&dir), 0, "the command never ran");
+        assert_eq!(model.calls(), 0);
+        {
+            let rt = Durare::sqlite(&dir.join("atomic.db")).await.expect("store");
+            assert!(
+                matches!(
+                    rt.status("unconfinable-1").await.expect("status"),
+                    Some(RunStatus::Pending)
+                ),
+                "no outcome was recorded"
+            );
+        }
+        // Resumed where the sandbox can start, it runs.
+        let (d, u) = (dir.clone(), url.clone());
+        let status = tokio::task::spawn_blocking(move || {
+            child_in(&d, &u, "recover", "unconfinable-1", None, "UTC", &[])
+        })
+        .await
+        .expect("child");
+        assert!(status.success(), "resumed: {status}");
+        assert_eq!(sends(&dir), 1);
+        assert!(dir.join("result.json").exists());
+    });
 }
 
 /// A finished exec step is never opened again: recovering the run after a

@@ -58,9 +58,24 @@ pub struct ChangeRequestResult {
 /// a cap that left no room for its next call parks the run instead. (An
 /// execution backend with no room makes the run wait; see
 /// `atomic_core::runtime`.)
+/// The exit code of a process that stopped because it cannot confine atoms'
+/// commands: a configuration error, as `atomic runner`'s contract has it.
+pub const UNCONFINABLE_EXIT: i32 = 78;
+
 pub(crate) fn failed(e: AtomError) -> DurableError {
     match e {
         AtomError::Budget(why) => DurableError::Parked(why),
+        // Nothing ran, and nothing will on this machine until it is fixed:
+        // the process stops, recording nothing, and the run waits to be
+        // resumed where atoms' commands can be confined.
+        AtomError::Unconfinable(why) => {
+            eprintln!("atomic: {why}");
+            eprintln!(
+                "atomic: stopping without recording an outcome; resume the run where the sandbox \
+                 can start"
+            );
+            std::process::exit(UNCONFINABLE_EXIT);
+        }
         e => DurableError::Failed(e.to_string()),
     }
 }

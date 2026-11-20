@@ -115,8 +115,9 @@ ATOMIC_DEV_SANDBOX=on scripts/dev.sh cargo test --workspace --locked \
 
 With the feature on, a sandbox that cannot start fails the tests. atomic itself
 needs the sandbox on Linux to run exec atoms and codex atoms' commands, and
-fails such a step without it, so the tests that drive the `atomic` executable
-(`crates/atomic/tests/run_cli.rs`) are behind the same feature there.
+stops before such a step without it, so the tests in
+`crates/atomic/tests/run_cli.rs` that run commands are behind the same feature
+there; the rest of that file runs in a plain `cargo test`.
 
 ## Releases
 

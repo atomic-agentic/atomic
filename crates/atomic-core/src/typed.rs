@@ -99,6 +99,12 @@ pub enum AtomError {
     /// made. Not a failure of the atom: a durable run parks on it.
     #[error("budget: {0}")]
     Budget(String),
+    /// The machine cannot confine the atom's commands at all, such as where
+    /// user namespaces are not allowed; nothing ran. Not a failure of the
+    /// atom: a durable run must stop without recording anything, to run the
+    /// step once the machine is fixed.
+    #[error("{0}")]
+    Unconfinable(String),
     /// Anything else in running the atom.
     #[error("{0}")]
     Runtime(String),

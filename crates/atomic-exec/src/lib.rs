@@ -220,6 +220,14 @@ pub enum ExecError {
         /// What failed.
         message: String,
     },
+    /// Commands cannot be confined on this machine at all, such as where
+    /// user namespaces are not allowed: nothing was started, and nothing will
+    /// start until the machine is fixed.
+    #[error("{message}")]
+    Unconfinable {
+        /// What the sandbox needs.
+        message: String,
+    },
     /// The backend cannot open a workspace now, for a reason that may pass,
     /// such as a full disk or no room for another runner: trying again later
     /// may succeed, and nothing was started.
@@ -338,9 +346,9 @@ pub struct LocalBackend {
     scratch_root: PathBuf,
     tmp: PathBuf,
     confine: Option<Arc<dyn Confine>>,
-    /// Whether its confinement works here, checked the first time a
-    /// workspace with files opens, and kept.
-    checked: Arc<std::sync::OnceLock<Result<(), ExecError>>>,
+    /// Set once its confinement has been seen to work here; a check that
+    /// fails is made again the next time.
+    checked: Arc<std::sync::OnceLock<()>>,
 }
 
 impl std::fmt::Debug for LocalBackend {
@@ -458,23 +466,33 @@ impl ExecutionBackend for LocalBackend {
     }
 
     /// A workspace with files is where confined commands, or a turn's
-    /// commands, will run: the first one checks that its confinement works
-    /// here ([`Confine::check`]), once for the backend, and while it does not
-    /// every such workspace is refused with the check's reason, before
-    /// anything runs. A workspace with no files, such as a lite atom's, needs
-    /// no check.
+    /// commands, will run: until its confinement has been seen to work here
+    /// ([`Confine::check`]), each such open checks it first and is refused,
+    /// before anything runs, if it does not: with
+    /// [`ExecError::Unavailable`] when the check may pass later (no room, no
+    /// process to spare), or [`ExecError::Unconfinable`] when the machine
+    /// cannot confine commands at all. Only a check that passed is kept. A
+    /// workspace with no files, such as a lite atom's, needs no check.
     fn open(&self, request: &Open) -> Result<Workspace, ExecError> {
-        if let (Some(confine), Some(_)) = (&self.confine, &request.source) {
-            let checked = self.checked.get_or_init(|| {
-                workspace::ensure_private(&self.tmp).map_err(|e| ExecError::Workspace {
-                    label: request.label.clone(),
-                    message: format!("create {}: {e}", self.tmp.display()),
-                })?;
-                confine.check(&self.tmp)
-            });
-            if let Err(e) = checked {
-                return Err(e.clone());
-            }
+        if let (Some(confine), Some(_)) = (&self.confine, &request.source)
+            && self.checked.get().is_none()
+        {
+            workspace::ensure_private(&self.tmp).map_err(|e| {
+                let message = format!("create {}: {e}", self.tmp.display());
+                if workspace::transient(&e) {
+                    ExecError::Unavailable {
+                        label: request.label.clone(),
+                        message,
+                    }
+                } else {
+                    ExecError::Workspace {
+                        label: request.label.clone(),
+                        message,
+                    }
+                }
+            })?;
+            confine.check(&self.tmp)?;
+            let _ = self.checked.set(());
         }
         workspace::open_local(&self.scratch_root, &self.tmp, request)
     }

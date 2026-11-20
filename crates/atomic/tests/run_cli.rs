@@ -21,9 +21,14 @@
 //! atom logs each time its command runs.
 
 // On Linux, atomic runs exec atoms' commands only under Codex's sandbox,
-// and refuses to start where it cannot: these tests need it, and with the
-// `sandbox-tests` feature on, a sandbox that cannot start fails them.
-#![cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+// and stops a run that needs it where it cannot start: the tests that run
+// commands need it (they are marked `needs_sandbox` below), and with the
+// `sandbox-tests` feature on, a sandbox that cannot start fails them. The
+// others run everywhere.
+#![cfg_attr(
+    all(target_os = "linux", not(feature = "sandbox-tests")),
+    allow(dead_code, unused_imports)
+)]
 #![recursion_limit = "512"]
 
 use atomic_core::testing::{FakeModel, Reply, on_codex_runtime};
@@ -296,6 +301,19 @@ fn state_dir(dir: &Path, project: &Path) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(&out.stdout).trim())
 }
 
+/// The database of the project whose state directory is `state`
+/// (`<home>/projects/<id>`): `<home>/private/<id>/atomic.db`.
+fn database(state: &Path) -> PathBuf {
+    let id = state.file_name().expect("a project id");
+    state
+        .parent()
+        .and_then(Path::parent)
+        .expect("the atomic home")
+        .join("private")
+        .join(id)
+        .join("atomic.db")
+}
+
 fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
     let started = Instant::now();
     while !done() {
@@ -373,6 +391,8 @@ fn wait_child(child: &mut Child, what: &str) -> std::process::ExitStatus {
     }
 }
 
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn a_name_a_path_and_the_project_flag_run_the_same_atom_on_the_same_input() {
     let dir = scratch("same");
@@ -451,6 +471,8 @@ fn a_name_a_path_and_the_project_flag_run_the_same_atom_on_the_same_input() {
     );
 }
 
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn a_workflow_runs_by_name_and_by_file() {
     let dir = scratch("workflow");
@@ -554,6 +576,8 @@ fn errors_say_what_to_do_and_json_carries_the_action_apart() {
     assert!(count_log(&dir).is_empty());
 }
 
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn a_run_killed_after_a_step_resumes_by_its_id_and_reruns_nothing_finished() {
     on_codex_runtime(async {
@@ -606,6 +630,8 @@ fn a_run_killed_after_a_step_resumes_by_its_id_and_reruns_nothing_finished() {
     });
 }
 
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn a_run_killed_at_a_gate_keeps_it_and_its_deadline_and_one_resume_runs_at_a_time() {
     on_codex_runtime(async {
@@ -623,9 +649,7 @@ fn a_run_killed_at_a_gate_keeps_it_and_its_deadline_and_one_resume_runs_at_a_tim
             &with(&env, &[]),
             &dir.join("first.log"),
         );
-        let rt = Durare::sqlite(&state.join("private/atomic.db"))
-            .await
-            .expect("store");
+        let rt = Durare::sqlite(&database(&state)).await.expect("store");
         let opened = open_gate(&rt, "gated-1").await;
         assert!(opened.deadline.is_some());
         first.kill().expect("SIGKILL the run");
@@ -689,6 +713,8 @@ fn a_run_killed_at_a_gate_keeps_it_and_its_deadline_and_one_resume_runs_at_a_tim
     });
 }
 
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn serve_started_after_a_kill_recovers_the_run_and_finishes_it() {
     on_codex_runtime(async {
@@ -724,9 +750,7 @@ fn serve_started_after_a_kill_recovers_the_run_and_finishes_it() {
             &with(&env, &[]),
             &dir.join("serve.log"),
         );
-        let rt = Durare::sqlite(&state.join("private/atomic.db"))
-            .await
-            .expect("store");
+        let rt = Durare::sqlite(&database(&state)).await.expect("store");
         let started = Instant::now();
         while rt.status("served-1").await.expect("status") != Some(RunStatus::Succeeded) {
             assert!(
@@ -771,12 +795,14 @@ fn serve_started_after_a_kill_recovers_the_run_and_finishes_it() {
 /// credential store, write a gate decision, or open a socket, and can still
 /// read the project.
 #[cfg(target_os = "linux")]
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn atomic_run_confines_an_exec_atoms_command() {
     let dir = scratch("confined");
     let project = project(&dir);
     let state = state_dir(&dir, &project);
-    let db = state.join("private/atomic.db");
+    let db = database(&state);
     let credentials = dir.join("atomic-home/credentials");
     std::fs::create_dir_all(&credentials).expect("credentials");
     let credential = credentials.join("local-dev");
@@ -810,30 +836,35 @@ fn atomic_run_confines_an_exec_atoms_command() {
             json!({"db": field, "gate": field, "credential": field, "tcp": field, "project": field}),
         ),
     );
-    let out = atomic(
-        &dir,
-        &project,
-        &["run", "probe-private", "--data", "{}"],
-        &[],
-        "",
-    );
-    assert!(out.status.success(), "{}", text(&out));
     let denied = |p: &Path| {
         format!(
             "PermissionError: [Errno 13] Permission denied: '{}'",
             p.display()
         )
     };
-    assert_eq!(
-        stdout_json(&out),
-        json!({
-            "db": denied(&db),
-            "gate": "OperationalError: unable to open database file",
-            "credential": denied(&credential),
-            "tcp": "PermissionError: [Errno 1] Operation not permitted",
-            "project": "ok",
-        })
-    );
+    // As the engine wires it, on this process's backend and through a
+    // runner process.
+    for runner in ["local", "process"] {
+        let out = atomic(
+            &dir,
+            &project,
+            &["run", "probe-private", "--runner", runner, "--data", "{}"],
+            &[],
+            "",
+        );
+        assert!(out.status.success(), "{runner}: {}", text(&out));
+        assert_eq!(
+            stdout_json(&out),
+            json!({
+                "db": denied(&db),
+                "gate": "OperationalError: unable to open database file",
+                "credential": denied(&credential),
+                "tcp": "PermissionError: [Errno 1] Operation not permitted",
+                "project": "ok",
+            }),
+            "{runner}"
+        );
+    }
 }
 
 /// State under /tmp would put atom commands' scratch directories where
@@ -863,6 +894,8 @@ fn state_under_the_temporary_directory_is_refused() {
     assert!(count_log(&dir).is_empty(), "nothing ran");
 }
 
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn exec_commands_run_in_a_runner_process_when_asked() {
     let dir = scratch("runner");
@@ -953,6 +986,8 @@ fn the_executor_identity_is_atomics_own_and_required_on_postgres() {
 /// Two processes on one PostgreSQL store, each with its own identity, each
 /// with a run waiting at a gate. One is killed; `atomic serve` restarted
 /// under its identity recovers its run and not the live one's.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn a_restarted_server_recovers_only_its_own_runs_on_postgres() {
     if !atomic_durable::POSTGRES_TESTS {

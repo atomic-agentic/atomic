@@ -299,6 +299,9 @@ pub(crate) async fn open_workspace(
                 tokio::time::sleep(wait).await;
                 wait = (wait * 2).min(OPEN_WAIT_MAX);
             }
+            Err(atomic_exec::ExecError::Unconfinable { message }) => {
+                return Err(AtomError::Unconfinable(message));
+            }
             Err(e) => return Err(AtomError::Runtime(format!("{label}: {e}"))),
         }
     }

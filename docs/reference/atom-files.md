@@ -48,8 +48,9 @@ in `env`, plus its own `HOME` and `TMPDIR` and the effect variables below.
 
 On Linux the command runs under the same sandbox as a Codex atom's commands. It
 can read the project and the rest of the filesystem except atomic's private
-state (every project's database and gate store, Codex's records, the credential
-and key directories). It can write only its own scratch directory (its `HOME`
+state (every project's database and gate store under the atomic home's
+`private/`, the current project's Codex records, the credential and key
+directories). It can write only its own scratch directory (its `HOME`
 and `TMPDIR`) and the project's build caches; a command that writes anywhere
 else fails. It has no network and cannot use sockets, until atoms can declare
 the network they need. It also:
@@ -70,9 +71,10 @@ reads (`LD_*`, `DYLD_*`, `GCONV_PATH`, `GLIBC_TUNABLES`), which would load code
 into the sandbox helper.
 
 On Linux, an atom that runs commands, an exec atom or a codex atom, needs
-bubblewrap and unprivileged user namespaces. Where the sandbox cannot run, the
-first such step fails before anything runs, saying what it needs; atoms that
-run no commands, such as lite atoms, run as usual. On macOS and Windows the
+bubblewrap and unprivileged user namespaces. Where the sandbox cannot start,
+atomic stops before such a step runs, saying what it needs and recording
+nothing, so the run continues once resumed where the sandbox can start; atoms
+that run no commands, such as lite atoms, run as usual. On macOS and Windows the
 command is not confined yet.
 
 A step runs at least once, and Atomic cannot see what a command does to other

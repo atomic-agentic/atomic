@@ -1790,8 +1790,10 @@ fn a_codex_atom_passes_its_declared_tool_homes_to_its_workspace() {
 
 /// Where the sandbox cannot run, the backend still connects and an atom
 /// that needs no sandbox, such as a lite atom, runs; an exec atom, or a
-/// codex atom whose turn would run commands, fails before anything runs,
-/// with what the sandbox needs. The check is made once.
+/// codex atom whose turn would run commands, is refused before anything
+/// runs as unconfinable, with what the sandbox needs, which a durable run
+/// stops on without recording anything. A failed check is not kept: each
+/// such atom checks again.
 #[test]
 fn only_atoms_that_run_commands_need_the_sandbox() {
     use crate::codex::{CodexPaths, ExecSandbox, StateGuard};
@@ -1851,7 +1853,7 @@ fn only_atoms_that_run_commands_need_the_sandbox() {
         )
         .await;
         let refused = |e: Option<&AtomError>| {
-            matches!(e, Some(AtomError::Runtime(m))
+            matches!(e, Some(AtomError::Unconfinable(m))
                 if m.contains("cannot start here")
                     && m.contains("bubblewrap")
                     && m.contains("unprivileged user namespaces")
@@ -1862,9 +1864,69 @@ fn only_atoms_that_run_commands_need_the_sandbox() {
         assert!(refused(r.as_ref().err()), "{r:?}");
         assert_eq!(
             checks.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "checked once"
+            2,
+            "a failed check is made again"
         );
         assert_eq!(model.calls(), 1, "only the lite atom called the model");
+    });
+}
+
+/// A sandbox check that fails for a reason that may pass (no room, no
+/// process to spare) makes the run wait, as a backend with no room does,
+/// and once it passes it is kept.
+#[test]
+fn a_check_that_may_pass_is_waited_for_and_kept_once_it_passes() {
+    struct Flaky(Arc<std::sync::atomic::AtomicUsize>);
+    impl atomic_exec::Confine for Flaky {
+        fn confine(
+            &self,
+            command: &atomic_exec::Command,
+            _: &std::path::Path,
+        ) -> Result<atomic_exec::Command, atomic_exec::ExecError> {
+            Ok(command.clone())
+        }
+        fn check(&self, _: &std::path::Path) -> Result<(), atomic_exec::ExecError> {
+            if self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
+                return Err(atomic_exec::ExecError::Unavailable {
+                    label: "the sandbox check".into(),
+                    message: "no process to spare".into(),
+                });
+            }
+            Ok(())
+        }
+    }
+    on_codex_runtime(async {
+        let model = FakeModel::start(Vec::new()).await.expect("fake model");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/atomic-core-tests")
+            .join(format!("flaky-check-{}", std::process::id()));
+        let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let backend = atomic_exec::Backend::connect(
+            atomic_exec::LocalBackend::in_dir(root.join("scratch"))
+                .confined(Arc::new(Flaky(checks.clone()))),
+        )
+        .expect("connects");
+        let mut all = runtimes(&model, "flaky-check");
+        all.exec = backend;
+        let (_, a, compiled) = exec_project("flaky-check", TOTAL, "");
+        for run in ["run-1", "run-2"] {
+            let (out, _) = run_declarative(
+                &a,
+                &compiled,
+                &mut Registry::new(),
+                &json!({"cents": [1, 2]}),
+                run,
+                "external",
+                &all,
+            )
+            .await
+            .expect("runs once the check passes");
+            assert_eq!(out, json!({"total": 3}));
+        }
+        assert_eq!(
+            checks.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "two refusals, one pass, then kept"
+        );
     });
 }

@@ -138,11 +138,15 @@ pub enum StateGuard {
 /// What [`StateGuard::Deny`] denies.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrivateState {
-    /// The project's state directory: its `private/` directory is denied,
-    /// and each thread gets its temporary directory in its `tmp/`.
+    /// The project's state directory, where each thread gets its temporary
+    /// directory in its `tmp/`.
     pub state_dir: PathBuf,
-    /// Other directories denied whole: the context key and the credential
-    /// file store.
+    /// Where every project of the atomic home keeps its private state
+    /// (`<home>/private`): denied whole, by one entry, so a project made
+    /// while a thread runs is covered too.
+    pub private: PathBuf,
+    /// Other directories denied whole: the context key, the credential file
+    /// store, and another atomic home's state.
     pub also: Vec<PathBuf>,
 }
 
@@ -154,16 +158,28 @@ impl StateGuard {
         Self::deny_state_dir(state.dir())
     }
 
-    /// The guard for a state directory at `state_dir`, with the user-wide
-    /// private directories as configured.
+    /// The guard for a state directory at `state_dir`, with the atomic home's
+    /// private state and the user-wide private directories as configured.
     pub fn deny_state_dir(state_dir: impl Into<PathBuf>) -> anyhow::Result<Self> {
+        let private = crate::state::base_dir()?.join("private");
+        crate::state::private_dir(&private)?;
         let mut also = vec![crate::state::credentials_dir()?];
         also.push(crate::context::default_key_dir().map_err(anyhow::Error::msg)?);
         for dir in &also {
             crate::state::private_dir(dir)?;
         }
+        // With ATOMIC_HOME set, the default home's state, credentials and
+        // keys are another atomic's: denied too, where they exist.
+        if std::env::var_os("ATOMIC_HOME").is_some_and(|h| !h.is_empty()) {
+            let defaults = [
+                dirs::data_dir().map(|d| d.join("atomic")),
+                dirs::config_dir().map(|d| d.join("atomic")),
+            ];
+            also.extend(defaults.into_iter().flatten().filter(|d| d.exists()));
+        }
         Ok(Self::Deny(PrivateState {
             state_dir: state_dir.into(),
+            private,
             also,
         }))
     }
@@ -176,19 +192,9 @@ impl StateGuard {
 /// below, so the sandbox needs no mount inside a denied directory. Both
 /// spellings of a path reached through a link are denied.
 fn denied_paths(private: &PrivateState, codex_home: &Path) -> (Vec<PathBuf>, Vec<String>) {
-    let mut denied = vec![private.state_dir.join("private")];
-    // Every other project's private state under the same atomic home too, as
-    // the projects stand when the thread or command starts.
-    if let Some(projects) = private.state_dir.parent() {
-        denied.extend(
-            std::fs::read_dir(projects)
-                .into_iter()
-                .flatten()
-                .flatten()
-                .map(|project| project.path().join("private"))
-                .filter(|dir| dir.is_dir() && *dir != private.state_dir.join("private")),
-        );
-    }
+    // Every project's private state, by one entry, however many projects
+    // the home holds.
+    let mut denied = vec![private.private.clone()];
     denied.extend(private.also.iter().cloned());
     let children = |dir: &Path, keep: &str| -> Vec<PathBuf> {
         std::fs::read_dir(dir)
@@ -631,8 +637,7 @@ impl atomic_exec::Confine for ExecSandbox {
         let confined = self.confine(&probe, tmp)?;
         let done =
             atomic_exec::ExecutionBackend::run(&atomic_exec::LocalBackend::default(), &confined);
-        let refuse = |why: String| atomic_exec::ExecError::Workspace {
-            label: "the execution backend".into(),
+        let refuse = |why: String| atomic_exec::ExecError::Unconfinable {
             message: format!(
                 "exec atoms' commands run under Codex's Linux sandbox, which cannot start here \
                  ({why}). It needs bubblewrap and unprivileged user namespaces; in a container, \
@@ -648,7 +653,12 @@ impl atomic_exec::Confine for ExecSandbox {
                     .map_or_else(|| "a signal".to_owned(), |c| format!("code {c}")),
                 String::from_utf8_lossy(&done.stderr).trim()
             ))),
-            Err(e) => Err(refuse(e.to_string())),
+            // The trial could not even start: no room or no process to
+            // spare, which may pass.
+            Err(e) => Err(atomic_exec::ExecError::Unavailable {
+                label: "the sandbox check".into(),
+                message: e.to_string(),
+            }),
         }
     }
 }
@@ -1562,6 +1572,7 @@ mod tests {
         );
         let guard = StateGuard::Deny(PrivateState {
             state_dir: state.clone(),
+            private: state.join("private"),
             also: vec![state.join("keys")],
         });
         let sandbox = ExecSandbox::new(&paths, guard, state.join("codex"))
@@ -1616,6 +1627,49 @@ mod tests {
             );
         }
         assert!(text.contains("restricted"), "no network: {text}");
+    }
+
+    /// However many projects the atomic home holds, their private state is
+    /// denied by one entry: the profile a command carries on its command
+    /// line stays the same size.
+    #[test]
+    fn the_profile_stays_bounded_however_many_projects_there_are() {
+        use atomic_exec::Confine;
+        let home = scratch("many-projects");
+        let paths =
+            CodexPaths::with_helpers("/opt/atomic".into(), "/opt/codex-linux-sandbox".into());
+        let profile_len = |home: &Path| {
+            let guard = StateGuard::Deny(PrivateState {
+                state_dir: home.join("projects/p0"),
+                private: home.join("private"),
+                also: Vec::new(),
+            });
+            let sandbox =
+                ExecSandbox::new(&paths, guard, home.join("projects/p0/codex")).expect("helper");
+            let confined = sandbox
+                .confine(
+                    &atomic_exec::Command {
+                        program: "sh".into(),
+                        cwd: home.to_owned(),
+                        ..Default::default()
+                    },
+                    home,
+                )
+                .expect("confined");
+            confined.args.iter().map(String::len).sum::<usize>()
+        };
+        std::fs::create_dir_all(home.join("private/p0")).expect("one project");
+        let one = profile_len(&home);
+        for n in 1..1000 {
+            std::fs::create_dir_all(home.join(format!("private/p{n}"))).expect("project");
+            std::fs::create_dir_all(home.join(format!("projects/p{n}"))).expect("state");
+        }
+        assert_eq!(
+            profile_len(&home),
+            one,
+            "the profile grew with the projects"
+        );
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -1754,6 +1808,7 @@ mod tests {
         std::fs::create_dir_all(home.join("tmp/other")).expect("codex tmp");
         let guard = StateGuard::Deny(PrivateState {
             state_dir: state.clone(),
+            private: state.join("private"),
             also: vec![dir.join("keys"), dir.join("credentials")],
         });
         let write = permission_profile(Sandbox::WorkspaceWrite, &guard, &home).expect("rw");
@@ -1865,6 +1920,7 @@ mod tests {
         }
         let mine = TurnTemp::create(&StateGuard::Deny(PrivateState {
             state_dir: state.clone(),
+            private: state.join("private"),
             also: Vec::new(),
         }))
         .expect("live");

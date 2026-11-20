@@ -151,8 +151,11 @@ fn an_exec_atom_cannot_reach_atomics_private_state() {
         std::env::set_var("ATOMIC_HOME", dir.join("home"));
     }
     on_codex_runtime(async move {
-        let state = dir.join("state");
-        let db = state.join("private/atomic.db");
+        // The layout atomic keeps: state under the home's `projects/`, and
+        // every project's private state under its `private/`.
+        let state = dir.join("home/projects/p");
+        std::fs::create_dir_all(&state).expect("state");
+        let db = dir.join("home/private/p/atomic.db");
         std::fs::create_dir_all(db.parent().expect("private")).expect("private");
         atomic_durable::store::open_sqlite(&db)
             .await
@@ -163,7 +166,7 @@ fn an_exec_atom_cannot_reach_atomics_private_state() {
         std::fs::write(&credential, "the operator's secret").expect("credential");
 
         // Another project's state under the same atomic home.
-        let other_db = dir.join("other/private/atomic.db");
+        let other_db = dir.join("home/private/other/atomic.db");
         std::fs::create_dir_all(other_db.parent().expect("private")).expect("other");
         std::fs::write(&other_db, "SQLite format 3").expect("other db");
         // A socket a confined command must not reach, such as a bus, and a

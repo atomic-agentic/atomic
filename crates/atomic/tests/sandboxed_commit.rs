@@ -309,6 +309,7 @@ fn a_project_under_the_system_temporary_directory_stays_out_of_reach() {
         );
         let guard = StateGuard::Deny(PrivateState {
             state_dir: state.clone(),
+            private: state.join("private"),
             also: Vec::new(),
         });
         let spec = TurnSpec {
@@ -359,6 +360,7 @@ fn a_read_only_turn_in_a_worktree_sees_its_checkout() {
         assert!(wt.path.starts_with(&state));
         let guard = StateGuard::Deny(PrivateState {
             state_dir: state.clone(),
+            private: state.join("private"),
             also: Vec::new(),
         });
         let command = format!(
