@@ -144,6 +144,50 @@ fn linked(dirs: &[PathBuf]) -> Option<&PathBuf> {
         .find(|d| std::fs::symlink_metadata(d).is_ok_and(|m| m.file_type().is_symlink()))
 }
 
+/// Write each of `files`, made new, filling each with `fill`. If any write
+/// fails, everything written and every directory made is removed again, so
+/// a failure leaves no half project behind.
+fn write_new(
+    files: &[(PathBuf, String)],
+    mut fill: impl FnMut(&mut std::fs::File, &str) -> std::io::Result<()>,
+) -> anyhow::Result<()> {
+    let (mut made, mut written): (Vec<PathBuf>, Vec<PathBuf>) = (Vec::new(), Vec::new());
+    let mut each = || -> anyhow::Result<()> {
+        for (file, text) in files {
+            if let Some(parent) = file.parent() {
+                let missing: Vec<PathBuf> = parent
+                    .ancestors()
+                    .take_while(|d| !d.exists())
+                    .map(Path::to_path_buf)
+                    .collect();
+                std::fs::create_dir_all(parent)?;
+                made.extend(missing.into_iter().rev());
+            }
+            // Made new, so a file or link that appeared since is never
+            // written through, nor removed if this fails.
+            let mut out = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(file)
+                .with_context(|| format!("write {}", file.display()))?;
+            written.push(file.clone());
+            fill(&mut out, text).with_context(|| format!("write {}", file.display()))?;
+        }
+        Ok(())
+    };
+    let outcome = each();
+    if outcome.is_err() {
+        for file in written.iter().rev() {
+            let _ = std::fs::remove_file(file);
+        }
+        // Deepest first; one that holds something else stays.
+        for dir in made.iter().rev() {
+            let _ = std::fs::remove_dir(dir);
+        }
+    }
+    outcome
+}
+
 /// Whether `dir` holds nothing a project would sit beside: nothing at all,
 /// or only an empty repository's `.git`.
 fn is_empty(dir: &Path) -> anyhow::Result<bool> {
@@ -267,19 +311,9 @@ pub fn init(args: InitArgs) -> anyhow::Result<()> {
         )
         .into());
     }
-    for (file, text) in &files {
-        if let Some(parent) = file.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        // Made new, so a file or link that appeared since is never written
-        // through.
-        let mut out = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(file)
-            .with_context(|| format!("write {}", file.display()))?;
-        std::io::Write::write_all(&mut out, text.as_bytes())?;
-    }
+    write_new(&files, |out, text| {
+        std::io::Write::write_all(out, text.as_bytes())
+    })?;
     let shown = |p: &Path| p.strip_prefix(&dir).unwrap_or(p).display().to_string();
     println!(
         "made {} project {name} in {}:",
@@ -298,7 +332,7 @@ pub fn init(args: InitArgs) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{InitArgs, bad_name, init, name_from};
+    use super::{InitArgs, bad_name, init, name_from, write_new};
     use crate::failure::Failure;
     use std::path::{Path, PathBuf};
 
@@ -348,6 +382,50 @@ mod tests {
                 "{linked}: nothing written through the link"
             );
         }
+    }
+
+    #[test]
+    fn a_write_that_fails_leaves_nothing_behind() {
+        let dir = scratch("half");
+        std::fs::create_dir_all(dir.join("keep")).expect("keep");
+        let files: Vec<(PathBuf, String)> = [
+            "atomic.yaml",
+            "atoms/a.astro",
+            "keep/b.yaml",
+            "evals/x/c.yaml",
+            "workflows/d.yaml",
+        ]
+        .iter()
+        .map(|f| (dir.join(f), "x\n".to_owned()))
+        .collect();
+        let mut n = 0;
+        let failed = write_new(&files, |out, text| {
+            n += 1;
+            if n == 4 {
+                return Err(std::io::Error::other("disk full"));
+            }
+            std::io::Write::write_all(out, text.as_bytes())
+        });
+        assert!(failed.is_err());
+        let left: Vec<String> = walk(&dir);
+        assert_eq!(left, ["keep"], "only what was there before");
+    }
+
+    /// Every path under `dir`, relative, sorted.
+    fn walk(dir: &Path) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut todo = vec![dir.to_path_buf()];
+        while let Some(d) = todo.pop() {
+            for entry in std::fs::read_dir(&d).expect("read") {
+                let path = entry.expect("entry").path();
+                out.push(path.strip_prefix(dir).expect("under").display().to_string());
+                if path.is_dir() {
+                    todo.push(path);
+                }
+            }
+        }
+        out.sort();
+        out
     }
 
     #[test]

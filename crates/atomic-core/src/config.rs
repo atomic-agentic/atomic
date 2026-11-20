@@ -337,21 +337,26 @@ fn kind(v: &Value) -> &'static str {
 }
 
 /// `message` with every double-quoted part, where serde puts the value it
-/// found, replaced by `"…"`. Names of fields are quoted with backticks, and
-/// stay.
+/// found, replaced by `"…"`. A quote escaped with a backslash inside one is
+/// part of it, and an unclosed one hides the rest. Names of fields are
+/// quoted with backticks, and stay.
 fn without_values(message: &str) -> String {
     let mut out = String::with_capacity(message.len());
-    let mut parts = message.split('"');
-    if let Some(first) = parts.next() {
-        out.push_str(first);
-    }
-    let rest: Vec<&str> = parts.collect();
-    // Pairs of quotes enclose values; an unpaired last quote hides the rest.
-    for (i, part) in rest.iter().enumerate() {
-        if i % 2 == 0 {
-            out.push_str("\"…\"");
-        } else {
-            out.push_str(part);
+    let mut chars = message.chars();
+    while let Some(c) = chars.next() {
+        if c != '"' {
+            out.push(c);
+            continue;
+        }
+        out.push_str("\"…\"");
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' => {
+                    chars.next();
+                }
+                '"' => break,
+                _ => {}
+            }
         }
     }
     out

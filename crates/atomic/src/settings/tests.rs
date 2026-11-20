@@ -27,6 +27,17 @@ fn resolved(
     vars: &[(&str, &str)],
     ollama: &dyn Fn(SocketAddr) -> Option<Vec<String>>,
 ) -> Resolved {
+    resolved_where(dir, args, vars, ollama, &|_| false).expect("resolves")
+}
+
+/// [`resolved`], with git tracking what `tracked` says, and its error.
+fn resolved_where(
+    dir: &Path,
+    args: &EngineArgs,
+    vars: &[(&str, &str)],
+    ollama: &dyn Fn(SocketAddr) -> Option<Vec<String>>,
+    tracked: &dyn Fn(&Path) -> bool,
+) -> Result<Resolved, ConfigError> {
     let vars: BTreeMap<String, String> = vars
         .iter()
         .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
@@ -39,9 +50,9 @@ fn resolved(
             env: &env,
             env_names: vars.keys().cloned().collect(),
             ollama,
+            tracked,
         },
     )
-    .expect("resolves")
 }
 
 fn nobody(_: SocketAddr) -> Option<Vec<String>> {
@@ -265,6 +276,15 @@ fn a_url_is_shown_without_its_user_password_or_query_and_never_if_it_does_not_pa
         ),
         ("https://api.openai.com/v1", "https://api.openai.com/v1"),
         ("http://127.0.0.1:11434/v1", "http://127.0.0.1:11434/v1"),
+        // A path segment that could be a key is not shown.
+        (
+            "https://gateway.example.com/v1/sk-0123456789abcdefghij/openai",
+            "https://gateway.example.com/v1/***/openai",
+        ),
+        (
+            "https://h.example.com/v1/k%20ey",
+            "https://h.example.com/v1/***",
+        ),
         // No scheme, or not a URL at all: nothing of it is shown.
         ("atomic:secret@db/atomic", NOT_SHOWN),
         ("host=db user=atomic password=secret", NOT_SHOWN),
@@ -305,28 +325,19 @@ fn a_committed_manifest_cannot_choose_the_variable_the_key_is_read_from() {
     let manifest = "atomic: 1\nname: notes\nmodel:\n  base_url: https://example.com/v1\n  \
                     api_key_env: AWS_SECRET_ACCESS_KEY\n";
     let d = dir(&[("atomic.yaml", manifest)]);
-    let env = |_: &str| None;
-    let refused = resolve(
-        &d,
-        &EngineArgs::default(),
-        &Surroundings {
-            env: &env,
-            env_names: vec![],
-            ollama: &nobody,
-        },
-    )
-    .expect_err("refused");
+    let refused =
+        resolved_where(&d, &EngineArgs::default(), &[], &nobody, &|_| false).expect_err("refused");
     let said = refused.to_string();
     assert!(said.contains("atomic.yaml:5"), "{said}");
     assert!(said.contains("atomic.local.yaml"), "{said}");
     assert!(said.contains("ATOMIC_MODEL_API_KEY_ENV"), "{said}");
     // The person's own file, a variable or a flag may.
     let d = dir(&[
+        ("atomic.yaml", MANIFEST_ONLY),
         (
-            "atomic.yaml",
-            "atomic: 1\nname: notes\nmodel:\n  base_url: https://example.com/v1\n",
+            "atomic.local.yaml",
+            "model:\n  base_url: https://example.com/v1\n  api_key_env: MY_KEY\n",
         ),
-        ("atomic.local.yaml", "model:\n  api_key_env: MY_KEY\n"),
     ]);
     let r = resolved(&d, &EngineArgs::default(), &[], &nobody);
     assert_eq!(r.settings.model.api_key_env.as_deref(), Some("MY_KEY"));
@@ -369,7 +380,7 @@ fn a_detected_ollama_is_sent_no_key_and_is_announced() {
 fn an_endpoint_from_the_projects_files_is_announced_and_one_the_runner_chose_is_not() {
     let d = dir(&[(
         "atomic.yaml",
-        "atomic: 1\nname: notes\nmodel:\n  base_url: https://u:p@example.com/v1\n  name: m\n",
+        "atomic: 1\nname: notes\nmodel:\n  base_url: https://u@example.com/v1\n  name: m\n",
     )]);
     let r = resolved(&d, &EngineArgs::default(), &[], &nobody);
     let said = r.announcement().expect("announced");
@@ -499,4 +510,129 @@ fn the_probe_gives_up_at_its_deadline_however_slowly_an_answer_trickles() {
         took < PROBE_DEADLINE + Duration::from_millis(500),
         "{took:?}"
     );
+}
+
+#[test]
+fn a_tracked_local_file_is_the_projects_and_cannot_choose_the_key() {
+    // A repository that commits its "personal" file.
+    let local =
+        "model:\n  base_url: https://example.com/v1\n  api_key_env: AWS_SECRET_ACCESS_KEY\n";
+    let d = dir(&[("atomic.yaml", MANIFEST_ONLY), ("atomic.local.yaml", local)]);
+    let tracked = |p: &Path| p.file_name().is_some_and(|f| f == "atomic.local.yaml");
+    let said = resolved_where(&d, &EngineArgs::default(), &[], &nobody, &tracked)
+        .expect_err("refused")
+        .to_string();
+    assert!(said.contains("atomic.local.yaml:3"), "{said}");
+    assert!(said.contains("does not track"), "{said}");
+    // Untracked, it is the person's own.
+    let r = resolved(&d, &EngineArgs::default(), &[], &nobody);
+    assert_eq!(
+        r.settings.model.api_key_env.as_deref(),
+        Some("AWS_SECRET_ACCESS_KEY")
+    );
+}
+
+#[test]
+fn a_key_is_never_sent_to_an_endpoint_the_project_chose() {
+    let d = dir(&[(
+        "atomic.yaml",
+        "atomic: 1\nname: notes\nmodel:\n  base_url: https://example.com/v1\n  name: m\n",
+    )]);
+    // The person's shell names a key; the project names where it goes.
+    let said = resolved_where(
+        &d,
+        &EngineArgs::default(),
+        &[("ATOMIC_MODEL_API_KEY_ENV", "OPENAI_API_KEY")],
+        &nobody,
+        &|_| false,
+    )
+    .expect_err("refused")
+    .to_string();
+    assert!(said.contains("atomic.yaml:4"), "{said}");
+    assert!(
+        said.contains("environment variable ATOMIC_MODEL_API_KEY_ENV"),
+        "{said}"
+    );
+    // So is a flag's.
+    let args = EngineArgs {
+        model_api_key_env: Some("MY_KEY".into()),
+        ..EngineArgs::default()
+    };
+    let said = resolved_where(&d, &args, &[], &nobody, &|_| false)
+        .expect_err("refused")
+        .to_string();
+    assert!(said.contains("flag --model-api-key-env"), "{said}");
+    // An endpoint the person chose takes the key.
+    let r = resolved(
+        &d,
+        &EngineArgs::default(),
+        &[
+            ("ATOMIC_MODEL_API_KEY_ENV", "OPENAI_API_KEY"),
+            ("ATOMIC_MODEL_BASE_URL", "https://api.openai.com/v1"),
+        ],
+        &nobody,
+    );
+    assert_eq!(
+        r.settings.model.api_key_env.as_deref(),
+        Some("OPENAI_API_KEY")
+    );
+}
+
+#[test]
+fn the_projects_files_name_no_store_and_no_password() {
+    for (file, text, line) in [
+        (
+            "atomic.yaml",
+            "atomic: 1\nname: notes\ndatabase:\n  url: postgres://db/atomic\n",
+            "atomic.yaml:4",
+        ),
+        (
+            "atomic.yaml",
+            "atomic: 1\nname: notes\nmodel:\n  base_url: https://u:pw@example.com/v1\n",
+            "atomic.yaml:4",
+        ),
+        (
+            "atomic.local.yaml",
+            "database:\n  url: postgres://db/atomic\n",
+            "atomic.local.yaml:2",
+        ),
+    ] {
+        let files = if file == "atomic.yaml" {
+            vec![(file, text)]
+        } else {
+            vec![("atomic.yaml", MANIFEST_ONLY), (file, text)]
+        };
+        let d = dir(&files);
+        let said = resolved_where(&d, &EngineArgs::default(), &[], &nobody, &|_| true)
+            .expect_err("refused")
+            .to_string();
+        assert!(said.contains(line), "{said}");
+        assert!(!said.contains("pw@"), "{said}");
+    }
+    // From the person: an untracked file or the variable.
+    let d = dir(&[
+        ("atomic.yaml", MANIFEST_ONLY),
+        (
+            "atomic.local.yaml",
+            "database:\n  url: postgres://db/atomic\n",
+        ),
+    ]);
+    resolved(&d, &EngineArgs::default(), &[], &nobody);
+    let d = dir(&[("atomic.yaml", MANIFEST_ONLY)]);
+    resolved(
+        &d,
+        &EngineArgs::default(),
+        &[("ATOMIC_DATABASE_URL", "postgres://u:pw@db/atomic")],
+        &nobody,
+    );
+}
+
+#[test]
+fn a_runner_atomic_does_not_know_is_refused_when_read() {
+    let d = dir(&[("atomic.yaml", "atomic: 1\nname: notes\nrunner: proces\n")]);
+    let said = resolved_where(&d, &EngineArgs::default(), &[], &nobody, &|_| false)
+        .expect_err("refused")
+        .to_string();
+    assert!(said.contains("must be local or process"), "{said}");
+    assert!(said.contains("atomic.yaml:3"), "{said}");
 }

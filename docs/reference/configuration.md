@@ -52,12 +52,29 @@ The settings `atomic run`, `atomic runs resume` and `atomic serve` resolve:
 | `executor_id` | `ATOMIC_EXECUTOR_ID` | `--executor-id` |
 | `budget.*` | `ATOMIC_BUDGET_*` | |
 
-`model.api_key_env` names the variable whose value is sent to the endpoint as
-its key, so it is the choice of whoever runs the project: set it in
-`atomic.local.yaml`, the variable or the flag. A committed `atomic.yaml` that
-sets it is refused. A variable set to the empty string sets nothing, and a
-variable for a string setting, such as `ATOMIC_EXECUTOR_ID=1`, is taken as the
-string it holds.
+Some settings send something of whoever runs the project to wherever the
+project chooses, so the project's own files cannot set them. The project's
+files are `atomic.yaml` and, when git tracks it, `atomic.local.yaml`; an
+`atomic.local.yaml` that git does not track is the person's own.
+
+- `model.api_key_env` names the variable whose value is sent to the endpoint
+  as its key. Set it in your own `atomic.local.yaml`, the variable or the
+  flag. When the project's files set `model.base_url`, no key is sent to it
+  at all: a key's variable from any source is refused until you set the
+  endpoint yourself.
+- `database.url` moves the run records, and the password it may carry, to
+  another store. Set it in your own `atomic.local.yaml` or
+  `ATOMIC_DATABASE_URL`.
+- A `model.base_url` that carries a password.
+
+A variable set to the empty string sets nothing, and a variable for a string
+setting, such as `ATOMIC_EXECUTOR_ID=1`, is taken as the string it holds.
+
+Settings come from the manifest of the project a command runs in: run from a
+workspace's root, atomic uses the root's settings, and a member's `model` or
+`budget` applies only to commands run in that member. `atomic check` reads
+the settings of the root and of every member as a run would, without looking
+for Ollama, so a setting a run would refuse fails the check.
 
 ## Start small
 

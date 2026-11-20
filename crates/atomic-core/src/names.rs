@@ -29,14 +29,15 @@ fn distance(a: &str, b: &str) -> usize {
 }
 
 /// The candidate `name` most likely meant: the fewest edits away, and close
-/// enough to be a slip: one edit for a name of four characters or fewer,
-/// otherwise at most two edits or a third of the name. A tie goes to the
+/// enough to be a slip: one edit for a name of three or four characters,
+/// otherwise at most two edits or a third of the name. A name of one or two
+/// characters is one edit from too many others to guess. A tie goes to the
 /// first in alphabetical order. `None` when nothing is that close.
 pub fn nearest<'a>(name: &str, candidates: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
-    if name.is_empty() {
+    let length = name.chars().count();
+    if length <= 2 {
         return None;
     }
-    let length = name.chars().count();
     // Two edits turn most short names into most others.
     let limit = if length <= 4 { 1 } else { 2.max(length / 3) };
     let mut best: Option<(usize, &'a str)> = None;
@@ -74,5 +75,7 @@ mod tests {
         assert_eq!(nearest("atmo", ["atom", "after"]), Some("atom"));
         assert_eq!(nearest("task", ["rank"]), None);
         assert_eq!(nearest("", names), None);
+        // Nor is anything one edit from a two-character name.
+        assert_eq!(nearest("cx", names), None);
     }
 }

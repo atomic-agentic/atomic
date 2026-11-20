@@ -136,3 +136,32 @@ fn printable_error_text_has_no_control_characters() {
     assert_eq!(printable(b"fatal: a\x1b[31mb\n\n"), "fatal: a?[31mb");
     assert_eq!(printable(b"one\ntwo\rthree\r"), "one\ntwo?three");
 }
+
+#[test]
+fn a_file_is_tracked_only_once_it_is_added() {
+    let git = Git::find().expect("git");
+    let dir = std::env::temp_dir().join(format!("atomic-git-tracks-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("dir");
+    let setup = |args: &[&str]| {
+        let ok = std::process::Command::new(git.program())
+            .args(args)
+            .current_dir(&dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .expect("git")
+            .success();
+        assert!(ok, "{args:?}");
+    };
+    // Outside any checkout, nothing answers.
+    std::fs::write(dir.join("atomic.local.yaml"), "model: {}\n").expect("file");
+    assert!(git.tracks(&dir.join("atomic.local.yaml")).is_err());
+    setup(&["init", "-q"]);
+    assert!(!git.tracks(&dir.join("atomic.local.yaml")).expect("tracks"));
+    setup(&["add", "atomic.local.yaml"]);
+    assert!(git.tracks(&dir.join("atomic.local.yaml")).expect("tracks"));
+    // A pattern is a name, not a glob.
+    std::fs::write(dir.join("a*"), "").expect("file");
+    assert!(!git.tracks(&dir.join("a*")).expect("tracks"));
+}

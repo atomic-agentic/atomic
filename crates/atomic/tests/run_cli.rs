@@ -732,6 +732,102 @@ fn no_secret_reaches_stderr_or_json_whatever_atomic_is_given() {
     }
 }
 
+/// Run git in `dir` for a test's setup, with no user or system config.
+fn git_in(dir: &Path, args: &[&str]) {
+    let ok = Command::new(atomic_core::git::Git::find().expect("git").program())
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .status()
+        .expect("git")
+        .success();
+    assert!(ok, "git {args:?}");
+}
+
+#[test]
+fn a_local_file_committed_with_the_project_cannot_choose_the_key() {
+    let dir = scratch("tracked-local");
+    let project = project(&dir);
+    std::fs::write(
+        project.join("atomic.local.yaml"),
+        "model:\n  base_url: https://example.com/v1\n  name: m\n  api_key_env: AWS_SECRET_ACCESS_KEY\n",
+    )
+    .expect("local");
+    git_in(&project, &["init", "-q"]);
+    git_in(&project, &["add", "atomic.local.yaml"]);
+    let out = atomic(
+        &dir,
+        &project,
+        &["--json", "run", "count-only", "--data", NOTE],
+        &[],
+        "",
+    );
+    assert!(!out.status.success(), "{}", text(&out));
+    let error = &stdout_json(&out)["error"];
+    assert_eq!(error["kind"], "config.invalid", "{error}");
+    let said = error["description"].as_str().unwrap_or_default();
+    assert!(said.contains("atomic.local.yaml:4"), "{said}");
+    assert!(said.contains("does not track"), "{said}");
+    // Once git no longer tracks it, it is the person's own file.
+    git_in(&project, &["rm", "-q", "--cached", "atomic.local.yaml"]);
+    let out = atomic(&dir, &project, &["--json", "config"], &[], "");
+    assert!(out.status.success(), "{}", text(&out));
+}
+
+#[test]
+fn check_reads_the_settings_of_every_manifest() {
+    let dir = scratch("check-settings");
+    let project = project(&dir);
+    let member = project.join("member");
+    std::fs::create_dir_all(&member).expect("member");
+    std::fs::write(
+        project.join("atomic.yaml"),
+        "atomic: 1\nname: notes\nworkspace:\n  members: [member]\n",
+    )
+    .expect("manifest");
+    let check = || atomic(&dir, &project, &["--json", "check"], &[], "");
+    // A misspelled setting in a member's manifest.
+    std::fs::write(
+        member.join("atomic.yaml"),
+        "atomic: 1\nname: member\nmodel:\n  bse_url: http://127.0.0.1:9/v1\n",
+    )
+    .expect("member manifest");
+    let out = check();
+    assert!(!out.status.success(), "{}", text(&out));
+    let error = &stdout_json(&out)["error"];
+    assert_eq!(error["kind"], "config.invalid", "{error}");
+    assert!(
+        error["description"]
+            .as_str()
+            .is_some_and(|d| d.contains("member/atomic.yaml:4") && d.contains("bse_url")),
+        "{error}"
+    );
+    // A runner that run would refuse, in the workspace's own manifest.
+    std::fs::write(member.join("atomic.yaml"), "atomic: 1\nname: member\n").expect("member");
+    std::fs::write(
+        project.join("atomic.yaml"),
+        "atomic: 1\nname: notes\nrunner: proces\nworkspace:\n  members: [member]\n",
+    )
+    .expect("manifest");
+    let out = check();
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(
+        stdout_json(&out)["error"]["description"]
+            .as_str()
+            .is_some_and(|d| d.contains("must be local or process")),
+        "{}",
+        text(&out)
+    );
+    std::fs::write(
+        project.join("atomic.yaml"),
+        "atomic: 1\nname: notes\nrunner: process\nworkspace:\n  members: [member]\n",
+    )
+    .expect("manifest");
+    let out = check();
+    assert!(out.status.success(), "{}", text(&out));
+}
+
 #[test]
 fn init_in_an_empty_directory_makes_a_project_that_checks_and_runs() {
     on_codex_runtime(async {

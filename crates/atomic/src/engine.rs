@@ -123,14 +123,10 @@ fn store_of(state: &ProjectState, settings: &settings::Settings) -> Database {
 /// The store atomic is configured to use for the project at `state`.
 pub fn database(state: &ProjectState) -> anyhow::Result<Database> {
     // The store needs no model, so no Ollama is looked for.
-    let around = settings::Surroundings {
-        ollama: &|_| None,
-        ..settings::Surroundings::here()
-    };
     let resolved = settings::resolve(
         &settings::config_dir(state.root()),
         &EngineArgs::default(),
-        &around,
+        &settings::Surroundings::without_probe(),
     )
     .map_err(|e| anyhow::anyhow!("the configuration cannot be read: {e}"))?;
     Ok(store_of(state, &resolved.settings))

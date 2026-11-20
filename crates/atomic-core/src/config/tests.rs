@@ -280,3 +280,14 @@ fn a_variable_set_to_nothing_sets_nothing() {
     assert_eq!(r.config.retries, 3);
     assert!(matches!(r.sources["retries"], Source::Default));
 }
+
+#[test]
+fn a_quote_inside_a_value_does_not_let_the_rest_of_it_out() {
+    let shown =
+        without_values(r#"invalid type: string "a\"sk-secret\" b", expected u32 for `retries`"#);
+    assert_eq!(
+        shown,
+        r#"invalid type: string "…", expected u32 for `retries`"#
+    );
+    assert_eq!(without_values(r#"unclosed "sk-secret"#), r#"unclosed "…""#);
+}

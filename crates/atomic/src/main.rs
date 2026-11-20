@@ -427,6 +427,23 @@ fn check(path: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
         return Ok(());
     }
     let project = project::discover(&path)?;
+    // Each manifest's settings, read as `atomic run` from its directory
+    // would read them, contacting nothing: a setting run would refuse fails
+    // here instead.
+    let mut manifests = vec![project.clone()];
+    if project.members.is_some() {
+        manifests.extend(project::members(&project)?);
+    }
+    for manifest in &manifests {
+        settings::check(&manifest.dir).map_err(|e| {
+            failure::Failure::new(
+                "config.invalid",
+                format!("the configuration cannot be read: {e}"),
+                "fix the setting it names; `atomic config --explain` lists every setting and \
+                 where it comes from",
+            )
+        })?;
+    }
     let files = collections::collect(&project)?;
     collections::load_schemas(&project, &mut registry).map_err(anyhow::Error::msg)?;
     let mut atoms = std::collections::BTreeMap::new();

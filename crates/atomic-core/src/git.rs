@@ -242,6 +242,29 @@ impl Git {
         self.path_at(dir, "--show-toplevel")
     }
 
+    /// Whether the checkout containing `file` tracks it, as `git ls-files`
+    /// says. Like discovery, this is for a trusted directory, such as a
+    /// project's; an error means no checkout answered.
+    pub fn tracks(&self, file: &Path) -> Result<bool, GitError> {
+        let (Some(dir), Some(name)) = (file.parent(), file.file_name()) else {
+            return Ok(false);
+        };
+        let dir = if dir.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            dir
+        };
+        let mut command = self.base();
+        let mut safe = OsString::from("safe.directory=");
+        safe.push(dir);
+        command.arg("-c").arg(safe).current_dir(dir);
+        // Pathspecs are literal (see `base`): the name matches only itself.
+        command.args(["ls-files", "-z", "--"]).arg(name);
+        Ok(!self
+            .run(command, "ls-files", None, MAX_OUTPUT_BYTES)?
+            .is_empty())
+    }
+
     fn find_repo(&self, dir: &Path) -> Result<Repo, GitError> {
         Ok(self.repo(self.path_at(dir, "--git-common-dir")?))
     }
