@@ -2697,23 +2697,25 @@ fn serve_ended(dir: &Path) -> bool {
 }
 
 /// Whether process `pid` still runs: `kill -0` reaches it, and on Linux it
-/// is not a zombie waiting to be reaped.
+/// is not a zombie waiting to be reaped. On Linux a process whose stat can
+/// no longer be read has been reaped since `kill -0` reached it, so it is
+/// gone too.
 fn alive(pid: &str) -> bool {
     let reached = Command::new("/bin/sh")
         .args(["-c", &format!("kill -0 {pid} 2>/dev/null")])
         .status()
         .expect("kill")
         .success();
-    let zombie = || {
-        std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
-            stat.rsplit(')')
-                .next()
-                .unwrap_or("")
-                .trim_start()
-                .starts_with('Z')
-        })
+    let gone = || match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat
+            .rsplit(')')
+            .next()
+            .unwrap_or("")
+            .trim_start()
+            .starts_with('Z'),
+        Err(_) => true,
     };
-    reached && !(cfg!(target_os = "linux") && zombie())
+    reached && !(cfg!(target_os = "linux") && gone())
 }
 
 /// Wait until no process with `marker` on its command line runs.
@@ -2838,15 +2840,41 @@ fn serve_stopped_mid_command_holds_the_lock_until_it_exits_and_runs_nothing_twic
         std::fs::read_to_string(dir.join("serve.log")).unwrap_or_default()
     );
     let pids = slow_pids(&dir);
+    assert!(
+        !pids.is_empty(),
+        "the slow command's processes were found before the stop"
+    );
     terminate(&serve);
-    // Until serve exits, the lock stays held and the command stays its own.
+    // While any command runs, the lock stays held, and it goes only with
+    // serve. The lock is probed first and the commands checked after: a
+    // command alive after a probe that found the lock free was alive during
+    // it, so the order is checked with no window to time.
     let stopping = Instant::now();
     let status = loop {
         let held = lock_held(&state);
+        let running: Vec<&String> = pids.iter().filter(|pid| alive(pid)).collect();
+        assert!(
+            held || running.is_empty(),
+            "the lock was free while command {running:?} still ran"
+        );
         if let Some(status) = serve.try_wait().expect("wait") {
             break status;
         }
-        assert!(held, "the lock was free while serve still ran");
+        if !held {
+            // Only serve's exit frees it: the kernel releases the lock as the
+            // process ends, a moment before it can be reaped.
+            let freed = Instant::now();
+            break loop {
+                if let Some(status) = serve.try_wait().expect("wait") {
+                    break status;
+                }
+                assert!(
+                    freed.elapsed() < Duration::from_secs(5),
+                    "the lock was free while serve still ran"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            };
+        }
         assert!(
             stopping.elapsed() < Duration::from_secs(30),
             "serve did not stop"

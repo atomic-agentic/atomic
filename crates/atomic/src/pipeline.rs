@@ -143,7 +143,7 @@ fn reached(id: &str, position: usize) -> Result<()> {
             "{DEAD_LETTERED} run {id} stopped {RECOVERY_LIMIT} times in this process at the same \
              step without finishing it, so it is not run again"
         );
-        eprintln!("{why}");
+        atomic_core::log_line!("{why}");
         return Err(failed(why));
     }
     Ok(())
@@ -705,6 +705,10 @@ async fn run_pipeline<C: WorkflowContext>(
                     &values,
                     &services.deployment,
                     replaying,
+                );
+                let decision = crate::telemetry::traced(
+                    crate::telemetry::gate_span(&g.id, ctx.workflow_id()),
+                    decision,
                 )
                 .await?;
                 failpoint(&format!("pipeline:after:{}", g.id));
@@ -894,7 +898,11 @@ async fn run_pipeline<C: WorkflowContext>(
                     runtimes.codex.meter = meter.clone();
                     runtimes.lite.meter = meter;
                 }
-                async move {
+                // Made here, in the step's body, so a step that replays from
+                // its checkpoint makes none.
+                let span = crate::telemetry::step_span(&atom.name, &id, &run_id);
+                let caller = (run_id.clone(), id.clone());
+                let work = async move {
                 if let Some(served) = served {
                     return served;
                 }
@@ -989,7 +997,9 @@ async fn run_pipeline<C: WorkflowContext>(
                 metadata.insert("input_sha256".into(), Value::String(input_sha256));
                 failpoint(&ran);
                 Ok(proposal)
-                }
+                };
+                // Model calls name the run and step on their spans.
+                crate::telemetry::traced(span, atomic_core::usage::for_step(caller.0, caller.1, work))
             },
             Vec::new(),
         )
@@ -1289,16 +1299,24 @@ pub fn register_pipeline<R: DurableRuntime>(rt: &mut R, services: Services) {
     let ledger = rt.ledger();
     let (replaying, replay_ledger) = (services.clone(), ledger.clone());
     rt.register(PIPELINE, move |ctx: R::Context, run: PipelineRun| {
-        run_pipeline(ctx, run, services.clone(), ledger.clone(), None)
+        let span = crate::telemetry::workflow_span(&run.pipeline.name, ctx.workflow_id());
+        crate::telemetry::traced(
+            span,
+            run_pipeline(ctx, run, services.clone(), ledger.clone(), None),
+        )
     });
     rt.register(REPLAY, move |ctx: R::Context, replay: ReplayRun| {
         let ReplayRun { of, run, recorded } = replay;
-        run_pipeline(
-            ctx,
-            run,
-            replaying.clone(),
-            replay_ledger.clone(),
-            Some(Arc::new(Replay { of, recorded })),
+        let span = crate::telemetry::workflow_span(&run.pipeline.name, ctx.workflow_id());
+        crate::telemetry::traced(
+            span,
+            run_pipeline(
+                ctx,
+                run,
+                replaying.clone(),
+                replay_ledger.clone(),
+                Some(Arc::new(Replay { of, recorded })),
+            ),
         )
     });
 }

@@ -311,8 +311,10 @@ fn refuse_uncovered_store(
 }
 
 /// atomic's own variables: its configuration and the credentials it holds,
-/// such as its database URL, project secrets and telemetry headers.
-const ATOMIC_OWN: [&str; 3] = ["ATOMIC_*", "DBOS__*", "OTEL_EXPORTER_OTLP_HEADERS"];
+/// such as its database URL, project secrets and telemetry settings. The
+/// core inheritance already leaves them out; this keeps them out if it ever
+/// widens.
+const ATOMIC_OWN: [&str; 3] = ["ATOMIC_*", "DBOS__*", "OTEL_*"];
 
 /// The environment of every command a thread runs: the platform's core
 /// variables from this process (`PATH`, `HOME`, `USER` and the like),
@@ -490,7 +492,9 @@ fn keep_sandbox_off_keyrings() {
             leave_session_keyring()
         };
         if let Err(e) = kept_off {
-            eprintln!("atomic: cannot keep a sandboxed command off the kernel keyrings: {e}");
+            crate::log_line!(
+                "atomic: cannot keep a sandboxed command off the kernel keyrings: {e}"
+            );
             std::process::exit(1);
         }
     }
@@ -1145,10 +1149,19 @@ where
             Err(e) => break Err(meter_error(e)),
         };
         report.turns += 1;
+        // One span per turn, which may make several requests; it ends before
+        // the turn is settled.
+        let span = crate::spans::hold(crate::usage::call_span(
+            &endpoint.model,
+            crate::usage::provider_name(&endpoint.base_url),
+        ));
         let bounded_by = ticket.as_ref().and_then(|t| t.bounded_by.clone());
         // A turn is cut off when its reserved time runs out; a failed or cut
         // off turn still reports the usage seen before it stopped.
-        let (turn, totals) = run_turn(&thread, &current, limit.time).await;
+        let (turn, totals) = span.run(run_turn(&thread, &current, limit.time)).await;
+        if let (Err(e), Some(span)) = (&turn, span.span()) {
+            crate::usage::record_error(&span, e);
+        }
         // Codex repeats the last totals in every token count, so a turn
         // whose requests reported nothing shows them unchanged; a request
         // that reports usage always grows them. A turn with nothing reported
@@ -1161,6 +1174,9 @@ where
                     output_tokens: (output - seen.1).max(0),
                 };
                 seen = (input, output);
+                if let Some(span) = span.span() {
+                    crate::usage::record_usage(&span, &grown);
+                }
                 report.input_tokens = input;
                 report.output_tokens = output;
                 report.total_tokens = total;
@@ -1168,6 +1184,7 @@ where
             }
             None => Outcome::Unknown,
         };
+        span.end();
         if let Err(e) = meter.settle(ticket, outcome).await {
             break Err(meter_error(e));
         }
@@ -1556,7 +1573,8 @@ async fn turn(
                     .last_agent_message
                     .context("the turn completed without a message");
             }
-            EventMsg::Error(event) => bail!(event.message),
+            // A provider's error can echo what it was sent.
+            EventMsg::Error(event) => bail!("{}", crate::redact::excerpt(&event.message, 4096)),
             EventMsg::TurnAborted(_) => bail!("turn aborted"),
             EventMsg::ExecApprovalRequest(_) => bail!("turn requested exec approval"),
             EventMsg::ApplyPatchApprovalRequest(_) => bail!("turn requested patch approval"),
@@ -1846,6 +1864,27 @@ mod tests {
             "{env:?}"
         );
         assert_eq!(env["CARGO_TARGET_DIR"], "/cache/target");
+    }
+
+    /// Should the inheritance ever widen, atomic's own variables still stay
+    /// out: the exporter's settings among them.
+    #[test]
+    fn atomics_own_variables_stay_out_whatever_is_inherited() {
+        use codex_protocol::config_types::ShellEnvironmentPolicyInherit;
+        let inherited = [
+            ("PATH", "/usr/bin"),
+            ("ATOMIC_DATABASE_URL", "postgres://atomic:pw@db/atomic"),
+            ("DBOS__APPVERSION", "1"),
+            ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4318"),
+            ("OTEL_EXPORTER_OTLP_HEADERS", "authorization=Bearer x"),
+            ("SOME_TOOL_SETTING", "x"),
+        ]
+        .map(|(k, v)| (k.to_owned(), v.to_owned()));
+        let mut policy = command_environment(&BTreeMap::new());
+        policy.inherit = ShellEnvironmentPolicyInherit::All;
+        let env = codex_protocol::shell_environment::create_env_from_vars(inherited, &policy, None);
+        let names: std::collections::BTreeSet<&str> = env.keys().map(String::as_str).collect();
+        assert_eq!(names, ["PATH", "SOME_TOOL_SETTING"].into(), "{env:?}");
     }
 
     #[test]
