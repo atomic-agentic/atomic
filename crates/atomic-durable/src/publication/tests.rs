@@ -963,11 +963,13 @@ async fn a_pre_upgrade_turn_checkpoint_still_decodes_on_sqlite() -> Result<()> {
 #[cfg(feature = "postgres-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_released_park_runs_the_turn_again_on_postgres() -> Result<()> {
-    a_released_park_runs_the_turn_again(postgres().await?).await
+    let (rt, _schema) = postgres().await?;
+    a_released_park_runs_the_turn_again(rt).await
 }
 
 #[cfg(feature = "postgres-tests")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pre_upgrade_turn_checkpoint_still_decodes_on_postgres() -> Result<()> {
-    a_pre_upgrade_turn_checkpoint_still_decodes(postgres().await?).await
+    let (rt, _schema) = postgres().await?;
+    a_pre_upgrade_turn_checkpoint_still_decodes(rt).await
 }
