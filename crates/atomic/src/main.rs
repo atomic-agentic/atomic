@@ -755,13 +755,12 @@ async fn prompt(
         artifacts: atomic_core::runtime::Artifacts::none(),
         meter: atomic_core::usage::Metering::none(),
         guard: codex::StateGuard::for_project(state)?,
-        backend,
     };
     let spec = codex::TurnSpec {
         prompt: args.prompt.join(" "),
         ..codex::TurnSpec::default()
     };
-    Ok(atomic_core::runtime::run_turn(&runtime, &spec).await?)
+    Ok(atomic_core::runtime::run_turn(&runtime, &backend, &spec).await?)
 }
 
 #[cfg(test)]

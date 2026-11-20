@@ -76,7 +76,6 @@ fn runtime(model: &FakeModel, tag: &str) -> CodexRuntime {
         defaults: AtomConfig::default(),
         artifacts: Artifacts::none(),
         meter: crate::usage::Metering::none(),
-        backend: Default::default(),
     }
 }
 
@@ -87,7 +86,7 @@ fn runtimes(model: &FakeModel, tag: &str) -> Runtimes {
     Runtimes {
         codex,
         lite,
-        exec: Default::default(),
+        backend: Default::default(),
         clock: None,
     }
 }
@@ -109,6 +108,7 @@ fn a_codex_atom_returns_a_valid_out_against_the_fake_model() {
                 text: "Export crashes on é.".into(),
             },
             &rt,
+            &Default::default(),
         )
         .await
         .expect("runs");
@@ -160,7 +160,14 @@ fn answers_that_do_not_fit_fail_with_a_schema_error() {
                     .await
                     .expect("fake model");
             let rt = runtime(&model, "bad");
-            match run_codex_atom(&Classify, &Note { text: "n".into() }, &rt).await {
+            match run_codex_atom(
+                &Classify,
+                &Note { text: "n".into() },
+                &rt,
+                &Default::default(),
+            )
+            .await
+            {
                 Err(AtomError::Schema {
                     message,
                     answer: got,
@@ -179,7 +186,14 @@ fn answers_that_do_not_fit_fail_with_a_schema_error() {
             .await
             .expect("fake model");
         let rt = runtime(&model, "invalid");
-        match run_codex_atom(&Classify, &Note { text: "n".into() }, &rt).await {
+        match run_codex_atom(
+            &Classify,
+            &Note { text: "n".into() },
+            &rt,
+            &Default::default(),
+        )
+        .await
+        {
             Err(AtomError::Validation(_)) => {}
             other => panic!(
                 "expected a validation error after {} model calls, got {other:?}",
@@ -200,9 +214,14 @@ fn a_bad_output_gets_one_repair_turn_then_fails_with_a_schema_error() {
         .await
         .expect("fake model");
         let rt = runtime(&model, "repair-ok");
-        let (out, meta) = run_codex_atom(&Classify, &Note { text: "n".into() }, &rt)
-            .await
-            .expect("repaired");
+        let (out, meta) = run_codex_atom(
+            &Classify,
+            &Note { text: "n".into() },
+            &rt,
+            &Default::default(),
+        )
+        .await
+        .expect("repaired");
         assert_eq!(out.category, "question");
         assert_eq!((model.calls(), meta.turns), (2, 2));
         assert_eq!(meta.total_tokens, 4, "two calls of 2 tokens each");
@@ -225,7 +244,14 @@ fn a_bad_output_gets_one_repair_turn_then_fails_with_a_schema_error() {
         .await
         .expect("fake model");
         let rt = runtime(&model, "repair-fails");
-        match run_codex_atom(&Classify, &Note { text: "n".into() }, &rt).await {
+        match run_codex_atom(
+            &Classify,
+            &Note { text: "n".into() },
+            &rt,
+            &Default::default(),
+        )
+        .await
+        {
             Err(AtomError::Schema { answer, .. }) => assert_eq!(answer, "still not json"),
             other => panic!("expected a schema error, got {other:?}"),
         }
@@ -588,7 +614,8 @@ fn compiler_failures_never_spend_a_repair_call() {
                 .await
                 .expect("fake model");
             let rt = runtime(&model, "compiler-infrastructure");
-            let backend = Backend::Codex(&rt);
+            let exec = atomic_exec::Backend::default();
+            let backend = Backend::Codex(&rt, &exec);
             let contract = json!({"type":"object","additionalProperties":false,"required":["ok"],"properties":{"ok":{"type":"boolean"}}});
             let validator = jsonschema::validator_for(&contract).expect("schema");
             let check = |_: Value| -> std::pin::Pin<
@@ -834,7 +861,13 @@ fn an_output_must_reference_artifacts_that_exist_with_the_right_type() {
             if let Some(store) = store {
                 rt.artifacts = Artifacts::new(store);
             }
-            let r = crate::runtime::run_lite_atom(&Patch, &Note { text: "n".into() }, &rt).await;
+            let r = crate::runtime::run_lite_atom(
+                &Patch,
+                &Note { text: "n".into() },
+                &rt,
+                &Default::default(),
+            )
+            .await;
             (model.calls(), r)
         };
 
@@ -947,9 +980,14 @@ fn an_answer_that_is_one_fenced_json_block_is_read_as_its_contents() {
         .await
         .expect("fake model");
         let rt = runtime(&model, "fenced");
-        let (out, meta) = run_codex_atom(&Classify, &Note { text: "n".into() }, &rt)
-            .await
-            .expect("accepted");
+        let (out, meta) = run_codex_atom(
+            &Classify,
+            &Note { text: "n".into() },
+            &rt,
+            &Default::default(),
+        )
+        .await
+        .expect("accepted");
         assert_eq!(out.category, "bug");
         assert_eq!((model.calls(), meta.turns), (1, 1), "no repair turn");
     });
@@ -964,9 +1002,14 @@ fn a_codex_atom_off_openai_states_its_schema_in_its_instructions() {
         .await
         .expect("fake model");
         let rt = runtime(&model, "schema-in-prompt");
-        run_codex_atom(&Classify, &Note { text: "n".into() }, &rt)
-            .await
-            .expect("runs");
+        run_codex_atom(
+            &Classify,
+            &Note { text: "n".into() },
+            &rt,
+            &Default::default(),
+        )
+        .await
+        .expect("runs");
         let request = model.requests()[0].to_string();
         assert!(
             request.contains("follows this JSON Schema"),
@@ -1406,9 +1449,11 @@ fn every_kind_of_atom_runs_through_its_execution_backend() {
         .expect("fake model");
 
         let codex = Recording::default();
-        let mut rt = runtime(&model, "seam-codex");
-        rt.backend = codex.backend();
-        run_codex_atom(&Classify, &note, &rt).await.expect("runs");
+        let rt = runtime(&model, "seam-codex");
+        let backend = codex.backend();
+        run_codex_atom(&Classify, &note, &rt, &backend)
+            .await
+            .expect("runs");
         assert_eq!(codex.calls(), ["open classify-note", "close classify-note"]);
         let (asked, given) = &codex.opened()[0];
         assert_eq!(asked.source.as_ref(), Some(&rt.cwd));
@@ -1420,9 +1465,9 @@ fn every_kind_of_atom_runs_through_its_execution_backend() {
         );
 
         let lite = Recording::default();
-        let mut lrt = crate::lite::LiteRuntime::new(rt.endpoint.clone(), AtomConfig::default());
-        lrt.backend = lite.backend();
-        run_lite_atom(&LiteClassify, &note, &lrt)
+        let lrt = crate::lite::LiteRuntime::new(rt.endpoint.clone(), AtomConfig::default());
+        let backend = lite.backend();
+        run_lite_atom(&LiteClassify, &note, &lrt, &backend)
             .await
             .expect("runs");
         assert_eq!(
@@ -1436,7 +1481,7 @@ fn every_kind_of_atom_runs_through_its_execution_backend() {
 
         let exec = Recording::default();
         let mut all = runtimes(&model, "seam-exec");
-        all.exec = exec.backend();
+        all.backend = exec.backend();
         let script = "import json, os, sys\norder = json.load(sys.stdin)\n\
             json.dump({'total': len(os.listdir(os.environ['HOME']))}, sys.stdout)\n";
         let (dir, a, compiled) = exec_project("seam-exec", script, "");
@@ -1475,21 +1520,21 @@ fn a_run_whose_workspace_cannot_be_opened_sends_and_runs_nothing() {
             ..Recording::default()
         };
 
-        let mut rt = runtime(&model, "seam-refuse");
-        rt.backend = refusing.backend();
-        let r = run_codex_atom(&Classify, &note, &rt).await;
+        let rt = runtime(&model, "seam-refuse");
+        let backend = refusing.backend();
+        let r = run_codex_atom(&Classify, &note, &rt, &backend).await;
         assert!(
             matches!(&r, Err(AtomError::Runtime(m)) if m.contains("no room on this backend")),
             "{r:?}"
         );
 
-        let mut lrt = crate::lite::LiteRuntime::new(rt.endpoint.clone(), AtomConfig::default());
-        lrt.backend = refusing.backend();
-        let r = run_lite_atom(&LiteClassify, &note, &lrt).await;
+        let lrt = crate::lite::LiteRuntime::new(rt.endpoint.clone(), AtomConfig::default());
+        let backend = refusing.backend();
+        let r = run_lite_atom(&LiteClassify, &note, &lrt, &backend).await;
         assert!(matches!(&r, Err(AtomError::Runtime(_))), "{r:?}");
 
         let mut all = runtimes(&model, "seam-refuse-exec");
-        all.exec = refusing.backend();
+        all.backend = refusing.backend();
         let (_, a, compiled) = exec_project("seam-refuse", TOTAL, "");
         let r = run_declarative(
             &a,
@@ -1527,15 +1572,15 @@ fn a_failed_run_closes_its_workspace() {
         .await
         .expect("fake model");
         let codex = Recording::default();
-        let mut rt = runtime(&model, "seam-fail");
-        rt.backend = codex.backend();
-        let r = run_codex_atom(&Classify, &Note { text: "n".into() }, &rt).await;
+        let rt = runtime(&model, "seam-fail");
+        let backend = codex.backend();
+        let r = run_codex_atom(&Classify, &Note { text: "n".into() }, &rt, &backend).await;
         assert!(matches!(&r, Err(AtomError::Schema { .. })), "{r:?}");
         assert_eq!(codex.calls(), ["open classify-note", "close classify-note"]);
 
         let exec = Recording::default();
         let mut all = runtimes(&model, "seam-fail-exec");
-        all.exec = exec.backend();
+        all.backend = exec.backend();
         let (_, a, compiled) = exec_project("seam-fail", "import sys\nsys.exit(3)\n", "");
         let r = run_declarative(
             &a,
@@ -1566,9 +1611,9 @@ fn a_codex_atom_whose_workspace_has_no_shell_sends_nothing() {
             no_shell: true,
             ..Recording::default()
         };
-        let mut rt = runtime(&model, "seam-no-shell");
-        rt.backend = shell_less.backend();
-        let r = run_codex_atom(&Classify, &Note { text: "n".into() }, &rt).await;
+        let rt = runtime(&model, "seam-no-shell");
+        let backend = shell_less.backend();
+        let r = run_codex_atom(&Classify, &Note { text: "n".into() }, &rt, &backend).await;
         assert!(
             matches!(&r, Err(AtomError::Runtime(m)) if m.contains("no shell")),
             "{r:?}"
@@ -1594,9 +1639,9 @@ fn an_unavailable_workspace_is_waited_for() {
             unavailable: Arc::new(std::sync::atomic::AtomicUsize::new(4)),
             ..Recording::default()
         };
-        let mut rt = runtime(&model, "seam-busy");
-        rt.backend = busy.backend();
-        run_codex_atom(&Classify, &Note { text: "n".into() }, &rt)
+        let rt = runtime(&model, "seam-busy");
+        let backend = busy.backend();
+        run_codex_atom(&Classify, &Note { text: "n".into() }, &rt, &backend)
             .await
             .expect("runs once the backend has room");
         let mut expected = vec!["open classify-note"; 5];
@@ -1608,9 +1653,9 @@ fn an_unavailable_workspace_is_waited_for() {
             unavailable: Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX)),
             ..Recording::default()
         };
-        rt.backend = full.backend();
+        let backend = full.backend();
         let waiting = tokio::spawn(async move {
-            run_codex_atom(&Classify, &Note { text: "n".into() }, &rt).await
+            run_codex_atom(&Classify, &Note { text: "n".into() }, &rt, &backend).await
         });
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         assert!(!waiting.is_finished(), "it waits");
@@ -1651,11 +1696,11 @@ fn a_run_that_panics_closes_its_workspace() {
             .await
             .expect("fake model");
         let recorded = Recording::default();
-        let mut rt = runtime(&model, "seam-panic");
-        rt.backend = recorded.backend();
-        let r = contained(
-            async move { run_codex_atom(&Panics, &Note { text: "n".into() }, &rt).await },
-        )
+        let rt = runtime(&model, "seam-panic");
+        let backend = recorded.backend();
+        let r = contained(async move {
+            run_codex_atom(&Panics, &Note { text: "n".into() }, &rt, &backend).await
+        })
         .await;
         assert!(matches!(&r, Err(AtomError::Panicked(_))), "{r:?}");
         let scratch = recorded.opened()[0].1.scratch.clone().expect("scratch");
@@ -1684,7 +1729,7 @@ fn a_cancelled_run_closes_its_workspace() {
         let model = FakeModel::start(Vec::new()).await.expect("fake model");
         let recorded = Recording::default();
         let mut all = runtimes(&model, "seam-cancel");
-        all.exec = recorded.backend();
+        all.backend = recorded.backend();
         // The command writes in its HOME, the scratch directory, after a
         // while: its workspace must still be there.
         let (_, a, compiled) = exec_project(
@@ -1766,7 +1811,7 @@ fn a_codex_atom_passes_its_declared_tool_homes_to_its_workspace() {
             .expect("fake model");
         let recorded = Recording::default();
         let mut all = runtimes(&model, "codex-env");
-        all.codex.backend = recorded.backend();
+        all.backend = recorded.backend();
         run_declarative(
             &a,
             &compiled,
@@ -1864,12 +1909,15 @@ fn only_atoms_that_run_commands_need_the_sandbox() {
         assert_eq!(checks.load(std::sync::atomic::Ordering::SeqCst), 0);
 
         let mut all = runtimes(&model, "no-sandbox");
-        all.codex.backend = backend.clone();
-        all.lite.backend = backend.clone();
-        all.exec = backend;
-        run_lite_atom(&LiteClassify, &Note { text: "n".into() }, &all.lite)
-            .await
-            .expect("a lite atom needs no sandbox");
+        all.backend = backend;
+        run_lite_atom(
+            &LiteClassify,
+            &Note { text: "n".into() },
+            &all.lite,
+            &all.backend,
+        )
+        .await
+        .expect("a lite atom needs no sandbox");
         assert_eq!(checks.load(std::sync::atomic::Ordering::SeqCst), 0);
 
         let (_, a, compiled) = exec_project("no-sandbox", TOTAL, "");
@@ -1891,7 +1939,13 @@ fn only_atoms_that_run_commands_need_the_sandbox() {
                     && m.contains("--security-opt"))
         };
         assert!(refused(r.as_ref().err()), "{r:?}");
-        let r = run_codex_atom(&Classify, &Note { text: "n".into() }, &all.codex).await;
+        let r = run_codex_atom(
+            &Classify,
+            &Note { text: "n".into() },
+            &all.codex,
+            &all.backend,
+        )
+        .await;
         assert!(refused(r.as_ref().err()), "{r:?}");
         assert_eq!(
             checks.load(std::sync::atomic::Ordering::SeqCst),
@@ -1938,7 +1992,7 @@ fn a_check_that_may_pass_is_waited_for_and_kept_once_it_passes() {
         )
         .expect("connects");
         let mut all = runtimes(&model, "flaky-check");
-        all.exec = backend;
+        all.backend = backend;
         let (_, a, compiled) = exec_project("flaky-check", TOTAL, "");
         for run in ["run-1", "run-2"] {
             let (out, _) = run_declarative(
@@ -2042,16 +2096,27 @@ fn an_answer_cel_cannot_read_is_repaired() {
             .await
             .expect("fake model");
         let rt = runtime(&model, "cel-repair");
-        let (out, _) = run_codex_atom(&Classify, &Note { text: "n".into() }, &rt)
-            .await
-            .expect("repaired");
+        let (out, _) = run_codex_atom(
+            &Classify,
+            &Note { text: "n".into() },
+            &rt,
+            &Default::default(),
+        )
+        .await
+        .expect("repaired");
         assert_eq!(out.line, Some(1));
         assert_eq!(model.calls(), 2, "one repair");
         let model = FakeModel::start(vec![wedging.clone(), wedging])
             .await
             .expect("fake model");
         let rt = runtime(&model, "cel-repair-fails");
-        let r = run_codex_atom(&Classify, &Note { text: "n".into() }, &rt).await;
+        let r = run_codex_atom(
+            &Classify,
+            &Note { text: "n".into() },
+            &rt,
+            &Default::default(),
+        )
+        .await;
         assert!(
             matches!(&r, Err(AtomError::Schema { message, .. }) if message.contains("integer")),
             "{r:?}"
@@ -2084,7 +2149,13 @@ fn a_typed_contract_that_cannot_be_checked_is_refused_before_the_model() {
     on_codex_runtime(async {
         let model = FakeModel::start(Vec::new()).await.expect("fake model");
         let rt = runtime(&model, "hidden");
-        let r = run_codex_atom(&Hidden, &Note { text: "n".into() }, &rt).await;
+        let r = run_codex_atom(
+            &Hidden,
+            &Note { text: "n".into() },
+            &rt,
+            &Default::default(),
+        )
+        .await;
         assert!(
             matches!(&r, Err(AtomError::Runtime(message)) if message.contains("contains")),
             "{r:?}"

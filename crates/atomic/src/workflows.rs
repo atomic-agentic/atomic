@@ -242,7 +242,7 @@ pub fn register_change_request<R: DurableRuntime>(
             let run = ctx.workflow_id().to_owned();
             let span = crate::telemetry::workflow_span(CHANGE_REQUEST, &run);
             let work = async move {
-                let lite = runtimes.lite.clone();
+                let (lite, backend) = (runtimes.lite.clone(), runtimes.backend.clone());
                 let request = ChangeRequest {
                     request: input.request.clone(),
                 };
@@ -251,7 +251,7 @@ pub fn register_change_request<R: DurableRuntime>(
                     &ctx,
                     "draft",
                     move |step| {
-                        let mut lite = lite.clone();
+                        let (mut lite, backend) = (lite.clone(), backend.clone());
                         lite.meter = meter.meter(&step, &draft_caps);
                         let request = request.clone();
                         let span =
@@ -260,9 +260,9 @@ pub fn register_change_request<R: DurableRuntime>(
                         crate::telemetry::traced(
                             span,
                             atomic_core::usage::for_step(step_id, "draft", async move {
-                                propose(
-                                    async move { run_lite_atom(&DraftTask, &request, &lite).await },
-                                )
+                                propose(async move {
+                                    run_lite_atom(&DraftTask, &request, &lite, &backend).await
+                                })
                                 .await
                             }),
                         )
@@ -273,7 +273,7 @@ pub fn register_change_request<R: DurableRuntime>(
                 failpoint("change-request:after-draft");
                 let task: DraftedTask = decode(&draft)?;
 
-                let codex = runtimes.codex.clone();
+                let (codex, backend) = (runtimes.codex.clone(), runtimes.backend.clone());
                 let review_request = ReviewRequest {
                     item: WorkItem {
                         id: format!("{}:draft", ctx.workflow_id()),
@@ -288,7 +288,7 @@ pub fn register_change_request<R: DurableRuntime>(
                     &ctx,
                     "review",
                     move |step| {
-                        let mut codex = codex.clone();
+                        let (mut codex, backend) = (codex.clone(), backend.clone());
                         codex.meter = budget.meter(&step, &review_caps);
                         let review_request = review_request.clone();
                         let span = crate::telemetry::step_span(
@@ -301,7 +301,8 @@ pub fn register_change_request<R: DurableRuntime>(
                             span,
                             atomic_core::usage::for_step(step_id, "review", async move {
                                 propose(async move {
-                                    run_codex_atom(&ReviewPatch, &review_request, &codex).await
+                                    run_codex_atom(&ReviewPatch, &review_request, &codex, &backend)
+                                        .await
                                 })
                                 .await
                             }),

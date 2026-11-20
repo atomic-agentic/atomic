@@ -96,9 +96,9 @@ async fn opens_as_it_stops() -> (Option<Result<String, AtomError>>, usize) {
         defaults: AtomConfig::default(),
         artifacts: Artifacts::none(),
         meter: Metering::none(),
-        backend,
     };
-    let turn = tokio::spawn(async move { run_turn(&runtime, &TurnSpec::default()).await });
+    let turn =
+        tokio::spawn(async move { run_turn(&runtime, &backend, &TurnSpec::default()).await });
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     // The process stops while the open is under way, then the open succeeds.
     stop_waiting_for_backend();

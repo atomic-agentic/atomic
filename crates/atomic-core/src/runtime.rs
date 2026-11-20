@@ -107,21 +107,21 @@ pub struct CodexRuntime {
     pub artifacts: Artifacts,
     /// What admits and settles each turn (see [`crate::usage`]).
     pub meter: Metering,
-    /// The execution backend each run opens its workspace on, from
-    /// [`cwd`](Self::cwd), and runs its turn's shell and file work through.
-    pub backend: atomic_exec::Backend,
 }
 
-/// The runtimes atoms run on, one for each kind of atom that calls a model.
-/// A declarative atom runs on the one its `kind` names.
+/// The runtimes atoms run on, one for each kind of atom that calls a model,
+/// and the one execution backend every atom opens its workspace on. A
+/// declarative atom runs on the runtime its `kind` names.
 #[derive(Clone, Debug)]
 pub struct Runtimes {
     /// For `kind: codex`.
     pub codex: CodexRuntime,
     /// For `kind: lite`.
     pub lite: LiteRuntime,
-    /// Where `kind: exec` commands run.
-    pub exec: atomic_exec::Backend,
+    /// Where every atom's workspace opens: a codex atom's turn and its
+    /// shell, a lite atom's empty one, and an exec atom's command. The plan
+    /// reads its statement.
+    pub backend: atomic_exec::Backend,
     /// The durable step's recorded clock, for the atom's helper calls (see
     /// [`crate::astro::StepClock`]). Without one, each operation's helpers
     /// see the current time and a fresh seed.
@@ -152,41 +152,42 @@ pub struct RunMetadata {
     pub turns: u32,
 }
 
-/// What runs an atom's turns.
+/// What runs an atom's turns, and the execution backend its workspace
+/// opens on.
 #[derive(Clone, Copy)]
 enum Backend<'a> {
     /// A Codex thread.
-    Codex(&'a CodexRuntime),
+    Codex(&'a CodexRuntime, &'a atomic_exec::Backend),
     /// One model call per turn.
-    Lite(&'a LiteRuntime),
+    Lite(&'a LiteRuntime, &'a atomic_exec::Backend),
 }
 
 impl Backend<'_> {
     fn endpoint(&self) -> &ModelEndpoint {
         match self {
-            Self::Codex(rt) => &rt.endpoint,
-            Self::Lite(rt) => &rt.endpoint,
+            Self::Codex(rt, _) => &rt.endpoint,
+            Self::Lite(rt, _) => &rt.endpoint,
         }
     }
 
     fn defaults(&self) -> &AtomConfig {
         match self {
-            Self::Codex(rt) => &rt.defaults,
-            Self::Lite(rt) => &rt.defaults,
+            Self::Codex(rt, _) => &rt.defaults,
+            Self::Lite(rt, _) => &rt.defaults,
         }
     }
 
     fn artifacts(&self) -> &(dyn ArtifactLookup + Send + Sync) {
         match self {
-            Self::Codex(rt) => rt.artifacts.0.as_ref(),
-            Self::Lite(rt) => rt.artifacts.0.as_ref(),
+            Self::Codex(rt, _) => rt.artifacts.0.as_ref(),
+            Self::Lite(rt, _) => rt.artifacts.0.as_ref(),
         }
     }
 
     fn execution(&self) -> &atomic_exec::Backend {
         match self {
-            Self::Codex(rt) => &rt.backend,
-            Self::Lite(rt) => &rt.backend,
+            Self::Codex(_, backend) => backend,
+            Self::Lite(_, backend) => backend,
         }
     }
 
@@ -195,8 +196,8 @@ impl Backend<'_> {
     /// and a lite atom's has no files.
     fn open(&self, request: &Request<'_>) -> Open {
         let source = match self {
-            Self::Codex(rt) => Some(rt.cwd.clone()),
-            Self::Lite(_) => None,
+            Self::Codex(rt, _) => Some(rt.cwd.clone()),
+            Self::Lite(..) => None,
         };
         Open {
             label: request.name.to_owned(),
@@ -571,7 +572,7 @@ async fn run_contract(
         ))
     })?;
     let developer = match backend {
-        Backend::Codex(rt) if !lite::is_openai_api(&rt.endpoint.base_url) => {
+        Backend::Codex(rt, _) if !lite::is_openai_api(&rt.endpoint.base_url) => {
             schema_in_instructions(&request.developer, &lowered.schema)
         }
         _ => request.developer,
@@ -652,7 +653,7 @@ async fn run_contract(
     // and the workspace is closed however the run ends.
     let workspace = open_workspace(backend.execution().shared(), opening).await?;
     let conversation = match backend {
-        Backend::Codex(rt) => match turn_in(workspace.workspace(), &mut spec) {
+        Backend::Codex(rt, _) => match turn_in(workspace.workspace(), &mut spec) {
             Ok(cwd) => {
                 codex::converse_async(
                     &rt.paths,
@@ -671,7 +672,7 @@ async fn run_contract(
                 return Err(e);
             }
         },
-        Backend::Lite(rt) => lite::converse_async(rt, &spec, next).await,
+        Backend::Lite(rt, _) => lite::converse_async(rt, &spec, next).await,
     };
     workspace.close().await;
     let (_, report) = conversation.map_err(|e| match crate::usage::meter_failure(&e) {
@@ -744,12 +745,16 @@ fn turn_in(workspace: &Workspace, spec: &mut TurnSpec) -> Result<PathBuf, AtomEr
     Ok(cwd)
 }
 
-/// Run `spec` as one turn on a fresh thread of `runtime`, in a workspace its
-/// backend opens from the runtime's directory with the spec's sandbox,
+/// Run `spec` as one turn on a fresh thread of `runtime`, in a workspace
+/// `backend` opens from the runtime's directory with the spec's sandbox,
 /// writable roots and environment, and return the final message. For tools
 /// and tests that need a bare turn; atoms run through [`run_codex_atom`] and
 /// [`run_declarative`].
-pub async fn run_turn(runtime: &CodexRuntime, spec: &TurnSpec) -> Result<String, AtomError> {
+pub async fn run_turn(
+    runtime: &CodexRuntime,
+    backend: &atomic_exec::Backend,
+    spec: &TurnSpec,
+) -> Result<String, AtomError> {
     let place = Place::unrecorded("turn");
     let opening = Open {
         label: "turn".into(),
@@ -761,7 +766,7 @@ pub async fn run_turn(runtime: &CodexRuntime, spec: &TurnSpec) -> Result<String,
         writable_roots: spec.writable_roots.clone(),
         env: spec.env.clone(),
     };
-    let workspace = open_workspace(runtime.backend.shared(), opening).await?;
+    let workspace = open_workspace(backend.shared(), opening).await?;
     let mut spec = spec.clone();
     let answer = match turn_in(workspace.workspace(), &mut spec) {
         Ok(cwd) => codex::converse_async(
@@ -783,13 +788,21 @@ pub async fn run_turn(runtime: &CodexRuntime, spec: &TurnSpec) -> Result<String,
     answer
 }
 
-/// Run a typed Codex atom on `input`, on a fresh Codex thread.
+/// Run a typed Codex atom on `input`, on a fresh Codex thread, in a
+/// workspace `backend` opens.
 pub async fn run_codex_atom<A: Atom>(
     atom: &A,
     input: &A::In,
     runtime: &CodexRuntime,
+    backend: &atomic_exec::Backend,
 ) -> Result<(A::Out, RunMetadata), AtomError> {
-    run_typed(atom, input, AtomKind::Codex, Backend::Codex(runtime)).await
+    run_typed(
+        atom,
+        input,
+        AtomKind::Codex,
+        Backend::Codex(runtime, backend),
+    )
+    .await
 }
 
 /// Run a typed lite atom on `input`: one schema-constrained model call, and
@@ -798,8 +811,9 @@ pub async fn run_lite_atom<A: Atom>(
     atom: &A,
     input: &A::In,
     runtime: &LiteRuntime,
+    backend: &atomic_exec::Backend,
 ) -> Result<(A::Out, RunMetadata), AtomError> {
-    run_typed(atom, input, AtomKind::Lite, Backend::Lite(runtime)).await
+    run_typed(atom, input, AtomKind::Lite, Backend::Lite(runtime, backend)).await
 }
 
 async fn run_typed<A: Atom>(
@@ -932,7 +946,7 @@ pub async fn run_declarative_with_context(
             compiled,
             input,
             &identity,
-            runtimes.exec.shared(),
+            runtimes.backend.shared(),
             runtimes.clock.as_ref(),
             // The store the model runtimes check references against.
             &runtimes.codex.artifacts,
@@ -940,8 +954,8 @@ pub async fn run_declarative_with_context(
         .await;
     }
     let backend = match atom.kind.as_str() {
-        "codex" => Backend::Codex(&runtimes.codex),
-        "lite" => Backend::Lite(&runtimes.lite),
+        "codex" => Backend::Codex(&runtimes.codex, &runtimes.backend),
+        "lite" => Backend::Lite(&runtimes.lite, &runtimes.backend),
         other => {
             return Err(AtomError::Runtime(format!(
                 "{} is a {other} atom, which this version cannot run",

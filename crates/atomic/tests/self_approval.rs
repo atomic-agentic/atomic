@@ -308,10 +308,12 @@ async fn sandboxed(
         artifacts: atomic_core::runtime::Artifacts::none(),
         meter: atomic_core::usage::Metering::none(),
         guard: guard.clone(),
-        backend: atomic_exec::Backend::connect(atomic_exec::LocalBackend::in_dir(scratch)).unwrap(),
     };
+    let backend =
+        atomic_exec::Backend::connect(atomic_exec::LocalBackend::in_dir(scratch)).unwrap();
     let answer = atomic_core::runtime::run_turn(
         &runtime,
+        &backend,
         &TurnSpec {
             prompt: "Do the work.".into(),
             sandbox: Sandbox::WorkspaceWrite,

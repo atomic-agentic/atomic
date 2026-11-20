@@ -697,7 +697,7 @@ async fn run_pipeline<C: WorkflowContext>(
     reached(&id, 0)?;
     let store = services.store.clone();
     fits("the workflow's input", &pipeline.input, &input)?;
-    plan(&pipeline, services.runtimes.codex.backend.statement())?;
+    plan(&pipeline, services.runtimes.backend.statement())?;
     // The budgets the run keeps: pinned before it started, or resolved now,
     // once, and recorded with its definitions.
     let planned = match &pipeline.budgets {
@@ -972,7 +972,8 @@ async fn run_pipeline<C: WorkflowContext>(
                 run_id: run_id.clone(),
                 step_id: step.id.clone(),
             };
-            let (opening, who, backend) = (atom.clone(), identity.clone(), runtimes.exec.shared());
+            let (opening, who, backend) =
+                (atom.clone(), identity.clone(), runtimes.backend.shared());
             let place = format!("run {run_id}, step {}", step.id);
             let attempt_step = format!("{}.attempt", step.id);
             let (begun, opened) = if replay.is_some() {
@@ -1062,7 +1063,7 @@ async fn run_pipeline<C: WorkflowContext>(
                 let proposal = match (tree, guard) {
                     (_, Some((_, _, opened, identity))) => {
                         let clock = runtimes.clock.clone();
-                        let backend = runtimes.exec.shared();
+                        let backend = runtimes.backend.shared();
                         // The store the model runtimes check references against.
                         let artifacts = runtimes.codex.artifacts.clone();
                         propose_at(&place, true, async move {

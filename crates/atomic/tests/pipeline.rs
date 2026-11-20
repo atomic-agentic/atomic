@@ -221,10 +221,9 @@ fn runtimes_on(dir: &Path, cwd: &Path, base_url: &str, model: &str) -> Arc<Runti
             defaults: AtomConfig::default(),
             artifacts: Artifacts::none(),
             meter: atomic_core::usage::Metering::none(),
-            backend: Default::default(),
         },
         lite: LiteRuntime::new(endpoint, AtomConfig::default()),
-        exec: Default::default(),
+        backend: Default::default(),
         clock: None,
     })
 }
@@ -394,9 +393,7 @@ async fn engine_built(
     let runtimes = match backend {
         Some(backend) => {
             let mut on = (*runtimes).clone();
-            on.codex.backend = backend.clone();
-            on.lite.backend = backend.clone();
-            on.exec = backend;
+            on.backend = backend;
             Arc::new(on)
         }
         None => runtimes,

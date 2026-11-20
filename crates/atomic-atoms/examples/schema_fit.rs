@@ -104,13 +104,12 @@ fn main() {
                         defaults: AtomConfig::default(),
                         artifacts: Artifacts::none(),
                         meter: atomic_core::usage::Metering::none(),
-                        backend: Default::default(),
                     };
                     let input = ChangeRequest {
                         request: (*request).to_owned(),
                     };
                     let started = Instant::now();
-                    let result = run_codex_atom(&atom, &input, &rt).await;
+                    let result = run_codex_atom(&atom, &input, &rt, &Default::default()).await;
                     let seconds = started.elapsed().as_secs_f64();
                     tally.seconds += seconds;
                     let outcome = match &result {

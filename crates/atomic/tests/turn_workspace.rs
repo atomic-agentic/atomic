@@ -65,7 +65,7 @@ fn shared_scratch() -> PathBuf {
     .clone()
 }
 
-fn runtime(dir: &Path, model: &FakeModel, backend: Backend) -> CodexRuntime {
+fn runtime(dir: &Path, model: &FakeModel) -> CodexRuntime {
     CodexRuntime {
         paths: CodexPaths::with_helpers(
             PathBuf::from(env!("CARGO_BIN_EXE_atomic")),
@@ -82,7 +82,6 @@ fn runtime(dir: &Path, model: &FakeModel, backend: Backend) -> CodexRuntime {
         artifacts: Artifacts::none(),
         meter: Metering::none(),
         guard: atomic_core::codex::StateGuard::NoProjectState,
-        backend,
     }
 }
 
@@ -169,8 +168,8 @@ fn a_turn_runs_where_its_workspace_says() {
             root: dir.join("elsewhere"),
         })
         .expect("connects");
-        let rt = runtime(&dir, &model, backend);
-        let (out, _) = run_codex_atom(&Report, &json!({}), &rt)
+        let rt = runtime(&dir, &model);
+        let (out, _) = run_codex_atom(&Report, &json!({}), &rt, &backend)
             .await
             .expect("runs");
         assert_eq!(out, json!({"done": true}));
@@ -215,13 +214,11 @@ async fn plant_in_live_exec_scratch(dir: &Path, scratch_root: PathBuf) -> (bool,
     ])
     .await
     .expect("fake model");
-    let rt = runtime(
-        dir,
-        &model,
-        Backend::connect(LocalBackend::in_dir(scratch_root)).expect("connects"),
-    );
+    let backend = Backend::connect(LocalBackend::in_dir(scratch_root)).expect("connects");
+    let rt = runtime(dir, &model);
     let answer = run_turn(
         &rt,
+        &backend,
         &TurnSpec {
             prompt: "Do the work.".into(),
             sandbox: Sandbox::WorkspaceWrite,
@@ -278,9 +275,10 @@ fn concurrent_turns_in_one_directory_never_break_each_others_sandbox() {
                     .collect();
                 script.push(Reply::Text("Done.".into()));
                 let model = FakeModel::start(script).await.expect("fake model");
-                let rt = runtime(&dir, &model, backend);
+                let rt = runtime(&dir, &model);
                 let answer = run_turn(
                     &rt,
+                    &backend,
                     &TurnSpec {
                         prompt: "Do the work.".into(),
                         sandbox: Sandbox::WorkspaceWrite,
@@ -393,9 +391,10 @@ fn a_tmp_codex_that_comes_and_goes_does_not_break_a_turn() {
             .collect();
         script.push(Reply::Text("Done.".into()));
         let model = FakeModel::start(script).await.expect("fake model");
-        let rt = runtime(&dir, &model, backend);
+        let rt = runtime(&dir, &model);
         let answer = run_turn(
             &rt,
+            &backend,
             &TurnSpec {
                 prompt: "Do the work.".into(),
                 sandbox: Sandbox::WorkspaceWrite,

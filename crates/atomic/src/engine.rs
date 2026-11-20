@@ -308,13 +308,9 @@ pub async fn open(
             meter: atomic_core::usage::Metering::none(),
             // Atoms' commands are kept out of atomic's private state.
             guard: atomic_core::codex::StateGuard::for_project(state)?,
-            backend: exec.clone(),
         },
-        lite: LiteRuntime {
-            backend: exec.clone(),
-            ..LiteRuntime::new(endpoint, AtomConfig::default())
-        },
-        exec,
+        lite: LiteRuntime::new(endpoint, AtomConfig::default()),
+        backend: exec,
         clock: None,
     });
     // A project in a git repository gets worktrees for its worktree steps.
