@@ -473,9 +473,36 @@ pub fn is_helper(mut args: impl Iterator<Item = std::ffi::OsString>) -> bool {
 /// touched.
 pub fn run_helper() -> anyhow::Result<()> {
     keep_sandbox_off_keyrings();
+    give_the_command_its_own_tmpdir();
     arg0_dispatch_or_else(|_| async {
         bail!("this process was started as a Codex helper Codex does not know")
     })
+}
+
+/// The variable that carries a turn's own temporary directory past Codex's
+/// sandbox helper to the command (see [`give_the_command_its_own_tmpdir`]).
+pub(crate) const TURN_TMPDIR: &str = "ATOMIC_TURN_TMPDIR";
+
+/// When this process is the inner stage of Codex's Linux sandbox helper,
+/// just before the command runs, give the command its own `TMPDIR`: the
+/// directory in [`TURN_TMPDIR`], private to its turn. The helper's outer
+/// stage keeps the backend's shared `TMPDIR`, where Codex keeps its registry
+/// of the mount points it makes, which every turn sharing a writable root
+/// must share; the command never writes there.
+fn give_the_command_its_own_tmpdir() {
+    #[cfg(target_os = "linux")]
+    if invoked_as_linux_sandbox()
+        && std::env::args_os().any(|a| a == "--apply-seccomp-then-exec")
+        && let Some(own) = std::env::var_os(TURN_TMPDIR)
+    {
+        // SAFETY: the helper is single-threaded here, before it applies its
+        // restrictions and executes the command.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var("TMPDIR", own);
+            std::env::remove_var(TURN_TMPDIR);
+        }
+    }
 }
 
 /// When this process is Codex's Linux sandbox helper, keep the command it

@@ -7,7 +7,9 @@
 //!   gave, not the ones the run asked for;
 //! - an exec atom's scratch directory, which its command, unsandboxed, uses
 //!   as `HOME` and `TMPDIR`, is outside everything a `workspace-write` turn
-//!   may write: a turn that tries to plant a file in a live one fails.
+//!   may write: a turn that tries to plant a file in a live one fails;
+//! - turns at once on one backend share Codex's registry of mount points and
+//!   nothing else: each command's `TMPDIR` is its own turn's.
 //!
 //! Needs bubblewrap and unprivileged user namespaces, so it runs with the
 //! `sandbox-tests` feature; with the feature on, a sandbox that cannot start
@@ -46,10 +48,9 @@ fn scratch(tag: &str) -> PathBuf {
     dir
 }
 
-/// One scratch root for every test here, as one project's backend has:
-/// tests run at once, and turns that share a writable root (here `/tmp`,
-/// which `workspace-write` leaves writable at this Codex revision) must
-/// share the TMPDIR where Codex's sandbox keeps its mount-point registry.
+/// One scratch root, and so one backend directory for Codex's registry of
+/// the mount points its sandbox makes, for every test here, as one
+/// project's turns share theirs: the tests' turns run at once.
 fn shared_scratch() -> PathBuf {
     static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     ROOT.get_or_init(|| {
@@ -257,10 +258,13 @@ fn a_turn_cannot_plant_files_in_a_live_exec_scratch() {
 }
 
 /// Several `workspace-write` turns at once on one backend, in the same
-/// directory, each running many commands: Codex's sandbox creates and
+/// directory, each running many commands. Codex's sandbox creates and
 /// removes mount points for the paths it protects in their shared writable
-/// root, and keeps a registry of them in TMPDIR, so the turns share one
-/// TMPDIR and never remove a mount point the other is using.
+/// root, and keeps a registry of them in its helper's TMPDIR, the backend's
+/// shared directory, so the turns never remove a mount point another is
+/// using. Each command's own TMPDIR is its turn's alone: no command finds
+/// another turn's file there, and nothing is made in the shared directory,
+/// which no turn may write.
 #[test]
 fn concurrent_turns_in_one_directory_never_break_each_others_sandbox() {
     support::require_sandbox();
@@ -273,8 +277,15 @@ fn concurrent_turns_in_one_directory_never_break_each_others_sandbox() {
             let dir = dir.clone();
             let backend = backend.clone();
             async move {
+                // Each command leaves a file in its TMPDIR and counts what it
+                // finds there that is not its own turn's.
                 let mut script: Vec<Reply> = (0..COMMANDS)
-                    .map(|i| tool(&format!("echo turn{n}-ok-{i}")))
+                    .map(|i| {
+                        tool(&format!(
+                            "touch \"$TMPDIR/turn{n}-{i}\" && echo turn{n}-ok-{i} \
+                             others=$(ls -A \"$TMPDIR\" | grep -vc '^turn{n}-')"
+                        ))
+                    })
                     .collect();
                 script.push(Reply::Text("Done.".into()));
                 let model = FakeModel::start(script).await.expect("fake model");
@@ -294,7 +305,11 @@ fn concurrent_turns_in_one_directory_never_break_each_others_sandbox() {
                 // so far; the last one carries them all.
                 let last = model.requests().last().cloned().expect("requests");
                 (0..COMMANDS)
-                    .filter(|i| !last.to_string().contains(&format!("turn{n}-ok-{i}\\n")))
+                    .filter(|i| {
+                        !last
+                            .to_string()
+                            .contains(&format!("turn{n}-ok-{i} others=0\\n"))
+                    })
                     .count()
             }
         };
@@ -303,6 +318,20 @@ fn concurrent_turns_in_one_directory_never_break_each_others_sandbox() {
         for t in turns {
             failed.push(t.await.expect("the turn"));
         }
-        assert_eq!(failed, vec![0; TURNS], "commands that failed in each turn");
+        assert_eq!(
+            failed,
+            vec![0; TURNS],
+            "commands in each turn that failed, or found another turn's files in their TMPDIR"
+        );
+        // The backend's shared directory, where Codex keeps its registry, is
+        // no turn's to write: nothing was made there to protect.
+        let shared = shared_scratch().join(".tmp");
+        for name in [".git", ".agents", ".codex", ".aws"] {
+            assert!(
+                !shared.join(name).exists(),
+                "{name} appeared in the backend's shared {}",
+                shared.display()
+            );
+        }
     });
 }

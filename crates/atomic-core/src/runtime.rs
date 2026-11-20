@@ -564,10 +564,10 @@ async fn run_contract(
 /// Set `spec` up to run in `workspace` and return the directory its thread
 /// runs in: the sandbox, the writable roots and the environment are the
 /// workspace's, and its shell must be one this process can drive. Its
-/// commands' `HOME`, `ZDOTDIR` and `TMPDIR` are the workspace's scratch
-/// directory, so no shell reads the developer's startup files and nothing
-/// is left in a shared temporary directory; a `workspace-write` turn may
-/// write there.
+/// commands' `HOME` and `ZDOTDIR` are the workspace's scratch directory and
+/// their `TMPDIR` a directory inside it, so no shell reads the developer's
+/// startup files, and nothing a turn leaves in its temporary directory is
+/// another turn's to see or touch; a `workspace-write` turn may write them.
 fn turn_in(workspace: &Workspace, spec: &mut TurnSpec) -> Result<PathBuf, AtomError> {
     let cwd = workspace
         .require_root()
@@ -597,10 +597,32 @@ fn turn_in(workspace: &Workspace, spec: &mut TurnSpec) -> Result<PathBuf, AtomEr
     };
     private("HOME", &workspace.scratch, spec);
     private("ZDOTDIR", &workspace.scratch, spec);
-    // Shared by every turn on the backend: Codex's sandbox keeps its
-    // registry of protected mount points in TMPDIR, and turns that share a
-    // writable root must share that registry.
-    private("TMPDIR", &workspace.tmp, spec);
+    // Codex's sandbox helper keeps its registry of the mount points it makes
+    // in TMPDIR, which every turn sharing a writable root must share: the
+    // backend's shared directory, never a writable root of a turn's, so no
+    // turn adds or removes anything there. The command itself gets a
+    // TMPDIR of its own turn's, inside its scratch directory, which the
+    // helper hands it just before it runs.
+    if let Some(tmp) = &workspace.tmp {
+        spec.env
+            .insert("TMPDIR".to_owned(), tmp.display().to_string());
+    }
+    if let Some(scratch) = &workspace.scratch {
+        let own = scratch.join("tmp");
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder.create(&own).map_err(|e| {
+            AtomError::Runtime(format!(
+                "{}: create the turn's temporary directory {}: {e}",
+                workspace.label,
+                own.display()
+            ))
+        })?;
+        spec.env
+            .insert(codex::TURN_TMPDIR.to_owned(), own.display().to_string());
+    }
     Ok(cwd)
 }
 
