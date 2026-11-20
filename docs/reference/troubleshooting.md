@@ -161,9 +161,13 @@ surface. Blindly retrying or starting a new run can duplicate the action.
 ## A coding fixture does not run
 
 A commit hash needs a repository that contains it. Treat absent fixture sources
-or commits as setup errors; do not substitute the developer's checkout. The
-v0.1 target requires paired `--fixture` / `--fixture-rev` options; use the
-[preparation helper](../../examples/02-change-request/README.md) for real inputs.
+or commits as setup errors; do not substitute the developer's checkout. A
+workflow that changes code needs the pair `--fixture` / `--fixture-rev`, and
+the failure's kind (`fixture.required`, `fixture.path`, `fixture.revision`,
+`fixture.unsupported`, `fixture.schema`, `fixture.input` or `fixture.snapshot`) says which part
+is wrong; the [CLI reference](cli.md#coding-fixture-selection) lists them. Use
+the [preparation helper](../../examples/02-change-request/README.md) for real
+inputs.
 
 For the recovery model, read [durable execution](../concepts/durable-execution.md).
 
