@@ -1384,12 +1384,16 @@ impl ExecutionBackend for Recording {
         atomic_exec::LocalBackend::default().run(command)
     }
 
+    /// Recorded once the close has done its work, so a test that sees it
+    /// sees what the close left; one that failed is recorded as failed.
     fn close(&self, workspace: &Workspace) -> Result<(), atomic_exec::ExecError> {
-        self.calls
-            .lock()
-            .expect("calls")
-            .push(format!("close {}", workspace.label));
-        atomic_exec::LocalBackend::default().close(workspace)
+        let closed = atomic_exec::LocalBackend::default().close(workspace);
+        let call = match &closed {
+            Ok(()) => format!("close {}", workspace.label),
+            Err(e) => format!("close {} failed: {e}", workspace.label),
+        };
+        self.calls.lock().expect("calls").push(call);
+        closed
     }
 }
 
