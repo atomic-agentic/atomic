@@ -36,15 +36,38 @@ pub enum GatesCommand {
         json: bool,
     },
     /// Approve a gate.
-    Approve(DecideArgs),
+    Approve {
+        #[command(flatten)]
+        gate: GateArg,
+        #[command(flatten)]
+        args: DecideArgs,
+    },
     /// Reject a gate.
-    Reject(DecideArgs),
+    Reject {
+        #[command(flatten)]
+        gate: GateArg,
+        #[command(flatten)]
+        args: DecideArgs,
+    },
+    /// Answer a question gate.
+    Answer {
+        /// The gate's id, as `atomic gates list` shows it.
+        gate: String,
+        /// The answer: JSON, or else the text itself.
+        answer: String,
+        #[command(flatten)]
+        args: DecideArgs,
+    },
+}
+
+#[derive(Debug, Args)]
+pub struct GateArg {
+    /// The gate's id, as `atomic gates list` shows it.
+    gate: String,
 }
 
 #[derive(Debug, Args)]
 pub struct DecideArgs {
-    /// The gate's id, as `atomic gates list` shows it.
-    gate: String,
     /// A comment to record with the decision.
     #[arg(long)]
     comment: Option<String>,
@@ -79,8 +102,23 @@ pub async fn run(command: GatesCommand, state: &ProjectState) -> anyhow::Result<
     match command {
         GatesCommand::Enroll { replace } => enroll(&rt, state, replace).await,
         GatesCommand::List { all, json } => list(&rt, all, json).await,
-        GatesCommand::Approve(args) => decide(&rt, state, args, Verdict::Approve).await,
-        GatesCommand::Reject(args) => decide(&rt, state, args, Verdict::Reject).await,
+        GatesCommand::Approve { gate, args } => {
+            decide(&rt, state, &gate.gate, args, Verdict::Approve, None).await
+        }
+        GatesCommand::Reject { gate, args } => {
+            decide(&rt, state, &gate.gate, args, Verdict::Reject, None).await
+        }
+        GatesCommand::Answer { gate, answer, args } => {
+            decide(
+                &rt,
+                state,
+                &gate,
+                args,
+                Verdict::Approve,
+                Some(parse_answer(&answer)),
+            )
+            .await
+        }
     }
 }
 
@@ -141,26 +179,45 @@ async fn list(rt: &Durare, all: bool, json: bool) -> anyhow::Result<()> {
         };
         println!("{}  {}  [{}]", g.id, g.title, state.to_lowercase());
         println!("    shows: {}", serde_json::to_string(&g.show)?);
+        if let Some(q) = &g.question {
+            println!("    answer: {}", serde_json::to_string(&q.answer)?);
+        }
     }
     Ok(())
 }
 
-async fn decide(
-    rt: &Durare,
-    state: &ProjectState,
-    args: DecideArgs,
-    verdict: Verdict,
-) -> anyhow::Result<()> {
+/// An answer as typed: JSON if it parses as JSON, the text otherwise.
+pub(crate) fn parse_answer(text: &str) -> serde_json::Value {
+    serde_json::from_str(text).unwrap_or_else(|_| serde_json::Value::String(text.to_owned()))
+}
+
+/// The local operator's credential for this project, from the configured
+/// store.
+pub(crate) fn operator_credential(state: &ProjectState) -> anyhow::Result<HumanCredential> {
     let (user, principal) = operator()?;
     let store = credential::configured_store(state.root())?;
     let account = credential::operator_account(state, &user);
     let secret = credential::operator_secret(store.as_ref(), &account)?.with_context(|| {
         format!("{principal} has no operator credential here; run atomic gates enroll")
     })?;
-    let found = gate::find(rt, &args.gate)
-        .await?
-        .with_context(|| format!("no gate {}", args.gate))?;
-    let command_id = match args.command_id {
+    Ok(HumanCredential::new(principal, secret))
+}
+
+/// Decide `found` as the local operator, with their credential, and wake
+/// its run.
+#[allow(clippy::too_many_arguments)] // each is one part of the decision
+pub(crate) async fn decide_as_operator(
+    rt: &Durare,
+    state: &ProjectState,
+    found: &gate::Gate,
+    verdict: Verdict,
+    comment: Option<String>,
+    answer: Option<serde_json::Value>,
+    proposal: Option<String>,
+    command_id: Option<String>,
+) -> anyhow::Result<gate::Decision> {
+    let credential = operator_credential(state)?;
+    let command_id = match command_id {
         Some(id) => id,
         None => format!(
             "cli-{}",
@@ -169,20 +226,17 @@ async fn decide(
     };
     let decision = gate::decide(
         rt,
-        &HumanCredential::new(principal, secret),
+        &credential,
         DecisionCommand {
             command_id,
             gate: found.id.clone(),
             verdict,
-            comment: args.comment,
-            proposal: args.proposal.unwrap_or(found.proposal),
+            comment,
+            proposal: proposal.unwrap_or_else(|| found.proposal.clone()),
+            answer,
         },
     )
     .await?;
-    println!(
-        "{} {:?} by {} ({})",
-        found.id, decision.verdict, decision.by, decision.command
-    );
     // The decision is recorded; waking the run is not part of it. Say so if
     // it fails, rather than leave the run to its deadline unannounced.
     if let Err(e) = gate::redeliver(rt).await {
@@ -191,6 +245,41 @@ async fn decide(
              atomic runs resume {} delivers it",
             found.run, found.run
         );
+    }
+    Ok(decision)
+}
+
+async fn decide(
+    rt: &Durare,
+    state: &ProjectState,
+    gate_id: &str,
+    args: DecideArgs,
+    verdict: Verdict,
+    answer: Option<serde_json::Value>,
+) -> anyhow::Result<()> {
+    let found = gate::find(rt, gate_id)
+        .await?
+        .with_context(|| format!("no gate {gate_id}"))?;
+    let decision = decide_as_operator(
+        rt,
+        state,
+        &found,
+        verdict,
+        args.comment,
+        answer,
+        args.proposal,
+        args.command_id,
+    )
+    .await?;
+    match &decision.answer {
+        Some(a) => println!(
+            "{} answered {a} by {} ({})",
+            found.id, decision.by, decision.command
+        ),
+        None => println!(
+            "{} {:?} by {} ({})",
+            found.id, decision.verdict, decision.by, decision.command
+        ),
     }
     Ok(())
 }

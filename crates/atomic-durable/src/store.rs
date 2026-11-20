@@ -136,10 +136,32 @@ const MIGRATIONS: &[Migration] = &[
                 PRIMARY KEY (request_id, attempt)
             )"],
     },
+    Migration {
+        version: 6,
+        // Question gates (see `gate`): the question a gate asks, as JSON,
+        // and the answer its decision gave; and the feedback log, a dated
+        // entry for each answer a question gate asked to remember.
+        sql: &[
+            "CREATE TABLE IF NOT EXISTS atomic_gate_questions (
+                gate_id TEXT PRIMARY KEY,
+                question TEXT NOT NULL,
+                answer TEXT
+            )",
+            "CREATE TABLE IF NOT EXISTS atomic_feedback (
+                gate_id TEXT PRIMARY KEY,
+                workflow TEXT NOT NULL,
+                step TEXT NOT NULL,
+                ask TEXT NOT NULL,
+                answer TEXT NOT NULL,
+                decided_by TEXT NOT NULL,
+                recorded_at BIGINT NOT NULL
+            )",
+        ],
+    },
 ];
 
 /// The store version this binary writes and understands.
-pub const STORE_VERSION: i64 = 5;
+pub const STORE_VERSION: i64 = 6;
 
 /// Why the store could not be opened.
 #[derive(Debug, thiserror::Error)]

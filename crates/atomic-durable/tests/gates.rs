@@ -112,6 +112,7 @@ fn register(rt: &mut Durare) {
             tier: Tier::High,
             timeout: Some(Duration::from_millis(input.timeout_ms)),
             on_timeout: OnTimeout::Reject,
+            question: None,
         };
         gate(&ctx, "ship", spec).await
     });
@@ -238,6 +239,7 @@ async fn a_gate_survives_a_kill_and_is_approved_from_a_second_process(store: Sto
             verdict: Verdict::Approve,
             comment: None,
             proposal: opened.proposal.clone(),
+            answer: None,
         },
     )
     .await

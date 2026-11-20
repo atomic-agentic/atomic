@@ -111,6 +111,7 @@ fn a_gate_is_approved_from_a_second_terminal_while_the_run_waits() {
                 tier: Tier::High,
                 timeout: None,
                 on_timeout: OnTimeout::Reject,
+                question: None,
             };
             gate::gate(&ctx, "ship", spec).await
         });

@@ -243,6 +243,22 @@ pub struct GateStep {
     pub timeout: Option<u64>,
     /// The approver groups the workflow file names, if it names any.
     pub approvers: Option<Vec<String>>,
+    /// For a question gate (`ask` in the workflow file, which is then the
+    /// `title` above), what it asks for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question: Option<QuestionStep>,
+}
+
+/// What a question gate asks for.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct QuestionStep {
+    /// The JSON Schema the answer must fit.
+    pub answer: Value,
+    /// Whether the answer goes into the feedback log.
+    pub remember: bool,
+    /// The answer the step resumes with if nobody answers in time; without
+    /// one, an unanswered question stops the run as an expired gate does.
+    pub default: Option<Value>,
 }
 
 /// One step of a pipeline.
@@ -468,7 +484,24 @@ fn gate_step(
     deployment: &Deployment,
 ) -> std::result::Result<GateStep, String> {
     let text = |key: &str| gate.get(key).and_then(Value::as_str).map(str::to_owned);
-    let title = text("title").ok_or_else(|| format!("gate `{id}` has no `title`"))?;
+    let title = text("title")
+        .or_else(|| text("ask"))
+        .ok_or_else(|| format!("gate `{id}` has no `title`"))?;
+    let question = match gate.get("answer") {
+        None => None,
+        Some(answer) => Some(QuestionStep {
+            answer: atomic_core::workflow::gate_answer(answer)
+                .map_err(|e| format!("gate `{id}`: {e}"))?,
+            remember: gate
+                .get("remember")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            default: gate
+                .get("on_timeout")
+                .and_then(|t| t.get("default"))
+                .cloned(),
+        }),
+    };
     let timeout = text("timeout")
         .map(|t| atomic_core::workflow::parse_timeout(&t))
         .transpose()
@@ -489,6 +522,7 @@ fn gate_step(
         show: text("show"),
         timeout,
         approvers,
+        question,
     })
 }
 
@@ -1040,14 +1074,40 @@ async fn run_gate<C: WorkflowContext>(
         tier: Tier::High,
         timeout: step.timeout.map(std::time::Duration::from_secs),
         on_timeout: Default::default(),
+        question: step.question.as_ref().map(|q| gate::Question {
+            answer: q.answer.clone(),
+            remember: q.remember,
+        }),
     };
     match gate::gate(ctx, &step.id, spec).await? {
-        Resolution::Decided(d) if d.verdict == gate::Verdict::Approve => Ok(json!({
-            "verdict": "approve",
-            "by": d.by.as_str(),
-            "comment": d.comment,
-            "at": d.at,
-        })),
+        Resolution::Decided(d) if d.verdict == gate::Verdict::Approve => {
+            let mut decision = json!({
+                "verdict": "approve",
+                "by": d.by.as_str(),
+                "comment": d.comment,
+                "at": d.at,
+            });
+            if step.question.is_some() {
+                // The store checked the answer against the question.
+                decision["answer"] = d
+                    .answer
+                    .ok_or_else(|| at("its decision carries no answer".into()))?;
+            }
+            Ok(decision)
+        }
+        // Nobody answered in time: the question's declared default.
+        Resolution::Expired { at: when, .. }
+            if step.question.as_ref().is_some_and(|q| q.default.is_some()) =>
+        {
+            let default = step.question.as_ref().and_then(|q| q.default.clone());
+            Ok(json!({
+                "verdict": "default",
+                "answer": default,
+                "by": null,
+                "comment": null,
+                "at": when,
+            }))
+        }
         Resolution::Decided(d) => Err(at(format!(
             "rejected by {}{}, so no step after it runs",
             d.by,

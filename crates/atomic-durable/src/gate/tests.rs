@@ -83,6 +83,7 @@ fn spec(input: &Gated) -> GateSpec {
         tier: Tier::High,
         timeout: input.timeout_ms.map(Duration::from_millis),
         on_timeout: OnTimeout::Reject,
+        question: None,
     }
 }
 
@@ -129,6 +130,7 @@ fn command(gate: &Gate, id: &str, verdict: Verdict) -> DecisionCommand {
         verdict,
         comment: Some("looks right".into()),
         proposal: gate.proposal.clone(),
+        answer: None,
     }
 }
 
@@ -350,6 +352,92 @@ async fn only_the_enrolled_credential_decides<R: DurableRuntime>(mut rt: R) {
         .expect("decided");
     assert_eq!(decision.by, operator());
     assert!(outcome(&rt, &run).await.expect("finishes").approved());
+    rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+}
+
+/// A question gate takes only an answer that fits its question, records
+/// it as the decision, and, asked to remember, keeps it in the feedback
+/// log; an approval gate takes no answer.
+async fn a_question_gate_takes_only_an_answer_that_fits<R: DurableRuntime>(mut rt: R) {
+    rt.register("asked", |ctx: R::Context, remember: bool| async move {
+        let mut s = spec(&input(None));
+        s.workflow = "asked".into();
+        s.title = "Which channel?".into();
+        s.question = Some(Question {
+            answer: json!({"enum": ["stable", "beta"]}),
+            remember,
+        });
+        gate(&ctx, "pick", s).await
+    });
+    register(&mut rt);
+    rt.launch().await.expect("launch");
+    let me = me(&rt).await;
+    let mut results = Vec::new();
+    for remember in [true, false] {
+        let run = unique("asked");
+        rt.start("asked", &run, remember).await.expect("start");
+        let id = gate_id(&run, "pick");
+        let opened = loop {
+            if let Some(g) = find(&rt, &id).await.expect("find") {
+                break g;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert_eq!(opened.question.as_ref().map(|q| q.remember), Some(remember));
+        let answering = |id: &str, answer: Option<Value>| DecisionCommand {
+            answer,
+            ..command(&opened, &format!("{run}-{id}"), Verdict::Approve)
+        };
+        for (cmd, why) in [
+            (
+                answering("c1", Some(json!("nightly"))),
+                "does not answer it",
+            ),
+            (answering("c2", None), "answer it"),
+            (
+                DecisionCommand {
+                    answer: Some(json!("beta")),
+                    ..command(&opened, &format!("{run}-c3"), Verdict::Reject)
+                },
+                "a rejection gives no answer",
+            ),
+        ] {
+            match decide(&rt, &me, cmd).await {
+                Err(DecideError::BadAnswer { why: got, .. }) => {
+                    assert!(got.contains(why), "{got}")
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        let decision = decide(&rt, &me, answering("c4", Some(json!("beta"))))
+            .await
+            .expect("answered");
+        assert_eq!(decision.answer, Some(json!("beta")));
+        let resolution = outcome(&rt, &run).await.expect("finishes");
+        assert_eq!(resolution, Resolution::Decided(decision.clone()));
+        results.push((id, remember));
+    }
+    let log = feedback(&rt).await.expect("feedback");
+    assert_eq!(
+        log.len(),
+        1,
+        "only the gate that asked to remember: {log:?}"
+    );
+    assert_eq!(log[0].gate, results[0].0);
+    assert_eq!(log[0].ask, "Which channel?");
+    assert_eq!(log[0].answer, json!("beta"));
+    assert_eq!(log[0].by, operator());
+
+    // An approval gate takes no answer.
+    let (_, plain) = start_gated(&rt, input(None)).await;
+    let cmd = DecisionCommand {
+        answer: Some(json!("beta")),
+        ..command(&plain, "c5", Verdict::Approve)
+    };
+    assert!(matches!(
+        decide(&rt, &me, cmd).await,
+        Err(DecideError::BadAnswer { .. })
+    ));
     rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
 }
 
@@ -647,7 +735,9 @@ async fn copy_gate_row(rt: &Durare, from: &str, id: &str) {
     rt.control_transaction(move |mut tx| {
         let (from, id) = (from.clone(), id.clone());
         Box::pin(async move {
-            let rest = COLUMNS.trim_start_matches("gate_id, ");
+            let rest = "run, workflow, step, title, show, evidence, proposal, approvers, tier, \
+                        opened_at, deadline, on_timeout, state, decided_by, decided_at, comment, \
+                        command_id";
             tx.execute(
                 &format!(
                     "INSERT INTO atomic_gates (gate_id, {rest}) \
@@ -761,6 +851,7 @@ on_backend!(
     a_replayed_decision_returns_the_original_and_another_conflicts,
     only_an_approver_on_the_shown_proposal_decides,
     only_the_enrolled_credential_decides,
+    a_question_gate_takes_only_an_answer_that_fits,
     a_wake_up_the_store_does_not_back_passes_nothing,
     a_passed_deadline_expires_the_gate_and_a_later_decision_conflicts,
     a_decision_after_the_deadline_records_the_expiry,
@@ -781,6 +872,7 @@ on_backend!(
     a_replayed_decision_returns_the_original_and_another_conflicts,
     only_an_approver_on_the_shown_proposal_decides,
     only_the_enrolled_credential_decides,
+    a_question_gate_takes_only_an_answer_that_fits,
     a_wake_up_the_store_does_not_back_passes_nothing,
     a_passed_deadline_expires_the_gate_and_a_later_decision_conflicts,
     a_decision_after_the_deadline_records_the_expiry,
