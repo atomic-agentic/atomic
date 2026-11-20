@@ -2231,6 +2231,15 @@ fn a_turns_cargo_home_is_its_own_and_its_toolchains_are_only_read() {
         let refused = turn_in(&workspace(&dir.join(inside)), &mut spec).expect_err(inside);
         assert!(refused.to_string().contains("RUSTUP_HOME"), "{refused}");
     }
+    // A cache an atom points into the temporary directory every turn
+    // shares.
+    let mut shared = workspace(&dir.join("toolchains"));
+    shared.env.insert(
+        "GOMODCACHE".into(),
+        dir.join("tmp/go").display().to_string(),
+    );
+    let refused = turn_in(&shared, &mut TurnSpec::default()).expect_err("shared");
+    assert!(refused.to_string().contains("GOMODCACHE"), "{refused}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

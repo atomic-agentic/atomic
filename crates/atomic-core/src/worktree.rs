@@ -186,21 +186,37 @@ impl Worktrees {
     }
 
     /// The build caches of run `run`'s worktree steps, beside the worktrees
-    /// in the state directory: `cache/<run>`, the run's own, with the
-    /// person's rustup toolchains as `rustup` found them. Nothing one run
-    /// writes there reaches another.
-    pub fn caches(&self, run: &str, rustup: Option<PathBuf>) -> Result<Caches> {
-        if run.is_empty() || run.starts_with('.') || run.contains(['/', '\\']) {
-            return Err(WorktreeError::Invalid(format!(
-                "the run id {run:?} cannot name a directory"
-            )));
-        }
-        let all = self
-            .dir
-            .parent()
-            .map_or_else(|| self.dir.join("cache"), |state| state.join("cache"));
+    /// in the state directory: `cache/<run>-<nonce>`, named as the run's
+    /// worktrees are and with the nonce its first step recorded, so a run
+    /// id used again, after its store was wiped, say, or names that differ
+    /// only in case, never finds another run's caches. Nothing one run
+    /// writes there reaches another. `rustup` is the person's toolchains, as
+    /// found when the run began.
+    pub fn caches(
+        &self,
+        run: &str,
+        nonce: Option<&str>,
+        rustup: Option<PathBuf>,
+    ) -> Result<Caches> {
+        let state = self.dir.parent().ok_or_else(|| {
+            WorktreeError::Invalid(format!(
+                "the worktrees directory {} has no parent to keep caches in",
+                self.dir.display()
+            ))
+        })?;
+        let name = match nonce {
+            Some(nonce) if !nonce.is_empty() && nonce.bytes().all(|b| b.is_ascii_hexdigit()) => {
+                format!("{}-{nonce}", component(run))
+            }
+            Some(nonce) => {
+                return Err(WorktreeError::Invalid(format!(
+                    "the run's cache nonce {nonce:?} is not hexadecimal"
+                )));
+            }
+            None => component(run),
+        };
         Ok(Caches {
-            dir: all.join(run),
+            dir: state.join("cache").join(name),
             rustup,
             target: None,
         })
@@ -420,9 +436,10 @@ impl Worktrees {
     }
 }
 
-/// Build and package caches shared by every worktree of a project, kept
-/// outside all of them under `<state>/cache`, so a fresh worktree does not
-/// build cold and resetting a worktree never discards them.
+/// Build and package caches kept outside every worktree: a run's own, for
+/// its worktree steps ([`Worktrees::caches`]), removed when the run ends, or
+/// the project's, under `<state>/cache`, for exec atoms
+/// ([`Caches::for_state`]).
 ///
 /// An atom's commands find them through [`env`](Self::env), and a
 /// `workspace-write` thread is given [`dir`](Self::dir) as a writable root
@@ -474,8 +491,16 @@ impl Caches {
         &self.dir
     }
 
-    /// Create the cache directory, readable by its owner only.
+    /// Create the cache directory, readable by its owner only. A link in
+    /// its place is refused: something else made it, since an exec atom's
+    /// command may write the project's caches beside it.
     pub fn create(&self) -> Result<()> {
+        if std::fs::symlink_metadata(&self.dir).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(WorktreeError::Invalid(format!(
+                "{} is a link, not the run's cache directory; atomic did not make it",
+                self.dir.display()
+            )));
+        }
         crate::state::private_dir(&self.dir).map_err(|e| WorktreeError::Io {
             what: "create",
             path: self.dir.clone(),
@@ -485,11 +510,10 @@ impl Caches {
 
     /// Remove the cache directory and everything in it; a repeat finds
     /// nothing to remove.
+    /// Directories a tool made read-only, as Go's module cache does, are
+    /// made writable first; a link is removed, never followed.
     pub fn remove(&self) -> Result<()> {
-        match std::fs::remove_dir_all(&self.dir) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(io("remove", &self.dir)(e)),
-            _ => Ok(()),
-        }
+        remove_tree(&self.dir)
     }
 
     /// The environment that points common build tools at the caches: the
@@ -706,14 +730,37 @@ mod tests {
         let git = crate::git::Git::find().expect("git");
         let worktrees = Worktrees::new(git.repo("/state/repo.git"), "/state/worktrees".into());
         let caches = worktrees
-            .caches("run-1", Some("/toolchains".into()))
+            .caches("run-1", Some("ab12"), Some("/toolchains".into()))
             .expect("caches");
-        assert_eq!(caches.dir(), Path::new("/state/cache/run-1"));
-        let other = worktrees.caches("run-2", None).expect("caches");
-        assert_ne!(caches.dir(), other.dir());
-        for bad in ["", "..", "../x", "a/b", ".hidden"] {
-            assert!(worktrees.caches(bad, None).is_err(), "{bad:?}");
+        assert_eq!(caches.dir(), Path::new("/state/cache/run-1-ab12"));
+        // Another run, the same id started again, and ids that differ in
+        // case only: each its own.
+        let dir = |run: &str, nonce: &str| {
+            worktrees
+                .caches(run, Some(nonce), None)
+                .expect("caches")
+                .dir()
+                .to_owned()
+        };
+        assert_ne!(dir("run-1", "ab12"), dir("run-2", "ab12"));
+        assert_ne!(dir("run-1", "ab12"), dir("run-1", "cd34"));
+        assert_ne!(
+            dir("Run-A", "ab12").to_string_lossy().to_lowercase(),
+            dir("run-a", "cd34").to_string_lossy().to_lowercase()
+        );
+        // Any id a run's worktrees take, named as they are, inside the
+        // state's caches.
+        for run in ["feature/x", "..", "../x", &"r".repeat(300)] {
+            let at = dir(run, "ab12");
+            assert_eq!(at.parent(), Some(Path::new("/state/cache")), "{run:?}");
+            assert!(at.file_name().is_some_and(|n| n.len() < 100), "{run:?}");
         }
+        assert!(worktrees.caches("run-1", Some("../x"), None).is_err());
+        let orphan = Worktrees::new(git.repo("/state/repo.git"), "/".into());
+        assert!(
+            orphan.caches("run-1", None, None).is_err(),
+            "never in the worktrees"
+        );
         let env = caches.env();
         assert!(
             !env.contains_key("CARGO_HOME"),
@@ -732,7 +779,7 @@ mod tests {
         for (name, value) in &one {
             if name != "RUSTUP_HOME" {
                 assert!(
-                    Path::new(value).starts_with("/state/cache/run-1"),
+                    Path::new(value).starts_with(caches.dir()),
                     "{name}={value}"
                 );
             }
@@ -753,9 +800,25 @@ mod tests {
             .mode();
         assert_eq!(mode & 0o777, 0o700);
         std::fs::write(caches.dir().join("built"), "x").expect("write");
+        // A directory a tool made read-only, as Go's module cache is.
+        let locked = caches.dir().join("go-mod/m@v1");
+        std::fs::create_dir_all(&locked).expect("locked");
+        std::fs::write(locked.join("go.mod"), "module m\n").expect("file");
+        for d in [&locked, &caches.dir().join("go-mod")] {
+            std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o500)).expect("mode");
+        }
         caches.remove().expect("remove");
         assert!(!caches.dir().exists());
         caches.remove().expect("a repeat finds nothing");
+        // A link in its place, which something else made, is refused.
+        std::fs::create_dir_all(dir.join("elsewhere")).expect("elsewhere");
+        std::fs::set_permissions(
+            dir.join("elsewhere"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .expect("mode");
+        std::os::unix::fs::symlink(dir.join("elsewhere"), caches.dir()).expect("link");
+        assert!(caches.create().is_err(), "a link was taken for the caches");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -90,10 +90,10 @@ attempt's own, and their `TMPDIR` is one private directory every turn of the
 project shares (Codex's sandbox keeps a registry there that turns sharing a
 writable root must share), so no shell startup file runs. Tools found through `HOME` are
 therefore not found: cargo's registry and tools, pyenv, nvm, Maven's `~/.m2`
-and the like. A worktree step's turn is pointed at its run's own build caches,
-removed when the run finishes, with a Cargo target directory for each
-worktree and `CARGO_HOME` in the attempt's own home, and at your rustup
-toolchains, read-only (see
+and the like. Every Codex turn's `CARGO_HOME` is `.cargo` in the attempt's own
+home. A worktree step's turn is also pointed at its run's own build caches,
+removed when the run ends, finished or failed, with a Cargo target directory
+for each worktree, and at your rustup toolchains, read-only (see
 [worktree steps](workflow-files.md#atom-steps)). Otherwise a codex or exec
 atom names what it needs in its `env`, as in `env: { RUSTUP_HOME:
 '/home/me/.rustup' }`. An

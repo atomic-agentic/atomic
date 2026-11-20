@@ -126,9 +126,10 @@ pub struct CodexRuntime {
     /// The execution backend each run opens its workspace on, from
     /// [`cwd`](Self::cwd), and runs its turn's shell and file work through.
     pub backend: atomic_exec::Backend,
-    /// The build caches a worktree step's turn shares with the project's
-    /// other worktree steps: its commands are pointed at them, and may
-    /// write them under `workspace-write`. `None` outside worktree steps.
+    /// The build caches of a worktree step's run, which its turn shares
+    /// with the run's other worktree steps, and nothing else: its commands
+    /// are pointed at them, and may write them under `workspace-write`.
+    /// `None` outside worktree steps.
     pub caches: Option<crate::worktree::Caches>,
 }
 
@@ -601,6 +602,19 @@ async fn run_contract(
 /// directory, so no shell reads the developer's startup files and nothing
 /// is left in a shared temporary directory; a `workspace-write` turn may
 /// write there.
+/// The build cache variables a turn's `env` may not point into the
+/// temporary directory its backend's turns share.
+const SHARED_TMP_REFUSED: &[&str] = &[
+    "ATOMIC_CACHE_DIR",
+    "XDG_CACHE_HOME",
+    "CARGO_HOME",
+    "CARGO_TARGET_DIR",
+    "npm_config_cache",
+    "PIP_CACHE_DIR",
+    "GOCACHE",
+    "GOMODCACHE",
+];
+
 fn turn_in(workspace: &Workspace, spec: &mut TurnSpec) -> Result<PathBuf, AtomError> {
     let cwd = workspace
         .require_root()
@@ -641,6 +655,20 @@ fn turn_in(workspace: &Workspace, spec: &mut TurnSpec) -> Result<PathBuf, AtomEr
     // registry of protected mount points in TMPDIR, and turns that share a
     // writable root must share that registry.
     private("TMPDIR", &workspace.tmp, spec);
+    // A cache in the temporary directory every turn of the backend shares
+    // would outlive the run and reach the next one.
+    if let Some(tmp) = &workspace.tmp {
+        for name in SHARED_TMP_REFUSED {
+            if let Some(value) = spec.env.get(*name)
+                && std::path::Path::new(value).starts_with(tmp)
+            {
+                return Err(AtomError::Runtime(format!(
+                    "{name}={value} is in the temporary directory every turn shares, so what is \
+                     cached there would reach other runs; leave {name} to atomic"
+                )));
+            }
+        }
+    }
     // The toolchains rustup runs are only ever read: never inside, or
     // holding, anything the turn may write.
     if let Some(rustup) = spec.env.get("RUSTUP_HOME").map(PathBuf::from) {

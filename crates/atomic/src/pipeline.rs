@@ -338,6 +338,24 @@ pub struct Pinned {
     pub helper_runtime: Option<String>,
     /// The budgets the run is metered under, as resolved when it started.
     pub budgets: BudgetPlan,
+    /// What names the run's build caches beside its id, chosen when it
+    /// started (see `Worktrees::caches`); `None` in a run recorded before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caches: Option<String>,
+}
+
+/// A fresh name for a run's build caches: random, or, with no randomness,
+/// the time.
+fn cache_nonce() -> String {
+    let mut bytes = [0u8; 8];
+    if getrandom::fill(&mut bytes).is_err() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        bytes = (now as u64).to_le_bytes();
+    }
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// One run of a pipeline.
@@ -662,6 +680,48 @@ async fn run_pipeline<C: WorkflowContext>(
     ledger: Ledger,
     replay: Option<Arc<Replay>>,
 ) -> Result<Value> {
+    let id = ctx.workflow_id().to_owned();
+    let mut caches = None;
+    let result = run_pipeline_in(ctx, run, services, ledger, replay, &mut caches).await;
+    // A run that ended, finished or failed, leaves no build caches: one
+    // resumed builds cold. One that only stopped, for recovery or another
+    // owner to go on with, keeps them.
+    if !matches!(result, Err(DurableError::Interrupted(_)))
+        && let Some(caches) = caches
+    {
+        remove_caches(&id, caches).await;
+    }
+    result
+}
+
+/// Remove run `id`'s build caches, saying so if they cannot be: what is
+/// left costs disk, never a later run its isolation.
+async fn remove_caches(id: &str, caches: atomic_core::worktree::Caches) {
+    let dir = caches.dir().to_owned();
+    let e = match tokio::task::spawn_blocking(move || caches.remove()).await {
+        Ok(Ok(())) => return,
+        Ok(Err(e)) => e.to_string(),
+        Err(e) => e.to_string(),
+    };
+    {
+        atomic_core::log_line!(
+            "atomic: run {id}: its build caches at {} could not be removed ({e}); remove them by \
+             hand",
+            dir.display()
+        );
+    }
+}
+
+/// [`run_pipeline`]'s work, leaving in `caches` the run's build caches once
+/// a worktree step has used them.
+async fn run_pipeline_in<C: WorkflowContext>(
+    ctx: C,
+    run: PipelineRun,
+    services: Arc<Services>,
+    ledger: Ledger,
+    replay: Option<Arc<Replay>>,
+    run_caches: &mut Option<atomic_core::worktree::Caches>,
+) -> Result<Value> {
     let PipelineRun { pipeline, input } = run;
     let id = ctx.workflow_id().to_owned();
     // Before anything is recorded: which execution this is, so `runs show`
@@ -744,6 +804,7 @@ async fn run_pipeline<C: WorkflowContext>(
                         files,
                         helper_runtime: Some(helper_runtime),
                         budgets,
+                        caches: Some(cache_nonce()),
                     });
                 }
             }
@@ -772,6 +833,7 @@ async fn run_pipeline<C: WorkflowContext>(
                 files,
                 helper_runtime: Some(helper_runtime),
                 budgets,
+                caches: Some(cache_nonce()),
             })
         })
         .await?;
@@ -789,9 +851,6 @@ async fn run_pipeline<C: WorkflowContext>(
     }});
     let decision_schema = json!({"type": "object", "properties": {"at": {"type": "integer"}}});
     let mut used_worktrees = false;
-    // The run's build caches, made once for all its worktree steps, with
-    // the person's rustup toolchains found once.
-    let mut run_caches: Option<atomic_core::worktree::Caches> = None;
     let mut accepted = Vec::new();
     for (position, step) in pipeline.steps.iter().enumerate() {
         // Before its attempt is recorded: a stopping process begins nothing.
@@ -933,12 +992,14 @@ async fn run_pipeline<C: WorkflowContext>(
                 .and_then(Value::as_str)
                 .ok_or_else(|| failed(format!("step `{}`: `base` is not a commit", step.id)))?;
             used_worktrees = true;
+            // The run's build caches, named once for all its worktree steps,
+            // with the person's rustup toolchains found once.
             let caches = match &run_caches {
                 Some(caches) => caches.clone(),
                 None => {
                     let rustup = atomic_core::worktree::rustup_home(&|n| std::env::var(n).ok());
                     let caches = worktrees
-                        .caches(&run_id, rustup)
+                        .caches(&run_id, pinned.caches.as_deref(), rustup)
                         .map_err(|e| failed(format!("the run's build caches: {e}")))?;
                     run_caches.insert(caches).clone()
                 }
@@ -1175,19 +1236,18 @@ async fn run_pipeline<C: WorkflowContext>(
         // The run's worktrees and build caches go; its accepted commits keep
         // their refs. A repeat finds less to remove and removes it.
         let run_id = ctx.workflow_id().to_owned();
-        let caches = worktrees.caches(&run_id, None);
+        let caches = run_caches.clone();
         let _removed: usize = ctx
             .step("cleanup", move |_| async move {
-                tokio::task::spawn_blocking(move || {
-                    if let Ok(caches) = &caches {
-                        caches.remove()?;
-                    }
-                    worktrees.cleanup(&run_id, &accepted)
-                })
-                .await
-                .map_err(|e| failed(format!("clean up the worktrees: {e}")))?
-                .map(|c| c.refs.len() + c.worktrees.len())
-                .map_err(|e| failed(format!("clean up the worktrees: {e}")))
+                if let Some(caches) = caches {
+                    // Never in the way of removing the worktrees.
+                    remove_caches(&run_id, caches).await;
+                }
+                tokio::task::spawn_blocking(move || worktrees.cleanup(&run_id, &accepted))
+                    .await
+                    .map_err(|e| failed(format!("clean up the worktrees: {e}")))?
+                    .map(|c| c.refs.len() + c.worktrees.len())
+                    .map_err(|e| failed(format!("clean up the worktrees: {e}")))
             })
             .await?;
     }

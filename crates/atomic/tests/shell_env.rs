@@ -124,9 +124,15 @@ fn write_codex_atom(project: &Path, name: &str, sandbox: &str) {
 }
 
 /// Where [`run_steps`] keeps the atomic home for `target`.
-fn atomic_home_for(target: &str) -> PathBuf {
+fn atomic_home_for(project: &Path, target: &str) -> PathBuf {
+    // Tests run at once, so each project's run has its own.
+    let test = project
+        .parent()
+        .and_then(Path::file_name)
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
     Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("atomic-shell-env-{}-{target}", std::process::id()))
+        .join(format!("atomic-shell-env-{}-{target}-{test}", std::process::id()))
 }
 
 /// Run `target` of `project` through `atomic run` as a person with home
@@ -140,6 +146,25 @@ async fn run_steps(
     commands: &[String],
     env: &[(&str, &str)],
 ) -> Vec<String> {
+    run_ending(home, project, target, data, commands, env, true).await
+}
+
+/// [`run_steps`], with each turn answering as it should when `succeeds`,
+/// or with what its atom's output schema refuses, so the run fails.
+async fn run_ending(
+    home: &Path,
+    project: &Path,
+    target: &str,
+    data: &str,
+    commands: &[String],
+    env: &[(&str, &str)],
+    succeeds: bool,
+) -> Vec<String> {
+    let answer = if succeeds {
+        r#"{"done": true}"#
+    } else {
+        r#"{"done": "no"}"#
+    };
     let replies = commands
         .iter()
         .flat_map(|command| {
@@ -148,12 +173,18 @@ async fn run_steps(
                     name: "exec_command".into(),
                     arguments: json!({"cmd": command, "yield_time_ms": 20000}),
                 },
-                Reply::Text(r#"{"done": true}"#.into()),
+                Reply::Text(answer.into()),
             ]
         })
+        .chain(
+            (!succeeds)
+                .then(|| (0..8).map(|_| Reply::Text(answer.into())))
+                .into_iter()
+                .flatten(),
+        )
         .collect();
     let model = FakeModel::start(replies).await.unwrap();
-    let atomic_home = atomic_home_for(target);
+    let atomic_home = atomic_home_for(project, target);
     let _ = std::fs::remove_dir_all(&atomic_home);
     let mut run = Command::new(env!("CARGO_BIN_EXE_atomic"));
     run.args(["run", target, "--data", data])
@@ -181,13 +212,20 @@ async fn run_steps(
     let out = tokio::task::spawn_blocking(move || run.output().unwrap())
         .await
         .unwrap();
-    assert!(
+    assert_eq!(
         out.status.success(),
+        succeeds,
         "stdout: {}\nstderr: {}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
     let requests = model.requests();
+    assert!(
+        requests.len() >= 2 * commands.len(),
+        "{} model calls; stderr: {}",
+        requests.len(),
+        String::from_utf8_lossy(&out.stderr)
+    );
     (0..commands.len())
         .map(|i| {
             requests[2 * i + 1]["input"]
@@ -227,7 +265,7 @@ fn printed_value(output: &str, name: &str) -> String {
 
 /// The directory of the one run's build caches, under `target`'s atomic
 /// home, from a path inside it that a command printed.
-fn run_caches(target: &str, inside: &str) -> PathBuf {
+fn run_caches(project: &Path, target: &str, inside: &str) -> PathBuf {
     let path = Path::new(inside);
     let at = path
         .ancestors()
@@ -238,7 +276,7 @@ fn run_caches(target: &str, inside: &str) -> PathBuf {
         })
         .unwrap_or_else(|| panic!("{inside} is in no run's caches"))
         .to_owned();
-    assert!(at.starts_with(atomic_home_for(target)), "{inside}");
+    assert!(at.starts_with(atomic_home_for(project, target)), "{inside}");
     at
 }
 
@@ -265,6 +303,8 @@ fn a_turn_writes_a_home_of_its_own_and_still_reads_nothing_of_the_persons() {
              echo \"target=$CARGO_TARGET_DIR\"; \
              mkdir -p \"$XDG_CACHE_HOME\" && touch \"$XDG_CACHE_HOME/w\" && echo cache-written; \
              touch \"$RUSTUP_HOME/w\" 2>/dev/null && echo rustup-written; \
+             mkdir -p \"$GOMODCACHE/m@v1\" && touch \"$GOMODCACHE/m@v1/go.mod\" && \
+             chmod 0500 \"$GOMODCACHE/m@v1\" \"$GOMODCACHE\"; \
              echo looked",
             home.display(),
             PROTECTED = PROTECTED.join(" ")
@@ -302,12 +342,13 @@ fn a_turn_writes_a_home_of_its_own_and_still_reads_nothing_of_the_persons() {
             format!("{}/.cargo", value("home")),
             "{printed}"
         );
-        let caches = run_caches("tidy-up", &value("gomod"));
+        let caches = run_caches(&project, "tidy-up", &value("gomod"));
         assert_eq!(Path::new(&value("gomod")), caches.join("go-mod"));
         assert!(
             Path::new(&value("target")).starts_with(caches.join("cargo-target")),
             "{printed}"
         );
+        // Gone, read-only directories and all.
         assert!(!caches.exists(), "the run's caches outlived it");
         assert_eq!(
             value("rustup"),
@@ -352,11 +393,41 @@ fn a_read_only_worktree_step_finds_its_caches_and_writes_nothing_there() {
                        mkdir -p \"$XDG_CACHE_HOME/x\" 2>/dev/null && echo cache-written; \
                        mkdir -p \"$CARGO_TARGET_DIR\" 2>/dev/null && echo target-written; echo looked";
         let printed = run_once(&home, &project, "peek-in", &data, command, &[]).await;
-        run_caches("peek-in", &printed_value(&printed, "xdg"));
+        run_caches(&project, "peek-in", &printed_value(&printed, "xdg"));
         assert!(printed.contains("looked"), "{printed}");
         for wrote in ["cache-written", "target-written"] {
             assert!(!printed.contains(wrote), "{wrote}: {printed}");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+#[test]
+fn a_run_that_fails_leaves_no_build_caches() {
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let dir = std::env::temp_dir().join(format!("atomic-failed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let project = dir.join("project");
+        write_project(&project);
+        let base = git(&project);
+        let data = json!({"base": base, "text": "the note"}).to_string();
+        let build = "mkdir -p \"$XDG_CACHE_HOME\" && echo built > \"$XDG_CACHE_HOME/x\"; \
+                     echo \"xdg=$XDG_CACHE_HOME\"";
+        let printed = run_ending(
+            &home,
+            &project,
+            "tidy-up",
+            &data,
+            &[build.to_owned()],
+            &[],
+            false,
+        )
+        .await;
+        let caches = run_caches(&project, "tidy-up", &printed_value(&printed[0], "xdg"));
+        assert!(!caches.exists(), "a failed run's caches stayed: {caches:?}");
         let _ = std::fs::remove_dir_all(&dir);
     });
 }
@@ -401,8 +472,8 @@ fn each_worktree_builds_in_a_target_directory_of_its_own() {
         );
         assert_ne!(one, two, "{first}\n{second}");
         assert_eq!(
-            run_caches("tidy-twice", &one),
-            run_caches("tidy-twice", &two)
+            run_caches(&project, "tidy-twice", &one),
+            run_caches(&project, "tidy-twice", &two)
         );
         let _ = std::fs::remove_dir_all(&dir);
     });
