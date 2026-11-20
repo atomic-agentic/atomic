@@ -69,31 +69,9 @@ pub struct EngineArgs {
     /// How many seconds a step waits for the execution backend to have room
     /// for its workspace before the run stops, unfinished and with nothing
     /// recorded, for `atomic runs resume`. Without it, a step waits for as
-    /// long as it takes.
-    /// `ATOMIC_BACKEND_WAIT` sets it too; an empty value sets none.
+    /// long as it takes (`backend_wait`, `ATOMIC_BACKEND_WAIT`).
     #[arg(long, value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(1..))]
     pub backend_wait: Option<u64>,
-}
-
-/// The wait `--backend-wait` gives, or else `ATOMIC_BACKEND_WAIT`; an empty
-/// variable gives none. At least a second either way.
-fn backend_wait(args: &EngineArgs) -> anyhow::Result<Option<u64>> {
-    if let Some(secs) = args.backend_wait {
-        return Ok(Some(secs));
-    }
-    match std::env::var("ATOMIC_BACKEND_WAIT") {
-        Err(_) => Ok(None),
-        Ok(text) if text.trim().is_empty() => Ok(None),
-        Ok(text) => match text.trim().parse::<u64>() {
-            Ok(secs) if secs >= 1 => Ok(Some(secs)),
-            _ => Err(Failure::new(
-                "config.backend_wait",
-                format!("ATOMIC_BACKEND_WAIT is {text:?}, not a whole number of seconds of at least 1"),
-                "set ATOMIC_BACKEND_WAIT to a number of seconds, such as 300, or leave it empty for no limit",
-            )
-            .into()),
-        },
-    }
 }
 
 /// The settings for the project at `state`, with `args` on top.
@@ -247,7 +225,10 @@ pub async fn open(
     state.lock_execution(command)?.hold_until_exit();
     let resolved = settings(state, args)?;
     atomic_core::runtime::limit_backend_wait(
-        backend_wait(args)?.map(std::time::Duration::from_secs),
+        resolved
+            .settings
+            .backend_wait
+            .map(std::time::Duration::from_secs),
     );
     let database = store_of(state, &resolved.settings);
     let executor = atomic_durable::executor_identity(resolved.settings.executor_id.as_deref())?;

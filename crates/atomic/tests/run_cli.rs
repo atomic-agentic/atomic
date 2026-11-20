@@ -2791,8 +2791,8 @@ fn serve_keeps_trying_a_step_that_found_no_room_in_time() {
 }
 
 /// `--backend-wait` is a whole number of seconds, at least 1, and so is
-/// `ATOMIC_BACKEND_WAIT`, whose empty value means none was given. Each is
-/// checked before anything runs; with no sandbox here the empty case may
+/// the `backend_wait` setting's variable, `ATOMIC_BACKEND_WAIT`, whose empty
+/// value means none was given. Each is checked before anything runs; with no sandbox here the empty case may
 /// stop for that, never for the wait.
 #[test]
 fn the_backend_wait_is_at_least_a_second() {
@@ -2834,7 +2834,14 @@ fn the_backend_wait_is_at_least_a_second() {
     );
     assert_eq!(
         stdout_json(&out)["error"]["kind"],
-        "config.backend_wait",
+        "config.invalid",
+        "{}",
+        text(&out)
+    );
+    assert!(
+        stdout_json(&out)["error"]["description"]
+            .as_str()
+            .is_some_and(|d| d.contains("backend_wait")),
         "{}",
         text(&out)
     );

@@ -53,6 +53,25 @@ fn scalar<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::E
     }
 }
 
+/// A number of seconds of at least one, or none. A whole number written as
+/// a string, as some files and variables give it, is read as that number.
+fn seconds<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+    let refuse =
+        || serde::de::Error::custom("backend_wait is a whole number of seconds, at least 1");
+    match Option::<Value>::deserialize(d)? {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(n)) => n.as_u64().filter(|s| *s >= 1).map(Some).ok_or_else(refuse),
+        Some(Value::String(s)) => s
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|s| *s >= 1)
+            .map(Some)
+            .ok_or_else(refuse),
+        Some(_) => Err(refuse()),
+    }
+}
+
 /// The string settings with no default, by path: a variable naming one is
 /// read as the string it holds, never as a number.
 const STRINGS: &[&str] = &[
@@ -127,6 +146,10 @@ pub struct Settings {
     /// This process's executor identity; required on PostgreSQL.
     #[serde(deserialize_with = "scalar")]
     pub executor_id: Option<String>,
+    /// How many seconds a step waits for the execution backend to have
+    /// room for its workspace; none, to wait as long as it takes.
+    #[serde(deserialize_with = "seconds")]
+    pub backend_wait: Option<u64>,
     /// Budget caps and prices (see [`atomic_core::budget`]).
     pub budget: BudgetSettings,
 }
@@ -144,6 +167,7 @@ impl Default for Settings {
             database: DatabaseSettings::default(),
             runner: "local".into(),
             executor_id: None,
+            backend_wait: None,
             budget: BudgetSettings::default(),
         }
     }
@@ -239,6 +263,9 @@ fn flags(args: &EngineArgs) -> Vec<(String, Value)> {
     put("model.name", &args.model);
     put("model.api_key_env", &args.model_api_key_env);
     put("executor_id", &args.executor_id);
+    if let Some(secs) = args.backend_wait {
+        out.push(("backend_wait".into(), Value::from(secs)));
+    }
     if let Some(runner) = args.runner {
         out.push((
             "runner".into(),

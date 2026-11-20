@@ -50,6 +50,7 @@ The settings `atomic run`, `atomic runs resume` and `atomic serve` resolve:
 | `database.schema` | `ATOMIC_DATABASE_SCHEMA` | |
 | `runner` | `ATOMIC_RUNNER` | `--runner` |
 | `executor_id` | `ATOMIC_EXECUTOR_ID` | `--executor-id` |
+| `backend_wait` | `ATOMIC_BACKEND_WAIT` | `--backend-wait` |
 | `budget.*` | `ATOMIC_BUDGET_*` | |
 
 Your own configuration is `$XDG_CONFIG_HOME/atomic/config.yaml`, by default
