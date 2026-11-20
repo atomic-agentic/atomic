@@ -4787,3 +4787,46 @@ fn a_note_kept_from_before_is_not_a_later_failures_cause() {
     );
     assert!(t.contains("run reused failed"), "{t}");
 }
+
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[test]
+fn the_debug_prompt_says_its_turn_is_not_metered() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text("Hello.".into())])
+            .await
+            .expect("fake model");
+        let dir = scratch("debug-unmetered");
+        let project = project(&dir);
+        let url = model.base_url();
+        let out = tokio::task::spawn_blocking(move || {
+            atomic(
+                &dir,
+                &project,
+                &[
+                    "debug",
+                    "codex-prompt",
+                    "--base-url",
+                    &url,
+                    "--model",
+                    "synthetic",
+                    "Hi.",
+                ],
+                &[],
+                "",
+            )
+        })
+        .await
+        .expect("atomic");
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "Hello.");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("this turn is not metered"),
+            "the unmetered turn was silent: {stderr}"
+        );
+        assert_eq!(model.calls(), 1);
+    });
+}

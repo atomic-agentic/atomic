@@ -330,6 +330,9 @@ pub async fn open(
             endpoint: endpoint.clone(),
             defaults: AtomConfig::default(),
             artifacts: Artifacts::store(store.clone(), file_limits()?),
+            // Each step's meter comes from the run's pinned caps, set where
+            // the step runs; a step whose atom calls a model and has none is
+            // refused there, never run unmetered.
             meter: atomic_core::usage::Metering::none(),
             // Atoms' commands are kept out of atomic's private state.
             guard: atomic_core::codex::StateGuard::for_project(state)?,
