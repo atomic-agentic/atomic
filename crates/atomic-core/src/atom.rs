@@ -254,6 +254,15 @@ fn check_env(kind: &str, fm: &serde_json::Map<String, Value>) -> Result<(), (Str
                         ),
                     );
                 }
+                if name == crate::codex::TURN_TMPDIR {
+                    return refuse(
+                        &format!("/env/{name}"),
+                        &format!(
+                            "`{name}` is set by atomic: it carries a turn's own TMPDIR past \
+                             Codex's sandbox helper; an atom cannot declare it"
+                        ),
+                    );
+                }
                 if kind == "codex" && loads_code(name) {
                     return refuse(
                         &format!("/env/{name}"),

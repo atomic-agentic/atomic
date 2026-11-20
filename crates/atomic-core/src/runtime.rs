@@ -566,8 +566,8 @@ async fn run_contract(
 /// workspace's, and its shell must be one this process can drive. Its
 /// commands' `HOME` and `ZDOTDIR` are the workspace's scratch directory and
 /// their `TMPDIR` a directory inside it, so no shell reads the developer's
-/// startup files, and nothing a turn leaves in its temporary directory is
-/// another turn's to see or touch; a `workspace-write` turn may write them.
+/// startup files, and no other turn can write what a turn leaves in its
+/// temporary directory; a `workspace-write` turn may write them.
 fn turn_in(workspace: &Workspace, spec: &mut TurnSpec) -> Result<PathBuf, AtomError> {
     let cwd = workspace
         .require_root()
@@ -597,33 +597,55 @@ fn turn_in(workspace: &Workspace, spec: &mut TurnSpec) -> Result<PathBuf, AtomEr
     };
     private("HOME", &workspace.scratch, spec);
     private("ZDOTDIR", &workspace.scratch, spec);
-    // Codex's sandbox helper keeps its registry of the mount points it makes
-    // in TMPDIR, which every turn sharing a writable root must share: the
-    // backend's shared directory, never a writable root of a turn's, so no
-    // turn adds or removes anything there. The command itself gets a
-    // TMPDIR of its own turn's, inside its scratch directory, which the
-    // helper hands it just before it runs.
-    if let Some(tmp) = &workspace.tmp {
-        spec.env
-            .insert("TMPDIR".to_owned(), tmp.display().to_string());
-    }
-    if let Some(scratch) = &workspace.scratch {
-        let own = scratch.join("tmp");
-        let mut builder = std::fs::DirBuilder::new();
-        builder.recursive(true);
-        #[cfg(unix)]
-        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-        builder.create(&own).map_err(|e| {
-            AtomError::Runtime(format!(
-                "{}: create the turn's temporary directory {}: {e}",
-                workspace.label,
-                own.display()
-            ))
-        })?;
-        spec.env
-            .insert(codex::TURN_TMPDIR.to_owned(), own.display().to_string());
-    }
+    turn_tmpdir(workspace, spec, cfg!(target_os = "linux"))?;
     Ok(cwd)
+}
+
+/// Give the commands of `spec`'s turn a `TMPDIR` of their own: a directory
+/// inside the workspace's scratch directory, which a `workspace-write` turn
+/// may write since the scratch directory is a writable root.
+///
+/// On Linux (`linux`), Codex's sandbox helper keeps its registry of the
+/// mount points it makes in its own `TMPDIR`, which every turn sharing a
+/// writable root must share: there it is the backend's shared directory,
+/// never a writable root of a turn's, and the turn's own directory goes in
+/// [`codex::TURN_TMPDIR`], which atomic's helper entry hands the command as
+/// its `TMPDIR` just before it runs. Elsewhere there is no such registry and
+/// no such handoff, and the command's `TMPDIR` is the turn's own directly.
+fn turn_tmpdir(workspace: &Workspace, spec: &mut TurnSpec, linux: bool) -> Result<(), AtomError> {
+    let Some(scratch) = &workspace.scratch else {
+        return Ok(());
+    };
+    let own = scratch.join("tmp");
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(&own).map_err(|e| {
+        AtomError::Runtime(format!(
+            "{}: create the turn's temporary directory {}: {e}",
+            workspace.label,
+            own.display()
+        ))
+    })?;
+    if !linux {
+        spec.env.remove(codex::TURN_TMPDIR);
+        spec.env
+            .insert("TMPDIR".to_owned(), own.display().to_string());
+        return Ok(());
+    }
+    let Some(shared) = &workspace.tmp else {
+        return Err(AtomError::Runtime(format!(
+            "the backend gave {}'s turn no shared temporary directory, where Codex's \
+             sandbox keeps its registry of the mount points it makes",
+            workspace.label
+        )));
+    };
+    spec.env
+        .insert("TMPDIR".to_owned(), shared.display().to_string());
+    spec.env
+        .insert(codex::TURN_TMPDIR.to_owned(), own.display().to_string());
+    Ok(())
 }
 
 /// Run `spec` as one turn on a fresh thread of `runtime`, in a workspace its
