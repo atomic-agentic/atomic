@@ -127,5 +127,7 @@ Read [design principles](concepts/design-principles.md) when you want the backgr
   [local and team operation](operations/running-atomic.md),
   [observability](operations/observability.md),
   [availability](reference/availability.md).
+- **See the design:** [design pages](design/README.md), including
+  [milestones and acceptance tests](design/milestones.md).
 
 [Full navigation](SUMMARY.md)
