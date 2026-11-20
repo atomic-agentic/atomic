@@ -219,25 +219,26 @@ fn a_configured_endpoint_comes_before_the_sign_in_and_the_sign_in_before_detecti
 }
 
 #[test]
-fn no_one_signed_in_to_a_keyring_that_cannot_be_reached_is_simply_not_signed_in() {
+fn with_no_sign_in_directory_no_store_is_read_and_with_one_an_unreadable_keyring_is_said() {
     let f = Fixture::new("no-keyring");
     let keyring = [
         ("ATOMIC_CREDENTIAL_STORE", "keyring"),
         ("OPENAI_API_KEY", "sk-detected"),
     ];
-    // Never signed in, and then with the sign-in's directory there (as a
-    // login that did not finish leaves it): the keyring, with no Secret
-    // Service here, is not taken for a sign-in that cannot be read.
-    for made in [false, true] {
-        if made {
-            std::fs::create_dir_all(f.credentials().join("codex-auth")).unwrap();
-        }
-        let out = f.atomic(&["config", "--explain"], &keyring);
-        let t = text(&out);
-        assert!(out.status.success(), "{t}");
-        assert!(!t.contains("could not be read"), "{made}: {t}");
-        assert!(t.contains("detected: OPENAI_API_KEY"), "{made}: {t}");
-    }
+    // Never signed in: nothing is read, nothing is said.
+    let out = f.atomic(&["config", "--explain"], &keyring);
+    let t = text(&out);
+    assert!(out.status.success(), "{t}");
+    assert!(!t.contains("could not be read"), "{t}");
+    assert!(t.contains("detected: OPENAI_API_KEY"), "{t}");
+    // The sign-in's directory, which login creates, and a keyring that
+    // cannot be reached (no Secret Service here): said, never taken for
+    // "signed out" without a word.
+    std::fs::create_dir_all(f.credentials().join("codex-auth")).unwrap();
+    let out = f.atomic(&["config", "--explain"], &keyring);
+    let t = text(&out);
+    assert!(out.status.success(), "{t}");
+    assert!(t.contains("the ChatGPT sign-in could not be read"), "{t}");
 }
 
 #[test]

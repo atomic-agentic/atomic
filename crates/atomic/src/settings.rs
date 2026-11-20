@@ -247,11 +247,11 @@ pub fn signed_in(project: Option<&Path>) -> SignInFound {
     }
 }
 
-/// Whether anyone is signed in at `sign_in`. A store that holds nothing is
-/// no one: `atomic model login` creates the sign-in's directory, so with
-/// none no store is read, and a keyring that cannot be reached holds no
-/// sign-in, since login keeps one only where it can. A file store that
-/// cannot be read is said.
+/// Whether anyone is signed in at `sign_in`. `atomic model login` creates
+/// the sign-in's directory, so with none no one ever signed in here and no
+/// store is read. With it, a store that cannot be read, a locked or
+/// unreachable keyring among them, is said, never taken for "signed out":
+/// that would move model calls to another account without a word.
 fn found(sign_in: SignIn) -> SignInFound {
     if !sign_in.auth_home().is_dir() {
         return Ok(None);
@@ -259,7 +259,6 @@ fn found(sign_in: SignIn) -> SignInFound {
     match sign_in.account() {
         Ok(Some(_)) => Ok(Some(sign_in)),
         Ok(None) => Ok(None),
-        Err(_) if sign_in.in_keyring() => Ok(None),
         Err(e) => Err(format!("{e:#}")),
     }
 }

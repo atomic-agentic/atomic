@@ -249,11 +249,6 @@ impl SignIn {
         self.store
     }
 
-    /// Whether it is kept in the OS keyring, not the file store.
-    pub fn in_keyring(&self) -> bool {
-        self.store != AuthCredentialsStoreMode::File
-    }
-
     /// Where the sign-in is kept, for a person: never a token.
     pub fn store_name(&self) -> &'static str {
         match self.store {
