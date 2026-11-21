@@ -1875,6 +1875,9 @@ where
             .run(run_turn(&thread, &current, limit.time, &mut recorder))
             .await;
         if let (Err(e), Some(span)) = (&turn, span.span()) {
+            // What this turn says of itself, for this step's span and its
+            // run's, which never hear this error (see [`crate::usage::Why`]).
+            crate::usage::note_step_failure(e);
             crate::usage::record_error(&span, e);
         }
         let totals = progress.totals(seen);

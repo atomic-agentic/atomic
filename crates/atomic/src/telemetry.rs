@@ -22,11 +22,12 @@
 //! span, such as in a provider's error, is not exported.
 //!
 //! A step or run that fails ends its span with the failure's class and a short
-//! reason, not the failure whole: what a model call that failed in the run
+//! reason, not the failure whole: what a model call that failed in that step
 //! said of its own cause (a provider's status and the type of error it named,
 //! none of its body), or, when nothing so near a model call failed, the
-//! failure's message cut short (see [`mark_failed`]). The whole failure stays
-//! in the run's stored error, where a person reads it.
+//! failure's message cut short (see [`mark_failed`]). A step notes on a handle
+//! of its own, which the run takes up only when that step failed. The whole
+//! failure stays in the run's stored error, where a person reads it.
 //!
 //! Names follow the GenAI semantic conventions where they fit, with atomic's
 //! own under `atomic.*` (see [`attributes`]).
@@ -109,40 +110,59 @@ fn error_type(e: &DurableError) -> Option<&'static str> {
     }
 }
 
-/// Mark `span`, a span of `why`'s run, failed with `e`: ERROR status with why
+/// Mark `span`, which `why` speaks for, failed with `e`: ERROR status with why
 /// it failed and its class (redacted on export).
 ///
-/// What the span says of why is what the step that failed noted — for a
+/// What the span says of why is what the calls it covers noted — for a
 /// provider's answer, its status and the type of error it named, none of the
-/// provider's own text (see [`atomic_core::usage::Why`]) — or, when no step
+/// provider's own text (see [`atomic_core::usage::Why`]) — or, when nothing
 /// noted anything, `e` itself, redacted and cut to
 /// [`atomic_core::usage::MAX_SPAN_ERROR`] characters, which is how a model
 /// call's own span cuts it. A span never carries the whole failure: that
 /// travels in `e` and stays in the run's stored error, where a person reads
 /// it. A step's span and its run's span say the same thing, because a durable
-/// step's failure reaches the run only as its error's text.
-pub fn mark_failed(span: &tracing::Span, why: &atomic_core::usage::Why, e: &DurableError) {
+/// step's failure reaches the run only as its error's text — and only for an
+/// execution of the run that ran the step: a run resumed after a restart has
+/// nothing noted, and its span says what the failure it recorded says, cut
+/// short. When `span` is one of the steps of `run`, what it noted goes to the
+/// run's note too, so the run's span says the same as this one did; a span
+/// that speaks for the run itself (`run: None`) and an outcome that is not a
+/// failure — a step that parks — leave the run's note as it is.
+pub fn mark_failed(
+    span: &tracing::Span,
+    why: &atomic_core::usage::Why,
+    run: Option<&atomic_core::usage::Why>,
+    e: &DurableError,
+) {
     use tracing_opentelemetry::OpenTelemetrySpanExt;
-    if let Some(kind) = error_type(e) {
-        let message = why.noted().unwrap_or_else(|| {
-            atomic_core::redact::bounded(&e.to_string(), atomic_core::usage::MAX_SPAN_ERROR - 1)
-        });
-        span.set_status(Status::error(message));
-        span.record("error.type", kind);
+    let Some(kind) = error_type(e) else {
+        return;
+    };
+    let message = why.noted().unwrap_or_else(|| {
+        atomic_core::redact::bounded(&e.to_string(), atomic_core::usage::MAX_SPAN_ERROR - 1)
+    });
+    span.set_status(Status::error(message));
+    span.record("error.type", kind);
+    if let Some(run) = run {
+        run.note_step(why);
     }
 }
 
 /// A future run inside a span, which ends when the future does, when the
 /// future is dropped, or when the process [`flush`]es before it exits,
 /// whichever comes first (see [`atomic_core::spans`]). A failure the future
-/// returns marks the span failed, as [`mark_failed`] has it.
+/// returns marks the span failed, as [`mark_failed`] has it, and — for a step
+/// made with [`traced_step`] — says the same on the run's spans.
 pub struct Traced<F> {
     inner: atomic_core::spans::InHeld<F>,
-    /// What this run's spans say of a step that failed.
+    /// What this span says of a call of its own that failed.
     why: atomic_core::usage::Why,
+    /// The run's own note, which takes `why`'s when this span's work fails:
+    /// `None` for a span that speaks for the run itself.
+    run: Option<atomic_core::usage::Why>,
 }
 
-/// Run `future` inside `span`, which belongs to the run `why` speaks for (see
+/// Run `future` inside `span`, which speaks for the run `why` notes for (see
 /// [`Traced`]).
 pub fn traced<F, T>(span: tracing::Span, why: atomic_core::usage::Why, future: F) -> Traced<F>
 where
@@ -151,6 +171,28 @@ where
     Traced {
         inner: atomic_core::spans::hold(span).run(future),
         why,
+        run: None,
+    }
+}
+
+/// Run `future` as one step of the run `run_why` notes for, inside the step's
+/// `span`, which `why` speaks for: `why` is what the step's model calls note
+/// on, its span says the same, and when the step fails the run's spans say it
+/// too (see [`mark_failed`] and [`atomic_core::usage::Why`]). A step that is
+/// retried, or whose failure the run goes on past, leaves nothing on them.
+pub fn traced_step<F, T>(
+    span: tracing::Span,
+    why: atomic_core::usage::Why,
+    run_why: &atomic_core::usage::Why,
+    future: F,
+) -> Traced<F>
+where
+    F: Future<Output = Result<T, DurableError>>,
+{
+    Traced {
+        inner: atomic_core::spans::hold(span).run(future),
+        why,
+        run: Some(run_why.clone()),
     }
 }
 
@@ -165,7 +207,9 @@ where
         if let Poll::Ready(out) = &polled {
             let held = self.inner.held();
             if let (Some(span), Err(e)) = (held.span(), out) {
-                mark_failed(&span, &self.why, e);
+                // A step hands its note to the run it failed, which is what
+                // `run` is for; a span that speaks for the run has none.
+                mark_failed(&span, &self.why, self.run.as_ref(), e);
             }
             // Ended now, not when the future's owner drops it.
             held.end();
@@ -501,10 +545,11 @@ mod tests {
     /// A step's span and its run's say why they failed by the provider's
     /// status and the type of error it named, and carry none of the
     /// provider's own text however long its body: what the model call said
-    /// reaches both spans, although workflow code is handed the run's failure
-    /// as text alone, and a step's span is marked before its run's.
-    #[test]
-    fn a_steps_span_and_its_runs_say_a_provider_failure_by_status_and_type() {
+    /// reaches both spans through the step's own note, although workflow code
+    /// is handed the run's failure as text alone, and a step's span is marked
+    /// before its run's.
+    #[tokio::test]
+    async fn a_steps_span_and_its_runs_say_a_provider_failure_by_status_and_type() {
         const RUN: &str = "run:provider-body";
         const URL: &str = "http://127.0.0.1:9/v1/chat/completions";
         // Long enough that its end is past what a span may carry, with a type
@@ -519,21 +564,32 @@ mod tests {
             whole.contains("detail") && whole.contains("PASTTHECAP"),
             "the failure a run keeps holds the provider's body: {whole}"
         );
-        // What a lite call notes for its run when it fails with this error.
-        let why = atomic_core::usage::Why::default();
-        why.note_call(&failure);
+        // What the model call that failed says of itself, on the note of the
+        // step it was made in (see `note_call`).
+        let step_why = atomic_core::usage::Why::for_step();
+        step_why.note_call(&failure);
         let memory = InMemorySpanExporter::default();
         let provider = SdkTracerProvider::builder()
             .with_simple_exporter(memory.clone())
             .build();
-        tracing::subscriber::with_default(subscriber(&provider), || {
-            for span in [
-                step_span("rank-note", "rank", RUN),
-                workflow_span("triage", RUN),
-            ] {
-                mark_failed(&span, &why, &DurableError::Failed(whole.clone()));
-            }
-        });
+        let run_why = atomic_core::usage::Why::default();
+        let failed = DurableError::Failed(whole);
+        let entered = tracing::subscriber::set_default(subscriber(&provider));
+        // The step as the workflow that ran it runs it, then its run, which
+        // is handed only the text the step's failure travelled as.
+        let of_the_step = traced_step(
+            step_span("rank-note", "rank", RUN),
+            step_why,
+            &run_why,
+            async { Err::<(), _>(failed.clone()) },
+        )
+        .await;
+        let of_the_run = traced(workflow_span("triage", RUN), run_why, async {
+            Err::<(), _>(failed)
+        })
+        .await;
+        drop(entered);
+        assert!(of_the_step.is_err() && of_the_run.is_err());
         provider.force_flush().expect("flush");
         let spans = memory.get_finished_spans().expect("spans");
         assert_eq!(spans.len(), 2, "{spans:?}");
@@ -563,8 +619,83 @@ mod tests {
         }
     }
 
+    /// A step's note reaches its run only through that step's own failure: a
+    /// call that failed in a step whose output was taken anyway labels
+    /// nothing, so the run says what the failure that stopped it says rather
+    /// than what an earlier step explained.
+    #[tokio::test]
+    async fn a_step_that_was_gone_labels_nothing_on_its_runs_span() {
+        const RUN: &str = "run:tolerated";
+        const URL: &str = "http://127.0.0.1:9/v1/chat/completions";
+        let failure = atomic_core::testing::provider_failure(
+            URL,
+            503,
+            r#"{"error": {"message": "busy", "type": "server_error"}}"#,
+        );
+        let memory = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(memory.clone())
+            .build();
+        let run_why = atomic_core::usage::Why::default();
+        let entered = tracing::subscriber::set_default(subscriber(&provider));
+        // A first step whose call failed and whose answer was taken anyway.
+        let first = atomic_core::usage::Why::for_step();
+        first.note_call(&failure);
+        let taken = traced_step(
+            step_span("rank-note", "rank", RUN),
+            first,
+            &run_why,
+            std::future::ready(Ok(())),
+        )
+        .await;
+        assert!(taken.is_ok(), "the step's output was taken");
+        // The run then failed on something no model call explained.
+        let whole = format!("{} THE END", "detail ".repeat(80));
+        let second = atomic_core::usage::Why::for_step();
+        let ran = traced_step(
+            step_span("summarize-note", "summarize", RUN),
+            second,
+            &run_why,
+            async { Err::<(), _>(DurableError::Failed(whole.clone())) },
+        )
+        .await;
+        assert!(ran.is_err());
+        let of_the_run = traced(workflow_span("triage", RUN), run_why, async {
+            Err::<(), _>(DurableError::Failed(whole))
+        })
+        .await;
+        assert!(of_the_run.is_err());
+        drop(entered);
+        provider.force_flush().expect("flush");
+        let spans = memory.get_finished_spans().expect("spans");
+        let said = |name: &str| -> Option<String> {
+            let data = spans
+                .iter()
+                .find(|s| s.name.as_ref() == name)
+                .unwrap_or_else(|| panic!("no {name} was exported: {spans:?}"));
+            match &data.status {
+                Status::Error { description } => Some(description.to_string()),
+                _ => None,
+            }
+        };
+        // The step that was taken anyway says nothing of the call that failed
+        // in it: it did not fail.
+        assert_eq!(said("invoke_agent rank-note"), None, "not a failure");
+        for name in ["invoke_agent summarize-note", "invoke_workflow triage"] {
+            let shown = said(name).unwrap_or_else(|| panic!("{name} did not fail"));
+            assert!(
+                !shown.contains("503"),
+                "{name} carries a failure the run went past: {shown}"
+            );
+            assert!(shown.ends_with('…'), "not cut short: {shown}");
+            assert!(!shown.contains("THE END"), "its end was carried: {shown}");
+        }
+    }
+
     /// A failure no model call explained is cut to what a span may carry, and
-    /// the `…` says it was: the whole stays in the run's stored error.
+    /// the `…` says it was: the whole stays in the run's stored error. This is
+    /// also what a run resumed after a restart says, since nothing noted in
+    /// the process that ran the step survives it.
     #[test]
     fn a_steps_span_cuts_a_failure_no_model_call_explained() {
         const RUN: &str = "run:cut-alone";
@@ -578,6 +709,7 @@ mod tests {
             mark_failed(
                 &span,
                 &atomic_core::usage::Why::default(),
+                None,
                 &DurableError::Failed(whole),
             );
         });

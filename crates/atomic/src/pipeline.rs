@@ -1303,11 +1303,10 @@ async fn turn<C: WorkflowContext>(
         .cloned()
         .ok_or_else(|| failed(format!("step `{}`: no atom `{}`", t.name, t.atom)))?;
     let mut runtimes = (*services.runtimes).clone();
-    // A model call this atom makes notes on the run's why, which its step's
-    // span and the run's read when they say why they failed: neither can hear
-    // the call's own error (see [`atomic_core::usage::Why`]).
-    let why = (*why).clone();
-    runtimes.lite.why = why.clone();
+    // What this run's spans say of a failure. Each run of this step notes on a
+    // handle of its own, which the run takes up only when that step failed
+    // (see [`atomic_core::usage::Why`] and [`crate::telemetry::traced_step`]).
+    let run_why = (*why).clone();
     // An atom with captured helpers gets its step's logical time and seed
     // from a step of its own, recorded once and read back on every retry,
     // so its helpers render the same prompt and reach the same validator
@@ -1474,6 +1473,9 @@ async fn turn<C: WorkflowContext>(
         // The turn runs again after a park is released, so each run
         // takes its own copies.
         let mut runtimes = runtimes.clone();
+        // What this run of this step's model calls say of a failure of their
+        // own, which its span says in turn.
+        let why = atomic_core::usage::Why::for_step();
         let (atom, atom_input, origins) = (atom.clone(), atom_input.clone(), origins.clone());
         let repair = repair.clone();
         let (id, ran, run_id) = (id.clone(), ran.clone(), run_id.clone());
@@ -1603,11 +1605,13 @@ async fn turn<C: WorkflowContext>(
             Ok(proposal)
         };
         // Model calls name the run and step on their spans, and say why they
-        // failed on this step's span and its run's (see `mark_failed`).
-        crate::telemetry::traced(
+        // failed here and, if this step is what failed the run, on its span
+        // too (see `mark_failed`).
+        crate::telemetry::traced_step(
             span,
             why.clone(),
-            atomic_core::usage::for_step(caller.0, caller.1, work),
+            &run_why,
+            atomic_core::usage::for_step(caller.0, caller.1, why, work),
         )
     })
     .await

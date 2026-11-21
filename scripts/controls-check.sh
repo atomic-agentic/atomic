@@ -71,6 +71,9 @@ CONTROLS=(
     "codex-home-read-only|crates/atomic-core/src/codex.rs|    for home in homes.into_iter().flatten() {|    for home in homes.into_iter().flatten().take(0) {|-p atomic-agentic-core --lib private_state_is_denied_and_the_rest_of_the_state_directory_is_not"
     "codex-home-files|crates/atomic-core/src/codex.rs|        planted_never(&codex_home.join(name))?;|        let _ = name;|-p atomic-agentic-core --lib private_state_is_denied_and_the_rest_of_the_state_directory_is_not"
     "review-escalates|crates/atomic/src/pipeline.rs|            _ => break (verdict, said),|            atomic_core::workflow::Verdict::Changes => return Ok((candidate.clone(), review_candidate(&candidate))), _ => break (verdict, said),|-p atomic-agentic --test pipeline a_reviewer_catches_a_seeded_bug_and_escalates_after_its_repair_rounds"
+    "span-why-lite|crates/atomic-core/src/lite.rs|            crate::usage::note_step_failure(e);|            // CONTROL_OFF: the call says nothing to its step's spans.|-p atomic-agentic-core --lib --features fake-model a_failed_call_says_on_its_step_what_its_span_says"
+    "span-why-run|crates/atomic/src/telemetry.rs|        run.note_step(why);|        // CONTROL_OFF: the run keeps nothing of this step.|--workspace --features ${FEATURES} --test telemetry a_key_a_lite_provider_echoes_is_redacted_in_its_excerpt"
+    "span-why-codex|crates/atomic-core/src/codex.rs|            crate::usage::note_step_failure(e);|            // CONTROL_OFF: the turn says nothing to its step's spans.|--workspace --features ${FEATURES} --test telemetry_sandbox a_codex_steps_span_says_what_its_turn_said_and_never_the_failure_whole"
 )
 
 die() {

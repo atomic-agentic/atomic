@@ -222,15 +222,15 @@ pub fn register_change_request<R: DurableRuntime>(
                 (budget.clone(), draft_caps.clone(), review_caps.clone());
             let run = ctx.workflow_id().to_owned();
             let id = run.clone();
-            let why = atomic_core::usage::Why::default();
-            let run_why = why.clone();
+            // What this run's spans say of a failure, which each step takes
+            // up only when that step failed (see [`atomic_core::usage::Why`]).
+            let run_why = atomic_core::usage::Why::default();
+            let step_why = run_why.clone();
             let span = crate::telemetry::workflow_span(CHANGE_REQUEST, &run);
             let work = async move {
-                let mut lite = runtimes.lite.clone();
-                // Its draft atom's failed calls say why on this run's spans,
-                // which cannot hear them (see [`atomic_core::usage::Why`]).
-                lite.why = why.clone();
-                let (draft_why, review_why) = (why.clone(), why.clone());
+                let lite = runtimes.lite.clone();
+                // The run's note, as each step holds it to hand its own to.
+                let (draft_run, review_run) = (step_why.clone(), step_why.clone());
                 let request = ChangeRequest {
                     request: input.request.clone(),
                 };
@@ -245,16 +245,24 @@ pub fn register_change_request<R: DurableRuntime>(
                         let span =
                             crate::telemetry::step_span("draft-task", "draft", &step.workflow_id);
                         let step_id = step.workflow_id.clone();
-                        crate::telemetry::traced(
-                            span,
-                            draft_why.clone(),
-                            atomic_core::usage::for_step(step_id, "draft", async move {
-                                propose(
-                                    async move { run_lite_atom(&DraftTask, &request, &lite).await },
-                                )
-                                .await
-                            }),
-                        )
+                        // A note of this step's own, which the run keeps only
+                        // if this step is the one that failed.
+                        let why = atomic_core::usage::Why::for_step();
+                        let run = draft_run.clone();
+                        async move {
+                            crate::telemetry::traced_step(
+                                span,
+                                why.clone(),
+                                &run,
+                                atomic_core::usage::for_step(step_id, "draft", why, async move {
+                                    propose(async move {
+                                        run_lite_atom(&DraftTask, &request, &lite).await
+                                    })
+                                    .await
+                                }),
+                            )
+                            .await
+                        }
                     },
                     Vec::new(),
                 )
@@ -286,16 +294,24 @@ pub fn register_change_request<R: DurableRuntime>(
                             &step.workflow_id,
                         );
                         let step_id = step.workflow_id.clone();
-                        crate::telemetry::traced(
-                            span,
-                            review_why.clone(),
-                            atomic_core::usage::for_step(step_id, "review", async move {
-                                propose(async move {
-                                    run_codex_atom(&ReviewPatch, &review_request, &codex).await
-                                })
-                                .await
-                            }),
-                        )
+                        // Its own note again: this step runs a Codex atom,
+                        // whose turn says on it what its own span says.
+                        let why = atomic_core::usage::Why::for_step();
+                        let run = review_run.clone();
+                        async move {
+                            crate::telemetry::traced_step(
+                                span,
+                                why.clone(),
+                                &run,
+                                atomic_core::usage::for_step(step_id, "review", why, async move {
+                                    propose(async move {
+                                        run_codex_atom(&ReviewPatch, &review_request, &codex).await
+                                    })
+                                    .await
+                                }),
+                            )
+                            .await
+                        }
                     },
                     Vec::new(),
                 )
