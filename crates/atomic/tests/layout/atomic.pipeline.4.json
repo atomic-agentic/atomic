@@ -32,21 +32,14 @@
               "rank-note": "string",
               "summarize-note": "string"
             },
-            "exec": {
-              "send-note": {
-                "tokens": "number",
-                "millis": "number",
-                "micro_usd": "null",
-                "origins": "array"
-              }
-            },
             "call": {
               "input_tokens": "number",
               "output_tokens": "number",
               "minutes": "number"
             },
             "pricing": {}
-          }
+          },
+          "caches": "string"
         },
         "failed": false
       },
@@ -234,21 +227,14 @@
               "rank-note": "string",
               "summarize-note": "string"
             },
-            "exec": {
-              "send-note": {
-                "tokens": "number",
-                "millis": "number",
-                "micro_usd": "null",
-                "origins": "array"
-              }
-            },
             "call": {
               "input_tokens": "number",
               "output_tokens": "number",
               "minutes": "number"
             },
             "pricing": {}
-          }
+          },
+          "caches": "string"
         },
         "failed": false
       },
@@ -404,21 +390,14 @@
               "rank-note": "string",
               "summarize-note": "string"
             },
-            "exec": {
-              "send-note": {
-                "tokens": "number",
-                "millis": "number",
-                "micro_usd": "null",
-                "origins": "array"
-              }
-            },
             "call": {
               "input_tokens": "number",
               "output_tokens": "number",
               "minutes": "number"
             },
             "pricing": {}
-          }
+          },
+          "caches": "string"
         },
         "failed": false
       },

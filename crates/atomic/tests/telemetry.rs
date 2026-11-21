@@ -20,10 +20,19 @@
 //!   are sent to the collector and reach neither the log nor the exec atoms'
 //!   commands (Codex atoms' commands: `telemetry_sandbox.rs`).
 
+//!
+//! A test whose run executes an exec atom needs Codex's Linux sandbox, as
+//! every exec atom's command runs under it: on Linux it runs with the
+//! `sandbox-tests` feature, and with it on, a sandbox that cannot start
+//! fails the test.
+
 #![allow(clippy::unwrap_used)]
 
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
+mod support;
 mod telemetry_common;
 
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 use atomic_core::testing::Reply;
 use serde_json::{Value, json};
 use std::io::Write;
@@ -31,8 +40,12 @@ use std::io::Write;
 use std::process::Stdio;
 use telemetry_common::*;
 
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn spans_over_http_json_parent_each_call_to_its_step_and_each_step_to_its_run() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
     let dir = scratch("json");
     project(&dir);
     let (model, _rt) = model(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())]);
@@ -99,8 +112,12 @@ fn spans_over_http_json_parent_each_call_to_its_step_and_each_step_to_its_run() 
     assert!(received.headers().contains("/v1/traces"));
 }
 
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn spans_over_http_protobuf_carry_the_exporters_headers_which_no_atom_sees() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
     let dir = scratch("protobuf");
     project(&dir);
     let (model, _rt) = model(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())]);
@@ -137,8 +154,12 @@ fn spans_over_http_protobuf_carry_the_exporters_headers_which_no_atom_sees() {
     assert!(!text(&out).contains(COLLECTOR_SEED), "{}", text(&out));
 }
 
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn spans_over_grpc_are_exported_from_the_commands_runtime() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
     let dir = scratch("grpc");
     project(&dir);
     let (model, _rt) = model(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())]);
@@ -168,8 +189,12 @@ fn spans_over_grpc_are_exported_from_the_commands_runtime() {
     }
 }
 
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn nothing_is_exported_when_the_variables_turn_export_off() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
     for (var, value) in [
         ("OTEL_SDK_DISABLED", "true"),
         ("OTEL_TRACES_EXPORTER", "none"),
@@ -189,8 +214,12 @@ fn nothing_is_exported_when_the_variables_turn_export_off() {
     }
 }
 
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn a_run_stopped_at_a_gate_ends_and_exports_its_spans() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
     let dir = scratch("gate");
     project(&dir);
     let (model, _rt) = model(vec![Reply::Text(RANK.into())]);
@@ -228,8 +257,12 @@ fn a_run_stopped_at_a_gate_ends_and_exports_its_spans() {
 /// A lite provider's error: its excerpt is redacted where it is made, so
 /// the run's stored error never holds the key, nor does anything shown.
 /// Each body puts its key right after an escape or a colour.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn a_key_a_lite_provider_echoes_is_redacted_in_its_excerpt() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
     let bodies = [
         (
             concat!("sk-ant-", "api03-LITEjsonSEEDED0123456789abcdef"),
@@ -272,10 +305,10 @@ fn a_key_a_lite_provider_echoes_is_redacted_in_its_excerpt() {
             !received.bodies().contains(seeded),
             "body {index} was exported"
         );
-        if index > 0 {
-            continue;
-        }
-        // Its spans say it failed, and why, redacted.
+        // Its call's span says it failed, and why: the status and the type
+        // of error the provider named, if it named one, none of its own
+        // text, which the run's stored error keeps; and the status code, as
+        // an integer.
         let spans = received.spans();
         let call = named(&spans, "chat synthetic");
         assert!(failed(call), "{call}");
@@ -283,11 +316,31 @@ fn a_key_a_lite_provider_echoes_is_redacted_in_its_excerpt() {
             attribute(call, "error.type").as_deref(),
             Some("atomic.model_call")
         );
-        assert!(
-            attribute(call, "error.message")
-                .unwrap()
-                .contains("[REDACTED]")
+        let expected = if index == 0 {
+            "401 Unauthorized: invalid_request_error"
+        } else {
+            "401 Unauthorized"
+        };
+        assert_eq!(
+            attribute(call, "error.message").as_deref(),
+            Some(expected),
+            "{call}"
         );
+        let status = call["attributes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|a| a["key"] == "http.response.status_code")
+            .map(|a| &a["value"]);
+        // OTLP/JSON may write an integer as a number or a string; either
+        // way it is an intValue, not a stringValue.
+        let int = status
+            .and_then(|v| v.get("intValue"))
+            .map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_owned));
+        assert_eq!(int.as_deref(), Some("401"), "{call}");
+        if index > 0 {
+            continue;
+        }
         for name in ["invoke_agent rank-note", "invoke_workflow triage"] {
             let span = named(&spans, name);
             assert!(failed(span), "{span}");
@@ -302,8 +355,12 @@ fn a_key_a_lite_provider_echoes_is_redacted_in_its_excerpt() {
 
 /// A command's stderr is redacted, then cut to its tail, where the step's
 /// error is made: the run's stored error never holds it.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn a_key_in_a_commands_stderr_is_redacted_in_its_tail() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
     const SEEDED: &str = concat!("glpat-", "STDERRtailSEEDED0123456789");
     let dir = scratch("stderr-tail");
     project(&dir);
@@ -321,8 +378,12 @@ fn a_key_in_a_commands_stderr_is_redacted_in_its_tail() {
 /// An output that does not fit its schema is quoted in the step's error as
 /// it was: the report redacts it, as text and as JSON, and so does the
 /// exporter.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn a_key_in_a_steps_error_is_redacted_in_the_text_report() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
     const SEEDED: &str = concat!("glpat-", "TEXTreportSEEDED0123456789");
     let dir = scratch("text-report");
     project(&dir);
@@ -333,8 +394,12 @@ fn a_key_in_a_steps_error_is_redacted_in_the_text_report() {
     assert!(!shown.contains(SEEDED), "the key was shown");
 }
 
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn a_key_in_a_steps_error_is_redacted_in_the_json_report() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
     const SEEDED: &str = concat!("glpat-", "JSONreportSEEDED0123456789");
     let dir = scratch("json-report");
     project(&dir);
@@ -352,8 +417,12 @@ fn a_key_in_a_steps_error_is_redacted_in_the_json_report() {
     assert!(!text(&out).contains(SEEDED), "the key was shown");
 }
 
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn a_key_in_a_steps_error_is_redacted_in_its_spans() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
     const SEEDED: &str = concat!("glpat-", "SPANstatusSEEDED0123456789");
     let dir = scratch("span-status");
     project(&dir);
@@ -376,6 +445,7 @@ fn a_key_in_a_steps_error_is_redacted_in_its_spans() {
 
 /// The rest of a child's output, read to its end on a thread of its own, so
 /// the child never writes to a closed pipe.
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 fn drain(mut out: impl std::io::Read + Send + 'static) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let _ = std::io::copy(&mut out, &mut std::io::sink());
@@ -383,12 +453,17 @@ fn drain(mut out: impl std::io::Read + Send + 'static) -> std::thread::JoinHandl
 }
 
 /// What a stopped process writes when a signal cuts its last flush short.
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 const STOPPED_FLUSH: &str = "stopping now, without sending the last spans";
 
 /// A command that ends normally sends its last spans, and a signal stops a
 /// collector that never answers from holding it up at all.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn a_signal_stops_the_last_flush_of_a_command_that_ended() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
     use std::io::BufRead;
     let dir = scratch("hung-normal");
     project(&dir);
@@ -421,8 +496,12 @@ fn a_signal_stops_the_last_flush_of_a_command_that_ended() {
 
 /// A command that ends normally with a collector that never answers exits
 /// within the flush's deadline, not the exporter's ten-second timeout.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn a_collector_that_never_answers_delays_an_exit_only_briefly() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
     use std::io::BufRead;
     let dir = scratch("hung-bounded");
     project(&dir);
@@ -511,8 +590,12 @@ fn a_key_in_a_check_warning_is_redacted() {
 
 /// A stop while a model call is in flight ends the run's spans, the call's
 /// among them, and exports them before the process exits.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn a_stop_during_a_model_call_exports_the_runs_open_spans() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
     let dir = scratch("stop-call");
     project(&dir);
     let (model, _rt) = model(vec![Reply::Delayed {
@@ -561,8 +644,12 @@ fn a_stop_during_a_model_call_exports_the_runs_open_spans() {
 
 /// A collector that never answers holds up a stopping process only until
 /// the next signal.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn a_second_signal_stops_at_once_while_spans_are_sent() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
     let dir = scratch("hung");
     project(&dir);
     let (model, _rt) = model(vec![Reply::Text(RANK.into())]);

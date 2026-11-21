@@ -398,6 +398,25 @@ fn atomic_check_reads_openapi_toolsets() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("1 toolset operations"));
+    // A response the executor checks against, though not the first, must
+    // compile too, or every call answered with its status would fail after
+    // its request was made.
+    std::fs::write(
+        dir.join("toolsets/jobs.openapi.yaml"),
+        "openapi: 3.1.0\ninfo: { title: Jobs, version: '1' }\npaths:\n  /jobs:\n    post:\n      operationId: submit\n      responses:\n        '200': { description: done, content: { application/json: { schema: { type: object } } } }\n        '202': { description: queued, content: { application/json: { schema: { type: object, properties: { ticket: { type: 12 } } } } } }\n",
+    )
+    .expect("spec");
+    let output = check();
+    assert!(
+        !output.status.success(),
+        "a response schema that does not compile passed"
+    );
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains("jobs.openapi.yaml") && error.contains("operation `submit`"),
+        "{error}"
+    );
+    std::fs::remove_file(dir.join("toolsets/jobs.openapi.yaml")).expect("remove");
     std::fs::write(
         dir.join("toolsets/broken.openapi.yaml"),
         "swagger: '2.0'\npaths: {}\n",

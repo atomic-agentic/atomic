@@ -52,7 +52,7 @@ commands, exec and Codex alike, never see them, so a collector credential in
 | A workflow run | `invoke_workflow <workflow>` | `atomic.workflow`, `atomic.workflow.id`, `gen_ai.conversation.id` |
 | An atom step | `invoke_agent <atom>` | `gen_ai.agent.name`, `atomic.step`, `atomic.workflow.id` |
 | A gate step | `atomic.gate <gate>` | `atomic.gate`, `atomic.step`, `atomic.workflow.id` |
-| A model call | `chat <model>` | `gen_ai.provider.name`, `gen_ai.request.model`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `atomic.workflow.id`, `atomic.step`, `error.type`, `error.message` |
+| A model call | `chat <model>` | `gen_ai.provider.name`, `gen_ai.request.model`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `atomic.workflow.id`, `atomic.step`, `error.type`, `error.message`, and `http.response.status_code` for a lite call the provider answered with an error status |
 
 Each step's span is a child of its run's, and each model call's a child of its
 step's, a client span. A Codex atom's call is one turn, which may make several
@@ -61,7 +61,17 @@ is `openai` for OpenAI's API and `openai_compatible` for any other endpoint.
 
 A step or run that fails ends its span with an error status, the failure's
 message and `error.type` (`atomic.failed`, `atomic.interrupted`, or for a
-model call `atomic.model_call` or `atomic.meter`). A process that stops while
+model call `atomic.model_call` or `atomic.meter`). A model call's
+`error.message` is redacted and at most 200 characters, with a `…` if it was
+cut. When the provider answered a lite atom's call with an error status, it
+holds only that status and the type of error the provider named, such as
+`401 Unauthorized: invalid_request_error`, and `http.response.status_code`
+holds the code. A type that does not read as one, such as `BadRequestError`,
+`DeploymentNotFound` or `"429"`, gives the status alone. Any other failure is what failed and its innermost cause,
+which can quote the provider or the model: a Codex atom's provider error, a
+lite answer that is not JSON, a refusal or an answer the provider stopped.
+The run's stored error keeps the whole, redacted. A failed step's or run's
+own span still carries its whole failure as its status message. A process that stops while
 runs are still going, such as one stopped while it waits at a gate, ends the
 spans still open with `atomic.stopped` set and exports them before it exits.
 
@@ -76,14 +86,22 @@ work that runs does. Each span's strings are redacted before they are
 exported, as atomic's log lines and error reports are: values in the formats
 of well-known keys and tokens, values given to a secret's name (`password`,
 `api_key`, `AWS_SECRET_KEY`, `DB_PASS`), and credential-looking values given to
-a name such as `token` or `pass`, become `[REDACTED]`. Each string is cut to
-4,096 characters before it is redacted. Redaction over-matches rather
-than under-matches, but it does let some things through: a short or
-word-like value after a name that only hints at a secret (`pass: 12`,
-`token: expired`), a `session=` value, a password given with `curl -u` or
-`mysql -p`, and a value that runs onto further lines. A webhook URL that
-carries its secret in its path (Slack, Discord, Microsoft Teams) is
-redacted after its host. One message is not redacted: a
+a name such as `token` or `pass`, become `[REDACTED]`; a count or a kind of
+token (`max_token`, `prompt_token`) only hints. Each string is cut to 4,096
+characters before it is redacted, and a cut string ends, or a cut tail of a
+command's output starts, with `…`. A token the cut splits is dropped whole,
+so a line that is one token longer than the cut shows only `…`; and when
+redacting what comes before a cut shrinks the text enough to bring the cut
+into view, the line at the cut is dropped too, since a secret there may have
+lost the part its rule needs. Redaction over-matches rather than
+under-matches, but it does let some things through: a short or word-like
+value after a name that only hints at a secret (`pass: 12`, `token: expired`),
+a `session=` value, a password given with `curl -u` or `mysql -p`, and a value
+that runs onto further lines. A webhook URL that carries its secret in its
+path (Slack, Discord, Microsoft Teams, a Telegram bot's) is redacted after its
+host. If redacting a panic's message fails or does not finish within five
+seconds, a fixed message is written in its place. One message is not
+redacted: a
 command-line usage error, such as an invalid value for a flag, repeats the
 argument as you typed it, since it is your own command line.
 

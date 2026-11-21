@@ -190,6 +190,7 @@ async fn engine(dir: &Path, project: &Path, base_url: &str) -> Durare {
             artifacts: Artifacts::none(),
             meter: atomic_core::usage::Metering::none(),
             backend: Default::default(),
+            caches: None,
         },
         lite: LiteRuntime::new(endpoint, AtomConfig::default()),
         exec: Default::default(),
@@ -255,6 +256,7 @@ async fn approve(rt: &Durare, g: &gate::Gate) {
             verdict: Verdict::Approve,
             comment: None,
             proposal: g.proposal.clone(),
+            answer: None,
         },
     )
     .await

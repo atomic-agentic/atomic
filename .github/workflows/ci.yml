@@ -4,6 +4,11 @@
 # request runs the checks on Linux. macOS is opt-in while atomic is built out:
 # start the workflow by hand (Actions > CI > Run workflow) and tick "macos" to
 # add it. Actions are pinned by commit SHA.
+#
+# The Linux Rust checks are split into jobs that run at once, so a pull
+# request waits for the slowest of them rather than for their sum;
+# docs/development.md ("Continuous integration") describes them and their
+# build caches.
 
 name: CI
 
@@ -55,6 +60,11 @@ jobs:
       # cannot do safely; tested with a stand-in for cargo.
       - run: scripts/controls-check-test.sh
       - run: scripts/backends-check-audit-test.sh
+      # acceptance.py fails on a listed test that failed or did not run.
+      - run: scripts/acceptance-test.sh
+      # test-shards.py fails on a test target in no shard, or in two, and on
+      # a test the shards miss; cache-trim.py keeps only dependencies.
+      - run: scripts/test-shards-test.sh
       # release-package.sh refuses a binary with failpoints compiled in.
       - run: scripts/release-package-test.sh
 
@@ -136,123 +146,120 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
       - run: cargo deny --locked check advisories
 
-  rust:
-    name: Rust (${{ matrix.os }})
+  # The Linux Rust checks run in parallel jobs, each set up by
+  # .github/actions/rust-setup, which restores the build caches the last push
+  # to main saved; on main, Clippy and "Acceptance and backends" save them
+  # again. "Rust (ubuntu-24.04)" passes only when every one of these jobs
+  # passes.
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: setup
+        uses: ./.github/actions/rust-setup
+        with:
+          target-cache: check
+          warm: "true"
+          warm-downloads: "true"
+      - run: cargo fmt --all --check
+      - name: Clippy
+        id: clippy
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # The suites behind the test features (the crash suite, the sandbox and
+      # Postgres variants) only compile with them.
+      - name: Clippy with the test features
+        id: clippy-features
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: cargo clippy --workspace --all-targets --locked --features atomic-agentic/postgres-tests,atomic-agentic/sandbox-tests -- -D warnings
+      # Only after both clippy passes, so that the cache saved under the
+      # exact key, which no later run saves again, is complete.
+      - name: Save the caches (main only)
+        if: ${{ !cancelled() && github.ref == 'refs/heads/main' && steps.clippy.outcome == 'success' && steps.clippy-features.outcome == 'success' }}
+        uses: ./.github/actions/rust-cache-save
+        with:
+          setup: ${{ toJSON(steps.setup.outputs) }}
+          cargo-home: "true"
+
+  # The workspace's tests, with Postgres and the sandbox, split into the shards
+  # scripts/test-shards.txt lists; with the features on, a missing database or
+  # sandbox fails them rather than skipping. Each shard first checks that every
+  # test target is in exactly one shard, so a new test file in none fails
+  # here. The crash suite is a shard of its own, in the job below.
+  test:
+    name: Test (${{ matrix.shard }}/3)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON(inputs.macos && '["ubuntu-24.04", "macos-15"]' || '["ubuntu-24.04"]') }}
-    runs-on: ${{ matrix.os }}
+        shard: [1, 2, 3]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      # The Codex graph's target directory, restored from the cache and saved
-      # again, outgrows the runner's free disk; drop toolchains this job never
-      # uses (.NET, Android, GHC, CodeQL).
-      - name: Free disk space (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          df -h /
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          df -h /
-
-      - name: System packages (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            build-essential pkg-config libcap-dev libssl-dev libdbus-1-dev bubblewrap
-
-      # Codex's Linux sandbox runs commands under bubblewrap, which needs unprivileged user
-      # namespaces; Ubuntu restricts them through AppArmor by default.
-      - name: User namespaces for the sandbox tests (Linux)
-        if: runner.os == 'Linux'
-        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-
-      # Postgres-backed suites read ATOMIC_TEST_DATABASE_URL and fail without it, so the
-      # database runs where the container service is available.
-      - name: Test Postgres (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          docker run -d --name atomic-test-postgres -p 127.0.0.1:5432:5432 \
-            -e POSTGRES_USER=atomic -e POSTGRES_PASSWORD=atomic -e POSTGRES_DB=atomic \
-            postgres:18.7-trixie@sha256:2ea8630df176ad090ec92136dee850397c5af8781e4bcf2e4162593691c61bbc
-          for _ in $(seq 1 60); do
-            docker exec atomic-test-postgres pg_isready -q -h 127.0.0.1 -U atomic && break
-            sleep 1
-          done
-          echo "ATOMIC_TEST_DATABASE_URL=postgres://atomic:atomic@127.0.0.1:5432/atomic" >>"$GITHUB_ENV"
-
-      # rustup installs the toolchain and components rust-toolchain.toml names.
-      - name: Pinned Astro compiler host
-        run: |
-          python3 scripts/setup-deno.py "${RUNNER_TEMP}/atomic-deno"
-          echo "${RUNNER_TEMP}/atomic-deno" >>"${GITHUB_PATH}"
-      - name: Toolchain
-        run: rustup show active-toolchain || rustup toolchain install
-
-      # The Codex patch block pulls large git sources (rusty_v8 and its submodules),
-      # so cargo's git and registry caches are kept between runs.
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - uses: ./.github/actions/rust-setup
         with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-          key: cargo-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
-          restore-keys: cargo-${{ runner.os }}-
+          target-cache: test
+          backends: "true"
+      - name: Test shard ${{ matrix.shard }} (with Postgres and the sandbox)
+        run: scripts/test-shards.py run ${{ matrix.shard }}
 
-      # The prebuilt V8 archive deps/v8.toml pins, checked against its SHA-256
-      # into target/v8-mirror, which .cargo/config.toml points rusty_v8 at.
-      - name: V8 archive
-        run: |
-          scripts/v8-archive.sh
-          scripts/v8-archive-test.sh
+  # The crash suite: every failpoint, triggered in turn, against real
+  # workflows and the scripted fake model; each run killed there must finish
+  # when recovered, with no completed step repeated. Its codex atom runs under
+  # the sandbox, hence sandbox-tests. Linux only.
+  crash:
+    name: Crash suite
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/rust-setup
+        with:
+          target-cache: test
+          backends: "true"
+      - name: Crash suite
+        run: scripts/test-shards.py run crash
 
-      - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      # The suites behind the test features (the crash suite, the sandbox and
-      # Postgres variants) only compile with them.
-      - name: Clippy with the test features (Linux)
-        if: runner.os == 'Linux'
-        run: cargo clippy --workspace --all-targets --locked --features atomic-agentic/postgres-tests,atomic-agentic/sandbox-tests -- -D warnings
-      - run: cargo build --workspace --locked
-      # The graph still resolves from scratch onto the libsqlite3-sys Codex
-      # locks, which both Codex and the durare fork link.
-      - name: Lockfile resolves from scratch (Linux)
-        if: runner.os == 'Linux'
-        run: scripts/lock-resolves.sh
-      # Each V8 version deps/v8.toml lists as locked but unbuilt stays out of
-      # the build graph.
-      - name: Unbuilt V8 versions stay unbuilt (Linux)
-        if: runner.os == 'Linux'
-        run: scripts/lock-check.sh v8-built
-      # Postgres variants run where the test database is, and the sandbox tests
-      # where Codex's Linux sandbox can start; with the features on, a missing
-      # database or sandbox fails them rather than skipping.
-      # The crash suite runs in a step of its own, below.
-      - name: Test (Linux, with Postgres and the sandbox)
-        id: test
-        if: runner.os == 'Linux'
-        run: cargo test --workspace --locked --no-fail-fast --features atomic-agentic/postgres-tests,atomic-agentic/sandbox-tests -- --skip every_failpoint_triggered_in_turn
-      # The crash suite: every failpoint, triggered in turn, against real
-      # workflows and the scripted fake model; each run killed there must
-      # finish when recovered, with no completed step repeated. Its codex atom
-      # runs under the sandbox, hence sandbox-tests. The same features as the
-      # step above, so nothing rebuilds. Linux only.
-      # These two also run when the test step failed, but not when it never
-      # ran because the build did not.
-      - name: Crash suite (Linux)
-        if: runner.os == 'Linux' && !cancelled() && steps.test.conclusion != 'skipped'
-        run: cargo test --workspace --locked --features atomic-agentic/postgres-tests,atomic-agentic/sandbox-tests --test crash
+  # The checks that need every test binary built: that the shards above run
+  # each test exactly once, the milestones' acceptance, and that suites fail
+  # without their backends. On main this job saves the test build's cache.
+  acceptance:
+    name: Acceptance and backends
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: setup
+        uses: ./.github/actions/rust-setup
+        with:
+          target-cache: test
+          backends: "true"
+          warm: "true"
+      # The test features scripts/acceptance.py and scripts/test-shards.py
+      # use, so nothing rebuilds for the steps below.
+      - name: Build the tests
+        id: build
+        run: cargo test --workspace --locked --no-fail-fast --features atomic-agentic/postgres-tests,atomic-agentic/sandbox-tests --no-run
+      # Each test the unsplit `cargo test --workspace` lists is listed by
+      # exactly one shard, and no shard lists another.
+      - name: Every test in exactly one shard
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: scripts/test-shards.py check
+      # Each milestone's acceptance clauses, the tests that show each listed in
+      # scripts/acceptance/; a listed test that fails, is ignored or no longer
+      # runs fails the step.
+      - name: M12 acceptance
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: python3 scripts/acceptance.py m12
       # A suite that cannot reach its backend fails; it never skips. The
       # Postgres and sandbox suites run once more with their backend missing,
       # and every one of their tests must fail, naming it. The sandbox half
-      # reuses the test step's build; the Postgres half rebuilds
+      # reuses the build above; the Postgres half rebuilds
       # atomic-agentic-durable with its own features.
-      - name: Suites fail without their backends (Linux)
-        if: runner.os == 'Linux' && !cancelled() && steps.test.conclusion != 'skipped'
+      - name: Suites fail without their backends
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: |
           scripts/backends-check.sh postgres
           old="$(sysctl -n user.max_user_namespaces)"
@@ -261,16 +268,88 @@ jobs:
           scripts/backends-check.sh sandbox || status=$?
           sudo sysctl -w user.max_user_namespaces="${old}"
           exit "${status}"
-      - name: Test (macOS)
-        if: runner.os == 'macOS'
-        run: cargo test --workspace --locked --no-fail-fast
+      - name: Save the build cache (main only)
+        if: ${{ !cancelled() && github.ref == 'refs/heads/main' && steps.build.outcome == 'success' }}
+        uses: ./.github/actions/rust-cache-save
+        with:
+          setup: ${{ toJSON(steps.setup.outputs) }}
 
+  # The plain build and the checks that need no test build. It restores the
+  # test build's cache, whose dependencies the plain build shares.
+  build:
+    name: Build, lockfile and SBOM
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: setup
+        uses: ./.github/actions/rust-setup
+        with:
+          target-cache: test
+      - run: scripts/v8-archive-test.sh
+      - name: Build
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: cargo build --workspace --locked
+      # The graph still resolves from scratch onto the libsqlite3-sys Codex
+      # locks, which both Codex and the durare fork link.
+      - name: Lockfile resolves from scratch
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: scripts/lock-resolves.sh
+      # Each V8 version deps/v8.toml lists as locked but unbuilt stays out of
+      # the build graph.
+      - name: Unbuilt V8 versions stay unbuilt
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: scripts/lock-check.sh v8-built
       # The release SBOM must list every fork at its pinned revision.
-      - name: SBOM (Linux)
-        if: runner.os == 'Linux'
+      - name: SBOM
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: |
           cdx=cargo-cyclonedx-x86_64-unknown-linux-gnu
           curl -fsSLo /tmp/cdx.tar.xz "https://github.com/CycloneDX/cyclonedx-rust-cargo/releases/download/cargo-cyclonedx-0.5.10/${cdx}.tar.xz"
           echo "2e4ef64a53c0a38d4b7d805c593b5f47ecd29821e98d81e484d03abaa0edb95f  /tmp/cdx.tar.xz" | sha256sum -c -
           tar -xJf /tmp/cdx.tar.xz -C "$HOME/.cargo/bin" --strip-components=1 "${cdx}/cargo-cyclonedx"
           scripts/sbom.sh
+
+  # The one check that stands for all the Linux Rust jobs above, under the
+  # name the single Rust job had.
+  rust:
+    name: Rust (ubuntu-24.04)
+    # always(), not !cancelled(): a cancelled run must end this check as a
+    # failure, not as skipped, which a required check would count as passed.
+    # The step fails on any result but success, cancelled and skipped too.
+    if: ${{ always() }}
+    needs: [clippy, test, crash, acceptance, build]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Every Linux Rust job passed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"${NEEDS}"
+          jq -e 'all(.[]; .result == "success")' <<<"${NEEDS}" >/dev/null
+
+  # macOS, started by hand with the workflow's macos input: the build and the
+  # tests without the Linux-only backends, in one job. It keeps no build
+  # cache, so that a run by hand never crowds Linux's out of the cache.
+  rust-macos:
+    name: Rust (macos-15)
+    if: ${{ inputs.macos }}
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Pinned Astro compiler host
+        run: |
+          python3 scripts/setup-deno.py "${RUNNER_TEMP}/atomic-deno"
+          echo "${RUNNER_TEMP}/atomic-deno" >>"${GITHUB_PATH}"
+      # rustup installs the toolchain and components rust-toolchain.toml names.
+      - name: Toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: V8 archive
+        run: |
+          scripts/v8-archive.sh
+          scripts/v8-archive-test.sh
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo build --workspace --locked
+      - name: Test (macOS)
+        run: cargo test --workspace --locked --no-fail-fast

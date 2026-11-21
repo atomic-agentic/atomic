@@ -438,7 +438,14 @@ async fn call(
         Wire::Responses => usage_of(v, "input_tokens", "output_tokens"),
     });
     let answer = if !status.is_success() {
-        Err(anyhow!("POST {url}: {status}: {}", excerpt(&text)))
+        Err(ProviderError {
+            url: url.clone(),
+            status: status.to_string(),
+            code: status.as_u16(),
+            kind: value.as_ref().and_then(error_kind),
+            excerpt: excerpt(&text),
+        }
+        .into())
     } else {
         match &value {
             None => Err(anyhow!(
@@ -453,6 +460,63 @@ async fn call(
         }
     };
     Called { answer, usage }
+}
+
+/// A provider's answer that is not a success: its status, the start of its
+/// body, and the type of error the body names, if it names one.
+#[derive(Debug, thiserror::Error)]
+#[error("POST {url}: {status}: {excerpt}")]
+pub(crate) struct ProviderError {
+    url: String,
+    /// The status, as `401 Unauthorized`.
+    status: String,
+    /// The status's code.
+    pub(crate) code: u16,
+    /// The error's type, from the body (see [`error_kind`]).
+    kind: Option<String>,
+    /// The start of the body, redacted.
+    excerpt: String,
+}
+
+impl ProviderError {
+    /// What a trace says of it: the status and the error's type, none of
+    /// the provider's own text.
+    pub(crate) fn summary(&self) -> String {
+        match &self.kind {
+            Some(kind) => format!("{}: {kind}", self.status),
+            None => self.status.clone(),
+        }
+    }
+}
+
+/// The type of error an OpenAI-style body names, `error.type` or else
+/// `error.code`, when it reads as one: see [`is_error_kind`]. Anything
+/// else is the provider's own text.
+fn error_kind(body: &Value) -> Option<String> {
+    let error = body.get("error")?;
+    ["type", "code"].iter().find_map(|field| {
+        let kind = error.get(*field)?.as_str()?;
+        is_error_kind(kind).then(|| kind.to_owned())
+    })
+}
+
+/// Whether `kind` reads as an error's type, such as `invalid_request_error`,
+/// `rate_limit_exceeded` or `overloaded`, and not as a key: a lower-case
+/// letter first, at most 40 lower-case letters, digits and `_`, an
+/// underscore if it has digits, and at most three digits. A key's mixed
+/// case, dashed prefix or run of digits fails it; one of letters alone
+/// passes any test of shape, and the redaction of the span's summary is
+/// what catches it.
+fn is_error_kind(kind: &str) -> bool {
+    let b = kind.as_bytes();
+    let lower = |c: &u8| c.is_ascii_lowercase();
+    let digits = b.iter().filter(|c| c.is_ascii_digit()).count();
+    b.first().is_some_and(lower)
+        && b.len() <= 40
+        && b.iter()
+            .all(|c| lower(c) || c.is_ascii_digit() || *c == b'_')
+        && (b.contains(&b'_') || digits == 0)
+        && digits <= 3
 }
 
 /// An answer the provider cut off at its output limit: not an answer that

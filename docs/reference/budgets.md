@@ -3,13 +3,13 @@
 Budgets bound the work an atom or workflow can attempt. They are part of the
 **v0.1 target**. The `budget` field, its defaults, the price table and the usage
 ledger described below are implemented and tested against the scripted fake
-model; the `atomic config --explain` and `atomic runs show` commands that display
-them are not yet.
+model. `atomic config --explain` shows the budget settings and where each came
+from, and `atomic runs show` shows a run's model calls and tokens.
 
 You can start with finite runtime defaults. Inspect them with
-`atomic config --explain` once it ships; override a cap when the task needs it.
-The current defaults are provisional and may change as they are tested against
-real providers.
+`atomic config --explain`; override a cap when the task needs it. The current
+defaults are provisional and may change as they are tested against real
+providers.
 
 ## Set a cap
 
@@ -55,8 +55,13 @@ and an estimated cost range, beside the cap, without calling a model.
 ## Defaults and prices
 
 Omitted limits come from the `budget` section of the configuration, which layers
-like every other setting (`atomic.yaml`, `atomic.local.yaml`, a profile, then
-`ATOMIC_*` variables such as `ATOMIC_BUDGET_ATOM_TOKENS`):
+like every other setting: your own configuration
+(`~/.config/atomic/config.yaml`), then `atomic.yaml`, then `atomic.local.yaml`,
+then `ATOMIC_BUDGET_*` variables such as `ATOMIC_BUDGET_ATOM_TOKENS`, each limit
+taken from the last of them that sets it. A variable atomic cannot read as its
+limit is refused, naming the variable. `pricing` is one setting, not one per
+model: a layer that sets it replaces the whole table below it rather than adding
+to it.
 
 ```yaml
 budget:
@@ -88,6 +93,14 @@ anything else, or an amount too large to account exactly, fails configuration.
 
 A run resolves its caps, call bounds and prices once, when it starts, and keeps
 them: a run resumed after the configuration changed is metered as it began.
+`atomic config --explain` shows each budget setting with the layer it came
+from.
+
+Every model call a run makes is metered: a step whose atom calls a model and
+that the run has no caps for is refused, never run without a meter. A live
+`atomic eval` is metered as a step is (see [eval cases](eval-cases.md)). The
+hidden developer diagnostics `atomic debug codex-prompt` and `atomic debug probe`
+make the only model call atomic makes without a meter, and say so on stderr.
 
 ## Bound a whole workflow
 
@@ -114,11 +127,14 @@ separate wall-clock deadline and continues during an offline interval.
 Before dispatch, Atomic durably reserves against the atom and every parent budget
 under a stable request/attempt ID, independently of output checkpoints. Settlement
 is idempotent by that ID. Failed or rejected attempts still count; an uncertain
-request retains its maximum reservation until usage is reconciled. Nothing
-reconciles usage yet: the usage query that would learn an uncertain request's
-real usage from the provider is not built, so an unknown or partly known charge
-keeps its value. A new actual
-retry needs another reservation rather than reusing uncertain allowance.
+request keeps its maximum reservation charged. atomic has no lookup of what one
+request used, and OpenAI, Azure OpenAI and local servers, as atomic calls them,
+offer none: on the Responses API atomic asks for its responses not to be kept for
+retrieval (`store: false`), it does not ask for Chat Completions to be stored,
+OpenAI's usage reports are totals over time rather than per request, and local
+servers keep no record. An unknown or partly known charge therefore keeps its
+value. A new actual retry needs another reservation rather than reusing uncertain
+allowance.
 
 For a supported bounded request, reserve its whole provider maximum: intentional
 unreserved overshoot is zero. Any declared excess is bounded by `max(0, B - R)`
@@ -169,7 +185,12 @@ and broke off, including a stream that Codex retried before giving up, or one
 that ended incomplete; one whose request the provider refused outright, without
 retrying, is charged what it reported. A turn's reported tokens can exceed its
 reservation, since every request sends the conversation again; the ledger
-records the overshoot, including the estimate added to it.
+records the overshoot, including the estimate added to it. A running turn records
+what it has reported each time that grows, charged the same way, with one request
+taken to be in flight, so a turn whose process is stopped by a signal or killed
+before the turn settles stays charged at least what it last recorded having
+reported and that request, never just its reservation. Usage reported after the
+last record, and before the stop, is not known.
 
 An exec atom's command counts toward `minutes` the same way: its step reserves
 the active time its atom has left (or less, if the run has less), the command is
@@ -191,16 +212,17 @@ budget does not price is not made.
 
 When a cap prevents more work, the run parks for inspection rather than silently
 starting another attempt. The call is not made, the park is recorded with its
-reason, and the run waits on it; resuming it finds it parked again. Already-started work and uncertain provider usage can
-require reconciliation; a configured cap is not a promise of a perfectly bounded
-provider bill. Pending usage is not treated as free after a crash.
+reason, and the run waits on it; resuming it finds it parked again. Uncertain
+provider usage stays charged; a configured cap is not a promise of a
+perfectly bounded provider bill. Pending usage is not treated as free after a
+crash.
 
 A released park runs the parked atom again, as new attempts at the same requests,
 and admits its calls against the caps as they are stored then. Releasing alone
 raises nothing, so a run released with no more room parks again. Room comes from
-raising the cap in the usage ledger, from an attempt left reserved being
-reconciled with its real usage, or, for a refusal caused by a sibling's
-reservation, from that sibling settling.
+raising the cap in the usage ledger, from a person entering an attempt's real
+usage in the ledger in place of its reservation (no command does that yet), or,
+for a refusal caused by a sibling's reservation, from that sibling settling.
 
 Inspect the run with `atomic runs show <run-id>`. This draft does not yet define
 the command that raises a cap and releases the park; resuming alone cannot bypass

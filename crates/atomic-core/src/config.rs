@@ -188,6 +188,17 @@ where
             name: name.clone(),
             message,
         })?;
+        // Read as the setting's own type, alone, so a value it cannot hold,
+        // such as a negative count or a word for an optional number, is
+        // refused by the variable's name rather than in the merged whole.
+        let mut alone = defaults.clone();
+        pointer_set(&mut alone, path, parsed.clone());
+        if let Err(e) = serde_json::from_value::<T>(alone) {
+            return Err(ConfigError::Value {
+                name: name.clone(),
+                message: without_values(&e.to_string()),
+            });
+        }
         pointer_set(&mut value, path, parsed);
         sources.insert(path.clone(), Source::Env(name.clone()));
     }

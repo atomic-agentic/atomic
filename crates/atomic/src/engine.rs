@@ -319,6 +319,8 @@ pub async fn open(
         atomic_core::log_line!("{line}");
     }
     let store = LocalStore::for_project(state).context("the artifact store")?;
+    // A run whose workflow code panics is noted where later processes look.
+    atomic_app::panics::keep_in(state.private_dir().join("panics"));
     let exec = exec_backend(state, paths, runner_of(&resolved)?)?;
     let runtimes = Arc::new(Runtimes {
         codex: CodexRuntime {
@@ -328,10 +330,14 @@ pub async fn open(
             endpoint: endpoint.clone(),
             defaults: AtomConfig::default(),
             artifacts: Artifacts::store(store.clone(), file_limits()?),
+            // Each step's meter comes from the run's pinned caps, set where
+            // the step runs; a step whose atom calls a model and has none is
+            // refused there, never run unmetered.
             meter: atomic_core::usage::Metering::none(),
             // Atoms' commands are kept out of atomic's private state.
             guard: atomic_core::codex::StateGuard::for_project(state)?,
             backend: exec.clone(),
+            caches: None,
         },
         lite: LiteRuntime {
             backend: exec.clone(),
@@ -341,8 +347,9 @@ pub async fn open(
         exec_meter: Default::default(),
         clock: None,
     });
-    // A project in a git repository gets worktrees for its worktree steps.
-    let worktrees = Worktrees::open(state).ok().map(Arc::new);
+    // Never the developer's checkout: a run's worktree steps use the
+    // snapshot of the fixture it is bound to (see `atomic_core::fixture`).
+    let worktrees: Option<Arc<Worktrees>> = None;
     let mut rt = Durare::open(&database, executor.as_deref(), LAYOUT_VERSION)
         .await
         .with_context(|| format!("open the durable store at {}", describe(&database)))?;
