@@ -1,0 +1,1 @@
+signin-foreign-nofollow|crates/atomic-core/src/state.rs|const NOT_THROUGH_A_LINK: i32 = libc::O_NOFOLLOW;|const NOT_THROUGH_A_LINK: i32 = 0; /*CONTROL_OFF*/|-p atomic-agentic-core --lib state::tests::another_users_link_file_is_opened_through_no_link

@@ -105,7 +105,7 @@ pub fn gate_span(gate: &str, run: &str) -> tracing::Span {
 /// outcome that is not a failure (a run that parks is waiting).
 fn error_type(e: &DurableError) -> Option<&'static str> {
     match e {
-        DurableError::Parked(_) => None,
+        DurableError::Parked { .. } => None,
         DurableError::Failed(_) => Some("atomic.failed"),
         DurableError::Interrupted(_) => Some("atomic.interrupted"),
         _ => Some("atomic.error"),

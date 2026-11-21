@@ -1,0 +1,1 @@
+request-media-application-tree|crates/atomic-schema/src/openapi.rs|    let application_tree = essence.starts_with("application/");|    let application_tree = essence.contains('/'); /*CONTROL_OFF*/|-p atomic-agentic-schema --lib -- openapi::tests::every_json_media_types_schema_is_kept_for_a_response

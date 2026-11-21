@@ -216,6 +216,7 @@ impl Fixture {
             "ATOMIC_MODEL",
             "ATOMIC_MODEL_API_KEY_ENV",
             "OPENAI_API_KEY",
+            "OPENAI_BASE_URL",
             "CODEX_API_KEY",
         ] {
             c.env_remove(name);

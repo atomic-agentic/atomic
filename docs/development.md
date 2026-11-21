@@ -196,8 +196,11 @@ whether it is named first or after global flags, and given only `PATH` from
 the control plane's environment; the sandbox helper's outer stage, which
 holds a confined command's proxy token, made non-dumpable; and the artifact store's
 holds, which keep the files an exec step hands over from every sweep until its
-turn is recorded; and that an exec atom's files move only through its
-workspace's backend), it
+turn is recorded, and what a run's input names from every sweep until the input
+is recorded, refusing an input whose typed artifact field names content the
+store does not hold, and waiting for the store's lock within one bounded wait
+that a stop signal ends; and
+that an exec atom's files move only through its workspace's backend), it
 switches the control off in the source, requires the control's test to fail,
 puts the source back and requires the test to pass. Each control costs a rebuild, so it
 runs by hand rather than in CI:
@@ -475,6 +478,14 @@ milestone suites pass at the candidate. Given a tag, or `latest` for Codex's
 latest release, it applies that candidate itself on any branch. To finish a
 bump, commit the `Cargo.lock` the workflow uploads, account for what
 `scripts/lock-check.sh` reports, and follow the other steps the script prints.
+
+atomic knows Codex's Linux sandbox helper by how Codex starts it, and a bump
+that changes that changes what atomic recognises as the helper. Check, in the
+candidate's `sandboxing` and `linux-sandbox` crates, that the helper's first
+arguments are still `--sandbox-policy-cwd`, alone or after
+`--inherit-pid-namespace`, and that the helper is still started under the
+name `codex-linux-sandbox`. Then update `LINUX_SANDBOX_ARG1` and
+`INHERIT_PID_NAMESPACE` in `crates/atomic-core/src/codex.rs` to match.
 
 `scripts/milestone-tests.sh` also runs locally:
 

@@ -58,6 +58,10 @@ pub struct Call {
     /// atom's command: it uses no tokens and costs nothing, and, like a
     /// turn, reserves the active time left and is cut off when it runs out.
     pub work: bool,
+    /// For a turn or work, the longest it can take when it has a limit of
+    /// its own, such as a command's: it reserves no more of the time left
+    /// than that.
+    pub longest: Option<Duration>,
 }
 
 /// The model name active work that is not a model call is accounted under.
@@ -186,8 +190,13 @@ pub enum Outcome {
 
 /// Admission was refused: a cap leaves no room for the call's bound.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("{0}")]
-pub struct Exhausted(pub String);
+#[error("{reason}")]
+pub struct Exhausted {
+    /// Why, for a person.
+    pub reason: String,
+    /// The allowance with no room, when the ledger named one.
+    pub scope: Option<String>,
+}
 
 /// Why the meter could not admit or settle a call.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]

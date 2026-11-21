@@ -1,0 +1,1 @@
+store-project-manifest|crates/atomic/src/engine.rs|        Err(atomic_core::project::ProjectError::NotFound(_)) => state|        Err(_) => state|-p atomic-agentic --bin atomic the_store_key_falls_back_only_when_no_manifest_is_there
