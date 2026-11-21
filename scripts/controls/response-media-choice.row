@@ -1,0 +1,1 @@
+response-media-choice|crates/atomic-core/src/http_tools.rs|    let wanted = media.map(media_essence);|    let wanted = /*CONTROL_OFF*/ None;|-p atomic-agentic-core --lib -- http_tools::tests::a_reply_is_checked_against_the_schema_its_content_type_names

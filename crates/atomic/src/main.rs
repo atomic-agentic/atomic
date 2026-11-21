@@ -588,16 +588,19 @@ fn check(path: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
         let tools = atomic_schema::openapi::operations(&spec)
             .map_err(|e| anyhow::anyhow!("{}: {e}", source.path.display()))?;
         for tool in &tools {
-            // The executor checks each response against its own schema, so
-            // each must compile, not only the first.
-            for schema in std::iter::once(&tool.input)
-                .chain(tool.output.as_ref())
-                .chain(
-                    tool.responses
-                        .values()
-                        .filter_map(atomic_schema::openapi::ResponseBody::schema),
-                )
-            {
+            // The executor checks each success against the schema of the
+            // media type its reply names, so every schema a response declares
+            // must compile, not only the first. The tool's own `output` is one
+            // of these same schemas or an `anyOf` of them, each one listed
+            // here, and the components they reference travel in the input's
+            // `$defs`, which is listed too.
+            let mut schemas: Vec<&serde_json::Value> = vec![&tool.input];
+            for body in tool.responses.values().flatten() {
+                for (_media, schema) in body.schemas() {
+                    schemas.push(schema);
+                }
+            }
+            for schema in schemas {
                 atomic_schema::registry::Registry::new()
                     .validator_for(schema)
                     .map_err(|e| {
