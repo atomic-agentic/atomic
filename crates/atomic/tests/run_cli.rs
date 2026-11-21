@@ -635,6 +635,7 @@ fn command_as(
         "ATOMIC_RUNNER",
         "ATOMIC_BACKEND_WAIT",
         "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
         "DATABASE_URL",
     ] {
         cmd.env_remove(name);
@@ -1423,6 +1424,98 @@ fn init_in_an_empty_directory_makes_a_project_that_checks_and_runs() {
             std::fs::read_to_string(fresh.join("atomic.yaml")).expect("manifest"),
             before
         );
+    });
+}
+
+/// With only `OPENAI_API_KEY` set, and the person's `OPENAI_BASE_URL`
+/// pointing it at an endpoint, as OpenAI's SDKs read it, `atomic init` and
+/// `atomic run` need nothing else: the run sends the key, as a bearer token,
+/// to that endpoint, and `config --explain` names both variables.
+#[test]
+fn with_only_an_api_key_and_its_base_url_init_and_run_need_no_configuration() {
+    on_codex_runtime(async {
+        const KEY: &str = "sk-test-only-for-the-fake";
+        let model = FakeModel::start(vec![Reply::Text(
+            r#"{"summary": "Export crashes on accented file names."}"#.into(),
+        )])
+        .await
+        .expect("fake model");
+        let dir = scratch("api-key-base-url");
+        std::fs::create_dir_all(dir.join("home")).expect("empty home");
+        let fresh = dir.join("note-tools");
+        std::fs::create_dir_all(&fresh).expect("dir");
+        let base_url = model.base_url();
+        let env = [
+            ("OPENAI_API_KEY", KEY),
+            ("OPENAI_BASE_URL", base_url.as_str()),
+        ];
+        let out = atomic(&dir, &fresh, &["init"], &env, "");
+        assert!(out.status.success(), "{}", text(&out));
+
+        let out = atomic(&dir, &fresh, &["--json", "config", "--explain"], &env, "");
+        assert!(out.status.success(), "{}", text(&out));
+        assert!(
+            !text(&out).contains(KEY),
+            "the key was shown: {}",
+            text(&out)
+        );
+        let doc = stdout_json(&out);
+        let setting = |name: &str| -> Value {
+            doc["settings"]
+                .as_array()
+                .and_then(|all| all.iter().find(|s| s["setting"] == name))
+                .cloned()
+                .unwrap_or_else(|| panic!("no {name}: {doc}"))
+        };
+        assert_eq!(
+            setting("model.base_url")["value"],
+            base_url.as_str(),
+            "{doc}"
+        );
+        assert_eq!(
+            setting("model.base_url")["source"],
+            "detected: OPENAI_API_KEY and OPENAI_BASE_URL are set",
+            "{doc}"
+        );
+        assert_eq!(
+            setting("model.api_key_env")["source"],
+            "detected: OPENAI_API_KEY and OPENAI_BASE_URL are set",
+            "{doc}"
+        );
+
+        let (d, f, u) = (dir.clone(), fresh.clone(), base_url.clone());
+        let out = tokio::task::spawn_blocking(move || {
+            atomic(
+                &d,
+                &f,
+                &[
+                    "run",
+                    "summarize-note",
+                    "--data",
+                    r#"{"text": "Exporting café.txt crashes the app."}"#,
+                ],
+                &[("OPENAI_API_KEY", KEY), ("OPENAI_BASE_URL", u.as_str())],
+                "",
+            )
+        })
+        .await
+        .expect("child");
+        assert!(out.status.success(), "{}", text(&out));
+        assert_eq!(
+            stdout_json(&out),
+            json!({"summary": "Export crashes on accented file names."})
+        );
+        let sent: Vec<String> = model
+            .headers()
+            .iter()
+            .map(|call| {
+                call.iter()
+                    .find(|(name, _)| name == "authorization")
+                    .map(|(_, value)| value.clone())
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert_eq!(sent, vec![format!("Bearer {KEY}")]);
     });
 }
 

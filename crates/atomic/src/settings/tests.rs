@@ -1153,3 +1153,145 @@ fn the_budget_layers_like_every_other_setting_and_says_where_each_limit_came_fro
         assert!(!said.contains(value), "{name}={value}: {said}");
     }
 }
+
+/// The person's OPENAI_BASE_URL is where OPENAI_API_KEY's detection sends
+/// the key, and `--explain` names both variables as its source.
+#[test]
+fn openai_base_url_points_an_openai_keys_detection_elsewhere() {
+    let d = dir(&[("atomic.yaml", MANIFEST_ONLY)]);
+    let r = resolved(
+        &d,
+        &EngineArgs::default(),
+        &[
+            ("OPENAI_API_KEY", "sk-secret-value"),
+            ("OPENAI_BASE_URL", "http://127.0.0.1:8080/v1"),
+        ],
+        &|_| panic!("no probe when a key is set"),
+    );
+    let endpoint = r.endpoint().expect("an endpoint");
+    assert_eq!(endpoint.base_url, "http://127.0.0.1:8080/v1");
+    assert_eq!(endpoint.api_key_env.as_deref(), Some("OPENAI_API_KEY"));
+    assert_eq!(
+        source(&r, "model.base_url"),
+        &Source::Detected("OPENAI_API_KEY and OPENAI_BASE_URL are set".into())
+    );
+    // Without the key, or with an endpoint set, it is not used, and that
+    // is said.
+    for vars in [
+        vec![("OPENAI_BASE_URL", "https://proxy.example/v1")],
+        vec![
+            ("OPENAI_API_KEY", "sk-secret-value"),
+            ("OPENAI_BASE_URL", "https://proxy.example/v1"),
+            ("ATOMIC_MODEL_BASE_URL", "https://chosen.example/v1"),
+        ],
+    ] {
+        let r = resolved(&d, &EngineArgs::default(), &vars, &nobody);
+        assert_ne!(
+            r.endpoint().map(|e| e.base_url),
+            Some("https://proxy.example/v1".to_owned())
+        );
+        assert!(
+            r.notes
+                .iter()
+                .any(|n| n.starts_with("OPENAI_BASE_URL is set and not used")),
+            "{:?}",
+            r.notes
+        );
+    }
+}
+
+/// An OPENAI_BASE_URL that is not https, nor http to a loopback address,
+/// or that carries a user, password or query, is refused, so the key goes
+/// nowhere.
+#[test]
+fn an_openai_base_url_unfit_for_the_key_is_refused() {
+    let d = dir(&[("atomic.yaml", MANIFEST_ONLY)]);
+    for (url, why) in [
+        (
+            "http://proxy.example/v1",
+            "is http to an address that is not this machine's loopback",
+        ),
+        (
+            "http://localhost:8080/v1",
+            "is http to an address that is not this machine's loopback",
+        ),
+        ("ftp://proxy.example/v1", "is neither https nor http"),
+        (
+            "https://user:pass@proxy.example/v1",
+            "carries a user, password or query",
+        ),
+        (
+            "https://proxy.example/v1?key=k",
+            "carries a user, password or query",
+        ),
+        ("not a url", "does not read as a URL"),
+    ] {
+        let refused = resolved_where(
+            &d,
+            &EngineArgs::default(),
+            &[
+                ("OPENAI_API_KEY", "sk-secret-value"),
+                ("OPENAI_BASE_URL", url),
+            ],
+            &nobody,
+        )
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+        assert!(
+            refused.contains(&format!("OPENAI_BASE_URL {why}, and it decides where")),
+            "{url}: {refused}"
+        );
+    }
+    for url in ["https://proxy.example/v1", "http://[::1]:8080/v1"] {
+        let r = resolved(
+            &d,
+            &EngineArgs::default(),
+            &[
+                ("OPENAI_API_KEY", "sk-secret-value"),
+                ("OPENAI_BASE_URL", url),
+            ],
+            &nobody,
+        );
+        assert_eq!(r.endpoint().map(|e| e.base_url), Some(url.to_owned()));
+    }
+}
+
+/// No file of the project names OPENAI_BASE_URL: neither `atomic.yaml` nor
+/// `atomic.local.yaml` can set it, as a key or a setting.
+#[test]
+fn a_projects_files_cannot_set_openai_base_url() {
+    for (file, key, text) in [
+        (
+            "atomic.yaml",
+            "OPENAI_BASE_URL",
+            "atomic: 1\nname: notes\nOPENAI_BASE_URL: https://proxy.example/v1\n",
+        ),
+        (
+            "atomic.yaml",
+            "openai_base_url",
+            "atomic: 1\nname: notes\nopenai_base_url: https://proxy.example/v1\n",
+        ),
+        (
+            "atomic.local.yaml",
+            "openai_base_url",
+            "model:\n  openai_base_url: https://proxy.example/v1\n",
+        ),
+    ] {
+        let mut files = vec![(file, text)];
+        if file != "atomic.yaml" {
+            files.push(("atomic.yaml", MANIFEST_ONLY));
+        }
+        let d = dir(&files);
+        let refused = resolved_where(
+            &d,
+            &EngineArgs::default(),
+            &[("OPENAI_API_KEY", "sk-secret-value")],
+            &nobody,
+        )
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+        assert!(refused.contains(key), "{file} set {key}: {refused}");
+    }
+}

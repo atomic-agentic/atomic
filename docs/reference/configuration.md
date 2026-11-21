@@ -91,8 +91,16 @@ What no layer sets, atomic looks for, and says so as `detected:` in
 
 | Found | Sets |
 | --- | --- |
-| `OPENAI_API_KEY` is set | the model endpoint to OpenAI's API (`https://api.openai.com/v1`), `model.api_key_env` to `OPENAI_API_KEY`, and `model.name` to `gpt-5-mini` unless one is set |
+| `OPENAI_API_KEY` is set | the model endpoint to OpenAI's API (`https://api.openai.com/v1`), or to the URL `OPENAI_BASE_URL` names when that is set too, `model.api_key_env` to `OPENAI_API_KEY`, and `model.name` to `gpt-5-mini` unless one is set |
 | Ollama answers on this machine, at `127.0.0.1:11434` | the model endpoint to `http://127.0.0.1:11434/v1`, and `model.name` to the first model it lists unless one is set |
+
+`OPENAI_BASE_URL` is read as OpenAI's SDKs read it, and only from your
+environment: no file, the project's or your own, sets it, since it decides
+where the key is sent. It must be an `https` URL, or `http` to a loopback
+address written as one (`127.0.0.1` or `[::1]`), with no user, password or
+query in it; anything else stops the command, and no key is sent. It is used
+only with `OPENAI_API_KEY`, when detection runs; otherwise it is said to be
+set and not used. `--explain` names both variables as the source.
 
 The key's value is never read for detection. Looking for Ollama is one
 `GET /api/tags` to the loopback address, which must answer within a second, and
