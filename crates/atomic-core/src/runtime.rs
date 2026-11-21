@@ -71,6 +71,7 @@ pub struct Artifacts(
 
 /// Lets go of what a step's command handed over when dropped (see
 /// [`Artifacts::releasing`]).
+#[must_use = "dropping it at once lets go of the step's holds at once"]
 pub struct Releasing {
     artifacts: Artifacts,
     identity: EffectIdentity,
@@ -188,9 +189,6 @@ pub struct CodexRuntime {
     pub artifacts: Artifacts,
     /// What admits and settles each turn (see [`crate::usage`]).
     pub meter: Metering,
-    /// The execution backend each run opens its workspace on, from
-    /// [`cwd`](Self::cwd), and runs its turn's shell and file work through.
-    pub backend: atomic_exec::Backend,
     /// The build caches of a worktree step's run, which its turn shares
     /// with the run's other worktree steps, and nothing else: its commands
     /// are pointed at them, and may write them under `workspace-write`.
@@ -198,16 +196,19 @@ pub struct CodexRuntime {
     pub caches: Option<crate::worktree::Caches>,
 }
 
-/// The runtimes atoms run on, one for each kind of atom that calls a model.
-/// A declarative atom runs on the one its `kind` names.
+/// The runtimes atoms run on, one for each kind of atom that calls a model,
+/// and the one execution backend every atom opens its workspace on. A
+/// declarative atom runs on the runtime its `kind` names.
 #[derive(Clone, Debug)]
 pub struct Runtimes {
     /// For `kind: codex`.
     pub codex: CodexRuntime,
     /// For `kind: lite`.
     pub lite: LiteRuntime,
-    /// Where `kind: exec` commands run.
-    pub exec: atomic_exec::Backend,
+    /// Where every atom's workspace opens: a codex atom's turn and its
+    /// shell, a lite atom's empty one, and an exec atom's command. The plan
+    /// reads its statement.
+    pub backend: atomic_exec::Backend,
     /// The meter an exec atom's command's active time goes through; with
     /// none, it is not accounted.
     pub exec_meter: Metering,
@@ -241,41 +242,42 @@ pub struct RunMetadata {
     pub turns: u32,
 }
 
-/// What runs an atom's turns.
+/// What runs an atom's turns, and the execution backend its workspace
+/// opens on.
 #[derive(Clone, Copy)]
 enum Backend<'a> {
     /// A Codex thread.
-    Codex(&'a CodexRuntime),
+    Codex(&'a CodexRuntime, &'a atomic_exec::Backend),
     /// One model call per turn.
-    Lite(&'a LiteRuntime),
+    Lite(&'a LiteRuntime, &'a atomic_exec::Backend),
 }
 
 impl Backend<'_> {
     fn endpoint(&self) -> &ModelEndpoint {
         match self {
-            Self::Codex(rt) => &rt.endpoint,
-            Self::Lite(rt) => &rt.endpoint,
+            Self::Codex(rt, _) => &rt.endpoint,
+            Self::Lite(rt, _) => &rt.endpoint,
         }
     }
 
     fn defaults(&self) -> &AtomConfig {
         match self {
-            Self::Codex(rt) => &rt.defaults,
-            Self::Lite(rt) => &rt.defaults,
+            Self::Codex(rt, _) => &rt.defaults,
+            Self::Lite(rt, _) => &rt.defaults,
         }
     }
 
     fn artifacts(&self) -> &(dyn ArtifactLookup + Send + Sync) {
         match self {
-            Self::Codex(rt) => rt.artifacts.0.as_ref(),
-            Self::Lite(rt) => rt.artifacts.0.as_ref(),
+            Self::Codex(rt, _) => rt.artifacts.0.as_ref(),
+            Self::Lite(rt, _) => rt.artifacts.0.as_ref(),
         }
     }
 
     fn execution(&self) -> &atomic_exec::Backend {
         match self {
-            Self::Codex(rt) => &rt.backend,
-            Self::Lite(rt) => &rt.backend,
+            Self::Codex(_, backend) => backend,
+            Self::Lite(_, backend) => backend,
         }
     }
 
@@ -284,14 +286,14 @@ impl Backend<'_> {
     /// and a lite atom's has no files.
     fn open(&self, request: &Request<'_>) -> Open {
         let source = match self {
-            Self::Codex(rt) => Some(rt.cwd.clone()),
-            Self::Lite(_) => None,
+            Self::Codex(rt, _) => Some(rt.cwd.clone()),
+            Self::Lite(..) => None,
         };
         let (mut env, mut writable_roots) = (std::collections::BTreeMap::new(), Vec::new());
         // A worktree step's build tools find its run's caches, and its
         // rustup proxies the person's toolchains; what the atom declares
         // wins.
-        if let Self::Codex(rt) = self
+        if let Self::Codex(rt, _) = self
             && let Some(caches) = &rt.caches
         {
             env.extend(caches.env());
@@ -362,6 +364,12 @@ const OPEN_WAIT_MAX: std::time::Duration = std::time::Duration::from_secs(30);
 const OPEN_WAIT_REPORT: std::time::Duration = std::time::Duration::from_secs(600);
 /// How often a waiting run looks whether this process is stopping.
 const OPEN_WAIT_SLICE: std::time::Duration = std::time::Duration::from_millis(100);
+/// How long a set-aside step whose sandbox cannot start waits before it
+/// first tries again, the wait doubling each time up to
+/// [`SANDBOX_RETRY_MAX`]: the machine is fixed by a person, not in seconds.
+const SANDBOX_RETRY_FIRST: std::time::Duration = std::time::Duration::from_secs(5);
+/// The longest wait between a set-aside step's tries of the sandbox.
+const SANDBOX_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The longest a step waits for its workspace, in milliseconds; 0 for as
 /// long as it takes. See [`limit_backend_wait`].
@@ -388,20 +396,25 @@ pub fn stop_waiting_for_backend() {
 
 /// Set by a long-running process, such as `atomic serve`: a step that has
 /// waited its limit is set aside rather than given up, and keeps trying,
-/// at most [`OPEN_WAIT_MAX`] apart, so its run goes on once there is room.
+/// at most [`OPEN_WAIT_MAX`] apart, so its run goes on once there is room;
+/// and a step whose commands cannot be confined is set aside too, trying
+/// the sandbox again at most [`SANDBOX_RETRY_MAX`] apart, so its run goes
+/// on once the machine is fixed.
 static KEEP_TRYING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// The runs whose step is set aside now, past its limit, each once per
-/// such step.
+/// The runs whose step is set aside now, past its limit or waiting for the
+/// sandbox to start, each once per such step.
 static SET_ASIDE_FOR_ROOM: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
-/// Make a step that has waited its limit ([`limit_backend_wait`]) keep
-/// trying, set aside, instead of giving up: for `atomic serve`.
+/// Make a step that has waited its limit ([`limit_backend_wait`]), or whose
+/// sandbox cannot start, keep trying, set aside, instead of giving up: for
+/// `atomic serve`.
 pub fn keep_trying_past_the_limit() {
     KEEP_TRYING.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
-/// The runs whose step is set aside now, waiting past its limit for room:
-/// work a stopping process need not wait for, since it records nothing.
+/// The runs whose step is set aside now, waiting past its limit for room or
+/// for the sandbox to start: work a stopping process need not wait for,
+/// since it records nothing.
 pub fn runs_set_aside_for_room() -> Vec<String> {
     SET_ASIDE_FOR_ROOM
         .lock()
@@ -438,7 +451,10 @@ impl Drop for SetAsideForRoom {
 /// as it takes, or up to the process's limit ([`limit_backend_wait`]),
 /// after which it gives up with [`AtomError::NoRoom`], or, in a process
 /// that keeps trying ([`keep_trying_past_the_limit`]), is set aside and
-/// tries again at most [`OPEN_WAIT_MAX`] apart, saying so each time. It records nothing
+/// tries again at most [`OPEN_WAIT_MAX`] apart, saying so each time. A
+/// backend that cannot confine commands here gives up at once with
+/// [`AtomError::Unconfinable`], or, in a process that keeps trying, sets the
+/// step aside and tries again at most [`SANDBOX_RETRY_MAX`] apart. It records nothing
 /// and spends none of the durable engine's recovery attempts, and it says
 /// on stderr that it is waiting, then again every ten minutes. Stopping the
 /// run, or the process ([`stop_waiting_for_backend`]), stops the wait.
@@ -452,6 +468,9 @@ pub(crate) async fn open_workspace(
     let mut reported: Option<std::time::Instant> = None;
     let started = std::time::Instant::now();
     let mut set_aside: Option<SetAsideForRoom> = None;
+    // When the step began waiting for the sandbox to start, and its pause.
+    let mut unconfinable: Option<std::time::Instant> = None;
+    let mut sandbox_wait = SANDBOX_RETRY_FIRST;
     loop {
         let (b, r) = (backend.clone(), request.clone());
         // The workspace's closer is made where it opens, on the blocking
@@ -481,6 +500,14 @@ pub(crate) async fn open_workspace(
                 if reported.is_some() {
                     crate::log_line!(
                         "atomic: {label}: the execution backend can open its workspace again"
+                    );
+                }
+                if unconfinable.is_some() {
+                    crate::log_line!(
+                        "atomic: {label} (run {}, step {}): the sandbox starts again, and the \
+                         step goes on",
+                        request.run,
+                        request.step
                     );
                 }
                 return Ok(guard);
@@ -552,7 +579,53 @@ pub(crate) async fn open_workspace(
                 wait = (wait * 2).min(OPEN_WAIT_MAX);
             }
             Err(atomic_exec::ExecError::Unconfinable { message }) => {
-                return Err(AtomError::Unconfinable(message));
+                if !KEEP_TRYING.load(Ordering::SeqCst) {
+                    return Err(AtomError::Unconfinable(message));
+                }
+                // Nothing ran. The step is set aside, recording nothing, and
+                // tries again now and then: the machine may be fixed while
+                // this process runs.
+                match unconfinable {
+                    None => {
+                        if set_aside.is_none() {
+                            set_aside = Some(SetAsideForRoom::start(&request.run));
+                        }
+                        crate::log_line!(
+                            "atomic: {label} (run {}, step {}): {message}",
+                            request.run,
+                            request.step
+                        );
+                        crate::log_line!(
+                            "atomic: {label} (run {}, step {}) is set aside, with nothing \
+                             recorded, until the sandbox can start; it tries again, at most \
+                             {}s apart, and other runs go on",
+                            request.run,
+                            request.step,
+                            SANDBOX_RETRY_MAX.as_secs()
+                        );
+                        unconfinable = Some(std::time::Instant::now());
+                    }
+                    Some(at) if at.elapsed() >= OPEN_WAIT_REPORT => {
+                        crate::log_line!(
+                            "atomic: {label} (run {}, step {}): the sandbox still cannot start: \
+                             {message}",
+                            request.run,
+                            request.step
+                        );
+                        unconfinable = Some(std::time::Instant::now());
+                    }
+                    Some(_) => {}
+                }
+                let mut left = sandbox_wait;
+                while !left.is_zero() {
+                    if STOP_WAITING.load(Ordering::SeqCst) {
+                        return Err(AtomError::Stopping);
+                    }
+                    let slice = left.min(OPEN_WAIT_SLICE);
+                    tokio::time::sleep(slice).await;
+                    left = left.saturating_sub(slice);
+                }
+                sandbox_wait = (sandbox_wait * 2).min(SANDBOX_RETRY_MAX);
             }
             Err(e) => return Err(AtomError::Runtime(format!("{label}: {e}"))),
         }
@@ -583,6 +656,15 @@ impl WorkspaceGuard {
         self.0
             .as_ref()
             .and_then(|closer| closer.workspace.as_ref())
+            .expect("an open workspace")
+    }
+
+    /// The backend that opened it.
+    pub(crate) fn backend(&self) -> Arc<dyn ExecutionBackend> {
+        // Present until the guard closes it.
+        self.0
+            .as_ref()
+            .map(|closer| closer.backend.clone())
             .expect("an open workspace")
     }
 
@@ -691,7 +773,7 @@ async fn run_contract(
         ))
     })?;
     let developer = match backend {
-        Backend::Codex(rt) if !lite::is_openai_api(&rt.endpoint.base_url) => {
+        Backend::Codex(rt, _) if !lite::is_openai_api(&rt.endpoint.base_url) => {
             schema_in_instructions(&request.developer, &lowered.schema)
         }
         _ => request.developer,
@@ -772,7 +854,7 @@ async fn run_contract(
     // and the workspace is closed however the run ends.
     let workspace = open_workspace(backend.execution().shared(), opening).await?;
     let conversation = match backend {
-        Backend::Codex(rt) => match turn_in(workspace.workspace(), &mut spec) {
+        Backend::Codex(rt, _) => match turn_in(workspace.workspace(), &mut spec) {
             Ok(cwd) => {
                 codex::converse_async(
                     &rt.paths,
@@ -791,14 +873,14 @@ async fn run_contract(
                 return Err(e);
             }
         },
-        Backend::Lite(rt) => lite::converse_async(rt, &spec, next).await,
+        Backend::Lite(rt, _) => lite::converse_async(rt, &spec, next).await,
     };
     workspace.close().await;
     let (_, report) = conversation.map_err(|e| match crate::usage::meter_failure(&e) {
         // The meter refused the next call: nothing was sent for it.
         Some(MeterError::Exhausted(refusal)) => AtomError::Budget(refusal.to_string()),
         Some(failure) => AtomError::Runtime(failure.to_string()),
-        None => AtomError::Model(format!("{e:#}")),
+        None => turn_failure(&e),
     })?;
     let metadata = RunMetadata {
         thread_id: report.thread_id,
@@ -818,6 +900,18 @@ async fn run_contract(
         (None, None) => Err(AtomError::Runtime(
             "the turn ended without an answer".into(),
         )),
+    }
+}
+
+/// What a turn that failed failed of: the model, or, when the sandbox's
+/// deny list could not be made, the machine it would have run on.
+fn turn_failure(e: &anyhow::Error) -> AtomError {
+    match e
+        .chain()
+        .find_map(|c| c.downcast_ref::<crate::codex::DenyRefused>())
+    {
+        Some(refused) => AtomError::Runtime(refused.to_string()),
+        None => AtomError::Model(format!("{e:#}")),
     }
 }
 
@@ -977,12 +1071,16 @@ fn turn_tmpdir(workspace: &Workspace, spec: &mut TurnSpec, linux: bool) -> Resul
     Ok(())
 }
 
-/// Run `spec` as one turn on a fresh thread of `runtime`, in a workspace its
-/// backend opens from the runtime's directory with the spec's sandbox,
+/// Run `spec` as one turn on a fresh thread of `runtime`, in a workspace
+/// `backend` opens from the runtime's directory with the spec's sandbox,
 /// writable roots and environment, and return the final message. For tools
 /// and tests that need a bare turn; atoms run through [`run_codex_atom`] and
 /// [`run_declarative`].
-pub async fn run_turn(runtime: &CodexRuntime, spec: &TurnSpec) -> Result<String, AtomError> {
+pub async fn run_turn(
+    runtime: &CodexRuntime,
+    backend: &atomic_exec::Backend,
+    spec: &TurnSpec,
+) -> Result<String, AtomError> {
     let place = Place::unrecorded("turn");
     let opening = Open {
         label: "turn".into(),
@@ -994,7 +1092,7 @@ pub async fn run_turn(runtime: &CodexRuntime, spec: &TurnSpec) -> Result<String,
         writable_roots: spec.writable_roots.clone(),
         env: spec.env.clone(),
     };
-    let workspace = open_workspace(runtime.backend.shared(), opening).await?;
+    let workspace = open_workspace(backend.shared(), opening).await?;
     let mut spec = spec.clone();
     let answer = match turn_in(workspace.workspace(), &mut spec) {
         Ok(cwd) => codex::converse_async(
@@ -1009,20 +1107,28 @@ pub async fn run_turn(runtime: &CodexRuntime, spec: &TurnSpec) -> Result<String,
         )
         .await
         .map(|(answer, _)| answer)
-        .map_err(|e| AtomError::Model(format!("{e:#}"))),
+        .map_err(|e| turn_failure(&e)),
         Err(e) => Err(e),
     };
     workspace.close().await;
     answer
 }
 
-/// Run a typed Codex atom on `input`, on a fresh Codex thread.
+/// Run a typed Codex atom on `input`, on a fresh Codex thread, in a
+/// workspace `backend` opens.
 pub async fn run_codex_atom<A: Atom>(
     atom: &A,
     input: &A::In,
     runtime: &CodexRuntime,
+    backend: &atomic_exec::Backend,
 ) -> Result<(A::Out, RunMetadata), AtomError> {
-    run_typed(atom, input, AtomKind::Codex, Backend::Codex(runtime)).await
+    run_typed(
+        atom,
+        input,
+        AtomKind::Codex,
+        Backend::Codex(runtime, backend),
+    )
+    .await
 }
 
 /// Run a typed lite atom on `input`: one schema-constrained model call, and
@@ -1031,8 +1137,9 @@ pub async fn run_lite_atom<A: Atom>(
     atom: &A,
     input: &A::In,
     runtime: &LiteRuntime,
+    backend: &atomic_exec::Backend,
 ) -> Result<(A::Out, RunMetadata), AtomError> {
-    run_typed(atom, input, AtomKind::Lite, Backend::Lite(runtime)).await
+    run_typed(atom, input, AtomKind::Lite, Backend::Lite(runtime, backend)).await
 }
 
 async fn run_typed<A: Atom>(
@@ -1202,7 +1309,7 @@ pub async fn run_declarative_repairing(
             compiled,
             input,
             &identity,
-            runtimes.exec.shared(),
+            runtimes.backend.shared(),
             runtimes.clock.as_ref(),
             // The store the model runtimes check references against.
             &runtimes.codex.artifacts,
@@ -1211,8 +1318,8 @@ pub async fn run_declarative_repairing(
         .await;
     }
     let backend = match atom.kind.as_str() {
-        "codex" => Backend::Codex(&runtimes.codex),
-        "lite" => Backend::Lite(&runtimes.lite),
+        "codex" => Backend::Codex(&runtimes.codex, &runtimes.backend),
+        "lite" => Backend::Lite(&runtimes.lite, &runtimes.backend),
         other => {
             return Err(AtomError::Runtime(format!(
                 "{} is a {other} atom, which this version cannot run",
@@ -1513,39 +1620,59 @@ pub async fn run_exec_opened(
     }
     h.update(&stdin);
     let prompt_hash = format!("{:x}", h.finalize());
-    // With a store, the command gets its exchange: an outputs directory to
-    // hand files over in, and the artifacts its input references, read-only.
-    // Unix only: elsewhere a command hands no files over, and an output
-    // that names one is refused (see `finish_exec`).
-    let exchange = match (&artifacts.1, workspace.workspace().scratch.clone()) {
-        (Some(store), Some(scratch)) if cfg!(unix) => {
+    // With a store, the command gets its exchange, from its workspace's
+    // backend, which alone touches the workspace's files: an outputs
+    // directory to hand files over in, and the artifacts its input
+    // references, read-only. A backend that hands no files over gives none:
+    // an input that references artifacts is then refused, and so is an
+    // output that names a file (see `finish_exec`).
+    let exchange = match &artifacts.1 {
+        Some(store) => {
             let (store, input, contract) =
                 (store.clone(), input.clone(), contract("Input")?.clone());
             let lookup = artifacts.0.clone();
+            let (backend, opened) = (workspace.backend(), workspace.workspace().clone());
+            let name = atom.name.clone();
             // The workspace stays open while its inputs are copied in, even
             // when the run is cancelled meanwhile.
             let held = workspace.hold();
             let made = tokio::task::spawn_blocking(move || {
                 let _held = held;
-                let exchange = crate::artifact::files::Exchange::create(&scratch)?;
                 let given = crate::artifact::files::referenced(&contract, &input, lookup.as_ref());
-                exchange.mount(store.as_ref(), &given)?;
-                Ok::<_, crate::artifact::ArtifactError>(exchange)
+                let exchange = backend
+                    .exchange(&opened)
+                    .map_err(|e| AtomError::Runtime(format!("{name}: prepare its files: {e}")))?;
+                let Some(exchange) = exchange else {
+                    return match given.first() {
+                        Some(a) => Err(AtomError::Runtime(format!(
+                            "{name}: its input references {a}, and its backend gives commands \
+                             no files"
+                        ))),
+                        None => Ok(None),
+                    };
+                };
+                let exchange = crate::artifact::files::Exchange::new(exchange);
+                exchange
+                    .mount(store.as_ref(), &given)
+                    .map_err(|e| store_error(&name, "give the command its input files", e))?;
+                Ok(Some(Arc::new(exchange)))
             })
             .await
-            .map_err(|e| AtomError::Runtime(format!("{}: prepare its files: {e}", atom.name)))?
-            .map_err(|e| store_error(&atom.name, "give the command its input files", e))?;
-            Some(Arc::new(made))
+            .map_err(|e| AtomError::Runtime(format!("{}: prepare its files: {e}", atom.name)))??;
+            Some(made)
         }
-        _ => None,
+        None => None,
     };
-    let (exchange_env, read_only) = match &exchange {
+    let (exchange_env, read_only) = match exchange.as_ref().and_then(Option::as_ref) {
         Some(x) => (
             vec![
-                ("ATOMIC_OUTPUTS".to_owned(), x.outputs.display().to_string()),
-                ("ATOMIC_INPUTS".to_owned(), x.inputs.display().to_string()),
+                (
+                    "ATOMIC_OUTPUTS".to_owned(),
+                    x.outputs().display().to_string(),
+                ),
+                ("ATOMIC_INPUTS".to_owned(), x.inputs().display().to_string()),
             ],
-            vec![x.inputs.clone()],
+            vec![x.inputs().to_owned()],
         ),
         None => (Vec::new(), Vec::new()),
     };
@@ -1716,7 +1843,8 @@ async fn finish_exec(
     atom: &AtomFile,
     program: &str,
     done: Result<atomic_exec::Completed, CommandError>,
-    exchange: Option<Arc<crate::artifact::files::Exchange>>,
+    // With a store: the exchange its backend gave, if any.
+    exchange: Option<Option<Arc<crate::artifact::files::Exchange>>>,
     artifacts: &Artifacts,
     identity: &EffectIdentity,
     output_contract: &Value,
@@ -1757,7 +1885,9 @@ async fn finish_exec(
     let output_contract = output_contract.clone();
     // The files it handed over go into the store, and their references into
     // the output, before the output is checked; off the async workers.
-    if let (Some(exchange), Some(store)) = (exchange, artifacts.1.clone()) {
+    // A store, and no exchange: the backend hands no files over.
+    let none_given = matches!(exchange, Some(None));
+    if let (Some(Some(exchange)), Some(store)) = (exchange, artifacts.1.clone()) {
         let provenance = crate::artifact::Provenance {
             media_type: crate::artifact::files::DEFAULT_MEDIA_TYPE.into(),
             workflow: Some(identity.run_id.clone()),
@@ -1825,10 +1955,17 @@ async fn finish_exec(
         // Held until the step records the output that references them.
         artifacts.keep(identity, holds);
     }
-    if !cfg!(unix) && crate::artifact::files::names_a_file(&output) {
+    // As gather would take them: an object anywhere else is the output's own.
+    if none_given
+        && crate::artifact::files::names_a_file_where_referenced(
+            &output,
+            &output_contract,
+            artifacts.0.as_ref(),
+        )
+        .map_err(|e| schema_error(e.to_string()))?
+    {
         return Err(schema_error(format!(
-            "the output names a file with `{}`: handing files over is supported on Linux and \
-             macOS only",
+            "the output names a file with `{}`, and its backend hands no files over",
             crate::artifact::files::FILE_KEY
         )));
     }
