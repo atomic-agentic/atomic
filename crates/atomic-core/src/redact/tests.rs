@@ -1785,3 +1785,80 @@ fn a_held_key_with_no_marker_is_judged_whole() {
         .collect();
     assert_eq!(keys, [REDACTED], "{out}");
 }
+
+/// Redacting text twice changes nothing: a rule that a first rule's marker
+/// leaves something for, a header after an assignment's marker or a value
+/// after an open assignment, has already read it.
+#[test]
+fn text_redacted_again_changes_nothing() {
+    for (case, input) in [
+        "api_key=Authorization: Cookie: =12",
+        "PASSWORD=Authorization: Authorization: Basic ;",
+        "secret: Authorization: x-api-key: =",
+        "--password Authorization: Cookie: Cookie: =12",
+        "=secret: Cookie: x-api-key: '&",
+        "123456x-api-key: Cookie: Authorization: Basic [REDACTED]",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let once = text(input).into_owned();
+        assert_eq!(text(&once), once, "case {case}: a second pass changed it");
+    }
+    // Generated: names, separators, headers and values strung together.
+    const PARTS: &[&str] = &[
+        "password=",
+        "password",
+        "token=",
+        "secret: ",
+        "Authorization: ",
+        "Bearer ",
+        "Cookie: ",
+        "x-api-key: ",
+        "--password ",
+        "-p",
+        "12",
+        "123456",
+        " ",
+        "\n",
+        "=",
+        ":",
+        ";",
+        ",",
+        "\"",
+        "'",
+        "abc",
+        "hunter2",
+        "dbpassword",
+        "(2)",
+        "[REDACTED]",
+        "api_key=",
+        "&",
+        "?",
+        "user",
+        "pass=",
+        "PASSWORD=",
+        "-12",
+        "=12",
+        "Basic ",
+    ];
+    let mut seed: u64 = 77;
+    let mut next = move |n: u64| {
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (seed >> 33) % n
+    };
+    let mut unstable = 0;
+    for _ in 0..50_000 {
+        let mut input = String::new();
+        for _ in 0..=next(6) {
+            input.push_str(PARTS[next(PARTS.len() as u64) as usize]);
+        }
+        let once = text(&input).into_owned();
+        if text(&once) != once {
+            unstable += 1;
+        }
+    }
+    assert_eq!(unstable, 0, "a second pass changed generated text");
+}

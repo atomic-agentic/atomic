@@ -1121,9 +1121,32 @@ fn redact_userinfo(captures: &Captures<'_>) -> String {
     format!("{}{REDACTED}{}", &captures[1], &captures[3])
 }
 
-/// Replaces secrets in text. Linear in the length of `input`; callers
-/// with text of unknown length bound it first (see [`excerpt`]).
+/// How many times [`text`] reads text again at most: each reading can
+/// leave what another rule reads as a secret only once a first rule has
+/// redacted around it, as a header after an assignment's marker.
+const TEXT_PASSES: usize = 4;
+
+/// Replaces secrets in text, read again until a reading changes nothing,
+/// so redacting the result again changes nothing. Linear in the length of
+/// `input`; callers with text of unknown length bound it first (see
+/// [`excerpt`]).
 pub fn text(input: &str) -> Cow<'_, str> {
+    let mut output = text_once(input);
+    for _ in 1..TEXT_PASSES {
+        let again = match text_once(&output) {
+            Cow::Borrowed(_) => None,
+            Cow::Owned(again) => Some(again),
+        };
+        match again {
+            Some(again) => output = Cow::Owned(again),
+            None => break,
+        }
+    }
+    output
+}
+
+/// One reading of `input` by every text rule (see [`text`]).
+fn text_once(input: &str) -> Cow<'_, str> {
     let mut output = match shapes(input) {
         Some(shaped) => Cow::Owned(shaped),
         None => Cow::Borrowed(input),
