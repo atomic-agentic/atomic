@@ -8,6 +8,8 @@
 //! its own. It confines commands without running them, so it needs no
 //! sandbox.
 
+#![cfg(target_os = "linux")]
+
 use atomic_core::codex::{CodexPaths, ExecSandbox, StateGuard};
 use atomic_core::network::DESCRIPTORS_PER_COMMAND;
 use atomic_exec::Confine;

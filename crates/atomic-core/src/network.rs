@@ -341,9 +341,10 @@ fn own_addresses() -> anyhow::Result<BTreeSet<IpAddr>> {
 /// proxy at once (Codex's Linux sandbox caps each route at this).
 const BRIDGE_CONNECTIONS: u64 = 128;
 
-/// The file descriptors a command's proxy connections can hold in atomic:
-/// two for each connection its bridge has open, the command's and the one
-/// upstream, and some to spare, for the proxy's own.
+/// The file descriptors atomic reserves for a command's proxy connections:
+/// two for each connection its bridge may have open, the command's and one
+/// upstream, and some to spare. A reservation, not a bound the proxy holds
+/// connections to; see the module documentation.
 pub const DESCRIPTORS_PER_COMMAND: u64 = 2 * BRIDGE_CONNECTIONS + 16;
 
 /// Room in this process's file descriptors for commands' proxy
@@ -384,8 +385,8 @@ impl Budget {
                 "{} commands that declare hosts are running, and atomic's limit of {limit} open \
                  files leaves room for {} at once: their proxy connections may take half of it, \
                  {DESCRIPTORS_PER_COMMAND} for each. atomic raises its own limit only as far as \
-                 its hard limit and at most to {RAISED_LIMIT}; start it with a higher limit \
-                 (`ulimit -n`) to run more at once",
+                 its hard limit and at most to {RAISED_LIMIT}; to run more at once, raise its \
+                 hard limit or start it with a soft limit above {RAISED_LIMIT}",
                 *reserved / DESCRIPTORS_PER_COMMAND,
                 share / DESCRIPTORS_PER_COMMAND,
             );
