@@ -1347,12 +1347,6 @@ pub fn tail(input: &str, chars: usize) -> String {
 }
 
 fn redact_string(string: &mut String, nested: usize) {
-    redact_string_held(string, nested, None);
-}
-
-/// [`redact_string`], for a string held under a name of strength `held`, if
-/// any: JSON inside it is held as surely.
-fn redact_string_held(string: &mut String, nested: usize, held: Option<Strength>) {
     if string.len() > MAX_TEXT {
         *string = bounded(string, MAX_TEXT);
     } else if let Cow::Owned(redacted) = text(string) {
@@ -1366,10 +1360,7 @@ fn redact_string_held(string: &mut String, nested: usize, held: Option<Strength>
         && let Ok(mut inner) = serde_json::from_str::<Value>(string)
     {
         let before = inner.clone();
-        match held {
-            Some(strength) => redact_held(strength, &mut inner, nested + 1),
-            None => redact_nested(&mut inner, nested + 1),
-        }
+        redact_nested(&mut inner, nested + 1);
         if inner != before {
             *string = inner.to_string();
         }
@@ -1385,18 +1376,10 @@ fn redact_held(strength: Strength, value: &mut Value, nested: usize) {
         *secret = Value::String(REDACTED.into());
     }
     match value {
-        // Whole, as anywhere: under a secret's name, every string; under
-        // a hint, one that looks like a credential.
         Value::String(string) if is_secret_value(strength, string) => {
             *string = REDACTED.into();
         }
-        // JSON under a hint, which can hold the secret by name, is redacted
-        // as JSON; when it cannot be opened, as text.
-        Value::String(string) => {
-            if strength == Strength::Strong || !open_held_json(string, nested) {
-                redact_string_held(string, nested, Some(strength));
-            }
-        }
+        Value::String(string) => redact_string(string, nested),
         Value::Number(_) if strength == Strength::Strong => *value = Value::String(REDACTED.into()),
         Value::Array(items) => {
             redact_flag_values(items);
@@ -1431,31 +1414,6 @@ fn redact_held(strength: Strength, value: &mut Value, nested: usize) {
             }
         }
         Value::Number(_) | Value::Null | Value::Bool(_) => {}
-    }
-}
-
-/// Open `string`, held under a hint, as JSON, before anything else touches
-/// it, and redact what it holds as held; then write it back in its own
-/// canonical form, pretty, so a key given twice keeps only what the JSON
-/// means, and redacting it again opens it again. Whether it was JSON that
-/// could be opened at this depth.
-fn open_held_json(string: &mut String, nested: usize) -> bool {
-    if nested >= MAX_NESTED_JSON
-        || string.len() > MAX_TEXT
-        || !string.trim_start().starts_with(['{', '['])
-    {
-        return false;
-    }
-    let Ok(mut inner) = serde_json::from_str::<Value>(string) else {
-        return false;
-    };
-    redact_held(Strength::Weak, &mut inner, nested + 1);
-    match serde_json::to_string_pretty(&inner) {
-        Ok(canonical) => {
-            *string = canonical;
-            true
-        }
-        Err(_) => false,
     }
 }
 

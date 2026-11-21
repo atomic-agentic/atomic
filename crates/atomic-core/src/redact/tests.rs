@@ -1510,16 +1510,6 @@ fn held_keys_redact_as_text_and_are_numbered_alike() {
     );
 }
 
-/// JSON in a string held under a secret's name is held as surely: a key in
-/// it that looks like a credential is redacted.
-#[test]
-fn json_in_a_held_string_is_held() {
-    let looks = concat!("Zx81kQ0p", "L2mN4bV6");
-    let mut held = json!({"token": format!("{{ \"{looks}\" : 1 }}")});
-    value(&mut held);
-    assert!(!held.to_string().contains(looks), "{held}");
-}
-
 /// Redacting a value redacted already changes nothing, held keys included.
 #[test]
 fn held_keys_redacted_again_change_nothing() {
@@ -1529,8 +1519,7 @@ fn held_keys_redacted_again_change_nothing() {
     let mut kept = partly.clone();
     value(&mut kept);
     assert_eq!(kept, partly);
-    let mut once = json!({"secrets": {"pwd=abc": 1, "k": {"pwd=def": 2}}, "pwd=ghi": 3,
-                          "token": "{ \"Zx81kQ0pL2mN4bV6\" : 1, \"pwd=jkl\": 2 }"});
+    let mut once = json!({"secrets": {"pwd=abc": 1, "k": {"pwd=def": 2}}, "pwd=ghi": 3});
     value(&mut once);
     let mut twice = once.clone();
     value(&mut twice);
@@ -1628,28 +1617,6 @@ fn json_under_a_secrets_name_is_hidden_whole() {
         let field = out.as_object().and_then(|o| o.values().next()).cloned();
         assert_eq!(field, Some(json!(REDACTED)), "{out}");
     }
-}
-
-/// JSON under a hint is hidden whole when it looks like a credential, as a
-/// cookie's compact JSON does; when it opens, a key given twice keeps only
-/// what the JSON means, and the first value of it goes.
-#[test]
-fn json_under_a_hint_is_hidden_or_opened_and_rewritten() {
-    let mut cookie = json!({"cookie": "{\"sid\":\"abc123\"}"});
-    value(&mut cookie);
-    assert_eq!(cookie, json!({"cookie": REDACTED}));
-    let mut twice = json!({"token": "{ \"a\": \"hunter2\", \"a\": true }"});
-    value(&mut twice);
-    assert!(!twice.to_string().contains("hunter2"), "{twice}");
-    let mut again = twice.clone();
-    value(&mut again);
-    assert_eq!(again, twice, "redacting again changes nothing");
-    // Opened before text redaction can rewrite it, so a secret's name in it
-    // does not break the JSON and leave the rest in clear.
-    let looks = concat!("Zx81kQ0p", "L2mN4bV6");
-    let mut named = json!({"token": format!("{{ \"password\": 1, \"x\": \"{looks}\" }}")});
-    value(&mut named);
-    assert!(!named.to_string().contains(looks), "{named}");
 }
 
 /// Under a secret's name, the value after a secret-named flag is redacted.
