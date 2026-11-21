@@ -426,6 +426,15 @@ fn a_stale_remote_root_is_refused_where_the_place_is_there() {
         aliases(&mounts, std::slice::from_ref(&place))
             .is_err_and(|e| e.to_string().contains("is not there"))
     );
+    // One that is a symbolic link to the place: a link is not the place,
+    // and is not followed.
+    std::fs::create_dir_all(dir.0.join("linked/home/u")).expect("dir");
+    std::os::unix::fs::symlink(&place, dir.0.join("linked/home/u/.ssh")).expect("link");
+    let mounts = ninep(&host, &dir.0.join("linked"), "/");
+    assert!(
+        aliases(&mounts, std::slice::from_ref(&place))
+            .is_err_and(|e| e.to_string().contains("shows another file or directory"))
+    );
     // A mount of part of the place over that part: checked against the
     // part it shows, which it is, so it passes.
     let keys = place.join("keys");

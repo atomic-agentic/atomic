@@ -344,6 +344,15 @@ fn aliases_of(
 /// Whether `alias` is the same file or directory as `path`, when `path` is
 /// there, neither followed through a link: refused when `alias` is not
 /// there, or is another, or either cannot be looked at.
+/// Whether looking at a path failed because nothing is there.
+#[cfg(unix)]
+fn not_there(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
+}
+
 fn same_file(path: &Path, alias: &Path) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
@@ -351,14 +360,7 @@ fn same_file(path: &Path, alias: &Path) -> anyhow::Result<()> {
         let place = match std::fs::symlink_metadata(path) {
             Ok(place) => place,
             // Not there yet: nothing to check it against.
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                ) =>
-            {
-                return Ok(());
-            }
+            Err(e) if not_there(&e) => return Ok(()),
             Err(e) => bail!(
                 "{} cannot be looked at ({e}), so atomic cannot check that its second mount at {} \
                  shows it; it cannot deny it at each",
