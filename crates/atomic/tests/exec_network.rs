@@ -189,3 +189,118 @@ fn a_confined_command_reaches_only_the_hosts_it_is_given() {
     local.close(&workspace).expect("closes");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// What a command with both declared hosts and read-only inputs tries.
+const BOTH: &str = r#"import json, os, sys, urllib.request
+allowed, other, inputs = sys.argv[1:]
+def attempt(f):
+    try:
+        return f()
+    except urllib.error.HTTPError as e:
+        return 'HTTP ' + str(e.code)
+    except Exception as e:
+        return type(e).__name__ + ': ' + str(e)
+proxy = os.environ.get('HTTP_PROXY')
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({'http': proxy} if proxy else {}))
+def fetch(url):
+    return lambda: opener.open(url, timeout=10).read().decode()
+def write(path):
+    def w():
+        with open(path, 'w') as f:
+            f.write('x')
+        return 'written'
+    return w
+json.dump({
+    'read': attempt(lambda: open(os.path.join(inputs, 'given')).read()),
+    'plant': attempt(write(os.path.join(inputs, 'planted'))),
+    'scratch': attempt(write(os.path.join(os.getcwd(), 'made'))),
+    'allowed': attempt(fetch('http://' + allowed + '/')),
+    'other': attempt(fetch('http://' + other + '/')),
+}, sys.stdout)
+"#;
+
+/// A command given declared hosts and read-only inputs at once keeps both:
+/// it reads its inputs and cannot write them, though they lie inside the
+/// scratch directory it may write, and it still reaches only the hosts it
+/// is given.
+#[test]
+fn a_confined_command_with_hosts_and_read_only_inputs_keeps_both() {
+    support::require_sandbox();
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("atomic-exec-network-ro-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("bin")).expect("scratch");
+    std::fs::create_dir_all(dir.join("project")).expect("project");
+    let dir = std::fs::canonicalize(dir).expect("canonical");
+    std::os::unix::fs::symlink(
+        env!("CARGO_BIN_EXE_atomic"),
+        dir.join("bin/codex-linux-sandbox"),
+    )
+    .expect("sandbox helper");
+    let paths = CodexPaths::with_helpers(
+        PathBuf::from(env!("CARGO_BIN_EXE_atomic")),
+        dir.join("bin/codex-linux-sandbox"),
+    );
+    let sandbox = ExecSandbox::new(&paths, StateGuard::NoProjectState, dir.join("codex"))
+        .expect("confinement")
+        .reaching_loopback_for_tests(vec!["127.0.0.1".into()]);
+    let local = LocalBackend::in_dir(dir.join("scratch")).confined(Arc::new(sandbox));
+    local.connect().expect("connects");
+    let workspace = local
+        .open(&atomic_exec::Open {
+            label: "network-ro".into(),
+            source: Some(dir.join("project")),
+            ..atomic_exec::Open::default()
+        })
+        .expect("opens");
+    let allowed = serve("127.0.0.1", "from the allowed server");
+    let other = serve("127.0.0.2", "from the other server");
+    let allowed_host = allowed.split(':').next().expect("host").to_owned();
+
+    let scratch = dir.join("cwd");
+    let inputs = scratch.join("inputs");
+    std::fs::create_dir_all(&inputs).expect("inputs");
+    std::fs::write(inputs.join("given"), "an input").expect("input");
+    let done = local
+        .run(&Command {
+            program: "python3".into(),
+            args: vec![
+                "-c".into(),
+                BOTH.into(),
+                allowed.clone(),
+                other.clone(),
+                inputs.display().to_string(),
+            ],
+            cwd: scratch.clone(),
+            env: vec![
+                ("HOME".into(), scratch.display().to_string()),
+                ("PATH".into(), "/usr/bin:/bin".into()),
+            ],
+            time_limit: Duration::from_secs(60),
+            output_limit: 1 << 16,
+            writable: vec![scratch.clone()],
+            read_only: vec![inputs.clone()],
+            network: vec![allowed_host],
+            ..Command::default()
+        })
+        .expect("the command runs");
+    assert!(done.success(), "{}", String::from_utf8_lossy(&done.stderr));
+    let got: Value = serde_json::from_slice(&done.stdout).unwrap_or_else(|e| {
+        panic!(
+            "{e}: {}{}",
+            String::from_utf8_lossy(&done.stdout),
+            String::from_utf8_lossy(&done.stderr)
+        )
+    });
+    assert_eq!(got["read"], "an input", "{got}");
+    assert!(
+        got["plant"].as_str().is_some_and(|s| s.contains("Error")),
+        "the read-only inputs were written: {got}"
+    );
+    assert!(!inputs.join("planted").exists(), "{got}");
+    assert_eq!(got["scratch"], "written", "{got}");
+    assert_eq!(got["allowed"], "from the allowed server", "{got}");
+    assert_eq!(got["other"], "HTTP 403", "{got}");
+    local.close(&workspace).expect("closes");
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -179,8 +179,13 @@ named_tests() {
             skip=0
             continue
         fi
+        # After `--`, the test binary's own flags, such as `--nocapture`, are
+        # not tests.
         if [ "${after}" -eq 1 ]; then
-            echo "${a}"
+            case "${a}" in
+            -*) ;;
+            *) echo "${a}" ;;
+            esac
             continue
         fi
         case "${a}" in
@@ -246,7 +251,9 @@ for row in "${selected[@]}"; do
     # was never run, is not a test that caught the control's removal.
     unfailed=""
     while read -r test; do
-        grep -qE "^test [^ ]*${test}[^ ]* \.\.\. FAILED$" "${LOG}" || unfailed="${unfailed} ${test}"
+        # The name as it is, not as a pattern: a failed test's path holds it.
+        grep -E '^test [^ ]+ \.\.\. FAILED$' "${LOG}" | cut -d' ' -f2 | grep -qF -- "${test}" ||
+            unfailed="${unfailed} ${test}"
     done < <(named_tests "${args}")
     if [ -n "${unfailed}" ]; then
         echo "FAIL ${name}: with the control off, these tests were not seen failing:${unfailed}" >&2

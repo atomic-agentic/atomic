@@ -49,7 +49,10 @@ skip=0
 no_fail_fast=0
 for a in "$@"; do
     if [ "${skip}" -eq 1 ]; then skip=0; continue; fi
-    if [ "${after}" -eq 1 ]; then names+=("${a}"); continue; fi
+    if [ "${after}" -eq 1 ]; then
+        case "${a}" in -*) ;; *) names+=("${a}") ;; esac
+        continue
+    fi
     case "${a}" in
     --) after=1 ;;
     --no-fail-fast) no_fail_fast=1 ;;
