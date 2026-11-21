@@ -135,9 +135,12 @@ pub fn run(args: SetupArgs) -> anyhow::Result<()> {
 /// Nothing is written until every skill directory atomic owns holds only what
 /// atomic wrote there and is reached without a link, so a refusal installs
 /// nothing and points no agent at a directory holding instructions atomic never
-/// wrote. What passes may be rewritten; the only thing removed is a file the
-/// manifest says atomic wrote, still holding what it recorded, that this pack
-/// no longer ships. The manifest goes down after the files it records.
+/// wrote. What passes may be rewritten; the only things removed are a file the
+/// manifest says atomic wrote, still holding what it recorded, that this pack no
+/// longer ships, the directories that removing those files leaves empty, and an
+/// empty directory atomic has no reason to write in -- the last only when it is
+/// all there was to refuse, and named in the refusal that comes with it. The
+/// manifest goes down after the files it records.
 pub fn install(agent: Agent, root: &Path) -> anyhow::Result<Vec<PathBuf>> {
     let root =
         std::fs::canonicalize(root).with_context(|| format!("cannot open {}", root.display()))?;
@@ -194,14 +197,18 @@ pub fn install(agent: Agent, root: &Path) -> anyhow::Result<Vec<PathBuf>> {
         &root.join(instructions),
         &instructions_files,
     )?;
-    // Where the instructions file really is, which is where the write below goes.
-    // For the one link `link_to_own_file` allows, to the other agent's
-    // instructions file, that is the other file: `write_inside` is pointed at it
-    // rather than at the link, because a write goes to where a file is, not
-    // through a link. For a plain file, and for one not written yet, this is the
-    // path as it was given.
-    let mut instructions_target = root.join(instructions);
-    if let Ok(resolved) = std::fs::canonicalize(&instructions_target) {
+    // Where the instructions file really is, which is where the write below
+    // goes. The path as it was given is where it goes when there is no file
+    // there yet, and for a plain file. For the one link `link_to_own_file`
+    // allows, to the other agent's instructions file, it is that other file:
+    // `write_inside` is pointed at it rather than at the link, because a write
+    // goes to where a file is, not through a link, and a link left in the way of
+    // a write is refused there.
+    let mut instructions_target = instructions.to_path_buf();
+    if let Ok(resolved) = std::fs::canonicalize(root.join(instructions)) {
+        // What the one allowed link leads to is a plain file below the root, so
+        // this holds; a file that resolves elsewhere is not written to here, and
+        // `link_to_own_file` has already refused it.
         if let Ok(below) = resolved.strip_prefix(&root) {
             instructions_target = below.to_path_buf();
         }
@@ -271,10 +278,7 @@ fn owned_dirs(pack: &[skills::SkillFile]) -> anyhow::Result<Vec<String>> {
         // names no such directory. A pack is built here from paths this crate
         // writes, so this is a statement about the pack, not a judgement on
         // anything a person left.
-        let (dir, name) = match file.path.split_once('/') {
-            Some(halves) => halves,
-            None => ("", ""),
-        };
+        let (dir, name): (&str, &str) = file.path.split_once('/').unwrap_or_default();
         ensure!(
             !dir.is_empty() && !name.is_empty(),
             "the pack writes {}, which is not a file inside a skill directory",
@@ -315,6 +319,20 @@ impl Report {
             && self.changed.is_empty()
             && self.extra.is_empty()
             && self.links.is_empty()
+    }
+
+    /// Whether every clause of this report names one of the `shells` empty
+    /// directories the walk refused. That is the only case in which setup clears
+    /// an empty directory at all: with anything else to complain of, every
+    /// directory stays exactly where it was found, so a refusal never takes away
+    /// what a person might still want. It is one call so that the control of it
+    /// has one site, which `scripts/controls/skill-dir-empty-shell.row` switches
+    /// off.
+    fn shells_only(&self, shells: usize) -> bool {
+        self.edited.is_empty()
+            && self.changed.is_empty()
+            && self.links.is_empty()
+            && self.extra.len() == shells
     }
 
     /// The refusal's clauses, in order.
@@ -535,9 +553,12 @@ impl<'a> OwnedDir<'a> {
     /// back from here for removal when this pack no longer ships it; a listed
     /// file holding other bytes was edited since and is refused. A file that is
     /// not listed but holds exactly what this pack writes there is atomic's own
-    /// work too, which is what lets a run that stopped halfway be run again.
-    /// With no manifest to go by, only a directory holding exactly this pack's
-    /// files, with this pack's bytes, passes.
+    /// work too, which is what lets a run that stopped halfway be run again. A
+    /// directory atomic does not write in is kept only while it holds a listed
+    /// file on disk; empty shells of that kind are the one thing a refusal here
+    /// can answer for the person, and they are removed when they are all it has
+    /// to complain of. With no manifest to go by, only a directory holding
+    /// exactly this pack's files, with this pack's bytes, passes.
     fn check(&self) -> anyhow::Result<Vec<String>> {
         let mut report = Report::default();
         if let Some(link) = self.chain_link() {
@@ -553,17 +574,27 @@ impl<'a> OwnedDir<'a> {
             if report.is_empty() {
                 return Ok(self.leftovers(&manifest, &report));
             }
-            // A directory atomic has no reason to write in is refused with the
-            // words "remove what is named", and an empty one shows nothing a
-            // person can see to remove -- often the shell of a directory an
-            // earlier pack wrote, whose files a later one stopped removing. It
-            // holds nothing atomic is asked to keep, so it goes, and the next
-            // setup finds the directory clean. What still holds something stays.
-            let cleared = self.clear_empty_dirs();
+            // An empty directory atomic has no reason to write in is the one
+            // thing a person is told to remove that they cannot see to remove --
+            // often the shell of a directory an earlier pack wrote, whose files a
+            // later one stopped removing. Setup clears those, and only when they
+            // are the whole of what is refused: a run that has anything else to
+            // complain of leaves every directory exactly as it found it, so what
+            // comes out of a skill directory is only ever an empty shell, and the
+            // refusal says so.
+            let shells = self.empty.borrow().len();
+            let cleared = if report.shells_only(shells) {
+                self.clear_empty_dirs()
+            } else {
+                Vec::new()
+            };
             let cleared = match cleared.len() {
                 0 => String::new(),
                 1 => format!(" ({} was empty and is removed)", cleared[0]),
-                n => format!(" ({n} empty directories are removed: {})", cleared.join(", ")),
+                n => format!(
+                    " ({n} empty directories are removed: {})",
+                    cleared.join(", ")
+                ),
             };
             bail!("{}{}", self.refusal(&report), cleared);
         }
@@ -714,9 +745,9 @@ impl<'a> OwnedDir<'a> {
     ///
     /// Entries are taken in name order, so a refusal does not depend on the
     /// order a filesystem happens to give. A directory is walked into only when
-    /// the pack writes a file under it or the manifest lists one there, so what
-    /// atomic never wrote is refused with the directory holding it and nothing
-    /// here descends past what atomic itself nested.
+    /// the pack writes a file under it or something standing in it is listed in
+    /// the manifest, so what atomic never wrote is refused with the directory
+    /// holding it and nothing here descends past what atomic itself nested.
     ///
     /// A name that is not text is refused where it stands. Naming it is only
     /// possible lossily, and two entries whose names differ only in bytes that
@@ -780,11 +811,14 @@ impl<'a> OwnedDir<'a> {
             }
             let listed = manifest.is_some_and(|m| m.files.contains_key(relative.as_str()));
             if kind.is_dir() {
-                let holds_one = manifest.is_some_and(|m| {
-                    let under = format!("{relative}/");
-                    m.files.keys().any(|p| p.starts_with(under.as_str()))
-                });
-                if !holds_one && !self.dirs.contains(relative.as_str()) {
+                // What keeps a directory that is not one of the pack's is what
+                // stands in it, not what a manifest once listed there: a
+                // directory whose listed files are no longer on disk is the
+                // shell an earlier pack left, which is exactly what atomic has
+                // no reason to write in.
+                if !self.dirs.contains(relative.as_str())
+                    && !self.holds_own(&entry, &relative, manifest)?
+                {
                     report
                         .extra
                         .push(format!("{shown} is not a directory atomic writes"));
@@ -793,8 +827,7 @@ impl<'a> OwnedDir<'a> {
                     // someone is using. An empty one is named and then cleared,
                     // because there is nothing in it for a person to go and
                     // remove; anything else is left exactly as it is found.
-                    if std::fs::read_dir(&entry).is_ok_and(|mut entries| entries.next().is_none())
-                    {
+                    if std::fs::read_dir(&entry).is_ok_and(|mut entries| entries.next().is_none()) {
                         self.empty.borrow_mut().insert(relative);
                     }
                     continue;
@@ -826,7 +859,8 @@ impl<'a> OwnedDir<'a> {
                 // away.
                 let bytes = self.bytes(&entry, &shown, meta.len())?;
                 let holds = manifest_vouches_for(manifest, &relative, &bytes);
-                let holds = holds || pack_holds(self.pack_bytes, &self.pack_path(&relative), &bytes);
+                let holds =
+                    holds || pack_holds(self.pack_bytes, &self.pack_path(&relative), &bytes);
                 if holds {
                     report.unmodified.insert(relative);
                 } else {
@@ -858,6 +892,45 @@ impl<'a> OwnedDir<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Whether the directory `entry`, which sits at `relative` below this one,
+    /// holds on disk anything the manifest lists: a file it names there, or a
+    /// directory that could hold one. What the manifest lists is not enough on
+    /// its own, because a directory whose listed files are no longer on disk is
+    /// the shell of one an earlier pack wrote, and atomic refuses a directory it
+    /// has no reason to write in, empty or not. A name that is not text is left
+    /// out of this: a manifest is text, so it can name no such entry.
+    fn holds_own(
+        &self,
+        entry: &Path,
+        relative: &str,
+        manifest: Option<&Manifest>,
+    ) -> anyhow::Result<bool> {
+        let Some(manifest) = manifest else {
+            return Ok(false);
+        };
+        let shown = self.shown(relative);
+        let read = std::fs::read_dir(entry).with_context(|| format!("cannot inspect {shown}"))?;
+        for seen in read {
+            let name = seen
+                .map(|seen| seen.file_name())
+                .with_context(|| format!("cannot inspect {shown}"))?;
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let child = format!("{relative}/{name}");
+            let under = format!("{child}/");
+            if manifest.files.contains_key(child.as_str())
+                || manifest
+                    .files
+                    .keys()
+                    .any(|path| path.starts_with(under.as_str()))
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// The bytes of a plain file the walk has seen to be one, read from `entry`,
@@ -908,10 +981,7 @@ fn parents_of(relative: &str) -> Vec<&str> {
         .unwrap_or("");
     while !at.is_empty() {
         parents.push(at);
-        at = at
-            .rsplit_once('/')
-            .map(|(parent, _)| parent)
-            .unwrap_or("");
+        at = at.rsplit_once('/').map(|(parent, _)| parent).unwrap_or("");
     }
     parents
 }
@@ -953,7 +1023,10 @@ fn with_section(text: Option<&str>, section: &str) -> anyhow::Result<String> {
 ///
 /// [`link_to_own_file`] is asked of the instructions file before anything is
 /// written, and `install` hands over where that link leads when there is one, so
-/// what is named here is a place to write, not a link to write through.
+/// what is named here is a place to write, not a link to write through. The
+/// chain of directories below the root is weighed again just before the rename,
+/// which is the one place that answers to
+/// `scripts/controls/skill-dir-write-chain.row`.
 fn write_inside(root: &Path, relative: &Path, contents: &[u8]) -> anyhow::Result<()> {
     ensure!(
         relative
@@ -991,8 +1064,7 @@ fn write_inside(root: &Path, relative: &Path, contents: &[u8]) -> anyhow::Result
                     .with_context(|| format!("create {}", line(&dir.to_string_lossy())))?;
             }
             Err(e) => {
-                return Err(e)
-                    .with_context(|| format!("inspect {}", line(&dir.to_string_lossy())));
+                return Err(e).with_context(|| format!("inspect {}", line(&dir.to_string_lossy())));
             }
         }
     }
@@ -1002,15 +1074,19 @@ fn write_inside(root: &Path, relative: &Path, contents: &[u8]) -> anyhow::Result
     // asks whether anything *is* a link, where resolving would answer what a link
     // leads to and read a broken one as no path at all. The directories were
     // weighed before anything was made below them, and a link put in their place
-    // since then would point the rest of this at somewhere else.
+    // since then would point the rest of this at somewhere else. The link is
+    // named as it sits below the root, which is where the person has to go and
+    // remove it.
     let mut chain = root.to_owned();
+    let mut below = PathBuf::new();
     for part in relative.parent().into_iter().flat_map(Path::components) {
         chain.push(part);
+        below.push(part);
         ensure!(
             !is_link(&chain),
             "{} is reached through {}, which is a symbolic link",
             line(&relative.to_string_lossy()),
-            line(&chain.to_string_lossy())
+            line(&below.to_string_lossy())
         );
     }
     // `.` and `..` are refused above, so the temporary cannot be written
@@ -1178,6 +1254,61 @@ mod tests {
         assert_eq!(std::fs::read_to_string(root.join(&at)).expect("read"), once);
     }
 
+    /// A pack is built in this crate from paths this crate writes, so a path of
+    /// it that names no skill directory is a bug here rather than something a
+    /// person left behind. It is still refused where it is, because a pack
+    /// nobody checked would write loose into the shared skills directory, where
+    /// no directory atomic owns covers it.
+    #[test]
+    fn a_pack_that_writes_outside_a_skill_directory_is_refused() {
+        let loose = [
+            skills::SkillFile {
+                path: "loose.md".to_owned(),
+                contents: "no directory in front of it\n".to_owned(),
+            },
+            skills::SkillFile {
+                path: "a-skill/".to_owned(),
+                contents: "nothing after the slash\n".to_owned(),
+            },
+        ];
+        for file in &loose {
+            let error = owned_dirs(std::slice::from_ref(file)).expect_err("refused");
+            assert_eq!(
+                format!("{error:#}"),
+                format!(
+                    "the pack writes {}, which is not a file inside a skill directory",
+                    file.path
+                )
+            );
+        }
+    }
+
+    /// The bounds setup refuses by size have to sit above what atomic writes
+    /// itself, or the check would refuse atomic's own work: every file of the
+    /// pack under the bound a listed file is read to, and the record of a whole
+    /// skill under the bound a manifest is read to.
+    #[test]
+    fn pack_files_fit_their_limits() {
+        let pack = skills::pack().expect("pack");
+        for file in &pack {
+            assert!(
+                file.contents.len() as u64 <= READ_BYTES_MAX,
+                "{} holds {} bytes, over the {} setup will read a file for",
+                file.path,
+                file.contents.len(),
+                READ_BYTES_MAX
+            );
+        }
+        for skill in owned_dirs(&pack).expect("the pack's skill directories") {
+            let bytes = Manifest::for_pack(&pack, &skill).text().len();
+            assert!(
+                bytes as u64 <= MANIFEST_BYTES_MAX,
+                "the record of {skill} holds {bytes} bytes, over the {MANIFEST_BYTES_MAX} a \
+                 manifest may hold"
+            );
+        }
+    }
+
     /// Re-running setup is what an up-to-date install meets, and the check must
     /// not stand in its way: the same pack installs again.
     #[test]
@@ -1244,6 +1375,171 @@ mod tests {
         );
     }
 
+    /// What an upgrade leaves when it takes a whole nested directory of the old
+    /// pack out: the directory stands empty, this pack has no reason to write in
+    /// it, and the next setup would refuse the directory it had just made. The
+    /// directories a removal empties go with the files they held, innermost
+    /// first; one that still holds something stays.
+    #[test]
+    fn a_directory_emptied_by_an_upgrade_goes_with_the_files_it_held() {
+        let root = scratch("emptied");
+        install(Agent::Codex, &root).expect("installed");
+        let skill = skill_dir(&root, Agent::Codex);
+        let old = skill.join("references/old/deep");
+        std::fs::create_dir_all(&old).expect("the old pack's nested directory");
+        let gone = "<!-- a reference this release no longer ships -->\n";
+        std::fs::write(old.join("gone.md"), gone).expect("write");
+        let mut manifest = manifest_of(&root, Agent::Codex);
+        manifest
+            .files
+            .insert("references/old/deep/gone.md".to_owned(), sha256(gone));
+        std::fs::write(skill.join(MANIFEST), manifest.text()).expect("write the record");
+        install(Agent::Codex, &root).expect("the upgrade installs");
+        assert!(
+            !skill.join("references/old").exists(),
+            "the empty shell of the old pack's directory stayed"
+        );
+        assert!(
+            skill.join("references/fields.md").is_file(),
+            "the pack's own reference went with it"
+        );
+        // The next setup is what an up-to-date install meets, and it has
+        // nothing there to refuse.
+        install(Agent::Codex, &root).expect("the next setup installs");
+    }
+
+    /// The other half of the same shell: a directory of the old pack that is
+    /// empty on disk while the record still speaks of a file in it. What keeps
+    /// such a directory is what stands in it, not what a manifest once named, so
+    /// it is refused -- and cleared on the spot, because an empty directory
+    /// shows a person nothing to go and remove.
+    #[test]
+    fn an_empty_directory_the_record_still_lists_is_refused_and_cleared() {
+        let root = scratch("shell");
+        install(Agent::Codex, &root).expect("installed");
+        let skill = skill_dir(&root, Agent::Codex);
+        std::fs::create_dir(skill.join("extras")).expect("the shell of a directory");
+        let wrote = "what an earlier release wrote there\n";
+        let mut manifest = manifest_of(&root, Agent::Codex);
+        manifest
+            .files
+            .insert("extras/gone.md".to_owned(), sha256(wrote));
+        std::fs::write(skill.join(MANIFEST), manifest.text()).expect("write the record");
+        let error = install(Agent::Codex, &root).expect_err("refused");
+        assert_eq!(
+            format!("{error:#}"),
+            ".agents/skills/atomic-create-atom holds what atomic did not write (an older \
+             version of atomic may be the cause): \
+             .agents/skills/atomic-create-atom/extras is not a directory atomic writes; remove \
+             what is named and run `atomic setup` again \
+             (.agents/skills/atomic-create-atom/extras was empty and is removed)"
+        );
+        assert!(
+            !skill.join("extras").exists(),
+            "the empty shell was left to be refused again"
+        );
+        // Nothing else moved: the refusal wrote no pack file and no record.
+        assert_eq!(
+            manifest_of(&root, Agent::Codex).files.get("extras/gone.md"),
+            Some(&sha256(wrote)),
+            "the record was rewritten over the refusal"
+        );
+        for file in skills::pack().expect("pack") {
+            assert_eq!(
+                std::fs::read(root.join(Agent::Codex.skills_dir()).join(&file.path)).expect("read"),
+                file.contents.as_bytes(),
+                "{} was written over",
+                file.path
+            );
+        }
+        // And the setup after it has nothing to refuse.
+        install(Agent::Codex, &root).expect("the next setup installs");
+    }
+
+    /// Clearing empty shells is the remedy only when it is the whole complaint.
+    /// With anything else refused as well, setup installs nothing and leaves
+    /// every directory where it found it, empty ones included: what it takes away
+    /// is never what a person might still have wanted.
+    #[test]
+    fn an_empty_directory_stays_while_something_else_is_refused() {
+        let root = scratch("shell-and-file");
+        install(Agent::Codex, &root).expect("installed");
+        let skill = skill_dir(&root, Agent::Codex);
+        std::fs::create_dir(skill.join("extras")).expect("the shell of a directory");
+        std::fs::write(skill.join("mine.md"), "mine\n").expect("write");
+        let mut manifest = manifest_of(&root, Agent::Codex);
+        manifest
+            .files
+            .insert("extras/gone.md".to_owned(), sha256("x"));
+        std::fs::write(skill.join(MANIFEST), manifest.text()).expect("write the record");
+        let error = install(Agent::Codex, &root).expect_err("refused");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("mine.md is not a file atomic writes")
+                && text.contains("extras is not a directory atomic writes"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("is removed"),
+            "setup cleared a directory while something else was refused too: {text}"
+        );
+        assert!(skill.join("extras").is_dir(), "the empty shell was removed");
+        assert_eq!(
+            std::fs::read_to_string(skill.join("mine.md")).expect("theirs"),
+            "mine\n"
+        );
+    }
+
+    /// A run that stopped between writing the files and writing its record
+    /// leaves this pack's bytes under the record of the run before it. Those
+    /// bytes are atomic's own work, wherever they came from, so running setup
+    /// again finishes the install rather than refusing the directory the
+    /// interrupted run had just written.
+    #[test]
+    fn an_interrupted_upgrade_is_finished_by_running_setup_again() {
+        let root = scratch("halfway");
+        install(Agent::Codex, &root).expect("installed");
+        let skill = skill_dir(&root, Agent::Codex);
+        // The record of a release before this one, which is what the run that
+        // wrote the files and then stopped leaves standing.
+        let mut older = manifest_of(&root, Agent::Codex);
+        for recorded in older.files.values_mut() {
+            *recorded = sha256(format!("what an older release wrote: {recorded}"));
+        }
+        std::fs::write(skill.join(MANIFEST), older.text()).expect("write the older record");
+        install(Agent::Codex, &root).expect("the run after the interruption installs");
+        let pack = skills::pack().expect("pack");
+        let under = format!("{SKILL}/");
+        let now = manifest_of(&root, Agent::Codex);
+        for file in &pack {
+            let relative = file
+                .path
+                .strip_prefix(under.as_str())
+                .expect("under the skill");
+            assert_eq!(
+                now.files.get(relative),
+                Some(&sha256(&file.contents)),
+                "{} is not recorded as what was written",
+                file.path
+            );
+            assert_eq!(
+                std::fs::read(root.join(Agent::Codex.skills_dir()).join(&file.path)).expect("read"),
+                file.contents.as_bytes(),
+                "{}",
+                file.path
+            );
+        }
+    }
+
+    /// The order to remove directories in: innermost first, so that emptying one
+    /// is what lets the one above it go as well.
+    #[test]
+    fn a_paths_directories_are_named_innermost_first() {
+        assert_eq!(parents_of("a/b/c.md"), ["a/b", "a"]);
+        assert_eq!(parents_of("a.md"), Vec::<&str>::new());
+        assert_eq!(parents_of("a/b"), ["a"]);
+    }
+
     /// What a version of atomic that wrote no manifest leaves behind is refused
     /// rather than taken in: with nothing to say who wrote a file, only the
     /// pack's own bytes count as atomic's, and clearing the old skill is the
@@ -1268,6 +1564,36 @@ mod tests {
             "---\nname: atomic-create-atom\n---\nmine\n"
         );
         assert!(!root.join("AGENTS.md").exists());
+    }
+
+    /// The same directory with nothing added to it and nothing changed is what
+    /// atomic is willing to take in without a record: bytes this atomic was
+    /// going to write there anyway are atomic's own work, whoever put them
+    /// there. The refusal above is what anything else costs.
+    #[test]
+    fn a_directory_written_without_a_record_that_holds_the_pack_installs() {
+        let root = scratch("no-record");
+        let skills_dir = root.join(Agent::Codex.skills_dir());
+        // What a release that kept no record leaves: the pack's files, with the
+        // pack's bytes, and no manifest beside them.
+        for file in skills::pack().expect("pack") {
+            let at = skills_dir.join(&file.path);
+            std::fs::create_dir_all(at.parent().expect("a parent")).expect("a directory");
+            std::fs::write(&at, &file.contents).expect("write");
+        }
+        install(Agent::Codex, &root).expect("the pack's own bytes install without a record");
+        assert!(
+            std::fs::read_to_string(root.join("AGENTS.md"))
+                .expect("AGENTS.md")
+                .contains("`atomic-create-atom` skill"),
+            "the agent was not told to use the skill"
+        );
+        // And the directory now carries the record that makes the next upgrade
+        // an upgrade rather than a clean-up.
+        assert_eq!(
+            manifest_of(&root, Agent::Codex).files.get("SKILL.md"),
+            Some(&sha256(&skills::pack().expect("pack")[0].contents))
+        );
     }
 
     /// A file atomic wrote, listed in its own manifest, that someone has since
@@ -1356,6 +1682,16 @@ mod tests {
                 bad_hash.into_bytes(),
                 "lists SKILL.md as not a hash",
             ),
+            (
+                // A key of its own making that both names somewhere else and
+                // carries a line break, which is what a refusal must not repeat
+                // unescaped.
+                "newline-in-a-key",
+                format!("{{\"format\":1,\"files\":{{\"../evil\\nelsewhere.md\":\"{zeros}\"}}}}")
+                    .into_bytes(),
+                // `line` writes the break as `\n`, so this is the escaped key.
+                "lists ../evil\\nelsewhere.md as",
+            ),
         ] {
             let root = scratch("manifest");
             install(Agent::Codex, &root).expect("installed");
@@ -1365,6 +1701,11 @@ mod tests {
             assert!(
                 error.contains(&format!("{MANIFEST} {says}")),
                 "{what}: {error}"
+            );
+            assert_eq!(
+                error.lines().count(),
+                1,
+                "{what}: what the manifest supplied was repeated unescaped: {error}"
             );
             assert_eq!(
                 std::fs::read(skill_dir(&root, Agent::Codex).join(MANIFEST)).expect("read"),
@@ -1474,6 +1815,63 @@ mod tests {
             "a name split the refusal: {error}"
         );
         assert!(!root.join("AGENTS.md").exists());
+    }
+
+    /// Two names that differ only in bytes which are not text are one name once
+    /// read as text. An entry weighed on a name another entry is called by can
+    /// hide that other entry, so a name atomic cannot read as text is refused
+    /// where it stands, and every entry is weighed on its own path.
+    #[cfg(unix)]
+    #[test]
+    fn a_name_that_is_not_text_is_refused_and_hides_nothing() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let root = scratch("not-text");
+        install(Agent::Codex, &root).expect("installed");
+        let skill = skill_dir(&root, Agent::Codex);
+        // The name that is text, which the record lists as atomic's own, and a
+        // second entry whose bytes read as that same name taken lossily.
+        let theirs = "what the record vouches for\n";
+        std::fs::write(skill.join("n\u{fffd}.md"), theirs).expect("write the name that is text");
+        let foreign = std::ffi::OsStr::from_bytes(b"n\xff.md");
+        std::fs::write(skill.join(foreign), "what someone else left\n")
+            .expect("write the name that is not text");
+        let mut manifest = manifest_of(&root, Agent::Codex);
+        manifest
+            .files
+            .insert("n\u{fffd}.md".to_owned(), sha256(theirs));
+        std::fs::write(skill.join(MANIFEST), manifest.text()).expect("write the record");
+        let error = install(Agent::Codex, &root).expect_err("refused");
+        assert_eq!(
+            format!("{error:#}"),
+            ".agents/skills/atomic-create-atom holds what atomic did not write (an older \
+             version of atomic may be the cause): \
+             .agents/skills/atomic-create-atom/n\u{fffd}.md is not a name atomic can read as \
+             text; remove what is named and run `atomic setup` again"
+        );
+        // Everything is left as it was found: the entry that shares the name,
+        // the one that does not, and the record that lists only the first.
+        assert_eq!(
+            std::fs::read_to_string(skill.join("n\u{fffd}.md")).expect("theirs"),
+            theirs
+        );
+        assert_eq!(
+            std::fs::read(skill.join(foreign)).expect("theirs"),
+            b"what someone else left\n",
+            "the entry with the name that is not text was written over"
+        );
+        assert_eq!(
+            manifest_of(&root, Agent::Codex).files.get("n\u{fffd}.md"),
+            Some(&sha256(theirs)),
+            "the record was rewritten over the refusal"
+        );
+        for file in skills::pack().expect("pack") {
+            assert_eq!(
+                std::fs::read(root.join(Agent::Codex.skills_dir()).join(&file.path)).expect("read"),
+                file.contents.as_bytes(),
+                "{} was written over",
+                file.path
+            );
+        }
     }
 
     /// Too much to name is counted, not squeezed: what is named stops, what is
@@ -1822,6 +2220,141 @@ mod tests {
                 .expect("meta")
                 .file_type()
                 .is_symlink()
+        );
+    }
+
+    /// One link, to a plain file, is all the instructions file may be. A chain
+    /// is refused: the second hop is a file that is itself an alias, which is
+    /// the question this check asks and not an answer to it, and what is written
+    /// then goes wherever the chain ends rather than to a named file.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_from_the_instructions_file_to_another_link_is_refused() {
+        let root = scratch("chain-of-two");
+        std::fs::create_dir_all(root.join(".claude")).expect("claude directory");
+        std::fs::write(root.join(".claude/shared.md"), "# Shared\n").expect("write");
+        std::os::unix::fs::symlink(".claude/shared.md", root.join("AGENTS.md"))
+            .expect("the first link");
+        std::os::unix::fs::symlink("AGENTS.md", root.join("CLAUDE.md")).expect("the second link");
+        let error = install(Agent::Claude, &root).expect_err("refused");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("CLAUDE.md is a symbolic link to")
+                && text.contains(".claude/shared.md")
+                && text.contains("which is not a file atomic may write through from here"),
+            "{text}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(".claude/shared.md")).expect("theirs"),
+            "# Shared\n",
+            "the instructions were written at the end of the chain"
+        );
+        assert!(
+            std::fs::symlink_metadata(root.join("AGENTS.md"))
+                .expect("meta")
+                .file_type()
+                .is_symlink(),
+            "the link in the middle of the chain was replaced"
+        );
+        assert!(
+            !skill_dir(&root, Agent::Claude).join("SKILL.md").is_file(),
+            "the skill was installed despite the refusal"
+        );
+    }
+
+    /// A write is confined to the repository it was pointed at: a directory in
+    /// its way that leads out of that repository is refused, and nothing is put
+    /// where the link leads.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_refuses_a_directory_that_leads_out_of_the_repository() {
+        let root = std::fs::canonicalize(scratch("write-out")).expect("canonical root");
+        let outside = scratch("write-out-target");
+        std::fs::create_dir_all(root.join(".agents/skills")).expect("skills");
+        std::os::unix::fs::symlink(&outside, root.join(".agents/skills/atomic-create-atom"))
+            .expect("link");
+        let error = write_inside(
+            &root,
+            Path::new(".agents/skills/atomic-create-atom/SKILL.md"),
+            b"the pack's bytes",
+        )
+        .expect_err("refused");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains(".agents/skills/atomic-create-atom/SKILL.md leads outside")
+                && text.contains("through a symbolic link"),
+            "{text}"
+        );
+        assert!(
+            std::fs::read_dir(&outside)
+                .expect("outside")
+                .next()
+                .is_none(),
+            "the bytes were written where the link leads"
+        );
+    }
+
+    /// A link inside the repository is no place to write either, and it is
+    /// refused on the way to the file, however it came to be standing there: a
+    /// directory put in place after any earlier weighing cannot move the write
+    /// somewhere else.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_refuses_a_directory_reached_through_a_link() {
+        let root = std::fs::canonicalize(scratch("write-chain")).expect("canonical root");
+        let elsewhere = root.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).expect("elsewhere");
+        std::fs::create_dir_all(root.join(".agents/skills")).expect("skills");
+        std::os::unix::fs::symlink(
+            "../../elsewhere",
+            root.join(".agents/skills/atomic-create-atom"),
+        )
+        .expect("link");
+        let error = write_inside(
+            &root,
+            Path::new(".agents/skills/atomic-create-atom/SKILL.md"),
+            b"the pack's bytes",
+        )
+        .expect_err("refused");
+        assert_eq!(
+            format!("{error:#}"),
+            ".agents/skills/atomic-create-atom/SKILL.md is reached through \
+             .agents/skills/atomic-create-atom, which is a symbolic link"
+        );
+        assert!(
+            std::fs::read_dir(&elsewhere)
+                .expect("elsewhere")
+                .next()
+                .is_none(),
+            "the bytes were written where the link leads"
+        );
+    }
+
+    /// What stands where a file belongs is replaced, never written through: the
+    /// bytes go to a temporary beside the target and the temporary is renamed
+    /// over it, which takes the link away, leaves a plain file, and does not
+    /// touch what the link led to.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_where_a_file_belongs_is_replaced_by_a_plain_file() {
+        let root = std::fs::canonicalize(scratch("write-replace")).expect("canonical root");
+        let target = root.join("notes.md");
+        std::fs::write(&target, "what the link led to\n").expect("write");
+        std::fs::create_dir_all(root.join(".agents/skills/atomic-create-atom")).expect("skill");
+        let file = root.join(".agents/skills/atomic-create-atom/SKILL.md");
+        std::os::unix::fs::symlink("../../notes.md", &file).expect("link");
+        write_inside(
+            &root,
+            Path::new(".agents/skills/atomic-create-atom/SKILL.md"),
+            b"the pack's bytes",
+        )
+        .expect("writes");
+        assert!(!is_link(&file), "the link still stands where the file is");
+        assert_eq!(std::fs::read(&file).expect("read"), b"the pack's bytes");
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("theirs"),
+            "what the link led to\n",
+            "the write went through the link"
         );
     }
 }

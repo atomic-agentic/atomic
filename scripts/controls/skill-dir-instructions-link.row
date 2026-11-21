@@ -1,0 +1,1 @@
+skill-dir-instructions-link|crates/atomic/src/setup.rs|        path != relative && other == resolved && !is_link(&other)|        path != relative && std::fs::canonicalize(other).is_ok_and(|target| target == resolved) // CONTROL_OFF|-p atomic-agentic --bin atomic -- a_link_from_the_instructions_file_to_another_link_is_refused

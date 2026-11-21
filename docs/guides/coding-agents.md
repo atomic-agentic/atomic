@@ -24,9 +24,18 @@ a later setup writes over only what that record still vouches for. A file or
 directory atomic did not write, a file atomic wrote that someone has since
 edited, and a symbolic link are each named in a refusal, and while any of them
 remains nothing is installed and no instruction points the agent at the
-directory. Remove what the refusal names and run setup again. Nothing of yours is
-deleted; a file an older release wrote that this one no longer ships does come
-out, once the record confirms nothing has touched it.
+directory. Remove what the refusal names and run setup again.
+
+Commit `.atomic-pack.json` with the skill. It is how a later setup tells atomic's
+own files from yours, and what follows is only as good as that record: keep it
+where a change to it shows.
+
+Nothing of yours is deleted, as long as the record is the one atomic wrote: what
+setup removes is only what the record says atomic wrote and nothing has touched
+since, and — when it is the only thing in the way — an empty directory atomic did
+not write, named in the refusal that removes it. A file an older release wrote
+that this one no longer ships does come out on that basis, and a directory that
+only held such files goes with them.
 
 The way to that directory matters as much as what is in it: it must run through
 plain directories from the repository root. A `.claude` or `.agents` that is
