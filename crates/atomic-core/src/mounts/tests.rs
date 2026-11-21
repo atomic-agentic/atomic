@@ -72,6 +72,7 @@ fn a_namespace_file_is_read_and_never_an_alias() {
             root: Some("/".into()),
             at: "/".into(),
             kind: "tmpfs".into(),
+            lost: false,
         },
         Mount {
             device: "0:4".into(),
@@ -154,7 +155,7 @@ fn a_network_filesystem_mounted_twice_is_refused() {
     assert!(
         aliases(&mounts, &[PathBuf::from("/home/u/.ssh")]).is_err_and(|e| e
             .to_string()
-            .contains("nfs4 filesystem, seen at /home, that is mounted again at /mnt/home"))
+            .contains("nfs4 filesystem seen at /home, that is mounted again at /mnt/home"))
     );
     let once = parse(
         b"1 0 8:1 / / rw - ext4 /dev/sda1 rw\n2 1 0:50 / /home rw - nfs4 server:/export/home rw\n",
@@ -236,7 +237,51 @@ fn a_mount_on_one_the_table_does_not_list_is_refused() {
         parse(cut).is_err_and(|e| e.to_string().contains("on mount 2, which it does not list"))
     );
     assert!(
-        parse(b"1 0 8:1 / /mnt rw - ext4 /dev/sda1 rw\n")
-            .is_err_and(|e| e.to_string().contains("no root mount"))
+        parse(b"1 0 8:1 / /mnt rw - ext4 /dev/sda1 rw\n").is_err_and(|e| e
+            .to_string()
+            .contains("lists no mount at / that is mounted on nothing"))
+    );
+}
+
+/// A FUSE mount whose root the kernel has lost, as when a lookup fails with
+/// its server away, shows `<dir>//deleted`, not the directory it shows:
+/// with its device mounted more than once, a denied place on it is refused,
+/// whichever mount lost it.
+#[test]
+fn a_lost_fuse_root_is_refused() {
+    for table in [
+        &b"1 0 8:1 / / rw - ext4 /dev/sda1 rw
+2 1 0:60 / /mnt/fuse rw - fuse.sshfs host:/home rw
+3 1 0:60 /u//deleted /home/u rw - fuse.sshfs host:/home rw
+"[..],
+        b"1 0 8:1 / / rw - ext4 /dev/sda1 rw
+2 1 0:60 /x//deleted /mnt/fuse rw - fuse.sshfs host:/home rw
+3 1 0:60 /u /home/u rw - fuse.sshfs host:/home rw
+",
+    ] {
+        let mounts = parse(table).expect("parses");
+        assert!(
+            aliases(&mounts, &[PathBuf::from("/home/u/.ssh")])
+                .is_err_and(|e| e.to_string().contains("the kernel no longer knows")),
+            "{:?}",
+            String::from_utf8_lossy(table)
+        );
+    }
+}
+
+/// SMB mounted more than once is refused, as NFS is: its roots are not
+/// trusted.
+#[test]
+fn smb_mounted_twice_is_refused() {
+    let mounts = parse(
+        b"1 0 8:1 / / rw - ext4 /dev/sda1 rw
+2 1 0:70 / /mnt/share rw - cifs //host/share rw
+3 1 0:70 /u /home/u rw - cifs //host/share rw
+",
+    )
+    .expect("parses");
+    assert!(
+        aliases(&mounts, &[PathBuf::from("/home/u/.ssh")])
+            .is_err_and(|e| e.to_string().contains("cifs filesystem seen at /home/u"))
     );
 }

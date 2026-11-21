@@ -416,16 +416,19 @@ path, inside toolbox or distrobox (the host's files under `/run/host`), or
 with a btrfs top-level subvolume mounted elsewhere, and so is each
 filesystem mounted inside a denied directory wherever else it is mounted.
 atomic reads the mount table for this when it makes the list, and nothing
-runs when it cannot read it, or when a denied place is on NFS and that
-filesystem is mounted more than once, since the table gives every NFS mount
-`/` as its root, whatever directory it shows; other network and FUSE
-filesystems, SMB, 9p, virtiofs and `fuse.*`, are followed as local ones are.
-The links followed and the second mounts found together come to at most
-512; past that, nothing runs. Not covered: the same remote directory
-mounted twice as two filesystems, each with a device of its own (9p, NFS
-with `nosharecache`, two SMB sessions or two FUSE daemons), neither of
-which is denied for the other; a
-snapshot, which holds a copy, not the place itself; an overlay or FUSE
+runs when it cannot read it; when a denied place is on NFS or SMB and that
+filesystem is mounted more than once, since the table cannot be trusted to
+say which directory each such mount shows (NFS gives every mount `/`); or
+when it is on a FUSE, 9p or virtiofs filesystem mounted more than once
+whose root the kernel has lost, as when a FUSE server is away. Otherwise
+FUSE (`fuse.*`), 9p and virtiofs mounts are followed as local ones are. The
+links followed and the second mounts found together come to at most 512;
+past that, nothing runs. Not covered: the same remote directory, or one
+inside another, mounted twice as two filesystems, each with a device of its
+own, such as with 9p, NFS with `nosharecache` or with mount options that
+differ (each gets a superblock of its own), Ceph (one per server path), two
+SMB sessions or two FUSE daemons, neither of which is denied for the other;
+a snapshot, which holds a copy, not the place itself; an overlay or FUSE
 filesystem built over a denied directory, such as an overlay whose upper or
 lower directory is inside one, which shows its files as its own; and a
 mount made after the list, such as one an automount makes when a path is

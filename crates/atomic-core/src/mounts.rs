@@ -14,9 +14,11 @@
 //!
 //! It refuses (an error, so nothing runs) when it cannot tell: a table or a
 //! line it cannot read, one with a mount on a mount it does not list, a
-//! denied path it finds no mount for, or a denied path on NFS
-//! ([`unknowable`]) that is mounted more than once, since the table gives
-//! every NFS mount `/` as its root, whatever directory it shows. A mount
+//! denied path it finds no mount for, a denied path on NFS or SMB
+//! ([`unknowable`]) that is mounted more than once, since the table cannot
+//! be trusted to say which directory each such mount shows, or one on a
+//! FUSE, 9p or virtiofs filesystem mounted more than once whose root the
+//! kernel has lost ([`may_lose_roots`]). A mount
 //! whose root is not a path, such as a namespace file (`net:[4026531840]`),
 //! shows no directory, and is never a second place.
 //!
@@ -31,10 +33,13 @@
 //! - a mount made after the list is built, such as one an automount
 //!   (`autofs`) makes when a path under it is first used, even from inside
 //!   the sandbox, which sees the host's new mounts;
-//! - the same remote directory mounted twice as two filesystems, each with
-//!   a device of its own: 9p, NFS with `nosharecache`, two SMB sessions, or
-//!   two FUSE daemons serving the same files. Neither is a second mount of
-//!   the other, so neither is denied for the other, nor refused.
+//! - the same remote directory, or one inside another, mounted twice as
+//!   two filesystems, each with a device of its own, such as 9p; NFS with
+//!   `nosharecache`, or with mount options that differ, which give each
+//!   mount a superblock of its own; Ceph, which has one per server path;
+//!   two SMB sessions; or two FUSE daemons serving the same files. Neither
+//!   is a second mount of the other, so neither is denied for the other,
+//!   nor refused.
 
 use anyhow::bail;
 use std::path::{Path, PathBuf};
@@ -55,14 +60,29 @@ struct Mount {
     at: PathBuf,
     /// The filesystem's type, such as `ext4` or `nfs4`.
     kind: String,
+    /// Whether the table shows the root as lost: `<dir>//deleted`.
+    lost: bool,
 }
 
-/// Whether a filesystem of type `kind` is one whose mounts all show `/` as
-/// their root in the table, whatever directory each shows: NFS. Other
-/// network and FUSE filesystems (SMB, 9p, virtiofs, `fuse.*`) show the
-/// directory a bind of part of them shows, as local ones do.
+/// Whether a filesystem of type `kind` is one whose mounts' roots in the
+/// table cannot be trusted to say what directory each shows: NFS, which
+/// gives every mount `/`, and SMB, whose root is found by walking from the
+/// share's and is the least known. FUSE, 9p and virtiofs show the directory
+/// a bind of part of them shows, as local filesystems do, unless the kernel
+/// has lost it ([`may_lose_roots`]).
 fn unknowable(kind: &str) -> bool {
-    matches!(kind, "nfs" | "nfs4")
+    matches!(kind, "nfs" | "nfs4" | "cifs" | "smb3" | "smbfs")
+}
+
+/// Whether a filesystem of type `kind` is one whose mount's root the kernel
+/// shows as `<dir>//deleted` once a lookup of it fails, as a FUSE
+/// filesystem's does when its server is away: the directory it names is not
+/// the one the mount shows.
+fn may_lose_roots(kind: &str) -> bool {
+    matches!(
+        kind,
+        "fuse" | "fuseblk" | "virtiofs" | "9p" | "cifs" | "smb3"
+    ) || kind.starts_with("fuse.")
 }
 
 /// A path field of the mount table with its octal escapes (`\040` for a
@@ -114,6 +134,8 @@ fn parse(mountinfo: &[u8]) -> anyhow::Result<Vec<Mount>> {
             if major.parse::<u32>().is_err() || minor.parse::<u32>().is_err() {
                 return None;
             }
+            // Before `//` is collapsed by reading it as a path.
+            let lost = fields.get(3)?.ends_with(b"//deleted");
             let root = unescape(fields.get(3)?)?;
             let at = unescape(fields.get(4)?)?;
             // The optional fields end with a lone `-`, then the type.
@@ -129,6 +151,7 @@ fn parse(mountinfo: &[u8]) -> anyhow::Result<Vec<Mount>> {
                 root: root.is_absolute().then_some(root),
                 at,
                 kind: kind.to_owned(),
+                lost,
             })
         };
         let Some(mount) = read() else {
@@ -143,8 +166,9 @@ fn parse(mountinfo: &[u8]) -> anyhow::Result<Vec<Mount>> {
     }
     // Every mount but the root is mounted on one the table lists: one that
     // is not was cut from the table, or the table is not one.
-    if let Some(root) = root_of(&mounts) {
-        let ids: std::collections::HashSet<u64> = mounts.iter().map(|m| m.id).collect();
+    let listed = ids(&mounts);
+    if let Some(root) = root_of(&mounts, &listed) {
+        let ids = listed;
         if let Some(orphan) = mounts
             .iter()
             .find(|m| m.id != root.id && !ids.contains(&m.parent))
@@ -158,8 +182,9 @@ fn parse(mountinfo: &[u8]) -> anyhow::Result<Vec<Mount>> {
         }
     } else if !mounts.is_empty() {
         bail!(
-            "the mount table has no root mount, so atomic cannot tell where else the places it \
-             denies are mounted"
+            "the mount table lists no mount at / that is mounted on nothing it lists, as when \
+             atomic runs under a chroot whose root is not a mount point, so atomic cannot tell \
+             where else the places it denies are mounted"
         );
     }
     Ok(mounts)
@@ -180,10 +205,14 @@ fn top<'a>(mounts: &'a [Mount], mut mount: &'a Mount) -> &'a Mount {
     mount
 }
 
-/// The root mount: the one at `/` mounted on nothing listed, or on itself,
-/// as an initramfs's root is.
-fn root_of(mounts: &[Mount]) -> Option<&Mount> {
-    let ids: std::collections::HashSet<u64> = mounts.iter().map(|m| m.id).collect();
+/// The IDs of `mounts`.
+fn ids(mounts: &[Mount]) -> std::collections::HashSet<u64> {
+    mounts.iter().map(|m| m.id).collect()
+}
+
+/// The root mount: the one at `/` mounted on nothing listed (`ids`), or on
+/// itself, as an initramfs's root is.
+fn root_of<'a>(mounts: &'a [Mount], ids: &std::collections::HashSet<u64>) -> Option<&'a Mount> {
     mounts
         .iter()
         .find(|m| m.at == Path::new("/") && (m.parent == m.id || !ids.contains(&m.parent)))
@@ -192,7 +221,7 @@ fn root_of(mounts: &[Mount]) -> Option<&Mount> {
 /// The mount `path` is in, as this process sees it: from the root mount,
 /// down the mounts on each directory of the path, each the top of its stack.
 fn mount_of<'a>(mounts: &'a [Mount], path: &Path) -> Option<&'a Mount> {
-    let root = root_of(mounts)?;
+    let root = root_of(mounts, &ids(mounts))?;
     let mut here = top(mounts, root);
     let mut at = PathBuf::from("/");
     for part in path.components().skip(1) {
@@ -223,11 +252,27 @@ fn aliases_of(mounts: &[Mount], path: &Path, out: &mut Vec<PathBuf>) -> anyhow::
     let Some(first) = same.first() else {
         return Ok(());
     };
+    if may_lose_roots(&home.kind)
+        && let Some(lost) = std::iter::once(home)
+            .chain(same.iter().copied())
+            .find(|m| m.lost)
+    {
+        bail!(
+            "{} is on the {} filesystem seen at {}, that is mounted again at {}, and the kernel \
+             no longer knows which directory the mount at {} shows, so atomic cannot deny it at \
+             each",
+            path.display(),
+            home.kind,
+            home.at.display(),
+            first.at.display(),
+            lost.at.display()
+        );
+    }
     if unknowable(&home.kind) {
         bail!(
-            "{} is on an {} filesystem, seen at {}, that is mounted again at {}, and the mount \
-             table does not say which directory each of its mounts shows, so atomic cannot deny \
-             it at each",
+            "{} is on the {} filesystem seen at {}, that is mounted again at {}, and the mount \
+             table cannot be trusted to say which directory each of its mounts shows, so atomic \
+             cannot deny it at each",
             path.display(),
             home.kind,
             home.at.display(),
@@ -356,7 +401,6 @@ pub fn second_mounts(groups: &[&[PathBuf]]) -> anyhow::Result<Vec<Vec<PathBuf>>>
         }
     };
     let Some(table) = table else {
-        let _ = (parse, aliases, real);
         return Ok(groups.iter().map(|_| Vec::new()).collect());
     };
     let mounts = parse(&table)?;

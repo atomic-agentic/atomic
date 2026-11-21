@@ -3036,6 +3036,17 @@ mod tests {
             message.contains("/w/a/b is a second mount") && message.contains("two or more levels"),
             "{message}"
         );
+        // Too many second mounts of Codex's home alone: they count too.
+        let mut many = String::from("1 0 8:1 / / rw - ext4 /dev/sda1 rw\n");
+        for i in 0..=MAX_LINK_TARGETS {
+            many.push_str(&format!(
+                "{} 1 8:1 {} /h{i} rw - ext4 /dev/sda1 rw\n",
+                i + 2,
+                codex_real.display()
+            ));
+        }
+        let message = refused(many, None, &[]);
+        assert!(message.contains("other places, more than"), "{message}");
         // Too many second mounts to deny.
         let mut many = String::from("1 0 8:1 / / rw - ext4 /dev/sda1 rw\n");
         for i in 0..=MAX_LINK_TARGETS {
