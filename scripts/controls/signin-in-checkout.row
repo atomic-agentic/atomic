@@ -1,0 +1,1 @@
+signin-in-checkout|crates/atomic-core/src/signin.rs|        outside_the_checkout(&dir, project)?;|        let _ = (&dir, project);|-p atomic-agentic --test model_auth a_sign_in_inside_the_checkout_holding_the_project_is_refused_and_explain_says_so

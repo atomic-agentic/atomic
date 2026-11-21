@@ -1,0 +1,1 @@
+signin-foreign-followed|crates/atomic-core/src/state.rs|            main_checkout(&git, false).unwrap_or(None)|            None::<PathBuf> /*CONTROL_OFF*/|-p atomic-agentic-core --lib state::tests::another_users_worktree_link_is_followed_and_a_malformed_one_ignored

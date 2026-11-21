@@ -1,0 +1,1 @@
+signin-found-absent|crates/atomic/src/settings.rs|        Err(gone) if absent(&gone) => return Ok(None),|        Err(_) => return Ok(None), /*CONTROL_OFF*/|-p atomic-agentic --test model_auth a_sign_in_that_cannot_be_used_refuses_a_run_and_nothing_takes_its_place

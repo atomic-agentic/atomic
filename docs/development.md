@@ -196,8 +196,11 @@ whether it is named first or after global flags, and given only `PATH` from
 the control plane's environment; the sandbox helper's outer stage, which
 holds a confined command's proxy token, made non-dumpable; and the artifact store's
 holds, which keep the files an exec step hands over from every sweep until its
-turn is recorded; and that an exec atom's files move only through its
-workspace's backend), it
+turn is recorded, and what a run's input names from every sweep until the input
+is recorded, refusing an input whose typed artifact field names content the
+store does not hold, and waiting for the store's lock within one bounded wait
+that a stop signal ends; and
+that an exec atom's files move only through its workspace's backend), it
 switches the control off in the source, requires the control's test to fail,
 puts the source back and requires the test to pass. Each control costs a rebuild, so it
 runs by hand rather than in CI:

@@ -59,6 +59,7 @@ deno_core = { workspace = true }
 codex-keyring-store = { workspace = true }
 codex-login = { workspace = true }
 codex-process-hardening = { workspace = true }
+url = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 seccompiler = { workspace = true }
