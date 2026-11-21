@@ -1815,7 +1815,13 @@ mod tests {
             (Err(DurableError::Failed("a step failed".into())), true),
             (Err(DurableError::Conflict("raced".into())), false),
             (Err(DurableError::Interrupted("stopping".into())), false),
-            (Err(DurableError::Parked("a cap".into())), false),
+            (
+                Err(DurableError::Parked {
+                    reason: "a cap".into(),
+                    scope: None,
+                }),
+                false,
+            ),
             (Err(DurableError::Engine("the store".into())), false),
             (Err(DurableError::Nested("a step".into())), false),
         ];
