@@ -203,6 +203,19 @@ pub(crate) fn check_not_within(denied: &Path, roots: &[PathBuf]) -> Result<(), S
     Ok(())
 }
 
+/// The directories of `denied` that lie inside no other of them: the ones a
+/// sandbox denies. Codex's Linux sandbox cannot open a writable directory
+/// again inside a denied one that lies inside another, so a backend's own
+/// scratch root inside a directory it is also told to deny, such as the
+/// atomic home's `scratch/`, is left to that one.
+fn outermost(denied: &[PathBuf]) -> Vec<PathBuf> {
+    denied
+        .iter()
+        .filter(|d| !denied.iter().any(|o| o != *d && d.starts_with(o)))
+        .cloned()
+        .collect()
+}
+
 /// Make each of `dirs`, other backends' scratch roots a workspace's commands
 /// are denied, if missing: one that appeared later, while a command ran,
 /// would not be denied to it.
@@ -317,7 +330,7 @@ pub(crate) fn open_local(
             label: request.label.clone(),
             sandbox: request.sandbox,
             env: request.env.clone(),
-            denied,
+            denied: outermost(&denied),
             ..Workspace::default()
         });
     };
@@ -383,7 +396,7 @@ pub(crate) fn open_local(
         sandbox: request.sandbox,
         writable_roots: request.writable_roots.clone(),
         env: request.env.clone(),
-        denied,
+        denied: outermost(&denied),
     })
 }
 
