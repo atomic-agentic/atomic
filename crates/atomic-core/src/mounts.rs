@@ -23,7 +23,11 @@
 //! directory, or is a link (which is not followed), or which, or whose
 //! part a second place shows, cannot be looked at for a reason other than
 //! not being there, since the table's roots there can be stale. A mount of
-//! part of a denied place is checked against that part. A mount whose
+//! part of a denied place is checked against that part. On any filesystem,
+//! it refuses when another mount of it is the same directory as a denied
+//! place, or as one above it on the place's own mount, and the table did
+//! not give that second place ([`shown_unlisted`]): its root went stale
+//! with nothing to say so. A mount whose
 //! root is not a path, such as a namespace file (`net:[4026531840]`), shows
 //! no directory, and is never a second place.
 //!
@@ -47,10 +51,9 @@
 //!   nor refused;
 //! - a stale root on a filesystem that is not local, for a place not there
 //!   yet: its second place is only checked against it once it is;
-//! - a stale root that makes a second mount look unrelated to a denied
-//!   place, on any filesystem, such as a bound overlay directory whose lower
-//!   directory was renamed beneath it: only the second places the table
-//!   gives are checked.
+//! - a stale root that makes a mount of a directory inside a denied place
+//!   look unrelated to it: mounts are checked against the place and the
+//!   directories above it, not each one below it.
 
 use anyhow::bail;
 use std::path::{Path, PathBuf};
