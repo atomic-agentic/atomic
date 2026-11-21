@@ -315,7 +315,7 @@ mod tests {
             1,
             "{said}"
         );
-        assert!(said.contains("\\u{1b}[2J"), "{said}");
+        assert!(said.contains("\\u{001b}[2J"), "{said}");
     }
 
     #[test]
