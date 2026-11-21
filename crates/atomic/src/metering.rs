@@ -270,6 +270,57 @@ impl BudgetPlan {
         Ok(())
     }
 
+    /// Check that no price in the plan is below the one `current` sets for
+    /// the same model, input or output, so a plan made elsewhere cannot make
+    /// calls look cheaper than they are here; and, under a dollar ceiling in
+    /// `current`, that every model the plan prices or calls is one `current`
+    /// prices, so none is counted at a price nobody here set.
+    pub fn priced_no_lower(&self, current: &BudgetSettings) -> Result<(), String> {
+        let ceilings = &current.ceilings;
+        let dollars = ceilings.atom.cost_usd.is_some() || ceilings.workflow.cost_usd.is_some();
+        for (model, price) in &self.pricing {
+            let Some(here) = current.pricing.get(model) else {
+                if dollars {
+                    return Err(format!(
+                        "the price of {model}: your price table has none for it, under your own \
+                         dollar cap"
+                    ));
+                }
+                continue;
+            };
+            for (field, plan, ours) in [
+                (
+                    "input_usd_per_mtok",
+                    price.input_usd_per_mtok,
+                    here.input_usd_per_mtok,
+                ),
+                (
+                    "output_usd_per_mtok",
+                    price.output_usd_per_mtok,
+                    here.output_usd_per_mtok,
+                ),
+            ] {
+                if plan < ours {
+                    return Err(format!(
+                        "the price of {model}: its {field} ({plan}) is below your price of {ours}"
+                    ));
+                }
+            }
+        }
+        if dollars
+            && let Some(model) = self
+                .models
+                .values()
+                .find(|model| !current.pricing.contains_key(*model))
+        {
+            return Err(format!(
+                "the run calls {model}, which your price table does not price, under your own \
+                 dollar cap"
+            ));
+        }
+        Ok(())
+    }
+
     /// Check that the plan has caps and a model for each of `atoms`, every
     /// atom a run calls a model from, and caps for each of `exec`, every exec
     /// atom it runs: none runs unmetered.

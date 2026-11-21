@@ -3266,6 +3266,121 @@ fn a_pinned_plan_without_ceilings_is_held_to_your_own() {
     });
 }
 
+/// A pinned plan may not price a call below what it costs here: a price
+/// under the current table's is refused, and under a dollar ceiling, so is a
+/// model the current table does not price.
+#[test]
+fn a_pinned_plan_priced_below_yours_is_refused() {
+    on_codex_runtime(async {
+        let dir = scratch("plan-priced");
+        let project = project(&dir);
+        let model = FakeModel::start(vec![Reply::Text(READ.into())])
+            .await
+            .expect("fake model");
+        let url = model.base_url();
+        let mut ours = small_calls();
+        priced_synthetic(&mut ours, None);
+        let rt = engine_with(&dir, &url, ours.clone()).await;
+        let pinned = |budgets: &BudgetSettings, file: &str| {
+            let mut pipeline = load(&project, file, TRIAGE);
+            pin_budgets(&mut pipeline, &runtimes(&dir, &url), budgets).expect("pinned");
+            pipeline
+        };
+        let mut cheaper = pinned(&ours, "cheaper.workflow.yaml");
+        if let Some(plan) = cheaper.budgets.as_mut() {
+            plan.pricing
+                .get_mut("synthetic")
+                .expect("a price")
+                .input_usd_per_mtok = 0.0;
+        }
+        let said = plan_refused(&rt, "cheaper", cheaper).await;
+        assert!(
+            said.contains(
+                "the price of synthetic: its input_usd_per_mtok (0) is below your price of 1"
+            ),
+            "{said}"
+        );
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+
+        // Under their dollar ceiling, with no price of theirs for the model.
+        let dir = scratch("plan-unpriced");
+        let other = crate::project(&dir);
+        let mut theirs = small_calls();
+        theirs.ceilings.atom.cost_usd = Some(1.0);
+        let rt = engine_with(&dir, &url, theirs).await;
+        let mut elsewhere = small_calls();
+        priced_synthetic(&mut elsewhere, None);
+        elsewhere.atom.cost_usd = Some(1.0);
+        let mut pipeline = load(&other, "unpriced.workflow.yaml", TRIAGE);
+        pin_budgets(&mut pipeline, &runtimes(&dir, &url), &elsewhere).expect("pinned");
+        let said = plan_refused(&rt, "unpriced", pipeline).await;
+        assert!(
+            said.contains("the price of synthetic: your price table has none for it, under your own dollar cap"),
+            "{said}"
+        );
+        assert_eq!(model.calls(), 0, "both plans were refused before any call");
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+/// A run whose plan carries no ceilings, as one pinned before plans kept
+/// them, is held to the ceilings of the person running it when it is
+/// recovered: it stops, saying to start it again, and calls nothing more.
+#[test]
+fn a_run_recovered_with_a_plan_of_no_ceilings_is_held_to_yours() {
+    on_codex_runtime(async {
+        let dir = scratch("recovered-unceilinged");
+        let project = project(&dir);
+        let model = FakeModel::start(vec![Reply::Text(READ.into()), Reply::Text(RANK.into())])
+            .await
+            .expect("fake model");
+        let url = model.base_url();
+        // Started with no ceilings at all, and stopped at its gate.
+        let rt = engine_with(&dir, &url, small_calls()).await;
+        let pipeline = load(&project, "gated.workflow.yaml", &gated());
+        rt.start(
+            PIPELINE,
+            "unceilinged-1",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": NOTE}),
+            },
+        )
+        .await
+        .expect("start");
+        let _ = open_gate(&rt, "unceilinged-1").await;
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+        let called = model.calls();
+
+        // Recovered by a process whose person caps an atom below the plan.
+        let rt = engine_with(&dir, &url, their_caps()).await;
+        rt.recover().await.expect("recover");
+        let failed = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            rt.result::<Value>("unceilinged-1"),
+        )
+        .await
+        .expect("the run ended");
+        assert!(
+            matches!(&failed, Err(atomic_durable::DurableError::Failed(m))
+                if m.contains("pinned before budgets kept their ceilings")
+                    && m.contains("your own configuration's ceilings")
+                    && m.contains("start the run again")),
+            "{failed:?}"
+        );
+        assert_eq!(model.calls(), called, "nothing more was called");
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
 #[test]
 fn a_stored_budget_plan_reads_past_fields_a_later_version_adds() {
     let dir = scratch("plan-later");

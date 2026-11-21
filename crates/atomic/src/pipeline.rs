@@ -961,16 +961,22 @@ async fn run_pipeline_in<C: WorkflowContext>(
                 .filter(|(_, atom)| atom.kind == "exec")
                 .map(|(name, _)| name.as_str())
                 .collect();
-            // And held to the ceilings of the person running it now, as
-            // well as to those it carries: a plan made elsewhere, or with
-            // none, cannot raise what their own configuration caps.
-            plan.validate()
+            // And held to the ceilings and prices of the person running it
+            // now, as well as to the ceilings it carries: a plan made
+            // elsewhere, or with none, cannot raise what their own
+            // configuration caps, nor price a call below what it is here.
+            services
+                .budgets
+                .validate()
+                .map_err(|e| e.to_string())
+                .and_then(|()| plan.validate())
                 .and_then(|()| {
                     plan.held_to(
                         &services.budgets.ceilings,
                         "your own configuration's ceilings",
                     )
                 })
+                .and_then(|()| plan.priced_no_lower(&services.budgets))
                 .and_then(|()| plan.covers(&model_atoms, &exec_atoms))
                 .map(|()| plan.clone())
                 .map_err(|e| format!("workflow {}: its pinned budget: {e}", pipeline.name))
@@ -1050,6 +1056,42 @@ async fn run_pipeline_in<C: WorkflowContext>(
         })
         .await?;
     let plan = pinned.budgets.clone();
+    // A plan pinned before plans kept their ceilings, as a run resumed or
+    // recovered from then has, carries none: it is held to the ceilings and
+    // prices of the person running it now. A plan that kept its own keeps
+    // them, so a resumed run keeps the ceilings it began under.
+    if plan.ceilings == atomic_core::budget::Ceilings::default() {
+        plan.held_to(
+            &services.budgets.ceilings,
+            "your own configuration's ceilings",
+        )
+        .and_then(|()| plan.priced_no_lower(&services.budgets))
+        .map_err(|e| {
+            failed(format!(
+                "workflow {}: its budget, pinned before budgets kept their ceilings: {e}; \
+                     start the run again to plan it under your current configuration",
+                pipeline.name
+            ))
+        })?;
+    }
+    // Under a dollar cap of the person's own, a model only a project prices
+    // is said, so a price they did not set is never counted unseen.
+    let unvouched: Vec<&str> = plan
+        .models
+        .values()
+        .filter(|model| services.budgets.priced_by_project.contains(*model))
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if !unvouched.is_empty() {
+        atomic_core::log_line!(
+            "atomic: run {}: under your own dollar cap, the run calls {} at prices only the \
+             project's configuration sets; `atomic config --explain` says more",
+            ctx.workflow_id(),
+            unvouched.join(", ")
+        );
+    }
     let budget = RunBudget::pinned(ledger, &plan);
     let (caps, models, exec_caps) = (plan.atoms, plan.models, plan.exec);
     let mut steps = Map::new();

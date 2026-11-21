@@ -839,6 +839,7 @@ fn person_budget(
     let mut budget = serde_json::to_value(&settings.budget)
         .map_err(|e| ConfigError::Invalid(format!("the budget settings cannot be held: {e}")))?;
     let mut ceilings = Ceilings::default();
+    let mut priced_by_project = std::collections::BTreeSet::new();
     let mut notes = Vec::new();
     if let Some(user) = user {
         match std::fs::read_to_string(user) {
@@ -847,11 +848,26 @@ fn person_budget(
                 // A `budget` that is not a mapping was refused with its file
                 // and line while the layers merged, so nothing caps from it.
                 if let Some(Value::Object(written)) = doc.value.pointer("/budget") {
-                    let (held, said) =
-                        hold_budget(user, written, &lines_of(&doc), &mut budget, sources);
+                    let lines = lines_of(&doc);
+                    own_budget_read(user, written, &lines)?;
+                    let (held, said) = hold_budget(user, written, &lines, &mut budget, sources);
                     nothing_free_under(user, written, &budget, &held)?;
+                    priced_by_project = project_priced(written, &budget, &held);
                     ceilings = held;
                     notes = said;
+                    if !priced_by_project.is_empty() {
+                        notes.push(format!(
+                            "budget.pricing: your own dollar cap ({}) counts calls to {} at \
+                             prices only the project's configuration sets; price them in your \
+                             own configuration to hold them to yours",
+                            user.display(),
+                            priced_by_project
+                                .iter()
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ));
+                    }
                 }
             }
             // No file of their own: nothing caps, as [`config::resolve`] read
@@ -872,7 +888,95 @@ fn person_budget(
         ))
     })?;
     settings.budget.ceilings = ceilings;
+    settings.budget.priced_by_project = priced_by_project;
     Ok(notes)
+}
+
+/// Refuse what the person's own `budget` section writes that its setting
+/// cannot take, by its file and line: a cap that is neither a number nor
+/// `null` (a count that is not a whole number), and a price that is not a
+/// price. It is checked on its own, as a value a project's layer replaces is
+/// never read otherwise, and a cap of theirs that could not be read would
+/// otherwise be dropped without a word.
+fn own_budget_read(
+    user: &Path,
+    written: &Map<String, Value>,
+    at_line: &BTreeMap<String, usize>,
+) -> Result<(), ConfigError> {
+    let refuse = |dotted: &str, what: &str| {
+        Err(ConfigError::Setting {
+            path: user.to_owned(),
+            line: line_of(at_line, dotted),
+            message: format!("{dotted} {what}"),
+        })
+    };
+    let whole = |v: &Value| v.is_null() || v.as_u64().is_some();
+    let number = |v: &Value| v.is_null() || v.as_f64().is_some();
+    for group in GROUPS {
+        let Some(section) = written.get(group) else {
+            continue;
+        };
+        let Some(fields) = section.as_object() else {
+            return refuse(&format!("budget.{group}"), "is a section, not a value");
+        };
+        for (field, value) in fields {
+            let dotted = format!("budget.{group}.{field}");
+            if ["tokens", "input_tokens", "output_tokens"].contains(&field.as_str()) {
+                if !whole(value) {
+                    return refuse(&dotted, "is not a whole number");
+                }
+            } else if !number(value) {
+                return refuse(&dotted, "is not a number");
+            }
+        }
+    }
+    let Some(pricing) = written.get("pricing") else {
+        return Ok(());
+    };
+    let Some(models) = pricing.as_object() else {
+        return refuse("budget.pricing", "is a section, not a value");
+    };
+    for (model, price) in models {
+        let dotted = format!("budget.pricing.{model}");
+        let Some(fields) = price.as_object() else {
+            return refuse(
+                &dotted,
+                "is not a price: write its input_usd_per_mtok and output_usd_per_mtok",
+            );
+        };
+        for field in ["input_usd_per_mtok", "output_usd_per_mtok"] {
+            if !fields.get(field).is_some_and(Value::is_number) {
+                return refuse(&format!("{dotted}.{field}"), "is not a number");
+            }
+        }
+        for field in ["max_input_tokens", "max_output_tokens"] {
+            if fields.get(field).is_some_and(|v| !whole(v)) {
+                return refuse(&format!("{dotted}.{field}"), "is not a whole number");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Under any dollar cap of the person's in `ceilings`, the models of the
+/// merged `budget`'s price table that their own `written` section does not
+/// price: a project prices them alone.
+fn project_priced(
+    written: &Map<String, Value>,
+    budget: &Value,
+    ceilings: &Ceilings,
+) -> std::collections::BTreeSet<String> {
+    if ceilings.atom.cost_usd.is_none() && ceilings.workflow.cost_usd.is_none() {
+        return Default::default();
+    }
+    let theirs = written.get("pricing").and_then(Value::as_object);
+    at(budget, "pricing")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|table| table.keys())
+        .filter(|model| !theirs.is_some_and(|t| t.contains_key(*model)))
+        .cloned()
+        .collect()
 }
 
 /// Refuse a project's zero price for a model under the person's own dollar
@@ -927,9 +1031,9 @@ fn nothing_free_under(
 ///   came from, and is said in a remark, so a number that is not the highest
 ///   layer's is never shown without its reason.
 ///
-/// Nothing here fails: `config::resolve` read this section as a
-/// `BudgetSettings` already and refused what it could not read, with the file
-/// and line of every key it refused.
+/// Nothing here fails: `config::resolve` refused every key that is not a
+/// setting, and [`own_budget_read`] every value of theirs a setting cannot
+/// take, each with its file and line.
 fn hold_budget(
     user: &Path,
     written: &Map<String, Value>,
@@ -951,11 +1055,12 @@ fn hold_budget(
     // 1. Their caps, held over the merged ones, and gathered as the ceilings
     //    that travel with the settings to hold a run's own budget block.
     //
-    // Every key of a group is one of its settings, and `config::resolve` read
-    // this section as `BudgetSettings` before this ran: what is here is a
-    // number for the limit it names, or nothing at all, which is how every
-    // layer says it sets no cap. What is in range from there, and what is too
-    // large to account for, `BudgetSettings::validate` says by its setting.
+    // Every key of a group is one of its settings (`config::resolve` refused
+    // any other), and `own_budget_read` checked this section on its own
+    // before this ran: what is here is a number for the limit it names, a
+    // whole one for a count, or `null`, which is how every layer says it sets
+    // no cap. What is in range from there, and what is too large to account
+    // for, `BudgetSettings::validate` says by its setting.
     let mut ceilings = Ceilings::default();
     for group in GROUPS {
         let Some(wrote) = written.get(group).and_then(Value::as_object) else {

@@ -1021,6 +1021,63 @@ fn your_own_configuration_caps_what_atomic_run_records() {
     });
 }
 
+/// Under the person's own dollar cap, a run that calls a model only the
+/// project prices says so on stderr at its start.
+#[test]
+fn a_run_says_which_models_only_the_project_prices_under_your_dollar_cap() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(RANK.into())])
+            .await
+            .expect("fake model");
+        let dir = scratch("project-priced");
+        let project = project(&dir);
+        let home =
+            std::env::temp_dir().join(format!("atomic-project-priced-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let config = home.join(".config/atomic");
+        std::fs::create_dir_all(&config).expect("config dir");
+        std::fs::write(
+            config.join("config.yaml"),
+            "budget:\n  atom:\n    cost_usd: 1\n",
+        )
+        .expect("their configuration");
+        std::fs::write(
+            project.join("atomic.yaml"),
+            "atomic: 1\nname: notes\nbudget:\n  pricing:\n    synthetic:\n      \
+             input_usd_per_mtok: 0.000001\n      output_usd_per_mtok: 0.000001\n",
+        )
+        .expect("manifest");
+        let env = model_env(&model.base_url());
+        let (d, p, h) = (dir.clone(), project.clone(), home.display().to_string());
+        let out = tokio::task::spawn_blocking(move || {
+            atomic(
+                &d,
+                &p,
+                &[
+                    "run",
+                    "rank-note",
+                    "--data",
+                    r#"{"title": "Export crashes", "words": 2}"#,
+                ],
+                &with(&env, &[("HOME", h.as_str())]),
+                "",
+            )
+        })
+        .await
+        .expect("child");
+        assert!(out.status.success(), "{}", text(&out));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(
+                "under your own dollar cap, the run calls synthetic at prices only the project's \
+                 configuration sets"
+            ),
+            "{stderr}"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    });
+}
+
 #[test]
 fn with_only_a_local_ollama_a_model_atom_runs_and_explain_says_why() {
     on_codex_runtime(async {

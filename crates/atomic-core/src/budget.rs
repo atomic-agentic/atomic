@@ -269,6 +269,11 @@ pub struct BudgetSettings {
     /// a file that writes `budget.ceilings` is refused as an unknown setting.
     #[serde(skip, default)]
     pub ceilings: Ceilings,
+    /// Under a dollar cap of the person's own, the models only a project's
+    /// configuration prices, which a run calling them says at its start.
+    /// Not a setting, as [`ceilings`](Self::ceilings) is not.
+    #[serde(skip, default)]
+    pub priced_by_project: std::collections::BTreeSet<String>,
 }
 
 /// The built-in defaults. Finite for tokens and time; no dollar cap, since
@@ -293,6 +298,7 @@ impl Default for BudgetSettings {
             },
             pricing: BTreeMap::new(),
             ceilings: Ceilings::default(),
+            priced_by_project: Default::default(),
         }
     }
 }

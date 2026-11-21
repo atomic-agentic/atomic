@@ -1498,6 +1498,88 @@ fn under_your_own_dollar_cap_a_project_cannot_make_a_model_free() {
     );
 }
 
+/// A cap or price in the person's own file that its setting cannot take is
+/// refused with their file and line, even where a project's layer replaces
+/// it, so a cap of theirs is never dropped without a word.
+#[test]
+fn a_cap_of_yours_that_cannot_be_read_is_refused_even_under_a_project_value() {
+    for (theirs, project, names, says) in [
+        (
+            "budget:\n  atom:\n    cost_usd: \"5\"\n",
+            "budget:\n  atom:\n    cost_usd: null\n",
+            "budget.atom.cost_usd",
+            "is not a number",
+        ),
+        (
+            "budget:\n  atom:\n    tokens: 150000.0\n",
+            "budget:\n  atom:\n    tokens: 1000\n",
+            "budget.atom.tokens",
+            "is not a whole number",
+        ),
+        (
+            "budget:\n  pricing:\n    m: null\n",
+            "budget:\n  pricing:\n    m:\n      input_usd_per_mtok: 1\n      output_usd_per_mtok: 1\n",
+            "budget.pricing.m",
+            "is not a price",
+        ),
+        (
+            "budget:\n  pricing:\n    m:\n      input_usd_per_mtok: 1\n",
+            "budget:\n  pricing:\n    m:\n      input_usd_per_mtok: 1\n      output_usd_per_mtok: 1\n",
+            "budget.pricing.m.output_usd_per_mtok",
+            "is not a number",
+        ),
+    ] {
+        let (_home, home) = person(theirs);
+        let manifest = format!("atomic: 1\nname: notes\n{project}");
+        let d = dir(&[("atomic.yaml", manifest.as_str())]);
+        let said = resolved_where(
+            &d,
+            &EngineArgs::default(),
+            &[("HOME", home.as_str())],
+            &nobody,
+        )
+        .expect_err("refused")
+        .to_string();
+        assert!(said.contains("config.yaml:"), "{names}: {said}");
+        assert!(said.contains(&format!("{names} {says}")), "{names}: {said}");
+    }
+}
+
+/// Under the person's own dollar cap, a model only the project prices is
+/// named, with what to do, in what `atomic config --explain` shows.
+#[test]
+fn under_your_own_dollar_cap_a_model_only_the_project_prices_is_named() {
+    let (_home, home) = person("budget:\n  atom:\n    cost_usd: 1\n");
+    let d = dir(&[(
+        "atomic.yaml",
+        "atomic: 1\nname: notes\nbudget:\n  pricing:\n    cheap-model:\n      \
+         input_usd_per_mtok: 0.000001\n      output_usd_per_mtok: 0.000001\n",
+    )]);
+    let r = resolved(
+        &d,
+        &EngineArgs::default(),
+        &[("HOME", home.as_str())],
+        &nobody,
+    );
+    assert!(r.settings.budget.priced_by_project.contains("cheap-model"));
+    let said = r.notes.join("\n");
+    assert!(
+        said.contains(
+            "counts calls to cheap-model at prices only the project's configuration sets"
+        ),
+        "{said}"
+    );
+    // Without a dollar cap of theirs, nothing is named.
+    let (_capless, no_dollars) = person("budget:\n  atom:\n    tokens: 1000\n");
+    let r = resolved(
+        &d,
+        &EngineArgs::default(),
+        &[("HOME", no_dollars.as_str())],
+        &nobody,
+    );
+    assert!(r.settings.budget.priced_by_project.is_empty());
+}
+
 #[test]
 fn your_own_dollar_cap_holds_a_larger_one_across_the_levels() {
     let (_home, home) = person("budget:\n  atom:\n    cost_usd: 0.5\n");
