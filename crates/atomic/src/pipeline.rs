@@ -1458,10 +1458,11 @@ async fn turn<C: WorkflowContext>(
     let repair = t.repair.clone();
     let charge = t.charge;
     // What an exec step's command hands over is held until the turn has
-    // recorded the output that references it, then let go.
+    // recorded the output that references it, then let go; and let go too
+    // when the turn is dropped or panics before that.
     let release = guard
         .as_ref()
-        .map(|(_, _, _, identity)| (runtimes.codex.artifacts.clone(), identity.clone()));
+        .map(|(_, _, _, identity)| runtimes.codex.artifacts.releasing(identity.clone()));
     let turn = execute_candidate_told(ctx, &format!("{}.turn", t.name), move |position| {
         // The turn runs again after a park is released, so each run
         // takes its own copies.
@@ -1598,9 +1599,7 @@ async fn turn<C: WorkflowContext>(
         crate::telemetry::traced(span, atomic_core::usage::for_step(caller.0, caller.1, work))
     })
     .await;
-    if let Some((artifacts, identity)) = release {
-        artifacts.release(&identity);
-    }
+    drop(release);
     turn
 }
 

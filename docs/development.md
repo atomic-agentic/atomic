@@ -188,7 +188,9 @@ of `/tmp`, and its denial of atomic's private state, to turns and to exec
 atoms' commands; the confinement of exec atoms' commands itself; and their
 network: none unless declared, and through the proxy only the declared hosts,
 on ports 80 and 443, never through another proxy, with the declaration checked
-when the atom loads and again before the command runs), it
+when the atom loads and again before the command runs; and the artifact store's
+holds, which keep the files an exec step hands over from every sweep until its
+turn is recorded), it
 switches the control off in the source, requires the control's test to fail,
 puts the source back and requires the test to pass. Each control costs a rebuild, so it
 runs by hand rather than in CI:

@@ -267,9 +267,18 @@ fn opening_a_store_sweeps_only_dead_stores_leftovers() {
         std::fs::write(dir.join("staging").join(name), b"left").expect("leftover");
     }
     let staged = |name: &str| dir.join("staging").join(name).exists();
+    // Each store's holds: the live one's, and the dead one's.
+    let live_holds = live.owner.held.clone();
+    let _hold = live
+        .hold(&ArtifactRef::from_digest(&"a".repeat(64)).expect("digest"))
+        .expect("hold");
+    let dead_holds = dir.join("artifact-held").join(&dead_id);
+    std::fs::create_dir_all(&dead_holds).expect("dead holds");
+    std::fs::write(dead_holds.join(format!("{}-1", "b".repeat(64))), b"").expect("hold");
     // Too new to judge: kept.
     let again = LocalStore::open(&dir).expect("open again");
     assert!(leftovers.iter().all(|n| staged(n)), "a new file was swept");
+    assert!(dead_holds.exists(), "a new owner's holds were cleared");
     assert!(
         dir.join("artifact-owners").join(&dead_id).exists(),
         "a new owner was judged"
@@ -283,6 +292,8 @@ fn opening_a_store_sweeps_only_dead_stores_leftovers() {
     assert!(staged(&leftovers[2]), "the live store's file was swept");
     assert!(!dir.join("artifact-owners").join(&dead_id).exists());
     assert!(dir.join("artifact-owners").join(&live_id).exists());
+    assert!(!dead_holds.exists(), "the dead store's holds were kept");
+    assert!(live_holds.is_dir(), "the live store's holds were cleared");
     drop((swept, live));
 }
 

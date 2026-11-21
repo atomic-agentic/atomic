@@ -381,18 +381,72 @@ async fn engine_built(
 
 /// As [`engine_storing`], with exec atoms' commands handing files over to
 /// `store`, as `atomic run` has them.
-async fn engine_handing_over(dir: &Path, base_url: &str, store: LocalStore) -> Durare {
+async fn engine_handing_over(
+    dir: &Path,
+    base_url: &str,
+    store: LocalStore,
+    backend: Option<atomic_exec::Backend>,
+) -> Durare {
     let artifacts = Artifacts::store(store.clone(), Default::default());
     engine_built_with(
         dir,
         base_url,
         BudgetSettings::default(),
         "synthetic",
-        None,
+        backend,
         store,
         Some(artifacts),
     )
     .await
+}
+
+/// The local backend, noting, as each exec step's workspace closes (after
+/// its command's files are stored, before its turn is recorded), the holds
+/// in `held`.
+struct HoldsAtClose {
+    held: PathBuf,
+    seen: Seen,
+    local: atomic_exec::LocalBackend,
+}
+
+/// Each workspace closed, by its label, with the holds seen then.
+type Seen = Arc<std::sync::Mutex<Vec<(String, Vec<String>)>>>;
+
+/// The names of the holds under `held`, every store's.
+fn holds_in(held: &Path) -> Vec<String> {
+    std::fs::read_dir(held)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .flat_map(|owner| std::fs::read_dir(owner.path()).into_iter().flatten())
+        .flatten()
+        .map(|hold| hold.file_name().to_string_lossy().into_owned())
+        .collect()
+}
+
+impl atomic_exec::ExecutionBackend for HoldsAtClose {
+    fn connect(&self) -> Result<atomic_exec::Statement, atomic_exec::ExecError> {
+        Ok(atomic_exec::LocalBackend::STATEMENT)
+    }
+    fn open(
+        &self,
+        request: &atomic_exec::Open,
+    ) -> Result<atomic_exec::Workspace, atomic_exec::ExecError> {
+        self.local.open(request)
+    }
+    fn run(
+        &self,
+        command: &atomic_exec::Command,
+    ) -> Result<atomic_exec::Completed, atomic_exec::ExecError> {
+        self.local.run(command)
+    }
+    fn close(&self, workspace: &atomic_exec::Workspace) -> Result<(), atomic_exec::ExecError> {
+        self.seen
+            .lock()
+            .expect("seen")
+            .push((workspace.label.clone(), holds_in(&self.held)));
+        self.local.close(workspace)
+    }
 }
 
 async fn engine_built_with(
@@ -2048,7 +2102,8 @@ fn an_exec_step_runs_its_command_and_only_model_steps_call_the_model() {
 
 /// The files an exec step's command hands over are held while its turn
 /// runs and let go once the turn has recorded the output that references
-/// them: a long-running process keeps no hold for a finished step.
+/// them, before the next step runs: a long-running process keeps no hold
+/// for a finished step.
 #[test]
 fn an_exec_steps_files_are_let_go_once_its_turn_is_recorded() {
     on_codex_runtime(async {
@@ -2091,11 +2146,19 @@ fn an_exec_steps_files_are_let_go_once_its_turn_is_recorded() {
              input: { $ref: ../atoms/make-patch.input.schema.json }\n\
              output: { $ref: ../atoms/make-patch.output.schema.json }\n\
              steps:\n  make:\n    atom: make-patch\n    with: { text: input.text }\n\
-             returns: steps.make.output\n",
+             \x20 again:\n    after: [make]\n    atom: make-patch\n    with: { text: input.text }\n\
+             returns: steps.again.output\n",
         );
         let model = FakeModel::start(vec![]).await.expect("fake model");
         let store = LocalStore::open(dir.join("artifacts")).expect("store");
-        let rt = engine_handing_over(&dir, &model.base_url(), store.clone()).await;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let backend = atomic_exec::Backend::connect(HoldsAtClose {
+            held: dir.join("artifacts/artifact-held"),
+            seen: seen.clone(),
+            local: atomic_exec::LocalBackend::default(),
+        })
+        .expect("connects");
+        let rt = engine_handing_over(&dir, &model.base_url(), store.clone(), Some(backend)).await;
         let run = PipelineRun {
             pipeline,
             input: json!({"text": "fix it"}),
@@ -2108,14 +2171,25 @@ fn an_exec_steps_files_are_let_go_once_its_turn_is_recorded() {
             .parse()
             .expect("parses");
         assert!(store.contains(&patch).expect("contains"));
-        let holds: Vec<PathBuf> = std::fs::read_dir(dir.join("artifacts/artifact-held"))
-            .into_iter()
-            .flatten()
-            .flatten()
-            .flat_map(|owner| std::fs::read_dir(owner.path()).into_iter().flatten())
-            .flatten()
-            .map(|hold| hold.path())
-            .collect();
+        // Each step's file was held, once, after it was stored and before
+        // its turn was recorded; the first step's hold was let go before
+        // the second step ran.
+        let seen = seen.lock().expect("seen").clone();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        for (_, holds) in &seen {
+            assert_eq!(holds.len(), 1, "{seen:?}");
+            assert!(holds[0].starts_with(patch.digest()), "{seen:?}");
+        }
+        // The first step's recorded output names what it held.
+        let steps = rt.steps("patch-1").await.expect("steps");
+        assert!(
+            steps
+                .iter()
+                .filter_map(|s| s.output.as_ref())
+                .any(|o| o.to_string().contains(patch.digest())),
+            "no recorded step names {patch}"
+        );
+        let holds = holds_in(&dir.join("artifacts/artifact-held"));
         assert!(holds.is_empty(), "held after its turn: {holds:?}");
         assert_eq!(model.calls(), 0);
         rt.shutdown(std::time::Duration::from_secs(5))
