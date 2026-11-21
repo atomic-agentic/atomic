@@ -62,6 +62,15 @@ pub enum StateError {
         /// The underlying error.
         source: std::io::Error,
     },
+    /// `ATOMIC_HOME` is relative, and the working directory it is taken
+    /// from could not be read.
+    #[error("cannot resolve ATOMIC_HOME {path}: {source}")]
+    Home {
+        /// The value given.
+        path: PathBuf,
+        /// The underlying error.
+        source: std::io::Error,
+    },
     /// Neither `ATOMIC_HOME` nor a user data directory is available.
     #[error("no user data directory on this platform; set ATOMIC_HOME")]
     NoDataDir,
@@ -452,11 +461,45 @@ fn database_in_use(path: &Path) -> bool {
 /// Where atomic keeps every project's state: `$ATOMIC_HOME`, or `atomic` in
 /// the user data directory.
 pub fn base_dir() -> Result<PathBuf, StateError> {
-    match std::env::var_os("ATOMIC_HOME").filter(|v| !v.is_empty()) {
-        Some(home) => Ok(PathBuf::from(home)),
+    match atomic_home()? {
+        Some(home) => Ok(home),
         None => Ok(dirs::data_dir()
             .ok_or(StateError::NoDataDir)?
             .join("atomic")),
+    }
+}
+
+/// `$ATOMIC_HOME`, if it is set, as an absolute path: one given relative
+/// is taken from the working directory atomic started in, so it names the
+/// same directory wherever it is used, such as by a helper Codex starts in
+/// another directory, with its `..` resolved as far as it exists.
+fn atomic_home() -> Result<Option<PathBuf>, StateError> {
+    let Some(home) = std::env::var_os("ATOMIC_HOME").filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    let home = PathBuf::from(home);
+    if home.is_absolute() {
+        return Ok(Some(home));
+    }
+    let joined = std::env::current_dir()
+        .map_err(|source| StateError::Home {
+            path: home.clone(),
+            source,
+        })?
+        .join(&home);
+    let mut rest = Vec::new();
+    let mut existing = joined.as_path();
+    loop {
+        if let Ok(real) = std::fs::canonicalize(existing) {
+            return Ok(Some(rest.iter().rev().fold(real, |p, part| p.join(part))));
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_owned());
+                existing = parent;
+            }
+            _ => return Ok(Some(joined)),
+        }
     }
 }
 
@@ -465,8 +508,8 @@ pub fn base_dir() -> Result<PathBuf, StateError> {
 /// `atomic/credentials` in the user configuration directory. Outside every
 /// project and every state directory.
 pub fn credentials_dir() -> Result<PathBuf, StateError> {
-    match std::env::var_os("ATOMIC_HOME").filter(|v| !v.is_empty()) {
-        Some(home) => Ok(PathBuf::from(home).join("credentials")),
+    match atomic_home()? {
+        Some(home) => Ok(home.join("credentials")),
         None => Ok(dirs::config_dir()
             .ok_or(StateError::NoDataDir)?
             .join("atomic/credentials")),

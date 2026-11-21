@@ -992,6 +992,10 @@ pub fn harden_runner() {
 /// instead: pointed here, the two keep one registry. Elsewhere than Linux
 /// Codex keeps no such registry, and this does nothing.
 ///
+/// Whatever this process and its helpers keep in their temporary directory
+/// is then kept there, which connecting the backend empties: give it only
+/// for a command that runs turns on that backend, before it connects.
+///
 /// Call it in `main` before [`dispatch`], while the process has one thread.
 pub fn share_sandbox_registry(tmp: &Path) {
     #[cfg(target_os = "linux")]

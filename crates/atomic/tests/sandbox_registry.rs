@@ -42,6 +42,8 @@ use std::process::Command;
 /// Set in the process this test starts again, to the directory its turns
 /// run in: that process runs the turns.
 const TURNS_IN: &str = "ATOMIC_TEST_SANDBOX_REGISTRY_TURNS_IN";
+/// Set beside it to how many edits each turn makes.
+const EDITS_IN: &str = "ATOMIC_TEST_SANDBOX_REGISTRY_EDITS";
 const NAME: &str = "commands_and_patches_at_once_in_one_directory_share_one_registry";
 const TURNS: usize = 4;
 const EDITS: usize = 25;
@@ -50,7 +52,8 @@ const EDITS: usize = 25;
 fn commands_and_patches_at_once_in_one_directory_share_one_registry() {
     support::require_sandbox();
     if let Some(dir) = std::env::var_os(TURNS_IN) {
-        return turns_at_once(Path::new(&dir));
+        let edits = std::env::var(EDITS_IN).unwrap().parse().unwrap();
+        return turns_at_once(Path::new(&dir), edits);
     }
     let root = Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("atomic-sandbox-registry-{}", std::process::id()));
@@ -63,7 +66,7 @@ fn commands_and_patches_at_once_in_one_directory_share_one_registry() {
         .shared_tmp()
         .unwrap()
         .to_owned();
-    let out = turns_in_a_process(&shared, &tmp);
+    let out = turns_in_a_process(&shared, &tmp, EDITS);
     assert!(
         out.status.success(),
         "turns with one registry failed:\n{}{}",
@@ -71,20 +74,20 @@ fn commands_and_patches_at_once_in_one_directory_share_one_registry() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        registry_in(&tmp).is_dir(),
+        registry_in(&tmp, &root).is_dir(),
         "no registry in {}",
         tmp.display()
     );
 
     // Given another TMPDIR, the file helper keeps its registry there, apart
     // from the commands': the registry is split. The turns may fail as they
-    // race, or not; either way the registry is split.
+    // race, or not; either way the registry is split, as one edit shows.
     let split = root.join("split");
     let elsewhere = split.join("elsewhere");
     std::fs::create_dir_all(&elsewhere).unwrap();
-    let out = turns_in_a_process(&split, &elsewhere);
+    let out = turns_in_a_process(&split, &elsewhere, 1);
     assert!(
-        registry_in(&elsewhere).is_dir(),
+        registry_in(&elsewhere, &root).is_dir(),
         "the file helper kept no registry in the TMPDIR it was given, {}:\n{}{}",
         elsewhere.display(),
         String::from_utf8_lossy(&out.stdout),
@@ -94,23 +97,22 @@ fn commands_and_patches_at_once_in_one_directory_share_one_registry() {
 }
 
 /// This test, run again with `TMPDIR` set to `tmpdir`, running the turns in
-/// `dir`.
-fn turns_in_a_process(dir: &Path, tmpdir: &Path) -> std::process::Output {
+/// `dir`, each making `edits` edits.
+fn turns_in_a_process(dir: &Path, tmpdir: &Path, edits: usize) -> std::process::Output {
     std::fs::create_dir_all(dir).unwrap();
     Command::new(std::env::current_exe().unwrap())
         .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
         .env(TURNS_IN, dir)
+        .env(EDITS_IN, edits.to_string())
         .env("TMPDIR", tmpdir)
         .output()
         .unwrap()
 }
 
 /// Where Codex's sandbox keeps its registry when its helper's `TMPDIR` is
-/// `tmp`.
-fn registry_in(tmp: &Path) -> PathBuf {
-    let uid = std::fs::metadata(env!("CARGO_TARGET_TMPDIR"))
-        .unwrap()
-        .uid();
+/// `tmp`, for the user who made `made`, as this test did.
+fn registry_in(tmp: &Path, made: &Path) -> PathBuf {
+    let uid = std::fs::metadata(made).unwrap().uid();
     std::fs::canonicalize(tmp)
         .unwrap()
         .join(format!("codex-bwrap-synthetic-mount-targets-{uid}"))
@@ -118,9 +120,9 @@ fn registry_in(tmp: &Path) -> PathBuf {
 
 /// [`TURNS`] `workspace-write` turns at once on one backend, in one
 /// directory, each running a shell command and then applying a patch,
-/// [`EDITS`] times. Every command prints what it should and every patch
+/// `edits` times. Every command prints what it should and every patch
 /// lands.
-fn turns_at_once(dir: &Path) {
+fn turns_at_once(dir: &Path, edits: usize) {
     let dir = std::fs::canonicalize(dir).unwrap();
     for sub in ["project", "codex-home", "bin"] {
         std::fs::create_dir_all(dir.join(sub)).unwrap();
@@ -134,7 +136,7 @@ fn turns_at_once(dir: &Path) {
             let dir = dir.clone();
             let backend = backend.clone();
             async move {
-                let mut script: Vec<Reply> = (0..EDITS)
+                let mut script: Vec<Reply> = (0..edits)
                     .flat_map(|i| {
                         [
                             exec(&format!("echo turn{n}-ok-{i}")),
@@ -164,7 +166,7 @@ fn turns_at_once(dir: &Path) {
                 // The last request carries every call's output. What failed
                 // is returned, not asserted here, so that every turn ends.
                 let last = model.requests().last().cloned().unwrap().to_string();
-                (0..EDITS)
+                (0..edits)
                     .filter_map(|i| {
                         let ran = last.contains(&format!("turn{n}-ok-{i}\\n"));
                         let landed = std::fs::read_to_string(
@@ -189,7 +191,7 @@ fn turns_at_once(dir: &Path) {
 fn exec(command: &str) -> Reply {
     Reply::Tool {
         name: "exec_command".into(),
-        arguments: json!({"cmd": command, "yield_time_ms": 10000}),
+        arguments: json!({"cmd": command, "yield_time_ms": 20000}),
     }
 }
 

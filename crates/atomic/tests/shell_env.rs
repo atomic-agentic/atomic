@@ -999,51 +999,71 @@ fn a_secret_the_system_keeps_or_a_pipe_stays_denied_and_the_persons_programs_run
 #[test]
 fn a_turns_patches_keep_their_sandbox_registry_with_its_commands() {
     support::require_sandbox();
-    on_codex_runtime(async {
-        let dir =
-            std::env::temp_dir().join(format!("atomic-patch-registry-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let home = dir.join("home");
-        let elsewhere = dir.join("elsewhere");
-        std::fs::create_dir_all(&home).unwrap();
-        std::fs::create_dir_all(&elsewhere).unwrap();
-        let project = dir.join("project");
-        write_project(&project);
-        let base = git(&project);
-        let data = json!({"base": base, "text": "the note"}).to_string();
-        let patch = "apply_patch <<'EOF'\n*** Begin Patch\n*** Add File: patched.txt\n\
-                     +patched\n*** End Patch\nEOF\n";
-        let tmpdir = elsewhere.to_string_lossy().into_owned();
-        let printed = run_once(
-            &home,
-            &project,
-            "tidy-up",
-            &data,
-            patch,
-            &[("TMPDIR", &tmpdir)],
-        )
-        .await;
-        assert!(
-            printed.contains("Success. Updated the following files")
-                && printed.contains("patched.txt"),
-            "{printed}"
-        );
-        let uid = std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(&home).unwrap());
-        let registry = format!("codex-bwrap-synthetic-mount-targets-{uid}");
-        assert!(
-            !elsewhere.join(&registry).exists(),
-            "the file helper kept its registry in the TMPDIR atomic was given"
-        );
-        let shared: Vec<PathBuf> = found(&atomic_home_for(&project, "tidy-up"), &registry)
-            .into_iter()
-            .map(|r| r.parent().unwrap().to_owned())
-            .collect();
-        assert!(
-            shared.len() == 1 && shared[0].ends_with("scratch/.tmp"),
-            "registries: {shared:?}"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    });
+    on_codex_runtime(patch_keeps_its_registry("registry", false));
+}
+
+/// The same with `ATOMIC_HOME` given relative to the directory atomic
+/// starts in: the file helper, which Codex starts elsewhere, still finds
+/// the shared directory, and the patch lands.
+#[test]
+fn a_relative_atomic_home_keeps_patches_and_their_registry_working() {
+    support::require_sandbox();
+    on_codex_runtime(patch_keeps_its_registry("relative-home", true));
+}
+
+/// Apply a patch in a worktree step through `atomic run`, given another
+/// `TMPDIR`, and with its state under an `ATOMIC_HOME` relative to the
+/// project when `relative`: it lands, and the one registry is in the
+/// backend's shared directory in the state.
+async fn patch_keeps_its_registry(tag: &str, relative: bool) {
+    let dir = std::env::temp_dir().join(format!("atomic-patch-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let home = dir.join("home");
+    let elsewhere = dir.join("elsewhere");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let project = dir.join("project");
+    write_project(&project);
+    let base = git(&project);
+    let data = json!({"base": base, "text": "the note"}).to_string();
+    let patch = "apply_patch <<'EOF'\n*** Begin Patch\n*** Add File: patched.txt\n\
+                 +patched\n*** End Patch\nEOF\n";
+    let tmpdir = elsewhere.to_string_lossy().into_owned();
+    let state = if relative {
+        Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("atomic-patch-{tag}-{}", std::process::id()))
+    } else {
+        atomic_home_for(&project, "tidy-up")
+    };
+    let _ = std::fs::remove_dir_all(&state);
+    // The state's path from the project's directory, where atomic starts.
+    let up = "../".repeat(project.components().count() - 1);
+    let from_project = format!("{up}{}", state.strip_prefix("/").unwrap().display());
+    let mut env = vec![("TMPDIR", tmpdir.as_str())];
+    if relative {
+        env.push(("ATOMIC_HOME", from_project.as_str()));
+    }
+    let printed = run_once(&home, &project, "tidy-up", &data, patch, &env).await;
+    assert!(
+        printed.contains("Success. Updated the following files") && printed.contains("patched.txt"),
+        "{printed}"
+    );
+    let uid = std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(&home).unwrap());
+    let registry = format!("codex-bwrap-synthetic-mount-targets-{uid}");
+    assert!(
+        !elsewhere.join(&registry).exists(),
+        "the file helper kept its registry in the TMPDIR atomic was given"
+    );
+    let shared: Vec<PathBuf> = found(&state, &registry)
+        .into_iter()
+        .map(|r| r.parent().unwrap().to_owned())
+        .collect();
+    assert!(
+        shared.len() == 1 && shared[0].ends_with("scratch/.tmp"),
+        "registries: {shared:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&state);
 }
 
 /// Every directory named `name` under `dir`.
