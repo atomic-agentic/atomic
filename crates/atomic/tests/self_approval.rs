@@ -310,6 +310,7 @@ async fn sandboxed(
         meter: atomic_core::usage::Metering::none(),
         guard: guard.clone(),
         backend: atomic_exec::Backend::connect(atomic_exec::LocalBackend::in_dir(scratch)).unwrap(),
+        caches: None,
     };
     let answer = atomic_core::runtime::run_turn(
         &runtime,

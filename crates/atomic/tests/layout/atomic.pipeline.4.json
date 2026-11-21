@@ -38,7 +38,8 @@
               "minutes": "number"
             },
             "pricing": {}
-          }
+          },
+          "caches": "string"
         },
         "failed": false
       },
@@ -232,7 +233,8 @@
               "minutes": "number"
             },
             "pricing": {}
-          }
+          },
+          "caches": "string"
         },
         "failed": false
       },
@@ -394,7 +396,8 @@
               "minutes": "number"
             },
             "pricing": {}
-          }
+          },
+          "caches": "string"
         },
         "failed": false
       },
@@ -546,189 +549,6 @@
         },
         "failed": false
       }
-    ],
-    "layout-4": [
-      {
-        "name": "pin",
-        "output": {
-          "snapshot": "string",
-          "files": "object",
-          "helper_runtime": "string",
-          "budgets": {
-            "run": {
-              "tokens": "number",
-              "millis": "number",
-              "micro_usd": "null",
-              "origins": "array"
-            },
-            "atoms": {
-              "check-title": {
-                "tokens": "number",
-                "millis": "number",
-                "micro_usd": "null",
-                "origins": "array"
-              },
-              "read-note": {
-                "tokens": "number",
-                "millis": "number",
-                "micro_usd": "null",
-                "origins": "array"
-              }
-            },
-            "models": {
-              "check-title": "string",
-              "read-note": "string"
-            },
-            "call": {
-              "input_tokens": "number",
-              "output_tokens": "number",
-              "minutes": "number"
-            },
-            "pricing": {}
-          }
-        },
-        "failed": false
-      },
-      {
-        "name": "read.turn",
-        "output": {
-          "Candidate": {
-            "id": "string",
-            "proposal": {
-              "output": "object",
-              "metadata": {
-                "thread_id": "string",
-                "model": "string",
-                "input_tokens": "number",
-                "output_tokens": "number",
-                "total_tokens": "number",
-                "human_actions": [],
-                "prompt_hash": "string",
-                "turns": "number",
-                "input_sha256": "string"
-              },
-              "writes": []
-            },
-            "digest": "string"
-          }
-        },
-        "failed": false
-      },
-      {
-        "name": "read.review.0.turn",
-        "output": {
-          "Candidate": {
-            "id": "string",
-            "proposal": {
-              "output": "object",
-              "metadata": {
-                "thread_id": "string",
-                "model": "string",
-                "input_tokens": "number",
-                "output_tokens": "number",
-                "total_tokens": "number",
-                "human_actions": [],
-                "prompt_hash": "string",
-                "turns": "number",
-                "input_sha256": "string"
-              },
-              "writes": []
-            },
-            "digest": "string"
-          }
-        },
-        "failed": false
-      },
-      {
-        "name": "read.review.0.publish",
-        "output": {
-          "verdict": "string",
-          "findings": [
-            {
-              "file": "string",
-              "severity": "string",
-              "message": "string"
-            }
-          ]
-        },
-        "failed": false
-      },
-      {
-        "name": "read.repair.1.turn",
-        "output": {
-          "Candidate": {
-            "id": "string",
-            "proposal": {
-              "output": "object",
-              "metadata": {
-                "thread_id": "string",
-                "model": "string",
-                "input_tokens": "number",
-                "output_tokens": "number",
-                "total_tokens": "number",
-                "human_actions": [],
-                "prompt_hash": "string",
-                "turns": "number",
-                "input_sha256": "string"
-              },
-              "writes": []
-            },
-            "digest": "string"
-          }
-        },
-        "failed": false
-      },
-      {
-        "name": "read.review.1.turn",
-        "output": {
-          "Candidate": {
-            "id": "string",
-            "proposal": {
-              "output": "object",
-              "metadata": {
-                "thread_id": "string",
-                "model": "string",
-                "input_tokens": "number",
-                "output_tokens": "number",
-                "total_tokens": "number",
-                "human_actions": [],
-                "prompt_hash": "string",
-                "turns": "number",
-                "input_sha256": "string"
-              },
-              "writes": []
-            },
-            "digest": "string"
-          }
-        },
-        "failed": false
-      },
-      {
-        "name": "read.review.1.publish",
-        "output": {
-          "verdict": "string",
-          "findings": []
-        },
-        "failed": false
-      },
-      {
-        "name": "read.accepted",
-        "output": {
-          "candidate": "string",
-          "digest": "string",
-          "accepted": "bool",
-          "reason": "string"
-        },
-        "failed": false
-      },
-      {
-        "name": "read.publish",
-        "output": {
-          "title": "string",
-          "words": "number"
-        },
-        "failed": false
-      }
     ]
   },
   "run": {
@@ -868,65 +688,5 @@
         "input_sha256": "string"
       }
     }
-  },
-  "reviewed": {
-    "pipeline": {
-      "name": "string",
-      "steps": [
-        {
-          "kind": "string",
-          "id": "string",
-          "atom": "string",
-          "with": "object",
-          "worktree": "bool",
-          "origins": "object",
-          "review": {
-            "reviewer": "string",
-            "with": "object",
-            "origins": "object",
-            "rounds": "number"
-          }
-        }
-      ],
-      "returns": "string",
-      "input": "object",
-      "output": "object",
-      "atoms": {
-        "<name>": {
-          "file": "string",
-          "name": "string",
-          "version": "number",
-          "kind": "string",
-          "description": "string",
-          "input": "scalar",
-          "output": "scalar",
-          "budget": {
-            "tokens": "null",
-            "millis": "null",
-            "micro_usd": "null"
-          },
-          "frontmatter": "object",
-          "program": {
-            "file": "string",
-            "root": "string",
-            "sources": "object",
-            "contracts": "object",
-            "source_paths": "object",
-            "helpers": "object"
-          },
-          "context": "null",
-          "case": "bool",
-          "judges": "object",
-          "declarations": "object"
-        }
-      },
-      "budget": {
-        "tokens": "null",
-        "millis": "null",
-        "micro_usd": "null"
-      },
-      "pins": "object"
-    },
-    "input": "object"
   }
 }
