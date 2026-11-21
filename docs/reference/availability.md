@@ -88,6 +88,19 @@ a command hands over are stored after it has run: a store held then is
 waited out a few times, and past that the step's outcome is unknown, as
 after a crash there.
 
+`atomic run` keeps the content its input names from a sweep until the input
+is recorded. Before the run starts, it holds each artifact the input names
+and marks it as just written, under the store's lock. Holding and marking
+share one wait for the lock, the store's 30 seconds: a sweep holding it is
+said once and waited for, and if it holds the lock longer the run is refused
+(`store.locked`); Ctrl-C while it waits stops the run (`run.stopped`). A field
+the workflow's input contract types as `atomic:artifact` that names content
+the store does not hold, or content a sweep removed after the store was
+listed, refuses the run (`run.input_missing`), and one naming content the
+contract does not allow there refuses it too (`input.invalid`); the first
+such field is the one named. A reference in free text is held if stored and
+otherwise left alone. Either way nothing is recorded.
+
 `atomic serve` also runs on PostgreSQL (`ATOMIC_DATABASE_URL`) when the process
 has an executor identity (`ATOMIC_EXECUTOR_ID`). `atomic runner` and
 `--runner process` run exec atoms' commands in a separate process with an

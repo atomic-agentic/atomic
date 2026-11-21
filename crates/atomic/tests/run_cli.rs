@@ -46,7 +46,7 @@ use atomic_durable::{DurableRuntime, Durare, RunStatus};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 #[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 mod support;
@@ -2287,6 +2287,233 @@ fn a_gate_decided_while_its_run_was_down_wakes_it_on_resume() {
             .await
             .expect("child");
         assert!(status.success());
+    });
+}
+
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[test]
+fn atomic_run_keeps_what_its_input_names_from_a_sweep_that_read_the_runs_before_it() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
+            .await
+            .expect("fake model");
+        let dir = scratch("input-sweep");
+        let project = project(&dir);
+        let state = state_dir(&dir, &project);
+        // The project's store, as `atomic run` opens it: its lock in the
+        // home's private directory.
+        let private = dir.join("atomic-home/private");
+        std::fs::create_dir_all(&private).expect("private");
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &private,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .expect("private");
+        let store =
+            atomic_core::artifact::LocalStore::open(state.join("artifacts")).expect("store");
+        let stored = atomic_core::artifact::ArtifactStore::put(
+            &store,
+            &mut &b"stored well before the run"[..],
+            atomic_core::artifact::Provenance::default(),
+        )
+        .expect("put")
+        .artifact;
+        // Written an hour ago, well past any grace.
+        let blob = state
+            .join("artifacts/blobs/sha256")
+            .join(&stored.digest()[..2])
+            .join(&stored.digest()[2..]);
+        std::fs::File::open(&blob)
+            .and_then(|f| f.set_modified(SystemTime::now() - Duration::from_secs(3600)))
+            .expect("backdate");
+        // A sweep that read the runs, and found nothing to keep, before the
+        // run existed.
+        let stale = atomic_app::retention::Kept {
+            artifacts: Default::default(),
+            read_at: SystemTime::now(),
+        };
+        let (d, p, e) = (dir.clone(), project.clone(), model_env(&model.base_url()));
+        // Its text names stored content, and content never stored, which
+        // free text may: only a field typed as an artifact must be stored.
+        let never = format!("artifact://sha256/{}", "1".repeat(64));
+        let data =
+            json!({ "text": format!("Exporting {stored} crashes the app, as {never} did.") })
+                .to_string();
+        let out = tokio::task::spawn_blocking(move || {
+            atomic(
+                &d,
+                &p,
+                &["run", "triage", "--run-id", "named-1", "--data", &data],
+                &with(&e, &[]),
+                "",
+            )
+        })
+        .await
+        .expect("child");
+        assert!(out.status.success(), "{}", text(&out));
+        let swept = store
+            .sweep(
+                &stale.artifacts,
+                atomic_core::artifact::Grace::none_for_tests(),
+                stale.read_at,
+            )
+            .expect("sweep");
+        assert!(swept.removed.is_empty(), "{swept:?}");
+        assert!(
+            atomic_core::artifact::ArtifactStore::contains(&store, &stored).expect("contains"),
+            "the sweep removed what the run's input names"
+        );
+    });
+}
+
+/// `atomic run` waiting for the artifact store's lock, held by a sweep, as
+/// it admits a run whose input names stored content: a stop signal ends
+/// the wait at once, and nothing is recorded.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[test]
+fn a_run_told_to_stop_while_it_waits_for_the_store_stops_and_records_nothing() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let dir = scratch("admit-stopped");
+        let project = project(&dir);
+        let state = state_dir(&dir, &project);
+        let private = dir.join("atomic-home/private");
+        std::fs::create_dir_all(&private).expect("private");
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &private,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .expect("private");
+        let store =
+            atomic_core::artifact::LocalStore::open(state.join("artifacts")).expect("store");
+        let stored = atomic_core::artifact::ArtifactStore::put(
+            &store,
+            &mut &b"named by the run"[..],
+            atomic_core::artifact::Provenance::default(),
+        )
+        .expect("put")
+        .artifact;
+        // A sweep's hold on the store's lock, as `atomic run` takes it.
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(
+                private
+                    .join(state.file_name().expect("id"))
+                    .join("artifacts.lock"),
+            )
+            .expect("lock file");
+        lock.lock().expect("the sweep's lock");
+        let data = json!({ "text": format!("Exporting {stored} crashes the app.") }).to_string();
+        let log = dir.join("stopped.log");
+        let mut child = command_as(
+            Path::new(ATOMIC),
+            &dir,
+            &project,
+            &[
+                "--json",
+                "run",
+                "triage",
+                "--run-id",
+                "stopped-1",
+                "--data",
+                &data,
+            ],
+            &UNUSED_MODEL,
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(std::fs::File::create(&log).expect("log"))
+        .spawn()
+        .expect("start atomic");
+        wait_until("the run to wait for the store", || {
+            std::fs::read_to_string(&log).is_ok_and(|l| l.contains("is held by another process"))
+        });
+        // SIGTERM, which a background job does not inherit as ignored, as
+        // it may SIGINT.
+        terminate(&child);
+        let started = Instant::now();
+        let status = wait_child(&mut child, "atomic run");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "it waited out the lock instead of stopping"
+        );
+        assert!(!status.success());
+        let mut out = String::new();
+        std::io::Read::read_to_string(&mut child.stdout.take().expect("stdout"), &mut out)
+            .expect("stdout");
+        let json: Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("{e}: {out}"));
+        assert_eq!(json["error"]["kind"], "run.stopped", "{json}");
+        drop(lock);
+        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        assert!(
+            rt.run_record("stopped-1").await.expect("record").is_none(),
+            "the stopped run was recorded"
+        );
+    });
+}
+
+/// A field the workflow's input contract types as an artifact, naming
+/// content the store does not hold, refuses the run before it is recorded,
+/// and says what to do.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[test]
+fn a_typed_input_naming_content_never_stored_is_refused() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
+    let dir = scratch("typed-absent");
+    let project = project(&dir);
+    std::fs::write(
+        project.join("workflows/attached.workflow.yaml"),
+        TRIAGE.replace("name: triage", "name: attached").replace(
+            "input: { $ref: ../atoms/count-note.input.schema.json }",
+            "input: { type: object, required: [text, file], properties: { text: { type: string }, file: { $ref: 'atomic:artifact' } } }",
+        ),
+    )
+    .expect("workflow");
+    let never = format!("artifact://sha256/{}", "1".repeat(64));
+    let data = json!({ "text": "a note", "file": never }).to_string();
+    let out = atomic(
+        &dir,
+        &project,
+        &[
+            "--json", "run", "attached", "--run-id", "typed-1", "--data", &data,
+        ],
+        &UNUSED_MODEL,
+        "",
+    );
+    assert!(!out.status.success(), "{}", text(&out));
+    let error = &stdout_json(&out)["error"];
+    assert_eq!(error["kind"], "run.input_missing", "{error}");
+    assert!(
+        error["description"]
+            .as_str()
+            .is_some_and(|d| d.contains(&never)),
+        "{error}"
+    );
+    assert!(
+        error["action"]
+            .as_str()
+            .is_some_and(|a| a.contains("store the content again")),
+        "{error}"
+    );
+    let state = state_dir(&dir, &project);
+    on_codex_runtime(async move {
+        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        assert!(
+            rt.run_record("typed-1").await.expect("record").is_none(),
+            "the refused run was recorded"
+        );
     });
 }
 

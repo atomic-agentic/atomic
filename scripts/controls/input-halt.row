@@ -1,0 +1,1 @@
+input-halt|crates/atomic/src/retention.rs|            if self.halt.load(std::sync::atomic::Ordering::SeqCst)|            if false /*CONTROL_OFF*/ && self.halt.load(std::sync::atomic::Ordering::SeqCst)|-p atomic-agentic --lib retention::tests::admission_told_to_stop_while_it_waits_stops
