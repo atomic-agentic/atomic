@@ -13,19 +13,27 @@
 //!                             entry for the whole of `<home>/private`:
 //!     atomic.db     atomic's own database (durable workflows, the gate store)
 //!     context/      context checkpoints
+//!     codex/        what Codex records of the project's threads: its state
+//!                   databases and its logs
 //!     runtime.lock  held by the one process that executes the project's runs
+//! <home>/scratch/<project>/   the project's backends' scratch roots, denied
+//!                             to every atom's commands, with every other
+//!                             project's, by one entry for the whole of
+//!                             `<home>/scratch`, an attempt's own apart:
+//!     run/          each atom attempt's scratch directory of `atomic run`,
+//!                   `atomic serve` and `atomic eval`, and the temporary
+//!                   directory their turns share
+//!     debug/        the same for `atomic debug codex-prompt` and `atomic debug
+//!                   probe`
 //! <state>/ = <home>/projects/<project>/
-//!   codex/        Codex's home for atom threads, with its own state database
-//!                 (denied to atoms too, apart from the shell snapshots and
-//!                 helper links Codex's shell needs)
+//!   codex/        Codex's home for atom threads: only the helper links
+//!                 Codex's shell needs, the rest denied to atoms
 //!   worktrees/    one worktree per code-changing step
 //!   cache/        build caches shared by a project's steps
 //!   fixtures/     a bare snapshot of each commit a coding run is bound to
 //!                 (see [`crate::fixture`]), each made whole before it
 //!                 appears
 //!   tmp/          each turn's own temporary directory
-//!   scratch/      each atom attempt's scratch directory, and the
-//!                 temporary directory its backend's turns share
 //! ```
 //!
 //! Atom threads therefore never mix with the user's own Codex sessions.
@@ -303,6 +311,7 @@ impl ProjectState {
         private_dir(&self.private_root())?;
         private_dir(&self.private)?;
         self.move_codex_records()?;
+        self.retire_legacy_scratch()?;
         let legacy: Vec<PathBuf> = [self.dir.join("private"), self.dir.clone()]
             .into_iter()
             .filter(|dir| LEGACY.iter().any(|name| dir.join(name).exists()))
@@ -421,44 +430,132 @@ impl ProjectState {
         self.private.join("codex")
     }
 
-    /// Move what an older atomic let Codex record in the Codex home (its
-    /// `*.sqlite` databases, their `-wal` and `-shm` files, and its `log/`)
-    /// into [`ProjectState::codex_records`], where no command can read it.
-    /// One already there is kept, and the old one removed.
+    /// Hold the state directory's migration lock while `body` runs: one
+    /// process migrates at a time. Taken and let go around each migration,
+    /// never nested, since a second lock on the same file waits forever.
+    fn migrating<T>(&self, body: impl FnOnce() -> Result<T, StateError>) -> Result<T, StateError> {
+        let lock_path = self.dir.join("migrate.lock");
+        let fail = |source| StateError::Create {
+            path: lock_path.clone(),
+            source,
+        };
+        let lock = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(fail)?;
+        lock.lock().map_err(fail)?;
+        let out = body();
+        drop(lock);
+        out
+    }
+
+    /// Move what an older atomic let Codex record in the Codex home, its
+    /// `*.sqlite` databases with their `-wal` and `-shm` files and its
+    /// `log/`, into [`ProjectState::codex_records`], where no command can
+    /// read it. A database moves as one unit, its sidecars first and its main
+    /// file last, so no `-wal` is ever paired with another database's file.
+    /// One already in the records keeps its place, and the old unit is
+    /// removed whole. A database another process still has open is left,
+    /// with a warning, to move once it is not. Under the migration lock; a
+    /// file that is gone when its turn comes was moved by another process.
     fn move_codex_records(&self) -> Result<(), StateError> {
         let home = self.codex_home();
-        let Ok(entries) = std::fs::read_dir(&home) else {
+        let names: Vec<String> = match std::fs::read_dir(&home) {
+            Ok(entries) => entries
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => return Err(StateError::Create { path: home, source }),
+        };
+        let mut bases: Vec<String> = names
+            .iter()
+            .filter_map(|n| {
+                ["-wal", "-shm", ""]
+                    .iter()
+                    .find_map(|tail| n.strip_suffix(&format!(".sqlite{tail}")))
+                    .map(str::to_owned)
+            })
+            .collect();
+        bases.sort();
+        bases.dedup();
+        let has_log = names.iter().any(|n| n == "log");
+        if bases.is_empty() && !has_log {
             return Ok(());
-        };
-        let records = self.codex_records();
-        let fail = |path: &Path| {
-            let path = path.to_owned();
-            move |source| StateError::Create { path, source }
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let text = name.to_string_lossy();
-            let recorded = text == "log"
-                || text.ends_with(".sqlite")
-                || text.ends_with(".sqlite-wal")
-                || text.ends_with(".sqlite-shm");
-            if !recorded {
-                continue;
-            }
-            private_dir(&records)?;
-            let (old, new) = (entry.path(), records.join(&name));
-            if new.exists() {
-                let gone = if old.is_dir() {
-                    std::fs::remove_dir_all(&old)
-                } else {
-                    std::fs::remove_file(&old)
-                };
-                gone.map_err(fail(&old))?;
-            } else {
-                std::fs::rename(&old, &new).map_err(fail(&new))?;
-            }
         }
-        Ok(())
+        let records = self.codex_records();
+        self.migrating(|| {
+            private_dir(&records)?;
+            for base in &bases {
+                let main = home.join(format!("{base}.sqlite"));
+                if database_in_use(&main) {
+                    eprintln!(
+                        "atomic: {} is in use, so it stays in the Codex home until it is not",
+                        main.display()
+                    );
+                    continue;
+                }
+                let keep = records.join(format!("{base}.sqlite")).exists();
+                // Sidecars first, the main file last.
+                for tail in ["-wal", "-shm", ""] {
+                    let name = format!("{base}.sqlite{tail}");
+                    let (old, new) = (home.join(&name), records.join(&name));
+                    if keep {
+                        remove_record(&old)?;
+                    } else {
+                        move_record(&old, &new)?;
+                    }
+                }
+            }
+            if has_log {
+                let (old, new) = (home.join("log"), records.join("log"));
+                if new.exists() {
+                    remove_record(&old)?;
+                } else {
+                    move_record(&old, &new)?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// The scratch roots an older atomic kept in the state directory,
+    /// `<state>/scratch` and `<state>/scratch-debug`, while they are still
+    /// there: denied to every backend's commands until they are gone.
+    fn legacy_scratch_roots(&self) -> Vec<PathBuf> {
+        [self.dir.join("scratch"), self.dir.join("scratch-debug")]
+            .into_iter()
+            // Only one surely not there is left out: one that cannot be
+            // looked at is denied.
+            .filter(|root| {
+                !matches!(std::fs::symlink_metadata(root), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+            })
+            .collect()
+    }
+
+    /// Retire the scratch roots an older atomic kept in the state directory:
+    /// what attempts of processes that no longer run left there goes, and a
+    /// root goes once nothing else is in it. One whose attempts may still
+    /// run, as under an older atomic still running, stays, and stays denied.
+    /// Under the migration lock.
+    fn retire_legacy_scratch(&self) -> Result<(), StateError> {
+        let roots = self.legacy_scratch_roots();
+        if roots.is_empty() {
+            return Ok(());
+        }
+        self.migrating(|| {
+            for root in &roots {
+                if let Err(e) = atomic_exec::retire_scratch_root(root) {
+                    eprintln!(
+                        "atomic: could not remove the old scratch directory {}: {e}",
+                        root.display()
+                    );
+                }
+            }
+            Ok(())
+        })
     }
 
     /// The scratch roots of the project's backends: `atomic run`, `atomic
@@ -486,14 +583,23 @@ impl ProjectState {
     /// atoms on.
     pub fn run_backend(&self) -> atomic_exec::LocalBackend {
         let [run, _] = self.scratch_roots();
-        atomic_exec::LocalBackend::in_dir(run).denying([self.scratch_home()])
+        atomic_exec::LocalBackend::in_dir(run).denying(self.denied_scratch())
+    }
+
+    /// What every backend of the project denies its commands: the home's
+    /// whole `scratch/`, and the scratch roots an older atomic kept in the
+    /// state directory, while they are still there.
+    fn denied_scratch(&self) -> Vec<PathBuf> {
+        let mut denied = vec![self.scratch_home()];
+        denied.extend(self.legacy_scratch_roots());
+        denied
     }
 
     /// The local backend `atomic debug codex-prompt` and `atomic debug probe`
     /// run their turn on, beside the one runs use.
     pub fn debug_backend(&self) -> atomic_exec::LocalBackend {
         let [_, debug] = self.scratch_roots();
-        atomic_exec::LocalBackend::in_dir(debug).denying([self.scratch_home()])
+        atomic_exec::LocalBackend::in_dir(debug).denying(self.denied_scratch())
     }
 
     /// The file the execution lock is held on.
@@ -645,6 +751,56 @@ fn hold_lock(path: &Path) -> Option<Option<std::fs::File>> {
 /// Whether another process has the SQLite database at `path` open in WAL
 /// mode: each such connection holds a read lock on its shared-memory file's
 /// "DMS" byte (offset 128) for as long as it is open.
+/// Remove a record a Codex home kept, a file or the `log/` directory; one
+/// already gone is no error.
+fn remove_record(path: &Path) -> Result<(), StateError> {
+    let gone = match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(path),
+        Ok(_) => std::fs::remove_file(path),
+        Err(e) => Err(e),
+    };
+    match gone {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(StateError::Create {
+            path: path.to_owned(),
+            source: e,
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// Move a record a Codex home kept to `new`: renamed, or, where `new` is on
+/// another filesystem, copied and then removed. One already gone is no
+/// error: another process moved it.
+fn move_record(old: &Path, new: &Path) -> Result<(), StateError> {
+    let fail = |source| StateError::Create {
+        path: new.to_owned(),
+        source,
+    };
+    match std::fs::rename(old, new) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
+            copy_record(old, new).map_err(fail)?;
+            remove_record(old)
+        }
+        Err(e) => Err(fail(e)),
+    }
+}
+
+/// Copy a record, a file or a directory of files, to `new`.
+fn copy_record(old: &Path, new: &Path) -> std::io::Result<()> {
+    if std::fs::symlink_metadata(old)?.is_dir() {
+        std::fs::create_dir_all(new)?;
+        for entry in std::fs::read_dir(old)? {
+            let entry = entry?;
+            copy_record(&entry.path(), &new.join(entry.file_name()))?;
+        }
+        Ok(())
+    } else {
+        std::fs::copy(old, new).map(|_| ())
+    }
+}
+
 fn database_in_use(path: &Path) -> bool {
     #[cfg(unix)]
     {
@@ -1208,6 +1364,173 @@ mod tests {
         assert!(
             codex.join("tmp/arg0-linux").is_dir(),
             "the helper links went too"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The scratch roots an older atomic kept in the state directory are
+    /// denied to every backend's commands while they are there, and go when
+    /// the state is next created, once what is in them belonged to
+    /// processes that no longer run. One holding a live attempt stays, and
+    /// stays denied.
+    #[test]
+    fn old_scratch_roots_are_denied_until_they_are_retired() {
+        use atomic_exec::ExecutionBackend;
+        let home = std::env::temp_dir().join(format!("atomic-old-scratch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let root = home.join("project");
+        std::fs::create_dir_all(&root).expect("project");
+        let state = ProjectState::under(&home, &root);
+        let (old, old_debug) = (
+            state.dir().join("scratch"),
+            state.dir().join("scratch-debug"),
+        );
+        // A dead turn's HOME, with what it kept there.
+        let dead = old.join("fix-0123/999999999.1-a0");
+        std::fs::create_dir_all(&dead).expect("dead attempt");
+        std::fs::write(dead.join(".bash_history"), "a secret typed in a turn").expect("secret");
+        // One whose owner may still run: this process, which is alive.
+        let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+        let start = stat
+            .rsplit_once(')')
+            .and_then(|(_, after)| after.split_whitespace().nth(19))
+            .unwrap_or("0")
+            .to_owned();
+        let live = old_debug.join(format!("check-4567/{}.{start}-a1", std::process::id()));
+        std::fs::create_dir_all(&live).expect("live attempt");
+        for backend in [state.run_backend(), state.debug_backend()] {
+            let workspace = backend
+                .open(&atomic_exec::Open {
+                    label: "t".into(),
+                    run: "r".into(),
+                    step: "s".into(),
+                    attempt: "a1".into(),
+                    source: Some(root.clone()),
+                    ..Default::default()
+                })
+                .expect("opens");
+            for dir in [&old, &old_debug] {
+                assert!(
+                    workspace.denied.contains(dir),
+                    "{} is not denied: {:?}",
+                    dir.display(),
+                    workspace.denied
+                );
+            }
+            backend.close(&workspace).expect("closes");
+        }
+        state.create().expect("created");
+        assert!(!old.exists(), "the dead attempts' old root stayed");
+        assert!(live.exists(), "a live attempt's scratch went");
+        let backend = state.run_backend();
+        let workspace = backend
+            .open(&atomic_exec::Open {
+                label: "t".into(),
+                run: "r".into(),
+                step: "s".into(),
+                attempt: "a2".into(),
+                source: Some(root.clone()),
+                ..Default::default()
+            })
+            .expect("opens");
+        assert!(
+            workspace.denied.contains(&old_debug),
+            "{:?}",
+            workspace.denied
+        );
+        assert!(!workspace.denied.contains(&old), "{:?}", workspace.denied);
+        backend.close(&workspace).expect("closes");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A Codex database another process still has open stays in the Codex
+    /// home, and the state is created all the same; it moves once closed.
+    #[test]
+    fn a_codex_database_in_use_moves_only_once_closed() {
+        let home = std::env::temp_dir().join(format!("atomic-codex-in-use-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let root = home.join("project");
+        std::fs::create_dir_all(&root).expect("project");
+        let state = ProjectState::under(&home, &root);
+        let codex = state.codex_home();
+        std::fs::create_dir_all(&codex).expect("codex home");
+        let db = codex.join("state_5.sqlite");
+        let mut holder = std::process::Command::new("python3")
+            .args([
+                "-c",
+                "import sqlite3, sys, time\n\
+                 c = sqlite3.connect(sys.argv[1]); c.execute('PRAGMA journal_mode=WAL')\n\
+                 c.execute('CREATE TABLE IF NOT EXISTS t (x)'); c.execute('INSERT INTO t VALUES (1)'); c.commit()\n\
+                 print('open', flush=True); time.sleep(60)",
+            ])
+            .arg(&db)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("python3");
+        let mut ready = String::new();
+        std::io::BufRead::read_line(
+            &mut std::io::BufReader::new(holder.stdout.as_mut().expect("stdout")),
+            &mut ready,
+        )
+        .expect("ready");
+        assert_eq!(ready.trim(), "open");
+        state.create().expect("created while the database is open");
+        assert!(db.exists(), "an open database was moved");
+        holder.kill().expect("stop the holder");
+        holder.wait().expect("reap");
+        state.create().expect("created");
+        assert!(!db.exists(), "the closed database stayed");
+        assert!(state.codex_records().join("state_5.sqlite").exists());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A Codex database moves as one unit: where the records already hold
+    /// one by that name, the old one and its sidecars are removed whole and
+    /// none of them is paired with the kept file. Two starts at once both
+    /// succeed, and each record moves once.
+    #[test]
+    fn codex_databases_move_whole_and_two_starts_agree() {
+        let home = std::env::temp_dir().join(format!("atomic-codex-units-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let root = home.join("project");
+        std::fs::create_dir_all(&root).expect("project");
+        let state = ProjectState::under(&home, &root);
+        let codex = state.codex_home();
+        std::fs::create_dir_all(&codex).expect("codex home");
+        let records = state.codex_records();
+        std::fs::create_dir_all(&records).expect("records");
+        std::fs::write(records.join("state_5.sqlite"), "kept").expect("kept");
+        std::fs::write(codex.join("state_5.sqlite"), "old").expect("old");
+        std::fs::write(codex.join("state_5.sqlite-wal"), "old wal").expect("old wal");
+        std::fs::write(codex.join("logs_2.sqlite"), "logs").expect("logs");
+        std::fs::write(codex.join("logs_2.sqlite-wal"), "logs wal").expect("logs wal");
+        let starts: Vec<_> = (0..2)
+            .map(|_| {
+                let state = state.clone();
+                std::thread::spawn(move || state.create())
+            })
+            .collect();
+        for start in starts {
+            start.join().expect("thread").expect("both starts succeed");
+        }
+        assert_eq!(
+            std::fs::read_to_string(records.join("state_5.sqlite")).expect("kept"),
+            "kept"
+        );
+        assert!(
+            !records.join("state_5.sqlite-wal").exists(),
+            "an old -wal was paired with the kept database"
+        );
+        assert!(
+            !codex.join("state_5.sqlite").exists() && !codex.join("state_5.sqlite-wal").exists()
+        );
+        assert_eq!(
+            std::fs::read_to_string(records.join("logs_2.sqlite")).expect("logs"),
+            "logs"
+        );
+        assert_eq!(
+            std::fs::read_to_string(records.join("logs_2.sqlite-wal")).expect("logs wal"),
+            "logs wal"
         );
         let _ = std::fs::remove_dir_all(&home);
     }

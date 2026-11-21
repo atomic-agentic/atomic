@@ -59,7 +59,7 @@ pub(crate) fn log(line: &str) {
     }
 }
 
-pub use workspace::{Open, Sandbox, Shell, Workspace};
+pub use workspace::{Open, Sandbox, Shell, Workspace, retire_scratch_root};
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -437,8 +437,8 @@ pub struct LocalBackend {
     tmp: PathBuf,
     confine: Option<Arc<dyn Confine>>,
     /// Directories its workspaces' commands are kept out of besides its own
-    /// scratch root, such as another backend's scratch root in the same
-    /// project.
+    /// scratch root, such as the directory that holds every backend's
+    /// scratch roots.
     denying: Vec<PathBuf>,
     /// Set once its confinement has been seen to work here; a check that
     /// fails is made again the next time.
@@ -490,10 +490,10 @@ impl LocalBackend {
     }
 
     /// The same backend, keeping its workspaces' commands out of `dirs` as
-    /// well as its own scratch root: the scratch roots of the project's other
-    /// backends, so no command of one reads another's attempts. Each is
-    /// created, if missing, when a workspace opens, so it cannot appear
-    /// undenied while a command runs.
+    /// well as its own scratch root, such as the directory that holds every
+    /// backend's scratch roots, of every project, so no command of one reads
+    /// another's attempts. Each is created, if missing, when a workspace
+    /// opens, so it cannot appear undenied while a command runs.
     pub fn denying(mut self, dirs: impl IntoIterator<Item = PathBuf>) -> Self {
         self.denying.extend(dirs);
         self

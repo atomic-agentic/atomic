@@ -900,3 +900,82 @@ fn a_leftover_that_left_the_group_holds_the_output_only_briefly() {
     );
     assert_eq!(done.stdout, b"done");
 }
+
+/// A backend's own scratch root inside a directory it also denies is left to
+/// that one, but only when it truly lies there: one that is a link to
+/// somewhere else is not covered by the directory its link sits in, and is
+/// denied itself.
+#[cfg(unix)]
+#[test]
+fn only_a_root_truly_inside_another_denied_one_is_left_to_it() {
+    let base = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/atomic-exec-tests")
+        .join(format!("outermost-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let (home, elsewhere) = (base.join("scratch"), base.join("elsewhere"));
+    std::fs::create_dir_all(home.join("p")).expect("home");
+    std::fs::create_dir_all(&elsewhere).expect("elsewhere");
+    let inside = home.join("p/run");
+    std::fs::create_dir_all(&inside).expect("inside");
+    let linked = home.join("p/debug");
+    std::os::unix::fs::symlink(&elsewhere, &linked).expect("link");
+    assert_eq!(
+        workspace::outermost(&[inside.clone(), home.clone()]),
+        vec![home.clone()],
+        "a root truly inside is left to the outer one"
+    );
+    assert_eq!(
+        workspace::outermost(&[linked.clone(), home.clone()]),
+        vec![linked.clone(), home.clone()],
+        "a root linked elsewhere is denied itself"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// A scratch root no longer used is retired: dead attempts go, and the root
+/// with them once only its dot-entries are left. An attempt whose owner may
+/// still run, or an entry that does not say whose it is, keeps it.
+#[test]
+fn an_old_scratch_root_goes_only_once_nothing_live_is_in_it() {
+    let make = |tag: &str| {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/atomic-exec-tests")
+            .join(format!("retire-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dead = root.join("fix-0123/999999999.1-a0");
+        std::fs::create_dir_all(&dead).expect("dead attempt");
+        std::fs::write(dead.join("secret"), "a dead turn's HOME").expect("secret");
+        std::fs::create_dir_all(root.join(".tmp")).expect("shared tmp");
+        root
+    };
+    let gone = make("dead");
+    assert!(
+        retire_scratch_root(&gone).expect("retired"),
+        "the root stayed"
+    );
+    assert!(!gone.exists());
+    assert!(
+        retire_scratch_root(&gone).expect("again"),
+        "a root already gone is retired"
+    );
+
+    let live = make("live");
+    let mine = live
+        .join("check-4567")
+        .join(tagged(std::process::id(), "a1"));
+    std::fs::create_dir_all(&mine).expect("live attempt");
+    assert!(!retire_scratch_root(&live).expect("kept"));
+    assert!(mine.exists(), "a live attempt's scratch went");
+    assert!(
+        !live.join("fix-0123/999999999.1-a0").exists(),
+        "the dead attempt beside it stayed"
+    );
+
+    let unknown = make("unknown");
+    std::fs::write(unknown.join("left-by-someone"), "x").expect("unknown entry");
+    assert!(!retire_scratch_root(&unknown).expect("kept"));
+    assert!(unknown.join("left-by-someone").exists());
+
+    let _ = std::fs::remove_dir_all(&live);
+    let _ = std::fs::remove_dir_all(&unknown);
+}

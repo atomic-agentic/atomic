@@ -1,1 +1,1 @@
-scratch-deny-other-projects|crates/atomic-core/src/state.rs|        atomic_exec::LocalBackend::in_dir(run).denying([self.scratch_home()])|        atomic_exec::LocalBackend::in_dir(run).denying(self.scratch_roots())|-p atomic-agentic-core --lib every_backend_denies_every_projects_scratch
+scratch-deny-other-projects|crates/atomic-core/src/state.rs|        atomic_exec::LocalBackend::in_dir(run).denying(self.denied_scratch())|        atomic_exec::LocalBackend::in_dir(run).denying(self.scratch_roots())|-p atomic-agentic-core --lib every_backend_denies_every_projects_scratch

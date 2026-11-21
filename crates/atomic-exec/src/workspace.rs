@@ -207,12 +207,21 @@ pub(crate) fn check_not_within(denied: &Path, roots: &[PathBuf]) -> Result<(), S
 /// sandbox denies. Codex's Linux sandbox cannot open a writable directory
 /// again inside a denied one that lies inside another, so a backend's own
 /// scratch root inside a directory it is also told to deny, such as the
-/// atomic home's `scratch/`, is left to that one.
-fn outermost(denied: &[PathBuf]) -> Vec<PathBuf> {
+/// atomic home's `scratch/`, is left to that one. Inside means as the paths
+/// resolve: one that is a link to somewhere else, such as another disk, is
+/// not covered by the directory its link sits in, and is denied itself.
+pub(crate) fn outermost(denied: &[PathBuf]) -> Vec<PathBuf> {
+    let real: Vec<PathBuf> = denied.iter().map(PathBuf::as_path).map(resolved).collect();
     denied
         .iter()
-        .filter(|d| !denied.iter().any(|o| o != *d && d.starts_with(o)))
-        .cloned()
+        .zip(&real)
+        .filter(|(d, r)| {
+            !denied
+                .iter()
+                .zip(&real)
+                .any(|(o, ro)| o != *d && ro != *r && r.starts_with(ro))
+        })
+        .map(|(d, _)| d.clone())
         .collect()
 }
 
@@ -540,6 +549,33 @@ pub(crate) fn sweep_local(scratch_root: &Path) -> usize {
         let _ = std::fs::remove_dir(&step);
     }
     removed
+}
+
+/// Retire `scratch_root`, a backend's scratch root no longer used: remove
+/// what attempts of processes that no longer run left there, as a connect
+/// does, and the root itself once nothing else is in it but its dot-entries,
+/// such as its shared temporary directory. Returns whether the root is gone.
+/// An attempt whose owner may still run, or an entry whose name does not
+/// say whose it is, keeps the root, so a backend still denies it.
+pub fn retire_scratch_root(scratch_root: &Path) -> std::io::Result<bool> {
+    let entries = match std::fs::read_dir(scratch_root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(e) => return Err(e),
+    };
+    drop(entries);
+    sweep_local(scratch_root);
+    for entry in std::fs::read_dir(scratch_root)? {
+        let entry = entry?;
+        if !entry.file_name().to_string_lossy().starts_with('.') {
+            return Ok(false);
+        }
+    }
+    match remove_tree(scratch_root) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(e) => Err(e),
+    }
 }
 
 /// Whether the process an attempt's directory names (`<pid>.<started>`, or

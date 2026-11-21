@@ -127,7 +127,9 @@ atomic's own environment or its credentials. A turn's commands run with no
 login shell; their `HOME` (and `ZDOTDIR`) is a private scratch directory of the
 attempt's own, and their `TMPDIR` a directory inside it, so no shell startup
 file runs and no other turn, of the project or another, can see, add, change
-or remove what a turn keeps in its `HOME` or temporary directory: every
+or remove what a turn keeps in its `HOME` or temporary directory (an exec
+atom's command, which has a scratch directory of its own too, is not yet kept
+from the others' in the same way): every
 project's scratch directories, those of `atomic run`, `atomic serve` and
 `atomic eval` and those of `atomic debug codex-prompt` and `atomic debug
 probe`, are kept in the atomic home's `scratch/`, which is denied to a turn's
@@ -136,9 +138,7 @@ commands whole, apart from a `workspace-write` turn's own directory. A
 even to list it. Apart from macOS, whose own sandbox denies them, only
 Codex's Linux sandbox helper, which the `atomic` binary provides, can deny
 them, so a process without it refuses the turn instead of running it. On
-macOS none of this is verified. An exec atom's
-command, which has a scratch directory of its own too, is not yet kept from
-the others' in the same way. (Codex's
+macOS none of this is verified. (Codex's
 sandbox keeps its registry of the mount points it makes in a directory every
 turn of the project shares, which no turn's command may write.) Tools found
 through `HOME` are therefore not found: cargo's registry and tools, pyenv, nvm,
@@ -153,9 +153,12 @@ its `env`, as in `env: { RUSTUP_HOME: '/home/me/.rustup' }`. An
 exec atom's command gets its own scratch directory as `HOME` and `TMPDIR`.
 Scratch directories live in the atomic home's `scratch/`, one directory per
 project, where no sandboxed turn may write; atomic refuses to run when that
-would be under `/tmp`, `$TMPDIR` or the project. Scratch directories an older
-atomic left in a project's state directory are no longer used, and can be
-removed. A turn's shell always runs on the machine its backend
+would be under `/tmp`, `$TMPDIR` or the project. The scratch directories an
+older atomic kept in a project's state directory are denied to every turn too,
+until atomic next starts in the project and removes them: what attempts of
+processes that no longer run left there goes then, and a directory that still
+holds a live attempt, as of an older atomic still running, stays, and stays
+denied, until a later start. A turn's shell always runs on the machine its backend
 names; `CODEX_EXEC_SERVER_URL` and an `environments.toml` in Codex's home have
 no effect.
 
