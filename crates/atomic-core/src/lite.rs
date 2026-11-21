@@ -85,64 +85,76 @@ fn http_loopback(base_url: &str) -> bool {
 
 /// Why a model call carrying a key to `base_url` would hand that key to a
 /// proxy in cleartext, if it would: the endpoint is plain `http` on this
-/// machine (see [`http_loopback_host`]), a proxy variable (`HTTP_PROXY`,
-/// `http_proxy`, `ALL_PROXY` or `all_proxy`) names a proxy, and no entry
-/// of `NO_PROXY` covers the host. As in the client, a `NO_PROXY` that is set
-/// at all, even empty, hides `no_proxy`. `var` reads the environment. A Codex
-/// atom's client cannot be told to skip proxies, so its turn is refused
-/// rather than sent.
-pub fn proxied_key(base_url: &str, var: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+/// machine (see [`http_loopback_host`]) and the client would send the call by
+/// a proxy. A Codex atom's client cannot be told to skip proxies, so its turn
+/// is refused rather than sent.
+///
+/// Whether the client would use a proxy is asked of the matcher the client
+/// itself uses, built from the variables `var` reads as the client reads
+/// them: the first of `HTTP_PROXY` and `http_proxy` that is set, else of
+/// `ALL_PROXY` and `all_proxy`, and of `NO_PROXY` and `no_proxy`. Where the
+/// client may also find a proxy elsewhere, `system_may_proxy` (another
+/// platform's proxy settings, or Codex told to respect them), the call is
+/// refused unless `NO_PROXY` exempts the host, since what those settings
+/// would do cannot be asked.
+pub fn proxied_key(
+    base_url: &str,
+    var: &dyn Fn(&str) -> Option<String>,
+    system_may_proxy: bool,
+) -> Option<String> {
     let host = http_loopback_host(base_url)?;
-    let set = |name: &str| var(name).filter(|v| !v.trim().is_empty());
-    let proxy = ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"]
-        .into_iter()
-        .find(|name| set(name).is_some())?;
-    let exempt = var("NO_PROXY")
-        .or_else(|| var("no_proxy"))
-        .is_some_and(|list| {
-            list.split(',')
-                .any(|entry| no_proxy_covers(entry.trim(), &host))
-        });
-    if exempt {
-        return None;
+    // The URI as the client sends it: parsed, so normalized, first. One that
+    // does not parse is never sent, so there is nothing to refuse.
+    let uri: http::Uri = reqwest::Url::parse(base_url).ok()?.as_str().parse().ok()?;
+    let first = |names: [&'static str; 2]| {
+        names
+            .into_iter()
+            .find_map(|name| var(name).map(|value| (name, value)))
+    };
+    let http = first(["HTTP_PROXY", "http_proxy"]);
+    let all = first(["ALL_PROXY", "all_proxy"]);
+    let no = first(["NO_PROXY", "no_proxy"])
+        .map(|(_, v)| v)
+        .unwrap_or_default();
+    let named = hyper_util::client::proxy::matcher::Matcher::builder()
+        .http(http.as_ref().map(|(_, v)| v.as_str()).unwrap_or_default())
+        .all(all.as_ref().map(|(_, v)| v.as_str()).unwrap_or_default())
+        .no(no.as_str())
+        .build();
+    let fix = format!("set NO_PROXY to include {host}, or use an https endpoint");
+    if named.intercept(&uri).is_some() {
+        // The variable the proxy came from: HTTP_PROXY's pair when it names
+        // one, else ALL_PROXY's.
+        let from = [http, all]
+            .into_iter()
+            .flatten()
+            .find(|(_, value)| {
+                hyper_util::client::proxy::matcher::Matcher::builder()
+                    .http(value.as_str())
+                    .build()
+                    .intercept(&uri)
+                    .is_some()
+            })
+            .map_or("a proxy variable", |(name, _)| name);
+        return Some(format!(
+            "the model endpoint {base_url} is plain http on this machine, and {from} names a \
+             proxy that would carry its API key there in cleartext; {fix}"
+        ));
     }
-    Some(format!(
-        "the model endpoint {base_url} is plain http on this machine, and {proxy} names a proxy \
-         that would carry its API key there in cleartext; set NO_PROXY to include {host}, or use \
-         an https endpoint"
-    ))
-}
-
-/// Whether one `NO_PROXY` entry covers `host`, matched as the model client
-/// matches it: an address host by the same address or a network holding it
-/// (`127.0.0.0/8`, never `[::1]` in brackets); a name host by `*`, the same
-/// name, or a domain it is under (`localhost` or `.localhost`). Anything the
-/// client would still send through the proxy is not covered.
-fn no_proxy_covers(entry: &str, host: &str) -> bool {
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        if let Some((net, bits)) = entry.split_once('/') {
-            let (Ok(net), Ok(bits)) = (net.parse::<std::net::IpAddr>(), bits.parse::<u32>()) else {
-                return false;
-            };
-            return match (ip, net) {
-                (std::net::IpAddr::V4(ip), std::net::IpAddr::V4(net)) if bits <= 32 => {
-                    let mask = u32::MAX.checked_shl(32 - bits).unwrap_or(0);
-                    u32::from(ip) & mask == u32::from(net) & mask
-                }
-                (std::net::IpAddr::V6(ip), std::net::IpAddr::V6(net)) if bits <= 128 => {
-                    let mask = u128::MAX.checked_shl(128 - bits).unwrap_or(0);
-                    u128::from(ip) & mask == u128::from(net) & mask
-                }
-                _ => false,
-            };
-        }
-        return entry.parse::<std::net::IpAddr>() == Ok(ip);
+    let exempt = hyper_util::client::proxy::matcher::Matcher::builder()
+        .http("proxy.invalid:3128")
+        .no(no.as_str())
+        .build()
+        .intercept(&uri)
+        .is_none();
+    if system_may_proxy && !exempt {
+        return Some(format!(
+            "the model endpoint {base_url} is plain http on this machine, and the system's proxy \
+             settings, which atomic cannot read, may carry its API key to a proxy in cleartext; \
+             {fix}"
+        ));
     }
-    if entry == "*" {
-        return true;
-    }
-    let entry = entry.trim_start_matches('.').to_ascii_lowercase();
-    !entry.is_empty() && (host == entry || host.ends_with(&format!(".{entry}")))
+    None
 }
 
 /// The host of `base_url` as the client matches it against `NO_PROXY`

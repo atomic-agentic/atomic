@@ -2785,9 +2785,19 @@ async fn new_config(
             // A key to an endpoint on this machine over plain http would go
             // to a proxy in cleartext, and Codex's client cannot be told to
             // skip proxies: the turn is refused, saying how to fix it.
+            // Elsewhere than Linux, or told to respect the system's proxy
+            // settings, Codex's client may find a proxy atomic cannot see.
+            let system_may_proxy = if cfg!(target_os = "linux") {
+                respect_system_proxy
+            } else {
+                true
+            };
             if endpoint.api_key_env.is_some()
-                && let Some(why) =
-                    crate::lite::proxied_key(&endpoint.base_url, &|name| std::env::var(name).ok())
+                && let Some(why) = crate::lite::proxied_key(
+                    &endpoint.base_url,
+                    &|name| std::env::var(name).ok(),
+                    system_may_proxy,
+                )
             {
                 anyhow::bail!(why);
             }
@@ -4254,6 +4264,50 @@ mod tests {
             assert_eq!(model.calls(), 1, "requests: {:#?}", model.requests());
             // The prompt reached the model.
             assert!(model.requests()[0].to_string().contains("ping"));
+        });
+    }
+
+    /// A Codex atom told to respect the system's proxy settings, which atomic
+    /// cannot read, is refused a key to an endpoint on this machine over plain
+    /// http unless NO_PROXY exempts the host; with the setting off, nothing
+    /// in this environment names a proxy and the configuration is made.
+    #[test]
+    fn a_key_the_systems_proxy_settings_may_carry_is_refused() {
+        on_codex_runtime(async {
+            for name in ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"] {
+                assert!(std::env::var_os(name).is_none(), "{name} is set here");
+            }
+            let endpoint = ModelEndpoint {
+                base_url: "http://127.0.0.1:9/v1".into(),
+                model: "synthetic".into(),
+                api_key_env: Some("PATH".into()),
+                sign_in: None,
+            };
+            let plain = scratch("home-no-system-proxy");
+            new_config(&endpoint, &plain, &plain, Arg0DispatchPaths::default())
+                .await
+                .expect("no proxy is named");
+            let respecting = scratch("home-system-proxy");
+            std::fs::write(
+                respecting.join("config.toml"),
+                "[features]\nrespect_system_proxy = true\n",
+            )
+            .expect("config");
+            let refused = new_config(
+                &endpoint,
+                &respecting,
+                &respecting,
+                Arg0DispatchPaths::default(),
+            )
+            .await
+            .expect_err("refused");
+            let message = format!("{refused:#}");
+            assert!(
+                message.contains("the system's proxy settings")
+                    && message
+                        .contains("set NO_PROXY to include 127.0.0.1, or use an https endpoint"),
+                "{message}"
+            );
         });
     }
 
