@@ -119,17 +119,14 @@ attempt's own, and their `TMPDIR` a directory inside it, so no shell startup
 file runs and no other turn of the project can see, add, change or remove what
 a turn keeps in its `HOME` or temporary directory: every scratch directory of
 the project, those of `atomic run`, `atomic serve` and `atomic eval` and those
-of `atomic debug prompt`, is denied to a turn's commands, apart from a
+of `atomic debug codex-prompt` and `atomic debug probe`, is denied to a turn's commands, apart from a
 `workspace-write` turn's own. A `read-only` turn, which may not write its own,
 cannot reach it at all, not even to list it. Other projects' scratch
 directories are not denied yet: a turn can read another project's live
 attempts by their path. Apart from macOS, whose own sandbox denies them, only
 Codex's Linux sandbox helper, which the `atomic` binary provides, can deny
 them, so a process without it refuses the turn instead of running it. On
-macOS none of this is verified: Codex's sandbox there has nothing like the
-Linux sandbox's reopening of a writable directory inside a denied one, so it
-may keep a turn from reading its own scratch directory too, and stop the
-turn. An exec atom's
+macOS none of this is verified. An exec atom's
 command, which has a scratch directory of its own too, is kept out of the
 project's other ones in the same way, its own apart, wherever its command is
 confined, on Linux; where exec atoms' commands run unconfined, it is not. (Codex's

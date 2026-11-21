@@ -269,8 +269,9 @@ impl ProjectState {
     }
 
     /// Every scratch root of the project's backends: `atomic run`, `atomic
-    /// serve` and `atomic eval`'s, and `atomic debug prompt`'s, which is apart because
-    /// that command takes no execution lock. Each backend denies its
+    /// serve` and `atomic eval`'s, and that of `atomic debug codex-prompt` and
+    /// `atomic debug probe`, which is apart because those commands take no
+    /// execution lock. Each backend denies its
     /// workspaces' commands all of them, its own scratch directory excepted.
     /// A backend with a scratch root of its own must be added here.
     fn scratch_roots(&self) -> [PathBuf; 2] {
@@ -284,8 +285,8 @@ impl ProjectState {
         atomic_exec::LocalBackend::in_dir(run).denying(self.scratch_roots())
     }
 
-    /// The local backend `atomic debug prompt` runs its turn on, beside the
-    /// one runs use.
+    /// The local backend `atomic debug codex-prompt` and `atomic debug probe`
+    /// run their turn on, beside the one runs use.
     pub fn debug_backend(&self) -> atomic_exec::LocalBackend {
         let [_, debug] = self.scratch_roots();
         atomic_exec::LocalBackend::in_dir(debug).denying(self.scratch_roots())

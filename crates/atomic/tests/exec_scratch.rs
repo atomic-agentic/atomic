@@ -163,7 +163,7 @@ fn an_exec_command_cannot_read_another_attempts_scratch_and_keeps_its_own() {
         let state = dir.join("state");
         let root = state.join("scratch");
         std::fs::create_dir_all(&root).expect("scratch root");
-        // Another backend's scratch root, as `atomic debug prompt` has, with
+        // Another backend's scratch root, as `atomic debug codex-prompt` has, with
         // a secret in it.
         let sibling = state.join("scratch-debug");
         std::fs::create_dir_all(sibling.join("planted")).expect("sibling root");
@@ -243,6 +243,10 @@ fn an_exec_command_cannot_read_another_attempts_scratch_and_keeps_its_own() {
             assert!(
                 holds(&root, "secret-of-the-keeper"),
                 "{what}: the keeper's secret was gone when the prober ended"
+            );
+            assert!(
+                holds(&sibling, "secret-in-the-sibling"),
+                "{what}: the other backend's secret was gone when the prober ended"
             );
             std::fs::write(&release, "").expect("release");
             let kept = keeper.await.expect("keeper");
