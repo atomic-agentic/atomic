@@ -158,6 +158,9 @@ mod descendants {
     /// How long the processes found at first are stopped and looked for
     /// again before all are killed.
     const STOP_PHASE: Duration = Duration::from_secs(1);
+    /// The longest one look in the wait may take, however often looks have
+    /// run out of time.
+    const LOOK_MAX: Duration = Duration::from_secs(60);
     /// When those still running are first reported, and how often after.
     const FIRST_REPORT: Duration = Duration::from_secs(10);
     const REPORT_EVERY: Duration = Duration::from_secs(30);
@@ -511,6 +514,18 @@ mod descendants {
         );
     }
 
+    /// How long the wait's next look may take, after one that found nothing
+    /// running and was incomplete: twice as long, up to [`LOOK_MAX`], if it
+    /// `ran_out` of time; as long, if it ended at once, as when /proc
+    /// cannot be listed.
+    fn next_look(look: Duration, ran_out: bool) -> Duration {
+        if ran_out {
+            look.saturating_mul(2).min(LOOK_MAX)
+        } else {
+            look
+        }
+    }
+
     /// Wait until nothing `find` finds, nor anything in `watched`, is
     /// `alive`, killing each process found that is not yet watched, and
     /// watching it: `find` gives what runs that may be killed, the processes
@@ -530,7 +545,11 @@ mod descendants {
         let mut look = STOP_PHASE;
         let mut next = FIRST_REPORT;
         loop {
-            let (others, own, complete) = find(Instant::now() + look);
+            let looked = Instant::now();
+            let (others, own, complete) = find(looked + look);
+            // Out of time, rather than cut short at once, as when /proc
+            // cannot be listed at all.
+            let ran_out = !complete && looked.elapsed() >= look;
             for process in others {
                 if watched.insert(process) {
                     kill(&process);
@@ -546,7 +565,7 @@ mod descendants {
                 return;
             }
             if left.is_empty() {
-                look *= 2;
+                look = next_look(look, ran_out);
             }
             if begun.elapsed() >= next {
                 if left.is_empty() {
@@ -686,6 +705,46 @@ mod descendants {
             );
             assert_eq!(found, HashSet::from([1, 2, 11, 12]));
             assert!(settled);
+        }
+
+        /// A look that ran out of time makes the next one twice as long, never
+        /// past the cap however often; one that ended at once does not.
+        #[test]
+        fn the_next_look_grows_only_when_one_ran_out_and_is_capped() {
+            let mut look = STOP_PHASE;
+            for _ in 0..200 {
+                look = next_look(look, true);
+            }
+            assert_eq!(look, LOOK_MAX);
+            assert_eq!(
+                next_look(Duration::from_secs(2), true),
+                Duration::from_secs(4)
+            );
+            assert_eq!(next_look(STOP_PHASE, false), STOP_PHASE);
+        }
+
+        /// Looks that end incomplete at once, as when /proc cannot be listed,
+        /// leave the wait waiting, the lock held, without growing the look:
+        /// only a look that ran out of time makes the next one longer.
+        #[test]
+        fn a_wait_whose_looks_end_at_once_incomplete_waits() {
+            let handle = std::thread::spawn(|| {
+                let mut watched = HashSet::<u32>::new();
+                wait_phase(
+                    &mut watched,
+                    &mut |_| (Vec::new(), Vec::new(), false),
+                    &mut |_| {},
+                    &mut |_| true,
+                    &mut |_| {},
+                    &|p| p.to_string(),
+                    Instant::now(),
+                );
+            });
+            std::thread::sleep(Duration::from_millis(1500));
+            assert!(
+                !handle.is_finished(),
+                "the wait ended, or panicked, with no look complete"
+            );
         }
 
         /// A look cut short that finds nothing running is no proof that
