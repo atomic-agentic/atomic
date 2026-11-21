@@ -86,7 +86,11 @@ directory goes regardless. One stopped with Ctrl-C leaves the directory, with
 nothing in the store. A logout removes the directory once both stores are
 checked, so later runs read no store, and removes one it made itself even if
 the keyring cannot be checked. Otherwise, while the keyring cannot be checked,
-the directory stays, and atomic says the sign-in could not be read.
+the directory stays, and atomic says the sign-in could not be read. A sign-in
+whose directory is there but which cannot be used, because its store cannot be
+read or because it is kept where it is refused, refuses a run that calls a
+model: an `OPENAI_API_KEY` or a local Ollama is never used in its place, since
+model calls would then go to another account.
 
 Keeping the token out of reach has side effects on atomic's own process, and so
 on everything it starts:

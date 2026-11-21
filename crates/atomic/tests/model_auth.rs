@@ -117,6 +117,52 @@ fn logout_forgets_the_file_copy_whichever_store_is_chosen() {
     }
 }
 
+/// A sign-in that is there and cannot be used, unreadable or refused where
+/// it is kept, refuses a run that calls a model: an API key or a detected
+/// endpoint is not used in its place. With no sign-in there, nothing is
+/// refused for one.
+#[test]
+fn a_sign_in_that_cannot_be_used_refuses_a_run_and_nothing_takes_its_place() {
+    let f = Fixture::new("unusable");
+    let run = ["run", "tidy-codex", "--data", r#"{"text": "a note"}"#];
+    let keyring = [
+        ("ATOMIC_CREDENTIAL_STORE", "keyring"),
+        ("ATOMIC_MODEL", "synthetic"),
+        ("OPENAI_API_KEY", "sk-detected"),
+    ];
+    // The sign-in's directory, and a keyring that cannot be reached.
+    std::fs::create_dir_all(f.credentials().join("codex-auth")).unwrap();
+    let out = f.atomic(&run, &keyring);
+    let t = text(&out);
+    assert!(!out.status.success(), "{t}");
+    assert!(t.contains("the ChatGPT sign-in cannot be used"), "{t}");
+    assert!(t.contains("atomic model logout"), "{t}");
+    std::fs::remove_dir_all(f.credentials().join("codex-auth")).unwrap();
+    // Kept inside the checkout holding the project: refused there. With no
+    // sign-in's directory there, the run is refused only for want of an
+    // endpoint; with one, for the sign-in.
+    std::fs::create_dir_all(f.dir.join(".git")).unwrap();
+    let inside = f.dir.join("atomic-home");
+    let home = [
+        ("ATOMIC_HOME", inside.to_str().unwrap()),
+        ("ATOMIC_MODEL", "synthetic"),
+    ];
+    let out = f.atomic(&run, &home);
+    let t = text(&out);
+    assert!(!out.status.success(), "{t}");
+    assert!(!t.contains("cannot be used"), "{t}");
+    assert!(
+        t.contains("no model endpoint is configured or detected"),
+        "{t}"
+    );
+    std::fs::create_dir_all(inside.join("credentials/codex-auth")).unwrap();
+    let out = f.atomic(&run, &home);
+    let t = text(&out);
+    assert!(!out.status.success(), "{t}");
+    assert!(t.contains("the ChatGPT sign-in cannot be used"), "{t}");
+    assert!(t.contains("inside the checkout holding the project"), "{t}");
+}
+
 #[test]
 fn a_shared_store_or_serve_refuses_the_personal_sign_in() {
     let f = Fixture::new("shared");
