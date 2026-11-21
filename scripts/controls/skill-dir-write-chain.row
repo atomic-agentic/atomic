@@ -1,1 +1,1 @@
-skill-dir-write-chain|crates/atomic/src/setup.rs|            !is_link(&chain),|            false, // CONTROL_OFF|-p atomic-agentic --bin atomic -- a_write_refuses_a_directory_reached_through_a_link
+skill-dir-write-chain|crates/atomic/src/setup.rs|            !is_link(&chain),|            true, // CONTROL_OFF|-p atomic-agentic --bin atomic -- a_write_refuses_a_directory_reached_through_a_link
