@@ -6031,19 +6031,21 @@ fn a_run_parked_before_its_next_command_finishes_in_the_same_process() {
         let park = nth_park(&rt, "naps-4", 1).await;
         assert!(park.step.starts_with("second"), "{}", park.step);
         assert_eq!(commands(&rt, "naps-4").await.len(), 1, "only the first ran");
-        rt.ledger()
-            .raise(
-                "run:naps-4",
-                Caps {
+        // An operator raises the run's minutes and releases the park.
+        release_raising(
+            &rt,
+            &park,
+            Some(atomic_durable::release::Raise {
+                scope: "run:naps-4".into(),
+                caps: Caps {
                     tokens: 0,
                     millis: 600_000,
                     micro_usd: None,
                 },
-            )
-            .await
-            .expect("raise")
-            .expect("exists");
-        atomic_durable::release(&rt, &park).await.expect("release");
+            }),
+        )
+        .await
+        .expect("release");
         let out: Value = rt.result("naps-4").await.expect("finishes");
         assert_eq!(out["slept"].as_f64(), Some(0.0), "{out}");
         let ran = commands(&rt, "naps-4").await;
