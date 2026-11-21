@@ -128,10 +128,10 @@ exit "${status}"
 SH
 chmod +x "${WORK}/bin/cargo"
 
-# A cp that keeps the timestamp of what it copies, as `cp -p` and some cp
-# implementations do. Only the rebuild case runs with it on the PATH: it is
-# how a restore can put a file back looking older than the binaries built
-# from it while its control was off.
+# A cp that keeps the timestamp of what it copies, as `cp -p` or an alias
+# for it does. A plain cp gives the file a new mtime, so cargo rebuilds; only
+# with this cp on the PATH does the rebuild case depend on the script's own
+# touch, which is what it tests.
 mkdir -p "${WORK}/bin-oldcp"
 cp_bin="$(command -v cp)"
 cat >"${WORK}/bin-oldcp/cp" <<SH
@@ -268,6 +268,24 @@ run honest
 grep -Eq "differ from HEAD:.*src/git\.rs.*src/codex\.rs" <<<"${out}" ||
     fail "dirty at the start, all controls: exit ${code}: ${out}"
 
+# A file git does not track, or one it is told to assume unchanged, cannot
+# be shown to match HEAD, so it is refused the same way.
+repo="$(fresh)"
+git -C "${repo}" update-index --assume-unchanged crates/atomic-core/src/git.rs
+printf '\n// a change git is told not to look at\n' >>"${repo}/crates/atomic-core/src/git.rs"
+run honest git-hardening
+[ "${code}" -ne 0 ] && grep -q "nothing was edited" <<<"${out}" ||
+    fail "assume-unchanged at the start: exit ${code}: ${out}"
+[ ! -e "${repo}/cargo-args" ] || fail "assume-unchanged at the start: cargo ran"
+repo="$(fresh)"
+git -C "${repo}" rm -q --cached crates/atomic-core/src/git.rs
+git -C "${repo}" -c user.name=test -c user.email=test@example.invalid -c commit.gpgSign=false \
+    commit -qm "stop tracking git.rs"
+run honest git-hardening
+[ "${code}" -ne 0 ] && grep -q "nothing was edited" <<<"${out}" ||
+    fail "untracked at the start: exit ${code}: ${out}"
+[ ! -e "${repo}/cargo-args" ] || fail "untracked at the start: cargo ran"
+
 # A restore that leaves a file matching the copy the run made, but not HEAD,
 # fails and keeps its state: the manifest's own hash cannot see that what was
 # saved was never the commit.
@@ -345,6 +363,7 @@ untouched || fail "after a kill: the saved original does not restore the file"
 # fails.
 #
 #   dirty+="${file} "                               dirty at the start
+#   *) return 1 ;;                  in head_diff    untracked, assume-unchanged
 #   head_diff "${file}" || code=$?  in restore      stale restore
 #   && touch -- "$1"                in put_back     rebuild, in rebuild.log
 #   touch -- "${file}"              in restore      rebuild, against artefacts

@@ -93,10 +93,9 @@ copy_of() {
     echo "${STATE}/$(tr / % <<<"$1")"
 }
 
-# Put a file's saved original back, and make its mtime newer than anything the
-# build has already made from it. cargo rebuilds on mtime, so a restore that
-# leaves a file looking older than the artefacts built while its control was
-# off would have the tests run the switched-off code again.
+# Put a file's saved original back, and make its mtime now. A plain cp already
+# does that, so cargo rebuilds what it built with the control off; the touch
+# keeps that true for a cp that preserves timestamps (cp -p, or an alias).
 put_back() {
     cp -- "$(copy_of "$1")" "$1" && touch -- "$1"
 }
@@ -104,8 +103,15 @@ put_back() {
 # git's answer for how a file stands against HEAD: 0 when it matches the
 # commit, 1 when it differs, and anything else when git could not be asked --
 # in a linked worktree whose main checkout's .git is not mounted, for instance.
+# A file git does not track, or one marked assume-unchanged or skip-worktree,
+# counts as differing: git diff would say nothing about it either way.
 head_diff() {
-    local code=0
+    local code=0 listed
+    listed="$(git ls-files -v -- "$1")" || return 2
+    case "${listed}" in
+        "H "*) ;;
+        *) return 1 ;;
+    esac
     git diff --quiet HEAD -- "$1" || code=$?
     return "${code}"
 }
@@ -151,7 +157,7 @@ for row in "${selected[@]}"; do
     seen+="${file} "
 done
 [ "${dirty}" = " " ] ||
-    die_unedited "these files differ from HEAD:${dirty% *}. A run edits them and puts back what it found, so it would restore that state and read as a clean restore; commit them or put them back first"
+    die_unedited "these files differ from HEAD:${dirty% *} (a file git does not track as committed counts). A run edits them and puts back what it found, so it would restore that state and read as a clean restore; commit them or put them back first"
 
 # Save every file the selected controls edit, and check each copy, before
 # editing anything.
