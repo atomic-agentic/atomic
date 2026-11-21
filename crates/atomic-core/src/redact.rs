@@ -1385,13 +1385,18 @@ fn redact_held(strength: Strength, value: &mut Value, nested: usize) {
         *secret = Value::String(REDACTED.into());
     }
     match value {
-        // JSON in a string is redacted as JSON, not taken whole for a
-        // credential: its compact form, as redaction writes it back, can
-        // look like one.
-        Value::String(string) if !is_json(string) && is_secret_value(strength, string) => {
+        // Whole, as anywhere: under a secret's name, every string; under
+        // a hint, one that looks like a credential.
+        Value::String(string) if is_secret_value(strength, string) => {
             *string = REDACTED.into();
         }
-        Value::String(string) => redact_string_held(string, nested, Some(strength)),
+        // JSON under a hint, which can hold the secret by name, is redacted
+        // as JSON; when it cannot be opened, as text.
+        Value::String(string) => {
+            if strength == Strength::Strong || !open_held_json(string, nested) {
+                redact_string_held(string, nested, Some(strength));
+            }
+        }
         Value::Number(_) if strength == Strength::Strong => *value = Value::String(REDACTED.into()),
         Value::Array(items) => {
             redact_flag_values(items);
@@ -1429,11 +1434,29 @@ fn redact_held(strength: Strength, value: &mut Value, nested: usize) {
     }
 }
 
-/// Whether `text` is a JSON object or array.
-fn is_json(text: &str) -> bool {
-    text.trim_start().starts_with(['{', '['])
-        && text.len() <= MAX_TEXT
-        && serde_json::from_str::<Value>(text).is_ok()
+/// Open `string`, held under a hint, as JSON, before anything else touches
+/// it, and redact what it holds as held; then write it back in its own
+/// canonical form, pretty, so a key given twice keeps only what the JSON
+/// means, and redacting it again opens it again. Whether it was JSON that
+/// could be opened at this depth.
+fn open_held_json(string: &mut String, nested: usize) -> bool {
+    if nested >= MAX_NESTED_JSON
+        || string.len() > MAX_TEXT
+        || !string.trim_start().starts_with(['{', '['])
+    {
+        return false;
+    }
+    let Ok(mut inner) = serde_json::from_str::<Value>(string) else {
+        return false;
+    };
+    redact_held(Strength::Weak, &mut inner, nested + 1);
+    match serde_json::to_string_pretty(&inner) {
+        Ok(canonical) => {
+            *string = canonical;
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 /// A key [`rename_keys`] renamed: what it was, and its new name before any
