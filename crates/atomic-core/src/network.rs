@@ -353,6 +353,7 @@ struct Budget(Mutex<u64>);
 
 /// The process's budget, shared by every proxy, since the limit is the
 /// process's.
+#[cfg(not(test))]
 static BUDGET: Budget = Budget(Mutex::new(0));
 
 /// One command's room in a [`Budget`], given back when it ends.
@@ -1159,7 +1160,11 @@ mod tests {
         let Err(why) = OURS.reserve(limit) else {
             panic!("room for a third");
         };
-        assert!(why.to_string().contains("commands that declare hosts are running"), "{why}");
+        assert!(
+            why.to_string()
+                .contains("commands that declare hosts are running"),
+            "{why}"
+        );
         drop(first);
         let third = OURS.reserve(limit).expect("room again");
         drop((second, third));

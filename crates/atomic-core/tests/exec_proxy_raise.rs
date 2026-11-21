@@ -21,7 +21,10 @@ fn limits() -> libc::rlimit {
         rlim_max: 0,
     };
     // SAFETY: getrlimit writes one rlimit.
-    assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) }, 0);
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+        0
+    );
     limit
 }
 
@@ -56,8 +59,8 @@ fn atomic_raises_its_limit_on_open_files_before_it_refuses_a_command() {
         PathBuf::from("/opt/atomic"),
         PathBuf::from("/opt/bin/codex-linux-sandbox"),
     );
-    let sandbox = ExecSandbox::new(&paths, StateGuard::NoProjectState, dir.join("codex"))
-        .expect("a helper");
+    let sandbox =
+        ExecSandbox::new(&paths, StateGuard::NoProjectState, dir.join("codex")).expect("a helper");
     let command = atomic_exec::Command {
         program: "sh".into(),
         cwd: dir.clone(),
