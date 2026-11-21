@@ -682,15 +682,20 @@ fn a_turns_helper_started_by_its_bare_name_is_never_found_along_path() {
     };
     // A bubblewrap from before `--argv0`: it runs what follows `--` as it is
     // named, looking a bare name up along PATH.
+    let bwrap_ran = dir.join("bwrap-ran");
     script(
         &dir.join("old-bwrap/bwrap"),
-        "#!/bin/sh\n\
+        &format!(
+            "#!/bin/sh\n\
          case \"$1\" in --help) echo 'usage: bwrap --as-pid-1 --perms --ro-bind-fd'; exit 0;; esac\n\
+         touch '{}'\n\
          while [ \"$#\" -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n\
          shift\n\
          if command -v \"$1\" >/dev/null 2>&1; then exec \"$@\"; fi\n\
          echo \"bwrap: execvp $1: Not a directory\" >&2\n\
          exit 1\n",
+            bwrap_ran.display()
+        ),
     );
     let ran = dir.join("planted-ran");
     script(
@@ -725,6 +730,14 @@ fn a_turns_helper_started_by_its_bare_name_is_never_found_along_path() {
         "the planted program ran in the inner stage's place:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    // The old bubblewrap is what the turn's command went to, and it was
+    // asked to run the name that is a path, which it could not.
+    assert!(bwrap_ran.exists(), "the old bubblewrap never ran");
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        said.contains("execvp /dev/null/codex-linux-sandbox"),
+        "the command's output: {said}"
+    );
 }
 
 /// A `workspace-write` turn in `dir` running one command, with atomic itself
@@ -742,8 +755,9 @@ fn turn_with_a_bare_helper(dir: &Path) {
             PathBuf::from(env!("CARGO_BIN_EXE_atomic")),
             PathBuf::from(env!("CARGO_BIN_EXE_atomic")),
         );
-        // The command may fail where the helper cannot be found; the turn
-        // ends either way.
+        // The command fails where the helper cannot be found; the turn ends
+        // either way, and what the command printed is shown for the test that
+        // started this process to read.
         let _ = run_turn(
             &rt,
             &backend,
@@ -754,5 +768,9 @@ fn turn_with_a_bare_helper(dir: &Path) {
             },
         )
         .await;
+        println!(
+            "{}",
+            serde_json::to_string(&model.requests()).expect("requests")
+        );
     });
 }

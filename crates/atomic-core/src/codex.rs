@@ -1343,7 +1343,7 @@ pub fn is_helper(mut args: impl Iterator<Item = std::ffi::OsString>) -> bool {
     // name, as Codex runs it when it could not make its link to atomic
     // under the helper's name (see [`run_as_linux_sandbox`]).
     #[cfg(target_os = "linux")]
-    if first == LINUX_SANDBOX_ARG1 {
+    if helper_arguments(&first, args.next().as_deref()) {
         return true;
     }
     // Exactly the first arguments Codex's dispatch at the pinned revision
@@ -1371,9 +1371,9 @@ pub fn run_helper() -> anyhow::Result<()> {
     // bare one it would look for along PATH. The inner stage is left as it
     // is, already past bubblewrap.
     #[cfg(target_os = "linux")]
-    if linux_sandbox_args()
+    if linux_sandbox_args(std::env::args_os())
         && !is_inner_stage(std::env::args_os())
-        && (!invoked_as_linux_sandbox() || started_by_bare_name())
+        && (!invoked_as_linux_sandbox() || started_by_relative_name())
     {
         return Err(run_as_linux_sandbox());
     }
@@ -2146,27 +2146,46 @@ fn scrub(mut remove: impl FnMut(&str)) {
 #[cfg(target_os = "linux")]
 const LINUX_SANDBOX_ARG1: &str = "--sandbox-policy-cwd";
 
-/// Whether this process was started under a name with no `/` in it, which
-/// a program it runs by that name would be looked for along PATH.
+/// Whether this process was started under a name that is not an absolute
+/// path: a bare one, which a program run by that name would be looked for
+/// along PATH, or a relative one, which would be resolved against whatever
+/// directory it is run from, the workspace a command writes among them.
 /// `scripts/controls/sandbox-helper-bare-name.row` switches this off.
 #[cfg(target_os = "linux")]
-fn started_by_bare_name() -> bool {
+fn started_by_relative_name() -> bool {
     let argv0 = std::env::args_os().next().unwrap_or_default();
-    !argv0.as_encoded_bytes().contains(&b'/')
+    !Path::new(&argv0).is_absolute()
+}
+
+/// The option Codex may give its Linux sandbox helper ahead of
+/// [`LINUX_SANDBOX_ARG1`], for a command of its own at the pinned revision.
+#[cfg(target_os = "linux")]
+const INHERIT_PID_NAMESPACE: &str = "--inherit-pid-namespace";
+
+/// Whether `first` and `second`, the first two arguments after the
+/// program's name, are how Codex starts its Linux sandbox helper: with
+/// [`LINUX_SANDBOX_ARG1`], alone or after [`INHERIT_PID_NAMESPACE`].
+/// `scripts/controls/sandbox-helper-pid-namespace.row` switches the second
+/// form off.
+#[cfg(target_os = "linux")]
+fn helper_arguments(first: &std::ffi::OsStr, second: Option<&std::ffi::OsStr>) -> bool {
+    let after_inherit = first == INHERIT_PID_NAMESPACE;
+    first == LINUX_SANDBOX_ARG1 || (after_inherit && second == Some(LINUX_SANDBOX_ARG1.as_ref()))
 }
 
 /// Whether this process was given the Linux sandbox helper's arguments,
 /// under a name that is not one of Codex's other helpers'.
 #[cfg(target_os = "linux")]
-fn linux_sandbox_args() -> bool {
-    let mut args = std::env::args_os();
+fn linux_sandbox_args(args: impl IntoIterator<Item = std::ffi::OsString>) -> bool {
+    let mut args = args.into_iter();
     let patch = args
         .next()
         .as_deref()
         .map(Path::new)
         .and_then(Path::file_name)
         .is_some_and(|name| name == "apply_patch" || name == "applypatch");
-    !patch && args.next().as_deref() == Some(LINUX_SANDBOX_ARG1.as_ref())
+    let first = args.next().unwrap_or_default();
+    !patch && helper_arguments(&first, args.next().as_deref())
 }
 
 /// The name this executable runs again under as Codex's Linux sandbox
@@ -4765,9 +4784,27 @@ mod tests {
         // The Linux sandbox helper by its arguments, as Codex runs atomic
         // itself when it could not link to it under the helper's name.
         #[cfg(target_os = "linux")]
-        assert!(is_helper(
-            args(&["/opt/atomic", "--sandbox-policy-cwd", "/x", "--", "true"]).into_iter()
-        ));
+        for by_args in [
+            &["/opt/atomic", "--sandbox-policy-cwd", "/x", "--", "true"][..],
+            &[
+                "/opt/atomic",
+                "--inherit-pid-namespace",
+                "--sandbox-policy-cwd",
+                "/x",
+                "--",
+                "true",
+            ][..],
+        ] {
+            assert!(is_helper(args(by_args).into_iter()), "{by_args:?}");
+            assert!(linux_sandbox_args(args(by_args)), "{by_args:?}");
+        }
+        #[cfg(target_os = "linux")]
+        for not_by_args in [
+            &["/opt/atomic", "--inherit-pid-namespace", "run"][..],
+            &["/opt/apply_patch", "--sandbox-policy-cwd", "/x"][..],
+        ] {
+            assert!(!linux_sandbox_args(args(not_by_args)), "{not_by_args:?}");
+        }
         for not in [
             &["atomic", "run", "x"][..],
             &["atomic", "--codex-run-as-anything"][..],
