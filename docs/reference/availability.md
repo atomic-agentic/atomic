@@ -95,7 +95,7 @@ on stderr that it waits, and the run goes on once there is room. atomic's own
 writes for a step that find the disk or a quota full, making its run's build
 caches or the directory its worktree goes in, wait the same way. A checkout git
 cannot finish, for a full disk or anything else, fails the step with what git
-said; once space is freed, `atomic runs resume` continues the run. Each of
+said, and the run ends failed; once space is freed, start it again. Each of
 these waits, and the wait for the backend, keeps its own clock, so a worktree
 step may wait up to three times its limit: for its caches, its worktree's
 directory and its workspace. Without a limit, a step whose own writes find the

@@ -87,7 +87,7 @@ impl WorktreeError {
     pub fn described(&self) -> String {
         match self {
             WorktreeError::Git(_) => {
-                format!("{self}; if the disk is full, free space and resume the run")
+                format!("{self}; if the disk is full, free space and start the run again")
             }
             _ => self.to_string(),
         }
@@ -1002,7 +1002,7 @@ mod tests {
         assert!(!git.disk_full(), "what git prints is not read");
         assert!(
             git.described()
-                .ends_with("; if the disk is full, free space and resume the run"),
+                .ends_with("; if the disk is full, free space and start the run again"),
             "{}",
             git.described()
         );
@@ -1162,7 +1162,7 @@ mod tests {
             };
             assert!(
                 e.described()
-                    .contains("if the disk is full, free space and resume the run"),
+                    .contains("if the disk is full, free space and start the run again"),
                 "{}",
                 e.described()
             );
