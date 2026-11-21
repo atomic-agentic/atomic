@@ -1,0 +1,1 @@
+skill-dir-temp-plain-mode|crates/atomic/src/setup.rs|        u32::from(st.st_mode) & 0o777|        u32::from(st.st_mode) & 0o7777|-p atomic-agentic --bin atomic -- a_replaced_files_special_bits_are_never_kept

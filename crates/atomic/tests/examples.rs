@@ -84,6 +84,7 @@ fn every_v0_1_example_passes_the_real_load_and_check() {
             .env("ATOMIC_HOME", dir.join(".state"))
             .env("ATOMIC_DETECT_OLLAMA_ADDR", "127.0.0.1:9")
             .env_remove("OPENAI_API_KEY")
+            .env_remove("OPENAI_BASE_URL")
             .env("XDG_CONFIG_HOME", dir.join(".state/config"))
             .output()
             .expect("atomic check");
@@ -248,6 +249,7 @@ fn a_workspace_member_resolves_shared_schemas_from_anywhere() {
             .env("ATOMIC_HOME", dir.join(".state"))
             .env("ATOMIC_DETECT_OLLAMA_ADDR", "127.0.0.1:9")
             .env_remove("OPENAI_API_KEY")
+            .env_remove("OPENAI_BASE_URL")
             .env("XDG_CONFIG_HOME", dir.join(".state/config"))
             .output()
             .expect("atomic check")
@@ -327,6 +329,7 @@ fn compact_sidecars_expand_to_the_example_long_forms() {
             .env("ATOMIC_HOME", dir.join(".state"))
             .env("ATOMIC_DETECT_OLLAMA_ADDR", "127.0.0.1:9")
             .env_remove("OPENAI_API_KEY")
+            .env_remove("OPENAI_BASE_URL")
             .env("XDG_CONFIG_HOME", dir.join(".state/config"))
             .output()
             .expect("atomic")
@@ -387,6 +390,7 @@ fn atomic_check_reads_openapi_toolsets() {
             .env("ATOMIC_HOME", dir.join(".state"))
             .env("ATOMIC_DETECT_OLLAMA_ADDR", "127.0.0.1:9")
             .env_remove("OPENAI_API_KEY")
+            .env_remove("OPENAI_BASE_URL")
             .env("XDG_CONFIG_HOME", dir.join(".state/config"))
             .output()
             .expect("atomic check")
@@ -417,6 +421,46 @@ fn atomic_check_reads_openapi_toolsets() {
         "{error}"
     );
     std::fs::remove_file(dir.join("toolsets/jobs.openapi.yaml")).expect("remove");
+    // The same for a response that declares its body under more than one media
+    // type: the reply's `Content-Type` picks which schema governs it, so the
+    // second one is checked too, and must compile.
+    std::fs::write(
+        dir.join("toolsets/media.openapi.yaml"),
+        "openapi: 3.1.0\ninfo: { title: Media, version: '1' }\npaths:\n  /thing:\n    get:\n      operationId: thing\n      responses:\n        '200':\n          description: two media types, the second one's schema broken\n          content:\n            application/json: { schema: { type: object } }\n            application/problem+json: { schema: { type: object, properties: { title: { type: 12 } } } }\n",
+    )
+    .expect("spec");
+    let output = check();
+    assert!(
+        !output.status.success(),
+        "a second media type's schema that does not compile passed"
+    );
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains("media.openapi.yaml") && error.contains("operation `thing`"),
+        "{error}"
+    );
+    std::fs::remove_file(dir.join("toolsets/media.openapi.yaml")).expect("remove");
+    // A failure response is not one a reply is checked against, so nothing of
+    // it is compiled: a `404` whose schema reaches for a component that is not
+    // in the spec does not fail the check, and the operation beside it is
+    // imported with its `200`.
+    std::fs::write(
+        dir.join("toolsets/failed.openapi.yaml"),
+        "openapi: 3.1.0\ninfo: { title: Failed, version: '1' }\npaths:\n  /thing:\n    get:\n      operationId: thing\n      responses:\n        '200': { description: ok, content: { application/json: { schema: { type: object } } } }\n        '404': { description: no such thing, content: { application/json: { schema: { $ref: '#/components/schemas/Nowhere' } } } }\n        '500': { description: broken, content: { application/json: { schema: { type: 12 } } } }\n",
+    )
+    .expect("spec");
+    let output = check();
+    assert!(
+        output.status.success(),
+        "a failure response's broken schema failed the check: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("2 toolset operations"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    std::fs::remove_file(dir.join("toolsets/failed.openapi.yaml")).expect("remove");
     std::fs::write(
         dir.join("toolsets/broken.openapi.yaml"),
         "swagger: '2.0'\npaths: {}\n",

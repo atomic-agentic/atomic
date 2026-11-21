@@ -1,0 +1,1 @@
+skill-dir-empty-shell|crates/atomic/src/setup.rs|            let cleared = if report.shells_only(shells) {|            let cleared = if true { // CONTROL_OFF|-p atomic-agentic --bin atomic -- an_empty_directory_stays_while_something_else_is_refused

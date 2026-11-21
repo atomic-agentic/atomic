@@ -1,0 +1,1 @@
+signin-tidy-no-link|crates/atomic-core/src/signin.rs|        if self.reached.is_symlink() {|        if false {|-p atomic-agentic-core --lib signin::tests::tidying_never_goes_through_a_link

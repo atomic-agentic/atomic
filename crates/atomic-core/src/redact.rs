@@ -1844,6 +1844,35 @@ pub fn value(value: &mut Value) {
     redact_nested(value, 0);
 }
 
+/// Tell the person where to sign in: Codex's authorize address for
+/// `atomic model login`, written as it is. It holds no secret (a client id,
+/// where to come back to, and a random state and PKCE challenge, which are
+/// public), but a random value can look like a token, and redacting one
+/// would break the login. Anything but such an address, on loopback or over
+/// HTTPS with no user or password in it, is redacted as any line is. Either
+/// is then made safe for a terminal, as every log line is.
+pub fn log_sign_in_address(address: &str) {
+    eprintln!("{}", sign_in_line(address));
+}
+
+/// What [`log_sign_in_address`] writes for `address`.
+pub(crate) fn sign_in_line(address: &str) -> String {
+    let authorize = url::Url::parse(address).is_ok_and(|u| {
+        let local = matches!(u.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"));
+        (u.scheme() == "https" || (u.scheme() == "http" && local))
+            && u.username().is_empty()
+            && u.password().is_none()
+            && u.path() == "/oauth/authorize"
+    });
+    let line = format!("Sign in in your browser. If it did not open, go to:\n\n  {address}\n");
+    let line = if authorize && line.chars().count() <= MAX_TEXT {
+        line
+    } else {
+        bounded(&line, MAX_TEXT)
+    };
+    crate::terminal::block(&line)
+}
+
 /// Write one log line to stderr, redacted and bounded to [`MAX_TEXT`]
 /// characters, and then made safe for a terminal, which can lengthen it. atomic's own log lines go
 /// through this, never straight to `eprintln!`: what they name, a run's id

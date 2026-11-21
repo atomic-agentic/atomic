@@ -1,0 +1,1 @@
+openai-base-url-deferred|crates/atomic/src/engine.rs|    if required && let Some(why) = &resolved.refused_endpoint {|    if required && let Some(why) = None::<&String> {|-p atomic-agentic --test run_cli an_unfit_openai_base_url_stops_a_model_run_and_not_a_check

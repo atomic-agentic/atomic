@@ -152,7 +152,10 @@ pub(crate) async fn settled<T>(
 /// `atomic serve` from reaching the arm here that stops the process.
 pub fn atom_failure(e: AtomError) -> DurableError {
     match e {
-        AtomError::Budget(why) => DurableError::Parked(why),
+        AtomError::Budget(refusal) => DurableError::Parked {
+            reason: refusal.reason,
+            scope: refusal.scope,
+        },
         // Nothing ran, and nothing will on this machine until it is fixed:
         // the process stops, recording nothing, and the run waits to be
         // resumed where atoms' commands can be confined.
