@@ -16,10 +16,21 @@
 //! - more than one document in a file;
 //! - plain (unquoted) `yes`, `no`, `on` and `off` in any letter case, which
 //!   YAML 1.1 reads as booleans: quote them to mean the string;
+//! - plain integers whose spelling YAML 1.1 and YAML 1.2 do not read the same
+//!   way: a leading zero (`0200` and `010`, which YAML 1.1 reads as the octal
+//!   128 and 8), and a sign written after the base prefix (`0x-1F`, which the
+//!   core schema reads as a string and a reader that takes a sign there reads
+//!   as -31);
+//! - a base-8 or base-16 integer past signed 64 bits, which the core schema
+//!   reads as an integer this loader cannot read as a number at all, where a
+//!   decimal that large is still read as one;
 //! - `.inf` and `.nan`, which JSON has no form for.
 //!
 //! Only `true` and `false` are booleans; `null`, `~` and an empty value are
-//! null; integers and floats follow the core schema.
+//! null; integers and floats follow the core schema, except where a bullet
+//! above refuses the spelling. The loader does not take a sign before a base
+//! prefix, so `-0x1F` and `+0o17` are strings: write `-31` and `15`. Quoting
+//! any refused spelling gives the string it is read as elsewhere.
 
 use saphyr_parser::{Event, Parser, ScalarStyle, Span};
 use serde_json::{Map, Number, Value};
@@ -254,26 +265,33 @@ impl<'a> Loader<'a> {
                     // its own text: OpenAPI specs write status codes unquoted,
                     // so `200:` is the key `"200"`, and the mapping's duplicate
                     // check sees the two spellings as one key.
-                    match self.scalar(at, &text, style)? {
-                        Value::String(s) => Ok((s, at)),
+                    match core_scalar(&text) {
+                        Core::Text => Ok((text.into_owned(), at)),
                         // Only when the number's string form is the source
                         // text, which leaves `0` and `-?[1-9][0-9]*`, read the
-                        // same by YAML 1.1 and 1.2. Any other spelling that
-                        // core_int takes for an integer, such as `+2`, `0200`,
-                        // `007`, `0x1F`, `0o17` or `-0`, would be renamed to
-                        // the value it reads as, so `007:` and `"007":` would
-                        // be two different keys; it is refused below.
-                        Value::Number(n)
+                        // same by YAML 1.1 and 1.2. Any other number reads as
+                        // a key that would be renamed to the value it is read
+                        // as, so `0x1F:` and `"0x1F":` would be two different
+                        // keys; it is refused below.
+                        Core::Value(Value::Number(n))
                             if (n.is_i64() || n.is_u64()) && n.to_string() == *text =>
                         {
                             Ok((text.into_owned(), at))
                         }
-                        other => Err(self.error(
+                        Core::Value(other) => Err(self.error(
                             at,
                             format!(
                                 "keys must be a string or a plain decimal integer, \
                                  and this one reads as {other}; quote it"
                             ),
+                        )),
+                        // A spelling core_int refuses, such as `0200:`, is
+                        // refused as a key for the same reason it is refused
+                        // as a value, and quoting it is the same fix either
+                        // way, so the reason is given as it stands.
+                        Core::Refused(why) => Err(self.error(
+                            at,
+                            format!("keys must be a string or a plain decimal integer, and {why}"),
                         )),
                     }
                 } else {
@@ -281,10 +299,11 @@ impl<'a> Loader<'a> {
                 }
             }
             Event::Alias(_) => Err(self.error(at, "aliases (*name) are not allowed")),
+            // Not "quote it": a mapping or a sequence is no key here whatever
+            // its own text, so the first clause is the whole advice.
             _ => Err(self.error(
                 at,
-                "keys must be a string or a plain decimal integer, \
-                 not a mapping or a sequence; quote it",
+                "keys must be a string or a plain decimal integer, not a mapping or a sequence",
             )),
         }
     }
@@ -293,74 +312,172 @@ impl<'a> Loader<'a> {
         if style != ScalarStyle::Plain {
             return Ok(Value::String(text.to_owned()));
         }
-        match text {
-            "" | "~" | "null" | "Null" | "NULL" => return Ok(Value::Null),
-            "true" | "True" | "TRUE" => return Ok(Value::Bool(true)),
-            "false" | "False" | "FALSE" => return Ok(Value::Bool(false)),
-            _ => {}
+        match core_scalar(text) {
+            Core::Text => Ok(Value::String(text.to_owned())),
+            Core::Value(value) => Ok(value),
+            Core::Refused(why) => Err(self.error(at, why)),
         }
-        if matches!(
-            text.to_ascii_lowercase().as_str(),
-            "yes" | "no" | "on" | "off"
-        ) {
-            return Err(self.error(
-                at,
-                format!(
-                    "unquoted {text:?} is a boolean in YAML 1.1 and a string in YAML 1.2; \
-                     write true or false for a boolean, or quote it (\"{text}\") for the string"
-                ),
-            ));
-        }
-        if let Some(n) = core_int(text) {
-            return Ok(Value::Number(n));
-        }
-        if let Some(f) = core_float(text) {
-            return match Number::from_f64(f) {
-                Some(n) => Ok(Value::Number(n)),
-                None => Err(self.error(at, format!("{text} cannot be written in JSON"))),
-            };
-        }
-        if matches!(
-            text,
-            ".inf"
-                | ".Inf"
-                | ".INF"
-                | "+.inf"
-                | "+.Inf"
-                | "+.INF"
-                | "-.inf"
-                | "-.Inf"
-                | "-.INF"
-                | ".nan"
-                | ".NaN"
-                | ".NAN"
-        ) {
-            return Err(self.error(at, format!("{text} cannot be written in JSON")));
-        }
-        Ok(Value::String(text.to_owned()))
     }
 }
 
+/// What the YAML 1.2 core schema reads a plain (unquoted) scalar as, and what
+/// this loader does with the spellings it will not take.
+enum Core {
+    /// Neither a null, a bool nor a number: the text, read as a string.
+    Text,
+    /// A null, bool or number that YAML 1.1, YAML 1.2 and JSON read alike.
+    Value(Value),
+    /// A spelling this loader refuses, because versions do not read it alike or
+    /// because it cannot be read as a number at all. The message says which,
+    /// and how to write what the author meant.
+    Refused(String),
+}
+
+fn core_scalar(text: &str) -> Core {
+    match text {
+        "" | "~" | "null" | "Null" | "NULL" => return Core::Value(Value::Null),
+        "true" | "True" | "TRUE" => return Core::Value(Value::Bool(true)),
+        "false" | "False" | "FALSE" => return Core::Value(Value::Bool(false)),
+        _ => {}
+    }
+    if matches!(
+        text.to_ascii_lowercase().as_str(),
+        "yes" | "no" | "on" | "off"
+    ) {
+        return Core::Refused(format!(
+            "unquoted {text:?} is a boolean in YAML 1.1 and a string in YAML 1.2; \
+             write true or false for a boolean, or quote it (\"{text}\") for the string"
+        ));
+    }
+    match core_int(text) {
+        CoreInt::Number(n) => return Core::Value(Value::Number(n)),
+        CoreInt::Refused(why) => return Core::Refused(why),
+        CoreInt::NotAnInt => {}
+    }
+    if let Some(f) = core_float(text) {
+        return match Number::from_f64(f) {
+            Some(n) => Core::Value(Value::Number(n)),
+            None => Core::Refused(format!("{text} cannot be written in JSON")),
+        };
+    }
+    if matches!(
+        text,
+        ".inf"
+            | ".Inf"
+            | ".INF"
+            | "+.inf"
+            | "+.Inf"
+            | "+.INF"
+            | "-.inf"
+            | "-.Inf"
+            | "-.INF"
+            | ".nan"
+            | ".NaN"
+            | ".NAN"
+    ) {
+        return Core::Refused(format!("{text} cannot be written in JSON"));
+    }
+    Core::Text
+}
+
+/// What the core schema reads a plain scalar written like an integer as.
+enum CoreInt {
+    /// Not an integer under the core schema: `1.5`, `1_000`, `0xZZ`.
+    NotAnInt,
+    /// An integer, read as a number.
+    Number(Number),
+    /// A spelling of an integer that versions do not read alike, or one too
+    /// large to read; the message says which, and how to fix it.
+    Refused(String),
+}
+
 /// Core schema integers: decimal with an optional sign, `0o` octal, `0x` hex.
-fn core_int(text: &str) -> Option<Number> {
-    let digits = text.strip_prefix(['-', '+']).unwrap_or(text);
+/// A leading zero and a sign written after the base prefix are refused rather
+/// than read, because YAML 1.1 and YAML 1.2 do not read them alike, and a
+/// base-8 or base-16 integer past signed 64 bits is refused because this
+/// loader cannot read it as a number.
+fn core_int(text: &str) -> CoreInt {
+    let (sign, digits) = match text.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", text.strip_prefix('+').unwrap_or(text)),
+    };
     if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+        if digits.len() > 1 && digits.starts_with('0') {
+            // YAML 1.2 reads the digits as decimal; YAML 1.1 reads them as
+            // octal, or as a string when a digit is not an octal digit. The
+            // two do not always land on a different number (`007` is 7 both
+            // ways), but the spelling is a decimal in one version and an
+            // octal in the other, so it is refused whatever it lands on.
+            let read_as = if !digits.bytes().all(|b| (b as char).is_digit(8)) {
+                // An 8 or a 9 is no octal digit, so YAML 1.1 reads it as a
+                // string rather than as an integer of either base.
+                "a string".to_owned()
+            } else {
+                match i64::from_str_radix(digits, 8) {
+                    // Name the octal number when a number can hold it.
+                    Ok(o) => format!("the octal {sign}{o}"),
+                    Err(_) => "an octal integer".to_owned(),
+                }
+            };
+            return CoreInt::Refused(format!(
+                "unquoted {text:?} has a leading zero, which YAML 1.1 reads as {read_as} and \
+                 YAML 1.2 as decimal; quote it (\"{text}\")"
+            ));
+        }
         // An integer too large for 64 bits is still an integer, as JSON
-        // reads it, never a string.
-        return text
+        // reads it, never a string. A decimal too many digits for even a
+        // float to hold is the string it reads as everywhere else.
+        return match text
             .parse::<i64>()
             .map(Number::from)
             .ok()
             .or_else(|| text.parse::<u64>().map(Number::from).ok())
-            .or_else(|| text.trim_start_matches('+').parse::<Number>().ok());
+            .or_else(|| text.trim_start_matches('+').parse::<Number>().ok())
+        {
+            Some(n) => CoreInt::Number(n),
+            None => CoreInt::NotAnInt,
+        };
     }
-    if let Some(oct) = text.strip_prefix("0o") {
-        return i64::from_str_radix(oct, 8).ok().map(Number::from);
+    let base = match text.strip_prefix("0o") {
+        Some(digits) => Some((8, 'o', "octal", digits)),
+        None => text
+            .strip_prefix("0x")
+            .map(|digits| (16, 'x', "hexadecimal", digits)),
+    };
+    let Some((radix, marker, name, digits)) = base else {
+        return CoreInt::NotAnInt;
+    };
+    if digits.is_empty() {
+        // `0x` and `0o` with no digits after the prefix are strings, as the
+        // core schema reads them.
+        return CoreInt::NotAnInt;
     }
-    if let Some(hex) = text.strip_prefix("0x") {
-        return i64::from_str_radix(hex, 16).ok().map(Number::from);
+    // The core schema writes an integer's sign before its prefix, so it reads
+    // `0x-1F` as a string; a reader that takes the sign where
+    // `from_str_radix` takes it reads the same text as a number. Refused
+    // rather than read as a string, so that a typo here cannot quietly change
+    // the value's type.
+    let sign_inside = match digits.strip_prefix(['-', '+']) {
+        Some(rest) => !rest.is_empty() && rest.bytes().all(|b| (b as char).is_digit(radix)),
+        None => false,
+    };
+    if sign_inside {
+        return CoreInt::Refused(format!(
+            "unquoted {text:?} is not an integer in the YAML 1.2 core schema, which writes the \
+             sign before 0{marker}; quote it (\"{text}\") for the string"
+        ));
     }
-    None
+    match i64::from_str_radix(digits, radix) {
+        Ok(n) => CoreInt::Number(Number::from(n)),
+        // The radix parse fails on a digit the base has no such thing as,
+        // which the core schema reads as a string, and on a value past the
+        // signed 64 bits a number here is read as.
+        Err(_) if !digits.bytes().all(|b| (b as char).is_digit(radix)) => CoreInt::NotAnInt,
+        Err(_) => CoreInt::Refused(format!(
+            "{text} is a {name} integer past signed 64 bits, which this loader cannot read as \
+             a number; quote it (\"{text}\") for the string"
+        )),
+    }
 }
 
 /// Core schema floats: `[-+]?(\.[0-9]+|[0-9]+(\.[0-9]*)?)([eE][-+]?[0-9]+)?`.
