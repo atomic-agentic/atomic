@@ -138,7 +138,9 @@ fn reached(id: &str, position: usize) -> Result<()> {
             *top = position;
             *entries = 0;
         }
-        if position == *top {
+        // A step that stopped for an artifact store held elsewhere, as a pin
+        // does, takes nothing toward dead-lettering, nor does it get further.
+        if position == *top && !atomic_core::runtime::take_held_stop(id) {
             *entries += 1;
         }
         *entries
@@ -723,9 +725,10 @@ fn failed(message: String) -> DurableError {
 /// run again: each try waits as long as the store waits for its lock, and
 /// the wait between tries doubles up to that long. With the store's 30 s,
 /// an execution waits about 7.4 minutes (11 tries of 30 s, and 111 s
-/// between them) before it spends one of durare's recoveries.
-const LOCKED_RETRIES: u32 = 10;
-const LOCKED_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
+/// between them) before it spends one of durare's recoveries. An exec
+/// step giving its command its inputs waits the same.
+const LOCKED_RETRIES: u32 = atomic_core::runtime::STORE_HELD_RETRIES;
+const LOCKED_BACKOFF: std::time::Duration = atomic_core::runtime::STORE_HELD_BACKOFF;
 
 /// How many times this process has found the artifact store held elsewhere
 /// for each run, try by try.
@@ -756,7 +759,7 @@ fn put_waiting_out_the_lock(
     let mut retries = 0;
     loop {
         match store.put(&mut &content[..], provenance.clone()) {
-            Err(ArtifactError::Locked { .. }) if retries < LOCKED_RETRIES => {
+            Err(e @ ArtifactError::Locked { .. }) if retries < LOCKED_RETRIES => {
                 let waits = {
                     let mut all = STORE_WAITS.lock().unwrap_or_else(|e| e.into_inner());
                     let n = all.entry(id.to_owned()).or_insert(0);
@@ -770,7 +773,11 @@ fn put_waiting_out_the_lock(
                     );
                 }
                 retries += 1;
-                std::thread::sleep(backoff);
+                // A stopping process waits no longer: the run stops as it
+                // does once the tries run out.
+                if atomic_core::runtime::sleep_unless_stopping(backoff) {
+                    return Err(e);
+                }
                 backoff = (backoff * 2).min(cap);
             }
             stored => return stored,
@@ -930,7 +937,7 @@ async fn run_pipeline_in<C: WorkflowContext>(
     reached(&id, 0)?;
     let store = services.store.clone();
     fits("the workflow's input", &pipeline.input, &input)?;
-    plan(&pipeline, services.runtimes.codex.backend.statement())?;
+    plan(&pipeline, services.runtimes.backend.statement())?;
     // Every step is held to its atom's trust before the run does anything.
     trusted(&pipeline).map_err(failed)?;
     // The budgets the run keeps: pinned before it started, or resolved now,
@@ -1482,7 +1489,8 @@ async fn turn<C: WorkflowContext>(
             run_id: run_id.clone(),
             step_id: t.name.clone(),
         };
-        let (opening, who, backend) = (atom.clone(), identity.clone(), runtimes.exec.shared());
+        let (opening, who, backend) = (atom.clone(), identity.clone(), runtimes.backend.shared());
+        let (giving, artifacts) = (atom_input.clone(), runtimes.codex.artifacts.clone());
         // The run's own build caches, with a Cargo target of the turn's own.
         let exec_caches = run.caches.map(|c| c.for_exec(&t.name));
         let place = format!("run {run_id}, step {}", t.name);
@@ -1491,13 +1499,25 @@ async fn turn<C: WorkflowContext>(
             (attempt::begin(ctx, &attempt_step).await?, None)
         } else {
             attempt::begin_with(ctx, &attempt_step, move || async move {
-                let opened = atomic_core::runtime::open_exec_workspace(
+                let mut opened = atomic_core::runtime::open_exec_workspace(
                     &opening,
                     &who,
                     backend,
                     exec_caches.as_ref(),
                 )
                 .await;
+                // Its inputs are given here, before the attempt is recorded:
+                // a store held too long then stops the step with nothing
+                // run and nothing recorded, and the run is run again.
+                if let (Ok(workspace), Ok(compiled)) =
+                    (&opened, compile::compile(&opening, &Registry::new()))
+                    && let Err(e) = atomic_core::runtime::give_exec_inputs(
+                        &opening, &compiled, &giving, &who, workspace, &artifacts,
+                    )
+                    .await
+                {
+                    opened = Err(e);
+                }
                 crate::workflows::settled(opened, &place, true).await
             })
             .await?
@@ -1576,33 +1596,44 @@ async fn turn<C: WorkflowContext>(
                     )));
                 }
             }
-            // An earlier execution's attempt replays as interrupted, but
-            // its command may never have started: a cap refused it and the
-            // step parked. The ledger says which: only a command admitted
-            // may have run.
-            let interrupted = match &guard {
-                Some((begun, false, _, _)) if begun.interrupted() => {
-                    !metered
-                        || ledgered.command_admitted(&at).await.map_err(|e| {
-                            failed(format!("step `{id}`: read its command's attempts: {e}"))
-                        })?
+            // The command may have run before when an earlier execution's
+            // attempt replays as interrupted, or when, in this process, an
+            // earlier run of the body took the workspace this attempt
+            // opened. Either way it may never have started: a cap refused it
+            // and the step parked. For a metered step the ledger says which:
+            // only a command admitted may have run. An unmetered one is
+            // taken to have run.
+            let (replayed, taken) = match &guard {
+                Some((begun, false, opened, _)) => {
+                    let replayed = begun.interrupted();
+                    // A replayed attempt opened no workspace here.
+                    (
+                        replayed,
+                        !replayed && opened.lock().map_or(true, |o| o.is_none()),
+                    )
                 }
-                _ => false,
+                _ => (false, false),
             };
-            if interrupted {
+            let admitted = if (replayed || taken) && metered {
+                ledgered
+                    .command_admitted(&at)
+                    .await
+                    .map_err(|e| failed(format!("step `{id}`: read its command's attempts: {e}")))?
+            } else {
+                true
+            };
+            if let Some(why) = ran_before(&atom.name, replayed && admitted, taken && admitted) {
                 return Err(failed(format!(
-                    "step `{id}`: outcome_unknown: an earlier attempt of `{}` was interrupted \
-                         before its result was saved, so whether its command's effects happened \
-                         is unknown. The step is parked and its command does not run again. If \
-                         repeating it is safe, declare `effects: {{ external: 'idempotent' }}` \
-                         (or `'read-only'` if it only reads)",
-                    atom.name
+                    "step `{id}`: outcome_unknown: {why}, so whether its command's effects \
+                     happened is unknown. The step is parked and its command does not run \
+                     again. If repeating it is safe, declare `effects: {{ external: \
+                     'idempotent' }}` (or `'read-only'` if it only reads)"
                 )));
             }
             let proposal = match (tree, guard) {
                 (_, Some((_, _, opened, identity))) => {
                     let clock = runtimes.clock.clone();
-                    let backend = runtimes.exec.shared();
+                    let backend = runtimes.backend.shared();
                     let exec_caches = step_caches.clone();
                     // The store the model runtimes check references against.
                     let artifacts = runtimes.codex.artifacts.clone();
@@ -2446,9 +2477,40 @@ fn recorded_results(
     Ok(recorded)
 }
 
+/// Why the command of exec atom `atom`, about to run in its step's body,
+/// may have run already, so that running it again could repeat its
+/// effects; `None` when this is its first run. Either an earlier execution
+/// was `interrupted` after the step's attempt began, or, in this process,
+/// an earlier run of the step's body took the workspace its attempt opened
+/// (`workspace_taken`), and so ran its command or began to.
+fn ran_before(atom: &str, interrupted: bool, workspace_taken: bool) -> Option<String> {
+    if interrupted {
+        Some(format!(
+            "an earlier attempt of `{atom}` was interrupted before its result was saved"
+        ))
+    } else if workspace_taken {
+        Some(format!(
+            "this step already ran `{atom}`'s command, or began to, in this process"
+        ))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A command runs again only through the effects rule: after an
+    /// interrupted attempt, and after an earlier run of the step's body in
+    /// this process took its attempt's workspace.
+    #[test]
+    fn an_exec_command_that_may_have_run_is_not_run_again_unchecked() {
+        assert_eq!(ran_before("x", false, false), None, "its first run");
+        assert!(ran_before("x", true, true).is_some_and(|why| why.contains("interrupted")));
+        assert!(ran_before("x", true, false).is_some_and(|why| why.contains("interrupted")));
+        assert!(ran_before("x", false, true).is_some_and(|why| why.contains("in this process")));
+    }
 
     /// Only a recorded outcome, finished or failed, removes a run's caches:
     /// an execution that lost a race, or whose outcome went unrecorded,

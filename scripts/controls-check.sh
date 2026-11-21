@@ -5,6 +5,11 @@
 # the control off in the source, runs the test that guards it and requires that
 # test to fail, then puts the source back and requires it to pass again.
 #
+# Every control is one file under scripts/controls/, named <name>.row and
+# holding its one row, so that two branches adding a control add two files and
+# never edit the same line. Add a control by adding a file there; the rows are
+# read in file-name order.
+#
 #   scripts/controls-check.sh            # every control
 #   scripts/controls-check.sh git-dir    # one, by name
 #
@@ -18,8 +23,8 @@
 # the script stops before editing anything.
 #
 # A control whose code has moved, so that its switch no longer applies, fails
-# the check: update the switch here with the code. Each control costs a rebuild
-# of the crates it is in.
+# the check: update the switch in its file under scripts/controls/ with the
+# code. Each control costs a rebuild of the crates it is in.
 #
 # The source is edited in place, so the script guards it. It refuses to start
 # when a file a control names differs from HEAD, because it would restore that
@@ -36,78 +41,18 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"
-FEATURES="atomic-agentic/postgres-tests,atomic-agentic/sandbox-tests"
 STATE="${ROOT}/target/controls-check"
 LOG="${STATE}/cargo.log"
 
-# name | file | text to replace | replacement | cargo test arguments. A
-# control guarded by several tests names them all after `--`; each must fail
-# with the control off.
-CONTROLS=(
-    "git-hardening|crates/atomic-core/src/git.rs|        for setting in HARDENING {|        for setting in HARDENING.iter().take(0) {|-p atomic-agentic-core --test git_safety nothing_in_the_worktree_or_the_repository_runs"
-    "git-filters|crates/atomic-core/src/git.rs|        let mut overrides = (*self.overrides).clone();|        let mut overrides = (*self.overrides).clone(); let names: Vec<String> = { let _ = names; Vec::new() };|-p atomic-agentic-core --test git_safety nothing_in_the_worktree_or_the_repository_runs"
-    "git-dir|crates/atomic-core/src/git.rs|            .env(\"GIT_DIR\", &self.git_dir)|            .env(\"ATOMIC_CONTROL_REMOVED\", &self.git_dir)|-p atomic-agentic-core --test git_safety nothing_in_the_worktree_or_the_repository_runs"
-    "sandbox-writes|crates/atomic-core/src/codex.rs|        crate::typed::Sandbox::WorkspaceWrite => PermissionProfile::workspace_write_with(|        crate::typed::Sandbox::WorkspaceWrite => PermissionProfile::Disabled, _ if false => PermissionProfile::workspace_write_with(|--workspace --features ${FEATURES} --test sandboxed_commit -- the_turn_cannot_commit_and_atomic_commits_after_it a_project_under_the_system_temporary_directory_stays_out_of_reach"
-    "sandbox-tmp|crates/atomic-core/src/codex.rs|            /*exclude_slash_tmp*/ true,|            /*exclude_slash_tmp*/ false,|--workspace --features ${FEATURES} --test sandboxed_commit a_project_under_the_system_temporary_directory_stays_out_of_reach"
-    "sandbox-private-state|crates/atomic-core/src/codex.rs|    for p in paths {|    for p in paths.into_iter().take(0) {|--workspace --features ${FEATURES} --test sandboxed_commit --test exec_private_state -- a_read_only_turn_in_a_worktree_sees_its_checkout an_exec_atom_cannot_reach_atomics_private_state"
-    "sandbox-second-mounts|crates/atomic-core/src/codex.rs|    all.extend(aliases.iter().cloned());|    let _ = aliases; // CONTROL_OFF|--workspace --features ${FEATURES} --test second_mounts a_denied_path_is_denied_at_a_second_mount_of_its_directory"
-    "sandbox-second-mounts-cap|crates/atomic-core/src/codex.rs|    if link_count + second > MAX_LINK_TARGETS {|    if std::hint::black_box(false) && link_count + second > MAX_LINK_TARGETS {|-p atomic-agentic-core --lib --features fake-model a_second_mount_that_cannot_be_denied_refuses_the_list"
-    "sandbox-second-mounts-needed|crates/atomic-core/src/codex.rs|        if let Some(needed) = covers(alias) {|        if let Some(needed) = covers(alias).and(None::<PathBuf>) {|-p atomic-agentic-core --lib --features fake-model a_second_mount_that_cannot_be_denied_refuses_the_list"
-    "sandbox-second-mounts-movable|crates/atomic-core/src/codex.rs|        if two_deep(alias, &writable) {|        if std::hint::black_box(false) && two_deep(alias, &writable) {|-p atomic-agentic-core --lib --features fake-model a_second_mount_that_cannot_be_denied_refuses_the_list"
-    "sandbox-second-mounts-home-checked|crates/atomic-core/src/codex.rs|    for alias in aliases.iter().chain(home_aliases) {|    for alias in aliases.iter() { let _ = home_aliases; // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model a_second_mount_that_cannot_be_denied_refuses_the_list"
-    "sandbox-mounts-namespace-files|crates/atomic-core/src/mounts.rs|                root: root.is_absolute().then_some(root),|                root: Some(root.is_absolute().then_some(root)?), // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model a_real_table_parses_and_finds_what_it_should"
-    "sandbox-mounts-orphan|crates/atomic-core/src/mounts.rs|        if let Some(orphan) = mounts|        if let Some(orphan) = Vec::<Mount>::new() // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model a_mount_on_one_the_table_does_not_list_is_refused"
-    "sandbox-mounts-lost-roots|crates/atomic-core/src/mounts.rs|    let lost_here = !local(&home.kind);|    let lost_here = false; // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model -- a_lost_fuse_root_is_refused a_lost_root_on_any_remote_kind_is_refused"
-    "sandbox-second-mounts-home-counted|crates/atomic-core/src/codex.rs|    let second = aliases.len() + home_aliases.len();|    let second = aliases.len(); let _ = home_aliases; // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model a_second_mount_that_cannot_be_denied_refuses_the_list"
-    "sandbox-mounts-stale-remote|crates/atomic-core/src/mounts.rs|            same_file(&shows, &alias)?;|            let _ = (&shows, &alias); // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model a_stale_remote_root_is_refused_where_the_place_is_there"
-    "sandbox-mounts-part-shown|crates/atomic-core/src/mounts.rs|            (other.at.clone(), path.join(part))|            (other.at.clone(), path.to_owned()) // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model a_stale_remote_root_is_refused_where_the_place_is_there"
-    "sandbox-mounts-alias-unfollowed|crates/atomic-core/src/mounts.rs|        match std::fs::symlink_metadata(alias) {|        match std::fs::metadata(alias) { // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model a_stale_remote_root_is_refused_where_the_place_is_there"
-    "sandbox-mounts-place-unreadable|crates/atomic-core/src/mounts.rs|            Err(e) if not_there(&e) => return Ok(()),|            Err(_) => return Ok(()), // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model a_place_that_cannot_be_looked_at_is_refused"
-    "sandbox-mounts-network|crates/atomic-core/src/mounts.rs|    if unknowable(&home.kind) {|    if std::hint::black_box(false) && unknowable(&home.kind) {|-p atomic-agentic-core --lib --features fake-model a_network_filesystem_mounted_twice_is_refused"
-    "sandbox-mounts-stacked|crates/atomic-core/src/mounts.rs|            here = top(mounts, child);|            here = child; // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model the_mount_at_a_path_is_the_top_of_its_stack"
-    "sandbox-mounts-inside|crates/atomic-core/src/mounts.rs|            aliases_of(mounts, &listed, &inner.at, &mut out)?;|            let _ = inner; // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model a_mount_inside_a_denied_directory_is_followed_to_its_other_mounts"
-    "turn-tmp|crates/atomic-core/src/codex.rs|            std::env::set_var(\"TMPDIR\", own);|            let _ = own;|--workspace --features ${FEATURES} --test turn_workspace concurrent_turns_in_one_directory_never_break_each_others_sandbox"
-    "helper-stage|crates/atomic-core/src/codex.rs|    arg != \"--\"|    { let _ = arg; true }|--workspace --features ${FEATURES} --test turn_workspace a_command_naming_the_inner_stage_leaves_the_registry_shared"
-    "exec-confinement|crates/atomic-exec/src/lib.rs|            Some(confine) => confine.confine_held(command, &self.tmp),|            Some(confine) if std::hint::black_box(false) => confine.confine_held(command, &self.tmp), Some(_) => Ok((command.clone(), None)),|--workspace --features ${FEATURES} --test exec_private_state --test run_cli -- an_exec_atom_cannot_reach_atomics_private_state atomic_run_confines_an_exec_atoms_command a_confined_command_has_no_controlling_terminal"
-    "sandbox-network|crates/atomic-core/src/codex.rs|    codex_protocol::permissions::NetworkSandboxPolicy::Restricted;|    codex_protocol::permissions::NetworkSandboxPolicy::Enabled;|--workspace --features ${FEATURES} --test self_approval --test exec_network -- an_atom_cannot_approve_its_own_gate_through_its_shell a_confined_command_reaches_only_the_hosts_it_is_given"
-    "exec-network-attribution|crates/atomic-core/src/network.rs|        let decision = if req.execution_id.is_none() {|        let decision = if /*CONTROL_OFF*/ false {|-p atomic-agentic-core --lib --features fake-model network::tests::only_a_commands_bridge_can_use_its_proxy"
-    "exec-network-embedded-ipv4|crates/atomic-core/src/network.rs|const EMBEDDING_IPV4: &[&str] = &[\"64:ff9b:*\", \"2002:*:*\", \"2001:0:*\", \"2001::*\"];|const EMBEDDING_IPV4: &[&str] = &[];|-p atomic-agentic-core --lib --features fake-model network::tests::embedded_ipv4_and_this_machines_addresses_are_never_reached"
-    "exec-network-own-addresses|crates/atomic-core/src/network.rs|        .chain(own.iter().map(IpAddr::to_string))|        .chain(own.iter().take(0).map(IpAddr::to_string))|-p atomic-agentic-core --lib --features fake-model network::tests::embedded_ipv4_and_this_machines_addresses_are_never_reached"
-    "exec-network-own-wired|crates/atomic-core/src/network.rs|        let own = self.own()?;|        let own: BTreeSet<IpAddr> = BTreeSet::new(); // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model network::tests::a_prepared_proxy_refuses_this_machines_addresses"
-    "exec-network-own-reuse|crates/atomic-core/src/network.rs|        self.own == *own && alive(self)|        alive(self)|-p atomic-agentic-core --lib --features fake-model network::tests::a_proxy_is_not_reused_once_this_machines_addresses_change"
-    "exec-network-own-nonempty|crates/atomic-core/src/network.rs|        !own.is_empty(),|        true,|-p atomic-agentic-core --lib --features fake-model network::tests::this_machines_addresses_come_from_its_interfaces"
-    "exec-network-public-suffix|crates/atomic-core/src/network.rs|    if lower.starts_with(\"*.\") && public_suffix(name) {|    if /*CONTROL_OFF*/ false {|-p atomic-agentic-core --lib --features fake-model network::tests::a_wildcard_over_a_public_suffix_is_refused"
-    "exec-network-suffix-rule-parent|crates/atomic-core/src/network.rs|    is_suffix(&format!(\"atomic-probe.{name}\"))|    false|-p atomic-agentic-core --lib --features fake-model network::tests::a_wildcard_over_a_public_suffix_is_refused"
-    "exec-network-wildcard-one-site|crates/atomic-core/src/network.rs|                    && within_one_site(&host, parent)|                    && true|-p atomic-agentic-core --lib --features fake-model network::tests::a_wildcard_does_not_reach_across_a_public_suffix_below_it"
-    "exec-network-allowlist|crates/atomic-core/src/network.rs|        } else if !declared(&self.0, &req.host) {|        } else if /*CONTROL_OFF*/ false {|--workspace --features ${FEATURES} --test run_cli an_exec_atom_reaches_only_the_hosts_it_declares"
-    "exec-network-ports|crates/atomic-core/src/network.rs|        } else if !PORTS.contains(&req.port) {|        } else if /*CONTROL_OFF*/ false {|--workspace --features ${FEATURES} --test run_cli an_exec_atom_reaches_only_the_hosts_it_declares"
-    "exec-network-upstream|crates/atomic-core/src/network.rs|        allow_upstream_proxy: false,|        allow_upstream_proxy: /*CONTROL_OFF*/ true,|-p atomic-agentic-core --lib --features fake-model network::tests::a_proxy_uses_no_upstream_proxy_and_no_socks"
-    "exec-network-recheck|crates/atomic-core/src/codex.rs|            let hosts = crate::network::check_hosts(&hosts)|            let hosts = /*CONTROL_OFF*/ Ok::<Vec<String>, String>(hosts)|--workspace --features ${FEATURES} --test exec_network a_confined_command_reaches_only_the_hosts_it_is_given"
-    "exec-network-policy|crates/atomic-core/src/atom.rs|            if let Err(why) = crate::network::check_hosts(&hosts) {|            if let Err(why) = /*CONTROL_OFF*/ Ok::<(), String>(()) { let _ = &hosts;|-p atomic-agentic-core --lib --features fake-model exec_declarations_are_checked_at_load"
-    "stop-subreaper|crates/atomic-exec/src/process.rs|            libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);|            let _ = libc::PR_SET_CHILD_SUBREAPER; // CONTROL_OFF|-p atomic-agentic-exec --test stop_all stopping_ends_every_process_a_command_started_before_it_returns"
-    "stop-wait-complete|crates/atomic-exec/src/process.rs|            if left.is_empty() && complete {|            if left.is_empty() /*CONTROL_OFF*/ {|-p atomic-agentic-exec --lib the_wait_ends_only_after_a_complete_look"
-    "stop-keep-found|crates/atomic-exec/src/process.rs|                found.insert(process);|                let _ = &process; // CONTROL_OFF|-p atomic-agentic-exec --lib the_stop_phase_is_bounded_and_keeps_what_it_found"
-    "stop-kill-on-sight|crates/atomic-exec/src/process.rs|                if watched.insert(process) {|                if /*CONTROL_OFF*/ false && watched.insert(process) {|-p atomic-agentic-exec --test stop_all stopping_ends_every_process_a_command_started_before_it_returns"
-    "stop-own-tool|crates/atomic-exec/src/process.rs|                let own = own(&all, &tools);|                let own = own(&all, &[] /*CONTROL_OFF*/);|-p atomic-agentic-exec --test stop_all stopping_ends_every_process_a_command_started_before_it_returns"
-    "stop-look-cap|crates/atomic-exec/src/process.rs|            look.saturating_mul(2).min(LOOK_MAX)|            look.saturating_mul(2) /*CONTROL_OFF*/|-p atomic-agentic-exec --lib the_next_look_grows_only_when_one_ran_out_and_is_capped"
-    "exec-caches-own|crates/atomic-core/src/runtime.rs|    env.extend(declared_env(atom));|    writable_roots.extend(caches.map(crate::worktree::Caches::dir).and_then(std::path::Path::parent).map(std::path::Path::to_path_buf)); env.extend(declared_env(atom));|--workspace --features ${FEATURES} --test exec_caches an_exec_steps_caches_are_its_runs_alone_and_go_with_it"
-    "signin-personal-only|crates/atomic/src/engine.rs|            (Some(why), true) => {|            (Some(why), true) if std::hint::black_box(false) => {|-p atomic-agentic --test model_auth -- a_shared_store_or_serve_refuses_the_personal_sign_in where_the_sign_in_is_refused_nothing_takes_its_place_and_it_says_what_to_do"
-    "process-hardening|crates/atomic-core/src/codex.rs|        codex_process_hardening::pre_main_hardening();|        let _ = codex_process_hardening::pre_main_hardening;|-p atomic-agentic --test model_auth a_running_atomic_cannot_be_read_through_proc_by_its_own_user"
-    "signin-restrictions|crates/atomic-core/src/codex.rs|        sign_in.allowed_by(&config.auth_config())?;|        let _ = sign_in;|-p atomic-agentic-core --lib --features fake-model codex_login_restrictions_refuse_a_sign_in_they_do_not_allow"
-    "signin-logout-both-stores|crates/atomic-core/src/signin.rs|            AuthCredentialsStoreMode::File,|            AuthCredentialsStoreMode::Keyring,|-p atomic-agentic --test model_auth logout_forgets_the_file_copy_whichever_store_is_chosen"
-    "signin-email-masked-text|crates/atomic/src/main.rs|                if let Some(email) = a.email.as_deref().map(atomic_core::signin::mask_email) {|                if let Some(email) = a.email.as_deref() {|-p atomic-agentic --test model_auth login_status_says_who_is_signed_in_and_logout_forgets_it"
-    "signin-email-masked-json|crates/atomic/src/main.rs|                    \"email\": a.email.as_deref().map(atomic_core::signin::mask_email),|                    \"email\": a.email.as_deref(),|-p atomic-agentic --test model_auth login_status_says_who_is_signed_in_and_logout_forgets_it"
-    "signin-token-overrides|crates/atomic-core/src/codex.rs|        remove(name);|        let _ = name;|-p atomic-agentic-core --lib the_environment_cannot_stand_in_for_or_redirect_a_sign_ins_tokens"
-    "codex-home-read-only|crates/atomic-core/src/codex.rs|    for home in homes.into_iter().flatten() {|    for home in homes.into_iter().flatten().take(0) {|-p atomic-agentic-core --lib private_state_is_denied_and_the_rest_of_the_state_directory_is_not"
-    "codex-home-files|crates/atomic-core/src/codex.rs|        planted_never(&codex_home.join(name))?;|        let _ = name;|-p atomic-agentic-core --lib private_state_is_denied_and_the_rest_of_the_state_directory_is_not"
-    "review-escalates|crates/atomic/src/pipeline.rs|            _ => break (verdict, said),|            atomic_core::workflow::Verdict::Changes => return Ok((candidate.clone(), review_candidate(&candidate))), _ => break (verdict, said),|-p atomic-agentic --test pipeline a_reviewer_catches_a_seeded_bug_and_escalates_after_its_repair_rounds"
-    "artifact-hold-gather|crates/atomic-core/src/artifact/files.rs|            held.push(store.hold(&s.artifact()?)?);|            let _ = &mut held; // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model -- a_sweep_racing_a_slow_gather_keeps_the_gathered_files a_store_held_while_files_are_stored_leaves_the_outcome_unknown"
-    "artifact-hold-sweep|crates/atomic-core/src/artifact.rs|        let (held, gone) = holds(self.held_dir(), self.owners(), &dead, STAGING_GRACE, now)?;|        let (_held, gone) = holds(self.held_dir(), self.owners(), &dead, STAGING_GRACE, now)?; let held = std::collections::HashSet::<String>::new(); // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model -- a_sweep_racing_a_slow_gather_keeps_the_gathered_files a_hold_keeps_content_until_it_is_let_go_or_its_store_is_gone"
-    "artifact-hold-dead|crates/atomic-core/src/artifact.rs|            gone.push(path);|            let _ = path; // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model -- a_hold_keeps_content_until_it_is_let_go_or_its_store_is_gone opening_a_store_sweeps_only_dead_stores_leftovers"
-    "artifact-hold-release|crates/atomic/src/pipeline.rs|    drop(release);|    std::mem::forget(release); // CONTROL_OFF|-p atomic-agentic --test pipeline an_exec_steps_files_are_let_go_once_its_turn_is_recorded"
-    "artifact-hold-release-on-drop|crates/atomic-core/src/runtime.rs|        self.artifacts.release(&self.identity);|        let _ = &self.identity; // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model a_store_held_while_files_are_stored_leaves_the_outcome_unknown"
-    "artifact-hold-snapshot|crates/atomic/src/retention.rs|    artifacts.extend(held);|    let _ = held; // CONTROL_OFF|-p atomic-agentic --test retention a_hold_let_go_while_a_sweep_reads_the_runs_still_keeps_its_content"
-)
+# Each control's row lives in its own file: scripts/controls/<name>.row holds
+# one line, name | file | text to replace | replacement | cargo test arguments.
+# A control guarded by several tests names them all after `--`; each must fail
+# with the control off. A row's arguments are taken as written, with no
+# expansion, so a row that needs the sandbox and Postgres suites names their
+# features itself. A row switches off the first place its text is found, so
+# where one control has two sites the text of each is unlike the other's
+# (stop-own-tool and stop-own-tool-wait), and there is a row for each.
+ROWS="${ROOT}/scripts/controls"
 
 die() {
     echo "scripts/controls-check.sh: $*" >&2
@@ -148,10 +93,49 @@ head_diff() {
     return "${code}"
 }
 
+# Read every control from its own file under ${ROWS}. Each rule here fails
+# closed: a row the script cannot read is a control it would otherwise never
+# check and still report as passing, so every refusal names the file and stops
+# the run before anything is edited.
+rows=()
+[ -d "${ROWS}" ] || die "${ROWS} is not a directory, so there is no control to check"
+entries=()
+while IFS= read -r -d '' entry; do
+    entries+=("${entry}")
+done < <(find "${ROWS}" -mindepth 1 -maxdepth 1 -print0 | LC_ALL=C sort -z)
+[ "${#entries[@]}" -gt 0 ] || die "${ROWS} holds no control"
+names=()
+for entry in "${entries[@]}"; do
+    base="${entry##*/}"
+    [ -f "${entry}" ] || die "${entry} is not a regular file"
+    case "${base}" in
+    *.row) ;;
+    *) die "${entry} is not named <name>.row, so its control would never be read" ;;
+    esac
+    lines=()
+    mapfile -t lines <"${entry}" || die "cannot read ${entry}"
+    [ "${#lines[@]}" -eq 1 ] ||
+        die "${entry} holds ${#lines[@]} rows, not the one it must"
+    row="${lines[0]}"
+    name="${row%%|*}"
+    [ -n "${name}" ] || die "${entry} names no control"
+    # Before the name's own rule: two files naming one control are refused for
+    # the name, which is what makes the second one wrong.
+    case " ${names[*]-} " in
+    *" ${name} "*)
+        die "${entry} names the control '${name}', which another row file already names"
+        ;;
+    esac
+    [ "${name}" = "${base%.row}" ] ||
+        die "${entry} names itself '${name}', which is not its file name"
+    names+=("${name}")
+    rows+=("${row}")
+done
+
 # The controls to check: all of them, or the one named.
 only="${1:-}"
 selected=()
-for row in "${CONTROLS[@]}"; do
+for row in "${rows[@]}"; do
     name="${row%%|*}"
     if [ -z "${only}" ] || [ "${only}" = "${name}" ]; then
         selected+=("${row}")
@@ -159,7 +143,7 @@ for row in "${CONTROLS[@]}"; do
 done
 if [ "${#selected[@]}" -eq 0 ]; then
     echo "scripts/controls-check.sh: no control is named '${only}'. The controls:" >&2
-    for row in "${CONTROLS[@]}"; do
+    for row in "${rows[@]}"; do
         echo "  ${row%%|*}" >&2
     done
     exit 2
@@ -325,7 +309,7 @@ status=0
 for row in "${selected[@]}"; do
     IFS='|' read -r name file text replacement args <<<"${row}"
     if ! grep -qF -- "${text}" "${file}"; then
-        echo "FAIL ${name}: its switch no longer applies to ${file}; update scripts/controls-check.sh" >&2
+        echo "FAIL ${name}: its switch no longer applies to ${file}; update ${ROWS}/${name}.row" >&2
         status=1
         continue
     fi
@@ -360,8 +344,15 @@ for row in "${selected[@]}"; do
     unfailed=""
     while read -r test; do
         # The name as it is, not as a pattern: a failed test's path holds it.
-        grep -E '^test [^ ]+ \.\.\. FAILED$' "${LOG}" | cut -d' ' -f2 | grep -qF -- "${test}" ||
+        # And read all of it, so `grep -F` does not stop at the first match:
+        # an earlier stage of the pipe would then die of SIGPIPE, which
+        # pipefail reports as a failure of the pipeline, and a test that did
+        # fail would read as one that was not seen. A name may have spaces
+        # in it, as a doctest's does.
+        if ! grep -E '^test .+ \.\.\. FAILED$' "${LOG}" | sed -E 's/^test (.+) \.\.\. FAILED$/\1/' |
+            grep -F -- "${test}" >/dev/null; then
             unfailed="${unfailed} ${test}"
+        fi
     done < <(named_tests "${args}")
     if [ -n "${unfailed}" ]; then
         echo "FAIL ${name}: with the control off, these tests were not seen failing:${unfailed}" >&2
