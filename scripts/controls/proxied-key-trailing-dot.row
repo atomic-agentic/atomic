@@ -1,0 +1,1 @@
+proxied-key-trailing-dot|crates/atomic-core/src/lite.rs|    local.then_some(host)|    local.then_some(host.trim_end_matches('.').to_owned())|-p atomic-agentic-core --lib --features fake-model a_key_a_proxy_would_carry_to_a_local_http_endpoint_is_refused
