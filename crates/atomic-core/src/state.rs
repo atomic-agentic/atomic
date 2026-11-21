@@ -480,6 +480,40 @@ pub fn real_path(path: &Path) -> PathBuf {
     }
 }
 
+/// Every checkout holding `dir`, a path as it really is: each directory
+/// around it with a `.git`, and for a linked worktree the checkout whose
+/// repository it shares, which its `.git` file names through the
+/// repository's `commondir`.
+pub fn checkouts_holding(dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for checkout in dir.ancestors().filter(|d| d.join(".git").exists()) {
+        found.push(checkout.to_owned());
+        if let Some(main) = main_checkout(&checkout.join(".git"))
+            && !found.contains(&main)
+        {
+            found.push(main);
+        }
+    }
+    found
+}
+
+/// The main checkout of the linked worktree whose `.git` file is `git`;
+/// `None` for a `.git` directory, a submodule's file, or a bare repository.
+fn main_checkout(git: &Path) -> Option<PathBuf> {
+    if !git.is_file() {
+        return None;
+    }
+    let text = std::fs::read_to_string(git).ok()?;
+    let gitdir = text.lines().find_map(|l| l.strip_prefix("gitdir:"))?.trim();
+    let gitdir = git.parent()?.join(gitdir);
+    let common = std::fs::read_to_string(gitdir.join("commondir")).ok()?;
+    let common = std::fs::canonicalize(gitdir.join(common.trim())).ok()?;
+    if common.file_name()? != ".git" {
+        return None;
+    }
+    common.parent().map(Path::to_owned)
+}
+
 /// Where the opt-in file store keeps operator credentials (see
 /// [`crate::credential::FileSecrets`]): `$ATOMIC_HOME/credentials`, or
 /// `atomic/credentials` in the user configuration directory. Outside every

@@ -32,6 +32,7 @@
 mod fixture;
 
 use fixture::{Fixture, text};
+use std::path::Path;
 
 #[test]
 fn login_status_says_who_is_signed_in_and_logout_forgets_it() {
@@ -268,23 +269,35 @@ fn a_sign_in_inside_the_checkout_holding_the_project_is_refused_and_explain_says
     assert!(t.contains("inside the checkout holding the project"), "{t}");
     // Reached through a link from outside, as a linked home is: the
     // sign-in is placed where the link leads, and refused there, before
-    // anything is made.
+    // anything is made, not even the credential directory around it.
+    let target = f.dir.join("linked-target");
+    std::fs::create_dir_all(&target).unwrap();
     let link = f.outside.join("linked-home");
-    std::os::unix::fs::symlink(&inside, &link).unwrap();
-    let home = [
-        ("ATOMIC_HOME", link.to_str().unwrap()),
-        ("ATOMIC_TEST_LOGIN_ISSUER", "http://127.0.0.1:9"),
-    ];
-    let out = f
-        .atomic_within(&["model", "login"], &home, 60)
-        .expect("login stopped");
-    let t = text(&out);
-    assert!(!out.status.success(), "{t}");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let login = |home: &Path| {
+        let env = [
+            ("ATOMIC_HOME", home.to_str().unwrap()),
+            ("ATOMIC_TEST_LOGIN_ISSUER", "http://127.0.0.1:9"),
+        ];
+        let out = f
+            .atomic_within(&["model", "login"], &env, 60)
+            .expect("login stopped");
+        assert!(!out.status.success(), "{}", text(&out));
+        text(&out)
+    };
+    let t = login(&link);
     assert!(t.contains("inside the checkout holding the project"), "{t}");
     assert!(
-        !inside.join("credentials/codex-auth").exists(),
-        "the sign-in's directory was made inside the checkout"
+        !target.join("credentials").exists(),
+        "the credential directory was made inside the checkout"
     );
+    // A link that leads nowhere yet: refused, saying so, and nothing made
+    // where it leads.
+    let dangling = f.outside.join("dangling-home");
+    std::os::unix::fs::symlink(f.dir.join("not-yet"), &dangling).unwrap();
+    let t = login(&dangling);
+    assert!(t.contains("which does not exist"), "{t}");
+    assert!(!f.dir.join("not-yet").exists(), "the link's target was made");
 }
 
 #[test]
@@ -299,21 +312,23 @@ fn a_login_that_fails_and_a_logout_leave_no_sign_in_directory() {
     // So no later run is told a sign-in could not be read.
     let out = f.atomic(&["config", "--explain"], &keyring);
     assert!(!text(&out).contains("could not be read"), "{}", text(&out));
-    // Nor does a logout leave one, signed in or not.
-    for signed_in in [false, true] {
-        if signed_in {
-            f.sign_in_unrevocable();
-        }
-        let out = f.atomic(&["model", "logout"], &[]);
-        assert!(out.status.success(), "{}", text(&out));
-        assert!(
-            !auth.exists(),
-            "a logout left {}: {:?}",
-            auth.display(),
-            std::fs::read_dir(&auth)
-                .map(|d| d.flatten().map(|e| e.file_name()).collect::<Vec<_>>())
-        );
-    }
+    // Nor does a logout with no one signed in.
+    let out = f.atomic(&["model", "logout"], &[]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(!auth.exists(), "a logout left {}", auth.display());
+    // Signed in, a logout leaves the directory only when the keyring could
+    // not be checked, which may still keep the sign-in: the directory is
+    // what says so.
+    f.sign_in_unrevocable();
+    let out = f.atomic(&["--json", "model", "logout"], &[]);
+    assert!(out.status.success(), "{}", text(&out));
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(
+        auth.exists(),
+        json["keyring_error"].is_string(),
+        "{json}: {:?}",
+        std::fs::read_dir(&auth).map(|d| d.flatten().map(|e| e.file_name()).collect::<Vec<_>>())
+    );
 }
 
 #[test]

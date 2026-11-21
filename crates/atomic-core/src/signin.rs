@@ -40,6 +40,10 @@ use std::path::{Path, PathBuf};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SignIn {
     auth_home: PathBuf,
+    /// The directory as it was reached, before any link was followed.
+    reached: PathBuf,
+    /// Whether this invocation made the directory, and so may remove it.
+    made: bool,
     store: AuthCredentialsStoreMode,
     backend: Option<String>,
     issuer: Option<String>,
@@ -139,9 +143,8 @@ fn outside_the_checkout(dir: &Path, project: Option<&Path>) -> Result<(), SignIn
         crate::state::real_path(dir),
         crate::state::real_path(project),
     );
-    match project
-        .ancestors()
-        .filter(|d| d.join(".git").exists())
+    match crate::state::checkouts_holding(&project)
+        .into_iter()
         .find(|checkout| here.starts_with(checkout))
     {
         Some(checkout) => Err(SignInError::Store(CredentialError::File(format!(
@@ -183,10 +186,26 @@ impl SignIn {
         let dir = crate::state::credentials_dir()
             .map_err(|e| CredentialError::File(e.to_string()))?
             .join("codex-auth");
+        // A link on the way that leads nowhere: making the directory would
+        // fail, or make what it names, somewhere not checked here.
+        if let Some(link) = dir
+            .ancestors()
+            .find(|a| a.is_symlink() && !a.exists())
+        {
+            return Err(SignInError::Store(CredentialError::File(format!(
+                "{} is a link to {}, which does not exist; make it, or point ATOMIC_HOME \
+                 elsewhere",
+                link.display(),
+                std::fs::read_link(link)
+                    .map(|t| t.display().to_string())
+                    .unwrap_or_else(|_| "somewhere unreadable".into())
+            ))));
+        }
         crate::credential::placed_apart(&dir, project)?;
         outside_the_checkout(&dir, project)?;
         // One spelling, so the keyring entry Codex keys by it is the same
         // however the directory is reached.
+        let located = dir.clone();
         let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
         let store = match std::env::var(STORE_VAR).ok().filter(|v| !v.is_empty()) {
             None => AuthCredentialsStoreMode::Keyring,
@@ -195,7 +214,9 @@ impl SignIn {
             Some(other) => return Err(CredentialError::UnknownStore(other).into()),
         };
         Ok(Self {
+            reached: located,
             auth_home: dir,
+            made: false,
             store,
             backend: None,
             issuer: None,
@@ -206,7 +227,12 @@ impl SignIn {
     /// [`SignIn::located`] finds it, its directory created readable by its
     /// owner only. Refused off Linux.
     pub fn configured(project: Option<&Path>) -> Result<Self, SignInError> {
-        let located = Self::located(project)?;
+        Self::made_at(Self::located(project)?, project)
+    }
+
+    /// [`SignIn::configured`] once `located` is found: its directory made,
+    /// and checked again where it was made.
+    fn made_at(located: Self, project: Option<&Path>) -> Result<Self, SignInError> {
         let existed = located.auth_home.is_dir();
         crate::state::private_dir(&located.auth_home)
             .map_err(|e| CredentialError::File(e.to_string()))?;
@@ -215,9 +241,10 @@ impl SignIn {
         // Where it was made, as it really is: a link on the way, such as a
         // linked home, could have put it somewhere the checks above did not
         // see. Refused there, it is removed again.
-        let placed = crate::credential::placed_apart(&auth_home, project)
-            .map_err(SignInError::from)
-            .and_then(|()| outside_the_checkout(&auth_home, project));
+        let mut placed = crate::credential::placed_apart(&auth_home, project).map_err(SignInError::from);
+        if placed.is_ok() {
+            placed = outside_the_checkout(&auth_home, project);
+        }
         if let Err(e) = placed {
             if !existed {
                 let _ = std::fs::remove_dir(&auth_home);
@@ -226,28 +253,49 @@ impl SignIn {
         }
         Ok(Self {
             auth_home,
+            made: !existed,
             ..located
         })
     }
 
-    /// Remove the sign-in's directory if it holds no sign-in, only Codex's
-    /// empty lock files, as after a login that did not finish or a logout:
-    /// with no directory, no store is read (see [`SignIn::account`]).
+    /// Remove the sign-in's directory, so no store is read (see
+    /// [`SignIn::account`]), when it holds nothing but Codex's empty lock
+    /// files and no one holds any of them. Only for a directory known to
+    /// hold no sign-in: one this invocation made, or one a logout forgot
+    /// in both stores. With the keyring store a live sign-in's directory
+    /// holds only lock files too. Never through a link, which would remove
+    /// what it leads to and leave the link behind.
     fn tidy(&self) {
+        if self.reached.is_symlink() {
+            return;
+        }
         let Ok(entries) = std::fs::read_dir(&self.auth_home) else {
             return;
         };
-        let mut locks = Vec::new();
+        let mut held = Vec::new();
         for entry in entries.flatten() {
+            let path = entry.path();
             let lock = entry.file_name().to_string_lossy().ends_with(".lock")
-                && entry.metadata().is_ok_and(|m| m.is_file() && m.len() == 0);
-            if !lock {
+                && std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file() && m.len() == 0);
+            // Codex takes these with `File::try_lock`: one it can take now
+            // is one no process holds, and it is held until removed.
+            let taken = lock
+                && std::fs::OpenOptions::new()
+                    .read(true)
+                    .open(&path)
+                    .is_ok_and(|file| {
+                        let free = file.try_lock().is_ok();
+                        if free {
+                            held.push((path.clone(), file));
+                        }
+                        free
+                    });
+            if !taken {
                 return;
             }
-            locks.push(entry.path());
         }
-        for lock in locks {
-            let _ = std::fs::remove_file(lock);
+        for (path, _file) in &held {
+            let _ = std::fs::remove_file(path);
         }
         let _ = std::fs::remove_dir(&self.auth_home);
     }
@@ -257,6 +305,8 @@ impl SignIn {
     pub fn in_files(dir: &Path) -> Self {
         Self {
             auth_home: dir.to_owned(),
+            reached: dir.to_owned(),
+            made: false,
             store: AuthCredentialsStoreMode::File,
             backend: None,
             issuer: None,
@@ -308,7 +358,7 @@ impl SignIn {
         if !self.auth_home.is_dir() {
             return Ok(None);
         }
-        let auth = codex_login::load_auth_dot_json(&self.auth_home, self.store, KEYRING)?;
+        let auth = self.stored()?;
         let store = self.store_name().to_owned();
         Ok(auth.and_then(|a| {
             if let Some(tokens) = &a.tokens {
@@ -328,6 +378,17 @@ impl SignIn {
                 workspace: None,
             })
         }))
+    }
+
+    /// The sign-in its store keeps, if any.
+    fn stored(&self) -> std::io::Result<Option<codex_login::AuthDotJson>> {
+        #[cfg(test)]
+        if self.store != AuthCredentialsStoreMode::File
+            && let Some(kept) = tests::keyring_holds(&self.auth_home)
+        {
+            return Ok(Some(kept));
+        }
+        codex_login::load_auth_dot_json(&self.auth_home, self.store, KEYRING)
     }
 
     /// Refused unless `policy`, Codex's login restrictions as a thread's
@@ -388,7 +449,9 @@ impl SignIn {
     /// machine without one is told so before any browser flow.
     pub async fn login(&self, device: bool) -> anyhow::Result<()> {
         let outcome = self.log_in(device).await;
-        if outcome.is_err() {
+        // Only a directory this login made: one that was here may hold a
+        // sign-in the keyring keeps, which a failed login leaves as it was.
+        if outcome.is_err() && self.made {
             self.tidy();
         }
         outcome
@@ -473,7 +536,11 @@ impl SignIn {
         )
         .await
         .map_err(|e| e.to_string());
-        self.tidy();
+        // A keyring that could not be checked may still hold the sign-in,
+        // and its directory is what says so.
+        if self.made || keyring.is_ok() {
+            self.tidy();
+        }
         Ok(Forgotten { file, keyring })
     }
 
@@ -717,6 +784,152 @@ mod tests {
                 let _ = std::fs::remove_dir_all(auth_dir(tag));
             }
         });
+    }
+
+    /// A keyring for tests: the sign-ins it keeps, by the directory Codex
+    /// keys them by. Read in place of the OS keyring by tests only.
+    static KEYRING: std::sync::Mutex<Vec<(PathBuf, String)>> = std::sync::Mutex::new(Vec::new());
+
+    pub(super) fn keyring_holds(dir: &Path) -> Option<codex_login::AuthDotJson> {
+        let kept = KEYRING.lock().expect("keyring");
+        kept.iter()
+            .find(|(d, _)| d == dir)
+            .map(|(_, json)| serde_json::from_str(json).expect("a sign-in"))
+    }
+
+    /// With the keyring store, a live sign-in's directory holds only
+    /// Codex's lock files. A login that fails there keeps the directory,
+    /// and the sign-in with it. One the login made itself is removed again,
+    /// but never while a lock in it is held.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_login_keeps_a_directory_it_did_not_make() {
+        crate::testing::on_codex_runtime(async {
+            let dir = auth_dir("keyring-kept");
+            for lock in ["auth.lock", "auth.json.lock"] {
+                std::fs::write(dir.join(lock), "").expect("lock");
+            }
+            let id_token = crate::testing::fake_id_token("dev@example.invalid", "account-1");
+            KEYRING.lock().expect("keyring").push((
+                dir.clone(),
+                serde_json::json!({"auth_mode": "chatgpt", "OPENAI_API_KEY": null, "tokens": {
+                    "id_token": id_token, "access_token": "", "refresh_token": "",
+                    "account_id": "account-1"}})
+                .to_string(),
+            ));
+            // The issuer is the discard port on loopback: the login fails
+            // there, if the keyring check before it does not.
+            let keyring = |dir: &Path, made: bool| {
+                SignIn {
+                    store: AuthCredentialsStoreMode::Keyring,
+                    made,
+                    ..SignIn::in_files(dir)
+                }
+                .with_issuer("http://127.0.0.1:9")
+            };
+            let sign_in = keyring(&dir, false);
+            assert!(sign_in.account().expect("account").is_some());
+            let failed = sign_in.login(true).await;
+            assert!(failed.is_err(), "{failed:?}");
+            assert!(dir.join("auth.lock").exists(), "a failed login removed a sign-in");
+            let account = sign_in.account().expect("account").expect("still signed in");
+            assert_eq!(account.mode, "chatgpt");
+
+            let made = auth_dir("keyring-made");
+            std::fs::write(made.join("auth.lock"), "").expect("lock");
+            let held = std::fs::File::open(made.join("auth.lock")).expect("open");
+            held.lock().expect("held");
+            let sign_in = keyring(&made, true);
+            assert!(sign_in.login(true).await.is_err());
+            assert!(made.join("auth.lock").exists(), "a held lock was removed");
+            drop(held);
+            assert!(sign_in.login(true).await.is_err());
+            assert!(!made.exists(), "a failed login left the directory it made");
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    /// The directory is checked again where it was made: a link that
+    /// appeared after the sign-in was located, leading into the checkout
+    /// holding the project, is refused there, and nothing is left inside.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_sign_in_is_checked_again_where_its_directory_is_made() {
+        let dir = auth_dir("made-at");
+        let checkout = dir.join("checkout");
+        for sub in [".git", "project", "home"] {
+            std::fs::create_dir_all(checkout.join(sub)).expect("checkout");
+        }
+        std::fs::create_dir_all(dir.join("outside")).expect("outside");
+        let link = dir.join("outside/linked-home");
+        std::os::unix::fs::symlink(checkout.join("home"), &link).expect("link");
+        // Located before the link was there, so as written.
+        let located = SignIn::in_files(&link.join("codex-auth"));
+        let refused = SignIn::made_at(located, Some(&checkout.join("project")))
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            refused.contains("inside the checkout holding the project"),
+            "{refused}"
+        );
+        assert!(
+            !checkout.join("home/codex-auth").exists(),
+            "the sign-in's directory was left inside the checkout"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A linked worktree shares its main checkout's repository, so that
+    /// checkout holds its project too.
+    #[test]
+    fn a_linked_worktrees_main_checkout_holds_its_project() {
+        let dir = auth_dir("worktree");
+        let main = dir.join("main");
+        std::fs::create_dir_all(main.join(".git/worktrees/wt")).expect("main");
+        std::fs::write(main.join(".git/worktrees/wt/commondir"), "../..\n").expect("commondir");
+        std::fs::create_dir_all(dir.join("wt/project")).expect("worktree");
+        std::fs::write(
+            dir.join("wt/.git"),
+            format!("gitdir: {}\n", main.join(".git/worktrees/wt").display()),
+        )
+        .expect(".git");
+        let project = dir.join("wt/project");
+        let refused = outside_the_checkout(&main.join("home/codex-auth"), Some(&project))
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            refused.contains("inside the checkout holding the project"),
+            "{refused}"
+        );
+        assert!(outside_the_checkout(&dir.join("elsewhere/codex-auth"), Some(&project)).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Tidying never goes through a link: it would remove what the link
+    /// leads to and leave the link dangling.
+    #[cfg(unix)]
+    #[test]
+    fn tidying_never_goes_through_a_link() {
+        let dir = auth_dir("tidy-link");
+        let target = dir.join("target");
+        std::fs::create_dir_all(&target).expect("target");
+        std::fs::write(target.join("auth.lock"), "").expect("lock");
+        let link = dir.join("codex-auth");
+        std::os::unix::fs::symlink(&target, &link).expect("link");
+        SignIn {
+            reached: link.clone(),
+            made: true,
+            ..SignIn::in_files(&target)
+        }
+        .tidy();
+        assert!(target.join("auth.lock").exists(), "tidied through a link");
+        SignIn {
+            made: true,
+            ..SignIn::in_files(&target)
+        }
+        .tidy();
+        assert!(!target.exists(), "reached as it is, it is tidied");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
