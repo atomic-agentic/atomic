@@ -72,10 +72,22 @@ file is missing, but no command names one yet. The `--profile` flag on
 ### How files merge
 
 Files are YAML, read with atomic's restricted loader: no anchors, aliases, tags
-or duplicate keys, and plain `yes`, `no`, `on` and `off` are refused, so quote
-them. Mappings merge key by key; any other value replaces the one below it. A
-setting atomic does not know is an error that names the file and the line, so a
-typo is never silently ignored.
+or duplicate keys, and no plain scalar whose spelling YAML 1.1 and YAML 1.2 do
+not read the same way. Plain `yes`, `no`, `on` and `off` are refused, so quote
+them, and so is every one of these numbers:
+
+- one with a leading zero (`0200`, which YAML 1.1 reads as an octal, 128, and
+  YAML 1.2 as decimal; `007`, which both read as 7, is refused for the same
+  spelling);
+- a sign written on either side of a base prefix (`-0x1F`, which YAML 1.1 reads
+  as -31, and `0x-1F`, which no version reads as a number);
+- one YAML 1.1 reads alone: binary (`0b11`), an underscore in a whole number
+  (`1_000`, `0x_1F`) and the sexagesimal (`12:30`, which 1.1 reads as 750).
+
+Quoting any of them gives the string it is read as elsewhere, and `0o200` and
+`0x1F` are the ways to write an octal and a hexadecimal. Mappings merge key by
+key; any other value replaces the one below it. A setting atomic does not know is
+an error that names the file and the line, so a typo is never silently ignored.
 
 ### How a variable names a setting
 
@@ -88,8 +100,10 @@ variable set to the empty string sets nothing, as if it were unset.
 A value takes the setting's type: `true` or `false` (or `1` and `0`) for
 switches, a number for numbers, JSON for lists and sections. A variable atomic
 cannot read as its setting's type is refused by its own name, before the layers
-are merged. A variable for a string setting is taken as the string it holds, so
-`ATOMIC_EXECUTOR_ID=1` is the identity `1`.
+are merged, and so is a number spelled a way the loader refuses: `0200` names
+its leading zero rather than quietly becoming the text `0200`. A variable for a
+string setting is taken as the string it holds, so `ATOMIC_EXECUTOR_ID=1` is the
+identity `1`.
 
 ## What nothing sets
 
