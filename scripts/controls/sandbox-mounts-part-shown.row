@@ -1,0 +1,1 @@
+sandbox-mounts-part-shown|crates/atomic-core/src/mounts.rs|            (other.at.clone(), path.join(part))|            (other.at.clone(), path.to_owned()) // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model a_stale_remote_root_is_refused_where_the_place_is_there
