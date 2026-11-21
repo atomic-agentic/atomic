@@ -301,8 +301,8 @@ pub fn signed_in(project: Option<&Path>) -> SignInFound {
         // Refused where it is kept: with no directory there no one ever
         // signed in, and nothing is refused; with one, it may hold a
         // sign-in, and that it cannot be used is said.
-        Err(e) => match atomic_core::signin::location() {
-            Some(dir) if std::fs::symlink_metadata(&dir).is_err() => Ok(None),
+        Err(e) => match atomic_core::signin::location().map(|d| std::fs::symlink_metadata(&d)) {
+            Some(Err(gone)) if absent(&gone) => Ok(None),
             _ => Err(e.to_string()),
         },
     }
@@ -314,14 +314,42 @@ pub fn signed_in(project: Option<&Path>) -> SignInFound {
 /// unreachable keyring among them, is said, never taken for "signed out":
 /// that would move model calls to another account without a word.
 fn found(sign_in: SignIn) -> SignInFound {
-    if !sign_in.auth_home().is_dir() {
-        return Ok(None);
+    match std::fs::metadata(sign_in.auth_home()) {
+        Ok(meta) if meta.is_dir() => {}
+        Err(gone) if absent(&gone) => return Ok(None),
+        // Something else there, or a directory that cannot be looked at, as
+        // under an ancestor this user cannot enter: not taken for absent.
+        Ok(_) => {
+            return Err(format!(
+                "{} is not a directory",
+                sign_in.auth_home().display()
+            ));
+        }
+        Err(e) => return Err(format!("{}: {e}", sign_in.auth_home().display())),
     }
     match sign_in.account() {
         Ok(Some(_)) => Ok(Some(sign_in)),
         Ok(None) => Ok(None),
         Err(e) => Err(format!("{e:#}")),
     }
+}
+
+/// The note for a sign-in that is there and cannot be used.
+fn unusable(why: &str) -> String {
+    format!(
+        "the ChatGPT sign-in could not be read: {why}; a run that calls a model is refused \
+         until it can be"
+    )
+}
+
+/// Whether looking at a path failed because nothing is there: no entry, or
+/// a component that is a file. Anything else, a permission refused among
+/// them, is no answer, and never taken for absent.
+fn absent(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
 }
 
 /// The root of the project configured in `dir`: `dir`, or its parent for an
@@ -522,7 +550,7 @@ pub fn resolve(
         match (around.sign_in)(project) {
             Ok(found) => sign_in = found,
             Err(why) => {
-                notes.push(format!("the ChatGPT sign-in could not be read: {why}"));
+                notes.push(unusable(&why));
                 sign_in_unreadable = Some(why);
             }
         }
@@ -1624,9 +1652,16 @@ pub fn config(args: &ConfigArgs, project: Option<&Path>, json: bool) -> anyhow::
     let signed_in = match SignIn::located(in_project.then_some(root.as_path())) {
         Ok(sign_in) => sign_in.explain(),
         Err(atomic_core::signin::SignInError::Unprotected(_)) => None,
+        // Said as resolution says it, when there is a sign-in's directory
+        // there to say it of.
         Err(e) => {
-            let note = format!("the ChatGPT sign-in could not be read: {e}");
-            if !notes.contains(&note) {
+            let there = match atomic_core::signin::location().map(|d| std::fs::symlink_metadata(&d))
+            {
+                Some(Err(gone)) => !absent(&gone),
+                _ => true,
+            };
+            let note = unusable(&e.to_string());
+            if there && !notes.contains(&note) {
                 notes.push(note);
             }
             None

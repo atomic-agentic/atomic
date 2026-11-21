@@ -289,9 +289,10 @@ pub fn endpoint(
                 "the ChatGPT sign-in cannot be used: {why}; nothing else is used in its place, \
                  since model calls would go to another account"
             ),
-            "fix what it names, or run `atomic model logout` to forget the sign-in; or set \
-             ATOMIC_MODEL_BASE_URL and ATOMIC_MODEL (or pass --model-base-url and --model), \
-             and ATOMIC_MODEL_API_KEY_ENV if the endpoint needs a key, to choose the endpoint \
+            "fix what it names; or forget the sign-in with `atomic model logout`, run from \
+             outside the project once the keyring can be reached; or set ATOMIC_MODEL_BASE_URL \
+             and ATOMIC_MODEL (or pass --model-base-url and --model), and \
+             ATOMIC_MODEL_API_KEY_ENV if the endpoint needs a key, to choose the endpoint \
              yourself",
         )
         .into());
