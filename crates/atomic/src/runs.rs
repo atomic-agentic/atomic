@@ -413,7 +413,31 @@ pub async fn run(
     // a field its contract types as an artifact must name stored content.
     use atomic_app::retention::start_keeping_input as admit;
     let typed = Some((run.pipeline.input.clone(), run.input.clone()));
-    let admitted = admit(&engine.artifacts, &engine.rt, PIPELINE, &run_id, run, typed).await;
+    // A signal while it waits for the store stops the wait, and admission
+    // ends there; one that comes once the run is recorded stops the run.
+    let halt: std::sync::Arc<std::sync::atomic::AtomicBool> = Default::default();
+    let told = halt.clone();
+    let admission = admit(&engine.artifacts, &engine.rt, PIPELINE, &run_id, run, typed, told);
+    tokio::pin!(admission);
+    let mut signalled = None;
+    let admitted = tokio::select! {
+        admitted = &mut admission => admitted,
+        signal = signals.next() => {
+            halt.store(true, std::sync::atomic::Ordering::SeqCst);
+            signalled = Some(signal);
+            admission.await
+        }
+    };
+    if let (Ok(()), Some(signal)) = (&admitted, signalled) {
+        let shown = crate::shown::line(&run_id);
+        atomic_core::redact::Line::new()
+            .shown(&format!(
+                "atomic run: {signal}: run {shown} stays unfinished; continue it with \
+                 `atomic runs resume {shown}`"
+            ))
+            .log();
+        stop(&mut signals, "atomic run", Exit::Signalled).await
+    }
     if let Err(e) = admitted {
         let refused = e
             .downcast_ref::<atomic_app::retention::InputRefused>()
@@ -432,6 +456,11 @@ pub async fn run(
                     "run.stopped",
                     r.to_string(),
                     "nothing was recorded; start the run again",
+                ),
+                atomic_app::retention::InputRefused::Invalid(_) => Failure::new(
+                    "input.invalid",
+                    r.to_string(),
+                    "name content of the kind the workflow's input contract asks for",
                 ),
             });
         let _ = engine.rt.shutdown(SHUTDOWN).await;

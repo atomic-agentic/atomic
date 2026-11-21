@@ -95,8 +95,10 @@ said once and waited for, and if it holds the lock longer the run is refused
 (`store.locked`); Ctrl-C while it waits stops the run (`run.stopped`). A field
 the workflow's input contract types as `atomic:artifact` that names content
 the store does not hold, or content a sweep removed after the store was
-listed, refuses the run (`run.input_missing`); a reference in free text is
-held if stored and otherwise left alone. Either way nothing is recorded.
+listed, refuses the run (`run.input_missing`), and one naming content the
+contract does not allow there refuses it too (`input.invalid`); the first
+such field is the one named. A reference in free text is held if stored and
+otherwise left alone. Either way nothing is recorded.
 
 `atomic serve` also runs on PostgreSQL (`ATOMIC_DATABASE_URL`) when the process
 has an executor identity (`ATOMIC_EXECUTOR_ID`). `atomic runner` and

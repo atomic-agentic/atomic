@@ -2127,6 +2127,87 @@ fn atomic_run_keeps_what_its_input_names_from_a_sweep_that_read_the_runs_before_
     });
 }
 
+/// `atomic run` waiting for the artifact store's lock, held by a sweep, as
+/// it admits a run whose input names stored content: a stop signal ends
+/// the wait at once, and nothing is recorded.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[test]
+fn a_run_told_to_stop_while_it_waits_for_the_store_stops_and_records_nothing() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let dir = scratch("admit-stopped");
+        let project = project(&dir);
+        let state = state_dir(&dir, &project);
+        let private = dir.join("atomic-home/private");
+        std::fs::create_dir_all(&private).expect("private");
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &private,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .expect("private");
+        let store = atomic_core::artifact::LocalStore::open(state.join("artifacts")).expect("store");
+        let stored = atomic_core::artifact::ArtifactStore::put(
+            &store,
+            &mut &b"named by the run"[..],
+            atomic_core::artifact::Provenance::default(),
+        )
+        .expect("put")
+        .artifact;
+        // A sweep's hold on the store's lock, as `atomic run` takes it.
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(private.join(state.file_name().expect("id")).join("artifacts.lock"))
+            .expect("lock file");
+        lock.lock().expect("the sweep's lock");
+        let data = json!({ "text": format!("Exporting {stored} crashes the app.") }).to_string();
+        let log = dir.join("stopped.log");
+        let mut child = command_as(
+            Path::new(ATOMIC),
+            &dir,
+            &project,
+            &["--json", "run", "triage", "--run-id", "stopped-1", "--data", &data],
+            &UNUSED_MODEL,
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(std::fs::File::create(&log).expect("log"))
+        .spawn()
+        .expect("start atomic");
+        wait_until("the run to wait for the store", || {
+            std::fs::read_to_string(&log).is_ok_and(|l| l.contains("is held by another process"))
+        });
+        let status = Command::new("/bin/sh")
+            .args(["-c", &format!("kill -INT {}", child.id())])
+            .status()
+            .expect("kill");
+        assert!(status.success());
+        let started = Instant::now();
+        let status = wait_child(&mut child, "atomic run");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "it waited out the lock instead of stopping"
+        );
+        assert!(!status.success());
+        let mut out = String::new();
+        std::io::Read::read_to_string(&mut child.stdout.take().expect("stdout"), &mut out)
+            .expect("stdout");
+        let json: Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("{e}: {out}"));
+        assert_eq!(json["error"]["kind"], "run.stopped", "{json}");
+        drop(lock);
+        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        assert!(
+            rt.run_record("stopped-1").await.expect("record").is_none(),
+            "the stopped run was recorded"
+        );
+    });
+}
+
 /// A field the workflow's input contract types as an artifact, naming
 /// content the store does not hold, refuses the run before it is recorded,
 /// and says what to do.
@@ -2172,6 +2253,14 @@ fn a_typed_input_naming_content_never_stored_is_refused() {
             .is_some_and(|a| a.contains("store the content again")),
         "{error}"
     );
+    let state = state_dir(&dir, &project);
+    on_codex_runtime(async move {
+        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        assert!(
+            rt.run_record("typed-1").await.expect("record").is_none(),
+            "the refused run was recorded"
+        );
+    });
 }
 
 // needs_sandbox

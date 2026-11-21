@@ -192,7 +192,9 @@ on ports 80 and 443, never through another proxy, with the declaration checked
 when the atom loads and again before the command runs; and the artifact store's
 holds, which keep the files an exec step hands over from every sweep until its
 turn is recorded, and what a run's input names from every sweep until the input
-is recorded, refusing an input that names content the store does not hold; and
+is recorded, refusing an input whose typed artifact field names content the
+store does not hold, and waiting for the store's lock within one bounded wait
+that a stop signal ends; and
 that an exec atom's files move only through its workspace's backend), it
 switches the control off in the source, requires the control's test to fail,
 puts the source back and requires the test to pass. Each control costs a rebuild, so it

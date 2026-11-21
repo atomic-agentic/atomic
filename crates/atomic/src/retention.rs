@@ -251,7 +251,13 @@ pub enum InputRefused {
         .0.as_secs()
     )]
     Locked(std::time::Duration),
-    /// The process was told to stop while it waited for the store's lock.
+    /// A field the workflow's input contract types as `atomic:artifact`
+    /// names stored content the contract does not allow, such as one of
+    /// another media type.
+    #[error("the run's input does not fit its contract: {0}")]
+    Invalid(String),
+    /// The caller, or the process, was told to stop while it waited for
+    /// the store's lock.
     #[error("the run was stopped while it waited for the artifact store, before it started")]
     Stopped,
 }
@@ -266,9 +272,11 @@ pub enum InputRefused {
 /// to stop waits no longer. `typed` is the workflow's input contract and
 /// the input it is held to: the run is refused, before anything is
 /// recorded, when a field it types as `atomic:artifact` names content the
-/// store does not hold. It is refused too when a sweep removed what the
-/// input names after the store was listed, or held the lock past the wait.
-/// Anything else the input's text names is held, never refused.
+/// store does not hold, or content the contract does not allow there (the
+/// first such field it finds). It is refused too when a sweep removed what
+/// the input names after the store was listed, or held the lock past the
+/// wait, or when `halt` is set, or the process told to stop, while it
+/// waits. Anything else the input's text names is held, never refused.
 pub async fn start_keeping_input<I>(
     store: &LocalStore,
     rt: &Durare,
@@ -276,17 +284,19 @@ pub async fn start_keeping_input<I>(
     id: &str,
     input: I,
     typed: Option<(Value, Value)>,
+    halt: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<()>
 where
     I: Serialize + Send,
 {
-    start_keeping_input_then(store, rt, name, id, input, typed, || {}).await
+    start_keeping_input_then(store, rt, name, id, input, typed, halt, || {}).await
 }
 
 /// [`start_keeping_input`], calling `once_held` once the input's artifacts
 /// are held and before they are marked: [`start_keeping_input`] calls
 /// nothing there, and this module's tests sweep there, as a sweep that
 /// takes the store's lock in that window would.
+#[allow(clippy::too_many_arguments)] // the public function's, and the hook
 async fn start_keeping_input_then<I>(
     store: &LocalStore,
     rt: &Durare,
@@ -294,17 +304,21 @@ async fn start_keeping_input_then<I>(
     id: &str,
     input: I,
     typed: Option<(Value, Value)>,
+    halt: std::sync::Arc<std::sync::atomic::AtomicBool>,
     once_held: impl FnOnce(),
 ) -> anyhow::Result<()>
 where
     I: Serialize + Send,
 {
     let named = serde_json::to_value(&input)?;
+    let began = std::time::Instant::now();
     let wait = Wait {
         run: id.to_owned(),
         for_at_most: store.lock_wait(),
-        until: std::time::Instant::now() + store.lock_wait(),
+        began,
+        until: began + store.lock_wait(),
         said: std::sync::atomic::AtomicBool::new(false),
+        halt,
     };
     let wait = std::sync::Arc::new(wait);
     let held = {
@@ -328,9 +342,15 @@ where
 struct Wait {
     run: String,
     for_at_most: std::time::Duration,
+    began: std::time::Instant,
     until: std::time::Instant,
     said: std::sync::atomic::AtomicBool,
+    halt: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
+
+/// How long admission waits for the store's lock before it says so: a
+/// sweep's lock is usually let go sooner.
+const SAY_AFTER: std::time::Duration = std::time::Duration::from_millis(500);
 
 impl Wait {
     /// What is left of it.
@@ -339,9 +359,12 @@ impl Wait {
             .saturating_duration_since(std::time::Instant::now())
     }
 
-    /// Say, once, that the run waits for the store.
+    /// Say, once, that the run waits for the store, once it has waited a
+    /// moment.
     fn say(&self) {
-        if !self.said.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        if self.began.elapsed() >= SAY_AFTER
+            && !self.said.swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
             atomic_core::log_line!(
                 "atomic: run {}: the artifact store is held by another process, such as a \
                  sweep; the run waits for it, up to {} s, before it starts",
@@ -351,12 +374,22 @@ impl Wait {
         }
     }
 
-    /// Pause before trying the lock again: whether the process was told to
-    /// stop meanwhile.
+    /// Pause before trying the lock again: whether the caller, or the
+    /// process, was told to stop meanwhile.
     fn pause(&self) -> bool {
-        atomic_core::runtime::sleep_unless_stopping(
-            std::time::Duration::from_millis(20).min(self.left()),
-        )
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(20).min(self.left());
+        loop {
+            if self.halt.load(std::sync::atomic::Ordering::SeqCst)
+                || atomic_core::runtime::stopping()
+            {
+                return true;
+            }
+            let left = until.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            std::thread::sleep(left.min(std::time::Duration::from_millis(5)));
+        }
     }
 
     /// The refusal when the store's lock was not had in time.
@@ -374,18 +407,25 @@ fn hold_named(
     typed: Option<&(Value, Value)>,
     wait: &Wait,
 ) -> anyhow::Result<Vec<(ArtifactRef, Hold)>> {
-    if let Some((contract, value)) = typed
-        && let Err(ArtifactCheckError::Missing { text, .. }) =
-            atomic_schema::artifact::check_refs(contract, value, store)
-        && let Ok(absent) = text.parse::<ArtifactRef>()
-    {
-        return Err(InputRefused::Absent(absent).into());
-    }
+    // Listed first, so what the check finds is in the listing the holds
+    // are taken from.
     let present: HashSet<String> = store
         .stored()?
         .into_iter()
         .map(|a| a.digest().to_owned())
         .collect();
+    if let Some((contract, value)) = typed
+        && let Err(e) = atomic_schema::artifact::check_refs(contract, value, store)
+    {
+        let refused = match &e {
+            ArtifactCheckError::Missing { text, .. } => match text.parse::<ArtifactRef>() {
+                Ok(absent) => InputRefused::Absent(absent),
+                Err(_) => InputRefused::Invalid(e.to_string()),
+            },
+            _ => InputRefused::Invalid(e.to_string()),
+        };
+        return Err(refused.into());
+    }
     let mut named = BTreeSet::new();
     references(input, &present, &mut named);
     let mut held = Vec::with_capacity(named.len());
@@ -493,6 +533,7 @@ mod tests {
                 "run-1",
                 serde_json::json!({ "file": input.to_string() }),
                 None,
+                Default::default(),
                 || {
                     let done = store.sweep(&kept.artifacts, Grace::none_for_tests(), kept.read_at);
                     *swept.lock().expect("lock") = Some(done.expect("sweep"));
@@ -530,6 +571,7 @@ mod tests {
                 "run-1",
                 serde_json::json!({ "file": input.to_string() }),
                 None,
+                Default::default(),
             )
             .await
             .expect("admitted");
@@ -571,6 +613,7 @@ mod tests {
                 "run-1",
                 serde_json::json!({ "file": input.to_string() }),
                 None,
+                Default::default(),
                 || {
                     let swept = store
                         .sweep(&first.artifacts, Grace::none_for_tests(), first.read_at)
@@ -625,6 +668,7 @@ mod tests {
                 "run-1",
                 serde_json::json!({ "file": input.to_string() }),
                 None,
+                Default::default(),
                 || {
                     let file = std::fs::OpenOptions::new()
                         .read(true)
@@ -660,6 +704,108 @@ mod tests {
         });
     }
 
+    /// The store's lock, taken as a sweep takes it, until the returned
+    /// file is dropped.
+    fn sweeping(dir: &std::path::Path) -> std::fs::File {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.join("artifacts/lock"))
+            .expect("lock file");
+        file.lock().expect("the sweep's lock");
+        file
+    }
+
+    /// A sweep holding the store's lock before admission begins: with no
+    /// wait left, the hold is refused as the lock, and nothing is recorded
+    /// or held; let go part way through the wait, the run is admitted.
+    #[test]
+    fn a_hold_waits_for_the_lock_within_the_wait() {
+        atomic_core::testing::on_codex_runtime(async {
+            let (dir, rt, store, input) = racing("hold-wait").await;
+            let lock = sweeping(&dir);
+            let error = start_keeping_input(
+                &store.clone().waiting_at_most(std::time::Duration::ZERO),
+                &rt,
+                "noop",
+                "run-1",
+                serde_json::json!({ "file": input.to_string() }),
+                None,
+                Default::default(),
+            )
+            .await
+            .expect_err("refused");
+            assert!(
+                matches!(error.downcast_ref::<InputRefused>(), Some(InputRefused::Locked(_))),
+                "{error}"
+            );
+            assert!(rt.run_record("run-1").await.expect("record").is_none());
+            assert!(store.held().expect("held").is_empty(), "a hold outlived the refusal");
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                drop(lock);
+            });
+            start_keeping_input(
+                &store,
+                &rt,
+                "noop",
+                "run-2",
+                serde_json::json!({ "file": input.to_string() }),
+                None,
+                Default::default(),
+            )
+            .await
+            .expect("admitted once the lock is let go");
+            rt.shutdown(std::time::Duration::from_secs(5))
+                .await
+                .expect("shutdown");
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    /// Told to stop while it waits for the store's lock, admission stops at
+    /// once, and nothing is recorded or held.
+    #[test]
+    fn admission_told_to_stop_while_it_waits_stops() {
+        atomic_core::testing::on_codex_runtime(async {
+            let (dir, rt, store, input) = racing("halted").await;
+            let lock = sweeping(&dir);
+            let halt: std::sync::Arc<std::sync::atomic::AtomicBool> = Default::default();
+            let told = halt.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                told.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+            let started = std::time::Instant::now();
+            let error = start_keeping_input(
+                &store,
+                &rt,
+                "noop",
+                "run-1",
+                serde_json::json!({ "file": input.to_string() }),
+                None,
+                halt,
+            )
+            .await
+            .expect_err("stopped");
+            drop(lock);
+            assert!(
+                matches!(error.downcast_ref::<InputRefused>(), Some(InputRefused::Stopped)),
+                "{error}"
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "waited out the lock instead of stopping"
+            );
+            assert!(rt.run_record("run-1").await.expect("record").is_none());
+            assert!(store.held().expect("held").is_empty(), "a hold outlived the stop");
+            rt.shutdown(std::time::Duration::from_secs(5))
+                .await
+                .expect("shutdown");
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
     /// A run whose input names content a sweep removed before the run was
     /// admitted is refused, and nothing is recorded.
     #[test]
@@ -673,6 +819,7 @@ mod tests {
                 "run-1",
                 serde_json::json!({ "file": input.to_string() }),
                 None,
+                Default::default(),
                 || {
                     // As if a sweep finished just before the hold was taken.
                     let blob = dir
@@ -714,6 +861,7 @@ mod tests {
                 "run-2",
                 typed.clone(),
                 Some((contract.clone(), typed)),
+                Default::default(),
             )
             .await
             .expect_err("refused");
@@ -734,6 +882,7 @@ mod tests {
                 "run-3",
                 text.clone(),
                 Some((contract, text)),
+                Default::default(),
             )
             .await
             .expect("admitted");
