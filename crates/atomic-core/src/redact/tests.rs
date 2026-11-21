@@ -1378,7 +1378,6 @@ fn numbering_keys_that_redact_alike_stays_linear() {
 /// number, the surer reading taken: a secret's name stays one, a count's
 /// name alone keeps its count, and a count that redaction numbered hides
 /// it. Redacting again then changes nothing.
-/// Redacting again then changes nothing more.
 #[test]
 fn a_numbered_keys_value_is_judged_by_its_name() {
     let (a, b) = (SHAPES[0], SHAPES[1]);
@@ -1434,9 +1433,57 @@ fn a_numbered_key_fed_back_in_settles_after_one_more_pass() {
     }
     let mut twice = once.clone();
     value(&mut twice);
-    let mut thrice = twice.clone();
-    value(&mut thrice);
-    assert_eq!(thrice, twice, "a third pass changed it");
+    assert_eq!(twice, once, "a second pass changed it");
+}
+
+/// Under a secret's name, a key that redacts as text and is then hidden
+/// whole still holds its value as what it said redacted: the value is not
+/// left to the weaker name it is under.
+#[test]
+fn a_held_key_hidden_whole_holds_its_value_as_its_text_form_says() {
+    let mut out = json!({"token": {"password=> secret.txt": "wordy"}});
+    value(&mut out);
+    assert!(!out.to_string().contains("wordy"), "the value showed");
+    assert!(!out.to_string().contains("secret.txt"), "the key showed");
+}
+
+/// Under a secret's name, a credential with white space or a separator
+/// around it is hidden as one.
+#[test]
+fn a_padded_held_credential_key_is_hidden() {
+    let credential = concat!("Zx81", "kQ0pL2mN4bV6");
+    for (case, key) in [
+        format!(" {credential}"),
+        format!("{credential}\n"),
+        format!(": {credential}"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut out = json!({"token": {key: 1}});
+        value(&mut out);
+        assert!(
+            !out.to_string().contains(&credential[4..]),
+            "case {case}: a credential showed"
+        );
+    }
+}
+
+/// Two held keys that redact alike and end in a long number settle in one
+/// pass: the padded token in each is hidden whole before they are
+/// numbered, so no number is left to read as a credential on a second.
+#[test]
+fn held_keys_numbered_after_a_long_number_settle_in_one_pass() {
+    let other = concat!("ghp_", "zyxwvutsrqponmlkjihgfedcba9876543210");
+    let mut once = json!({"token": {
+        format!(" {SAMPLE} (123456)"): 1,
+        format!(" {other} (123456)"): 2,
+    }});
+    value(&mut once);
+    assert!(!once.to_string().contains(&SAMPLE[4..]), "a token showed");
+    let mut twice = once.clone();
+    value(&mut twice);
+    assert_eq!(twice, once, "a second pass changed it");
 }
 
 /// The same object numbers its entries the same, whatever order its keys

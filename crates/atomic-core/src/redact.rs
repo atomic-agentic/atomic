@@ -1479,13 +1479,13 @@ fn base_name(key: &str) -> &str {
 /// [`name_strength`]), number and all, so a second pass reads it as this
 /// one does; for a key renamed, the surer of that and what its new name
 /// said before it was numbered, and, under a secret's name (`held`), what
-/// its original key said too, so a secret's name redacted whole is still
-/// one there.
+/// its original key said and what it said redacted as text too, so a
+/// secret's name redacted, or hidden whole, is still one there.
 fn judged(key: &str, renamed: &std::collections::HashMap<String, Renamed>, held: bool) -> Strength {
     let whole = name_strength(key);
     match renamed.get(key) {
         Some(r) if held => surer(
-            whole,
+            surer(whole, name_strength(&text(&r.original))),
             surer(name_strength(&r.original), name_strength(&r.name)),
         ),
         Some(r) => surer(whole, name_strength(&r.name)),
@@ -1516,8 +1516,8 @@ fn surer(a: Strength, b: Strength) -> Strength {
 /// [`REDACTED`] when it looks like a credential itself, as in
 /// `{"token": {"<key>": 1}}`, whatever word it spells, or when what is
 /// left of it once it redacts as text does; else as it redacts as text.
-/// A key redacted in part is judged by what is left of it, so this gives
-/// its final form at once, and redacting again changes nothing.
+/// A key redacted in part is judged by what is left of it, as a second pass
+/// would judge it, so a second pass leaves it as it is.
 fn held_key(key: &str) -> Option<String> {
     if held_credential(key) {
         return Some(REDACTED.to_owned());
@@ -1530,22 +1530,22 @@ fn held_key(key: &str) -> Option<String> {
 }
 
 /// Whether `key`, under a secret's name, looks like a credential: before
-/// its number, and when redacted in part, by what is left once the marker
-/// and the separators around it go (of `password= [REDACTED]`, the name
-/// `password`). A key with no marker is judged whole, separators and all.
+/// its number, read without any marker it holds, both as it is and with
+/// the white space and separators around it trimmed, and taken for one if
+/// either reading is. So of `password= [REDACTED]` both `password= ` and
+/// `password` are read, and a padded credential such as ` <credential>`
+/// is one.
 fn held_credential(key: &str) -> bool {
     let base = base_name(key);
     if base == REDACTED {
         return false;
     }
-    let rest = if base.contains(REDACTED) {
-        let rest = base.replace(REDACTED, "");
-        rest.trim_matches(|c: char| c.is_whitespace() || matches!(c, '=' | ':' | ';' | ','))
-            .to_owned()
-    } else {
-        base.to_owned()
-    };
-    !rest.is_empty() && key_looks_like_credential(&rest)
+    let whole = base.replace(REDACTED, "");
+    let trimmed =
+        whole.trim_matches(|c: char| c.is_whitespace() || matches!(c, '=' | ':' | ';' | ','));
+    [whole.as_str(), trimmed]
+        .iter()
+        .any(|k| !k.trim().is_empty() && key_looks_like_credential(k))
 }
 
 /// Whether a key looks like a credential rather than a name: not a
