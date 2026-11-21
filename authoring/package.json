@@ -28,7 +28,10 @@
     "render:context": "node src/context-cli.mjs",
     "prerender:context": "node src/generate.mjs",
     "preprobe:context": "node src/generate.mjs",
-    "build": "node src/build-worker.mjs"
+    "build": "node src/build-worker.mjs",
+    "preprobe:compiler-rs": "node src/generate.mjs",
+    "probe:compiler-rs": "node spike-compiler-rs/parity.mjs && node spike-compiler-rs/parity-render.mjs && node spike-compiler-rs/parity-errors.mjs && node spike-compiler-rs/tsx-positions.mjs",
+    "bench:compiler-rs": "node spike-compiler-rs/bench.mjs"
   },
   "devDependencies": {
     "@astrojs/compiler": "4.0.0",
