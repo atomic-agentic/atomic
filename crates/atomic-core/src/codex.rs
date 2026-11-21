@@ -440,13 +440,17 @@ impl StateGuard {
             home_secrets(&person_env, crate::state::passwd_home()).map_err(anyhow::Error::msg)?,
         );
         // With ATOMIC_HOME set, the default home's state, credentials and
-        // keys are another atomic's: denied too, where they exist. The entry
-        // from `dirs` is where that other atomic would keep its credentials
-        // (see [`crate::state::credentials_dir`]), which is not always the
-        // directory denied above: that one comes from
-        // [`crate::state::user_config_dir`], the same function
-        // [`crate::state::outside_user_config`] reads, so the directory a
-        // state directory is refused for sitting inside is denied outright.
+        // keys are another atomic's: denied too, where they exist. That
+        // atomic's credentials and keys sit under
+        // [`crate::state::user_config_dir`], the directory denied above and
+        // the same function [`crate::state::outside_user_config`] reads, so
+        // the directory a state directory is refused for sitting inside is
+        // denied outright. The entries from `dirs` are denied beside it: the
+        // state directory `base_dir` falls back to, and the configuration
+        // directory `dirs` names — not always the same one, where `dirs`
+        // takes a relative spelling of `HOME` or `XDG_CONFIG_HOME` that
+        // `user_config_dir` gives way from, which is where an older atomic
+        // kept its credentials and keys.
         if std::env::var_os("ATOMIC_HOME").is_some_and(|h| !h.is_empty()) {
             let defaults = [
                 dirs::data_dir().map(|d| d.join("atomic")),

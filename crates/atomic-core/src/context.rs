@@ -163,16 +163,24 @@ fn private_dir(dir: &Path) -> Result<(), String> {
 
 /// The default directory for the checkpoint authentication key: apart from
 /// the checkpoints, so a copy of the state directory, or a process that can
-/// only write there, cannot sign a checkpoint. A process running as the same
+/// only write there, cannot sign a checkpoint. Without `ATOMIC_HOME` it
+/// sits under [`crate::state::user_config_dir`] — the same directory the
+/// person's own configuration resolves under and the denial is made of —
+/// so one spelling of `HOME`, `XDG_CONFIG_HOME` or the password database
+/// places settings, credentials, keys and the denial together, and never a
+/// place a working directory would complete. A process running as the same
 /// user can still read the key; it detects tampering by anything with less
 /// access than that.
 pub fn default_key_dir() -> Result<PathBuf, String> {
-    match std::env::var_os("ATOMIC_HOME").filter(|value| !value.is_empty()) {
-        Some(home) => Ok(PathBuf::from(home).join("keys")),
-        None => dirs::config_dir()
-            .map(|dir| dir.join("atomic/keys"))
+    match crate::state::atomic_home().map_err(|e| e.to_string())? {
+        Some(home) => Ok(home.join("keys")),
+        None => crate::state::user_config_dir()
+            .map(|config| config.join("keys"))
             .ok_or_else(|| {
-                "no user configuration directory for the context key; set ATOMIC_HOME".into()
+                "the home directory is unknown (HOME is unset or not an absolute path, and \
+                 the user has no home in the password database), so there is no configuration \
+                 directory for the context key; set HOME, or set ATOMIC_HOME"
+                    .into()
             }),
     }
 }
@@ -631,5 +639,100 @@ Profile: {context.profile}; step: {context.step.id}; input: {input.text}
         assert!(error.contains("outside source"), "{error}");
         let _ = std::fs::remove_dir_all(&keys);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The key directory is placed by the one resolution settings and the
+    /// denial are made of: a relative `HOME` gives way to the home the
+    /// password database gives, `XDG_CONFIG_HOME` moves the place, a
+    /// relative one of those gives way to `HOME`, `ATOMIC_HOME` keeps the
+    /// keys inside the home, and no absolute spelling at all is refused
+    /// saying the home is unknown. The environment and the password
+    /// database are what the test says they are, so this needs neither
+    /// this machine's user nor this process's own environment; see
+    /// [`crate::state::as_process`].
+    #[test]
+    fn the_key_directory_is_placed_by_the_one_configuration_directory() {
+        /// The throwaway directory of the case, which goes when the case
+        /// ends, however it ends.
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let made = std::env::temp_dir().join(format!(
+            "atomic-keys-place-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&made);
+        for dir in ["home", "settings", "real-home/.config/atomic"] {
+            std::fs::create_dir_all(made.join(dir)).expect("a directory of the case");
+        }
+        let scratch =
+            Scratch(std::fs::canonicalize(&made).expect("the throwaway directory placed"));
+        let _relative_home =
+            crate::state::as_process(&scratch.0, &[("HOME", "rel-home")], Some("real-home"));
+        let config = scratch.0.join("real-home/.config/atomic");
+        assert_eq!(
+            default_key_dir(),
+            Ok(config.join("keys")),
+            "the key directory is not the one under the home the password database gives"
+        );
+        assert_eq!(
+            default_key_dir().expect("keys"),
+            crate::state::user_config_dir()
+                .expect("the configuration directory")
+                .join("keys"),
+            "the key directory is not where settings and the denial are made"
+        );
+        drop(_relative_home);
+        let _home = crate::state::as_process(&scratch.0, &[("HOME", "/home")], None);
+        assert_eq!(
+            default_key_dir(),
+            Ok(scratch.0.join("home/.config/atomic/keys")),
+            "the key directory is not under `HOME`"
+        );
+        drop(_home);
+        let _xdg = crate::state::as_process(
+            &scratch.0,
+            &[("HOME", "/home"), ("XDG_CONFIG_HOME", "/settings")],
+            None,
+        );
+        assert_eq!(
+            default_key_dir(),
+            Ok(scratch.0.join("settings/atomic/keys")),
+            "`XDG_CONFIG_HOME` did not move the key directory"
+        );
+        drop(_xdg);
+        let _relative_xdg = crate::state::as_process(
+            &scratch.0,
+            &[("HOME", "/home"), ("XDG_CONFIG_HOME", "settings")],
+            None,
+        );
+        assert_eq!(
+            default_key_dir(),
+            Ok(scratch.0.join("home/.config/atomic/keys")),
+            "a relative `XDG_CONFIG_HOME` did not give way to `HOME`"
+        );
+        drop(_relative_xdg);
+        let _atomic = crate::state::as_process(
+            &scratch.0,
+            &[("HOME", "/home"), ("ATOMIC_HOME", "/home")],
+            None,
+        );
+        assert_eq!(
+            default_key_dir(),
+            Ok(scratch.0.join("home/keys")),
+            "`ATOMIC_HOME` did not keep the keys inside the home"
+        );
+        drop(_atomic);
+        let _none = crate::state::as_process(&scratch.0, &[("HOME", "rel-home")], None);
+        let why = default_key_dir().expect_err("no absolute spelling of a home");
+        assert!(
+            why.starts_with("the home directory is unknown") && why.contains("set ATOMIC_HOME"),
+            "not the unknown-home refusal for the key directory: {why}"
+        );
     }
 }

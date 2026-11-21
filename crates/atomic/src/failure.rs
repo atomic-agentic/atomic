@@ -159,6 +159,15 @@ fn known(cause: &(dyn std::error::Error + 'static)) -> Option<Failure> {
                 state::StateError::NoDataDir => {
                     "set ATOMIC_HOME to a directory for atomic's state".into()
                 }
+                // The same home every place is placed by: naming another
+                // directory is no remedy while no spelling of the home is
+                // absolute.
+                state::StateError::NoConfigDir => {
+                    "set HOME to an absolute directory, or point XDG_CONFIG_HOME at one, so \
+                     your own configuration directory can be placed; or set ATOMIC_HOME, which \
+                     keeps credentials under it instead"
+                        .into()
+                }
                 state::StateError::InUse { path, .. } => format!(
                     "stop the other atomic process using {} (an older atomic's `atomic serve`, \
                      `run` or `runs resume`), then run atomic again; its state moves then",
@@ -312,6 +321,27 @@ mod tests {
         assert_eq!(f.kind, "error");
         assert_eq!(f.description, "something odd");
         assert!(!f.action.is_empty());
+    }
+
+    /// A home no spelling places is the configuration directory's own
+    /// failure, not the state directory's: the action says which home to
+    /// set, and does not send the person to a state directory that is not
+    /// the trouble.
+    #[test]
+    fn an_unknown_home_names_the_home_to_set() {
+        let f = analyze(&anyhow::Error::new(state::StateError::NoConfigDir));
+        assert_eq!(f.kind, "state.unavailable");
+        assert!(
+            f.description.starts_with("the home directory is unknown"),
+            "{}",
+            f.description
+        );
+        assert!(f.action.contains("HOME"), "{}", f.action);
+        assert!(
+            !f.action.contains("writable directory for atomic's state"),
+            "the unknown home is passed off as a state-directory problem: {}",
+            f.action
+        );
     }
 
     /// A directory atomic cannot place is named in the description, and the

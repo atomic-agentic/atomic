@@ -1,0 +1,1 @@
+context-keys-config-dir|crates/atomic-core/src/context.rs|        None => crate::state::user_config_dir()|        None => Some(dirs::config_dir().unwrap_or_default())|-p atomic-agentic-core --lib -- the_key_directory_is_placed_by_the_one_configuration_directory

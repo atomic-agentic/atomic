@@ -80,6 +80,16 @@ pub enum StateError {
     /// Neither `ATOMIC_HOME` nor a user data directory is available.
     #[error("no user data directory on this platform; set ATOMIC_HOME")]
     NoDataDir,
+    /// `ATOMIC_HOME` is unset and the home directory is unknown: `HOME` and
+    /// `XDG_CONFIG_HOME` name no absolute directory and the password
+    /// database gives no absolute home, so there is no configuration
+    /// directory to keep credentials in.
+    #[error(
+        "the home directory is unknown (HOME is unset or not an absolute path, and the user \
+         has no home in the password database), so there is no configuration directory for \
+         credentials; set HOME, or set ATOMIC_HOME to keep them under it"
+    )]
+    NoConfigDir,
     /// The directory could not be created.
     #[error("cannot create the state directory {path}: {source}")]
     Create {
@@ -603,9 +613,12 @@ pub fn base_dir() -> Result<PathBuf, StateError> {
 /// `$ATOMIC_HOME`, if it is set, as an absolute path: one given relative
 /// is taken from the working directory atomic started in, so it names the
 /// same directory wherever it is used, such as by a helper Codex starts in
-/// another directory, with its `..` resolved as far as it exists.
-fn atomic_home() -> Result<Option<PathBuf>, StateError> {
-    let Some(home) = std::env::var_os("ATOMIC_HOME").filter(|v| !v.is_empty()) else {
+/// another directory, with its `..` resolved as far as it exists. The
+/// variable is read as [`user_config_dir`] reads its own, so the home and
+/// the configuration directory beside it come from one reading of the
+/// environment.
+pub(crate) fn atomic_home() -> Result<Option<PathBuf>, StateError> {
+    let Some(home) = process_env("ATOMIC_HOME").filter(|v| !v.is_empty()) else {
         return Ok(None);
     };
     let home = PathBuf::from(home);
@@ -841,14 +854,18 @@ fn link_file(path: &Path, through_links: bool) -> Result<Option<String>, String>
 
 /// Where the opt-in file store keeps operator credentials (see
 /// [`crate::credential::FileSecrets`]): `$ATOMIC_HOME/credentials`, or
-/// `atomic/credentials` in the user configuration directory. Outside every
-/// project and every state directory.
+/// `credentials` under [`user_config_dir`] — the same directory the
+/// person's own configuration resolves under and the denial is made of, so
+/// one spelling of `HOME`, `XDG_CONFIG_HOME` or the password database
+/// places settings, credentials, keys and the denial together, and never a
+/// place a working directory would complete. Outside every project and
+/// every state directory.
 pub fn credentials_dir() -> Result<PathBuf, StateError> {
     match atomic_home()? {
         Some(home) => Ok(home.join("credentials")),
-        None => Ok(dirs::config_dir()
-            .ok_or(StateError::NoDataDir)?
-            .join("atomic/credentials")),
+        None => Ok(user_config_dir()
+            .ok_or(StateError::NoConfigDir)?
+            .join("credentials")),
     }
 }
 
@@ -958,7 +975,11 @@ fn process_passwd_home() -> Option<PathBuf> {
 /// [`process_passwd_home`] until the returned guard is dropped, which puts
 /// this process's own back however the thread ends.
 #[cfg(test)]
-fn as_process(scratch: &Path, vars: &[(&str, &str)], passwd: Option<&str>) -> TestProcessGuard {
+pub(crate) fn as_process(
+    scratch: &Path,
+    vars: &[(&str, &str)],
+    passwd: Option<&str>,
+) -> TestProcessGuard {
     let below = |value: &str| match value.strip_prefix('/') {
         Some(rest) => scratch.join(rest).into_os_string(),
         None => std::ffi::OsString::from(value),
@@ -978,7 +999,7 @@ fn as_process(scratch: &Path, vars: &[(&str, &str)], passwd: Option<&str>) -> Te
 /// Puts this process's own environment and password database back for its
 /// thread; see [`as_process`].
 #[cfg(test)]
-struct TestProcessGuard(());
+pub(crate) struct TestProcessGuard(());
 
 #[cfg(test)]
 impl Drop for TestProcessGuard {
@@ -2367,6 +2388,93 @@ mod tests {
             ),
             "a state directory inside the password home was not refused by the check itself: \
              {outcome:?}"
+        );
+    }
+
+    /// Settings, the denial and the credential store name one configuration
+    /// directory for every spelling of the home: `$XDG_CONFIG_HOME/atomic`,
+    /// else `~/.config/atomic`, else the home the password database gives.
+    /// A *relative* `HOME` is no home and gives way to the password
+    /// database, so credentials are never placed at a spelling a working
+    /// directory would complete; no absolute spelling at all is refused
+    /// saying the home is unknown, rather than placing credentials
+    /// nowhere-different.
+    #[test]
+    fn credentials_are_kept_in_the_one_configuration_directory_of_every_spelling() {
+        let scratch = setup(
+            "credentials-place",
+            &["home", "settings", "real-home/.config/atomic"],
+            &[],
+        );
+        // A relative `HOME`: no configuration directory, and no place for
+        // credentials that `<cwd>/rel-home/.config` would name.
+        let _relative_home = as_process(&scratch, &[("HOME", "rel-home")], Some("real-home"));
+        let config = scratch.join("real-home/.config/atomic");
+        assert_eq!(
+            credentials_dir().expect("credentials"),
+            config.join("credentials"),
+            "credentials are not kept under the home the password database gives"
+        );
+        assert_eq!(
+            credentials_dir().expect("credentials"),
+            user_config_dir()
+                .expect("the configuration directory")
+                .join("credentials"),
+            "credentials are not kept where settings and the denial are made"
+        );
+        drop(_relative_home);
+        let _home = as_process(&scratch, &[("HOME", "/home")], None);
+        assert_eq!(
+            credentials_dir().expect("credentials"),
+            scratch.join("home/.config/atomic/credentials"),
+            "credentials are not under `HOME`"
+        );
+        drop(_home);
+        let _xdg = as_process(
+            &scratch,
+            &[("HOME", "/home"), ("XDG_CONFIG_HOME", "/settings")],
+            None,
+        );
+        assert_eq!(
+            credentials_dir().expect("credentials"),
+            scratch.join("settings/atomic/credentials"),
+            "`XDG_CONFIG_HOME` did not move the credentials"
+        );
+        drop(_xdg);
+        let _relative_xdg = as_process(
+            &scratch,
+            &[("HOME", "/home"), ("XDG_CONFIG_HOME", "settings")],
+            None,
+        );
+        assert_eq!(
+            credentials_dir().expect("credentials"),
+            scratch.join("home/.config/atomic/credentials"),
+            "a relative `XDG_CONFIG_HOME` did not give way to `HOME`"
+        );
+        drop(_relative_xdg);
+        // `ATOMIC_HOME` keeps credentials inside the home, and is read from
+        // the same environment as the configuration directory beside it.
+        let _atomic = as_process(
+            &scratch,
+            &[("HOME", "/home"), ("ATOMIC_HOME", "/home")],
+            None,
+        );
+        assert_eq!(
+            credentials_dir().expect("credentials"),
+            scratch.join("home/credentials"),
+            "`ATOMIC_HOME` did not keep the credentials inside the home"
+        );
+        drop(_atomic);
+        let _none = as_process(&scratch, &[("HOME", "rel-home")], None);
+        let why = credentials_dir().expect_err("no absolute spelling of a home");
+        assert!(
+            matches!(why, StateError::NoConfigDir),
+            "not the unknown-home refusal for credentials: {why}"
+        );
+        assert!(
+            why.to_string().contains("the home directory is unknown")
+                && why.to_string().contains("set ATOMIC_HOME"),
+            "the refusal does not say which home is missing and what to set: {why}"
         );
     }
 }
