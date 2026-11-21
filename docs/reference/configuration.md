@@ -273,11 +273,16 @@ not addresses, and `NO_PROXY`, when it is set at all, hides `no_proxy`. Add the
 host to `NO_PROXY` (for example `NO_PROXY=127.0.0.1`) or use an `https`
 endpoint.
 
-The system's proxy settings can carry the key too, and atomic cannot read them:
-on macOS and Windows Codex's client may take a proxy from them, and on any
-platform it does when Codex's `respect_system_proxy` feature is on. So on any
-platform but Linux, and wherever that feature is on, the turn is refused unless
-`NO_PROXY` exempts the host, whatever the variables say.
+On any platform but Linux, the system's proxy settings can carry the key too,
+and atomic cannot read them. With Codex's default, Codex's client may take a
+proxy from them where the variables name none, and `NO_PROXY` still applies:
+the turn is refused unless `NO_PROXY` exempts the host. With Codex's
+`respect_system_proxy` feature on, the platform's settings and their own bypass
+list decide and `NO_PROXY` changes nothing, so the turn is always refused: turn
+the feature off, or use an `https` endpoint. On Linux the feature finds no
+platform settings, and Codex reads the proxy variables itself, taking the
+first of each pair that is not empty.
+
 This machine is recognised as for a lite atom: a host name that only resolves
 here is not refused and goes through the proxy, so put it in `NO_PROXY`
 yourself.

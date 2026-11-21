@@ -2786,17 +2786,14 @@ async fn new_config(
             // to a proxy in cleartext, and Codex's client cannot be told to
             // skip proxies: the turn is refused, saying how to fix it.
             // Elsewhere than Linux, or told to respect the system's proxy
-            // settings, Codex's client may find a proxy atomic cannot see.
-            let system_may_proxy = if cfg!(target_os = "linux") {
-                respect_system_proxy
-            } else {
-                true
-            };
+            // settings, Codex's client finds its proxy by other rules.
+            let rules =
+                crate::lite::ProxyRules::for_codex(cfg!(target_os = "linux"), respect_system_proxy);
             if endpoint.api_key_env.is_some()
                 && let Some(why) = crate::lite::proxied_key(
                     &endpoint.base_url,
                     &|name| std::env::var(name).ok(),
-                    system_may_proxy,
+                    rules,
                 )
             {
                 anyhow::bail!(why);
@@ -4267,15 +4264,29 @@ mod tests {
         });
     }
 
-    /// A Codex atom told to respect the system's proxy settings, which atomic
-    /// cannot read, is refused a key to an endpoint on this machine over plain
-    /// http unless NO_PROXY exempts the host; with the setting off, nothing
-    /// in this environment names a proxy and the configuration is made.
+    /// A Codex atom's key to an endpoint on this machine over plain http, in
+    /// an environment that names no proxy and exempts nothing, with Codex's
+    /// `respect_system_proxy` feature off and on. On Linux, where the feature
+    /// finds no platform settings, the configuration is made either way.
+    /// Elsewhere the platform's settings may name a proxy atomic cannot read:
+    /// with the feature off the key is refused unless NO_PROXY exempts the
+    /// host, and with it on, where NO_PROXY changes nothing, it is refused
+    /// with the feature named.
     #[test]
-    fn a_key_the_systems_proxy_settings_may_carry_is_refused() {
+    fn a_key_the_systems_proxy_settings_may_carry_is_refused_where_they_apply() {
         on_codex_runtime(async {
-            for name in ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"] {
-                assert!(std::env::var_os(name).is_none(), "{name} is set here");
+            for name in [
+                "HTTP_PROXY",
+                "http_proxy",
+                "ALL_PROXY",
+                "all_proxy",
+                "NO_PROXY",
+                "no_proxy",
+            ] {
+                assert!(
+                    std::env::var_os(name).is_none(),
+                    "{name} is set in this test's environment"
+                );
             }
             let endpoint = ModelEndpoint {
                 base_url: "http://127.0.0.1:9/v1".into(),
@@ -4284,30 +4295,38 @@ mod tests {
                 sign_in: None,
             };
             let plain = scratch("home-no-system-proxy");
-            new_config(&endpoint, &plain, &plain, Arg0DispatchPaths::default())
-                .await
-                .expect("no proxy is named");
+            let default = new_config(&endpoint, &plain, &plain, Arg0DispatchPaths::default()).await;
             let respecting = scratch("home-system-proxy");
             std::fs::write(
                 respecting.join("config.toml"),
                 "[features]\nrespect_system_proxy = true\n",
             )
             .expect("config");
-            let refused = new_config(
+            let respected = new_config(
                 &endpoint,
                 &respecting,
                 &respecting,
                 Arg0DispatchPaths::default(),
             )
-            .await
-            .expect_err("refused");
-            let message = format!("{refused:#}");
-            assert!(
-                message.contains("the system's proxy settings")
-                    && message
-                        .contains("set NO_PROXY to include 127.0.0.1, or use an https endpoint"),
-                "{message}"
-            );
+            .await;
+            if cfg!(target_os = "linux") {
+                default.expect("no proxy is named");
+                respected.expect("no proxy is named, and Linux has no platform settings");
+            } else {
+                let message = format!("{:#}", default.expect_err("refused"));
+                assert!(
+                    message.contains("the system's proxy settings")
+                        && message.contains(
+                            "set NO_PROXY to include 127.0.0.1, or use an https endpoint"
+                        ),
+                    "{message}"
+                );
+                let message = format!("{:#}", respected.expect_err("refused"));
+                assert!(
+                    message.contains("turn respect_system_proxy off, or use an https endpoint"),
+                    "{message}"
+                );
+            }
         });
     }
 
