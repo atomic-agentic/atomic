@@ -680,8 +680,10 @@ and model allowlists through managed requirements.
 ### M27a
 
 **v0.5, alongside M9.** OIDC sign-in everywhere, groups read from token claims,
-approver groups per gate, no approving one's own change, and model allowlists
-through managed requirements.
+approver groups per gate, no approving one's own change, model allowlists
+through managed requirements, and step-up for high-tier gates: a gate tier may
+set `requires_acr`, which makes a decision need a fresh step-up login such as a
+passkey, with the ACR stored on the decision.
 
 **Acceptance:**
 
@@ -689,6 +691,9 @@ through managed requirements.
 - Someone outside a gate's approver group cannot approve it.
 - The author of a change cannot approve it.
 - A model missing from the allowlist is refused.
+- On a server, a tier that requires step-up refuses a decision whose token
+  has no fresh ACR and accepts one whose token has it; the audit entry records
+  the ACR.
 
 ### M27b
 
@@ -1248,9 +1253,7 @@ gates as durable `recv` waits; proposal and evidence hashes that cannot change
 and stay pinned while a decision or a recovery may still need them; a terminal
 prompt inside `atomic run`; question gates (`ask` with a typed `answer`,
 `remember`, and a default when time runs out), kept in that store and sent on
-those channels; a gate tier may set `requires_acr`, which makes a high-tier
-decision need a fresh step-up login such as a passkey, with the ACR stored on
-the decision; a single reviewer atom whose typed verdict escalates to the
+those channels; a single reviewer atom whose typed verdict escalates to the
 terminal; and the commands `atomic gates enroll`, `list`, `approve` and
 `reject`. An operator enrolls a credential once per project, held in the OS
 keyring, and a decision counts only when it carries that credential (see the
@@ -1277,9 +1280,6 @@ keyring, and a decision counts only when it carries that credential (see the
   answer, writes the feedback entry when asked, and resumes with the declared
   default if nobody answers in time. An answer that is not one of the enum's
   values is refused.
-- On a server, a tier that requires step-up refuses a decision whose token
-  has no fresh ACR and accepts one whose token has it; the audit entry records
-  the ACR.
 
 ## M46: AI-reviewed gates
 
