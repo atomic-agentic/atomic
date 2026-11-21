@@ -508,7 +508,8 @@ path, walked a directory at a time with each link on the way followed,
 would land in a directory it may write or in atomic's state, where a
 command could put a file there for what reads the place to find; passes
 through a link in such a directory, which a command could point
-elsewhere; or leads where atomic cannot tell: point the link elsewhere, or
+elsewhere, or climbs back out of one with `..`, where a command could make
+what it climbs out of a link; or leads where atomic cannot tell: point the link elsewhere, or
 make what it leads to first. The model chooses
 the commands, so none of these reach it through them. atomic makes the list
 when the turn starts: a place on it that appears while a command runs is

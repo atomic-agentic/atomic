@@ -1008,6 +1008,19 @@ fn dangling_into(path: &Path, writable: &[PathBuf]) -> Option<anyhow::Error> {
             continue;
         }
         if part == ".." {
+            // Up out of a directory a command may write: what it holds,
+            // that this climbs back out of, a command can make a link.
+            if let Some(root) = inside_of(writable, &done) {
+                return refuse(format!(
+                    "{} leads by way of {}, and climbs back out of it, in {}, which atoms' \
+                     commands may write, so a command could make it a link that leads \
+                     elsewhere; point {} without `..`",
+                    path.display(),
+                    done.display(),
+                    root.display(),
+                    path.display()
+                ));
+            }
             done.pop();
             continue;
         }
@@ -5868,6 +5881,20 @@ mod tests {
             why.contains(&format!(
                 "leads by way of {}, a link in {}",
                 work.join("hop").display(),
+                work.display()
+            )),
+            "{why}"
+        );
+        // Up through a directory of what the thread may write, back out of
+        // it: a command could make that directory a link.
+        std::fs::remove_file(&place).expect("unlink");
+        std::fs::create_dir_all(work.join("sub")).expect("dir");
+        link(&work.join("sub/../../elsewhere/aws"), &place);
+        let why = refused(writable).expect("refused");
+        assert!(
+            why.contains(&format!(
+                "leads by way of {}, and climbs back out of it, in {}",
+                work.join("sub").display(),
                 work.display()
             )),
             "{why}"
