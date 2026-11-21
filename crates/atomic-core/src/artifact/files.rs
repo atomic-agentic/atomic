@@ -115,16 +115,30 @@ impl Exchange {
     /// directory, named by its digest and read-only, then make the
     /// directory read-only. Each copy is checked against its digest as it is
     /// made.
+    ///
+    /// Each artifact is [held](ArtifactStore::hold) until every copy is made,
+    /// so no sweep removes one from when it is held until its copy is made,
+    /// even a sweep that did not see the input's reference. One that a sweep
+    /// finished removing before the hold was taken is missing, and the mount
+    /// fails.
+    /// Every hold is taken before anything is given, so a mount that fails
+    /// with [`ArtifactError::Locked`] has given nothing and may be tried
+    /// again.
     pub fn mount(
         &self,
         store: &dyn ArtifactStore,
         artifacts: &[ArtifactRef],
     ) -> Result<(), ArtifactError> {
-        let mut given = HashSet::new();
+        let mut seen = HashSet::new();
+        let artifacts: Vec<&ArtifactRef> = artifacts
+            .iter()
+            .filter(|a| seen.insert(a.digest()))
+            .collect();
+        let mut held: Vec<Hold> = Vec::with_capacity(artifacts.len());
+        for artifact in &artifacts {
+            held.push(store.hold(artifact)?);
+        }
         for artifact in artifacts {
-            if !given.insert(artifact.digest()) {
-                continue;
-            }
             // The store's reader says when the blob no longer matches its
             // digest; whatever the exchange itself says is its own failure.
             let mut content = Watched {
@@ -140,7 +154,10 @@ impl Exchange {
                 }
             })?;
         }
-        self.0.seal().map_err(io(self.inputs()))
+        self.0.seal().map_err(io(self.inputs()))?;
+        // Every copy is made: the inputs are the command's now.
+        drop(held);
+        Ok(())
     }
 
     /// Replace each `{"$file": …}` object in `output` that sits where
@@ -346,36 +363,48 @@ impl Exchange {
 }
 
 /// The artifacts `input` references where `contract` expects references, in
-/// the order the check meets them, each once. A reference anywhere else, or
-/// one the store does not hold, is not among them.
+/// the order the check meets them, each once: each the store held when the
+/// check asked about it. An input whose references the contract's check
+/// refuses, such as one to an artifact the store does not hold, is refused.
+/// A reference anywhere else is not among them, nor one the check asked
+/// about only in an alternative the input does not take, as when one branch
+/// of an `anyOf` fits without it.
 pub fn referenced(
     contract: &Value,
     input: &Value,
     lookup: &(dyn ArtifactLookup + Sync),
-) -> Vec<ArtifactRef> {
+) -> Result<Vec<ArtifactRef>, atomic_schema::artifact::ArtifactCheckError> {
     let recording = Recording {
         inner: lookup,
         asked: std::sync::Mutex::new(Vec::new()),
     };
-    let _ = atomic_schema::artifact::check_refs(contract, input, &recording);
-    let mut asked = recording.asked.into_inner().unwrap_or_default();
+    let checked = atomic_schema::artifact::check_refs(contract, input, &recording);
+    checked?;
+    let asked = recording.asked.into_inner().unwrap_or_default();
     let mut seen = std::collections::BTreeSet::new();
-    asked.retain(|a| seen.insert(a.digest().to_owned()) && lookup.media_types(a).is_some());
-    asked
+    // As the check found them: not looked up again, so one swept since is
+    // given, and found missing then, rather than left out.
+    Ok(asked
+        .into_iter()
+        .filter(|(a, held)| *held && seen.insert(a.digest().to_owned()))
+        .map(|(a, _)| a)
+        .collect())
 }
 
-/// A lookup that records what it was asked about.
+/// A lookup that records what it was asked about, and whether the store
+/// held it.
 struct Recording<'a> {
     inner: &'a (dyn ArtifactLookup + Sync),
-    asked: std::sync::Mutex<Vec<ArtifactRef>>,
+    asked: std::sync::Mutex<Vec<(ArtifactRef, bool)>>,
 }
 
 impl ArtifactLookup for Recording<'_> {
     fn media_types(&self, artifact: &ArtifactRef) -> Option<Vec<String>> {
+        let found = self.inner.media_types(artifact);
         if let Ok(mut asked) = self.asked.lock() {
-            asked.push(artifact.clone());
+            asked.push((artifact.clone(), found.is_some()));
         }
-        self.inner.media_types(artifact)
+        found
     }
 }
 
