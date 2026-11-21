@@ -50,13 +50,16 @@ removed format does not bypass the check. See [the expression guide](../guides/t
 
 ## A prompt section is missing or mismatched
 
-Nothing checks that section tags balance. The parser closes a section you left
-open and ignores a closing tag that opens nothing, so a mismatch is never
-reported: it shows up as prompt structure that is not what you wrote. Render the
-atom and read the prompt it produces (`atomic render`), and check for a
-misspelled closing tag or sections closed in the wrong order. Tags that start
-with `data-` are reserved and are rejected wherever you write them. See
-[section tags](../guides/template-tags.md).
+Nothing checks that section tags balance. A misspelled closing tag still closes
+a section: the innermost one that is open, whatever its name. The symptom is
+therefore text landing inside the wrong section, or after it, rather than an
+error. A closing tag with no section open is dropped, and a section still open
+at the end of the file is closed there. Render the atom and read the prompt it
+produces (`atomic render`), then compare the nesting in that output with what
+you wrote. Inside a `{…}` expression a section left open does fail the load,
+with a TypeScript syntax error such as `':' expected.` that does not name the
+tag. Tags that start with `data-` are reserved and are rejected wherever you
+write them. See [section tags](../guides/template-tags.md).
 
 ## `atomic check` says a diagram is stale
 

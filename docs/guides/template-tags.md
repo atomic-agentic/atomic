@@ -117,10 +117,16 @@ parameter language. A component used without being imported is an error.
 ## Sections and grouping
 
 Lowercase section tags such as `<criteria>` and `<rubric>` organize the prompt;
-the model reads them as prompt structure. Nothing checks that they balance: the
-parser closes a section you left open and ignores a closing tag that opens
-nothing, and the load fails only on what the parser reports as an error, so a
-mismatch is repaired rather than refused. A literal section takes no attributes.
+the model reads them as prompt structure. Nothing checks that they balance, so
+an unbalanced tag moves text around instead of failing the load. A closing tag
+closes the innermost section that is open, whatever its name:
+`<criteria><rubric>…</criteria>tail` renders
+`<criteria><rubric>…</rubric>tail</criteria>`. A closing tag with no section
+open is dropped. A section still open at the end of the file is closed there,
+so text written after it ends up inside it. Inside a `{…}` expression a section
+left open does fail the load, with a TypeScript syntax error such as
+`':' expected.`, which does not name the tag. A literal section takes no
+attributes.
 `<Fragment>` groups content without adding a section, and takes only a `slot`
 attribute. The `<data-…>` prefix is reserved for atomic's own value wrappers,
 and `<data-…>`, `<script>` and `<style>` are rejected wherever you write them.
