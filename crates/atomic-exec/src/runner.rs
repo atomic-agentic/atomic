@@ -405,7 +405,7 @@ pub struct ProcessRunner {
 }
 
 /// How much longer than its command a runner may take before it is stopped.
-const RUNNER_GRACE: Duration = Duration::from_secs(30);
+pub const RUNNER_GRACE: Duration = Duration::from_secs(30);
 
 impl ProcessRunner {
     /// Runners started as `program runner`, with only `PATH` from this

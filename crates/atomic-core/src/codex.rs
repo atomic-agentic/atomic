@@ -2271,6 +2271,7 @@ where
                 input_bound: None,
                 turn: true,
                 work: false,
+                longest: None,
             })
             .await
         {

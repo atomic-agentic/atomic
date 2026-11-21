@@ -1,0 +1,1 @@
+signin-forget-failed|crates/atomic-core/src/signin.rs|            Tidy::Login(Forgot::Failed) => false,|            Tidy::Login(Forgot::Failed) if false /*CONTROL_OFF*/ => false,|-p atomic-agentic-core --lib signin::tests::an_unreadable_keyring_keeps_a_directory_a_save_may_have_used
