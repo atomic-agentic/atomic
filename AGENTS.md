@@ -178,8 +178,9 @@ first.
    "any" and "always" are literally true, or the exceptions are named. A
    change covers every path it claims: lite, Codex and exec atoms, plain and
    `--json` output, every call site. When something becomes built, update
-   `docs/reference/availability.md`; when an example changes, run
-   `tools/check_examples.py`.
+   `docs/reference/availability.md`; when an example changes, run the
+   example checker as CI's examples job does (its virtualenv and pinned Deno
+   included).
 4. **Fail closed.** No error path, empty set, unknown value or missing
    component ends up allowing, showing or passing what it should refuse.
    Unknown means refused. When narrowing or redacting, compare with main on
@@ -190,13 +191,16 @@ first.
    environment variable, configuration file or atom can turn them on.
 6. **It passes the checks on current main.** Run the fmt, clippy and test
    commands from [Build and test](#build-and-test) for what you touched, on
-   your change merged with current `origin/main`. Merge in a throwaway
-   worktree so your own tree is untouched: `git worktree add --detach
-   <scratch> HEAD`, `git -C <scratch> merge --no-edit origin/main`, build and
-   test there through `scripts/dev.sh` (with `ATOMIC_DEV_MOUNTS` as
-   docs/development.md describes for a linked worktree), then `git worktree
-   remove <scratch>`. A clean textual merge can still break a call whose
-   signature changed.
+   your change merged with current `origin/main`. Merge in a scratch worktree
+   so your own tree is untouched, and keep that worktree between checks so
+   its `target/` stays warm: `git worktree add --detach <scratch> HEAD` once;
+   then each time `git -C <scratch> checkout --detach <your HEAD>` and
+   `git -C <scratch> merge --no-commit --no-edit origin/main`. If it
+   conflicts, report the files and stop. Build and test there through
+   `scripts/dev.sh` (a linked worktree needs the main checkout's `.git`
+   mounted, as docs/development.md describes), then `git -C <scratch> merge
+   --abort`. A clean textual merge can still break a call whose signature
+   changed.
 7. **Resources and races.** A lock, hold, reservation or temporary directory
    is released on every path, including errors, panics and drops. Anything
    checked before a lock is re-read under it. A step that runs twice is safe.
@@ -220,10 +224,11 @@ first.
    test fails rather than passing vacuously. Put the list in your report.
 10. **Prove every row bites, by running it.**
     `ATOMIC_DEV_SANDBOX=on scripts/dev.sh scripts/controls-check.sh <name>`
-    for each row you added or touched, and quote each result line. The script
-    refuses files that differ from HEAD, so it runs on committed work; if you
-    have not been asked to commit, say which rows are unrun and why. For each
-    row, say what the switched-off code then does and which assertion fails.
+    for each row you added or touched (in a linked worktree, mount the main
+    checkout's `.git` as docs/development.md describes), and quote each
+    result line. The script refuses files that differ from HEAD, so it runs
+    on committed work; if you have not been asked to commit, say which rows
+    are unrun and why. For each row, say what the switched-off code then does and which assertion fails.
     A guard with two halves (kill and reap, the terms of a count, a check and
     its message) is switched off one half at a time; a half whose removal
     fails no test gets its own test and row. With any control off, the test
