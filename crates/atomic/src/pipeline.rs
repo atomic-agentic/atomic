@@ -937,6 +937,7 @@ async fn run_pipeline_in<C: WorkflowContext>(
     reached(&id, 0)?;
     let store = services.store.clone();
     fits("the workflow's input", &pipeline.input, &input)?;
+    check_reviews(&pipeline)?;
     plan(&pipeline, services.runtimes.backend.statement())?;
     // Every step is held to its atom's trust before the run does anything.
     trusted(&pipeline).map_err(failed)?;
@@ -1741,35 +1742,6 @@ async fn reviewed<C: WorkflowContext>(
     input: Value,
     (mut candidate, author_turn): (Candidate, i32),
 ) -> Result<(Candidate, Acceptance)> {
-    // As the loader refuses them, for a run whose pipeline came from
-    // anywhere else.
-    if step.id.contains('.') {
-        return Err(failed(format!(
-            "step `{}` has a dot in its name, which its review's durable names would share",
-            step.id
-        )));
-    }
-    let kind = |name: &str| run.pipeline.atoms.get(name).map(|a| a.kind.as_str());
-    if kind(&step.atom) == Some("exec") {
-        return Err(failed(format!(
-            "step `{}`: an exec atom's output cannot be reviewed",
-            step.id
-        )));
-    }
-    if !matches!(kind(&review.reviewer), Some("lite" | "codex")) {
-        return Err(failed(format!(
-            "step `{}`: its reviewer `{}` is not a lite or codex atom of the run",
-            step.id, review.reviewer
-        )));
-    }
-    if review.rounds > atomic_core::workflow::MAX_REVIEW_ROUNDS {
-        return Err(failed(format!(
-            "step `{}`: its review gives {} repair rounds, more than the {} atomic allows",
-            step.id,
-            review.rounds,
-            atomic_core::workflow::MAX_REVIEW_ROUNDS
-        )));
-    }
     let author = run
         .pipeline
         .atoms
@@ -1931,6 +1903,47 @@ async fn reviewed<C: WorkflowContext>(
             }
         ))),
     }
+}
+
+/// Refuse, before anything of the run is paid for, a reviewed step the
+/// workflow loader would have refused, for a run whose pipeline came from
+/// anywhere else: a dotted name, an exec author, a reviewer that is not a
+/// model atom of the run, or more rounds than atomic allows.
+fn check_reviews(pipeline: &Pipeline) -> Result<()> {
+    for step in &pipeline.steps {
+        let Step::Atom(step) = step else { continue };
+        let Some(review) = &step.review else { continue };
+        // As the loader refuses them, for a run whose pipeline came from
+        // anywhere else.
+        if step.id.contains('.') {
+            return Err(failed(format!(
+                "step `{}` has a dot in its name, which its review's durable names would share",
+                step.id
+            )));
+        }
+        let kind = |name: &str| pipeline.atoms.get(name).map(|a| a.kind.as_str());
+        if kind(&step.atom) == Some("exec") {
+            return Err(failed(format!(
+                "step `{}`: an exec atom's output cannot be reviewed",
+                step.id
+            )));
+        }
+        if !matches!(kind(&review.reviewer), Some("lite" | "codex")) {
+            return Err(failed(format!(
+                "step `{}`: its reviewer `{}` is not a lite or codex atom of the run",
+                step.id, review.reviewer
+            )));
+        }
+        if review.rounds > atomic_core::workflow::MAX_REVIEW_ROUNDS {
+            return Err(failed(format!(
+                "step `{}`: its review gives {} repair rounds, more than the {} atomic allows",
+                step.id,
+                review.rounds,
+                atomic_core::workflow::MAX_REVIEW_ROUNDS
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Refuse, before anything runs, a step the execution backend's statement
