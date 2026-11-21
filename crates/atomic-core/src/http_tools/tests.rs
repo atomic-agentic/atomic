@@ -385,6 +385,16 @@ paths:
   /ping:
     get:
       operationId: ping
+  /health:
+    get:
+      operationId: health
+      responses:
+        "200": { description: alive }
+  /thing:
+    get:
+      operationId: thing
+      responses:
+        "2XX": { description: any }
   /lookup:
     get:
       operationId: lookup
@@ -459,6 +469,77 @@ async fn each_success_is_checked_against_the_response_its_status_declares() {
         .expect_err("only a 404 declared");
     assert!(
         matches!(&error, CallError::Undeclared { status: 200, .. }),
+        "{error}"
+    );
+}
+
+// A response the spec declares with no content declares no body as well, so
+// a reply that selects one and comes back with a body breaks the contract.
+// It is refused the way every other response violation is, before its body
+// is parsed, and never handed to the caller as a result.
+//
+// A 204 is the one status whose body no client ever reads: the protocol ends
+// the reply at its headers, so what arrives for a 204 is empty whatever the
+// server wrote after them. The check covers a 204 all the same; the refusals
+// below run on statuses whose body does arrive.
+#[tokio::test]
+async fn a_success_declared_with_no_content_must_carry_no_body() {
+    let (host, _) = server(vec![
+        (204, ""),                   // exactly what the spec declares
+        (200, r#"{"alive": true}"#), // a 200 declared with no content
+        (200, "deleted"),            // and a body that is not JSON at all
+        (200, r#"{"matters": 1}"#),  // the same, selected by the `2XX` range
+        (200, "  \n"),               // whitespace is an empty body
+        // A status declared with a JSON body is still checked against it.
+        (200, r#"{"result": "ok"}"#),
+        (200, r#"{"ticket": 7}"#),
+    ])
+    .await;
+    let tools = jobs(&host);
+    let args = json!({});
+    assert_eq!(
+        tools.call("submit", &args).await.expect("an empty 204"),
+        Value::Null,
+        "an empty body is no result"
+    );
+    for (operation, key) in [("health", "200"), ("health", "200"), ("thing", "2XX")] {
+        let error = tools
+            .call(operation, &args)
+            .await
+            .expect_err("a body where the spec declares none");
+        assert!(
+            matches!(&error, CallError::Response { status: 200, response, .. } if response == key),
+            "{operation}: {error}"
+        );
+        // Said with the status and the response it was checked against, and
+        // with how much arrived.
+        let said = format!("returned 200, which does not fit its response `{key}`");
+        assert!(error.to_string().contains(&said), "{error}");
+        assert!(error.to_string().contains("no body"), "{error}");
+    }
+    assert_eq!(
+        tools
+            .call("health", &args)
+            .await
+            .expect("a body of whitespace is an empty one"),
+        Value::Null
+    );
+    // A status the spec declares a JSON body for is checked against that
+    // schema as before: the reply that fits passes, the one that would fit
+    // another response does not.
+    assert_eq!(
+        tools
+            .call("submit", &args)
+            .await
+            .expect("a 200 that fits its own schema"),
+        json!({ "result": "ok" })
+    );
+    let error = tools
+        .call("submit", &args)
+        .await
+        .expect_err("a 200 that fits another response");
+    assert!(
+        matches!(&error, CallError::Response { status: 200, response, .. } if response == "200"),
         "{error}"
     );
 }

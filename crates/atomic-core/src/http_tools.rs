@@ -19,9 +19,9 @@
 //! a 429 or a 5xx; others are sent once. Responses are bounded. A success
 //! is checked against the response the operation declares for its status
 //! (its own code, else its range, else `default`): its schema, if it has
-//! one. A success with a status the operation declares no response for,
-//! when it declares any, is refused; it was answered, so it is not sent
-//! again.
+//! one, and no body at all where it declares no content, as a `204` does.
+//! A success with a status the operation declares no response for, when it
+//! declares any, is refused; it was answered, so it is not sent again.
 
 use atomic_schema::openapi::Operation;
 use reqwest::Url;
@@ -100,7 +100,9 @@ pub enum CallError {
         /// What failed.
         message: String,
     },
-    /// The response breaks the schema the operation declares for its status.
+    /// The response breaks the contract the operation declares for its
+    /// status: it does not fit that response's schema, or it carries a body
+    /// where that response declares no content.
     #[error(
         "`{operation}` returned {status}, which does not fit its response `{response}`: {errors}"
     )]
@@ -134,6 +136,13 @@ fn redacted(headers: &[(String, String)]) -> Vec<String> {
         .iter()
         .map(|(name, _)| format!("{}: ***", name.to_ascii_lowercase()))
         .collect()
+}
+
+/// Whether a response body carries nothing: no bytes, or whitespace only.
+/// A response declared with no content must have one, and an empty body is
+/// read as `null` rather than as JSON that fails to parse.
+fn is_empty_body(bytes: &[u8]) -> bool {
+    bytes.iter().all(u8::is_ascii_whitespace)
 }
 
 impl std::fmt::Debug for HttpToolset {
@@ -537,13 +546,34 @@ impl HttpToolset {
             let status = response.status();
             let bytes = read_bounded(response).await.map_err(&transport)?;
             if status.is_success() {
-                let value = if bytes.is_empty() {
+                let code = status.as_u16();
+                // A response the operation declares with no content, such as
+                // a `204`, declares no body either: whatever it comes back
+                // with breaks the contract, and is refused as such before it
+                // is parsed.
+                if !is_empty_body(&bytes)
+                    && let Some((key, None)) = self
+                        .operations
+                        .get(name)
+                        .and_then(|operation| operation.response(code))
+                {
+                    return Err(CallError::Response {
+                        operation: name.to_owned(),
+                        status: code,
+                        response: key.to_owned(),
+                        errors: format!(
+                            "its response declares no body, and {} bytes were returned",
+                            bytes.len()
+                        ),
+                    });
+                }
+                let value = if is_empty_body(&bytes) {
                     Value::Null
                 } else {
                     serde_json::from_slice(&bytes)
                         .map_err(|e| transport(format!("the response is not JSON: {e}")))?
                 };
-                return self.check_response(name, status.as_u16(), value);
+                return self.check_response(name, code, value);
             }
             let error = CallError::Status {
                 operation: name.to_owned(),
@@ -564,7 +594,8 @@ impl HttpToolset {
     /// the operation declares for that status (see
     /// [`atomic_schema::openapi::Operation::response`]), or the operation
     /// declares none to fit: a response it declares with no JSON body, such
-    /// as a `204`, has nothing to check, and an operation that declares no
+    /// as a `204`, has nothing to check here, because its caller has already
+    /// refused one that carried a body, and an operation that declares no
     /// response at all takes any. A success whose status the operation does
     /// not declare, when it declares others, is refused.
     fn check_response(&self, name: &str, status: u16, value: Value) -> Result<Value, CallError> {
