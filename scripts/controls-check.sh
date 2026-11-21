@@ -77,6 +77,7 @@ CONTROLS=(
     "artifact-hold-release|crates/atomic/src/pipeline.rs|    drop(release);|    std::mem::forget(release); // CONTROL_OFF|-p atomic-agentic --test pipeline an_exec_steps_files_are_let_go_once_its_turn_is_recorded"
     "artifact-hold-release-on-drop|crates/atomic-core/src/runtime.rs|        self.artifacts.release(&self.identity);|        let _ = &self.identity; // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model a_store_held_while_files_are_stored_leaves_the_outcome_unknown"
     "artifact-hold-snapshot|crates/atomic/src/retention.rs|    artifacts.extend(held);|    let _ = held; // CONTROL_OFF|-p atomic-agentic --test retention a_hold_let_go_while_a_sweep_reads_the_runs_still_keeps_its_content"
+    "exec-exchange-backend|crates/atomic-core/src/runtime.rs|                    .exchange(&opened)|                    .exchange(&opened).and(atomic_exec::LocalBackend::default().exchange(&opened)) // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model a_remote_backend_gives_inputs_and_hands_a_file_over"
 )
 
 die() {

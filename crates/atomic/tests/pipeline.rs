@@ -447,6 +447,12 @@ impl atomic_exec::ExecutionBackend for HoldsAtClose {
             .push((workspace.label.clone(), holds_in(&self.held)));
         self.local.close(workspace)
     }
+    fn exchange(
+        &self,
+        workspace: &atomic_exec::Workspace,
+    ) -> Result<Option<Box<dyn atomic_exec::exchange::Exchange>>, atomic_exec::ExecError> {
+        self.local.exchange(workspace)
+    }
 }
 
 async fn engine_built_with(
