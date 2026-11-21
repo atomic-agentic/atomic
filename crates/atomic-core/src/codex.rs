@@ -992,6 +992,7 @@ where
     F: FnOnce(CodexPaths) -> Fut + Send + 'static,
     Fut: Future<Output = anyhow::Result<()>>,
 {
+    // Before anything that could re-execute this process: see run_helper.
     keep_sandbox_off_keyrings();
     harden();
     give_the_command_its_own_tmpdir();
@@ -1076,6 +1077,10 @@ pub fn is_helper(mut args: impl Iterator<Item = std::ffi::OsString>) -> bool {
 /// A helper never returns; anything else is an error, and nothing was
 /// touched.
 pub fn run_helper() -> anyhow::Result<()> {
+    // Anything that re-executes the helper must come before this: it makes
+    // the outer stage non-dumpable and then reads the command's proxy token
+    // into its environment, and an exec after that would leave the token in
+    // the environment of a process that is dumpable again.
     keep_sandbox_off_keyrings();
     give_the_command_its_own_tmpdir();
     arg0_dispatch_or_else(|_| async {
