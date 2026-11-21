@@ -456,6 +456,19 @@ pub fn load(file: &Path, registry: &mut Registry) -> Result<Atom, AtomError> {
             ));
         }
     }
+    // How trusted its input must be: one of the three origins, exactly, so
+    // a misspelt value cannot silently accept anything.
+    match fm.get("trust") {
+        None => {}
+        Some(Value::String(s)) if crate::workflow::TRUST.contains(&s.as_str()) => {}
+        Some(other) => {
+            return Err(fail(
+                line_of("/trust"),
+                "/trust",
+                format!("`trust` is external, agent or team, not {other}"),
+            ));
+        }
+    }
     // No network unless declared. An exec atom may name the hosts its
     // command reaches, within atomic's policy; other atoms run with none.
     // Every atom's `network` is held to the same shape.

@@ -21,13 +21,17 @@
 # the check: update the switch here with the code. Each control costs a rebuild
 # of the crates it is in.
 #
-# The source is edited in place, so the script guards it. Before any edit it
-# copies every file it will touch to target/controls-check/ and checks each
-# copy against the file's git hash-object; if that fails, nothing is edited. On
-# exit, however it ends, it copies the originals back and checks each file's
-# hash again, and fails loudly, keeping the copies, if one does not match. A run
-# killed outright leaves target/controls-check/ behind, and the next run refuses
-# to start until someone has looked. scripts/controls-check-test.sh tests this.
+# The source is edited in place, so the script guards it. It refuses to start
+# when a file a control names differs from HEAD, because it would restore that
+# dirty state and read as clean. Before any edit it copies every file it will
+# touch to target/controls-check/ and checks each copy against the file's git
+# hash-object; if that fails, nothing is edited. On exit, however it ends, it
+# copies the originals back, checks each file's hash again and asks git that the
+# file no longer differs from HEAD, and fails loudly, keeping the copies, if
+# either fails. Each file put back is touched, so cargo rebuilds it rather than
+# reusing an artefact built with the control off. A run killed outright leaves
+# target/controls-check/ behind, and the next run refuses to start until someone
+# has looked. scripts/controls-check-test.sh tests this.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -56,6 +60,9 @@ CONTROLS=(
     "exec-network-own-wired|crates/atomic-core/src/network.rs|        let own = self.own()?;|        let own: BTreeSet<IpAddr> = BTreeSet::new(); // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model network::tests::a_prepared_proxy_refuses_this_machines_addresses"
     "exec-network-own-reuse|crates/atomic-core/src/network.rs|        self.own == *own && alive(self)|        alive(self)|-p atomic-agentic-core --lib --features fake-model network::tests::a_proxy_is_not_reused_once_this_machines_addresses_change"
     "exec-network-own-nonempty|crates/atomic-core/src/network.rs|        !own.is_empty(),|        true,|-p atomic-agentic-core --lib --features fake-model network::tests::this_machines_addresses_come_from_its_interfaces"
+    "exec-network-public-suffix|crates/atomic-core/src/network.rs|    if lower.starts_with(\"*.\") && public_suffix(name) {|    if /*CONTROL_OFF*/ false {|-p atomic-agentic-core --lib --features fake-model network::tests::a_wildcard_over_a_public_suffix_is_refused"
+    "exec-network-suffix-rule-parent|crates/atomic-core/src/network.rs|    is_suffix(&format!(\"atomic-probe.{name}\"))|    false|-p atomic-agentic-core --lib --features fake-model network::tests::a_wildcard_over_a_public_suffix_is_refused"
+    "exec-network-wildcard-one-site|crates/atomic-core/src/network.rs|                    && within_one_site(&host, parent)|                    && true|-p atomic-agentic-core --lib --features fake-model network::tests::a_wildcard_does_not_reach_across_a_public_suffix_below_it"
     "exec-network-allowlist|crates/atomic-core/src/network.rs|        } else if !declared(&self.0, &req.host) {|        } else if /*CONTROL_OFF*/ false {|--workspace --features ${FEATURES} --test run_cli an_exec_atom_reaches_only_the_hosts_it_declares"
     "exec-network-ports|crates/atomic-core/src/network.rs|        } else if !PORTS.contains(&req.port) {|        } else if /*CONTROL_OFF*/ false {|--workspace --features ${FEATURES} --test run_cli an_exec_atom_reaches_only_the_hosts_it_declares"
     "exec-network-upstream|crates/atomic-core/src/network.rs|        allow_upstream_proxy: false,|        allow_upstream_proxy: /*CONTROL_OFF*/ true,|-p atomic-agentic-core --lib --features fake-model network::tests::a_proxy_uses_no_upstream_proxy_and_no_socks"
@@ -96,6 +103,29 @@ copy_of() {
     echo "${STATE}/$(tr / % <<<"$1")"
 }
 
+# Put a file's saved original back, and make its mtime now. A plain cp already
+# does that, so cargo rebuilds what it built with the control off; the touch
+# keeps that true for a cp that preserves timestamps (cp -p, or an alias).
+put_back() {
+    cp -- "$(copy_of "$1")" "$1" && touch -- "$1"
+}
+
+# git's answer for how a file stands against HEAD: 0 when it matches the
+# commit, 1 when it differs, and anything else when git could not be asked --
+# in a linked worktree whose main checkout's .git is not mounted, for instance.
+# A file git does not track, or one marked assume-unchanged or skip-worktree,
+# counts as differing: git diff would say nothing about it either way.
+head_diff() {
+    local code=0 listed
+    listed="$(git ls-files -v -- "$1")" || return 2
+    case "${listed}" in
+        "H "*) ;;
+        *) return 1 ;;
+    esac
+    git diff --quiet HEAD -- "$1" || code=$?
+    return "${code}"
+}
+
 # The controls to check: all of them, or the one named.
 only="${1:-}"
 selected=()
@@ -117,6 +147,28 @@ if [ -e "${STATE}" ]; then
     die "${STATE} is left from a run that did not finish. Its manifest names each file that run edited, with the file's original hash, and the directory holds the originals: compare them with the files (git diff), put them back, then remove ${STATE}."
 fi
 
+# Refuse to start on a file that already differs from HEAD. The run saves what
+# it finds and puts that back, so a file dirty before the start would end the
+# run dirty again and read as a clean restore; and a switch applied to someone
+# else's uncommitted change is not this control. HEAD is the baseline for the
+# whole run, so ask for it before anything is edited.
+dirty=" "
+seen=" "
+for row in "${selected[@]}"; do
+    IFS='|' read -r _ file _ <<<"${row}"
+    case "${seen}" in *" ${file} "*) continue ;; esac
+    code=0
+    head_diff "${file}" || code=$?
+    if [ "${code}" -eq 1 ]; then
+        dirty+="${file} "
+    elif [ "${code}" -ne 0 ]; then
+        die_unedited "cannot compare ${file} with HEAD"
+    fi
+    seen+="${file} "
+done
+[ "${dirty}" = " " ] ||
+    die_unedited "these files differ from HEAD:${dirty% *} (a file git does not track as committed counts). A run edits them and puts back what it found, so it would restore that state and read as a clean restore; commit them or put them back first"
+
 # Save every file the selected controls edit, and check each copy, before
 # editing anything.
 mkdir -p "${STATE}" || die_unedited "cannot create ${STATE}"
@@ -135,9 +187,13 @@ for row in "${selected[@]}"; do
 done
 
 # Put every saved file back and check it. A file that cannot be put back is
-# named, and the originals stay.
+# named, and the originals stay. The saved copies and the manifest are this
+# script's own state, so neither is asked what the source should be: after the
+# hash, git says whether the file matches HEAD, and a restore that leaves it
+# differing is a failure even when it matches the copy. Each file is touched on
+# the way back, so the next cargo run rebuilds it.
 restore() {
-    local bad=0 hash file
+    local bad=0 hash file code
     if [ ! -r "${STATE}/manifest" ]; then
         echo "scripts/controls-check.sh: ${STATE}/manifest cannot be read, so no file can be checked. Compare the files with git and ${STATE} by hand." >&2
         return 1
@@ -147,7 +203,20 @@ restore() {
         if [ "$(git hash-object -- "${file}" 2>/dev/null)" != "${hash}" ]; then
             echo "scripts/controls-check.sh: ${file} IS LEFT MODIFIED: it does not match its original, ${hash}. Put it back by hand; ${STATE} keeps what was saved." >&2
             bad=1
+            continue
         fi
+        code=0
+        head_diff "${file}" || code=$?
+        if [ "${code}" -ne 0 ]; then
+            if [ "${code}" -eq 1 ]; then
+                echo "scripts/controls-check.sh: ${file} IS LEFT DIFFERENT FROM HEAD: it matches the copy made at the start, which was not HEAD. Put it back from HEAD; ${STATE} keeps what was saved." >&2
+            else
+                echo "scripts/controls-check.sh: cannot compare ${file} with HEAD, so it cannot be shown to be back as committed." >&2
+            fi
+            bad=1
+            continue
+        fi
+        touch -- "${file}" 2>/dev/null
     done <"${STATE}/manifest"
     if [ "${bad}" -eq 0 ]; then
         rm -rf "${STATE}"
@@ -241,7 +310,7 @@ for row in "${selected[@]}"; do
     switch_off "${file}" "${text}" "${replacement}" || die "cannot switch ${name} off"
     run_cargo "${args}"
     removed=$?
-    cp -- "$(copy_of "${file}")" "${file}" || die "cannot put ${file} back"
+    put_back "${file}" || die "cannot put ${file} back"
     if grep -q "^error\(\[E[0-9]*\]\)\?: could not compile\|^error: could not compile" "${LOG}"; then
         echo "FAIL ${name}: with the control off the code does not build" >&2
         grep -m5 -E "^error" "${LOG}" >&2
