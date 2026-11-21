@@ -1351,10 +1351,12 @@ const HELPER_DIR: &str = "atomic-helper";
 /// from two paths sharing a Codex home never run each other's.
 ///
 /// `tmp`, `atomic-helper` and `<key>` are opened one at a time, never
-/// through a link, each made only when it is not there, and each must be a
-/// directory of this user's that no one else may write: anything else falls
-/// back to Codex's own helper. The link is made in the `<key>` directory
-/// held open, beside its place, and renamed into it.
+/// through a link, each made only when it is not there, and each, like the
+/// Codex home, must be a directory of this user's that no one else may
+/// write: one of this user's that others may write, as a umask such as 002
+/// leaves one, is narrowed first, and anything else falls back to Codex's
+/// own helper. The link is made in the `<key>` directory held open, beside
+/// its place, and renamed into it.
 #[cfg(target_os = "linux")]
 fn own_helper_link(codex_home: &Path) -> Option<PathBuf> {
     use sha2::Digest as _;
@@ -1363,7 +1365,24 @@ fn own_helper_link(codex_home: &Path) -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let key = sha2::Sha256::digest(exe.as_os_str().as_bytes());
     let key: String = key[..8].iter().map(|b| format!("{b:02x}")).collect();
-    let mut dir: OwnedFd = std::fs::File::open(codex_home).ok()?.into();
+    let home = std::ffi::CString::new(codex_home.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `home` is valid for the call; the result is owned below.
+    #[allow(unsafe_code)]
+    let fd = unsafe {
+        libc::open(
+            home.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return None;
+    }
+    // SAFETY: `fd` was just returned open, and nothing else owns it.
+    #[allow(unsafe_code)]
+    let mut dir = unsafe { OwnedFd::from_raw_fd(fd) };
+    if !tightened(&dir) || !private_dir(&dir) {
+        return None;
+    }
     for part in ["tmp", HELPER_DIR, key.as_str()] {
         let name = std::ffi::CString::new(part).ok()?;
         let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
@@ -1395,7 +1414,7 @@ fn own_helper_link(codex_home: &Path) -> Option<PathBuf> {
                 libc::fchmod(next.as_raw_fd(), 0o700);
             }
         }
-        if !private_dir(&next) {
+        if !tightened(&next) || !private_dir(&next) {
             return None;
         }
         dir = next;
@@ -1452,6 +1471,35 @@ fn own_helper_link(codex_home: &Path) -> Option<PathBuf> {
     Some(link)
 }
 
+/// Take group and other write off the directory held open as `dir` when it
+/// is this user's own, as a umask such as 002 leaves one another program
+/// made: `false` only when that fails. One that is not this user's is left
+/// as it is, for [`private_dir`] to refuse.
+/// `scripts/controls/sandbox-helper-link-tighten.row` switches this off.
+#[cfg(target_os = "linux")]
+fn tightened(dir: &std::os::fd::OwnedFd) -> bool {
+    use std::os::fd::AsRawFd;
+    // SAFETY: a zeroed stat is a valid value of a plain C struct.
+    #[allow(unsafe_code)]
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `st` is valid for the call, and `dir` is open.
+    #[allow(unsafe_code)]
+    if unsafe { libc::fstat(dir.as_raw_fd(), &mut st) } != 0 {
+        return false;
+    }
+    // SAFETY: geteuid takes nothing and cannot fail.
+    #[allow(unsafe_code)]
+    let ours = st.st_uid == unsafe { libc::geteuid() };
+    let narrow = ours && st.st_mode & 0o022 != 0;
+    if !narrow {
+        return true;
+    }
+    // SAFETY: fchmod takes an open descriptor and a mode.
+    #[allow(unsafe_code)]
+    let r = unsafe { libc::fchmod(dir.as_raw_fd(), st.st_mode & 0o7777 & !0o022) };
+    r == 0
+}
+
 /// Whether the directory held open as `dir` is this user's own, which no
 /// one else may write. `scripts/controls/sandbox-helper-link-private.row`
 /// switches this off.
@@ -1494,6 +1542,13 @@ const HELPER_LINKS_WAIT: std::time::Duration = std::time::Duration::from_secs(10
 /// is full.
 fn hold_helper_links(codex_home: &Path) -> Option<std::fs::File> {
     let dir = codex_home.join("tmp");
+    // Private, as atomic's own link to itself requires of it, whatever the
+    // umask (see `own_helper_link`).
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(std::fs::DirBuilder::new().recursive(true), 0o700)
+        .create(&dir)
+        .ok()?;
+    #[cfg(not(unix))]
     std::fs::create_dir_all(&dir).ok()?;
     let lock = std::fs::OpenOptions::new()
         .write(true)
@@ -5118,9 +5173,18 @@ mod tests {
             Some(link.clone()),
             "mended, not made twice"
         );
-        let helpers = home.join("tmp").join(HELPER_DIR);
-        std::fs::set_permissions(&helpers, std::fs::Permissions::from_mode(0o770)).expect("mode");
-        assert_eq!(own_helper_link(&home), None, "a directory others may write");
+        // Directories of this user's that others may write, as a umask of
+        // 002 leaves them, are narrowed and used.
+        let tmp = home.join("tmp");
+        let helpers = tmp.join(HELPER_DIR);
+        for dir in [&home, &tmp, &helpers] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o775)).expect("mode");
+        }
+        assert_eq!(own_helper_link(&home), Some(link.clone()), "a umask of 002");
+        for dir in [&home, &tmp, &helpers] {
+            let mode = std::fs::metadata(dir).expect("meta").permissions().mode();
+            assert_eq!(mode & 0o022, 0, "{} is writable by others", dir.display());
+        }
         std::fs::remove_dir_all(&helpers).expect("removed");
         let elsewhere = scratch("own-helper-elsewhere");
         std::os::unix::fs::symlink(&elsewhere, &helpers).expect("link");
@@ -5137,6 +5201,24 @@ mod tests {
             "something was made where the link leads"
         );
         let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&elsewhere);
+    }
+
+    /// A directory others may write is not private, whoever owns it, so one
+    /// atomic cannot narrow is never used.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_directory_others_may_write_is_not_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("not-private");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o775)).expect("mode");
+        let held: std::os::fd::OwnedFd = std::fs::File::open(&dir).expect("open").into();
+        assert!(!private_dir(&held), "group write");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o757)).expect("mode");
+        assert!(!private_dir(&held), "other write");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("mode");
+        assert!(private_dir(&held));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The helper's directory is left readable only when it is a real
