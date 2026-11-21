@@ -1840,6 +1840,78 @@ fn an_unavailable_workspace_is_waited_for() {
     });
 }
 
+/// An exec step's build caches are made in each attempt to open its
+/// workspace, as the backend's room is waited for: caches the disk is too
+/// full for wait, opening nothing meanwhile, and caches that cannot be made
+/// for another reason fail the step at once.
+#[test]
+fn an_exec_steps_caches_wait_for_room_and_fail_only_for_good() {
+    use std::sync::atomic::AtomicUsize;
+    on_codex_runtime(async {
+        let (dir, a, _) = exec_project("exec-room", TOTAL, "");
+        let identity = EffectIdentity {
+            run_id: "run-1".into(),
+            step_id: "total".into(),
+        };
+        // The backend has no room twice: the caches are there for the try
+        // that opens.
+        let busy = Recording {
+            unavailable: Arc::new(AtomicUsize::new(2)),
+            ..Recording::default()
+        };
+        let caches = crate::worktree::Caches::new(dir.join("state/cache/run-1-ab"));
+        let guard = open_exec_workspace(&a, &identity, busy.backend().shared(), Some(&caches))
+            .await
+            .expect("opens once there is room");
+        assert_eq!(busy.calls(), ["open total"; 3]);
+        assert!(caches.dir().is_dir());
+        guard.close().await;
+
+        // The disk is full for the first two tries at making them: the step
+        // waits, and the backend is asked only once they are made.
+        let full = crate::worktree::Caches::new(dir.join("state/cache/run-2-cd"));
+        crate::worktree::FAIL_FOR_TESTS.lock().expect("fail").push((
+            full.dir().to_owned(),
+            std::io::ErrorKind::StorageFull,
+            2,
+        ));
+        let room = Recording::default();
+        let guard = open_exec_workspace(&a, &identity, room.backend().shared(), Some(&full))
+            .await
+            .expect("opens once there is room");
+        assert_eq!(room.calls(), ["open total"]);
+        assert!(full.dir().is_dir());
+        assert!(
+            crate::worktree::FAIL_FOR_TESTS
+                .lock()
+                .expect("fail")
+                .iter()
+                .any(|(d, _, left)| d == full.dir() && *left == 0),
+            "it waited through both"
+        );
+        guard.close().await;
+
+        // Caches that cannot be made for another reason, under a file: the
+        // step fails at once, and nothing is opened.
+        std::fs::write(dir.join("file"), "").expect("file");
+        let never = Recording::default();
+        let refused = open_exec_workspace(
+            &a,
+            &identity,
+            never.backend().shared(),
+            Some(&crate::worktree::Caches::new(dir.join("file/run-1"))),
+        )
+        .await;
+        assert!(
+            matches!(&refused, Err(AtomError::Runtime(m)) if m.contains("the run's build caches") && m.contains("Not a directory")),
+            "{:?}",
+            refused.err()
+        );
+        assert!(never.calls().is_empty(), "{:?}", never.calls());
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
 /// An atom that panics after its workspace opened still closes it.
 #[test]
 fn a_run_that_panics_closes_its_workspace() {

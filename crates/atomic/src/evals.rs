@@ -838,7 +838,7 @@ fn print(
             println!(
                 "  scorers not run ({}): atomic eval has no judge to call, so only the pass rate \
                  decides",
-                names.join(", ")
+                shown::line(&names.join(", "))
             );
         }
         if let Some(t) = tally {

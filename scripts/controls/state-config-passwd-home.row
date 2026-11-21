@@ -1,0 +1,1 @@
+state-config-passwd-home|crates/atomic-core/src/state.rs|    Some(home.join(".config"))|    None // CONTROL_OFF|-p atomic-agentic-core --lib -- state::tests::a_home_inside_the_password_home_is_refused

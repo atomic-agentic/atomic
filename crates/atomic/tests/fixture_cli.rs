@@ -315,6 +315,119 @@ async fn coding_run_at_the_top(dir: &Path, project: &Path, fixture: &Path, base:
     assert_eq!(git_state(fixture), source, "the fixture is as it was");
 }
 
+/// A fixture-bound coding step whose reviewer asks for changes, then
+/// approves the repair: the repair round's worktree starts from the run's
+/// base in the snapshot, as check_base requires, and the commit published is
+/// the repair's, the one the second verdict was given.
+#[test]
+fn a_repair_round_of_a_fixture_bound_step_publishes_the_repairs_commit() {
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let dir = scratch("repaired");
+        let outside = outside_any_repository("repaired-project");
+        let project = project(&outside.join("project"));
+        reviewed_coding(&project);
+        let base = fixture(&dir.join("fixture"));
+        let model = FakeModel::start(vec![
+            Reply::Text(r#"{"done": true}"#.into()),
+            Reply::Text(r#"{"verdict": "request_changes"}"#.into()),
+            Reply::Text(r#"{"done": true}"#.into()),
+            Reply::Text(r#"{"verdict": "approve"}"#.into()),
+        ])
+        .await
+        .unwrap();
+        let data = json!({"base": base, "task": "multiply by quantity"}).to_string();
+        let fixture_arg = dir.join("fixture").to_string_lossy().into_owned();
+        let out = atomic(
+            &dir,
+            &project,
+            &[
+                "--json",
+                "run",
+                "reviewed",
+                "--run-id",
+                "repaired-1",
+                "--data",
+                &data,
+                "--fixture",
+                &fixture_arg,
+                "--fixture-rev",
+                "main",
+            ],
+            &model.base_url(),
+            &[],
+        )
+        .await;
+        assert!(out.status.success(), "{}", text(&out));
+        assert_eq!(model.calls(), 4);
+        // The run keeps one accepted commit, the repair round's, made from
+        // the run's base in the snapshot.
+        let snapshots = snapshots(&dir);
+        let refs = git_in(
+            &snapshots[0],
+            &[
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+                "refs/atomic/repaired-1/",
+            ],
+        );
+        let kept: Vec<&str> = refs.lines().collect();
+        assert_eq!(kept.len(), 1, "{refs}");
+        assert!(kept[0].contains("repair_1"), "{refs}");
+        let repaired = kept[0].split(' ').nth(1).unwrap().to_owned();
+        assert_eq!(
+            git_in(&snapshots[0], &["rev-parse", &format!("{repaired}^")]),
+            base
+        );
+        // The second verdict, which approved, was given the repair's
+        // commit; the first, which asked for changes, another.
+        let requests = model.requests();
+        assert!(
+            !requests[1].to_string().contains(&repaired),
+            "{}",
+            requests[1]
+        );
+        assert!(
+            requests[3].to_string().contains(&repaired),
+            "the approved candidate is not the repair's"
+        );
+        let _ = std::fs::remove_dir_all(&outside);
+    });
+}
+
+/// The `reviewed` workflow and its reviewer, `check-commit`, in `project`.
+fn reviewed_coding(project: &Path) {
+    write(
+        &project.join("atoms/check-commit.atom.astro"),
+        "---\nimport type { Props, Input, Output } from '../.atomic/types/check-commit';\n\
+         import type { AtomConfig } from '../.atomic/types/authoring';\n\
+         const { input }: Props = Astro.props;\n\
+         export const config: AtomConfig<Input, Output> = { description: 'Check the commit.', \
+         kind: 'lite' };\n---\nReview commit {input.commit}.\n",
+    );
+    write(
+        &project.join("atoms/check-commit.input.schema.json"),
+        &json!({"type": "object", "additionalProperties": false, "required": ["commit"],
+            "properties": {"commit": {"type": "string"}}})
+        .to_string(),
+    );
+    write(
+        &project.join("atoms/check-commit.output.schema.json"),
+        &json!({"type": "object", "additionalProperties": false, "required": ["verdict"],
+            "properties": {"verdict": {"type": "string", "enum": ["approve", "request_changes"]}}})
+        .to_string(),
+    );
+    write(
+        &project.join("workflows/reviewed.workflow.yaml"),
+        "atomic: 1\nname: reviewed\n\
+         input: { $ref: ../atoms/fix-code.input.schema.json }\n\
+         output: { $ref: ../atoms/fix-code.output.schema.json }\n\
+         steps:\n  fix:\n    atom: fix-code\n    with: { base: input.base, task: input.task }\n    worktree: true\n\
+         \x20   review:\n      reviewer: check-commit\n      with: { commit: candidate.metadata.commit }\n\
+         returns: steps.fix.output\n",
+    );
+}
+
 /// A fixture-bound coding step under review: its reviewer is given the
 /// commit atomic made in the fixture's snapshot, as a SHA (it runs in the
 /// project, not the snapshot, so the SHA is what it has of the change).
@@ -325,35 +438,7 @@ fn a_reviewer_of_a_fixture_bound_step_is_given_the_commit_in_the_snapshot() {
         let dir = scratch("reviewed");
         let outside = outside_any_repository("reviewed-project");
         let project = project(&outside.join("project"));
-        write(
-            &project.join("atoms/check-commit.atom.astro"),
-            "---\nimport type { Props, Input, Output } from '../.atomic/types/check-commit';\n\
-             import type { AtomConfig } from '../.atomic/types/authoring';\n\
-             const { input }: Props = Astro.props;\n\
-             export const config: AtomConfig<Input, Output> = { description: 'Check the commit.', \
-             kind: 'lite' };\n---\nReview commit {input.commit}.\n",
-        );
-        write(
-            &project.join("atoms/check-commit.input.schema.json"),
-            &json!({"type": "object", "additionalProperties": false, "required": ["commit"],
-                "properties": {"commit": {"type": "string"}}})
-            .to_string(),
-        );
-        write(
-            &project.join("atoms/check-commit.output.schema.json"),
-            &json!({"type": "object", "additionalProperties": false, "required": ["verdict"],
-                "properties": {"verdict": {"type": "string", "enum": ["approve", "request_changes"]}}})
-            .to_string(),
-        );
-        write(
-            &project.join("workflows/reviewed.workflow.yaml"),
-            "atomic: 1\nname: reviewed\n\
-             input: { $ref: ../atoms/fix-code.input.schema.json }\n\
-             output: { $ref: ../atoms/fix-code.output.schema.json }\n\
-             steps:\n  fix:\n    atom: fix-code\n    with: { base: input.base, task: input.task }\n    worktree: true\n\
-             \x20   review:\n      reviewer: check-commit\n      with: { commit: candidate.metadata.commit }\n\
-             returns: steps.fix.output\n",
-        );
+        reviewed_coding(&project);
         let base = fixture(&dir.join("fixture"));
         let model = FakeModel::start(vec![
             Reply::Text(r#"{"done": true}"#.into()),
