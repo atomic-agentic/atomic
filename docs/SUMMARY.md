@@ -20,7 +20,7 @@
   - [Set up VS Code](guides/vs-code.md)
   - [Write atoms with a coding agent](guides/coding-agents.md)
   - [Test and improve an atom](guides/testing-and-evals.md)
-  - [Template tags and the JSX-style form](guides/template-tags.md)
+  - [Prompt expressions and components](guides/template-tags.md)
   - [Diagrams with Mermaid](guides/diagrams.md)
   - [Tools and integrations](guides/tools-and-integrations.md)
   - [Call AWS and other services with an SDK](guides/scripts-and-cloud-sdks.md)
@@ -43,8 +43,6 @@
   - [Glossary](reference/glossary.md)
   - [Troubleshooting](reference/troubleshooting.md)
   - [Availability and delivery stages](reference/availability.md)
-  - [Atom tags (as implemented)](reference/atom-tags.md)
-  - [Configuration layers (as implemented)](configuration.md)
 - For contributors
   - [Developing atomic](development.md)
 - Design

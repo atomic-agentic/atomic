@@ -78,12 +78,39 @@ pub fn trust_rank(origin: &str) -> usize {
 }
 
 /// The riskiest input origin `atom` accepts: its `trust`, or external when
-/// it declares none.
-pub fn accepted_trust(atom: &Atom) -> &str {
-    atom.frontmatter
-        .get("trust")
-        .and_then(Value::as_str)
-        .unwrap_or("external")
+/// it declares none. A `trust` that is not one of [`TRUST`], as an atom a
+/// run recorded before the load refused one might hold, is an error that
+/// carries the value as written: such an atom accepts nothing.
+pub fn accepted_trust(atom: &Atom) -> Result<&'static str, String> {
+    match atom.frontmatter.get("trust") {
+        None => Ok("external"),
+        Some(Value::String(s)) => TRUST
+            .iter()
+            .find(|t| **t == s.as_str())
+            .copied()
+            .ok_or_else(|| format!("'{s}'")),
+        Some(other) => Err(other.to_string()),
+    }
+}
+
+/// Why `atom` accepts no input at all, if its `trust` is not one of
+/// [`TRUST`] (see [`accepted_trust`]).
+pub fn unknown_trust(atom: &Atom) -> Option<String> {
+    accepted_trust(atom).err().map(|written| {
+        format!(
+            "atom `{}` declares `trust: {written}`, which is not external, agent or team, so \
+             it accepts no input",
+            atom.name
+        )
+    })
+}
+
+/// What to change for an atom refused by [`unknown_trust`].
+pub fn unknown_trust_advice(atom: &Atom) -> String {
+    format!(
+        "set atom `{}`'s `trust` to external, agent or team",
+        atom.name
+    )
 }
 
 /// Why `source`, which is `origin` data, may not bind an input of `atom`, if
@@ -91,15 +118,30 @@ pub fn accepted_trust(atom: &Atom) -> &str {
 /// [`accepted_trust`]). A workflow's step and a direct run of the atom are
 /// held to this alike.
 pub fn untrusted_binding(atom: &Atom, source: &str, origin: &str) -> Option<String> {
-    let accepts = accepted_trust(atom);
+    // An unknown origin ranks as external, the least trusted; an unknown
+    // trust accepts nothing rather than everything.
+    let accepts = match accepted_trust(atom) {
+        Ok(accepts) => accepts,
+        Err(_) => return unknown_trust(atom),
+    };
     (trust_rank(origin) < trust_rank(accepts)).then(|| {
         format!(
             "`{source}` is {origin} data, and atom `{}` accepts {accepts} input at most \
-             (`trust: '{accepts}'`); pass it through a step that can take it, or declare a lower trust \
-             on the atom if it is built for {origin} input",
+             (`trust: '{accepts}'`)",
             atom.name
         )
     })
+}
+
+/// Where data `trust` accepts can come from: what a binding refused by
+/// [`untrusted_binding`] could read instead. Only a person's decision at a
+/// gate, or a literal the workflow file writes, is team data; a model's
+/// output is agent data as well.
+pub fn trusted_sources(trust: &str) -> &'static str {
+    match trust {
+        "team" => "a gate a person decides, or a literal in the workflow file",
+        _ => "a model step's output, a gate a person decides, or a literal in the workflow file",
+    }
 }
 
 /// The most a binding's sources allow it to be trusted: the least trusted
@@ -586,7 +628,24 @@ pub fn load(
                     None => allowed,
                 };
                 if let Some(refused) = untrusted_binding(atom, source, origin) {
-                    return Err(fail(&wp, refused));
+                    // The step's own `origins` entry may be what lowered it.
+                    let lowered = if origin != allowed {
+                        format!(", remove the `origins` entry that marks it {origin}")
+                    } else {
+                        String::new()
+                    };
+                    let action = match accepted_trust(atom) {
+                        Ok(accepts) => format!(
+                            "bind it to {} instead{lowered}, or declare a lower `trust` on the \
+                             atom if it is built for {origin} input",
+                            trusted_sources(accepts)
+                        ),
+                        Err(_) => unknown_trust_advice(atom),
+                    };
+                    return Err(WorkflowError {
+                        action: Some(action),
+                        ..fail(&wp, refused)
+                    });
                 }
             }
             for r in &required {
@@ -1011,14 +1070,15 @@ fn check_review(
             ));
         }
     };
-    let accepts = |atom: &Atom| {
-        atom.frontmatter
-            .get("trust")
-            .and_then(Value::as_str)
-            .unwrap_or("external")
-            .to_owned()
+    // An atom whose `trust` is none of the three accepts nothing: refused
+    // here as any binding into it would be.
+    let accepts = |atom: &Atom, at: &str| {
+        accepted_trust(atom).map_err(|_| WorkflowError {
+            action: Some(unknown_trust_advice(atom)),
+            ..fail(at, unknown_trust(atom).unwrap_or_default())
+        })
     };
-    let reviewer_accepts = accepts(reviewer);
+    let reviewer_accepts = accepts(reviewer, &format!("{rp}/reviewer"))?;
     // What the reviewer's findings carry: a model's output on what it read.
     let mut findings = "agent";
     for (field, e) in &with {
@@ -1060,7 +1120,7 @@ fn check_review(
             }
         }
         let origin = review_origin(source, kinds).map_err(|m| fail(&wp, m))?;
-        if trust_rank(origin) < trust_rank(&reviewer_accepts) {
+        if trust_rank(origin) < trust_rank(reviewer_accepts) {
             return Err(fail(
                 &wp,
                 format!(
@@ -1092,8 +1152,8 @@ fn check_review(
     }
     // A repair round hands the author the reviewer's findings: no more
     // trusted than what the reviewer read.
-    let author_accepts = accepts(reviewed.atom);
-    if rounds > 0 && trust_rank(findings) < trust_rank(&author_accepts) {
+    let author_accepts = accepts(reviewed.atom, &format!("{rp}/rounds"))?;
+    if rounds > 0 && trust_rank(findings) < trust_rank(author_accepts) {
         return Err(fail(
             &format!("{rp}/rounds"),
             format!(
