@@ -216,7 +216,11 @@ async fn run_ending(
     for (name, value) in env {
         run.env(name, value);
     }
-    let out = tokio::task::spawn_blocking(move || run.output().unwrap())
+    let at = atomic_home.with_file_name(format!(
+        "{}-run",
+        atomic_home.file_name().unwrap().to_string_lossy()
+    ));
+    let out = tokio::task::spawn_blocking(move || bounded(run, &at))
         .await
         .unwrap();
     assert_eq!(
@@ -631,7 +635,11 @@ fn an_atoms_shell_sees_none_of_the_persons_secrets() {
         for name in CANARIES {
             command.env(name, format!("canary-{}", name.to_lowercase()));
         }
-        let out = tokio::task::spawn_blocking(move || command.output().unwrap())
+        let at = atomic_home.with_file_name(format!(
+            "{}-run",
+            atomic_home.file_name().unwrap().to_string_lossy()
+        ));
+        let out = tokio::task::spawn_blocking(move || bounded(command, &at))
             .await
             .unwrap();
         assert!(
@@ -695,8 +703,69 @@ fn an_atoms_shell_sees_none_of_the_persons_secrets() {
     });
 }
 
+/// How long one `atomic run` here may take before the test fails instead of
+/// waiting on it: the longest, a workflow of several worktree steps, takes
+/// under a minute.
+const RUN_LIMIT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Run `run` to its end and return how it ended and what it printed, kept
+/// in `<at>.stdout` and `<at>.stderr` rather than pipes, so nothing it
+/// leaves running can hold the test. A run that has not ended within
+/// [`RUN_LIMIT`] is sent SIGKILL, with the process group it leads, and
+/// fails the test with what it printed; a command it started in a session
+/// of its own is not in that group.
+fn bounded(mut run: Command, at: &Path) -> std::process::Output {
+    let file = |ext: &str| PathBuf::from(format!("{}.{ext}", at.display()));
+    let (stdout, stderr) = (file("stdout"), file("stderr"));
+    run.stdout(std::fs::File::create(&stdout).unwrap())
+        .stderr(std::fs::File::create(&stderr).unwrap());
+    std::os::unix::process::CommandExt::process_group(&mut run, 0);
+    let mut child = run.spawn().unwrap();
+    let started = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if started.elapsed() > RUN_LIMIT {
+            // The child leads its own group, so the group's id is its pid.
+            // Signalled before it is reaped, so the id is still its own.
+            if let Ok(group) = libc::pid_t::try_from(child.id()) {
+                // SAFETY: killpg only sends a signal; a group that is gone
+                // is ESRCH.
+                #[allow(unsafe_code)]
+                unsafe {
+                    libc::killpg(group, libc::SIGKILL);
+                }
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let (stdout, stderr) = (
+        std::fs::read(&stdout).unwrap_or_default(),
+        std::fs::read(&stderr).unwrap_or_default(),
+    );
+    let Some(status) = status else {
+        panic!(
+            "the run had not ended after {RUN_LIMIT:?}, so it was killed: stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr)
+        );
+    };
+    std::process::Output {
+        status,
+        stdout,
+        stderr,
+    }
+}
+
 /// Run `look` once through `atomic run` with home `home`, its command
-/// `command`, and return what the command printed.
+/// `command`, and return what the command printed, failing the test if the
+/// run does not end in time ([`bounded`]). Its atomic home is the test's
+/// own, named after `dir`:
+/// the tests that call this run at once, and each removes its home first.
 async fn look_once(dir: &Path, home: &Path, command: &str, env: &[(&str, &str)]) -> String {
     let model = FakeModel::start(vec![
         Reply::Tool {
@@ -709,8 +778,10 @@ async fn look_once(dir: &Path, home: &Path, command: &str, env: &[(&str, &str)])
     .unwrap();
     let project = dir.join("project");
     write_project(&project);
-    let atomic_home = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("atomic-shell-env-linked-{}", std::process::id()));
+    let atomic_home = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "atomic-shell-env-{}",
+        dir.file_name().unwrap().to_string_lossy()
+    ));
     let _ = std::fs::remove_dir_all(&atomic_home);
     let mut run = Command::new(env!("CARGO_BIN_EXE_atomic"));
     run.args(["run", "look", "--data", r#"{"text": "the note"}"#])
@@ -733,7 +804,8 @@ async fn look_once(dir: &Path, home: &Path, command: &str, env: &[(&str, &str)])
     for (name, value) in env {
         run.env(name, value);
     }
-    let out = tokio::task::spawn_blocking(move || run.output().unwrap())
+    let at = dir.join("look");
+    let out = tokio::task::spawn_blocking(move || bounded(run, &at))
         .await
         .unwrap();
     assert!(
@@ -742,6 +814,7 @@ async fn look_once(dir: &Path, home: &Path, command: &str, env: &[(&str, &str)])
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+    let _ = std::fs::remove_dir_all(&atomic_home);
     model.requests()[1]["input"]
         .as_array()
         .into_iter()
@@ -821,6 +894,100 @@ fn a_secret_place_linked_to_a_device_or_a_system_program_leaves_both_usable() {
         for ran in ["null-written", "null-read", "python-ran", "looked"] {
             assert!(printed.contains(ran), "{ran}: {printed}");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+/// A credential place kept with the person's dotfiles on a file system
+/// that marks every file executable stays denied: it is no program.
+#[test]
+fn a_linked_secret_marked_executable_stays_denied() {
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let dir = std::env::temp_dir().join(format!("atomic-marked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
+        std::fs::create_dir_all(home.join("dotfiles")).unwrap();
+        std::fs::write(
+            home.join("dotfiles/netrc"),
+            "machine example.com login dev password canary-marked\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            home.join("dotfiles/netrc"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(home.join("dotfiles/netrc"), home.join(".netrc")).unwrap();
+        let command = format!(
+            "cat {h}/.netrc {h}/dotfiles/netrc; echo looked",
+            h = home.display()
+        );
+        let printed = look_once(&dir, &home, &command, &[]).await;
+        assert!(printed.contains("looked"), "{printed}");
+        assert!(
+            !printed.contains("canary"),
+            "the marked secret was read: {printed}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+#[test]
+fn a_secret_the_system_keeps_or_a_pipe_stays_denied_and_the_persons_programs_run() {
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let dir = std::env::temp_dir().join(format!("atomic-kept-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
+        std::fs::create_dir_all(home.join(".kube")).unwrap();
+        std::fs::create_dir_all(home.join(".config/fish/bin")).unwrap();
+        // A cluster's credentials kept by the system, root's own, outside
+        // the system's program directories: here /etc/hostname stands in.
+        let kept = Path::new("/etc/hostname");
+        let secret = std::fs::read_to_string(kept).expect("a file the system keeps");
+        assert!(!secret.trim().is_empty());
+        std::os::unix::fs::symlink(kept, home.join(".kube/config")).unwrap();
+        // A credential served through a pipe, which nothing writes to.
+        let fifo =
+            std::ffi::CString::new(home.join(".netrc").into_os_string().into_encoded_bytes())
+                .unwrap();
+        // SAFETY: mkfifo reads a NUL-terminated path and makes a pipe there.
+        #[allow(unsafe_code)]
+        let made = unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) };
+        assert_eq!(made, 0, "mkfifo: {}", std::io::Error::last_os_error());
+        // A program of the person's own, linked from inside a denied
+        // directory, as a virtual environment's python is.
+        std::fs::create_dir_all(dir.join("tools")).unwrap();
+        std::fs::write(dir.join("tools/python3"), "#!/bin/sh\necho program-ran\n").unwrap();
+        std::fs::set_permissions(
+            dir.join("tools/python3"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            dir.join("tools/python3"),
+            home.join(".config/fish/bin/python3"),
+        )
+        .unwrap();
+        let command = format!(
+            "cat {h}/.kube/config /etc/hostname; timeout 3 cat {h}/.netrc; echo \"pipe=$?\"; \
+             {d}/tools/python3; echo looked",
+            h = home.display(),
+            d = dir.display()
+        );
+        let printed = look_once(&dir, &home, &command, &[]).await;
+        assert!(printed.contains("looked"), "{printed}");
+        assert!(
+            !printed.contains(secret.trim()),
+            "the kept secret was read: {printed}"
+        );
+        // Refused at once (1), not waited on until the time ran out (124).
+        assert!(
+            printed.lines().any(|l| l.trim() == "pipe=1"),
+            "the pipe was opened: {printed}"
+        );
+        assert!(printed.contains("program-ran"), "{printed}");
         let _ = std::fs::remove_dir_all(&dir);
     });
 }

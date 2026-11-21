@@ -191,7 +191,8 @@ network: none unless declared, and through the proxy only the declared hosts,
 on ports 80 and 443, never through another proxy, with the declaration checked
 when the atom loads and again before the command runs; and the artifact store's
 holds, which keep the files an exec step hands over from every sweep until its
-turn is recorded), it
+turn is recorded; and that an exec atom's files move only through its
+workspace's backend), it
 switches the control off in the source, requires the control's test to fail,
 puts the source back and requires the test to pass. Each control costs a rebuild, so it
 runs by hand rather than in CI:
