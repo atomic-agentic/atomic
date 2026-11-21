@@ -2226,13 +2226,26 @@ fn planted_secrets_after_a_secret_name_stay_hidden_beside_os_errors() {
                     "='" => "'",
                     _ => "",
                 };
-                for input in [
+                let mut inputs = vec![
                     format!("{name}{sep}{secret}{close}"),
                     format!("/srv/app/{name}{sep}{secret}{close} (os error 13)"),
                     format!("{name}{sep}{secret}{close} denied (os error 13)"),
                     format!("{name}{sep}{secret}{close}: Permission denied (os error 13)"),
                     format!("open /srv/{name}{sep}{secret}{close}"),
-                ] {
+                ];
+                // A quoted value that leads with an operating system's
+                // error and goes on: the whole quoted value is the secret's,
+                // and it stays hidden. Only quoted: after a bare value main
+                // hides nothing past its first word either.
+                if !close.is_empty() {
+                    inputs.push(format!(
+                        "{name}{sep}Permission denied (os error 13) {secret}{close}"
+                    ));
+                    inputs.push(format!(
+                        "{name}{sep}No such file or directory (os error 2){secret}{close}"
+                    ));
+                }
+                for input in inputs {
                     if text(&input).contains(&secret) {
                         shown.push(n);
                     }

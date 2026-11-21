@@ -1,0 +1,1 @@
+redact-os-error-bare|crates/atomic-core/src/redact.rs|        let bare = value_from == start;|        let bare = true; /*CONTROL_OFF*/|-p atomic-agentic-core --lib redact::tests::planted_secrets_after_a_secret_name_stay_hidden_beside_os_errors

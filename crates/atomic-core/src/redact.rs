@@ -1064,8 +1064,11 @@ fn assigned(input: &str) -> Option<String> {
         };
         // What the operating system said of the path before it, as Rust
         // writes it, `Permission denied (os error 13)`: no secret, whatever
-        // the path's last name is.
-        if is_os_error(&input[value_from..]) {
+        // the path's last name is. Only a bare value: a quoted one runs to
+        // its closing quote, and whatever follows the error in it is the
+        // value's.
+        let bare = value_from == start;
+        if bare && is_os_error(&input[value_from..]) {
             at = at.max(value_to);
             continue;
         }
@@ -1127,8 +1130,10 @@ fn is_os_error(text: &str) -> bool {
     OS_ERRORS.iter().any(|words| {
         text.strip_prefix(words)
             .and_then(|rest| rest.strip_prefix(" (os error "))
-            .and_then(|rest| rest.split_once(')'))
-            .is_some_and(|(code, _)| !code.is_empty() && code.bytes().all(|b| b.is_ascii_digit()))
+            .is_some_and(|rest| {
+                let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+                digits > 0 && rest.as_bytes().get(digits) == Some(&b')')
+            })
     })
 }
 
