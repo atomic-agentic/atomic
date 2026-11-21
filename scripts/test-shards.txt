@@ -75,6 +75,7 @@ test test_database
 test model_auth
 test model_auth_sandbox
 test stop_all
+test secret_socket
 test stop_bomb
 
 [crash]

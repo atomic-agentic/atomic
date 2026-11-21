@@ -38,14 +38,22 @@
 //! another process of the same user can take it only by attaching to the
 //! helper, which Yama's `ptrace_scope` of 1 or more refuses to a process
 //! that is not its ancestor, and at `ptrace_scope` 0 allows. `atomic
-//! runner`, under `--runner process`, gets it in its request on stdin, a
-//! pipe, which it reads once it is non-dumpable; until then another process
-//! of the same user can reopen that pipe through /proc and read it. Once
-//! they are non-dumpable, only a process with `CAP_SYS_PTRACE` over their
-//! user namespace can read it from them, or from the helper's bridges,
-//! which inherit it. A command's token
-//! admits no new connection once the command ends, and the proxy stops once
-//! no command needs it.
+//! runner`, under `--runner process`, gets it on a socket of its own beside
+//! its request, with the digest of that request, and reads it once it is
+//! non-dumpable; at `ptrace_scope` 0 that socket is open to the same attach
+//! as the helper's, before then. Its request waits in its stdin, a pipe
+//! another process of the same user can reopen through /proc before then,
+//! to read the request (its program, arguments, directory and whole
+//! environment) or replace it; the runner refuses a request the digest does
+//! not name, so a replaced one never gets the token, though a replaced
+//! request without one still runs as that user's own command, and a request
+//! read and written back unchanged still runs. Once
+//! they are non-dumpable, no process of the same user without
+//! `CAP_SYS_PTRACE` over their user namespace can newly read it from them,
+//! or from the helper's bridges, which inherit it; but one that attached
+//! during the window, as `ptrace_scope` 0 lets it, keeps what it attached
+//! to. A command's token admits no new connection once the command ends,
+//! and the proxy stops once no command needs it.
 //!
 //! Each command that declares hosts is admitted against a budget of file
 //! descriptors ([`Budget`]): it reserves [`DESCRIPTORS_PER_COMMAND`], two for
