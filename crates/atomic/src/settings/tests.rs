@@ -1164,3 +1164,29 @@ fn the_budget_layers_like_every_other_setting_and_says_where_each_limit_came_fro
         assert!(!said.contains(value), "{name}={value}: {said}");
     }
 }
+
+/// The settings a person reads, the denial of their own configuration directory
+/// to every atom's commands, and the refusal of a state directory inside it are
+/// made from one resolution: [`atomic_core::state::user_config_dir`], which
+/// reads `XDG_CONFIG_HOME` and `HOME` as the operating system gives them and
+/// falls back to the home the password database gives. Read the variables as
+/// text instead — which is what [`Surroundings::env`] does, and what the test
+/// helper above does because a test's environment says nothing about this
+/// machine's user — the two name two directories as soon as one of them is
+/// bytes that are not text, and settings would come from a directory no atom is
+/// denied while the denial covered another. That is shown end to end by
+/// `a_setting_in_a_configuration_directory_of_bytes_that_are_not_text_is_sourced_from_it`
+/// in `crates/atomic/tests/state_cli.rs`, which gives a command such a
+/// directory; what is fixed here is that a person's run asks for the directory
+/// the same way both times, whatever this process's environment and password
+/// database happen to give.
+#[test]
+fn settings_read_the_configuration_directory_the_denial_and_the_state_check_name() {
+    let here = Surroundings::here();
+    assert_eq!(
+        user_config(here.user_config_dir),
+        atomic_core::state::user_config_dir().map(|dir| dir.join("config.yaml")),
+        "settings do not read the configuration directory the denial and the state \
+         check are made from"
+    );
+}

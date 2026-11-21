@@ -231,11 +231,16 @@ impl ResolveSide {
                  would be inside your own configuration directory"
                     .into()
             }
+            // Not "missing": a name below the deepest directory that is there
+            // is what placing folds without asking, and is no reason to refuse.
+            // What cannot be placed is a directory no one may enter, a path
+            // through something that is not a directory, and a link that leads
+            // nowhere — see [`real_path`].
             ResolveSide::Config => {
                 "fix HOME, or XDG_CONFIG_HOME, so that your configuration directory can be \
-                 placed: it, or a directory above it, is missing, cannot be read, or is a link \
-                 that leads nowhere; until then atomic cannot tell whether its state would be \
-                 inside that directory"
+                 placed: it, or a directory above it, cannot be entered, passes through \
+                 something that is not a directory, or is a link that leads nowhere; until \
+                 then atomic cannot tell whether its state would be inside that directory"
                     .into()
             }
         }
@@ -693,29 +698,45 @@ pub fn user_config_dir() -> Option<PathBuf> {
     user_config_dir_in(&process_env, &process_passwd_home())
 }
 
-/// A variable of this process's environment, as the operating system gives it.
-#[cfg(not(test))]
+// What [`process_env`] and [`process_passwd_home`] answer: this process's own
+// environment and password database, or, in a test run of this crate only, what
+// a test has said they are for its own thread — see [`as_process`], which says
+// it, and [`TestProcessGuard`], which puts this process's own back.
+//
+// The entry point above reads the environment and the password database
+// itself, so without this their *wiring* — that they ask the password database
+// for a home when the environment names none — could be tested only against
+// this machine's user and this process's real environment, which a test must
+// not depend on and must not change under the other tests running beside it.
+// A build that is not this crate's own tests compiles the override away:
+// nothing outside those tests can set it, and no variable, file or atom can.
+
+/// A variable of this process's environment, as the operating system gives it;
+/// for the thread a test runs on, what `as_process` said this thread's
+/// environment holds instead.
 fn process_env(name: &str) -> Option<std::ffi::OsString> {
+    #[cfg(test)]
+    if let Some(said) = PROCESS.with(|p| {
+        p.borrow()
+            .as_ref()
+            .map(|process| process.env.get(name).cloned())
+    }) {
+        return said;
+    }
     std::env::var_os(name)
 }
 
-/// The home this process's user has in the password database.
-#[cfg(not(test))]
+/// The home this process's user has in the password database; for the thread a
+/// test runs on, what `as_process` said the password database gives instead.
 fn process_passwd_home() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(said) = PROCESS.with(|p| p.borrow().as_ref().map(|process| process.passwd.clone()))
+    {
+        return said;
+    }
     passwd_home()
 }
 
-// What [`process_env`] and [`process_passwd_home`] answer: this process's own
-// environment and password database, or, in a test run of this crate only, what
-// a test has said they are for its own thread.
-//
-// The two entry points above read the environment and the password database
-// themselves, so without this their *wiring* — that they ask the password
-// database for a home when the environment names none — could be tested only
-// against this machine's user and this process's real environment, which a test
-// must not depend on and must not change under the other tests running beside
-// it. A release build compiles the override away: nothing outside this crate's
-// own tests can set it, and no variable, file or atom can.
 #[cfg(test)]
 thread_local! {
     static PROCESS: std::cell::RefCell<Option<TestProcess>> = const {
@@ -728,22 +749,6 @@ thread_local! {
 struct TestProcess {
     env: std::collections::BTreeMap<String, std::ffi::OsString>,
     passwd: Option<PathBuf>,
-}
-
-#[cfg(test)]
-fn process_env(name: &str) -> Option<std::ffi::OsString> {
-    PROCESS.with(|p| match p.borrow().as_ref() {
-        Some(process) => process.env.get(name).cloned(),
-        None => std::env::var_os(name),
-    })
-}
-
-#[cfg(test)]
-fn process_passwd_home() -> Option<PathBuf> {
-    PROCESS.with(|p| match p.borrow().as_ref() {
-        Some(process) => process.passwd.clone(),
-        None => passwd_home(),
-    })
 }
 
 /// Say, for this test thread, that the environment holds exactly `vars` — a
@@ -912,6 +917,16 @@ pub fn outside_user_config(state_dir: &Path) -> Result<(), StateError> {
 /// needs before it can be compared with anything: [`std::path::absolute`],
 /// which joins the working directory without folding the names that are not
 /// there yet. `None` when the working directory cannot be read.
+///
+/// Every home a command brings to [`outside_user_config`] is absolute before
+/// it gets there: [`atomic_home`] reads a relative `ATOMIC_HOME` from the
+/// working directory itself, and the default data directory and the
+/// configuration directory name an absolute one or nothing. So this is the
+/// backstop rather than the usual path — and a backstop that must still work,
+/// because a spelling compared unresolved is the one thing that lets a state
+/// into the denied directory. The test that keeps it living is
+/// `a_relative_state_directory_is_placed_from_the_working_directory`, which
+/// asks [`outside_user_config`] itself, with the spelling relative.
 fn placed(path: &Path) -> Option<PathBuf> {
     std::path::absolute(path).ok()
 }
@@ -1845,8 +1860,19 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         // A process that may look in any directory cannot make these lookups
         // fail, so the refusal has nothing here to be seen in: mode 000 is no
-        // bar to the superuser.
+        // bar to the superuser. The skip is said rather than returned in
+        // silence, because this test is what
+        // `scripts/controls/state-walk-notfound-only.row` runs, and a control
+        // that cannot be seen in must not read as one that was checked.
+        // `scripts/controls-check.sh` and the suite run as the operator, never
+        // as root; the same shape is still pinned where the superuser cannot
+        // undo it, by `a_home_that_walks_through_a_file_is_refused`.
         if effective_uid() == 0 {
+            eprintln!(
+                "SKIP {}: mode 000 is no bar to the superuser, so no lookup below it can \
+                 fail here",
+                module_path!()
+            );
             return;
         }
         let scratch = setup("closed", &["closed", "settings/atomic"], &[]);
@@ -1905,6 +1931,45 @@ mod tests {
         );
     }
 
+    /// A name in the middle of a home's path that is a file and not a
+    /// directory, with one name below it and two `..` back over both. Asking
+    /// what is below a file is not the same as a name not being there: only
+    /// `NotFound` may be read as missing. Reading what the filesystem says about
+    /// a file as "missing" and walking on finds the file itself, and the home is
+    /// then placed by folding its own spelling over it — out of the file's name,
+    /// back out of the directory holding it, to the throwaway directory beside
+    /// the configuration directory, and accepted — while a directory below a
+    /// file cannot be anywhere at all. So the refusal is for the lookup that
+    /// failed, and it says what the filesystem said. The superuser sees this
+    /// shape too: nothing here needs a directory closed.
+    #[test]
+    fn a_home_that_walks_through_a_file_is_refused() {
+        let scratch = setup("notdir", &["home/.config/atomic"], &[]);
+        std::fs::write(scratch.join("gate"), "a file, not a directory").expect("the file");
+        let spelled = "/gate/x/../..";
+        let outcome = check(
+            &scratch,
+            &[("HOME", "/home"), ("ATOMIC_HOME", spelled)],
+            spelled,
+            None,
+            None,
+        );
+        let why = words(&outcome);
+        let home = scratch.join("gate/x/../..");
+        assert!(
+            why.starts_with(&format!(
+                "refused: cannot resolve atomic's state directory {}: ",
+                home.display()
+            )),
+            "not the refusal of a home below a file: {why}"
+        );
+        assert!(
+            why.contains(&format!("{} cannot be looked up: ", home.display()))
+                && why.contains("Not a directory"),
+            "the refusal does not say which lookup failed and what it said: {why}"
+        );
+    }
+
     /// What a run of this binary really does when nothing in the environment
     /// names an absolute home: the configuration directory is the one under the
     /// home the password database gives, both for the check and for the denial
@@ -1936,6 +2001,46 @@ mod tests {
             ),
             "a state directory inside the password home was not refused by the check itself: \
              {outcome:?}"
+        );
+    }
+
+    /// A relative state directory is placed — read from the directory the
+    /// command was run in, the names below it that are not there yet kept as
+    /// they were spelled — before it is compared with anything. This asks
+    /// [`outside_user_config`], the one entry a command uses, because [`placed`]
+    /// is what does that on that path: the homes a command brings are absolute
+    /// before they get there, so this is where the placing of a relative
+    /// spelling is kept working, for the caller that hands one over. Given the
+    /// spelling unresolved there is nothing to compare, and the check refuses
+    /// the run for a directory it cannot place.
+    ///
+    /// Nothing is created in the working directory: the name is one no
+    /// directory holds, so placing it asks nothing of the filesystem beyond the
+    /// working directory itself.
+    #[test]
+    fn a_relative_state_directory_is_placed_from_the_working_directory() {
+        let scratch = setup("relative-home", &[], &[]);
+        // The configuration directory is `.config/atomic` below `HOME`, which
+        // the throwaway directory's parent gives — below the temporary
+        // directory, so a state below this process's working directory is not
+        // inside it and the placed case runs.
+        let _process = as_process(&scratch, &[("HOME", "/.."), ("ATOMIC_HOME", "state")], None);
+        let outcome = outside_user_config(Path::new("state"));
+        assert_eq!(
+            words(&outcome),
+            "accepted",
+            "a relative state directory was not placed from the working directory, and \
+             unresolved there is nothing to compare it with: {outcome:?}"
+        );
+        // The same directory spelled out from the working directory answers
+        // alike: placing is what makes the two spellings one directory.
+        let spelled = std::env::current_dir()
+            .expect("the working directory")
+            .join("state");
+        assert_eq!(
+            words(&outside_user_config(&spelled)),
+            words(&outcome),
+            "{spelled:?} is not what the relative spelling names: {outcome:?}"
         );
     }
 }

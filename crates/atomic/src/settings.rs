@@ -285,10 +285,28 @@ impl Surroundings<'static> {
                 .filter_map(|(k, _)| k.into_string().ok())
                 .collect(),
             ollama: &|_| None,
-            user_config_dir: &atomic_core::state::user_config_dir,
+            user_config_dir: &user_config_dir_here,
             sign_in: &|_| Ok(None),
         }
     }
+}
+
+/// [`Surroundings`] reads the person's own configuration directory from this
+/// process with [`atomic_core::state::user_config_dir`], which reads
+/// `XDG_CONFIG_HOME` and `HOME` as the operating system gives them and falls
+/// back to the home the password database gives: the same resolution the denial
+/// of that directory to atoms' commands and the refusal of a state directory
+/// inside it are made from.
+///
+/// A function, where every other field `without_probe` gives is a closure,
+/// because a control's switch is written in a `|`-delimited row (see
+/// `scripts/controls-check.sh`), which no closure can be written without:
+/// `scripts/controls/settings-user-config-dir.row`
+/// switches what this asks of the environment to `XDG_CONFIG_HOME` as text,
+/// which is the one reading [`Surroundings::env`] already gives and the one that
+/// sees nothing where the operating system gives bytes that are not text.
+fn user_config_dir_here() -> Option<PathBuf> {
+    atomic_core::state::user_config_dir()
 }
 
 /// The person's sign-in, if someone is signed in, found without creating
