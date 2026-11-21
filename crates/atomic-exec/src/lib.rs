@@ -295,9 +295,10 @@ pub trait ExecutionBackend: Send + Sync {
     /// Connect, and state what the control plane may plan on.
     fn connect(&self) -> Result<Statement, ExecError>;
 
-    /// Open a workspace for one attempt of one atom run. Each call opens a
-    /// workspace of its own, even for a request opened before: an attempt
-    /// that runs again starts in a new one.
+    /// Open a workspace for one attempt of one atom run. Each attempt opens
+    /// a workspace of its own: one that runs again, as a new attempt,
+    /// starts in a new one, and opening an attempt that is open already is
+    /// refused.
     fn open(&self, request: &Open) -> Result<Workspace, ExecError>;
 
     /// Run `command` to completion in a workspace this backend opened. A
