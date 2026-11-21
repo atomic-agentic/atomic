@@ -145,6 +145,89 @@ pub struct Command {
     /// confines it; with none, it has no network at all. A backend that does
     /// not confine its commands ignores it.
     pub network: Vec<String>,
+    /// Variables it gets on a socket instead of in its environment, which
+    /// another process of the same user can read through /proc until the
+    /// program has made itself non-dumpable: see [`SecretEnv`]. Only a
+    /// program that reads the socket, such as atomic's sandbox helper, gets
+    /// them. Unlike a pipe, a socket cannot be reopened through
+    /// `/proc/<pid>/fd`, so in that window another process can take them
+    /// only by attaching to the program (ptrace, `pidfd_getfd`), which Yama's
+    /// `ptrace_scope` of 1 or more refuses to a process that is not its
+    /// ancestor; at `ptrace_scope` 0 the window is narrowed, not closed.
+    pub secret_env: SecretEnv,
+}
+
+/// The variable that names the descriptor a command reads its
+/// [`SecretEnv`] from.
+pub const SECRET_ENV_FD: &str = "ATOMIC_SECRET_ENV_FD";
+
+/// Variables handed to a command on a Unix socket rather than in its exec
+/// environment: the command finds the socket's descriptor in
+/// [`SECRET_ENV_FD`] and reads `KEY=VALUE` entries, each ended by a NUL
+/// byte, until the other end closes. Its `Debug` form shows the names only.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SecretEnv(pub Vec<(String, String)>);
+
+impl std::fmt::Debug for SecretEnv {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(self.0.iter().map(|(k, _)| format!("{k}=<hidden>")))
+            .finish()
+    }
+}
+
+impl SecretEnv {
+    /// Whether it holds no variable.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Its entries as they cross the socket, or why one cannot: a name that
+    /// is empty or holds `=` or NUL, or a value that holds NUL.
+    pub fn encode(&self) -> Result<Vec<u8>, String> {
+        let mut bytes = Vec::new();
+        for (key, value) in &self.0 {
+            if key.is_empty() || key.contains(['=', '\0']) {
+                return Err(format!("{key:?} cannot name a secret variable"));
+            }
+            if value.contains('\0') {
+                return Err(format!("the secret variable {key} holds a NUL byte"));
+            }
+            bytes.extend_from_slice(key.as_bytes());
+            bytes.push(b'=');
+            bytes.extend_from_slice(value.as_bytes());
+            bytes.push(0);
+        }
+        Ok(bytes)
+    }
+
+    /// The entries in `bytes`, as [`encode`](Self::encode) wrote them, each
+    /// ended by its NUL, the last too.
+    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+        let Some(entries) = bytes.strip_suffix(&[0]) else {
+            return if bytes.is_empty() {
+                Ok(Self::default())
+            } else {
+                Err("the secret variables end before their last NUL".to_owned())
+            };
+        };
+        entries
+            .split(|b| *b == 0)
+            .map(|entry| {
+                let entry = std::str::from_utf8(entry)
+                    .map_err(|_| "a secret variable is not UTF-8".to_owned())?;
+                let (key, value) = entry
+                    .split_once('=')
+                    .ok_or_else(|| "a secret variable has no `=`".to_owned())?;
+                if key.is_empty() {
+                    return Err("a secret variable has no name".to_owned());
+                }
+                Ok((key.to_owned(), value.to_owned()))
+            })
+            .collect::<Result<_, _>>()
+            .map(Self)
+    }
 }
 
 /// Puts a command under a sandbox before a backend runs it: what it may
@@ -644,12 +727,13 @@ impl LocalBackend {
             program: command.program.clone(),
             message,
         })?;
-        process::run_in(
+        process::run_in_with_secret(
             group,
             &program,
             &command.args,
             Some(&command.cwd),
             &command.env,
+            &command.secret_env,
             &command.stdin,
             process::Limits {
                 time: command.time_limit,
