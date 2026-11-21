@@ -6,19 +6,35 @@
 //! snapshot, wherever the project is (outside any repository, or in a
 //! subdirectory of the developer's), and atomic commits there. The
 //! developer's checkout and the fixture repository itself are left exactly
-//! as they were; nothing the fixture's configuration names (hooks, a file
-//! system monitor, filter drivers, remotes) ever runs; and a run killed
-//! after one step goes on from the snapshot after its source is gone, each
-//! step's commit on the last.
+//! as they were — compared file by file and byte by byte, as
+//! `repository_state` does, and not only as git reports them. A read-only
+//! Codex atom named directly is the one Codex turn whose working directory
+//! is the developer's checkout, and it too changes nothing there; nothing
+//! the fixture's configuration names (hooks, a file system monitor, filter
+//! drivers, remotes) ever runs; and a run killed after one step goes on from
+//! the snapshot after its source is gone, each step's commit on the last.
 //!
-//! Needs bubblewrap and unprivileged user namespaces, so it runs with the
-//! `sandbox-tests` feature; with the feature on, a sandbox that cannot start
-//! fails the tests.
+//! Those runs need bubblewrap and unprivileged user namespaces: each one is
+//! marked `needs_sandbox` and asks for the sandbox, so with the `sandbox-tests`
+//! feature on a sandbox that cannot start fails them, and in a build without
+//! the feature they are not built at all. What asks for the sandbox and what
+//! does not is what scripts/backends-check.sh counts on: the tests it names are
+//! exactly the tests the sandbox is for, and each must fail naming it. Three
+//! tests ask for no sandbox, because nothing they run reaches a turn: the two
+//! `target.unsafe` refusals, which are made while a run is loaded, and the
+//! check of that comparison itself. They run wherever atomic builds.
 
-#![cfg(all(target_os = "linux", feature = "sandbox-tests"))]
+// On Linux the sandbox is there to be asked for only with the `sandbox-tests`
+// feature, so without it the tests that need it are not built, and the helpers
+// they alone use would read as dead.
+#![cfg_attr(
+    all(target_os = "linux", not(feature = "sandbox-tests")),
+    allow(dead_code, unused_imports)
+)]
 #![recursion_limit = "512"]
 #![allow(clippy::unwrap_used)]
 
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 mod support;
 
 use atomic_core::testing::{FakeModel, Reply, on_codex_runtime};
@@ -41,9 +57,11 @@ fn stdout_json(out: &Output) -> Value {
     serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("{e}: {}", text(out)))
 }
 
-/// git in `dir`, as a person runs it.
-fn git_in(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
+/// The command `git` runs in `dir`: as a person runs it, with no global or
+/// system configuration read.
+fn git_command(dir: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new("git");
+    command
         .args([
             "-c",
             "user.name=dev",
@@ -55,13 +73,33 @@ fn git_in(dir: &Path, args: &[&str]) -> String {
         .args(args)
         .current_dir(dir)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .output()
-        .unwrap();
+        .env("GIT_CONFIG_NOSYSTEM", "1");
+    command
+}
+
+/// git in `dir`, as a person runs it, failing the test with what it printed
+/// when it fails.
+fn git_in(dir: &Path, args: &[&str]) -> String {
+    let out = git_command(dir, args).output().unwrap();
     assert!(out.status.success(), "git {args:?}: {}", text(&out));
     String::from_utf8_lossy(&out.stdout).trim().to_owned()
 }
 
+/// git in `dir`, where a non-zero exit is an answer of its own: whether it
+/// succeeded, and what it printed. `git symbolic-ref -q HEAD` exits 1 and
+/// prints nothing exactly when HEAD is detached, which is a state a test
+/// wants to see rather than a failure to compare.
+fn git_try_in(dir: &Path, args: &[&str]) -> (bool, String) {
+    let out = git_command(dir, args).output().unwrap();
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).trim().to_owned(),
+    )
+}
+
+/// What git records about the repository at `dir`: its refs, its worktrees,
+/// and what `git status` sees there — every change and every untracked file,
+/// which is not every file (see [`repository_state`]).
 fn git_state(dir: &Path) -> String {
     format!(
         "{}\n{}\n{}",
@@ -69,6 +107,153 @@ fn git_state(dir: &Path) -> String {
         git_in(dir, &["worktree", "list", "--porcelain"]),
         git_in(dir, &["status", "--porcelain", "--untracked-files=all"])
     )
+}
+
+/// The sha256 of `bytes`, so a file's whole content is compared without its
+/// content landing in a test's failure message.
+fn digest(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    format!("{:x}", sha2::Sha256::digest(bytes))
+}
+
+/// Every working file under `dir`, the checkout's own; only its `.git`
+/// metadata is skipped, which [`git_metadata_files`] covers where it matters.
+/// A directory that is there but cannot be listed fails rather than goes
+/// unseen: a file hidden inside it is a change this comparison would otherwise
+/// read as nothing. One that is not there at all, like a repository with no
+/// `.git/hooks`, has nothing to list.
+fn working_files(dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![dir.to_owned()];
+    while let Some(at) = stack.pop() {
+        let entries = match std::fs::read_dir(&at) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => panic!("cannot list {} to compare it: {e}", at.display()),
+        };
+        for entry in entries {
+            let path = entry
+                .unwrap_or_else(|e| panic!("cannot read an entry of {}: {e}", at.display()))
+                .path();
+            if path.file_name().is_some_and(|n| n == ".git") {
+                continue;
+            }
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                found.push(path);
+            }
+        }
+    }
+    found
+}
+
+/// What a run could leave changed inside `<dir>/.git` that no `git status`
+/// line and no `for-each-ref` shows: the repository's own configuration,
+/// every hook, and `info/exclude`, the ignore file that lives in the
+/// repository itself. `.git/index` is left out on purpose: `git status`
+/// refreshes it as it runs, and a change *to* the index is what `git status`'s
+/// own lines report.
+fn git_metadata_files(dir: &Path) -> Vec<PathBuf> {
+    let git = dir.join(".git");
+    let mut found = vec![git.join("config"), git.join("info/exclude")];
+    found.extend(working_files(&git.join("hooks")));
+    found
+}
+
+/// Every file under `dir`, and the git metadata above, as one sorted line
+/// each — `<path, relative to dir> <sha256>`, or `<path> unreadable: <why>`
+/// for a file that is not there to be read. Two answers differ whenever a file
+/// appeared, vanished or changed a byte: tracked, untracked or ignored, in the
+/// working tree or in `.git`.
+fn file_state(dir: &Path) -> String {
+    let mut paths = working_files(dir);
+    paths.extend(git_metadata_files(dir));
+    let mut lines: Vec<String> = paths
+        .iter()
+        .map(|path| {
+            let name = path.strip_prefix(dir).unwrap_or(path).display();
+            match std::fs::read(path) {
+                Ok(bytes) => format!("{name} {}", digest(&bytes)),
+                Err(e) => format!("{name} unreadable: {e}"),
+            }
+        })
+        .collect();
+    lines.sort();
+    lines.join("\n")
+}
+
+/// The line [`repository_state`] puts between what git reported and the files
+/// it compared, so a test can tell the two apart.
+const FILES_MARK: &str = "files:";
+
+/// Everything about the repository at `dir` that a run could leave changed:
+/// what git records ([`git_state`]); HEAD's own commit and name, read from the
+/// repository (`for-each-ref` lists the refs and never HEAD, and only
+/// `git worktree list` says anything of HEAD, in its own shape); and every
+/// file's bytes ([`file_state`]), which nothing in `git status` shows for an
+/// ignored file, a hook, the repository's configuration or `info/exclude`. Two
+/// answers are equal only when the repository is as it was, byte for byte,
+/// apart from `.git/index` (see [`git_metadata_files`]).
+fn repository_state(dir: &Path) -> String {
+    let head = git_in(dir, &["rev-parse", "HEAD"]);
+    let (named, branch) = git_try_in(dir, &["symbolic-ref", "-q", "HEAD"]);
+    let where_head = format!(
+        "HEAD at {head} as {}",
+        if named { &branch } else { "(detached)" }
+    );
+    format!(
+        "{}\n{where_head}\n{FILES_MARK}\n{}",
+        git_state(dir),
+        file_state(dir)
+    )
+}
+
+/// The lines of a [`repository_state`] answer that name HEAD: where it stands,
+/// and what it is called when it has a name.
+fn head_state(state: &str) -> Vec<&str> {
+    state
+        .lines()
+        .filter(|l| l.starts_with("HEAD at "))
+        .collect()
+}
+
+/// The file lines of a [`repository_state`] answer, which follow
+/// [`FILES_MARK`]; what git reported comes before it.
+fn file_lines(state: &str) -> std::str::Lines<'_> {
+    let (_, files) = state.split_once(FILES_MARK).unwrap_or_else(|| {
+        panic!("no {FILES_MARK} line in a repository state:\n{state}");
+    });
+    files.lines()
+}
+
+/// The file lines of a [`repository_state`] answer as `<path, sha256>` pairs:
+/// a pair that is in both of two answers is a file that did not change, and a
+/// path whose pair is not is one that appeared, vanished or changed a byte.
+fn file_entries(state: &str) -> Vec<(&str, &str)> {
+    file_lines(state)
+        .map(|line| line.split_once(' ').unwrap_or((line, "")))
+        .collect()
+}
+
+/// What a run left in the checkout, as the paths whose file line in
+/// [`repository_state`] differs between `before` and `after` — appeared,
+/// vanished or changed a byte. A checkout left exactly as it was gives nothing.
+fn left_behind<'a>(before: &'a str, after: &'a str) -> Vec<&'a str> {
+    let (was, now) = (file_entries(before), file_entries(after));
+    let mut changed: Vec<&'a str> = was
+        .iter()
+        .filter(|e| !now.contains(e))
+        .map(|(path, _)| *path)
+        .collect();
+    changed.extend(
+        now.iter()
+            .filter(|e| !was.contains(e))
+            .map(|(path, _)| *path),
+    );
+    changed.sort();
+    changed.dedup();
+    changed
 }
 
 fn write(path: &Path, text: &str) {
@@ -136,6 +321,45 @@ fn project(at: &Path) -> PathBuf {
          returns: steps.fix.output\n",
     );
     project
+}
+
+/// `read-note`, a read-only Codex atom, in `project`: named directly, with no
+/// worktree and no fixture, and no `base` its input would need. A Codex atom
+/// that may not write is the one `atomic run` lets work where its project sits.
+fn read_only_atom(project: &Path) {
+    write(
+        &project.join("atoms/read-note.atom.astro"),
+        "---\nimport type { Props, Input, Output } from '../.atomic/types/read-note';\n\
+         import type { AtomConfig } from '../.atomic/types/authoring';\n\
+         const { input }: Props = Astro.props;\n\
+         export const config: AtomConfig<Input, Output> = { description: 'Read the note.', \
+         kind: 'codex', sandbox: 'read-only' };\n---\nRead this: {input.task}\n",
+    );
+    write(
+        &project.join("atoms/read-note.input.schema.json"),
+        &json!({"type": "object", "additionalProperties": false, "required": ["task"],
+            "properties": {"task": {"type": "string"}}})
+        .to_string(),
+    );
+    write(
+        &project.join("atoms/read-note.output.schema.json"),
+        &json!({"type": "object", "additionalProperties": false, "required": ["done"],
+            "properties": {"done": {"type": "boolean"}}})
+        .to_string(),
+    );
+}
+
+/// The project in a developer's checkout of their own, under `dir`: written at
+/// `dev/examples/coding`, then committed, so the checkout is clean and every
+/// comparison of it has one answer to compare with. Returns the checkout and
+/// the project.
+fn project_in(dir: &Path) -> (PathBuf, PathBuf) {
+    let checkout = dir.join("dev");
+    let project = project(&checkout.join("examples/coding"));
+    git_in(&checkout, &["init", "-q"]);
+    git_in(&checkout, &["add", "."]);
+    git_in(&checkout, &["commit", "-q", "-m", "project"]);
+    (checkout, project)
 }
 
 /// A fixture repository at `at` with one commit; returns it.
@@ -214,6 +438,27 @@ async fn atomic(dir: &Path, cwd: &Path, args: &[&str], url: &str, env: &[(&str, 
     .unwrap()
 }
 
+/// `atomic` with `args`, from `project`, on the fake model at `url`, with the
+/// run bound to the repository at `fixture`: every fixture-bound run of this
+/// file ends with the same pair, since atomic takes a fixture only with the
+/// revision to start from.
+async fn run_bound(
+    dir: &Path,
+    project: &Path,
+    args: &[&str],
+    fixture: &Path,
+    url: &str,
+    env: &[(&str, &str)],
+) -> Output {
+    let fixture_arg = fixture.to_string_lossy().into_owned();
+    let all: Vec<&str> = args
+        .iter()
+        .copied()
+        .chain(["--fixture", &fixture_arg, "--fixture-rev", "main"])
+        .collect();
+    atomic(dir, project, &all, url, env).await
+}
+
 /// The snapshots atomic made under `dir`'s atomic home.
 fn snapshots(dir: &Path) -> Vec<PathBuf> {
     std::fs::read_dir(dir.join("atomic-home/projects"))
@@ -275,25 +520,15 @@ async fn coding_run_at_the_top(dir: &Path, project: &Path, fixture: &Path, base:
     ])
     .await
     .unwrap();
-    let source = git_state(fixture);
+    let source = repository_state(fixture);
     let data = json!({"base": base, "task": "multiply by quantity"}).to_string();
-    let fixture_arg = fixture.to_string_lossy().into_owned();
-    let out = atomic(
+    let out = run_bound(
         dir,
         project,
         &[
-            "--json",
-            "run",
-            "coding",
-            "--run-id",
-            "fix-1",
-            "--data",
-            &data,
-            "--fixture",
-            &fixture_arg,
-            "--fixture-rev",
-            "main",
+            "--json", "run", "coding", "--run-id", "fix-1", "--data", &data,
         ],
+        fixture,
         &model.base_url(),
         &[],
     )
@@ -317,15 +552,24 @@ async fn coding_run_at_the_top(dir: &Path, project: &Path, fixture: &Path, base:
         git_in(&snapshots[0], &["rev-parse", &format!("{step}^")]),
         base
     );
-    assert_eq!(git_state(fixture), source, "the fixture is as it was");
+    let after = repository_state(fixture);
+    assert_eq!(
+        after,
+        source,
+        "the fixture is exactly as it was: {}",
+        left_behind(&source, &after).join(", ")
+    );
 }
 
 /// A fixture-bound coding step whose reviewer asks for changes, then
 /// approves the repair: the repair round's worktree starts from the run's
 /// base in the snapshot, as check_base requires, and the commit published is
 /// the repair's, the one the second verdict was given.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn a_repair_round_of_a_fixture_bound_step_publishes_the_repairs_commit() {
+    #[cfg(target_os = "linux")]
     support::require_sandbox();
     on_codex_runtime(async {
         let dir = scratch("repaired");
@@ -342,8 +586,7 @@ fn a_repair_round_of_a_fixture_bound_step_publishes_the_repairs_commit() {
         .await
         .unwrap();
         let data = json!({"base": base, "task": "multiply by quantity"}).to_string();
-        let fixture_arg = dir.join("fixture").to_string_lossy().into_owned();
-        let out = atomic(
+        let out = run_bound(
             &dir,
             &project,
             &[
@@ -354,11 +597,8 @@ fn a_repair_round_of_a_fixture_bound_step_publishes_the_repairs_commit() {
                 "repaired-1",
                 "--data",
                 &data,
-                "--fixture",
-                &fixture_arg,
-                "--fixture-rev",
-                "main",
             ],
+            &dir.join("fixture"),
             &model.base_url(),
             &[],
         )
@@ -436,8 +676,11 @@ fn reviewed_coding(project: &Path) {
 /// A fixture-bound coding step under review: its reviewer is given the
 /// commit atomic made in the fixture's snapshot, as a SHA (it runs in the
 /// project, not the snapshot, so the SHA is what it has of the change).
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn a_reviewer_of_a_fixture_bound_step_is_given_the_commit_in_the_snapshot() {
+    #[cfg(target_os = "linux")]
     support::require_sandbox();
     on_codex_runtime(async {
         let dir = scratch("reviewed");
@@ -452,8 +695,7 @@ fn a_reviewer_of_a_fixture_bound_step_is_given_the_commit_in_the_snapshot() {
         .await
         .unwrap();
         let data = json!({"base": base, "task": "multiply by quantity"}).to_string();
-        let fixture_arg = dir.join("fixture").to_string_lossy().into_owned();
-        let out = atomic(
+        let out = run_bound(
             &dir,
             &project,
             &[
@@ -464,11 +706,8 @@ fn a_reviewer_of_a_fixture_bound_step_is_given_the_commit_in_the_snapshot() {
                 "reviewed-1",
                 "--data",
                 &data,
-                "--fixture",
-                &fixture_arg,
-                "--fixture-rev",
-                "main",
             ],
+            &dir.join("fixture"),
             &model.base_url(),
             &[],
         )
@@ -485,8 +724,11 @@ fn a_reviewer_of_a_fixture_bound_step_is_given_the_commit_in_the_snapshot() {
     });
 }
 
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn a_project_outside_any_repository_runs_its_coding_step_in_the_snapshot() {
+    #[cfg(target_os = "linux")]
     support::require_sandbox();
     on_codex_runtime(async {
         let dir = scratch("outside");
@@ -498,21 +740,148 @@ fn a_project_outside_any_repository_runs_its_coding_step_in_the_snapshot() {
     });
 }
 
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn a_project_in_a_subdirectory_of_a_checkout_runs_at_the_top_of_the_fixture() {
+    #[cfg(target_os = "linux")]
     support::require_sandbox();
     on_codex_runtime(async {
         let dir = scratch("subdirectory");
-        let checkout = dir.join("dev");
-        let project = project(&checkout.join("examples/coding"));
-        git_in(&checkout, &["init", "-q"]);
-        git_in(&checkout, &["add", "."]);
-        git_in(&checkout, &["commit", "-q", "-m", "project"]);
-        let before = git_state(&checkout);
+        let (checkout, project) = project_in(&dir);
+        let before = repository_state(&checkout);
         let base = fixture(&dir.join("fixture"));
         coding_run_at_the_top(&dir, &project, &dir.join("fixture"), &base).await;
-        assert_eq!(git_state(&checkout), before, "the checkout is as it was");
+        assert_eq!(
+            repository_state(&checkout),
+            before,
+            "the checkout is exactly as it was: {}",
+            left_behind(&before, &repository_state(&checkout)).join(", ")
+        );
     });
+}
+
+/// The comparison every claim below makes when it says the checkout is exactly
+/// as it was is [`repository_state`], which is a control of its own: a change
+/// a run could leave in the checkout that git never reports must still show up
+/// in it. Here each of those is planted by hand and required to show, and then
+/// undone and required not to. Nothing here runs a turn or reaches a model, so
+/// this test needs no sandbox.
+#[test]
+fn the_state_a_checkout_is_compared_by_sees_what_git_does_not() {
+    let dir = scratch("state");
+    let checkout = dir.join("dev");
+    write(&checkout.join("price.txt"), "125\n");
+    git_in(&checkout, &["init", "-q"]);
+    git_in(&checkout, &["add", "price.txt"]);
+    git_in(&checkout, &["commit", "-q", "-m", "seed"]);
+    let tip = git_in(&checkout, &["rev-parse", "HEAD"]);
+    let (git, whole) = (git_state(&checkout), repository_state(&checkout));
+
+    // Where HEAD stands, and what it is called, read from the repository
+    // itself: `for-each-ref` lists the refs and never HEAD, and only
+    // `git worktree list` says anything of HEAD, in its own shape. Detaching
+    // HEAD at its own commit moves no file and no ref, and leaves HEAD with no
+    // name at all.
+    assert_eq!(
+        head_state(&whole),
+        [format!("HEAD at {tip} as refs/heads/main").as_str()],
+        "HEAD is not recorded where it stands and what it is called"
+    );
+    git_in(&checkout, &["checkout", "-q", "--detach"]);
+    let moved = repository_state(&checkout);
+    assert_eq!(
+        head_state(&moved),
+        [format!("HEAD at {tip} as (detached)").as_str()],
+        "a detached HEAD is not recorded: {moved}"
+    );
+    assert!(
+        left_behind(&whole, &moved).is_empty(),
+        "detaching HEAD moved a file: {}",
+        left_behind(&whole, &moved).join(", ")
+    );
+    assert_ne!(moved, whole, "a detached HEAD makes no difference");
+    git_in(&checkout, &["checkout", "-q", "main"]);
+
+    // A hook: code that runs the next time anyone runs git in the checkout.
+    let hook = checkout.join(".git/hooks").join("post-checkout");
+    write(&hook, "#!/bin/sh\nexit 0\n");
+    assert_eq!(git_state(&checkout), git, "git reports no hook");
+    assert_eq!(
+        left_behind(&whole, &repository_state(&checkout)),
+        [".git/hooks/post-checkout"],
+        "a planted hook is not compared"
+    );
+    std::fs::remove_file(&hook).unwrap();
+
+    // The repository's own configuration: what it would run, fetch or filter.
+    let config = checkout.join(".git/config");
+    let config_bytes = std::fs::read(&config).unwrap();
+    git_in(&checkout, &["config", "atomic.test", "planted"]);
+    assert_eq!(
+        git_state(&checkout),
+        git,
+        "git reports no configuration change"
+    );
+    assert_eq!(
+        left_behind(&whole, &repository_state(&checkout)),
+        [".git/config"],
+        "the repository's configuration is not compared"
+    );
+    std::fs::write(&config, &config_bytes).unwrap();
+
+    // And the very file the writing test looks for, once the repository is
+    // told to ignore it: `git status` never names an ignored file, and the
+    // ignore file a repository keeps for itself, `info/exclude`, is one status
+    // never shows either.
+    let exclude = checkout.join(".git/info/exclude");
+    let exclude_bytes = std::fs::read(&exclude).unwrap();
+    write(
+        &exclude,
+        &format!("{}\nnote.txt\n", String::from_utf8_lossy(&exclude_bytes)),
+    );
+    write(&checkout.join("note.txt"), "written\n");
+    assert_eq!(
+        git_state(&checkout),
+        git,
+        "git sees neither an ignored file nor the rule that ignores it"
+    );
+    assert_eq!(
+        left_behind(&whole, &repository_state(&checkout)),
+        [".git/info/exclude", "note.txt"],
+        "an ignored file, and the repository's own ignore file, are not compared"
+    );
+
+    // A directory whose contents cannot be listed, which is where a turn with
+    // write access would hide a file. Nothing can be read inside it, so the
+    // walk names the directory and fails: reading the checkout as unchanged
+    // here is the hole this closes.
+    use std::os::unix::fs::PermissionsExt;
+    let hidden = checkout.join("hidden");
+    write(&hidden.join("planted.txt"), "hidden\n");
+    std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = repository_state(&checkout);
+    }))
+    .is_err();
+    std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        refused,
+        "a directory that cannot be listed was read as nothing to compare"
+    );
+    std::fs::remove_dir_all(&hidden).unwrap();
+
+    // Every one of these undone: what the checkout holds is what it held
+    // before, so none of the comparisons above fired on anything else a
+    // moment of ordinary git left behind.
+    std::fs::remove_file(checkout.join("note.txt")).unwrap();
+    std::fs::write(&exclude, &exclude_bytes).unwrap();
+    assert_eq!(
+        repository_state(&checkout),
+        whole,
+        "the checkout is as it was again: {}",
+        left_behind(&whole, &repository_state(&checkout)).join(", ")
+    );
 }
 
 /// The typed text of the `target.unsafe` refusal, and its advice, as
@@ -523,32 +892,60 @@ const UNSAFE: &str = "which may write files, outside a worktree, so it would wri
 const UNSAFE_ADVICE: &str = "run it from a workflow step with `worktree: true` and a `base` \
                             commit, or make the atom read-only";
 
+/// `atomic runs show <id>`, which must answer that no run of that id is
+/// recorded: a run refused as it was loaded started nothing, plain or `--json`.
+async fn assert_nothing_recorded(dir: &Path, project: &Path, id: &str) {
+    let out = atomic(
+        dir,
+        project,
+        &["--json", "runs", "show", id],
+        "http://127.0.0.1:9/v1",
+        &[],
+    )
+    .await;
+    assert!(
+        !out.status.success(),
+        "a run {id} was recorded: {}",
+        text(&out)
+    );
+    let error = &stdout_json(&out)["error"];
+    assert_eq!(error["kind"], "run.not_found", "{error}");
+    assert!(
+        error["description"]
+            .as_str()
+            .is_some_and(|d| d.contains(&format!("no run {id} "))),
+        "{error}"
+    );
+}
+
 /// A `workspace-write` Codex atom named directly is a step with no worktree,
 /// so it would write in the developer's checkout: `atomic run` refuses it with
-/// `target.unsafe` before the run starts, and the checkout is left exactly as
-/// it was.
+/// `target.unsafe` before the run starts, records no run, and leaves the
+/// checkout exactly as it was. The refusal is made as the run is loaded, before
+/// any turn runs, so this test needs no sandbox.
 #[test]
 fn a_writing_codex_atom_run_directly_in_a_checkout_is_refused() {
-    support::require_sandbox();
     on_codex_runtime(async {
         let dir = scratch("unsafe-direct");
-        let checkout = dir.join("dev");
-        let project = project(&checkout.join("examples/coding"));
-        git_in(&checkout, &["init", "-q"]);
-        git_in(&checkout, &["add", "."]);
-        git_in(&checkout, &["commit", "-q", "-m", "project"]);
+        let (checkout, project) = project_in(&dir);
         // A JSON object, so the run reaches the write control; its missing
         // `base` is never checked, because the control refuses before the
         // input is. With the control removed, the run stops at the input
         // check — it never reaches a model.
         let data = json!({"task": "multiply"}).to_string();
-        let before = git_state(&checkout);
-        let atom_file = project.join("atoms/fix-code.atom.astro");
-        let written_before = std::fs::read(&atom_file).unwrap();
+        let before = repository_state(&checkout);
         let out = atomic(
             &dir,
             &project,
-            &["--json", "run", "fix-code", "--data", &data],
+            &[
+                "--json",
+                "run",
+                "fix-code",
+                "--run-id",
+                "refused-direct",
+                "--data",
+                &data,
+            ],
             "http://127.0.0.1:9/v1",
             &[],
         )
@@ -563,21 +960,31 @@ fn a_writing_codex_atom_run_directly_in_a_checkout_is_refused() {
             "{error}"
         );
         assert_eq!(error["action"], UNSAFE_ADVICE, "{error}");
-        // Nothing ran, so the checkout is as it was: its refs, its worktree
-        // list, its working tree with every untracked file, and the bytes of
+        // Nothing ran, so the checkout is exactly as it was: its refs and
+        // HEAD, its worktree list, its working tree with every untracked and
+        // every ignored file, its configuration and hooks, and the bytes of
         // the very atom that was refused.
-        assert_eq!(git_state(&checkout), before, "the checkout is as it was");
+        let after = repository_state(&checkout);
         assert_eq!(
-            std::fs::read(&atom_file).unwrap(),
-            written_before,
-            "the refused atom's file is unchanged"
+            after,
+            before,
+            "the checkout is as it was: {}",
+            left_behind(&before, &after).join(", ")
         );
+        assert_nothing_recorded(&dir, &project, "refused-direct").await;
         // And without `--json`, the same refusal reaches a person: a
         // description naming the write, and its advice on its own line.
         let out = atomic(
             &dir,
             &project,
-            &["run", "fix-code", "--data", &data],
+            &[
+                "run",
+                "fix-code",
+                "--run-id",
+                "refused-plain",
+                "--data",
+                &data,
+            ],
             "http://127.0.0.1:9/v1",
             &[],
         )
@@ -590,27 +997,31 @@ fn a_writing_codex_atom_run_directly_in_a_checkout_is_refused() {
                 && stderr.contains(&format!("\n  to fix: {UNSAFE_ADVICE}")),
             "{stderr}"
         );
+        let after = repository_state(&checkout);
         assert_eq!(
-            git_state(&checkout),
+            after,
             before,
-            "the plain run left the checkout as it was"
+            "the plain run left the checkout as it was: {}",
+            left_behind(&before, &after).join(", ")
         );
+        assert_nothing_recorded(&dir, &project, "refused-plain").await;
         let _ = std::fs::remove_dir_all(&checkout);
     });
 }
 
 /// The same `workspace-write` Codex atom as a workflow step that names no
-/// `worktree: true`: refused with `target.unsafe`, and the checkout is left as
-/// it was.
+/// `worktree: true`: refused with `target.unsafe` before anything starts, with
+/// nothing recorded, and with the checkout left exactly as it was. Like the
+/// refusal of the same atom named directly, this is made as the run is loaded,
+/// so it needs no sandbox.
 #[test]
 fn a_writing_codex_atom_in_a_step_without_a_worktree_is_refused() {
-    support::require_sandbox();
     on_codex_runtime(async {
         let dir = scratch("unsafe-step");
-        let checkout = dir.join("dev");
-        let project = project(&checkout.join("examples/coding"));
+        let (checkout, project) = project_in(&dir);
         // `coding`, but its step names no worktree: the same atom, run in a
-        // step that would write in the checkout.
+        // step that would write in the checkout. Committed with the rest, so
+        // the checkout's state covers it too.
         write(
             &project.join("workflows/writable.workflow.yaml"),
             "atomic: 1\nname: writable\n\
@@ -619,18 +1030,28 @@ fn a_writing_codex_atom_in_a_step_without_a_worktree_is_refused() {
              steps:\n  fix:\n    atom: fix-code\n    with: { base: input.base, task: input.task }\n\
              returns: steps.fix.output\n",
         );
-        git_in(&checkout, &["init", "-q"]);
         git_in(&checkout, &["add", "."]);
-        git_in(&checkout, &["commit", "-q", "-m", "project"]);
+        git_in(
+            &checkout,
+            &["commit", "-q", "-m", "a step with no worktree"],
+        );
         // A JSON object, so the step reaches the write control; its missing
         // `base` is never checked, because the control refuses before the
         // input is. With the control removed the run stops at the input check.
         let data = json!({"task": "multiply"}).to_string();
-        let before = git_state(&checkout);
+        let before = repository_state(&checkout);
         let out = atomic(
             &dir,
             &project,
-            &["--json", "run", "writable", "--data", &data],
+            &[
+                "--json",
+                "run",
+                "writable",
+                "--run-id",
+                "refused-step",
+                "--data",
+                &data,
+            ],
             "http://127.0.0.1:9/v1",
             &[],
         )
@@ -644,7 +1065,14 @@ fn a_writing_codex_atom_in_a_step_without_a_worktree_is_refused() {
             "{error}"
         );
         assert_eq!(error["action"], UNSAFE_ADVICE, "{error}");
-        assert_eq!(git_state(&checkout), before, "the checkout is as it was");
+        let after = repository_state(&checkout);
+        assert_eq!(
+            after,
+            before,
+            "the checkout is as it was: {}",
+            left_behind(&before, &after).join(", ")
+        );
+        assert_nothing_recorded(&dir, &project, "refused-step").await;
         let _ = std::fs::remove_dir_all(&checkout);
     });
 }
@@ -653,17 +1081,16 @@ fn a_writing_codex_atom_in_a_step_without_a_worktree_is_refused() {
 /// that creates a file — and the developer's checkout is left exactly as it
 /// was: the write lands in the step's worktree, which atomic commits in the
 /// fixture's snapshot, never in the checkout.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn running_a_writing_codex_atom_leaves_the_checkout_exactly_as_it_was() {
+    #[cfg(target_os = "linux")]
     support::require_sandbox();
     on_codex_runtime(async {
         let dir = scratch("wrote");
-        let checkout = dir.join("dev");
-        let project = project(&checkout.join("examples/coding"));
-        git_in(&checkout, &["init", "-q"]);
-        git_in(&checkout, &["add", "."]);
-        git_in(&checkout, &["commit", "-q", "-m", "project"]);
-        let before = git_state(&checkout);
+        let (checkout, project) = project_in(&dir);
+        let before = repository_state(&checkout);
         let base = fixture(&dir.join("fixture"));
         // The turn writes a file in its worktree and prints it, then answers.
         let model = FakeModel::start(vec![
@@ -676,23 +1103,13 @@ fn running_a_writing_codex_atom_leaves_the_checkout_exactly_as_it_was() {
         .await
         .unwrap();
         let data = json!({"base": base, "task": "write a note"}).to_string();
-        let fixture_arg = dir.join("fixture").to_string_lossy().into_owned();
-        let out = atomic(
+        let out = run_bound(
             &dir,
             &project,
             &[
-                "--json",
-                "run",
-                "coding",
-                "--run-id",
-                "wrote-1",
-                "--data",
-                &data,
-                "--fixture",
-                &fixture_arg,
-                "--fixture-rev",
-                "main",
+                "--json", "run", "coding", "--run-id", "wrote-1", "--data", &data,
             ],
+            &dir.join("fixture"),
             &model.base_url(),
             &[],
         )
@@ -712,16 +1129,22 @@ fn running_a_writing_codex_atom_leaves_the_checkout_exactly_as_it_was() {
         assert_eq!(
             git_in(&snapshots[0], &["show", &format!("{commit}:note.txt")]),
             "written",
-            "the file the turn wrote is in the commit atomic accepted"
+            "the file the turn wrote is not in the fixture's snapshot, at the \
+             commit atomic accepted for its step"
         );
-        // The developer's checkout is as it was: refs, worktree list, the
-        // working tree with every untracked file, and no copy of the file the
-        // turn wrote anywhere in it.
+        // The developer's checkout is exactly as it was: its refs and where
+        // HEAD stands, its worktree list, and the bytes of every file it holds
+        // — tracked, untracked or ignored — with its configuration, its hooks
+        // and its own ignore file, so nothing the turn wrote is anywhere in it.
+        let after = repository_state(&checkout);
         assert_eq!(
-            git_state(&checkout),
+            after,
             before,
-            "the checkout is exactly as it was"
+            "the checkout is exactly as it was: {}",
+            left_behind(&before, &after).join(", ")
         );
+        // And the one file the turn was told to write, named: the comparison
+        // above covers it, this says which file was looked for.
         let strayed: Vec<_> = working_files(&checkout)
             .into_iter()
             .filter(|p| p.file_name().is_some_and(|n| n == "note.txt"))
@@ -734,32 +1157,85 @@ fn running_a_writing_codex_atom_leaves_the_checkout_exactly_as_it_was() {
     });
 }
 
-/// Every working file under `dir`, the checkout's own; only its `.git`
-/// metadata is skipped, which holds no file the turn could have written.
-fn working_files(dir: &Path) -> Vec<PathBuf> {
-    let mut found = Vec::new();
-    let mut stack = vec![dir.to_owned()];
-    while let Some(at) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&at) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.file_name().is_some_and(|n| n == ".git") {
-                continue;
-            }
-            if path.is_dir() {
-                stack.push(path);
-            } else {
-                found.push(path);
-            }
-        }
-    }
-    found
+/// A read-only Codex atom named directly is not refused, and it is the one
+/// Codex turn whose working directory is the developer's checkout: it has no
+/// worktree to run in, and it may not write there. Its command reads a file of
+/// the checkout and prints where it ran, and the checkout is left exactly as it
+/// was — the turn read it and changed nothing, not a file, not a ref, not HEAD,
+/// not its configuration.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[test]
+fn a_read_only_codex_atom_run_directly_reads_the_checkout_and_leaves_it_as_it_was() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let dir = scratch("read-only");
+        let (checkout, project) = project_in(&dir);
+        read_only_atom(&project);
+        // A file of the checkout for the turn to read, at the top of the
+        // project it runs in.
+        write(&project.join("note.md"), "read me\n");
+        git_in(&checkout, &["add", "."]);
+        git_in(&checkout, &["commit", "-q", "-m", "a read-only atom"]);
+        let before = repository_state(&checkout);
+        // `pwd` is the point: a read-only Codex atom named directly runs where
+        // its project sits, which is the checkout being compared. If that ever
+        // stops being so, this test says so rather than pass for nothing.
+        let model = FakeModel::start(vec![
+            Reply::Tool {
+                name: "exec_command".into(),
+                arguments: json!({"cmd": "cat note.md; pwd", "yield_time_ms": 20000}),
+            },
+            Reply::Text(r#"{"done": true}"#.into()),
+        ])
+        .await
+        .unwrap();
+        let data = json!({"task": "read the note"}).to_string();
+        let out = atomic(
+            &dir,
+            &project,
+            &[
+                "--json",
+                "run",
+                "read-note",
+                "--run-id",
+                "read-1",
+                "--data",
+                &data,
+            ],
+            &model.base_url(),
+            &[],
+        )
+        .await;
+        assert!(out.status.success(), "{}", text(&out));
+        let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(doc["output"], json!({"done": true}), "{doc}");
+        let said = printed(&model);
+        assert!(
+            said.contains("read me"),
+            "the turn read no file of the checkout: {said}"
+        );
+        assert!(
+            said.contains(&project.display().to_string()),
+            "the turn did not run in the checkout: {said}"
+        );
+        let after = repository_state(&checkout);
+        assert_eq!(
+            after,
+            before,
+            "the checkout is exactly as it was: {}",
+            left_behind(&before, &after).join(", ")
+        );
+        let _ = std::fs::remove_dir_all(&checkout);
+    });
 }
 
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn a_step_never_starts_from_a_commit_another_run_made_on_the_same_fixture() {
+    #[cfg(target_os = "linux")]
     support::require_sandbox();
     on_codex_runtime(async {
         let dir = scratch("other-run");
@@ -773,22 +1249,11 @@ fn a_step_never_starts_from_a_commit_another_run_made_on_the_same_fixture() {
             .await
             .unwrap();
         let data = json!({"from": theirs, "task": "multiply"}).to_string();
-        let fixture_arg = dir.join("fixture").to_string_lossy().into_owned();
-        let out = atomic(
+        let out = run_bound(
             &dir,
             &project,
-            &[
-                "run",
-                "relay",
-                "--run-id",
-                "relay-1",
-                "--data",
-                &data,
-                "--fixture",
-                &fixture_arg,
-                "--fixture-rev",
-                "main",
-            ],
+            &["run", "relay", "--run-id", "relay-1", "--data", &data],
+            &dir.join("fixture"),
             &model.base_url(),
             &[],
         )
@@ -808,8 +1273,11 @@ fn a_step_never_starts_from_a_commit_another_run_made_on_the_same_fixture() {
     });
 }
 
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn nothing_a_hostile_fixtures_configuration_names_ever_runs() {
+    #[cfg(target_os = "linux")]
     support::require_sandbox();
     on_codex_runtime(async {
         let dir = scratch("hostile");
@@ -870,8 +1338,7 @@ fn nothing_a_hostile_fixtures_configuration_names_ever_runs() {
             .await
             .unwrap();
         let data = json!({"base": base, "task": "multiply"}).to_string();
-        let source_arg = source.to_string_lossy().into_owned();
-        let out = atomic(
+        let out = run_bound(
             &dir,
             &project,
             &[
@@ -882,11 +1349,8 @@ fn nothing_a_hostile_fixtures_configuration_names_ever_runs() {
                 "hostile-1",
                 "--data",
                 &data,
-                "--fixture",
-                &source_arg,
-                "--fixture-rev",
-                "main",
             ],
+            &source,
             &model.base_url(),
             &[],
         )
@@ -902,8 +1366,11 @@ fn nothing_a_hostile_fixtures_configuration_names_ever_runs() {
     });
 }
 
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
 fn a_run_killed_after_a_step_goes_on_from_the_snapshot_once_its_source_is_gone() {
+    #[cfg(target_os = "linux")]
     support::require_sandbox();
     on_codex_runtime(async {
         let dir = scratch("resume");
@@ -916,22 +1383,11 @@ fn a_run_killed_after_a_step_goes_on_from_the_snapshot_once_its_source_is_gone()
         .await
         .unwrap();
         let data = json!({"base": base, "task": "multiply"}).to_string();
-        let fixture_arg = dir.join("fixture").to_string_lossy().into_owned();
-        let out = atomic(
+        let out = run_bound(
             &dir,
             &project,
-            &[
-                "run",
-                "twice",
-                "--run-id",
-                "twice-1",
-                "--data",
-                &data,
-                "--fixture",
-                &fixture_arg,
-                "--fixture-rev",
-                "main",
-            ],
+            &["run", "twice", "--run-id", "twice-1", "--data", &data],
+            &dir.join("fixture"),
             &model.base_url(),
             &[("ATOMIC_FAILPOINT", "pipeline:after:first")],
         )
