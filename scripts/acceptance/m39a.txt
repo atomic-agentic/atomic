@@ -6,10 +6,15 @@
 ## From `atomic init` to a passing eval takes a new user under 15 minutes.
 # `init` writes a project with one atom, one workflow and one eval case; that
 # project checks and runs with nothing configured, and an eval of a project
-# with cases records and replays to a passing report. No test joins the two.
+# with cases records and replays to a passing report. The third test joins the
+# two: it evals a project `atomic init` wrote, hand editing nothing, records
+# that project's own sample case against the fake model, replays it offline to
+# a passing report, and bounds the whole wall clock of `init` and the two evals
+# at 120 s. That bound is the tool's share of the clause's 15 minutes; those 15
+# minutes are a person's clock, and no test measures a person reading a report.
 run_cli init_in_an_empty_directory_makes_a_project_that_checks_and_runs
 eval_cli atomic_eval_records_replays_offline_and_fails_ci_on_a_pass_rate_drop
-pending: no test runs `atomic eval` on a project `atomic init` made. The init test checks and runs that project, whose sample eval case is never evaluated, and the passing record-and-replay eval is shown on a project written by hand. A test would init a project, record its sample case against the fake model with `--live`, replay it and assert the report passes, and bound those commands' whole wall clock: the clause's 15 minutes is a person's clock and nothing measures it yet.
+eval_cli from_init_to_a_passing_eval_records_and_replays_the_sample_case_within_the_bound
 
 ## With only an API key or Ollama on a fresh machine, `init` and `run` need no configuration, and `config --explain` gives each setting's source.
 run_cli init_in_an_empty_directory_makes_a_project_that_checks_and_runs
