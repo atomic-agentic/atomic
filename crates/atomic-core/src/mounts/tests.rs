@@ -204,6 +204,7 @@ fn a_mount_inside_a_denied_directory_is_followed_to_its_other_mounts() {
 
 #[test]
 fn a_fuse_filesystem_bound_in_part_is_followed() {
+    absent("/home/u/.ssh");
     let fuse = b"\
 1 0 8:1 / / rw - ext4 /dev/sda1 rw
 2 1 0:60 / /mnt/fuse rw - fuse.sshfs host:/home rw
@@ -335,6 +336,7 @@ fn a_lost_root_on_a_local_kind_is_denied_whole() {
 /// A 9p filesystem bound in part is followed as a local one is.
 #[test]
 fn a_9p_filesystem_bound_in_part_is_followed() {
+    absent("/home/u/.ssh");
     let table = b"\
 1 0 8:1 / / rw - ext4 /dev/sda1 rw
 2 1 0:90 / /mnt/host rw - 9p host rw
@@ -347,32 +349,110 @@ fn a_9p_filesystem_bound_in_part_is_followed() {
     );
 }
 
-/// Off a local filesystem, a second place that is not the same directory
-/// as the place, when the place is there, is refused: the table's root for
-/// it is stale.
-#[test]
-fn a_stale_remote_root_is_refused_where_the_place_is_there() {
-    let dir = std::env::temp_dir().join(format!("atomic-mounts-stale-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    for d in ["place", "elsewhere", "same"] {
-        std::fs::create_dir_all(dir.join(d)).expect("dir");
+/// Off a local filesystem a second place is checked against the place where
+/// the place is there. A table made up with paths of its own holds only on
+/// a host where they are not.
+fn absent(path: &str) {
+    assert!(
+        std::fs::symlink_metadata(path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+        "{path} is on this host, so a made-up table naming it is checked against it"
+    );
+}
+
+/// Removed when dropped, whatever the test came to.
+struct Scratch(PathBuf);
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        for entry in walk_dirs(&self.0) {
+            let _ = std::fs::set_permissions(entry, std::fs::Permissions::from_mode(0o700));
+        }
+        let _ = std::fs::remove_dir_all(&self.0);
     }
-    let place = std::fs::canonicalize(dir.join("place")).expect("real");
-    let elsewhere = std::fs::canonicalize(dir.join("elsewhere")).expect("real");
-    let at = |path: &Path| path.display().to_string();
-    // The place's mount, and another of the same 9p filesystem whose root
-    // claims to show it but is another directory.
+}
+
+fn walk_dirs(dir: &Path) -> Vec<PathBuf> {
+    let mut all = vec![dir.to_owned()];
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            all.extend(walk_dirs(&entry.path()));
+        }
+    }
+    all
+}
+
+fn scratch(tag: &str) -> Scratch {
+    let dir = std::env::temp_dir().join(format!("atomic-mounts-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch");
+    Scratch(std::fs::canonicalize(&dir).expect("real"))
+}
+
+/// A 9p filesystem mounted at `host`, with one more mount `also` of it,
+/// whose root is `root`.
+fn ninep(host: &Path, also: &Path, root: &str) -> Vec<Mount> {
     let table = format!(
         "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n\
          2 1 0:91 / {} rw - 9p host rw\n\
-         3 1 0:91 / {} rw - 9p host rw\n",
-        at(&place),
-        at(&elsewhere)
+         3 1 0:91 {root} {} rw - 9p host rw\n",
+        host.display(),
+        also.display()
     );
-    let mounts = parse(table.as_bytes()).expect("parses");
+    parse(table.as_bytes()).expect("parses")
+}
+
+/// Off a local filesystem, where the place is there, each second place
+/// must show what its root says: one that is another directory, or is not
+/// there, is refused; one that is, is denied. A mount of part of the place
+/// is checked against that part, not the place.
+#[test]
+fn a_stale_remote_root_is_refused_where_the_place_is_there() {
+    let dir = scratch("stale");
+    let host = dir.0.join("host");
+    let place = host.join("home/u/.ssh");
+    std::fs::create_dir_all(place.join("keys")).expect("dir");
+    std::fs::create_dir_all(dir.0.join("elsewhere/home/u/.ssh")).expect("dir");
+    // A mount of the whole filesystem whose root says it shows what is at
+    // `host`, but is another directory.
+    let mounts = ninep(&host, &dir.0.join("elsewhere"), "/");
     assert!(
         aliases(&mounts, std::slice::from_ref(&place))
-            .is_err_and(|e| e.to_string().contains("is stale"))
+            .is_err_and(|e| e.to_string().contains("shows another file or directory"))
     );
-    let _ = std::fs::remove_dir_all(&dir);
+    // One that is not there at all.
+    let mounts = ninep(&host, &dir.0.join("nowhere"), "/");
+    assert!(
+        aliases(&mounts, std::slice::from_ref(&place))
+            .is_err_and(|e| e.to_string().contains("is not there"))
+    );
+    // A mount of part of the place over that part: checked against the
+    // part it shows, which it is, so it passes.
+    let keys = place.join("keys");
+    let mounts = ninep(&host, &keys, "/home/u/.ssh/keys");
+    let found = aliases(&mounts, std::slice::from_ref(&place)).expect("the same directory");
+    assert_eq!(found, vec![keys]);
+}
+
+/// A place that cannot be looked at, other than for not being there, is
+/// refused: that is how a stale root can show.
+#[test]
+fn a_place_that_cannot_be_looked_at_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch("locked");
+    let host = dir.0.join("host");
+    let place = host.join("home/u/.ssh");
+    std::fs::create_dir_all(&place).expect("dir");
+    std::fs::create_dir_all(dir.0.join("also")).expect("dir");
+    std::fs::set_permissions(host.join("home"), std::fs::Permissions::from_mode(0o000))
+        .expect("lock");
+    if std::fs::symlink_metadata(&place).is_ok() {
+        // Run as root: nothing is locked.
+        return;
+    }
+    let mounts = ninep(&host, &dir.0.join("also"), "/");
+    assert!(
+        aliases(&mounts, std::slice::from_ref(&place))
+            .is_err_and(|e| e.to_string().contains("cannot be looked at"))
+    );
 }
