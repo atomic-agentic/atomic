@@ -348,7 +348,13 @@ pub fn register_change_request<R: DurableRuntime>(
                                 &run,
                                 atomic_core::usage::for_step(step_id, "review", why, async move {
                                     propose(async move {
-                                        run_codex_atom(&ReviewPatch, &review_request, &codex, &backend).await
+                                        run_codex_atom(
+                                            &ReviewPatch,
+                                            &review_request,
+                                            &codex,
+                                            &backend,
+                                        )
+                                        .await
                                     })
                                     .await
                                 }),

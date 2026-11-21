@@ -276,7 +276,7 @@ async fn a_failed_call_says_on_its_step_what_its_span_says() {
         "run:note",
         "rank",
         why.clone(),
-        run_lite_atom(&Classify, &note(), &rt),
+        run_lite_atom(&Classify, &note(), &rt, &Default::default()),
     )
     .await;
     let Err(AtomError::Model(kept)) = &answer else {
@@ -305,7 +305,11 @@ async fn a_failed_call_outside_a_step_notes_nothing() {
     .expect("fake model");
     let rt = runtime(&model, Wire::ChatCompletions);
     let why = crate::usage::Why::for_step();
-    assert!(run_lite_atom(&Classify, &note(), &rt).await.is_err());
+    assert!(
+        run_lite_atom(&Classify, &note(), &rt, &Default::default())
+            .await
+            .is_err()
+    );
     assert_eq!(why.noted(), None, "nothing was noted for a step");
 }
 
