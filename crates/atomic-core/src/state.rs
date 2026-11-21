@@ -162,6 +162,7 @@ impl ProjectState {
         create(&self.codex_home())?;
         private_dir(&self.private_root())?;
         private_dir(&self.private)?;
+        self.move_codex_records()?;
         let legacy: Vec<PathBuf> = [self.dir.join("private"), self.dir.clone()]
             .into_iter()
             .filter(|dir| LEGACY.iter().any(|name| dir.join(name).exists()))
@@ -271,6 +272,53 @@ impl ProjectState {
     /// Codex's home for atom threads.
     pub fn codex_home(&self) -> PathBuf {
         self.dir.join("codex")
+    }
+
+    /// Where Codex keeps what it records of the project's threads, its state
+    /// databases and logs: in the project's private directory, which every
+    /// project's commands are denied, not in its Codex home.
+    pub fn codex_records(&self) -> PathBuf {
+        self.private.join("codex")
+    }
+
+    /// Move what an older atomic let Codex record in the Codex home (its
+    /// `*.sqlite` databases, their `-wal` and `-shm` files, and its `log/`)
+    /// into [`ProjectState::codex_records`], where no command can read it.
+    /// One already there is kept, and the old one removed.
+    fn move_codex_records(&self) -> Result<(), StateError> {
+        let home = self.codex_home();
+        let Ok(entries) = std::fs::read_dir(&home) else {
+            return Ok(());
+        };
+        let records = self.codex_records();
+        let fail = |path: &Path| {
+            let path = path.to_owned();
+            move |source| StateError::Create { path, source }
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let text = name.to_string_lossy();
+            let recorded = text == "log"
+                || text.ends_with(".sqlite")
+                || text.ends_with(".sqlite-wal")
+                || text.ends_with(".sqlite-shm");
+            if !recorded {
+                continue;
+            }
+            private_dir(&records)?;
+            let (old, new) = (entry.path(), records.join(&name));
+            if new.exists() {
+                let gone = if old.is_dir() {
+                    std::fs::remove_dir_all(&old)
+                } else {
+                    std::fs::remove_file(&old)
+                };
+                gone.map_err(fail(&old))?;
+            } else {
+                std::fs::rename(&old, &new).map_err(fail(&new))?;
+            }
+        }
+        Ok(())
     }
 
     /// The scratch roots of the project's backends: `atomic run`, `atomic
@@ -659,6 +707,33 @@ fn project_id(root: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What an older atomic let Codex record in the project's Codex home, its
+    /// databases and logs, moves into the project's private directory when
+    /// the state is created; what a turn's shell needs there stays.
+    #[test]
+    fn codex_records_move_out_of_the_codex_home() {
+        let home = std::env::temp_dir().join(format!("atomic-codex-records-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let root = home.join("project");
+        std::fs::create_dir_all(&root).expect("project");
+        let state = ProjectState::under(&home, &root);
+        let codex = state.codex_home();
+        std::fs::create_dir_all(codex.join("log")).expect("log");
+        std::fs::create_dir_all(codex.join("tmp/arg0-linux")).expect("arg0");
+        for name in ["state_5.sqlite", "state_5.sqlite-wal", "logs_2.sqlite", "log/codex.log"] {
+            std::fs::write(codex.join(name), "records").expect("record");
+        }
+        state.create().expect("created");
+        let records = state.codex_records();
+        assert!(records.starts_with(state.private_dir()));
+        for name in ["state_5.sqlite", "state_5.sqlite-wal", "logs_2.sqlite", "log/codex.log"] {
+            assert!(!codex.join(name).exists(), "{name} is still in the Codex home");
+            assert!(records.join(name).exists(), "{name} did not move");
+        }
+        assert!(codex.join("tmp/arg0-linux").is_dir(), "the helper links went too");
+        let _ = std::fs::remove_dir_all(&home);
+    }
 
     /// No backend's commands may read another's attempts, of this project or
     /// another: each backend of the project keeps its scratch root in the

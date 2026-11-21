@@ -176,8 +176,12 @@ would cover its working directory or a directory it may write, apart from its
 own scratch directory, which a denied scratch root covers and which is opened
 to it again, or when a
 denied place or a linked secret lies two or more levels inside a directory it
-may write. Other projects'
-Codex records are not denied yet. atomic makes the list when a
+may write. What Codex records of a project's threads, its state databases and
+its logs, is kept with the project's private state, in the atomic home's
+`private/`, which every project's commands are denied; its Codex home keeps
+only the helper links a turn's shell runs. Records an older atomic left in a
+project's Codex home move there when atomic next starts in that project, so
+until then another project's commands can still read them. atomic makes the list when a
 turn or an exec step starts: a place on it that appears while a command runs
 is denied only to the commands that start after it, and a link made after
 the list is not followed until the next turn or step. Credentials kept
