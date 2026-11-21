@@ -1425,11 +1425,11 @@ fn an_exec_atom_declares_the_public_hosts_its_command_reaches() {
     let (_, a, _) = exec_project(
         "network-load",
         TOTAL,
-        ", network: { allow: ['API.example.com', '*.s3.amazonaws.com'] }",
+        ", network: { allow: ['API.example.com', '*.cdn.example.net'] }",
     );
     assert_eq!(
         declared_network(&a),
-        ["*.s3.amazonaws.com", "api.example.com"]
+        ["*.cdn.example.net", "api.example.com"]
     );
     let (_, none, _) = exec_project("network-none", TOTAL, ", network: false");
     assert!(declared_network(&none).is_empty());

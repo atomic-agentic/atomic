@@ -207,8 +207,12 @@ are refused too, whatever IPv4 address they carry: NAT64's `64:ff9b::/32`
 (which holds the well-known `64:ff9b::/96` and the local-use
 `64:ff9b:1::/48`), 6to4's `2002::/16` and Teredo's `2001:0::/32`. On an
 IPv6-only network that reaches IPv4 through DNS64, a listed host with only
-an IPv4 address therefore cannot be reached: its request fails when the
-proxy dials, with all resolved addresses blocked.
+an IPv4 address therefore cannot be reached: the proxy refuses the address
+DNS64 makes up for it, and the IPv4 one has no route. A NAT64 prefix of the
+network's own, other than `64:ff9b::/32`, is not covered. The machine's
+addresses are read when a proxy starts: one it gains while that proxy runs is
+not refused by it, and a command that starts after the change gets a new
+proxy that refuses it.
 
 Know what a listed host can get:
 
@@ -219,9 +223,19 @@ Know what a listed host can get:
 - **More than the one site.** An HTTPS tunnel is opaque to the proxy, which
   checks only the name the command asked for. Other sites served from the same
   CDN edge or load balancer can be reached through it.
-- **Every tenant under a wildcard.** `*.s3.amazonaws.com` or any wildcard over
-  a shared-hosting suffix reaches every customer's buckets and sites there, not
-  only yours. List the exact names.
+- **Every name under a wildcard.** atomic checks a wildcard against the
+  Public Suffix List, its ICANN section (`co.uk`) and its private one, where
+  each name is someone else's (`github.io`, `s3.amazonaws.com`). A wildcard
+  is refused when the atom loads if the name under it is on the list, or if
+  every name just below it is (`*.run.app`, `*.kawasaki.jp`). That refuses
+  `*.googleapis.com`, `*.githubusercontent.com` and `*.cloudfront.net`, among
+  others: name the exact hosts instead. A wildcard above a listed name, such
+  as `*.amazonaws.com`, loads, but the proxy keeps it from crossing that name:
+  it reaches `foo.amazonaws.com`, and not `bucket.s3.amazonaws.com`, which is
+  someone else's site under `s3.amazonaws.com`. A wildcard under a name you
+  hold, such as `*.example.com`, still reaches whatever is served under it,
+  and a shared host missing from the list is not caught. List exact names
+  where you can.
 
 The rule is enforced on Linux only. On macOS and Windows exec commands run
 unconfined, with whatever network the machine has, and a declaration restricts
