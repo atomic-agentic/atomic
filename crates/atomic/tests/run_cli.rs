@@ -5424,7 +5424,7 @@ fn the_runner_role_keeps_its_exit_code_contract() {
     assert_eq!(out.status.code(), Some(64), "{}", text(&out));
     // A request it can read runs, and the answer says how the command ended.
     let request = json!({
-        "protocol": 2, "program": "/bin/sh", "args": ["-c", "cat; exit 3"],
+        "protocol": 3, "program": "/bin/sh", "args": ["-c", "cat; exit 3"],
         "cwd": "/", "env": [], "stdin": "6869", "time_limit_ms": 10000, "output_limit": 1024
     });
     let out = atomic(&dir, &dir, &["runner"], &[], &request.to_string());
@@ -5437,16 +5437,17 @@ fn the_runner_role_keeps_its_exit_code_contract() {
     let out = atomic(&dir, &dir, &["--json", "runner"], &[], &request.to_string());
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
     assert_eq!(stdout_json(&out)["code"], 3);
-    // A request of the first protocol, from an older atomic, is refused
-    // with a reason, since it could not carry a command's secret variables.
+    // A request of an earlier protocol, from an older atomic, is refused
+    // with a reason, since its command's secret variables would not reach
+    // the runner as this one reads them.
     let old = json!({
-        "protocol": 1, "program": "/bin/sh", "args": ["-c", "exit 0"],
+        "protocol": 2, "program": "/bin/sh", "args": ["-c", "exit 0"],
         "cwd": "/", "env": [], "stdin": "", "time_limit_ms": 10000, "output_limit": 1024
     });
     let out = atomic(&dir, &dir, &["runner"], &[], &old.to_string());
     assert_eq!(out.status.code(), Some(64), "{}", text(&out));
     assert!(
-        text(&out).contains("request protocol 1 is not 2"),
+        text(&out).contains("request protocol 2 is not 3"),
         "{}",
         text(&out)
     );

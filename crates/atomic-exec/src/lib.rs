@@ -153,7 +153,9 @@ pub struct Command {
     /// `/proc/<pid>/fd`, so in that window another process can take them
     /// only by attaching to the program (ptrace, `pidfd_getfd`), which Yama's
     /// `ptrace_scope` of 1 or more refuses to a process that is not its
-    /// ancestor; at `ptrace_scope` 0 the window is narrowed, not closed.
+    /// ancestor; at `ptrace_scope` 0 one can attach in that window and keep
+    /// its access after, so the window is narrowed, not closed. A process
+    /// runner forwards them to its runner the same way.
     pub secret_env: SecretEnv,
 }
 

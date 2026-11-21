@@ -2750,6 +2750,7 @@ fn a_turns_tmpdir_is_its_own_on_every_platform() {
     std::fs::create_dir_all(&shared).expect("shared");
     let mut declared = std::collections::BTreeMap::new();
     declared.insert(codex::TURN_TMPDIR.to_owned(), "/elsewhere".to_owned());
+    declared.insert(atomic_exec::SECRET_ENV_FD.to_owned(), "3".to_owned());
     let workspace = Workspace {
         label: "t".into(),
         root: Some(base.clone()),
@@ -2770,6 +2771,13 @@ fn a_turns_tmpdir_is_its_own_on_every_platform() {
     };
 
     let linux = built(true, &workspace).expect("linux");
+    for spec in [&linux, &built(false, &workspace).expect("elsewhere")] {
+        assert!(
+            !spec.env.contains_key(atomic_exec::SECRET_ENV_FD),
+            "a turn names no secret socket: {:?}",
+            spec.env
+        );
+    }
     assert_eq!(linux.env["TMPDIR"], shared.display().to_string());
     assert_eq!(linux.env[codex::TURN_TMPDIR], own);
     assert!(!linux.writable_roots.contains(&shared));

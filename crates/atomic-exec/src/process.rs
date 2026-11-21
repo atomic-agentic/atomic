@@ -1063,7 +1063,7 @@ pub fn run_in(
 /// socket rather than a pipe: another process cannot reopen it through
 /// `/proc/<pid>/fd` before the child has protected itself.
 #[cfg(unix)]
-fn secret_pipe(secret: &crate::SecretEnv) -> std::io::Result<Option<std::os::fd::OwnedFd>> {
+fn secret_socket(secret: &crate::SecretEnv) -> std::io::Result<Option<std::os::fd::OwnedFd>> {
     use std::io::Write;
     if secret.is_empty() {
         return Ok(None);
@@ -1077,12 +1077,58 @@ fn secret_pipe(secret: &crate::SecretEnv) -> std::io::Result<Option<std::os::fd:
         ));
     }
     // Both ends are close-on-exec; the child clears it on its own copy of
-    // the end it reads.
+    // the end it reads. Dropping the other end, once written, ends what it
+    // reads.
     let (read, mut write) = std::os::unix::net::UnixStream::pair()?;
     write.write_all(&bytes)?;
-    write.shutdown(std::net::Shutdown::Write)?;
     drop(write);
     Ok(Some(std::os::fd::OwnedFd::from(read)))
+}
+
+/// Whether `fd` is past the standard three, as a handed socket must be.
+#[cfg(unix)]
+fn above_stdio(fd: &std::os::fd::RawFd) -> bool {
+    *fd > 2
+}
+
+/// The [`crate::SecretEnv`] this process was handed on the socket whose
+/// descriptor `fd` names, as [`run_in_with_secret`] hands it: read to its
+/// end, and closed. Refused when `fd` is not a number above 2 or not a
+/// socket, or what it holds is not well formed. Call it only once this
+/// process can no longer be read through /proc by another of its user.
+#[cfg(unix)]
+pub fn read_secret_socket(fd: &std::ffi::OsStr) -> std::io::Result<crate::SecretEnv> {
+    use std::io::Read;
+    use std::os::fd::FromRawFd;
+    use std::os::unix::fs::FileTypeExt;
+    let invalid = |why: String| std::io::Error::new(std::io::ErrorKind::InvalidData, why);
+    let fd: std::os::fd::RawFd = fd
+        .to_str()
+        .and_then(|fd| fd.parse().ok())
+        .filter(above_stdio)
+        .ok_or_else(|| invalid("its descriptor is not a number above 2".to_owned()))?;
+    // SAFETY: the descriptor was handed to this process for this alone; it
+    // is read and closed here, once.
+    #[allow(unsafe_code)]
+    let mut socket = unsafe { std::fs::File::from_raw_fd(fd) };
+    if !socket.metadata()?.file_type().is_socket() {
+        return Err(invalid("its descriptor is not a socket".to_owned()));
+    }
+    let mut bytes = Vec::new();
+    socket.read_to_end(&mut bytes)?;
+    drop(socket);
+    crate::SecretEnv::decode(&bytes).map_err(invalid)
+}
+
+/// The [`crate::SecretEnv`] this process was handed, if its environment
+/// names a socket in [`crate::SECRET_ENV_FD`] (see [`read_secret_socket`]);
+/// none if it names none.
+#[cfg(unix)]
+pub fn take_inherited_secret_env() -> std::io::Result<crate::SecretEnv> {
+    match std::env::var_os(crate::SECRET_ENV_FD) {
+        Some(fd) => read_secret_socket(&fd),
+        None => Ok(crate::SecretEnv::default()),
+    }
 }
 
 /// [`run_in`], with `secret` on a socket the child inherits, whose
@@ -1112,21 +1158,21 @@ pub fn run_in_with_secret(
         command.current_dir(cwd);
     }
     #[cfg(unix)]
-    let secret_read_end = {
+    let secret_end = {
         use std::os::fd::AsRawFd;
-        let pipe = secret_pipe(secret).map_err(|e| ExecError::Start {
+        let socket = secret_socket(secret).map_err(|e| ExecError::Start {
             program: name.clone(),
             message: format!("hand it its secret variables: {e}"),
         })?;
-        if let Some(pipe) = &pipe {
-            let fd = pipe.as_raw_fd();
+        if let Some(socket) = &socket {
+            let fd = socket.as_raw_fd();
             command.env(crate::SECRET_ENV_FD, fd.to_string());
             // SAFETY: between fork and exec the closure makes one
             // async-signal-safe call, fcntl, and allocates nothing.
             #[allow(unsafe_code)]
             unsafe {
                 std::os::unix::process::CommandExt::pre_exec(&mut command, move || {
-                    // The child keeps the read end across exec; this process
+                    // The child keeps its end across exec; this process
                     // closes its own once the child has started.
                     if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
                         return Err(std::io::Error::last_os_error());
@@ -1135,7 +1181,7 @@ pub fn run_in_with_secret(
                 });
             }
         }
-        pipe
+        socket
     };
     #[cfg(not(unix))]
     if !secret.is_empty() {
@@ -1198,7 +1244,7 @@ pub fn run_in_with_secret(
     })?;
     // The child has its own copy of the secret socket.
     #[cfg(unix)]
-    drop(secret_read_end);
+    drop(secret_end);
     // A process in this one's group is stopped with this process.
     let own = (group != Group::Inherit).then(|| child.id());
     running.extend(own);

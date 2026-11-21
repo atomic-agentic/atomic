@@ -38,9 +38,10 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// The version of the request and response format: 2 since a request
-/// carries secret variables, which a runner that knows only 1 would drop.
-pub const PROTOCOL: u32 = 2;
+/// The version of the request and response format: 3 since a command's
+/// secret variables reach the runner on a socket of their own, which a
+/// runner that knows only 1 or 2 would not read.
+pub const PROTOCOL: u32 = 3;
 
 /// The exit codes `atomic runner` uses.
 pub mod code {
@@ -152,13 +153,6 @@ pub struct Request {
     pub time_limit_ms: u64,
     /// The most stdout it may write, in bytes.
     pub output_limit: usize,
-    /// Its [`crate::SecretEnv`], which the runner hands it on a socket. The
-    /// runner reads this request only after it has made itself non-dumpable,
-    /// but the request waits in the runner's stdin, a pipe, from its start:
-    /// until then another process of the same user can reopen that pipe
-    /// through `/proc/<pid>/fd/0` and read it.
-    #[serde(default, skip_serializing_if = "crate::SecretEnv::is_empty")]
-    pub secret_env: crate::SecretEnv,
 }
 
 impl Request {
@@ -173,11 +167,11 @@ impl Request {
             stdin: hex(&command.stdin),
             time_limit_ms: u64::try_from(command.time_limit.as_millis()).unwrap_or(u64::MAX),
             output_limit: command.output_limit,
-            secret_env: command.secret_env.clone(),
         }
     }
 
-    /// The command it carries.
+    /// The command it carries, without secret variables, which never cross
+    /// in a request: the runner gets them on a socket of their own.
     pub fn command(&self) -> Result<Command, String> {
         Ok(Command {
             program: self.program.clone(),
@@ -191,7 +185,7 @@ impl Request {
             writable: Vec::new(),
             read_only: Vec::new(),
             network: Vec::new(),
-            secret_env: self.secret_env.clone(),
+            secret_env: crate::SecretEnv::default(),
         })
     }
 }
@@ -226,6 +220,18 @@ pub fn serve(
     errors: &mut dyn Write,
     backend: &dyn ExecutionBackend,
 ) -> i32 {
+    serve_with_secret(input, output, errors, backend, crate::SecretEnv::default())
+}
+
+/// [`serve`], running the request's command with `secret`, the variables
+/// handed to the runner on a socket of their own.
+pub fn serve_with_secret(
+    input: &mut dyn Read,
+    output: &mut dyn Write,
+    errors: &mut dyn Write,
+    backend: &dyn ExecutionBackend,
+    secret: crate::SecretEnv,
+) -> i32 {
     let mut bytes = Vec::new();
     if let Err(e) = input.read_to_end(&mut bytes) {
         let _ = writeln!(errors, "atomic runner: cannot read the request: {e}");
@@ -246,13 +252,14 @@ pub fn serve(
         );
         return code::USAGE;
     }
-    let command = match request.command() {
+    let mut command = match request.command() {
         Ok(c) => c,
         Err(e) => {
             let _ = writeln!(errors, "atomic runner: {e}");
             return code::USAGE;
         }
     };
+    command.secret_env = secret;
     let response = match backend.run(&command) {
         Ok(done) => Response::Completed {
             code: done.code,
@@ -277,14 +284,32 @@ pub fn serve(
 /// errors written to `errors` (the binary passes a writer that redacts them
 /// on their way to stderr), running commands as child processes in the
 /// runner's own process group, so that the control plane stops a command,
-/// with everything it started, by stopping its runner's group.
+/// with everything it started, by stopping its runner's group. A command's
+/// secret variables come on the socket [`crate::SECRET_ENV_FD`] names; call
+/// this once the process is hardened, as `atomic runner` does.
 pub fn serve_stdio(errors: &mut dyn Write) -> i32 {
     process::ignore_stop_signals();
-    let code = serve(
+    // The command's secret variables come on a socket of their own, never
+    // in the request: read here, once the caller has hardened this process.
+    #[cfg(unix)]
+    let secret = match process::take_inherited_secret_env() {
+        Ok(secret) => secret,
+        Err(e) => {
+            let _ = writeln!(
+                errors,
+                "atomic runner: cannot read the secret variables handed to it: {e}"
+            );
+            return code::USAGE;
+        }
+    };
+    #[cfg(not(unix))]
+    let secret = crate::SecretEnv::default();
+    let code = serve_with_secret(
         &mut std::io::stdin().lock(),
         &mut std::io::stdout().lock(),
         errors,
         &InRunnerGroup(LocalBackend::default()),
+        secret,
     );
     let _ = errors.flush();
     code
@@ -352,12 +377,15 @@ impl ProcessRunner {
     fn attempt(&self, command: &Command, request: &[u8]) -> Result<(Exit, Completed), ExecError> {
         // The runner's group holds its command too: whatever is left in it
         // when the runner ends goes with it.
-        let done = process::run_in(
+        // The command's secret variables go on a socket of their own, which
+        // cannot be reopened through /proc as the request's stdin pipe can.
+        let done = process::run_in_with_secret(
             process::Group::Own,
             &self.program,
             &self.args,
             None,
             &self.env,
+            &command.secret_env,
             request,
             Limits {
                 time: command.time_limit.saturating_add(RUNNER_GRACE),

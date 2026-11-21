@@ -924,3 +924,29 @@ fn secret_variables_cross_only_as_well_formed_entries() {
     assert!(SecretEnv::decode(b"K=v\0\0").is_err(), "an empty entry");
     assert!(SecretEnv::decode(b"Kv\0").is_err(), "no `=`");
 }
+
+/// A process reads its secret variables only from a socket whose
+/// descriptor is past the standard three: a pipe, or 2, is refused.
+#[test]
+fn a_secret_socket_is_read_only_from_a_socket_past_the_standard_three() {
+    use std::io::Write;
+    use std::os::fd::IntoRawFd;
+    let read = |fd: &str| process::read_secret_socket(std::ffi::OsStr::new(fd));
+    let (socket, mut write) = std::os::unix::net::UnixStream::pair().expect("a socket");
+    write.write_all(b"K=v\0").expect("written");
+    drop(write);
+    let fd = socket.into_raw_fd().to_string();
+    assert_eq!(
+        read(&fd).expect("read"),
+        SecretEnv(vec![("K".into(), "v".into())])
+    );
+    let (pipe, write) = std::io::pipe().expect("a pipe");
+    drop(write);
+    let fd = std::os::fd::OwnedFd::from(pipe).into_raw_fd().to_string();
+    let refused = read(&fd).expect_err("a pipe is refused");
+    assert!(refused.to_string().contains("not a socket"), "{refused}");
+    for fd in ["2", "-1", "x"] {
+        let refused = read(fd).expect_err(fd);
+        assert!(refused.to_string().contains("above 2"), "{fd}: {refused}");
+    }
+}

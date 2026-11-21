@@ -38,14 +38,14 @@
 //! another process of the same user can take it only by attaching to the
 //! helper, which Yama's `ptrace_scope` of 1 or more refuses to a process
 //! that is not its ancestor, and at `ptrace_scope` 0 allows. `atomic
-//! runner`, under `--runner process`, gets it in its request on stdin, a
-//! pipe, which it reads once it is non-dumpable; until then another process
-//! of the same user can reopen that pipe through /proc and read it. Once
-//! they are non-dumpable, only a process with `CAP_SYS_PTRACE` over their
-//! user namespace can read it from them, or from the helper's bridges,
-//! which inherit it. A command's token
-//! admits no new connection once the command ends, and the proxy stops once
-//! no command needs it.
+//! runner`, under `--runner process`, gets it the same way, on a socket of
+//! its own beside its request, and reads it once it is non-dumpable. Once
+//! they are non-dumpable, no process of the same user without
+//! `CAP_SYS_PTRACE` over their user namespace can newly read it from them,
+//! or from the helper's bridges, which inherit it; but one that attached
+//! during the window, as `ptrace_scope` 0 lets it, keeps what it attached
+//! to. A command's token admits no new connection once the command ends,
+//! and the proxy stops once no command needs it.
 
 use anyhow::Context as _;
 use codex_network_proxy::{

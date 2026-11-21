@@ -1140,11 +1140,13 @@ fn an_option(arg: &std::ffi::OsString) -> bool {
 /// outside the sandbox while the command runs, is also made non-dumpable,
 /// and only then reads the command's proxy token from the socket it was
 /// handed ([`take_secret_env`]): the token is never in its exec
-/// environment, and once it is in its memory only a process with
-/// `CAP_SYS_PTRACE` over its user namespace can read it through /proc.
-/// Between its exec and then, the socket waits unread; it cannot be
-/// reopened through /proc, so only a process that may attach to the helper
-/// can take it (narrowed, not closed, at Yama's `ptrace_scope` 0).
+/// environment, and once it is in its memory no process of the same user
+/// without `CAP_SYS_PTRACE` over its user namespace can newly read it
+/// through /proc or attach to it. Between its exec and then, the socket
+/// waits unread; it cannot be reopened through /proc, so only a process
+/// that may attach to the helper can take it, and one that attached then,
+/// as Yama's `ptrace_scope` 0 allows, keeps its access afterwards: the
+/// window is narrowed, not closed, at `ptrace_scope` 0.
 /// Exec resets it: where the outer stage has no mounts of its own to manage
 /// it execs bubblewrap itself, by which time Codex's helper has taken the
 /// token out of its environment, and the bridges it forked first keep the
@@ -1194,40 +1196,24 @@ fn split_off_token(env: Vars) -> (Vars, Vars) {
 /// command's proxy token on a socket ([`atomic_exec::SecretEnv`]), read it
 /// into its environment, where Codex's helper looks for it, and close the
 /// socket. Only that one variable is taken, and only from a socket: a
-/// descriptor that is not one, or any other variable, fails it. Called once
-/// it is non-dumpable, so from then on no other process of its user without
-/// `CAP_SYS_PTRACE` over its user namespace can read the token from it.
-/// Before that, from its exec, the socket cannot be reopened through
-/// /proc as a pipe could, so another process of its user can take it only
-/// by attaching to it, which Yama's `ptrace_scope` of 1 or more refuses to
-/// one that is not its ancestor; at `ptrace_scope` 0 the window is
-/// narrowed, not closed.
+/// descriptor that is not one, any other variable, or an empty token fails
+/// it. Called once it is non-dumpable, so from then on no other process of
+/// its user without `CAP_SYS_PTRACE` over its user namespace can newly read
+/// the token from it. Before that, from its exec, the socket cannot be
+/// reopened through /proc as a pipe could, so another process of its user
+/// can take it only by attaching to it, which Yama's `ptrace_scope` of 1 or
+/// more refuses to one that is not its ancestor; at `ptrace_scope` 0 one
+/// can attach then and keep its access after, so the window is narrowed,
+/// not closed.
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 fn take_secret_env() -> std::io::Result<()> {
-    use std::io::Read;
-    use std::os::fd::FromRawFd;
     let Some(fd) = std::env::var_os(atomic_exec::SECRET_ENV_FD) else {
         return Ok(());
     };
-    let invalid = |why: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, why.to_owned());
-    let fd: std::os::fd::RawFd = fd
-        .to_str()
-        .and_then(|fd| fd.parse().ok())
-        .filter(|fd| *fd > 2)
-        .ok_or_else(|| invalid("its descriptor is not a number above 2"))?;
-    // SAFETY: the descriptor was handed to this process for this alone; it
-    // is read and closed here, once.
-    let mut socket = unsafe { std::fs::File::from_raw_fd(fd) };
-    use std::os::unix::fs::FileTypeExt;
-    if !socket.metadata()?.file_type().is_socket() {
-        return Err(invalid("its descriptor is not a socket"));
-    }
-    let mut bytes = Vec::new();
-    socket.read_to_end(&mut bytes)?;
-    drop(socket);
-    let secret = atomic_exec::SecretEnv::decode(&bytes).map_err(|e| invalid(&e))?;
-    let token = the_proxy_token(secret).map_err(|e| invalid(&e))?;
+    let invalid = |why: String| std::io::Error::new(std::io::ErrorKind::InvalidData, why);
+    let secret = atomic_exec::process::read_secret_socket(&fd)?;
+    let token = the_proxy_token(secret).map_err(invalid)?;
     // SAFETY: the helper is single-threaded here, before Codex's helper
     // starts and reads its environment.
     unsafe {
@@ -1247,6 +1233,9 @@ fn the_proxy_token(secret: atomic_exec::SecretEnv) -> Result<String, String> {
     };
     if name != codex_network_proxy::PROXY_ATTRIBUTION_TOKEN_ENV_KEY {
         return Err(format!("it was handed {name}, not the proxy token"));
+    }
+    if token.is_empty() {
+        return Err("it was handed an empty proxy token".to_owned());
     }
     Ok(token)
 }
@@ -3648,7 +3637,7 @@ mod tests {
     /// arguments, both of which other processes can read before the helper
     /// can protect itself.
     #[test]
-    fn a_commands_proxy_token_reaches_its_helper_on_a_pipe_only() {
+    fn a_commands_proxy_token_reaches_its_helper_on_a_socket_only() {
         use atomic_exec::Confine;
         let state = scratch("exec-token-pipe");
         let paths = CodexPaths::with_helpers(
@@ -3705,6 +3694,7 @@ mod tests {
         assert_eq!(token(&[(key, "abc")]).as_deref(), Ok("abc"));
         for refused in [
             &[][..],
+            &[(key, "")][..],
             &[("LD_PRELOAD", "/tmp/x.so")][..],
             &[(key, "abc"), ("LD_PRELOAD", "/tmp/x.so")][..],
         ] {

@@ -325,18 +325,64 @@ fn a_runner_has_only_path_from_the_control_planes_environment() {
     assert_eq!(names, ["PATH"]);
 }
 
-/// A request carries its command's secret variables to the runner, and
-/// shows them in no `Debug` form.
+/// A request never carries its command's secret variables: they cross on
+/// a socket of their own.
 #[test]
-fn a_request_carries_secret_variables_and_hides_them() {
+fn a_request_never_carries_secret_variables() {
     let mut sent = command("true", &[], b"");
     sent.secret_env = crate::SecretEnv(vec![("K".into(), "the-secret-value".into())]);
     let request = Request::new(&sent);
-    assert!(!format!("{request:?}").contains("the-secret-value"));
-    let json = serde_json::to_vec(&request).expect("json");
-    let back: Request = serde_json::from_slice(&json).expect("read back");
-    assert_eq!(back.command().expect("command").secret_env, sent.secret_env);
-    // A request with none says nothing of them.
-    let plain = serde_json::to_string(&Request::new(&command("true", &[], b""))).expect("json");
-    assert!(!plain.contains("secret_env"), "{plain}");
+    let json = serde_json::to_string(&request).expect("json");
+    assert!(!json.contains("the-secret-value"), "{json}");
+    assert!(!json.contains("secret_env"), "{json}");
+    let back: Request = serde_json::from_str(&json).expect("read back");
+    assert!(back.command().expect("command").secret_env.is_empty());
+}
+
+/// A runner gets its command's secret variables on a socket of their own,
+/// never in the request on its stdin, a pipe another process could reopen
+/// through /proc before the runner has hardened itself: a stand-in runner
+/// that keeps what each brought shows it.
+#[test]
+fn a_runner_gets_secret_variables_on_a_socket_never_in_its_stdin() {
+    const STAND_IN: &str = r#"import os, sys
+out = sys.argv[1]
+stdin = sys.stdin.buffer.read()
+fd = int(os.environ['ATOMIC_SECRET_ENV_FD'])
+secret = b''
+while True:
+    chunk = os.read(fd, 4096)
+    if not chunk:
+        break
+    secret += chunk
+open(os.path.join(out, 'stdin'), 'wb').write(stdin)
+open(os.path.join(out, 'secret'), 'wb').write(secret)
+"#;
+    let dir = scratch("secret-socket");
+    let runner = ProcessRunner {
+        program: "python3".into(),
+        args: vec!["-c".into(), STAND_IN.into(), dir.display().to_string()],
+        env: std::env::var("PATH")
+            .map(|path| vec![("PATH".to_owned(), path)])
+            .unwrap_or_default(),
+        retries: 0,
+        lease_wait: Duration::from_millis(10),
+        workspaces: LocalBackend::default(),
+    };
+    let mut sent = command("true", &[], b"");
+    sent.secret_env = crate::SecretEnv(vec![("K".into(), "the-secret-value".into())]);
+    let request = serde_json::to_vec(&Request::new(&sent)).expect("json");
+    let (_, done) = runner.attempt(&sent, &request).expect("the stand-in runs");
+    let stdin = std::fs::read(dir.join("stdin"))
+        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&done.stderr)));
+    assert_eq!(stdin, request, "its stdin is the request");
+    assert!(
+        !String::from_utf8_lossy(&stdin).contains("the-secret-value"),
+        "the secret crossed in its stdin"
+    );
+    assert_eq!(
+        std::fs::read(dir.join("secret")).expect("secret"),
+        b"K=the-secret-value\0"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
