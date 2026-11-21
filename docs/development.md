@@ -220,15 +220,24 @@ ATOMIC_DEV_SANDBOX=on scripts/dev.sh scripts/acceptance.py m12
 
 Each clause is written as the milestones state it, and a clause of several
 parts, separated by semicolons, can list each part on a `### ` line with tests
-of its own. The check fails when the list's clauses and the milestone's differ,
-when anything in the milestone's Acceptance block cannot be read as a clause,
-when a listed test fails, is ignored or does not run (renamed, removed, or
-built out by a feature), when a clause or part lists no test, or when cargo
-fails. A clause its tests do not yet show in full is marked `pending:` with the
-reason, and the verdict names it. The
-Postgres and sandbox tests it lists need their backends, as in the test jobs,
-hence `ATOMIC_DEV_SANDBOX=on`. `scripts/acceptance-test.sh` (in CI) tests the
-check itself.
+of its own. Dropping those `### ` lines drops that requirement with them: the
+clause's tests, taken together, then need only show the clause, and no part
+needs one of its own. Parts are split on `;` alone, so a clause whose parts are
+joined with `, and` cannot be listed part by part.
+
+A milestone's clauses are those of every Acceptance block under its heading, a
+titled block such as `**Acceptance, the managed Deno:**` included. A "b" part
+finishes its parent's work, so its list states its parent's clauses as well as
+its own; an "a" part states only its own.
+
+The check fails when the list's clauses and the milestone's differ, when
+anything in a milestone's Acceptance block cannot be read as a clause, when a
+listed test fails, is ignored or does not run (renamed, removed, or built out
+by a feature), when a clause or part lists no test, or when cargo fails. A
+clause its tests do not yet show in full is marked `pending:` with the reason,
+and the verdict names it. The Postgres and sandbox tests it lists need their
+backends, as in the test jobs, hence `ATOMIC_DEV_SANDBOX=on`.
+`scripts/acceptance-test.sh` (in CI) tests the check itself.
 
 ## The crash suite
 

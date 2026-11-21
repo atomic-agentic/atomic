@@ -195,11 +195,69 @@ for odd in '* Another clause.' '1. Another clause.' ' - Another clause.' $'-\tAn
         fail "a line '${odd}' in the Acceptance block was not refused: ${out}"
     fi
 done
-printf '## M0: A milestone\n\n**Acceptance:**\n\n- A cap parks the run.\n\n### More\n\n**Acceptance:**\n\n- Another.\n' >"${WORK}/two-blocks.md"
-out="$(python3 "${CHECK}" m0 --milestones "${WORK}/two-blocks.md" --list "${WORK}/list.txt" --check 2>&1)"
-if [ $? -ne 1 ] || ! grep -qF "2 Acceptance blocks" <<<"${out}"; then
-    fail "a second Acceptance block was not refused: ${out}"
-fi
+# check <exit code> <text> <milestones file> <list file> <milestone>: the same
+# for a milestones document of its own, as the shapes below write them.
+list_check_against() {
+    local code="$1" text="$2" milestones="$3" list="$4" id="$5" out got
+    out="$(python3 "${CHECK}" "${id}" --milestones "${milestones}" --list "${list}" --check 2>&1)"
+    got=$?
+    if [ "${got}" -ne "${code}" ] || ! grep -qF -- "${text}" <<<"${out}"; then
+        fail "${id}: expected exit ${code} and '${text}': ${out}"
+    fi
+}
+
+# Every Acceptance block of a milestone reads, a titled one among them: its
+# clauses are those of all its blocks, in order.
+printf '## M0: A milestone\n\n**Acceptance, extra:**\n\n- Another.\n\n**Acceptance:**\n\n- A cap parks the run.\n- Cases in JSONL run the same, written over two lines.\n- A scorer fails CI.\n' >"${WORK}/titled.md"
+list_check_against 1 "M0's clause is not listed: Another." "${WORK}/titled.md" "${WORK}/list.txt" m0
+{ cat "${WORK}/list.txt"; printf '## Another.\nbudgets a_cap_parks\n'; } >"${WORK}/titled-list.txt"
+list_check_against 0 "lists M0's 4 clauses" "${WORK}/titled.md" "${WORK}/titled-list.txt" m0
+
+# A bullet under a deeper heading inside the section is refused, not skipped:
+# which block it belongs to would be a guess.
+printf '## M0: A milestone\n\n**Acceptance:**\n\n- A cap parks the run.\n\n#### Under a deeper heading\n\n- Another clause.\n' >"${WORK}/deeper.md"
+list_check_against 1 "a bullet under the deeper heading" "${WORK}/deeper.md" "${WORK}/list.txt" m0
+# A block marker after a deeper heading starts a block of its own, so what is
+# under it reads.
+printf '## M0: A milestone\n\n#### Under a deeper heading\n\n**Acceptance, extra:**\n\n- A cap parks the run.\n- Cases in JSONL run the same, written over two lines.\n- A scorer fails CI.\n' >"${WORK}/after-deeper.md"
+list_check_against 0 "lists M0's 3 clauses" "${WORK}/after-deeper.md" "${WORK}/list.txt" m0
+
+# A split milestone states its own clauses, its "a" part its own, and its "b"
+# part its parent's, since it finishes that work, with any of its own after
+# them. Nothing of a part reads as its parent's, or the other way round.
+cat >"${WORK}/split.md" <<'EOF'
+## M4: Split
+
+**Acceptance:**
+
+- A cap parks the run.
+- A scorer fails CI.
+
+### M4a
+
+**Acceptance:**
+
+- A child cannot spend twice.
+- A wait outlives a restart.
+
+### M4b
+
+**v1.0.** Finishes M4 and must pass its full acceptance.
+
+**Acceptance, beyond the full M4 test:**
+
+- Restarting twice costs nothing.
+EOF
+printf '## A cap parks the run.\nbudgets a_cap_parks\n## A scorer fails CI.\nbudgets a_cap_parks\n' >"${WORK}/m4.txt"
+printf '## A child cannot spend twice.\nbudgets a_cap_parks\n## A wait outlives a restart.\nbudgets a_cap_parks\n' >"${WORK}/m4a.txt"
+cat "${WORK}/m4.txt" >"${WORK}/m4b.txt"
+printf '## Restarting twice costs nothing.\nbudgets a_cap_parks\n' >>"${WORK}/m4b.txt"
+list_check_against 0 "lists M4's 2 clauses" "${WORK}/split.md" "${WORK}/m4.txt" m4
+list_check_against 0 "lists M4A's 2 clauses" "${WORK}/split.md" "${WORK}/m4a.txt" m4a
+list_check_against 0 "lists M4B's 3 clauses" "${WORK}/split.md" "${WORK}/m4b.txt" m4b
+# A "b" part is asked for its parent's clauses as well as its own.
+printf '## Restarting twice costs nothing.\nbudgets a_cap_parks\n' >"${WORK}/m4b-less.txt"
+list_check_against 1 "M4B's clause is not listed: A cap parks the run." "${WORK}/split.md" "${WORK}/m4b-less.txt" m4b
 # A milestone under a `###` heading is found, and ends at the next heading
 # of its level.
 printf '## Phase\n\n### M3a: Small\n\n**Acceptance:**\n\n- A cap parks the run.\n\n### M3b: Next\n\n**Acceptance:**\n\n- Other.\n' >"${WORK}/nested.md"
@@ -217,6 +275,21 @@ for list in "${ROOT}"/scripts/acceptance/*.txt; do
     milestone="$(basename "${list}" .txt)"
     out="$(python3 "${CHECK}" "${milestone}" --check 2>&1)" || fail "${list}: ${out}"
 done
+
+# And every milestone heading in the repository's own milestones document reads:
+# an Acceptance block in a shape the check cannot read fails here, whether or
+# not that milestone has a list yet. An empty list is enough to ask: it is the
+# only problem of its own, so any problem naming the milestones document is a
+# shape that could not be read.
+MILESTONES="${ROOT}/docs/design/milestones.md"
+swept=0
+while read -r milestone; do
+    out="$(python3 "${CHECK}" "${milestone}" --milestones "${MILESTONES}" --list /dev/null --check 2>&1)"
+    unread="$(grep -F -- "${MILESTONES}" <<<"${out}")"
+    [ -z "${unread}" ] || fail "${milestone}'s acceptance cannot be read: ${unread}"
+    swept=$((swept + 1))
+done < <(grep -oE '^#+[[:space:]]+M[0-9]+[a-z]?' "${MILESTONES}" | grep -oE 'M[0-9]+[a-z]?')
+[ "${swept}" -gt 50 ] || fail "the sweep read only ${swept} milestone headings in ${MILESTONES}"
 
 # The features it runs with are those CI builds the tests with, so nothing
 # rebuilds.
