@@ -314,10 +314,15 @@ fn project_root(dir: &Path) -> &Path {
 
 /// The person's own configuration file, which no project supplies:
 /// `$XDG_CONFIG_HOME/atomic/config.yaml`, by default
-/// `~/.config/atomic/config.yaml`. `None` when neither variable names an
-/// absolute directory.
+/// `~/.config/atomic/config.yaml`. `None` when neither variable, as `env`
+/// reads it, names an absolute directory.
 pub fn user_config(env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
-    atomic_core::state::user_config_dir_in(env).map(|d| d.join("config.yaml"))
+    // The directory the denial and the state check are made from, as the
+    // environment names it. The home the password database gives is not asked
+    // for here: settings come from what the environment names, and a test's
+    // environment says nothing about this machine's user.
+    atomic_core::state::user_config_dir_in(&|name| env(name).map(std::ffi::OsString::from), &None)
+        .map(|d| d.join("config.yaml"))
 }
 
 /// The directory whose `atomic.yaml` and siblings configure the project at

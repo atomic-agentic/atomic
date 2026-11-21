@@ -43,7 +43,8 @@
 //! The home must not be the person's own configuration directory
 //! ([`user_config_dir`]) or a directory inside it: every atom's commands are
 //! denied that directory whole, so [`ProjectState::create`] refuses a state
-//! directory there before it creates anything.
+//! directory there before it creates anything — and refuses one whose path it
+//! cannot resolve, since then it cannot say where that home is.
 
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -100,16 +101,21 @@ pub enum StateError {
     },
     /// The state directory is the person's own configuration directory, or a
     /// directory inside it, where every atom's commands are denied whole:
-    /// the state there would be denied with it.
-    #[error(
-        "{state} is atomic's state directory, inside {config}, your own configuration \
-         directory, which every atom's commands are denied"
-    )]
-    InsideConfig {
-        /// The state directory, as it really is.
-        state: PathBuf,
-        /// The person's configuration directory, as it really is.
-        config: PathBuf,
+    /// the state there would be denied with it. Its words are the refusal's
+    /// own ([`OutsideConfig`]), and nothing else is said for them.
+    #[error("{0}")]
+    InsideConfig(OutsideConfig),
+    /// A directory the state directory is placed by could not be resolved, so
+    /// atomic cannot tell where the state would go and runs nowhere.
+    #[error("cannot resolve {what} {path}: {why}")]
+    Resolve {
+        /// Which directory this is, in a sentence.
+        what: &'static str,
+        /// The directory, as it was given.
+        path: PathBuf,
+        /// The part of it that could not be looked up, and what the
+        /// filesystem said.
+        why: String,
     },
     /// State an older atomic left is there, and so is the current layout's,
     /// as after running an older atomic again: which one holds the project's
@@ -127,15 +133,43 @@ pub enum StateError {
     },
 }
 
-impl StateError {
-    /// The refusal of a state directory inside the person's own configuration
-    /// directory, both as they really are. atomic's own check makes it, so a
-    /// test that compares the words a command reported compares what this
-    /// process would report.
-    pub fn inside_config(state: &Path, config: &Path) -> Self {
-        StateError::InsideConfig {
-            state: state.to_owned(),
-            config: config.to_owned(),
+/// [`outside_user_config`]'s own report: a state directory that is
+/// [`user_config_dir`], or sits inside it. It names `ATOMIC_HOME` as the person
+/// set it, the state directory that spelling leads to as it really is, and the
+/// configuration directory — so which of their own settings put the state
+/// there is visible from the message alone, including when no home is set and
+/// the default data directory leads there.
+#[derive(Debug)]
+pub struct OutsideConfig {
+    /// The state directory, as it really is.
+    pub state: PathBuf,
+    /// `ATOMIC_HOME` as the person set it, word for word; `None` when nothing
+    /// sets it and the default data directory gives this instead.
+    pub given: Option<PathBuf>,
+    /// The person's configuration directory, as it really is.
+    pub config: PathBuf,
+}
+
+impl std::fmt::Display for OutsideConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.given {
+            Some(home) => write!(
+                f,
+                "ATOMIC_HOME is set to {home}, which puts atomic's state directory {state} \
+                 inside {config}, your own configuration directory, which every atom's \
+                 commands are denied",
+                home = home.display(),
+                state = self.state.display(),
+                config = self.config.display(),
+            ),
+            None => write!(
+                f,
+                "ATOMIC_HOME is not set to a directory, so atomic's state directory {state} \
+                 is inside {config}, your own configuration directory, which every atom's \
+                 commands are denied",
+                state = self.state.display(),
+                config = self.config.display(),
+            ),
         }
     }
 }
@@ -180,7 +214,9 @@ impl ProjectState {
     ///
     /// A state directory that is the person's own configuration directory, or
     /// inside it, is refused here, before anything is created
-    /// ([`outside_user_config`]).
+    /// ([`outside_user_config`]) — and so is one whose path cannot be resolved,
+    /// rather than run on a spelling that was never compared with the denial
+    /// ([`StateError::Resolve`]).
     pub fn create(&self) -> Result<(), StateError> {
         outside_user_config(&self.dir)?;
         let create = |d: &Path| {
@@ -510,45 +546,124 @@ pub fn credentials_dir() -> Result<PathBuf, StateError> {
 }
 
 /// The directory of the person's own configuration, which no project
-/// supplies: `$XDG_CONFIG_HOME/atomic`, by default `~/.config/atomic`, on
-/// every platform. `None` when neither variable, as `env` reads them, names
-/// an absolute directory.
-pub fn user_config_dir_in(env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
+/// supplies: `$XDG_CONFIG_HOME/atomic`, else `~/.config/atomic` under `HOME`,
+/// else under `passwd`, the home the password database gives — the home `dirs`
+/// takes to the same place when the environment names none, and the one
+/// [`crate::codex::real_homes`] denies a person's secrets under. A relative
+/// `XDG_CONFIG_HOME` is no configuration directory and gives way to `HOME`,
+/// as the XDG rule says; a relative `HOME` gives way to `passwd`. `None` only
+/// when none of the three names an absolute directory.
+///
+/// Both the denial of this directory to atoms' commands
+/// ([`crate::codex::StateGuard::deny_state_dir`]) and the refusal of a state
+/// directory inside it ([`outside_user_config`]) come from [`user_config_dir`],
+/// so a directory no atom's command can reach is never taken for a place the
+/// state may live.
+pub fn user_config_dir_in(
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+    passwd: &Option<PathBuf>,
+) -> Option<PathBuf> {
     let absolute = |name: &str| env(name).map(PathBuf::from).filter(|p| p.is_absolute());
     absolute("XDG_CONFIG_HOME")
+        .or_else(|| absolute("HOME").map(|h| h.join(".config")))
+        .or_else(|| passwd_config(passwd))
         .map(|d| d.join("atomic"))
-        .or_else(|| absolute("HOME").map(|h| h.join(".config/atomic")))
 }
 
-/// [`user_config_dir_in`] this process's environment.
-pub fn user_config_dir() -> Option<PathBuf> {
-    user_config_dir_in(&|name| std::env::var(name).ok())
-}
-
-/// `path` with the directories that already exist in it resolved: a symbolic
-/// link among them is followed to where it really points, and the components
-/// that do not exist yet, as a state directory before its first run, keep
-/// their place. A path no part of which exists is returned as it was given.
-fn real_path(path: &Path) -> PathBuf {
-    let mut missing: Vec<std::ffi::OsString> = Vec::new();
-    let mut existing = path;
-    let resolved = loop {
-        match std::fs::canonicalize(existing) {
-            Ok(real) => break real,
-            Err(_) => match (existing.parent(), existing.file_name()) {
-                (Some(parent), Some(name)) => {
-                    missing.push(name.to_os_string());
-                    existing = parent;
-                }
-                _ => return path.to_owned(),
-            },
-        }
-    };
-    let mut out = resolved;
-    for name in missing.iter().rev() {
-        out.push(name);
+/// Where the configuration of a person with no absolute home in the
+/// environment lives: under `passwd`, the home the password database gives,
+/// when it is an absolute path. This is where `dirs` takes the configuration
+/// directory when the environment names none, and where
+/// [`crate::codex::real_homes`] denies a person's secrets, so it is a
+/// configuration directory for the denial and for the state check alike.
+fn passwd_config(passwd: &Option<PathBuf>) -> Option<PathBuf> {
+    let home = passwd.as_deref()?;
+    if !home.is_absolute() {
+        return None;
     }
-    out
+    Some(home.join(".config"))
+}
+
+/// [`user_config_dir_in`] with this process's `XDG_CONFIG_HOME` and `HOME`,
+/// read as the operating system gives them, and the home the password
+/// database gives this process's user.
+pub fn user_config_dir() -> Option<PathBuf> {
+    user_config_dir_in(&|name| std::env::var_os(name), &passwd_home())
+}
+
+/// `path`, absolute and with the directories that already exist in it
+/// resolved: a symbolic link among them is followed to where it really
+/// points. The components below the last of those cannot be links yet, so
+/// they are folded without asking the filesystem: `.` goes, and each `..`
+/// pops the name before it, which is where the operating system would land
+/// once those names do exist.
+///
+/// `absolute` makes a relative path absolute, which is how a home named
+/// relative to the directory the command was run in reaches the comparison.
+/// Nothing comes back for a path that cannot be made absolute, or whose
+/// deepest existing directory cannot be looked up. Nothing else must come back
+/// either: the unresolved spelling would compare as a stranger to the
+/// configuration directory and let the state through, into the place no atom's
+/// command can reach. [`StateError::Resolve`] names the side that could not be
+/// placed, and the run is refused.
+fn real_path(
+    what: &'static str,
+    path: &Path,
+    absolute: &dyn Fn(&Path) -> Option<PathBuf>,
+) -> Result<PathBuf, StateError> {
+    let unresolved = |why: String| StateError::Resolve {
+        what,
+        path: path.to_owned(),
+        why,
+    };
+    let absolute = absolute(path).ok_or_else(|| {
+        unresolved("it is not an absolute path and the directory to read it from is unknown".into())
+    })?;
+    // The deepest prefix of `absolute` that exists. A directory is there only
+    // where its parent is, so below that prefix every component is missing
+    // too, and none of them can be a link.
+    let found = absolute
+        .ancestors()
+        .find(|prefix| std::fs::symlink_metadata(prefix).is_ok());
+    let (found, below) = match found {
+        // Not even the root of `absolute` is there, which an absolute path
+        // always is. Nothing is known about where this leads.
+        None => {
+            return Err(unresolved(format!(
+                "{} is not there, and neither is any directory above it",
+                absolute.display()
+            )));
+        }
+        // `found` is `absolute`'s own spelling cut at a separator, so this
+        // gives what comes after it, links and all, unchanged.
+        Some(found) => match absolute.strip_prefix(found) {
+            Ok(below) => (found, below),
+            Err(_) => {
+                return Err(unresolved(format!(
+                    "{} is above {}, which does not contain it",
+                    found.display(),
+                    absolute.display()
+                )));
+            }
+        },
+    };
+    let mut out = std::fs::canonicalize(found).map_err(|source| {
+        unresolved(if found == absolute.as_path() {
+            format!("it cannot be read: {source}")
+        } else {
+            format!("{} cannot be read: {source}", found.display())
+        })
+    })?;
+    for part in below.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    Ok(out)
 }
 
 /// Refuse a state directory that is [`user_config_dir`], or sits inside it.
@@ -556,21 +671,72 @@ fn real_path(path: &Path) -> PathBuf {
 /// whole (see [`crate::codex::StateGuard`]), and a denied path inside another
 /// denied path is dropped, so a state directory there is denied with it: its
 /// worktrees and caches fall out of reach of the commands that must use them,
-/// which fail saying nothing of where the cause is. Both sides are resolved
-/// with [`real_path`] first, and compared by path components, so a link into
-/// the configuration directory is caught and a sibling of it, such as
+/// which fail saying nothing of where the cause is. Both sides are placed
+/// with [`real_path`] first — absolute, links followed, `..` folded — and
+/// compared by path components, so a link into the configuration directory
+/// and a `..` that leads into it are caught, and a sibling of it, such as
 /// `~/.config/atomic-state`, is not.
 ///
-/// `user_config_dir` reads this process's `XDG_CONFIG_HOME` and `HOME`, which
-/// is how the denial itself is made: when neither names an absolute directory
-/// there is no configuration directory to be swallowed by.
+/// `env` is how the person's `ATOMIC_HOME` and `XDG_CONFIG_HOME` and `HOME`
+/// are read, `passwd` is the home the password database gives, and `absolute`
+/// makes a relative path absolute.
+///
+/// The configuration directory compared against is [`user_config_dir_in`] as
+/// `env` and `passwd` give it — the same resolution
+/// [`crate::codex::StateGuard::deny_state_dir`] denies every atom's command
+/// from, so the two cannot name different directories. When none of them names
+/// an absolute directory there is no configuration directory for a state to be
+/// swallowed by and the denial covers nothing either; a run in that situation
+/// does not reach here, because the same missing home is why
+/// [`crate::codex::real_homes`] refuses to build the denial at all. A state
+/// directory that cannot be made absolute is refused rather than compared as a
+/// stranger.
 pub fn outside_user_config(state_dir: &Path) -> Result<(), StateError> {
-    let Some(config) = user_config_dir() else {
+    outside_user_config_in(
+        state_dir,
+        &|name| std::env::var_os(name),
+        &passwd_home(),
+        &placed,
+    )
+}
+
+/// Where the path `path` is read from, which is what a relative spelling
+/// needs before it can be compared with anything: [`std::path::absolute`],
+/// which joins the working directory without folding the names that are not
+/// there yet. `None` when the working directory cannot be read.
+fn placed(path: &Path) -> Option<PathBuf> {
+    std::path::absolute(path).ok()
+}
+
+/// [`outside_user_config`] with the environment as `env` reads it, the
+/// password home as `passwd` gives it and relative paths as `absolute` makes
+/// them absolute.
+pub fn outside_user_config_in(
+    state_dir: &Path,
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+    passwd: &Option<PathBuf>,
+    absolute: &dyn Fn(&Path) -> Option<PathBuf>,
+) -> Result<(), StateError> {
+    let Some(config) = user_config_dir_in(env, passwd) else {
         return Ok(());
     };
-    let (state, config) = (real_path(state_dir), real_path(&config));
+    let (state, config) = (
+        real_path("atomic's state directory", state_dir, absolute)?,
+        real_path("your configuration directory", &config, absolute)?,
+    );
     if state.starts_with(&config) {
-        return Err(StateError::inside_config(&state, &config));
+        // The person's own spelling, word for word, so the message names what
+        // they set; the state directory beside it says where it leads. Nothing
+        // sets it when it is unset or empty, and then the default data
+        // directory is what leads there.
+        let given = env("ATOMIC_HOME")
+            .filter(|home| !home.is_empty())
+            .map(PathBuf::from);
+        return Err(StateError::InsideConfig(OutsideConfig {
+            state,
+            given,
+            config,
+        }));
     }
     Ok(())
 }
@@ -961,5 +1127,442 @@ mod tests {
         assert_eq!(a, project_id(Path::new("/work/My Repo")));
         assert!(a.starts_with("My_Repo-"), "{a}");
         assert_ne!(a, project_id(Path::new("/other/My Repo")));
+    }
+
+    /// What came back for a home, in the words atomic would show: the paths
+    /// the refusal is made of, or the part that could not be placed.
+    fn words(outcome: &Result<(), StateError>) -> String {
+        match outcome {
+            Ok(()) => "accepted".to_string(),
+            Err(StateError::InsideConfig(outside)) => format!(
+                "inside: given {:?}, state {}, config {}",
+                outside.given.as_deref().map(Path::display),
+                outside.state.display(),
+                outside.config.display(),
+            ),
+            Err(e @ StateError::Resolve { .. }) => format!("refused: {e}"),
+            Err(e) => panic!("not the check's own refusal: {e}"),
+        }
+    }
+
+    /// A throwaway directory with `make` created in it and `links` standing
+    /// where they are named: the filesystem a case is checked against. A path
+    /// that starts with `/` is below it.
+    fn setup(tag: &str, make: &[&str], links: &[(&str, &str)]) -> PathBuf {
+        let scratch =
+            std::env::temp_dir().join(format!("atomic-place-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).expect("the throwaway directory");
+        for dir in make {
+            std::fs::create_dir_all(scratch.join(dir)).expect("a directory of the case");
+        }
+        for (from, to) in links {
+            std::os::unix::fs::symlink(scratch.join(to), scratch.join(from)).expect("the link");
+        }
+        scratch
+    }
+
+    /// The check a command makes of the home `home`, with the environment as
+    /// `vars` gives it, the password home as `passwd` gives it and a relative
+    /// spelling read from `cwd` — no part of this process's own environment.
+    /// `home` and `vars` name a path below the throwaway directory with a
+    /// leading `/`, and anything else word for word, which is how its owner
+    /// wrote it; `cwd: None` is a caller that cannot place a relative path at
+    /// all.
+    ///
+    /// A case whose names are not there yet is the point: the check has to say
+    /// where such a home leads, which is what an unresolved spelling cannot.
+    fn check(
+        scratch: &Path,
+        vars: &[(&str, &str)],
+        home: &str,
+        cwd: Option<&str>,
+        passwd: Option<&str>,
+    ) -> Result<(), StateError> {
+        let below = |value: &str| -> std::ffi::OsString {
+            match value.strip_prefix('/') {
+                Some(rest) => scratch.join(rest).into_os_string(),
+                None => std::ffi::OsString::from(value),
+            }
+        };
+        let env = |name: &str| -> Option<std::ffi::OsString> {
+            vars.iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| below(value))
+        };
+        outside_user_config_in(
+            Path::new(&below(home)),
+            &env,
+            &passwd.map(|p| scratch.join(p)),
+            &|path: &Path| -> Option<PathBuf> {
+                if path.is_absolute() {
+                    Some(path.to_path_buf())
+                } else {
+                    cwd.map(|cwd| scratch.join(cwd).join(path))
+                }
+            },
+        )
+    }
+
+    /// [`setup`] and [`check`] together.
+    fn place(
+        tag: &str,
+        make: &[&str],
+        links: &[(&str, &str)],
+        vars: &[(&str, &str)],
+        home: &str,
+        cwd: Option<&str>,
+        passwd: Option<&str>,
+    ) -> (PathBuf, Result<(), StateError>) {
+        let scratch = setup(tag, make, links);
+        let outcome = check(&scratch, vars, home, cwd, passwd);
+        (scratch, outcome)
+    }
+
+    /// How `words` is to say the home `home` was given.
+    fn given(scratch: &Path, home: &str) -> String {
+        match home.strip_prefix('/') {
+            Some(rest) => scratch.join(rest).display().to_string(),
+            None => home.to_string(),
+        }
+    }
+
+    /// A home whose only absolute path is `~/.config/atomic`, nothing of it
+    /// created yet: the check is made of directories that do not exist.
+    #[test]
+    fn a_home_that_is_the_configuration_directory_is_refused_before_it_exists() {
+        let home = "/home/.config/atomic";
+        let (scratch, outcome) = place(
+            "equal",
+            &[],
+            &[],
+            &[("HOME", "/home"), ("ATOMIC_HOME", home)],
+            home,
+            None,
+            None,
+        );
+        let config = scratch.join("home/.config/atomic");
+        assert_eq!(
+            words(&outcome),
+            format!(
+                "inside: given Some({given:?}), state {}, config {}",
+                config.display(),
+                config.display(),
+                given = given(&scratch, home),
+            ),
+            "not the refusal of a home that is the configuration directory"
+        );
+        assert!(
+            !scratch.join("home/.config").exists(),
+            "the check created what it was refusing"
+        );
+    }
+
+    /// A case of the three shapes a spelling can take: a name for its
+    /// throwaway directory, the directories to make in it, the home as its
+    /// owner wrote it, where that home lands below the throwaway directory,
+    /// and the directory a relative spelling is read from.
+    type Placed<'a> = (&'a str, &'a [&'a str], &'a str, &'a str, Option<&'a str>);
+
+    /// A case of the environment: a name, the variables as the person set
+    /// them, and the home.
+    type Spelled<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a str);
+
+    /// The three shapes a spelling can hide a home in: a `..` over a name that
+    /// is not there, a `..` back into the configuration directory, and a
+    /// relative name read from inside it. All three are the configuration
+    /// directory or a directory inside it, and a check that compared the
+    /// spelling would let all three through.
+    #[test]
+    fn a_home_is_placed_and_not_read() {
+        let cases: &[Placed] = &[
+            (
+                "dotdot-missing",
+                &["home/.config/atomic"],
+                "/home/.config/atomic-state/../atomic",
+                "home/.config/atomic",
+                None,
+            ),
+            (
+                "dotdot-inside",
+                &["home/.config/atomic"],
+                "/home/.config/atomic/../atomic/state",
+                "home/.config/atomic/state",
+                None,
+            ),
+            (
+                "relative",
+                &["home/.config/atomic"],
+                "state",
+                "home/.config/atomic/state",
+                Some("home/.config/atomic"),
+            ),
+        ];
+        for (tag, make, home, inside, cwd) in cases {
+            let vars = [("HOME", "/home"), ("ATOMIC_HOME", *home)];
+            let (scratch, outcome) = place(tag, make, &[], &vars, home, *cwd, None);
+            let state = scratch.join(inside);
+            let config = scratch.join("home/.config/atomic");
+            assert_eq!(
+                words(&outcome),
+                format!(
+                    "inside: given Some({given:?}), state {}, config {}",
+                    state.display(),
+                    config.display(),
+                    given = given(&scratch, home),
+                ),
+                "{tag}: the home was read instead of placed"
+            );
+        }
+    }
+
+    /// A home spelled further out than the configuration directory, which a
+    /// string comparison would refuse and a placed one does not.
+    #[test]
+    fn a_home_beside_the_configuration_directory_still_runs() {
+        let cases: &[(&str, &str, Option<&str>)] = &[
+            ("sibling", "/home/.config/atomic-state", None),
+            ("out-and-back", "/home/.config/atomic/../atomic-state", None),
+            ("dot", "/home/./x/../.config/atomic-state", None),
+        ];
+        for (tag, home, cwd) in cases {
+            let (_, outcome) = place(
+                tag,
+                &["home/.config/atomic"],
+                &[],
+                &[("HOME", "/home")],
+                home,
+                *cwd,
+                None,
+            );
+            assert_eq!(words(&outcome), "accepted", "{tag}");
+        }
+    }
+
+    /// A configuration directory that is itself a link, and a home that is one
+    /// leading into it: both sides are placed, so both links are followed and
+    /// the refusal says where the directories really are.
+    #[test]
+    fn a_home_is_placed_through_a_link() {
+        let (scratch, outcome) = place(
+            "linked-config",
+            &["settings/atomic", "home/.config"],
+            &[("home/.config/atomic", "settings/atomic")],
+            &[("HOME", "/home"), ("ATOMIC_HOME", "/settings/atomic/state")],
+            "/settings/atomic/state",
+            None,
+            None,
+        );
+        let settings = scratch.join("settings/atomic");
+        assert_eq!(
+            words(&outcome),
+            format!(
+                "inside: given Some(\"{s}/state\"), state {s}/state, config {s}",
+                s = settings.display()
+            ),
+            "the link named in the environment was not followed"
+        );
+        let (scratch, outcome) = place(
+            "linked-home",
+            &["home/.config/atomic"],
+            &[("far", "home/.config/atomic")],
+            &[("HOME", "/home"), ("ATOMIC_HOME", "/far")],
+            "/far",
+            None,
+            None,
+        );
+        let config = scratch.join("home/.config/atomic");
+        assert_eq!(
+            words(&outcome),
+            format!(
+                "inside: given Some(\"{far}\"), state {config}, config {config}",
+                far = scratch.join("far").display(),
+                config = config.display()
+            ),
+            "the link given as the home was not followed"
+        );
+    }
+
+    /// A relative `XDG_CONFIG_HOME` names no configuration directory and gives
+    /// way to `HOME`, which is the directory the denial is made of. With no
+    /// absolute home anywhere there is no configuration directory to compare
+    /// with, and an absolute home is accepted as it is.
+    #[test]
+    fn the_configuration_directory_is_the_absolute_one() {
+        let cases: &[Spelled] = &[
+            (
+                "xdg-relative",
+                &[("XDG_CONFIG_HOME", "settings"), ("HOME", "/home")],
+                "/data",
+            ),
+            ("no-home", &[], "/data"),
+            ("home-relative", &[("HOME", "home")], "/data"),
+        ];
+        for (tag, vars, home) in cases {
+            let (_, outcome) = place(tag, &["home/.config/atomic"], &[], vars, home, None, None);
+            assert_eq!(words(&outcome), "accepted", "{tag}");
+        }
+        // And with `HOME` absolute, it is the configuration directory under it
+        // that the home is compared with, not the one the relative variable
+        // would name.
+        let (scratch, outcome) = place(
+            "xdg-relative-inside",
+            &["home/.config/atomic"],
+            &[],
+            &[("XDG_CONFIG_HOME", "settings"), ("HOME", "/home")],
+            "/home/.config/atomic/state",
+            None,
+            None,
+        );
+        assert!(
+            words(&outcome).starts_with("inside:"),
+            "a home inside the configuration directory `HOME` gives was \
+             accepted because a relative `XDG_CONFIG_HOME` named another: {}",
+            scratch.display()
+        );
+    }
+
+    /// With no home in the environment, the home the password database gives
+    /// is the configuration directory, as it is for the denial; giving that
+    /// home to the check is what makes the two agree.
+    #[test]
+    fn a_home_inside_the_password_home_is_refused() {
+        let (scratch, outcome) = place(
+            "passwd",
+            &["real-home/.config/atomic"],
+            &[],
+            &[("ATOMIC_HOME", "/real-home/.config/atomic/state")],
+            "/real-home/.config/atomic/state",
+            None,
+            Some("real-home"),
+        );
+        let real = scratch.join("real-home/.config/atomic");
+        assert_eq!(
+            words(&outcome),
+            format!(
+                "inside: given Some(\"{r}/state\"), state {r}/state, config {r}",
+                r = real.display()
+            ),
+            "the home the password database gives was not compared with"
+        );
+        // A `HOME` that is an absolute path wins over the password database,
+        // as it does for the denial.
+        let (_, outcome) = place(
+            "passwd-beats-nothing",
+            &["real-home/.config/atomic", "home/.config"],
+            &[],
+            &[("HOME", "/home")],
+            "/real-home/.config/atomic/state",
+            None,
+            Some("real-home"),
+        );
+        assert_eq!(words(&outcome), "accepted", "HOME was ignored");
+    }
+
+    /// Nothing sets the home — or nothing useful does, which is the same to
+    /// the state directory that goes to the default data directory. The refusal
+    /// has no `ATOMIC_HOME` spelling to name then, and says so.
+    #[test]
+    fn a_home_no_atomic_home_sets_is_refused_by_what_it_is() {
+        let cases: &[(&str, &[(&str, &str)])] = &[
+            ("unset", &[("XDG_CONFIG_HOME", "/settings")]),
+            (
+                "empty",
+                &[("XDG_CONFIG_HOME", "/settings"), ("ATOMIC_HOME", "")],
+            ),
+        ];
+        for (tag, vars) in cases {
+            let (scratch, outcome) = place(
+                tag,
+                &["settings/atomic"],
+                &[],
+                vars,
+                // Where the default data directory leads, which is what a
+                // command hands the check when nothing sets the home.
+                "/settings/atomic/state",
+                None,
+                None,
+            );
+            let settings = scratch.join("settings/atomic");
+            assert_eq!(
+                words(&outcome),
+                format!(
+                    "inside: given None, state {s}/state, config {s}",
+                    s = settings.display()
+                ),
+                "ATOMIC_HOME {tag} was not refused for what it is"
+            );
+        }
+    }
+
+    /// A home that cannot be placed is refused, and says which of its two
+    /// directories could not be placed and what the filesystem said: an
+    /// unresolved spelling compares as a stranger to the configuration
+    /// directory, which is the failure this check exists to stop.
+    #[test]
+    fn a_home_that_cannot_be_placed_is_refused() {
+        let scratch = setup(
+            "unplaced",
+            &["home/.config"],
+            &[("gone", "nowhere"), ("home/.config/atomic", "nowhere")],
+        );
+        let home = "/gone/state";
+        let vars = [("HOME", "/home"), ("ATOMIC_HOME", home)];
+        // The home is read through a link to nowhere: where it leads cannot be
+        // said, so neither can it be said that it is outside the configuration
+        // directory.
+        let outcome = check(&scratch, &vars, home, None, None);
+        assert_eq!(
+            words(&outcome),
+            format!(
+                "refused: cannot resolve atomic's state directory {s}: {g} cannot be read: \
+                 No such file or directory (os error 2)",
+                s = scratch.join("gone/state").display(),
+                g = scratch.join("gone").display(),
+            ),
+            "the refusal of a home read through a link to nowhere"
+        );
+        // The configuration directory is the link to nowhere, so no spelling
+        // of a home can be compared with it — and the refusal says which of the
+        // two directories it could not place.
+        let outcome = check(&scratch, &[("HOME", "/home")], "/home/state", None, None);
+        assert!(
+            words(&outcome).starts_with(&format!(
+                "refused: cannot resolve your configuration directory {}: it cannot be read: ",
+                scratch.join("home/.config/atomic").display()
+            )),
+            "{}",
+            words(&outcome)
+        );
+        // A home below two links that point at each other: the same refusal,
+        // with what the filesystem said about the cycle.
+        let scratch = setup(
+            "cycle",
+            &["home/.config/atomic"],
+            &[("there", "back"), ("back", "there")],
+        );
+        let outcome = check(&scratch, &[("HOME", "/home")], "/there/state", None, None);
+        let why = words(&outcome);
+        assert!(
+            why.starts_with(&format!(
+                "refused: cannot resolve atomic's state directory {}: ",
+                scratch.join("there/state").display()
+            )) && why.contains("cannot be read:"),
+            "{why}"
+        );
+        assert!(
+            why.contains("symbolic link"),
+            "the refusal does not say what the cycle did: {why}"
+        );
+        // A relative home, with no directory to read it from.
+        let outcome = check(&scratch, &[("HOME", "/home")], "state", None, None);
+        assert!(
+            matches!(
+                &outcome,
+                Err(StateError::Resolve { what, path, .. })
+                    if what == &"atomic's state directory" && path == Path::new("state")
+            ),
+            "a relative home was not refused for want of a directory to read it from: {outcome:?}"
+        );
     }
 }

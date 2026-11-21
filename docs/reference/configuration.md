@@ -267,7 +267,7 @@ process environment does.
 
 | Variable | Sets |
 | --- | --- |
-| `ATOMIC_HOME` | where every project's state is kept, instead of the platform's user data directory; it may not be your own atomic configuration directory (`$XDG_CONFIG_HOME/atomic`, by default `~/.config/atomic`) or a directory inside it, which every atom's commands are denied, and a command that starts a project's runs refuses such a home at start |
+| `ATOMIC_HOME` | where every project's state is kept, instead of the platform's user data directory; it may not be your own atomic configuration directory (`$XDG_CONFIG_HOME/atomic`, by default `~/.config/atomic`) or a directory inside it, which every atom's commands are denied. A home that leads there is refused at start, before anything is created in it — whether it leads there directly, by a link, by `..`, or from the directory the command was run in — and so is a home whose path atomic cannot resolve. Every `atomic` command refuses it but `atomic model`, which keeps nothing in a project's state, the `runner` role, which runs one command for a control plane, and the help and version output, which run nothing |
 | `ATOMIC_CREDENTIAL_STORE` | `file`, to keep credentials in your own atomic directory; the OS keyring is the default, and `keyring` says so |
 | `ATOMIC_DETECT_OLLAMA_ADDR` | the loopback address to probe for Ollama |
 | `ATOMIC_EXEC_MAX_FILE_BYTES`, `ATOMIC_EXEC_MAX_STEP_BYTES` | how much an exec atom's command may hand over by reference: 1 GiB a file and 4 GiB a step by default, in bytes; see [large results go by reference](atom-files.md#large-results-go-by-reference) |

@@ -170,12 +170,19 @@ fn known(cause: &(dyn std::error::Error + 'static)) -> Option<Failure> {
                     current.display(),
                     old.display()
                 ),
-                state::StateError::InsideConfig { config, .. } => format!(
-                    "move ATOMIC_HOME outside {}, or point XDG_CONFIG_HOME, or HOME, \
-                     elsewhere; a worktree or a cache inside your own configuration \
+                state::StateError::InsideConfig(outside) => format!(
+                    "set ATOMIC_HOME to a directory outside {}, or point XDG_CONFIG_HOME, or \
+                     HOME, elsewhere; a worktree or a cache inside your own configuration \
                      directory is out of atoms' commands' reach",
-                    config.display()
+                    outside.config.display()
                 ),
+                state::StateError::Resolve { .. } => {
+                    "set ATOMIC_HOME to a directory atomic can place, with a directory above it \
+                     that exists and can be read, or point XDG_CONFIG_HOME, or HOME, at one; \
+                     until then atomic cannot tell whether its state would be inside your own \
+                     configuration directory"
+                        .into()
+                }
                 _ => "set ATOMIC_HOME to a writable directory for atomic's state, or fix the \
                       permissions the description names"
                     .into(),
