@@ -329,6 +329,9 @@ fn token_files(
         let Some(file) = env(name).filter(|v| !v.is_empty()).map(PathBuf::from) else {
             continue;
         };
+        // Named as plainly as it reads, so a trailing `/` is no directory it
+        // must be: only one above the file can fail as not a directory.
+        let file: PathBuf = file.components().collect();
         let file = if file.is_absolute() {
             file
         } else {
@@ -898,10 +901,12 @@ fn denied_paths(
         if named.as_path() == root.as_path() {
             continue;
         }
-        if let Some(place) = all.iter().find(|p| p.starts_with(root)) {
+        let codex = real_spelling(codex_home);
+        if let Some(place) = all.iter().chain([&codex]).find(|p| p.starts_with(root)) {
             return Err(refuse(format!(
                 "{} is inside {}, which atoms' commands may write, named {} through a link, so \
-                 its denial would not hold; name that directory by its real path",
+                 its denial would not hold; point ATOMIC_HOME, or HOME, and the project at \
+                 their real paths, with no link above them",
                 place.display(),
                 root.display(),
                 named.display()
@@ -3301,6 +3306,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A token file named with a trailing `/` is found in its projected
+    /// volume all the same: the name is read plainly, so only a directory
+    /// above the file can fail as not a directory.
+    #[cfg(unix)]
+    #[test]
+    fn a_token_named_with_a_trailing_slash_is_still_found_in_its_volume() {
+        let dir = scratch("trailing-slash");
+        let volume = dir.join("volume");
+        std::fs::create_dir_all(volume.join("..2026_01_01_00_00_00.1")).expect("version");
+        std::fs::write(volume.join("..2026_01_01_00_00_00.1/token"), "t").expect("token");
+        link(Path::new("..2026_01_01_00_00_00.1"), &volume.join("..data"));
+        link(Path::new("..data/token"), &volume.join("token"));
+        let named = format!("{}/token/", volume.display());
+        let env = |name: &str| {
+            (name == "AWS_WEB_IDENTITY_TOKEN_FILE").then(|| std::ffi::OsString::from(&named))
+        };
+        let here = || -> std::io::Result<PathBuf> { Ok(PathBuf::from("/")) };
+        let found = token_files(&env, &here).expect("found");
+        assert!(found.contains(&volume), "the volume is denied");
+        assert!(found.contains(&volume.join("token")), "the token is denied");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A relative token file with no working directory to resolve it
     /// against is refused, naming the variable, so nothing runs.
     #[test]
@@ -3390,6 +3418,21 @@ mod tests {
             .err()
             .map(|e| e.to_string())
             .unwrap_or_default();
+        assert!(
+            refused.contains("through a link, so its denial would not hold"),
+            "{refused}"
+        );
+        // And so is Codex's home there, whose databases a pattern denies.
+        std::fs::create_dir_all(dir.join("real/codex-home")).expect("codex home");
+        let refused = denied_paths(
+            &private(vec![]),
+            &dir.join("real/codex-home"),
+            None,
+            &[dir.join("linked")],
+        )
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
         assert!(
             refused.contains("through a link, so its denial would not hold"),
             "{refused}"
