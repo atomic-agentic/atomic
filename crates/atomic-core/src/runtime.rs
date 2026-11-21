@@ -1926,6 +1926,9 @@ async fn run_command(
         // Inside it, the inputs it is given, which it only reads.
         read_only: reach.read_only,
         network: reach.network,
+        // Every other attempt's scratch directory, a turn's or another exec
+        // step's: its own stays writable inside them.
+        denied: workspace.denied.clone(),
     };
     // The command holds its workspace open until it ends, even when the run
     // that started it is cancelled and drops its guard.

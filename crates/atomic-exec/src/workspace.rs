@@ -114,8 +114,8 @@ pub struct Workspace {
     pub env: BTreeMap<String, String>,
     /// Directories of the backend's own that the workspace's commands may
     /// neither read nor write, `scratch` excepted: the scratch directories of
-    /// every other attempt, live or not, so no turn reads another's `HOME`
-    /// or `TMPDIR`.
+    /// every other attempt, live or not, so no turn and no confined command
+    /// reads another's `HOME` or `TMPDIR`.
     pub denied: Vec<PathBuf>,
 }
 

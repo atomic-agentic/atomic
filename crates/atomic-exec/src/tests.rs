@@ -15,6 +15,7 @@ fn shell(script: &str, stdin: &[u8], time: Duration) -> Result<Completed, ExecEr
         writable: Vec::new(),
         read_only: Vec::new(),
         network: Vec::new(),
+        denied: Vec::new(),
     })
 }
 
@@ -71,6 +72,7 @@ fn no_shell_expands_the_arguments() {
             writable: Vec::new(),
             read_only: Vec::new(),
             network: Vec::new(),
+            denied: Vec::new(),
         })
         .expect("runs");
     assert_eq!(done.stdout, b"$HOME;`id`");
@@ -90,6 +92,7 @@ fn a_missing_program_cannot_start() {
             writable: Vec::new(),
             read_only: Vec::new(),
             network: Vec::new(),
+            denied: Vec::new(),
         })
         .expect_err("missing");
     assert!(matches!(error, ExecError::Start { .. }), "{error}");
@@ -594,6 +597,7 @@ fn a_command_in_a_local_workspace_runs_as_it_would_directly() {
         writable: Vec::new(),
         read_only: Vec::new(),
         network: Vec::new(),
+        denied: Vec::new(),
     };
     let through = LocalBackend::default().run(&command).expect("runs");
     let direct = process::run(
