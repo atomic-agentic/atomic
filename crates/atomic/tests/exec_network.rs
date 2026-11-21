@@ -384,6 +384,8 @@ fn a_confined_command_with_hosts_and_read_only_inputs_keeps_both() {
 /// What a command given a declared host checks about its proxy token.
 const TOKEN: &str = r#"import json, os, sys, time, urllib.request
 ready, done = sys.argv[1:]
+# What it was started with, before it opens anything of its own.
+fds = sorted(int(fd) for fd in os.listdir('/proc/self/fd') if os.path.exists('/proc/self/fd/' + fd))
 key = 'CODEX_NETWORK_PROXY_ATTRIBUTION'
 seen = []
 for pid in os.listdir('/proc'):
@@ -408,6 +410,8 @@ json.dump({
     'env': key in os.environ,
     'self': key.encode() in open('/proc/self/environ', 'rb').read(),
     'seen': seen,
+    'secret_fd_var': 'ATOMIC_SECRET_ENV_FD' in os.environ,
+    'fds': fds,
     'fetched': fetched,
 }, sys.stdout)
 "#;
@@ -544,6 +548,10 @@ fn a_confined_command_never_holds_its_proxy_token() {
     assert_eq!(got["env"], false, "{got}");
     assert_eq!(got["self"], false, "{got}");
     assert_eq!(got["seen"], serde_json::json!([]), "{got}");
+    // Nor does it keep the variable that named the token's socket, or any
+    // descriptor beyond its standard three: the socket was the helper's.
+    assert_eq!(got["secret_fd_var"], false, "{got}");
+    assert_eq!(got["fds"], serde_json::json!([0, 1, 2]), "{got}");
     assert_eq!(got["fetched"], "HTTP 403 not_allowed_local", "{got}");
     assert!(
         !helpers.is_empty(),
