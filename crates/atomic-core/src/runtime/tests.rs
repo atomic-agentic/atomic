@@ -1290,6 +1290,14 @@ fn exec_declarations_are_checked_at_load() {
             "set by atomic",
         ),
         (
+            "kind: 'codex', env: { ATOMIC_SECRET_ENV_FD: '3' }",
+            "set by atomic",
+        ),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, env: { ATOMIC_SECRET_ENV_FD: '3' }",
+            "set by atomic",
+        ),
+        (
             "kind: 'exec', exec: { command: ['x'] }, env: { ATOMIC_TURN_TMPDIR: '/x' }",
             "set by atomic",
         ),

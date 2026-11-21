@@ -963,33 +963,36 @@ pub fn run_in(
     run_in_with_secret(group, program, args, cwd, env, &none, stdin, limits)
 }
 
-/// A pipe holding `secret`'s entries, written and closed, whose read end
-/// a child inherits; none for an empty one.
+/// A connected Unix socket holding `secret`'s entries, with its other end
+/// written and closed, which a child inherits; none for an empty one. A
+/// socket rather than a pipe: another process cannot reopen it through
+/// `/proc/<pid>/fd` before the child has protected itself.
 #[cfg(unix)]
 fn secret_pipe(secret: &crate::SecretEnv) -> std::io::Result<Option<std::os::fd::OwnedFd>> {
     use std::io::Write;
     if secret.is_empty() {
         return Ok(None);
     }
-    let bytes = secret.encode();
-    // A pipe holds this much without a reader; the entries are a token or
-    // two, far less.
+    let bytes = secret.encode().map_err(std::io::Error::other)?;
+    // A socket's buffer holds this much without a reader; the entries are a
+    // token or two, far less.
     if bytes.len() > 4096 {
         return Err(std::io::Error::other(
-            "the secret variables are too long for a pipe",
+            "the secret variables are too long to hand over",
         ));
     }
     // Both ends are close-on-exec; the child clears it on its own copy of
-    // the read end.
-    let (read, mut write) = std::io::pipe()?;
+    // the end it reads.
+    let (read, mut write) = std::os::unix::net::UnixStream::pair()?;
     write.write_all(&bytes)?;
+    write.shutdown(std::net::Shutdown::Write)?;
     drop(write);
     Ok(Some(std::os::fd::OwnedFd::from(read)))
 }
 
-/// [`run_in`], with `secret` on a pipe the child inherits, whose descriptor
-/// it finds in [`crate::SECRET_ENV_FD`]; the variables are never in its
-/// environment.
+/// [`run_in`], with `secret` on a socket the child inherits, whose
+/// descriptor it finds in [`crate::SECRET_ENV_FD`]; the variables are never
+/// in its environment.
 #[allow(clippy::too_many_arguments)]
 pub fn run_in_with_secret(
     group: Group,
@@ -1043,7 +1046,7 @@ pub fn run_in_with_secret(
     if !secret.is_empty() {
         return Err(ExecError::Start {
             program: name,
-            message: "secret variables are handed on a pipe only on Unix".into(),
+            message: "secret variables are handed on a socket only on Unix".into(),
         });
     }
     #[cfg(unix)]
@@ -1098,7 +1101,7 @@ pub fn run_in_with_secret(
         program: name.clone(),
         message: e.to_string(),
     })?;
-    // The child has its own copy of the secret pipe's read end.
+    // The child has its own copy of the secret socket.
     #[cfg(unix)]
     drop(secret_read_end);
     // A process in this one's group is stopped with this process.
