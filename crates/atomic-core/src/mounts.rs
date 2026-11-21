@@ -34,7 +34,8 @@
 //!   own;
 //! - a mount made after the list is built, such as one an automount
 //!   (`autofs`) makes when a path under it is first used, even from inside
-//!   the sandbox, which sees the host's new mounts;
+//!   the sandbox, which sees the host's new mounts, until the table is read
+//!   again: the sandbox helper reads it again as each command starts;
 //! - the same remote directory, or one inside another, mounted twice as
 //!   two filesystems, each with a device of its own, such as 9p; NFS with
 //!   `nosharecache`, or with mount options that differ, which give each
