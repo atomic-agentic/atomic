@@ -273,6 +273,9 @@ jobs:
       - name: M35a acceptance
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: python3 scripts/acceptance.py m35a
+      - name: M39a acceptance
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: python3 scripts/acceptance.py m39a
       - name: M45 acceptance
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: python3 scripts/acceptance.py m45
