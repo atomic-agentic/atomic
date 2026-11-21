@@ -899,6 +899,7 @@ fn without_standard_error_on_the_terminal_or_in_the_background_it_does_not_promp
 /// shown, each with its own value: neither hides the other's.
 #[test]
 fn keys_that_redact_alike_in_what_a_gate_shows_are_both_shown() {
+    support::require_sandbox();
     let p = Project::new("collide");
     p.enroll();
     let data = json!({ "text": "a note" }).to_string();
