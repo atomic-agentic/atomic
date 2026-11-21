@@ -1785,3 +1785,132 @@ fn a_held_key_with_no_marker_is_judged_whole() {
         .collect();
     assert_eq!(keys, [REDACTED], "{out}");
 }
+
+/// A secret's name and value pair in JSON held in a string is read as
+/// written, before text redaction hides the name: its value is hidden as
+/// it is in a real object, pretty or compact, under a hint or not.
+#[test]
+fn a_pair_in_json_in_a_string_is_read_by_the_name_written() {
+    let secret = "correct horse";
+    let shapes = [
+        json!([{"key": "DB_PASSWORD", "value": secret}]),
+        json!({"items": [{"value": secret, "key": "GITHUB_TOKEN"}]}),
+        json!({"env": [{"header": "DB_PASSWORD", "value": secret}]}),
+    ];
+    for (case, shape) in shapes.iter().enumerate() {
+        // As a real object, for the record.
+        let mut real = json!({ "key": shape.clone() });
+        value(&mut real);
+        for text in [
+            serde_json::to_string_pretty(shape).expect("JSON"),
+            shape.to_string(),
+        ] {
+            for parent in ["key", "note"] {
+                let mut out = json!({ parent: text.clone() });
+                value(&mut out);
+                let shown = out.to_string();
+                assert!(
+                    !shown.contains(secret),
+                    "case {case} under {parent}: the value showed"
+                );
+                let mut again = out.clone();
+                value(&mut again);
+                assert_eq!(
+                    again, out,
+                    "case {case} under {parent}: a second pass changed it"
+                );
+            }
+        }
+        assert!(
+            !real.to_string().contains(secret),
+            "case {case}: a real object showed"
+        );
+    }
+}
+
+/// Reading JSON in a string as written as well never shows what redaction
+/// hid before, and never makes a stable result unstable: over generated
+/// strings of pairs, flags and named fields, every planted secret hidden
+/// before is hidden now.
+#[test]
+fn reading_pairs_as_written_never_shows_what_was_hidden() {
+    let mut seed: u64 = 0x9a17_5eed;
+    let mut next = move |n: u64| {
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (seed >> 33) % n
+    };
+    const NAMES: &[&str] = &[
+        "DB_PASSWORD",
+        "GITHUB_TOKEN",
+        "password",
+        "token",
+        "note",
+        "Authorization",
+        "cookie",
+        "--password",
+        "api_key",
+        "user",
+    ];
+    const PARENTS: &[&str] = &["key", "note", "token", "data", "args"];
+    let (mut shown_more, mut hidden_more, mut unstable) = (0, 0, 0);
+    for _ in 0..3000 {
+        let mut planted = Vec::new();
+        let mut secret = |next: &mut dyn FnMut(u64) -> u64| {
+            let alphabet = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+            let mut s = String::from("P");
+            for _ in 0..13 {
+                s.push(char::from(alphabet[next(alphabet.len() as u64) as usize]));
+            }
+            planted.push(s.clone());
+            if next(2) == 0 { format!("{s} x") } else { s }
+        };
+        let mut items = Vec::new();
+        for _ in 0..=next(3) {
+            let name = NAMES[next(NAMES.len() as u64) as usize];
+            items.push(match next(4) {
+                0 => json!({"name": name, "value": secret(&mut next)}),
+                1 => json!({"key": name, "value": secret(&mut next)}),
+                2 => json!([name, secret(&mut next)]),
+                _ => json!({ name: secret(&mut next) }),
+            });
+        }
+        let inner = Value::Array(items);
+        let text = if next(2) == 0 {
+            serde_json::to_string_pretty(&inner).expect("JSON")
+        } else {
+            inner.to_string()
+        };
+        let doc = json!({ PARENTS[next(PARENTS.len() as u64) as usize]: text });
+        let run = |as_written: bool| {
+            PAIRS_AS_WRITTEN.with(|p| p.set(as_written));
+            let mut once = doc.clone();
+            value(&mut once);
+            let mut twice = once.clone();
+            value(&mut twice);
+            PAIRS_AS_WRITTEN.with(|p| p.set(true));
+            (once, twice)
+        };
+        let (now, now_again) = run(true);
+        let (before, before_again) = run(false);
+        if before_again == before && now_again != now {
+            unstable += 1;
+        }
+        let (now, before) = (now.to_string(), before.to_string());
+        shown_more += planted
+            .iter()
+            .filter(|p| now.contains(p.as_str()) && !before.contains(p.as_str()))
+            .count();
+        hidden_more += planted
+            .iter()
+            .filter(|p| before.contains(p.as_str()) && !now.contains(p.as_str()))
+            .count();
+    }
+    assert_eq!(shown_more, 0, "a secret hidden before is shown now");
+    assert_eq!(
+        unstable, 0,
+        "a second pass changes what it did not change before"
+    );
+    assert!(hidden_more > 0, "nothing is hidden that was shown before");
+}

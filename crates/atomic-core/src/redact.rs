@@ -1347,6 +1347,15 @@ pub fn tail(input: &str, chars: usize) -> String {
 }
 
 fn redact_string(string: &mut String, nested: usize) {
+    // JSON as written, before text redaction rewrites any of it: a secret's
+    // name in a name and value pair, such as `"key": "DB_PASSWORD"`, reads
+    // as one only until text redaction hides the name itself.
+    let written = (reads_pairs_as_written()
+        && nested < MAX_NESTED_JSON
+        && string.len() <= MAX_TEXT
+        && string.trim_start().starts_with(['{', '[']))
+    .then(|| serde_json::from_str::<Value>(string).ok())
+    .flatten();
     if string.len() > MAX_TEXT {
         *string = bounded(string, MAX_TEXT);
     } else if let Cow::Owned(redacted) = text(string) {
@@ -1361,10 +1370,58 @@ fn redact_string(string: &mut String, nested: usize) {
     {
         let before = inner.clone();
         redact_nested(&mut inner, nested + 1);
+        // What the JSON as written hides, it hides as redacted too.
+        if let Some(mut written) = written {
+            redact_nested(&mut written, nested + 1);
+            hide_where_hidden(&written, &mut inner);
+        }
         if inner != before {
             *string = inner.to_string();
         }
     }
+}
+
+/// Hide each value of `into` that `hidden`, the same JSON redacted from
+/// another reading, hid at the same place: by the same keys and the same
+/// indices, where the two still have them.
+fn hide_where_hidden(hidden: &Value, into: &mut Value) {
+    match (hidden, into) {
+        (Value::String(s), into) if s == REDACTED && into.as_str() != Some(REDACTED) => {
+            *into = Value::String(REDACTED.into());
+        }
+        (Value::Array(hidden), Value::Array(into)) if hidden.len() == into.len() => {
+            for (h, i) in hidden.iter().zip(into.iter_mut()) {
+                hide_where_hidden(h, i);
+            }
+        }
+        (Value::Object(hidden), Value::Object(into)) => {
+            for (key, h) in hidden {
+                if let Some(i) = into.get_mut(key) {
+                    hide_where_hidden(h, i);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// Whether this thread reads JSON in a string as written as well as
+    /// redacted; tests switch it off to compare with redaction before it.
+    static PAIRS_AS_WRITTEN: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Whether JSON in a string is also read as written (see
+/// `PAIRS_AS_WRITTEN`); always outside tests.
+#[cfg(test)]
+fn reads_pairs_as_written() -> bool {
+    PAIRS_AS_WRITTEN.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+const fn reads_pairs_as_written() -> bool {
+    true
 }
 
 /// Redact what a value held under a name of this strength holds, keeping
@@ -1379,7 +1436,14 @@ fn redact_held(strength: Strength, value: &mut Value, nested: usize) {
         Value::String(string) if is_secret_value(strength, string) => {
             *string = REDACTED.into();
         }
-        Value::String(string) => redact_string(string, nested),
+        Value::String(string) => {
+            redact_string(string, nested);
+            // As a second pass reads what it became: rewritten JSON can read
+            // as a credential whole where the string it came from did not.
+            if is_secret_value(strength, string) {
+                *string = REDACTED.into();
+            }
+        }
         Value::Number(_) if strength == Strength::Strong => *value = Value::String(REDACTED.into()),
         Value::Array(items) => {
             redact_flag_values(items);
