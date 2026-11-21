@@ -334,26 +334,29 @@ fn hold_named(store: &LocalStore, input: &Value) -> anyhow::Result<Vec<(Artifact
 /// Every `artifact://sha256/<digest>` reference written out in `value`'s
 /// strings and keys.
 fn explicit_references(value: &Value, into: &mut BTreeSet<ArtifactRef>) {
-    let mut found = |text: &str| {
-        let mut rest = text;
-        while let Some(at) = rest.find("artifact://sha256/") {
-            let after = &rest[at + "artifact://sha256/".len()..];
-            if let Some(digest) = after.get(..64)
-                && let Ok(a) = ArtifactRef::from_digest(digest)
-            {
-                into.insert(a);
-            }
-            rest = after;
-        }
-    };
     match value {
-        Value::String(s) => found(s),
+        Value::String(s) => written_out(s, into),
         Value::Array(items) => items.iter().for_each(|v| explicit_references(v, into)),
         Value::Object(map) => map.iter().for_each(|(k, v)| {
-            found(k);
+            written_out(k, into);
             explicit_references(v, into);
         }),
         _ => {}
+    }
+}
+
+/// Every `artifact://sha256/<digest>` written out in `text`.
+fn written_out(text: &str, into: &mut BTreeSet<ArtifactRef>) {
+    const PREFIX: &str = "artifact://sha256/";
+    let mut rest = text;
+    while let Some(at) = rest.find(PREFIX) {
+        let after = &rest[at + PREFIX.len()..];
+        if let Some(digest) = after.get(..64)
+            && let Ok(a) = ArtifactRef::from_digest(digest)
+        {
+            into.insert(a);
+        }
+        rest = after;
     }
 }
 
