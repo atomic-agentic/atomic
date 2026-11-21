@@ -64,8 +64,8 @@ directory as a checkout holding the project, and a well-formed worktree link in
 it is still followed, through no link, but nothing wrong with it refuses
 anything. What it names still counts, though: with your home itself a checkout
 (a `~/.git`), a well-formed link left in `/tmp` naming your home's repository
-refuses your own configuration for projects under `/tmp`. It holds the same settings as `atomic.yaml`, and the
-project's files override it — except the
+refuses your own configuration for projects under `/tmp`. It holds the same
+settings as `atomic.yaml`, and the project's files override it — except the
 `budget` caps and prices, which are ceilings a project can only tighten, as
 [Budgets](budgets.md#your-own-caps-are-ceilings) describes.
 

@@ -1407,7 +1407,7 @@ mod tests {
         std::os::unix::fs::symlink(&fifo, gitdir.join("commondir")).expect("commondir");
         let foreign = link_file(&gitdir.join("commondir"), false).expect_err("refused");
         assert!(
-            foreign.contains("os error 40"),
+            foreign.contains(&format!("os error {}", libc::ELOOP)),
             "the link was followed: {foreign}"
         );
         let own = link_file(&gitdir.join("commondir"), true).expect_err("refused");
