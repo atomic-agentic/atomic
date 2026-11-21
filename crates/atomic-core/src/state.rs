@@ -503,6 +503,11 @@ pub fn checkouts_holding(dir: &Path) -> Result<Vec<PathBuf>, String> {
 /// The most a `.git` file or a `commondir` is read for: a path or two.
 const LINK_FILE_MAX: u64 = 4096;
 
+/// How a link file is opened: without waiting on a pipe's writer, and
+/// never as the process's controlling terminal.
+#[cfg(unix)]
+const LINK_OPEN_FLAGS: i32 = libc::O_NONBLOCK | libc::O_NOCTTY;
+
 /// The main checkout of the linked worktree whose `.git` is `git`; `None`
 /// for a `.git` directory, a submodule's file (no `commondir`), or a bare
 /// repository.
@@ -547,7 +552,7 @@ fn link_file(path: &Path) -> Result<Option<String>, String> {
     let mut open = std::fs::OpenOptions::new();
     open.read(true);
     #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut open, libc::O_NONBLOCK);
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut open, LINK_OPEN_FLAGS);
     let file = match open.open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -755,7 +760,26 @@ mod tests {
             "{held:?}"
         );
 
-        // A device, which never ends, as a pipe would never answer.
+        // A pipe with no writer, which a blocking open would wait on for
+        // ever: refused, and in time.
+        std::fs::remove_file(&commondir).expect("remove");
+        let name = std::ffi::CString::new(commondir.as_os_str().as_encoded_bytes()).expect("path");
+        // SAFETY: `name` is a NUL-terminated path that outlives the call.
+        #[allow(unsafe_code)]
+        let made = unsafe { libc::mkfifo(name.as_ptr(), 0o600) };
+        assert_eq!(made, 0, "mkfifo");
+        let (send, done) = std::sync::mpsc::channel();
+        let looked = project.clone();
+        std::thread::spawn(move || {
+            let _ = send.send(checkouts_holding(&looked));
+        });
+        let refused = done
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the read of a pipe waited instead of refusing it")
+            .expect_err("a pipe");
+        assert!(refused.contains("is not a regular file"), "{refused}");
+
+        // A device, which never ends.
         std::fs::remove_file(&commondir).expect("remove");
         std::os::unix::fs::symlink("/dev/zero", &commondir).expect("link");
         let refused = checkouts_holding(&project).expect_err("a device");

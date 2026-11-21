@@ -70,9 +70,12 @@ project's own or one around it such as a submodule's superproject or the main
 checkout of a linked worktree, is refused, since a repository could have
 supplied it. That includes the default location when your home directory is
 itself a git checkout (a `~/.git`) holding the project: set `ATOMIC_HOME` to a
-directory outside it. A link on the way that leads nowhere is refused too. A
-login that fails leaves no sign-in directory behind if it made one and no other
-login kept a sign-in there meanwhile; one stopped with Ctrl-C leaves it. A
+directory outside it. A link on the way that leads nowhere is refused too, and
+so is a checkout whose `.git` file or `commondir` is not a small regular file,
+as git writes them: that refuses your own configuration as well. A login that
+fails removes the sign-in directory it made, unless the store then holds a
+sign-in saved since it made it, or the store cannot be read and the directory
+holds a lock file a save may have left; one stopped with Ctrl-C leaves it. A
 logout removes the directory once both stores are checked, so later runs read
 no store; while the keyring cannot be checked, the directory stays, and atomic
 says the sign-in could not be read.

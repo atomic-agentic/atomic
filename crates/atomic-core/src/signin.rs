@@ -44,6 +44,10 @@ pub struct SignIn {
     reached: PathBuf,
     /// Whether this invocation made the directory, and so may remove it.
     made: bool,
+    /// What the store held when this invocation made the directory, as
+    /// JSON: an entry that outlived its directory, which is no sign-in and
+    /// is not made one by a login that fails.
+    stale: Option<String>,
     store: AuthCredentialsStoreMode,
     backend: Option<String>,
     issuer: Option<String>,
@@ -256,11 +260,23 @@ impl SignIn {
             }
             return Err(e);
         }
-        Ok(Self {
+        let made = Self {
             auth_home,
             made: !existed,
             ..located
-        })
+        };
+        // What the store holds now, in a directory made just now, is no
+        // sign-in of this invocation's: a keyring entry that outlived its
+        // directory.
+        let stale = if made.made {
+            made.stored()
+                .ok()
+                .flatten()
+                .and_then(|a| serde_json::to_string(&a).ok())
+        } else {
+            None
+        };
+        Ok(Self { stale, ..made })
     }
 
     /// Remove the sign-in's directory, so no store is read (see
@@ -299,11 +315,30 @@ impl SignIn {
                 return;
             }
         }
-        // Codex saves a sign-in while it holds these locks, so with them
-        // held this read comes after any save that took them first: one
-        // another login kept meanwhile is seen here, and stays.
-        if matches!(self.stored(), Ok(Some(_))) {
-            return;
+        // A sign-in another login kept meanwhile is seen here, and stays.
+        // That this read comes after such a save rests on Codex's own
+        // storage at its pinned revision: its save blocks on auth.lock,
+        // which is held here, and makes the directory again
+        // (create_dir_all in CommittedStorage::lock) if it is gone by then.
+        // A Codex update could change either.
+        match self.stored() {
+            // Only what the store held when this invocation made the
+            // directory is no sign-in; anything else was saved since.
+            Ok(Some(found)) => {
+                let same = serde_json::to_string(&found).ok();
+                let saved_since = !self.made || same.is_none() || same != self.stale;
+                if saved_since {
+                    return;
+                }
+            }
+            Ok(None) => {}
+            // Unknown: a directory with a lock file in it may have had a
+            // save, which Codex makes only with both locks, so it stays.
+            Err(_) => {
+                if !held.is_empty() {
+                    return;
+                }
+            }
         }
         for (path, _file) in &held {
             let _ = std::fs::remove_file(path);
@@ -318,6 +353,7 @@ impl SignIn {
             auth_home: dir.to_owned(),
             reached: dir.to_owned(),
             made: false,
+            stale: None,
             store: AuthCredentialsStoreMode::File,
             backend: None,
             issuer: None,
@@ -397,7 +433,7 @@ impl SignIn {
         if self.store != AuthCredentialsStoreMode::File
             && let Some(kept) = tests::keyring_holds(&self.auth_home)
         {
-            return Ok(Some(kept));
+            return kept;
         }
         codex_login::load_auth_dot_json(&self.auth_home, self.store, KEYRING)
     }
@@ -800,13 +836,43 @@ mod tests {
 
     /// A keyring for tests: the sign-ins it keeps, by the directory Codex
     /// keys them by. Read in place of the OS keyring by tests only.
-    static KEYRING: std::sync::Mutex<Vec<(PathBuf, String)>> = std::sync::Mutex::new(Vec::new());
+    /// A directory listed with `None` holds nothing; one not listed falls
+    /// through to the OS keyring.
+    static KEYRING: std::sync::Mutex<Vec<(PathBuf, Option<String>)>> =
+        std::sync::Mutex::new(Vec::new());
 
-    pub(super) fn keyring_holds(dir: &Path) -> Option<codex_login::AuthDotJson> {
+    pub(super) fn keyring_holds(
+        dir: &Path,
+    ) -> Option<std::io::Result<Option<codex_login::AuthDotJson>>> {
         let kept = KEYRING.lock().expect("keyring");
         kept.iter()
+            .rev()
             .find(|(d, _)| d == dir)
-            .map(|(_, json)| serde_json::from_str(json).expect("a sign-in"))
+            .map(|(_, json)| match json.as_deref() {
+                Some(UNREACHABLE) => Err(std::io::Error::other("the keyring cannot be reached")),
+                Some(j) => Ok(Some(serde_json::from_str(j).expect("a sign-in"))),
+                None => Ok(None),
+            })
+    }
+
+    /// Kept for a directory whose keyring cannot be reached.
+    const UNREACHABLE: &str = "unreachable";
+
+    /// Keep `json` (or nothing) in the test keyring for `dir`.
+    fn keep(dir: &Path, json: Option<String>) {
+        KEYRING
+            .lock()
+            .expect("keyring")
+            .push((std::fs::canonicalize(dir).expect("dir"), json));
+    }
+
+    /// A ChatGPT sign-in for `account`, as the keyring keeps it.
+    fn signed_in(account: &str) -> String {
+        let id_token = crate::testing::fake_id_token("dev@example.invalid", account);
+        serde_json::json!({"auth_mode": "chatgpt", "OPENAI_API_KEY": null, "tokens": {
+            "id_token": id_token, "access_token": "", "refresh_token": "",
+            "account_id": account}})
+        .to_string()
     }
 
     /// With the keyring store, a live sign-in's directory holds only
@@ -821,14 +887,7 @@ mod tests {
             for lock in ["auth.lock", "auth.json.lock"] {
                 std::fs::write(dir.join(lock), "").expect("lock");
             }
-            let id_token = crate::testing::fake_id_token("dev@example.invalid", "account-1");
-            KEYRING.lock().expect("keyring").push((
-                std::fs::canonicalize(&dir).expect("dir"),
-                serde_json::json!({"auth_mode": "chatgpt", "OPENAI_API_KEY": null, "tokens": {
-                    "id_token": id_token, "access_token": "", "refresh_token": "",
-                    "account_id": "account-1"}})
-                .to_string(),
-            ));
+            keep(&dir, Some(signed_in("account-1")));
             // The issuer is the discard port on loopback: the login fails
             // there, if the keyring check before it does not.
             // Made as `SignIn::configured` makes it, which finds whether
@@ -859,6 +918,7 @@ mod tests {
             let made = auth_dir("keyring-made");
             std::fs::remove_dir(&made).expect("not there yet");
             let sign_in = keyring(&made);
+            keep(&made, None);
             std::fs::write(made.join("auth.lock"), "").expect("lock");
             let held = std::fs::File::open(made.join("auth.lock")).expect("open");
             held.lock().expect("held");
@@ -924,6 +984,17 @@ mod tests {
             "{refused}"
         );
         assert!(outside_the_checkout(&dir.join("elsewhere/codex-auth"), Some(&project)).is_ok());
+        // A commondir git would not write refuses the sign-in wherever it
+        // is kept, rather than counting as no checkout.
+        std::fs::write(
+            main.join(".git/worktrees/wt/commondir"),
+            "x".repeat(5000),
+        )
+        .expect("commondir");
+        let refused = outside_the_checkout(&dir.join("elsewhere/codex-auth"), Some(&project))
+            .expect_err("refused")
+            .to_string();
+        assert!(refused.contains("is larger than a link file"), "{refused}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -947,14 +1018,7 @@ mod tests {
             for lock in ["auth.lock", "auth.json.lock"] {
                 std::fs::write(dir.join(lock), "").expect("lock");
             }
-            let id_token = crate::testing::fake_id_token("dev@example.invalid", "account-1");
-            KEYRING.lock().expect("keyring").push((
-                std::fs::canonicalize(&dir).expect("dir"),
-                serde_json::json!({"auth_mode": "chatgpt", "OPENAI_API_KEY": null, "tokens": {
-                    "id_token": id_token, "access_token": "", "refresh_token": "",
-                    "account_id": "account-1"}})
-                .to_string(),
-            ));
+            keep(&dir, Some(signed_in("account-1")));
             assert!(waiting.login(true).await.is_err());
             assert!(
                 dir.join("auth.lock").exists(),
@@ -966,6 +1030,59 @@ mod tests {
                 .expect("still signed in");
             assert_eq!(account.mode, "chatgpt");
             let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    /// A keyring entry that outlived its directory is no sign-in, and a
+    /// login that makes the directory and fails does not make it one.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_login_does_not_revive_an_entry_that_outlived_its_directory() {
+        crate::testing::on_codex_runtime(async {
+            let dir = auth_dir("outlived");
+            keep(&dir, Some(signed_in("account-old")));
+            std::fs::remove_dir(&dir).expect("its directory removed");
+            let located = SignIn {
+                store: AuthCredentialsStoreMode::Keyring,
+                ..SignIn::in_files(&dir)
+            };
+            let sign_in = SignIn::made_at(located, None)
+                .expect("made")
+                .with_issuer("http://127.0.0.1:9");
+            assert!(sign_in.login(true).await.is_err());
+            assert!(!dir.exists(), "the failed login kept the outlived entry's directory");
+            assert!(
+                sign_in.account().expect("account").is_none(),
+                "an outlived entry reads as a sign-in"
+            );
+        });
+    }
+
+    /// A keyring that cannot be read leaves a directory with a lock file in
+    /// it, which a save of another login's may have left, and removes one
+    /// with none.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unreadable_keyring_keeps_a_directory_a_save_may_have_used() {
+        crate::testing::on_codex_runtime(async {
+            for locked in [true, false] {
+                let dir = auth_dir(&format!("unreadable-{locked}"));
+                std::fs::remove_dir(&dir).expect("not there yet");
+                let located = SignIn {
+                    store: AuthCredentialsStoreMode::Keyring,
+                    ..SignIn::in_files(&dir)
+                };
+                let sign_in = SignIn::made_at(located, None)
+                    .expect("made")
+                    .with_issuer("http://127.0.0.1:9");
+                if locked {
+                    std::fs::write(dir.join("auth.lock"), "").expect("lock");
+                }
+                keep(&dir, Some(UNREACHABLE.into()));
+                assert!(sign_in.login(true).await.is_err());
+                assert_eq!(dir.exists(), locked, "locked: {locked}");
+                let _ = std::fs::remove_dir_all(&dir);
+            }
         });
     }
 
