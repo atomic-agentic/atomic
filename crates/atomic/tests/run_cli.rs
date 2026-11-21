@@ -2683,6 +2683,112 @@ fn a_gate_recovered_by_serve_keeps_its_first_deadline_and_is_approved_from_anoth
     });
 }
 
+/// A manifest that is there but will not load names no project: every
+/// command that reads the project's runs and gates refuses, saying so,
+/// rather than read them under another key and find none. Mended, the
+/// manifest finds them all again, the gate still open: nothing was stranded.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[test]
+fn a_broken_manifest_refuses_the_gate_and_run_commands_and_strands_nothing() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
+            .await
+            .expect("fake model");
+        let dir = scratch("broken-manifest");
+        let project = project(&dir);
+        let state = state_dir(&dir, &project);
+        let env = model_env(&model.base_url());
+        let mut first = spawn(
+            &dir,
+            &project,
+            &["run", "gated", "--run-id", "kept-1", "--data", NOTE],
+            &with(&env, &[]),
+            &dir.join("first.log"),
+        );
+        let rt = project_store(&state).await;
+        let opened = open_gate(&rt, "kept-1").await;
+        first.kill().expect("SIGKILL the run");
+        first.wait().expect("reap");
+
+        let manifest = project.join("atomic.yaml");
+        let good = std::fs::read_to_string(&manifest).expect("manifest");
+        std::fs::write(&manifest, "atomic: 1\nname: [notes\n").expect("broken");
+        let commands: Vec<Vec<String>> = [
+            vec!["gates", "list"],
+            vec!["gates", "list", "--all", "--json"],
+            vec!["gates", "approve", opened.id.as_str()],
+            vec!["gates", "reject", opened.id.as_str()],
+            vec!["runs", "show", "kept-1"],
+            vec!["runs", "resume", "kept-1"],
+            vec!["run", "gated", "--run-id", "kept-2", "--data", NOTE],
+        ]
+        .into_iter()
+        .map(|args| args.into_iter().map(str::to_owned).collect())
+        .collect();
+        for args in &commands {
+            let (d, p, e, a) = (dir.clone(), project.clone(), env.clone(), args.clone());
+            let out = tokio::task::spawn_blocking(move || {
+                let a: Vec<&str> = a.iter().map(String::as_str).collect();
+                atomic(
+                    &d,
+                    &p,
+                    &a,
+                    &with(&e, &[("ATOMIC_CREDENTIAL_STORE", "file")]),
+                    "",
+                )
+            })
+            .await
+            .expect("child");
+            let said = text(&out);
+            assert!(!out.status.success(), "{args:?} ran: {said}");
+            assert!(
+                (said.contains("manifest") || said.contains("atomic.yaml"))
+                    && !said.contains("no gate"),
+                "{args:?} did not name the manifest: {said}"
+            );
+        }
+        // Nothing was decided, run or recorded under another key.
+        assert_eq!(model.calls(), 1, "rank once, before the kill");
+        let still = gate::find(&rt, &opened.id)
+            .await
+            .expect("gate")
+            .expect("exists");
+        assert!(still.resolution.is_none(), "{:?}", still.resolution);
+        assert!(
+            rt.run_record("kept-2").await.expect("record").is_none(),
+            "a run started under the broken manifest"
+        );
+
+        std::fs::write(&manifest, good).expect("mended");
+        let (d, p, e) = (dir.clone(), project.clone(), env.clone());
+        let listed = tokio::task::spawn_blocking(move || {
+            atomic(&d, &p, &["gates", "list", "--json"], &with(&e, &[]), "")
+        })
+        .await
+        .expect("child");
+        assert!(listed.status.success(), "{}", text(&listed));
+        let listed = stdout_json(&listed);
+        assert_eq!(listed[0]["id"], json!(opened.id), "{listed}");
+        let (d, p, e) = (dir.clone(), project.clone(), env.clone());
+        let shown = tokio::task::spawn_blocking(move || {
+            atomic(
+                &d,
+                &p,
+                &["--json", "runs", "show", "kept-1"],
+                &with(&e, &[]),
+                "",
+            )
+        })
+        .await
+        .expect("child");
+        assert!(shown.status.success(), "{}", text(&shown));
+        assert_eq!(stdout_json(&shown)["status"], json!("unfinished"));
+    });
+}
+
 // needs_sandbox
 #[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]

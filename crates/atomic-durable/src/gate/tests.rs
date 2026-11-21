@@ -981,28 +981,65 @@ async fn a_project_sees_and_decides_only_its_own_gates_and_runs_on_postgres() {
 }
 
 /// A local SQLite store's runs recorded for no project, as before runs had
-/// one, become the project's when atomic opens the store for it: its gates
-/// are listed and its runs shown.
+/// one, or under an older name of the project's (`<old name>/<state id>`, as
+/// before its manifest was renamed), become the project's when atomic opens
+/// the store for it: their gates are listed and the runs shown. Another
+/// project's run is left as it is.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_private_stores_old_runs_become_the_projects() {
     let path = std::env::temp_dir().join(format!("{}.db", unique("atomic_gate_adopt")));
-    let mut old = Durare::sqlite(&path).await.expect("engine");
-    register(&mut old);
-    old.launch().await.expect("launch");
-    let (run, gate) = start_gated(&old, input(None)).await;
-    old.shutdown(Duration::from_secs(5))
-        .await
-        .expect("shutdown");
+    let database = crate::Database::Sqlite(path.clone());
+    // A run started for `key`, and its gate.
+    let started = |key: Option<&'static str>| {
+        let database = database.clone();
+        let path = path.clone();
+        async move {
+            let mut rt = match key {
+                Some(key) => Durare::open(&database, None, crate::DEFAULT_VERSION, key)
+                    .await
+                    .expect("engine"),
+                None => Durare::sqlite(&path).await.expect("engine"),
+            };
+            register(&mut rt);
+            rt.launch().await.expect("launch");
+            let started = start_gated(&rt, input(None)).await;
+            rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+            started
+        }
+    };
+    // Under an older name of the project, as before its manifest was
+    // renamed; another project's; and, last, one from before runs had a
+    // project.
+    let renamed = started(Some("old-name/the-project-0123")).await;
+    let foreign = started(Some("notes/another-project-4567")).await;
+    let unowned = started(None).await;
     let opened = Durare::open(
-        &crate::Database::Sqlite(path.clone()),
+        &database,
         None,
         crate::DEFAULT_VERSION,
-        "project-a",
+        "notes/the-project-0123",
     )
     .await
     .expect("engine");
-    assert!(opened.own_run_record(&run).await.expect("record").is_some());
-    assert!(find(&opened, &gate.id).await.expect("find").is_some());
+    for (run, gate) in [&unowned, &renamed] {
+        assert!(
+            opened.own_run_record(run).await.expect("record").is_some(),
+            "{run}"
+        );
+        assert!(
+            find(&opened, &gate.id).await.expect("find").is_some(),
+            "{run}"
+        );
+    }
+    let (run, gate) = &foreign;
+    assert!(
+        opened.own_run_record(run).await.expect("record").is_none(),
+        "{run}"
+    );
+    assert!(
+        find(&opened, &gate.id).await.expect("find").is_none(),
+        "{run}"
+    );
     opened
         .shutdown(Duration::from_secs(5))
         .await
