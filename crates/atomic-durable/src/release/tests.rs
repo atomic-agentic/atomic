@@ -614,7 +614,12 @@ async fn the_same_release_sent_twice_at_once_is_one_release_on_postgres() {
     let pause = pause_at("after_replay_check", &park);
     let (second_rt, second_cred, second_park) = (rt.clone(), mine.clone(), park.clone());
     let second = tokio::spawn(async move {
-        release_park(&*second_rt, &second_cred, command(&second_park, "twice", None)).await
+        release_park(
+            &*second_rt,
+            &second_cred,
+            command(&second_park, "twice", None),
+        )
+        .await
     });
     reached(&pause).await;
     let first = release_park(&*rt, &mine, command(&park, "twice", None))

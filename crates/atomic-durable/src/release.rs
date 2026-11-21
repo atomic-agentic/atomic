@@ -308,10 +308,12 @@ pub async fn release_park<R: DurableRuntime>(
                     .await?
                 {
                     // Released by this same command, committed since the
-                    // replay check above: on PostgreSQL each statement reads
-                    // what has committed by then, so the release and its
-                    // journal entry, committed together, are both seen now.
-                    // A replay, then, not a release someone else made.
+                    // replay check above: at PostgreSQL's read committed
+                    // isolation, which this transaction runs at, each
+                    // statement reads what has committed by its start, so
+                    // the release and its journal entry, committed
+                    // together, are both seen now. A replay, then, not a
+                    // release someone else made.
                     let replay = journaled(&mut tx, &cmd.command_id, &request).await?;
                     if let Some(found) = replay {
                         return Ok(found.map(|r| (r, false)));
