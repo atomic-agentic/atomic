@@ -43,7 +43,11 @@
 //!   is a second mount of the other, so neither is denied for the other,
 //!   nor refused;
 //! - a stale root on a filesystem that is not local, for a place not there
-//!   yet: its second place is only checked against it once it is.
+//!   yet: its second place is only checked against it once it is;
+//! - a stale root that makes a second mount look unrelated to a denied
+//!   place, on any filesystem, such as a bound overlay directory whose lower
+//!   directory was renamed beneath it: only the second places the table
+//!   gives are checked.
 
 use anyhow::bail;
 use std::path::{Path, PathBuf};
@@ -58,7 +62,8 @@ struct Mount {
     /// The filesystem's device, `major:minor`.
     device: String,
     /// The directory of the filesystem the mount shows; `None` when the
-    /// root is not a path, as a namespace file's is not.
+    /// root is not a path, as a namespace file's is not. A lost root holds
+    /// where it was.
     root: Option<PathBuf>,
     /// Where it is mounted.
     at: PathBuf,
@@ -271,11 +276,13 @@ fn aliases_of(
     let Some(first) = same.first() else {
         return Ok(());
     };
-    if !local(&home.kind)
-        && let Some(lost) = std::iter::once(home)
-            .chain(same.iter().copied())
-            .find(|m| m.lost)
-    {
+    // Only off a local filesystem is a lost root one that may name another
+    // directory than the mount shows.
+    let lost_here = !local(&home.kind);
+    let lost = std::iter::once(home)
+        .chain(same.iter().copied())
+        .find(|m| m.lost);
+    if lost_here && let Some(lost) = lost {
         bail!(
             "{} is on the {} filesystem seen at {}, that is mounted again at {}, and the kernel \
              no longer knows which directory the mount at {} shows, so atomic cannot deny it at \
@@ -306,14 +313,16 @@ fn aliases_of(
         let Some(other_root) = &other.root else {
             continue;
         };
-        let alias = if let Ok(below) = inside.strip_prefix(other_root) {
+        // The second place, and what it shows of the place: the place itself,
+        // or, for a mount of part of it, that part.
+        let (alias, shows) = if let Ok(below) = inside.strip_prefix(other_root) {
             if below.as_os_str().is_empty() {
-                other.at.clone()
+                (other.at.clone(), path.to_owned())
             } else {
-                other.at.join(below)
+                (other.at.join(below), path.to_owned())
             }
-        } else if other_root.starts_with(&inside) {
-            other.at.clone()
+        } else if let Ok(part) = other_root.strip_prefix(&inside) {
+            (other.at.clone(), path.join(part))
         } else {
             continue;
         };
@@ -323,9 +332,9 @@ fn aliases_of(
         // Off a local filesystem, a root may be stale with nothing in the
         // table to say so: an ancestor of it lost, or renamed on the server
         // and not checked again yet. Where the place is there, its second
-        // place must be the same file or directory.
+        // place must be the same file or directory as what it shows.
         if !local(&home.kind) {
-            same_file(path, &alias)?;
+            same_file(&shows, &alias)?;
         }
         out.push(alias);
     }
@@ -333,19 +342,49 @@ fn aliases_of(
 }
 
 /// Whether `alias` is the same file or directory as `path`, when `path` is
-/// there: refused when it is not there, or is another.
+/// there, neither followed through a link: refused when `alias` is not
+/// there, or is another, or either cannot be looked at.
+/// Whether looking at a path failed because nothing is there.
+#[cfg(unix)]
+fn not_there(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
+}
+
 fn same_file(path: &Path, alias: &Path) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let Ok(place) = std::fs::metadata(path) else {
-            return Ok(());
+        let place = match std::fs::symlink_metadata(path) {
+            Ok(place) => place,
+            // Not there yet: nothing to check it against.
+            Err(e) if not_there(&e) => return Ok(()),
+            Err(e) => bail!(
+                "{} cannot be looked at ({e}), so atomic cannot check that its second mount at {} \
+                 shows it; it cannot deny it at each",
+                path.display(),
+                alias.display()
+            ),
         };
-        match std::fs::metadata(alias) {
+        match std::fs::symlink_metadata(alias) {
             Ok(there) if (there.dev(), there.ino()) == (place.dev(), place.ino()) => Ok(()),
-            _ => bail!(
-                "{} should show {}, and does not, so the mount table's word for where that \
+            Ok(_) => bail!(
+                "{} should show {}, and shows another file or directory, so the mount table's \
+                 word for where that filesystem's mounts are is stale; atomic cannot deny it at \
+                 each",
+                alias.display(),
+                path.display()
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => bail!(
+                "{} should show {}, and is not there, so the mount table's word for where that \
                  filesystem's mounts are is stale; atomic cannot deny it at each",
+                alias.display(),
+                path.display()
+            ),
+            Err(e) => bail!(
+                "{} should show {}, and cannot be looked at ({e}); atomic cannot deny it at each",
                 alias.display(),
                 path.display()
             ),

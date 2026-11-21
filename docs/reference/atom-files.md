@@ -435,11 +435,15 @@ inside another, mounted twice as two filesystems, each with a device of its
 own, such as with 9p, NFS with `nosharecache` or with mount options that
 differ (each gets a superblock of its own), Ceph (one per server path), two
 SMB sessions or two FUSE daemons, neither of which is denied for the other;
-a stale root, off a local filesystem, for a place that is not there yet;
+a stale root, off a local filesystem, for a place that is not there yet,
+and one, on any filesystem, that makes a second mount look unrelated to a
+denied place, such as a bound overlay directory whose lower directory was
+renamed beneath it;
 a snapshot, which holds a copy, not the place itself; an overlay or FUSE
 filesystem built over a denied directory, such as an overlay whose upper or
 lower directory is inside one, which shows its files as its own; and a
-mount made after the list, such as one an automount makes when a path is
+mount made after the list, or a root that goes stale after it, such as a
+mount an automount makes when a path is
 first used, even from inside the sandbox, which sees the host's new mounts
 until the next turn. A turn does
 not start when a denial would cover its working directory or a directory it

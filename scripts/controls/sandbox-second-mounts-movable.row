@@ -1,0 +1,1 @@
+sandbox-second-mounts-movable|crates/atomic-core/src/codex.rs|        if deep_inside(&writable, alias).is_some() {|        if std::hint::black_box(false) && deep_inside(&writable, alias).is_some() {|-p atomic-agentic-core --lib --features fake-model a_second_mount_that_cannot_be_denied_refuses_the_list

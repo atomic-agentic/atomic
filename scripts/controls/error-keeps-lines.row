@@ -1,0 +1,1 @@
+error-keeps-lines|crates/atomic/src/failure.rs|crate::shown::block(&atomic_core::redact::text(text))|crate::shown::line(&atomic_core::redact::text(text)) /*CONTROL_OFF*/|-p atomic-agentic --bin atomic failure::tests::a_multi_line_error_keeps_its_lines_and_tabs
