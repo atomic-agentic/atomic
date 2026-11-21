@@ -102,6 +102,7 @@ fn spec(evidence: Vec<String>) -> Result<GateSpec, atomic_durable::DurableError>
         tier: Tier::High,
         timeout: None,
         on_timeout: OnTimeout::Reject,
+        question: None,
     })
 }
 
@@ -199,6 +200,7 @@ fn a_sweep_removes_what_nothing_keeps_and_keeps_what_gates_pin() {
                 verdict: Verdict::Approve,
                 comment: None,
                 proposal: g.proposal.clone(),
+                answer: None,
             },
         )
         .await

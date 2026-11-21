@@ -679,6 +679,7 @@ async fn decide(rt: &Durare, g: &gate::Gate, verdict: Verdict, comment: &str) {
             verdict,
             comment: Some(comment.into()),
             proposal: g.proposal.clone(),
+            answer: None,
         },
     )
     .await

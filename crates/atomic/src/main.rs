@@ -18,10 +18,12 @@ mod evals;
 mod failure;
 mod gates;
 mod init;
+mod prompt;
 mod runs;
 mod settings;
 mod setup;
 mod show;
+mod shown;
 mod skills;
 mod target;
 

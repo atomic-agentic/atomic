@@ -36,7 +36,9 @@ for gate deadlines, budgets and recovery limits.
 workflow, status, input and output; each attempt, which is each time the run
 executed, from its start or from its checkpoints; each recorded step with the
 attempt that ran it, so after a kill and a resume it shows which steps the
-resume found checkpointed and which it ran again; its model calls and tokens;
+resume found checkpointed and which it ran again; its model calls and tokens,
+counting what a Codex turn still running, or stopped before it settled, last
+recorded having reported;
 its gates; and the Codex threads that hold its transcripts. `--json` gives the
 same as one document, with each step's output. It reads the store alone, and
 runs nothing: it needs no model, does not take the project's execution lock,
@@ -160,6 +162,8 @@ authentication](../getting-started/authentication.md).
 | `atomic gates list` | Inspect durable gates | v0.1 local |
 | `atomic gates approve <gate-id>` | Approve a recorded proposal as the local operator | v0.1 local |
 | `atomic gates reject <gate-id>` | Reject a recorded proposal as the local operator | v0.1 local |
+| `atomic gates answer <gate-id> <answer>` | Answer a question gate as the local operator | v0.1 local |
+| The prompt in `atomic run` and `atomic runs resume` | Decide or answer each gate the run reaches, at the terminal | v0.1 local |
 | `atomic workflows show <name>` | Inspect a workflow definition and its steps | v0.5 |
 | `atomic graph` | Inspect work items, status and blocking dependencies | v0.5 |
 | Live thread controls | Answer, steer, stop and take over work | v0.5 CLI |
