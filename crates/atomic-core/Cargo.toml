@@ -24,6 +24,10 @@ workspace = true
 failpoints = []
 # The scripted fake model (atomic_core::testing), for other crates' tests.
 fake-model = []
+# ExecSandbox::reaching_loopback_for_tests, which lets a confined command
+# reach this machine's loopback interface on any port, for the sandbox suites
+# that serve on it. Never in a build that runs atoms.
+exec-loopback-tests = []
 
 [dependencies]
 anyhow = { workspace = true }
