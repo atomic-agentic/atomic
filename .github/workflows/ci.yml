@@ -264,9 +264,15 @@ jobs:
       # Each milestone's acceptance clauses, the tests that show each listed in
       # scripts/acceptance/; a listed test that fails, is ignored or no longer
       # runs fails the step.
+      - name: M42a acceptance
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: python3 scripts/acceptance.py m42a
       - name: M12 acceptance
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: python3 scripts/acceptance.py m12
+      - name: M35a acceptance
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: python3 scripts/acceptance.py m35a
       - name: M45 acceptance
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: python3 scripts/acceptance.py m45
