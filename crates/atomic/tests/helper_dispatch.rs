@@ -33,6 +33,11 @@ fn a_codex_helper_creates_nothing_under_its_home() {
             Path::new(env!("CARGO_BIN_EXE_atomic")).to_owned(),
             vec!["--codex-run-as-apply-patch"],
         ),
+        // The Linux sandbox helper run as atomic itself, by its arguments.
+        (
+            Path::new(env!("CARGO_BIN_EXE_atomic")).to_owned(),
+            vec!["--sandbox-policy-cwd", "/"],
+        ),
     ] {
         let _ = Command::new(&program)
             .args(&args)

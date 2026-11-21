@@ -2149,6 +2149,39 @@ fn only_atoms_that_run_commands_need_the_sandbox() {
             ),
             "a failure that may pass waits"
         );
+        // A helper that is not the helper, as when Codex ran atomic itself in
+        // its place, or bubblewrap could not run it by its name, fails the run
+        // at once rather than waiting for a sandbox that never starts.
+        for (name, says) in [
+            (
+                "atomic-itself",
+                "error: unexpected argument '--sandbox-policy-cwd' found",
+            ),
+            (
+                "no-argv0",
+                "bwrap: execvp codex-linux-sandbox: No such file or directory",
+            ),
+        ] {
+            use std::os::unix::fs::PermissionsExt;
+            let path = root.join(name);
+            std::fs::write(
+                &path,
+                format!("#!/bin/sh\ncat >&2 <<'SAID'\n{says}\nSAID\nexit 2\n"),
+            )
+            .expect("helper");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+            let other = CodexPaths::with_helpers(path.clone(), path);
+            let other = ExecSandbox::new(&other, StateGuard::NoProjectState, root.join("codex"))
+                .expect("a helper");
+            assert!(
+                matches!(
+                    atomic_exec::Confine::check(&other, &tmp),
+                    Err(atomic_exec::ExecError::Unconfinable { ref message })
+                        if message.contains("Codex's Linux sandbox helper could not be set up")
+                ),
+                "{name}: a helper that is not the helper waited"
+            );
+        }
         let sandbox = ExecSandbox::new(&paths, StateGuard::NoProjectState, root.join("codex"))
             .expect("a helper");
         let backend = atomic_exec::Backend::connect(
