@@ -393,7 +393,30 @@ pub fn without_values(message: &str) -> String {
     out
 }
 
+/// Why an environment value spelled like a number is refused instead of read:
+/// both halves of what the loader refuses among numbers, with the message the
+/// loader would give. `None` says the text is no refused number spelling.
+fn refused_as_a_number(text: &str) -> Option<yaml::Refusal> {
+    match yaml::refused_number(text) {
+        Some(why) => Some(why),
+        None => yaml::refused_one_version_number(text),
+    }
+}
+
+/// Parse an environment value as the type its default has.
+///
+/// A number spelled a way the loader refuses is refused first, whatever the
+/// setting's type, with the loader's own message. Every arm would otherwise read
+/// such a text its own way: `0200` is the number 200 to an integer setting, no
+/// number at all to a float one, and the text `0200` to an optional one, where
+/// YAML 1.1 reads the octal 128 and a file refuses the spelling outright. The
+/// numbers YAML 1.1 reads alone are no number to any arm, so `1_000` and `12:30`
+/// came through as the plain text for an optional setting and as a wrong type for
+/// a number one, while YAML 1.1 reads 1000 and 750 out of them.
 fn parse_like(target: &Value, raw: &str) -> Result<Value, String> {
+    if let Some(why) = refused_as_a_number(raw.trim()) {
+        return Err(why.as_value());
+    }
     match target {
         Value::Bool(_) => match raw.to_ascii_lowercase().as_str() {
             "true" | "1" => Ok(Value::Bool(true)),
@@ -419,22 +442,18 @@ fn parse_like(target: &Value, raw: &str) -> Result<Value, String> {
         // An optional setting (default null): read the value as a YAML
         // scalar, so numbers and booleans keep their type; else a string.
         //
-        // A spelling the loader refuses as an integer is refused here and not
-        // fallen back to a string. The fallback is faithful where every version
-        // reads the text as a string -- `yes`, `.inf` -- and was not here: this
-        // branch read `0200` as the number 200 until the loader began refusing
-        // that spelling, and a setting that changes its own type is worse than
-        // one that says what to write instead. The message names both fixes.
-        _ => {
-            if let Some(why) = yaml::refused_number(raw.trim()) {
-                return Err(why.as_value());
-            }
-            Ok(yaml::load(Path::new("environment"), raw)
-                .ok()
-                .map(|d| d.value)
-                .filter(|v| !v.is_object() && !v.is_array())
-                .unwrap_or_else(|| Value::String(raw.to_owned())))
-        }
+        // Falling back to the string is faithful where YAML 1.2 and JSON read
+        // the text as a string, which is what a refusal's "quote it" offers:
+        // `yes` is a boolean in YAML 1.1, not in 1.2, and `.inf` is a float in
+        // both that JSON has no form for. Neither is a number spelling, and
+        // those are refused above rather than fallen back — this branch once
+        // read `0200` as the number 200, and a setting that changes its own type
+        // is worse than one that says what to write instead.
+        _ => Ok(yaml::load(Path::new("environment"), raw)
+            .ok()
+            .map(|d| d.value)
+            .filter(|v| !v.is_object() && !v.is_array())
+            .unwrap_or_else(|| Value::String(raw.to_owned()))),
     }
 }
 

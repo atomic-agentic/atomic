@@ -2,9 +2,10 @@
 
 //! The restricted YAML loader for atom frontmatter, workflows and schemas.
 //!
-//! YAML here is a way to write JSON: anything that JSON cannot express, or that
-//! different YAML versions read differently, is refused at load with the file,
-//! line and column. The loader uses the YAML 1.2 core schema and rejects:
+//! YAML here is a way to write JSON: what JSON cannot express, and a plain
+//! scalar one YAML version reads as a number of one kind where the other reads
+//! a number of another kind or a string, is refused at load with the file, line
+//! and column. The loader uses the YAML 1.2 core schema and rejects:
 //!
 //! - duplicate keys, and keys that are neither a string nor a canonical
 //!   decimal integer (`true:`, `null:`, `1.5:`, and equally `+2:`, `007:` --
@@ -18,11 +19,16 @@
 //!   YAML 1.1 reads as booleans: quote them to mean the string;
 //! - plain numbers whose spelling YAML 1.1 and YAML 1.2 do not read the same
 //!   way: a leading zero (`0200` and `010`, which YAML 1.1 reads as 128 and
-//!   8), a sign written on either side of the base prefix (`0x-1F` and
-//!   `-0x1F`, which one version or the other reads as -31), and a number YAML
-//!   1.1 alone reads: binary (`0b11`), an underscore in a whole number
-//!   (`1_000`, `0x_1F`) and the sexagesimal `12:30`, which 1.1 reads as 3,
-//!   1000, 31 and 750 and 1.2 and JSON read as strings;
+//!   8), a sign written on either side of a base marker (`0x-1F` and `-0o17`,
+//!   which neither version reads as a number, and `-0x1F`, which only 1.1
+//!   reads, as -31), and a number YAML 1.1 alone reads: binary (`0b11`), an
+//!   underscore in a whole number (`1_000`, `0x_1F`) and the sexagesimal
+//!   (`12:30`), which 1.1 reads as 3, 1000, 31 and 750 and 1.2 and JSON read
+//!   as strings;
+//! - the same shapes in a float, which only YAML 1.1's float type takes: an
+//!   underscore among a float's digits (`1_000.5`, `.5_0`, `01_2.5`) and a
+//!   sexagesimal with a fraction (`1:30.5`), which 1.1 reads as 1000.5, 0.5,
+//!   12.5 and 90.5 and the core schema and JSON read as strings;
 //! - a base-8 or base-16 integer past signed 64 bits, which the core schema
 //!   reads as an integer this loader does not read as a number at all -- it
 //!   keeps the digits it was given, and only a decimal keeps its own digits
@@ -31,10 +37,21 @@
 //!
 //! Only `true` and `false` are booleans; `null`, `~` and an empty value are
 //! null; integers and floats follow the core schema, except where a bullet
-//! above refuses the spelling. A float with no dot and a signless exponent
-//! (`1e3`) is a number, as JSON and the core schema read it, where PyYAML
-//! reads it as a string. Quoting any refused spelling gives the string it is
-//! read as elsewhere.
+//! above refuses the spelling.
+//!
+//! Three spellings are read as the core schema reads them although YAML 1.1
+//! reads something else, and each is kept on purpose:
+//!
+//! - `0o17` is 15 and `0o200` is 128, where 1.1 writes an octal `017` and
+//!   `0200` and has no marker with an `o` in it, so PyYAML reads both as
+//!   strings;
+//! - `1e3` and `1.5e3` are the floats 1000 and 1500, as JSON and the core
+//!   schema read an exponent with no sign, where 1.1 takes an exponent only
+//!   with a sign and PyYAML reads both texts as strings;
+//! - `2001-12-14` stays the string it is written as, where 1.1 resolves an
+//!   unquoted date to a timestamp.
+//!
+//! Quoting any refused spelling gives the string it is read as elsewhere.
 
 use saphyr_parser::{Event, Parser, ScalarStyle, Span};
 use serde_json::{Map, Number, Value};
@@ -282,6 +299,25 @@ impl<'a> Loader<'a> {
                         {
                             Ok((text.into_owned(), at))
                         }
+                        // Digits that are their own text and say no dot and no
+                        // exponent, so they are a decimal, and no 64-bit integer
+                        // holds them: a decimal that long is still a number here,
+                        // the key would be renamed to it, and the same digits
+                        // quoted would be a second key. A float keeps the message
+                        // below, which says what it reads as and nothing about
+                        // how big a number a key may be.
+                        Core::Value(Value::Number(n))
+                            if n.to_string() == *text && !text.contains(['.', 'e', 'E']) =>
+                        {
+                            Err(self.error(
+                                at,
+                                format!(
+                                    "keys must be a string or a plain decimal integer a 64-bit \
+                                     integer can hold, and this one reads as the number {n}; \
+                                     quote it"
+                                ),
+                            ))
+                        }
                         Core::Value(other) => Err(self.error(
                             at,
                             format!(
@@ -366,9 +402,10 @@ fn core_scalar(text: &str) -> Core {
             None => Core::Refused(no_json(text)),
         };
     }
-    // Asked only once neither reading has made a number of the text, so that
-    // `1_000.5` stays the float the core schema reads and only a whole number
-    // spelled with an underscore is refused.
+    // Asked only once neither reading has made a number of the text, so that a
+    // float both readings agree on (`00.5`, `1.5e3`) is read as one before it
+    // can be refused: what this arm then takes is a shape only YAML 1.1 reads
+    // as a number, whether a whole one or a float.
     if let Some(why) = changed_across_yaml_versions(text) {
         return Core::Refused(why);
     }
@@ -461,9 +498,12 @@ fn sign_text(sign: Option<char>) -> &'static str {
     if sign == Some('-') { "-" } else { "" }
 }
 
-/// Whether `text` is not empty and every character of it satisfies `digit`.
-fn every(text: &str, digit: impl FnMut(char) -> bool) -> bool {
-    !text.is_empty() && text.chars().all(digit)
+/// Whether `text` is not empty and every character of it satisfies `keep`.
+/// Named for what it asks and not for a digit, because what it is asked of the
+/// characters is not always that they are digits: an underscore counts among
+/// YAML 1.1's digits and no radix parse takes one.
+fn all_chars(text: &str, keep: impl FnMut(char) -> bool) -> bool {
+    !text.is_empty() && text.chars().all(keep)
 }
 
 /// Whether `digits` is not empty and every character of it is a digit this
@@ -485,11 +525,11 @@ fn base_of(body: &str) -> (u32, &'static str, &'static str, &str) {
     (10, "decimal", "", body)
 }
 
-/// The number these digits say, with the sign in front, or nothing when no
-/// number can hold it or when nothing but underscores is left. Underscores are
-/// no part of the number, and a decimal's leading zeros are only how the digits
-/// were written.
-fn number_text(sign: Option<char>, digits: &str, radix: u32) -> Option<String> {
+/// The number these digits say with `sign` in front, or nothing when no signed
+/// 64-bit number holds them or when nothing but underscores is left.
+/// Underscores are no part of the number, and a decimal's leading zeros are
+/// only how the digits were written.
+fn signed_number(sign: Option<char>, digits: &str, radix: u32) -> Option<i64> {
     let mut bare = digits.replace('_', "");
     if radix == 10 {
         bare = bare.trim_start_matches('0').to_owned();
@@ -497,19 +537,24 @@ fn number_text(sign: Option<char>, digits: &str, radix: u32) -> Option<String> {
     if bare.is_empty() {
         return None;
     }
-    i64::from_str_radix(&format!("{}{bare}", sign_text(sign)), radix)
-        .ok()
-        .map(|n| n.to_string())
+    i64::from_str_radix(&format!("{}{bare}", sign_text(sign)), radix).ok()
+}
+
+/// The number these digits say, as the decimal text to write back, or nothing
+/// when no signed 64-bit number holds it.
+fn number_text(sign: Option<char>, digits: &str, radix: u32) -> Option<String> {
+    signed_number(sign, digits, radix).map(|n| n.to_string())
 }
 
 /// Core schema integers: decimal with an optional sign, `0o` octal, `0x` hex.
-/// A leading zero and a sign written on either side of the base prefix are
-/// refused rather than read, because YAML 1.1 and YAML 1.2 do not read them
-/// alike, and a base-8 or base-16 integer past signed 64 bits is refused
+/// A leading zero is refused rather than read because one version reads an
+/// octal where the other reads a decimal, and a sign written on either side of
+/// a base marker is refused because at most one version reads such a spelling
+/// as a number. A base-8 or base-16 integer past signed 64 bits is refused
 /// because this loader cannot read it as a number.
 fn core_int(text: &str) -> CoreInt {
     let (sign, body) = split_sign(text);
-    if every(body, |c| c.is_ascii_digit()) {
+    if all_chars(body, |c| c.is_ascii_digit()) {
         if body.len() > 1 && body.starts_with('0') {
             // YAML 1.2 reads the digits as decimal; YAML 1.1 reads them as an
             // octal, or as a string when a digit is no octal digit. The two do
@@ -568,19 +613,20 @@ fn core_int(text: &str) -> CoreInt {
     if radix == 10 || digits.is_empty() {
         // Nothing here is a base-8 or base-16 spelling, or the marker has no
         // digits after it: either way this is a string, as the core schema
-        // reads it. `every` says no to an empty body, so `-` and `+` on their
-        // own end up here too.
+        // reads it. `all_chars` says no to an empty body, so `-` and `+` on
+        // their own end up here too.
         return CoreInt::NotAnInt;
     }
     // Which side of the marker the sign sits on decides the message: only a
-    // sign before it is a number in YAML 1.1, and only a sign after it is a
-    // number in neither.
+    // sign before a `0x` is a number in YAML 1.1, whose integer rules take
+    // `[-+]?0x...` and have no class an `o` sits in; every other sign around a
+    // marker is no number in either version.
     let (inner_sign, inner_digits) = split_sign(digits);
     if inner_sign.is_some() && all_digits(inner_digits, radix) {
         return CoreInt::Refused(sign_around_prefix(
             text,
+            sign,
             inner_sign,
-            false,
             radix,
             name,
             marker,
@@ -589,7 +635,7 @@ fn core_int(text: &str) -> CoreInt {
     }
     if sign.is_some() && all_digits(digits, radix) {
         return CoreInt::Refused(sign_around_prefix(
-            text, sign, true, radix, name, marker, digits,
+            text, sign, None, radix, name, marker, digits,
         ));
     }
     match i64::from_str_radix(digits, radix) {
@@ -603,49 +649,72 @@ fn core_int(text: &str) -> CoreInt {
                 "{text} is a {name} integer past signed 64 bits, which this loader does not \
                  read as a number"
             ),
-            format!("write it in decimal, or quote it (\"{text}\")"),
+            // The number to write in decimal is the one these digits say, which
+            // is what a decimal that long reads as: only a decimal keeps its own
+            // digits past 64 bits. `u128` reaches that far; past even that the
+            // digits are out of reach and only the base can be named.
+            match u128::from_str_radix(digits, radix).ok() {
+                Some(n) => format!("write {n} in decimal, or quote it (\"{text}\") for the string"),
+                None => format!("write it in decimal, or quote it (\"{text}\")"),
+            },
         )),
     }
 }
 
-/// Why a sign written on the wrong side of a base marker is refused. `before`
-/// says which side: a sign before the marker is a number in YAML 1.1 and a
-/// string in the core schema, and a sign after it is no number in either.
-/// Either way the digits say the number the author meant.
+/// Why a sign written on the wrong side of a base marker is refused. `outer` is
+/// the sign before the marker and `inner` the one between the marker and its
+/// digits, and one of the two is present. Only a sign before a `0x` makes a
+/// number, in YAML 1.1 alone: its integer rules take `[-+]?0x[0-9a-fA-F_]+` and
+/// have no class an `o` sits in, so `-0x1F` is -31 there and a string in the
+/// core schema, while `-0o17`, `0x-1F` and `0o-17` are no number in either.
 fn sign_around_prefix(
     text: &str,
-    sign: Option<char>,
-    before: bool,
+    outer: Option<char>,
+    inner: Option<char>,
     radix: u32,
     name: &str,
     marker: &str,
     digits: &str,
 ) -> Refusal {
-    let number = number_text(sign, digits, radix);
-    let problem = if before {
-        format!(
+    // The number the digits say with the sign that touches them. Two signs, one
+    // on each side of the marker, say no one number, so none is named.
+    let number = match (outer, inner) {
+        (Some(_), Some(_)) => None,
+        _ => number_text(inner.or(outer), digits, radix),
+    };
+    let problem = match (outer, inner) {
+        (Some(_), Some(_)) => format!(
+            "unquoted {text:?} puts a sign on each side of its {marker}, which is no number in \
+             either YAML version"
+        ),
+        (Some(_), None) if radix == 16 => format!(
             "unquoted {text:?} puts a sign before its {name} prefix, which YAML 1.1 reads as {} \
              and YAML 1.2 as a string",
             number.as_deref().unwrap_or("a number")
-        )
-    } else {
-        format!(
+        ),
+        (Some(_), None) => format!(
+            "unquoted {text:?} puts a sign before its {marker} marker, which is no number in \
+             either YAML version"
+        ),
+        _ => format!(
             "unquoted {text:?} puts a sign after its {marker}, which is no number in either \
              YAML version"
-        )
+        ),
     };
     let fix = match &number {
         Some(n) => format!("write {n} for the number, or quote it (\"{text}\") for the string"),
-        // No number can hold these digits, so only the string can be offered.
+        // No number holds these digits, or two signs say which was meant, so
+        // only the string can be offered.
         None => format!("quote it (\"{text}\") for the string"),
     };
     Refusal::new(problem, fix)
 }
 
 /// A number that only YAML 1.1 reads, and the number it reads: binary (`0b11`),
-/// a whole number written with an underscore (`1_000`, `0x_1F`, `1000_`), or
-/// the sexagesimal `12:30`. YAML 1.1's integer type takes all three; the core
-/// schema and JSON read them as strings.
+/// a whole number written with an underscore (`1_000`, `0x_1F`, `1000_`), the
+/// sexagesimal `12:30`, or a float of the last two kinds (`1_000.5`, `.5_0`,
+/// `1:30.5`). YAML 1.1's integer and float types take all four; the core schema
+/// and JSON read them as strings.
 enum Yaml11 {
     Binary {
         sign: Option<char>,
@@ -661,6 +730,12 @@ enum Yaml11 {
     Sexagesimal {
         sign: Option<char>,
         value: Option<i128>,
+    },
+    /// A float, spelled with an underscore among its digits or as a
+    /// sexagesimal with a fraction, which only YAML 1.1's float type reads.
+    Float {
+        sign: Option<char>,
+        value: Option<f64>,
     },
 }
 
@@ -685,13 +760,141 @@ impl Yaml11 {
             Yaml11::Sexagesimal { sign, value } => {
                 value.map(|v| format!("{}{v}", sign_text(*sign)))
             }
+            Yaml11::Float { sign, value } => value.map(|v| format!("{}{v}", sign_text(*sign))),
         }
     }
 }
 
-/// What YAML 1.1's integer type reads this text as, if it reads it as a number
-/// at all. This follows the integer rules YAML 1.1 gives, which is what PyYAML
-/// resolves with and what `tools/check_examples.py` mirrors:
+/// The base-60 digit one group of a sexagesimal says, or nothing when the group
+/// is no `[0-5]?[0-9]`: two digits at most, and no underscore.
+fn sexagesimal_group(group: &str) -> Option<i128> {
+    match group.as_bytes() {
+        [d] if d.is_ascii_digit() => Some(i128::from(d - b'0')),
+        [f, s] if (b'0'..=b'5').contains(f) && s.is_ascii_digit() => {
+            Some(i128::from((f - b'0') * 10 + (s - b'0')))
+        }
+        _ => None,
+    }
+}
+
+/// What YAML 1.1's sexagesimal counts out of `head`, its text with no sign and
+/// nothing after the last group: the number it says, `None` where the head is no
+/// sexagesimal, and `Some(None)` for one whose groups say more than an `i128`
+/// can name. The head starts at 1 and counts every group after a colon in base
+/// 60, so `01:30`, `1:70` and `12:3a` are none; an underscore may sit anywhere
+/// after the first digit, never where the digit is, so `_1:30` is none either,
+/// and `1:2_0` is none because a group takes no underscore.
+fn sexagesimal(head: &str) -> Option<Option<i128>> {
+    let (first, rest) = head.split_once(':')?;
+    if !matches!(first.as_bytes().first(), Some(b'1'..=b'9')) {
+        return None;
+    }
+    let bare = first.replace('_', "");
+    if !all_chars(&bare, |c| c.is_ascii_digit()) {
+        return None;
+    }
+    let mut value: Option<i128> = bare.parse().ok();
+    for group in rest.split(':') {
+        let group = sexagesimal_group(group)?;
+        // A chain of groups Python's unbounded integers hold and no number here
+        // can name: still 1.1's number, still refused, only unnamed in the
+        // message.
+        value = match value {
+            Some(v) => v.checked_mul(60).and_then(|v| v.checked_add(group)),
+            None => None,
+        };
+    }
+    Some(value)
+}
+
+/// What YAML 1.1's float type makes of a plain scalar whose digits hold a dot,
+/// given the text before the first dot and all of it after. `None` says 1.1
+/// reads no float; otherwise the number it reads, or nothing when its groups say
+/// more than a number here can name. PyYAML resolves a float with these three
+/// alternatives, which take an exponent only with a sign and let an underscore
+/// sit anywhere among the digits:
+///
+/// ```text
+/// [-+]?[0-9][0-9_]*\.[0-9_]*([eE][-+][0-9]+)?
+///   |  [-+]?\.[0-9_]+([eE][-+][0-9]+)?
+///   |  [-+]?[0-9][0-9_]*(:[0-5]?[0-9])+\.[0-9_]*
+/// ```
+///
+/// [`core_float`], which is asked first, reads every text the first two
+/// alternatives say without an underscore in it, and reads the third's
+/// sexagesimal as a string. So what is left for here — the shapes the two
+/// readings disagree on — is an underscore among a float's digits and a
+/// sexagesimal with a fraction. A text whose underscores change nothing, like
+/// `._`, is a float to 1.1 by its type definition and one PyYAML cannot
+/// construct; the loader refuses it and names no number.
+fn yaml_11_float(sign: Option<char>, head: &str, tail: &str) -> Option<Yaml11> {
+    // An exponent belongs to the fraction, and YAML 1.1 takes one only with a
+    // sign: `1.5e3` is the float the core schema reads and YAML 1.1 reads as a
+    // string, which is the other way round and is not refused here.
+    let (frac, exponent) = match tail.find(['e', 'E']) {
+        Some(i) => {
+            // The sign is part of the shape: without it 1.1 reads no float and
+            // the text is a string to both readings, which is not refused.
+            let digits = tail[i + 1..].strip_prefix(['-', '+'])?;
+            if !all_chars(digits, |c| c.is_ascii_digit()) {
+                return None;
+            }
+            (&tail[..i], Some(&tail[i..]))
+        }
+        None => (tail, None),
+    };
+    // What counts as a float's digits: YAML 1.1 lets an underscore sit anywhere
+    // among them, and a radix parse takes none of them, so they are stripped
+    // before any number is read.
+    let float_digits = |part: &str| all_chars(part, |c| c.is_ascii_digit() || c == '_');
+    let bare = |part: &str| part.replace('_', "");
+    if head.contains(':') {
+        // The third alternative takes no exponent, and its fraction may be
+        // empty. Groups that say more than a number here can name leave the
+        // refusal to name only the difference.
+        let value = sexagesimal(head)?;
+        if exponent.is_some() || (!frac.is_empty() && !float_digits(frac)) {
+            return None;
+        }
+        let fraction = if frac.is_empty() {
+            0.0
+        } else {
+            match format!("0.{}", bare(frac)).parse::<f64>() {
+                Ok(f) => f,
+                Err(_) => return None,
+            }
+        };
+        return Some(Yaml11::Float {
+            sign,
+            value: value.map(|v| v as f64 + fraction),
+        });
+    }
+    if head.is_empty() {
+        // The second alternative, `\.[0-9_]+`: no digits before the dot and at
+        // least one after it. A fraction alone with no underscore at all is the
+        // float `core_float` has already read.
+        if frac.is_empty() || !float_digits(frac) {
+            return None;
+        }
+    } else {
+        // The first alternative: the whole part starts at a digit and may hold
+        // underscores anywhere after it, and the fraction may be empty.
+        let whole_ok =
+            matches!(head.as_bytes().first(), Some(b'0'..=b'9')) && float_digits(&bare(head));
+        if !whole_ok || (!frac.is_empty() && !float_digits(frac)) {
+            return None;
+        }
+    }
+    let text = format!("{}.{}{}", bare(head), bare(frac), exponent.unwrap_or(""));
+    Some(Yaml11::Float {
+        sign,
+        value: text.parse::<f64>().ok(),
+    })
+}
+
+/// What YAML 1.1's integer and float types read this text as, if either reads
+/// it as a number at all. This follows the integer rules YAML 1.1 gives, which
+/// is what PyYAML resolves with and what `tools/check_examples.py` mirrors:
 ///
 /// ```text
 /// [-+]?0b[0-1_]+  |  [-+]?0[0-7_]+  |  [-+]?(0|[1-9][0-9_]*)
@@ -702,15 +905,26 @@ impl Yaml11 {
 /// are numbers there and strings here, and only a leading underscore makes a
 /// string of both. A colon group is `[0-5]?[0-9]` and takes no underscore, and
 /// there is no `o` marker in this list: `0o17` is the core schema's octal, which
-/// [`core_int`] reads as 15. The shapes the core schema reads as numbers too --
-/// a plain decimal, a plain `0x` hex, a leading-zero octal -- are answered by
-/// [`core_int`] as well, which is asked first.
+/// [`core_int`] reads as 15. A dot goes to [`yaml_11_float`], since only YAML
+/// 1.1's float type takes the dotted shapes that reach here. The shapes the core
+/// schema reads as numbers too -- a plain decimal, a plain `0x` hex, a
+/// leading-zero octal -- are answered by [`core_int`] as well, which is asked
+/// first.
 fn yaml_11_int(text: &str) -> Option<Yaml11> {
     let (sign, body) = split_sign(text);
+    // A dot is asked about first, because the dotted shapes that get this far
+    // are ones `core_float` read no number out of: an underscore among the
+    // digits, or a sexagesimal with a fraction.
+    if let Some(dot) = body.find('.')
+        && let Some(one) = yaml_11_float(sign, &body[..dot], &body[dot + 1..])
+    {
+        return Some(one);
+    }
     if body.contains('o') {
-        // No class in that list holds an `o`, so nothing with one is a number
-        // YAML 1.1 reads. `0o17` is YAML 1.2's octal, which [`core_int`] reads
-        // as 15, and `0o7_7` is a string to both versions.
+        // No class in those two lists holds an `o`, so nothing with one is a
+        // number either of YAML 1.1's types reads. `0o17` is YAML 1.2's octal,
+        // which [`core_int`] reads as 15, and `0o7_7` and `0o19.5` are strings
+        // to both versions.
         return None;
     }
     match body.strip_prefix("0b") {
@@ -719,7 +933,7 @@ fn yaml_11_int(text: &str) -> Option<Yaml11> {
             // are strings to every version. An underscore alone after the
             // marker is in the class YAML 1.1 gives its binary integers, which
             // is why `0b_` is refused even though no number reads out of it.
-            let binary = every(digits, |c| c == '_' || c == '0' || c == '1');
+            let binary = all_chars(digits, |c| c == '_' || c == '0' || c == '1');
             return binary.then(|| Yaml11::Binary {
                 sign,
                 digits: digits.to_owned(),
@@ -731,41 +945,13 @@ fn yaml_11_int(text: &str) -> Option<Yaml11> {
             }
         }
     }
-    if let Some((first, rest)) = body.split_once(':') {
-        // The sexagesimal starts at 1 and counts every group after a colon in
-        // base 60, so `01:30`, `1:70` and `12:3a` are no sexagesimal and stay
-        // strings for both versions.
-        // An underscore may sit anywhere after that first digit, never where
-        // the digit is, so `_1:30` is no sexagesimal either.
-        if !matches!(first.as_bytes().first(), Some(b'1'..=b'9')) {
-            return None;
-        }
-        let head = first.replace('_', "");
-        if !every(&head, |c| c.is_ascii_digit()) {
-            return None;
-        }
-        let mut value: Option<i128> = head.parse().ok();
-        for group in rest.split(':') {
-            // A colon group is `[0-5]?[0-9]`: two digits at most, and no
-            // underscore, which the head allows and a group does not. So `1:70`
-            // and `1:2_0` are no sexagesimal, as PyYAML reads them too, and a
-            // group that does match is a base-60 digit by its shape.
-            let group = match group.as_bytes() {
-                [d] if d.is_ascii_digit() => i128::from(d - b'0'),
-                [f, s] if (b'0'..=b'5').contains(f) && s.is_ascii_digit() => {
-                    i128::from((f - b'0') * 10 + (s - b'0'))
-                }
-                _ => return None,
-            };
-            // A chain of groups Python's unbounded integers hold and no number
-            // here can name: still 1.1's number, still refused, only unnamed in
-            // the message.
-            value = match value {
-                Some(v) => v.checked_mul(60).and_then(|v| v.checked_add(group)),
-                None => None,
-            };
-        }
-        return Some(Yaml11::Sexagesimal { sign, value });
+    if body.contains(':') {
+        // `1:70`, `1:2_0`, `01:30` and `_1:30` are no sexagesimal and stay
+        // strings for both versions, as PyYAML reads them too.
+        return Some(Yaml11::Sexagesimal {
+            sign,
+            value: sexagesimal(body)?,
+        });
     }
     if !body.contains('_') {
         return None;
@@ -780,7 +966,7 @@ fn yaml_11_int(text: &str) -> Option<Yaml11> {
     // Hex takes a hex digit in any place, and an underscore after the `0x`
     // marker sits in its class, as it does after `0b`.
     let (read_as, head_ok) = if marker == "0x" {
-        (16, every(digits, |c| c == '_' || c.is_ascii_hexdigit()))
+        (16, all_chars(digits, |c| c == '_' || c.is_ascii_hexdigit()))
     } else if first == '0' {
         (8, true)
     } else {
@@ -812,18 +998,31 @@ fn changed_across_yaml_versions(text: &str) -> Option<Refusal> {
 }
 
 /// Why a plain (unquoted) scalar spelled like an integer is refused, with the
-/// message the loader would give it. A caller that reads one bare scalar — an
-/// environment value, say, where there is no file to point at — and falls back
-/// to a string when the loader refuses the spelling needs this: the string is
-/// what every version reads for `yes` or `.inf`, so nothing is lost, while for
-/// `0200` that fallback quietly turns the number 200 into a string. `None` says
-/// the text is no refused integer spelling, whether it is a number, a string or
-/// a refusal of another kind.
+/// message the loader would give it. [`refused_one_version_number`] is the other
+/// half: together the two are every number spelling [`core_scalar`] refuses.
+///
+/// A caller that reads one bare scalar — an environment value, say, where there
+/// is no file to point at — and falls back to a string when the loader refuses
+/// the spelling needs these. The fallback gives what YAML 1.2 and JSON read for
+/// `yes`, which is a boolean in YAML 1.1, and for `.inf`, which both YAML
+/// versions read as a float JSON has no form for; the caller may keep the string
+/// for those. It may not for `0200`, whose fallback quietly turns the number 200
+/// into a string. `None` says the text is no refused integer spelling, whether it
+/// is a number, a string or a refusal of another kind.
 pub fn refused_number(text: &str) -> Option<Refusal> {
     match core_int(text) {
         CoreInt::Refused(why) => Some(why),
         CoreInt::Number(_) | CoreInt::NotAnInt => None,
     }
+}
+
+/// Why a whole number or a float only YAML 1.1 reads is refused — `0b11`,
+/// `1_000`, `12:30`, `1_000.5` — with the message the loader would give it. The
+/// same caller needs this half too: its fallback reads these the way YAML 1.2
+/// and JSON do, as the string, while YAML 1.1 reads 3, 1000, 750 and 1000.5, and
+/// a file already refuses every one of them.
+pub fn refused_one_version_number(text: &str) -> Option<Refusal> {
+    changed_across_yaml_versions(text)
 }
 
 /// Core schema floats: `[-+]?(\.[0-9]+|[0-9]+(\.[0-9]*)?)([eE][-+]?[0-9]+)?`.

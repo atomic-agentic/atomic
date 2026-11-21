@@ -279,9 +279,17 @@ fn a_plain_key_is_read_or_refused_by_its_own_text() {
         ("18446744073709551616", "reads as"),
         ("0x-1F", "puts a sign after its 0x"),
         ("-0x1F", "puts a sign before its hexadecimal prefix"),
+        ("-0x-1F", "puts a sign on each side of its 0x"),
+        ("-0o17", "puts a sign before its 0o marker"),
+        (
+            "0x8000000000000000",
+            "is a hexadecimal integer past signed 64 bits",
+        ),
         ("1_000", "is a number in YAML 1.1"),
         ("0b11", "is a number in YAML 1.1"),
         ("12:30", "is a number in YAML 1.1"),
+        ("1_000.5", "is a number in YAML 1.1"),
+        ("1:30.5", "is a number in YAML 1.1"),
         ("yes", "is a boolean in YAML 1.1"),
         (".inf", "cannot be written in JSON"),
     ] {
@@ -297,6 +305,18 @@ fn a_plain_key_is_read_or_refused_by_its_own_text() {
         // Quoted, the same text is an ordinary key.
         assert_eq!(
             ok(&format!("\"{spelling}\": a\n")).value,
+            json!({spelling: "a"}),
+            "{spelling}"
+        );
+    }
+    // A base marker with a sign in the wrong place is only refused while the
+    // digits are of that base: with an `8` in an octal or a letter in one there
+    // is no number to be read either way, and the key is the string it reads as.
+    // `tools/check_examples.py` classifies these the same way, which is what
+    // keeps its `0x`-and-`0o` rule from refusing spellings the loader reads.
+    for spelling in ["-0o19", "0o-8", "+0oF", "0o7_7"] {
+        assert_eq!(
+            ok(&format!("{spelling}: a\n")).value,
             json!({spelling: "a"}),
             "{spelling}"
         );
@@ -407,40 +427,80 @@ fn a_sign_after_the_base_prefix_is_refused() {
 }
 
 /// A sign before the base prefix is the other mistake in the same place, and
-/// this one is a real difference between the versions: YAML 1.1's integer rules
-/// take the sign before the digits of any base, so PyYAML reads `-0x1F` as -31
-/// where the core schema reads the text as a string. Refusing it is the whole
-/// point of this loader, so it is refused rather than read as a string.
+/// only some spellings of it are a real difference between the versions: YAML
+/// 1.1's integer rules take the sign before a `0x`, so PyYAML reads `-0x1F` as
+/// -31 where the core schema reads the text as a string. YAML 1.1 writes an
+/// octal `017` and has no marker with an `o` in it at all, so `-0o17` is no
+/// number in either version and is refused for that reason and not for a
+/// difference. Either way the loader refuses rather than read a number, and
+/// quoting is the fix. Two signs say no one number, so none is named.
 #[test]
 fn a_sign_before_the_base_prefix_is_refused() {
-    for (text, name, number) in [
-        ("a: -0x1F\n", "hexadecimal", "-31"),
-        ("a: +0x1F\n", "hexadecimal", "31"),
-        ("a: -0o17\n", "octal", "-15"),
-        ("a: +0o17\n", "octal", "15"),
+    for (text, says, number) in [
+        (
+            "a: -0x1F\n",
+            "hexadecimal prefix, which YAML 1.1 reads as -31 and YAML 1.2 as a string",
+            Some("-31"),
+        ),
+        (
+            "a: +0x1F\n",
+            "hexadecimal prefix, which YAML 1.1 reads as 31 and YAML 1.2 as a string",
+            Some("31"),
+        ),
+        (
+            "a: -0o17\n",
+            "0o marker, which is no number in either YAML version",
+            Some("-15"),
+        ),
+        (
+            "a: +0o17\n",
+            "0o marker, which is no number in either YAML version",
+            Some("15"),
+        ),
     ] {
         let e = err(text);
+        let spelling = text.trim_start_matches("a: ").trim_end();
         assert!(
             e.message
-                .contains(&format!("puts a sign before its {name} prefix")),
+                .contains(&format!("puts a sign before its {says}")),
             "{text:?}: {e}"
         );
+        let fix = match number {
+            Some(n) => {
+                format!("write {n} for the number, or quote it (\"{spelling}\") for the string")
+            }
+            None => format!("quote it (\"{spelling}\") for the string"),
+        };
+        assert!(e.message.contains(&fix), "{text:?}: {e}");
+        assert_eq!(e.at, at(1, 4), "{text:?}: {e}");
+        assert_eq!(
+            ok(&format!("a: \"{spelling}\"\n")).value,
+            json!({"a": spelling}),
+            "{text:?}"
+        );
+    }
+    // A sign on each side of the marker is no number in either version, and the
+    // two signs say no one number, so the message offers only the string.
+    for (text, marker) in [("a: -0x-1F\n", "0x"), ("a: +0o+7\n", "0o")] {
+        let e = err(text);
+        let spelling = text.trim_start_matches("a: ").trim_end();
         assert!(
             e.message.contains(&format!(
-                "which YAML 1.1 reads as {number} and YAML 1.2 as a string; write {number} for \
-                 the number, or quote it ({:?}) for the string",
-                text.trim_start_matches("a: ").trim_end()
+                "puts a sign on each side of its {marker}, which is no number in either YAML \
+                 version"
             )),
             "{text:?}: {e}"
         );
+        assert!(
+            e.message
+                .contains(&format!("quote it (\"{spelling}\") for the string")),
+            "{text:?}: {e}"
+        );
+        assert!(!e.message.contains("write "), "{text:?}: {e}");
         assert_eq!(e.at, at(1, 4), "{text:?}: {e}");
         assert_eq!(
-            ok(&format!(
-                "a: \"{}\"\n",
-                text.trim_start_matches("a: ").trim_end()
-            ))
-            .value,
-            json!({"a": text.trim_start_matches("a: ").trim_end()}),
+            ok(&format!("a: \"{spelling}\"\n")).value,
+            json!({"a": spelling}),
             "{text:?}"
         );
     }
@@ -455,7 +515,9 @@ fn a_sign_before_the_base_prefix_is_refused() {
 /// Three shapes YAML 1.1's integer type reads and the YAML 1.2 core schema and
 /// JSON read as strings: binary, an underscore in a whole number, and the
 /// sexagesimal. The loader refuses all three and names the number 1.1 reads, so
-/// that an author who meant a number has it written the other way.
+/// that an author who meant a number has it written the other way. The same
+/// three in a float, which only YAML 1.1's float type reads, are refused the
+/// same way.
 #[test]
 fn a_number_only_one_yaml_version_reads_is_refused() {
     for (spelling, number) in [
@@ -479,6 +541,18 @@ fn a_number_only_one_yaml_version_reads_is_refused() {
         // and a group may keep its leading zero.
         ("1_2:30", "750"),
         ("1:07", "67"),
+        // A float with an underscore in its digits, which the core schema's
+        // float has no place for, and a sexagesimal with a fraction, which the
+        // core schema has no place for at all. An exponent still needs its own
+        // sign in YAML 1.1, so `1.5e3` is read as a float and 1_0.5e+3 refused.
+        ("1_000.5", "1000.5"),
+        ("-1_000.5", "-1000.5"),
+        ("01_2.5", "12.5"),
+        (".5_0", "0.5"),
+        ("1:30.5", "90.5"),
+        ("-1:30.5", "-90.5"),
+        ("1:30.", "90"),
+        ("1_0.5e+3", "10500"),
     ] {
         let e = err(&format!("a: {spelling}\n"));
         assert!(
@@ -546,19 +620,33 @@ fn a_number_only_one_yaml_version_reads_is_refused() {
         );
         assert!(!e.message.contains("write "), "{spelling}: {e}");
     }
-    // An underscore in a float is no integer spelling, so no rule here reads it:
-    // the core schema and JSON read this text as a string, and the loader reads
-    // it as one. YAML 1.1's float type takes the underscore and PyYAML reads
-    // 1000.5, so the same difference exists on the float side; the loader does
-    // not refuse it yet, and the refusal is filed as a follow-up.
-    assert_eq!(ok("a: 1_000.5\n").value, json!({"a": "1_000.5"}));
-    assert_eq!(ok("a: -1_000.5\n").value, json!({"a": "-1_000.5"}));
+    // An underscore among a float's digits makes it a float in YAML 1.1 and
+    // leaves it a string in the core schema, so both readings of the number have
+    // to be named; and a float whose underscores change nothing is refused too,
+    // where PyYAML resolves the tag and then fails to construct the number.
+    let e = err("a: ._\n");
+    assert!(
+        e.message
+            .contains("is a number in YAML 1.1 and a string in YAML 1.2 and JSON"),
+        "{e}"
+    );
+    assert!(!e.message.contains("write "), "{e}");
     // `0o` is YAML 1.2's octal marker and YAML 1.1 has no such thing: `0o17` is
     // 15 to the core schema and a string to 1.1, so the loader reads the number
-    // and says nothing about a difference. An underscore in it is a string to
-    // both, since no class 1.1 gives its integers holds an `o`.
+    // and says nothing about a difference. An underscore in it, or a fraction on
+    // it, is a string to both, since no class either of 1.1's number types gives
+    // holds an `o`.
     assert_eq!(ok("a: 0o17\n").value, json!({"a": 15}));
     assert_eq!(ok("a: 0o7_7\n").value, json!({"a": "0o7_7"}));
+    assert_eq!(ok("a: 0o19.5\n").value, json!({"a": "0o19.5"}));
+    assert_eq!(ok("a: 0b10.5\n").value, json!({"a": "0b10.5"}));
+    // Two dots, or a colon group that is no sexagesimal with a fraction on it,
+    // are no float of either reading: the core schema reads the text as a string
+    // and so does the loader.
+    assert_eq!(
+        ok("a: 1.2.3\nb: 12:3a\nc: 1_0.5e3\n").value,
+        json!({"a": "1.2.3", "b": "12:3a", "c": "1_0.5e3"})
+    );
     // A number with underscores in it is refused as a value too, and a flow
     // sequence has no key to name.
     let e = err("a: [1_000]\n");
@@ -573,16 +661,25 @@ fn a_number_only_one_yaml_version_reads_is_refused() {
 /// The core schema reads a base-8 or base-16 integer of any size; this loader
 /// has no number to read one past signed 64 bits as, so it refuses it rather
 /// than read it as a string. A decimal that large is still a number, as JSON
-/// reads it.
+/// reads it, which is why the refusal names the decimal these digits say.
 #[test]
 fn a_base_integer_past_signed_64_bits_is_refused() {
-    // One past i64's last value in each base.
-    let hex = format!("a: 0x1{}\n", "0".repeat(16));
-    let octal = format!("a: 0o1{}\n", "0".repeat(21));
-    for (text, name) in [
-        ("a: 0xFFFFFFFFFFFFFFFF\n", "hexadecimal"),
-        (hex.as_str(), "hexadecimal"),
-        (octal.as_str(), "octal"),
+    // 2^63, the first value past i64's last, and past it in each base.
+    let hex_past = format!("a: 0x1{}\n", "0".repeat(16));
+    let octal_past = format!("a: 0o1{}\n", "0".repeat(21));
+    for (text, name, decimal) in [
+        (
+            "a: 0x8000000000000000\n",
+            "hexadecimal",
+            "9223372036854775808",
+        ),
+        (
+            "a: 0xFFFFFFFFFFFFFFFF\n",
+            "hexadecimal",
+            "18446744073709551615",
+        ),
+        (hex_past.as_str(), "hexadecimal", "18446744073709551616"),
+        (octal_past.as_str(), "octal", "9223372036854775808"),
     ] {
         let e = err(text);
         assert!(
@@ -593,7 +690,7 @@ fn a_base_integer_past_signed_64_bits_is_refused() {
         let spelling = text.trim_start_matches("a: ").trim_end();
         assert!(
             e.message.contains(&format!(
-                "write it in decimal, or quote it (\"{spelling}\")"
+                "write {decimal} in decimal, or quote it (\"{spelling}\")"
             )),
             "{text:?}: {e}"
         );
@@ -639,12 +736,16 @@ fn a_base_integer_past_signed_64_bits_is_refused() {
         serde_json::from_str::<Value>(&format!("{{\"a\": {huge}}}")).expect("json"),
         "a decimal no float can hold"
     );
+    // A decimal that long is no key, and says so as the size that is the
+    // problem and not as a number that was read oddly.
+    let says = "keys must be a string or a plain decimal integer a 64-bit integer \
+                can hold, and this one reads as the number ";
     let e = err(&format!("{huge}: a\n"));
     assert!(
-        e.message
-            .starts_with("keys must be a string or a plain decimal integer, and this one reads as"),
+        e.message.starts_with(says),
         "a decimal past 64 bits is no key"
     );
+    assert!(e.message.ends_with("; quote it"), "{e}");
 }
 
 /// A flow mapping's keys are read by the same rule as a block mapping's, so an

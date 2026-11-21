@@ -43,40 +43,73 @@ CORE_INT = re.compile(r"^[-+]?(?:0|[1-9][0-9]*|0o[0-7]+|0x[0-9a-fA-F]+)$")
 CORE_FLOAT = re.compile(r"^[-+]?(\.[0-9]+|[0-9]+(\.[0-9]*)?)([eE][-+]?[0-9]+)?$")
 CANONICAL_INT = re.compile(r"^(?:0|-?[1-9][0-9]*)$")
 LEADING_ZERO_INT = re.compile(r"^[-+]?0[0-9]+$")
-# A sign on the wrong side of the base marker: `-0x1F`, which YAML 1.1 reads as
-# a number where 1.2 reads a string, and `0x-1F`, which no version reads as a
-# number at all. Both are refused, and quoting is the fix either way.
-SIGN_ON_A_BASE_MARKER = re.compile(r"^(?:[-+]0[ox][0-9a-fA-F]+|0[ox][-+][0-9a-fA-F]+)$")
+# A sign on either side of the base marker: `-0x1F`, which YAML 1.1 reads as a
+# number where 1.2 reads a string, and `0x-1F`, `-0o17` and `-0x-1F`, which no
+# version reads as a number. All are refused, and quoting is the fix either way.
+# A sign must actually be there, on one side or the other: `0x1F` and `0o17` are
+# plain core-schema numbers and are refused below as ones. And the digits must be
+# of that base, or no version reads a number and the text is the string it reads
+# as: `-0o19`, `0o-8` and `+0oF` name no number and are ordinary keys.
+SIGN_ON_A_BASE_MARKER = re.compile(r"^(?=.*[-+])[-+]?0(?:x[-+]?[0-9a-fA-F]+|o[-+]?[0-7]+)$")
 INF_OR_NAN = re.compile(r"^(?:[-+]?\.(?:inf|Inf|INF)|\.(?:nan|NaN|NAN))$")
 YAML_11_BOOLS = {"yes", "no", "on", "off"}
 # YAML 1.1's integer rules exactly as PyYAML resolves them, in the order its
 # resolver tries them. An underscore counts anywhere after the first digit, so
 # `1000_` and `0x_1F` are integers to it, and a sexagesimal starts at 1 and
 # counts its groups in base 60. `0o` is absent because YAML 1.1 writes an octal
-# `0777` or `o777`, never `0o777`: PyYAML reads `0o7_7` as a string, and the
-# loader refuses that spelling only because 1.1's own type definition has an
-# `o` marker an underscore may sit in.
+# `0777` or `o777`, never `0o777`: PyYAML reads `0o7_7` and `0o19.5` as strings,
+# and the loader reads them as the strings they are and refuses neither.
 YAML_11_BINARY = re.compile(r"0b[01_]+$")
 YAML_11_SEXAGESIMAL = re.compile(r"[1-9][0-9_]*(?::[0-5]?[0-9])+$")
 YAML_11_OTHER = re.compile(r"(?:0x[0-9a-fA-F_]+|0[0-7_]+|0|[1-9][0-9_]*)$")
+# The floats YAML 1.1's type definition takes and the core schema's does not: a
+# dot with an underscore among the digits on either side of it, and a sexagesimal
+# with a fraction. An exponent goes the other way -- YAML 1.1 wants a sign on it
+# and the core schema does not, so `1e3` and `1.5e3` are floats to the loader and
+# strings to PyYAML, which is a difference the loader keeps -- which is why
+# `CORE_FLOAT` answers those texts before these rules are asked.
+YAML_11_FLOAT = re.compile(r"(?:[0-9][0-9_]*\.[0-9_]*|\.[0-9_]+)(?:[eE][-+][0-9]+)?$")
+# The sexagesimal float, with the same head `sexagesimal` in the loader takes: it
+# starts at 1, so `01:30.5` is no sexagesimal there and stays a string. PyYAML's
+# own float rule starts at 0, resolves that spelling and then fails to construct
+# it, which is a crash and not a divergence, and not something to copy here.
+YAML_11_SEXAGESIMAL_FLOAT = re.compile(r"[1-9][0-9_]*(?::[0-5]?[0-9])+\.[0-9_]*$")
 
 
-def one_version_integer(spelling):
-    """Whether YAML 1.1 alone reads this plain scalar as an integer.
+def one_version_number(spelling):
+    """Whether YAML 1.1 alone reads this plain scalar as a number.
 
-    Binary (`0b11`), a whole number with an underscore in it (`1_000`,
-    `0x_1F`, `07_7`) and the sexagesimal (`12:30`) are integers to YAML 1.1 and
-    strings to the core schema and JSON. A spelling both read as an integer is
+    Binary (`0b11`), a whole number with an underscore in it (`1_000`, `0x_1F`,
+    `07_7`) and the sexagesimal (`12:30`) are integers to YAML 1.1 and strings to
+    the core schema and JSON. So are a float with an underscore among its digits
+    (`1_000.5`, `.5_0`) and a sexagesimal with a fraction (`1:30.5`), which only
+    YAML 1.1's float type takes. A spelling both readings make a number of is
     left out: the loader has already read it as one or refused it for its own
-    reason. `yaml_11_int` in the loader is the same rule.
+    reason. `yaml_11_int` and `yaml_11_float` in the loader are the same rules.
     """
-    if CORE_INT.match(spelling) or LEADING_ZERO_INT.match(spelling) or SIGN_ON_A_BASE_MARKER.match(spelling):
+    if (
+        CORE_INT.match(spelling)
+        or LEADING_ZERO_INT.match(spelling)
+        or SIGN_ON_A_BASE_MARKER.match(spelling)
+    ):
         return False
     digits = re.sub(r"^[-+]", "", spelling)
     if YAML_11_BINARY.match(digits):
         return True
     if ":" in digits:
-        return YAML_11_SEXAGESIMAL.match(digits) is not None
+        return (
+            YAML_11_SEXAGESIMAL.match(digits) is not None
+            or YAML_11_SEXAGESIMAL_FLOAT.match(digits) is not None
+        )
+    if CORE_FLOAT.match(digits):
+        # A number the loader reads as a float. It is the same float to YAML 1.1
+        # unless the exponent carries no sign -- `1e3` and `1.5e3` are strings to
+        # PyYAML -- and the loader keeps that difference rather than refusing it.
+        # Nothing 1.1 reads alone reaches here: its own floats have an underscore
+        # or a colon in them, which no core-schema float spelling has.
+        return False
+    if "." in digits:
+        return YAML_11_FLOAT.match(digits) is not None
     return "_" in digits and YAML_11_OTHER.match(digits) is not None
 
 
@@ -100,12 +133,14 @@ def mapping_key(loader, key_node, deep):
 
     The loader takes a plain key that is a canonical decimal integer -- `0` or
     `-?[1-9][0-9]*` -- as its own text, so an OpenAPI spec's `200:` is the
-    property name "200" and one key with `"200":`. Every other plain integer
-    spelling is refused there, because the key would be renamed to the number
-    some version reads, and quoting is the fix. That is judged from the key's
-    own text and not from what PyYAML constructs, since PyYAML follows YAML 1.1:
-    it reads `200:` as the integer 200, `0200:` as an octal, 128, `08:` as a
-    string, `0o17:` as a string and `12:30:` as the integer 750.
+    property name "200" and one key with `"200":`. Every other plain spelling
+    the loader reads as a number is refused there, because the key would be
+    renamed to that number, and quoting is the fix. A plain spelling no version
+    reads as a number at all is an ordinary key, `-0o19:` among them. All of it
+    is judged from the key's own text and not from what PyYAML constructs, since
+    PyYAML follows YAML 1.1: it reads `200:` as the integer 200, `0200:` as an
+    octal, 128, `08:` as a string, `0o17:` as a string and `12:30:` as the
+    integer 750.
 
     A key the loader reads as neither a string nor a number -- `true:`, `null:`
     -- is left as PyYAML constructs it, because `json_model` is what reports
@@ -126,10 +161,13 @@ def mapping_key(loader, key_node, deep):
         elif SIGN_ON_A_BASE_MARKER.match(spelling):
             reason = "puts a sign on the wrong side of its base marker"
         elif LEADING_ZERO_INT.match(spelling):
-            reason = "has a leading zero, which YAML 1.1 reads as an octal"
+            reason = (
+                "has a leading zero, which YAML 1.1 reads as an octal or as a "
+                "string and YAML 1.2 as decimal"
+            )
         elif CORE_INT.match(spelling) or CORE_FLOAT.match(spelling):
-            reason = "is a number, so the key would be renamed to it"
-        elif one_version_integer(spelling):
+            reason = "is a number the loader reads, so the key would be renamed to it"
+        elif one_version_number(spelling):
             reason = "is a number in YAML 1.1 and a string in YAML 1.2 and JSON"
         require(
             reason is None,
@@ -640,44 +678,70 @@ def check_yaml_loader_mirror():
         # A number the core schema reads is no key either: the key would be
         # renamed to the number and would no longer match its quoted form. This
         # is where the loader's own message says what the key reads as.
-        ("+2: a\n", "is a number, so the key would be renamed to it"),
-        ("-0: a\n", "is a number, so the key would be renamed to it"),
-        ("0x1F: a\n", "is a number, so the key would be renamed to it"),
-        ("0o17: a\n", "is a number, so the key would be renamed to it"),
-        ("1.5: a\n", "is a number, so the key would be renamed to it"),
+        ("+2: a\n", "is a number the loader reads, so the key would be renamed to it"),
+        ("-0: a\n", "is a number the loader reads, so the key would be renamed to it"),
+        ("0x1F: a\n", "is a number the loader reads, so the key would be renamed to it"),
+        ("0o17: a\n", "is a number the loader reads, so the key would be renamed to it"),
+        ("1.5: a\n", "is a number the loader reads, so the key would be renamed to it"),
         # 1e3 is a float to JSON and to the core schema and a string to PyYAML.
-        ("1e3: a\n", "is a number, so the key would be renamed to it"),
-        # Past what a 64-bit integer holds the loader reads a float, where
-        # PyYAML, with Python's integers, reads the digits as an integer.
+        ("1e3: a\n", "is a number the loader reads, so the key would be renamed to it"),
+        # Past what a 64-bit integer holds the loader still reads the digits as a
+        # number, keeping them as written, where PyYAML, with Python's
+        # integers, reads an integer too. A base marker past 64 bits is refused
+        # for the size and not read at all.
         (
             "99999999999999999999: a\n",
-            "is a number, so the key would be renamed to it",
+            "is a number the loader reads, so the key would be renamed to it",
         ),
         (
             "18446744073709551616: a\n",
-            "is a number, so the key would be renamed to it",
+            "is a number the loader reads, so the key would be renamed to it",
         ),
-        # A sign on the wrong side of the base marker: `-0x1F` is -31 to 1.1 and
-        # a string to 1.2, and `0x-1F` is no number to either.
+        (
+            "0x8000000000000000: a\n",
+            "is a number the loader reads, so the key would be renamed to it",
+        ),
+        # A sign on either side of the base marker: `-0x1F` is -31 to 1.1 and a
+        # string to 1.2, and `0x-1F`, `-0o17` and `-0x-1F` are no number to
+        # either version, which is why the loader refuses them and not reads.
         ("-0x1F: a\n", "puts a sign on the wrong side of its base marker"),
         ("0x-1F: a\n", "puts a sign on the wrong side of its base marker"),
+        ("-0x-1F: a\n", "puts a sign on the wrong side of its base marker"),
+        ("-0o17: a\n", "puts a sign on the wrong side of its base marker"),
+        ("+0o+7: a\n", "puts a sign on the wrong side of its base marker"),
         # Only YAML 1.1 reads these as numbers: binary, an underscore in a whole
-        # number, and the sexagesimal. PyYAML reads all three as integers, so a
-        # mirror that only looked at what PyYAML constructs would call `0o17` a
-        # string and `12:30` the integer 750 and let both through.
+        # number, the sexagesimal, and the same shapes in a float. PyYAML reads
+        # all of them as numbers, so a mirror that only looked at what PyYAML
+        # constructs would call `0o17` a string and `12:30` the integer 750 and
+        # let both through.
         ("0b11: a\n", "is a number in YAML 1.1 and a string in YAML 1.2 and JSON"),
         ("1_000: a\n", "is a number in YAML 1.1 and a string in YAML 1.2 and JSON"),
         ("12:30: a\n", "is a number in YAML 1.1 and a string in YAML 1.2 and JSON"),
+        ("1_000.5: a\n", "is a number in YAML 1.1 and a string in YAML 1.2 and JSON"),
+        (".5_0: a\n", "is a number in YAML 1.1 and a string in YAML 1.2 and JSON"),
+        ("1:30.5: a\n", "is a number in YAML 1.1 and a string in YAML 1.2 and JSON"),
         # And the boolean words YAML 1.1 resolves, and what JSON cannot hold.
         ("yes: a\n", "is a boolean in YAML 1.1 and a string in YAML 1.2"),
         (".inf: a\n", "cannot be written in JSON"),
     ]:
         checks += refused(text, why)
+    # A base marker with a sign in the wrong place is refused only while the
+    # digits are of that base. With an `8` in an octal, a letter in one or an
+    # underscore, no version reads a number, and the key is the string the loader
+    # reads. A date is a string to the loader too, but PyYAML resolves it as a
+    # timestamp, so it is not a key this table can compare against text.
+    for spelling in ("-0o19", "0o-8", "+0oF", "0o7_7"):
+        require(
+            read_yaml(f"{spelling}: ok\n") == {spelling: "ok"},
+            f"the plain key {spelling} is refused; no version reads it as a number",
+        )
+        checks += 1
     # Quoted, every one of those spellings is the string it is read as, and
     # quoting is the fix the message gives.
     for spelling in (
-        "0200", "08", "00", "-00", "0x1F", "0o17", "1e3", "-0x1F", "0x-1F", "0b11", "1_000",
-        "12:30", "yes", "99999999999999999999",
+        "0200", "08", "00", "-00", "0x1F", "0o17", "1e3", "-0x1F", "0x-1F", "-0x-1F", "-0o17",
+        "-0o19", "0o-8", "+0oF", "0b11", "1_000", "1_000.5", "12:30", "yes",
+        "99999999999999999999",
     ):
         require(
             read_yaml(f"\"{spelling}\": ok\n") == {spelling: "ok"},

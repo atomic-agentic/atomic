@@ -209,38 +209,81 @@ fn a_bad_environment_value_is_refused() {
     ));
 }
 
-/// A value for an optional setting is read as a YAML scalar, and the string it
-/// falls back to is faithful only where every YAML version reads that text as a
-/// string. `0200` is not such a spelling: this branch read it as the number 200
-/// until the loader began refusing it, so it is refused here too, with the
-/// loader's own message.
+/// A number spelled a way the loader refuses is refused by the variable's own
+/// name before any arm reads it, whatever the setting's type: an integer setting
+/// would read `0200` as the number 200, and the string an optional setting falls
+/// back to would say `1_000` where YAML 1.1 reads 1000. A file refuses every one
+/// of these spellings, so the message is the loader's own.
 #[test]
 fn an_environment_value_refused_as_a_number_is_refused_by_name() {
     let d = dir(&[]);
-    for (value, why) in [
-        ("0200", "has a leading zero"),
-        ("007", "write 7, or 0o7 for octal"),
-        ("-0x1F", "puts a sign before its hexadecimal prefix"),
-        ("0x-1F", "puts a sign after its 0x"),
+    for (setting, value, why) in [
+        ("ATOMIC_MODEL_TIMEOUT_SECS", "0200", "has a leading zero"),
+        (
+            "ATOMIC_MODEL_TIMEOUT_SECS",
+            "007",
+            "write 7, or 0o7 for octal",
+        ),
+        (
+            "ATOMIC_MODEL_TIMEOUT_SECS",
+            "-0x1F",
+            "puts a sign before its hexadecimal prefix",
+        ),
+        (
+            "ATOMIC_MODEL_TIMEOUT_SECS",
+            "0x-1F",
+            "puts a sign after its 0x",
+        ),
+        // Numbers YAML 1.1 reads alone, which used to fall back to a string.
+        (
+            "ATOMIC_MODEL_TIMEOUT_SECS",
+            "0b11",
+            "is a number in YAML 1.1",
+        ),
+        (
+            "ATOMIC_MODEL_TIMEOUT_SECS",
+            "1_000",
+            "write 1000 for the number",
+        ),
+        (
+            "ATOMIC_MODEL_TIMEOUT_SECS",
+            "12:30",
+            "write 750 for the number",
+        ),
+        (
+            "ATOMIC_MODEL_TIMEOUT_SECS",
+            "1_000.5",
+            "write 1000.5 for the number",
+        ),
+        // A setting whose own default is a number read `0200` as 200, and one
+        // whose default is a string took the text as it stands: both are
+        // refused, and the refusal says which variable it is about.
+        ("ATOMIC_RETRIES", "0200", "has a leading zero"),
+        ("ATOMIC_RETRIES", "0b11", "is a number in YAML 1.1"),
+        ("ATOMIC_MODEL_BASE_URL", "0200", "has a leading zero"),
+        ("ATOMIC_MODEL_BASE_URL", "1_000", "is a number in YAML 1.1"),
     ] {
-        match load(&d, None, &[("ATOMIC_MODEL_TIMEOUT_SECS", value)], vec![]) {
-            Err(ConfigError::Value { message, .. }) => {
-                assert!(message.contains(why), "{value}: {message}");
-                assert!(message.contains("quote it"), "{value}: {message}");
+        match load(&d, None, &[(setting, value)], vec![]) {
+            Err(ConfigError::Value { name, message }) => {
+                assert_eq!(name, setting, "{value}: {message}");
+                assert!(message.contains(why), "{setting}={value}: {message}");
+                assert!(message.contains("quote it"), "{setting}={value}: {message}");
             }
-            other => panic!("expected a value error for {value:?}, got {other:?}"),
+            other => panic!("expected a value error for {setting}={value:?}, got {other:?}"),
         }
     }
-    // Every other refused spelling is a string to both YAML versions, so the
-    // fallback gives what a file would give for the quoted form, and a number
-    // or a bool keeps its type as it always did.
-    let d = dir(&[]);
+    // A refusal that is no number spelling still gives the string a file gives
+    // for its quoted form, which is what YAML 1.2 and JSON read: `yes` is a
+    // boolean only in YAML 1.1, and `.inf` is a float in both versions that JSON
+    // has no form for. A number or a bool keeps its type as it always did.
     let r = load(&d, None, &[("ATOMIC_MODEL_NAME", "yes")], vec![]).expect("load");
     assert_eq!(r.config.model.name.as_deref(), Some("yes"));
     let r = load(&d, None, &[("ATOMIC_MODEL_NAME", ".inf")], vec![]).expect("load");
     assert_eq!(r.config.model.name.as_deref(), Some(".inf"));
-    let r = load(&d, None, &[("ATOMIC_MODEL_NAME", "1_000")], vec![]).expect("load");
-    assert_eq!(r.config.model.name.as_deref(), Some("1_000"));
+    let r = load(&d, None, &[("ATOMIC_MODEL_TIMEOUT_SECS", "30")], vec![]).expect("load");
+    assert_eq!(r.config.model.timeout_secs, Some(30));
+    let r = load(&d, None, &[("ATOMIC_MODEL_TIMEOUT_SECS", "0o20")], vec![]).expect("load");
+    assert_eq!(r.config.model.timeout_secs, Some(16));
 }
 
 #[test]

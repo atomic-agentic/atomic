@@ -78,22 +78,32 @@ file is missing, but no command names one yet. The `--profile` flag on
 ### How files merge
 
 Files are YAML, read with atomic's restricted loader: no anchors, aliases, tags
-or duplicate keys, and no plain scalar whose spelling YAML 1.1 and YAML 1.2 do
+or duplicate keys, and no plain number whose spelling YAML 1.1 and YAML 1.2 do
 not read the same way. Plain `yes`, `no`, `on` and `off` are refused, so quote
 them, and so is every one of these numbers:
 
 - one with a leading zero (`0200`, which YAML 1.1 reads as an octal, 128, and
   YAML 1.2 as decimal; `007`, which both read as 7, is refused for the same
   spelling);
-- a sign written on either side of a base prefix (`-0x1F`, which YAML 1.1 reads
-  as -31, and `0x-1F`, which no version reads as a number);
+- a sign written on either side of a base marker (`-0x1F`, which YAML 1.1 reads
+  as -31 and no other version does; `0x-1F`, `-0o17` and a sign on each side of
+  the marker, which no version reads as a number at all);
 - one YAML 1.1 reads alone: binary (`0b11`), an underscore in a whole number
-  (`1_000`, `0x_1F`) and the sexagesimal (`12:30`, which 1.1 reads as 750).
+  (`1_000`, `0x_1F`) and the sexagesimal (`12:30`, which 1.1 reads as 750);
+- the same shapes in a float, which only YAML 1.1's float type reads: an
+  underscore among a float's digits (`1_000.5`, `.5_0`) and a sexagesimal with a
+  fraction (`1:30.5`, which 1.1 reads as 90.5).
 
 Quoting any of them gives the string it is read as elsewhere, and `0o200` and
-`0x1F` are the ways to write an octal and a hexadecimal. Mappings merge key by
-key; any other value replaces the one below it. A setting atomic does not know is
-an error that names the file and the line, so a typo is never silently ignored.
+`0x1F` are the ways to write an octal and a hexadecimal. Three plain scalars are
+read as the loader's own YAML 1.2 core schema reads them although YAML 1.1 reads
+something else, and each is kept on purpose: `0o200` is 128, where 1.1 writes an
+octal `0200` and has no marker with an `o` in it; `1e3` and `1.5e3` are the
+floats 1000 and 1500, where 1.1 takes an exponent only with a sign; and a date
+such as `2001-12-14` stays the string it is written as, where 1.1 resolves an
+unquoted date to a timestamp. Mappings merge key by key; any other value replaces
+the one below it. A setting atomic does not know is an error that names the file
+and the line, so a typo is never silently ignored.
 
 ### How a variable names a setting
 
@@ -106,10 +116,16 @@ variable set to the empty string sets nothing, as if it were unset.
 A value takes the setting's type: `true` or `false` (or `1` and `0`) for
 switches, a number for numbers, JSON for lists and sections. A variable atomic
 cannot read as its setting's type is refused by its own name, before the layers
-are merged, and so is a number spelled a way the loader refuses: `0200` names
-its leading zero rather than quietly becoming the text `0200`. A variable for a
-string setting is taken as the string it holds, so `ATOMIC_EXECUTOR_ID=1` is the
-identity `1`.
+are merged. So is a number spelled a way the loader refuses, whatever the
+setting's type: `ATOMIC_RETRIES=0200` names its leading zero instead of quietly
+becoming the number 200, and `ATOMIC_MODEL_NAME=1_000` says what YAML 1.1 reads,
+1000, instead of taking the string. An optional setting reads its value as a YAML
+scalar, so `ATOMIC_MODEL_TIMEOUT_SECS=30` is the number 30, and where that
+refuses a text that is no number spelling the value is the string, which is what
+YAML 1.2 and JSON read it as: `yes`, which YAML 1.1 reads as a boolean, and
+`.inf`, which both read as a float JSON has no form for. A variable for a string
+setting is taken as the string it holds, so `ATOMIC_EXECUTOR_ID=1` is the
+identity `1`, and only a refused number spelling is refused there too.
 
 ## What nothing sets
 
