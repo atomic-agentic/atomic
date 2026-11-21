@@ -335,6 +335,24 @@ run honest git-hardening
 [ ! -e "${repo}/cargo-args" ] || fail "a row file with two rows: cargo ran"
 
 repo="$(fresh)"
+printf '%s\n' 'git-hardening|crates/atomic-core/src/git.rs|a || b|c|args' \
+    >"${repo}/scripts/controls/git-hardening.row"
+run honest git-hardening
+[ "${code}" -eq 1 ] &&
+    grep -q "scripts/controls/git-hardening.row has 6 '|' separators, not the 4 between its five fields" <<<"${out}" ||
+    fail "a row whose field holds a '|': exit ${code}: ${out}"
+[ ! -e "${repo}/cargo-args" ] || fail "a row whose field holds a '|': cargo ran"
+
+repo="$(fresh)"
+printf '%s\n' 'git-hardening|crates/atomic-core/src/git.rs|a|args' \
+    >"${repo}/scripts/controls/git-hardening.row"
+run honest git-hardening
+[ "${code}" -eq 1 ] &&
+    grep -q "scripts/controls/git-hardening.row has 3 '|' separators, not the 4 between its five fields" <<<"${out}" ||
+    fail "a row missing a field: exit ${code}: ${out}"
+[ ! -e "${repo}/cargo-args" ] || fail "a row missing a field: cargo ran"
+
+repo="$(fresh)"
 : >"${repo}/scripts/controls/git-hardening.row"
 run honest git-hardening
 [ "${code}" -eq 1 ] &&

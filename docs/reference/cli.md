@@ -164,6 +164,8 @@ authentication](../getting-started/authentication.md).
 | `atomic gates reject <gate-id>` | Reject a recorded proposal as the local operator | v0.1 local |
 | `atomic gates answer <gate-id> <answer>` | Answer a question gate as the local operator | v0.1 local |
 | The prompt in `atomic run` and `atomic runs resume` | Decide or answer each gate the run reaches, at the terminal | v0.1 local |
+| `atomic parks list` | List the runs parked on a budget cap and not yet released | v0.1 local |
+| `atomic parks release <park-id>` | Release a parked run as the local operator, with your enrolled credential; `--tokens`, `--minutes` and `--cost-usd` raise the refusing allowance first (`--scope` names another of the run's own), `--comment` is recorded, `--command-id` makes a repeat safe | v0.1 local, Linux |
 | `atomic workflows show <name>` | Inspect a workflow definition and its steps | v0.5 |
 | `atomic graph` | Inspect work items, status and blocking dependencies | v0.5 |
 | Live thread controls | Answer, steer, stop and take over work | v0.5 CLI |

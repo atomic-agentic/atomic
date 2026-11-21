@@ -1,0 +1,1 @@
+lite-no-redirect|crates/atomic-core/src/lite.rs|        .redirect(reqwest::redirect::Policy::none());|        .redirect(reqwest::redirect::Policy::limited(10));|-p atomic-agentic-core --test model_client the_model_client_keeps_the_key_off_proxies_and_redirects
