@@ -409,7 +409,10 @@ pub async fn run(
             f.commit
         );
     }
-    engine.rt.start(PIPELINE, &run_id, run).await?;
+    // What its input names is kept from a sweep until the input is recorded.
+    let store = atomic_core::artifact::LocalStore::for_project(&state)?;
+    atomic_app::retention::start_keeping_input(&store, &engine.rt, PIPELINE, &run_id, run).await?;
+    drop(store);
     finish(&engine, &state, &run_id, json, &mut signals, "atomic run").await
 }
 

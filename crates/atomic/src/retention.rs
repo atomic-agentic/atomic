@@ -27,10 +27,19 @@
 //! (eval cases, cassettes, reports) refers to artifacts no run records, so
 //! only the caller's keep set covers it.
 //!
+//! A run's input can name content stored long before the run starts. Until
+//! the input is recorded, no reading of the runs finds it, so a sweep that
+//! read the runs before then could remove it: [`start_keeping_input`] holds
+//! what the input names, and marks it as just written, while the run is
+//! admitted and its input recorded.
+//!
 //! Nothing sweeps on its own: a caller decides when.
 
-use atomic_core::artifact::{ArtifactRef, Grace, LocalStore, Swept};
+use atomic_core::artifact::{
+    ArtifactRef, ArtifactStore, Grace, Hold, LocalStore, Refreshed, Swept,
+};
 use atomic_durable::{DurableRuntime, Durare};
+use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeSet, HashSet};
 
@@ -226,10 +235,241 @@ pub async fn sweep(
     )
 }
 
+/// Start run `id` of workflow `name` on `input`, keeping every artifact
+/// `store` holds that the input names from every sweep until the run, and
+/// so its input, is recorded. Each is held first, so a sweep that takes the
+/// store's lock from then on keeps it; then marked as just written, so a
+/// sweep that read the runs before the run existed, and takes the lock once
+/// the hold is let go, keeps it by its grace. One a sweep removed before the
+/// hold refuses the run, before anything is recorded.
+pub async fn start_keeping_input<I>(
+    store: &LocalStore,
+    rt: &Durare,
+    name: &str,
+    id: &str,
+    input: I,
+) -> anyhow::Result<()>
+where
+    I: Serialize + Send,
+{
+    start_keeping_input_then(store, rt, name, id, input, || {}).await
+}
+
+/// [`start_keeping_input`], calling `between` once the input's artifacts
+/// are held and before they are marked: [`start_keeping_input`] calls
+/// nothing there, and this module's tests sweep there, as a sweep that
+/// takes the store's lock in that window would.
+async fn start_keeping_input_then<I>(
+    store: &LocalStore,
+    rt: &Durare,
+    name: &str,
+    id: &str,
+    input: I,
+    between: impl FnOnce(),
+) -> anyhow::Result<()>
+where
+    I: Serialize + Send,
+{
+    let named = serde_json::to_value(&input)?;
+    let held = {
+        let store = store.clone();
+        tokio::task::spawn_blocking(move || hold_named(&store, &named)).await??
+    };
+    between();
+    {
+        let store = store.clone();
+        let artifacts: Vec<ArtifactRef> = held.iter().map(|(a, _)| a.clone()).collect();
+        tokio::task::spawn_blocking(move || mark_named(&store, &artifacts)).await??;
+    }
+    rt.start(name, id, input).await?;
+    // The input is recorded: a reading of the runs finds it from now on.
+    drop(held);
+    Ok(())
+}
+
+/// A hold on every artifact `store` holds that `input` names.
+fn hold_named(store: &LocalStore, input: &Value) -> anyhow::Result<Vec<(ArtifactRef, Hold)>> {
+    let present: HashSet<String> = store
+        .stored()?
+        .into_iter()
+        .map(|a| a.digest().to_owned())
+        .collect();
+    let mut named = BTreeSet::new();
+    references(input, &present, &mut named);
+    let mut held = Vec::with_capacity(named.len());
+    for artifact in named {
+        let hold = store.hold(&artifact)?;
+        held.push((artifact, hold));
+    }
+    Ok(held)
+}
+
+/// Mark each of `artifacts` as just written; one no longer stored refuses
+/// the run.
+fn mark_named(store: &LocalStore, artifacts: &[ArtifactRef]) -> anyhow::Result<()> {
+    for artifact in artifacts {
+        if store.refresh(artifact)? == Refreshed::Missing {
+            anyhow::bail!(
+                "the run's input names {artifact}, which a sweep of the artifact store removed \
+                 as the run started; store it again, then start the run"
+            );
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use atomic_core::artifact::{ArtifactStore, Provenance};
+
+    /// A store with one artifact in it written an hour ago, and a durable
+    /// runtime with a workflow that does nothing, launched.
+    async fn racing(name: &str) -> (std::path::PathBuf, Durare, LocalStore, ArtifactRef) {
+        let dir =
+            std::env::temp_dir().join(format!("atomic-retention-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let mut rt = Durare::sqlite(&dir.join("atomic.db")).await.expect("store");
+        rt.register(
+            "noop",
+            |_ctx: atomic_durable::DurareContext, _input: Value| async move { Ok(()) },
+        );
+        rt.launch().await.expect("launch");
+        let store = LocalStore::open(dir.join("artifacts")).expect("artifacts");
+        let input = store
+            .put(
+                &mut &b"stored well before the run"[..],
+                Provenance::default(),
+            )
+            .expect("put")
+            .artifact;
+        for blob in store.stored().expect("stored") {
+            let path = dir
+                .join("artifacts/blobs/sha256")
+                .join(&blob.digest()[..2])
+                .join(&blob.digest()[2..]);
+            std::fs::File::open(&path)
+                .and_then(|f| {
+                    f.set_modified(
+                        std::time::SystemTime::now() - std::time::Duration::from_secs(3600),
+                    )
+                })
+                .expect("backdate");
+        }
+        (dir, rt, store, input)
+    }
+
+    /// A sweep that read the runs before a run existed, and takes the
+    /// store's lock while the run is admitted, keeps what the run's input
+    /// names: it is held.
+    #[test]
+    fn a_sweep_during_admission_keeps_what_the_input_names() {
+        atomic_core::testing::on_codex_runtime(async {
+            let (dir, rt, store, input) = racing("admitting").await;
+            let kept = read_kept(&store, &rt, &BTreeSet::new())
+                .await
+                .expect("read");
+            let swept = std::sync::Mutex::new(None);
+            start_keeping_input_then(
+                &store,
+                &rt,
+                "noop",
+                "run-1",
+                serde_json::json!({ "file": input.to_string() }),
+                || {
+                    let done = store.sweep(&kept.artifacts, Grace::none_for_tests(), kept.read_at);
+                    *swept.lock().expect("lock") = Some(done.expect("sweep"));
+                },
+            )
+            .await
+            .expect("admitted");
+            let swept = swept.lock().expect("lock").take().expect("swept");
+            assert!(swept.removed.is_empty(), "{swept:?}");
+            assert!(
+                store.contains(&input).expect("contains"),
+                "removed during admission"
+            );
+            rt.shutdown(std::time::Duration::from_secs(5))
+                .await
+                .expect("shutdown");
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    /// A sweep that read the runs before a run existed, and takes the
+    /// store's lock once the run is admitted and its hold let go, keeps what
+    /// the run's input names: it was marked as just written.
+    #[test]
+    fn a_sweep_after_admission_keeps_what_the_input_names() {
+        atomic_core::testing::on_codex_runtime(async {
+            let (dir, rt, store, input) = racing("admitted").await;
+            let kept = read_kept(&store, &rt, &BTreeSet::new())
+                .await
+                .expect("read");
+            start_keeping_input(
+                &store,
+                &rt,
+                "noop",
+                "run-1",
+                serde_json::json!({ "file": input.to_string() }),
+            )
+            .await
+            .expect("admitted");
+            let swept = store
+                .sweep(&kept.artifacts, Grace::none_for_tests(), kept.read_at)
+                .expect("sweep");
+            assert!(swept.removed.is_empty(), "{swept:?}");
+            assert!(
+                store.contains(&input).expect("contains"),
+                "removed after admission"
+            );
+            rt.shutdown(std::time::Duration::from_secs(5))
+                .await
+                .expect("shutdown");
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    /// A run whose input names content a sweep removed before the run was
+    /// admitted is refused, and nothing is recorded.
+    #[test]
+    fn a_run_naming_swept_content_is_refused() {
+        atomic_core::testing::on_codex_runtime(async {
+            let (dir, rt, store, input) = racing("swept").await;
+            let error = start_keeping_input_then(
+                &store,
+                &rt,
+                "noop",
+                "run-1",
+                serde_json::json!({ "file": input.to_string() }),
+                || {
+                    // As if a sweep finished just before the hold was taken.
+                    let blob = dir
+                        .join("artifacts/blobs/sha256")
+                        .join(&input.digest()[..2])
+                        .join(&input.digest()[2..]);
+                    std::fs::remove_file(blob).expect("remove");
+                },
+            )
+            .await
+            .expect_err("refused");
+            assert!(
+                error
+                    .to_string()
+                    .contains("a sweep of the artifact store removed"),
+                "{error}"
+            );
+            assert!(
+                rt.run_record("run-1").await.expect("record").is_none(),
+                "recorded"
+            );
+            rt.shutdown(std::time::Duration::from_secs(5))
+                .await
+                .expect("shutdown");
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
 
     /// The holds are read before the runs: a step that records its
     /// reference and lets its hold go while the sweep reads the runs, after
