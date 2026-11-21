@@ -46,7 +46,7 @@ use atomic_durable::{DurableRuntime, Durare, RunStatus};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 #[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
 mod support;
@@ -2044,6 +2044,81 @@ fn a_gate_decided_while_its_run_was_down_wakes_it_on_resume() {
             .await
             .expect("child");
         assert!(status.success());
+    });
+}
+
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[test]
+fn atomic_run_keeps_what_its_input_names_from_a_sweep_that_read_the_runs_before_it() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
+            .await
+            .expect("fake model");
+        let dir = scratch("input-sweep");
+        let project = project(&dir);
+        let state = state_dir(&dir, &project);
+        // The project's store, as `atomic run` opens it: its lock in the
+        // home's private directory.
+        let private = dir.join("atomic-home/private");
+        std::fs::create_dir_all(&private).expect("private");
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &private,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .expect("private");
+        let store =
+            atomic_core::artifact::LocalStore::open(state.join("artifacts")).expect("store");
+        let stored = atomic_core::artifact::ArtifactStore::put(
+            &store,
+            &mut &b"stored well before the run"[..],
+            atomic_core::artifact::Provenance::default(),
+        )
+        .expect("put")
+        .artifact;
+        // Written an hour ago, well past any grace.
+        let blob = state
+            .join("artifacts/blobs/sha256")
+            .join(&stored.digest()[..2])
+            .join(&stored.digest()[2..]);
+        std::fs::File::open(&blob)
+            .and_then(|f| f.set_modified(SystemTime::now() - Duration::from_secs(3600)))
+            .expect("backdate");
+        // A sweep that read the runs, and found nothing to keep, before the
+        // run existed.
+        let stale = atomic_app::retention::Kept {
+            artifacts: Default::default(),
+            read_at: SystemTime::now(),
+        };
+        let (d, p, e) = (dir.clone(), project.clone(), model_env(&model.base_url()));
+        let data = json!({ "text": format!("Exporting {stored} crashes the app.") }).to_string();
+        let out = tokio::task::spawn_blocking(move || {
+            atomic(
+                &d,
+                &p,
+                &["run", "triage", "--run-id", "named-1", "--data", &data],
+                &with(&e, &[]),
+                "",
+            )
+        })
+        .await
+        .expect("child");
+        assert!(out.status.success(), "{}", text(&out));
+        let swept = store
+            .sweep(
+                &stale.artifacts,
+                atomic_core::artifact::Grace::none_for_tests(),
+                stale.read_at,
+            )
+            .expect("sweep");
+        assert!(swept.removed.is_empty(), "{swept:?}");
+        assert!(
+            atomic_core::artifact::ArtifactStore::contains(&store, &stored).expect("contains"),
+            "the sweep removed what the run's input names"
+        );
     });
 }
 

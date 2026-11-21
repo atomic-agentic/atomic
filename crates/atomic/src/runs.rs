@@ -410,9 +410,26 @@ pub async fn run(
         );
     }
     // What its input names is kept from a sweep until the input is recorded.
-    let store = atomic_core::artifact::LocalStore::for_project(&state)?;
-    atomic_app::retention::start_keeping_input(&store, &engine.rt, PIPELINE, &run_id, run).await?;
-    drop(store);
+    use atomic_app::retention::start_keeping_input as admit;
+    let admitted = admit(&engine.artifacts, &engine.rt, PIPELINE, &run_id, run).await;
+    if let Err(e) = admitted {
+        let refused = e
+            .downcast_ref::<atomic_app::retention::InputRefused>()
+            .map(|r| match r {
+                atomic_app::retention::InputRefused::Absent(_) => Failure::new(
+                    "run.input_missing",
+                    r.to_string(),
+                    "store the content again, or name content the store holds, then start the run",
+                ),
+                atomic_app::retention::InputRefused::Locked(_) => Failure::new(
+                    "store.locked",
+                    r.to_string(),
+                    "let the sweep finish, or stop it, then start the run again",
+                ),
+            });
+        let _ = engine.rt.shutdown(SHUTDOWN).await;
+        return Err(refused.map_or(e, Into::into));
+    }
     finish(&engine, &state, &run_id, json, &mut signals, "atomic run").await
 }
 

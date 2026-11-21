@@ -87,6 +87,15 @@ a command hands over are stored after it has run: a store held then is
 waited out a few times, and past that the step's outcome is unknown, as
 after a crash there.
 
+`atomic run` keeps the content its input names from a sweep until the input
+is recorded. Before the run starts, it holds each artifact the input names
+and marks it as just written, under the store's lock: a sweep holding the
+lock is waited for once, for the store's 30-second wait, and the run is
+refused (`store.locked`) if it is held longer. An input that names, as
+`artifact://sha256/…`, content the store does not hold, or content a sweep
+removed after the store was listed, is refused (`run.input_missing`). Either
+way nothing is recorded.
+
 `atomic serve` also runs on PostgreSQL (`ATOMIC_DATABASE_URL`) when the process
 has an executor identity (`ATOMIC_EXECUTOR_ID`). `atomic runner` and
 `--runner process` run exec atoms' commands in a separate process with an

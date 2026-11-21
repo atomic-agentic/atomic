@@ -355,6 +355,8 @@ pub struct Engine {
     /// Whether model atoms run on a ChatGPT sign-in, which lite atoms cannot
     /// use.
     pub signed_in: bool,
+    /// The project's artifact store, which its runs read and write.
+    pub artifacts: LocalStore,
 }
 
 impl Engine {
@@ -467,7 +469,7 @@ pub async fn open(
         &mut rt,
         Services {
             runtimes,
-            store,
+            store: store.clone(),
             deployment: deployment(),
             worktrees,
             // Each run's build caches, in a directory of its own here.
@@ -494,6 +496,7 @@ pub async fn open(
         store: describe(&database),
         shared: matches!(database, Database::Postgres { .. }),
         signed_in,
+        artifacts: store,
     })
 }
 

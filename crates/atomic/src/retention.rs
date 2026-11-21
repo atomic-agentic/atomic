@@ -235,13 +235,33 @@ pub async fn sweep(
     )
 }
 
+/// Why a run's input could not be kept from a sweep: the run is refused,
+/// and nothing of it is recorded.
+#[derive(Debug, thiserror::Error)]
+pub enum InputRefused {
+    /// The input names, as `artifact://sha256/…`, content the store does
+    /// not hold, or a sweep removed content it names after the store was
+    /// listed.
+    #[error("the run's input names {0}, which the artifact store does not hold")]
+    Absent(ArtifactRef),
+    /// A sweep held the store's lock for longer than a write waits for it.
+    #[error(
+        "a sweep of the artifact store held its lock for more than {} s while the run started",
+        .0.as_secs()
+    )]
+    Locked(std::time::Duration),
+}
+
 /// Start run `id` of workflow `name` on `input`, keeping every artifact
 /// `store` holds that the input names from every sweep until the run, and
 /// so its input, is recorded. Each is held first, so a sweep that takes the
-/// store's lock from then on keeps it; then marked as just written, so a
-/// sweep that read the runs before the run existed, and takes the lock once
-/// the hold is let go, keeps it by its grace. One a sweep removed before the
-/// hold refuses the run, before anything is recorded.
+/// store's lock from then on keeps it; then marked as just written, under
+/// the store's shared lock, waited for as a write waits, so a sweep that
+/// read the runs before the run existed keeps it by its grace. The run is
+/// refused, before anything is recorded, when its input names
+/// `artifact://sha256/…` content the store does not hold, when a sweep
+/// removed what it names after the store was listed, or when a sweep holds
+/// the lock for longer than a write waits.
 pub async fn start_keeping_input<I>(
     store: &LocalStore,
     rt: &Durare,
@@ -255,7 +275,7 @@ where
     start_keeping_input_then(store, rt, name, id, input, || {}).await
 }
 
-/// [`start_keeping_input`], calling `between` once the input's artifacts
+/// [`start_keeping_input`], calling `once_held` once the input's artifacts
 /// are held and before they are marked: [`start_keeping_input`] calls
 /// nothing there, and this module's tests sweep there, as a sweep that
 /// takes the store's lock in that window would.
@@ -265,7 +285,7 @@ async fn start_keeping_input_then<I>(
     name: &str,
     id: &str,
     input: I,
-    between: impl FnOnce(),
+    once_held: impl FnOnce(),
 ) -> anyhow::Result<()>
 where
     I: Serialize + Send,
@@ -275,7 +295,7 @@ where
         let store = store.clone();
         tokio::task::spawn_blocking(move || hold_named(&store, &named)).await??
     };
-    between();
+    once_held();
     {
         let store = store.clone();
         let artifacts: Vec<ArtifactRef> = held.iter().map(|(a, _)| a.clone()).collect();
@@ -287,13 +307,20 @@ where
     Ok(())
 }
 
-/// A hold on every artifact `store` holds that `input` names.
+/// A hold on every artifact `store` holds that `input` names; an
+/// `artifact://sha256/…` reference to content it does not hold refuses the
+/// run.
 fn hold_named(store: &LocalStore, input: &Value) -> anyhow::Result<Vec<(ArtifactRef, Hold)>> {
     let present: HashSet<String> = store
         .stored()?
         .into_iter()
         .map(|a| a.digest().to_owned())
         .collect();
+    let mut explicit = BTreeSet::new();
+    explicit_references(input, &mut explicit);
+    if let Some(absent) = explicit.into_iter().find(|a| !present.contains(a.digest())) {
+        return Err(InputRefused::Absent(absent).into());
+    }
     let mut named = BTreeSet::new();
     references(input, &present, &mut named);
     let mut held = Vec::with_capacity(named.len());
@@ -304,15 +331,50 @@ fn hold_named(store: &LocalStore, input: &Value) -> anyhow::Result<Vec<(Artifact
     Ok(held)
 }
 
-/// Mark each of `artifacts` as just written; one no longer stored refuses
-/// the run.
+/// Every `artifact://sha256/<digest>` reference written out in `value`'s
+/// strings and keys.
+fn explicit_references(value: &Value, into: &mut BTreeSet<ArtifactRef>) {
+    let mut found = |text: &str| {
+        let mut rest = text;
+        while let Some(at) = rest.find("artifact://sha256/") {
+            let after = &rest[at + "artifact://sha256/".len()..];
+            if let Some(digest) = after.get(..64)
+                && let Ok(a) = ArtifactRef::from_digest(digest)
+            {
+                into.insert(a);
+            }
+            rest = after;
+        }
+    };
+    match value {
+        Value::String(s) => found(s),
+        Value::Array(items) => items.iter().for_each(|v| explicit_references(v, into)),
+        Value::Object(map) => map.iter().for_each(|(k, v)| {
+            found(k);
+            explicit_references(v, into);
+        }),
+        _ => {}
+    }
+}
+
+/// Mark each of `artifacts` as just written. [`LocalStore::refresh`] does
+/// not wait for the store's lock, and a sweep holding it leaves the mark
+/// unmade, so it is tried again until it is made, or finds the content
+/// gone, for as long as a write waits for the lock. One no longer stored,
+/// or a lock held that long, refuses the run.
 fn mark_named(store: &LocalStore, artifacts: &[ArtifactRef]) -> anyhow::Result<()> {
+    let wait = store.lock_wait();
+    let deadline = std::time::Instant::now() + wait;
     for artifact in artifacts {
-        if store.refresh(artifact)? == Refreshed::Missing {
-            anyhow::bail!(
-                "the run's input names {artifact}, which a sweep of the artifact store removed \
-                 as the run started; store it again, then start the run"
-            );
+        loop {
+            match store.refresh(artifact)? {
+                Refreshed::Now => break,
+                Refreshed::Missing => return Err(InputRefused::Absent(artifact.clone()).into()),
+                Refreshed::Held if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Refreshed::Held => return Err(InputRefused::Locked(wait).into()),
+            }
         }
     }
     Ok(())
@@ -431,6 +493,63 @@ mod tests {
         });
     }
 
+    /// Two sweeps that both read the runs before a run existed: the first
+    /// takes the store's lock while the run is admitted, keeps what the
+    /// input names because it is held, and holds the lock a while longer;
+    /// the mark waits for it rather than being skipped, so the second,
+    /// queued behind it, keeps what the input names by its grace.
+    #[test]
+    fn two_overlapping_sweeps_keep_what_the_input_names() {
+        atomic_core::testing::on_codex_runtime(async {
+            let (dir, rt, store, input) = racing("overlapping").await;
+            let first = read_kept(&store, &rt, &BTreeSet::new())
+                .await
+                .expect("read");
+            let second = read_kept(&store, &rt, &BTreeSet::new())
+                .await
+                .expect("read");
+            let lock = dir.join("artifacts/lock");
+            start_keeping_input_then(
+                &store,
+                &rt,
+                "noop",
+                "run-1",
+                serde_json::json!({ "file": input.to_string() }),
+                || {
+                    let swept = store
+                        .sweep(&first.artifacts, Grace::none_for_tests(), first.read_at)
+                        .expect("sweep");
+                    assert!(swept.removed.is_empty(), "{swept:?}");
+                    // Still holding the store's lock as the mark is tried.
+                    let file = std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&lock)
+                        .expect("lock file");
+                    file.lock().expect("the sweep's lock");
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(300));
+                        drop(file);
+                    });
+                },
+            )
+            .await
+            .expect("admitted");
+            let swept = store
+                .sweep(&second.artifacts, Grace::none_for_tests(), second.read_at)
+                .expect("sweep");
+            assert!(swept.removed.is_empty(), "{swept:?}");
+            assert!(
+                store.contains(&input).expect("contains"),
+                "the second sweep removed what the input names"
+            );
+            rt.shutdown(std::time::Duration::from_secs(5))
+                .await
+                .expect("shutdown");
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
     /// A run whose input names content a sweep removed before the run was
     /// admitted is refused, and nothing is recorded.
     #[test]
@@ -455,15 +574,40 @@ mod tests {
             .await
             .expect_err("refused");
             assert!(
-                error
-                    .to_string()
-                    .contains("a sweep of the artifact store removed"),
+                matches!(
+                    error.downcast_ref::<InputRefused>(),
+                    Some(InputRefused::Absent(a)) if *a == input
+                ),
                 "{error}"
             );
             assert!(
                 rt.run_record("run-1").await.expect("record").is_none(),
                 "recorded"
             );
+            assert!(
+                store.held().expect("held").is_empty(),
+                "a hold outlived the refusal"
+            );
+            // An input that names, written out, content never stored is
+            // refused too, before anything is held.
+            let never = ArtifactRef::from_digest(&"1".repeat(64)).expect("digest");
+            let error = start_keeping_input(
+                &store,
+                &rt,
+                "noop",
+                "run-2",
+                serde_json::json!({ "file": never.to_string() }),
+            )
+            .await
+            .expect_err("refused");
+            assert!(
+                matches!(
+                    error.downcast_ref::<InputRefused>(),
+                    Some(InputRefused::Absent(a)) if *a == never
+                ),
+                "{error}"
+            );
+            assert!(rt.run_record("run-2").await.expect("record").is_none());
             rt.shutdown(std::time::Duration::from_secs(5))
                 .await
                 .expect("shutdown");
