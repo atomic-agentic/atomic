@@ -1837,23 +1837,26 @@ fn with_no_configuration_of_their_own_nothing_is_capped() {
     );
 }
 
-/// The settings a person reads, the denial of their own configuration directory
-/// to every atom's commands, and the refusal of a state directory inside it are
-/// made from one resolution: [`atomic_core::state::user_config_dir`], which
-/// reads `XDG_CONFIG_HOME` and `HOME` as the operating system gives them and
-/// falls back to the home the password database gives. Read the variables as
-/// text instead — which is what [`Surroundings::env`] does, and what the test
-/// helper above does because a test's environment says nothing about this
-/// machine's user — the two name two directories as soon as one of them is
-/// bytes that are not text, and settings would come from a directory no atom is
-/// denied while the denial covered another. That is shown end to end by
+/// Only the wiring, and nothing about how the directory is read: that
+/// [`Surroundings::here`], which is what a person's run builds, asks
+/// [`atomic_core::state::user_config_dir`] for the person's own configuration
+/// directory — the same function the denial of that directory to every atom's
+/// commands and the refusal of a state directory inside it call — rather than
+/// putting a reading of `XDG_CONFIG_HOME` and `HOME` here.
+///
+/// Both sides read this process's own environment and its own password
+/// database, so what this can see is a person's run asking for a different
+/// *resolution* — other variables, another fallback, none at all — and not for a
+/// different *reading* of the same two, because two readings of one environment
+/// in which every variable is text agree. That the reading itself must be as the
+/// operating system gives it — see a configuration directory whose name is bytes
+/// that are not text as the directory it is, and source the settings in it — is
+/// pinned end to end by
 /// `a_setting_in_a_configuration_directory_of_bytes_that_are_not_text_is_sourced_from_it`
-/// in `crates/atomic/tests/state_cli.rs`, which gives a command such a
-/// directory; what is fixed here is that a person's run asks for the directory
-/// the same way both times, whatever this process's environment and password
-/// database happen to give.
+/// in `crates/atomic/tests/state_cli.rs`, which is the test
+/// `scripts/controls/settings-user-config-dir.row` switches off and runs.
 #[test]
-fn settings_read_the_configuration_directory_the_denial_and_the_state_check_name() {
+fn a_persons_run_asks_the_state_for_its_own_configuration_directory() {
     let here = Surroundings::here();
     assert_eq!(
         user_config(here.user_config_dir),

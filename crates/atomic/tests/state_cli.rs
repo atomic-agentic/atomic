@@ -27,6 +27,10 @@
 //!   creates anything, because all of them come through one function;
 //! - a home beside it, `~/.config/atomic-state`, is accepted: the comparison
 //!   is by path components, not by string;
+//! - a `HOME` that is not absolute gives a state home that is not absolute
+//!   either — the platform's data directory under it — and such a home is
+//!   placed from the directory the command was run in before it is compared
+//!   with anything;
 //! - the configuration directory itself may be one whose name the operating
 //!   system gives as bytes that are not text: `atomic --json config --explain`
 //!   says a setting comes from the `config.yaml` in that directory, which is
@@ -564,8 +568,9 @@ impl Side {
             Side::Config => {
                 "fix HOME, or XDG_CONFIG_HOME, so that your configuration directory can be \
                  placed: it, or a directory above it, cannot be entered, passes through \
-                 something that is not a directory, or is a link that leads nowhere; until \
-                 then atomic cannot tell whether its state would be inside that directory"
+                 something that is not a directory, is a link that leads nowhere, or cannot \
+                 otherwise be looked up; until then atomic cannot tell whether its state \
+                 would be inside that directory"
             }
         }
     }
@@ -761,6 +766,66 @@ fn a_relative_xdg_config_home_gives_way_to_home() {
     assert!(private.is_dir(), "the private directory is missing: {t}");
 }
 
+/// A `HOME` that is not absolute still gives the platform's data directory, so
+/// it gives a state home that is not absolute either — and a run places it from
+/// the directory the command was run in before it compares that home with
+/// anything. `crates/atomic-core/src/state.rs`'s
+/// `a_relative_state_directory_is_placed_from_the_working_directory` asks the
+/// same check directly, which is what `scripts/controls/state-home-placed.row`
+/// switches off and runs; this is the same control on the path a person takes,
+/// which `scripts/controls/state-home-placed-cli.row` switches off and runs —
+/// where the relative home is not spelled out but is what `dirs::data_dir`
+/// makes of a relative `HOME`, with no `ATOMIC_HOME` and no `XDG_DATA_HOME` set.
+#[test]
+fn a_relative_home_gives_a_state_directory_placed_from_the_working_directory() {
+    let dir = scratch("relative-home");
+    let project = dir.join("project");
+    // The configuration directory the state home is compared with: outside this
+    // checkout, and outside the state home. It has to be named by an absolute
+    // path for this test to ask anything of the placing at all — the password
+    // database is the only other thing that can name one, and a test may not
+    // depend on what it says about whoever runs it. With no configuration
+    // directory there is nothing to compare the state home with and the check
+    // never places it.
+    let person = person_config("relative-home");
+    let settings = person.join("settings");
+    std::fs::create_dir_all(settings.join("atomic")).expect("the configuration directory");
+    // The home is `home`, relative, and the command runs in `project`, so what
+    // the platform's data directory rule gives is `home/.local/share/atomic`
+    // read from there. Left unset: `ATOMIC_HOME`, which would be made absolute
+    // before the check ever saw it, and `XDG_DATA_HOME`, which that rule takes
+    // only as an absolute path and which the command's environment carries none
+    // of.
+    let base = project.join("home/.local/share/atomic");
+    let id = project_id(&dir, &project);
+    let (state, private) = state_and_private(&base, &id);
+    let out = command_os(
+        &dir,
+        &project,
+        &["debug", "state-dir"],
+        &[
+            ("HOME", OsString::from("home")),
+            ("XDG_CONFIG_HOME", settings.into_os_string()),
+        ],
+    )
+    .output()
+    .expect("start atomic");
+    let t = text(&out);
+    assert!(
+        out.status.success(),
+        "a run whose state home is placed from the working directory was refused: {t}"
+    );
+    // The state is there, below the directory the command was run in: that is
+    // the placed reading of the home the platform's rule gave, and it is the
+    // check that compares the home with the configuration directory that asks
+    // for it. A check handed the unresolved spelling refuses the run and creates
+    // nothing, which is what these two assertions then say. `debug state-dir`
+    // prints the spelling the platform's rule made, not a placed one, so the
+    // directories are what is asked here and not stdout.
+    assert!(state.is_dir(), "the state directory is missing: {t}");
+    assert!(private.is_dir(), "the private directory is missing: {t}");
+}
+
 /// `XDG_CONFIG_HOME` as the operating system gives it, and not as text.
 ///
 /// A directory whose name is bytes that are not UTF-8 is a directory all the
@@ -770,11 +835,10 @@ fn a_relative_xdg_config_home_gives_way_to_home() {
 /// reads the variables as the operating system gives them; reading the variable
 /// as text sees nothing here, and would take the settings from
 /// `~/.config/atomic/config.yaml` — a directory no atom is denied — while the
-/// denial and the state check covered this one. The same resolution seen from
-/// the inside is
-/// `settings_read_the_configuration_directory_the_denial_and_the_state_check_name`
-/// in `crates/atomic/src/settings/tests.rs`; here it is the command a person
-/// runs, whose output carries a path that is not text.
+/// denial and the state check covered this one. What is pinned beside it, in
+/// `crates/atomic/src/settings/tests.rs`, is only the wiring — that a person's
+/// run asks the state's own resolution; here it is the command a person runs,
+/// whose output carries a path that is not text.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_setting_in_a_configuration_directory_of_bytes_that_are_not_text_is_sourced_from_it() {

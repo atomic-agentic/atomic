@@ -234,13 +234,16 @@ impl ResolveSide {
             // Not "missing": a name below the deepest directory that is there
             // is what placing folds without asking, and is no reason to refuse.
             // What cannot be placed is a directory no one may enter, a path
-            // through something that is not a directory, and a link that leads
-            // nowhere — see [`real_path`].
+            // through something that is not a directory, a link that leads
+            // nowhere, a link that leads round in a circle, and whatever else
+            // the filesystem says when asked — see [`real_path`], which refuses
+            // on every answer but "not there".
             ResolveSide::Config => {
                 "fix HOME, or XDG_CONFIG_HOME, so that your configuration directory can be \
                  placed: it, or a directory above it, cannot be entered, passes through \
-                 something that is not a directory, or is a link that leads nowhere; until \
-                 then atomic cannot tell whether its state would be inside that directory"
+                 something that is not a directory, is a link that leads nowhere, or cannot \
+                 otherwise be looked up; until then atomic cannot tell whether its state \
+                 would be inside that directory"
                     .into()
             }
         }
@@ -918,15 +921,25 @@ pub fn outside_user_config(state_dir: &Path) -> Result<(), StateError> {
 /// which joins the working directory without folding the names that are not
 /// there yet. `None` when the working directory cannot be read.
 ///
-/// Every home a command brings to [`outside_user_config`] is absolute before
-/// it gets there: [`atomic_home`] reads a relative `ATOMIC_HOME` from the
-/// working directory itself, and the default data directory and the
-/// configuration directory name an absolute one or nothing. So this is the
-/// backstop rather than the usual path — and a backstop that must still work,
-/// because a spelling compared unresolved is the one thing that lets a state
-/// into the denied directory. The test that keeps it living is
-/// `a_relative_state_directory_is_placed_from_the_working_directory`, which
-/// asks [`outside_user_config`] itself, with the spelling relative.
+/// Most homes a command brings to [`outside_user_config`] are absolute before
+/// they get here: [`atomic_home`] reads a relative `ATOMIC_HOME` from the
+/// working directory itself, and the configuration directory is kept only when
+/// `XDG_CONFIG_HOME`, `HOME` or the password database names an absolute one.
+/// The default data directory is absolute too, except in one case: the platform
+/// rule [`base_dir`] falls back to — `dirs::data_dir` — takes a `HOME` that is
+/// not absolute as the home it gives, so a person who sets a relative `HOME`,
+/// sets no `ATOMIC_HOME` and sets no `XDG_DATA_HOME` gets
+/// `<relative HOME>/.local/share/atomic`, which is relative and comes here as it
+/// stands, read from the working directory like any other relative spelling. So
+/// this is the backstop for a relative
+/// `ATOMIC_HOME` and the live path for that one — and a backstop that must
+/// still work, because a spelling compared unresolved is the one thing that
+/// lets a state into the denied directory. The tests that keep it living are
+/// `a_relative_state_directory_is_placed_from_the_working_directory`, which asks
+/// [`outside_user_config`] itself, with the spelling relative, and
+/// `a_relative_home_gives_a_state_directory_placed_from_the_working_directory`
+/// in `crates/atomic/tests/state_cli.rs`, which is what a command does with a
+/// relative `HOME` and no `ATOMIC_HOME`.
 fn placed(path: &Path) -> Option<PathBuf> {
     std::path::absolute(path).ok()
 }
@@ -1855,26 +1868,23 @@ mod tests {
     /// configuration directory, and the state gets made inside the very
     /// directory every atom's command is denied. Only `NotFound` may be read as
     /// missing, so this home is refused for the lookup that failed.
+    ///
+    /// Mode 000 is no bar to the superuser, so this does not stop when the
+    /// tests run as root: it then asserts the refusal this shape exists to
+    /// bring about — the home is the configuration directory's own, which the
+    /// walk through the closed directory is what would have hidden — so a check
+    /// that let a state inside the denied directory fails here whoever runs it.
+    /// What only a process that cannot look in everything sees is *which*
+    /// answer the walk gave: the lookup that failed, and the configuration
+    /// directory as the side that cannot be placed. `scripts/controls-check.sh`
+    /// runs as the operator, never as root, so that is what
+    /// `scripts/controls/state-walk-notfound-only.row` is switched off and seen
+    /// failing under; the same rule where the superuser cannot undo it is
+    /// pinned by `a_home_that_walks_through_a_file_is_refused`, which the same
+    /// row runs.
     #[test]
     fn a_home_behind_a_directory_nobody_may_look_in_is_refused() {
         use std::os::unix::fs::PermissionsExt;
-        // A process that may look in any directory cannot make these lookups
-        // fail, so the refusal has nothing here to be seen in: mode 000 is no
-        // bar to the superuser. The skip is said rather than returned in
-        // silence, because this test is what
-        // `scripts/controls/state-walk-notfound-only.row` runs, and a control
-        // that cannot be seen in must not read as one that was checked.
-        // `scripts/controls-check.sh` and the suite run as the operator, never
-        // as root; the same shape is still pinned where the superuser cannot
-        // undo it, by `a_home_that_walks_through_a_file_is_refused`.
-        if effective_uid() == 0 {
-            eprintln!(
-                "SKIP {}: mode 000 is no bar to the superuser, so no lookup below it can \
-                 fail here",
-                module_path!()
-            );
-            return;
-        }
         let scratch = setup("closed", &["closed", "settings/atomic"], &[]);
         std::os::unix::fs::symlink(
             scratch.join("settings/atomic"),
@@ -1889,6 +1899,7 @@ mod tests {
         // The home as its owner spelled it: `ATOMIC_HOME` names the link, which
         // is where the configuration directory really is.
         let home = scratch.join("closed/into-config/state");
+        let config = scratch.join("settings/atomic");
         let outcome = check(
             &scratch,
             &[
@@ -1899,6 +1910,26 @@ mod tests {
             None,
             None,
         );
+        if effective_uid() == 0 {
+            // Nothing failed to be looked up: the walk went through the closed
+            // directory, followed the link and read where the home really is,
+            // which is inside the configuration directory. That is the refusal
+            // this shape is for, so the comparison that refuses a directory
+            // inside the configuration one — the half mode 000 cannot hide — is
+            // seen failing for the superuser too, rather than passing because
+            // nothing here could be made to fail.
+            assert!(
+                matches!(
+                    &outcome,
+                    Err(StateError::InsideConfig(outside))
+                        if outside.state == config.join("state") && outside.config == config
+                ),
+                "as the superuser the home behind the closed directory is the \
+                 configuration directory's own and was not refused for it: {:?}",
+                words(&outcome)
+            );
+            return;
+        }
         let why = words(&outcome);
         assert!(
             why.starts_with(&format!(
@@ -1914,7 +1945,11 @@ mod tests {
         );
         // The same closed door on the other side: with the configuration
         // directory itself unreachable, no home can be compared with it, and
-        // the refusal says which of the two directories it could not place.
+        // the refusal says which of the two directories it could not place. Not
+        // reached as the superuser, for whom the door opens: the target the link
+        // leads to is placed, `/elsewhere` is beside it, and there is nothing to
+        // refuse. A directory that cannot be placed for anyone at all is the
+        // shape `a_home_that_walks_through_a_file_is_refused` pins.
         let outcome = check(
             &scratch,
             &[("XDG_CONFIG_HOME", "/closed/into-config")],
@@ -2008,11 +2043,15 @@ mod tests {
     /// command was run in, the names below it that are not there yet kept as
     /// they were spelled — before it is compared with anything. This asks
     /// [`outside_user_config`], the one entry a command uses, because [`placed`]
-    /// is what does that on that path: the homes a command brings are absolute
-    /// before they get there, so this is where the placing of a relative
-    /// spelling is kept working, for the caller that hands one over. Given the
-    /// spelling unresolved there is nothing to compare, and the check refuses
-    /// the run for a directory it cannot place.
+    /// is what does that on that path. A command brings an absolute home here
+    /// except with a relative `HOME` and no `ATOMIC_HOME` — see [`placed`] — so
+    /// this is where the placing of a relative spelling is kept working for the
+    /// caller that hands one over, which the command a person runs with a
+    /// relative `HOME` shows end to end:
+    /// `a_relative_home_gives_a_state_directory_placed_from_the_working_directory`
+    /// in `crates/atomic/tests/state_cli.rs`. Given the spelling unresolved here
+    /// there is nothing to compare, and the check refuses the run for a
+    /// directory it cannot place.
     ///
     /// Nothing is created in the working directory: the name is one no
     /// directory holds, so placing it asks nothing of the filesystem beyond the

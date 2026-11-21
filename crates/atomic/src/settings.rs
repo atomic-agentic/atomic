@@ -301,11 +301,19 @@ impl Surroundings<'static> {
 ///
 /// A function, where every other field `without_probe` gives is a closure,
 /// because a control's switch is written in a `|`-delimited row (see
-/// `scripts/controls-check.sh`), which no closure can be written without:
-/// `scripts/controls/settings-user-config-dir.row`
-/// switches what this asks of the environment to `XDG_CONFIG_HOME` as text,
-/// which is the one reading [`Surroundings::env`] already gives and the one that
-/// sees nothing where the operating system gives bytes that are not text.
+/// `scripts/controls-check.sh`), which no closure can be written without.
+/// `scripts/controls/settings-user-config-dir.row` switches what this asks of
+/// `XDG_CONFIG_HOME` and `HOME` to what [`Surroundings::env`] already gives —
+/// the same two variables read as text — which is the one reading that sees
+/// nothing where the operating system gives bytes that are not text, and so the
+/// one that looks for a person's settings in another directory than the one the
+/// denial covers. The row runs
+/// `a_setting_in_a_configuration_directory_of_bytes_that_are_not_text_is_sourced_from_it`,
+/// which gives a command a configuration directory of just such bytes: that is
+/// where the two readings part, and the switch keeps the home the password
+/// database gives, since that fallback is what
+/// `scripts/controls/state-config-passwd-home.row` and
+/// `scripts/controls/state-check-passwd-wired.row` switch, in `state.rs`.
 fn user_config_dir_here() -> Option<PathBuf> {
     atomic_core::state::user_config_dir()
 }
