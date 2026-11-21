@@ -71,9 +71,10 @@ checkout of a linked worktree, is refused, since a repository could have
 supplied it. That includes the default location when your home directory is
 itself a git checkout (a `~/.git`) holding the project: set `ATOMIC_HOME` to a
 directory outside it. A link on the way that leads nowhere is refused too. A
-login that does not finish leaves no sign-in directory behind if it made one,
-and a logout removes it once both stores are checked, so later runs read no
-store; while the keyring cannot be checked, the directory stays, and atomic
+login that fails leaves no sign-in directory behind if it made one and no other
+login kept a sign-in there meanwhile; one stopped with Ctrl-C leaves it. A
+logout removes the directory once both stores are checked, so later runs read
+no store; while the keyring cannot be checked, the directory stays, and atomic
 says the sign-in could not be read.
 
 Keeping the token out of reach has side effects on atomic's own process, and so

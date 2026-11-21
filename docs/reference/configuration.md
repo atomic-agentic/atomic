@@ -52,8 +52,11 @@ setting by setting.
 
 Layer 2 is the operator's own file: the person who runs the command, not the
 project. No project supplies it, and atomic refuses to read one that lies inside
-the project or inside the checkout that holds it, since the project could have
-supplied it; point `XDG_CONFIG_HOME`, or `HOME`, outside it. It holds the same
+the project or inside any checkout around it (a submodule's superproject, the
+checkout a worktree sits in, or a linked worktree's main checkout), since the
+project could have supplied it; point `XDG_CONFIG_HOME`, or `HOME`, outside it.
+That includes the default `~/.config/atomic` when your home directory is itself
+a git checkout (a `~/.git`) holding the project. It holds the same
 settings as `atomic.yaml`, and the project's files override it.
 
 Selecting a configuration profile is planned. The loader reads

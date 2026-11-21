@@ -483,35 +483,90 @@ pub fn real_path(path: &Path) -> PathBuf {
 /// Every checkout holding `dir`, a path as it really is: each directory
 /// around it with a `.git`, and for a linked worktree the checkout whose
 /// repository it shares, which its `.git` file names through the
-/// repository's `commondir`.
-pub fn checkouts_holding(dir: &Path) -> Vec<PathBuf> {
+/// repository's `commondir`. A `.git` or `commondir` that is not a small
+/// regular file, as git writes them, is refused rather than read: the
+/// project supplies both, and a pipe or a device there would hang or fill
+/// memory.
+pub fn checkouts_holding(dir: &Path) -> Result<Vec<PathBuf>, String> {
     let mut found = Vec::new();
     for checkout in dir.ancestors().filter(|d| d.join(".git").exists()) {
         found.push(checkout.to_owned());
-        if let Some(main) = main_checkout(&checkout.join(".git"))
+        if let Some(main) = main_checkout(&checkout.join(".git"))?
             && !found.contains(&main)
         {
             found.push(main);
         }
     }
-    found
+    Ok(found)
 }
 
-/// The main checkout of the linked worktree whose `.git` file is `git`;
-/// `None` for a `.git` directory, a submodule's file, or a bare repository.
-fn main_checkout(git: &Path) -> Option<PathBuf> {
-    if !git.is_file() {
-        return None;
+/// The most a `.git` file or a `commondir` is read for: a path or two.
+const LINK_FILE_MAX: u64 = 4096;
+
+/// The main checkout of the linked worktree whose `.git` is `git`; `None`
+/// for a `.git` directory, a submodule's file (no `commondir`), or a bare
+/// repository.
+fn main_checkout(git: &Path) -> Result<Option<PathBuf>, String> {
+    if std::fs::metadata(git).is_ok_and(|m| m.is_dir()) {
+        return Ok(None);
     }
-    let text = std::fs::read_to_string(git).ok()?;
-    let gitdir = text.lines().find_map(|l| l.strip_prefix("gitdir:"))?.trim();
-    let gitdir = git.parent()?.join(gitdir);
-    let common = std::fs::read_to_string(gitdir.join("commondir")).ok()?;
-    let common = std::fs::canonicalize(gitdir.join(common.trim())).ok()?;
-    if common.file_name()? != ".git" {
-        return None;
+    let Some(text) = link_file(git)? else {
+        return Ok(None);
+    };
+    let Some(gitdir) = text.lines().find_map(|l| l.strip_prefix("gitdir:")) else {
+        return Ok(None);
+    };
+    let Some(parent) = git.parent() else {
+        return Ok(None);
+    };
+    let gitdir = parent.join(gitdir.trim());
+    let Some(common) = link_file(&gitdir.join("commondir"))? else {
+        return Ok(None);
+    };
+    let Ok(common) = std::fs::canonicalize(gitdir.join(common.trim())) else {
+        return Ok(None);
+    };
+    if common.file_name().is_none_or(|n| n != ".git") {
+        return Ok(None);
     }
-    common.parent().map(Path::to_owned)
+    Ok(common.parent().map(Path::to_owned))
+}
+
+/// The text of `path`, a small regular file, or `None` when there is none:
+/// opened without blocking, so a pipe there cannot hang the read, and
+/// refused when it is anything but a regular file of at most
+/// [`LINK_FILE_MAX`] bytes.
+fn link_file(path: &Path) -> Result<Option<String>, String> {
+    use std::io::Read;
+    let refused = |why: &str| {
+        Err(format!(
+            "{} {why}, which git does not write there; remove it or fix the checkout",
+            path.display()
+        ))
+    };
+    let mut open = std::fs::OpenOptions::new();
+    open.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut open, libc::O_NONBLOCK);
+    let file = match open.open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    match file.metadata() {
+        Ok(m) if !m.is_file() => return refused("is not a regular file"),
+        Ok(m) if m.len() > LINK_FILE_MAX => return refused("is larger than a link file"),
+        Ok(_) => {}
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    }
+    let mut text = String::new();
+    file.take(LINK_FILE_MAX + 1)
+        .read_to_string(&mut text)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    if text.len() as u64 > LINK_FILE_MAX {
+        return refused("is larger than a link file");
+    }
+    Ok(Some(text))
 }
 
 /// Where the opt-in file store keeps operator credentials (see
@@ -673,6 +728,49 @@ fn project_id(root: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A worktree's `.git` or its repository's `commondir` that is a pipe,
+    /// or larger than git writes, is refused without being read to its end,
+    /// and says which file; a well-formed pair names the main checkout.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_file_that_is_not_a_small_regular_file_is_refused() {
+        let dir = std::env::temp_dir().join(format!("atomic-link-files-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let main = dir.join("main");
+        let gitdir = main.join(".git/worktrees/wt");
+        std::fs::create_dir_all(&gitdir).expect("main");
+        std::fs::create_dir_all(dir.join("wt/project")).expect("worktree");
+        std::fs::write(
+            dir.join("wt/.git"),
+            format!("gitdir: {}\n", gitdir.display()),
+        )
+        .expect(".git");
+        let project = dir.join("wt/project");
+        let commondir = gitdir.join("commondir");
+        std::fs::write(&commondir, "../..\n").expect("commondir");
+        let held = checkouts_holding(&project).expect("read");
+        assert!(
+            held.contains(&std::fs::canonicalize(&main).expect("main")),
+            "{held:?}"
+        );
+
+        // A pipe, which a blocking read would wait on for ever.
+        std::fs::remove_file(&commondir).expect("remove");
+        let name = std::ffi::CString::new(commondir.as_os_str().as_encoded_bytes()).expect("path");
+        // SAFETY: `name` is a NUL-terminated path that outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0, "mkfifo");
+        let refused = checkouts_holding(&project).expect_err("a pipe");
+        assert!(refused.contains("is not a regular file"), "{refused}");
+        assert!(refused.contains("commondir"), "{refused}");
+
+        // Larger than a link file.
+        std::fs::remove_file(&commondir).expect("remove");
+        std::fs::write(&commondir, "x".repeat(5000)).expect("commondir");
+        let refused = checkouts_holding(&project).expect_err("too large");
+        assert!(refused.contains("is larger than a link file"), "{refused}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[cfg(unix)]
     #[test]

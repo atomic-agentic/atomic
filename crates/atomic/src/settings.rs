@@ -391,7 +391,8 @@ pub fn resolve(
         // Every checkout around the project counts, not only the nearest:
         // a submodule's superproject, the checkout a worktree sits in, and
         // a linked worktree's main checkout, whose repository it shares.
-        let checkouts = atomic_core::state::checkouts_holding(&root);
+        let checkouts =
+            atomic_core::state::checkouts_holding(&root).map_err(ConfigError::Invalid)?;
         for (what, enclosing) in std::iter::once(("project", root.as_path())).chain(
             checkouts
                 .iter()

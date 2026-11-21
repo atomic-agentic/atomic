@@ -143,7 +143,9 @@ fn outside_the_checkout(dir: &Path, project: Option<&Path>) -> Result<(), SignIn
         crate::state::real_path(dir),
         crate::state::real_path(project),
     );
-    match crate::state::checkouts_holding(&project)
+    let checkouts = crate::state::checkouts_holding(&project)
+        .map_err(|e| SignInError::Store(CredentialError::File(e)))?;
+    match checkouts
         .into_iter()
         .find(|checkout| here.starts_with(checkout))
     {
@@ -296,6 +298,12 @@ impl SignIn {
             if !taken {
                 return;
             }
+        }
+        // Codex saves a sign-in while it holds these locks, so with them
+        // held this read comes after any save that took them first: one
+        // another login kept meanwhile is seen here, and stays.
+        if matches!(self.stored(), Ok(Some(_))) {
+            return;
         }
         for (path, _file) in &held {
             let _ = std::fs::remove_file(path);
@@ -917,6 +925,45 @@ mod tests {
         );
         assert!(outside_the_checkout(&dir.join("elsewhere/codex-auth"), Some(&project)).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Another login kept a sign-in while this one waited: this one fails
+    /// in a directory it made, and the sign-in the other kept stays.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_sign_in_kept_while_a_login_waited_outlives_its_failure() {
+        crate::testing::on_codex_runtime(async {
+            let dir = auth_dir("kept-meanwhile");
+            std::fs::remove_dir(&dir).expect("not there yet");
+            let located = SignIn {
+                store: AuthCredentialsStoreMode::Keyring,
+                ..SignIn::in_files(&dir)
+            };
+            let waiting = SignIn::made_at(located, None)
+                .expect("made")
+                .with_issuer("http://127.0.0.1:9");
+            // The other login's sign-in, kept in the keyring, and the locks
+            // its save left behind.
+            for lock in ["auth.lock", "auth.json.lock"] {
+                std::fs::write(dir.join(lock), "").expect("lock");
+            }
+            let id_token = crate::testing::fake_id_token("dev@example.invalid", "account-1");
+            KEYRING.lock().expect("keyring").push((
+                std::fs::canonicalize(&dir).expect("dir"),
+                serde_json::json!({"auth_mode": "chatgpt", "OPENAI_API_KEY": null, "tokens": {
+                    "id_token": id_token, "access_token": "", "refresh_token": "",
+                    "account_id": "account-1"}})
+                .to_string(),
+            ));
+            assert!(waiting.login(true).await.is_err());
+            assert!(dir.join("auth.lock").exists(), "the other login's sign-in was tidied away");
+            let account = waiting
+                .account()
+                .expect("account")
+                .expect("still signed in");
+            assert_eq!(account.mode, "chatgpt");
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 
     /// Tidying never goes through a link: it would remove what the link
