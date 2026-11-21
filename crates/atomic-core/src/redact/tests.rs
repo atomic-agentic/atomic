@@ -1365,6 +1365,13 @@ fn numbering_keys_that_redact_alike_stays_linear() {
         large < 32 * small,
         "{large} steps at sixteen times the keys of {small}"
     );
+    // The same under a secret's name, where keys are held.
+    let held = |n: usize| json!({ "token": keyed(n) });
+    let (small, large) = (steps(held(500)), steps(held(8_000)));
+    assert!(
+        large < 32 * small,
+        "held: {large} steps at sixteen times the keys of {small}"
+    );
 }
 
 /// A numbered key's value is judged by its name before its number: a
@@ -1417,4 +1424,106 @@ fn keys_that_redact_alike_are_numbered_in_their_own_order() {
     assert_eq!(f, b);
     assert_eq!(f["[REDACTED]"], "first", "{f}");
     assert_eq!(f["[REDACTED] (2)"], "second", "{f}");
+}
+
+/// Under a secret's name, a key that names a secret stays, to say what its
+/// value is, and its value is held as surely as its name says; a key of a
+/// known format redacted as a whole still holds its value as its name did.
+#[test]
+fn a_held_key_that_names_a_secret_stays_and_holds_its_value() {
+    let mut named =
+        json!({"credentials": {"DB_PASSWORD": "hunter2", "oauth2ClientSecret": "hunter3"}});
+    value(&mut named);
+    assert_eq!(
+        named,
+        json!({"credentials": {"DB_PASSWORD": "[REDACTED]", "oauth2ClientSecret": "[REDACTED]"}})
+    );
+    // A known format whose token runs on into a secret's name: the key goes
+    // whole, and the value is still held as a secret's.
+    let mut shaped = json!({"token": {format!("{}_secret", SHAPES[0]): "hunter2"}});
+    value(&mut shaped);
+    assert_eq!(shaped, json!({"token": {"[REDACTED]": "[REDACTED]"}}));
+}
+
+/// Under a secret's name, keys that are names stay: environment variables,
+/// model ids, emails, UUIDs and references, so a person sees which secrets
+/// a step is given.
+#[test]
+fn held_keys_that_are_names_stay() {
+    let names = [
+        "OPENAI_API_KEY",
+        "GITHUB_TOKEN",
+        "AWS_SECRET_ACCESS_KEY",
+        "DATABASE_URL",
+        "NODE_ENV",
+        "gpt-4o-2024-08-06",
+        "dev@example.com",
+        "123e4567-e89b-12d3-a456-426614174000",
+        "${GITHUB_TOKEN}",
+    ];
+    let fields: serde_json::Map<String, Value> = names
+        .iter()
+        .map(|n| ((*n).to_owned(), json!("value")))
+        .collect();
+    let mut held = json!({ "secrets": Value::Object(fields) });
+    value(&mut held);
+    let kept = held["secrets"].as_object().expect("an object");
+    let lost: Vec<&str> = names
+        .iter()
+        .copied()
+        .filter(|n| !kept.contains_key(*n))
+        .collect();
+    assert!(lost.is_empty(), "{lost:?}");
+}
+
+/// Under a secret's name, a key that redacts as text does keeps the rest of
+/// itself; two that come out alike are numbered, and each judged by its
+/// name before its number.
+#[test]
+fn held_keys_redact_as_text_and_are_numbered_alike() {
+    let (a, b) = (SHAPES[0], SHAPES[1]);
+    let mut held = json!({"token": {
+        format!("Bearer {a}"): 1,
+        format!("{a} dbpassword"): "hunter2",
+        format!("{b} dbpassword"): "hunter3",
+    }});
+    value(&mut held);
+    let inner = held["token"].as_object().expect("an object");
+    assert!(inner.contains_key("Bearer [REDACTED]"), "{held}");
+    assert_eq!(inner["[REDACTED] dbpassword"], REDACTED, "{held}");
+    assert_eq!(inner["[REDACTED] dbpassword (2)"], REDACTED, "{held}");
+    // A numbered key that comes in so, as from an output redacted before,
+    // is judged by its name before its number too.
+    let mut again = json!({"token": {"[REDACTED] dbpassword (2)": "hunter3"}});
+    value(&mut again);
+    assert_eq!(
+        again,
+        json!({"token": {"[REDACTED] dbpassword (2)": "[REDACTED]"}})
+    );
+}
+
+/// JSON in a string held under a secret's name is held as surely: a key in
+/// it that looks like a credential is redacted.
+#[test]
+fn json_in_a_held_string_is_held() {
+    let looks = concat!("Zx81kQ0p", "L2mN4bV6");
+    let mut held = json!({"token": format!("{{ \"{looks}\" : 1 }}")});
+    value(&mut held);
+    assert!(!held.to_string().contains(looks), "{held}");
+}
+
+/// Redacting a value redacted already changes nothing, held keys included.
+#[test]
+fn held_keys_redacted_again_change_nothing() {
+    // A key redacted in part already, which would otherwise look like a
+    // credential itself, is left as it is.
+    let partly = json!({"token": {"x9Q2[REDACTED]": 1}});
+    let mut kept = partly.clone();
+    value(&mut kept);
+    assert_eq!(kept, partly);
+    let mut once = json!({"secrets": {"pwd=abc": 1, "k": {"pwd=def": 2}}, "pwd=ghi": 3});
+    value(&mut once);
+    let mut twice = once.clone();
+    value(&mut twice);
+    assert_eq!(once, twice);
 }

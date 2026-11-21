@@ -1347,6 +1347,12 @@ pub fn tail(input: &str, chars: usize) -> String {
 }
 
 fn redact_string(string: &mut String, nested: usize) {
+    redact_string_held(string, nested, None);
+}
+
+/// [`redact_string`], for a string held under a name of strength `held`, if
+/// any: JSON inside it is held as surely.
+fn redact_string_held(string: &mut String, nested: usize, held: Option<Strength>) {
     if string.len() > MAX_TEXT {
         *string = bounded(string, MAX_TEXT);
     } else if let Cow::Owned(redacted) = text(string) {
@@ -1360,7 +1366,10 @@ fn redact_string(string: &mut String, nested: usize) {
         && let Ok(mut inner) = serde_json::from_str::<Value>(string)
     {
         let before = inner.clone();
-        redact_nested(&mut inner, nested + 1);
+        match held {
+            Some(strength) => redact_held(strength, &mut inner, nested + 1),
+            None => redact_nested(&mut inner, nested + 1),
+        }
         if inner != before {
             *string = inner.to_string();
         }
@@ -1375,7 +1384,7 @@ fn redact_held(strength: Strength, value: &mut Value, nested: usize) {
         Value::String(string) if is_secret_value(strength, string) => {
             *string = REDACTED.into();
         }
-        Value::String(string) => redact_string(string, nested),
+        Value::String(string) => redact_string_held(string, nested, Some(strength)),
         Value::Number(_) if strength == Strength::Strong => *value = Value::String(REDACTED.into()),
         Value::Array(items) => items
             .iter_mut()
@@ -1384,11 +1393,10 @@ fn redact_held(strength: Strength, value: &mut Value, nested: usize) {
             // Its keys are redacted as any key is, and one that looks like a
             // credential too: under a secret's name, a key can be the
             // secret, as in `{"token": {"<key>": 1}}`.
-            let named = rename_held_keys(strength, fields);
+            let renamed = rename_keys(fields, held_key);
             // A field inside is held at least as surely as its own name says.
             for (key, field) in fields.iter_mut() {
-                let name = named.get(key).map_or(key.as_str(), String::as_str);
-                let own = self::strength(name);
+                let own = judged(key, &renamed, true);
                 let held = if own == Strength::Strong {
                     own
                 } else {
@@ -1401,28 +1409,28 @@ fn redact_held(strength: Strength, value: &mut Value, nested: usize) {
     }
 }
 
-/// Redact the keys of `fields`, held under a name of `strength`: a key that
-/// redacts as text does, or one that looks like a credential, is replaced,
-/// two that come out alike are numbered so neither entry is lost, and the
-/// name of each, before its number, is returned for every numbered key.
-fn rename_held_keys(
-    strength: Strength,
+/// A key [`rename_keys`] renamed: what it was, and its new name before any
+/// number.
+struct Renamed {
+    original: String,
+    name: String,
+}
+
+/// Rename each key of `fields` that `redact` changes, in the keys' own order
+/// so the same object comes out the same however it was built. Two that
+/// come out alike, as two that start private key blocks do, each keep
+/// their entry, the later ones numbered: each name keeps its next number,
+/// so numbering stays linear. Returns each renamed key, by its new key.
+fn rename_keys(
     fields: &mut serde_json::Map<String, Value>,
-) -> std::collections::HashMap<String, String> {
+    redact: impl Fn(&str) -> Option<String>,
+) -> std::collections::HashMap<String, Renamed> {
     let mut renamed: Vec<(String, String)> = fields
         .keys()
-        .filter_map(|key| {
-            if strength != Strength::None && looks_like_credential(key) {
-                return Some((key.clone(), REDACTED.to_owned()));
-            }
-            match text(key) {
-                Cow::Owned(new_key) => Some((key.clone(), new_key)),
-                Cow::Borrowed(_) => None,
-            }
-        })
+        .filter_map(|key| redact(key).map(|new_key| (key.clone(), new_key)))
         .collect();
     renamed.sort();
-    let mut named = std::collections::HashMap::new();
+    let mut done = std::collections::HashMap::new();
     let mut next: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for (old_key, new_key) in renamed {
         if let Some(field) = fields.remove(&old_key) {
@@ -1430,18 +1438,103 @@ fn rename_held_keys(
             if fields.contains_key(&key) {
                 let n = next.entry(new_key.clone()).or_insert(2);
                 loop {
+                    step(1);
                     key = format!("{new_key} ({n})");
                     *n += 1;
                     if !fields.contains_key(&key) {
                         break;
                     }
                 }
-                named.insert(key.clone(), new_key);
             }
+            done.insert(
+                key.clone(),
+                Renamed {
+                    original: old_key,
+                    name: new_key,
+                },
+            );
             fields.insert(key, field);
         }
     }
-    named
+    done
+}
+
+/// `key` without the ` (n)` [`rename_keys`] numbers it with.
+fn base_name(key: &str) -> &str {
+    key.strip_suffix(')')
+        .and_then(|k| k.rsplit_once(" ("))
+        .filter(|(_, n)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        .map_or(key, |(base, _)| base)
+}
+
+/// How surely the field at `key` holds a secret: for a key renamed, what
+/// its new name says, before its number, or, under a secret's name
+/// (`held`), the surer of that and what its original key said, so a
+/// secret's name redacted whole is still one there; for any other key,
+/// what its name says, before any number.
+fn judged(key: &str, renamed: &std::collections::HashMap<String, Renamed>, held: bool) -> Strength {
+    match renamed.get(key) {
+        Some(r) if held => surer(strength(&r.original), strength(&r.name)),
+        Some(r) => strength(&r.name),
+        None => strength(base_name(key)),
+    }
+}
+
+/// The surer of two strengths.
+fn surer(a: Strength, b: Strength) -> Strength {
+    let rank = |s: Strength| match s {
+        Strength::None => 0,
+        Strength::Weak => 1,
+        Strength::Strong => 2,
+    };
+    if rank(a) >= rank(b) { a } else { b }
+}
+
+/// What a key under a secret's name becomes, if anything: as any key
+/// redacts, or wholly when it looks like a credential itself, as in
+/// `{"token": {"<key>": 1}}`. A key that names a secret, such as
+/// `DB_PASSWORD`, stays to say so; one redacted already is left.
+fn held_key(key: &str) -> Option<String> {
+    let base = base_name(key);
+    if base.contains(REDACTED) {
+        return None;
+    }
+    if strength(base) == Strength::None && key_looks_like_credential(base) {
+        return Some(REDACTED.to_owned());
+    }
+    match text(key) {
+        Cow::Owned(new_key) => Some(new_key),
+        Cow::Borrowed(_) => None,
+    }
+}
+
+/// Whether a key looks like a credential rather than a name: not a
+/// reference, a placeholder, an email, a UUID, or words and numbers joined
+/// by `-`, `_`, `.`, `/` or `:`, where a word may be all capitals, as an
+/// environment variable's (`DATABASE_URL`, `gpt-4o-2024-08-06`).
+fn key_looks_like_credential(key: &str) -> bool {
+    let caps_or_digits = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+    };
+    let email = key
+        .split_once('@')
+        .is_some_and(|(user, host)| !user.is_empty() && host.contains('.'));
+    let uuid = {
+        let parts: Vec<&str> = key.split('-').collect();
+        parts.iter().map(|p| p.len()).eq([8, 4, 4, 4, 12])
+            && parts
+                .iter()
+                .all(|p| p.bytes().all(|b| b.is_ascii_hexdigit()))
+    };
+    !(is_not_a_secret(key)
+        || email
+        || uuid
+        || key
+            .split(['-', '_', '.', '/', ':'])
+            .all(|s| is_wordlike(s) || caps_or_digits(s)))
+        && looks_like_credential(key)
 }
 
 /// Header names whose values are credentials.
@@ -1524,46 +1617,14 @@ fn redact_nested(value: &mut Value, nested: usize) {
                 .for_each(|item| redact_nested(item, nested));
         }
         Value::Object(fields) => {
-            // In the order of the keys themselves, so the same object
-            // numbers its entries the same however it was built.
-            let mut renamed: Vec<(String, String)> = fields
-                .keys()
-                .filter_map(|key| match text(key) {
-                    Cow::Owned(new_key) => Some((key.clone(), new_key)),
-                    Cow::Borrowed(_) => None,
-                })
-                .collect();
-            renamed.sort();
-            // Each numbered key's name as redacted, before its number, which
-            // is what says whether its value is a secret.
-            let mut named: std::collections::HashMap<String, String> =
-                std::collections::HashMap::new();
-            // The next number for each name, so numbering stays linear.
-            let mut next: std::collections::HashMap<String, usize> =
-                std::collections::HashMap::new();
-            for (old_key, new_key) in renamed {
-                if let Some(field) = fields.remove(&old_key) {
-                    // Two keys can redact to the same text, as two that
-                    // start private key blocks do: each keeps its entry,
-                    // the later ones numbered, so neither hides the other.
-                    let mut key = new_key.clone();
-                    if fields.contains_key(&key) {
-                        let n = next.entry(new_key.clone()).or_insert(2);
-                        loop {
-                            step(1);
-                            key = format!("{new_key} ({n})");
-                            *n += 1;
-                            if !fields.contains_key(&key) {
-                                break;
-                            }
-                        }
-                        named.insert(key.clone(), new_key);
-                    }
-                    fields.insert(key, field);
-                }
-            }
+            let renamed = rename_keys(fields, |key| match text(key) {
+                Cow::Owned(new_key) => Some(new_key),
+                Cow::Borrowed(_) => None,
+            });
             for (key, field) in fields.iter_mut() {
-                let name = named.get(key).map_or(key.as_str(), String::as_str);
+                let name = renamed
+                    .get(key)
+                    .map_or_else(|| base_name(key), |r| r.original.as_str());
                 // A header's value, such as `"Authorization": "Bearer …"`.
                 if HEADERS.iter().any(|h| name.eq_ignore_ascii_case(h))
                     && field.as_str().is_some_and(|v| is_header_secret(name, v))
@@ -1571,7 +1632,7 @@ fn redact_nested(value: &mut Value, nested: usize) {
                     *field = Value::String(REDACTED.into());
                     continue;
                 }
-                match strength(name) {
+                match judged(key, &renamed, false) {
                     Strength::None => redact_nested(field, nested),
                     held => redact_held(held, field, nested),
                 }
