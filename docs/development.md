@@ -201,7 +201,10 @@ ATOMIC_DEV_SANDBOX=on scripts/dev.sh scripts/controls-check.sh
 In a linked worktree, also mount the main checkout's `.git` with
 `ATOMIC_DEV_MOUNTS`, since the script hashes files with git. It puts every
 file it edits back, even when interrupted, and `scripts/controls-check-test.sh`
-(in CI) tests that.
+(in CI) tests that. It refuses to start while a file a selected control edits
+differs from HEAD, including a file git does not track or is told to assume
+unchanged, so commit or put back changes to those files first; changes to
+other files do not matter.
 
 A control added later gets a row in the script. A row whose code has moved
 fails until it is updated.
