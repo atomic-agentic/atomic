@@ -832,6 +832,8 @@ async fn run_pipeline_in<C: WorkflowContext>(
     let store = services.store.clone();
     fits("the workflow's input", &pipeline.input, &input)?;
     plan(&pipeline, services.runtimes.codex.backend.statement())?;
+    // Every step is held to its atom's trust before the run does anything.
+    trusted(&pipeline).map_err(failed)?;
     // The budgets the run keeps: pinned before it started, or resolved now,
     // once, and recorded with its definitions.
     let planned = match &pipeline.budgets {
@@ -1018,19 +1020,6 @@ async fn run_pipeline_in<C: WorkflowContext>(
             .get(&step.atom)
             .cloned()
             .ok_or_else(|| failed(format!("step `{}`: no atom `{}`", step.id, step.atom)))?;
-        // Held to the atom's trust again where it runs, however the run was
-        // prepared: a resumed or served run, or one built by a constructor
-        // that skipped the loader's check. A field with no recorded origin
-        // is taken as external.
-        for (field, source) in &step.with {
-            let origin = step.origins.get(field).map_or("external", String::as_str);
-            if let Some(refused) = atomic_core::workflow::untrusted_binding(&atom, source, origin) {
-                return Err(failed(format!(
-                    "step `{}`: `with.{field}`: {refused}",
-                    step.id
-                )));
-            }
-        }
         let mut runtimes = (*services.runtimes).clone();
         // An atom with captured helpers gets its step's logical time and seed
         // from a step of its own, recorded once and read back on every retry,
@@ -1691,6 +1680,57 @@ pub fn register_pipeline<R: DurableRuntime>(rt: &mut R, services: Services) {
             ),
         )
     });
+}
+
+/// Hold every atom step's bindings to its atom's trust, as the loader does,
+/// from the pipeline alone: before a run does anything, so no step's effect
+/// lands before a later step is refused. Each binding's origin is the lower
+/// of what the run recorded for it (external, when it recorded nothing) and
+/// what its expression reads, recomputed from the steps before it, so a
+/// pipeline built some other way, or a run recorded before a check existed,
+/// cannot raise one. A resumed or served run is checked on the pipeline it
+/// recorded.
+fn trusted(pipeline: &Pipeline) -> std::result::Result<(), String> {
+    let mut kinds = BTreeMap::new();
+    for step in &pipeline.steps {
+        let step = match step {
+            Step::Gate(gate) => {
+                kinds.insert(gate.id.clone(), "gate".to_owned());
+                continue;
+            }
+            Step::Atom(step) => step,
+        };
+        let atom = pipeline
+            .atoms
+            .get(&step.atom)
+            .ok_or_else(|| format!("step `{}`: no atom `{}`", step.id, step.atom))?;
+        for (field, source) in &step.with {
+            let allowed = origin_of(source, &kinds).unwrap_or("external");
+            let recorded = step.origins.get(field).map_or("external", String::as_str);
+            let origin = if rank(recorded) < rank(allowed) {
+                recorded
+            } else {
+                allowed
+            };
+            if let Some(refused) = atomic_core::workflow::untrusted_binding(atom, source, origin) {
+                let lowered = if rank(recorded) < rank(allowed) {
+                    format!(", remove the `origins` entry that marks it {recorded}")
+                } else {
+                    String::new()
+                };
+                return Err(format!(
+                    "step `{}`: `with.{field}`: {refused}; bind it to {} instead{lowered}, or \
+                     declare a lower `trust` on the atom if it is built for {origin} input",
+                    step.id,
+                    atomic_core::workflow::trusted_sources(atomic_core::workflow::accepted_trust(
+                        atom
+                    )),
+                ));
+            }
+        }
+        kinds.insert(step.id.clone(), atom.kind.clone());
+    }
+    Ok(())
 }
 
 /// The name a replay of a recorded run is registered under.

@@ -92,6 +92,16 @@ pub fn accepted_trust(atom: &Atom) -> &str {
 /// held to this alike.
 pub fn untrusted_binding(atom: &Atom, source: &str, origin: &str) -> Option<String> {
     let accepts = accepted_trust(atom);
+    // An unknown origin ranks as external, the least trusted; an unknown
+    // trust, as a run recorded before the load refused one might hold,
+    // accepts nothing rather than everything.
+    if !TRUST.contains(&accepts) {
+        return Some(format!(
+            "atom `{}` declares `trust: '{accepts}'`, which is not external, agent or team, \
+             so it accepts no input",
+            atom.name
+        ));
+    }
     (trust_rank(origin) < trust_rank(accepts)).then(|| {
         format!(
             "`{source}` is {origin} data, and atom `{}` accepts {accepts} input at most \
@@ -538,10 +548,16 @@ pub fn load(
                     None => allowed,
                 };
                 if let Some(refused) = untrusted_binding(atom, source, origin) {
+                    // The step's own `origins` entry may be what lowered it.
+                    let lowered = if origin != allowed {
+                        format!(", remove the `origins` entry that marks it {origin}")
+                    } else {
+                        String::new()
+                    };
                     return Err(WorkflowError {
                         action: Some(format!(
-                            "bind it to {} instead, or declare a lower `trust` on the atom if it \
-                             is built for {origin} input",
+                            "bind it to {} instead{lowered}, or declare a lower `trust` on the \
+                             atom if it is built for {origin} input",
                             trusted_sources(accepted_trust(atom))
                         )),
                         ..fail(&wp, refused)

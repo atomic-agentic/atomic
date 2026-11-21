@@ -142,15 +142,15 @@ fn a_trust_other_than_the_three_origins_fails_where_it_is_written() {
     ] {
         for root in [project("{input.text}", config, None), untyped(config)] {
             load(&root.join("test.atom.astro"), &mut Registry::new()).expect_err(config);
+            let _ = std::fs::remove_dir_all(root);
         }
-        let error = load(
-            &untyped(config).join("test.atom.astro"),
-            &mut Registry::new(),
-        )
-        .expect_err(config)
-        .to_string();
+        let root = untyped(config);
+        let error = load(&root.join("test.atom.astro"), &mut Registry::new())
+            .expect_err(config)
+            .to_string();
+        let _ = std::fs::remove_dir_all(root);
         assert!(
-            error.contains("/trust") && error.contains("`trust` is external, agent, team"),
+            error.contains("/trust") && error.contains("`trust` is external, agent or team, not"),
             "{config}: {error}"
         );
     }
@@ -162,6 +162,7 @@ fn a_trust_other_than_the_three_origins_fails_where_it_is_written() {
     ] {
         for root in [project("{input.text}", config, None), untyped(config)] {
             load(&root.join("test.atom.astro"), &mut Registry::new()).expect(config);
+            let _ = std::fs::remove_dir_all(root);
         }
     }
 }
@@ -177,6 +178,7 @@ fn unknown_fields_and_unavailable_permissions_fail_closed() {
     ] {
         let root = project("{input.text}", config, None);
         load(&root.join("test.atom.astro"), &mut Registry::new()).expect_err(config);
+        let _ = std::fs::remove_dir_all(root);
     }
 }
 

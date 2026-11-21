@@ -3680,48 +3680,175 @@ fn trust_is_checked_per_binding() {
     .expect("agent accepted");
 }
 
+/// Start `pipeline` on a fresh engine and return why it was refused, with
+/// the number of model calls made first.
+async fn refused(dir: &Path, pipeline: Pipeline, run: &str) -> (String, usize) {
+    let model = FakeModel::start(vec![
+        Reply::Text(READ.into()),
+        Reply::Text(RANK.into()),
+        Reply::Text(SUMMARY.into()),
+    ])
+    .await
+    .expect("fake model");
+    let rt = engine(dir, &model.base_url()).await;
+    let input = json!({"text": "Exporting a file named café.txt crashes the app."});
+    rt.start(PIPELINE, run, PipelineRun { pipeline, input })
+        .await
+        .expect("start");
+    let error = rt
+        .result::<Value>(run)
+        .await
+        .expect_err("refused")
+        .to_string();
+    rt.shutdown(std::time::Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+    (error, model.calls())
+}
+
+/// The atom step `id` of `pipeline`.
+fn atom_step<'p>(pipeline: &'p mut Pipeline, id: &str) -> &'p mut atomic_app::pipeline::AtomStep {
+    pipeline
+        .steps
+        .iter_mut()
+        .find_map(|s| match s {
+            Step::Atom(step) if step.id == id => Some(step),
+            _ => None,
+        })
+        .expect("the step")
+}
+
 #[test]
-fn a_run_is_held_to_its_atoms_trust_where_each_step_runs() {
+fn a_run_is_held_to_its_atoms_trust_before_any_step_runs() {
     on_codex_runtime(async {
         let dir = scratch("trust-dispatch");
         let project = project(&dir);
         // Prepared as the loader allows, then handed to the engine with the
-        // rank step's atom trusting only team input: as a run prepared some
-        // other way would be, the step that maps external data is refused
-        // where it runs, before its model is called.
+        // rank step's atom trusting only team input. The rank step maps the
+        // read step's output, agent data: as a run prepared some other way
+        // would be, it is refused before the read step, or any, runs.
         let mut pipeline = load(&project, "triage.workflow.yaml", TRIAGE);
         pipeline
             .atoms
             .get_mut("rank-note")
             .expect("rank-note")
             .frontmatter["trust"] = json!("team");
-        let model = FakeModel::start(vec![
-            Reply::Text(READ.into()),
-            Reply::Text(RANK.into()),
-            Reply::Text(SUMMARY.into()),
-        ])
-        .await
-        .expect("fake model");
-        let rt = engine(&dir, &model.base_url()).await;
-        let run = PipelineRun {
-            pipeline,
-            input: json!({"text": "Exporting a file named café.txt crashes the app."}),
-        };
-        rt.start(PIPELINE, "untrusted", run).await.expect("start");
-        let error = rt
-            .result::<Value>("untrusted")
-            .await
-            .expect_err("refused at dispatch")
-            .to_string();
+        let (error, calls) = refused(&dir, pipeline, "untrusted").await;
         assert!(
-            error.contains("step `rank`") && error.contains("accepts team input at most"),
+            error.contains("step `rank`")
+                && error.contains("is agent data")
+                && error.contains("accepts team input at most"),
             "{error}"
         );
-        assert_eq!(model.calls(), 1, "only the read step called its model");
-        rt.shutdown(std::time::Duration::from_secs(5))
-            .await
-            .expect("shutdown");
+        assert!(
+            error.contains("bind it to a gate a person decides, or a literal in the workflow file"),
+            "the refusal names what to change"
+        );
+        assert_eq!(calls, 0, "a step ran before the refusal");
+
+        // A trust a stored run's atom holds that is none of the three accepts
+        // nothing.
+        let mut pipeline = load(&project, "triage.workflow.yaml", TRIAGE);
+        pipeline
+            .atoms
+            .get_mut("rank-note")
+            .expect("rank-note")
+            .frontmatter["trust"] = json!("Team");
+        let (error, calls) = refused(&dir, pipeline, "unknown-trust").await;
+        assert!(
+            error.contains("declares `trust: 'Team'`") && error.contains("accepts no input"),
+            "{error}"
+        );
+        assert_eq!(calls, 0);
     });
+}
+
+#[test]
+fn a_bindings_origin_at_run_time_is_the_lower_of_what_was_recorded_and_what_it_reads() {
+    on_codex_runtime(async {
+        let dir = scratch("trust-origins");
+        let project = project(&dir);
+        trusting_atom(&project, "team");
+        // Literals: team data, so the loader takes them.
+        let literals =
+            policy_workflow("'Be brief.'", "").replace("note: input.text", "note: \"'A note.'\"");
+        let prepared = load(&project, "policy.workflow.yaml", &literals);
+        // A field the run recorded no origin for counts as external.
+        let mut pipeline = prepared.clone();
+        atom_step(&mut pipeline, "apply").origins.clear();
+        let (error, calls) = refused(&dir, pipeline, "no-origins").await;
+        assert!(
+            error.contains("step `apply`") && error.contains("is external data"),
+            "{error}"
+        );
+        assert_eq!(calls, 0);
+        // A recorded origin above what the binding reads is not believed:
+        // the run's input, marked team, is still external.
+        let mut pipeline = prepared.clone();
+        let step = atom_step(&mut pipeline, "apply");
+        step.with.insert("note".into(), "input.text".into());
+        step.origins.insert("note".into(), "team".into());
+        let (error, calls) = refused(&dir, pipeline, "raised-origin").await;
+        assert!(error.contains("`input.text` is external data"), "{error}");
+        assert_eq!(calls, 0);
+        // A recorded origin below what the binding reads is kept, and the
+        // refusal says the `origins` entry lowered it.
+        let mut pipeline = prepared;
+        atom_step(&mut pipeline, "apply")
+            .origins
+            .insert("policy".into(), "agent".into());
+        let (error, _) = refused(&dir, pipeline, "lowered-origin").await;
+        assert!(
+            error.contains("remove the `origins` entry that marks it agent"),
+            "the refusal names the lowering entry"
+        );
+    });
+}
+
+#[test]
+fn a_refused_binding_says_what_can_take_its_place() {
+    let dir = scratch("trust-advice");
+    let project = project(&dir);
+    trusting_atom(&project, "team");
+    let action = |text: &str| {
+        let file = project.join("workflows/advice.workflow.yaml");
+        std::fs::write(&file, text).expect("workflow");
+        let mut registry = Registry::new();
+        let mut atoms = BTreeMap::new();
+        for entry in std::fs::read_dir(project.join("atoms")).expect("atoms") {
+            let path = entry.expect("entry").path();
+            if path.to_string_lossy().ends_with(".atom.astro") {
+                let atom = atom::load(&path, &mut registry).expect("atom loads");
+                atoms.insert(atom.name.clone(), atom);
+            }
+        }
+        workflow::load(&file, &atoms, &mut registry)
+            .expect_err("refused")
+            .action
+            .unwrap_or_default()
+    };
+    // Agent data for a team atom: what yields team data takes its place.
+    let agent = action(
+        &policy_workflow("steps.read.output.title", "")
+            .replace("\"steps.read.output.title\"", "steps.read.output.title"),
+    );
+    assert!(
+        agent.contains("bind it to a gate a person decides, or a literal in the workflow file"),
+        "the advice names the team sources"
+    );
+    assert!(
+        !agent.contains("`origins` entry"),
+        "no origins entry to remove"
+    );
+    // A literal that `origins` lowered: the advice names that entry.
+    let lowered = action(
+        &policy_workflow("'Be brief.'", "    origins: { policy: agent }\n")
+            .replace("note: input.text", "note: \"'A note.'\""),
+    );
+    assert!(
+        lowered.contains("remove the `origins` entry that marks it agent"),
+        "the advice names the lowering entry"
+    );
 }
 
 /// The shape of a serialized value: each object's keys, with the shape of

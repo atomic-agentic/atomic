@@ -445,10 +445,7 @@ pub fn load(file: &Path, registry: &mut Registry) -> Result<Atom, AtomError> {
             return Err(fail(
                 line_of("/trust"),
                 "/trust",
-                format!(
-                    "`trust` is {}, not {other}",
-                    crate::workflow::TRUST.join(", ")
-                ),
+                format!("`trust` is external, agent or team, not {other}"),
             ));
         }
     }
