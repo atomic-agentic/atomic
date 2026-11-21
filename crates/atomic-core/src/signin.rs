@@ -225,6 +225,7 @@ impl SignIn {
             reached: located,
             auth_home: dir,
             made: false,
+            stale: None,
             store,
             backend: None,
             issuer: None,
