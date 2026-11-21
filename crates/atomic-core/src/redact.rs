@@ -1474,36 +1474,54 @@ fn redact_nested(value: &mut Value, nested: usize) {
                 .for_each(|item| redact_nested(item, nested));
         }
         Value::Object(fields) => {
-            let renamed: Vec<(String, String)> = fields
+            // In the order of the keys themselves, so the same object
+            // numbers its entries the same however it was built.
+            let mut renamed: Vec<(String, String)> = fields
                 .keys()
                 .filter_map(|key| match text(key) {
                     Cow::Owned(new_key) => Some((key.clone(), new_key)),
                     Cow::Borrowed(_) => None,
                 })
                 .collect();
+            renamed.sort();
+            // Each numbered key's name as redacted, before its number, which
+            // is what says whether its value is a secret.
+            let mut named: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            // The next number for each name, so numbering stays linear.
+            let mut next: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
             for (old_key, new_key) in renamed {
                 if let Some(field) = fields.remove(&old_key) {
                     // Two keys can redact to the same text, as two that
                     // start private key blocks do: each keeps its entry,
                     // the later ones numbered, so neither hides the other.
                     let mut key = new_key.clone();
-                    let mut n = 2;
-                    while fields.contains_key(&key) {
-                        key = format!("{new_key} ({n})");
-                        n += 1;
+                    if fields.contains_key(&key) {
+                        let n = next.entry(new_key.clone()).or_insert(2);
+                        loop {
+                            step(1);
+                            key = format!("{new_key} ({n})");
+                            *n += 1;
+                            if !fields.contains_key(&key) {
+                                break;
+                            }
+                        }
+                        named.insert(key.clone(), new_key);
                     }
                     fields.insert(key, field);
                 }
             }
             for (key, field) in fields.iter_mut() {
+                let name = named.get(key).map_or(key.as_str(), String::as_str);
                 // A header's value, such as `"Authorization": "Bearer …"`.
-                if HEADERS.iter().any(|h| key.eq_ignore_ascii_case(h))
-                    && field.as_str().is_some_and(|v| is_header_secret(key, v))
+                if HEADERS.iter().any(|h| name.eq_ignore_ascii_case(h))
+                    && field.as_str().is_some_and(|v| is_header_secret(name, v))
                 {
                     *field = Value::String(REDACTED.into());
                     continue;
                 }
-                match strength(key) {
+                match strength(name) {
                     Strength::None => redact_nested(field, nested),
                     held => redact_held(held, field, nested),
                 }

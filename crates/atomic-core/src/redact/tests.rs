@@ -1310,3 +1310,76 @@ fn a_line_is_written_as_it_was_put_together() {
     assert_eq!(long.written().chars().count(), MAX_TEXT + 1);
     assert!(long.written().ends_with('…'));
 }
+
+/// Many keys that redact alike are numbered in linear time: each name keeps
+/// its next number rather than counting up from two again.
+#[test]
+fn numbering_keys_that_redact_alike_stays_linear() {
+    let keyed = |n: usize| {
+        let fields: serde_json::Map<String, Value> =
+            (0..n).map(|i| (format!("secret=a{i}"), json!(i))).collect();
+        Value::Object(fields)
+    };
+    let steps = |mut v: Value| {
+        STEPS.with(|s| s.set(0));
+        value(&mut v);
+        STEPS.with(std::cell::Cell::get)
+    };
+    let (small, large) = (steps(keyed(500)), steps(keyed(8_000)));
+    assert!(
+        large < 32 * small,
+        "{large} steps at sixteen times the keys of {small}"
+    );
+}
+
+/// A numbered key's value is judged by its name before its number: a
+/// secret's name stays one, and a count's stays a count.
+#[test]
+fn a_numbered_keys_value_is_judged_by_its_name() {
+    let (a, b) = (SHAPES[0], SHAPES[1]);
+    let mut held = json!({
+        format!("{a} dbpassword"): "hunter2",
+        format!("{b} dbpassword"): "hunter3",
+    });
+    value(&mut held);
+    let fields = held.as_object().expect("an object");
+    assert_eq!(fields.len(), 2, "{held}");
+    assert!(
+        fields.values().all(|v| v == REDACTED),
+        "a numbered secret's value showed"
+    );
+    let mut counted = json!({
+        format!("{a} token_count"): 12,
+        format!("{b} token_count"): 13,
+    });
+    value(&mut counted);
+    let mut kept: Vec<i64> = counted
+        .as_object()
+        .expect("an object")
+        .values()
+        .filter_map(Value::as_i64)
+        .collect();
+    kept.sort_unstable();
+    assert_eq!(kept, [12, 13], "{counted}");
+}
+
+/// The same object numbers its entries the same, whatever order its keys
+/// were put in.
+#[test]
+fn keys_that_redact_alike_are_numbered_in_their_own_order() {
+    let block = concat!("-----BEGIN PRIVATE", " KEY-----");
+    let one = format!("{block}1");
+    let two = format!("{block}2");
+    let mut forwards = serde_json::Map::new();
+    forwards.insert(one.clone(), json!("first"));
+    forwards.insert(two.clone(), json!("second"));
+    let mut backwards = serde_json::Map::new();
+    backwards.insert(two, json!("second"));
+    backwards.insert(one, json!("first"));
+    let (mut f, mut b) = (Value::Object(forwards), Value::Object(backwards));
+    value(&mut f);
+    value(&mut b);
+    assert_eq!(f, b);
+    assert_eq!(f["[REDACTED]"], "first", "{f}");
+    assert_eq!(f["[REDACTED] (2)"], "second", "{f}");
+}
