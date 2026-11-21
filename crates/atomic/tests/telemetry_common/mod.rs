@@ -786,16 +786,19 @@ const POLL_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
 /// answered, that none did. None of it quotes a killed poll, whose output
 /// stops where the kill landed and would hide the last real answer.
 ///
-/// No row under `scripts/controls/` switches this bound, or the guard that
-/// starts no poll once the deadline has passed, off: a row needs a test that
+/// Neither bound has a row under `scripts/controls/`: a row needs a test that
 /// fails with the control off, and nothing in the repository makes
 /// `atomic gates list` stop answering on its own, while the deadline is
 /// [`GATE_LIMIT`], which no test outlasts on the thread that runs it. Both
-/// are measured by hand, the second with the deadline shortened to seconds:
-/// with the guard gone the wait starts a poll it has no time left to wait
-/// for and counts it as killed; and with a killed poll's output kept no part
-/// apart from an answered one, the same message ends up quoting an empty
-/// answer as the last thing `gates list` said.
+/// are measured by hand. With the poll replaced by a command that never ends,
+/// the wait kills it, counts it and tries again, and with the poll's bound
+/// removed the same wait does not come back at all. With the deadline
+/// shortened to seconds, the guard is what keeps the wait from starting a
+/// poll it has no time left to wait for: with the guard gone the message
+/// counts one more killed poll than the same wait with it. A poll that had to
+/// be killed is kept out of what the message quotes because such a poll holds
+/// only what it got out before the kill, which for a command that never
+/// answered is nothing.
 /// `a_wait_for_a_gate_gives_up_at_its_limit_and_quotes_the_last_answer` runs
 /// to the deadline for real and holds what the wait counts and what it quotes
 /// to what actually happened.
