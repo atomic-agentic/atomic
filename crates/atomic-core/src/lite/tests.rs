@@ -351,6 +351,7 @@ impl Meter for Recorder {
                 admitted: Instant::now(),
                 limit: self.limit,
                 bounded_by: None,
+                release: crate::usage::Release::default(),
             };
             self.calls.lock().expect("calls").push(call);
             Ok(ticket)

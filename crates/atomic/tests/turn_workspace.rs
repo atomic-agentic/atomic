@@ -417,6 +417,7 @@ impl atomic_core::usage::Meter for Recorder {
                 admitted: std::time::Instant::now(),
                 limit: self.limit,
                 bounded_by: None,
+                release: atomic_core::usage::Release::default(),
             })
         })
     }
