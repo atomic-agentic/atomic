@@ -339,7 +339,7 @@ time rather than passing unchecked.
 | `kind` | `lite`, `codex` or `exec` |
 | `input`, `output` | Full JSON Schema or a local schema reference |
 | `model`, `sandbox` | Model selection and effective sandbox request |
-| `trust` | The riskiest input origin the atom accepts: `team`, `agent` or `external` (the default). A workflow that maps less trusted data into it fails to load; see [where each input came from](workflow-files.md#where-each-input-came-from) |
+| `trust` | The riskiest input origin the atom accepts: `team`, `agent` or `external` (the default). A workflow that maps less trusted data into it fails to load, and `atomic run <atom>`, whose input is external data, refuses it before anything runs unless the atom accepts external input; see [where each input came from](workflow-files.md#where-each-input-came-from) |
 | `validate` | Expression-bodied typed callbacks over `{input, output}` |
 | `examples` | Named `{input, output}` examples checked against full contracts |
 | `case`, `judges` | Full evaluation-case and judge input/output schema declarations |
@@ -389,9 +389,11 @@ home directory fails to read them.
 
 Anything that finds its files through your home directory does not find
 them: rustup's and cargo's homes (`~/.rustup`, `~/.cargo`), the Go module
-cache, pyenv and asdf shims, `~/.gitconfig` and `~/.npmrc`. A tool the
-atom's commands need has to be on `PATH` without them, and settings it
-needs passed in the atom's `env`.
+cache, pyenv and asdf shims, `~/.gitconfig` and `~/.npmrc`. A worktree step
+is pointed at its run's own build caches and your rustup toolchains (see
+[worktree steps](workflow-files.md#atom-steps)); for anything else, a tool the
+atom's commands need has to be on `PATH` without them, and settings it needs
+passed in the atom's `env`.
 
 Some integrations shown in the catalog remain staged. Unavailable permissions,
 remote atoms, credentials, skills and runtime declarations fail explicitly in the

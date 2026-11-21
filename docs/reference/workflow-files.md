@@ -56,7 +56,26 @@ commit its mapped `base` names; the step must map `base`. Every attempt starts
 again from that commit. When the atom's turn ends, Atomic commits what it left,
 outside the sandbox, and records the commit in `steps.<id>.metadata.commit`,
 beside `base` and `commit_ref`. The worktrees are removed when the run finishes;
-accepted commits keep their refs.
+accepted commits keep their refs. A run that fails keeps its worktrees and
+their refs, so it can be inspected and resumed.
+
+No build cache an atom writes outlives its run. A worktree step's commands
+get build caches of the run's own, which they may write and which are
+removed when the run ends, whether it finishes or fails. A run stopped to
+be resumed, parked, or taken over by another process keeps them; one
+resumed after they went builds cold:
+`XDG_CACHE_HOME`, npm's, pip's and Go's caches
+(`GOCACHE`, `GOMODCACHE`) and `ATOMIC_CACHE_DIR` all point into one private
+directory in the state directory, shared by the run's worktree steps.
+`CARGO_TARGET_DIR` is each worktree's own, so no worktree runs what another
+built. Their `HOME` is the attempt's own, empty, directory, which they may
+write, and `CARGO_HOME` is `.cargo` inside it, never shared and never yours.
+`RUSTUP_HOME` points at the toolchains installed for you (your `RUSTUP_HOME`,
+or `~/.rustup`), which the commands may only read: a step does not start if
+it is inside, or holds, a directory the turn may write. A read-only step finds
+the same variables and writes nothing. A variable the atom declares in `env`
+wins over these, except that no build cache variable may point into the
+temporary directory every turn shares. Each run therefore builds from cold.
 
 ### Where each input came from
 
