@@ -78,6 +78,7 @@ fn runtime(model: &FakeModel, tag: &str) -> CodexRuntime {
         artifacts: Artifacts::none(),
         meter: crate::usage::Metering::none(),
         backend: Default::default(),
+        caches: None,
     }
 }
 
@@ -2386,6 +2387,121 @@ fn a_lite_atom_says_a_sign_in_is_not_for_it() {
         assert!(said.contains("ATOMIC_MODEL_BASE_URL"), "{said}");
         assert_eq!(model.calls(), 0);
     });
+}
+
+#[tokio::test]
+async fn a_worktree_steps_turn_finds_its_runs_caches_and_only_it_may_write_them() {
+    let model = FakeModel::start(vec![]).await.expect("model");
+    let mut rt = runtime(&model, "caches");
+    let contract = json!({"type": "object"});
+    let validator = jsonschema::validator_for(&contract).expect("schema");
+    let request = |sandbox, env: &[(&str, &str)]| Request {
+        developer: String::new(),
+        prompt: String::new(),
+        model: None,
+        sandbox,
+        contract: &contract,
+        validator: &validator,
+        name: "fix",
+        place: Place::of("run-1", "fix"),
+        env: env
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect(),
+    };
+    use crate::typed::Sandbox::{ReadOnly, WorkspaceWrite};
+    // Outside a worktree step, nothing of the caches.
+    let open = Backend::Codex(&rt).open(&request(WorkspaceWrite, &[]));
+    assert!(
+        open.env.is_empty() && open.writable_roots.is_empty(),
+        "{open:?}"
+    );
+    let caches = crate::worktree::Caches::new(std::env::temp_dir().join("atomic-caches-x"));
+    rt.caches = Some(caches.clone());
+    let open = Backend::Codex(&rt).open(&request(WorkspaceWrite, &[("CARGO_TARGET_DIR", "/mine")]));
+    assert!(
+        !open.env.contains_key("CARGO_HOME"),
+        "cargo's home is the attempt's own: {open:?}"
+    );
+    for name in [
+        "PIP_CACHE_DIR",
+        "GOMODCACHE",
+        "XDG_CACHE_HOME",
+        "ATOMIC_CACHE_DIR",
+    ] {
+        let at = open
+            .env
+            .get(name)
+            .unwrap_or_else(|| panic!("{name}: {open:?}"));
+        assert!(
+            std::path::Path::new(at).starts_with(caches.dir()),
+            "{name}={at}"
+        );
+    }
+    assert!(!open.env.contains_key("HOME"), "HOME is the attempt's own");
+    assert_eq!(
+        open.env["CARGO_TARGET_DIR"], "/mine",
+        "what the atom declares wins"
+    );
+    assert_eq!(open.writable_roots, [caches.dir().to_owned()]);
+    // A read-only turn finds them, and writes nothing.
+    let open = Backend::Codex(&rt).open(&request(ReadOnly, &[]));
+    assert!(open.env.contains_key("XDG_CACHE_HOME"));
+    assert!(open.writable_roots.is_empty(), "{open:?}");
+}
+
+#[test]
+fn a_turns_cargo_home_is_its_own_and_its_toolchains_are_only_read() {
+    use crate::typed::Sandbox::WorkspaceWrite;
+    let dir = std::env::temp_dir().join(format!("atomic-turn-in-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for sub in ["tree", "scratch", "tmp", "caches", "toolchains"] {
+        std::fs::create_dir_all(dir.join(sub)).expect("dir");
+    }
+    let workspace = |rustup: &std::path::Path| atomic_exec::Workspace {
+        label: "fix".into(),
+        root: Some(dir.join("tree")),
+        scratch: Some(dir.join("scratch")),
+        tmp: Some(dir.join("tmp")),
+        shell: Shell::Local,
+        sandbox: WorkspaceWrite,
+        writable_roots: vec![dir.join("caches")],
+        env: [("RUSTUP_HOME".to_owned(), rustup.display().to_string())].into(),
+    };
+    let mut spec = TurnSpec::default();
+    turn_in(&workspace(&dir.join("toolchains")), &mut spec).expect("toolchains apart");
+    assert_eq!(
+        spec.env["CARGO_HOME"],
+        dir.join("scratch/.cargo").display().to_string()
+    );
+    // Toolchains inside, or holding, anything the turn may write.
+    for inside in ["caches/rustup", "tree/rustup", "scratch/.rustup", ""] {
+        let mut spec = TurnSpec::default();
+        let refused = turn_in(&workspace(&dir.join(inside)), &mut spec).expect_err(inside);
+        assert!(refused.to_string().contains("RUSTUP_HOME"), "{refused}");
+    }
+    // A cache an atom points into the temporary directory every turn
+    // shares.
+    let mut shared = workspace(&dir.join("toolchains"));
+    shared.env.insert(
+        "GOMODCACHE".into(),
+        dir.join("tmp/go").display().to_string(),
+    );
+    let refused = turn_in(&shared, &mut TurnSpec::default()).expect_err("shared");
+    assert!(refused.to_string().contains("GOMODCACHE"), "{refused}");
+    // Through a link to it, too.
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(dir.join("tmp"), dir.join("alias")).expect("link");
+        let mut linked = workspace(&dir.join("toolchains"));
+        linked.env.insert(
+            "XDG_CACHE_HOME".into(),
+            dir.join("alias/xdg").display().to_string(),
+        );
+        let refused = turn_in(&linked, &mut TurnSpec::default()).expect_err("linked");
+        assert!(refused.to_string().contains("XDG_CACHE_HOME"), "{refused}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // A turn's commands get a TMPDIR of their own turn's on every platform: on

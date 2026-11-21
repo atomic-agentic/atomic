@@ -223,6 +223,7 @@ fn runtimes_on(dir: &Path, cwd: &Path, base_url: &str, model: &str) -> Arc<Runti
             artifacts: Artifacts::none(),
             meter: atomic_core::usage::Metering::none(),
             backend: Default::default(),
+            caches: None,
         },
         lite: LiteRuntime::new(endpoint, AtomConfig::default()),
         exec: Default::default(),

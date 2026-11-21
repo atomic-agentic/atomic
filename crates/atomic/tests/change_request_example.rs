@@ -191,6 +191,7 @@ async fn engine(dir: &Path, project: &Path, base_url: &str) -> Durare {
             artifacts: Artifacts::none(),
             meter: atomic_core::usage::Metering::none(),
             backend: Default::default(),
+            caches: None,
         },
         lite: LiteRuntime::new(endpoint, AtomConfig::default()),
         exec: Default::default(),

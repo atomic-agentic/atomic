@@ -16,8 +16,12 @@
 //!   header that frames the request.
 //!
 //! Safe methods (GET, HEAD, OPTIONS) are retried after a connection failure,
-//! a 429 or a 5xx; others are sent once. Responses are bounded, and checked
-//! against the operation's response schema when it declares one.
+//! a 429 or a 5xx; others are sent once. Responses are bounded. A success
+//! is checked against the response the operation declares for its status
+//! (its own code, else its range, else `default`): its schema, if it has
+//! one. A success with a status the operation declares no response for,
+//! when it declares any, is refused; it was answered, so it is not sent
+//! again.
 
 use atomic_schema::openapi::Operation;
 use reqwest::Url;
@@ -96,13 +100,30 @@ pub enum CallError {
         /// What failed.
         message: String,
     },
-    /// The response breaks the operation's declared response schema.
-    #[error("`{operation}` returned a response that does not fit its schema: {errors}")]
+    /// The response breaks the schema the operation declares for its status.
+    #[error(
+        "`{operation}` returned {status}, which does not fit its response `{response}`: {errors}"
+    )]
     Response {
         /// The operation.
         operation: String,
+        /// The HTTP status.
+        status: u16,
+        /// The response it was checked against, as the spec declares it:
+        /// `200`, `2XX` or `default`.
+        response: String,
         /// Each violation, with its path.
         errors: String,
+    },
+    /// The server answered a success with a status the operation declares
+    /// no response for. The request was made and answered, so it is not
+    /// sent again.
+    #[error("`{operation}` returned {status}, a status its spec declares no response for")]
+    Undeclared {
+        /// The operation.
+        operation: String,
+        /// The HTTP status.
+        status: u16,
     },
 }
 
@@ -522,7 +543,7 @@ impl HttpToolset {
                     serde_json::from_slice(&bytes)
                         .map_err(|e| transport(format!("the response is not JSON: {e}")))?
                 };
-                return self.check_response(name, value);
+                return self.check_response(name, status.as_u16(), value);
             }
             let error = CallError::Status {
                 operation: name.to_owned(),
@@ -539,14 +560,32 @@ impl HttpToolset {
 }
 
 impl HttpToolset {
-    /// `value` if it fits the operation's response schema, or has none to
-    /// fit.
-    fn check_response(&self, name: &str, value: Value) -> Result<Value, CallError> {
-        let Some(schema) = self.operations.get(name).and_then(|op| op.output.as_ref()) else {
+    /// `value`, the body of a success with `status`, if it fits the schema
+    /// the operation declares for that status (see
+    /// [`atomic_schema::openapi::Operation::response`]), or the operation
+    /// declares none to fit: a response it declares with no JSON body, such
+    /// as a `204`, has nothing to check, and an operation that declares no
+    /// response at all takes any. A success whose status the operation does
+    /// not declare, when it declares others, is refused.
+    fn check_response(&self, name: &str, status: u16, value: Value) -> Result<Value, CallError> {
+        let Some(operation) = self.operations.get(name) else {
             return Ok(value);
+        };
+        let (key, schema) = match operation.response(status) {
+            Some((key, Some(schema))) => (key, schema),
+            Some((_, None)) => return Ok(value),
+            None if operation.responses.is_empty() => return Ok(value),
+            None => {
+                return Err(CallError::Undeclared {
+                    operation: name.to_owned(),
+                    status,
+                });
+            }
         };
         let response = |errors: String| CallError::Response {
             operation: name.to_owned(),
+            status,
+            response: key.to_owned(),
             errors,
         };
         let validator = atomic_schema::registry::Registry::new()
