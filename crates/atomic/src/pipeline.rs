@@ -865,10 +865,11 @@ async fn run_pipeline<C: WorkflowContext>(
     services: Arc<Services>,
     ledger: Ledger,
     replay: Option<Arc<Replay>>,
+    why: atomic_core::usage::Why,
 ) -> Result<Value> {
     let id = ctx.workflow_id().to_owned();
     let mut caches = None;
-    let result = run_pipeline_in(ctx, run, services, ledger, replay, &mut caches).await;
+    let result = run_pipeline_in(ctx, run, services, ledger, replay, &why, &mut caches).await;
     if let Some(caches) = caches {
         settle_caches(&id, caches, &result).await;
     }
@@ -914,6 +915,7 @@ async fn run_pipeline_in<C: WorkflowContext>(
     services: Arc<Services>,
     ledger: Ledger,
     replay: Option<Arc<Replay>>,
+    why: &atomic_core::usage::Why,
     run_caches: &mut Option<atomic_core::worktree::Caches>,
 ) -> Result<Value> {
     let PipelineRun { pipeline, input } = run;
@@ -937,6 +939,7 @@ async fn run_pipeline_in<C: WorkflowContext>(
     reached(&id, 0)?;
     let store = services.store.clone();
     fits("the workflow's input", &pipeline.input, &input)?;
+    check_reviews(&pipeline)?;
     plan(&pipeline, services.runtimes.backend.statement())?;
     // Every step is held to its atom's trust before the run does anything.
     trusted(&pipeline).map_err(failed)?;
@@ -1112,6 +1115,7 @@ async fn run_pipeline_in<C: WorkflowContext>(
                 );
                 let decision = crate::telemetry::traced(
                     crate::telemetry::gate_span(&g.id, ctx.workflow_id()),
+                    why.clone(),
                     decision,
                 )
                 .await?;
@@ -1143,6 +1147,7 @@ async fn run_pipeline_in<C: WorkflowContext>(
             worktrees: run_worktrees.as_ref(),
             accepted: &accepted,
             caches: run_caches.as_ref(),
+            why,
         };
         used_worktrees |= step.worktree;
         let (candidate, told) = turn(
@@ -1288,6 +1293,9 @@ struct RunScope<'a> {
     /// The run's build caches, shared by its worktree and exec turns,
     /// repairs and reviews included.
     caches: Option<&'a atomic_core::worktree::Caches>,
+    /// What this run's spans say of a step that failed (see
+    /// [`atomic_core::usage::Why`]).
+    why: &'a atomic_core::usage::Why,
 }
 
 /// One turn of an atom: a step's author, a reviewer, or the author's repair
@@ -1330,6 +1338,7 @@ async fn turn<C: WorkflowContext>(
         models,
         replay,
         pinned,
+        why,
         ..
     } = *run;
     // A fixture is its own repository (see `in_worktree`).
@@ -1340,6 +1349,10 @@ async fn turn<C: WorkflowContext>(
         .cloned()
         .ok_or_else(|| failed(format!("step `{}`: no atom `{}`", t.name, t.atom)))?;
     let mut runtimes = (*services.runtimes).clone();
+    // What this run's spans say of a failure. Each run of this step notes on a
+    // handle of its own, which the run takes up only when that step failed
+    // (see [`atomic_core::usage::Why`] and [`crate::telemetry::traced_step`]).
+    let run_why = (*why).clone();
     // An atom with captured helpers gets its step's logical time and seed
     // from a step of its own, recorded once and read back on every retry,
     // so its helpers render the same prompt and reach the same validator
@@ -1547,6 +1560,9 @@ async fn turn<C: WorkflowContext>(
         // The turn runs again after a park is released, so each run
         // takes its own copies.
         let mut runtimes = runtimes.clone();
+        // What this run of this step's model calls say of a failure of their
+        // own, which its span says in turn.
+        let why = atomic_core::usage::Why::for_step();
         let step_caches = step_caches.clone();
         let (atom, atom_input, origins) = (atom.clone(), atom_input.clone(), origins.clone());
         let repair = repair.clone();
@@ -1707,8 +1723,15 @@ async fn turn<C: WorkflowContext>(
             failpoint(&ran);
             Ok(proposal)
         };
-        // Model calls name the run and step on their spans.
-        crate::telemetry::traced(span, atomic_core::usage::for_step(caller.0, caller.1, work))
+        // Model calls name the run and step on their spans, and say why they
+        // failed here and, if this step is what failed the run, on its span
+        // too (see `mark_failed`).
+        crate::telemetry::traced_step(
+            span,
+            why.clone(),
+            &run_why,
+            atomic_core::usage::for_step(caller.0, caller.1, why, work),
+        )
     })
     .await;
     drop(release);
@@ -1741,35 +1764,6 @@ async fn reviewed<C: WorkflowContext>(
     input: Value,
     (mut candidate, author_turn): (Candidate, i32),
 ) -> Result<(Candidate, Acceptance)> {
-    // As the loader refuses them, for a run whose pipeline came from
-    // anywhere else.
-    if step.id.contains('.') {
-        return Err(failed(format!(
-            "step `{}` has a dot in its name, which its review's durable names would share",
-            step.id
-        )));
-    }
-    let kind = |name: &str| run.pipeline.atoms.get(name).map(|a| a.kind.as_str());
-    if kind(&step.atom) == Some("exec") {
-        return Err(failed(format!(
-            "step `{}`: an exec atom's output cannot be reviewed",
-            step.id
-        )));
-    }
-    if !matches!(kind(&review.reviewer), Some("lite" | "codex")) {
-        return Err(failed(format!(
-            "step `{}`: its reviewer `{}` is not a lite or codex atom of the run",
-            step.id, review.reviewer
-        )));
-    }
-    if review.rounds > atomic_core::workflow::MAX_REVIEW_ROUNDS {
-        return Err(failed(format!(
-            "step `{}`: its review gives {} repair rounds, more than the {} atomic allows",
-            step.id,
-            review.rounds,
-            atomic_core::workflow::MAX_REVIEW_ROUNDS
-        )));
-    }
     let author = run
         .pipeline
         .atoms
@@ -1906,6 +1900,7 @@ async fn reviewed<C: WorkflowContext>(
     *working = None;
     let resolution = crate::telemetry::traced(
         crate::telemetry::gate_span(&id, ctx.workflow_id()),
+        (*run.why).clone(),
         gate::gate(ctx, &id, spec),
     )
     .await?;
@@ -1931,6 +1926,47 @@ async fn reviewed<C: WorkflowContext>(
             }
         ))),
     }
+}
+
+/// Refuse, before anything of the run is paid for, a reviewed step the
+/// workflow loader would have refused, for a run whose pipeline came from
+/// anywhere else: a dotted name, an exec author, a reviewer that is not a
+/// model atom of the run, or more rounds than atomic allows.
+fn check_reviews(pipeline: &Pipeline) -> Result<()> {
+    for step in &pipeline.steps {
+        let Step::Atom(step) = step else { continue };
+        let Some(review) = &step.review else { continue };
+        // As the loader refuses them, for a run whose pipeline came from
+        // anywhere else.
+        if step.id.contains('.') {
+            return Err(failed(format!(
+                "step `{}` has a dot in its name, which its review's durable names would share",
+                step.id
+            )));
+        }
+        let kind = |name: &str| pipeline.atoms.get(name).map(|a| a.kind.as_str());
+        if kind(&step.atom) == Some("exec") {
+            return Err(failed(format!(
+                "step `{}`: an exec atom's output cannot be reviewed",
+                step.id
+            )));
+        }
+        if !matches!(kind(&review.reviewer), Some("lite" | "codex")) {
+            return Err(failed(format!(
+                "step `{}`: its reviewer `{}` is not a lite or codex atom of the run",
+                step.id, review.reviewer
+            )));
+        }
+        if review.rounds > atomic_core::workflow::MAX_REVIEW_ROUNDS {
+            return Err(failed(format!(
+                "step `{}`: its review gives {} repair rounds, more than the {} atomic allows",
+                step.id,
+                review.rounds,
+                atomic_core::workflow::MAX_REVIEW_ROUNDS
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Refuse, before anything runs, a step the execution backend's statement
@@ -2219,31 +2255,34 @@ pub fn register_pipeline<R: DurableRuntime>(rt: &mut R, services: Services) {
     rt.register(PIPELINE, move |ctx: R::Context, run: PipelineRun| {
         let span = crate::telemetry::workflow_span(&run.pipeline.name, ctx.workflow_id());
         let id = ctx.workflow_id().to_owned();
-        crate::panics::caught(
-            id,
-            crate::telemetry::traced(
-                span,
-                run_pipeline(ctx, run, services.clone(), ledger.clone(), None),
-            ),
-        )
+        // One for this execution of the run, which its steps note when a
+        // model call of theirs fails (see [`atomic_core::usage::Why`]).
+        let why = atomic_core::usage::Why::default();
+        let traced = crate::telemetry::traced(
+            span,
+            why.clone(),
+            run_pipeline(ctx, run, services.clone(), ledger.clone(), None, why),
+        );
+        crate::panics::caught(id, traced)
     });
     rt.register(REPLAY, move |ctx: R::Context, replay: ReplayRun| {
         let ReplayRun { of, run, recorded } = replay;
         let span = crate::telemetry::workflow_span(&run.pipeline.name, ctx.workflow_id());
         let id = ctx.workflow_id().to_owned();
-        crate::panics::caught(
-            id,
-            crate::telemetry::traced(
-                span,
-                run_pipeline(
-                    ctx,
-                    run,
-                    replaying.clone(),
-                    replay_ledger.clone(),
-                    Some(Arc::new(Replay { of, recorded })),
-                ),
+        let why = atomic_core::usage::Why::default();
+        let traced = crate::telemetry::traced(
+            span,
+            why.clone(),
+            run_pipeline(
+                ctx,
+                run,
+                replaying.clone(),
+                replay_ledger.clone(),
+                Some(Arc::new(Replay { of, recorded })),
+                why,
             ),
-        )
+        );
+        crate::panics::caught(id, traced)
     });
 }
 
