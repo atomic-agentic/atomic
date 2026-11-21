@@ -16,11 +16,12 @@
 //! which resolves each declared name before it connects and refuses one
 //! that resolves to this machine or a private network, or does not
 //! resolve. To the addresses Codex's proxy counts as private, atomic adds
-//! the IPv6 forms that carry an IPv4 address inside them (NAT64, 6to4 and
-//! Teredo), whatever that address is, and every address this machine's
-//! interfaces have, public ones too ([`denied_addresses`]). The proxy never goes through another proxy, even when atomic's
-//! own environment names one, and speaks only HTTP and HTTPS `CONNECT`, not
-//! SOCKS.
+//! three IPv6 prefixes that carry an IPv4 address inside them (NAT64, 6to4
+//! and Teredo), whatever that address is, and every address the interfaces
+//! of atomic's network namespace have, public ones too
+//! ([`denied_addresses`]). The proxy never goes through another proxy, even
+//! when atomic's own environment names one, and speaks only HTTP and HTTPS
+//! `CONNECT`, not SOCKS.
 //!
 //! While a command that declared hosts runs, its proxy listens on this
 //! machine's loopback interface, and serves only that command's bridge: the
@@ -199,6 +200,15 @@ struct Running {
     own: BTreeSet<IpAddr>,
 }
 
+impl Running {
+    /// Whether a command may use this proxy while this machine has the
+    /// addresses `own`: only if it was started with the same ones, so it
+    /// refuses every one of them, and still accepts connections.
+    fn reusable(&self, own: &BTreeSet<IpAddr>) -> bool {
+        self.own == *own && alive(self)
+    }
+}
+
 /// IPv6 addresses that carry an IPv4 address, as patterns over the way the
 /// proxy writes an address (Rust's, lowercase and compressed), for its deny
 /// list: NAT64's prefixes, well-known and local-use (`64:ff9b::/32`, which
@@ -221,7 +231,20 @@ fn denied_addresses(own: &BTreeSet<IpAddr>) -> Vec<String> {
         .collect()
 }
 
-/// Every address this machine's interfaces have now.
+/// `own`, read as this machine's addresses, or why not: a machine always
+/// has its loopback interface's, so a list without any is wrong, and a
+/// proxy given it would refuse none of them.
+fn checked(own: BTreeSet<IpAddr>) -> anyhow::Result<BTreeSet<IpAddr>> {
+    anyhow::ensure!(
+        !own.is_empty(),
+        "this machine's network interfaces were listed with no addresses, not even loopback's"
+    );
+    Ok(own)
+}
+
+/// Every address the interfaces of this process's network namespace have
+/// now: this machine's, as far as the proxy can tell. A container's or a
+/// virtual machine's addresses on another namespace are not among them.
 #[allow(unsafe_code)]
 fn own_addresses() -> anyhow::Result<BTreeSet<IpAddr>> {
     let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
@@ -258,7 +281,7 @@ fn own_addresses() -> anyhow::Result<BTreeSet<IpAddr>> {
     }
     // SAFETY: `list` came from getifaddrs and is not used after this.
     unsafe { libc::freeifaddrs(list) };
-    Ok(own)
+    checked(own)
 }
 
 /// What a command holds while it runs: its proxy runs until no command
@@ -284,12 +307,18 @@ fn token() -> anyhow::Result<String> {
 /// The proxies a confining backend runs, one for each distinct list of
 /// hosts, each kept while a command that declared it runs.
 #[derive(Clone, Default)]
-pub(crate) struct Proxies(Arc<Mutex<HashMap<Vec<String>, Weak<Running>>>>);
+pub(crate) struct Proxies {
+    running: Arc<Mutex<HashMap<Vec<String>, Weak<Running>>>>,
+    /// This machine's addresses as a test says they are, in place of its
+    /// interfaces'.
+    #[cfg(test)]
+    own_for_tests: Arc<Mutex<Option<BTreeSet<IpAddr>>>>,
+}
 
 impl std::fmt::Debug for Proxies {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let hosts: Vec<Vec<String>> = self
-            .0
+            .running
             .lock()
             .map(|m| m.keys().cloned().collect())
             .unwrap_or_default();
@@ -341,17 +370,17 @@ impl Proxies {
         key.extend(loopback.iter().map(|l| format!("loopback:{l}")));
         // A proxy started before this machine's addresses changed would
         // reach a new one: start another.
-        let own = own_addresses()?;
+        let own = self.own()?;
         let running = {
             let mut proxies = self
-                .0
+                .running
                 .lock()
                 .map_err(|_| anyhow::anyhow!("the network proxies' lock is poisoned"))?;
             proxies.retain(|_, running| running.strong_count() > 0);
             match proxies
                 .get(&key)
                 .and_then(Weak::upgrade)
-                .filter(|running| running.own == own && alive(running))
+                .filter(|running| running.reusable(&own))
             {
                 Some(running) => running,
                 None => {
@@ -387,10 +416,31 @@ impl Proxies {
         Ok((prepared, lease))
     }
 
+    /// This machine's addresses now, or, in a test that set them, the
+    /// test's.
+    fn own(&self) -> anyhow::Result<BTreeSet<IpAddr>> {
+        #[cfg(test)]
+        if let Some(own) = self
+            .own_for_tests
+            .lock()
+            .map_err(|_| anyhow::anyhow!("the test's addresses' lock is poisoned"))?
+            .clone()
+        {
+            return checked(own);
+        }
+        own_addresses()
+    }
+
+    /// Have the proxies take `own` as this machine's addresses.
+    #[cfg(test)]
+    fn set_own_for_tests(&self, own: BTreeSet<IpAddr>) {
+        *self.own_for_tests.lock().expect("addresses") = Some(own);
+    }
+
     /// How many proxies run now.
     #[cfg(test)]
     fn running(&self) -> usize {
-        self.0
+        self.running
             .lock()
             .map(|m| m.values().filter(|r| r.strong_count() > 0).count())
             .unwrap_or_default()
@@ -419,11 +469,8 @@ async fn start(
     // every request reaches the decider, which checks host and port.
     config.set_allowed_domains(loopback.to_vec());
     // A test's loopback address is on this machine too, and stays reachable.
-    let denied: BTreeSet<IpAddr> = own
-        .iter()
-        .filter(|ip| !loopback.contains(&ip.to_string()))
-        .copied()
-        .collect();
+    let reachable: BTreeSet<IpAddr> = loopback.iter().filter_map(|l| l.parse().ok()).collect();
+    let denied: BTreeSet<IpAddr> = own.difference(&reachable).copied().collect();
     config.set_denied_domains(denied_addresses(&denied));
     let state = codex_network_proxy::build_config_state(
         config,
@@ -728,11 +775,82 @@ mod tests {
     }
 
     /// The machine's addresses are its interfaces': loopback's among them.
+    /// A list with none is refused, since there is always loopback's.
     #[test]
     fn this_machines_addresses_come_from_its_interfaces() {
         let own = own_addresses().expect("addresses");
         assert!(own.contains(&IpAddr::V4(Ipv4Addr::LOCALHOST)), "{own:?}");
         let denied = denied_addresses(&own);
         assert!(denied.contains(&"127.0.0.1".to_owned()), "{denied:?}");
+        assert!(checked(BTreeSet::new()).is_err());
+        let proxies = Proxies::default();
+        proxies.set_own_for_tests(BTreeSet::new());
+        let Err(refused) = proxies.prepare(&["allowed.invalid".to_owned()], &[], HashMap::new())
+        else {
+            panic!("a proxy without this machine's addresses");
+        };
+        assert!(refused.to_string().contains("no addresses"), "{refused}");
+    }
+
+    /// A proxy a command prepares refuses this machine's own addresses: one
+    /// of loopback's is refused as denied, by the list, before the proxy's
+    /// own check of local addresses (`not_allowed_local`) is reached.
+    #[test]
+    fn a_prepared_proxy_refuses_this_machines_addresses() {
+        let proxies = Proxies::default();
+        let (prepared, _lease) = proxies
+            .prepare(&["allowed.invalid".to_owned()], &[], HashMap::new())
+            .expect("starts");
+        let addr = prepared.env["HTTP_PROXY"]
+            .trim_start_matches("http://")
+            .trim_end_matches('/')
+            .to_owned();
+        assert_eq!(fetch_from(&addr, None, "127.0.0.1"), "403 denied");
+    }
+
+    /// A proxy is used again only while this machine has the addresses it
+    /// started with: once they change, a command gets a new proxy, which
+    /// refuses the new ones, while the old one runs on for its command.
+    #[test]
+    fn a_proxy_is_not_reused_once_this_machines_addresses_change() {
+        let proxies = Proxies::default();
+        let hosts = ["allowed.invalid".to_owned()];
+        let one: IpAddr = "2001:db8::5".parse().expect("address");
+        let two: IpAddr = "2001:db8::6".parse().expect("address");
+        let proxy_of = |p: &PreparedManagedNetwork| {
+            p.env["HTTP_PROXY"]
+                .trim_start_matches("http://")
+                .trim_end_matches('/')
+                .to_owned()
+        };
+        proxies.set_own_for_tests([one].into());
+        let (first, _first) = proxies
+            .prepare(&hosts, &[], HashMap::new())
+            .expect("starts");
+        let (again, _again) = proxies
+            .prepare(&hosts, &[], HashMap::new())
+            .expect("reused");
+        assert_eq!(
+            proxy_of(&first),
+            proxy_of(&again),
+            "the same addresses: reused"
+        );
+        proxies.set_own_for_tests([two].into());
+        let (moved, _moved) = proxies
+            .prepare(&hosts, &[], HashMap::new())
+            .expect("starts");
+        assert_ne!(
+            proxy_of(&first),
+            proxy_of(&moved),
+            "new addresses: a new proxy"
+        );
+        assert_eq!(
+            fetch_from(&proxy_of(&moved), None, "[2001:db8::6]"),
+            "403 denied"
+        );
+        assert_eq!(
+            fetch_from(&proxy_of(&first), None, "[2001:db8::5]"),
+            "403 denied"
+        );
     }
 }
