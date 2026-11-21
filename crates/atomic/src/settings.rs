@@ -858,8 +858,9 @@ fn person_budget(
                     if !priced_by_project.is_empty() {
                         notes.push(format!(
                             "budget.pricing: your own dollar cap ({}) counts calls to {} at \
-                             prices only the project's configuration sets; price them in your \
-                             own configuration to hold them to yours",
+                             prices only a layer above yours sets (the project's files or \
+                             ATOMIC_BUDGET_PRICING); price them in your own configuration to \
+                             hold them to yours",
                             user.display(),
                             priced_by_project
                                 .iter()
@@ -945,8 +946,16 @@ fn own_budget_read(
             );
         };
         for field in ["input_usd_per_mtok", "output_usd_per_mtok"] {
-            if !fields.get(field).is_some_and(Value::is_number) {
-                return refuse(&format!("{dotted}.{field}"), "is not a number");
+            match fields.get(field) {
+                Some(v) if v.is_number() => {}
+                Some(_) => return refuse(&format!("{dotted}.{field}"), "is not a number"),
+                None => {
+                    return refuse(
+                        &format!("{dotted}.{field}"),
+                        "is missing: a price needs both input_usd_per_mtok and \
+                         output_usd_per_mtok",
+                    );
+                }
             }
         }
         for field in ["max_input_tokens", "max_output_tokens"] {

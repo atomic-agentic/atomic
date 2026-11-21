@@ -62,7 +62,8 @@
                 "output_tokens": "null",
                 "minutes": "null"
               }
-            }
+            },
+            "held": "bool"
           },
           "caches": "string"
         },
@@ -282,7 +283,8 @@
                 "output_tokens": "null",
                 "minutes": "null"
               }
-            }
+            },
+            "held": "bool"
           },
           "caches": "string"
         },
@@ -470,7 +472,8 @@
                 "output_tokens": "null",
                 "minutes": "null"
               }
-            }
+            },
+            "held": "bool"
           },
           "caches": "string"
         },
@@ -680,7 +683,8 @@
                 "output_tokens": "null",
                 "minutes": "null"
               }
-            }
+            },
+            "held": "bool"
           },
           "caches": "string"
         },

@@ -978,7 +978,10 @@ async fn run_pipeline_in<C: WorkflowContext>(
                 })
                 .and_then(|()| plan.priced_no_lower(&services.budgets))
                 .and_then(|()| plan.covers(&model_atoms, &exec_atoms))
-                .map(|()| plan.clone())
+                .map(|()| BudgetPlan {
+                    held: true,
+                    ..plan.clone()
+                })
                 .map_err(|e| format!("workflow {}: its pinned budget: {e}", pipeline.name))
         }
         None => plan_budgets(&pipeline, &services.runtimes, &services.budgets),
@@ -1056,25 +1059,26 @@ async fn run_pipeline_in<C: WorkflowContext>(
         })
         .await?;
     let plan = pinned.budgets.clone();
-    // A plan pinned before plans kept their ceilings, as a run resumed or
-    // recovered from then has, carries none: it is held to the ceilings and
-    // prices of the person running it now. A plan that kept its own keeps
-    // them, so a resumed run keeps the ceilings it began under.
-    if plan.ceilings == atomic_core::budget::Ceilings::default() {
-        plan.held_to(
-            &services.budgets.ceilings,
-            "your own configuration's ceilings",
-        )
-        .and_then(|()| plan.priced_no_lower(&services.budgets))
-        .map_err(|e| {
-            failed(format!(
-                "workflow {}: its budget, pinned before budgets kept their ceilings: {e}; \
-                     start the run again to plan it under your current configuration",
-                pipeline.name
-            ))
-        })?;
+    // A plan recorded before plans were held to the person's ceilings and
+    // prices, as a run resumed or recovered from then has, is held to those
+    // of the person running it now. A plan held when it was made keeps its
+    // own, so a resumed run keeps the ceilings and prices it began under.
+    if !plan.held {
+        let now = &services.budgets;
+        now.validate()
+            .map_err(|e| e.to_string())
+            .and_then(|()| plan.held_to(&now.ceilings, "your own configuration's ceilings"))
+            .and_then(|()| plan.priced_no_lower(now))
+            .map_err(|e| {
+                failed(format!(
+                    "workflow {}: its budget, recorded before budgets were held to your own \
+                     ceilings and prices: {e}; start the run again to plan it under your \
+                     current configuration",
+                    pipeline.name
+                ))
+            })?;
     }
-    // Under a dollar cap of the person's own, a model only a project prices
+    // Under a dollar cap of the person's own, a model only a layer above them prices
     // is said, so a price they did not set is never counted unseen.
     let unvouched: Vec<&str> = plan
         .models
@@ -1086,8 +1090,8 @@ async fn run_pipeline_in<C: WorkflowContext>(
         .collect();
     if !unvouched.is_empty() {
         atomic_core::log_line!(
-            "atomic: run {}: under your own dollar cap, the run calls {} at prices only the \
-             project's configuration sets; `atomic config --explain` says more",
+            "atomic: run {}: under your own dollar cap, the run calls {} at prices only a \
+             layer above your own configuration sets; `atomic config --explain` says more",
             ctx.workflow_id(),
             unvouched.join(", ")
         );

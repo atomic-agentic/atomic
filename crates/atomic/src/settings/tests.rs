@@ -1526,7 +1526,7 @@ fn a_cap_of_yours_that_cannot_be_read_is_refused_even_under_a_project_value() {
             "budget:\n  pricing:\n    m:\n      input_usd_per_mtok: 1\n",
             "budget:\n  pricing:\n    m:\n      input_usd_per_mtok: 1\n      output_usd_per_mtok: 1\n",
             "budget.pricing.m.output_usd_per_mtok",
-            "is not a number",
+            "is missing: a price needs both",
         ),
     ] {
         let (_home, home) = person(theirs);
@@ -1564,9 +1564,7 @@ fn under_your_own_dollar_cap_a_model_only_the_project_prices_is_named() {
     assert!(r.settings.budget.priced_by_project.contains("cheap-model"));
     let said = r.notes.join("\n");
     assert!(
-        said.contains(
-            "counts calls to cheap-model at prices only the project's configuration sets"
-        ),
+        said.contains("counts calls to cheap-model at prices only a layer above yours sets"),
         "{said}"
     );
     // Without a dollar cap of theirs, nothing is named.

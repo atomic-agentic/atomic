@@ -1,1 +1,1 @@
-plan-recovered-held|crates/atomic/src/pipeline.rs|    if plan.ceilings == atomic_core::budget::Ceilings::default() {|    if std::hint::black_box(false) && plan.ceilings == atomic_core::budget::Ceilings::default() {|-p atomic-agentic --test pipeline -- --exact a_run_recovered_with_a_plan_of_no_ceilings_is_held_to_yours
+plan-recovered-held|crates/atomic/src/pipeline.rs|    if !plan.held {|    if std::hint::black_box(false) && !plan.held {|-p atomic-agentic --test pipeline -- --exact a_run_recovered_with_a_plan_recorded_before_plans_were_held_is_held_to_yours

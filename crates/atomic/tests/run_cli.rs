@@ -1069,8 +1069,8 @@ fn a_run_says_which_models_only_the_project_prices_under_your_dollar_cap() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
             stderr.contains(
-                "under your own dollar cap, the run calls synthetic at prices only the project's \
-                 configuration sets"
+                "under your own dollar cap, the run calls synthetic at prices only a layer \
+                 above your own configuration sets"
             ),
             "{stderr}"
         );
