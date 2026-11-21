@@ -1066,9 +1066,224 @@ pub fn is_helper(mut args: impl Iterator<Item = std::ffi::OsString>) -> bool {
 /// touched.
 pub fn run_helper() -> anyhow::Result<()> {
     keep_sandbox_off_keyrings();
+    deny_links_made_since_the_list();
     give_the_command_its_own_tmpdir();
     arg0_dispatch_or_else(|_| async {
         bail!("this process was started as a Codex helper Codex does not know")
+    })
+}
+
+/// When this process is the outer stage of Codex's Linux sandbox helper,
+/// starting one command, deny what links made since its profile's deny list
+/// was built point at (see [`late_link_targets`]), or exit. A turn's list
+/// is built when its thread starts, and each of its commands starts the
+/// helper with it: a link a later process made inside a denied place, such
+/// as `~/.aws/credentials` leading to a file kept elsewhere, would leave
+/// that file readable by its own path. When there is anything to add, the
+/// helper starts again with the larger list, and finds nothing more.
+fn deny_links_made_since_the_list() {
+    #[cfg(target_os = "linux")]
+    if invoked_as_linux_sandbox() && !is_inner_stage(std::env::args_os()) {
+        let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+        // Started again once already: what it adds is its last chance.
+        let again_already = std::env::var_os(RELISTED).is_some();
+        if again_already {
+            // SAFETY: the helper is single-threaded here, before it starts
+            // anything.
+            #[allow(unsafe_code)]
+            unsafe {
+                std::env::remove_var(RELISTED);
+            }
+        }
+        match relisted(&args) {
+            Ok(None) => {}
+            Ok(Some(_)) if again_already => {
+                crate::log_line!(
+                    "atomic: links in the places denied to atoms' commands kept changing while \
+                     the sandbox started; the command does not run"
+                );
+                std::process::exit(1);
+            }
+            Ok(Some(again)) => {
+                use std::os::unix::process::CommandExt;
+                let started = std::env::current_exe().map(|exe| {
+                    std::process::Command::new(exe)
+                        .arg0(&again[0])
+                        .args(&again[1..])
+                        .env(RELISTED, "1")
+                        .exec()
+                });
+                // `exec` returns only when it failed.
+                crate::log_line!(
+                    "atomic: cannot start the sandbox helper again with the links made since its \
+                     deny list was built denied: {}",
+                    match started {
+                        Ok(e) | Err(e) => e,
+                    }
+                );
+                std::process::exit(1);
+            }
+            Err(e) => {
+                crate::log_line!("atomic: {e:#}");
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+/// Set on the sandbox helper started again with more denied, and taken off
+/// before anything else sees it.
+#[cfg(target_os = "linux")]
+const RELISTED: &str = "ATOMIC_SANDBOX_RELISTED";
+
+/// The helper's arguments `args`, with what links made since its profile's
+/// deny list was built point at denied in it; `None` when there is nothing
+/// to add, or no profile to add it to.
+#[cfg(target_os = "linux")]
+fn relisted(args: &[std::ffi::OsString]) -> anyhow::Result<Option<Vec<std::ffi::OsString>>> {
+    use codex_protocol::permissions::{
+        FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry, FileSystemSandboxKind,
+    };
+    let options: Vec<&std::ffi::OsString> =
+        args.iter().skip(1).take_while(|a| an_option(a)).collect();
+    let value = |flag: &str| {
+        options
+            .iter()
+            .position(|a| *a == flag)
+            .and_then(|at| options.get(at + 1))
+            .map(|v| (*v).clone())
+    };
+    let Some(profile) = value("--permission-profile") else {
+        return Ok(None);
+    };
+    let at = 1
+        + options
+            .iter()
+            .position(|a| *a == "--permission-profile")
+            .unwrap_or_default()
+        + 1;
+    let text = profile
+        .to_str()
+        .context("the sandbox helper's profile is not UTF-8")?;
+    let profile: PermissionProfile =
+        serde_json::from_str(text).context("read the sandbox helper's profile")?;
+    let (mut policy, network) = profile.to_runtime_permissions();
+    if policy.kind != FileSystemSandboxKind::Restricted {
+        return Ok(None);
+    }
+    let paths = |mode: FileSystemAccessMode| -> Vec<PathBuf> {
+        policy
+            .entries
+            .iter()
+            .filter(|e| e.access == mode)
+            .filter_map(|e| match &e.path {
+                FileSystemPath::Path { path } => Some(path.to_path_buf()),
+                _ => None,
+            })
+            .collect()
+    };
+    let denied = paths(FileSystemAccessMode::Deny);
+    let mut writable = paths(FileSystemAccessMode::Write);
+    // The command's directory may be the workspace, which the profile names
+    // only as such.
+    for flag in ["--command-cwd", "--sandbox-policy-cwd"] {
+        writable.extend(value(flag).map(PathBuf::from));
+    }
+    let late = late_link_targets(&denied, &writable)?;
+    if late.is_empty() {
+        return Ok(None);
+    }
+    for target in late {
+        let target = AbsolutePathBuf::from_absolute_path(&target)
+            .with_context(|| format!("resolve the sandbox path {}", target.display()))?;
+        policy.entries.push(FileSystemSandboxEntry::new(
+            FileSystemPath::from(target),
+            FileSystemAccessMode::Deny,
+        ));
+    }
+    let profile = PermissionProfile::from_runtime_permissions(&policy, network);
+    let mut again = args.to_vec();
+    again[at] = serde_json::to_string(&profile)
+        .context("encode the sandbox profile")?
+        .into();
+    Ok(Some(again))
+}
+
+/// What links inside `denied`, up to [`LINK_DEPTH`] levels, and denied
+/// places that are links, point at that no denied path covers yet: each
+/// must be denied, by the rules a thread's list follows when it is built
+/// ([`deniable`]). Nothing runs when one would cover a directory of
+/// `writable`, the directories the command may write and works in, or lies
+/// two or more levels inside one, where a command could move it out from
+/// under its denial, or when there are more than [`MAX_LINK_TARGETS`].
+fn late_link_targets(denied: &[PathBuf], writable: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
+    let covered: Vec<PathBuf> = denied.iter().map(|p| real(p)).collect();
+    let writable: Vec<PathBuf> = writable.iter().map(|p| real(p)).collect();
+    let mut late = Vec::new();
+    for place in denied {
+        let Ok(meta) = std::fs::symlink_metadata(place) else {
+            continue;
+        };
+        let mut links = Vec::new();
+        if meta.file_type().is_symlink() {
+            links.push((place.clone(), true));
+        } else if meta.is_dir() {
+            let mut found = Vec::new();
+            links_in(place, LINK_DEPTH, &mut found);
+            links.extend(found.into_iter().map(|l| (l, false)));
+        }
+        for (link, listed) in links {
+            let Ok(target) = std::fs::canonicalize(&link) else {
+                continue;
+            };
+            if !deniable(&target, listed) || covered.iter().any(|c| target.starts_with(c)) {
+                continue;
+            }
+            if let Some(needed) = held_in(&writable, &target) {
+                bail!(DenyRefused(format!(
+                    "{} now leads to {}, which holds {}, which this command needs; atomic cannot \
+                     deny it",
+                    link.display(),
+                    target.display(),
+                    needed.display()
+                )));
+            }
+            if let Some(root) = deep_inside(&writable, &target) {
+                bail!(DenyRefused(format!(
+                    "{} now leads to {}, inside {}, which this command may write, so it could \
+                     move it out from under its denial",
+                    link.display(),
+                    target.display(),
+                    root.display()
+                )));
+            }
+            late.push(target);
+        }
+    }
+    late.sort();
+    late.dedup();
+    if late.len() > MAX_LINK_TARGETS {
+        bail!(DenyRefused(format!(
+            "the places denied to atoms' commands now hold {} links to files elsewhere, more \
+             than the {MAX_LINK_TARGETS} atomic follows",
+            late.len()
+        )));
+    }
+    Ok(late)
+}
+
+/// The first of `dirs` that `path` holds.
+fn held_in<'a>(dirs: &'a [PathBuf], path: &Path) -> Option<&'a PathBuf> {
+    dirs.iter().find(|d| d.starts_with(path))
+}
+
+/// The first of `dirs` that holds `path` two or more levels inside it,
+/// where a command that may write it could rename a directory above `path`.
+fn deep_inside<'a>(dirs: &'a [PathBuf], path: &Path) -> Option<&'a PathBuf> {
+    dirs.iter().find(|d| {
+        path.strip_prefix(d)
+            .is_ok_and(|rest| rest.components().count() >= 2)
     })
 }
 
@@ -2910,6 +3125,49 @@ mod tests {
             );
         }
         assert!(denied.contains(&home.join(".ssh")), "{denied:?}");
+    }
+
+    /// What a link made inside a denied place since the list was built
+    /// points at is found, unless a denied path covers it already; one that
+    /// would cover what the command needs, or lies two levels inside a
+    /// directory it may write, refuses the command.
+    #[cfg(unix)]
+    #[test]
+    fn a_late_link_is_found_and_one_that_cannot_be_denied_refuses() {
+        let dir = scratch("late-links");
+        let place = dir.join("home/.aws");
+        let work = dir.join("work");
+        for d in [&place, &work.join("deep"), &dir.join("elsewhere")] {
+            std::fs::create_dir_all(d).expect("dir");
+        }
+        let real = |p: &Path| std::fs::canonicalize(p).expect("real");
+        let creds = dir.join("elsewhere/creds");
+        std::fs::write(&creds, "x").expect("creds");
+        let denied = [place.clone()];
+        assert!(late_link_targets(&denied, &[]).expect("none").is_empty());
+        link(&creds, &place.join("credentials"));
+        assert_eq!(
+            late_link_targets(&denied, &[]).expect("found"),
+            [real(&creds)]
+        );
+        // Denied already: nothing more.
+        let covered = [place.clone(), dir.join("elsewhere")];
+        assert!(late_link_targets(&covered, &[]).expect("none").is_empty());
+        // Two levels inside a directory the command may write.
+        std::fs::write(work.join("deep/creds"), "x").expect("creds");
+        std::fs::remove_file(place.join("credentials")).expect("unlink");
+        link(&work.join("deep/creds"), &place.join("credentials"));
+        let refused = late_link_targets(&denied, std::slice::from_ref(&work))
+            .expect_err("refused")
+            .to_string();
+        assert!(refused.contains("could move it"), "{refused}");
+        // Leading to what the command needs.
+        std::fs::remove_file(place.join("credentials")).expect("unlink");
+        link(&work, &place.join("credentials"));
+        let refused = late_link_targets(&denied, &[work.join("deep")])
+            .expect_err("refused")
+            .to_string();
+        assert!(refused.contains("which this command needs"), "{refused}");
     }
 
     #[cfg(unix)]

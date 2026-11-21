@@ -158,8 +158,10 @@ denied place or a linked secret lies two or more levels inside a directory it
 may write. Other projects'
 Codex records are not denied yet. atomic makes the list when a
 turn or an exec step starts: a place on it that appears while a command runs
-is denied only to the commands that start after it, and a link made after
-the list is not followed until the next turn or step. Credentials kept
+is denied only to the commands that start after it, and so is what a link
+made after the list inside a denied place points at: each command looks for
+such links again as it starts, and one made while a command runs is followed
+from the next. Credentials kept
 anywhere else are not covered. An
 exec atom's command may write only its scratch directory and its run's own
 build caches, which no other run's command may write, though one can still read them by their path, and which go when the run ends, and only read the artifacts it is given there; `--runner process` confines it the same way. It runs in a process

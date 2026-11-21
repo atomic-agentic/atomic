@@ -417,9 +417,10 @@ it may write, where a command could move the directory above it away from
 its denial. The model chooses the
 commands, so none of these reach it through them. atomic makes the list
 when the turn starts: a place on it that appears while a command runs is
-denied only to later commands, and a link made after the list is not
-followed until the next turn. Credentials kept anywhere else are not
-covered.
+denied only to later commands, and so is what a link made later inside a
+denied place points at, which each command looks for again as it starts; a
+command whose new link leads somewhere atomic would refuse to deny does not
+start. Credentials kept anywhere else are not covered.
 
 Cargo's own configuration (`.cargo/config.toml`) is not denied, since cargo
 reads it in every directory above a project: a registry token kept there,
