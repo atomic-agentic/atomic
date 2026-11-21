@@ -20,7 +20,11 @@
 //!   it once read from the directory the command was run in;
 //! - so is a home where no `ATOMIC_HOME` points, because the default data
 //!   directory is the configuration directory, and one atomic cannot place at
-//!   all, rather than running on a spelling it has not compared;
+//!   all, rather than running on a spelling it has not compared — and so is a
+//!   *configuration* directory atomic cannot place, which leaves no home
+//!   comparable with it. `atomic run` and `atomic serve` are what is run here;
+//!   every command that starts a project's runs makes the same check before it
+//!   creates anything, because all of them come through one function;
 //! - a home beside it, `~/.config/atomic-state`, is accepted: the comparison
 //!   is by path components, not by string.
 
@@ -404,14 +408,19 @@ fn a_relative_home_inside_the_configuration_directory_is_refused() {
 fn a_home_replacing_a_link_named_home_is_refused() {
     let dir = scratch("passwd-home");
     let project = dir.join("project");
-    // A home directory that is a link elsewhere, as many people have one. With
-    // `HOME` unset atomic still denies the configuration directory under the
-    // home the password database gives, so a state directory inside it is
-    // denied with it and is refused here too. The link stands where the
-    // password database says this user's home is, which is why `HOME` is not
-    // given to the command at all; where the database says something else, the
-    // run cannot get that far, so the refusal is checked with `HOME` naming the
-    // same directory, which is the same walk of `..` and links.
+    // A home directory that is a link elsewhere, as many people have one: the
+    // configuration directory under it is the one the person's files really
+    // live in, so a state directory inside it must be refused even though the
+    // home atomic was given, read by string, says nothing of links. `HOME` is
+    // given to the command and names the link, which is what a person's shell
+    // gives it, so the state's directory and the configuration directory are
+    // placed by walking through that same link to the home it leads to — and
+    // meet there, inside the denial.
+    //
+    // What `HOME` is not given to decide is which home the password database
+    // gives: this command always has a `HOME`, so the case where the *database*
+    // is what names the home is the unit test's, in `state.rs`:
+    // `a_process_with_no_home_in_its_environment_is_placed_by_the_password_home`.
     let target = dir.join("real-home");
     std::fs::create_dir_all(target.join(".config/atomic")).expect("the configuration directory");
     let link = dir.join("home");
@@ -463,6 +472,100 @@ fn a_home_the_default_data_directory_leads_to_is_refused() {
     );
 }
 
+/// Which of the two directories a run could not place. The words atomic is to
+/// say for each: one names the directory in the refusal, another says what to
+/// change for it — the state's own home, which `ATOMIC_HOME` names, or the
+/// configuration directory, which `HOME` and `XDG_CONFIG_HOME` name. Both
+/// spelled out here, so that an action which stopped saying which of the two
+/// failed its test here instead of agreeing with whatever came back.
+enum Side {
+    State,
+    Config,
+}
+
+impl Side {
+    fn words(&self) -> &'static str {
+        match self {
+            Side::State => "atomic's state directory",
+            Side::Config => "your configuration directory",
+        }
+    }
+
+    fn fix(&self) -> &'static str {
+        match self {
+            Side::State => {
+                "set ATOMIC_HOME to a directory atomic can place, with a directory above it \
+                 that exists and can be read; until then atomic cannot tell whether its state \
+                 would be inside your own configuration directory"
+            }
+            Side::Config => {
+                "fix HOME, or XDG_CONFIG_HOME, so that your configuration directory can be \
+                 placed: it, or a directory above it, is missing, cannot be read, or is a link \
+                 that leads nowhere; until then atomic cannot tell whether its state would be \
+                 inside that directory"
+            }
+        }
+    }
+}
+
+/// A run refused because the directory `side` could not be placed at
+/// `directory`, which is where the home `home` leads; `cause` is what the
+/// filesystem said, and `absent` what the refusal left uncreated. Both the
+/// person's text and a script's `--json` carry the same refusal and the same
+/// action.
+fn cannot_place_refused(
+    dir: &Path,
+    project: &Path,
+    home: &Path,
+    side: Side,
+    directory: &Path,
+    cause: &str,
+    absent: &Path,
+) {
+    let (what, fix) = (side.words(), side.fix());
+    let words = format!("cannot resolve {what} {}: ", directory.display());
+    let env = home_env(home);
+    let run = |json: bool| {
+        let mut args: Vec<&str> = Vec::new();
+        if json {
+            args.push("--json");
+        }
+        args.extend(["run", "count-note", "--data", r#"{"text": "a note"}"#]);
+        atomic(dir, project, &args, &env)
+    };
+
+    let out = run(false);
+    let t = text(&out);
+    assert!(!out.status.success(), "the run was not refused: {t}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&format!("error: {words}")),
+        "not the refusal of {what}: {t}"
+    );
+    assert!(
+        stderr.contains(cause),
+        "the refusal of {what} does not say what stood in the way: {t}"
+    );
+    assert!(
+        stderr.contains(&format!("  to fix: {fix}")),
+        "the action does not say what to change for {what}: {t}"
+    );
+
+    let out = run(true);
+    let t = text(&out);
+    let error = stdout_json(&out)["error"].clone();
+    assert_eq!(error["kind"], "state.unavailable", "{t}");
+    assert_eq!(error["action"], fix, "the action of {what}: {t}");
+    let description = error["description"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no description: {t}"));
+    assert!(
+        description.starts_with(&words) && description.contains(cause),
+        "the description is not the refusal of {what}: {t}"
+    );
+    assert!(!absent.exists(), "the refused home was created anyway: {t}");
+}
+
 #[test]
 fn a_home_atomic_cannot_place_is_refused() {
     let dir = scratch("unplaced");
@@ -478,66 +581,38 @@ fn a_home_atomic_cannot_place_is_refused() {
     let far = dir.join("far");
     std::os::unix::fs::symlink(dir.join("nowhere"), &far).expect("the link to nowhere");
     let state_home = state_and_private(&far, &id).0;
-    let out = atomic(
+    cannot_place_refused(
         &dir,
         &project,
-        &["run", "count-note", "--data", r#"{"text": "a note"}"#],
-        &home_env(&far),
-    );
-    let t = text(&out);
-    assert!(
-        !out.status.success(),
-        "a home atomic could not place ran anyway: {t}"
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains(&format!(
-            "error: cannot resolve atomic's state directory {}: ",
-            state_home.display()
-        )),
-        "not the refusal of an unplaceable state directory: {t}"
-    );
-    assert!(
-        stderr.contains(&format!("{} cannot be read: ", far.display()))
-            && stderr.contains("No such file or directory"),
-        "the refusal does not say what stood in the way: {t}"
-    );
-    assert!(
-        !dir.join("far/projects").exists(),
-        "the unplaceable home was created anyway: {t}"
+        &far,
+        Side::State,
+        &state_home,
+        &format!(
+            "{} cannot be read: No such file or directory",
+            far.display()
+        ),
+        &dir.join("far/projects"),
     );
     // The configuration directory, which then no spelling of a home can be
     // compared with: `~/.config/atomic` is a link to nowhere, so where it is
-    // cannot be said. (A directory nobody may look in stops the same lookup a
-    // step earlier; the unit test of the same check covers that shape, which
-    // the person's own unreadable configuration would also stop at.)
+    // cannot be said. A directory nobody may look in stops the same walk as
+    // surely, a step earlier and saying something different about it, but not
+    // in this file: the configuration directory here is always under the home
+    // the command is given, and closing that is not a home a run could be
+    // started with. The unit test of the same check has that shape:
+    // `state.rs`'s `a_home_behind_a_directory_nobody_may_look_in_is_refused`.
     let home = dir.join("state");
     std::fs::create_dir_all(config.parent().expect(".config")).expect("the config directory");
     std::os::unix::fs::symlink(dir.join("nowhere"), &config).expect("the dangling link");
-    let out = atomic(
+    cannot_place_refused(
         &dir,
         &project,
-        &["run", "count-note", "--data", r#"{"text": "a note"}"#],
-        &home_env(&home),
+        &home,
+        Side::Config,
+        &config,
+        "cannot be read: No such file or directory",
+        &home,
     );
-    let t = text(&out);
-    assert!(
-        !out.status.success(),
-        "a home beside an unplaceable configuration directory ran anyway: {t}"
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains(&format!(
-            "error: cannot resolve your configuration directory {}: ",
-            config.display()
-        )),
-        "not the refusal of an unplaceable configuration directory: {t}"
-    );
-    assert!(
-        stderr.contains("cannot be read:") && stderr.contains("No such file or directory"),
-        "the refusal does not say what stood in the way: {t}"
-    );
-    assert!(!home.exists(), "the home was created anyway: {t}");
 }
 
 #[test]

@@ -231,12 +231,26 @@ pub type SignInFound = Result<Option<SignIn>, String>;
 /// What resolution reads from outside: the environment, a local Ollama, and
 /// the person's sign-in. Passed in, so tests choose what is there.
 pub struct Surroundings<'a> {
-    /// A variable's value.
+    /// A variable's value, as text, so a value the operating system gives as
+    /// bytes that are not text is no value here. That is why the person's
+    /// configuration directory, which is a path and not text, does not come
+    /// from `env` but from [`Surroundings::user_config_dir`].
     pub env: &'a dyn Fn(&str) -> Option<String>,
     /// The variables there are.
     pub env_names: Vec<String>,
     /// The models a local Ollama at an address lists, if one answers.
     pub ollama: &'a dyn Fn(SocketAddr) -> Option<Vec<String>>,
+    /// The person's own configuration directory, where their `config.yaml`
+    /// lives: [`atomic_core::state::user_config_dir`] in a person's run.
+    ///
+    /// It is the resolution the denial of that directory to atoms' commands and
+    /// the refusal of a state directory inside it are made from — not
+    /// `env`, which reads the same `XDG_CONFIG_HOME` and `HOME` as text and so
+    /// sees nothing where the operating system gives bytes that are not text.
+    /// Read the same way, all three name one directory or none; read two ways,
+    /// settings would come from a directory no atom is denied while the denial
+    /// covered another.
+    pub user_config_dir: &'a dyn Fn() -> Option<PathBuf>,
     /// The person's sign-in, kept apart from the project rooted at the path
     /// when there is one.
     pub sign_in: &'a dyn Fn(Option<&Path>) -> SignInFound,
@@ -271,6 +285,7 @@ impl Surroundings<'static> {
                 .filter_map(|(k, _)| k.into_string().ok())
                 .collect(),
             ollama: &|_| None,
+            user_config_dir: &atomic_core::state::user_config_dir,
             sign_in: &|_| Ok(None),
         }
     }
@@ -314,15 +329,14 @@ fn project_root(dir: &Path) -> &Path {
 
 /// The person's own configuration file, which no project supplies:
 /// `$XDG_CONFIG_HOME/atomic/config.yaml`, by default
-/// `~/.config/atomic/config.yaml`. `None` when neither variable, as `env`
-/// reads it, names an absolute directory.
-pub fn user_config(env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
-    // The directory the denial and the state check are made from, as the
-    // environment names it. The home the password database gives is not asked
-    // for here: settings come from what the environment names, and a test's
-    // environment says nothing about this machine's user.
-    atomic_core::state::user_config_dir_in(&|name| env(name).map(std::ffi::OsString::from), &None)
-        .map(|d| d.join("config.yaml"))
+/// `~/.config/atomic/config.yaml`, and under the home the password database
+/// gives when the environment names no absolute one. `config_dir` is where that
+/// directory is — [`atomic_core::state::user_config_dir`] in a person's run, the
+/// same resolution the denial of that directory to atoms' commands and the
+/// refusal of a state directory inside it are made from, so the three cannot
+/// name different directories. `None` when it names none.
+pub fn user_config(config_dir: &dyn Fn() -> Option<PathBuf>) -> Option<PathBuf> {
+    config_dir().map(|dir| dir.join("config.yaml"))
 }
 
 /// The directory whose `atomic.yaml` and siblings configure the project at
@@ -383,7 +397,7 @@ pub fn resolve(
     args: &EngineArgs,
     around: &Surroundings<'_>,
 ) -> Result<Resolved, ConfigError> {
-    let user = user_config(around.env);
+    let user = user_config(around.user_config_dir);
     // A project could supply a "personal" file inside itself, or inside the
     // checkout that holds it, as when the home directory is where the
     // repository is mounted. Only for a project: outside one, such as

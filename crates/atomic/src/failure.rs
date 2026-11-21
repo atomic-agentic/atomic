@@ -170,19 +170,13 @@ fn known(cause: &(dyn std::error::Error + 'static)) -> Option<Failure> {
                     current.display(),
                     old.display()
                 ),
-                state::StateError::InsideConfig(outside) => format!(
-                    "set ATOMIC_HOME to a directory outside {}, or point XDG_CONFIG_HOME, or \
-                     HOME, elsewhere; a worktree or a cache inside your own configuration \
-                     directory is out of atoms' commands' reach",
-                    outside.config.display()
-                ),
-                state::StateError::Resolve { .. } => {
-                    "set ATOMIC_HOME to a directory atomic can place, with a directory above it \
-                     that exists and can be read, or point XDG_CONFIG_HOME, or HOME, at one; \
-                     until then atomic cannot tell whether its state would be inside your own \
-                     configuration directory"
-                        .into()
-                }
+                // What to change, in the refusal's own words: a state
+                // directory inside the configuration directory is set wrong,
+                // while a directory that cannot be *placed* is fixed on the
+                // side that could not be placed — the state's home, or
+                // `HOME`/`XDG_CONFIG_HOME`, which is not the same advice.
+                state::StateError::InsideConfig(outside) => outside.fix(),
+                state::StateError::Resolve { side, .. } => side.fix(),
                 _ => "set ATOMIC_HOME to a writable directory for atomic's state, or fix the \
                       permissions the description names"
                     .into(),
@@ -271,5 +265,63 @@ mod tests {
         assert_eq!(f.kind, "error");
         assert_eq!(f.description, "something odd");
         assert!(!f.action.is_empty());
+    }
+
+    /// A directory atomic cannot place is named in the description, and the
+    /// side to fix is the same side in the action: the state's own home, or the
+    /// configuration directory under `HOME` or `XDG_CONFIG_HOME`. Setting the
+    /// other is no remedy for a failure to place this one.
+    #[test]
+    fn an_unplaceable_directory_names_the_side_to_fix() {
+        let refused = |side: state::ResolveSide| {
+            analyze(&anyhow::Error::new(state::StateError::Resolve {
+                side,
+                path: "/home/dev/.config/atomic".into(),
+                why: "it cannot be read: Permission denied (os error 13)".into(),
+            }))
+        };
+        let state_side = refused(state::ResolveSide::State);
+        assert_eq!(state_side.kind, "state.unavailable");
+        assert!(
+            state_side
+                .description
+                .contains("cannot resolve atomic's state directory"),
+            "{}",
+            state_side.description
+        );
+        assert!(
+            state_side
+                .action
+                .starts_with("set ATOMIC_HOME to a directory atomic can place"),
+            "the action of an unplaceable state directory: {}",
+            state_side.action
+        );
+        assert!(
+            !state_side.action.contains("XDG_CONFIG_HOME"),
+            "the action of an unplaceable state directory sends the person to their \
+             configuration directory: {}",
+            state_side.action
+        );
+        let config_side = refused(state::ResolveSide::Config);
+        assert!(
+            config_side
+                .description
+                .contains("cannot resolve your configuration directory"),
+            "{}",
+            config_side.description
+        );
+        assert!(
+            config_side
+                .action
+                .starts_with("fix HOME, or XDG_CONFIG_HOME,"),
+            "the action of an unplaceable configuration directory: {}",
+            config_side.action
+        );
+        assert!(
+            !config_side.action.contains("set ATOMIC_HOME"),
+            "the action of an unplaceable configuration directory sends the person to \
+             ATOMIC_HOME: {}",
+            config_side.action
+        );
     }
 }
