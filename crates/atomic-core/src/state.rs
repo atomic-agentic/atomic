@@ -1295,8 +1295,11 @@ mod tests {
         std::fs::create_dir_all(&gitdir).expect("main");
         std::fs::write(gitdir.join("commondir"), "../..\n").expect("commondir");
         std::fs::create_dir_all(dir.join("wt/project")).expect("worktree");
-        std::fs::write(dir.join("wt/.git"), format!("gitdir: {}\n", gitdir.display()))
-            .expect(".git");
+        std::fs::write(
+            dir.join("wt/.git"),
+            format!("gitdir: {}\n", gitdir.display()),
+        )
+        .expect(".git");
         let project = dir.join("wt/project");
         let other = Some(effective_uid().wrapping_add(1));
         let held = checkouts_holding_as(&project, other).expect("read");
@@ -1338,7 +1341,9 @@ mod tests {
         mode(0o000);
         if std::fs::read_dir(closed.join("inner")).is_ok() {
             mode(0o700);
-            eprintln!("SKIPPED the out-of-reach case: running as a user mode 000 does not keep out");
+            eprintln!(
+                "SKIPPED the out-of-reach case: running as a user mode 000 does not keep out"
+            );
         } else {
             assert!(present(&closed.join("inner/.git")), "taken for absent");
             mode(0o700);
