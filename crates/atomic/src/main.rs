@@ -302,6 +302,8 @@ fn real_main() -> anyhow::Result<()> {
             std::process::exit(1);
         }
     };
+    #[cfg(target_os = "linux")]
+    share_sandbox_registry(&cli, &state);
     codex::dispatch(&state.codex_home(), move |paths| async move {
         // Only this role, the command itself, exports spans; Codex's helper
         // roles never reach here. Spans go where the standard
@@ -404,6 +406,8 @@ async fn run(cli: Cli, paths: CodexPaths, state: ProjectState) -> anyhow::Result
     codex::sweep_turn_temps(state.dir())?;
     let (json, project) = (cli.json, cli.project);
     let project = project.as_deref();
+    // The backend a command's turns run on, as `main` chose it.
+    let turns = turn_backend(cli.command.as_ref(), &state);
     match cli.command {
         Some(Command::Gates(command)) => gates::run(command, &state).await,
         Some(Command::Parks(command)) => parks::run(command, &state).await,
@@ -437,7 +441,7 @@ async fn run(cli: Cli, paths: CodexPaths, state: ProjectState) -> anyhow::Result
             Ok(())
         }
         Some(Command::Debug(Debug::CodexPrompt(args))) => {
-            let answer = prompt(&paths, &state, &args).await?;
+            let answer = prompt(&paths, &state, &args, turns).await?;
             // A model's answer, as text, escaped for the terminal.
             println!("{}", shown::block(&answer));
             Ok(())
@@ -448,7 +452,7 @@ async fn run(cli: Cli, paths: CodexPaths, state: ProjectState) -> anyhow::Result
                 "durable store {}: {runs} probe run(s)",
                 state.database().display()
             );
-            let answer = prompt(&paths, &state, &args).await?;
+            let answer = prompt(&paths, &state, &args, turns).await?;
             println!("codex: {}", shown::block(&answer));
             Ok(())
         }
@@ -594,7 +598,11 @@ fn check(path: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
             // each must compile, not only the first.
             for schema in std::iter::once(&tool.input)
                 .chain(tool.output.as_ref())
-                .chain(tool.responses.values().flatten())
+                .chain(
+                    tool.responses
+                        .values()
+                        .filter_map(atomic_schema::openapi::ResponseBody::schema),
+                )
             {
                 atomic_schema::registry::Registry::new()
                     .validator_for(schema)
@@ -804,6 +812,50 @@ fn render(args: RenderArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The backend on this machine that `command`'s Codex turns run on, if it
+/// runs any: the one `atomic run`, `atomic eval`, `atomic serve` and
+/// `atomic runs resume` share, or the one of `atomic debug`'s own.
+fn turn_backend(
+    command: Option<&Command>,
+    state: &ProjectState,
+) -> Option<atomic_exec::LocalBackend> {
+    match command? {
+        Command::Run(_) | Command::Eval(_) | Command::Serve(_) | Command::Runs(Runs::Resume(_)) => {
+            Some(engine::local_backend(state))
+        }
+        Command::Debug(Debug::CodexPrompt(_) | Debug::Probe(_)) => {
+            Some(engine::debug_backend(state))
+        }
+        _ => None,
+    }
+}
+
+/// For a command that runs Codex turns, point this process's TMPDIR at the
+/// shared directory of the backend they run on (see
+/// [`codex::share_sandbox_registry`]): Codex's file helper, which applies a
+/// turn's patches, keeps its sandbox's registry of mount points there, where
+/// the turns' commands keep theirs. A scratch root connecting would refuse
+/// is left alone, with the TMPDIR it is checked against: no turn runs on
+/// it. A shared directory that cannot be made stops the command. Called
+/// while the process has one thread.
+#[cfg(target_os = "linux")]
+fn share_sandbox_registry(cli: &Cli, state: &ProjectState) {
+    let Some(backend) = turn_backend(cli.command.as_ref(), state) else {
+        return;
+    };
+    if backend.check_scratch_root().is_err() {
+        return;
+    }
+    match backend.shared_tmp() {
+        Ok(tmp) => codex::share_sandbox_registry(tmp),
+        Err(e) => {
+            let e = anyhow::Error::from(e).context("create the backend's shared directory");
+            failure::report(&failure::analyze(&e), cli.json);
+            std::process::exit(1);
+        }
+    }
+}
+
 /// What `atomic debug codex-prompt` and `atomic debug probe` say on stderr:
 /// their turn is not metered.
 const UNMETERED: &str = "atomic debug: this turn is not metered: no budget caps it and the \
@@ -813,16 +865,16 @@ async fn prompt(
     paths: &CodexPaths,
     state: &ProjectState,
     args: &PromptArgs,
+    local: Option<atomic_exec::LocalBackend>,
 ) -> anyhow::Result<String> {
     // The only model call atomic makes without a meter: said, never silent.
     atomic_core::log_line!("{UNMETERED}");
     // A backend of its own, beside the one `atomic run` and `atomic serve`
     // use: this command takes no execution lock, and connecting empties a
     // backend's shared temporary directory, which their turns may be using.
-    let backend = atomic_exec::Backend::connect(atomic_exec::LocalBackend::in_dir(
-        state.dir().join("scratch-debug"),
-    ))
-    .context("connect to the execution backend")?;
+    let local = local.context("atomic debug has no backend for its turn")?;
+    let backend =
+        atomic_exec::Backend::connect(local).context("connect to the execution backend")?;
     let runtime = atomic_core::runtime::CodexRuntime {
         paths: paths.clone(),
         codex_home: state.codex_home(),

@@ -15,8 +15,55 @@
 //! response bodies are read from a JSON media type (`application/json`,
 //! with parameters or not, or a `+json` type). An operation whose required
 //! body has no JSON media type is kept, marked [`Operation::unsupported`].
+//!
+//! Each response says which of three things it declares about its body — no
+//! `content` map at all, a `content` map with no JSON schema to check
+//! against, or a JSON schema — as [`ResponseBody`]. Only the first says
+//! there is no body to read; only the last says what shape the body has.
 
 use serde_json::{Map, Value, json};
+
+/// What one response of a spec declares about its body, as
+/// [`Operation::responses`] keeps it.
+///
+/// The three cases are not the same claim. Only [`ResponseBody::NoBody`]
+/// says there is no body to read; the other two declare a body and simply
+/// say different amounts about it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ResponseBody {
+    /// It declares no `content` map at all, so it declares no body: a `204`,
+    /// or a `200` written with only a description.
+    NoBody,
+    /// It declares a `content` map, but one that gives atomic no JSON schema
+    /// to check against: it names only media types atomic does not read
+    /// (`*/*`, `text/plain`, `application/octet-stream`), or a JSON media
+    /// type with no `schema`. A body is declared, of a shape nothing in the
+    /// spec describes.
+    NoJsonSchema,
+    /// It declares a JSON media type with a schema, which its body has to
+    /// fit.
+    Json(Value),
+}
+
+impl ResponseBody {
+    /// The schema a body of this response is checked against, when the
+    /// response declares one.
+    pub fn schema(&self) -> Option<&Value> {
+        match self {
+            ResponseBody::Json(schema) => Some(schema),
+            ResponseBody::NoBody | ResponseBody::NoJsonSchema => None,
+        }
+    }
+
+    /// The schema to change in place, when there is one;
+    /// [`ResponseBody::schema`] borrows it read-only.
+    fn schema_mut(&mut self) -> Option<&mut Value> {
+        match self {
+            ResponseBody::Json(schema) => Some(schema),
+            ResponseBody::NoBody | ResponseBody::NoJsonSchema => None,
+        }
+    }
+}
 
 /// One operation of a spec, as a tool.
 #[derive(Clone, Debug, PartialEq)]
@@ -44,9 +91,9 @@ pub struct Operation {
     pub output: Option<Value>,
     /// Each response it declares, success or not, by the status it is
     /// declared for as the spec writes it: a code such as `200` or `404`, a
-    /// range such as `2XX`, or `default`. Its JSON schema, or `None` where it
-    /// declares no JSON body, as a `204` does.
-    pub responses: std::collections::BTreeMap<String, Option<Value>>,
+    /// range such as `2XX`, or `default`. Each says what it declares about
+    /// its body, see [`ResponseBody`].
+    pub responses: std::collections::BTreeMap<String, ResponseBody>,
     /// Why atomic cannot call it, when it cannot: a required request body
     /// with no JSON media type.
     pub unsupported: Option<String>,
@@ -57,8 +104,11 @@ impl Operation {
     /// is declared under, as OpenAPI picks one: the status's own code, else
     /// its range (`2XX`, in either case), else `default`. `None` for a
     /// status that is not a success (outside 200 to 299), whose body atomic
-    /// never checks, and for a success it declares none of them for.
-    pub fn response(&self, status: u16) -> Option<(&str, &Option<Value>)> {
+    /// never checks, and for a success it declares none of them for. What
+    /// the response declares about its body is the [`ResponseBody`] it
+    /// comes with; a status can select one that declares no body as well as
+    /// one whose body has a schema.
+    pub fn response(&self, status: u16) -> Option<(&str, &ResponseBody)> {
         if !(200..=299).contains(&status) {
             return None;
         }
@@ -72,7 +122,7 @@ impl Operation {
                     .find(|(key, _)| key.eq_ignore_ascii_case(&range))
             })
             .or_else(|| self.responses.get_key_value("default"))
-            .map(|(key, schema)| (key.as_str(), schema))
+            .map(|(key, body)| (key.as_str(), body))
     }
 }
 
@@ -97,6 +147,23 @@ pub fn is_json_media(media: &str) -> bool {
         .to_ascii_lowercase();
     essence == "application/json"
         || (essence.starts_with("application/") && essence.ends_with("+json"))
+}
+
+/// What a response object declares about its body.
+///
+/// A `content` map is kept as declared even when atomic can get no schema
+/// out of it: media types it does not read, a JSON media type with no
+/// `schema`, a map that is not a map at all. Those declare a body of an
+/// unknown shape, which is not the same as declaring no body, so they are
+/// kept apart from a response with no `content` key.
+fn declared_body(response: &Value) -> ResponseBody {
+    let Some(content) = response.get("content") else {
+        return ResponseBody::NoBody;
+    };
+    match json_content(content) {
+        Some(schema) => ResponseBody::Json(schema.clone()),
+        None => ResponseBody::NoJsonSchema,
+    }
 }
 
 /// The schema under a `content` map's first JSON media type, if any.
@@ -313,22 +380,23 @@ pub fn operations(spec: &Value) -> Result<Vec<Operation>, OpenApiError> {
             if !required.is_empty() {
                 input["required"] = Value::Array(required);
             }
-            // Every response it declares, each with its own schema: a reply
-            // is checked against the one for its status, never another's.
+            // Every response it declares, each with what it declares for its
+            // body: a reply is checked against the one for its status, never
+            // another's.
             let mut kept = std::collections::BTreeMap::new();
             if let Some(responses) = operation.get("responses").and_then(Value::as_object) {
                 for (code, response) in responses {
                     let response = resolve(spec, response, &at)?;
-                    let schema = match response.get("content").and_then(json_content) {
-                        Some(schema) => Some(convert(schema, &format!("{at}/responses/{code}"))?),
-                        None => None,
-                    };
-                    kept.insert(code.clone(), schema);
+                    let mut body = declared_body(&response);
+                    if let Some(schema) = body.schema_mut() {
+                        *schema = convert(schema, &format!("{at}/responses/{code}"))?;
+                    }
+                    kept.insert(code.clone(), body);
                 }
             }
             if !defs.is_empty() {
                 input["$defs"] = Value::Object(defs.clone());
-                for schema in kept.values_mut().flatten() {
+                for schema in kept.values_mut().filter_map(ResponseBody::schema_mut) {
                     if let Value::Object(map) = schema {
                         map.insert("$defs".into(), Value::Object(defs.clone()));
                     }
@@ -339,7 +407,7 @@ pub fn operations(spec: &Value) -> Result<Vec<Operation>, OpenApiError> {
                 .iter()
                 .find(|(code, _)| code.starts_with('2'))
                 .or_else(|| kept.get_key_value("default"))
-                .and_then(|(_, schema)| schema.clone());
+                .and_then(|(_, body)| body.schema().cloned());
             let description = operation["summary"]
                 .as_str()
                 .or_else(|| operation["description"].as_str())

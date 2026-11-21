@@ -1,0 +1,1 @@
+header-after-descent|crates/atomic-core/src/redact.rs|fn hide_header_secret(name: &str, field: &mut Value) {|fn hide_header_secret(name: &str, field: &mut Value) { return; /*CONTROL_OFF*/|-p atomic-agentic-core --lib redact::tests::rewritten_held_json_settles_in_one_pass

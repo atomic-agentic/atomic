@@ -1,0 +1,1 @@
+plan-priced-unpriced|crates/atomic/src/metering.rs|                if dollars {|                if std::hint::black_box(false) && dollars {|-p atomic-agentic --test pipeline -- --exact a_pinned_plan_priced_below_yours_is_refused

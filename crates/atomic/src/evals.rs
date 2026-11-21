@@ -354,7 +354,7 @@ pub async fn run(
             &database,
             executor.as_deref(),
             LAYOUT_VERSION,
-            &crate::engine::store_project(&state),
+            &crate::engine::store_project(&state)?,
         )
         .await
         .map_err(|e| {
@@ -394,6 +394,16 @@ pub async fn run(
                     "fix the atom's budget block",
                 )
             })?;
+            // As a run does: under the person's own dollar cap, a model
+            // only a layer above them prices is said.
+            if budgets.priced_by_project.contains(&model) {
+                atomic_core::log_line!(
+                    "atomic: eval of {}: under your own dollar cap, it calls {model} at prices \
+                     only a layer above your own configuration sets; `atomic config --explain` \
+                     says more",
+                    atom.name
+                );
+            }
             plans.insert(atom.name.clone(), plan);
         }
     }
@@ -843,7 +853,7 @@ fn print(
             println!(
                 "  scorers not run ({}): atomic eval has no judge to call, so only the pass rate \
                  decides",
-                names.join(", ")
+                shown::line(&names.join(", "))
             );
         }
         if let Some(t) = tally {

@@ -268,7 +268,7 @@ pub async fn show(
         &database,
         None,
         LAYOUT_VERSION,
-        &crate::engine::store_project(&state),
+        &crate::engine::store_project(&state)?,
     )
     .await
     .with_context(|| format!("open the store at {}", engine::describe(&database)))?;

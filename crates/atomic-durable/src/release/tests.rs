@@ -836,22 +836,65 @@ async fn a_project_sees_and_releases_only_its_own_parks(database: Database) {
 }
 
 /// A SQLite store is one project's own: a park recorded there before parks
-/// had a project becomes the project's when the store is opened for it.
+/// had a project, or under an older name of the project's (`<old
+/// name>/<state id>`, as before its manifest was renamed), becomes the
+/// project's when the store is opened for it. One recorded for another key
+/// is left as it is. A key that is empty or holds a control character
+/// opens nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_private_store_adopts_its_parks_without_a_project() {
     let path = std::env::temp_dir().join(format!("{}.db", unique("atomic_release_adopt")));
+    let database = Database::Sqlite(path.clone());
+    for bad in ["", " ", "notes/a\0b", "notes/a\nb"] {
+        assert!(
+            Durare::open(&database, None, DEFAULT_VERSION, bad)
+                .await
+                .is_err(),
+            "{bad:?} opened a store"
+        );
+    }
     let before = Durare::sqlite(&path).await.expect("engine");
-    let park = bare_park(&before, &unique("before"), 100).await;
-    let mine = Durare::open(&Database::Sqlite(path), None, DEFAULT_VERSION, "project-a")
+    let unowned = bare_park(&before, &unique("before"), 100).await;
+    let keyed = |run: String, key: &'static str| {
+        let rt = &before;
+        async move {
+            let park = bare_park(rt, &run, 100).await;
+            let id = park.clone();
+            rt.control_transaction(move |mut tx| {
+                let id = id.clone();
+                Box::pin(async move {
+                    tx.execute(
+                        "INSERT INTO atomic_park_projects (park_id, project) VALUES (?, ?)",
+                        &[Param::Text(id), Param::Text(key.into())],
+                    )
+                    .await
+                    .map(|_| ())
+                })
+            })
+            .await
+            .expect("keyed");
+            park
+        }
+    };
+    let renamed = keyed(unique("renamed"), "old-name/the-project-0123").await;
+    let foreign = keyed(unique("foreign"), "notes/another-project-4567").await;
+    let mine = Durare::open(&database, None, DEFAULT_VERSION, "notes/the-project-0123")
         .await
         .expect("engine");
-    let ids: Vec<String> = waiting(&mine)
+    let mut ids: Vec<String> = waiting(&mine)
         .await
         .expect("waiting")
         .into_iter()
         .map(|p| p.id)
         .collect();
-    assert_eq!(ids, vec![park]);
+    ids.sort();
+    let mut adopted = vec![unowned, renamed];
+    adopted.sort();
+    assert_eq!(ids, adopted, "the project's own parks, and no other");
+    assert!(
+        !ids.contains(&foreign),
+        "another project's park was adopted"
+    );
     assert!(
         waiting(&before).await.expect("waiting").is_empty(),
         "still no project's"
