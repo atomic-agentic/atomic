@@ -1,0 +1,1 @@
+exec-network-upstream|crates/atomic-core/src/network.rs|        allow_upstream_proxy: false,|        allow_upstream_proxy: /*CONTROL_OFF*/ true,|-p atomic-agentic-core --lib --features fake-model network::tests::a_proxy_uses_no_upstream_proxy_and_no_socks
