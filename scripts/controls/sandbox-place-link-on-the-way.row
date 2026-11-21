@@ -1,0 +1,1 @@
+sandbox-place-link-on-the-way|crates/atomic-core/src/codex.rs|        if let Some(root) = inside_of(writable, &next) {|        if let Some(root) = None::<&PathBuf> { // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model a_dangling_place_link_into_what_the_thread_may_write_refuses_it

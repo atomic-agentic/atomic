@@ -985,14 +985,34 @@ const GLOB_SPECIAL: &[char] = &['*', '?', '[', ']', '{', '}', '\\'];
 const SQLITE_FILES: &str = "*.sqlite*";
 
 /// Why a denied place that is a link leading nowhere yet cannot be left as
-/// it is: where it would lead, followed through each further link, lies in
-/// one of `writable`, where a command could put a file for what reads the
-/// place to find, or cannot be told. `None` when it leads elsewhere.
+/// it is. Its path is walked as the kernel walks it, a directory at a time,
+/// each link on the way followed where it is: it is refused when a link on
+/// the way lies in one of `writable`, where a command could point it
+/// elsewhere; when where it would lead, from the first thing that is not
+/// there on, lies in one of `writable`, where a command could put a file
+/// for what reads the place to find; or when it cannot be told. `None` when
+/// it leads elsewhere.
 fn dangling_into(path: &Path, writable: &[PathBuf]) -> Option<anyhow::Error> {
+    use std::path::Component;
     let refuse = |why: String| Some(anyhow::Error::new(DenyRefused(why)));
-    let mut at = path.to_owned();
-    for _ in 0..=LINK_HOPS {
-        let link = match std::fs::symlink_metadata(&at) {
+    // What is walked so far, every link in it followed, and what is left.
+    let mut done = PathBuf::from("/");
+    let mut rest: std::collections::VecDeque<std::ffi::OsString> = path
+        .components()
+        .filter(|c| !matches!(c, Component::RootDir))
+        .map(|c| c.as_os_str().to_owned())
+        .collect();
+    let mut hops = 0;
+    while let Some(part) = rest.pop_front() {
+        if part == "." {
+            continue;
+        }
+        if part == ".." {
+            done.pop();
+            continue;
+        }
+        let next = done.join(&part);
+        let link = match std::fs::symlink_metadata(&next) {
             Ok(meta) => meta.file_type().is_symlink(),
             Err(e)
                 if matches!(
@@ -1000,64 +1020,94 @@ fn dangling_into(path: &Path, writable: &[PathBuf]) -> Option<anyhow::Error> {
                     std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
                 ) =>
             {
-                false
+                // Not there: where it would lead is this, and the rest.
+                if rest.iter().any(|p| p == ".." || p == ".") {
+                    return refuse(format!(
+                        "{} is a link that leads nowhere yet, by way of {}, and atomic cannot \
+                         tell where it would lead; point the link elsewhere",
+                        path.display(),
+                        next.display()
+                    ));
+                }
+                let lands: PathBuf = rest.iter().fold(next, |p, part| p.join(part));
+                let root = inside_of(writable, &lands)?;
+                return refuse(format!(
+                    "{} is a link to {}, which is not there yet and lies in {}, which atoms' \
+                     commands may write, so a command could put a file there for what reads {} \
+                     to find; point the link elsewhere, or make what it leads to first",
+                    path.display(),
+                    lands.display(),
+                    root.display(),
+                    path.display()
+                ));
             }
             Err(e) => {
                 return refuse(format!(
-                    "{} leads to {}, which cannot be looked at ({e}); point the link at \
+                    "{} leads by way of {}, which cannot be looked at ({e}); point the link at \
                      something atomic can reach",
                     path.display(),
-                    at.display()
+                    next.display()
                 ));
             }
         };
         if !link {
-            // Where it leads, as far as anything is there.
-            let unsettled = at.components().any(|c| {
-                matches!(
-                    c,
-                    std::path::Component::ParentDir | std::path::Component::CurDir
-                )
-            });
-            if unsettled {
-                return refuse(format!(
-                    "{} is a link to {}, which is not there yet, and atomic cannot tell where \
-                     that would be; point the link elsewhere",
-                    path.display(),
-                    at.display()
-                ));
-            }
-            let root = writable.iter().find(|w| at.starts_with(w))?;
+            done = next;
+            continue;
+        }
+        // A link on the way: one a command may point elsewhere decides
+        // where the place leads, whatever it points at now.
+        if let Some(root) = inside_of(writable, &next) {
             return refuse(format!(
-                "{} is a link to {}, which is not there yet and lies in {}, which atoms' \
-                 commands may write, so a command could put a file there for what reads {} to \
-                 find; point the link elsewhere, or make what it leads to first",
+                "{} leads by way of {}, a link in {}, which atoms' commands may write, so a \
+                 command could point it elsewhere; point {} past it",
                 path.display(),
-                at.display(),
+                next.display(),
                 root.display(),
                 path.display()
             ));
         }
-        let to = match std::fs::read_link(&at) {
+        hops += 1;
+        if hops > LINK_HOPS {
+            return refuse(format!(
+                "{} leads through more than {LINK_HOPS} links; atomic cannot tell where",
+                path.display()
+            ));
+        }
+        let to = match std::fs::read_link(&next) {
             Ok(to) => to,
             Err(e) => {
                 return refuse(format!(
-                    "{} is a link atomic cannot read ({e}); remove it, or point it at something \
-                     atomic can reach",
-                    at.display()
+                    "{} leads by way of {}, a link atomic cannot read ({e}); point it at \
+                     something atomic can reach",
+                    path.display(),
+                    next.display()
                 ));
             }
         };
-        let to = match at.parent() {
-            Some(dir) if to.is_relative() => dir.join(to),
-            _ => to,
-        };
-        at = real_spelling(&to);
+        if to.is_absolute() {
+            done = PathBuf::from("/");
+        }
+        for part in to
+            .components()
+            .filter(|c| !matches!(c, Component::RootDir))
+            .rev()
+        {
+            rest.push_front(part.as_os_str().to_owned());
+        }
     }
+    // All there after all, as when it was made a moment ago.
+    let root = inside_of(writable, &done)?;
     refuse(format!(
-        "{} leads through more than {LINK_HOPS} links; atomic cannot tell where",
-        path.display()
+        "{} leads to {}, in {}, which atoms' commands may write; point the link elsewhere",
+        path.display(),
+        done.display(),
+        root.display()
     ))
+}
+
+/// The first of `dirs` that holds `path`, or is it.
+fn inside_of<'a>(dirs: &'a [PathBuf], path: &Path) -> Option<&'a PathBuf> {
+    dirs.iter().find(|d| path.starts_with(d))
 }
 
 /// The most links [`dangling_into`] follows, as the kernel does.
@@ -5780,12 +5830,54 @@ mod tests {
             why.contains(&format!("lies in {}", work.display())),
             "{why}"
         );
+        // Through a link partway along, itself leading nowhere yet, into
+        // what the thread may write.
+        std::fs::remove_file(&place).expect("unlink");
+        std::fs::create_dir_all(dir.0.join("elsewhere")).expect("dir");
+        link(&work.join("d"), &dir.0.join("elsewhere/d"));
+        link(&dir.0.join("elsewhere/d/aws"), &place);
+        let why = refused(writable).expect("refused");
+        assert!(
+            why.contains(&format!(
+                "is a link to {}, which is not there yet and lies in {}",
+                work.join("d/aws").display(),
+                work.display()
+            )),
+            "{why}"
+        );
+        // Through a link a command may point elsewhere: one partway along in
+        // what the thread may write, leading out of it now.
+        std::fs::remove_file(&place).expect("unlink");
+        link(&dir.0.join("elsewhere"), &work.join("lnk"));
+        link(&work.join("lnk/aws"), &place);
+        let why = refused(writable).expect("refused");
+        assert!(
+            why.contains(&format!(
+                "leads by way of {}, a link in {}",
+                work.join("lnk").display(),
+                work.display()
+            )),
+            "{why}"
+        );
+        // And a further link that is itself in what the thread may write.
+        std::fs::remove_file(&place).expect("unlink");
+        link(&dir.0.join("elsewhere/aws"), &work.join("hop"));
+        link(&work.join("hop"), &place);
+        let why = refused(writable).expect("refused");
+        assert!(
+            why.contains(&format!(
+                "leads by way of {}, a link in {}",
+                work.join("hop").display(),
+                work.display()
+            )),
+            "{why}"
+        );
         // Somewhere it cannot tell: up from what is not there.
         std::fs::remove_file(&place).expect("unlink");
         link(&dir.0.join("missing/../aws"), &place);
         let why = refused(writable).expect("refused");
         assert!(
-            why.contains("atomic cannot tell where that would be"),
+            why.contains("atomic cannot tell where it would lead"),
             "{why}"
         );
         // Elsewhere: passed over, as before.

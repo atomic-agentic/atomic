@@ -504,10 +504,12 @@ a denied place is a link atomic cannot resolve for a reason other than
 leading nowhere yet, such as a link to itself or into a directory you may
 not search: remove the link, or point it at something atomic can reach.
 Nor does it start when a denied place is a link leading nowhere yet whose
-target, followed through any further link, would lie in a directory it may
-write or in atomic's state, where a command could put a file there for what
-reads the place to find, or where atomic cannot tell where it would be:
-point the link elsewhere, or make what it leads to first. The model chooses
+path, walked a directory at a time with each link on the way followed,
+would land in a directory it may write or in atomic's state, where a
+command could put a file there for what reads the place to find; passes
+through a link in such a directory, which a command could point
+elsewhere; or leads where atomic cannot tell: point the link elsewhere, or
+make what it leads to first. The model chooses
 the commands, so none of these reach it through them. atomic makes the list
 when the turn starts: a place on it that appears while a command runs is
 denied only to later commands, and so is what a link made later inside a
