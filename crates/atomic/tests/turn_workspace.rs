@@ -556,24 +556,47 @@ fn a_turn_cannot_read_another_turns_scratch_and_keeps_its_own() {
                 under.display()
             )
         };
+        // A holder holds its attempt open until this test, once every look
+        // has ended and it has seen the secrets still there, leaves
+        // `release`: in calls of up to 8 s, under the 10 s a command may run
+        // before its turn goes on, and up to 64 s in all.
+        let hold = |who: &str| {
+            let mut calls = vec![
+                "for i in $(seq 80); do [ -e release ] && break; sleep 0.1; done"
+                    .to_owned();
+                7
+            ];
+            calls.push(format!(
+                "for i in $(seq 80); do [ -e release ] && break; sleep 0.1; done; \
+                 [ -e release ] && echo {who}-held"
+            ));
+            calls
+        };
         let first = tokio::spawn(turn(
-            vec![
-                "echo secret-of-the-first > \"$HOME/secret\" && \
-                 echo secret-of-the-first > \"$TMPDIR/secret\" && touch first-wrote && \
-                 echo first-wrote"
-                    .into(),
-                "sleep 8; echo first-held".into(),
-            ],
+            [
+                vec![
+                    "echo secret-of-the-first > \"$HOME/secret\" && \
+                     echo secret-of-the-first > \"$TMPDIR/secret\" && touch first-wrote && \
+                     echo first-wrote"
+                        .to_owned(),
+                ],
+                hold("first"),
+            ]
+            .concat(),
             Sandbox::WorkspaceWrite,
             &backend,
         ));
         let neighbour = tokio::spawn(turn(
-            vec![format!(
-                "echo secret-of-the-neighbour > \"$HOME/secret\" && touch neighbour-wrote; \
-                 {}; {}; sleep 6; echo neighbour-held",
-                wait("first-wrote"),
-                look("neighbour-found", &root, "secret-of-the-first"),
-            )],
+            [
+                vec![format!(
+                    "echo secret-of-the-neighbour > \"$HOME/secret\" && touch neighbour-wrote; \
+                     {}; {}; touch neighbour-looked",
+                    wait("first-wrote"),
+                    look("neighbour-found", &root, "secret-of-the-first"),
+                )],
+                hold("neighbour"),
+            ]
+            .concat(),
             Sandbox::WorkspaceWrite,
             &neighbours,
         ));
@@ -603,11 +626,32 @@ fn a_turn_cannot_read_another_turns_scratch_and_keeps_its_own() {
             Sandbox::ReadOnly,
             &backend,
         ));
-        let (first, neighbour, writer, reader) = (
+        let (writer, reader) = (writer.await.expect("writer"), reader.await.expect("reader"));
+        let cwd = dir.join("project");
+        for _ in 0..300 {
+            if cwd.join("neighbour-looked").exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        // Every look has ended, and what it looked for is still there: the
+        // holders still hold their attempts.
+        assert!(
+            cwd.join("neighbour-looked").exists(),
+            "the neighbour never looked"
+        );
+        assert!(
+            holds(&root, "secret-of-the-first"),
+            "the first's secret was gone"
+        );
+        assert!(
+            holds(&sibling, "secret-of-the-neighbour"),
+            "the neighbour's secret was gone"
+        );
+        std::fs::write(cwd.join("release"), "").expect("release");
+        let (first, neighbour) = (
             first.await.expect("first"),
             neighbour.await.expect("neighbour"),
-            writer.await.expect("writer"),
-            reader.await.expect("reader"),
         );
         assert!(
             first.contains("first-wrote") && first.contains("first-held"),
@@ -633,6 +677,22 @@ fn a_turn_cannot_read_another_turns_scratch_and_keeps_its_own() {
             "the read-only turn read the first's scratch, or reached its own: {reader}"
         );
     });
+}
+
+/// Whether a file under `dir` holds `needle`, as this test process, which no
+/// sandbox confines, finds it.
+fn holds(dir: &Path, needle: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.filter_map(Result::ok).any(|entry| {
+        let path = entry.path();
+        if path.is_dir() {
+            holds(&path, needle)
+        } else {
+            std::fs::read_to_string(&path).is_ok_and(|text| text.contains(needle))
+        }
+    })
 }
 
 /// The variable that says `/tmp` belongs to this test run alone, as in
