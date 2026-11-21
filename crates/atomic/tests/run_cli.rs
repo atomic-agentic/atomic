@@ -2195,11 +2195,9 @@ fn a_run_told_to_stop_while_it_waits_for_the_store_stops_and_records_nothing() {
         wait_until("the run to wait for the store", || {
             std::fs::read_to_string(&log).is_ok_and(|l| l.contains("is held by another process"))
         });
-        let status = Command::new("/bin/sh")
-            .args(["-c", &format!("kill -INT {}", child.id())])
-            .status()
-            .expect("kill");
-        assert!(status.success());
+        // SIGTERM, which a background job does not inherit as ignored, as
+        // it may SIGINT.
+        terminate(&child);
         let started = Instant::now();
         let status = wait_child(&mut child, "atomic run");
         assert!(
