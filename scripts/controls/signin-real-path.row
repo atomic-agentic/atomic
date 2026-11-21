@@ -1,0 +1,1 @@
+signin-real-path|crates/atomic-core/src/signin.rs|        crate::state::real_path(dir),|        dir.to_path_buf(),|-p atomic-agentic --test model_auth a_sign_in_inside_the_checkout_holding_the_project_is_refused_and_explain_says_so

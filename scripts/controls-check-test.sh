@@ -155,18 +155,35 @@ exec "${cp_bin}" -p "\$@"
 SH
 chmod +x "${WORK}/bin-oldcp/cp"
 
-# The controls the script lists, and the files they edit.
-mapfile -t CONTROL_ROWS < <(grep -E '^    "[a-z0-9-]+\|' "${ROOT}/scripts/controls-check.sh")
+# The controls the script reads, one per file under scripts/controls/, and the
+# files they edit.
+mapfile -d '' -t CONTROL_ROW_FILES < <(
+    find "${ROOT}/scripts/controls" -mindepth 1 -maxdepth 1 -type f -name '*.row' -print0 |
+        LC_ALL=C sort -z
+)
+[ "${#CONTROL_ROW_FILES[@]}" -gt 0 ] || {
+    echo "no controls found under scripts/controls" >&2
+    exit 1
+}
+CONTROL_ROWS=()
+for control_row_file in "${CONTROL_ROW_FILES[@]}"; do
+    mapfile -t control_row_lines <"${control_row_file}"
+    [ "${#control_row_lines[@]}" -eq 1 ] || {
+        echo "${control_row_file} does not hold exactly one row" >&2
+        exit 1
+    }
+    CONTROL_ROWS+=("${control_row_lines[0]}")
+done
 mapfile -t CONTROL_FILES < <(printf '%s\n' "${CONTROL_ROWS[@]}" | cut -d'|' -f2 | sort -u)
-[ "${#CONTROL_ROWS[@]}" -gt 0 ] || { echo "no controls found in scripts/controls-check.sh" >&2; exit 1; }
 
 # A fresh copy of the repository's part the script touches, committed.
 fresh() {
     local repo="${WORK}/repo"
     chmod -R u+w "${repo}" 2>/dev/null
     rm -rf "${repo}"
-    mkdir -p "${repo}/scripts"
+    mkdir -p "${repo}/scripts/controls"
     cp "${ROOT}/scripts/controls-check.sh" "${repo}/scripts/"
+    cp "${ROOT}"/scripts/controls/*.row "${repo}/scripts/controls/"
     # Every file a control names.
     local file
     for file in "${CONTROL_FILES[@]}"; do
@@ -203,6 +220,8 @@ run honest
 [ "$(grep -c '^ok ' <<<"${out}")" -eq "${#CONTROL_ROWS[@]}" ] ||
     fail "honest: not all ${#CONTROL_ROWS[@]} controls ok: ${out}"
 untouched || fail "honest: the source is left modified"
+[ -z "$(git -C "${repo}" status --porcelain -- scripts)" ] ||
+    fail "honest: a file under scripts/ is left changed: $(git -C "${repo}" status --porcelain -- scripts)"
 [ ! -e "${repo}/target/controls-check" ] || fail "honest: the saved copies are left behind"
 
 # A test that passes with its control off fails the check.
@@ -227,6 +246,17 @@ run missing sandbox-writes
     fail "missing: exit ${code}: ${out}"
 untouched || fail "missing: the source is left modified"
 
+# A row's arguments reach cargo as written: no variable in them is expanded,
+# and none is left to be.
+repo="$(fresh)"
+run honest sandbox-writes
+grep -q -- "--features atomic-agentic/postgres-tests,atomic-agentic/sandbox-tests" "${repo}/cargo-args" ||
+    fail "features: cargo was not given the row's features: $(cat "${repo}/cargo-args")"
+! grep -q '\${' "${repo}/cargo-args" ||
+    fail "features: a variable reached cargo unexpanded: $(cat "${repo}/cargo-args")"
+! grep -l '\${' "${ROOT}"/scripts/controls/*.row >/dev/null 2>&1 ||
+    fail "features: a row holds a variable: $(grep -l '\${' "${ROOT}"/scripts/controls/*.row)"
+
 # A failed test whose name has spaces in it, as a doctest's does, is seen
 # failing.
 repo="$(fresh)"
@@ -238,10 +268,10 @@ untouched || fail "spaces: the source is left modified"
 # A row whose only argument after `--` is a flag of the test binary's, not a
 # test: the flag is not taken for a test that should have been seen failing.
 repo="$(fresh)"
-sed -i '/"git-dir|/ s/|-p atomic-agentic-core .*"$/|-p atomic-agentic-core --lib -- --exact"/' \
-    "${repo}/scripts/controls-check.sh"
-grep -q '"git-dir|.*-- --exact"$' "${repo}/scripts/controls-check.sh" ||
-    fail "flag after --: the row was not changed: $(grep '"git-dir|' "${repo}/scripts/controls-check.sh")"
+sed -i 's/|-p atomic-agentic-core .*$/|-p atomic-agentic-core --lib -- --exact/' \
+    "${repo}/scripts/controls/git-dir.row"
+grep -q '^git-dir|.*-- --exact$' "${repo}/scripts/controls/git-dir.row" ||
+    fail "flag after --: the row was not changed: $(cat "${repo}/scripts/controls/git-dir.row")"
 run honest git-dir
 [ "${code}" -eq 0 ] && grep -q "^ok git-dir" <<<"${out}" ||
     fail "flag after --: exit ${code}: ${out}"
@@ -267,6 +297,113 @@ run honest no-such-control
 [ "${code}" -eq 2 ] && grep -q "no control is named 'no-such-control'" <<<"${out}" ||
     fail "unknown name: exit ${code}: ${out}"
 untouched || fail "unknown name: the source is edited"
+
+# A control is whatever a file under scripts/controls/ says it is, to the end
+# of the run: a file added there is a control the script selects, switches off
+# and requires its test to fail. A run that asked cargo what to check, instead
+# of reading the rows, would never switch this one off and would pass.
+repo="$(fresh)"
+printf '%s\n' \
+    'no-such-control|crates/atomic-core/src/git.rs|        for setting in HARDENING {|        for setting in HARDENING.iter().take(0) {|guard' \
+    >"${repo}/scripts/controls/no-such-control.row"
+run blind no-such-control
+[ "${code}" -ne 0 ] && grep -q "FAIL no-such-control: its test passed with the control off" <<<"${out}" ||
+    fail "a row added is a control run: exit ${code}: ${out}"
+untouched || fail "a row added is a control run: the source is left modified"
+
+# Each rule that reads the rows names the file it refuses and stops before
+# anything is edited: a control the script cannot read is one it would
+# otherwise never check and still report.
+repo="$(fresh)"
+printf '%s\n' 'another-name|crates/atomic-core/src/git.rs|a|b|args' \
+    >"${repo}/scripts/controls/git-hardening.row"
+run honest git-hardening
+[ "${code}" -eq 1 ] &&
+    grep -q "scripts/controls/git-hardening.row names itself 'another-name', which is not its file name" <<<"${out}" ||
+    fail "a row named otherwise: exit ${code}: ${out}"
+[ ! -e "${repo}/cargo-args" ] || fail "a row named otherwise: cargo ran"
+
+repo="$(fresh)"
+printf '%s\n%s\n' \
+    'git-hardening|crates/atomic-core/src/git.rs|a|b|args' \
+    'git-filters|crates/atomic-core/src/git.rs|c|d|args' \
+    >"${repo}/scripts/controls/git-hardening.row"
+run honest git-hardening
+[ "${code}" -eq 1 ] &&
+    grep -q "scripts/controls/git-hardening.row holds 2 rows, not the one it must" <<<"${out}" ||
+    fail "a row file with two rows: exit ${code}: ${out}"
+[ ! -e "${repo}/cargo-args" ] || fail "a row file with two rows: cargo ran"
+
+repo="$(fresh)"
+: >"${repo}/scripts/controls/git-hardening.row"
+run honest git-hardening
+[ "${code}" -eq 1 ] &&
+    grep -q "scripts/controls/git-hardening.row holds 0 rows, not the one it must" <<<"${out}" ||
+    fail "an empty row file: exit ${code}: ${out}"
+[ ! -e "${repo}/cargo-args" ] || fail "an empty row file: cargo ran"
+
+repo="$(fresh)"
+printf '%s\n' '|crates/atomic-core/src/git.rs|a|b|args' \
+    >"${repo}/scripts/controls/git-hardening.row"
+run honest git-hardening
+[ "${code}" -eq 1 ] && grep -q "scripts/controls/git-hardening.row names no control" <<<"${out}" ||
+    fail "a row naming no control: exit ${code}: ${out}"
+[ ! -e "${repo}/cargo-args" ] || fail "a row naming no control: cargo ran"
+
+repo="$(fresh)"
+printf '%s\n' 'git-hardening|crates/atomic-core/src/git.rs|a|b|args' \
+    >"${repo}/scripts/controls/zsecond.row"
+run honest git-hardening
+[ "${code}" -eq 1 ] &&
+    grep -q "scripts/controls/zsecond.row names the control 'git-hardening', which another row file already names" <<<"${out}" ||
+    fail "two rows naming one control: exit ${code}: ${out}"
+[ ! -e "${repo}/cargo-args" ] || fail "two rows naming one control: cargo ran"
+
+repo="$(fresh)"
+printf '%s\n' 'git-hardening|crates/atomic-core/src/git.rs|a|b|args' \
+    >"${repo}/scripts/controls/git-hardening.row.txt"
+run honest git-hardening
+[ "${code}" -eq 1 ] &&
+    grep -q "scripts/controls/git-hardening.row.txt is not named <name>.row, so its control would never be read" <<<"${out}" ||
+    fail "a row file named otherwise: exit ${code}: ${out}"
+[ ! -e "${repo}/cargo-args" ] || fail "a row file named otherwise: cargo ran"
+
+repo="$(fresh)"
+mkdir -p "${repo}/scripts/controls/sub.row"
+run honest git-hardening
+[ "${code}" -eq 1 ] && grep -q "scripts/controls/sub.row is not a regular file" <<<"${out}" ||
+    fail "a directory in the rows: exit ${code}: ${out}"
+[ ! -e "${repo}/cargo-args" ] || fail "a directory in the rows: cargo ran"
+
+# Rows that are gone are no control to check. A run that found nothing and
+# said nothing would be the quiet way to lose every control at once.
+repo="$(fresh)"
+rm -rf "${repo}/scripts/controls"
+run honest
+[ "${code}" -eq 1 ] &&
+    grep -q "scripts/controls is not a directory, so there is no control to check" <<<"${out}" ||
+    fail "the rows gone: exit ${code}: ${out}"
+[ ! -e "${repo}/cargo-args" ] || fail "the rows gone: cargo ran"
+untouched || fail "the rows gone: the source is edited"
+
+repo="$(fresh)"
+rm -f "${repo}"/scripts/controls/*.row
+run honest
+[ "${code}" -eq 1 ] && grep -q "scripts/controls holds no control" <<<"${out}" ||
+    fail "no row files: exit ${code}: ${out}"
+[ ! -e "${repo}/cargo-args" ] || fail "no row files: cargo ran"
+
+# One row file gone is one control gone: every other control still runs, and
+# the name that lost its file is unknown.
+repo="$(fresh)"
+rm -f "${repo}/scripts/controls/git-hardening.row"
+run honest
+[ "${code}" -eq 0 ] || fail "one row file gone: exit ${code}: ${out}"
+[ "$(grep -c '^ok ' <<<"${out}")" -eq "$((${#CONTROL_ROWS[@]} - 1))" ] ||
+    fail "one row file gone: not every other control ok: ${out}"
+run honest git-hardening
+[ "${code}" -eq 2 ] && grep -q "no control is named 'git-hardening'" <<<"${out}" ||
+    fail "one row file gone, by name: exit ${code}: ${out}"
 
 # When the originals cannot be saved, nothing is edited.
 repo="$(fresh)"
@@ -309,7 +446,9 @@ grep -q "never committed" <<<"$(git -C "${repo}" diff -- crates/atomic-core/src/
 # A whole-suite run names every file it refuses, not just the first.
 printf '\n// a change that was never committed\n' >>"${repo}/crates/atomic-core/src/codex.rs"
 run honest
-grep -Eq "differ from HEAD:.*src/git\.rs.*src/codex\.rs" <<<"${out}" ||
+# Both, whichever order the rows list them in.
+dirty="$(grep -o 'differ from HEAD:[^(]*' <<<"${out}")"
+grep -q "src/git\.rs" <<<"${dirty}" && grep -q "src/codex\.rs" <<<"${dirty}" ||
     fail "dirty at the start, all controls: exit ${code}: ${out}"
 
 # A file git does not track, or one it is told to assume unchanged, cannot
@@ -411,6 +550,21 @@ untouched || fail "after a kill: the saved original does not restore the file"
 #   head_diff "${file}" || code=$?  in restore      stale restore
 #   && touch -- "$1"                in put_back     rebuild, in rebuild.log
 #   touch -- "${file}"              in restore      rebuild, against artefacts
+#   [ -d "${ROWS}" ] || die                         the rows gone
+#   [ "${#entries[@]}" -gt 0 ] || die               no row files
+#   [ -f "${entry}" ] || die                        a directory in the rows
+#   *.row) ;;                                       a row file with another
+#                                                   extension
+#   [ "${#lines[@]}" -eq 1 ] || die                 two rows, and an empty file
+#   [ -n "${name}" ] || die                         a row naming no control
+#   case " ${names[*]-} " in                        two rows naming one control
+#   [ "${name}" = "${base%.row}" ] || die           a row naming itself
+#                                                   otherwise
+#   selected+=("${row}")                            a row added, one row file
+#                                                   gone, and the honest count
+#   [ "${#selected[@]}" -eq 0 ] || ... exit 2       unknown names, the name of
+#                                                   a control whose file is
+#                                                   gone
 
 if [ "${failures}" -ne 0 ]; then
     echo "${failures} controls-check test(s) failed" >&2

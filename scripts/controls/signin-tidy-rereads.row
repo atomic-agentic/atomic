@@ -1,0 +1,1 @@
+signin-tidy-rereads|crates/atomic-core/src/signin.rs|        match self.stored() {|        match Ok::<Option<codex_login::AuthDotJson>, std::io::Error>(None) /*CONTROL_OFF*/ {|-p atomic-agentic-core --lib signin::tests::a_sign_in_kept_while_a_login_waited_outlives_its_failure
