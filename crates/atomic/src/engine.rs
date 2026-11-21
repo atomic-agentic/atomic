@@ -66,6 +66,12 @@ pub struct EngineArgs {
     /// `ATOMIC_EXECUTOR_ID`).
     #[arg(long)]
     pub executor_id: Option<String>,
+    /// How many seconds a step waits for the execution backend to have room
+    /// for its workspace before the run stops, unfinished and with nothing
+    /// recorded, for `atomic runs resume`. Without it, a step waits for as
+    /// long as it takes (`backend_wait`, `ATOMIC_BACKEND_WAIT`).
+    #[arg(long, value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(1..))]
+    pub backend_wait: Option<u64>,
 }
 
 /// The settings for the project at `state`, with `args` on top. The
@@ -122,21 +128,17 @@ pub fn exec_backend(
     // Exec atoms' commands run under the same sandbox helper as turns'
     // commands, denied atomic's private state. Elsewhere than Linux this is
     // not verified, and they run unconfined (see the availability notes).
-    // They may write their scratch directory and the project's caches.
+    // They may write their scratch directory and their run's own build
+    // caches, which each workspace names, and nothing shared between runs.
     #[cfg(target_os = "linux")]
-    let local = {
-        let caches = atomic_core::worktree::Caches::for_state(state);
-        caches.create().context("the project's caches")?;
-        local.confined(std::sync::Arc::new(
-            atomic_core::codex::ExecSandbox::new(
-                paths,
-                atomic_core::codex::StateGuard::for_project(state)?,
-                state.codex_home(),
-            )
-            .context("confine exec atoms' commands")?
-            .also_writing(vec![caches.dir().to_owned()]),
-        ))
-    };
+    let local = local.confined(std::sync::Arc::new(
+        atomic_core::codex::ExecSandbox::new(
+            paths,
+            atomic_core::codex::StateGuard::for_project(state)?,
+            state.codex_home(),
+        )
+        .context("confine exec atoms' commands")?,
+    ));
     match runner {
         RunnerKind::Local => atomic_exec::Backend::connect(local),
         RunnerKind::Process => atomic_exec::Backend::connect(ProcessRunner {
@@ -365,6 +367,12 @@ pub async fn open(
     // started still runs must not let another process recover that run.
     state.lock_execution(command)?.hold_until_exit();
     let resolved = settings(state, args, needs_model)?;
+    atomic_core::runtime::limit_backend_wait(
+        resolved
+            .settings
+            .backend_wait()
+            .map(std::time::Duration::from_secs),
+    );
     let database = store_of(state, &resolved.settings);
     let executor = atomic_durable::executor_identity(resolved.settings.executor_id.as_deref())?;
     if matches!(database, Database::Postgres { .. }) && executor.is_none() {
@@ -424,6 +432,7 @@ pub async fn open(
             ..LiteRuntime::new(endpoint, AtomConfig::default())
         },
         exec,
+        exec_meter: Default::default(),
         clock: None,
     });
     // Never the developer's checkout: a run's worktree steps use the
@@ -439,6 +448,8 @@ pub async fn open(
             store,
             deployment: deployment(),
             worktrees,
+            // Each run's build caches, in a directory of its own here.
+            caches: Some(state.dir().join("cache")),
             // Budget caps and prices, through the configuration layers.
             budgets: Arc::new(resolved.settings.budget.clone()),
             // No context settings yet: a step whose atom declares a public

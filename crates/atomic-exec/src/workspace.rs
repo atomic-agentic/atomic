@@ -62,8 +62,9 @@ pub struct Open {
     /// The sandbox a model turn's shell and file work runs in. An exec
     /// atom's command is not a model turn and is not sandboxed by it.
     pub sandbox: Sandbox,
-    /// Directories a `workspace-write` turn may write besides the
-    /// workspace, such as the project's shared caches.
+    /// Directories a `workspace-write` turn, or an exec command, may write
+    /// besides the workspace and its scratch directory, such as its run's
+    /// build caches.
     pub writable_roots: Vec<PathBuf>,
     /// The environment the atom declares for every command it runs. Nothing
     /// else of the control plane's environment is passed on.

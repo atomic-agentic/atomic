@@ -90,6 +90,7 @@ fn runtimes(model: &FakeModel, tag: &str) -> Runtimes {
         codex,
         lite,
         exec: Default::default(),
+        exec_meter: Default::default(),
         clock: None,
     }
 }
@@ -1104,6 +1105,7 @@ fn exec_validators_follow_the_steps_clock() {
                 Arc::new(atomic_exec::LocalBackend::default()),
                 Some(&clock),
                 &Artifacts::none(),
+                &crate::usage::Metering::none(),
             )
             .await
             .expect("the recorded clock passes");
@@ -1117,6 +1119,7 @@ fn exec_validators_follow_the_steps_clock() {
             Arc::new(atomic_exec::LocalBackend::default()),
             None,
             &Artifacts::none(),
+            &crate::usage::Metering::none(),
         )
         .await;
         assert!(matches!(fresh, Err(AtomError::Validation(_))), "{fresh:?}");
@@ -1207,6 +1210,33 @@ fn an_exec_command_sees_only_its_declared_environment_from_the_project_root() {
         .expect("the environment is exactly the declared one");
         assert_eq!(out, json!({"total": 1}));
     });
+}
+
+#[test]
+fn an_exec_atoms_declared_environment_wins_over_its_runs_caches() {
+    let (_, a, _) = exec_project(
+        "exec-env-wins",
+        TOTAL,
+        ", env: { XDG_CACHE_HOME: '/mine', REGION: 'eu' }",
+    );
+    let caches = crate::worktree::Caches::new("/state/cache/run-1-ab".into()).for_exec("total");
+    let (env, writable) = exec_environment(&a, Some(&caches));
+    assert_eq!(env["XDG_CACHE_HOME"], "/mine", "declared wins");
+    assert_eq!(env["REGION"], "eu");
+    for (name, value) in caches.env() {
+        if name != "XDG_CACHE_HOME" {
+            assert_eq!(env[&name], value, "{name}");
+        }
+    }
+    assert_eq!(writable, [std::path::Path::new("/state/cache/run-1-ab")]);
+    // With no caches, as in an eval, only what the atom declares.
+    let (env, writable) = exec_environment(&a, None);
+    assert_eq!(
+        env.keys().collect::<Vec<_>>(),
+        ["REGION", "XDG_CACHE_HOME"],
+        "{env:?}"
+    );
+    assert!(writable.is_empty());
 }
 
 #[test]
@@ -2149,6 +2179,7 @@ fn an_exec_atom_output_names_only_artifacts_the_store_holds() {
                 Arc::new(atomic_exec::LocalBackend::default()),
                 None,
                 &Artifacts::new(store.clone()),
+                &crate::usage::Metering::none(),
             )
             .await;
             match want {
@@ -2243,6 +2274,7 @@ fn an_exec_output_cel_cannot_read_fails() {
             Arc::new(atomic_exec::LocalBackend::default()),
             None,
             &Artifacts::none(),
+            &crate::usage::Metering::none(),
         )
         .await;
         assert!(
@@ -2823,6 +2855,7 @@ fn a_cancelled_run_waits_for_its_files_to_be_copied_and_read() {
                     backend,
                     None,
                     &artifacts,
+                    &crate::usage::Metering::none(),
                 )
                 .await
             });
@@ -2907,6 +2940,7 @@ fn a_store_held_while_files_are_stored_leaves_the_outcome_unknown() {
             step_id: "total".into(),
         };
         let input = json!({"cents": [1]});
+        let meter = crate::usage::Metering::none();
         let run = || {
             run_exec(
                 &a,
@@ -2916,6 +2950,7 @@ fn a_store_held_while_files_are_stored_leaves_the_outcome_unknown() {
                 Arc::new(atomic_exec::LocalBackend::default()),
                 None,
                 &artifacts,
+                &meter,
             )
         };
         let held = hold();
@@ -3164,6 +3199,7 @@ fn a_runtime_dropped_under_a_running_command_or_a_held_workspace_shuts_down() {
                 backend,
                 None,
                 &Artifacts::none(),
+                &crate::usage::Metering::none(),
             )
             .await;
         });
