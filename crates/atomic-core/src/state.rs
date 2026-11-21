@@ -669,15 +669,49 @@ pub fn as_it_really_is(path: &Path) -> PathBuf {
 /// Every checkout holding `dir`, a path as it really is: each directory
 /// around it with a `.git`, and for a linked worktree the checkout whose
 /// repository it shares, which its `.git` file names through the
-/// repository's `commondir`. A `.git` or `commondir` that is not a small
-/// regular file, as git writes them, is refused rather than read: the
-/// project supplies both, and a pipe or a device there would hang or fill
-/// memory.
+/// repository's `commondir`. Of this user's own `.git`, a `.git` or
+/// `commondir` that is not a small regular file, as git writes them, is
+/// refused rather than read: a pipe or a device there would hang or fill
+/// memory. Another user's is read through no link and refuses nothing (see
+/// [`checkouts_holding_as`]).
 pub fn checkouts_holding(dir: &Path) -> Result<Vec<PathBuf>, String> {
+    #[cfg(unix)]
+    let me = Some(effective_uid());
+    #[cfg(not(unix))]
+    let me = None;
+    checkouts_holding_as(dir, me)
+}
+
+/// [`checkouts_holding`], for the user `me` (`None` where files have no
+/// owner to compare).
+///
+/// A `.git` that is there, or that cannot be looked at, makes its directory
+/// a checkout. What a `.git` links to may refuse the project only when it is
+/// this user's own and no hard link another user could have made to a file
+/// of theirs. Any other `.git`, such as one planted in `/tmp` above every
+/// project there, is still followed when it is a regular file that reads as
+/// a worktree's link, so a real worktree written by another user (under
+/// `sudo`, or seen through a user namespace) still holds the project in its
+/// main checkout; but nothing wrong with it refuses anything. The trade-off:
+/// a well-formed plant that names a directory with a `.git` makes that
+/// directory count as a checkout too, refusing a sign-in or a configuration
+/// kept there.
+fn checkouts_holding_as(dir: &Path, me: Option<u32>) -> Result<Vec<PathBuf>, String> {
     let mut found = Vec::new();
-    for checkout in dir.ancestors().filter(|d| d.join(".git").exists()) {
+    for checkout in dir.ancestors().filter(|d| present(&d.join(".git"))) {
         found.push(checkout.to_owned());
-        if let Some(main) = main_checkout(&checkout.join(".git"))?
+        let git = checkout.join(".git");
+        let main = if answerable(&git, me) {
+            main_checkout(&git, true)?
+        } else if std::fs::symlink_metadata(&git).is_ok_and(|m| m.is_file()) {
+            // Opened through no link at all, the `.git` and its
+            // `commondir` alike: what another user's names is never opened,
+            // a device or a pipe included.
+            main_checkout(&git, false).unwrap_or(None)
+        } else {
+            None
+        };
+        if let Some(main) = main
             && !found.contains(&main)
         {
             found.push(main);
@@ -686,22 +720,70 @@ pub fn checkouts_holding(dir: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(found)
 }
 
+/// Whether there is something at `path`: anything but a lookup that finds
+/// nothing, so one this user cannot make counts.
+fn present(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => true,
+        Err(e) => !matches!(
+            e.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+        ),
+    }
+}
+
+/// Whether what the `.git` at `git` says may refuse the project: it is
+/// `me`'s own, and not a file with other hard links, which another user
+/// could have made to a file of `me`'s.
+fn answerable(git: &Path, me: Option<u32>) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        owned_by(git, me)
+            && std::fs::symlink_metadata(git)
+                .is_ok_and(|meta| !(meta.is_file() && meta.nlink() > 1))
+    }
+    #[cfg(not(unix))]
+    owned_by(git, me)
+}
+
+/// Whether `path` itself, not what a link there leads to, is owned by `me`;
+/// with no owner to compare, it counts as owned.
+fn owned_by(path: &Path, me: Option<u32>) -> bool {
+    #[cfg(unix)]
+    if let Some(me) = me {
+        use std::os::unix::fs::MetadataExt;
+        return std::fs::symlink_metadata(path).is_ok_and(|m| m.uid() == me);
+    }
+    let _ = (path, me);
+    true
+}
+
 /// The most a `.git` file or a `commondir` is read for: a path or two.
 const LINK_FILE_MAX: u64 = 4096;
 
 /// How a link file is opened: without waiting on a pipe's writer, and
 /// never as the process's controlling terminal.
 #[cfg(unix)]
-const LINK_OPEN_FLAGS: i32 = libc::O_NONBLOCK | libc::O_NOCTTY;
+const LINK_OPEN_FLAGS: i32 = NOT_WAITING | libc::O_NOCTTY;
+
+/// What makes an open of a link file not wait on a pipe's writer.
+#[cfg(unix)]
+const NOT_WAITING: i32 = libc::O_NONBLOCK;
+
+/// What makes an open of another user's link file refuse a link where it
+/// ends, so it opens nothing that link names.
+#[cfg(unix)]
+const NOT_THROUGH_A_LINK: i32 = libc::O_NOFOLLOW;
 
 /// The main checkout of the linked worktree whose `.git` is `git`; `None`
 /// for a `.git` directory, a submodule's file (no `commondir`), or a bare
 /// repository.
-fn main_checkout(git: &Path) -> Result<Option<PathBuf>, String> {
+fn main_checkout(git: &Path, through_links: bool) -> Result<Option<PathBuf>, String> {
     if std::fs::metadata(git).is_ok_and(|m| m.is_dir()) {
         return Ok(None);
     }
-    let Some(text) = link_file(git)? else {
+    let Some(text) = link_file(git, through_links)? else {
         return Ok(None);
     };
     let Some(gitdir) = text.lines().find_map(|l| l.strip_prefix("gitdir:")) else {
@@ -711,7 +793,7 @@ fn main_checkout(git: &Path) -> Result<Option<PathBuf>, String> {
         return Ok(None);
     };
     let gitdir = parent.join(gitdir.trim());
-    let Some(common) = link_file(&gitdir.join("commondir"))? else {
+    let Some(common) = link_file(&gitdir.join("commondir"), through_links)? else {
         return Ok(None);
     };
     let Ok(common) = std::fs::canonicalize(gitdir.join(common.trim())) else {
@@ -727,7 +809,7 @@ fn main_checkout(git: &Path) -> Result<Option<PathBuf>, String> {
 /// opened without blocking, so a pipe there cannot hang the read, and
 /// refused when it is anything but a regular file of at most
 /// [`LINK_FILE_MAX`] bytes.
-fn link_file(path: &Path) -> Result<Option<String>, String> {
+fn link_file(path: &Path, through_links: bool) -> Result<Option<String>, String> {
     use std::io::Read;
     let refused = |why: &str| {
         Err(format!(
@@ -738,7 +820,16 @@ fn link_file(path: &Path) -> Result<Option<String>, String> {
     let mut open = std::fs::OpenOptions::new();
     open.read(true);
     #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut open, LINK_OPEN_FLAGS);
+    std::os::unix::fs::OpenOptionsExt::custom_flags(
+        &mut open,
+        if through_links {
+            LINK_OPEN_FLAGS
+        } else {
+            LINK_OPEN_FLAGS | NOT_THROUGH_A_LINK
+        },
+    );
+    #[cfg(not(unix))]
+    let _ = through_links;
     let file = match open.open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1122,6 +1213,36 @@ pub fn passwd_home() -> Option<PathBuf> {
     None
 }
 
+/// The name the password database gives `uid`; `None` when it has no entry
+/// or the name is not UTF-8.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+pub(crate) fn passwd_name(uid: u32) -> Option<String> {
+    let mut buffer = vec![0 as libc::c_char; 16 * 1024];
+    // SAFETY: an all-zero `passwd` is a valid value of the plain C struct.
+    let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut found: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: getpwuid_r writes only into `entry` and `buffer`, both of the
+    // sizes given and alive for the call, and sets `found` to null or to
+    // `entry`.
+    let code = unsafe {
+        libc::getpwuid_r(
+            uid,
+            &mut entry,
+            buffer.as_mut_ptr(),
+            buffer.len(),
+            &mut found,
+        )
+    };
+    if code != 0 || found.is_null() || entry.pw_name.is_null() {
+        return None;
+    }
+    // SAFETY: on success `pw_name` points at a NUL-terminated string inside
+    // `buffer`, which is still alive.
+    let name = unsafe { std::ffi::CStr::from_ptr(entry.pw_name) };
+    name.to_str().ok().map(str::to_owned)
+}
+
 /// Make sure `dir` is readable by its owner only: create it so if it is
 /// missing, and close it if it is open to others. A directory already closed
 /// is left as it is, so one mounted read-only, such as a Kubernetes secret,
@@ -1205,6 +1326,142 @@ fn project_id(root: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `.git` another user owns above a project, here a link to a device,
+    /// counts its directory as a checkout and refuses nothing: it is not a
+    /// regular file, so it is not read. The same link, this user's own, is
+    /// read, and refused.
+    #[cfg(unix)]
+    #[test]
+    fn another_users_git_above_a_project_is_a_checkout_and_refuses_nothing() {
+        let dir = std::env::temp_dir().join(format!("atomic-foreign-git-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("project")).expect("project");
+        std::os::unix::fs::symlink("/dev/zero", dir.join(".git")).expect(".git");
+        let project = dir.join("project");
+        let me = effective_uid();
+        let held = checkouts_holding_as(&project, Some(me.wrapping_add(1))).expect("not read");
+        assert!(held.contains(&dir), "{held:?}");
+        let refused = checkouts_holding_as(&project, Some(me)).expect_err("read, and refused");
+        assert!(refused.contains("is not a regular file"), "{refused}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Another user's `.git` that is a worktree's link, well formed, is
+    /// still followed to its main checkout, which then holds the project;
+    /// one of theirs that is malformed refuses nothing.
+    #[cfg(unix)]
+    #[test]
+    fn another_users_worktree_link_is_followed_and_a_malformed_one_ignored() {
+        let dir = std::env::temp_dir().join(format!("atomic-foreign-wt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let main = dir.join("main");
+        let gitdir = main.join(".git/worktrees/wt");
+        std::fs::create_dir_all(&gitdir).expect("main");
+        std::fs::write(gitdir.join("commondir"), "../..\n").expect("commondir");
+        std::fs::create_dir_all(dir.join("wt/project")).expect("worktree");
+        std::fs::write(
+            dir.join("wt/.git"),
+            format!("gitdir: {}\n", gitdir.display()),
+        )
+        .expect(".git");
+        let project = dir.join("wt/project");
+        let other = Some(effective_uid().wrapping_add(1));
+        let held = checkouts_holding_as(&project, other).expect("read");
+        assert!(
+            held.contains(&std::fs::canonicalize(&main).expect("main")),
+            "another user's worktree lost its main checkout: {held:?}"
+        );
+        std::fs::write(gitdir.join("commondir"), "x".repeat(5000)).expect("commondir");
+        let held = checkouts_holding_as(&project, other).expect("refuses nothing");
+        assert!(held.contains(&dir.join("wt")), "{held:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `.git` that is a hard link to a file of this user's, which another
+    /// user could make where links are not protected, refuses nothing, and
+    /// one this user cannot look at still counts as a checkout.
+    #[cfg(unix)]
+    #[test]
+    fn a_hard_linked_git_refuses_nothing_and_one_out_of_reach_still_counts() {
+        let dir = std::env::temp_dir().join(format!("atomic-linked-git-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("project")).expect("project");
+        std::fs::write(dir.join("mine"), "x".repeat(5000)).expect("a file of mine");
+        std::fs::hard_link(dir.join("mine"), dir.join(".git")).expect("hard link");
+        let me = Some(effective_uid());
+        let held = checkouts_holding_as(&dir.join("project"), me).expect("refuses nothing");
+        assert!(held.contains(&dir), "{held:?}");
+        // Out of reach: a directory this user cannot look in.
+        let closed = dir.join("closed");
+        std::fs::create_dir_all(closed.join("inner/project")).expect("closed");
+        std::fs::create_dir_all(closed.join("inner/.git")).expect(".git");
+        let mode = |m: u32| {
+            std::fs::set_permissions(
+                closed.join("inner"),
+                std::os::unix::fs::PermissionsExt::from_mode(m),
+            )
+            .expect("mode")
+        };
+        mode(0o000);
+        // Opened again however the test ends.
+        struct Reopened(PathBuf);
+        impl Drop for Reopened {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(
+                    &self.0,
+                    std::os::unix::fs::PermissionsExt::from_mode(0o700),
+                );
+            }
+        }
+        let _reopened = Reopened(closed.join("inner"));
+        assert!(
+            std::fs::read_dir(closed.join("inner")).is_err(),
+            "mode 000 did not keep this user out (root?): run the test as a user"
+        );
+        let held =
+            checkouts_holding_as(&closed.join("inner/project"), me).expect("refuses nothing");
+        assert!(
+            held.contains(&closed.join("inner")),
+            "taken for absent: {held:?}"
+        );
+        drop(_reopened);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Another user's worktree link whose `commondir` is a link to a pipe
+    /// opens nothing the link names: the open is refused at the link, so the
+    /// pipe, or a device in its place, is never opened. This user's own is
+    /// opened, and refused as not a regular file.
+    #[cfg(unix)]
+    #[test]
+    fn another_users_link_file_is_opened_through_no_link() {
+        let dir = std::env::temp_dir().join(format!("atomic-foreign-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let gitdir = dir.join("att/wt");
+        std::fs::create_dir_all(&gitdir).expect("gitdir");
+        let fifo = dir.join("pipe");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).expect("path");
+        // SAFETY: `name` is a NUL-terminated path that outlives the call.
+        #[allow(unsafe_code)]
+        let made = unsafe { libc::mkfifo(name.as_ptr(), 0o600) };
+        assert_eq!(made, 0, "mkfifo");
+        std::os::unix::fs::symlink(&fifo, gitdir.join("commondir")).expect("commondir");
+        let foreign = link_file(&gitdir.join("commondir"), false).expect_err("refused");
+        assert!(
+            foreign.contains(&format!("os error {}", libc::ELOOP)),
+            "the link was followed: {foreign}"
+        );
+        let own = link_file(&gitdir.join("commondir"), true).expect_err("refused");
+        assert!(own.contains("is not a regular file"), "{own}");
+        std::fs::create_dir_all(dir.join("project")).expect("project");
+        std::fs::write(dir.join(".git"), format!("gitdir: {}\n", gitdir.display())).expect(".git");
+        let held =
+            checkouts_holding_as(&dir.join("project"), Some(effective_uid().wrapping_add(1)))
+                .expect("refuses nothing");
+        assert!(held.contains(&dir), "{held:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A worktree's `.git` or its repository's `commondir` that is a device,
     /// or larger than git writes, is refused without being read to its end,

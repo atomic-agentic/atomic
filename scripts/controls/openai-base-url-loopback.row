@@ -1,0 +1,1 @@
+openai-base-url-loopback|crates/atomic/src/settings.rs|        "http" if loopback => Ok(()),|        "http" => Ok(()),|-p atomic-agentic --bins settings::tests::an_openai_base_url_unfit_for_the_key_is_refused

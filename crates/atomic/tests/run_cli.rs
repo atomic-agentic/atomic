@@ -635,6 +635,7 @@ fn command_as(
         "ATOMIC_RUNNER",
         "ATOMIC_BACKEND_WAIT",
         "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
         "DATABASE_URL",
     ] {
         cmd.env_remove(name);
@@ -1382,9 +1383,24 @@ fn no_secret_reaches_stderr_or_json_whatever_atomic_is_given() {
         ("ATOMIC_EXECUTOR_ID", "leak-free-id"),
     ];
     let bad_budget = [("ATOMIC_BUDGET_WORKFLOW_TOKENS", "leak-not-a-number")];
+    // The key's own endpoint, carrying what it may not, with nothing set in
+    // its place, so detection reads it and refuses it.
+    let base_url = [
+        ("OPENAI_API_KEY", "sk-leak-openai"),
+        (
+            "OPENAI_BASE_URL",
+            "https://me:leak-base@127.0.0.1:9/v1?key=leak-query#leak-fragment",
+        ),
+    ];
     /// A command and the variables it runs with.
     type Case<'a> = (&'a [&'a str], Vec<(&'a str, &'a str)>);
-    let runs: [Case; 5] = [
+    let runs: [Case; 8] = [
+        (&["config", "--explain"], base_url.to_vec()),
+        (&["--json", "config", "--explain"], base_url.to_vec()),
+        (
+            &["--json", "run", "count-only", "--data", NOTE],
+            base_url.to_vec(),
+        ),
         (&["config", "--explain"], secrets.to_vec()),
         (&["--json", "config", "--explain"], secrets.to_vec()),
         // A setting atomic refuses, from the variables and as JSON.
@@ -1672,6 +1688,134 @@ fn init_in_an_empty_directory_makes_a_project_that_checks_and_runs() {
             std::fs::read_to_string(fresh.join("atomic.yaml")).expect("manifest"),
             before
         );
+    });
+}
+
+/// An OPENAI_BASE_URL unfit for the key stops only what would send it: the
+/// project still checks, and a run that calls a model is refused, saying
+/// why, with nothing sent.
+#[test]
+fn an_unfit_openai_base_url_stops_a_model_run_and_not_a_check() {
+    let dir = scratch("unfit-base-url");
+    let project = project(&dir);
+    let env = [
+        ("OPENAI_API_KEY", "sk-test-not-for-printing"),
+        ("OPENAI_BASE_URL", "http://proxy.example/v1"),
+    ];
+    let out = atomic(&dir, &project, &["--json", "check"], &env, "");
+    assert!(out.status.success(), "the project checks: {}", text(&out));
+    let out = atomic(
+        &dir,
+        &project,
+        &[
+            "--json",
+            "run",
+            "rank-note",
+            "--data",
+            r#"{"title": "Export crashes", "words": 2}"#,
+        ],
+        &env,
+        "",
+    );
+    assert!(!out.status.success(), "{}", text(&out));
+    let error = &stdout_json(&out)["error"];
+    assert_eq!(error["kind"], "config.model", "{error}");
+    let said = error["description"].as_str().unwrap_or_default();
+    assert!(
+        said.contains("OPENAI_BASE_URL is http to an address that is not this machine's loopback"),
+        "{said}"
+    );
+}
+
+/// With only `OPENAI_API_KEY` set, and the person's `OPENAI_BASE_URL`
+/// pointing it at an endpoint, as OpenAI's SDKs read it, `atomic init` and
+/// `atomic run` need nothing else: the run sends the key, as a bearer token,
+/// to that endpoint, and `config --explain` names both variables.
+#[test]
+fn with_only_an_api_key_and_its_base_url_init_and_run_need_no_configuration() {
+    on_codex_runtime(async {
+        const KEY: &str = "sk-test-only-for-the-fake";
+        let model = FakeModel::start(vec![Reply::Text(
+            r#"{"summary": "Export crashes on accented file names."}"#.into(),
+        )])
+        .await
+        .expect("fake model");
+        let dir = scratch("api-key-base-url");
+        std::fs::create_dir_all(dir.join("home")).expect("empty home");
+        let fresh = dir.join("note-tools");
+        std::fs::create_dir_all(&fresh).expect("dir");
+        let base_url = model.base_url();
+        let env = [
+            ("OPENAI_API_KEY", KEY),
+            ("OPENAI_BASE_URL", base_url.as_str()),
+        ];
+        let out = atomic(&dir, &fresh, &["init"], &env, "");
+        assert!(out.status.success(), "{}", text(&out));
+
+        let out = atomic(&dir, &fresh, &["--json", "config", "--explain"], &env, "");
+        assert!(out.status.success(), "{}", text(&out));
+        assert!(
+            !text(&out).contains(KEY),
+            "the key was shown: {}",
+            text(&out)
+        );
+        let doc = stdout_json(&out);
+        let setting = |name: &str| -> Value {
+            doc["settings"]
+                .as_array()
+                .and_then(|all| all.iter().find(|s| s["setting"] == name))
+                .cloned()
+                .unwrap_or_else(|| panic!("no {name}: {doc}"))
+        };
+        assert_eq!(
+            setting("model.base_url")["value"],
+            base_url.as_str(),
+            "{doc}"
+        );
+        assert_eq!(
+            setting("model.base_url")["source"],
+            "detected: OPENAI_API_KEY and OPENAI_BASE_URL are set",
+            "{doc}"
+        );
+        assert_eq!(
+            setting("model.api_key_env")["source"],
+            "detected: OPENAI_API_KEY and OPENAI_BASE_URL are set",
+            "{doc}"
+        );
+
+        let (d, f, u) = (dir.clone(), fresh.clone(), base_url.clone());
+        let out = tokio::task::spawn_blocking(move || {
+            atomic(
+                &d,
+                &f,
+                &[
+                    "run",
+                    "summarize-note",
+                    "--data",
+                    r#"{"text": "Exporting café.txt crashes the app."}"#,
+                ],
+                &[("OPENAI_API_KEY", KEY), ("OPENAI_BASE_URL", u.as_str())],
+                "",
+            )
+        })
+        .await
+        .expect("child");
+        assert!(out.status.success(), "{}", text(&out));
+        assert_eq!(
+            stdout_json(&out),
+            json!({"summary": "Export crashes on accented file names."})
+        );
+        let sent: Vec<String> = model
+            .headers()
+            .iter()
+            .map(|call| {
+                call.iter()
+                    .find(|(name, _)| name == "authorization")
+                    .map(|(_, value)| value.clone())
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert_eq!(sent, vec![format!("Bearer {KEY}")]);
     });
 }
 
@@ -3393,6 +3537,110 @@ fn a_cancelled_run_is_not_resumed_and_a_parked_one_is() {
         );
         assert_eq!(model.calls(), 3);
     });
+}
+
+/// When Codex cannot make its links to atomic under its helpers' names, as
+/// when another atomic process sweeping the same Codex home takes their
+/// directory away, it runs atomic itself as its Linux sandbox helper: an
+/// exec atom's confined command still runs, rather than its run waiting for
+/// a sandbox that never starts.
+#[cfg(target_os = "linux")]
+// needs_sandbox
+#[cfg(feature = "sandbox-tests")]
+#[test]
+fn an_exec_atom_runs_when_codex_cannot_link_its_helpers() {
+    support::require_sandbox();
+    let dir = scratch("no-helper-links");
+    let project = project(&dir);
+    let state = state_dir(&dir, &project);
+    // Where Codex makes its links, made unusable: a file where their
+    // directory goes.
+    let links = state.join("codex/tmp/arg0-linux");
+    let _ = std::fs::remove_dir_all(&links);
+    std::fs::create_dir_all(links.parent().expect("parent")).expect("dir");
+    std::fs::write(&links, "not a directory").expect("file");
+    let out = atomic(
+        &dir,
+        &project,
+        &["run", "count-only", "--data", NOTE],
+        // A sandbox that never starts fails the run soon, not after minutes.
+        &[("ATOMIC_BACKEND_WAIT", "5")],
+        "",
+    );
+    let said = text(&out);
+    assert!(
+        said.contains("could not create PATH aliases"),
+        "Codex made its links after all: {said}"
+    );
+    assert!(out.status.success(), "{said}");
+    assert_eq!(count_log(&dir), 1, "the command ran once");
+}
+
+/// With Codex's links unmade and a bubblewrap without `--argv0`, which runs
+/// the helper's inner stage by the name it was started under, a program a
+/// command put on `PATH` under the helper's name is never run in its place:
+/// the name is a path that cannot exist, so the run fails at once instead,
+/// saying the helper could not be set up.
+#[cfg(target_os = "linux")]
+// needs_sandbox
+#[cfg(feature = "sandbox-tests")]
+#[test]
+fn a_helper_run_by_name_is_never_found_along_path() {
+    use std::os::unix::fs::PermissionsExt;
+    support::require_sandbox();
+    let dir = scratch("helper-by-name");
+    let project = project(&dir);
+    let state = state_dir(&dir, &project);
+    let links = state.join("codex/tmp/arg0-linux");
+    let _ = std::fs::remove_dir_all(&links);
+    std::fs::create_dir_all(links.parent().expect("parent")).expect("dir");
+    std::fs::write(&links, "not a directory").expect("file");
+    let script = |path: &Path, text: &str| {
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        std::fs::write(path, text).expect("script");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    };
+    // A bubblewrap from before `--argv0`: it runs what follows `--` as it
+    // is named, looking a bare name up along PATH.
+    script(
+        &dir.join("bwrap/bwrap"),
+        "#!/bin/sh\n\
+         case \"$1\" in --help) echo 'usage: bwrap --as-pid-1 --perms --ro-bind-fd'; exit 0;; esac\n\
+         while [ \"$#\" -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n\
+         shift\n\
+         if command -v \"$1\" >/dev/null 2>&1; then exec \"$@\"; fi\n\
+         echo \"bwrap: execvp $1: Not a directory\" >&2\n\
+         exit 1\n",
+    );
+    let ran = dir.join("planted-ran");
+    script(
+        &dir.join("planted/codex-linux-sandbox"),
+        &format!("#!/bin/sh\ntouch '{}'\n", ran.display()),
+    );
+    let path = format!(
+        "{}:{}:{}",
+        dir.join("bwrap").display(),
+        dir.join("planted").display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = atomic(
+        &dir,
+        &project,
+        &["run", "count-only", "--data", NOTE],
+        &[("PATH", path.as_str()), ("ATOMIC_BACKEND_WAIT", "5")],
+        "",
+    );
+    assert!(!ran.exists(), "the planted program ran: {}", text(&out));
+    assert!(!out.status.success(), "{}", text(&out));
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        said.contains(
+            "Codex's Linux sandbox helper could not be set up: what ran in its place was not \
+             the helper (a trial command exited with code 1: bwrap: execvp \
+             /dev/null/codex-linux-sandbox: Not a directory)"
+        ),
+        "{said}"
+    );
 }
 
 /// `atomic run` confines an exec atom's command: through the engine as it
@@ -6566,7 +6814,7 @@ fn the_runner_role_keeps_its_exit_code_contract() {
     assert_eq!(out.status.code(), Some(64), "{}", text(&out));
     // A request it can read runs, and the answer says how the command ended.
     let request = json!({
-        "protocol": 2, "program": "/bin/sh", "args": ["-c", "cat; exit 3"],
+        "protocol": 3, "program": "/bin/sh", "args": ["-c", "cat; exit 3"],
         "cwd": "/", "env": [], "stdin": "6869", "time_limit_ms": 10000, "output_limit": 1024
     });
     let out = atomic(&dir, &dir, &["runner"], &[], &request.to_string());
@@ -6579,19 +6827,38 @@ fn the_runner_role_keeps_its_exit_code_contract() {
     let out = atomic(&dir, &dir, &["--json", "runner"], &[], &request.to_string());
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
     assert_eq!(stdout_json(&out)["code"], 3);
-    // A request of the first protocol, from an older atomic, is refused
-    // with a reason, since it could not carry a command's secret variables.
+    // A request of an earlier protocol, from an older atomic, is refused
+    // with a reason, since its command's secret variables would not reach
+    // the runner as this one reads them.
     let old = json!({
-        "protocol": 1, "program": "/bin/sh", "args": ["-c", "exit 0"],
+        "protocol": 2, "program": "/bin/sh", "args": ["-c", "exit 0"],
         "cwd": "/", "env": [], "stdin": "", "time_limit_ms": 10000, "output_limit": 1024
     });
     let out = atomic(&dir, &dir, &["runner"], &[], &old.to_string());
     assert_eq!(out.status.code(), Some(64), "{}", text(&out));
     assert!(
-        text(&out).contains("request protocol 1 is not 2"),
+        text(&out).contains("request protocol 2 is not 3"),
         "{}",
         text(&out)
     );
+    // A socket for its secret variables that it cannot read, or that is
+    // one of its standard three, is a usage error, and nothing runs.
+    for fd in ["999", "2", "nonsense"] {
+        let out = atomic(
+            &dir,
+            &dir,
+            &["runner"],
+            &[("ATOMIC_SECRET_ENV_FD", fd)],
+            &request.to_string(),
+        );
+        assert_eq!(out.status.code(), Some(64), "{fd}: {}", text(&out));
+        assert!(
+            text(&out).contains("cannot read the secret variables"),
+            "{fd}: {}",
+            text(&out)
+        );
+        assert!(out.stdout.is_empty(), "{fd}: nothing ran");
+    }
     // The runner never makes a state directory.
     assert!(!dir.join("atomic-home").exists());
 }

@@ -2149,6 +2149,39 @@ fn only_atoms_that_run_commands_need_the_sandbox() {
             ),
             "a failure that may pass waits"
         );
+        // A helper that is not the helper, as when Codex ran atomic itself in
+        // its place, or bubblewrap could not run it by its name, fails the run
+        // at once rather than waiting for a sandbox that never starts.
+        for (name, says) in [
+            (
+                "atomic-itself",
+                "error: unexpected argument '--sandbox-policy-cwd' found",
+            ),
+            (
+                "no-argv0",
+                "bwrap: execvp codex-linux-sandbox: No such file or directory",
+            ),
+        ] {
+            use std::os::unix::fs::PermissionsExt;
+            let path = root.join(name);
+            std::fs::write(
+                &path,
+                format!("#!/bin/sh\ncat >&2 <<'SAID'\n{says}\nSAID\nexit 2\n"),
+            )
+            .expect("helper");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+            let other = CodexPaths::with_helpers(path.clone(), path);
+            let other = ExecSandbox::new(&other, StateGuard::NoProjectState, root.join("codex"))
+                .expect("a helper");
+            assert!(
+                matches!(
+                    atomic_exec::Confine::check(&other, &tmp),
+                    Err(atomic_exec::ExecError::Unconfinable { ref message })
+                        if message.contains("Codex's Linux sandbox helper could not be set up")
+                ),
+                "{name}: a helper that is not the helper waited"
+            );
+        }
         let sandbox = ExecSandbox::new(&paths, StateGuard::NoProjectState, root.join("codex"))
             .expect("a helper");
         let backend = atomic_exec::Backend::connect(
@@ -2823,6 +2856,7 @@ fn a_turns_tmpdir_is_its_own_on_every_platform() {
     std::fs::create_dir_all(&shared).expect("shared");
     let mut declared = std::collections::BTreeMap::new();
     declared.insert(codex::TURN_TMPDIR.to_owned(), "/elsewhere".to_owned());
+    declared.insert(atomic_exec::SECRET_ENV_FD.to_owned(), "3".to_owned());
     let workspace = Workspace {
         label: "t".into(),
         root: Some(base.clone()),
@@ -2843,6 +2877,13 @@ fn a_turns_tmpdir_is_its_own_on_every_platform() {
     };
 
     let linux = built(true, &workspace).expect("linux");
+    for spec in [&linux, &built(false, &workspace).expect("elsewhere")] {
+        assert!(
+            !spec.env.contains_key(atomic_exec::SECRET_ENV_FD),
+            "a turn names no secret socket: {:?}",
+            spec.env
+        );
+    }
     assert_eq!(linux.env["TMPDIR"], shared.display().to_string());
     assert_eq!(linux.env[codex::TURN_TMPDIR], own);
 

@@ -265,12 +265,14 @@ async fn run_once(
         .remove(0)
 }
 
-/// The value of `name=` that a command printed on a line of its own.
+/// The value of `name=` that a command printed on a line of its own. A
+/// command that printed no such line fails the test, saying so, rather than
+/// reading as an empty value.
 fn printed_value(output: &str, name: &str) -> String {
     output
         .lines()
         .find_map(|l| l.strip_prefix(&format!("{name}=")))
-        .unwrap_or_default()
+        .unwrap_or_else(|| panic!("no line {name}=… in: {output}"))
         .to_owned()
 }
 
@@ -305,17 +307,21 @@ fn a_turn_writes_a_home_of_its_own_and_still_reads_nothing_of_the_persons() {
         let project = dir.join("project");
         write_project(&project);
         let base = git(&project);
+        // What the command says on stderr arrives beside its stdout in no
+        // set order, and can land inside a line this test reads, so every
+        // part that may fail sends its stderr nowhere: what is asserted is
+        // on stdout.
         let command = format!(
-            "ls -A \"$HOME\"; echo listed; find \"$HOME\" -type l; echo linked; \
+            "ls -A \"$HOME\"; echo listed; find \"$HOME\" -type l 2>/dev/null; echo linked; \
              for d in {PROTECTED}; do ls -A \"$HOME/$d\" 2>/dev/null; done; echo protected; \
-             mkdir -p \"$HOME/.cache\" && echo cached > \"$HOME/.cache/x\" && cat \"$HOME/.cache/x\"; \
-             cat {0}/.ssh/id_ed25519 {0}/.profile; echo \"home=$HOME\"; \
+             (mkdir -p \"$HOME/.cache\" && echo cached > \"$HOME/.cache/x\" && cat \"$HOME/.cache/x\") 2>/dev/null; \
+             cat {0}/.ssh/id_ed25519 {0}/.profile 2>/dev/null; echo \"home=$HOME\"; \
              echo \"cargo=$CARGO_HOME\"; echo \"rustup=$RUSTUP_HOME\"; echo \"gomod=$GOMODCACHE\"; \
              echo \"target=$CARGO_TARGET_DIR\"; \
-             mkdir -p \"$XDG_CACHE_HOME\" && touch \"$XDG_CACHE_HOME/w\" && echo cache-written; \
+             (mkdir -p \"$XDG_CACHE_HOME\" && touch \"$XDG_CACHE_HOME/w\" && echo cache-written) 2>/dev/null; \
              touch \"$RUSTUP_HOME/w\" 2>/dev/null && echo rustup-written; \
-             mkdir -p \"$GOMODCACHE/m@v1\" && touch \"$GOMODCACHE/m@v1/go.mod\" && \
-             chmod 0500 \"$GOMODCACHE/m@v1\" \"$GOMODCACHE\"; \
+             (mkdir -p \"$GOMODCACHE/m@v1\" && touch \"$GOMODCACHE/m@v1/go.mod\" && \
+             chmod 0500 \"$GOMODCACHE/m@v1\" \"$GOMODCACHE\" && echo gomod-locked) 2>/dev/null; \
              echo looked",
             home.display(),
             PROTECTED = PROTECTED.join(" ")
@@ -341,6 +347,8 @@ fn a_turn_writes_a_home_of_its_own_and_still_reads_nothing_of_the_persons() {
         assert_eq!(inside.trim(), "", "the placeholders hold: {inside}");
         // The turn may write it.
         assert!(rest.contains("cached\n"), "{printed}");
+        // The read-only module cache the run's end must remove was made.
+        assert!(rest.contains("gomod-locked\n"), "{printed}");
         // And reads nothing of the person's.
         assert!(!rest.contains("canary"), "{printed}");
         assert!(
@@ -428,8 +436,8 @@ fn a_run_that_fails_leaves_no_build_caches() {
         write_project(&project);
         let base = git(&project);
         let data = json!({"base": base, "text": "the note"}).to_string();
-        let build = "mkdir -p \"$XDG_CACHE_HOME\" && echo built > \"$XDG_CACHE_HOME/x\"; \
-                     echo \"xdg=$XDG_CACHE_HOME\"";
+        let build = "(mkdir -p \"$XDG_CACHE_HOME\" && echo built > \"$XDG_CACHE_HOME/x\") \
+                     2>/dev/null && echo built-ok; echo \"xdg=$XDG_CACHE_HOME\"";
         let printed = run_ending(
             &home,
             &project,
@@ -440,6 +448,8 @@ fn a_run_that_fails_leaves_no_build_caches() {
             false,
         )
         .await;
+        // The cache was written, so its absence afterwards means it was removed.
+        assert!(printed[0].contains("built-ok\n"), "{}", printed[0]);
         let caches = run_caches(&project, "tidy-up", &printed_value(&printed[0], "xdg"));
         assert!(!caches.exists(), "a failed run's caches stayed: {caches:?}");
         let _ = std::fs::remove_dir_all(&dir);
@@ -971,7 +981,8 @@ fn a_secret_the_system_keeps_or_a_pipe_stays_denied_and_the_persons_programs_run
         )
         .unwrap();
         let command = format!(
-            "cat {h}/.kube/config /etc/hostname; timeout 3 cat {h}/.netrc; echo \"pipe=$?\"; \
+            "cat {h}/.kube/config /etc/hostname 2>/dev/null; timeout 3 cat {h}/.netrc 2>/dev/null; \
+             echo \"pipe=$?\"; \
              {d}/tools/python3; echo looked",
             h = home.display(),
             d = dir.display()

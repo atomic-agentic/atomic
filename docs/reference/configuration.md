@@ -58,7 +58,13 @@ project could have supplied it; point `XDG_CONFIG_HOME`, or `HOME`, outside it.
 That includes the default `~/.config/atomic` when your home directory is itself
 a git checkout (a `~/.git`) holding the project. A checkout whose `.git` file or
 `commondir` is not a small regular file, as git writes them, refuses your own
-configuration, and the sign-in, until it is fixed. It holds the same
+configuration, and the sign-in, until it is fixed. A `.git` another user owns,
+such as one left in `/tmp`, or one that is a hard link, still counts its
+directory as a checkout holding the project, and a well-formed worktree link in
+it is still followed, through no link, but nothing wrong with it refuses
+anything. What it names still counts, though: with your home itself a checkout
+(a `~/.git`), a well-formed link left in `/tmp` naming your home's repository
+refuses your own configuration for projects under `/tmp`. It holds the same
 settings as `atomic.yaml`, and the project's files override it — except the
 `budget` caps and prices, which are ceilings a project can only tighten, as
 [Budgets](budgets.md#your-own-caps-are-ceilings) describes.
@@ -112,8 +118,21 @@ What no layer sets, atomic looks for, and says so as `detected:` in
 
 | Found | Sets |
 | --- | --- |
-| `OPENAI_API_KEY` is set | the model endpoint to OpenAI's API (`https://api.openai.com/v1`), `model.api_key_env` to `OPENAI_API_KEY`, and `model.name` to `gpt-5-mini` unless one is set |
+| `OPENAI_API_KEY` is set | the model endpoint to OpenAI's API (`https://api.openai.com/v1`), or to the URL `OPENAI_BASE_URL` names when that is set too, `model.api_key_env` to `OPENAI_API_KEY`, and `model.name` to `gpt-5-mini` unless one is set |
 | Ollama answers on this machine, at `127.0.0.1:11434` | the model endpoint to `http://127.0.0.1:11434/v1`, and `model.name` to the first model it lists unless one is set |
+
+`OPENAI_BASE_URL` is read as OpenAI's SDKs read it, and only from your
+environment: no file, the project's or your own, sets it, since it decides
+where the key is sent. So whatever sets your environment decides where the
+key goes, a shell profile or a tool that loads variables for a directory,
+such as direnv or a `.env` loader, among them. It must be an `https` URL, or
+`http` to a loopback IP address (`127.0.0.1` or `[::1]`; a name such as
+`localhost` is refused), with no user, password, query or fragment in it.
+Anything else detects no endpoint: a command that would send the key stops
+and says why, and one that sends none, such as `atomic check`, carries on.
+It is used only with `OPENAI_API_KEY`, when detection runs; otherwise it is
+said to be set and not used. `--explain` names both variables as the
+source, and a run says that the key is sent, and to which host.
 
 The key's value is never read for detection. Looking for Ollama is one
 `GET /api/tags` to the loopback address, which must answer within a second, and
@@ -226,6 +245,22 @@ model:
   base_url: http://127.0.0.1:8000/v1
   name: Qwen3-8B
 ```
+
+A lite atom's key goes only to the endpoint `model.base_url` names, and the same
+holds for the key `atomic eval --live` forwards while recording. The client
+follows no redirect: an endpoint that answers with one fails the call, which
+says where it points, without its query or credentials. It suggests a
+`model.base_url` to set only when the redirect stays on the same host, keeps
+`https`, and keeps the call's own path; a redirect from `https` to plain `http`
+or to another host is said as such. While recording, `atomic eval --live`
+passes the redirect back without its location, so the call says only that it
+was redirected. An endpoint on this machine over plain `http`, a loopback or
+unspecified address or `localhost` and the names under it, is reached
+directly, never through a proxy that `HTTP_PROXY` or `ALL_PROXY` names, which
+would see the key in cleartext. No other name is resolved to find out: a host
+name that resolves to this machine, such as one that `/etc/hosts` maps to
+`127.0.1.1`, counts as elsewhere and uses the proxies the environment names, so
+put it in `NO_PROXY`.
 
 Planned is naming a **tier** instead of a model, and mapping tiers to models per
 project: `basic`, `fast`, `advanced` and `frontier`, from least to most capable,
