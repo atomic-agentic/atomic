@@ -465,9 +465,25 @@ fn sandbox_helpers_in(dir: &Path) -> Vec<u32> {
 /// the proxy's list here, so every request goes through the token check.
 #[test]
 fn a_confined_command_never_holds_its_proxy_token() {
+    never_holds_its_proxy_token(false);
+}
+
+/// As [`a_confined_command_never_holds_its_proxy_token`], under a runner
+/// process, as `--runner process` runs commands: the command still sees
+/// the token nowhere, keeps no descriptor beyond its three, and its bridge
+/// still sends the token, which reached the helper by way of the runner.
+#[test]
+fn a_confined_command_under_a_runner_never_holds_its_proxy_token() {
+    never_holds_its_proxy_token(true);
+}
+
+/// The token checks, with the command run by a runner process when
+/// `in_runner`; then the helper is the runner's child, not this process's,
+/// so only the command's own view is checked.
+fn never_holds_its_proxy_token(in_runner: bool) {
     support::require_sandbox();
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("atomic-exec-network-token-{}", std::process::id()));
+        .join(format!("atomic-exec-network-token-{in_runner}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("bin")).expect("scratch");
     std::fs::create_dir_all(dir.join("project")).expect("project");
@@ -483,7 +499,15 @@ fn a_confined_command_never_holds_its_proxy_token() {
     );
     let sandbox = ExecSandbox::new(&paths, StateGuard::NoProjectState, dir.join("codex"))
         .expect("confinement");
-    let local = LocalBackend::in_dir(dir.join("scratch")).confined(Arc::new(sandbox));
+    let confined = LocalBackend::in_dir(dir.join("scratch")).confined(Arc::new(sandbox));
+    let local: Box<dyn ExecutionBackend> = if in_runner {
+        Box::new(atomic_exec::runner::ProcessRunner {
+            workspaces: confined,
+            ..atomic_exec::runner::ProcessRunner::atomic(PathBuf::from(env!("CARGO_BIN_EXE_atomic")))
+        })
+    } else {
+        Box::new(confined)
+    };
     local.connect().expect("connects");
     let workspace = local
         .open(&atomic_exec::Open {
@@ -525,7 +549,9 @@ fn a_confined_command_never_holds_its_proxy_token() {
             );
             std::thread::sleep(Duration::from_millis(100));
         }
-        let helpers: Vec<(u32, std::io::Result<Vec<u8>>)> = sandbox_helpers_in(&scratch)
+        let helpers: Vec<(u32, std::io::Result<Vec<u8>>)> = (!in_runner)
+            .then(|| sandbox_helpers_in(&scratch))
+            .unwrap_or_default()
             .into_iter()
             .map(|pid| (pid, std::fs::read(format!("/proc/{pid}/environ"))))
             .collect();
@@ -554,7 +580,7 @@ fn a_confined_command_never_holds_its_proxy_token() {
     assert_eq!(got["fds"], serde_json::json!([0, 1, 2]), "{got}");
     assert_eq!(got["fetched"], "HTTP 403 not_allowed_local", "{got}");
     assert!(
-        !helpers.is_empty(),
+        in_runner || !helpers.is_empty(),
         "found no sandbox helper of this process"
     );
     for (pid, read) in helpers {

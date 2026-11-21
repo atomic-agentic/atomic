@@ -38,8 +38,13 @@
 //! another process of the same user can take it only by attaching to the
 //! helper, which Yama's `ptrace_scope` of 1 or more refuses to a process
 //! that is not its ancestor, and at `ptrace_scope` 0 allows. `atomic
-//! runner`, under `--runner process`, gets it the same way, on a socket of
-//! its own beside its request, and reads it once it is non-dumpable. Once
+//! runner`, under `--runner process`, gets it on a socket of its own beside
+//! its request, with the digest of that request, and reads it once it is
+//! non-dumpable. Its request waits in its stdin, a pipe another process of
+//! the same user can reopen and replace before then; the runner refuses a
+//! request the digest does not name, so a replaced one never gets the
+//! token, though a replaced request without one still runs as that user's
+//! own command. Once
 //! they are non-dumpable, no process of the same user without
 //! `CAP_SYS_PTRACE` over their user namespace can newly read it from them,
 //! or from the helper's bridges, which inherit it; but one that attached

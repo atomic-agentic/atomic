@@ -43,6 +43,43 @@ use std::time::Duration;
 /// runner that knows only 1 or 2 would not read.
 pub const PROTOCOL: u32 = 3;
 
+/// The entry beside a command's secret variables, on the runner's socket,
+/// that holds the SHA-256 of the exact request bytes the control plane
+/// wrote to the runner's stdin, in hexadecimal. The runner refuses a
+/// request that does not match before it runs anything: a request swapped
+/// into its stdin before it hardened itself never gets the secret.
+pub const REQUEST_DIGEST: &str = "ATOMIC_RUNNER_REQUEST_SHA256";
+
+/// The SHA-256 of `request`, in hexadecimal.
+fn request_digest(request: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(request)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// `secret`, as the runner hands it to its command, once the digest beside
+/// it shows `request` is the one the control plane sent; or why not. With
+/// no secret there is nothing to bind, and none is handed.
+fn bound_secret(secret: crate::SecretEnv, request: &[u8]) -> Result<crate::SecretEnv, String> {
+    if secret.is_empty() {
+        return Ok(secret);
+    }
+    let (digest, rest): (Vec<_>, Vec<_>) =
+        secret.0.into_iter().partition(|(k, _)| k == REQUEST_DIGEST);
+    let [(_, digest)] = digest.as_slice() else {
+        return Err("its secret variables came with no single digest of their request".into());
+    };
+    if *digest != request_digest(request) {
+        return Err("the request on its stdin is not the one its secret variables were sent with".into());
+    }
+    if rest.is_empty() {
+        return Err("its secret variables came with a digest and nothing else".into());
+    }
+    Ok(crate::SecretEnv(rest))
+}
+
 /// The exit codes `atomic runner` uses.
 pub mod code {
     /// It ran the request and wrote the response.
@@ -237,6 +274,15 @@ pub fn serve_with_secret(
         let _ = writeln!(errors, "atomic runner: cannot read the request: {e}");
         return code::CRASH;
     }
+    // Before anything is read from it: the secret goes only to the command
+    // of the request it was sent with.
+    let secret = match bound_secret(secret, &bytes) {
+        Ok(secret) => secret,
+        Err(e) => {
+            let _ = writeln!(errors, "atomic runner: {e}; refused");
+            return code::USAGE;
+        }
+    };
     let request: Request = match serde_json::from_slice(&bytes) {
         Ok(r) => r,
         Err(e) => {
@@ -290,7 +336,9 @@ pub fn serve_with_secret(
 pub fn serve_stdio(errors: &mut dyn Write) -> i32 {
     process::ignore_stop_signals();
     // The command's secret variables come on a socket of their own, never
-    // in the request: read here, once the caller has hardened this process.
+    // in the request: read here, once the caller has hardened this process
+    // (the reader refuses while it is dumpable), and handed on only with the
+    // request their digest names (see serve_with_secret).
     #[cfg(unix)]
     let secret = match process::take_inherited_secret_env() {
         Ok(secret) => secret,
@@ -378,14 +426,22 @@ impl ProcessRunner {
         // The runner's group holds its command too: whatever is left in it
         // when the runner ends goes with it.
         // The command's secret variables go on a socket of their own, which
-        // cannot be reopened through /proc as the request's stdin pipe can.
+        // cannot be reopened through /proc as the request's stdin pipe can,
+        // with the digest of the request that binds them to it: a request
+        // put in that pipe in place of this one gets no secret.
+        let mut secret = command.secret_env.clone();
+        if !secret.is_empty() {
+            secret
+                .0
+                .push((REQUEST_DIGEST.to_owned(), request_digest(request)));
+        }
         let done = process::run_in_with_secret(
             process::Group::Own,
             &self.program,
             &self.args,
             None,
             &self.env,
-            &command.secret_env,
+            &secret,
             request,
             Limits {
                 time: command.time_limit.saturating_add(RUNNER_GRACE),

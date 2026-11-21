@@ -1077,12 +1077,28 @@ fn secret_socket(secret: &crate::SecretEnv) -> std::io::Result<Option<std::os::f
         ));
     }
     // Both ends are close-on-exec; the child clears it on its own copy of
-    // the end it reads. Dropping the other end, once written, ends what it
-    // reads.
+    // the end it reads, which ends once the other end is shut down.
     let (read, mut write) = std::os::unix::net::UnixStream::pair()?;
     write.write_all(&bytes)?;
+    write.shutdown(std::net::Shutdown::Write)?;
     drop(write);
     Ok(Some(std::os::fd::OwnedFd::from(read)))
+}
+
+/// Whether this process can still be read through /proc by another of its
+/// user: on Linux, whether it is dumpable; elsewhere, never said to be.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn still_dumpable() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: PR_GET_DUMPABLE takes no pointer and touches no memory.
+        unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) != 0 }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
 }
 
 /// Whether `fd` is past the standard three, as a handed socket must be.
@@ -1094,14 +1110,21 @@ fn above_stdio(fd: &std::os::fd::RawFd) -> bool {
 /// The [`crate::SecretEnv`] this process was handed on the socket whose
 /// descriptor `fd` names, as [`run_in_with_secret`] hands it: read to its
 /// end, and closed. Refused when `fd` is not a number above 2 or not a
-/// socket, or what it holds is not well formed. Call it only once this
-/// process can no longer be read through /proc by another of its user.
+/// socket, or what it holds is not well formed, and on Linux while this
+/// process is still dumpable: it must first be hardened so that no other
+/// process of its user can read what it is about to hold.
 #[cfg(unix)]
 pub fn read_secret_socket(fd: &std::ffi::OsStr) -> std::io::Result<crate::SecretEnv> {
     use std::io::Read;
     use std::os::fd::FromRawFd;
     use std::os::unix::fs::FileTypeExt;
     let invalid = |why: String| std::io::Error::new(std::io::ErrorKind::InvalidData, why);
+    if still_dumpable() {
+        return Err(invalid(
+            "this process is still dumpable; it reads secret variables only once hardened"
+                .to_owned(),
+        ));
+    }
     let fd: std::os::fd::RawFd = fd
         .to_str()
         .and_then(|fd| fd.parse().ok())
@@ -1122,13 +1145,18 @@ pub fn read_secret_socket(fd: &std::ffi::OsStr) -> std::io::Result<crate::Secret
 
 /// The [`crate::SecretEnv`] this process was handed, if its environment
 /// names a socket in [`crate::SECRET_ENV_FD`] (see [`read_secret_socket`]);
-/// none if it names none.
+/// none if it names none. The variable is gone from its environment after.
+/// Call it while this process has one thread.
 #[cfg(unix)]
+#[allow(unsafe_code)]
 pub fn take_inherited_secret_env() -> std::io::Result<crate::SecretEnv> {
-    match std::env::var_os(crate::SECRET_ENV_FD) {
-        Some(fd) => read_secret_socket(&fd),
-        None => Ok(crate::SecretEnv::default()),
-    }
+    let Some(fd) = std::env::var_os(crate::SECRET_ENV_FD) else {
+        return Ok(crate::SecretEnv::default());
+    };
+    // SAFETY: called before this process starts any thread, so nothing
+    // reads the environment concurrently.
+    unsafe { std::env::remove_var(crate::SECRET_ENV_FD) };
+    read_secret_socket(&fd)
 }
 
 /// [`run_in`], with `secret` on a socket the child inherits, whose

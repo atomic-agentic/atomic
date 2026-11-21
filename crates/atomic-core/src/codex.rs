@@ -971,10 +971,12 @@ fn harden() {
 
 /// Harden `atomic runner` as [`dispatch`] hardens atomic: the commands it
 /// runs arrive on its stdin with their environments, and a confined one's
-/// with its proxy token, so no process of the same user may read its memory
-/// or the /proc files that show it, such as `environ` and `mem`, unless it
-/// has `CAP_SYS_PTRACE` over the runner's user namespace; its `cmdline` and
-/// `stat` stay readable. Call it first, before the request is read.
+/// proxy token on a socket beside it, so no process of the same user may
+/// read its memory or the /proc files that show it, such as `environ` and
+/// `mem`, unless it has `CAP_SYS_PTRACE` over the runner's user namespace;
+/// its `cmdline` and `stat` stay readable. Call it first, before the request
+/// or the socket is read; the socket's reader refuses while the runner is
+/// still dumpable.
 pub fn harden_runner() {
     // The runner holds commands' environments, proxy tokens among them.
     codex_process_hardening::pre_main_hardening();
@@ -3639,7 +3641,7 @@ mod tests {
     #[test]
     fn a_commands_proxy_token_reaches_its_helper_on_a_socket_only() {
         use atomic_exec::Confine;
-        let state = scratch("exec-token-pipe");
+        let state = scratch("exec-token-socket");
         let paths = CodexPaths::with_helpers(
             PathBuf::from("/opt/atomic"),
             PathBuf::from("/opt/bin/codex-linux-sandbox"),

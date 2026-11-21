@@ -167,8 +167,7 @@ pub const SECRET_ENV_FD: &str = "ATOMIC_SECRET_ENV_FD";
 /// environment: the command finds the socket's descriptor in
 /// [`SECRET_ENV_FD`] and reads `KEY=VALUE` entries, each ended by a NUL
 /// byte, until the other end closes. Its `Debug` form shows the names only.
-#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct SecretEnv(pub Vec<(String, String)>);
 
 impl std::fmt::Debug for SecretEnv {

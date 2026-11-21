@@ -380,9 +380,85 @@ open(os.path.join(out, 'secret'), 'wb').write(secret)
         !String::from_utf8_lossy(&stdin).contains("the-secret-value"),
         "the secret crossed in its stdin"
     );
+    let secret = crate::SecretEnv::decode(&std::fs::read(dir.join("secret")).expect("secret"))
+        .expect("well formed");
     assert_eq!(
-        std::fs::read(dir.join("secret")).expect("secret"),
-        b"K=the-secret-value\0"
+        secret.0,
+        [
+            ("K".to_owned(), "the-secret-value".to_owned()),
+            (REQUEST_DIGEST.to_owned(), request_digest(&request)),
+        ],
+        "the secret, and the digest of the request it goes with"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The runner hands its command the secret only with the request it was
+/// sent with: a request put in its stdin in place of that one, or a secret
+/// with no digest or a second one, is refused before anything runs, and no
+/// command gets the secret.
+#[test]
+fn a_runner_refuses_a_request_its_secret_was_not_sent_with() {
+    let dir = scratch("forged-request");
+    let marker = dir.join("ran");
+    let forged = serde_json::to_vec(&Request::new(&command(
+        "/bin/sh",
+        &["-c", &format!("env > '{}'", marker.display())],
+        b"",
+    )))
+    .expect("encode");
+    let real = serde_json::to_vec(&Request::new(&command("true", &[], b""))).expect("encode");
+    let secret = |entries: &[(&str, String)]| {
+        crate::SecretEnv(
+            entries
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), v.clone()))
+                .collect(),
+        )
+    };
+    let value = "the-secret-value".to_owned();
+    for (case, handed) in [
+        (
+            "the real request's digest",
+            secret(&[("K", value.clone()), (REQUEST_DIGEST, request_digest(&real))]),
+        ),
+        ("no digest", secret(&[("K", value.clone())])),
+        (
+            "two digests",
+            secret(&[
+                ("K", value.clone()),
+                (REQUEST_DIGEST, request_digest(&forged)),
+                (REQUEST_DIGEST, request_digest(&forged)),
+            ]),
+        ),
+    ] {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = serve_with_secret(
+            &mut forged.as_slice(),
+            &mut out,
+            &mut err,
+            &LocalBackend::default(),
+            handed,
+        );
+        assert_eq!(code, code::USAGE, "{case}: {}", String::from_utf8_lossy(&err));
+        assert!(
+            String::from_utf8_lossy(&err).contains("refused"),
+            "{case}: {}",
+            String::from_utf8_lossy(&err)
+        );
+        assert!(!marker.exists(), "{case}: the forged request ran");
+    }
+    // The request the secret was sent with runs, with the secret and
+    // without the digest.
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let code = serve_with_secret(
+        &mut forged.as_slice(),
+        &mut out,
+        &mut err,
+        &LocalBackend::default(),
+        secret(&[("K", value.clone()), (REQUEST_DIGEST, request_digest(&forged))]),
+    );
+    assert_eq!(code, code::CLEAN, "{}", String::from_utf8_lossy(&err));
+    assert!(marker.exists(), "the request it was sent with ran");
     let _ = std::fs::remove_dir_all(&dir);
 }
