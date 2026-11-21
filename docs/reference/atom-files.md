@@ -239,9 +239,10 @@ proxy that refuses it.
 Know what a listed host can get:
 
 - **Anything the command can read.** It can send a listed host whatever it
-  reads, which is the project and most of the filesystem, including files such
-  as `~/.ssh` and `~/.aws` reached by absolute path; only atomic's private state
-  is denied to it.
+  reads, which is the project and most of the filesystem. What is denied to it,
+  atomic's private state and, on Linux, the places where credentials are kept,
+  such as `~/.ssh` and `~/.aws`, is listed under
+  [configuration](#configuration); anything else it can read, it can send.
 - **More than the one site.** An HTTPS tunnel is opaque to the proxy, which
   checks only the name the command asked for. Other sites served from the same
   CDN edge or load balancer can be reached through it.
@@ -426,8 +427,23 @@ and history files of bash, zsh and fish, among others. They are denied
 under `$HOME` and under the home directory the system records for your user,
 wherever the variables that move them (`XDG_CONFIG_HOME`, `ZDOTDIR`,
 `HISTFILE`, `GNUPGHOME`, `CARGO_HOME`, `DOCKER_CONFIG`, the AWS file
-variables, `KUBECONFIG` and others) put them, and a link among them, up to
-four directory levels inside a denied directory, is denied as what it
+variables, `KUBECONFIG` and others) put them. AWS's workload token files
+are denied too: the files `AWS_WEB_IDENTITY_TOKEN_FILE` and
+`AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE` name (one named relative to
+atomic's working directory, as AWS's SDKs read it), the whole projected
+volume when such a file is in one Kubernetes mounts, found through any
+links that lead to it (so the token it rotates in next is denied as well),
+and EKS's usual token directories,
+`/var/run/secrets/eks.amazonaws.com/serviceaccount` and
+`/var/run/secrets/pods.eks.amazonaws.com/serviceaccount`, whether or not a
+variable names them. An ordinary token file is denied by its path each
+time a command starts, so one replaced there is denied to the next command.
+A token given as a value rather than a file, such as
+`AWS_CONTAINER_AUTHORIZATION_TOKEN`, never reaches a command, which gets
+only a few core variables and those its atom declares, and the credential
+endpoints AWS serves on link-local and unique-local addresses are out of its
+reach, since a command reaches no private or local address. A link among them, up to four
+directory levels inside a denied directory, is denied as what it
 points at, whoever owns it and wherever it is, under `/run`, `/etc` or
 `/opt` too. Never denied, so that commands keep working: anything under
 `/usr`, `/bin`, `/sbin`, `/lib*`, `/nix/store`, `/dev`, `/proc` or `/sys`,
@@ -455,18 +471,32 @@ any filesystem but a local one (ext2/3/4, XFS, btrfs, F2FS, tmpfs, ramfs,
 overlay) mounted more than once whose root the kernel shows as lost, as
 when a FUSE server is away or another Ceph client renamed the directory;
 or when, on such a filesystem, the place is there and its second place is
-missing or another file or directory. Otherwise FUSE (`fuse.*`), 9p,
-virtiofs and other mounts are followed as local ones are. The
-links followed and the second mounts found together come to at most 512;
+missing, is another file or directory, or is a link, which is not
+followed, or the place, or the part of it a second mount shows, cannot be
+looked at for a reason other than not being there. A second mount of part
+of a place is checked against that part. On any filesystem, nothing runs
+when another of its mounts is the same directory as a denied place, or as
+a directory above it on the mount the place is under, and the mount
+table's root for it does not say so: the root has gone stale with nothing
+to mark it, as an overlay's does when a lower directory under a bound
+overlay directory is renamed. A mount point that is not there is passed
+over, and so is one behind a directory you may not search that someone
+else owns, by a uid you cannot map (`/etc/subuid`, or any uid when
+`/etc/nsswitch.conf` takes subordinate uids from a directory service);
+behind one of your own, or of a uid you may map, which a command could
+step around from a user namespace of its own, nothing runs, and nor does
+it for a denied place that cannot be looked at. Otherwise FUSE
+(`fuse.*`), 9p, virtiofs and other mounts are followed as local ones are.
+The links followed and the second mounts found together come to at most 512;
 past that, nothing runs. Not covered: the same remote directory, or one
 inside another, mounted twice as two filesystems, each with a device of its
 own, such as with 9p, NFS with `nosharecache` or with mount options that
 differ (each gets a superblock of its own), Ceph (one per server path), two
 SMB sessions or two FUSE daemons, neither of which is denied for the other;
 a stale root, off a local filesystem, for a place that is not there yet,
-and one, on any filesystem, that makes a second mount look unrelated to a
-denied place, such as a bound overlay directory whose lower directory was
-renamed beneath it;
+and one, on any filesystem, that makes a mount of a directory inside a
+denied place look unrelated to it, or, being the root of the place's own
+mount, makes a second mount of a directory above that root look so;
 a snapshot, which holds a copy, not the place itself; an overlay or FUSE
 filesystem built over a denied directory, such as an overlay whose upper or
 lower directory is inside one, which shows its files as its own; and a
@@ -477,7 +507,13 @@ until the next turn. A turn does
 not start when a denial would cover its working directory or a directory it
 may write, or when a denied place, a linked secret or a second mount of a
 denied place lies two or more levels inside a directory it may write, where
-a command could move the directory above it away from its denial. The model
+a command could move the directory above it away from its denial. Nor
+does it start when a denied place is named through a link inside a
+directory it may write, which a command could point elsewhere; when a
+denied place lies in a directory it may write that it is given through a
+link, rather than by its real path; or when a token file is named relative
+while atomic's own working directory is unknown. Each place is denied under
+its real path, which denies it under every spelling. The model
 chooses the
 commands, so none of these reach it through them. atomic makes the list
 when the turn starts: a place on it that appears while a command runs is

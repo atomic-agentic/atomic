@@ -1,0 +1,1 @@
+deno-manifest-lock-kind|tools/deno_exec.py|    _require(mode is None or stat.S_ISREG(mode), f"{manifest}: lockfile {lock.name} is not a regular file")|    _require(mode is None or stat.S_ISDIR(mode) or stat.S_ISREG(mode), f"{manifest}: lockfile {lock.name} is not a regular file")|-p atomic-agentic --test catalog_checker the_catalog_checker_refuses_what_it_cannot_read

@@ -277,19 +277,58 @@ for marker in '**Acceptance, beyond the full M4 test**:' '**Acceptance, beyond t
     list_check_against 1 "not an Acceptance block marker" "${WORK}/near.md" "${WORK}/m4b.txt" m4b
 done
 # The same for a line shaped like the marker in any other shape: no wrapper,
-# the word misspelt or plural, a wrapper that is not bold, a bullet before it.
-# Only a line beginning `**Acceptance` opens a block, so what sits under any of
-# these is read as nothing, and outside a block such a line was skipped in
-# silence.
+# the word misspelt or plural, a wrapper that is not bold, and the same in any
+# bullet's shape, as `- `, `* ` and `+ ` and a number's `1. ` and `1) `, which
+# is how a clause's bullet is written. Only a line beginning `**Acceptance`
+# opens a block, so what sits under any of these is read as nothing, and outside
+# a block such a line was skipped in silence. The refusal names the line and its
+# number, so it cannot pass on some other line's refusal.
 for marker in 'Acceptance:' 'Acceptance, files and data:' 'acceptance:' \
     '__Acceptance:__' '**Acceptence:**' '**Acceptances:**' '- **Acceptance:**' \
-    '- **Acceptance, beyond the full M4 test:**'; do
+    '- **Acceptance, beyond the full M4 test:**' '+ **Acceptance:**' \
+    '1. **Acceptance:**' '1) **Acceptance:**' \
+    '+ **Acceptance, beyond the full M4 test:**' \
+    '1. **Acceptance, beyond the full M4 test:**' '  + **Acceptance:**'; do
     printf '## M4: Split\n\n**Acceptance:**\n\n- A cap parks the run.\n- A scorer fails CI.\n\n### M4b\n\n**v1.0.** Finishes M4.\n\n%s\n\n- Restarting twice costs nothing.\n' \
             "${marker}" >"${WORK}/shaped.md"
     out="$(python3 "${CHECK}" m4b --milestones "${WORK}/shaped.md" --list "${WORK}/m4b.txt" --check 2>&1)"
-    if [ $? -ne 1 ] || ! grep -qF "not an Acceptance block marker" <<<"${out}"; then
-        fail "a line shaped like a marker, '${marker}', was not refused: ${out}"
+    got=$?
+    # The refusal quotes the line as written, with its left margin removed.
+    quoted="${marker#"${marker%%[![:space:]]*}"}"
+    if [ "${got}" -ne 1 ] || ! grep -qF "shaped.md:12: not an Acceptance block marker" <<<"${out}" ||
+        ! grep -qF ": ${quoted}" <<<"${out}"; then
+        fail "a line shaped like a marker, '${marker}', was not refused with its line: ${out}"
     fi
+done
+# A marker led by a bullet opens no block, in every shape a clause's bullet
+# takes, and is refused with its own line named before a block that does read:
+# the `- ` shape was refused this way already, and the `+ ` and numbered ones
+# were skipped in silence, which loses the clauses under such a line.
+for shape in '- ' '* ' '+ ' '1. ' '1) ' '  + '; do
+    marker="${shape}**Acceptance, files and data:**"
+    printf '## M0: A milestone\n\n%s\n\n- A thing that is not a clause.\n\n**Acceptance:**\n\n- A cap parks the run.\n- Cases in JSONL run the same, written over two lines.\n- A scorer fails CI.\n' \
+        "${marker}" >"${WORK}/shaped-bullet.md"
+    out="$(python3 "${CHECK}" m0 --milestones "${WORK}/shaped-bullet.md" --list "${WORK}/list.txt" --check 2>&1)"
+    got=$?
+    # The refusal quotes the line as written, with its left margin removed.
+    quoted="${marker#"${marker%%[![:space:]]*}"}"
+    if [ "${got}" -ne 1 ] ||
+        ! grep -qF "shaped-bullet.md:3: not an Acceptance block marker" <<<"${out}" ||
+        ! grep -qF ": ${quoted}" <<<"${out}"; then
+        fail "a marker led by the bullet '${shape% }' was not refused with its line: ${out}"
+    fi
+    # It is the line that is refused, not the block after it.
+    grep -qF "M0's clause is not listed" <<<"${out}" &&
+        fail "a marker led by the bullet '${shape% }' stopped the block after it: ${out}"
+done
+# What the same bullets hold instead is the section's own prose, which is read
+# as nothing, a bullet that ends in a colon among it: only a line whose first
+# word is a spelling of `accept` is marker-shaped. A check that refused every
+# `+ ` and numbered bullet would pass the two loops above and fail this one.
+for shape in '- ' '* ' '+ ' '1. ' '1) ' '  + '; do
+    printf '## M0: A milestone\n\n**Delivers:**\n\n%sWhat the run shows:\n\n**Acceptance:**\n\n- A cap parks the run.\n- Cases in JSONL run the same, written over two lines.\n- A scorer fails CI.\n' \
+        "${shape}" >"${WORK}/prose-shape.md"
+    list_check_against 0 "lists M0's 3 clauses" "${WORK}/prose-shape.md" "${WORK}/list.txt" m0
 done
 # The same line before a block that does read: open block or not, it is the
 # line that is refused, and named with its number.
@@ -379,15 +418,19 @@ grep -qF "M0 states no Acceptance clause" <<<"${said}" ||
     fail "a milestone stating no Acceptance clause is not named: ${said}"
 # Which is what a milestone whose only marker is mangled comes to: its clauses
 # sit under a line that opens no block, so none of them is read. Each shape
-# below must fail the sweep, naming the milestone whose clauses went unread.
+# below must fail the sweep, naming the milestone whose clauses went unread and
+# the line that opens no block.
 for marker in 'Acceptance:' '__Acceptance:__' '**Acceptence:**' \
-    '**Acceptances:**' '- **Acceptance:**'; do
+    '**Acceptances:**' '- **Acceptance:**' '+ **Acceptance:**' \
+    '1. **Acceptance:**' '1) **Acceptance:**'; do
     printf '## M0: A milestone\n\n**Delivers:** a thing.\n\n%s\n\n- A cap parks the run.\n- A scorer fails CI.\n' \
             "${marker}" >"${WORK}/mangled-doc.md"
     sweep_ok m0 "${WORK}/mangled-doc.md" "${WORK}/sweep.txt" &&
         fail "the sweep passed a milestone whose only marker was '${marker}': ${said}"
     grep -qF "M0 states no Acceptance clause" <<<"${said}" ||
         fail "a milestone whose only marker was '${marker}' is not named: ${said}"
+    grep -qF "mangled-doc.md:5: not an Acceptance block marker" <<<"${said}" ||
+        fail "the sweep did not name the mangled marker '${marker}': ${said}"
 done
 
 # The features it runs with are those CI builds the tests with, so nothing
