@@ -563,6 +563,7 @@ dependencies = [
  "ignore",
  "jsonschema",
  "libc",
+ "psl",
  "regex",
  "reqwest 0.12.28",
  "seccompiler",

@@ -128,7 +128,7 @@ fn an_atom_reference_like_no_atom_lists_the_atoms_there_are() {
     let action = e.action.as_deref().unwrap_or_default();
     assert!(
         action.contains("review-summary") && action.contains("summarize-note"),
-        "{action}"
+        "the action names what to change"
     );
 }
 
@@ -200,7 +200,7 @@ fn a_mapping_that_cannot_fit_fails() {
     assert!(
         action.contains("`with.draft` in step `review`")
             && action.contains("atom `summarize-note` (step `summarize`)"),
-        "{action}"
+        "the action names what to change"
     );
 }
 

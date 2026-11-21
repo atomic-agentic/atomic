@@ -222,11 +222,10 @@ fn runtimes_on(dir: &Path, cwd: &Path, base_url: &str, model: &str) -> Arc<Runti
             defaults: AtomConfig::default(),
             artifacts: Artifacts::none(),
             meter: atomic_core::usage::Metering::none(),
-            backend: Default::default(),
             caches: None,
         },
         lite: LiteRuntime::new(endpoint, AtomConfig::default()),
-        exec: Default::default(),
+        backend: Default::default(),
         exec_meter: Default::default(),
         clock: None,
     })
@@ -492,9 +491,7 @@ async fn engine_built_with(
     let runtimes = match backend {
         Some(backend) => {
             let mut on = (*runtimes).clone();
-            on.codex.backend = backend.clone();
-            on.lite.backend = backend.clone();
-            on.exec = backend;
+            on.backend = backend;
             Arc::new(on)
         }
         None => runtimes,
@@ -3962,6 +3959,195 @@ fn trust_is_checked_per_binding() {
     .expect("agent accepted");
 }
 
+/// Start `pipeline` on a fresh engine and return why it was refused, with
+/// the number of model calls made first.
+async fn refused(dir: &Path, pipeline: Pipeline, run: &str) -> (String, usize) {
+    let model = FakeModel::start(vec![
+        Reply::Text(READ.into()),
+        Reply::Text(RANK.into()),
+        Reply::Text(SUMMARY.into()),
+    ])
+    .await
+    .expect("fake model");
+    let rt = engine(dir, &model.base_url()).await;
+    let input = json!({"text": "Exporting a file named café.txt crashes the app."});
+    rt.start(PIPELINE, run, PipelineRun { pipeline, input })
+        .await
+        .expect("start");
+    let error = rt
+        .result::<Value>(run)
+        .await
+        .expect_err("refused")
+        .to_string();
+    rt.shutdown(std::time::Duration::from_secs(5))
+        .await
+        .expect("shutdown");
+    (error, model.calls())
+}
+
+/// The atom step `id` of `pipeline`.
+fn atom_step<'p>(pipeline: &'p mut Pipeline, id: &str) -> &'p mut atomic_app::pipeline::AtomStep {
+    pipeline
+        .steps
+        .iter_mut()
+        .find_map(|s| match s {
+            Step::Atom(step) if step.id == id => Some(step),
+            _ => None,
+        })
+        .expect("the step")
+}
+
+#[test]
+fn a_run_is_held_to_its_atoms_trust_before_any_step_runs() {
+    on_codex_runtime(async {
+        let dir = scratch("trust-dispatch");
+        let project = project(&dir);
+        // Prepared as the loader allows, then handed to the engine with the
+        // rank step's atom trusting only team input. The rank step maps the
+        // read step's output, agent data: as a run prepared some other way
+        // would be, it is refused before the read step, or any, runs.
+        let mut pipeline = load(&project, "triage.workflow.yaml", TRIAGE);
+        pipeline
+            .atoms
+            .get_mut("rank-note")
+            .expect("rank-note")
+            .frontmatter["trust"] = json!("team");
+        let (error, calls) = refused(&dir, pipeline, "untrusted").await;
+        assert!(
+            error.contains("step `rank`")
+                && error.contains("is agent data")
+                && error.contains("accepts team input at most"),
+            "{error}"
+        );
+        assert!(
+            error.contains("bind it to a gate a person decides, or a literal in the workflow file"),
+            "the refusal names what to change"
+        );
+        assert_eq!(calls, 0, "a step ran before the refusal");
+
+        // A trust a stored run's atom holds that is none of the three, a
+        // string or not, accepts nothing, and the refusal says what to set.
+        for (n, (trust, written)) in [
+            (json!("Team"), "`trust: 'Team'`"),
+            (json!(1), "`trust: 1`"),
+            (json!(["team"]), "`trust: [\"team\"]`"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut pipeline = load(&project, "triage.workflow.yaml", TRIAGE);
+            pipeline
+                .atoms
+                .get_mut("rank-note")
+                .expect("rank-note")
+                .frontmatter["trust"] = trust;
+            let (error, calls) = refused(&dir, pipeline, &format!("unknown-trust-{n}")).await;
+            assert!(
+                error.contains(&format!("declares {written}"))
+                    && error.contains("accepts no input"),
+                "{error}"
+            );
+            assert!(
+                error.contains("set atom `rank-note`'s `trust` to external, agent or team"),
+                "the refusal says to set a known trust"
+            );
+            assert_eq!(calls, 0);
+        }
+    });
+}
+
+#[test]
+fn a_bindings_origin_at_run_time_is_the_lower_of_what_was_recorded_and_what_it_reads() {
+    on_codex_runtime(async {
+        let dir = scratch("trust-origins");
+        let project = project(&dir);
+        trusting_atom(&project, "team");
+        // Literals: team data, so the loader takes them.
+        let literals =
+            policy_workflow("'Be brief.'", "").replace("note: input.text", "note: \"'A note.'\"");
+        let prepared = load(&project, "policy.workflow.yaml", &literals);
+        // A field the run recorded no origin for counts as external.
+        let mut pipeline = prepared.clone();
+        atom_step(&mut pipeline, "apply").origins.clear();
+        let (error, calls) = refused(&dir, pipeline, "no-origins").await;
+        assert!(
+            error.contains("step `apply`") && error.contains("is external data"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("`origins` entry"),
+            "the advice names no origins entry the run did not record"
+        );
+        assert_eq!(calls, 0);
+        // A recorded origin above what the binding reads is not believed:
+        // the run's input, marked team, is still external.
+        let mut pipeline = prepared.clone();
+        let step = atom_step(&mut pipeline, "apply");
+        step.with.insert("note".into(), "input.text".into());
+        step.origins.insert("note".into(), "team".into());
+        let (error, calls) = refused(&dir, pipeline, "raised-origin").await;
+        assert!(error.contains("`input.text` is external data"), "{error}");
+        assert_eq!(calls, 0);
+        // A recorded origin below what the binding reads is kept, and the
+        // refusal says the `origins` entry lowered it.
+        let mut pipeline = prepared;
+        atom_step(&mut pipeline, "apply")
+            .origins
+            .insert("policy".into(), "agent".into());
+        let (error, _) = refused(&dir, pipeline, "lowered-origin").await;
+        assert!(
+            error.contains("remove the `origins` entry that marks it agent"),
+            "the refusal names the lowering entry"
+        );
+    });
+}
+
+#[test]
+fn a_refused_binding_says_what_can_take_its_place() {
+    let dir = scratch("trust-advice");
+    let project = project(&dir);
+    trusting_atom(&project, "team");
+    let refusal = |text: &str| {
+        let file = project.join("workflows/advice.workflow.yaml");
+        std::fs::write(&file, text).expect("workflow");
+        let mut registry = Registry::new();
+        let mut atoms = BTreeMap::new();
+        for entry in std::fs::read_dir(project.join("atoms")).expect("atoms") {
+            let path = entry.expect("entry").path();
+            if path.to_string_lossy().ends_with(".atom.astro") {
+                let atom = atom::load(&path, &mut registry).expect("atom loads");
+                atoms.insert(atom.name.clone(), atom);
+            }
+        }
+        let error = workflow::load(&file, &atoms, &mut registry).expect_err("refused");
+        (error.message, error.action.unwrap_or_default())
+    };
+    // A model step's output, agent data, for a team atom, its other field a
+    // literal: what yields team data takes its place.
+    let (message, agent) = refusal(
+        &policy_workflow("steps.read.output.title", "")
+            .replace("note: input.text", "note: \"'A note.'\""),
+    );
+    assert!(message.contains("is agent data"), "{message}");
+    assert!(
+        agent.contains("bind it to a gate a person decides, or a literal in the workflow file"),
+        "the advice names the team sources"
+    );
+    assert!(
+        !agent.contains("`origins` entry"),
+        "no origins entry to remove"
+    );
+    // A literal that `origins` lowered: the advice names that entry.
+    let (_, lowered) = refusal(
+        &policy_workflow("'Be brief.'", "    origins: { policy: agent }\n")
+            .replace("note: input.text", "note: \"'A note.'\""),
+    );
+    assert!(
+        lowered.contains("remove the `origins` entry that marks it agent"),
+        "the advice names the lowering entry"
+    );
+}
+
 /// The shape of a serialized value: each object's keys, with the shape of
 /// what each holds, an array's first element, and a scalar's type. The
 /// values under `opaque` keys are data whose keys are not layout, such as a
@@ -4841,6 +5027,126 @@ fn the_candidate_reaches_the_reviewer_as_external_data() {
 }
 
 #[test]
+fn a_review_is_held_to_its_reviewers_trust_before_any_step_runs() {
+    on_codex_runtime(async {
+        let dir = scratch("review-trust-dispatch");
+        let project = project(&dir);
+        let prepared = reviewed(&project, 1);
+        // A reviewer that accepts only agent input, handed the candidate,
+        // external data, in a run prepared some other way.
+        let mut pipeline = prepared.clone();
+        pipeline
+            .atoms
+            .get_mut("check-title")
+            .expect("check-title")
+            .frontmatter["trust"] = json!("agent");
+        let (error, calls) = refused(&dir, pipeline, "reviewer-trust").await;
+        assert!(
+            error.contains("step `read`: `review.with.")
+                && error.contains("is external data")
+                && error.contains("accepts agent input at most"),
+            "{error}"
+        );
+        assert_eq!(calls, 0, "a step ran before the refusal");
+        // A recorded review origin above what the binding reads is not
+        // believed.
+        let mut pipeline = prepared.clone();
+        pipeline
+            .atoms
+            .get_mut("check-title")
+            .expect("check-title")
+            .frontmatter["trust"] = json!("team");
+        let review = atom_step(&mut pipeline, "read")
+            .review
+            .as_mut()
+            .expect("a review");
+        review.origins.insert("text".into(), "team".into());
+        review.origins.insert("title".into(), "team".into());
+        let (error, calls) = refused(&dir, pipeline, "review-raised").await;
+        assert!(error.contains("is external data"), "{error}");
+        assert_eq!(calls, 0);
+        // An author that accepts agent input, its own binding a literal, is
+        // not handed the findings on external data in a repair round.
+        let mut pipeline = prepared.clone();
+        pipeline
+            .atoms
+            .get_mut("read-note")
+            .expect("read-note")
+            .frontmatter["trust"] = json!("agent");
+        let step = atom_step(&mut pipeline, "read");
+        step.with.insert("text".into(), "'Exports crash.'".into());
+        step.origins.insert("text".into(), "team".into());
+        let (error, calls) = refused(&dir, pipeline, "review-findings").await;
+        assert!(
+            error.contains("`review.rounds`") && error.contains("a repair round hands `read-note`"),
+            "{error}"
+        );
+        assert_eq!(calls, 0);
+        // A reviewer whose trust is none of the three accepts nothing.
+        let mut pipeline = prepared;
+        pipeline
+            .atoms
+            .get_mut("check-title")
+            .expect("check-title")
+            .frontmatter["trust"] = json!(true);
+        let (error, calls) = refused(&dir, pipeline, "reviewer-unknown").await;
+        assert!(
+            error.contains("declares `trust: true`")
+                && error.contains("set atom `check-title`'s `trust` to external, agent or team"),
+            "{error}"
+        );
+        assert_eq!(calls, 0);
+    });
+}
+
+#[test]
+fn a_review_whose_atoms_trust_is_unknown_fails_to_load() {
+    let dir = scratch("review-trust-unknown");
+    let project = project(&dir);
+    reviewed(&project, 1);
+    // Each atom as loaded, then the one named given a `trust` the load of
+    // an atom file refuses, as one built some other way might hold.
+    let load_with = |name: &str| {
+        let mut registry = Registry::new();
+        let mut atoms = BTreeMap::new();
+        for entry in std::fs::read_dir(project.join("atoms")).expect("atoms") {
+            let path = entry.expect("entry").path();
+            if path.to_string_lossy().ends_with(".atom.astro") {
+                let atom = atom::load(&path, &mut registry).expect("atom loads");
+                atoms.insert(atom.name.clone(), atom);
+            }
+        }
+        atoms.get_mut(name).expect("the atom").frontmatter["trust"] = json!(1);
+        workflow::load(
+            &project.join("workflows/reviewed.workflow.yaml"),
+            &atoms,
+            &mut registry,
+        )
+        .expect_err("refused")
+    };
+    let error = load_with("check-title");
+    assert!(
+        error.path.ends_with("/review/reviewer")
+            && error
+                .message
+                .contains("atom `check-title` declares `trust: 1`")
+            && error.message.contains("accepts no input"),
+        "{error:?}"
+    );
+    assert_eq!(
+        error.action.as_deref(),
+        Some("set atom `check-title`'s `trust` to external, agent or team")
+    );
+    let error = load_with("read-note");
+    assert!(
+        error
+            .message
+            .contains("atom `read-note` declares `trust: 1`"),
+        "{error:?}"
+    );
+}
+
+#[test]
 fn a_replay_of_a_reviewed_run_reviews_nothing_again() {
     on_codex_runtime(async {
         let dir = scratch("review-replay");
@@ -5605,6 +5911,60 @@ fn a_run_with_no_minutes_left_parks_before_the_next_command() {
     });
 }
 
+/// The same park released in the process that parked it: the second step's
+/// body runs again after the workspace its attempt opened was taken, and its
+/// command, which the cap refused, runs once. Each command runs once.
+#[test]
+fn a_run_parked_before_its_next_command_finishes_in_the_same_process() {
+    on_codex_runtime(async {
+        let dir = scratch("exec-park-here");
+        let project = napping_project(&dir, "");
+        let pipeline = load(
+            &project,
+            "naps.workflow.yaml",
+            &naps(true, "budget:\n  minutes: 1\n"),
+        );
+        let model = FakeModel::start(Vec::new()).await.expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        rt.start(
+            PIPELINE,
+            "naps-4",
+            PipelineRun {
+                pipeline,
+                input: json!({"seconds": 0}),
+            },
+        )
+        .await
+        .expect("start");
+        let g = open_gate(&rt, "naps-4").await;
+        spend_all_but(&rt, "naps-4", 100).await;
+        decide(&rt, &g, Verdict::Approve, "fine").await;
+        let park = nth_park(&rt, "naps-4", 1).await;
+        assert!(park.step.starts_with("second"), "{}", park.step);
+        assert_eq!(commands(&rt, "naps-4").await.len(), 1, "only the first ran");
+        rt.ledger()
+            .raise(
+                "run:naps-4",
+                Caps {
+                    tokens: 0,
+                    millis: 600_000,
+                    micro_usd: None,
+                },
+            )
+            .await
+            .expect("raise")
+            .expect("exists");
+        atomic_durable::release(&rt, &park).await.expect("release");
+        let out: Value = rt.result("naps-4").await.expect("finishes");
+        assert_eq!(out["slept"].as_f64(), Some(0.0), "{out}");
+        let ran = commands(&rt, "naps-4").await;
+        assert_eq!(ran.len(), 2, "each command ran once: {ran:?}");
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
 /// A plan pinned in the run's input with no caps for an exec atom the run
 /// has is refused before anything runs: no command runs unmetered.
 #[test]
@@ -5640,6 +6000,178 @@ fn a_pinned_plan_without_an_exec_atoms_caps_is_refused() {
             "{error}"
         );
         assert!(commands(&rt, "uncapped").await.is_empty(), "a command ran");
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+/// The local backend, taking the artifact store's lock, as a sweep would,
+/// as it opens the first workspace, and counting the workspaces it opens.
+struct LocksTheStoreOnOpen {
+    lock: PathBuf,
+    holder: Arc<std::sync::Mutex<Option<std::fs::File>>>,
+    opens: Arc<std::sync::atomic::AtomicUsize>,
+    local: atomic_exec::LocalBackend,
+}
+
+impl atomic_exec::ExecutionBackend for LocksTheStoreOnOpen {
+    fn connect(&self) -> Result<atomic_exec::Statement, atomic_exec::ExecError> {
+        Ok(atomic_exec::LocalBackend::STATEMENT)
+    }
+    fn open(
+        &self,
+        request: &atomic_exec::Open,
+    ) -> Result<atomic_exec::Workspace, atomic_exec::ExecError> {
+        if self.opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            let held = std::fs::File::options()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&self.lock)
+                .expect("the store's lock");
+            held.lock().expect("held");
+            *self.holder.lock().expect("holder") = Some(held);
+        }
+        self.local.open(request)
+    }
+    fn run(
+        &self,
+        command: &atomic_exec::Command,
+    ) -> Result<atomic_exec::Completed, atomic_exec::ExecError> {
+        self.local.run(command)
+    }
+    fn close(&self, workspace: &atomic_exec::Workspace) -> Result<(), atomic_exec::ExecError> {
+        self.local.close(workspace)
+    }
+    fn exchange(
+        &self,
+        workspace: &atomic_exec::Workspace,
+    ) -> Result<Option<Box<dyn atomic_exec::exchange::Exchange>>, atomic_exec::ExecError> {
+        self.local.exchange(workspace)
+    }
+}
+
+/// An exec step whose inputs cannot be given while the artifact store is
+/// held elsewhere waits a bounded time, then stops the run to be run again,
+/// recording nothing as failed and running nothing, however many times it
+/// stops: it is never dead-lettered for it. Once the store is free, the run
+/// finishes, its command run once.
+#[test]
+fn an_exec_step_whose_store_is_held_while_its_inputs_are_given_is_run_again() {
+    on_codex_runtime(async {
+        let dir = scratch("exec-inputs-held");
+        let project = dir.join("project");
+        std::fs::write(project.join("atomic.yaml"), "atomic: 1\nname: inputs\n").expect("manifest");
+        std::fs::create_dir_all(project.join("tools")).expect("tools");
+        std::fs::write(
+            project.join("tools/use.py"),
+            "import json, os, sys\njson.load(sys.stdin)\n\
+             open('ran', 'a').write('x')\n\
+             json.dump({'runs': len(open('ran').read())}, sys.stdout)\n",
+        )
+        .expect("script");
+        let atoms = project.join("atoms");
+        std::fs::write(
+            atoms.join("use-patch.atom.astro"),
+            "---\nimport type { Props, Input, Output } from '../.atomic/types/use-patch';\n\
+             import type { AtomConfig } from '../.atomic/types/authoring';\n\
+             const { input }: Props = Astro.props;\n\
+             export const config: AtomConfig<Input, Output> = { description: 'Use a patch.', kind: 'exec', exec: { command: ['python3', 'tools/use.py'] } };\n---\n",
+        )
+        .expect("atom");
+        std::fs::write(
+            atoms.join("use-patch.input.schema.json"),
+            object(json!({"patch": {"$ref": "atomic:artifact", "mediaType": "text/x-diff"}}))
+                .to_string(),
+        )
+        .expect("input");
+        std::fs::write(
+            atoms.join("use-patch.output.schema.json"),
+            object(json!({"runs": {"type": "integer"}})).to_string(),
+        )
+        .expect("output");
+        let pipeline = load(
+            &project,
+            "use.workflow.yaml",
+            "atomic: 1\nname: use\n\
+             input: { $ref: ../atoms/use-patch.input.schema.json }\n\
+             output: { $ref: ../atoms/use-patch.output.schema.json }\n\
+             steps:\n  use:\n    atom: use-patch\n    with: { patch: input.patch }\n\
+             returns: steps.use.output\n",
+        );
+        let model = FakeModel::start(vec![]).await.expect("fake model");
+        let store = LocalStore::open(dir.join("artifacts"))
+            .expect("store")
+            .waiting_at_most(std::time::Duration::from_millis(100));
+        let patch = store
+            .put(
+                &mut &b"--- a\n+++ b\n"[..],
+                atomic_core::artifact::Provenance {
+                    media_type: "text/x-diff".into(),
+                    ..Default::default()
+                },
+            )
+            .expect("put")
+            .artifact;
+        let holder = Arc::new(std::sync::Mutex::new(None));
+        let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let backend = atomic_exec::Backend::connect(LocksTheStoreOnOpen {
+            lock: dir.join("artifacts/lock"),
+            holder: holder.clone(),
+            opens: opens.clone(),
+            local: atomic_exec::LocalBackend::default(),
+        })
+        .expect("connects");
+        let rt = engine_handing_over(&dir, &model.base_url(), store, Some(backend)).await;
+        let run = PipelineRun {
+            pipeline,
+            input: json!({"patch": patch.to_string()}),
+        };
+        rt.start(PIPELINE, "held-1", run).await.expect("start");
+        // Stopped more times than dead-lettering allows, with nothing
+        // failed, and opened again each time.
+        let executions = atomic_app::pipeline::RECOVERY_LIMIT as usize + 2;
+        let started = std::time::Instant::now();
+        while opens.load(std::sync::atomic::Ordering::SeqCst) < executions {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(240),
+                "{} executions so far",
+                opens.load(std::sync::atomic::Ordering::SeqCst)
+            );
+            assert_eq!(
+                rt.status("held-1").await.expect("status"),
+                Some(RunStatus::Pending),
+                "it stopped waiting"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(!project.join("ran").exists(), "the command ran while held");
+        let failed: Vec<String> = rt
+            .steps("held-1")
+            .await
+            .expect("steps")
+            .into_iter()
+            .filter(|s| s.error.is_some())
+            .map(|s| s.name)
+            .collect();
+        assert!(failed.is_empty(), "recorded as failed: {failed:?}");
+        drop(holder.lock().expect("holder").take());
+        let started = std::time::Instant::now();
+        while rt.status("held-1").await.expect("status") != Some(RunStatus::Succeeded) {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(60),
+                "once the store was free, it did not finish: {:?}",
+                rt.status("held-1").await
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            std::fs::read_to_string(project.join("ran")).expect("ran"),
+            "x",
+            "its command ran once"
+        );
         rt.shutdown(std::time::Duration::from_secs(5))
             .await
             .expect("shutdown");
