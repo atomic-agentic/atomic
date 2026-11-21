@@ -1785,3 +1785,46 @@ fn a_held_key_with_no_marker_is_judged_whole() {
         .collect();
     assert_eq!(keys, [REDACTED], "{out}");
 }
+
+/// A flag's value quoted with escaped quotes, as a command held in JSON in
+/// a string writes it, is hidden as one in plain quotes is, at any depth,
+/// and the JSON around it still reads as JSON.
+#[test]
+fn a_flag_value_in_escaped_quotes_is_hidden() {
+    let credential = concat!("Zx81", "kQ0pL2mN4bV6");
+    for (case, line) in [
+        "run --password \\\"hunter2\\\" now".to_owned(),
+        "run --password \\\\\\\"hunter2\\\\\\\" now".to_owned(),
+        format!("run --token \\\"{credential}\\\" now"),
+        "[\\\"--password\\\", \\\"hunter2\\\"]".to_owned(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let out = text(&line);
+        assert!(!out.contains("hunter2"), "case {case}: the value showed");
+        assert!(
+            !out.contains(&credential[4..]),
+            "case {case}: the value showed"
+        );
+    }
+    // In JSON held in a string, one level deep and two.
+    let inner = json!({"cmd": "deploy --password \"hunter2\""}).to_string();
+    for (depth, doc) in [
+        (1, json!({"arguments": inner.clone()})),
+        (2, json!({"arguments": json!({"body": inner}).to_string()})),
+    ] {
+        let mut out = doc;
+        value(&mut out);
+        assert!(
+            !out.to_string().contains("hunter2"),
+            "depth {depth}: the value showed"
+        );
+        let mut held = out["arguments"].clone();
+        for _ in 0..depth {
+            let text = held.as_str().expect("a string").to_owned();
+            let parsed: Value = serde_json::from_str(&text).expect("still JSON");
+            held = parsed.get("body").cloned().unwrap_or(parsed);
+        }
+    }
+}

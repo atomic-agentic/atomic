@@ -296,12 +296,18 @@ fn regex(pattern: &str) -> Regex {
 
 /// A command-line flag and its value: `--password x`, at the start of the
 /// text or after a space, a quote, a bracket or a comma, and as two items of
-/// an argument list, `"--token", "abc"`.
+/// an argument list, `"--token", "abc"`. A value may be quoted with escaped
+/// quotes, `--password \"x\"`, as in a command held in JSON in a string, at
+/// any depth of escaping.
 static FLAG: LazyLock<Regex> = LazyLock::new(|| {
-    regex(
-        r#"(?:^|[\s"'\[,])(--?([A-Za-z0-9][A-Za-z0-9-]*)(?:\s+|["']\s*,\s*["']))("[^"\n]*"|'[^'\n]*'|\[REDACTED\]|[^\s"',\]-][^\s"',\]]*)"#,
-    )
+    regex(&format!(
+        r#"(?:^|[\s"'\[,])(--?([A-Za-z0-9][A-Za-z0-9-]*)(?:\s+|\\*["']\s*,\s*\\*["']))({escaped}"[^"\n]*"|'[^'\n]*'|\[REDACTED\]|[^\s"',\]-][^\s"',\]]*)"#,
+        escaped = ESCAPED_QUOTED,
+    ))
 });
+/// A value in escaped quotes, `\"x\"` or `\\\"x\\\"`, as alternatives of
+/// [`FLAG`]'s value, tried before a bare value would take the backslash.
+const ESCAPED_QUOTED: &str = r#"\\+"[^"\n]*?\\+"|\\+'[^'\n]*?\\+'|"#;
 /// An authorization, cookie or API key header and its value, to the end of
 /// the line or the quote around it.
 static HEADER: LazyLock<Regex> = LazyLock::new(|| {
@@ -1084,7 +1090,8 @@ fn assigned(input: &str) -> Option<String> {
 }
 
 fn redact_flag(captures: &Captures<'_>) -> String {
-    let value = captures[3].trim_matches(['"', '\'']);
+    // Quoted, or quoted with escaped quotes, as in JSON held in a string.
+    let value = captures[3].trim_matches(['"', '\'', '\\']);
     if !is_secret_value(strength(&captures[2]), value) {
         return captures[0].to_string();
     }
