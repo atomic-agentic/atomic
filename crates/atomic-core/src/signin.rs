@@ -541,7 +541,8 @@ impl SignIn {
         .map_err(|e| e.to_string());
         // A keyring that could not be checked may still hold the sign-in,
         // and its directory is what says so.
-        if self.made || keyring.is_ok() {
+        let nothing_kept = self.made || keyring.is_ok();
+        if nothing_kept {
             self.tidy();
         }
         Ok(Forgotten { file, keyring })
