@@ -23,14 +23,22 @@ names it as pending rather than passed outright.
 
 In the milestones document, an Acceptance block starts at a line that begins
 `**Acceptance` and ends `:**`, with or without a title after the word, and
-holds a bullet per clause: a milestone's clauses are those of all its blocks,
-in order. A line that only looks like that marker is refused with its line
-number, not skipped, so a block in such a shape cannot go unread: outside a
-block, any line that leads with a spelling of `accept` and ends in a colon is
-refused as one, however it is wrapped. A split milestone's parts are sections
-under it. An "a" part states its own acceptance; a "b" part finishes its
-parent's work, so its clauses are its parent's, with any of its own blocks
-after them.
+holds a `- ` bullet per clause: a milestone's clauses are those of all its
+blocks, in order. A line that only looks like that marker is refused with its
+line number, not skipped, so a block in such a shape cannot go unread. The
+shapes refused are a line beginning `**Acceptance` that is not a marker; any
+other line that leads, after a bullet or markdown punctuation at most, with a
+spelling of `accept` and ends in a colon, open block or not, in any wrapper
+that reads as one (`Acceptance:`, `__Acceptance:__`, `**Acceptence:**`,
+`- **Acceptance, files and data:**`, `+ **Acceptance, files and data:**`,
+`1. **Acceptance, files and data:**`); a heading of the milestone's own level
+that is about the acceptance and states no milestone id, since it ends the
+section there; and a fence left open at the section's end. A fenced code block
+states nothing at all, and prose whose last line only happens to end in a
+colon is marker-shaped to this check, so rewrap it. A split milestone's parts
+are sections under it. An "a" part states its own acceptance; a "b" part
+finishes its parent's work, so its clauses are its parent's, with any of its
+own blocks after them.
 
 Every listed test is run in one `cargo test` over the workspace, with CI's
 test features (FEATURES, which must match CI's test build, and which
@@ -70,16 +78,33 @@ ACCEPTANCE = re.compile(r"^\*\*Acceptance\b.*:\*\*$")
 # outside the bold. Refused wherever it sits, open block or not: the clauses
 # under it would be skipped in silence.
 NEAR_MARKER = re.compile(r"^\*\*Acceptance\b", re.IGNORECASE)
+# How a bullet starts: `- `, `* ` or `+ `, or a number and `.` or `)`.
+BULLET_START = r"[-*+][ \t]|\d+[.)][ \t]"
 # Any line shaped like that marker, whatever wrapper it is in and however the
 # word is spelt: `Acceptance:`, `__Acceptance:__`, `**Acceptence:**`,
-# `- **Acceptance, files and data:**`. The wrapper holds markdown punctuation
-# only, so a line whose first word is not a spelling of `accept` stays prose.
-# Outside a block such a line is refused too, since only a line beginning
-# `**Acceptance` opens one.
-MARKERISH = re.compile(r"^[-_*~>#\s]*accept\w*\b.*:[-_*~>#\s]*$", re.IGNORECASE)
-# A bullet: `- `, `* ` or `+ `, or a number, at the start of the line or
-# indented. Only a `- ` at the start of a line is read as a clause.
-BULLET = re.compile(r"^\s*(?:[-*+][ \t]|\d+[.)]\s)")
+# `- **Acceptance, files and data:**`, `+ **Acceptance, files and data:**`,
+# `1. **Acceptance, files and data:**`. The wrapper holds a bullet, as BULLET
+# knows one, and markdown punctuation, so a line whose first word is not a
+# spelling of `accept` stays prose. Outside a block such a line is refused too,
+# since only a line beginning `**Acceptance` opens one; so is one inside a
+# block, whose clauses would be read as the clauses of the block before it.
+MARKERISH = re.compile(
+    rf"^\s*(?:{BULLET_START})?[-_*~>#\s]*accept\w*\b.*:[-_*~>#\s]*$", re.IGNORECASE
+)
+# A bullet, at the start of the line or indented. Only a `- ` at the start of a
+# line is read as a clause.
+BULLET = re.compile(rf"^\s*(?:{BULLET_START})")
+# The letters, in order, that a word has to hold to be the accept word: spelt
+# right they are `a`,`c`,`c`,`e`,`p`,`t`, and dropping the second `c` still
+# leaves them. So a mangled spelling, `Aceptance`, `Accepatance`,
+# `Accpptance`, is one, and a word that is not, `Cache`, `Capacity`, `Except`,
+# is not. `acceptish` asks the question of a word; a word of a heading that
+# answers it makes the heading one about the acceptance.
+ACCEPT_LETTERS = "acept"
+# The line that opens a fenced code block: at least three backticks or tildes,
+# indented by no more than three spaces. The rest of the line, which may name
+# the language, does not matter here.
+FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 # A heading's first word, which holds its id when the heading states one.
 HEADING_ID = re.compile(r"^#+\s+(\S+)")
 # A milestone id: `M11`, or `M11b` for one of its parts.
@@ -188,28 +213,82 @@ def is_part(stated, parent):
     return stated.startswith(parent) and len(stated) == len(parent) + 1 and stated[-1].isalpha()
 
 
-def own(lines, milestone, start, level, path):
+def acceptish(word):
+    """Whether `word` is the accept word, spelt right or mangled: its letters,
+    in order, hold ACCEPT_LETTERS, which spelt right they do twice over. A word
+    spelt another way is not it, however like the heading it looks: `Cache`,
+    `Capacity` and `Except` all fail where one of the letters is not to be had."""
+    letters = "".join(c for c in word.lower() if c.isalpha())
+    at = 0
+    for c in ACCEPT_LETTERS:
+        at = letters.find(c, at) + 1
+        if not at:
+            return False
+    return True
+
+
+def marker_heading(line):
+    """Whether the heading `line` ends a section as a line about the
+    acceptance: it holds a word that is the accept word, spelt right or
+    mangled, and states no milestone id, which is what tells a heading that
+    ends a section from one that starts the next milestone."""
+    return id_of(line) is None and any(acceptish(w) for w in re.findall(r"[^\W\d_]+", line))
+
+
+def own(lines, milestone, start, level, path, title=None):
     """The clauses in the Acceptance blocks of the section `path` states for
     `milestone` from line `start`, and what in them could not be read as one.
+    `title` is how the document names the milestone, and defaults to its id.
 
     The section's own text ends where one of its parts' sections starts. Under
     any other deeper heading a bullet is refused, because which block it
     belongs to would be a guess; a block marker ends that, as it starts a block
-    of its own. A line that only looks like a block marker is refused too: open
-    block or not, one that begins `**Acceptance`, and outside a block any line
-    shaped like the marker at all. What sits under such a line is read as
-    nothing, and a "b" part, which is asked for its parent's clauses as well as
-    its own, is never then asked for a clause it states itself."""
+    of its own. A heading of the section's own level that is about the
+    acceptance ends the section too, and is refused as the marker it was meant
+    to be, since what sits under it leaves the section with the heading. A line
+    that only looks like a block marker is refused too, open block or not: one
+    that begins `**Acceptance`, and any other line shaped like the marker, since
+    only a line beginning `**Acceptance` opens one. Inside a block such a line
+    is refused as well: it opens no block, so the clauses under it join the block
+    above, and a document could state two blocks while being checked for one.
+    What sits under a line that opens no block is read as nothing, and a
+    "b" part, which is asked for its parent's clauses as well as its own, is
+    never then asked for a clause it states itself. A fenced code block is
+    example text, which states no heading, no marker and no clause; a fence
+    left open at the section's end is refused, since what it held went unread
+    and the next section's would go unread with it."""
     clauses, problems = [], []
     inside, deeper = False, None
+    # Where the open block's marker sat, for a message about a line inside it.
+    opened_at = 0
+    named = title or milestone.upper()
     parent = PART.match(milestone)
     # The ids whose part sections come under this one: its own, and, as this
     # milestone is itself a part, its parent's, whose other parts sit beside it.
     wholes = [milestone] + ([parent.group(1)] if parent else [])
+    fence = None
     for n, line in enumerate(lines[start + 1:], start + 2):
+        if fence is not None:
+            # Inside a fence nothing is a heading, a marker or a clause: the
+            # block holds example text, which this check has no say about.
+            if line.strip().startswith(fence):
+                fence = None
+            continue
+        opened = FENCE.match(line)
+        if opened:
+            fence = opened.group(1)[0] * 3
+            continue
         heading = HEADING.match(line)
         if heading:
             if len(heading.group(1)) <= level:
+                if marker_heading(line):
+                    problems.append(
+                        f"{path}:{n}: not an Acceptance block marker: this heading is about "
+                        f"the acceptance and ends {named} where it sits, so everything under "
+                        f"it in {named} would be skipped. A block starts inside the "
+                        "milestone whose section it sits in, at a line that begins "
+                        "`**Acceptance` and ends `:**`, as `**Acceptance:**`: " + line.strip()
+                    )
                 break
             stated = id_of(line)
             if stated and any(is_part(stated, whole) for whole in wholes):
@@ -218,16 +297,36 @@ def own(lines, milestone, start, level, path):
             continue
         text = line.strip()
         if ACCEPTANCE.match(text):
-            inside, deeper = True, None
+            inside, deeper, opened_at = True, None, n
             continue
         if not text:
             continue
-        if NEAR_MARKER.match(text) or not inside and MARKERISH.match(text):
+        if inside and (NEAR_MARKER.match(text) or MARKERISH.match(text)):
+            # Under a clause of an open block, even a line that means to open a
+            # block opens none: a marker ends a block, so what sits under this
+            # one would be read as more clauses of the block above it.
             problems.append(
-                f"{path}:{n}: not an Acceptance block marker, so everything "
-                "under it would be skipped: a block starts at a line "
-                'that begins `**Acceptance` and ends `:**`, as `**Acceptance:**` '
-                "or `**Acceptance, beyond the full M4 test:**`: " + text
+                f"{path}:{n}: not an Acceptance block marker, so the clauses under it would "
+                f"be read as more clauses of the block that started at line {opened_at}: "
+                "a clause starts at a `- ` bullet, or on the next line indented by at "
+                "least two spaces; only a line that begins `**Acceptance` and ends `:**` "
+                "starts a block: " + text
+            )
+        elif NEAR_MARKER.match(text):
+            problems.append(
+                f"{path}:{n}: not an Acceptance block marker, so everything under it would "
+                "be skipped: a block starts at a line that begins `**Acceptance` and ends "
+                "`:**`, as `**Acceptance:**` or `**Acceptance, beyond the full M4 test:**`: "
+                + text
+            )
+        elif MARKERISH.match(text):
+            problems.append(
+                f"{path}:{n}: not an Acceptance block marker, so everything under it would "
+                "be skipped: a block starts at a line that begins `**Acceptance` and ends "
+                "`:**`, as `**Acceptance:**` or `**Acceptance, beyond the full M4 test:**`. "
+                "A line of prose that only happens to end in a colon is shaped like this "
+                "marker to the check, so rewrap it or reword it so it does not end in "
+                "one: " + text
             )
         elif BULLET.match(line):
             if deeper:
@@ -251,6 +350,11 @@ def own(lines, milestone, start, level, path):
             clauses[-1] += " " + line.strip()
         else:
             problems.append(f"{path}:{n}: not a clause or its continuation: {text}")
+    if fence is not None:
+        problems.append(
+            f"{path}: {named}'s section ends inside a fenced code block, so what it held "
+            "and the sections after it were not read"
+        )
     return [words(c) for c in clauses], problems
 
 
@@ -271,14 +375,14 @@ def milestone_clauses(milestone, path=MILESTONES):
     start, level = heading_at(lower)
     if start is None:
         return None, [f"{path} has no section for {milestone}"]
-    clauses, problems = own(lines, lower, start, level, path)
+    clauses, problems = own(lines, lower, start, level, path, milestone)
     part = PART.match(lower)
     if part and part.group(2) == "b":
         parent, at = heading_at(part.group(1))
         if parent is None:
             problems.append(f"{path}: {milestone} has no {part.group(1).upper()} to finish")
         else:
-            stated, unread = own(lines, part.group(1), parent, at, path)
+            stated, unread = own(lines, part.group(1), parent, at, path, part.group(1).upper())
             problems += unread
             clauses = [c for c in stated if c not in clauses] + clauses
     if not clauses:

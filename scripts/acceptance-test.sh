@@ -206,6 +206,19 @@ list_check_against() {
         fail "${id}: expected exit ${code} and '${text}': ${out}"
     fi
 }
+# clauses_of <milestone> <document>: the clauses the reader states for the
+# milestone in that document, one per line. A list that cannot be checked stops
+# before the clauses are compared, so what was read of the document shows only
+# by asking the reader itself.
+clauses_of() {
+    python3 -c "
+import sys
+sys.path.insert(0, '${ROOT}/scripts')
+import acceptance
+stated, _ = acceptance.milestone_clauses(sys.argv[1].upper(), sys.argv[2])
+print('\n'.join(stated or []))
+" "${1}" "${2}"
+}
 
 # Every Acceptance block of a milestone reads, a titled one among them: its
 # clauses are those of all its blocks, in order.
@@ -283,7 +296,8 @@ done
 # silence.
 for marker in 'Acceptance:' 'Acceptance, files and data:' 'acceptance:' \
     '__Acceptance:__' '**Acceptence:**' '**Acceptances:**' '- **Acceptance:**' \
-    '- **Acceptance, beyond the full M4 test:**'; do
+    '- **Acceptance, beyond the full M4 test:**' '+ **Acceptance, files and data:**' \
+    '1. **Acceptance, files and data:**' '2) **Acceptance:**'; do
     printf '## M4: Split\n\n**Acceptance:**\n\n- A cap parks the run.\n- A scorer fails CI.\n\n### M4b\n\n**v1.0.** Finishes M4.\n\n%s\n\n- Restarting twice costs nothing.\n' \
             "${marker}" >"${WORK}/shaped.md"
     out="$(python3 "${CHECK}" m4b --milestones "${WORK}/shaped.md" --list "${WORK}/m4b.txt" --check 2>&1)"
@@ -291,6 +305,62 @@ for marker in 'Acceptance:' 'Acceptance, files and data:' 'acceptance:' \
         fail "a line shaped like a marker, '${marker}', was not refused: ${out}"
     fi
 done
+# A line shaped like the marker inside an open block is refused too, with its
+# line number. A marker ends a block and this line opens none, so the clause
+# under it joins the block above: the document says two blocks, the check would
+# read one, which is why the line is refused and not skipped.
+printf '## M0: A milestone\n\n**Acceptance:**\n\n- A cap parks the run.\n\n**Acceptence:**\n\n- A scorer fails CI.\n' >"${WORK}/inside.md"
+out="$(python3 "${CHECK}" m0 --milestones "${WORK}/inside.md" --list "${WORK}/list.txt" --check 2>&1)"
+if [ $? -ne 1 ] || ! grep -qF "inside.md:7: not an Acceptance block marker" <<<"${out}"; then
+    fail "a mangled marker inside an open block was not refused with its line: ${out}"
+fi
+grep -qF "not a clause or its continuation" <<<"${out}" &&
+    fail "a mangled marker inside an open block was refused as a clause: ${out}"
+grep -qF "block that started at line 3" <<<"${out}" ||
+    fail "a mangled marker inside an open block does not say which block it sits in: ${out}"
+# Both of its bullets are what the reader states of such a document, which is the
+# reading the refusal above stops: a milestone cannot be checked for fewer clauses
+# than it states.
+now_reads="$(clauses_of m0 "${WORK}/inside.md")"
+[ "${now_reads}" = $'A cap parks the run.\nA scorer fails CI.' ] ||
+    fail "a mangled marker inside an open block changed the clauses read: ${now_reads}"
+# Hard-wrapped prose whose last line ends in a colon is shaped like the marker,
+# so it is still refused. It is prose, so the refusal says what to do about it.
+printf '## M0: A milestone\n\n**Delivers:** a runner that\naccepts one of three decisions:\n\n**Acceptance:**\n\n- A cap parks the run.\n- Cases in JSONL run the same, written over two lines.\n- A scorer fails CI.\n' >"${WORK}/wrapped.md"
+list_check_against 1 "so rewrap it or reword it so it does not end in one" "${WORK}/wrapped.md" "${WORK}/list.txt" m0
+# A fenced code block is example text, which states no heading, no marker and no
+# clause: what it holds is this check's business no more than a milestone's prose
+# is. A fence left open at the section's end is refused, since what it held and
+# the sections after it went unread, and its own closer cannot be found.
+printf '## M0: A milestone\n\n**Delivers:** a thing, as\n\n```markdown\n- Accepts one of three decisions:\n**Acceptance, files and data:**\n```\n\nand as YAML:\n\n```yaml\nacceptance_criteria:\n  - a cap parks the run\n```\n\n**Acceptance:**\n\n- A cap parks the run.\n- Cases in JSONL run the same, written over two lines.\n- A scorer fails CI.\n' >"${WORK}/fenced.md"
+check 0 "M0 acceptance: passed, 1 clause pending" --milestones "${WORK}/fenced.md" --log "${WORK}/ok.log"
+printf '## M0: A milestone\n\n**Acceptance:**\n\n- A cap parks the run.\n\n```yaml\nacceptance_criteria:\n' >"${WORK}/open-fence.md"
+list_check_against 1 "ends inside a fenced code block" "${WORK}/open-fence.md" "${WORK}/list.txt" m0
+# A heading of the milestone's own level that is about the acceptance ends the
+# section where it sits, before any marker-shaped line is consulted, so what sits
+# under it leaves the milestone with the heading. It is refused as the marker it
+# was meant to be, and the milestone it truncates is named. A mangled spelling of
+# the word is refused with it: a word whose letters hold the accept word is that
+# word to this check.
+for heading in '## Acceptance criteria' '## Aceptance criteria'; do
+    printf '## M0: A milestone\n\n**Delivers:** a thing.\n%s\n\n- A cap parks the run.\n- A scorer fails CI.\n' \
+            "${heading}" >"${WORK}/marker-heading.md"
+    out="$(python3 "${CHECK}" m0 --milestones "${WORK}/marker-heading.md" --list "${WORK}/list.txt" --check 2>&1)"
+    if [ $? -ne 1 ] || ! grep -qF "not an Acceptance block marker" <<<"${out}"; then
+        fail "a heading '${heading}' that ends a milestone was not refused: ${out}"
+    fi
+    grep -qF "M0 states no Acceptance clause" <<<"${out}" ||
+        fail "a milestone truncated by a heading '${heading}' was not named: ${out}"
+done
+# The same at the level a milestone under a phase heading has of its own.
+printf '## Phase\n\n### M3a: Small\n\n**Delivers:** a thing.\n### Acceptance:\n\n- A cap parks the run.\n' >"${WORK}/deep-heading.md"
+printf '# Nothing is listed.\n' >"${WORK}/none.txt"
+list_check_against 1 "M3A would be skipped" "${WORK}/deep-heading.md" "${WORK}/none.txt" m3a
+# A heading that states a milestone id ends a section as it should, though its
+# title is about the acceptance: it starts the next milestone's section.
+printf '## Phase\n\n### M3a: Small\n\n**Acceptance:**\n\n- A cap parks the run.\n\n### M3b: Acceptance under load\n\n**Acceptance:**\n\n- A scorer fails CI.\n' >"${WORK}/named-heading.md"
+printf '## A cap parks the run.\nbudgets a_cap_parks\n' >"${WORK}/m3a.txt"
+list_check_against 0 "lists M3A's 1 clauses" "${WORK}/named-heading.md" "${WORK}/m3a.txt" m3a
 # The same line before a block that does read: open block or not, it is the
 # line that is refused, and named with its number.
 printf '## M0: A milestone\n\n**Acceptance, files and data**:\n\n- A thing that is not a clause.\n\n**Acceptance:**\n\n- A cap parks the run.\n- Cases in JSONL run the same, written over two lines.\n- A scorer fails CI.\n' >"${WORK}/near-open.md"
@@ -341,54 +411,112 @@ done
 # that states no clause at all, or the check itself failing.
 MILESTONES="${ROOT}/docs/design/milestones.md"
 printf '# Nothing is listed.\n' >"${WORK}/sweep.txt"
-# sweep_ok <milestone> <milestones document> <empty list>: leaves what the check
-# said in `said`, and says whether that was exactly the sweep's answer.
+# sweep_ok <milestone> <document> <title> <what else the check is asked to say,
+# one problem per argument>: leaves what the check said in `said`, and says
+# whether those were the only problems, in that order. Each argument is matched
+# against the start of a problem line, so a message may say more than the test
+# asks. The list it asks with holds no clauses, so what the check always has to
+# say is that the list states none; of a milestone whose blocks all read that is
+# all it says. A block it could not read, a milestone that states no clause at
+# all, or the check itself failing says more, and that is what the arguments
+# name - and a run that crashed says something the shape below cannot match.
 sweep_ok() {
-    local id="$1" doc="$2" list="$3" title want
-    title="$(tr '[:lower:]' '[:upper:]' <<<"${id}")"
-    said="$(python3 "${CHECK}" "${id}" --milestones "${doc}" --list "${list}" --check 2>&1)"
-    [ $? -eq 1 ] || return 1
-    want="${list}: no clauses"$'\n\n'
-    want+="${title} acceptance: FAILED: the list cannot be checked"
-    [ "${said}" = "${want}" ]
+    local id="$1" doc="$2" title="$3" got code arg verdict
+    local -a lines
+    shift 3
+    got="$(python3 "${CHECK}" "${id}" --milestones "${doc}" --list "${WORK}/sweep.txt" --check 2>&1)"
+    code=$?
+    said="${got}"
+    [ "${code}" -eq 1 ] || return 1
+    verdict="${title} acceptance: FAILED: the list cannot be checked"
+    [[ "${got}" == *$'\n\n'"${verdict}" ]] || return 1
+    mapfile -t lines <<<"${got%$'\n\n'"${verdict}"}"
+    [ "${#lines[@]}" -eq $((1 + $#)) ] || return 1
+    [ "${lines[0]}" = "${WORK}/sweep.txt: no clauses" ] || return 1
+    local n=0
+    for arg in "$@"; do
+        [[ "${lines[$((1 + n))]}" == "${arg}"* ]] || return 1
+        n=$((n + 1))
+    done
 }
 swept=0
+# The ids the sweep asked about, for the count of clauses below.
+swept_ids=()
 while read -r milestone; do
-    sweep_ok "${milestone}" "${MILESTONES}" "${WORK}/sweep.txt" ||
+    sweep_ok "${milestone}" "${MILESTONES}" "$(tr '[:lower:]' '[:upper:]' <<<"${milestone}")" ||
         fail "${milestone}: the sweep asked with an empty list and heard: ${said}"
     swept=$((swept + 1))
+    swept_ids+=("${milestone}")
 done < <(grep -oE '^#+[[:space:]]+M[0-9]+[a-z]?' "${MILESTONES}" | grep -oE 'M[0-9]+[a-z]?')
 [ "${swept}" -gt 50 ] || fail "the sweep read only ${swept} milestone headings in ${MILESTONES}"
-# Only that answer passes, so a marker the check cannot read fails the sweep even
-# in a document no list asks about. A document of its own, written here, so that
-# no retitle of the real one can leave this asking about nothing.
-printf '## M4: Split\n\n**Acceptance:**\n\n- A cap parks the run.\n\n### M4b\n\n**Acceptance, beyond the full M4 test**:\n\n- Restarting twice costs nothing.\n' >"${WORK}/near-doc.md"
-sweep_ok m4b "${WORK}/near-doc.md" "${WORK}/sweep.txt" &&
-    fail "the sweep passed a marker it cannot read: ${said}"
-grep -qF "not an Acceptance block marker" <<<"${said}" ||
-    fail "the sweep did not name the marker it cannot read: ${said}"
-# Nor a run of the check that failed outright, whose traceback names no file.
-sweep_ok m12 "${MILESTONES}" "${WORK}/no-such-list.txt" &&
+# How many clauses the document states, over every milestone heading. The sweep
+# above only asks that nothing went unread; a shape that stops the reader early
+# loses clauses too, and a document whose blocks all read says so by how many it
+# states. The count is a floor, which a document with more milestones clears.
+stated_total=0
+for milestone in "${swept_ids[@]}"; do
+    n="$(clauses_of "${milestone}" "${MILESTONES}" | grep -c .)"
+    stated_total=$((stated_total + n))
+done
+[ "${stated_total}" -ge 425 ] ||
+    fail "the reader states ${stated_total} clauses over ${MILESTONES}, fewer than the 425 it states today"
+# Only that answer passes, so anything else the check has to say of a milestone
+# fails the sweep: a marker it cannot read, a milestone that states no clause, a
+# document it cannot open. A document of the sweep's own, written here, so that no
+# retitle of the real one can leave this asking about nothing.
+named_doc="${WORK}/named-doc.md"
+printf '## M4: Split\n\n**Acceptance:**\n\n- A cap parks the run.\n\n### M4b\n\n**v1.0.** Finishes M4.\n' >"${named_doc}"
+# marker_line <milestone> <title> <document> <line number>: the check's answer for
+# that milestone in that document, when all that is wrong is the one line.
+marker_line() {
+    sweep_ok "${1}" "${3}" "${2}" \
+        "${3}:${4}: not an Acceptance block marker" \
+        "${3}: ${2} states no Acceptance clause"
+}
+# So a marker the check cannot read is named even in a document no list asks
+# about, by its line. A "b" part is not also named as stating no clause, since it
+# inherits its parent's; the refusal is what the sweep cannot take.
+printf '\n**Acceptance, beyond the full M4 test**:\n\n- Restarting twice costs nothing.\n' >>"${named_doc}"
+sweep_ok m4b "${named_doc}" M4B "${named_doc}:11: not an Acceptance block marker" ||
+    fail "a marker the check cannot read is not named as the sweep hears it: ${said}"
+# A document the check cannot open says so in a traceback that names neither a
+# line nor a milestone, so it is never the one answer the sweep takes.
+sweep_ok m12 M12 "${WORK}/no-such-doc.md" &&
     fail "the sweep passed a check that failed outright: ${said}"
-# Nor a milestone that states no clause at all: it is named, so the sweep cannot
-# pass a document whose milestone states none.
+grep -qF "Traceback" <<<"${said}" ||
+    fail "a document the check cannot open is not asked about as one: ${said}"
+# A milestone that states no clause at all is named, so a document whose
+# milestone states none is never the answer the sweep takes either.
 printf '## M0: A milestone\n\n**Delivers:** a thing.\n' >"${WORK}/no-clause-doc.md"
-sweep_ok m0 "${WORK}/no-clause-doc.md" "${WORK}/sweep.txt" &&
-    fail "a milestone stating no clause passed as the answer the sweep takes: ${said}"
-grep -qF "M0 states no Acceptance clause" <<<"${said}" ||
-    fail "a milestone stating no Acceptance clause is not named: ${said}"
-# Which is what a milestone whose only marker is mangled comes to: its clauses
-# sit under a line that opens no block, so none of them is read. Each shape
-# below must fail the sweep, naming the milestone whose clauses went unread.
-for marker in 'Acceptance:' '__Acceptance:__' '**Acceptence:**' \
-    '**Acceptances:**' '- **Acceptance:**'; do
+sweep_ok m0 "${WORK}/no-clause-doc.md" M0 \
+    "${WORK}/no-clause-doc.md: M0 states no Acceptance clause" ||
+    fail "a milestone stating no clause is not named: ${said}"
+# Which is what a milestone whose only marker is mangled comes to: its clauses sit
+# under a line that opens no block, so none of them is read, and the check says
+# both the line and the milestone. The wrapper may be none, bold, or a bullet -
+# `+` and a number among them - and the word misspelt or plural.
+for marker in 'Acceptance:' 'acceptance:' '__Acceptance:__' '**Acceptence:**' \
+    '**Acceptances:**' '- **Acceptance:**' '+ **Acceptance:**' '1. **Acceptance:**'; do
     printf '## M0: A milestone\n\n**Delivers:** a thing.\n\n%s\n\n- A cap parks the run.\n- A scorer fails CI.\n' \
             "${marker}" >"${WORK}/mangled-doc.md"
-    sweep_ok m0 "${WORK}/mangled-doc.md" "${WORK}/sweep.txt" &&
-        fail "the sweep passed a milestone whose only marker was '${marker}': ${said}"
-    grep -qF "M0 states no Acceptance clause" <<<"${said}" ||
-        fail "a milestone whose only marker was '${marker}' is not named: ${said}"
+    marker_line m0 M0 "${WORK}/mangled-doc.md" 5 ||
+        fail "a milestone whose only marker was '${marker}' is not named as the sweep hears it: ${said}"
 done
+# A heading of the milestone's own level is the same shape, read as the next
+# section's start rather than as a marker, and named as the line that ended the
+# milestone it truncated.
+printf '## M0: A milestone\n\n**Delivers:** a thing.\n\n## Acceptance criteria\n\n- A cap parks the run.\n' >"${WORK}/heading-doc.md"
+sweep_ok m0 "${WORK}/heading-doc.md" M0 \
+    "${WORK}/heading-doc.md:5: not an Acceptance block marker" \
+    "${WORK}/heading-doc.md: M0 states no Acceptance clause" ||
+    fail "a heading that truncates a milestone is not named as the sweep hears it: ${said}"
+# A fence left open at the end says so too, though it names no line: what it held
+# and every section after it went unread.
+printf '## M0: A milestone\n\n**Delivers:** a thing.\n\n```yaml\nacceptance_criteria:\n' >"${WORK}/open-fence-doc.md"
+sweep_ok m0 "${WORK}/open-fence-doc.md" M0 \
+    "${WORK}/open-fence-doc.md: M0's section ends inside a fenced code block" \
+    "${WORK}/open-fence-doc.md: M0 states no Acceptance clause" ||
+    fail "a fence left open is not named as the sweep hears it: ${said}"
 
 # The features it runs with are those CI builds the tests with, so nothing
 # rebuilds.

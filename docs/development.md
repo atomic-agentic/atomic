@@ -235,14 +235,24 @@ parent's. A "b" part finishes its parent's work, so its list states its parent's
 clauses as well as its own; an "a" part states only its own. Only a line that
 states a marker opens a block, and only a block holds clauses, so what is
 written under a line that opens none, or under a deeper heading that states
-none, is read as nothing. Each such line is refused with its line number:
-outside a block, every line that leads with a spelling of `accept` and ends in
-a colon, however it is wrapped or spelt (`Acceptance:`, `__Acceptance:__`,
-`**Acceptence:**`, `- **Acceptance, files and data:**`); within a block, every
-line that begins `**Acceptance` and is not a marker; and under a deeper
-heading, every bullet, of whatever shape. A clause carried onto its next line
-is read as one clause only when that line is indented by at least two spaces
-and begins with neither a bullet nor a number, so a hard-wrapped clause whose
+none, is read as nothing. Each such line is refused with its line number: every
+line that begins `**Acceptance` and is not a marker, open block or not; every
+other line that leads, after a bullet or markdown punctuation at most, with a
+spelling of `accept` and ends in a colon, open block or not (`Acceptance:`,
+`__Acceptance:__`, `**Acceptence:**`, `- **Acceptance, files and data:**`,
+`+ **Acceptance, files and data:**`, `1. **Acceptance, files and data:**`) —
+within a block, the clauses under such a line are read as more clauses of the
+block above it, since a marker ends a block and this one opens none; a heading
+of the milestone's own level that is about the acceptance and states no
+milestone id, which ends the milestone where it sits (`### Acceptance:`,
+`## Aceptance criteria`); and, under a deeper heading, every bullet, of
+whatever shape. A fenced code block states nothing at all — no heading, no
+marker, no clause, however its lines are shaped — and a fence left open at the
+end of a milestone's section is refused, since what it held and the sections
+after it went unread. A line of prose that only happens to end in a colon is
+marker-shaped to the check, so rewrap it. A clause carried onto its next line is
+read as one clause only when that line is indented by at least two spaces and
+begins with neither a bullet nor a number, so a hard-wrapped clause whose
 continuation begins with a number, as `  100. The run then waits.`, is refused
 too.
 
