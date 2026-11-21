@@ -1517,7 +1517,9 @@ fn surer(a: Strength, b: Strength) -> Strength {
 /// `{"token": {"<key>": 1}}`, whatever word it spells, or when what is
 /// left of it once it redacts as text does; else as it redacts as text.
 /// A key redacted in part is judged by what is left of it, as a second pass
-/// would judge it, so a second pass leaves it as it is.
+/// would judge it. Keys that collide once redacted are numbered after this,
+/// and a second pass can then hide one of them whole, when what precedes
+/// its number is itself a long number; that only ever hides more.
 fn held_key(key: &str) -> Option<String> {
     if held_credential(key) {
         return Some(REDACTED.to_owned());

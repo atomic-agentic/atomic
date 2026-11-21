@@ -1470,8 +1470,9 @@ fn a_padded_held_credential_key_is_hidden() {
 }
 
 /// Two held keys that redact alike and end in a long number settle in one
-/// pass: the padded token in each is hidden whole before they are
-/// numbered, so no number is left to read as a credential on a second.
+/// pass when each is hidden whole before they are numbered, as a padded
+/// token is. (Keys that redact as text first can still be hidden on a
+/// second pass; that only hides more.)
 #[test]
 fn held_keys_numbered_after_a_long_number_settle_in_one_pass() {
     let other = concat!("ghp_", "zyxwvutsrqponmlkjihgfedcba9876543210");
