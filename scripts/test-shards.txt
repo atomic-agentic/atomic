@@ -62,6 +62,8 @@ test gates
 test nested_steps
 test step_positions
 test test_database
+test stop_all
+test stop_bomb
 
 [crash]
 test crash
