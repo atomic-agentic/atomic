@@ -1070,8 +1070,13 @@ fn assigned(input: &str) -> Option<String> {
         // one written hard against its name, `passwd:Permission denied …`,
         // or inside `Some(`, is no error message's shape. The byte after the
         // separator is tested itself, since `value_start` skips `Some(` too.
+        // Never under a header's name, such as `proxy-authorization`: what a
+        // header holds is a credential, however it reads, and a later pass
+        // over the same text, such as a JSON string's own, takes what this
+        // one hid as the header's credential and hides the rest with it.
         let set_off = bytes.get(sep + sep_len).is_some_and(is_blank);
-        let bare = value_from == start && set_off;
+        let header = is_header_name(&input[name_start..name_end]);
+        let bare = value_from == start && set_off && !header;
         if bare && is_os_error(&input[value_from..]) {
             at = at.max(value_to);
             continue;
@@ -1591,9 +1596,7 @@ fn header_named(name: &str) -> Option<&str> {
     } else {
         name.rsplit('.').next().unwrap_or(name)
     };
-    [name, last]
-        .into_iter()
-        .find(|n| HEADERS.iter().any(|h| n.eq_ignore_ascii_case(h)))
+    [name, last].into_iter().find(|n| is_header_name(n))
 }
 
 /// A key [`rename_keys`] renamed: what it was, and its new name before any
@@ -1780,6 +1783,11 @@ fn key_looks_like_credential(key: &str) -> bool {
         .is_some_and(|(user, host)| !user.is_empty() && host.contains('.'));
     !(is_not_a_secret(key) || email || key.split(['-', '_', '.', '/', ':']).all(word))
         && looks_like_credential(key)
+}
+
+/// Whether `name` is one of [`HEADERS`], in any case.
+fn is_header_name(name: &str) -> bool {
+    HEADERS.iter().any(|h| name.eq_ignore_ascii_case(h))
 }
 
 /// Header names whose values are credentials.

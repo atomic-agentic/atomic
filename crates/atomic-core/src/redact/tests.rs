@@ -2267,6 +2267,33 @@ fn planted_secrets_after_a_secret_name_stay_hidden_beside_os_errors() {
             n += 1;
         }
     }
+    // An operating system's error under a header's name, read twice: once
+    // as text and again as the JSON around it, by excerpt(), or inside a
+    // JSON string that value() reads twice. The header's value is a
+    // credential, so the second reading must not find the secret. (A log
+    // line holding it, read once by value(), shows the secret after the
+    // error on main too: only its first word is taken for the value.)
+    for _ in 0..8 {
+        let secret = planted.secret();
+        let log = format!("proxy-authorization: Permission denied (os error 13) {secret}");
+        let nested =
+            format!("open proxy-authorization : Permission denied (os error 13) :{secret}");
+        let line = serde_json::json!({"log": log});
+        let args = serde_json::json!({"args": serde_json::json!({"log": nested}).to_string()});
+        let mut read = args.clone();
+        value(&mut read);
+        let readings = [
+            excerpt(&line.to_string(), 4096),
+            excerpt(&args.to_string(), 4096),
+            read.to_string(),
+        ];
+        for reading in readings {
+            if reading.contains(&secret) {
+                shown.push(n);
+            }
+            n += 1;
+        }
+    }
     assert!(
         shown.is_empty(),
         "planted secrets shown in cases {shown:?} of {n}"
