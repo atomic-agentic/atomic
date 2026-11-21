@@ -898,8 +898,9 @@ async fn remove_caches(id: &str, caches: atomic_core::worktree::Caches) {
     }
 }
 
-/// [`run_pipeline`]'s work, leaving in `caches` the run's build caches once
-/// a worktree step has used them.
+/// [`run_pipeline`]'s work, leaving in `run_caches` the run's build caches,
+/// named before its first step, for [`run_pipeline`] to settle when the run
+/// ends.
 async fn run_pipeline_in<C: WorkflowContext>(
     ctx: C,
     run: PipelineRun,
@@ -1054,22 +1055,26 @@ async fn run_pipeline_in<C: WorkflowContext>(
     } else {
         None
     };
-    // The run's build caches, named once for all its worktree steps from
-    // what its first step recorded, with the person's rustup toolchains
-    // found once; named before any step, so a run that ends before its
-    // first worktree step still removes what an earlier execution left.
-    if pipeline
-        .steps
-        .iter()
-        .any(|s| matches!(s, Step::Atom(step) if step.worktree))
-        && let Some(worktrees) = &run_worktrees
-    {
-        let rustup = atomic_core::worktree::rustup_home(&|n| std::env::var(n).ok());
-        *run_caches = Some(
-            worktrees
-                .caches(ctx.workflow_id(), pinned.caches.as_deref(), rustup)
-                .map_err(|e| failed(format!("the run's build caches: {e}")))?,
-        );
+    // The run's build caches, named once for all its worktree and exec
+    // steps from what its first step recorded, with the person's rustup
+    // toolchains found once; named before any step, so a run that ends
+    // before the first step that uses them still removes what an earlier
+    // execution left. Made only when a step uses them.
+    let rustup = || atomic_core::worktree::rustup_home(&|n| std::env::var(n).ok());
+    let named = match (&services.caches, &run_worktrees) {
+        (Some(root), _) => Some(atomic_core::worktree::Caches::for_run(
+            root,
+            ctx.workflow_id(),
+            pinned.caches.as_deref(),
+            rustup(),
+        )),
+        (None, Some(worktrees)) => {
+            Some(worktrees.caches(ctx.workflow_id(), pinned.caches.as_deref(), rustup()))
+        }
+        (None, None) => None,
+    };
+    if let Some(named) = named {
+        *run_caches = Some(named.map_err(|e| failed(format!("the run's build caches: {e}")))?);
     }
     let mut accepted = Vec::new();
     for (position, step) in pipeline.steps.iter().enumerate() {
@@ -1271,7 +1276,8 @@ struct RunScope<'a> {
     worktrees: Option<&'a Arc<Worktrees>>,
     /// The commits its earlier worktree steps made.
     accepted: &'a [String],
-    /// The run's build caches, once a worktree step needs them.
+    /// The run's build caches, shared by its worktree and exec turns,
+    /// repairs and reviews included.
     caches: Option<&'a atomic_core::worktree::Caches>,
 }
 
@@ -1475,14 +1481,21 @@ async fn turn<C: WorkflowContext>(
             step_id: t.name.clone(),
         };
         let (opening, who, backend) = (atom.clone(), identity.clone(), runtimes.backend.shared());
+        // The run's own build caches, with a Cargo target of the turn's own.
+        let exec_caches = run.caches.map(|c| c.for_exec(&t.name));
         let place = format!("run {run_id}, step {}", t.name);
         let attempt_step = format!("{}.attempt", t.name);
         let (begun, opened) = if replay.is_some() {
             (attempt::begin(ctx, &attempt_step).await?, None)
         } else {
             attempt::begin_with(ctx, &attempt_step, move || async move {
-                let opened =
-                    atomic_core::runtime::open_exec_workspace(&opening, &who, backend).await;
+                let opened = atomic_core::runtime::open_exec_workspace(
+                    &opening,
+                    &who,
+                    backend,
+                    exec_caches.as_ref(),
+                )
+                .await;
                 crate::workflows::settled(opened, &place, true).await
             })
             .await?
@@ -1501,10 +1514,12 @@ async fn turn<C: WorkflowContext>(
     let serving = replay.clone();
     let repair = t.repair.clone();
     let charge = t.charge;
+    let step_caches = run.caches.map(|c| c.for_exec(&t.name));
     execute_candidate_told(ctx, &format!("{}.turn", t.name), move |position| {
         // The turn runs again after a park is released, so each run
         // takes its own copies.
         let mut runtimes = runtimes.clone();
+        let step_caches = step_caches.clone();
         let (atom, atom_input, origins) = (atom.clone(), atom_input.clone(), origins.clone());
         let repair = repair.clone();
         let (id, ran, run_id) = (id.clone(), ran.clone(), run_id.clone());
@@ -1564,14 +1579,18 @@ async fn turn<C: WorkflowContext>(
                 Some((begun, false, opened, _)) => {
                     let replayed = begun.interrupted();
                     // A replayed attempt opened no workspace here.
-                    (replayed, !replayed && opened.lock().map_or(true, |o| o.is_none()))
+                    (
+                        replayed,
+                        !replayed && opened.lock().map_or(true, |o| o.is_none()),
+                    )
                 }
                 _ => (false, false),
             };
             let admitted = if (replayed || taken) && metered {
-                ledgered.command_admitted(&at).await.map_err(|e| {
-                    failed(format!("step `{id}`: read its command's attempts: {e}"))
-                })?
+                ledgered
+                    .command_admitted(&at)
+                    .await
+                    .map_err(|e| failed(format!("step `{id}`: read its command's attempts: {e}")))?
             } else {
                 true
             };
@@ -1587,6 +1606,7 @@ async fn turn<C: WorkflowContext>(
                 (_, Some((_, _, opened, identity))) => {
                     let clock = runtimes.clock.clone();
                     let backend = runtimes.backend.shared();
+                    let exec_caches = step_caches.clone();
                     // The store the model runtimes check references against.
                     let artifacts = runtimes.codex.artifacts.clone();
                     let meter = runtimes.exec_meter.clone();
@@ -1599,8 +1619,13 @@ async fn turn<C: WorkflowContext>(
                         let opened = match first {
                             Some(opened) => opened,
                             None => {
-                                atomic_core::runtime::open_exec_workspace(&atom, &identity, backend)
-                                    .await?
+                                atomic_core::runtime::open_exec_workspace(
+                                    &atom,
+                                    &identity,
+                                    backend,
+                                    exec_caches.as_ref(),
+                                )
+                                .await?
                             }
                         };
                         atomic_core::runtime::run_exec_opened(
@@ -2143,6 +2168,11 @@ pub struct Services {
     /// The project repository's worktrees, for `worktree: true` steps, or
     /// `None` when the project is not in a git repository.
     pub worktrees: Option<Arc<Worktrees>>,
+    /// Where each run's build caches go, the state directory's `cache/`:
+    /// a directory of the run's own there, which its worktree and exec
+    /// steps may write and which goes when the run ends. `None` puts them
+    /// beside the run's worktrees, and a run with neither gets none.
+    pub caches: Option<PathBuf>,
     /// The budget settings every run's model calls are metered under.
     pub budgets: Arc<BudgetSettings>,
     /// The public context settings a step whose atom declares a context is

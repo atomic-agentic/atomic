@@ -1406,7 +1406,7 @@ pub async fn run_exec(
     artifacts: &Artifacts,
     meter: &Metering,
 ) -> Result<(Value, RunMetadata), AtomError> {
-    let workspace = open_exec_workspace(atom, identity, backend).await?;
+    let workspace = open_exec_workspace(atom, identity, backend, None).await?;
     run_exec_opened(
         atom, compiled, input, identity, workspace, clock, artifacts, meter,
     )
@@ -1416,13 +1416,21 @@ pub async fn run_exec(
 /// Open the workspace an exec atom's command will run in, as [`run_exec`]
 /// does. A workflow opens it before it records the step's attempt, so an
 /// attempt whose workspace never opened never counts as one whose command
-/// may have run.
+/// may have run. With `caches`, its run's own build caches, the command is
+/// pointed at them and may write them; what the atom declares wins. None
+/// outlives the run.
 pub async fn open_exec_workspace(
     atom: &AtomFile,
     identity: &EffectIdentity,
     backend: Arc<dyn atomic_exec::ExecutionBackend>,
+    caches: Option<&crate::worktree::Caches>,
 ) -> Result<WorkspaceGuard, AtomError> {
-    let declared = declared_env(atom);
+    if let Some(caches) = caches {
+        caches
+            .create()
+            .map_err(|e| AtomError::Runtime(format!("the run's build caches: {e}")))?;
+    }
+    let (env, writable_roots) = exec_environment(atom, caches);
     open_workspace(
         backend,
         Open {
@@ -1431,11 +1439,29 @@ pub async fn open_exec_workspace(
             step: identity.step_id.clone(),
             attempt: new_attempt(),
             source: Some(atom.program.root.clone()),
-            env: declared,
+            writable_roots,
+            env,
             ..Open::default()
         },
     )
     .await
+}
+
+/// What an exec atom's command opens with besides its scratch directory:
+/// the environment, its run's build caches' variables, when it has them,
+/// then what the atom declares in its `env`, which wins; and the
+/// directories it may write, the caches alone.
+fn exec_environment(
+    atom: &AtomFile,
+    caches: Option<&crate::worktree::Caches>,
+) -> (std::collections::BTreeMap<String, String>, Vec<PathBuf>) {
+    let (mut env, mut writable_roots) = (std::collections::BTreeMap::new(), Vec::new());
+    if let Some(caches) = caches {
+        env.extend(caches.env());
+        writable_roots.push(caches.dir().to_owned());
+    }
+    env.extend(declared_env(atom));
+    (env, writable_roots)
 }
 
 /// The environment an atom declares in its `env`, by name.
@@ -1891,8 +1917,14 @@ async fn run_command(
         stdin,
         time_limit,
         output_limit: EXEC_OUTPUT_LIMIT,
-        // A confining backend lets it write its scratch directory only.
-        writable: workspace.scratch.iter().cloned().collect(),
+        // A confining backend lets it write its scratch directory and its
+        // run's build caches only.
+        writable: workspace
+            .scratch
+            .iter()
+            .chain(&workspace.writable_roots)
+            .cloned()
+            .collect(),
         // Inside it, the inputs it is given, which it only reads.
         read_only: reach.read_only,
         network: reach.network,
