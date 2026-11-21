@@ -252,12 +252,32 @@ impl SignIn {
                 .map_err(|e| file(format!("{}: {e}", parent.display())))?;
             builder.recursive(false);
         }
-        let existed = match builder.create(&located.auth_home) {
-            Ok(()) => false,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => true,
-            Err(e) => return Err(file(format!("{}: {e}", located.auth_home.display()))),
+        // Found, it is checked where it is and never made again here: one
+        // another invocation removed meanwhile is made by this one, which
+        // then knows it made it.
+        let mut existed = None;
+        for _ in 0..3 {
+            match builder.create(&located.auth_home) {
+                Ok(()) => existed = Some(false),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if crate::state::existing_private_dir(&located.auth_home)
+                        .map_err(|e| file(e.to_string()))?
+                    {
+                        existed = Some(true);
+                    }
+                }
+                Err(e) => return Err(file(format!("{}: {e}", located.auth_home.display()))),
+            }
+            if existed.is_some() {
+                break;
+            }
+        }
+        let Some(existed) = existed else {
+            return Err(file(format!(
+                "{} kept appearing and going while it was made; try again",
+                located.auth_home.display()
+            )));
         };
-        crate::state::private_dir(&located.auth_home).map_err(|e| file(e.to_string()))?;
         let auth_home =
             std::fs::canonicalize(&located.auth_home).unwrap_or_else(|_| located.auth_home.clone());
         // Where it was made, as it really is: a link on the way, such as a
@@ -329,12 +349,17 @@ impl SignIn {
         let keep = match after {
             // The store could not be made to forget an entry that outlived
             // the directory: whatever it reads is no sign-in of this
-            // invocation's, and the directory goes, failing closed.
+            // invocation's, and the directory goes, failing closed. A
+            // sign-in another login saved in that moment stays in the store,
+            // but with no directory reads as no sign-in until it logs in
+            // again.
             Tidy::Login(Forgot::Failed) => false,
             Tidy::Login(forgot) => match self.stored() {
                 // Forgotten before the flow began (see `log_in`), so a sign-in
                 // there now was saved since. Not forgotten, it is one only if
-                // a save, which leaves its locks, put it there.
+                // a save, which leaves its locks, put it there; locks a
+                // concurrent logout or a refresh left keep it too, failing
+                // towards keeping a sign-in.
                 Ok(Some(_)) => forgot.keeps_a_sign_in(locked),
                 Ok(None) => false,
                 // Unknown: a directory with a lock file in it may have had a
@@ -343,7 +368,7 @@ impl SignIn {
             },
             Tidy::Logout { made, deleted } => match self.stored() {
                 // Trusted only once the logout's own delete went through.
-                Ok(Some(_)) => deleted || !made,
+                Ok(Some(_)) => !matches!((made, deleted), (true, false)),
                 Ok(None) => false,
                 // A logout that made the directory and cannot read the store
                 // removes it whatever locks its own forgetting left: it may
@@ -609,7 +634,26 @@ impl SignIn {
     /// whichever store `ATOMIC_CREDENTIAL_STORE` now chooses and even when
     /// revoking fails. Says what it found in each.
     pub async fn logout(&self) -> anyhow::Result<Forgotten> {
+        let outcome = self.log_out().await;
+        // A logout that made the directory and stopped short of the stores,
+        // or of the keyring, leaves no directory that would make an entry
+        // still in the keyring read as a sign-in.
+        let stopped_short = outcome.is_err() && self.made;
+        if stopped_short {
+            self.tidy(Tidy::Logout {
+                made: true,
+                deleted: false,
+            });
+        }
+        outcome
+    }
+
+    async fn log_out(&self) -> anyhow::Result<Forgotten> {
         protected()?;
+        #[cfg(test)]
+        if tests::logout_fails(&self.auth_home) {
+            anyhow::bail!("the test's logout stops before the stores");
+        }
         let route = crate::codex::auth_policy(&self.auth_home)
             .await?
             .auth_route_config;
@@ -941,6 +985,17 @@ mod tests {
 
     /// Kept for a directory whose keyring cannot be reached.
     const UNREACHABLE: &str = "unreachable";
+
+    /// Directories whose logout stops before it reaches the stores.
+    static LOGOUT_FAILS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+    pub(super) fn logout_fails(dir: &Path) -> bool {
+        LOGOUT_FAILS
+            .lock()
+            .expect("logout")
+            .iter()
+            .any(|d| d == dir)
+    }
 
     /// Directories whose keyring the probe finds unusable.
     static PROBE_FAILS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
@@ -1307,6 +1362,61 @@ mod tests {
                 "an outlived entry reads as a sign-in"
             );
         });
+    }
+
+    /// A logout that made the directory and stops before the stores leaves
+    /// no directory beside an entry that outlived an earlier one.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_logout_that_stops_short_leaves_no_directory_it_made() {
+        crate::testing::on_codex_runtime(async {
+            let dir = auth_dir("logout-short");
+            keep(&dir, Some(signed_in("account-old")));
+            std::fs::remove_dir(&dir).expect("its directory removed");
+            let located = SignIn {
+                store: AuthCredentialsStoreMode::Keyring,
+                ..SignIn::in_files(&dir)
+            };
+            let sign_in = SignIn::made_at(located, None).expect("made");
+            LOGOUT_FAILS
+                .lock()
+                .expect("logout")
+                .push(std::fs::canonicalize(&dir).expect("dir"));
+            let stopped = sign_in.logout().await.expect_err("stopped short");
+            assert!(
+                stopped.to_string().contains("stops before the stores"),
+                "{stopped}"
+            );
+            assert!(!dir.exists(), "the logout left the directory it made");
+            assert!(
+                sign_in.account().expect("account").is_none(),
+                "an outlived entry reads as a sign-in"
+            );
+        });
+    }
+
+    /// A logout trusts a sign-in it finds once its own delete went through,
+    /// or when the directory was there before it: one it made, whose delete
+    /// did not go through, goes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_logout_trusts_what_it_finds_only_once_its_delete_went_through() {
+        for (made, deleted, kept) in [
+            (true, false, false),
+            (true, true, true),
+            (false, false, true),
+        ] {
+            let dir = auth_dir(&format!("logout-trust-{made}-{deleted}"));
+            keep(&dir, Some(signed_in("account-1")));
+            let sign_in = SignIn {
+                store: AuthCredentialsStoreMode::Keyring,
+                made,
+                ..SignIn::in_files(&dir)
+            };
+            sign_in.tidy(Tidy::Logout { made, deleted });
+            assert_eq!(dir.exists(), kept, "made {made}, deleted {deleted}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     /// Tidying never goes through a link: it would remove what the link
