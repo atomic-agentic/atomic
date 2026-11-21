@@ -275,6 +275,13 @@ A manual run with the `macos` input adds "Rust (macos-15)", which builds and
 tests on macOS in one job. CodeQL runs in a workflow of its own, on pull
 requests too, and nothing in CI waits for it.
 
+Main is merged through a merge queue. A pull request whose checks pass joins
+the queue, which runs CI again on the pull request merged onto main and its
+other queued pull requests (the `merge_group` event), and merges it only if
+those checks pass. So what reaches main has passed CI as it is merged, and a
+pull request is not held back by changes elsewhere on main. CodeQL is not one of
+the queue's checks.
+
 ### Test shards
 
 `scripts/test-shards.txt` assigns each test target to a shard: each
