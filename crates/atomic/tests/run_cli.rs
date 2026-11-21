@@ -750,6 +750,21 @@ fn state_dir(dir: &Path, project: &Path) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(&out.stdout).trim())
 }
 
+/// The store of the `notes` project whose state directory is `state`,
+/// opened as atomic opens it, for that project, by its manifest's name and
+/// its state id: what it lists of parks is the project's.
+async fn project_store(state: &Path) -> Durare {
+    let id = state.file_name().expect("a project id").to_string_lossy();
+    Durare::open(
+        &atomic_durable::Database::Sqlite(database(state)),
+        None,
+        atomic_app::pipeline::LAYOUT_VERSION,
+        &format!("notes/{id}"),
+    )
+    .await
+    .expect("store")
+}
+
 /// The database of the project whose state directory is `state`
 /// (`<home>/projects/<id>`): `<home>/private/<id>/atomic.db`.
 fn database(state: &Path) -> PathBuf {
@@ -2090,7 +2105,7 @@ fn a_resumed_run_keeps_the_budget_it_already_spent() {
             &with(&env, &[]),
             &dir.join("resumed.log"),
         );
-        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        let rt = project_store(&state).await;
         let started = Instant::now();
         let park = loop {
             if let Some(p) = atomic_durable::parks(&rt, "budget-1")
@@ -2709,14 +2724,15 @@ fn a_gate_recovered_by_serve_keeps_its_first_deadline_and_is_approved_from_anoth
         .await
         .expect("enrolled");
 
-        // A local serve recovers it.
-        let mut serve = spawn(
+        // A local serve recovers it. Reaped, so that an assertion that
+        // fails below does not leave `atomic serve` running.
+        let mut serve = Reaped(spawn(
             &dir,
             &project,
             &["serve"],
             &with(&env, &[]),
             &dir.join("serve.log"),
-        );
+        ));
         wait_until("serve to start", || {
             std::fs::read_to_string(dir.join("serve.log"))
                 .is_ok_and(|l| l.contains("recovered 1 unfinished run(s); serving until stopped"))
@@ -2743,11 +2759,28 @@ fn a_gate_recovered_by_serve_keeps_its_first_deadline_and_is_approved_from_anoth
         .expect("child");
         assert!(out.status.success(), "{}", text(&out));
         let started = Instant::now();
-        while rt.status("served-gate").await.expect("status") != Some(RunStatus::Succeeded) {
+        loop {
+            let status = rt.status("served-gate").await.expect("status");
+            if status == Some(RunStatus::Succeeded) {
+                break;
+            }
+            let log = || {
+                std::fs::read_to_string(dir.join("serve.log"))
+                    .unwrap_or_else(|e| format!("<no serve log: {e}>"))
+            };
+            // A run that has failed is finished, and not successfully: say
+            // so now, with what it failed as, instead of waiting out the
+            // deadline below.
+            if let Some(RunStatus::Failed(why)) = &status {
+                panic!(
+                    "serve failed the approved run ({status:?}): {why}\nserve log: {}",
+                    log()
+                );
+            }
             assert!(
                 started.elapsed() < Duration::from_secs(60),
-                "serve did not finish the approved run: {}",
-                std::fs::read_to_string(dir.join("serve.log")).unwrap_or_default()
+                "serve did not finish the approved run (last status {status:?}): {}",
+                log()
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
@@ -5512,18 +5545,22 @@ fn signals_ignored_when_serve_starts_stay_ignored() {
     let log = dir.join("serve.log");
     // As `nohup`, and a shell starting a background job, leave them.
     let script = format!("trap '' HUP INT QUIT; exec '{ATOMIC}' serve");
-    let mut serve = command_as(
-        Path::new("/bin/sh"),
-        &dir,
-        &project,
-        &["-c", &script],
-        &UNUSED_MODEL,
-    )
-    .stdin(Stdio::null())
-    .stdout(Stdio::null())
-    .stderr(std::fs::File::create(&log).expect("log"))
-    .spawn()
-    .expect("start serve");
+    // Reaped, so that an assertion that fails below does not leave `atomic
+    // serve` running: the shell execs it, so the child is serve itself.
+    let mut serve = Reaped(
+        command_as(
+            Path::new("/bin/sh"),
+            &dir,
+            &project,
+            &["-c", &script],
+            &UNUSED_MODEL,
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&log).expect("log"))
+        .spawn()
+        .expect("start serve"),
+    );
     wait_until("serve to start", || {
         std::fs::read_to_string(&log).is_ok_and(|l| l.contains("serving until stopped"))
     });
@@ -6501,7 +6538,7 @@ fn a_budget_in_the_projects_configuration_reaches_its_runs() {
             &with(&env, &[]),
             &dir.join("run.log"),
         );
-        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        let rt = project_store(&state).await;
         let started = Instant::now();
         let park = loop {
             if let Some(p) = atomic_durable::parks(&rt, "configured-1")
@@ -6854,13 +6891,12 @@ fn a_restarted_server_recovers_only_its_own_runs_on_postgres() {
     });
 }
 
-/// A spawned `atomic` process that is killed and reaped when this is
-/// dropped, if it has not ended by then: a test that fails part-way leaves
-/// nothing running on its schema once the schema's guard drops it.
-#[cfg(feature = "postgres-tests")]
+/// A spawned child process — `atomic` itself, or the shell that execs it —
+/// that is killed and reaped when this is dropped, if it has not ended by
+/// then: a test that fails part-way leaves nothing running behind it, and
+/// nothing holding its schema once the schema's guard drops it.
 struct Reaped(Child);
 
-#[cfg(feature = "postgres-tests")]
 impl std::ops::Deref for Reaped {
     type Target = Child;
     fn deref(&self) -> &Child {
@@ -6868,14 +6904,12 @@ impl std::ops::Deref for Reaped {
     }
 }
 
-#[cfg(feature = "postgres-tests")]
 impl std::ops::DerefMut for Reaped {
     fn deref_mut(&mut self) -> &mut Child {
         &mut self.0
     }
 }
 
-#[cfg(feature = "postgres-tests")]
 impl Drop for Reaped {
     fn drop(&mut self) {
         let _ = self.0.kill();

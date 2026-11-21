@@ -35,6 +35,7 @@ test budgets
 test change_request
 test change_request_example
 test change_review_helpers
+test catalog_checker
 test coding_tasks
 test command_environment
 test entry_point
