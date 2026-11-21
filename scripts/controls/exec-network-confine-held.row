@@ -1,0 +1,1 @@
+exec-network-confine-held|crates/atomic-core/src/codex.rs|        if declares_hosts {|        if /*CONTROL_OFF*/ false {|-p atomic-agentic-core --lib --features fake-model a_command_with_hosts_is_confined_only_with_its_proxy_held

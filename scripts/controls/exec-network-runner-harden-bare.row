@@ -1,0 +1,1 @@
+exec-network-runner-harden-bare|crates/atomic/src/main.rs|        codex::harden_runner(); // the role first on the command line|        // CONTROL_OFF|-p atomic-agentic --test model_auth a_runner_cannot_be_read_through_proc_by_its_own_user
