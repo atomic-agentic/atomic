@@ -6066,7 +6066,7 @@ fn gates_are_listed_and_decided_in_the_postgres_store() {
         // gate, nor shows the run: to it, they are not there.
         let other_dir = dir.join("other");
         std::fs::create_dir_all(&other_dir).expect("other");
-        let other = project(&other_dir);
+        let other = crate::project(&other_dir);
         let in_other = |args: Vec<String>| {
             let (d, p, e) = (dir.clone(), other.clone(), env.clone());
             tokio::task::spawn_blocking(move || {
