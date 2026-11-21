@@ -27,11 +27,63 @@
 
 use atomic_core::testing::{FakeModel, Reply, on_codex_runtime};
 use serde_json::{Value, json};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 const ATOMIC: &str = env!("CARGO_BIN_EXE_atomic");
+
+/// How long a command that should finish may take before the test gives up on
+/// it: a suite that cannot reach its backend fails, and never hangs.
+const COMMAND_BOUND: Duration = Duration::from_secs(120);
+
+/// Run what `cmd` describes to its end, writing `stdin` to it, and say what it
+/// answered. A command still running after [`COMMAND_BOUND`] is killed and
+/// reaped, and the test fails: a command that hangs is never left running for
+/// the next one. Its pipes are read on a thread of their own, so a command
+/// that fills one is read while it is waited for.
+fn run_and_capture(cmd: &mut Command, stdin: &str, what: &str) -> Output {
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("start {what}: {e}"));
+    let mut input = child.stdin.take().expect("stdin");
+    let mut stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let stdin = stdin.to_owned();
+    let pipes = std::thread::spawn(move || {
+        let _ = input.write_all(stdin.as_bytes());
+        drop(input);
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let _ = stdout.read_to_end(&mut out);
+        let _ = stderr.read_to_end(&mut err);
+        (out, err)
+    });
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if started.elapsed() >= COMMAND_BOUND {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("{what} did not finish within {} s", COMMAND_BOUND.as_secs());
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => panic!("{what}: waiting for it: {e}"),
+        }
+    };
+    let (stdout, stderr) = pipes.join().expect("read the command's output");
+    Output {
+        status,
+        stdout,
+        stderr,
+    }
+}
 
 fn scratch(tag: &str) -> PathBuf {
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -193,8 +245,8 @@ fn eval(dir: &Path, project: &Path, url: &str, args: &[&str]) -> Output {
 
 /// `atomic <args>` run in `cwd`, with nothing configured: HOME and atomic's
 /// own state inside the test's scratch directory, no key and no endpoint from
-/// the environment, and no local Ollama for detection to find. What `env`
-/// adds is the only configuration the command sees.
+/// the environment, and no local Ollama for detection to find. What a caller
+/// adds to this is the only configuration the command sees.
 fn atomic_command(dir: &Path, cwd: &Path, args: &[&str]) -> Command {
     let mut cmd = Command::new(ATOMIC);
     cmd.args(args)
@@ -208,18 +260,13 @@ fn atomic_command(dir: &Path, cwd: &Path, args: &[&str]) -> Command {
         .env_remove("ATOMIC_DATABASE_URL")
         // Nothing listens on the discard port, so detection never finds a
         // local Ollama and an endpoint comes only from what a test sets.
-        .env("ATOMIC_DETECT_OLLAMA_ADDR", "127.0.0.1:9")
-        .stdin(Stdio::null());
+        .env("ATOMIC_DETECT_OLLAMA_ADDR", "127.0.0.1:9");
     cmd
 }
 
-/// `atomic <args>` run in `cwd` on that environment, with `env` added.
-fn atomic(dir: &Path, cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
-    let mut cmd = atomic_command(dir, cwd, args);
-    for (k, v) in env {
-        cmd.env(k, v);
-    }
-    cmd.output().expect("atomic")
+/// `atomic <args>` run in `cwd` on that environment, with nothing added.
+fn atomic(dir: &Path, cwd: &Path, args: &[&str]) -> Output {
+    run_and_capture(&mut atomic_command(dir, cwd, args), "", "atomic")
 }
 
 fn eval_with(dir: &Path, project: &Path, url: &str, args: &[&str], env: &[(&str, &str)]) -> Output {
@@ -396,23 +443,34 @@ fn from_init_to_a_passing_eval_records_and_replays_the_sample_case_within_the_bo
         // A new user's first command, in an empty directory of their own.
         let fresh = dir.join("note-tools");
         std::fs::create_dir_all(&fresh).expect("dir");
-        let init = atomic(&dir, &fresh, &["init"], &[]);
+        let init = atomic(&dir, &fresh, &["init"]);
         assert!(init.status.success(), "{}", text(&init));
 
         // Nothing is hand edited: the case recorded below is the one init
-        // wrote, with the expectation it ships with.
+        // wrote, with the expectation and the input it ships with.
         let case = std::fs::read_to_string(fresh.join("evals/summarize-note/export-crash.yaml"))
             .expect("the sample case init wrote");
         assert!(
             case.contains("output.summary.size() > 0"),
             "the case is init's own, not a test's: {case}"
         );
+        let note = case
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("text: "))
+            .unwrap_or_else(|| panic!("the case gives its own input: {case}"))
+            .to_owned();
 
         // Recorded live against the fake model: every atom with cases runs,
-        // which is the one atom init wrote, in one model call.
+        // which is the one atom init wrote, in one model call that asks with
+        // the note from init's own case.
         let live = eval_async(&dir, &fresh, &url, &["--live"]).await;
         assert!(live.status.success(), "{}", text(&live));
         assert_eq!(model.calls(), 1, "recording the case is one model call");
+        let asked = model.requests()[0].to_string();
+        assert!(
+            asked.contains(&note),
+            "the live eval sent the input from the case init wrote ({note}): {asked}"
+        );
         let out = String::from_utf8_lossy(&live.stdout);
         assert!(
             out.contains("PASS summarize-note: 1 of 1 cases passed"),
@@ -420,24 +478,32 @@ fn from_init_to_a_passing_eval_records_and_replays_the_sample_case_within_the_bo
         );
 
         // The recording is in the project, beside the case it answers, which
-        // is what makes the next replay need nothing but the project.
+        // is what makes the next replay need nothing but the project: one
+        // case, one recording.
         let cassettes = fresh.join("evals/summarize-note/cassettes");
         let recordings: Vec<PathBuf> = std::fs::read_dir(&cassettes)
             .unwrap_or_else(|e| panic!("{}: {e}", cassettes.display()))
             .map(|entry| entry.expect("entry").path())
             .collect();
-        assert!(
-            !recordings.is_empty(),
-            "the recorded answer is kept in the project: {recordings:?}"
+        assert_eq!(
+            recordings.len(),
+            1,
+            "the one case leaves one recording: {recordings:?}"
         );
 
         // Replayed: no key, no model call, the answer read off that
         // recording. It names the endpoint it was made against, so the replay
         // is given that same endpoint and the fake model counts whatever it
-        // is asked for.
+        // is asked for — which, offline, is nothing at all.
+        let sent = model.every_request();
         let replayed = eval_async(&dir, &fresh, &url, &["--json"]).await;
         assert!(replayed.status.success(), "{}", text(&replayed));
         assert_eq!(model.calls(), 1, "the replay made no model call");
+        assert_eq!(
+            model.every_request(),
+            sent,
+            "offline, the replay sent the endpoint no request of any kind"
+        );
         let report: Value =
             serde_json::from_slice(&replayed.stdout).expect("one JSON report from --json");
         assert_eq!(report["passed"], true, "the replayed report passes");
@@ -644,6 +710,13 @@ fn a_replay_reads_no_api_key_and_sends_none() {
         .await
         .expect("eval");
         assert!(live.status.success(), "{}", text(&live));
+        // The live eval sent one request per case, and nothing else.
+        let sent = model.every_request();
+        assert_eq!(
+            sent.len(),
+            2,
+            "two cases, two requests, no probe beside them: {sent:?}"
+        );
         let (d, p, u) = (dir.clone(), project.clone(), url.clone());
         let replay = tokio::task::spawn_blocking(move || {
             eval_with(&d, &p, &u, &["note", "--json"], &secret)
@@ -651,6 +724,12 @@ fn a_replay_reads_no_api_key_and_sends_none() {
         .await
         .expect("eval");
         assert!(replay.status.success(), "{}", text(&replay));
+        assert_eq!(model.calls(), 2, "the replay made no model call");
+        assert_eq!(
+            model.every_request(),
+            sent,
+            "the replay sent the endpoint no request of any kind"
+        );
         let report: Value = serde_json::from_slice(&replay.stdout).expect("one JSON report");
         assert_eq!(report["cassettes"][0]["replayed"], 2, "{report}");
         assert_eq!(

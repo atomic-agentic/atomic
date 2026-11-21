@@ -62,12 +62,20 @@ fn git_in(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_owned()
 }
 
+/// What git records about the repository at `dir` that a turn must not
+/// change: its refs, its worktrees, its working tree with every untracked
+/// file, its own configuration (`.git/config`, where a remote, a hook path or
+/// a filter driver would appear) and the counts and sizes of its objects. A
+/// test compares two of these, before a turn and after it, to say the
+/// repository was left alone.
 fn git_state(dir: &Path) -> String {
     format!(
-        "{}\n{}\n{}",
+        "{}\n{}\n{}\n{}\n{}",
         git_in(dir, &["for-each-ref"]),
         git_in(dir, &["worktree", "list", "--porcelain"]),
-        git_in(dir, &["status", "--porcelain", "--untracked-files=all"])
+        git_in(dir, &["status", "--porcelain", "--untracked-files=all"]),
+        git_in(dir, &["config", "--list", "--local"]),
+        git_in(dir, &["count-objects", "-v"]),
     )
 }
 
