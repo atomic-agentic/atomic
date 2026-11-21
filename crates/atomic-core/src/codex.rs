@@ -862,7 +862,9 @@ fn harden() {
 /// Harden `atomic runner` as [`dispatch`] hardens atomic: the commands it
 /// runs arrive on its stdin with their environments, and a confined one's
 /// with its proxy token, so no process of the same user may read its memory
-/// or its /proc files. Call it first, before the request is read.
+/// or the /proc files that show it, such as `environ` and `mem`; its
+/// `cmdline` and `stat` stay readable. Call it first, before the request is
+/// read.
 pub fn harden_runner() {
     // The runner holds commands' environments, proxy tokens among them.
     codex_process_hardening::pre_main_hardening();
@@ -1022,8 +1024,13 @@ fn an_option(arg: &std::ffi::OsString) -> bool {
 /// could read what they hold, or plant a key. The outer stage, which stays
 /// outside the sandbox while the command runs and was started with the
 /// command's proxy token in its environment, is also made non-dumpable, so
-/// no process of the same user can read that environment through /proc.
-/// (Exec resets it, so bubblewrap and the command are unaffected.)
+/// that from then on no process of the same user without `CAP_SYS_PTRACE`
+/// over its user namespace can read that environment through /proc; between
+/// its exec and this prologue, a few milliseconds, one can. Exec resets
+/// it: where the outer stage has no mounts of its own to manage it execs
+/// bubblewrap itself, by which time Codex's helper has taken the token out
+/// of its environment, and the bridges it forked first keep the token,
+/// non-dumpable.
 fn keep_sandbox_off_keyrings() {
     #[cfg(target_os = "linux")]
     if invoked_as_linux_sandbox() {
@@ -1075,7 +1082,9 @@ fn not_dumpable() -> std::io::Result<()> {
     not(feature = "exec-loopback-tests"),
     doc = r#"
 Only a build with the `exec-loopback-tests` feature, for the sandbox suites,
-can let a command reach this machine's loopback interface:
+can let a command reach this machine's loopback interface. (rustdoc does not
+check the error code of a `compile_fail` test; the twin below, which runs
+with the feature, pins that this fails for want of the method.)
 
 ```compile_fail,E0599
 fn widen(sandbox: atomic_core::codex::ExecSandbox) -> atomic_core::codex::ExecSandbox {

@@ -3519,9 +3519,11 @@ fn exec_commands_run_in_a_runner_process_when_asked() {
     assert_eq!(stdout_json(&local), stdout_json(&split));
     assert_eq!(count_log(&dir), 2);
 
-    // A runner process starts the command, and has only PATH from atomic's
-    // environment, which has HOME, USER and ATOMIC_HOME too. The command
-    // cannot see what started it, so it asks from here.
+    // A runner process starts the command. The command cannot see what
+    // started it, so it asks from here. The runner is non-dumpable, so its
+    // environment cannot be read from here; that it gets only PATH from
+    // atomic's is tested where its environment is set (atomic-exec's runner
+    // tests).
     let log = command_log(&dir, "parent-env.log");
     std::fs::write(
         project.join("tools/parent-env.py"),
@@ -3550,15 +3552,14 @@ fn exec_commands_run_in_a_runner_process_when_asked() {
     let names = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let seen = names.clone();
     let watch = RunnerWatch::new(vec![log], move |runner| {
-        let environ = std::fs::read(format!("/proc/{runner}/environ")).expect("environ");
-        let mut found: Vec<String> = environ
+        // Its command line stays readable, and says what it is.
+        let cmdline = std::fs::read(format!("/proc/{runner}/cmdline")).expect("cmdline");
+        let found: Vec<String> = cmdline
             .split(|b| *b == 0)
-            .filter(|e| !e.is_empty())
-            .map(|e| {
-                String::from_utf8_lossy(e.split(|b| *b == b'=').next().unwrap_or(e)).into_owned()
-            })
+            .skip(1)
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .filter(|a| !a.is_empty())
             .collect();
-        found.sort();
         *seen.lock().expect("names") = found;
     });
     let out = atomic(
@@ -3575,7 +3576,7 @@ fn exec_commands_run_in_a_runner_process_when_asked() {
         json!({"seen": true}),
         "a runner started it"
     );
-    assert_eq!(*names.lock().expect("names"), ["PATH"]);
+    assert_eq!(*names.lock().expect("names"), ["runner"]);
 }
 
 /// An exec atom whose command logs that it ran, then, the first time or

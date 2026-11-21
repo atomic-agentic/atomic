@@ -34,9 +34,10 @@
 //! bridge, which adds the token itself. Non-dumpable helpers only narrow who
 //! can read the token: the sandbox helper's outer stage and its bridges, and
 //! `atomic runner`, are non-dumpable once atomic's prologue has run, so only
-//! a process with `CAP_SYS_PTRACE` over their user namespace can read their
-//! environment; in the few milliseconds between the helper's exec and that
-//! prologue, a process of the same user can read it too. A command's token
+//! a process with `CAP_SYS_PTRACE` over their user namespace can read the
+//! token from the helpers' environment or from the runner's memory, where
+//! its request puts it; in the few milliseconds between the helper's exec
+//! and that prologue, a process of the same user can read it too. A command's token
 //! admits no new connection once the command ends, and the proxy stops once
 //! no command needs it.
 

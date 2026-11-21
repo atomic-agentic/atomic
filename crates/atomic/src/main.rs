@@ -254,7 +254,7 @@ fn real_main() -> anyhow::Result<()> {
         ..
     }) = &parsed
     {
-        codex::harden_runner();
+        codex::harden_runner(); // the role after global flags
         std::process::exit(atomic_exec::runner::serve_stdio(
             &mut atomic_core::redact::stderr_lines(),
         ));
