@@ -987,7 +987,6 @@ fn read_at_most(path: &Path, max: u64) -> std::io::Result<Option<Vec<u8>>> {
     use std::io::Read as _;
     let mut open = std::fs::OpenOptions::new();
     open.read(true);
-    #[cfg(unix)]
     let file = open.open(path)?;
     if !file.metadata()?.is_file() {
         return Err(std::io::Error::other("not a plain file"));
@@ -1339,7 +1338,8 @@ mod at {
     /// `scripts/controls/skill-dir-read-waits.row` the second.
     const READ_NOT_THROUGH_A_LINK: libc::c_int = libc::O_NOFOLLOW;
     const READ_WITHOUT_WAITING: libc::c_int = libc::O_NONBLOCK;
-    /// Both, as one set of flags, for a file read by its path.
+    /// Both, as one set of flags, for a file opened by name in a held
+    /// directory.
     pub(super) const READ_FLAGS: libc::c_int = READ_NOT_THROUGH_A_LINK | READ_WITHOUT_WAITING;
 
     /// The bytes of the plain file at `relative` below `root`, read through
@@ -1448,10 +1448,12 @@ mod at {
     /// The names in the directory held open as `dir`, but `.` and `..`.
     pub(super) fn list(dir: &OwnedFd) -> anyhow::Result<Vec<std::ffi::OsString>> {
         use std::os::unix::ffi::OsStringExt;
-        // fdopendir takes the descriptor it is given, so it is given a copy.
-        // SAFETY: dup takes an open descriptor and touches no memory.
+        // fdopendir takes the descriptor it is given, so it is given a copy,
+        // closed on exec as the original is.
+        // SAFETY: fcntl with F_DUPFD_CLOEXEC takes an open descriptor and a
+        // lowest number, and touches no memory.
         #[allow(unsafe_code)]
-        let copy = unsafe { libc::dup(dir.as_raw_fd()) };
+        let copy = unsafe { libc::fcntl(dir.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
         if copy < 0 {
             return Err(std::io::Error::last_os_error().into());
         }
@@ -1526,7 +1528,8 @@ mod at {
 
     /// The bytes of the plain file `name` in the directory held open as
     /// `dir`, opened never through a link and never waiting, or `None` when
-    /// it holds more than `max`.
+    /// it holds more than `max`. A file with other names, as a hard link
+    /// has, is refused, as [`read_plain`] refuses one.
     pub(super) fn read_in(
         dir: &OwnedFd,
         name: &OsStr,
@@ -1535,7 +1538,14 @@ mod at {
         use std::io::Read as _;
         let flags = libc::O_RDONLY | libc::O_CLOEXEC | READ_FLAGS;
         let file = std::fs::File::from(openat(dir.as_fd(), &c_name(name)?, flags, 0)?);
-        anyhow::ensure!(file.metadata()?.is_file(), "not a plain file");
+        let meta = file.metadata()?;
+        anyhow::ensure!(meta.is_file(), "not a plain file");
+        // `scripts/controls/skill-dir-read-in-one-name.row` switches this off.
+        let one_name = std::os::unix::fs::MetadataExt::nlink(&meta) == 1;
+        anyhow::ensure!(
+            one_name,
+            "it has other names, as a hard link does, and atomic reads only a file that is its own"
+        );
         let mut bytes = Vec::new();
         file.take(max + 1).read_to_end(&mut bytes)?;
         Ok((bytes.len() as u64 <= max).then_some(bytes))
@@ -3481,6 +3491,46 @@ mod tests {
             .map(|e| format!("{e:#}"))
             .unwrap_or_default();
         assert_eq!(refused, ".agents is not a directory");
+    }
+
+    /// A file in a held directory is never read through a link, even one put
+    /// there after the walk saw a plain file at its name.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_in_a_held_directory_is_never_read_through_a_link() {
+        let root = std::fs::canonicalize(scratch("read-in-link")).expect("canonical root");
+        std::fs::write(root.join("secret"), "a key\n").expect("secret");
+        std::os::unix::fs::symlink("secret", root.join("x")).expect("link");
+        let dir: std::os::fd::OwnedFd = std::fs::File::open(&root).expect("open").into();
+        let read = at::read_in(&dir, std::ffi::OsStr::new("x"), 1024);
+        let errno = read
+            .as_ref()
+            .err()
+            .and_then(|e| e.downcast_ref::<std::io::Error>())
+            .and_then(std::io::Error::raw_os_error);
+        assert_eq!(errno, Some(libc::ELOOP), "{:?}", read.map(|_| "read"));
+    }
+
+    /// Nor is a file with other names, as a hard link has, read and hashed
+    /// by one of them.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_in_a_held_directory_with_other_names_is_refused() {
+        let root = std::fs::canonicalize(scratch("read-in-names")).expect("canonical root");
+        std::fs::write(root.join("theirs"), "a key\n").expect("theirs");
+        std::fs::hard_link(root.join("theirs"), root.join("x")).expect("hard link");
+        let dir: std::os::fd::OwnedFd = std::fs::File::open(&root).expect("open").into();
+        let refused = at::read_in(&dir, std::ffi::OsStr::new("x"), 1024)
+            .err()
+            .map(|e| format!("{e:#}"))
+            .unwrap_or_default();
+        assert_eq!(
+            refused,
+            "it has other names, as a hard link does, and atomic reads only a file that is its own"
+        );
+        std::fs::remove_file(root.join("theirs")).expect("one name left");
+        let read = at::read_in(&dir, std::ffi::OsStr::new("x"), 1024).expect("read");
+        assert_eq!(read.as_deref(), Some(&b"a key\n"[..]));
     }
 
     /// The instructions file's read does not wait on a fifo standing there.
