@@ -6244,3 +6244,149 @@ fn a_direct_run_takes_external_input_into_an_atom_that_accepts_it() {
         assert_eq!(model.calls(), 2);
     });
 }
+
+/// What a run's input and output carry, as a model's or a command's text
+/// can, reaches no terminal raw: not in the run's result, plain or
+/// `--json`, nor in `runs show`, plain or `--json`, nor in an error; each
+/// `--json` form still reads back as the same text.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[test]
+fn a_runs_hostile_text_reaches_no_terminal_raw() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
+    let raw = |out: &std::process::Output| {
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    };
+    let hostile = ['\u{1b}', '\u{7f}', '\u{9b}', '\u{202e}', '\u{E0041}'];
+    let reached = |text: &str| {
+        hostile
+            .iter()
+            .copied()
+            .filter(|c| text.contains(*c))
+            .collect::<Vec<_>>()
+    };
+    let dir = scratch("hostile-text");
+    let project = project(&dir);
+    let note = "Ship\u{1b}[2J\u{7f}\u{9b}31m\u{202e}gpj.exe\u{E0041} now";
+    let data = json!({ "text": note }).to_string();
+    // The result, plain and as JSON.
+    let plain = atomic(
+        &dir,
+        &project,
+        &["run", "count-note", "--data", &data],
+        &[],
+        "",
+    );
+    assert!(plain.status.success(), "{}", text(&plain));
+    assert!(
+        reached(&raw(&plain)).is_empty(),
+        "the result: {:?}",
+        reached(&raw(&plain))
+    );
+    let out = atomic(
+        &dir,
+        &project,
+        &["--json", "run", "count-note", "--data", &data],
+        &[],
+        "",
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        reached(&raw(&out)).is_empty(),
+        "the JSON result: {:?}",
+        reached(&raw(&out))
+    );
+    let doc = stdout_json(&out);
+    let id = doc["run"].as_str().expect("run id").to_owned();
+    assert!(
+        doc["output"]["title"]
+            .as_str()
+            .is_some_and(|t| t.contains('\u{1b}')),
+        "the output read back whole: {doc}"
+    );
+    // runs show, plain and as JSON.
+    let shown = atomic(&dir, &project, &["runs", "show", &id], &[], "");
+    assert!(shown.status.success(), "{}", text(&shown));
+    assert!(
+        reached(&raw(&shown)).is_empty(),
+        "runs show: {:?}",
+        reached(&raw(&shown))
+    );
+    let shown = atomic(&dir, &project, &["--json", "runs", "show", &id], &[], "");
+    assert!(shown.status.success(), "{}", text(&shown));
+    assert!(
+        reached(&raw(&shown)).is_empty(),
+        "runs show --json: {:?}",
+        reached(&raw(&shown))
+    );
+    let doc = stdout_json(&shown);
+    assert_eq!(doc["input"]["text"], note, "the input read back whole");
+    // An error that quotes it, plain and as JSON.
+    let hostile_id = format!("run-{note}");
+    for json in [false, true] {
+        let mut args = vec!["runs", "show", hostile_id.as_str()];
+        if json {
+            args.insert(0, "--json");
+        }
+        let failed = atomic(&dir, &project, &args, &[], "");
+        assert!(!failed.status.success(), "{}", text(&failed));
+        assert!(
+            reached(&raw(&failed)).is_empty(),
+            "the error (json {json}): {:?}",
+            reached(&raw(&failed))
+        );
+    }
+}
+
+/// A model's answer to `debug codex-prompt` reaches no terminal raw.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[test]
+fn the_debug_prompt_escapes_its_answer() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(
+            "Hello\u{1b}[2J\u{9b}31m\u{202e}\u{E0041}.\nSecond line.".into(),
+        )])
+        .await
+        .expect("fake model");
+        let dir = scratch("debug-hostile");
+        let project = project(&dir);
+        let url = model.base_url();
+        let out = tokio::task::spawn_blocking(move || {
+            atomic(
+                &dir,
+                &project,
+                &[
+                    "debug",
+                    "codex-prompt",
+                    "--base-url",
+                    &url,
+                    "--model",
+                    "synthetic",
+                    "Hi.",
+                ],
+                &[],
+                "",
+            )
+        })
+        .await
+        .expect("atomic");
+        assert!(out.status.success(), "{out:?}");
+        let said = String::from_utf8_lossy(&out.stdout);
+        for c in ['\u{1b}', '\u{9b}', '\u{202e}', '\u{E0041}'] {
+            assert!(
+                !said.contains(c),
+                "U+{:04X} reached the terminal",
+                u32::from(c)
+            );
+        }
+        assert!(said.contains("Second line."), "{said}");
+    });
+}

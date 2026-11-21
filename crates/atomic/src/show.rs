@@ -163,16 +163,7 @@ async fn gather(rt: &Durare, id: &str) -> anyhow::Result<Option<Value>> {
 /// error or a gate's title may carry from a model or a command, and the
 /// marks that reorder text, are escaped instead of acted on.
 fn plain(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        let reorders = matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
-        if c.is_control() || reorders {
-            out.extend(c.escape_default());
-        } else {
-            out.push(c);
-        }
-    }
-    out
+    crate::shown::line(text)
 }
 
 /// A string field of `v`, [`plain`].
@@ -195,9 +186,10 @@ fn render(doc: &Value) -> String {
     if let Some(why) = doc["error"].as_str() {
         out.push_str(&format!("error: {}\n", plain(why)));
     }
-    out.push_str(&format!("input: {}\n", doc["input"]));
+    let compact = |v: &Value| crate::shown::compact(v).unwrap_or_default();
+    out.push_str(&format!("input: {}\n", compact(&doc["input"])));
     if !doc["output"].is_null() {
-        out.push_str(&format!("output: {}\n", doc["output"]));
+        out.push_str(&format!("output: {}\n", compact(&doc["output"])));
     }
     for a in &attempts {
         let started = a["started_at"].as_i64().map(utc).unwrap_or_default();
@@ -288,7 +280,9 @@ pub async fn show(
         .into());
     };
     if json {
-        println!("{}", serde_json::to_string_pretty(&doc)?);
+        // What a model or a command wrote is in it: escaped for the
+        // terminal, and still the same JSON.
+        println!("{}", crate::shown::pretty(&doc)?);
     } else {
         print!("{}", render(&doc));
     }
@@ -325,7 +319,7 @@ mod tests {
             1,
             "{said}"
         );
-        assert!(said.contains("\\u{1b}[2J"), "{said}");
+        assert!(said.contains("\\u{001b}[2J"), "{said}");
     }
 
     #[test]
