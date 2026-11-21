@@ -27,11 +27,10 @@ fail() {
 mkdir -p "${WORK}/bin"
 cat >"${WORK}/bin/cargo" <<'SH'
 #!/usr/bin/env bash
+# A control is off while any file the script edits differs from the copy's
+# commit.
 off() {
-    grep -qE 'HARDENING\.iter\(\)\.take\(0\)|ATOMIC_CONTROL_REMOVED|let names: Vec<String> = \{ let _ = names|PermissionProfile::Disabled|exclude_slash_tmp\*/ false|paths\.into_iter\(\)\.take\(0\)|black_box\(false\)|let _ = own;|let _ = arg; true|NetworkSandboxPolicy::Enabled;|CONTROL_OFF|Verdict::Changes => return Ok' \
-        crates/atomic-core/src/git.rs crates/atomic-core/src/codex.rs crates/atomic-core/src/network.rs \
-        crates/atomic-core/src/atom.rs crates/atomic-exec/src/lib.rs crates/atomic-exec/src/process.rs \
-        crates/atomic/src/pipeline.rs
+    ! git diff --quiet -- crates
 }
 case "${FAKE_CARGO}" in
 lose) rm -f target/controls-check/crates* ;;
@@ -92,20 +91,24 @@ exit "${status}"
 SH
 chmod +x "${WORK}/bin/cargo"
 
+# The controls the script lists, and the files they edit.
+mapfile -t CONTROL_ROWS < <(grep -E '^    "[a-z0-9-]+\|' "${ROOT}/scripts/controls-check.sh")
+mapfile -t CONTROL_FILES < <(printf '%s\n' "${CONTROL_ROWS[@]}" | cut -d'|' -f2 | sort -u)
+[ "${#CONTROL_ROWS[@]}" -gt 0 ] || { echo "no controls found in scripts/controls-check.sh" >&2; exit 1; }
+
 # A fresh copy of the repository's part the script touches, committed.
 fresh() {
     local repo="${WORK}/repo"
     chmod -R u+w "${repo}" 2>/dev/null
     rm -rf "${repo}"
-    mkdir -p "${repo}/scripts" "${repo}/crates/atomic-core/src" "${repo}/crates/atomic-exec/src" \
-        "${repo}/crates/atomic/src"
+    mkdir -p "${repo}/scripts"
     cp "${ROOT}/scripts/controls-check.sh" "${repo}/scripts/"
-    cp "${ROOT}/crates/atomic-core/src/git.rs" "${ROOT}/crates/atomic-core/src/codex.rs" \
-        "${ROOT}/crates/atomic-core/src/network.rs" "${ROOT}/crates/atomic-core/src/atom.rs" \
-        "${repo}/crates/atomic-core/src/"
-    cp "${ROOT}/crates/atomic-exec/src/lib.rs" "${ROOT}/crates/atomic-exec/src/process.rs" \
-        "${repo}/crates/atomic-exec/src/"
-    cp "${ROOT}/crates/atomic/src/pipeline.rs" "${repo}/crates/atomic/src/"
+    # Every file a control names.
+    local file
+    for file in "${CONTROL_FILES[@]}"; do
+        mkdir -p "${repo}/$(dirname "${file}")"
+        cp "${ROOT}/${file}" "${repo}/${file}"
+    done
     git -C "${repo}" init -q
     git -C "${repo}" -c user.name=test -c user.email=test@example.invalid add -A
     git -C "${repo}" -c user.name=test -c user.email=test@example.invalid -c commit.gpgSign=false \
@@ -130,7 +133,8 @@ untouched() {
 repo="$(fresh)"
 run honest
 [ "${code}" -eq 0 ] || fail "honest: exit ${code}: ${out}"
-[ "$(grep -c '^ok ' <<<"${out}")" -eq 22 ] || fail "honest: not twenty-two controls ok: ${out}"
+[ "$(grep -c '^ok ' <<<"${out}")" -eq "${#CONTROL_ROWS[@]}" ] ||
+    fail "honest: not all ${#CONTROL_ROWS[@]} controls ok: ${out}"
 untouched || fail "honest: the source is left modified"
 [ ! -e "${repo}/target/controls-check" ] || fail "honest: the saved copies are left behind"
 

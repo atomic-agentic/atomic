@@ -75,7 +75,6 @@ use codex_core_api::arg0_dispatch_or_else;
 use codex_core_api::bootstrap_auth_config;
 use codex_core_api::built_in_model_providers;
 use codex_core_api::init_state_db;
-use codex_core_api::install_image_generation_extension;
 use codex_core_api::load_config_toml_with_layer_stack;
 use codex_core_api::local_agent_graph_store_from_state_db;
 use codex_core_api::passthrough_image_store;
@@ -99,6 +98,10 @@ pub struct ModelEndpoint {
     pub model: String,
     /// Environment variable holding the API key, if the endpoint needs one.
     pub api_key_env: Option<String>,
+    /// A ChatGPT sign-in (see [`crate::signin`]): Codex atoms call ChatGPT's
+    /// Codex backend with it, and `base_url` and `api_key_env` are not
+    /// used. Lite atoms cannot use it.
+    pub sign_in: Option<crate::signin::SignIn>,
 }
 
 /// One turn to run on a fresh thread.
@@ -611,6 +614,26 @@ fn denied_paths(
     Ok((all, globs))
 }
 
+/// What Codex reads from its home at start: `.env` sets variables in
+/// atomic's process (none of Codex's own), and `config.toml` its settings.
+const CODEX_HOME_FILES: &[&str] = &[".env", "config.toml"];
+
+/// Create `path` empty, readable by its owner only, unless it exists.
+fn planted_never(path: &Path) -> anyhow::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    match options.open(path) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(anyhow::Error::new(e).context(format!("create {}", path.display()))),
+    }
+}
+
 /// The network every sandbox has: none, local sockets included.
 const SANDBOX_NETWORK: codex_protocol::permissions::NetworkSandboxPolicy =
     codex_protocol::permissions::NetworkSandboxPolicy::Restricted;
@@ -644,7 +667,29 @@ pub(crate) fn permission_profile(
     let StateGuard::Deny(private) = guard else {
         return Ok(base);
     };
+    // Files Codex reads from its home when atomic starts: there from the
+    // start, so they are denied with the rest, and a command can never plant
+    // them for the next run.
+    for name in CODEX_HOME_FILES {
+        planted_never(&codex_home.join(name))?;
+    }
     let mut policy = base.file_system_sandbox_policy();
+    // The rest of Codex's home is readable and never writable, even under a
+    // writable root that covers it: no command plants a file Codex reads
+    // from there (environments.toml, AGENTS.md, rules, hooks) for the next
+    // thread.
+    let homes = [
+        Some(codex_home.to_owned()),
+        std::fs::canonicalize(codex_home).ok(),
+    ];
+    for home in homes.into_iter().flatten() {
+        let home = AbsolutePathBuf::from_absolute_path(&home)
+            .with_context(|| format!("resolve the Codex home {}", home.display()))?;
+        policy.entries.push(FileSystemSandboxEntry::new(
+            FileSystemPath::from(home),
+            FileSystemAccessMode::Read,
+        ));
+    }
     let (paths, globs) = denied_paths(private, codex_home, cwd, writable)?;
     for p in paths {
         let p = AbsolutePathBuf::from_absolute_path(&p)
@@ -802,6 +847,17 @@ impl CodexPaths {
     }
 }
 
+/// Harden atomic itself, not one of Codex's helpers: the process that holds
+/// a sign-in's token and the operator credential cannot be dumped, read
+/// through /proc by a same-user process, or leave a core file. It loses its
+/// LD_* variables, and the commands it starts inherit a core-file limit of
+/// zero (on macOS it also refuses a debugger). Both entry points call it.
+fn harden() {
+    if !is_helper(std::env::args_os()) {
+        codex_process_hardening::pre_main_hardening();
+    }
+}
+
 /// The process entry point.
 ///
 /// The same executable re-runs itself as Codex's helpers (the Linux sandbox,
@@ -815,16 +871,47 @@ where
     Fut: Future<Output = anyhow::Result<()>>,
 {
     keep_sandbox_off_keyrings();
+    harden();
     give_the_command_its_own_tmpdir();
-    // SAFETY: called at the start of main, while the process has one thread,
-    // so no other thread can read the environment concurrently.
     // The person's own Codex home stays denied to atoms' commands.
     let _ = PERSON_CODEX_HOME.set(std::env::var_os("CODEX_HOME"));
+    // SAFETY: called at the start of main, while the process has one thread,
+    // so no other thread can read the environment concurrently.
     #[allow(unsafe_code)]
     unsafe {
         std::env::set_var("CODEX_HOME", codex_home);
     }
+    scrub_overrides();
     arg0_dispatch_or_else(move |paths| main_fn(CodexPaths(paths)))
+}
+
+/// The entry point for a command that starts no Codex thread, such as
+/// `atomic model`: hardened as [`dispatch`] hardens atomic, with nothing in
+/// the environment standing in for a sign-in's tokens, but with no Codex
+/// home, so no `.env` of one is loaded. Call this first in `main`, before any
+/// thread starts.
+pub fn without_threads<Fut>(main_fn: Fut) -> anyhow::Result<()>
+where
+    Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    harden();
+    scrub_overrides();
+    // Codex's own entry point gives its futures this much stack.
+    const STACK: usize = 16 * 1024 * 1024;
+    let handle = std::thread::Builder::new()
+        .name("atomic-main".into())
+        .stack_size(STACK)
+        .spawn(move || {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .thread_stack_size(STACK)
+                .build()?
+                .block_on(main_fn)
+        })?;
+    match handle.join() {
+        Ok(result) => result,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
 }
 
 /// Whether this process was started as one of Codex's helpers rather than
@@ -1382,6 +1469,35 @@ fn process_alive(pid: u32) -> bool {
     }
 }
 
+/// Variables Codex reads that would replace a sign-in's token, or send its
+/// refresh or revocation elsewhere.
+const OVERRIDES: &[&str] = &[
+    codex_login::CODEX_ACCESS_TOKEN_ENV_VAR,
+    codex_login::REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR,
+    codex_login::REVOKE_TOKEN_URL_OVERRIDE_ENV_VAR,
+];
+
+/// Remove [`OVERRIDES`] from the environment: nothing in it stands in for,
+/// or redirects, a sign-in's tokens. Codex's own `.env` loading never sets a
+/// `CODEX_` variable, so none comes back.
+pub fn scrub_overrides() {
+    scrub(|name| {
+        // SAFETY: called at the start of main, while the process has one
+        // thread, so no other thread can read the environment concurrently.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::remove_var(name);
+        }
+    });
+}
+
+/// Remove each of [`OVERRIDES`] with `remove`.
+fn scrub(mut remove: impl FnMut(&str)) {
+    for name in OVERRIDES {
+        remove(name);
+    }
+}
+
 /// Whether this process is Codex's Linux sandbox helper: this executable,
 /// run under the helper's name, which [`dispatch`] hands to Codex.
 #[cfg(target_os = "linux")]
@@ -1643,8 +1759,37 @@ where
         .context("turn shell snapshots off")?;
     let state_db = init_state_db(&config).await;
 
-    let auth_manager =
-        AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false).await?;
+    if let Some(sign_in) = &endpoint.sign_in {
+        crate::signin::protected()?;
+        // Codex's login restrictions hold for the sign-in as for its own.
+        sign_in.allowed_by(&config.auth_config())?;
+    }
+    let auth_manager = match &endpoint.sign_in {
+        // The developer's own sign-in, kept apart from every project (see
+        // `crate::signin`); never a key from the environment. Codex loads it
+        // only from the workspaces its restrictions allow.
+        Some(sign_in) => Arc::new(
+            AuthManager::new(
+                sign_in.auth_home().to_path_buf(),
+                /*enable_codex_api_key_env*/ false,
+                sign_in.store(),
+                config.auth_config().effective_chatgpt_workspaces(),
+                Some(config.chatgpt_base_url.clone()),
+                sign_in.keyring_kind(),
+                config.auth_route_config(),
+            )
+            .await,
+        ),
+        None => {
+            AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false).await?
+        }
+    };
+    if endpoint.sign_in.is_some() && auth_manager.auth().await.is_none() {
+        bail!(
+            "no one is signed in with ChatGPT: sign in with `atomic model login`, or configure a \
+             model endpoint"
+        );
+    }
     let local_runtime_paths = ExecServerRuntimeOptions::from_optional_paths(
         config.codex_self_exe.clone(),
         config.codex_linux_sandbox_exe.clone(),
@@ -1655,10 +1800,8 @@ where
     let user_instructions_provider = Arc::new(CodexHomeUserInstructionsProvider::new(
         config.codex_home.clone(),
     ));
-    let mut extensions = ExtensionRegistryBuilder::<Config>::new();
-    install_image_generation_extension(&mut extensions, auth_manager.clone(), |config: &Config| {
-        Some(config.codex_home.clone())
-    });
+    // No extensions: an atom's tools are the ones its file declares.
+    let extensions = ExtensionRegistryBuilder::<Config>::new();
     let startup = codex_core_api::build_startup_models(
         &config,
         Arc::clone(&auth_manager),
@@ -1853,20 +1996,36 @@ async fn new_config(
             .feature_requirements
             .as_ref(),
     )?;
-    // An OpenAI-compatible Responses endpoint: the built-in OpenAI provider,
-    // pointed at another base URL, with no OpenAI sign-in and no websockets.
-    let model_provider_id = ENDPOINT_PROVIDER_ID.to_string();
     let mut model_providers = built_in_model_providers(/*openai_base_url*/ None);
     let mut model_provider = model_providers
         .get(OPENAI_PROVIDER_ID)
         .context("OpenAI model provider should be available")?
         .clone();
-    model_provider.name = "atomic endpoint".to_string();
-    model_provider.base_url = Some(endpoint.base_url.clone());
-    model_provider.env_key = endpoint.api_key_env.clone();
-    model_provider.requires_openai_auth = false;
-    model_provider.supports_websockets = false;
-    env_headers_for(&endpoint.base_url, &mut model_provider.env_http_headers);
+    let model_provider_id = match &endpoint.sign_in {
+        // The built-in OpenAI provider as it is, with the sign-in's tokens:
+        // ChatGPT's Codex backend.
+        Some(sign_in) => {
+            // For tests: the backend's Codex route.
+            model_provider.base_url = sign_in.backend().map(|b| format!("{b}/codex"));
+            model_provider.supports_websockets = false;
+            // The organization and project headers are for OpenAI's API
+            // keys, never for a ChatGPT sign-in.
+            model_provider.env_http_headers = None;
+            OPENAI_PROVIDER_ID.to_string()
+        }
+        // An OpenAI-compatible Responses endpoint: the built-in OpenAI
+        // provider, pointed at another base URL, with no OpenAI sign-in and
+        // no websockets.
+        None => {
+            model_provider.name = "atomic endpoint".to_string();
+            model_provider.base_url = Some(endpoint.base_url.clone());
+            model_provider.env_key = endpoint.api_key_env.clone();
+            model_provider.requires_openai_auth = false;
+            model_provider.supports_websockets = false;
+            env_headers_for(&endpoint.base_url, &mut model_provider.env_http_headers);
+            ENDPOINT_PROVIDER_ID.to_string()
+        }
+    };
     model_providers.insert(model_provider_id.clone(), model_provider.clone());
 
     let mut config = Config {
@@ -2047,10 +2206,26 @@ async fn new_config(
         tool_suggest: ToolSuggestConfig::default(),
         otel: OtelConfig::default(),
     };
+    if let Some(backend) = endpoint.sign_in.as_ref().and_then(|s| s.backend()) {
+        // Every ChatGPT route, not only the model's: nothing reaches the
+        // real backend from a test.
+        config.chatgpt_base_url = format!("{backend}/");
+        config.chatgpt_base_url_is_explicit = true;
+    }
     config
         .features
         .set(Features::with_defaults())
         .context("configure default features")?;
+    // Nothing that reaches a ChatGPT account's connectors, plugins, apps or
+    // hosted tools, or acts outside the sandbox: with a sign-in those would
+    // carry its token, and read-only connector tools need no approval. An
+    // atom's tools are the ones its file declares.
+    for feature in ATOMIC_OFF {
+        config
+            .features
+            .set_enabled(*feature, false)
+            .with_context(|| format!("turn off Codex feature {feature:?}"))?;
+    }
     // AuthManager and MCP both derive their credential backend from Config.
     config.features.set_enabled(
         Feature::SecretAuthStorage,
@@ -2058,6 +2233,63 @@ async fn new_config(
     )?;
     Ok(config)
 }
+
+/// Codex's login settings for a sign-in kept in `codex_home`, as a
+/// thread's configuration resolves them: how it reaches the network, and
+/// the login restrictions of the machine and of `codex_home`'s own
+/// configuration.
+pub(crate) async fn auth_policy(codex_home: &Path) -> anyhow::Result<codex_login::AuthConfig> {
+    let endpoint = ModelEndpoint {
+        base_url: "http://127.0.0.1:9/unused".into(),
+        model: "unused".into(),
+        api_key_env: None,
+        sign_in: None,
+    };
+    let config = new_config(
+        &endpoint,
+        codex_home,
+        codex_home,
+        Arg0DispatchPaths::default(),
+    )
+    .await?;
+    Ok(config.auth_config())
+}
+
+/// Codex features atomic's threads never have: ChatGPT apps and connectors
+/// (the codex_apps MCP server), plugins and their suggestions, hosted image
+/// generation, browser and computer use, realtime and in-app surfaces.
+const ATOMIC_OFF: &[Feature] = &[
+    Feature::Apps,
+    Feature::EnableMcpApps,
+    Feature::CodexAppsMcp20260728,
+    Feature::AppsEarlyResourceDiscovery,
+    Feature::Plugins,
+    Feature::RemotePlugin,
+    Feature::RecommendedPlugins,
+    Feature::PluginSharing,
+    Feature::PluginDiscoveryPrefetch,
+    Feature::PluginHooks,
+    Feature::ToolSuggest,
+    Feature::SkillMcpDependencyInstall,
+    Feature::ImageGeneration,
+    Feature::ImageGenerationAnimation,
+    Feature::InAppBrowser,
+    Feature::BrowserAnnotationApi,
+    Feature::BrowserUse,
+    Feature::BrowserUseFullCdpAccess,
+    Feature::BrowserUseExternal,
+    Feature::ComputerUse,
+    Feature::InAppChat,
+    Feature::InAppDictation,
+    Feature::InAppVoice,
+    Feature::InAppLocalAutomation,
+    Feature::InAppUpdates,
+    Feature::RealtimeConversation,
+    Feature::RemoteControl,
+    Feature::WebSearchRequest,
+    Feature::WebSearchCached,
+    Feature::StandaloneWebSearch,
+];
 
 /// OpenAI's API, the one endpoint the OpenAI provider's organization and
 /// project headers are for.
@@ -2733,6 +2965,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_sign_in_sends_no_organization_or_project_headers() {
+        on_codex_runtime(async {
+            let (home, auth) = (scratch("home-headers"), scratch("auth-headers"));
+            let signed_in = ModelEndpoint {
+                base_url: crate::signin::CODEX_BACKEND.into(),
+                model: "synthetic".into(),
+                api_key_env: None,
+                sign_in: Some(crate::signin::SignIn::in_files(&auth)),
+            };
+            let config = new_config(&signed_in, &home, &home, Arg0DispatchPaths::default())
+                .await
+                .expect("config");
+            assert_eq!(config.model_provider_id, OPENAI_PROVIDER_ID);
+            assert_eq!(config.model_provider.env_http_headers, None);
+            // OpenAI's API with a key keeps them: the provider has them.
+            let api = ModelEndpoint {
+                base_url: "https://api.openai.com/v1".into(),
+                api_key_env: Some("OPENAI_API_KEY".into()),
+                sign_in: None,
+                ..signed_in.clone()
+            };
+            let config = new_config(&api, &home, &home, Arg0DispatchPaths::default())
+                .await
+                .expect("config");
+            assert!(config.model_provider.env_http_headers.is_some());
+        });
+    }
+
     fn scratch(tag: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("atomic-codex-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&d).expect("mkdir");
@@ -2769,6 +3030,7 @@ mod tests {
                 base_url: model.base_url(),
                 model: "synthetic".into(),
                 api_key_env: None,
+                sign_in: None,
             };
             let answer = one_turn(
                 &CodexPaths::without_helpers(),
@@ -2800,6 +3062,7 @@ mod tests {
                 base_url: model.base_url(),
                 model: "synthetic".into(),
                 api_key_env: None,
+                sign_in: None,
             };
             let first = TurnSpec {
                 prompt: "t0".into(),
@@ -3132,6 +3395,20 @@ mod tests {
     }
 
     #[test]
+    fn the_environment_cannot_stand_in_for_or_redirect_a_sign_ins_tokens() {
+        let mut removed = Vec::new();
+        scrub(|name| removed.push(name.to_owned()));
+        assert_eq!(
+            removed,
+            [
+                "CODEX_ACCESS_TOKEN",
+                "CODEX_REFRESH_TOKEN_URL_OVERRIDE",
+                "CODEX_REVOKE_TOKEN_URL_OVERRIDE",
+            ]
+        );
+    }
+
+    #[test]
     fn private_state_is_denied_and_the_rest_of_the_state_directory_is_not() {
         use crate::typed::Sandbox;
         use codex_protocol::permissions::FileSystemAccessMode::*;
@@ -3169,6 +3446,28 @@ mod tests {
             );
             assert_eq!(at(&dir.join("credentials/x").display().to_string()), Deny);
             assert_eq!(at(&p("codex/auth.json")), Deny);
+            // There from the start, so a command cannot plant them.
+            assert_eq!(at(&p("codex/.env")), Deny);
+            assert_eq!(at(&p("codex/config.toml")), Deny);
+            // Nothing else Codex reads from its home can be planted, even
+            // under a writable root over the whole state directory.
+            let state_dir = state.display().to_string();
+            for planted in [
+                "environments.toml",
+                "AGENTS.md",
+                "AGENTS.override.md",
+                "hooks.json",
+                "rules/default.rules",
+                "skills/x/SKILL.md",
+            ] {
+                let at_all = access(
+                    profile,
+                    &worktree,
+                    &[&state_dir],
+                    &p(&format!("codex/{planted}")),
+                );
+                assert_ne!(at_all, Write, "{planted} could be planted");
+            }
             assert_eq!(at(&p("codex/log/x")), Deny);
             assert_eq!(at(&p("codex/tmp/other/x")), Deny);
             // Shell snapshots are off, and none is readable.
@@ -3296,6 +3595,7 @@ mod tests {
                 base_url: model.base_url(),
                 model: "synthetic".into(),
                 api_key_env: None,
+                sign_in: None,
             };
             let answer = one_turn(
                 &CodexPaths::without_helpers(),
@@ -3507,6 +3807,7 @@ mod tests {
             base_url: model.base_url(),
             model: "synthetic".into(),
             api_key_env: None,
+            sign_in: None,
         };
         let recorder = Arc::new(Recorder {
             limit,

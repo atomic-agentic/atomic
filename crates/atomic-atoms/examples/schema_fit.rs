@@ -78,6 +78,7 @@ fn main() {
         base_url: std::env::var("ATOMIC_MODEL_BASE_URL").expect("set ATOMIC_MODEL_BASE_URL"),
         model: std::env::var("ATOMIC_MODEL").expect("set ATOMIC_MODEL"),
         api_key_env: std::env::var("ATOMIC_MODEL_API_KEY_ENV").ok(),
+        sign_in: None,
     };
     let home = std::env::temp_dir().join(format!("atomic-schema-fit-{}", std::process::id()));
     std::fs::create_dir_all(&home).expect("codex home");
