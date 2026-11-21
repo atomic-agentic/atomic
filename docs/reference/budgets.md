@@ -226,9 +226,29 @@ raising the cap in the usage ledger, from a person entering an attempt's real
 usage in the ledger in place of its reservation (no command does that yet), or,
 for a refusal caused by a sibling's reservation, from that sibling settling.
 
-Inspect the run with `atomic runs show <run-id>`. This draft does not yet define
-the command that raises a cap and releases the park; resuming alone cannot bypass
-a cap.
+Inspect the run with `atomic runs show <run-id>`. A person releases a parked run
+with `atomic parks release <park-id>`, raising the cap at the same time:
+
+```sh
+atomic parks list
+atomic parks release run-1a2b:3 --tokens 200000 --comment "one more draft"
+```
+
+The release needs the operator credential you enrolled with
+`atomic gates enroll`, as a gate decision does. It raises the allowance that
+refused the call (or the one `--scope` names) to at least the caps given, marks
+the park released and records who released it, with what and when, in one
+transaction, then wakes the run. Only an allowance of the parked run may be
+raised: the run's and its atoms', and those above them, such as its workflow's;
+another run's is refused. A raise that changes nothing, a park whose run has finished,
+and a park already released are said so. The command prints its command id; sent
+again with `--command-id`, it returns what it did. If waking the run fails, or
+the person's process stops before it, the release stands and the next
+`atomic runs resume` or `atomic serve` wakes the run.
+
+A model's tool call or an atom's shell cannot release a park or raise a cap:
+neither can reach the store or the credential. Resuming alone cannot bypass a
+cap.
 
 See [atom fields](atom-files.md), [workflow fields](workflow-files.md#top-level-fields)
 and [observability](../operations/observability.md).

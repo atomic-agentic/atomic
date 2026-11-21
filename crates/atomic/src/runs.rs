@@ -541,8 +541,10 @@ pub async fn resume(
             atomic_app::panics::forget(id);
             atomic_durable::failpoint("resume:queued");
             engine.launch().await?;
-            // A gate decided while the run was down may never have woken it.
+            // A gate decided, or a park released, while the run was down
+            // may never have woken it.
             atomic_durable::gate::redeliver(&engine.rt).await?;
+            atomic_durable::release::redeliver(&engine.rt).await?;
             finish(
                 &engine,
                 &state,
@@ -763,8 +765,10 @@ pub async fn serve(
             ),
         }
     }
-    // A gate decided while its run was down may never have woken it.
+    // A gate decided, or a park released, while its run was down may never
+    // have woken it.
     atomic_durable::gate::redeliver(&engine.rt).await?;
+    atomic_durable::release::redeliver(&engine.rt).await?;
     // Runs of another layout are this executor's too, but only an atomic of
     // their layout can continue them.
     let stranded: Vec<String> = engine
@@ -796,6 +800,9 @@ pub async fn serve(
             _ = tokio::time::sleep(REDELIVERY) => {
                 if let Err(e) = atomic_durable::gate::redeliver(&engine.rt).await {
                     atomic_core::log_line!("atomic serve: waking runs whose gates were decided: {e}");
+                }
+                if let Err(e) = atomic_durable::release::redeliver(&engine.rt).await {
+                    atomic_core::log_line!("atomic serve: waking runs whose parks were released: {e}");
                 }
             }
         }
