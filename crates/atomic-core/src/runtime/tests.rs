@@ -597,7 +597,7 @@ fn compiler_failures_never_spend_a_repair_call() {
                 .await
                 .expect("fake model");
             let rt = runtime(&model, "compiler-infrastructure");
-            let exec = atomic_exec::Backend::default();
+            let exec = helperless();
             let backend = Backend::Codex(&rt, &exec);
             let contract = json!({"type":"object","additionalProperties":false,"required":["ok"],"properties":{"ok":{"type":"boolean"}}});
             let validator = jsonschema::validator_for(&contract).expect("schema");
@@ -2412,7 +2412,7 @@ fn a_codex_atom_runs_on_a_chatgpt_sign_in_with_no_api_key() {
                 text: "Export crashes on é.".into(),
             },
             &rt,
-            &atomic_exec::Backend::default(),
+            &helperless(),
         )
         .await
         .expect("runs on the sign-in");
@@ -2465,13 +2465,7 @@ fn a_stale_sign_in_is_refreshed_at_the_test_issuer() {
         };
         // The fake has no token endpoint, so the refresh fails; whether the
         // turn then runs on the old token is Codex's to decide.
-        let _ = run_codex_atom(
-            &Classify,
-            &Note { text: "n".into() },
-            &rt,
-            &atomic_exec::Backend::default(),
-        )
-        .await;
+        let _ = run_codex_atom(&Classify, &Note { text: "n".into() }, &rt, &helperless()).await;
         let asked = model.every_request();
         assert!(
             asked.contains(&("POST".to_owned(), "/oauth/token".to_owned())),
@@ -2510,14 +2504,9 @@ fn codex_login_restrictions_refuse_a_sign_in_they_do_not_allow() {
                 api_key_env: None,
                 sign_in: Some(signed_in(&auth, &backend)),
             };
-            let refused = run_codex_atom(
-                &Classify,
-                &Note { text: "n".into() },
-                &rt,
-                &atomic_exec::Backend::default(),
-            )
-            .await
-            .expect_err("refused");
+            let refused = run_codex_atom(&Classify, &Note { text: "n".into() }, &rt, &helperless())
+                .await
+                .expect_err("refused");
             assert!(refused.to_string().contains(said), "{tag}: {refused}");
             assert_eq!(model.calls(), 0, "{tag}");
         }
