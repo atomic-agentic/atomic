@@ -571,3 +571,23 @@ fn out_of_range_settings_are_refused() {
     // A cost never passes LIMIT, so the ledger's sums cannot overflow.
     assert!(priced().cost("gpt-test", LIMIT, LIMIT) <= LIMIT);
 }
+
+/// An exec atom's minutes cap that the person's own ceiling holds below the
+/// least a command needs is refused, saying whose cap it is.
+#[test]
+fn a_work_cap_held_down_by_a_persons_ceiling_says_it_is_theirs() {
+    let mut settings = roomy();
+    settings.ceilings.atom.minutes = Some(0.001);
+    let caps = resolve(&Budget::default(), Level::Atom, &settings, &[]).expect("resolves");
+    assert_eq!(
+        caps.origins[1],
+        Origin::Ceiled("budget.atom.minutes".into())
+    );
+    let refused = check_work_room(&caps, Level::Atom).expect_err("below the least a command needs");
+    assert!(
+        refused
+            .to_string()
+            .contains("capped by your own budget.atom.minutes"),
+        "{refused}"
+    );
+}
