@@ -529,36 +529,102 @@ pub fn hung_collector() -> String {
     url
 }
 
-/// Send `child` the signal named `name`, as `kill -<name>` does.
+/// Send `child` the signal named `name` (`TERM`, `INT` or `KILL`).
 pub fn signal(child: &std::process::Child, name: &str) {
-    let sent = Command::new("/bin/sh")
-        .args(["-c", &format!("kill -{name} {}", child.id())])
-        .status()
-        .unwrap();
-    assert!(sent.success(), "kill -{name}");
+    let number = match name {
+        "TERM" => libc::SIGTERM,
+        "INT" => libc::SIGINT,
+        "KILL" => libc::SIGKILL,
+        other => panic!("no signal {other} here"),
+    };
+    let pid = libc::pid_t::try_from(child.id()).expect("a pid");
+    // SAFETY: kill only sends a signal, to the one process given.
+    #[allow(unsafe_code)]
+    let sent = unsafe { libc::kill(pid, number) };
+    assert_eq!(sent, 0, "kill -{name}: {}", std::io::Error::last_os_error());
+}
+
+/// How long [`wait_for_gate`] waits for a run to reach its gate: far more
+/// than a run of one model call takes, however loaded the machine.
+pub const GATE_LIMIT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// What a run started with piped output printed, read as it goes so the
+/// run never blocks on a full pipe.
+pub struct Drained {
+    stdout: std::thread::JoinHandle<Vec<u8>>,
+    stderr: std::thread::JoinHandle<Vec<u8>>,
+}
+
+impl Drained {
+    /// Start reading `child`'s piped stdout and stderr.
+    pub fn of(child: &mut std::process::Child) -> Self {
+        let read = |pipe: Option<Box<dyn Read + Send>>| {
+            std::thread::spawn(move || {
+                let mut all = Vec::new();
+                if let Some(mut pipe) = pipe {
+                    let _ = pipe.read_to_end(&mut all);
+                }
+                all
+            })
+        };
+        let stdout = child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>);
+        let stderr = child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>);
+        Self {
+            stdout: read(stdout),
+            stderr: read(stderr),
+        }
+    }
+
+    /// Wait for `child` to end and return how it ended and all it printed.
+    pub fn wait(self, child: &mut std::process::Child) -> Output {
+        let status = child.wait().unwrap();
+        Output {
+            status,
+            stdout: self.stdout.join().unwrap(),
+            stderr: self.stderr.join().unwrap(),
+        }
+    }
 }
 
 /// Wait until the run `child` runs in `dir`'s project waits at a gate, as
-/// `atomic gates list` shows.
-pub fn wait_for_gate(dir: &Path, model: &str, child: &mut std::process::Child) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+/// `atomic gates list` shows, reading its output meanwhile. A run that ends
+/// first, or has not reached its gate within [`GATE_LIMIT`], fails the
+/// test with how it ended and what it printed; one still running then is
+/// killed first.
+pub fn wait_for_gate(dir: &Path, model: &str, child: &mut std::process::Child) -> Drained {
+    let drained = Drained::of(child);
+    let deadline = std::time::Instant::now() + GATE_LIMIT;
     loop {
         let listed = command(dir, model, &["gates", "list", "--json"], &[])
             .output()
             .unwrap();
         let open: Value = serde_json::from_slice(&listed.stdout).unwrap_or(json!([]));
         if open.as_array().is_some_and(|g| !g.is_empty()) {
-            return;
+            return drained;
         }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "no gate opened: {}",
-            text(&listed)
-        );
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "the run ended before its gate"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        let ended = child.try_wait().unwrap();
+        if ended.is_some() || std::time::Instant::now() >= deadline {
+            let why = match ended {
+                Some(_) => "the run ended before its gate".to_owned(),
+                None => {
+                    signal(child, "KILL");
+                    format!("no gate opened in {GATE_LIMIT:?}, so the run was killed")
+                }
+            };
+            let out = drained.wait(child);
+            panic!(
+                "{why}; it ended {}: {}\n`atomic gates list` last said: {}",
+                out.status,
+                text(&out),
+                text(&listed)
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
     }
 }

@@ -1,0 +1,1 @@
+git-dir|crates/atomic-core/src/git.rs|            .env("GIT_DIR", &self.git_dir)|            .env("ATOMIC_CONTROL_REMOVED", &self.git_dir)|-p atomic-agentic-core --test git_safety nothing_in_the_worktree_or_the_repository_runs
