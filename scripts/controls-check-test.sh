@@ -20,10 +20,11 @@ fail() {
 # A stand-in for cargo. Each test a row names is in a test binary of its
 # own. FAKE_CARGO says how it behaves: `honest` fails every test while any
 # control is switched off, `blind` always passes them, `partial` fails only
-# the first a control names, `missing` finds no test for the second, `lose`
-# also deletes the saved originals, `unreadable` makes the manifest
-# unreadable, `kill` kills the script outright, and `hang` waits, with the
-# control off, until it is stopped. It notes its arguments in cargo-args.
+# the first a control names, `missing` finds no test for the second, `flood`
+# fails tens of thousands of others after the one named, `lose` also deletes
+# the saved originals, `unreadable` makes the manifest unreadable, `kill`
+# kills the script outright, and `hang` waits, with the control off, until it
+# is stopped. It notes its arguments in cargo-args.
 mkdir -p "${WORK}/bin"
 cat >"${WORK}/bin/cargo" <<'SH'
 #!/usr/bin/env bash
@@ -40,7 +41,8 @@ hang) : >cargo-started; exec sleep 300 ;;
 esac
 # The tests the arguments name, after `--` or as positional filters, each
 # in a test binary of its own, run in order as cargo runs them: without
-# --no-fail-fast, cargo stops at the first binary that fails.
+# --no-fail-fast, cargo stops at the first binary that fails. A flag's value
+# is no test, and neither is a flag of the test binary's after `--`.
 echo "$*" >>cargo-args
 [ "${1:-}" = test ] && shift
 names=()
@@ -54,7 +56,7 @@ for a in "$@"; do
         continue
     fi
     case "${a}" in
-    --) after=1 ;;
+    --) after=1 skip=0 ;;
     --no-fail-fast) no_fail_fast=1 ;;
     -p | --package | --features | --test | --bin | --example) skip=1 ;;
     -*) ;;
@@ -79,6 +81,14 @@ for n in "${names[@]}"; do
     fi
     if [ "${fails}" -eq 1 ]; then
         echo "test tests::${n} ... FAILED"
+        # `flood`: and so many other tests failed after it that what is left
+        # to read is far past what a pipe holds, which a check that stops at
+        # the first match pays for with a broken pipe.
+        if [ "${FAKE_CARGO}" = flood ]; then
+            awk 'BEGIN {
+                for (i = 1; i <= 40000; i++) print "test tests::another_" i " ... FAILED"
+            }'
+        fi
         echo "test result: FAILED. 0 passed; 1 failed"
         status=101
         [ "${no_fail_fast}" -eq 1 ] || exit 101
@@ -159,6 +169,27 @@ run missing sandbox-writes
 [ "${code}" -ne 0 ] && grep -q "FAIL sandbox-writes: with the control off, these tests were not seen failing: a_project_under_the_system_temporary_directory_stays_out_of_reach" <<<"${out}" ||
     fail "missing: exit ${code}: ${out}"
 untouched || fail "missing: the source is left modified"
+
+# A row whose only argument after `--` is a flag of the test binary's, not a
+# test: the flag is not taken for a test that should have been seen failing.
+repo="$(fresh)"
+sed -i '/"git-dir|/ s/|-p atomic-agentic-core .*"$/|-p atomic-agentic-core --lib -- --exact"/' \
+    "${repo}/scripts/controls-check.sh"
+grep -q '"git-dir|.*-- --exact"$' "${repo}/scripts/controls-check.sh" ||
+    fail "flag after --: the row was not changed: $(grep '"git-dir|' "${repo}/scripts/controls-check.sh")"
+run honest git-dir
+[ "${code}" -eq 0 ] && grep -q "^ok git-dir" <<<"${out}" ||
+    fail "flag after --: exit ${code}: ${out}"
+untouched || fail "flag after --: the source is left modified"
+
+# Tens of thousands of other tests failed as well, after the one a row names:
+# that one is still seen failing, where a check that stopped at the first
+# match would kill whatever piped to it and read that as a test never seen.
+repo="$(fresh)"
+run flood git-dir
+[ "${code}" -eq 0 ] && grep -q "^ok git-dir" <<<"${out}" ||
+    fail "flood: exit ${code}: ${out}"
+untouched || fail "flood: the source is left modified"
 
 # Every test binary runs, so a test after a failing one is seen too.
 repo="$(fresh)"
