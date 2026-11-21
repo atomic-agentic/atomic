@@ -373,10 +373,13 @@ fn case_from(
             ""
         };
         let label = match crate::workflow::accepted_trust(atom) {
-            "team" => "label the case `origin: team` if a person on the team wrote or reviewed \
+            Err(_) => crate::workflow::unknown_trust_advice(atom),
+            Ok("team") => {
+                "label the case `origin: team` if a person on the team wrote or reviewed \
                        its input"
-                .to_owned(),
-            accepts => format!(
+                    .to_owned()
+            }
+            Ok(accepts) => format!(
                 "label the case `origin: {accepts}` if its input came from a model step, or \
                  `origin: team` if a person on the team wrote or reviewed it"
             ),

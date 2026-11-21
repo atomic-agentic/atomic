@@ -118,10 +118,11 @@ pub struct TurnSpec {
     /// The sandbox the thread runs in. The network is always restricted.
     pub sandbox: crate::typed::Sandbox,
     /// Environment variables set for every command the thread runs, such as
-    /// the project's shared caches (see [`crate::worktree::Caches`]).
+    /// those that point build tools at its run's caches (see
+    /// [`crate::worktree::Caches`]).
     pub env: BTreeMap<String, String>,
     /// Directories a `workspace-write` thread may write besides its working
-    /// directory, such as the project's shared caches. Absolute paths.
+    /// directory, such as its run's build caches. Absolute paths.
     pub writable_roots: Vec<PathBuf>,
 }
 
@@ -1066,7 +1067,7 @@ fn not_dumpable() -> std::io::Result<()> {
 /// atomic's private state, which is denied as it is to turns (see
 /// [`denied_paths`]), and the private state of every other project under
 /// the same atomic home; only the command's own writable directories, such
-/// as its scratch directory, and the project's caches writable; no network
+/// as its scratch directory and its run's build caches, writable; no network
 /// and no sockets, unless its atom declares hosts, and then only those,
 /// through a proxy of atomic's own (see [`crate::network`]).
 /// The command still runs with exactly its environment, in its directory.
@@ -1101,7 +1102,6 @@ pub struct ExecSandbox {
     helper: PathBuf,
     guard: StateGuard,
     codex_home: PathBuf,
-    also_writable: Vec<PathBuf>,
     /// The proxies that limit commands declaring network access to their
     /// hosts, shared by every command this sandbox confines.
     proxies: crate::network::Proxies,
@@ -1122,7 +1122,6 @@ impl ExecSandbox {
             helper,
             guard,
             codex_home,
-            also_writable: Vec::new(),
             proxies: crate::network::Proxies::default(),
             loopback_for_tests: Vec::new(),
         })
@@ -1145,13 +1144,6 @@ impl ExecSandbox {
         self
     }
 
-    /// The same confinement, letting every command also write `dirs`, such
-    /// as the project's build and package caches.
-    pub fn also_writing(mut self, dirs: Vec<PathBuf>) -> Self {
-        self.also_writable = dirs;
-        self
-    }
-
     /// The profile for a command that may write `writable`, except the
     /// directories in `read_only` inside them.
     fn profile(
@@ -1162,17 +1154,15 @@ impl ExecSandbox {
         use codex_protocol::permissions::{
             FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry,
         };
-        let mut writes = writable.to_vec();
-        writes.extend(self.also_writable.iter().cloned());
         let base = permission_profile(
             crate::typed::Sandbox::ReadOnly,
             &self.guard,
             &self.codex_home,
             None,
-            &writes,
+            writable,
         )?;
         let mut policy = base.file_system_sandbox_policy();
-        for dir in writable.iter().chain(&self.also_writable) {
+        for dir in writable {
             let dir = AbsolutePathBuf::from_absolute_path(dir)
                 .with_context(|| format!("resolve the writable directory {}", dir.display()))?;
             policy.entries.push(FileSystemSandboxEntry::new(
@@ -1944,7 +1934,8 @@ where
             seen,
             recorded: seen,
             records: 0,
-            warned: false,
+            warnings: 0,
+            said: None,
         };
         let (turn, progress) = span
             .run(run_turn(&thread, &current, limit.time, &mut recorder))
@@ -2504,6 +2495,11 @@ impl Progress {
     }
 }
 
+/// Where a running turn sends a line it has to say: production gives the
+/// recorder none, and the line goes to the log; a test gives it one and
+/// reads the line back.
+type Said = Arc<dyn Fn(&str) + Send + Sync>;
+
 /// Where a running turn's reported usage is recorded as it grows, so that a
 /// turn whose process is stopped or killed before it settles stays charged
 /// at least what it reported (see [`crate::usage::Meter::progress`]).
@@ -2516,8 +2512,12 @@ struct ProgressLog<'a> {
     recorded: (i64, i64),
     /// How many times it recorded.
     records: u32,
-    /// Whether a record failed, and was said to.
-    warned: bool,
+    /// How many times a failed record was said to, which is at most once a
+    /// turn. Counted rather than flagged, so that a second one trying to
+    /// follow the first is visible to a test instead of merely unseen.
+    warnings: u32,
+    /// Where what it says goes (see [`Said`]).
+    said: Option<Said>,
 }
 
 /// How long a turn waits on one record of its progress before it goes on
@@ -2564,29 +2564,51 @@ impl ProgressLog<'_> {
                     ));
                 }
             }
-            failed if !self.warned => {
-                self.warned = true;
+            failed if self.warnings == 0 => {
+                self.warnings += 1;
                 let why = match failed {
                     Ok(Err(e)) => e.to_string(),
                     _ => format!("the store did not answer within {PROGRESS_PATIENCE:?}"),
                 };
-                // The meter's request id is `<run>:<step>:<call>`.
                 let (run, request) = match self.ticket {
-                    Some(t) => (
-                        t.request.rsplitn(3, ':').nth(2).unwrap_or(&t.request),
-                        t.request.as_str(),
-                    ),
+                    Some(t) => (run_of_request(&t.request), t.request.as_str()),
                     None => ("?", "?"),
                 };
-                crate::log_line!(
-                    "run {run}: a Codex turn's usage so far was not recorded for request \
-                     {request} ({why}); until it is, a stop before the turn settles leaves it \
-                     charged at its last record"
-                );
+                let line = progress_warning(run, request, &why, self.records > 0);
+                match &self.said {
+                    Some(said) => said(&line),
+                    None => crate::log_line!("{line}"),
+                }
             }
             _ => {}
         }
     }
+}
+
+/// The run a meter's request id names. The ledger meter in the `atomic`
+/// binary makes each one as `<run>:<step>:<call>`, so the run is what is
+/// left after two fields are cut off the end: a run's id may itself hold
+/// colons. An id of any other shape names no run and is said as it is.
+fn run_of_request(request: &str) -> &str {
+    request.rsplitn(3, ':').nth(2).unwrap_or(request)
+}
+
+/// What a turn says when a record of its progress fails. `recorded` is
+/// whether any record of it was ever written: with none, a stop before the
+/// turn settles leaves it charged what its admission reserved, and only
+/// with one is there a last record to be charged at (see
+/// [`ProgressLog::note`]).
+fn progress_warning(run: &str, request: &str, why: &str, recorded: bool) -> String {
+    let charged = if recorded {
+        "charged at its last record"
+    } else {
+        "charged at the whole bound its request reserved"
+    };
+    format!(
+        "run {run}: a Codex turn's usage so far was not recorded for request \
+         {request} ({why}); until it is, a stop before the turn settles leaves \
+         it {charged}"
+    )
 }
 
 /// Run one turn, cut off after `time` if one is given, recording its
@@ -3170,7 +3192,7 @@ mod tests {
     /// An exec command, confined, is the sandbox helper running `env -i`
     /// with exactly the command's environment, then the command: its
     /// profile denies atomic's private state and lets it write only its own
-    /// directories and the project's caches.
+    /// directories and those it is given, such as its run's caches.
     #[test]
     fn an_exec_command_is_confined_under_the_sandbox_helper() {
         use atomic_exec::Confine;
@@ -3186,9 +3208,7 @@ mod tests {
             private: state.join("private"),
             also: vec![state.join("keys")],
         });
-        let sandbox = ExecSandbox::new(&paths, guard, state.join("codex"))
-            .expect("a helper")
-            .also_writing(vec![state.join("cache")]);
+        let sandbox = ExecSandbox::new(&paths, guard, state.join("codex")).expect("a helper");
         let tmp = state.join("scratch/.tmp");
         let confined = sandbox
             .confine(
@@ -3197,7 +3217,7 @@ mod tests {
                     args: vec!["-c".into(), "true".into()],
                     cwd: state.clone(),
                     env: vec![("HOME".into(), scratch_dir.display().to_string())],
-                    writable: vec![scratch_dir.clone()],
+                    writable: vec![scratch_dir.clone(), state.join("cache/run-1")],
                     ..Default::default()
                 },
                 &tmp,
@@ -3231,7 +3251,8 @@ mod tests {
                 "{denied:?}: {text}"
             );
         }
-        for writable in [&scratch_dir, &state.join("cache")] {
+        // Its scratch and its run's caches, as the command names them.
+        for writable in [&scratch_dir, &state.join("cache/run-1")] {
             assert!(
                 text.contains(&writable.display().to_string()),
                 "{writable:?}: {text}"
@@ -3835,6 +3856,18 @@ mod tests {
         }
     }
 
+    /// A sink for a [`ProgressLog`] to say its warnings into, and the lines
+    /// it keeps: a test hands the sink to a recorder as `said` and reads
+    /// back what it wrote, instead of what reached the log.
+    fn warning_sink() -> (Said, Arc<std::sync::Mutex<Vec<String>>>) {
+        let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = {
+            let lines = lines.clone();
+            move |line: &str| lines.lock().expect("said").push(line.to_owned())
+        };
+        (Arc::new(sink), lines)
+    }
+
     #[tokio::test]
     async fn a_progress_record_advances_only_once_written_and_a_failure_is_said_once() {
         use std::sync::atomic::Ordering::SeqCst;
@@ -3844,13 +3877,15 @@ mod tests {
         });
         let metering = Metering::new(meter.clone());
         let ticket = progress_ticket();
+        let (sink, said) = warning_sink();
         let mut log = ProgressLog {
             meter: &metering,
             ticket: Some(&ticket),
             seen: (0, 0),
             recorded: (0, 0),
             records: 0,
-            warned: false,
+            warnings: 0,
+            said: Some(sink),
         };
         let grown = Progress {
             usage: Some((3, 2, 5)),
@@ -3859,15 +3894,72 @@ mod tests {
         // A failed record does not advance, so the next token event, though
         // it reports nothing new, tries it again; the failure is said once.
         log.note(&grown).await;
-        assert_eq!((log.recorded, log.records, log.warned), ((0, 0), 0, true));
+        assert_eq!((log.recorded, log.records, log.warnings), ((0, 0), 0, 1));
         log.note(&grown).await;
         assert_eq!(meter.records.load(SeqCst), 2);
-        assert_eq!((log.recorded, log.records), ((0, 0), 0));
+        assert_eq!((log.recorded, log.records, log.warnings), ((0, 0), 0, 1));
+        // What was written, not what was meant: two failures asked for, one
+        // line said. Drop the guard that says it once and this is two.
+        let lines = said.lock().expect("said").clone();
+        assert_eq!(lines.len(), 1, "said once, of two failures: {lines:?}");
+        // Nothing was recorded, so a stop would charge the reservation, and
+        // the line names it instead of a record that does not exist.
+        assert!(lines[0].contains("reserved"), "{lines:?}");
+        assert!(!lines[0].contains("last record"), "{lines:?}");
+        // The run it names is the run the request id belongs to.
+        assert!(lines[0].starts_with("run run-1: "), "{lines:?}");
         // Written, it advances; with nothing new, nothing is asked again.
         log.note(&grown).await;
         assert_eq!((log.recorded, log.records), ((3, 2), 1));
         log.note(&grown).await;
         assert_eq!(meter.records.load(SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn a_progress_warning_of_a_turn_that_had_recorded_names_its_last_record() {
+        let meter = Arc::new(Flaky {
+            failing: 1.into(),
+            ..Flaky::default()
+        });
+        let metering = Metering::new(meter.clone());
+        let ticket = progress_ticket();
+        let (sink, said) = warning_sink();
+        let mut log = ProgressLog {
+            meter: &metering,
+            ticket: Some(&ticket),
+            seen: (0, 0),
+            recorded: (3, 2),
+            records: 1,
+            warnings: 0,
+            said: Some(sink),
+        };
+        // One record is kept, the turn reports more, and the store refuses
+        // it: what a stop would charge is that last record, not a bound a
+        // record was meant to replace.
+        log.note(&Progress {
+            usage: Some((5, 4, 9)),
+            ..Progress::default()
+        })
+        .await;
+        let lines = said.lock().expect("said").clone();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("last record"), "{lines:?}");
+        assert!(!lines[0].contains("reserved"), "{lines:?}");
+        assert_eq!((log.recorded, log.records), ((3, 2), 1));
+    }
+
+    #[test]
+    fn the_run_a_request_id_names_keeps_the_colons_it_has() {
+        // The ledger meter makes every request id `<run>:<step>:<call>`, so
+        // only the last two fields are cut off (see `metering` in the
+        // `atomic` binary).
+        assert_eq!(run_of_request("run-1:2:0"), "run-1");
+        assert_eq!(run_of_request("wf:7:ab:2:0"), "wf:7:ab");
+        // An id of any other shape names no run and is said as it is, as
+        // the ids of a meter that keeps nothing between admit and settle.
+        assert_eq!(run_of_request("r:0"), "r:0");
+        assert_eq!(run_of_request("0"), "0");
+        assert_eq!(run_of_request(""), "");
     }
 
     #[tokio::test]
@@ -3884,7 +3976,8 @@ mod tests {
             seen: (0, 0),
             recorded: (0, 0),
             records: 0,
-            warned: false,
+            warnings: 0,
+            said: None,
         };
         let started = std::time::Instant::now();
         log.note(&Progress {
@@ -3897,7 +3990,7 @@ mod tests {
             waited >= PROGRESS_PATIENCE && waited < PROGRESS_PATIENCE * 3,
             "{waited:?}"
         );
-        assert_eq!((log.records, log.warned), (0, true));
+        assert_eq!((log.records, log.warnings), (0, 1));
     }
 
     async fn metered_conversation(
