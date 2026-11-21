@@ -20,9 +20,14 @@
 //! SOCKS.
 //!
 //! While a command that declared hosts runs, its proxy listens on this
-//! machine's loopback interface without authentication: another process on
-//! this machine can use it to reach the same hosts. It stops once no
-//! command needs it.
+//! machine's loopback interface, shared by the running commands that declared
+//! the same hosts. The sandbox helper's bridge opens each connection with a
+//! token atomic made for its command alone (Codex's attribution frame), and
+//! the proxy refuses every request on a connection without a token it issued,
+//! so a sandboxed process or another user's process reaches nothing through
+//! it. A process of the same user outside any sandbox can still read a token
+//! from the helper's environment. A command's token admits no new connection
+//! once the command ends, and the proxy stops once no command needs it.
 
 use codex_network_proxy::{
     NetworkDecision, NetworkPolicyDecider, NetworkPolicyDeciderFuture, NetworkPolicyRequest,
@@ -30,6 +35,7 @@ use codex_network_proxy::{
     NetworkProxyState, PreparedManagedNetwork,
 };
 use std::collections::{BTreeSet, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 /// The most hosts one atom may declare.
@@ -43,6 +49,10 @@ pub const PORT_REFUSED: &str = "port_not_allowed";
 
 /// The reason the proxy gives for a host no atom declared.
 pub const HOST_REFUSED: &str = "not_allowed";
+
+/// The reason the proxy gives for a request on a connection that no
+/// confined command's bridge opened: one without a token the proxy issued.
+pub const UNATTRIBUTED_REFUSED: &str = "not_from_a_command";
 
 /// Check an atom's declared hosts against atomic's policy, returning them
 /// in a canonical order. Each is a DNS name with at least two labels, such
@@ -154,14 +164,19 @@ fn declared(declared: &[String], host: &str) -> bool {
         })
 }
 
-/// The proxy's decision for a request: a declared host on port 80 or 443.
-/// The proxy then resolves the host, and still refuses one on this machine
-/// or a private network.
+/// The proxy's decision for a request: from a confined command's bridge,
+/// for a declared host on port 80 or 443. The proxy then resolves the host,
+/// and still refuses one on this machine or a private network.
 struct DeclaredHosts(Vec<String>);
 
 impl NetworkPolicyDecider for DeclaredHosts {
     fn decide(&self, req: NetworkPolicyRequest) -> NetworkPolicyDeciderFuture<'_> {
-        let decision = if !declared(&self.0, &req.host) {
+        // The proxy names the execution only for a connection that opened
+        // with a token one of this proxy's commands holds: anything else
+        // came from some other process on this machine.
+        let decision = if req.execution_id.is_none() {
+            NetworkDecision::deny(UNATTRIBUTED_REFUSED)
+        } else if !declared(&self.0, &req.host) {
             NetworkDecision::deny(HOST_REFUSED)
         } else if !PORTS.contains(&req.port) {
             NetworkDecision::deny(PORT_REFUSED)
@@ -179,8 +194,24 @@ struct Running {
 }
 
 /// What a command holds while it runs: its proxy runs until no command
-/// holds it.
+/// holds it, and its token works until it lets go.
 pub(crate) type Lease = Arc<dyn std::any::Any + Send + Sync>;
+
+/// One command's hold on a proxy.
+struct Leased {
+    /// The proxy scoped to this command, which keeps its token registered;
+    /// dropped first, so the token stops working before the proxy might.
+    _scope: NetworkProxy,
+    _running: Arc<Running>,
+}
+
+/// A token for one command's bridge to open its connections with: 32 random
+/// bytes, in hexadecimal.
+fn token() -> anyhow::Result<String> {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).map_err(|e| anyhow::anyhow!("make a proxy token: {e}"))?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
 
 /// The proxies a confining backend runs, one for each distinct list of
 /// hosts, each kept while a command that declared it runs.
@@ -226,9 +257,12 @@ impl Proxies {
     /// `env` with the variables that send a command's traffic through the
     /// proxy for `hosts`, started now if none runs for them, and what the
     /// sandbox needs to route it there; with the lease that keeps the proxy
-    /// running, to hold until the command has ended. `loopback` names
-    /// loopback addresses the proxy also reaches, for tests only. Called
-    /// from a blocking thread, never from inside an async task.
+    /// running, to hold until the command has ended. The variables include
+    /// the command's own token, for the helper's bridge and never the
+    /// command. `loopback` names loopback addresses the proxy also reaches,
+    /// for tests only: those are on the proxy's own list, so a request for
+    /// one is not checked for a token. Called from a blocking thread, never
+    /// from inside an async task.
     pub(crate) fn prepare(
         &self,
         hosts: &[String],
@@ -256,8 +290,29 @@ impl Proxies {
                 }
             }
         };
-        let prepared = running.proxy.prepare_for_optional_environment(env, None)?;
-        let lease: Lease = running;
+        // Each command gets a token of its own, which its helper's bridge
+        // sends first on every connection; the command never sees it.
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let token = token()?;
+        let scope = running.proxy.for_execution(
+            "atomic",
+            &format!("command-{}", NEXT.fetch_add(1, Ordering::Relaxed)),
+            token.clone(),
+            None,
+            None,
+        )?;
+        let prepared = scope.prepare_for_optional_environment(env, None)?;
+        anyhow::ensure!(
+            prepared
+                .env
+                .get(codex_network_proxy::PROXY_ATTRIBUTION_TOKEN_ENV_KEY)
+                .is_some_and(|t| *t == token),
+            "the proxy did not hand the command's bridge its token"
+        );
+        let lease: Lease = Arc::new(Leased {
+            _scope: scope,
+            _running: running,
+        });
         Ok((prepared, lease))
     }
 
@@ -423,10 +478,10 @@ mod tests {
         let (prepared, lease) = proxies
             .prepare(&hosts, &[], HashMap::new())
             .expect("starts");
-        let running = lease.downcast_ref::<Running>().expect("a running proxy");
+        let leased = lease.downcast_ref::<Leased>().expect("a running proxy");
         let cfg = runtime()
             .expect("runtime")
-            .block_on(running.proxy.current_cfg())
+            .block_on(leased._running.proxy.current_cfg())
             .expect("config");
         assert!(!cfg.allow_upstream_proxy, "{cfg:?}");
         assert!(!cfg.enable_socks5 && !cfg.enable_socks5_udp, "{cfg:?}");
@@ -451,9 +506,17 @@ mod tests {
             .prepare(&hosts, &[], HashMap::new())
             .expect("reused");
         assert_eq!(
-            first_env.env, second_env.env,
+            first_env.env.get("HTTP_PROXY"),
+            second_env.env.get("HTTP_PROXY"),
             "one proxy for one list of hosts"
         );
+        let token = |p: &PreparedManagedNetwork| {
+            p.env
+                .get(codex_network_proxy::PROXY_ATTRIBUTION_TOKEN_ENV_KEY)
+                .cloned()
+        };
+        assert!(token(&first_env).is_some());
+        assert_ne!(token(&first_env), token(&second_env), "a token each");
         assert_eq!(proxies.running(), 1);
         drop(first);
         assert_eq!(proxies.running(), 1, "a command still holds it");
@@ -464,5 +527,75 @@ mod tests {
             .expect("starts again");
         assert_eq!(proxies.running(), 1);
         drop(again);
+    }
+
+    /// What a request for `http://allowed.invalid/` through the proxy at
+    /// `addr` gets, sent from this machine's loopback interface, opening
+    /// with `token`'s attribution frame or none: `403 <reason>`, or what
+    /// went wrong.
+    fn fetch(addr: &str, token: Option<&str>) -> String {
+        use std::io::{Read, Write};
+        let attempt = || -> std::io::Result<String> {
+            let mut stream = std::net::TcpStream::connect(addr)?;
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
+            if let Some(token) = token {
+                codex_network_proxy::write_attribution_frame(&mut stream, token)?;
+            }
+            stream.write_all(
+                b"GET http://allowed.invalid/ HTTP/1.1\r\nHost: allowed.invalid\r\nConnection: close\r\n\r\n",
+            )?;
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response)?;
+            let response = String::from_utf8_lossy(&response).into_owned();
+            let status = response.split(' ').nth(1).unwrap_or("none").to_owned();
+            let body = response.split_once("\r\n\r\n").map_or("", |(_, b)| b);
+            let reason = serde_json::from_str::<serde_json::Value>(body)
+                .ok()
+                .and_then(|v| v["reason"].as_str().map(str::to_owned))
+                .unwrap_or_else(|| body.trim().to_owned());
+            Ok(format!("{status} {reason}").trim().to_owned())
+        };
+        attempt().unwrap_or_else(|e| format!("{:?}", e.kind()))
+    }
+
+    /// Only a confined command's bridge can use its proxy. A client on this
+    /// machine's loopback interface without the command's token is refused
+    /// before its host is looked at, as is one with a token the proxy never
+    /// issued, or a token whose command has ended. With the command's token
+    /// the same request passes, to be refused only by the address check,
+    /// since the host never resolves.
+    #[test]
+    fn only_a_commands_bridge_can_use_its_proxy() {
+        let proxies = Proxies::default();
+        let hosts = ["allowed.invalid".to_owned()];
+        let (prepared, lease) = proxies
+            .prepare(&hosts, &[], HashMap::new())
+            .expect("starts");
+        // Another command keeps the proxy running after the first ends.
+        let (_, other) = proxies
+            .prepare(&hosts, &[], HashMap::new())
+            .expect("reused");
+        let addr = prepared.env["HTTP_PROXY"]
+            .trim_start_matches("http://")
+            .trim_end_matches('/')
+            .to_owned();
+        let token = prepared.env[codex_network_proxy::PROXY_ATTRIBUTION_TOKEN_ENV_KEY].clone();
+
+        assert_eq!(fetch(&addr, None), format!("403 {UNATTRIBUTED_REFUSED}"));
+        let forged = fetch(&addr, Some(&"0".repeat(64)));
+        assert!(
+            !forged.starts_with("403") && !forged.starts_with("200"),
+            "{forged}"
+        );
+        assert_eq!(fetch(&addr, Some(&token)), "403 not_allowed_local");
+
+        drop(lease);
+        assert_eq!(proxies.running(), 1, "the other command holds it");
+        let ended = fetch(&addr, Some(&token));
+        assert!(
+            !ended.starts_with("403") && !ended.starts_with("200"),
+            "{ended}"
+        );
+        drop(other);
     }
 }
