@@ -50,16 +50,19 @@ removed format does not bypass the check. See [the expression guide](../guides/t
 
 ## A prompt section is missing or mismatched
 
-Nothing checks that section tags balance. A misspelled closing tag still closes
-a section: the innermost one that is open, whatever its name. The symptom is
-therefore text landing inside the wrong section, or after it, rather than an
-error. A closing tag with no section open is dropped, and a section still open
-at the end of the file is closed there. Render the atom and read the prompt it
-produces (`atomic render`), then compare the nesting in that output with what
-you wrote. Inside a `{…}` expression a section left open does fail the load,
-with a TypeScript syntax error such as `':' expected.` that does not name the
-tag. Tags that start with `data-` are reserved and are rejected wherever you
-write them. See [section tags](../guides/template-tags.md).
+Section tags must balance, in the atom and in each component it uses, inside
+`{…}` expressions as well as outside them. The load fails, naming the file,
+the line and the tag, when a closing tag names another element than the
+innermost one open (`` `</notes>` closes <section>, opened on line 8 ``), when
+a closing tag has nothing open to close, and when an element is still open at
+the end of the file. Close the element the message names, or remove the stray
+closing tag. The load fails too when Astro does not read a closing tag as the
+end of the element it is written for, as with a `<slot>` or `<head>` after
+leading text, or a closing tag inside a `{…}` expression the element did not
+open in; the message names the element, both lines and what to change. A void
+HTML element such as `<input>` has no closing tag, so it
+cannot be a section's name. Tags that start with `data-` are reserved and are
+rejected wherever you write them. See [section tags](../guides/template-tags.md).
 
 ## `atomic check` says a diagram is stale
 
