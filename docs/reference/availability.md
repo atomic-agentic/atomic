@@ -99,7 +99,16 @@ rendered, which runs the atom's helpers, it opens a workspace there before any
 model call or command, and closes it however the run ends, including a panic or
 a cancelled run, and only once a command running in it has ended. A backend
 with no room for a workspace makes the run wait, recording nothing and saying
-on stderr that it waits, and the run goes on once there is room. With the
+on stderr that it waits, and the run goes on once there is room. atomic's own
+writes for a step that find the disk or a quota full, making its run's build
+caches or the directory its worktree goes in, wait the same way. A checkout git
+cannot finish, for a full disk or anything else, fails the step with what git
+said, and the run ends failed; once space is freed, start it again. Each of
+these waits, and the wait for the backend, keeps its own clock, so a worktree
+step may wait up to three times its limit: for its caches, its worktree's
+directory and its workspace. Without a limit, a step whose own writes find the
+disk full waits for as long as it takes, saying so on stderr every ten minutes.
+With the
 `backend_wait` setting (`--backend-wait <seconds>`, `ATOMIC_BACKEND_WAIT`) it
 waits at most that long: `atomic run` and
 `atomic runs resume` then stop with exit code 75, the run unfinished and nothing
