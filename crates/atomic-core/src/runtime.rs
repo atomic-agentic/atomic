@@ -1156,6 +1156,8 @@ fn turn_in(workspace: &Workspace, spec: &mut TurnSpec) -> Result<PathBuf, AtomEr
 /// its `TMPDIR` just before it runs. Elsewhere there is no such registry and
 /// no such handoff, and the command's `TMPDIR` is the turn's own directly.
 fn turn_tmpdir(workspace: &Workspace, spec: &mut TurnSpec, linux: bool) -> Result<(), AtomError> {
+    // Only atomic hands a sandbox helper a socket; a turn's never names one.
+    spec.env.remove(atomic_exec::SECRET_ENV_FD);
     let Some(scratch) = &workspace.scratch else {
         return Ok(());
     };
@@ -2276,6 +2278,7 @@ async fn run_command(
         // Inside it, the inputs it is given, which it only reads.
         read_only: reach.read_only,
         network: reach.network,
+        secret_env: Default::default(),
     };
     // The command holds its workspace open until it ends, even when the run
     // that started it is cancelled and drops its guard.
