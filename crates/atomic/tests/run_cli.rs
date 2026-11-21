@@ -1582,6 +1582,25 @@ fn a_run_killed_after_a_step_resumes_by_its_id_and_reruns_nothing_finished() {
         assert_eq!(model.calls(), 1, "rank ran");
         assert_eq!(count_log(&dir), 1, "count ran");
 
+        // Resumed, and killed again before the run ends, so its caches,
+        // and the tally count keeps there, are still there to read: a
+        // later execution that ran count again would show.
+        let (d, p, e, i) = (dir.clone(), project.clone(), env.clone(), id.clone());
+        let out = tokio::task::spawn_blocking(move || {
+            atomic(
+                &d,
+                &p,
+                &["runs", "resume", &i],
+                &with(&e, &[("ATOMIC_FAILPOINT", "pipeline:after:summarize")]),
+                "",
+            )
+        })
+        .await
+        .expect("child");
+        assert!(!out.status.success(), "killed again: {}", text(&out));
+        assert_eq!(model.calls(), 2, "only summarize ran again");
+        assert_eq!(count_log(&dir), 1, "count did not run again");
+
         let (d, p, e, i) = (dir.clone(), project.clone(), env.clone(), id.clone());
         let out = tokio::task::spawn_blocking(move || {
             atomic(
@@ -1599,7 +1618,7 @@ fn a_run_killed_after_a_step_resumes_by_its_id_and_reruns_nothing_finished() {
             stdout_json(&out),
             json!({"run": id, "status": "succeeded", "output": {"line": "P1: Export crashes on accents"}})
         );
-        assert_eq!(model.calls(), 2, "only summarize ran again");
+        assert_eq!(model.calls(), 2, "nothing ran again");
         assert_eq!(count_log(&dir), 1, "count did not run again");
     });
 }
