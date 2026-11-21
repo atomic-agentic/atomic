@@ -1430,9 +1430,20 @@ fn an_exec_cap_too_small_to_start_a_command_fails_configuration() {
     )
     .expect("a plan");
     plan.validate().expect("valid");
+    let mut run_small = plan.clone();
     plan.exec.get_mut("nap").expect("nap").millis = 400;
     let refused = plan.validate().expect_err("refused");
-    assert!(refused.starts_with("atom nap: "), "{refused}");
+    assert!(
+        refused.starts_with("atom nap: the atom minutes cap (0.4 seconds"),
+        "{refused}"
+    );
+    // The run's cap, under its exec atom's.
+    run_small.run.millis = 400;
+    let refused = run_small.validate().expect_err("refused");
+    assert!(
+        refused.starts_with("the run: the workflow minutes cap (0.4 seconds"),
+        "{refused}"
+    );
 }
 
 #[test]

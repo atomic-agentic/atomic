@@ -145,7 +145,8 @@ pub struct Request {
     pub turn: bool,
     /// For a turn, the longest it can run in active milliseconds, when it
     /// has a limit of its own, such as a command's: it reserves no more of
-    /// the time left than that, so the rest stays free for its siblings.
+    /// the time left than that, or than `reserve.millis` if that is more,
+    /// so the rest stays free for its siblings.
     pub longest: Option<i64>,
 }
 

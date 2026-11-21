@@ -199,7 +199,11 @@ The command is stopped when that time runs out or at its own limit, whichever
 is first. The step is charged from the command's admission to its settlement:
 the command itself, and also starting its runner, trying again while another
 runner held its workspace, and storing its output files. Only the command is
-stopped at the cap, so that extra time can take a run a little past it. A
+stopped at the cap, so a command the cap stops can take its run past the cap by
+that extra time: up to its runner's 30 seconds, two retries a second apart, and
+about 1.4 seconds of waiting while a cleanup holds the artifact store, so about
+35 seconds, plus the time its output files take to store. Each exec step
+running at the same time can go past by that much. A
 command uses no tokens and costs nothing, so an exec atom's budget needs no
 price, even under a dollar cap, and only its time is checked: a run whose
 tokens or dollars went past their caps on earlier model calls still runs it.

@@ -21,7 +21,11 @@
 //! Its charge runs from its admission to its settlement, so it also takes in
 //! starting its runner, trying again while another runner held its
 //! workspace, and storing its output files: those are charged but not cut
-//! off, and can take a run a little past its minutes cap.
+//! off. A command the cap bounds can so take its run past the cap by up to
+//! its runner's grace ([`atomic_exec::runner::RUNNER_GRACE`], 30 s), two
+//! retries a second apart, and about 1.4 s of backoff while a sweep holds
+//! the artifact store: about 35 s, plus the time its output files take to
+//! store. Each exec step running at once can go past by that much.
 //!
 //! A run's caps, prices and call bounds are resolved once, before it starts,
 //! into a [`BudgetPlan`] the run keeps: a resumed run is metered as it began,

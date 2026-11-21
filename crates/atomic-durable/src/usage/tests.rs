@@ -611,54 +611,76 @@ async fn a_turn_reserves_the_active_time_left<R: DurableRuntime>(rt: R) {
 
 async fn an_amount_a_call_reserves_none_of_is_not_held_to_its_cap<R: DurableRuntime>(rt: R) {
     let ledger = rt.ledger();
-    let run = unique("none-of");
-    // A call that reported more tokens than it reserved takes its atom past
-    // its token cap.
-    let (req, attempt) = admitted(
-        &ledger
-            .admit(request(&run, 1, 0, 1_000, 150))
+    // A call that reported more than it reserved takes its atom past its
+    // token cap, its dollar cap, or both.
+    for (tag, tokens_over, dollars_over) in [
+        ("tokens", true, false),
+        ("dollars", false, true),
+        ("both", true, true),
+    ] {
+        let run = unique(&format!("none-of-{tag}"));
+        let capped = |call: u32| {
+            let cap = if tokens_over { 150 } else { 1_000 };
+            let mut r = request(&run, 1, call, cap, cap);
+            for scope in &mut r.chain {
+                scope.caps.micro_usd = Some(if dollars_over { 60 } else { 1_000 });
+            }
+            r
+        };
+        let (req, attempt) = admitted(&ledger.admit(capped(0)).await.expect("admit"));
+        ledger
+            .settle(
+                &req,
+                attempt,
+                Settlement::Reported {
+                    input_tokens: 150,
+                    output_tokens: 50,
+                    millis: 10,
+                    micro_usd: 80,
+                },
+            )
             .await
-            .expect("admit"),
-    );
-    ledger
-        .settle(
-            &req,
-            attempt,
-            Settlement::Reported {
-                input_tokens: 150,
-                output_tokens: 50,
-                millis: 10,
-                micro_usd: 0,
-            },
-        )
-        .await
-        .expect("settle");
-    assert_eq!(charged(&ledger, &format!("atom:{run}:1")).await.tokens, 200);
-    // Another model call is refused on its tokens; work that reserves only
-    // time, such as a command, is admitted on the time left.
-    match ledger
-        .admit(request(&run, 1, 1, 1_000, 150))
-        .await
-        .expect("admit")
-    {
-        Admission::Refused { reason, .. } => assert!(reason.contains("tokens"), "{reason}"),
-        other => panic!("refused: {other:?}"),
+            .expect("settle");
+        let atom = charged(&ledger, &format!("atom:{run}:1")).await;
+        assert_eq!((atom.tokens, atom.micro_usd), (200, 80), "{tag}");
+        // Another model call is refused on what it is over; work that
+        // reserves only time, such as a command, is admitted on the time
+        // left.
+        match ledger.admit(capped(1)).await.expect("admit") {
+            Admission::Refused { reason, .. } => {
+                assert_eq!(
+                    reason.contains("tokens charged"),
+                    tokens_over,
+                    "{tag}: {reason}"
+                );
+                assert_eq!(
+                    reason.contains("micro-dollars charged"),
+                    dollars_over,
+                    "{tag}: {reason}"
+                );
+            }
+            other => panic!("{tag}: refused: {other:?}"),
+        }
+        let time = Charge {
+            tokens: 0,
+            millis: 500,
+            micro_usd: 0,
+        };
+        let work = Request {
+            id: format!("{run}:1:2"),
+            model: "(command)".into(),
+            reserve: time,
+            maximum: time,
+            turn: true,
+            ..capped(2)
+        };
+        match ledger.admit(work).await {
+            Ok(Admission::Admitted { .. }) => {}
+            other => panic!("{tag}: the command is admitted: {other:?}"),
+        }
+        let atom = charged(&ledger, &format!("atom:{run}:1")).await;
+        assert_eq!((atom.tokens, atom.micro_usd), (200, 80), "{tag}");
     }
-    let time = Charge {
-        tokens: 0,
-        millis: 500,
-        micro_usd: 0,
-    };
-    let work = Request {
-        id: format!("{run}:1:2"),
-        model: "(command)".into(),
-        reserve: time,
-        maximum: time,
-        turn: true,
-        ..request(&run, 1, 2, 1_000, 150)
-    };
-    admitted(&ledger.admit(work).await.expect("admit"));
-    assert_eq!(charged(&ledger, &format!("atom:{run}:1")).await.tokens, 200);
 }
 
 async fn a_turn_with_a_limit_of_its_own_reserves_no_more_than_it<R: DurableRuntime>(rt: R) {
@@ -708,6 +730,31 @@ async fn a_turn_with_a_limit_of_its_own_reserves_no_more_than_it<R: DurableRunti
     };
     assert_eq!(millis, 15_000);
     assert_eq!(bounded_by, Some(format!("atom:{run}:1")));
+    // A limit below one request's bound reserves that bound, still its own.
+    ledger
+        .settle(
+            &format!("{run}:1:1"),
+            1,
+            Settlement::Reported {
+                input_tokens: 0,
+                output_tokens: 0,
+                millis: 1_000,
+                micro_usd: 0,
+            },
+        )
+        .await
+        .expect("settle");
+    let mut short = request(&run, 1, 2, 1_000_000, 1_000_000);
+    short.turn = true;
+    short.longest = Some(200);
+    let Admission::Admitted {
+        millis, bounded_by, ..
+    } = ledger.admit(short).await.expect("admit")
+    else {
+        panic!("admitted");
+    };
+    assert_eq!(millis, BOUND.millis);
+    assert_eq!(bounded_by, None);
 }
 
 async fn unreported_and_dead_attempts_are_charged_the_time_they_took<R: DurableRuntime>(rt: R) {
