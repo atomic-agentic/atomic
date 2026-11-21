@@ -1337,6 +1337,22 @@ fn exec_declarations_are_checked_at_load() {
             "set by atomic",
         ),
         (
+            "kind: 'codex', env: { ATOMIC_SANDBOX_RELISTED: '1' }",
+            "marks Codex's sandbox helper",
+        ),
+        (
+            "kind: 'codex', env: { ATOMIC_SANDBOX_PLACES: '[]' }",
+            "carries the places its sandbox denies",
+        ),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, env: { ATOMIC_SANDBOX_PLACES: '[]' }",
+            "carries the places its sandbox denies",
+        ),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, env: { ATOMIC_SANDBOX_RELISTED: '1' }",
+            "marks Codex's sandbox helper",
+        ),
+        (
             "kind: 'exec', exec: { command: ['x'] }, env: { HOME: '/x' }",
             "set by atomic",
         ),
