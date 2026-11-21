@@ -340,7 +340,11 @@ fn a_login_that_fails_and_a_logout_leave_no_sign_in_directory() {
     for store in [&[][..], &keyring[..]] {
         let out = f.atomic(&["--json", "model", "logout"], store);
         assert!(out.status.success(), "{}", text(&out));
-        assert!(!auth.exists(), "a logout left {} ({store:?})", auth.display());
+        assert!(
+            !auth.exists(),
+            "a logout left {} ({store:?})",
+            auth.display()
+        );
     }
     // Signed in, a logout leaves the directory only when the keyring could
     // not be checked, which may still keep the sign-in: the directory is
