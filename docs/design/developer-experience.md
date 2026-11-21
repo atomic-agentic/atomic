@@ -41,7 +41,7 @@ in [project structure](../guides/project-structure.md) and
 - **Safe by convention.** By default the sandbox is read-only with no network;
   an atom writes only if it says so, and then only inside its step's worktree;
   every atom has a budget; a push needs a gate first; and build caches live
-  outside worktrees. Projects can relax safety deliberately, but never have to
+  outside worktrees, one set for each run, gone when it ends. Projects can relax safety deliberately, but never have to
   ask for it.
 - **Admin endpoints.** Next to health and readiness, `atomic serve` reports its
   resolved configuration, the conditions it detected, its runs and its metrics

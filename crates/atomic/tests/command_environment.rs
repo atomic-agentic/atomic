@@ -254,6 +254,7 @@ async fn codex_turn() {
             scratch_root.clone(),
         ))
         .expect("connects"),
+        caches: None,
     };
     let answer = run_turn(
         &runtime,
