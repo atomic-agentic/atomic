@@ -416,9 +416,15 @@ path, inside toolbox or distrobox (the host's files under `/run/host`), or
 with a btrfs top-level subvolume mounted elsewhere, and so is each
 filesystem mounted inside a denied directory wherever else it is mounted.
 atomic reads the mount table for this when it makes the list, and nothing
-runs when it cannot read it, or when a denied place is on a network or FUSE
-filesystem (NFS, SMB, `fuse.*`) mounted more than once, since the table
-does not say which directory each such mount shows. Not covered: a
+runs when it cannot read it, or when a denied place is on NFS and that
+filesystem is mounted more than once, since the table gives every NFS mount
+`/` as its root, whatever directory it shows; other network and FUSE
+filesystems, SMB, 9p, virtiofs and `fuse.*`, are followed as local ones are.
+The links followed and the second mounts found together come to at most
+512; past that, nothing runs. Not covered: the same remote directory
+mounted twice as two filesystems, each with a device of its own (9p, NFS
+with `nosharecache`, two SMB sessions or two FUSE daemons), neither of
+which is denied for the other; a
 snapshot, which holds a copy, not the place itself; an overlay or FUSE
 filesystem built over a denied directory, such as an overlay whose upper or
 lower directory is inside one, which shows its files as its own; and a

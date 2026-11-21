@@ -13,11 +13,12 @@
 //! directory, whose files the denial hides there too.
 //!
 //! It refuses (an error, so nothing runs) when it cannot tell: a table or a
-//! line it cannot read, a denied path it finds no mount for, or a denied
-//! path on a network or FUSE filesystem ([`unknowable`]) that is mounted
-//! more than once, since the table does not say which directory each of its
-//! mounts shows. A mount whose root is not a path, such as a namespace file
-//! (`net:[4026531840]`), shows no directory, and is never a second place.
+//! line it cannot read, one with a mount on a mount it does not list, a
+//! denied path it finds no mount for, or a denied path on NFS
+//! ([`unknowable`]) that is mounted more than once, since the table gives
+//! every NFS mount `/` as its root, whatever directory it shows. A mount
+//! whose root is not a path, such as a namespace file (`net:[4026531840]`),
+//! shows no directory, and is never a second place.
 //!
 //! What it cannot see:
 //!
@@ -29,7 +30,11 @@
 //!   own;
 //! - a mount made after the list is built, such as one an automount
 //!   (`autofs`) makes when a path under it is first used, even from inside
-//!   the sandbox, which sees the host's new mounts.
+//!   the sandbox, which sees the host's new mounts;
+//! - the same remote directory mounted twice as two filesystems, each with
+//!   a device of its own: 9p, NFS with `nosharecache`, two SMB sessions, or
+//!   two FUSE daemons serving the same files. Neither is a second mount of
+//!   the other, so neither is denied for the other, nor refused.
 
 use anyhow::bail;
 use std::path::{Path, PathBuf};
@@ -52,26 +57,12 @@ struct Mount {
     kind: String,
 }
 
-/// Whether a filesystem of type `kind` is one whose mounts may all show `/`
-/// as their root in the table, whatever directory each shows: a network or
-/// FUSE filesystem.
+/// Whether a filesystem of type `kind` is one whose mounts all show `/` as
+/// their root in the table, whatever directory each shows: NFS. Other
+/// network and FUSE filesystems (SMB, 9p, virtiofs, `fuse.*`) show the
+/// directory a bind of part of them shows, as local ones do.
 fn unknowable(kind: &str) -> bool {
-    matches!(
-        kind,
-        "nfs"
-            | "nfs4"
-            | "cifs"
-            | "smb3"
-            | "smbfs"
-            | "9p"
-            | "ceph"
-            | "glusterfs"
-            | "lustre"
-            | "afs"
-            | "fuse"
-            | "fuseblk"
-            | "virtiofs"
-    ) || kind.starts_with("fuse.")
+    matches!(kind, "nfs" | "nfs4")
 }
 
 /// A path field of the mount table with its octal escapes (`\040` for a
@@ -150,6 +141,27 @@ fn parse(mountinfo: &[u8]) -> anyhow::Result<Vec<Mount>> {
         };
         mounts.push(mount);
     }
+    // Every mount but the root is mounted on one the table lists: one that
+    // is not was cut from the table, or the table is not one.
+    if let Some(root) = root_of(&mounts) {
+        let ids: std::collections::HashSet<u64> = mounts.iter().map(|m| m.id).collect();
+        if let Some(orphan) = mounts
+            .iter()
+            .find(|m| m.id != root.id && !ids.contains(&m.parent))
+        {
+            bail!(
+                "the mount table lists {} on mount {}, which it does not list, so atomic cannot \
+                 tell where else the places it denies are mounted",
+                orphan.at.display(),
+                orphan.parent
+            );
+        }
+    } else if !mounts.is_empty() {
+        bail!(
+            "the mount table has no root mount, so atomic cannot tell where else the places it \
+             denies are mounted"
+        );
+    }
     Ok(mounts)
 }
 
@@ -168,13 +180,19 @@ fn top<'a>(mounts: &'a [Mount], mut mount: &'a Mount) -> &'a Mount {
     mount
 }
 
+/// The root mount: the one at `/` mounted on nothing listed, or on itself,
+/// as an initramfs's root is.
+fn root_of(mounts: &[Mount]) -> Option<&Mount> {
+    let ids: std::collections::HashSet<u64> = mounts.iter().map(|m| m.id).collect();
+    mounts
+        .iter()
+        .find(|m| m.at == Path::new("/") && (m.parent == m.id || !ids.contains(&m.parent)))
+}
+
 /// The mount `path` is in, as this process sees it: from the root mount,
 /// down the mounts on each directory of the path, each the top of its stack.
 fn mount_of<'a>(mounts: &'a [Mount], path: &Path) -> Option<&'a Mount> {
-    let ids: std::collections::HashSet<u64> = mounts.iter().map(|m| m.id).collect();
-    let root = mounts
-        .iter()
-        .find(|m| m.at == Path::new("/") && !ids.contains(&m.parent))?;
+    let root = root_of(mounts)?;
     let mut here = top(mounts, root);
     let mut at = PathBuf::from("/");
     for part in path.components().skip(1) {
@@ -207,9 +225,9 @@ fn aliases_of(mounts: &[Mount], path: &Path, out: &mut Vec<PathBuf>) -> anyhow::
     };
     if unknowable(&home.kind) {
         bail!(
-            "{} is on a {} filesystem mounted more than once ({} and {}), and the mount table \
-             does not say which directory each such mount shows, so atomic cannot deny it at \
-             each",
+            "{} is on an {} filesystem, seen at {}, that is mounted again at {}, and the mount \
+             table does not say which directory each of its mounts shows, so atomic cannot deny \
+             it at each",
             path.display(),
             home.kind,
             home.at.display(),
@@ -225,7 +243,11 @@ fn aliases_of(mounts: &[Mount], path: &Path, out: &mut Vec<PathBuf>) -> anyhow::
             continue;
         };
         let alias = if let Ok(below) = inside.strip_prefix(other_root) {
-            other.at.join(below)
+            if below.as_os_str().is_empty() {
+                other.at.clone()
+            } else {
+                other.at.join(below)
+            }
         } else if other_root.starts_with(&inside) {
             other.at.clone()
         } else {
@@ -294,6 +316,7 @@ pub(crate) fn with_table(table: &[u8]) -> TableGuard {
 /// Puts this process's own mount table back for [`second_mounts`] when
 /// dropped.
 #[cfg(test)]
+#[must_use = "dropping the guard puts this process's own table back at once"]
 pub(crate) struct TableGuard;
 
 #[cfg(test)]
@@ -303,32 +326,47 @@ impl Drop for TableGuard {
     }
 }
 
-/// Every other place the mount table shows each of `denied`, and each
-/// filesystem mounted inside one: each must be denied too. On Linux the
-/// table is `/proc/self/mountinfo`, the mounts this process and the sandbox
-/// it starts see; one that cannot be read, or that leaves a place it cannot
-/// tell about, fails it rather than leave a place undenied. Elsewhere there
-/// is no such table, and none is found.
-pub fn second_mounts(denied: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
-    #[cfg(test)]
-    if let Some(table) = TABLE.with(|t| t.borrow().clone()) {
-        let real: Vec<PathBuf> = denied.iter().map(|p| real(p)).collect();
-        return aliases(&parse(&table)?, &real);
-    }
-    #[cfg(target_os = "linux")]
-    {
-        use anyhow::Context;
-        let table = std::fs::read("/proc/self/mountinfo").context(
-            "read /proc/self/mountinfo, to find where else the places atomic denies are mounted",
-        )?;
-        let real: Vec<PathBuf> = denied.iter().map(|p| real(p)).collect();
-        aliases(&parse(&table)?, &real)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (denied, parse, aliases, real);
-        Ok(Vec::new())
-    }
+/// For each group of `groups`, every other place the mount table shows
+/// each of its paths, and each filesystem mounted inside one: each must be
+/// denied too. The table is read once for all of them. On Linux it is
+/// `/proc/self/mountinfo`, the mounts this process and the sandbox it starts
+/// see; one that cannot be read, or that leaves a place it cannot tell
+/// about, fails it rather than leave a place undenied. Elsewhere there is no
+/// such table, and none is found.
+pub fn second_mounts(groups: &[&[PathBuf]]) -> anyhow::Result<Vec<Vec<PathBuf>>> {
+    let table: Option<Vec<u8>> = {
+        #[cfg(test)]
+        let injected = TABLE.with(|t| t.borrow().clone());
+        #[cfg(not(test))]
+        let injected: Option<Vec<u8>> = None;
+        match injected {
+            Some(table) => Some(table),
+            None => {
+                #[cfg(target_os = "linux")]
+                {
+                    use anyhow::Context;
+                    Some(std::fs::read("/proc/self/mountinfo").context(
+                        "read /proc/self/mountinfo, to find where else the places atomic \
+                         denies are mounted",
+                    )?)
+                }
+                #[cfg(not(target_os = "linux"))]
+                None
+            }
+        }
+    };
+    let Some(table) = table else {
+        let _ = (parse, aliases, real);
+        return Ok(groups.iter().map(|_| Vec::new()).collect());
+    };
+    let mounts = parse(&table)?;
+    groups
+        .iter()
+        .map(|group| {
+            let real: Vec<PathBuf> = group.iter().map(|p| real(p)).collect();
+            aliases(&mounts, &real)
+        })
+        .collect()
 }
 
 #[cfg(test)]

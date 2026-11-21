@@ -721,17 +721,21 @@ fn denied_paths(
     // The same places wherever else they are mounted, such as a home bound
     // at a second path or the host's files under /run/host: denied there
     // too, or nothing runs (see `crate::mounts`).
-    let aliases = crate::mounts::second_mounts(&all).map_err(|e| refuse(format!("{e:#}")))?;
+    // And Codex's home, whose databases a pattern denies (see below).
+    let home = [codex_home.to_owned()];
+    let found =
+        crate::mounts::second_mounts(&[&all, &home]).map_err(|e| refuse(format!("{e:#}")))?;
+    let (aliases, home_aliases) = (&found[0], &found[1]);
     // One cap for both, as both go to the sandbox helper in one argument.
-    if link_count + aliases.len() > MAX_LINK_TARGETS {
+    let second = aliases.len() + home_aliases.len();
+    if link_count + second > MAX_LINK_TARGETS {
         return Err(refuse(format!(
             "the places denied to atoms' commands hold {link_count} links to files elsewhere and \
-             are mounted at {} other places, more than the {MAX_LINK_TARGETS} atomic denies \
-             besides the places themselves",
-            aliases.len()
+             are mounted at {second} other places, more than the {MAX_LINK_TARGETS} atomic \
+             denies besides the places themselves"
         )));
     }
-    for alias in &aliases {
+    for alias in aliases.iter().chain(home_aliases) {
         if let Some(needed) = covers(alias) {
             return Err(refuse(format!(
                 "{} is a second mount of a place denied to atoms' commands, and holds {}, which \
@@ -749,7 +753,7 @@ fn denied_paths(
             )));
         }
     }
-    all.extend(aliases);
+    all.extend(aliases.iter().cloned());
     // A path inside another denied path is denied with it, and the sandbox
     // cannot mount a denial inside one: such as the credential store inside
     // the person's own configuration directory.
@@ -762,9 +766,7 @@ fn denied_paths(
     // covers it.
     // And so at each second mount of Codex's home.
     let mut globs = vec![format!("{}/*.sqlite*", codex_home.display())];
-    for alias in crate::mounts::second_mounts(&[codex_home.to_owned()])
-        .map_err(|e| refuse(format!("{e:#}")))?
-    {
+    for alias in home_aliases {
         globs.push(format!("{}/*.sqlite*", alias.display()));
     }
     Ok((all, globs))
@@ -3017,6 +3019,21 @@ mod tests {
         let message = refused(bound("/w/a"), None, &[PathBuf::from("/w")]);
         assert!(
             message.contains("is a second mount") && message.contains("two or more levels"),
+            "{message}"
+        );
+        // Codex's home bound two levels inside a writable directory: its
+        // databases' pattern there is held to the same checks.
+        let codex_real = std::fs::canonicalize(&codex).expect("real");
+        let message = refused(
+            format!(
+                "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n2 1 8:1 {} /w/a/b rw - ext4 /dev/sda1 rw\n",
+                codex_real.display()
+            ),
+            None,
+            &[PathBuf::from("/w")],
+        );
+        assert!(
+            message.contains("/w/a/b is a second mount") && message.contains("two or more levels"),
             "{message}"
         );
         // Too many second mounts to deny.

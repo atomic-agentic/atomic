@@ -88,7 +88,14 @@ fn a_namespace_file_is_read_and_never_an_alias() {
 #[test]
 fn a_real_table_parses_and_finds_what_it_should() {
     let mounts = parse(include_bytes!("host.mountinfo")).expect("the real table parses");
+    assert_eq!(mounts.len(), 19);
     assert!(mounts.iter().any(|m| m.kind == "nsfs" && m.root.is_none()));
+    // A FUSE mount under the user's runtime directory is found where it is.
+    let gvfs = mount_of(&mounts, Path::new("/run/user/1000/gvfs/share")).expect("a mount");
+    assert_eq!(
+        (gvfs.kind.as_str(), gvfs.at.as_path()),
+        ("fuse.gvfsd-fuse", Path::new("/run/user/1000/gvfs"))
+    );
     assert!(mounts.iter().any(|m| m.kind == "autofs"));
     assert!(found(&mounts, "/home/user/.ssh").is_empty());
     // The bound container store is the home's own directory, there too.
@@ -132,10 +139,10 @@ fn a_mount_point_that_is_not_utf8_is_read() {
     assert_eq!(mounts[1].at.as_os_str().as_bytes(), b"/mnt/\xff");
 }
 
-/// A denied place on a network or FUSE filesystem mounted more than once
-/// is refused: the table gives every such mount `/` as its root, so it
-/// cannot say where the place is at each. Mounted once, there is nothing
-/// to find.
+/// A denied place on NFS mounted more than once is refused: the table gives
+/// every NFS mount `/` as its root, so it cannot say where the place is at
+/// each. Mounted once, there is nothing to find. A FUSE filesystem shows the
+/// directory a bind of part of it shows, and is followed as a local one is.
 #[test]
 fn a_network_filesystem_mounted_twice_is_refused() {
     let twice = b"\
@@ -147,7 +154,7 @@ fn a_network_filesystem_mounted_twice_is_refused() {
     assert!(
         aliases(&mounts, &[PathBuf::from("/home/u/.ssh")]).is_err_and(|e| e
             .to_string()
-            .contains("nfs4 filesystem mounted more than once"))
+            .contains("nfs4 filesystem, seen at /home, that is mounted again at /mnt/home"))
     );
     let once = parse(
         b"1 0 8:1 / / rw - ext4 /dev/sda1 rw\n2 1 0:50 / /home rw - nfs4 server:/export/home rw\n",
@@ -186,5 +193,50 @@ fn a_mount_inside_a_denied_directory_is_followed_to_its_other_mounts() {
     assert_eq!(
         found(&mounts, "/home/u/.ssh"),
         [PathBuf::from("/srv/c/keys")]
+    );
+}
+
+#[test]
+fn a_fuse_filesystem_bound_in_part_is_followed() {
+    let fuse = b"\
+1 0 8:1 / / rw - ext4 /dev/sda1 rw
+2 1 0:60 / /mnt/fuse rw - fuse.sshfs host:/home rw
+3 1 0:60 /u /home/u rw - fuse.sshfs host:/home rw
+";
+    let mounts = parse(fuse).expect("parses");
+    assert_eq!(
+        found(&mounts, "/home/u/.ssh"),
+        [PathBuf::from("/mnt/fuse/u/.ssh")]
+    );
+}
+
+/// A root mount that is its own parent, as an initramfs's is, is the root.
+#[test]
+fn a_root_that_is_its_own_parent_is_the_root() {
+    let own = b"\
+1 1 0:2 / / rw - rootfs rootfs rw
+2 1 0:2 / /mnt/again rw - rootfs rootfs rw
+";
+    let mounts = parse(own).expect("parses");
+    assert_eq!(
+        found(&mounts, "/home/u"),
+        [PathBuf::from("/mnt/again/home/u")]
+    );
+}
+
+/// A mount on a mount the table does not list, other than the root, is a
+/// table cut short, or not one at all: refused.
+#[test]
+fn a_mount_on_one_the_table_does_not_list_is_refused() {
+    let cut = b"\
+1 0 8:1 / / rw - ext4 /dev/sda1 rw
+3 2 8:2 / /home rw - ext4 /dev/sdb1 rw
+";
+    assert!(
+        parse(cut).is_err_and(|e| e.to_string().contains("on mount 2, which it does not list"))
+    );
+    assert!(
+        parse(b"1 0 8:1 / /mnt rw - ext4 /dev/sda1 rw\n")
+            .is_err_and(|e| e.to_string().contains("no root mount"))
     );
 }
