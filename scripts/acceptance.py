@@ -26,11 +26,13 @@ In the milestones document, an Acceptance block starts at a line that begins
 holds a bullet per clause: a milestone's clauses are those of all its blocks,
 in order. A line that only looks like that marker is refused with its line
 number, not skipped, so a block in such a shape cannot go unread: outside a
-block, any line that leads with a spelling of `accept` and ends in a colon is
-refused as one, however it is wrapped. A split milestone's parts are sections
-under it. An "a" part states its own acceptance; a "b" part finishes its
-parent's work, so its clauses are its parent's, with any of its own blocks
-after them.
+block, a line is refused as one when, past a wrapper of markdown punctuation
+(`-`, `_`, `*`, `~`, `>`, `#` and spaces) that may carry one bullet's mark
+(`- `, `* `, `+ `, or a number, then `.` or `)`, then a space), its first word
+is a spelling of `accept` and the line ends in a colon with only that
+punctuation after it. A split milestone's parts are sections under it. An "a" part states
+its own acceptance; a "b" part finishes its parent's work, so its clauses are
+its parent's, with any of its own blocks after them.
 
 Every listed test is run in one `cargo test` over the workspace, with CI's
 test features (FEATURES, which must match CI's test build, and which
@@ -70,16 +72,25 @@ ACCEPTANCE = re.compile(r"^\*\*Acceptance\b.*:\*\*$")
 # outside the bold. Refused wherever it sits, open block or not: the clauses
 # under it would be skipped in silence.
 NEAR_MARKER = re.compile(r"^\*\*Acceptance\b", re.IGNORECASE)
-# Any line shaped like that marker, whatever wrapper it is in and however the
-# word is spelt: `Acceptance:`, `__Acceptance:__`, `**Acceptence:**`,
-# `- **Acceptance, files and data:**`. The wrapper holds markdown punctuation
-# only, so a line whose first word is not a spelling of `accept` stays prose.
-# Outside a block such a line is refused too, since only a line beginning
-# `**Acceptance` opens one.
-MARKERISH = re.compile(r"^[-_*~>#\s]*accept\w*\b.*:[-_*~>#\s]*$", re.IGNORECASE)
 # A bullet: `- `, `* ` or `+ `, or a number, at the start of the line or
 # indented. Only a `- ` at the start of a line is read as a clause.
 BULLET = re.compile(r"^\s*(?:[-*+][ \t]|\d+[.)]\s)")
+# The same bullet, optional and unanchored, for a pattern that matches a whole
+# line: `- `, `* `, `+ `, or a number, then `.` or `)`, then a space.
+BULLET_MARK = r"(?:[-*+][ \t]|\d+[.)]\s)?"
+# Any line shaped like that marker: `Acceptance:`, `__Acceptance:__`,
+# `**Acceptence:**`, `- **Acceptance, files and data:**`, and the same marker
+# led by a bullet. Before the word it takes markdown punctuation (`-`, `_`,
+# `*`, `~`, `>`, `#` and spaces), which may carry BULLET_MARK once; after the
+# colon, that punctuation only. So a line whose first word is not a spelling
+# of `accept` stays prose, as `1. Cap the run.`, and a wrapper sitting
+# anywhere else in the line does too, as in `The **Acceptance:** list`.
+# Outside a block such a line is refused too, since only a line beginning
+# `**Acceptance` opens one.
+MARKERISH = re.compile(
+    rf"^[-_*~>#\s]*{BULLET_MARK}[-_*~>#\s]*accept\w*\b.*:[-_*~>#\s]*$",
+    re.IGNORECASE,
+)
 # A heading's first word, which holds its id when the heading states one.
 HEADING_ID = re.compile(r"^#+\s+(\S+)")
 # A milestone id: `M11`, or `M11b` for one of its parts.

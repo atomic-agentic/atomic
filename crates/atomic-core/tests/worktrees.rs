@@ -246,6 +246,7 @@ fn run_step_resets_runs_and_commits() {
         let request = StepRequest {
             run: "run".into(),
             step: "implement".into(),
+            atom: "implement-it".into(),
             base: f.first.clone(),
             message: "Implement it".into(),
             signature: Signature::default(),

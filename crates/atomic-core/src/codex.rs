@@ -22,7 +22,6 @@ use codex_core_api::AuthKeyringBackendKind;
 use codex_core_api::AuthManager;
 use codex_core_api::AutoCompactTokenLimitScope;
 use codex_core_api::CodexAppsToolsCache;
-use codex_core_api::CodexHomeUserInstructionsProvider;
 use codex_core_api::CodexThread;
 use codex_core_api::Config;
 use codex_core_api::ConfigLayerStack;
@@ -38,6 +37,8 @@ use codex_core_api::Feature;
 use codex_core_api::Features;
 use codex_core_api::GhostSnapshotConfig;
 use codex_core_api::History;
+use codex_core_api::LoadInstructionsFuture;
+use codex_core_api::LoadedUserInstructions;
 use codex_core_api::MemoriesConfig;
 use codex_core_api::ModelAvailabilityNuxConfig;
 use codex_core_api::ModelCatalogSettings;
@@ -70,6 +71,7 @@ use codex_core_api::TuiPetAnchor;
 use codex_core_api::TurnInputRequest;
 use codex_core_api::UriBasedFileOpener;
 use codex_core_api::UserInput;
+use codex_core_api::UserInstructionsProvider;
 use codex_core_api::WebSearchMode;
 use codex_core_api::arg0_dispatch_or_else;
 use codex_core_api::bootstrap_auth_config;
@@ -80,6 +82,8 @@ use codex_core_api::local_agent_graph_store_from_state_db;
 use codex_core_api::passthrough_image_store;
 use codex_core_api::resolve_bootstrap_respect_system_proxy;
 use codex_core_api::resolve_installation_id;
+use codex_extension_api::SkillInvocationContributor;
+use codex_protocol::config_types::TrustLevel;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::future::Future;
@@ -351,7 +355,13 @@ impl StateGuard {
             home_secrets(&person_env, crate::state::passwd_home()).map_err(anyhow::Error::msg)?,
         );
         // With ATOMIC_HOME set, the default home's state, credentials and
-        // keys are another atomic's: denied too, where they exist.
+        // keys are another atomic's: denied too, where they exist. The entry
+        // from `dirs` is where that other atomic would keep its credentials
+        // (see [`crate::state::credentials_dir`]), which is not always the
+        // directory denied above: that one comes from
+        // [`crate::state::user_config_dir`], the same function
+        // [`crate::state::outside_user_config`] reads, so the directory a
+        // state directory is refused for sitting inside is denied outright.
         if std::env::var_os("ATOMIC_HOME").is_some_and(|h| !h.is_empty()) {
             let defaults = [
                 dirs::data_dir().map(|d| d.join("atomic")),
@@ -1034,6 +1044,35 @@ fn harden() {
 pub fn harden_runner() {
     // The runner holds commands' environments, proxy tokens among them.
     codex_process_hardening::pre_main_hardening();
+}
+
+/// Point this process's `TMPDIR` at `tmp`, the shared temporary directory of
+/// the backend its turns run on ([`atomic_exec::LocalBackend::shared_tmp`]).
+///
+/// Codex's sandbox keeps a registry of the mount points it makes in a turn's
+/// writable roots, such as the empty `.git` it mounts read-only where there
+/// is none, in its helper's `TMPDIR`, so that a sandbox never removes one
+/// another sandbox is still using. A turn's commands give their helper the
+/// backend's shared directory. Codex's file helper, which applies a turn's
+/// patches under the same sandbox, takes its `TMPDIR` from this process
+/// instead: pointed here, the two keep one registry. Elsewhere than Linux
+/// Codex keeps no such registry, and this does nothing.
+///
+/// Whatever this process and its helpers keep in their temporary directory
+/// is then kept there, which connecting the backend empties: give it only
+/// for a command that runs turns on that backend, before it connects.
+///
+/// Call it in `main` before [`dispatch`], while the process has one thread.
+pub fn share_sandbox_registry(tmp: &Path) {
+    #[cfg(target_os = "linux")]
+    // SAFETY: called at the start of main, while the process has one thread,
+    // so no other thread can read the environment concurrently.
+    #[allow(unsafe_code)]
+    unsafe {
+        std::env::set_var("TMPDIR", tmp);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = tmp;
 }
 
 /// The process entry point.
@@ -1914,6 +1953,43 @@ where
     .await
 }
 
+/// The instructions a Codex host declares for itself: none, and read from
+/// nowhere.
+///
+/// At the pinned rev Codex's own host provider reads `AGENTS.override.md` and
+/// then `AGENTS.md` straight out of the Codex home and sends them to every
+/// thread as global user instructions. atomic's Codex home is the project's
+/// state directory (see [`crate::state`]), so those files are not a
+/// checkout's; they are still input no atom declared, no pin recorded and
+/// nothing checked. An atom's inputs are what its file declares, so the host
+/// declares none: this answers "nothing" and opens no file doing it.
+struct NoHostInstructions;
+
+impl UserInstructionsProvider for NoHostInstructions {
+    fn load_user_instructions(&self) -> LoadInstructionsFuture<'_> {
+        Box::pin(std::future::ready(LoadedUserInstructions::default()))
+    }
+}
+
+/// Whether atomic needs a snapshot of the skills Codex finds in the host. It
+/// has no skill catalog of its own, so it needs none.
+///
+/// That answer is what `Feature::SkipHostSkillDiscovery` (`new_config`) acts
+/// on: Codex asks its installed skill contributors, and a registry with no
+/// contributor at all is taken for the old behavior of searching anyway
+/// (`ext/extension-api/src/registry.rs`). Answering here is the only way the
+/// feature reaches an atom's thread; with nothing discovered, a `$name` in a
+/// turn's text names no skill, so no `SKILL.md` of the checkout is loaded.
+const ATOMIC_NEEDS_HOST_SKILLS: bool = false;
+
+struct NoSkillCatalog;
+
+impl SkillInvocationContributor for NoSkillCatalog {
+    fn requires_host_skill_discovery(&self) -> bool {
+        ATOMIC_NEEDS_HOST_SKILLS
+    }
+}
+
 /// Conversation with asynchronous checks between turns. Each turn is
 /// admitted by `meter` before it is submitted and settled once after it.
 #[allow(clippy::too_many_arguments)] // each is one thing every thread needs
@@ -2039,11 +2115,16 @@ where
     let thread_store = ThreadStoreBuilder::from_config(&config, state_db.clone()).build();
     let environment_manager = Arc::new(local_environment(local_runtime_paths).await?);
     let installation_id = resolve_installation_id(&config.codex_home).await?;
-    let user_instructions_provider = Arc::new(CodexHomeUserInstructionsProvider::new(
-        config.codex_home.clone(),
-    ));
-    // No extensions: an atom's tools are the ones its file declares.
-    let extensions = ExtensionRegistryBuilder::<Config>::new();
+    // The host declares no instructions of its own, so it reads none from
+    // the Codex home (see [`NoHostInstructions`]).
+    let user_instructions_provider: Arc<dyn UserInstructionsProvider> =
+        Arc::new(NoHostInstructions);
+    // No extension gives a thread tools or context: an atom's tools are the
+    // ones its file declares. The one entry answers the question Codex asks
+    // before it searches the checkout for `.agents/skills` (see
+    // [`ATOMIC_NEEDS_HOST_SKILLS`]).
+    let mut extensions = ExtensionRegistryBuilder::<Config>::new();
+    extensions.skill_invocation_contributor(Arc::new(NoSkillCatalog));
     let startup = codex_core_api::build_startup_models(
         &config,
         Arc::clone(&auth_manager),
@@ -2119,6 +2200,9 @@ where
             .run(run_turn(&thread, &current, limit.time, &mut recorder))
             .await;
         if let (Err(e), Some(span)) = (&turn, span.span()) {
+            // What this turn says of itself, for this step's span and its
+            // run's, which never hear this error (see [`crate::usage::Why`]).
+            crate::usage::note_step_failure(e);
             crate::usage::record_error(&span, e);
         }
         let totals = progress.totals(seen);
@@ -2186,6 +2270,26 @@ where
     let outcome = outcome?;
     shutdown_result.context("shut down Codex thread")?;
     Ok(outcome)
+}
+
+/// Codex finds repository instructions on its own: it walks up from a
+/// thread's working directory to the project root and, in each directory on
+/// the way, reads the first file it finds named `AGENTS.override.md` or
+/// `AGENTS.md` (a configured fallback name next, and atomic configures
+/// none), sending their text to the model as user instructions. An
+/// atom's inputs are what its file declares, so no thread atomic starts gets
+/// any of that text: a checkout's or worktree's instruction files are
+/// untrusted input that nothing has pinned or recorded the provenance of. At
+/// the pinned rev Codex stops discovery on either of the two values below
+/// (`core/src/agents_md.rs`), so both are set: a zero-byte project-doc budget,
+/// and the project explicitly untrusted. Repository skills and the Codex
+/// home's own instruction file come to Codex by other routes and are switched
+/// off there: `new_config` sets `Feature::SkipHostSkillDiscovery`, which acts
+/// on the answer in [`ATOMIC_NEEDS_HOST_SKILLS`], and [`NoHostInstructions`]
+/// replaces Codex's host provider. With nothing read, a step's repair and
+/// resume turns see the same instructions as its first.
+fn no_repository_instructions() -> (usize, Option<TrustLevel>) {
+    (0, Some(TrustLevel::Untrusted))
 }
 
 async fn new_config(
@@ -2271,6 +2375,10 @@ async fn new_config(
         }
     };
     model_providers.insert(model_provider_id.clone(), model_provider.clone());
+
+    // Codex finds a checkout's or worktree's own instruction files unless
+    // both these say otherwise (see [`no_repository_instructions`]).
+    let (project_doc_max_bytes, project_trust) = no_repository_instructions();
 
     let mut config = Config {
         application_network_policy: Default::default(),
@@ -2369,7 +2477,7 @@ async fn new_config(
         mcp_oauth_callback_url: None,
         mcp_optional_startup_grace: std::time::Duration::from_secs(1),
         model_providers,
-        project_doc_max_bytes: 32 * 1024,
+        project_doc_max_bytes,
         project_doc_fallback_filenames: Vec::new(),
         tool_output_token_limit: None,
         agents_enabled: true,
@@ -2441,7 +2549,9 @@ async fn new_config(
 
         runtime_feature_defaults: Default::default(),
         suppress_unstable_features_warning: false,
-        active_project: ProjectConfig { trust_level: None },
+        active_project: ProjectConfig {
+            trust_level: project_trust,
+        },
         notices: Notice::default(),
         check_for_update_on_startup: false,
         disable_paste_burst: false,
@@ -2470,6 +2580,18 @@ async fn new_config(
             .set_enabled(*feature, false)
             .with_context(|| format!("turn off Codex feature {feature:?}"))?;
     }
+    // Codex would otherwise search every directory from the project root down
+    // to the thread's working directory for a `.agents/skills/` folder and
+    // load each skill it finds there, with neither the project's trust level
+    // nor the instruction budget in the way (`ext/skills/src/host_roots.rs`).
+    // A `$name` in a turn's text then sends that skill's `SKILL.md` to the
+    // model. The feature stops that search once Codex has asked whether
+    // anything needs the host's skills, which is what the one contributor
+    // registered in `converse_async` answers (see [`ATOMIC_NEEDS_HOST_SKILLS`]).
+    config
+        .features
+        .set_enabled(Feature::SkipHostSkillDiscovery, true)
+        .context("skip the checkout's skills")?;
     // AuthManager and MCP both derive their credential backend from Config.
     config.features.set_enabled(
         Feature::SecretAuthStorage,
@@ -3495,6 +3617,24 @@ mod tests {
         d
     }
 
+    /// A scratch directory this call alone has: named by a counter and the
+    /// clock as well as the pid, and made with `create_dir`, so a second run
+    /// says so instead of planting its canaries where the first left them.
+    fn scratch_once(tag: &str) -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let d = std::env::temp_dir().join(format!(
+            "atomic-codex-{tag}-{}-{n}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&d).expect("this test's own scratch directory");
+        d
+    }
+
     /// Codex runs on threads with large stacks, as its entry point sets up.
     fn on_codex_runtime<F: std::future::Future<Output = ()> + Send + 'static>(f: F) {
         const STACK: usize = 16 * 1024 * 1024;
@@ -3541,6 +3681,233 @@ mod tests {
             assert_eq!(model.calls(), 1, "requests: {:#?}", model.requests());
             // The prompt reached the model.
             assert!(model.requests()[0].to_string().contains("ping"));
+        });
+    }
+
+    /// The configuration every Codex thread is started with leaves Codex's
+    /// own repository-instruction discovery switched off, on both of the
+    /// settings Codex gates it on.
+    #[test]
+    fn no_threads_configuration_discovers_repository_instructions() {
+        on_codex_runtime(async {
+            let home = scratch("home-docs");
+            let endpoint = ModelEndpoint {
+                base_url: "http://127.0.0.1:9/unused".into(),
+                model: "synthetic".into(),
+                api_key_env: None,
+                sign_in: None,
+            };
+            let config = new_config(&endpoint, &home, &home, Arg0DispatchPaths::default())
+                .await
+                .expect("config");
+            assert_eq!(config.project_doc_max_bytes, 0);
+            assert_eq!(
+                config.active_project.trust_level,
+                Some(TrustLevel::Untrusted),
+                "an unset trust level still lets Codex read the project's docs"
+            );
+            assert!(
+                config.features.enabled(Feature::SkipHostSkillDiscovery),
+                "without it Codex searches the checkout for `.agents/skills`"
+            );
+        });
+    }
+
+    /// A turn whose working directory is inside a checkout sees none of the
+    /// instruction files lying about it: not the `AGENTS.md` at the project
+    /// root Codex walks up to, nor the `AGENTS.override.md` in the turn's own
+    /// directory, which is the one Codex would read there. Both are there to
+    /// be seen: the turn runs twice, as a step's repair and resume turns do,
+    /// and neither request holds either.
+    #[test]
+    fn a_turn_is_sent_no_instruction_file_of_the_checkout_it_runs_in() {
+        on_codex_runtime(async {
+            let dir = scratch_once("ambient-docs");
+            let (root, nested) = (dir.join("repo"), dir.join("repo/sub"));
+            for d in [&root, &nested] {
+                std::fs::create_dir_all(d).expect("directory");
+            }
+            // A project root, so Codex walks up from the turn's directory to
+            // it, as it does in a checkout or a worktree.
+            std::fs::create_dir(root.join(".git")).expect("the project root's marker");
+            std::fs::write(root.join("AGENTS.md"), "AMBIENT-CANARY-ROOT").expect("root doc");
+            // In one directory Codex reads the first of these two names, so
+            // this is the file its own directory would contribute.
+            std::fs::write(nested.join("AGENTS.override.md"), "AMBIENT-CANARY-OVERRIDE")
+                .expect("the local override");
+            let model = FakeModel::start(vec![Reply::Text("pong".into()); 2])
+                .await
+                .expect("fake model");
+            let home = dir.join("codex");
+            std::fs::create_dir_all(&home).expect("codex home");
+            let endpoint = ModelEndpoint {
+                base_url: model.base_url(),
+                model: "synthetic".into(),
+                api_key_env: None,
+                sign_in: None,
+            };
+            let first = TurnSpec {
+                prompt: "ping".into(),
+                ..TurnSpec::default()
+            };
+            let mut turns = 0;
+            let (last, report) = converse(
+                &CodexPaths::without_helpers(),
+                &home,
+                &nested,
+                &endpoint,
+                &StateGuard::NoProjectState,
+                &first,
+                |answer| {
+                    assert_eq!(answer, "pong");
+                    turns += 1;
+                    (turns < 2).then(|| TurnSpec {
+                        prompt: "again".into(),
+                        ..TurnSpec::default()
+                    })
+                },
+            )
+            .await
+            .expect("both turns");
+            assert_eq!(last, "pong");
+            assert_eq!(report.turns, 2, "the thread ran both turns");
+            let requests = model.requests();
+            assert_eq!(requests.len(), 2, "requests: {requests:#?}");
+            for (i, request) in requests.iter().enumerate() {
+                let sent = request.to_string();
+                // Each request is there to read: its own prompt is in it.
+                assert!(
+                    sent.contains(if i == 0 { "ping" } else { "again" }),
+                    "turn {i}: {sent}"
+                );
+                for canary in ["AMBIENT-CANARY-ROOT", "AMBIENT-CANARY-OVERRIDE"] {
+                    assert!(
+                        !sent.contains(canary),
+                        "turn {i} was sent repository instructions: {canary} is in {sent}"
+                    );
+                }
+            }
+        });
+    }
+
+    /// Nor any skill of that checkout. Pinned Codex loads
+    /// `<dir>/.agents/skills/*/SKILL.md` from every directory between the
+    /// project root and the thread's working directory, gated by neither the
+    /// project's trust level nor the instruction budget, and a `$name` in a
+    /// turn's text then sends that skill's `SKILL.md` to the model. The
+    /// mention is in the prompt, so the request would show the skill's text
+    /// beside it; it shows none.
+    #[test]
+    fn a_turn_is_sent_no_skill_of_the_checkout_it_runs_in() {
+        on_codex_runtime(async {
+            let dir = scratch_once("ambient-skills");
+            let (root, cwd) = (dir.join("repo"), dir.join("repo/sub"));
+            for d in [&root, &cwd] {
+                std::fs::create_dir_all(d).expect("directory");
+            }
+            std::fs::create_dir(root.join(".git")).expect("the project root's marker");
+            let skill = root.join(".agents/skills/canary-skill");
+            std::fs::create_dir_all(&skill).expect("skill directory");
+            std::fs::write(
+                skill.join("SKILL.md"),
+                "---\nname: canary-skill\ndescription: Say hello, once.\n---\n\n\
+                 AMBIENT-SKILL-CANARY say hello and nothing else\n",
+            )
+            .expect("SKILL.md");
+            let model = FakeModel::start(vec![Reply::Text("pong".into())])
+                .await
+                .expect("fake model");
+            let home = dir.join("codex");
+            std::fs::create_dir_all(&home).expect("codex home");
+            let endpoint = ModelEndpoint {
+                base_url: model.base_url(),
+                model: "synthetic".into(),
+                api_key_env: None,
+                sign_in: None,
+            };
+            let (answer, report) = converse(
+                &CodexPaths::without_helpers(),
+                &home,
+                &cwd,
+                &endpoint,
+                &StateGuard::NoProjectState,
+                &TurnSpec {
+                    prompt: "run $canary-skill for ping".into(),
+                    ..TurnSpec::default()
+                },
+                |_| None,
+            )
+            .await
+            .expect("one turn");
+            assert_eq!(answer, "pong");
+            assert_eq!(report.turns, 1, "the thread ran its one turn");
+            let requests = model.requests();
+            assert_eq!(requests.len(), 1, "requests: {requests:#?}");
+            let sent = requests[0].to_string();
+            // The request is there to read, and so is the mention in it.
+            assert!(sent.contains("$canary-skill"), "{sent}");
+            assert!(
+                !sent.contains("AMBIENT-SKILL-CANARY"),
+                "the turn was sent a repository skill: AMBIENT-SKILL-CANARY is in {sent}"
+            );
+        });
+    }
+
+    /// Nor the Codex home's own instruction file. The home is atomic's
+    /// per-project state directory, so it is not a checkout's path, but
+    /// pinned Codex reads `AGENTS.override.md` and `AGENTS.md` there as global
+    /// instructions for every thread it starts, and an atom's inputs are only
+    /// what its file declares. The host declares none: it reads nothing, so a
+    /// file planted in the home reaches no model.
+    #[test]
+    fn a_turn_is_sent_no_instruction_file_of_the_codex_home() {
+        on_codex_runtime(async {
+            let dir = scratch_once("home-instructions");
+            let (home, cwd) = (dir.join("codex"), dir.join("work"));
+            std::fs::create_dir_all(&home).expect("codex home");
+            std::fs::create_dir_all(&cwd).expect("working directory");
+            std::fs::write(
+                home.join("AGENTS.override.md"),
+                "AMBIENT-HOME-CANARY-OVERRIDE",
+            )
+            .expect("the override Codex reads first");
+            std::fs::write(home.join("AGENTS.md"), "AMBIENT-HOME-CANARY").expect("AGENTS.md");
+            let model = FakeModel::start(vec![Reply::Text("pong".into())])
+                .await
+                .expect("fake model");
+            let endpoint = ModelEndpoint {
+                base_url: model.base_url(),
+                model: "synthetic".into(),
+                api_key_env: None,
+                sign_in: None,
+            };
+            let (answer, report) = converse(
+                &CodexPaths::without_helpers(),
+                &home,
+                &cwd,
+                &endpoint,
+                &StateGuard::NoProjectState,
+                &TurnSpec {
+                    prompt: "ping".into(),
+                    ..TurnSpec::default()
+                },
+                |_| None,
+            )
+            .await
+            .expect("one turn");
+            assert_eq!(answer, "pong");
+            assert_eq!(report.turns, 1, "the thread ran its one turn");
+            let requests = model.requests();
+            assert_eq!(requests.len(), 1, "requests: {requests:#?}");
+            let sent = requests[0].to_string();
+            // The request is there to read: its prompt is in it.
+            assert!(sent.contains("ping"), "{sent}");
+            for canary in ["AMBIENT-HOME-CANARY-OVERRIDE", "AMBIENT-HOME-CANARY"] {
+                assert!(
+                    !sent.contains(canary),
+                    "the turn was sent the Codex home's instructions: {canary} is in {sent}"
+                );
+            }
         });
     }
 
