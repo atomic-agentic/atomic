@@ -239,7 +239,7 @@ fn describe(g: &Gate) {
     let mut hidden = false;
     Line::new()
         .plain("\ngate ")
-        .plain(&shown::line(&g.id))
+        .shown(&shown::line(&g.id))
         .plain(" is waiting for you")
         .log();
     let label = if g.question.is_some() {
@@ -249,7 +249,7 @@ fn describe(g: &Gate) {
     };
     let (title, cut) = redacted_text(&g.title);
     hidden |= cut;
-    Line::new().plain("  ").plain(label).plain(&title).log();
+    Line::new().plain("  ").plain(label).shown(&title).log();
     if !g.show.is_null() {
         let mut show = g.show.clone();
         atomic_core::redact::value(&mut show);
@@ -258,7 +258,7 @@ fn describe(g: &Gate) {
         for (i, l) in shows.split('\n').enumerate() {
             Line::new()
                 .plain(if i == 0 { "  shows: " } else { "  " })
-                .plain(&shown::line(l))
+                .shown(&shown::line(l))
                 .log();
         }
     }
@@ -269,9 +269,9 @@ fn describe(g: &Gate) {
                 hidden |= cut;
                 Line::new()
                     .plain("  ")
-                    .plain(&shown::label(i))
+                    .shown(&shown::label(i))
                     .plain(") ")
-                    .plain(&choice)
+                    .shown(&choice)
                     .log();
             }
         }
@@ -280,13 +280,13 @@ fn describe(g: &Gate) {
             hidden |= cut;
             Line::new()
                 .plain("  silence selects ")
-                .plain(&default)
+                .shown(&default)
                 .log();
         }
     }
     if hidden {
         Line::new()
-            .plain(&format!(
+            .shown(&format!(
                 "  something here is shown as {}; `atomic gates list` shows it in full",
                 atomic_core::redact::REDACTED
             ))
@@ -294,7 +294,7 @@ fn describe(g: &Gate) {
     }
     if let Some(deadline) = g.deadline {
         let left = (deadline - now_ms()).max(0) / 1000;
-        Line::new().plain(&format!("  it waits {left}s more")).log();
+        Line::new().shown(&format!("  it waits {left}s more")).log();
     }
 }
 
@@ -348,7 +348,7 @@ async fn prompt(rt: &Durare, state: &ProjectState, g: &Gate, lines: &Lines) -> D
                 Ok(Some(now)) if now.resolution.is_some() => {
                     Line::new()
                         .plain("\ngate ")
-                        .plain(&shown::line(&g.id))
+                        .shown(&shown::line(&g.id))
                         .plain(" was resolved meanwhile")
                         .log();
                     return Done::Settled;
@@ -359,7 +359,7 @@ async fn prompt(rt: &Durare, state: &ProjectState, g: &Gate, lines: &Lines) -> D
             if g.deadline.is_some_and(|d| now_ms() >= d) {
                 Line::new()
                     .plain("\ngate ")
-                    .plain(&shown::line(&g.id))
+                    .shown(&shown::line(&g.id))
                     .plain(": its deadline passed")
                     .log();
                 return Done::Settled;
@@ -387,18 +387,18 @@ async fn prompt(rt: &Durare, state: &ProjectState, g: &Gate, lines: &Lines) -> D
                 };
                 Line::new()
                     .plain("gate ")
-                    .plain(&shown::line(&g.id))
+                    .shown(&shown::line(&g.id))
                     .plain(": ")
-                    .plain(&what)
+                    .shown(&what)
                     .plain(" by ")
-                    .plain(&shown::line(&d.by.to_string()))
+                    .shown(&shown::line(&d.by.to_string()))
                     .log();
                 return Done::Settled;
             }
             Err(e) => {
                 Line::new()
                     .plain("not recorded: ")
-                    .plain(&redacted_text(&format!("{e:#}")).0)
+                    .shown(&redacted_text(&format!("{e:#}")).0)
                     .log();
                 match e.downcast_ref::<DecideError>() {
                     Some(DecideError::Conflict { .. }) => return Done::Settled,
@@ -465,13 +465,13 @@ pub async fn at_gates(rt: &Durare, state: &ProjectState, run_id: &str) {
                 // hide how to decide the gate.
                 Line::new()
                     .plain("run ")
-                    .plain(&shown::line(run_id))
+                    .shown(&shown::line(run_id))
                     .plain(" waits at gate ")
-                    .plain(&shown::line(&g.id))
+                    .shown(&shown::line(&g.id))
                     .plain(": decide it from a terminal with ")
-                    .plain(&how)
+                    .shown(&how)
                     .plain("; it asks: ")
-                    .plain(&redacted_text(&g.title).0)
+                    .shown(&redacted_text(&g.title).0)
                     .log();
             }
         }

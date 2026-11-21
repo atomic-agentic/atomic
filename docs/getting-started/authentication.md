@@ -1,41 +1,108 @@
 # Subscriptions and authentication
 
-**Subscription sign-in is implemented in upstream Codex.** Atomic plans to offer
-that path for eligible local Codex-backed use, alongside API keys. This repository
-does not yet implement Atomic login, so the commands below run **Codex**, not Atomic.
+Codex atoms can run on an eligible ChatGPT subscription, signed in through
+Codex's own login, or on an API key at any OpenAI-compatible endpoint. Lite
+atoms call a model API themselves and always need an endpoint.
 
-## Use an eligible subscription with Codex today
-
-Start the upstream CLI and choose **Sign in with ChatGPT**, or run:
+## Sign in with ChatGPT for Codex atoms
 
 ```sh
-codex login
-codex login status
+atomic model login                # sign in in your browser
+atomic model login --device-auth  # with no browser: a code to enter elsewhere
+atomic model status               # who is signed in, on which plan, kept where
+atomic model logout               # revoke the sign-in and forget every copy
 ```
 
-This uses your account's Codex entitlement and limits. API-key authentication uses
+`atomic model status` shows the account's email masked (`d***@example.com`),
+and creates nothing. `atomic model logout` forgets the sign-in in both the OS
+keyring and the file store, whichever `ATOMIC_CREDENTIAL_STORE` chooses now,
+and says what it found in each; if the keyring cannot be reached, it says so.
+
+The sign-in uses your account's Codex entitlement and limits; API keys use
 separate API billing. Check current eligibility in
-[OpenAI's authentication guide](https://learn.chatgpt.com/docs/auth).
+[OpenAI's authentication guide](https://learn.chatgpt.com/docs/auth). Device
+login must be enabled for the account or workspace.
 
-For a machine where browser callbacks are unavailable:
+When no model endpoint is configured (`ATOMIC_MODEL_BASE_URL` unset, and no
+`model.base_url` in a configuration file or flag), Codex atoms use the sign-in,
+with no API key. Set `ATOMIC_MODEL` to a model your plan offers for Codex. A
+configured endpoint always comes first, and the sign-in comes before what atomic
+detects: with someone signed in, `OPENAI_API_KEY` and a local Ollama are not
+used. `atomic config --explain` shows the sign-in as `model.sign_in`, how and
+where it is kept, never a token or an email, and whether it is used; a run says
+which model goes to ChatGPT. The sign-in is looked for only when a model will
+be called on it: never for a replay or a run with no model atom.
+
+The sign-in is yours, for local use. atomic refuses it on a shared
+(PostgreSQL) store, whether a variable or your configuration file names it, and
+for `atomic serve`. Nothing takes its place there, neither `OPENAI_API_KEY` nor
+a local Ollama: configure `model.base_url` (with `model.api_key_env` naming the
+key's variable), or run `atomic model logout` to have atomic detect them again.
+On a project's own store it serves `atomic run`, and `atomic runs resume` for
+whichever run in that store you resume.
+
+Codex's managed login restrictions hold for the sign-in as they do for Codex's
+own: `forced_login_method`, `forced_chatgpt_workspace_id`, and a machine's
+managed `allowed_login_methods` and `allowed_chatgpt_workspaces`. Login is
+refused, or limited to the allowed workspaces, and a run on a sign-in they do
+not allow is refused before its first model call.
+
+atomic keeps the sign-in once per user, apart from every project and from
+your personal Codex sessions:
+
+- in the OS keyring by default (on Linux, the Secret Service);
+- with `ATOMIC_CREDENTIAL_STORE=file`, for a machine with no keyring, in a
+  directory readable by you only (`$ATOMIC_HOME/credentials/codex-auth`, or
+  `~/.config/atomic/credentials/codex-auth`).
+
+atomic never prints the token, and no atom's commands see it: Codex sends it
+to the model from atomic's own process, which cannot be dumped or read through
+`/proc`; Codex atoms' commands and exec atoms' alike run under Codex's sandbox,
+which denies them the credential directory; and they can neither use the
+kernel keyrings nor reach the Secret Service. A signed-in atom has none of
+ChatGPT's connectors, plugins or hosted tools: the token reaches the model and
+nothing else, and an atom's tools are the ones its file declares. As with the
+operator credential, this has been verified on Linux only, so `atomic model
+login` is refused on macOS and Windows for now. atomic does not reuse an
+existing `codex login`. A sign-in kept inside the checkout that holds the
+project (`ATOMIC_HOME` pointed there) is refused, since the repository could
+have supplied it.
+
+Keeping the token out of reach has side effects on atomic's own process, and so
+on everything it starts:
+
+- `LD_*` variables, such as `LD_PRELOAD` and `LD_LIBRARY_PATH`, are removed
+  from its environment, and its commands do not inherit them;
+- it writes no core file, and its commands inherit a core-file size limit of
+  zero;
+- on macOS, it refuses a debugger.
+
+Codex's sandbox and patch helpers, which atomic runs as itself, are left as
+they are.
+
+## API keys
+
+Point atomic at an OpenAI-compatible Responses endpoint and name the variable
+that holds its key:
 
 ```sh
-codex login --device-auth
+export ATOMIC_MODEL_BASE_URL=https://api.openai.com/v1
+export ATOMIC_MODEL=<model>
+export ATOMIC_MODEL_API_KEY_ENV=OPENAI_API_KEY
 ```
 
-Device login must be enabled for the account/workspace. These commands do not
-establish an Atomic login or promise automatic credential reuse.
+Keep the key's value out of committed files.
 
-## The planned Atomic experience
+## Lite atoms
 
-For local Codex-backed use, choose subscription sign-in or API-key access, finish
-login and begin work. The exact Atomic login commands are not specified yet.
-The API-key path detects `OPENAI_API_KEY`; keep its value out of committed files.
-
-Atomic keeps workflow state and transcripts separate from personal Codex sessions.
-Automatic reuse of an existing Codex login is not yet specified. Subscription
-access for Codex-backed sessions does not establish support for lite atoms,
-embeddings or other provider paths; those need their own supported model access.
+A lite atom calls its endpoint directly, so a ChatGPT sign-in does not cover
+it. With only a sign-in configured, a run that would reach a lite atom is
+refused before it starts, with a message that says so and names the settings
+it needs: `ATOMIC_MODEL_BASE_URL`,
+`ATOMIC_MODEL`, and `ATOMIC_MODEL_API_KEY_ENV` if the endpoint asks for a key.
+Subscription access for Codex atoms does not establish support for lite atoms,
+embeddings or other provider paths; those need their own supported model
+access.
 
 ## Automation and team deployment
 

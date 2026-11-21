@@ -240,7 +240,8 @@ The decision carries your enrolled operator credential, as `atomic gates
 approve` does. Only what you type after a gate is shown decides it: input typed
 earlier is discarded, and commands that atoms run have no terminal to type into.
 Titles and what a gate shows can come from a model, so control characters in
-them are shown escaped. When standard input or standard error is not a terminal,
+them are shown escaped, in `atomic gates list --json` too, where they are
+written as JSON escapes and read back as the same text. When standard input or standard error is not a terminal,
 or the run is in the background, the run prints how to decide the gate from
 another terminal and waits.
 

@@ -68,6 +68,11 @@ decision counts only with the credential its person enrolled. `atomic run` and
 question gates (`ask` with a typed `answer`, `remember`, and a default when time
 runs out) are built; `atomic gates answer` answers one from another terminal.
 
+Codex atoms can run on a ChatGPT sign-in (`atomic model login`, `model status`,
+`model logout`), kept in the OS keyring or the opt-in credential file store, on Linux
+only, for the developer's own runs: a shared store and `atomic serve` refuse it.
+Lite atoms need a model endpoint and say so.
+
 A project's artifact store takes a lock in its private state while it is
 written or swept. A run that finds it held by another process, such as a sweep,
 says so once, waits and tries again for a bounded time (about 7.4 minutes with
@@ -157,7 +162,12 @@ before the step runs and without recording an outcome, and the run continues
 when resumed where the sandbox can start. `atomic serve` instead leaves that run
 unfinished, says so, and goes on serving the others; the run continues when a
 later process recovers it. A sandbox that fails in a way that may pass, such as
-on a full disk, makes the step wait, as a backend with no room does. Atoms that run no commands run as usual. On macOS and
+on a full disk, makes the step wait, as a backend with no room does. Atoms that run no commands run as usual. When atomic
+stops with commands still running, on Linux it ends every process they
+started, inside their sandboxes too, before it exits and frees the project's
+execution lock. On macOS and Windows it kills each command's process group and
+does not wait, so a process that left its group may outlive atomic and the
+lock. On macOS and
 Windows this has not been verified: exec atoms' commands run unconfined there,
 so atomic keeps no operator credential and refuses credentialed gate decisions.
 
