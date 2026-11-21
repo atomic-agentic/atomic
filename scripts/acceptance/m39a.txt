@@ -21,17 +21,25 @@ run_cli init_in_an_empty_directory_makes_a_project_that_checks_and_runs
 run_cli with_only_a_local_ollama_a_model_atom_runs_and_explain_says_why
 run_cli with_only_an_api_key_explain_names_openai_and_never_the_key
 atomic settings::tests::every_setting_has_a_source_and_the_manifest_keys_are_not_settings
-pending: only the Ollama case is run end to end. With `OPENAI_API_KEY` as the only thing set, detection names api.openai.com, which tests never reach, so that case is shown by `config --explain` alone and no `init` and `run` is made with it; a test would point the key's detection at the fake model, as `ATOMIC_DETECT_OLLAMA_ADDR` points the Ollama one.
+# The API-key case end to end: the key with its base URL, OPENAI_BASE_URL
+# as OpenAI's SDKs read it, pointing at the fake model.
+run_cli with_only_an_api_key_and_its_base_url_init_and_run_need_no_configuration
 
 ## The developer's own checkout is left exactly as it was after `atomic run` executes a Codex atom.
 # The turn works in a worktree of the fixture's snapshot, never in the
 # checkout: the first compares the checkout that holds the project (its refs,
 # its worktree list, its working tree with every untracked file) before and
 # after, and the second compares the fixture repository the same way when the
-# project sits outside any repository.
+# project sits outside any repository. The third gives its turn a file to
+# write and shows that file committed in the snapshot's worktree, never in the
+# checkout. The last two run a `workspace-write` Codex atom directly and as a
+# step with no `worktree: true`: both are refused `target.unsafe` before the
+# run starts, and the checkout is left as it was.
 fixture_cli a_project_in_a_subdirectory_of_a_checkout_runs_at_the_top_of_the_fixture
 fixture_cli a_project_outside_any_repository_runs_its_coding_step_in_the_snapshot
-pending: the fixture turns only read (`cat` and `pwd`), and the second test has no developer checkout, so no test has a Codex atom write and then shows the checkout unchanged. The control that refuses a writing Codex atom outside a worktree (`target.unsafe`) has no test at all. A test would run a `workspace-write` Codex atom directly and in a step without a worktree, expect `target.unsafe` and an unchanged checkout, and give the fixture turn a file to write.
+fixture_cli running_a_writing_codex_atom_leaves_the_checkout_exactly_as_it_was
+fixture_cli a_writing_codex_atom_run_directly_in_a_checkout_is_refused
+fixture_cli a_writing_codex_atom_in_a_step_without_a_worktree_is_refused
 
 ## Changing a `validate` rule re-runs evals from cassettes with no model call.
 # The cassette test edits the atom's own `validate` rule: both recordings

@@ -209,6 +209,40 @@ fn a_bad_environment_value_is_refused() {
     ));
 }
 
+/// A value for an optional setting is read as a YAML scalar, and the string it
+/// falls back to is faithful only where every YAML version reads that text as a
+/// string. `0200` is not such a spelling: this branch read it as the number 200
+/// until the loader began refusing it, so it is refused here too, with the
+/// loader's own message.
+#[test]
+fn an_environment_value_refused_as_a_number_is_refused_by_name() {
+    let d = dir(&[]);
+    for (value, why) in [
+        ("0200", "has a leading zero"),
+        ("007", "write 7, or 0o7 for octal"),
+        ("-0x1F", "puts a sign before its hexadecimal prefix"),
+        ("0x-1F", "puts a sign after its 0x"),
+    ] {
+        match load(&d, None, &[("ATOMIC_MODEL_TIMEOUT_SECS", value)], vec![]) {
+            Err(ConfigError::Value { message, .. }) => {
+                assert!(message.contains(why), "{value}: {message}");
+                assert!(message.contains("quote it"), "{value}: {message}");
+            }
+            other => panic!("expected a value error for {value:?}, got {other:?}"),
+        }
+    }
+    // Every other refused spelling is a string to both YAML versions, so the
+    // fallback gives what a file would give for the quoted form, and a number
+    // or a bool keeps its type as it always did.
+    let d = dir(&[]);
+    let r = load(&d, None, &[("ATOMIC_MODEL_NAME", "yes")], vec![]).expect("load");
+    assert_eq!(r.config.model.name.as_deref(), Some("yes"));
+    let r = load(&d, None, &[("ATOMIC_MODEL_NAME", ".inf")], vec![]).expect("load");
+    assert_eq!(r.config.model.name.as_deref(), Some(".inf"));
+    let r = load(&d, None, &[("ATOMIC_MODEL_NAME", "1_000")], vec![]).expect("load");
+    assert_eq!(r.config.model.name.as_deref(), Some("1_000"));
+}
+
 #[test]
 fn an_open_section_takes_any_keys_and_a_section_is_not_a_value() {
     let d = dir(&[("atomic.yaml", "labels:\n  team: core\n  tier: gold\n")]);

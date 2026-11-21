@@ -43,6 +43,7 @@ impl Terminal {
             // No model endpoint from this machine: no Ollama, no key.
             .env("ATOMIC_DETECT_OLLAMA_ADDR", "127.0.0.1:9")
             .env_remove("OPENAI_API_KEY")
+            .env_remove("OPENAI_BASE_URL")
             // None of the person's own configuration.
             .env("XDG_CONFIG_HOME", self.home.join("config"));
         c
@@ -81,6 +82,7 @@ impl Terminal {
         .env_remove("LOGNAME")
         .env("ATOMIC_DETECT_OLLAMA_ADDR", "127.0.0.1:9")
         .env_remove("OPENAI_API_KEY")
+        .env_remove("OPENAI_BASE_URL")
         .env("XDG_CONFIG_HOME", self.home.join("config"));
         c.output().unwrap()
     }

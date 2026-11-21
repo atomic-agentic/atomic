@@ -992,6 +992,137 @@ fn a_secret_the_system_keeps_or_a_pipe_stays_denied_and_the_persons_programs_run
     });
 }
 
+/// Credential places named through a directory that is an absolute link, as
+/// `/var/run` links to `/run`, stay denied under both spellings, and every
+/// command still starts: a projected volume reached by a link to its token's
+/// link, the version it rotates in next, an item nested in one of its
+/// directories, and a moved key directory.
+#[test]
+fn credentials_behind_an_absolutely_linked_directory_stay_denied() {
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let dir = std::env::temp_dir().join(format!("atomic-aws-linked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let (real, linked) = (dir.join("real"), dir.join("linked"));
+        std::fs::create_dir_all(real.join("gnupg")).unwrap();
+        std::fs::write(real.join("gnupg/key"), "canary-gnupg\n").unwrap();
+        std::os::unix::fs::symlink(&real, &linked).unwrap();
+        let now = "..2026_01_01_00_00_00.1";
+        let next = "..2026_01_01_01_00_00.2";
+        for volume in ["sa", "nested"] {
+            for version in [now, next] {
+                let at = real.join(volume).join(version);
+                std::fs::create_dir_all(at.join("aws")).unwrap();
+                std::fs::write(at.join("token"), format!("canary-{volume}{version}\n")).unwrap();
+                std::fs::write(at.join("aws/token"), format!("canary-{volume}-aws\n")).unwrap();
+            }
+            std::os::unix::fs::symlink(now, real.join(volume).join("..data")).unwrap();
+            std::os::unix::fs::symlink("..data/token", real.join(volume).join("token")).unwrap();
+            std::os::unix::fs::symlink("..data/aws", real.join(volume).join("aws")).unwrap();
+        }
+        std::fs::create_dir_all(dir.join("etc")).unwrap();
+        std::os::unix::fs::symlink(linked.join("sa/token"), dir.join("etc/token")).unwrap();
+        let mut reads = vec![dir.join("etc/token")];
+        for root in [&real, &linked] {
+            reads.push(root.join("gnupg/key"));
+            for volume in ["sa", "nested"] {
+                for item in ["token", "aws/token"] {
+                    reads.push(root.join(volume).join(item));
+                    for version in [now, next] {
+                        reads.push(root.join(volume).join(version).join(item));
+                    }
+                }
+            }
+        }
+        let reads: Vec<String> = reads.iter().map(|p| p.display().to_string()).collect();
+        let command = format!("cat {} 2>/dev/null; echo looked", reads.join(" "));
+        let gnupg = linked.join("gnupg").display().to_string();
+        let web = dir.join("etc/token").display().to_string();
+        let nested = linked.join("nested/aws/token").display().to_string();
+        let printed = look_once(
+            &dir,
+            &home,
+            &command,
+            &[
+                ("GNUPGHOME", gnupg.as_str()),
+                ("AWS_WEB_IDENTITY_TOKEN_FILE", web.as_str()),
+                ("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE", nested.as_str()),
+            ],
+        )
+        .await;
+        assert!(printed.contains("looked"), "the command ran: {printed}");
+        assert!(
+            !printed.contains("canary"),
+            "a credential was read: {printed}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+/// AWS's workload token files stay denied to a turn's commands, whether a
+/// variable in atomic's environment names an ordinary file or a token in a
+/// projected volume, as Kubernetes mounts one: the token there now, the
+/// file behind its link, and the next version of it, which Kubernetes
+/// rotates in, are all out of reach; the rest of the machine is not.
+#[test]
+fn aws_workload_token_files_stay_denied_whether_plain_or_mounted() {
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let dir = std::env::temp_dir().join(format!("atomic-aws-token-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        // An ordinary token file.
+        std::fs::create_dir_all(dir.join("tokens")).unwrap();
+        std::fs::write(dir.join("tokens/web-identity"), "canary-web-identity\n").unwrap();
+        // A projected volume: the token a link through `..data` to the
+        // current version, and the version the next rotation brings.
+        let volume = dir.join("serviceaccount");
+        let now = "..2026_01_01_00_00_00.1";
+        let next = "..2026_01_01_01_00_00.2";
+        for (version, canary) in [(now, "canary-pod-identity"), (next, "canary-next-token")] {
+            std::fs::create_dir_all(volume.join(version)).unwrap();
+            std::fs::write(volume.join(version).join("token"), format!("{canary}\n")).unwrap();
+        }
+        std::os::unix::fs::symlink(now, volume.join("..data")).unwrap();
+        std::os::unix::fs::symlink("..data/token", volume.join("token")).unwrap();
+        std::fs::write(dir.join("tokens/readme"), "readable-beside\n").unwrap();
+        let command = format!(
+            "cat {d}/tokens/web-identity {v}/token {v}/{now}/token {v}/{next}/token; \
+             cat {d}/tokens/readme; echo looked",
+            d = dir.display(),
+            v = volume.display()
+        );
+        let web = dir.join("tokens/web-identity").display().to_string();
+        let pod = volume.join("token").display().to_string();
+        let printed = look_once(
+            &dir,
+            &home,
+            &command,
+            &[
+                ("AWS_WEB_IDENTITY_TOKEN_FILE", web.as_str()),
+                ("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE", pod.as_str()),
+            ],
+        )
+        .await;
+        assert!(printed.contains("looked"), "{printed}");
+        assert!(
+            printed.contains("readable-beside"),
+            "a file beside an ordinary token stays readable: {printed}"
+        );
+        for canary in [
+            "canary-web-identity",
+            "canary-pod-identity",
+            "canary-next-token",
+        ] {
+            assert!(!printed.contains(canary), "{canary} was read: {printed}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
 /// Codex's file helper, which applies a turn's patches under the turn's
 /// sandbox, keeps that sandbox's registry of mount points where the turn's
 /// commands keep theirs: in the backend's shared directory in atomic's

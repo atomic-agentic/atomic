@@ -1263,6 +1263,37 @@ fn a_cookie_line_cut_at_a_tails_start_is_not_shown() {
     assert!(out.starts_with('…'), "the tail does not say it was cut");
 }
 
+#[test]
+fn the_address_to_sign_in_at_is_written_whole_and_nothing_else_is() {
+    // A state that happens to look like a key: written as it is, or the
+    // login would break.
+    let state = concat!("sk-", "proj-AbCdEfGhIjKlMnOpQrStUvWxYz012345");
+    let address = format!(
+        "https://auth.openai.com/oauth/authorize?response_type=code&client_id=app_x\
+         &code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&state={state}"
+    );
+    assert!(sign_in_line(&address).contains(&address));
+    let local = format!("http://127.0.0.1:4000/oauth/authorize?state={state}");
+    assert!(sign_in_line(&local).contains(&local));
+    // Made safe for a terminal, as every log line is: an escape sequence
+    // after the address is shown, not run.
+    let escaped = format!("{address}\u{1b}]0;title\u{7}");
+    let line = sign_in_line(&escaped);
+    assert!(
+        !line.contains('\u{1b}') && !line.contains('\u{7}'),
+        "{line:?}"
+    );
+    // Anything else is redacted as any line is.
+    for other in [
+        format!("https://example.com/other?state={state}"),
+        format!("http://example.com/oauth/authorize?state={state}"),
+        format!("https://user:pass@auth.openai.com/oauth/authorize?state={state}"),
+        format!("not a url {state}"),
+    ] {
+        assert!(!sign_in_line(&other).contains(state), "{other}");
+    }
+}
+
 /// A secret used as a key under a secret's name is redacted, as a key of a
 /// known format is anywhere in it; a key that reads as a name stays.
 #[test]

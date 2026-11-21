@@ -135,7 +135,7 @@ runtime:
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `binary` | `managed` | Which Deno runs the code: the copy Atomic downloads and verifies, `system` for the `deno` on your `PATH`, or a path. Any choice must be a version Atomic supports |
-| `lock` | `deno.lock` | The lockfile every run must match, relative to the manifest |
+| `lock` | `deno.lock` | The lockfile every run must match: a relative path is taken from the manifest's directory, and the lockfile must stay inside the project |
 | `minimum_dependency_age` | `1d` | How old a release must be before it can be locked; hours or days, such as `12h` or `7d` |
 | `install_scripts` | None | Packages allowed to run install scripts, named one by one |
 | `allow_packages` | Any pinned package | When set, the only packages atom code may import, such as `npm:@aws-sdk/*` |

@@ -1,0 +1,1 @@
+project-priced-named|crates/atomic/src/settings.rs|                    priced_by_project = project_priced(written, &budget, &held);|                    let _ = project_priced;|-p atomic-agentic --bins -- --exact settings::tests::under_your_own_dollar_cap_a_model_only_the_project_prices_is_named

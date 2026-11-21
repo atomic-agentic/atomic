@@ -215,6 +215,7 @@ fn a_fuse_filesystem_bound_in_part_is_followed() {
 /// A root mount that is its own parent, as an initramfs's is, is the root.
 #[test]
 fn a_root_that_is_its_own_parent_is_the_root() {
+    absent("/home/u");
     let own = b"\
 1 1 0:2 / / rw - rootfs rootfs rw
 2 1 0:2 / /mnt/again rw - rootfs rootfs rw
@@ -374,29 +375,26 @@ struct Scratch(PathBuf);
 
 impl Drop for Scratch {
     fn drop(&mut self) {
-        use std::os::unix::fs::PermissionsExt;
-        for entry in walk_dirs(&self.0) {
-            let _ = std::fs::set_permissions(entry, std::fs::Permissions::from_mode(0o700));
-        }
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
-fn walk_dirs(dir: &Path) -> Vec<PathBuf> {
-    let mut all = vec![dir.to_owned()];
-    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        if entry.file_type().is_ok_and(|t| t.is_dir()) {
-            all.extend(walk_dirs(&entry.path()));
+/// A new directory of the test's own: its name is not one to guess, and it
+/// is made only where nothing is.
+fn scratch(tag: &str) -> Scratch {
+    use std::hash::{BuildHasher, Hasher};
+    for _ in 0..16 {
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u32(std::process::id());
+        let dir =
+            std::env::temp_dir().join(format!("atomic-mounts-{tag}-{:016x}", hasher.finish()));
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return Scratch(std::fs::canonicalize(&dir).expect("real")),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => panic!("scratch: {e}"),
         }
     }
-    all
-}
-
-fn scratch(tag: &str) -> Scratch {
-    let dir = std::env::temp_dir().join(format!("atomic-mounts-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch");
-    Scratch(std::fs::canonicalize(&dir).expect("real"))
+    panic!("scratch: no new name");
 }
 
 /// A 9p filesystem mounted at `host`, with one more mount `also` of it,
@@ -451,24 +449,28 @@ fn a_stale_remote_root_is_refused_where_the_place_is_there() {
     let mounts = ninep(&host, &keys, "/home/u/.ssh/keys");
     let found = aliases(&mounts, std::slice::from_ref(&place)).expect("the same directory");
     assert_eq!(found, vec![keys]);
+    // A mount of a part the place does not hold, perhaps from a stale root:
+    // nothing to check it against, so it is denied as it is.
+    let mounts = ninep(&host, &dir.0.join("elsewhere"), "/home/u/.ssh/gone");
+    let found = aliases(&mounts, std::slice::from_ref(&place)).expect("denied unchecked");
+    assert_eq!(found, vec![dir.0.join("elsewhere")]);
 }
 
 /// A place that cannot be looked at, other than for not being there, is
 /// refused: that is how a stale root can show.
 #[test]
 fn a_place_that_cannot_be_looked_at_is_refused() {
-    use std::os::unix::fs::PermissionsExt;
-    let dir = scratch("locked");
+    let dir = scratch("loop");
     let host = dir.0.join("host");
-    let place = host.join("home/u/.ssh");
-    std::fs::create_dir_all(&place).expect("dir");
+    std::fs::create_dir_all(&host).expect("dir");
     std::fs::create_dir_all(dir.0.join("also")).expect("dir");
-    std::fs::set_permissions(host.join("home"), std::fs::Permissions::from_mode(0o000))
-        .expect("lock");
-    if std::fs::symlink_metadata(&place).is_ok() {
-        // Run as root: nothing is locked.
-        return;
-    }
+    // A link to itself on the way to the place: looking fails with ELOOP
+    // for anyone, root too.
+    std::os::unix::fs::symlink("home", host.join("home")).expect("link");
+    let place = host.join("home/u/.ssh");
+    assert!(
+        std::fs::symlink_metadata(&place).is_err_and(|e| e.raw_os_error() == Some(libc::ELOOP))
+    );
     let mounts = ninep(&host, &dir.0.join("also"), "/");
     assert!(
         aliases(&mounts, std::slice::from_ref(&place))

@@ -19,8 +19,11 @@
 //! be trusted to say which directory each such mount shows; one on any
 //! filesystem but a local one ([`local`]) mounted more than once whose root
 //! the kernel shows as lost (`<path>//deleted`); and one there now whose
-//! second place, on such a filesystem, is missing or is another file or
-//! directory, since the table's roots there can be stale. A mount whose
+//! second place, on such a filesystem, is missing, is another file or
+//! directory, or is a link (which is not followed), or which, or whose
+//! part a second place shows, cannot be looked at for a reason other than
+//! not being there, since the table's roots there can be stale. A mount of
+//! part of a denied place is checked against that part. A mount whose
 //! root is not a path, such as a namespace file (`net:[4026531840]`), shows
 //! no directory, and is never a second place.
 //!
@@ -374,7 +377,9 @@ fn aliases_of(index: &Index<'_>, path: &Path, out: &mut Vec<PathBuf>) -> anyhow:
         // Off a local filesystem, a root may be stale with nothing in the
         // table to say so: an ancestor of it lost, or renamed on the server
         // and not checked again yet. Where the place is there, its second
-        // place must be the same file or directory as what it shows.
+        // place must be the same file or directory as what it shows. Where
+        // what it shows is not there, it is denied unchecked: a stale root
+        // then denies more, never less.
         if !local(&home.kind) {
             same_file(&shows, &alias)?;
         }
@@ -383,9 +388,6 @@ fn aliases_of(index: &Index<'_>, path: &Path, out: &mut Vec<PathBuf>) -> anyhow:
     Ok(())
 }
 
-/// Whether `alias` is the same file or directory as `path`, when `path` is
-/// there, neither followed through a link: refused when `alias` is not
-/// there, or is another, or either cannot be looked at.
 /// Whether looking at a path failed because nothing is there.
 #[cfg(unix)]
 fn not_there(e: &std::io::Error) -> bool {
@@ -395,6 +397,12 @@ fn not_there(e: &std::io::Error) -> bool {
     )
 }
 
+/// Whether `alias` is the same file or directory as `path`, when `path` is
+/// there, neither followed through a link: refused when `alias` is not
+/// there, or is another, or either cannot be looked at. Where `path` is not
+/// there, nothing is checked and `alias` is denied as it is: so a mount of a
+/// part the place does not hold, perhaps from a stale root, is denied too,
+/// which denies more, never less.
 fn same_file(path: &Path, alias: &Path) -> anyhow::Result<()> {
     #[cfg(unix)]
     {

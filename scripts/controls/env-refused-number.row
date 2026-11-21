@@ -1,0 +1,1 @@
+env-refused-number|crates/atomic-core/src/config.rs|yaml::refused_number(raw.trim())|None::<yaml::Refusal>|-p atomic-agentic-core --lib config::tests::an_environment_value_refused_as_a_number_is_refused_by_name

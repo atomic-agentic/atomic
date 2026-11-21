@@ -340,6 +340,7 @@ impl Project {
             "ATOMIC_MODEL_API_KEY_ENV",
             "ATOMIC_RUNNER",
             "OPENAI_API_KEY",
+            "OPENAI_BASE_URL",
             "DATABASE_URL",
         ] {
             c.env_remove(name);

@@ -10,6 +10,7 @@ import { intrinsics } from './intrinsics.mjs';
 import { contextForStep } from './context.mjs';
 import { captureHelper } from './capture.mjs';
 import { FenceError, literalFences } from './fences.mjs';
+import { unbalanced } from './balance.mjs';
 
 const denied = new Set(['__proto__', 'prototype', 'constructor']);
 const dataBrand = Symbol('data');
@@ -238,6 +239,10 @@ export async function compile(file, options = {}) {
     const parsed = await parse(fenced, { position: true });
     const parseError = parsed.diagnostics?.find((d) => d.severity === 1);
     if (parseError) throw new AtomDiagnostic(parseError.text ?? 'Astro parse error', canonical, parseError.location?.line);
+    // Tags are the prompt's structure, and Astro accepts unbalanced ones
+    // without a word: refused here, from Astro's own reading of them.
+    const tagError = unbalanced(fenced, parsed.ast);
+    if (tagError) throw new AtomDiagnostic(tagError.message, canonical, tagError.line);
     const defaults = canonical.endsWith('.atom.astro')
       ? { atomic: 1, name: path.basename(canonical, '.atom.astro'), kind: 'lite' }
       : {};
