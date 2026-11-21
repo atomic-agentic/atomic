@@ -240,12 +240,18 @@ impl SignIn {
         let file = |e: String| SignInError::Store(CredentialError::File(e));
         // Made here, or found: decided by the one call that makes it, so two
         // invocations never both take it for theirs.
-        if let Some(parent) = located.auth_home.parent() {
-            crate::state::private_dir(parent).map_err(|e| file(e.to_string()))?;
-        }
+        // Its parents as making it whole would make them: readable by their
+        // owner only, those that exist left as they are.
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
         std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        if let Some(parent) = located.auth_home.parent() {
+            builder
+                .recursive(true)
+                .create(parent)
+                .map_err(|e| file(format!("{}: {e}", parent.display())))?;
+            builder.recursive(false);
+        }
         let existed = match builder.create(&located.auth_home) {
             Ok(()) => false,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => true,
