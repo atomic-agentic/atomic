@@ -253,10 +253,22 @@ project's runs. The lock is released only when its process exits.
 `atomic serve`, `atomic run` and `atomic runs resume` stop on SIGTERM, SIGINT,
 SIGHUP or SIGQUIT, except one they were started ignoring, as under `nohup` or
 as a shell's background job, which they keep ignoring. No step starts after the first signal, and running steps get
-up to 10 seconds to reach a checkpoint; a second signal stops the process at
+up to 10 seconds to reach a checkpoint; a second signal ends that wait at
 once. A command still running then is killed, with everything it
 started, also under `--runner process`, and the process exits without recording
-how the command ended: `atomic serve` with status 1, `atomic run` and
+how the command ended. On Linux it exits, freeing the project's execution lock,
+only once every process it started has ended, one in another process group or
+session, such as a sandboxed command, included; atomic's own git is let finish,
+within its ten-minute time limit, rather than killed. A step whose atom ends
+while atomic stops records nothing, whatever ended it, a killed command, a
+model turn's or a compiler's included, so it stays unfinished too. It names any process still running after ten seconds, and
+again every thirty, and goes on waiting: only SIGKILL ends that wait, as it
+ends atomic at once. The same holds however the command ends, by an error
+included, though not when atomic itself panics. A process that left atomic's
+descendants, as one that daemonizes outside its sandbox's process namespace
+does, is not found. Elsewhere than Linux, atomic kills each command's process
+group and exits without waiting, so a process that left the group may outlive
+it and its lock. Then it exits: `atomic serve` with status 1, `atomic run` and
 `atomic runs resume` with status 130, leaving the run for `atomic runs resume`. Unfinished work stays recorded for the
 next `serve` or `runs resume`, and an interrupted command runs again only if it
 declares `effects.external` as `read-only` or `idempotent`; any other is parked
@@ -266,7 +278,7 @@ Whatever a command leaves running in its group when it ends is stopped then
 (under `--runner process`, when its runner ends). Output that arrives more than
 two seconds after a command exits is not its output, so a process that left
 its group, such as one started with `setsid`, cannot hold the step open,
-though atomic cannot stop it. A runner
+though atomic stops it only when it stops itself. A runner
 ignores the stop signals a command in its group might send it.
 
 One process recovers a run at most five times at the same step before it fails

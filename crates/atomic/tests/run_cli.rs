@@ -243,6 +243,13 @@ fn pids_with(marker: &str) -> Vec<String> {
     pids
 }
 
+/// The session of process `pid`, from field 6 of `/proc/<pid>/stat`.
+fn session_of(pid: &str) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let session = stat.rsplit(')').next()?.split_whitespace().nth(3)?;
+    Some(session.to_owned())
+}
+
 /// The parent of process `pid`, from field 4 of `/proc/<pid>/stat`.
 fn parent_of(pid: &str) -> Option<String> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
@@ -3165,6 +3172,108 @@ fn serve_stopped_mid_command_holds_the_lock_until_it_exits_and_runs_nothing_twic
     let ends = std::fs::read_to_string(dir.join("slow.log")).expect("log");
     assert!(!ends.contains("end"), "no command ran to its end: {ends}");
     assert_eq!(slow_starts(&dir), 2, "started twice, never at once");
+}
+
+/// The slow command made stubborn: it and the grandchild it starts ignore
+/// SIGTERM, and the grandchild leaves its process group and session and
+/// holds a gigabyte it has written, which takes the kernel a while to free
+/// once it is killed, so a process that exits before it has ended is seen.
+const STUBBORN: &str = "import json, os, signal, subprocess, sys, time\n\
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n\
+    note = json.load(sys.stdin)\n\
+    log = sys.argv[1]\n\
+    child = subprocess.Popen(['python3', '-c', 'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); held = bytearray(1 << 30); held[::4096] = b\\'x\\' * (1 << 18); time.sleep(60)', log], start_new_session=True)\n\
+    open(log, 'a').write('start\\n')\n\
+    time.sleep(60)\n\
+    open(log, 'a').write('end\\n')\n\
+    json.dump({'title': note['text'][:25], 'words': len(note['text'].split())}, sys.stdout)\n";
+
+/// A stopped serve holds the execution lock until every process of the
+/// command it stopped has ended, under either runner: one that ignores
+/// SIGTERM and one that left the command's process group and session
+/// included. The lock is probed first and the processes checked after, so
+/// a process alive after a probe that found the lock free was alive
+/// during it.
+// needs_sandbox
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
+#[test]
+fn serve_holds_the_lock_until_every_process_of_a_stopped_command_has_ended() {
+    support::require_sandbox();
+    for runner in ["local", "process"] {
+        let dir = scratch(&format!("serve-stubborn-{runner}"));
+        let project = project(&dir);
+        let state = slow_run_killed_mid_command(&dir, &project, "stubborn-1");
+        std::fs::write(project.join("tools/slow.py"), STUBBORN).expect("script");
+        let log = dir.join("serve.log");
+        let mut serve = spawn(
+            &dir,
+            &project,
+            &["serve", "--runner", runner],
+            &UNUSED_MODEL,
+            &log,
+        );
+        wait_until("serve to start the command again", || {
+            slow_starts(&dir) == 2 || serve_ended(&dir)
+        });
+        let text = || std::fs::read_to_string(&log).unwrap_or_default();
+        assert_eq!(slow_starts(&dir), 2, "{runner}: {}", text());
+        // The grandchild is in a session of its own.
+        let started = Instant::now();
+        let pids = loop {
+            let pids = slow_pids(&dir);
+            let sessions: std::collections::BTreeSet<String> =
+                pids.iter().filter_map(|pid| session_of(pid)).collect();
+            if sessions.len() >= 2 {
+                break pids;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "{runner}: no process of the command in a session of its own: {pids:?}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        terminate(&serve);
+        let stopping = Instant::now();
+        let status = loop {
+            let held = lock_held(&state);
+            let running: Vec<&String> = pids.iter().filter(|pid| alive(pid)).collect();
+            assert!(
+                held || running.is_empty(),
+                "{runner}: the lock was free while {running:?} still ran: {}",
+                text()
+            );
+            if let Some(status) = serve.try_wait().expect("wait") {
+                break status;
+            }
+            assert!(
+                stopping.elapsed() < Duration::from_secs(30),
+                "{runner}: serve did not stop: {}",
+                text()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(
+            !status.success(),
+            "{runner}: a command was stopped: {}",
+            text()
+        );
+        assert!(
+            text().contains("stopped 1 command(s)"),
+            "{runner}: {}",
+            text()
+        );
+        all_gone(&pids, "the stopped command and its grandchild");
+        assert!(
+            !text().contains("have not ended yet"),
+            "{runner}: every process ended at its kill: {}",
+            text()
+        );
+        let ends = std::fs::read_to_string(dir.join("slow.log")).expect("log");
+        assert!(
+            !ends.contains("end"),
+            "{runner}: no command ran to its end: {ends}"
+        );
+    }
 }
 
 // needs_sandbox
