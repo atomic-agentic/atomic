@@ -1146,8 +1146,10 @@ impl Durare {
         }
         let mut rt = Self::open_for_none(database, executor, version).await?;
         // A SQLite store is one project's own: a park recorded before parks
-        // had a project is its.
-        if matches!(database, Database::Sqlite(_)) {
+        // had a project is its. Written only when there is one, so opening a
+        // store another process is writing to, as `atomic runs show` does,
+        // takes no write lock.
+        if matches!(database, Database::Sqlite(_)) && rt.has_parks_of_none().await? {
             let project = project.to_owned();
             rt.control_transaction(move |mut tx| {
                 let project = project.clone();
@@ -1166,6 +1168,24 @@ impl Durare {
         }
         rt.project = Some(project.into());
         Ok(rt)
+    }
+
+    /// Whether a park recorded for no project is in the store.
+    async fn has_parks_of_none(&self) -> Result<bool> {
+        self.reads.read(|mut tx| {
+            Box::pin(async move {
+                Ok(tx
+                    .query_opt(
+                        "SELECT p.park_id AS park_id FROM atomic_parks p WHERE NOT EXISTS \
+                         (SELECT 1 FROM atomic_park_projects pp WHERE pp.park_id = p.park_id) \
+                         LIMIT 1",
+                        &[],
+                    )
+                    .await?
+                    .is_some())
+            })
+        })
+        .await
     }
 
     async fn open_for_none(
