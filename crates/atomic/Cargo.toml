@@ -16,7 +16,7 @@ workspace = true
 [features]
 # Run the tests that need Codex's Linux sandbox (bubblewrap and unprivileged
 # user namespaces). With this on, a sandbox that cannot start fails them.
-sandbox-tests = []
+sandbox-tests = ["atomic-core/exec-loopback-tests"]
 # Run the tests that need PostgreSQL at ATOMIC_TEST_DATABASE_URL, here and
 # in the durable store. With this on, a database that cannot be reached fails
 # them; with it off, they are not built.
