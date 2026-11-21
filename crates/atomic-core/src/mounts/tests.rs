@@ -467,3 +467,117 @@ fn a_place_that_cannot_be_looked_at_is_refused() {
             .is_err_and(|e| e.to_string().contains("cannot be looked at"))
     );
 }
+
+/// Another mount of the place's filesystem whose mount point is the place,
+/// or a directory above it, shows the place there whatever its root says:
+/// where the table yields that second place it passes, and where its root
+/// says another directory, the table is stale and the list is refused. (A
+/// mount point reached through a linked directory stands in here for a
+/// mount of the same directory; the sandbox suite's `stale_roots` makes
+/// real ones.)
+#[test]
+fn a_mount_of_a_directory_above_the_place_is_checked_whatever_its_root_says() {
+    let dir = scratch("above");
+    let home = dir.0.join("host/home");
+    let place = home.join("u/.ssh");
+    std::fs::create_dir_all(&place).expect("dir");
+    std::os::unix::fs::symlink(&home, dir.0.join("link")).expect("link");
+    let shown = dir.0.join("link/u");
+    let table = |root: &Path| {
+        format!(
+            "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n2 1 8:1 {} {} rw - ext4 /dev/sda1 rw\n",
+            root.display(),
+            shown.display()
+        )
+    };
+    // Its root names the directory it is: the table yields it, and it passes.
+    let mounts = parse(table(&home.join("u")).as_bytes()).expect("parses");
+    assert_eq!(
+        aliases(&mounts, std::slice::from_ref(&place)).expect("yielded"),
+        [shown.join(".ssh")]
+    );
+    // Its root names another: refused.
+    let mounts = parse(table(Path::new("/elsewhere")).as_bytes()).expect("parses");
+    assert!(
+        aliases(&mounts, std::slice::from_ref(&place)).is_err_and(|e| {
+            let e = e.to_string();
+            e.contains(&format!("the mount at {} shows", shown.display()))
+                && e.contains("(/elsewhere) names no path")
+        })
+    );
+}
+
+/// Gives a directory its mode back when dropped, so that its scratch can
+/// be removed whatever the test came to.
+struct Unlocked(PathBuf);
+
+impl Drop for Unlocked {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+    }
+}
+
+/// A directory this user may not search, and the dropping of it.
+fn locked(dir: &Path) -> Unlocked {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(dir).expect("dir");
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o000)).expect("lock");
+    assert!(
+        std::fs::symlink_metadata(dir.join("x"))
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied),
+        "this test needs a user that file modes stop, not root"
+    );
+    Unlocked(dir.to_owned())
+}
+
+/// A mount point, or a place, behind a directory this user may not search
+/// is out of reach only when that directory is someone else's: one of the
+/// user's own stops it by its mode alone, which a command can step around
+/// from a user namespace of its own, so the list is refused.
+#[test]
+fn what_hides_behind_the_users_own_locked_directory_is_refused() {
+    let dir = scratch("locked-own");
+    let place = dir.0.join("home/.ssh");
+    std::fs::create_dir_all(&place).expect("dir");
+    let elsewhere = dir.0.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).expect("dir");
+    let table = |at: &Path| {
+        format!(
+            "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n2 1 8:1 /x {} rw - ext4 /dev/sda1 rw\n",
+            at.display()
+        )
+    };
+    // A second mount of the place's filesystem behind it.
+    let _unlocked = locked(&dir.0.join("locked"));
+    let mounts = parse(table(&dir.0.join("locked/m")).as_bytes()).expect("parses");
+    assert!(
+        aliases(&mounts, std::slice::from_ref(&place)).is_err_and(|e| e.to_string().contains(
+            &format!(
+                "the mount at {} cannot be looked at",
+                dir.0.join("locked/m").display()
+            )
+        ))
+    );
+    // A place behind it, with a second mount of its filesystem elsewhere.
+    let hidden = dir.0.join("locked/.kube");
+    let mounts = parse(table(&elsewhere).as_bytes()).expect("parses");
+    assert!(
+        aliases(&mounts, std::slice::from_ref(&hidden)).is_err_and(|e| e
+            .to_string()
+            .contains(&format!("{} cannot be looked at", hidden.display())))
+    );
+    // The same directory, someone else's: out of reach of the user's
+    // commands too, and passed.
+    let _other = with_uid(crate::state::effective_uid() + 1);
+    let mounts = parse(table(&dir.0.join("locked/m")).as_bytes()).expect("parses");
+    assert_eq!(
+        aliases(&mounts, std::slice::from_ref(&place)).expect("out of reach"),
+        Vec::<PathBuf>::new()
+    );
+    let mounts = parse(table(&elsewhere).as_bytes()).expect("parses");
+    assert_eq!(
+        aliases(&mounts, std::slice::from_ref(&hidden)).expect("out of reach"),
+        Vec::<PathBuf>::new()
+    );
+}
