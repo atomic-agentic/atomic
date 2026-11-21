@@ -140,6 +140,7 @@ async fn probe(
         backend,
         None,
         &runtime::Artifacts::none(),
+        &atomic_core::usage::Metering::none(),
     )
     .await
     .expect("the command runs");

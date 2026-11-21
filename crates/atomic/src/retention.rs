@@ -21,11 +21,11 @@
 //! reading these, however long the reading and the wait for the store's
 //! lock take, and anything a store holds as it begins reading or as it
 //! sweeps: an exec step holds the files its command handed over from before
-//! they are stored until its turn is checkpointed. What it cannot see: any other producer that stores
-//! content more than a grace period before the step that refers to it is
-//! checkpointed. And
-//! what lives in the source tree (eval cases, cassettes, reports) refers to
-//! artifacts no run records, so only the caller's keep set covers it.
+//! they are stored until its turn is checkpointed. What it cannot see: any
+//! other producer that stores content more than a grace period before the
+//! step that refers to it is checkpointed. And what lives in the source tree
+//! (eval cases, cassettes, reports) refers to artifacts no run records, so
+//! only the caller's keep set covers it.
 //!
 //! Nothing sweeps on its own: a caller decides when.
 
@@ -60,15 +60,32 @@ pub async fn read_kept(
     rt: &Durare,
     keep: &BTreeSet<ArtifactRef>,
 ) -> anyhow::Result<Kept> {
+    read_kept_then(store, rt, keep, || {}).await
+}
+
+/// [`read_kept`], calling `between` once the holds are read and before the
+/// runs are, as a step that records its reference and lets its hold go in
+/// that window would: for tests.
+#[doc(hidden)]
+pub async fn read_kept_then(
+    store: &LocalStore,
+    rt: &Durare,
+    keep: &BTreeSet<ArtifactRef>,
+    between: impl FnOnce(),
+) -> anyhow::Result<Kept> {
     let read_at = std::time::SystemTime::now();
     let mut artifacts = keep.clone();
-    let held = {
-        let store = store.clone();
-        tokio::task::spawn_blocking(move || store.held()).await??
-    };
+    let held = held_now(store).await?;
+    between();
     artifacts.extend(held);
     artifacts.extend(referenced(store, rt).await?);
     Ok(Kept { artifacts, read_at })
+}
+
+/// What every store holds now, read off the async workers.
+async fn held_now(store: &LocalStore) -> anyhow::Result<BTreeSet<ArtifactRef>> {
+    let store = store.clone();
+    Ok(tokio::task::spawn_blocking(move || store.held()).await??)
 }
 
 /// Every blob of `present` that `text` may name, in either case: any 64 hex

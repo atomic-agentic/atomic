@@ -90,6 +90,7 @@ fn runtimes(model: &FakeModel, tag: &str) -> Runtimes {
         codex,
         lite,
         exec: Default::default(),
+        exec_meter: Default::default(),
         clock: None,
     }
 }
@@ -1104,6 +1105,7 @@ fn exec_validators_follow_the_steps_clock() {
                 Arc::new(atomic_exec::LocalBackend::default()),
                 Some(&clock),
                 &Artifacts::none(),
+                &crate::usage::Metering::none(),
             )
             .await
             .expect("the recorded clock passes");
@@ -1117,6 +1119,7 @@ fn exec_validators_follow_the_steps_clock() {
             Arc::new(atomic_exec::LocalBackend::default()),
             None,
             &Artifacts::none(),
+            &crate::usage::Metering::none(),
         )
         .await;
         assert!(matches!(fresh, Err(AtomError::Validation(_))), "{fresh:?}");
@@ -2156,6 +2159,7 @@ fn an_exec_atom_output_names_only_artifacts_the_store_holds() {
                 Arc::new(atomic_exec::LocalBackend::default()),
                 None,
                 &Artifacts::new(store.clone()),
+                &crate::usage::Metering::none(),
             )
             .await;
             match want {
@@ -2250,6 +2254,7 @@ fn an_exec_output_cel_cannot_read_fails() {
             Arc::new(atomic_exec::LocalBackend::default()),
             None,
             &Artifacts::none(),
+            &crate::usage::Metering::none(),
         )
         .await;
         assert!(
@@ -2837,6 +2842,7 @@ fn a_cancelled_run_waits_for_its_files_to_be_copied_and_read() {
                     backend,
                     None,
                     &artifacts,
+                    &crate::usage::Metering::none(),
                 )
                 .await
             });
@@ -2921,6 +2927,7 @@ fn a_store_held_while_files_are_stored_leaves_the_outcome_unknown() {
             step_id: "total".into(),
         };
         let input = json!({"cents": [1]});
+        let meter = crate::usage::Metering::none();
         let run = || {
             run_exec(
                 &a,
@@ -2930,6 +2937,7 @@ fn a_store_held_while_files_are_stored_leaves_the_outcome_unknown() {
                 Arc::new(atomic_exec::LocalBackend::default()),
                 None,
                 &artifacts,
+                &meter,
             )
         };
         let held = hold();
@@ -3202,6 +3210,7 @@ fn a_runtime_dropped_under_a_running_command_or_a_held_workspace_shuts_down() {
                 backend,
                 None,
                 &Artifacts::none(),
+                &crate::usage::Metering::none(),
             )
             .await;
         });
@@ -3259,6 +3268,10 @@ fn a_runtime_dropped_under_a_running_command_or_a_held_workspace_shuts_down() {
 #[derive(Clone, Default)]
 struct Remote {
     files: Arc<std::sync::Mutex<RemoteFiles>>,
+    /// Whether it hands no files over, giving no exchange.
+    none: bool,
+    /// What its command writes, in place of a patch made from its input.
+    stdout: Option<Value>,
 }
 
 /// What a [`Remote`] backend's exchange holds.
@@ -3292,6 +3305,13 @@ impl ExecutionBackend for Remote {
         &self,
         command: &atomic_exec::Command,
     ) -> Result<atomic_exec::Completed, atomic_exec::ExecError> {
+        if let Some(stdout) = &self.stdout {
+            return Ok(atomic_exec::Completed {
+                code: Some(0),
+                stdout: serde_json::to_vec(stdout).expect("output"),
+                stderr: Vec::new(),
+            });
+        }
         let env: std::collections::BTreeMap<_, _> = command.env.iter().cloned().collect();
         assert_eq!(
             env.get("ATOMIC_INPUTS").map(String::as_str),
@@ -3326,6 +3346,9 @@ impl ExecutionBackend for Remote {
         &self,
         workspace: &Workspace,
     ) -> Result<Option<Box<dyn atomic_exec::exchange::Exchange>>, atomic_exec::ExecError> {
+        if self.none {
+            return Ok(None);
+        }
         let scratch = workspace.require_scratch()?;
         Ok(Some(Box::new(RemoteExchange {
             outputs: scratch.join("outputs"),
@@ -3429,6 +3452,7 @@ fn a_remote_backend_gives_inputs_and_hands_a_file_over() {
             Arc::new(remote.clone()),
             None,
             &artifacts,
+            &crate::usage::Metering::none(),
         )
         .await
         .expect("runs");
@@ -3450,5 +3474,115 @@ fn a_remote_backend_gives_inputs_and_hands_a_file_over() {
             vec![given.digest()]
         );
         assert!(!std::path::Path::new(REMOTE_ROOT).exists());
+    });
+}
+
+/// An exec atom whose input contract has an artifact where `patch` is, if
+/// `given`, and whose output contract has one there and an object of its
+/// own where `meta` is; with a store, as `atomic run` has.
+fn remote_atom(
+    tag: &str,
+    given: bool,
+) -> (crate::atom::Atom, Compiled, crate::artifact::LocalStore) {
+    use crate::{atom, compile};
+    let store = crate::artifact::LocalStore::open(scratch(&format!("{tag}-store"))).expect("store");
+    let (dir, _, _) = exec_project(tag, "", "");
+    if given {
+        std::fs::write(
+            dir.join("atoms/total.input.schema.yaml"),
+            "type: object\nadditionalProperties: false\nrequired: [cents, patch]\nproperties:\n  cents: {type: array, items: {type: integer}}\n  patch: {$ref: 'atomic:artifact', mediaType: text/x-diff}\n",
+        )
+        .expect("input");
+    }
+    std::fs::write(
+        dir.join("atoms/total.output.schema.yaml"),
+        "type: object\nadditionalProperties: false\nrequired: [total]\nproperties:\n  total: {type: integer}\n  patch: {$ref: 'atomic:artifact', mediaType: text/x-diff}\n  meta: {type: object}\n",
+    )
+    .expect("output");
+    let mut registry = Registry::new();
+    let a = atom::load(&dir.join("atoms/total.atom.astro"), &mut registry).expect("loads");
+    let compiled = compile::compile(&a, &registry).expect("compiles");
+    (a, compiled, store)
+}
+
+/// On a backend that hands no files over, an exec atom whose input
+/// references an artifact is refused before its command runs, and so is an
+/// output that names a file where its contract expects a reference; a
+/// `$file` object anywhere else is the output's own, and stays.
+#[cfg(unix)]
+#[test]
+fn a_backend_with_no_exchange_refuses_what_it_cannot_hand_over() {
+    use crate::artifact::{ArtifactStore, Provenance};
+    on_codex_runtime(async {
+        let identity = EffectIdentity {
+            run_id: "run-1".into(),
+            step_id: "total".into(),
+        };
+        let meter = crate::usage::Metering::none();
+        // An input that references an artifact.
+        let (a, compiled, store) = remote_atom("no-exchange-input", true);
+        let given = store
+            .put(
+                &mut &b"--- a\n+++ b\n"[..],
+                Provenance {
+                    media_type: "text/x-diff".into(),
+                    ..Default::default()
+                },
+            )
+            .expect("put")
+            .artifact;
+        let remote = Remote {
+            none: true,
+            stdout: Some(json!({"total": 1})),
+            ..Default::default()
+        };
+        let artifacts = Artifacts::store(store, Default::default());
+        let r = run_exec(
+            &a,
+            &compiled,
+            &json!({"cents": [1], "patch": given.uri()}),
+            &identity,
+            Arc::new(remote),
+            None,
+            &artifacts,
+            &meter,
+        )
+        .await;
+        assert!(
+            matches!(&r, Err(AtomError::Runtime(m)) if m.contains("gives commands no files")),
+            "{r:?}"
+        );
+        // An output that names a file where a reference goes, and one that
+        // has a `$file` object of its own.
+        let (a, compiled, store) = remote_atom("no-exchange-output", false);
+        let artifacts = Artifacts::store(store, Default::default());
+        let input = json!({"cents": [1]});
+        let run = |stdout: Value| {
+            let remote = Remote {
+                none: true,
+                stdout: Some(stdout),
+                ..Default::default()
+            };
+            run_exec(
+                &a,
+                &compiled,
+                &input,
+                &identity,
+                Arc::new(remote),
+                None,
+                &artifacts,
+                &meter,
+            )
+        };
+        let r =
+            run(json!({"total": 1, "patch": {"$file": "out.diff", "mediaType": "text/x-diff"}}))
+                .await;
+        assert!(
+            matches!(&r, Err(AtomError::Schema { message, .. }) if message.contains("hands no files over")),
+            "{r:?}"
+        );
+        let own = json!({"total": 1, "meta": {"$file": "notes.txt"}});
+        let (out, _) = run(own.clone()).await.expect("its own object");
+        assert_eq!(out, own);
     });
 }
