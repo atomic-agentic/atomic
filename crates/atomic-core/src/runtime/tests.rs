@@ -2767,6 +2767,12 @@ impl crate::artifact::ArtifactStore for Stalling {
     fn discard(&self, staged: crate::artifact::Staged) {
         self.inner.discard(staged)
     }
+    fn hold(
+        &self,
+        artifact: &crate::artifact::ArtifactRef,
+    ) -> Result<crate::artifact::Hold, crate::artifact::ArtifactError> {
+        self.inner.hold(artifact)
+    }
     fn contains(
         &self,
         artifact: &crate::artifact::ArtifactRef,
@@ -2838,6 +2844,7 @@ fn a_cancelled_run_waits_for_its_files_to_be_copied_and_read() {
             let artifacts = Artifacts(
                 Arc::new(store.clone()),
                 Some(Arc::new(stalling.clone())),
+                Default::default(),
                 Default::default(),
             );
             let _let_go = LetGo(stalling.clone());
@@ -2974,7 +2981,44 @@ fn a_store_held_while_files_are_stored_leaves_the_outcome_unknown() {
             "{out}"
         );
         sweep.join().expect("sweep");
+        // What it handed over is held until the step lets it go.
+        let holds = || -> Vec<std::path::PathBuf> {
+            std::fs::read_dir(root.join("artifact-held"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .flat_map(|owner| std::fs::read_dir(owner.path()).into_iter().flatten())
+                .flatten()
+                .map(|hold| hold.path())
+                .collect()
+        };
+        let digest = out["patch"]
+            .as_str()
+            .and_then(|r| r.strip_prefix("artifact://sha256/"))
+            .expect("a reference")
+            .to_owned();
+        let held = holds();
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert!(held[0].to_string_lossy().contains(&digest), "{held:?}");
+        artifacts.release(&identity);
+        assert!(holds().is_empty(), "still held once released");
+        // A step dropped before it recorded its output lets go too.
+        let releasing = artifacts.releasing(identity.clone());
+        run().await.expect("runs again");
+        assert_eq!(holds().len(), 1);
+        drop(releasing);
+        assert!(holds().is_empty(), "still held once the step was dropped");
     });
+}
+
+#[test]
+fn a_deny_list_that_cannot_be_made_fails_the_machine_not_the_model() {
+    let refused = anyhow::Error::new(crate::codex::DenyRefused("no".into())).context("the turn");
+    assert!(matches!(turn_failure(&refused), AtomError::Runtime(_)));
+    assert!(matches!(
+        turn_failure(&anyhow::anyhow!("the model said no")),
+        AtomError::Model(_)
+    ));
 }
 
 /// A local backend whose open waits, once it has begun, until it is let

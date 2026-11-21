@@ -57,18 +57,46 @@ use atomic_exec::{ExecutionBackend, Open, Shell, Workspace};
 /// Where a runtime looks up the artifacts an output references, and, when
 /// it has a store, where an exec atom's command hands files over and reads
 /// the artifacts it is given (see [`crate::artifact::files`]).
+///
+/// The files a step's command handed over stay [held](crate::artifact::Hold)
+/// from before they are stored until [`Artifacts::release`] lets them go
+/// once the step has recorded its output, or until the store closes.
 #[derive(Clone)]
 pub struct Artifacts(
     Arc<dyn ArtifactLookup + Send + Sync>,
     Option<Arc<dyn crate::artifact::ArtifactStore + Send + Sync>>,
     crate::artifact::files::Limits,
+    Arc<Holding>,
 );
+
+/// Lets go of what a step's command handed over when dropped (see
+/// [`Artifacts::releasing`]).
+pub struct Releasing {
+    artifacts: Artifacts,
+    identity: EffectIdentity,
+}
+
+impl Drop for Releasing {
+    fn drop(&mut self) {
+        self.artifacts.release(&self.identity);
+    }
+}
+
+/// The holds on what each step's command handed over, by the step's effect
+/// key, until the step lets them go.
+#[derive(Default)]
+struct Holding(std::sync::Mutex<std::collections::HashMap<String, Vec<crate::artifact::Hold>>>);
 
 impl Artifacts {
     /// Look artifacts up in `lookup`, such as a [`crate::artifact::LocalStore`].
     /// Commands can hand no files over.
     pub fn new(lookup: impl ArtifactLookup + Send + Sync + 'static) -> Self {
-        Self(Arc::new(lookup), None, Default::default())
+        Self(
+            Arc::new(lookup),
+            None,
+            Default::default(),
+            Default::default(),
+        )
     }
 
     /// Look artifacts up in `store`, and store the files commands hand over
@@ -77,7 +105,44 @@ impl Artifacts {
         store: crate::artifact::LocalStore,
         limits: crate::artifact::files::Limits,
     ) -> Self {
-        Self(Arc::new(store.clone()), Some(Arc::new(store)), limits)
+        Self(
+            Arc::new(store.clone()),
+            Some(Arc::new(store)),
+            limits,
+            Default::default(),
+        )
+    }
+
+    /// Let go of what the step `identity` names had its command hand over:
+    /// once the step has recorded its output, which references it, a sweep
+    /// keeps it for that.
+    pub fn release(&self, identity: &EffectIdentity) {
+        let gone = (self.3)
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&identity.key());
+        drop(gone);
+    }
+
+    /// A guard that [releases](Self::release) the step `identity` names when
+    /// it is dropped, however the step ends: when it has recorded its output,
+    /// or when the step is dropped, cancelled or panics on the way.
+    pub fn releasing(&self, identity: EffectIdentity) -> Releasing {
+        Releasing {
+            artifacts: self.clone(),
+            identity,
+        }
+    }
+
+    /// Keep `holds` for the step `identity` names, until it is released.
+    fn keep(&self, identity: &EffectIdentity, holds: Vec<crate::artifact::Hold>) {
+        if holds.is_empty() {
+            return;
+        }
+        // A poisoned registry still keeps them: they go with the store.
+        let mut held = (self.3).0.lock().unwrap_or_else(|e| e.into_inner());
+        held.entry(identity.key()).or_default().extend(holds);
     }
 
     /// No store: every reference fails (see [`NoArtifacts`]).
@@ -733,7 +798,7 @@ async fn run_contract(
         // The meter refused the next call: nothing was sent for it.
         Some(MeterError::Exhausted(refusal)) => AtomError::Budget(refusal.clone()),
         Some(failure) => AtomError::Runtime(failure.to_string()),
-        None => AtomError::Model(format!("{e:#}")),
+        None => turn_failure(&e),
     })?;
     let metadata = RunMetadata {
         thread_id: report.thread_id,
@@ -753,6 +818,18 @@ async fn run_contract(
         (None, None) => Err(AtomError::Runtime(
             "the turn ended without an answer".into(),
         )),
+    }
+}
+
+/// What a turn that failed failed of: the model, or, when the sandbox's
+/// deny list could not be made, the machine it would have run on.
+fn turn_failure(e: &anyhow::Error) -> AtomError {
+    match e
+        .chain()
+        .find_map(|c| c.downcast_ref::<crate::codex::DenyRefused>())
+    {
+        Some(refused) => AtomError::Runtime(refused.to_string()),
+        None => AtomError::Model(format!("{e:#}")),
     }
 }
 
@@ -944,7 +1021,7 @@ pub async fn run_turn(runtime: &CodexRuntime, spec: &TurnSpec) -> Result<String,
         )
         .await
         .map(|(answer, _)| answer)
-        .map_err(|e| AtomError::Model(format!("{e:#}"))),
+        .map_err(|e| turn_failure(&e)),
         Err(e) => Err(e),
     };
     workspace.close().await;
@@ -1749,16 +1826,19 @@ async fn finish_exec(
                         std::thread::sleep(wait);
                         wait = (wait * 2).min(GATHER_LOCKED_BACKOFF_MAX);
                     }
-                    gathered => break gathered.map(|()| output),
+                    gathered => break gathered.map(|holds| (output, holds)),
                 }
             }
         })
         .await
         .map_err(|e| AtomError::Runtime(format!("{}: store its files: {e}", atom.name)))?;
-        output = gathered.map_err(|e| match e {
+        let holds;
+        (output, holds) = gathered.map_err(|e| match e {
             crate::artifact::ArtifactError::Refused(message) => schema_error(message),
             e => store_error(&atom.name, "store its files", e),
         })?;
+        // Held until the step records the output that references them.
+        artifacts.keep(identity, holds);
     }
     if !cfg!(unix) && crate::artifact::files::names_a_file(&output) {
         return Err(schema_error(format!(

@@ -87,11 +87,15 @@ impl Fixture {
         std::fs::write(self.exchange.outputs.join(name), bytes).expect("write");
     }
 
-    fn gather(&self, output: &mut Value) -> Result<(), ArtifactError> {
+    fn gather(&self, output: &mut Value) -> Result<Vec<Hold>, ArtifactError> {
         self.gather_within(output, Limits::default())
     }
 
-    fn gather_within(&self, output: &mut Value, limits: Limits) -> Result<(), ArtifactError> {
+    fn gather_within(
+        &self,
+        output: &mut Value,
+        limits: Limits,
+    ) -> Result<Vec<Hold>, ArtifactError> {
         self.exchange.gather(
             &self.store,
             &self.store,
@@ -391,6 +395,9 @@ impl ArtifactStore for Tampering<'_> {
     fn discard(&self, staged: crate::artifact::Staged) {
         self.inner.discard(staged)
     }
+    fn hold(&self, artifact: &ArtifactRef) -> Result<Hold, ArtifactError> {
+        self.inner.hold(artifact)
+    }
     fn contains(&self, artifact: &ArtifactRef) -> Result<bool, ArtifactError> {
         self.inner.contains(artifact)
     }
@@ -466,6 +473,9 @@ impl ArtifactStore for Counting<'_> {
     fn discard(&self, staged: crate::artifact::Staged) {
         self.inner.discard(staged)
     }
+    fn hold(&self, artifact: &ArtifactRef) -> Result<Hold, ArtifactError> {
+        self.inner.hold(artifact)
+    }
     fn contains(&self, artifact: &ArtifactRef) -> Result<bool, ArtifactError> {
         self.inner.contains(artifact)
     }
@@ -485,7 +495,7 @@ impl Fixture {
         &self,
         store: &dyn ArtifactStore,
         output: &mut Value,
-    ) -> Result<(), ArtifactError> {
+    ) -> Result<Vec<Hold>, ArtifactError> {
         self.exchange.gather(
             store,
             &self.store,
@@ -744,4 +754,91 @@ fn the_outputs_own_file_objects_are_not_counted() {
     f.gather(&mut output).expect("gathered");
     assert_eq!(output["patch"], json!(reference_of(b"x")));
     assert_eq!(output["meta"]["files"], json!(own));
+}
+
+/// A store that sweeps itself after each commit as a sweep that began
+/// reading what to keep long after the commit would, keeping nothing it was
+/// told of and nothing recent, while a gather has more files to store and
+/// its step has recorded none of them.
+struct Sweeping<'a> {
+    inner: &'a LocalStore,
+}
+
+impl Sweeping<'_> {
+    fn sweep(&self) -> crate::artifact::Swept {
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(24 * 3600);
+        self.inner
+            .sweep(
+                &BTreeSet::new(),
+                crate::artifact::Grace::none_for_tests(),
+                later,
+            )
+            .expect("sweep")
+    }
+}
+
+impl ArtifactStore for Sweeping<'_> {
+    fn stage(&self, content: &mut dyn Read) -> Result<crate::artifact::Staged, ArtifactError> {
+        self.inner.stage(content)
+    }
+    fn commit(
+        &self,
+        staged: crate::artifact::Staged,
+        provenance: &[Provenance],
+    ) -> Result<Vec<crate::artifact::Manifest>, ArtifactError> {
+        let manifests = self.inner.commit(staged, provenance)?;
+        self.sweep();
+        Ok(manifests)
+    }
+    fn discard(&self, staged: crate::artifact::Staged) {
+        self.inner.discard(staged)
+    }
+    fn hold(&self, artifact: &ArtifactRef) -> Result<Hold, ArtifactError> {
+        self.inner.hold(artifact)
+    }
+    fn contains(&self, artifact: &ArtifactRef) -> Result<bool, ArtifactError> {
+        self.inner.contains(artifact)
+    }
+    fn open(&self, artifact: &ArtifactRef) -> Result<Box<dyn Read + Send>, ArtifactError> {
+        self.inner.open(artifact)
+    }
+    fn manifests(
+        &self,
+        artifact: &ArtifactRef,
+    ) -> Result<Vec<crate::artifact::Manifest>, ArtifactError> {
+        self.inner.manifests(artifact)
+    }
+}
+
+/// A sweep that lands while a gather stores its files, or after it and
+/// before its step records them, keeps every file it stored, however long
+/// the step takes: the gather holds them until they are let go. A sweep
+/// after that removes them.
+#[test]
+fn a_sweep_racing_a_slow_gather_keeps_the_gathered_files() {
+    let f = fixture("racing");
+    f.write("a.diff", b"first");
+    f.write("b.diff", b"second");
+    let mut output = json!({
+        "patch": {"$file": "a.diff", "mediaType": "text/x-diff"},
+        "more": [{"$file": "b.diff"}]
+    });
+    let sweeping = Sweeping { inner: &f.store };
+    let held = f
+        .gather_through(&sweeping, &mut output)
+        .expect("gathered while swept");
+    let refs = [&output["patch"], &output["more"][0]];
+    for reference in refs {
+        let a: ArtifactRef = reference
+            .as_str()
+            .expect("a reference")
+            .parse()
+            .expect("parses");
+        assert!(f.store.contains(&a).expect("contains"), "{reference} swept");
+    }
+    assert_eq!(held.len(), 2);
+    // Long after, and still not recorded.
+    assert!(sweeping.sweep().removed.is_empty());
+    drop(held);
+    assert_eq!(sweeping.sweep().removed.len(), 2);
 }
