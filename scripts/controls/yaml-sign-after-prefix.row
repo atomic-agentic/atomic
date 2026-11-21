@@ -1,0 +1,1 @@
+yaml-sign-after-prefix|crates/atomic-schema/src/yaml.rs|if inner_sign.is_some() && all_digits(inner_digits, radix) {|if false && inner_sign.is_some() && all_digits(inner_digits, radix) {|-p atomic-agentic-schema --lib yaml::tests::a_sign_after_the_base_prefix_is_refused

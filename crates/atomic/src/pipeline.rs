@@ -99,7 +99,7 @@ pub const PIPELINE: &str = "atomic.pipeline";
 /// record, through an approved and a rejected gate, with the shape of each
 /// checkpoint, and the run's own shape. They fail when the layout no longer
 /// matches this version's, whose file is never rewritten.
-pub const LAYOUT_VERSION: &str = "atomic.pipeline.6";
+pub const LAYOUT_VERSION: &str = "atomic.pipeline.7";
 
 /// How many times one process recovers one run of `run_pipeline` at the
 /// same step before it fails the run as dead-lettered: enough for a crash
@@ -964,9 +964,27 @@ async fn run_pipeline_in<C: WorkflowContext>(
                 .filter(|(_, atom)| atom.kind == "exec")
                 .map(|(name, _)| name.as_str())
                 .collect();
-            plan.validate()
+            // And held to the ceilings and prices of the person running it
+            // now, as well as to the ceilings it carries: a plan made
+            // elsewhere, or with none, cannot raise what their own
+            // configuration caps, nor price a call below what it is here.
+            services
+                .budgets
+                .validate()
+                .map_err(|e| e.to_string())
+                .and_then(|()| plan.validate())
+                .and_then(|()| {
+                    plan.held_to(
+                        &services.budgets.ceilings,
+                        "your own configuration's ceilings",
+                    )
+                })
+                .and_then(|()| plan.priced_no_lower(&services.budgets))
                 .and_then(|()| plan.covers(&model_atoms, &exec_atoms))
-                .map(|()| plan.clone())
+                .map(|()| BudgetPlan {
+                    held: true,
+                    ..plan.clone()
+                })
                 .map_err(|e| format!("workflow {}: its pinned budget: {e}", pipeline.name))
         }
         None => plan_budgets(&pipeline, &services.runtimes, &services.budgets),
@@ -1044,6 +1062,43 @@ async fn run_pipeline_in<C: WorkflowContext>(
         })
         .await?;
     let plan = pinned.budgets.clone();
+    // A plan recorded before plans were held to the person's ceilings and
+    // prices, as a run resumed or recovered from then has, is held to those
+    // of the person running it now. A plan held when it was made keeps its
+    // own, so a resumed run keeps the ceilings and prices it began under.
+    if !plan.held {
+        let now = &services.budgets;
+        now.validate()
+            .map_err(|e| e.to_string())
+            .and_then(|()| plan.held_to(&now.ceilings, "your own configuration's ceilings"))
+            .and_then(|()| plan.priced_no_lower(now))
+            .map_err(|e| {
+                failed(format!(
+                    "workflow {}: its budget, recorded before budgets were held to your own \
+                     ceilings and prices: {e}; start the run again to plan it under your \
+                     current configuration",
+                    pipeline.name
+                ))
+            })?;
+    }
+    // Under a dollar cap of the person's own, a model only a layer above them prices
+    // is said, so a price they did not set is never counted unseen.
+    let unvouched: Vec<&str> = plan
+        .models
+        .values()
+        .filter(|model| services.budgets.priced_by_project.contains(*model))
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if !unvouched.is_empty() {
+        atomic_core::log_line!(
+            "atomic: run {}: under your own dollar cap, the run calls {} at prices only a \
+             layer above your own configuration sets; `atomic config --explain` says more",
+            ctx.workflow_id(),
+            unvouched.join(", ")
+        );
+    }
     let budget = RunBudget::pinned(ledger, &plan);
     let (caps, models, exec_caps) = (plan.atoms, plan.models, plan.exec);
     let mut steps = Map::new();
@@ -1479,6 +1534,7 @@ async fn turn<C: WorkflowContext>(
             StepRequest {
                 run: run_id.clone(),
                 step: t.name.clone(),
+                atom: atom.name.clone(),
                 base: base.to_owned(),
                 message: format!("{}: {}", pipeline.name, t.name),
                 signature: Signature::default(),
@@ -2079,9 +2135,9 @@ async fn in_worktree(
         };
         // The run's build caches, with a Cargo target directory of this
         // worktree's own.
-        caches
-            .create()
-            .map_err(|e| AtomError::Runtime(format!("the build caches: {e}")))?;
+        // On a full disk the step waits for room, as for the execution
+        // backend's, rather than failing its run.
+        caches.create_waiting(&atom.name, &run_id, &step).await?;
         worktrees
             .run_step(request, |tree| async move {
                 let mut here = (*runtimes).clone();
@@ -2102,7 +2158,10 @@ async fn in_worktree(
             .await
             .map_err(|e| match e {
                 StepError::Body(e) => e,
-                StepError::Worktree(e) => AtomError::Runtime(format!("the step's worktree: {e}")),
+                StepError::Worktree(e) => {
+                    AtomError::Runtime(format!("the step's worktree: {}", e.described()))
+                }
+                StepError::Waited(e) => e,
             })
     })
     .await;

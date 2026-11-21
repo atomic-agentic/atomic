@@ -6,27 +6,40 @@
 ## From `atomic init` to a passing eval takes a new user under 15 minutes.
 # `init` writes a project with one atom, one workflow and one eval case; that
 # project checks and runs with nothing configured, and an eval of a project
-# with cases records and replays to a passing report. No test joins the two.
+# with cases records and replays to a passing report. The third test joins the
+# two: it evals a project `atomic init` wrote, hand editing nothing, records
+# that project's own sample case against the fake model, replays it offline to
+# a passing report, and bounds the whole wall clock of `init` and the two evals
+# at 120 s. That bound is the tool's share of the clause's 15 minutes; those 15
+# minutes are a person's clock, and no test measures a person reading a report.
 run_cli init_in_an_empty_directory_makes_a_project_that_checks_and_runs
 eval_cli atomic_eval_records_replays_offline_and_fails_ci_on_a_pass_rate_drop
-pending: no test runs `atomic eval` on a project `atomic init` made. The init test checks and runs that project, whose sample eval case is never evaluated, and the passing record-and-replay eval is shown on a project written by hand. A test would init a project, record its sample case against the fake model with `--live`, replay it and assert the report passes, and bound those commands' whole wall clock: the clause's 15 minutes is a person's clock and nothing measures it yet.
+eval_cli from_init_to_a_passing_eval_records_and_replays_the_sample_case_within_the_bound
 
 ## With only an API key or Ollama on a fresh machine, `init` and `run` need no configuration, and `config --explain` gives each setting's source.
 run_cli init_in_an_empty_directory_makes_a_project_that_checks_and_runs
 run_cli with_only_a_local_ollama_a_model_atom_runs_and_explain_says_why
 run_cli with_only_an_api_key_explain_names_openai_and_never_the_key
 atomic settings::tests::every_setting_has_a_source_and_the_manifest_keys_are_not_settings
-pending: only the Ollama case is run end to end. With `OPENAI_API_KEY` as the only thing set, detection names api.openai.com, which tests never reach, so that case is shown by `config --explain` alone and no `init` and `run` is made with it; a test would point the key's detection at the fake model, as `ATOMIC_DETECT_OLLAMA_ADDR` points the Ollama one.
+# The API-key case end to end: the key with its base URL, OPENAI_BASE_URL
+# as OpenAI's SDKs read it, pointing at the fake model.
+run_cli with_only_an_api_key_and_its_base_url_init_and_run_need_no_configuration
 
 ## The developer's own checkout is left exactly as it was after `atomic run` executes a Codex atom.
 # The turn works in a worktree of the fixture's snapshot, never in the
 # checkout: the first compares the checkout that holds the project (its refs,
 # its worktree list, its working tree with every untracked file) before and
 # after, and the second compares the fixture repository the same way when the
-# project sits outside any repository.
+# project sits outside any repository. The third gives its turn a file to
+# write and shows that file committed in the snapshot's worktree, never in the
+# checkout. The last two run a `workspace-write` Codex atom directly and as a
+# step with no `worktree: true`: both are refused `target.unsafe` before the
+# run starts, and the checkout is left as it was.
 fixture_cli a_project_in_a_subdirectory_of_a_checkout_runs_at_the_top_of_the_fixture
 fixture_cli a_project_outside_any_repository_runs_its_coding_step_in_the_snapshot
-pending: the fixture turns only read (`cat` and `pwd`), and the second test has no developer checkout, so no test has a Codex atom write and then shows the checkout unchanged. The control that refuses a writing Codex atom outside a worktree (`target.unsafe`) has no test at all. A test would run a `workspace-write` Codex atom directly and in a step without a worktree, expect `target.unsafe` and an unchanged checkout, and give the fixture turn a file to write.
+fixture_cli running_a_writing_codex_atom_leaves_the_checkout_exactly_as_it_was
+fixture_cli a_writing_codex_atom_run_directly_in_a_checkout_is_refused
+fixture_cli a_writing_codex_atom_in_a_step_without_a_worktree_is_refused
 
 ## Changing a `validate` rule re-runs evals from cassettes with no model call.
 # The cassette test edits the atom's own `validate` rule: both recordings
@@ -67,11 +80,15 @@ pipeline an_interrupted_exec_step_with_no_effects_declaration_parks
 # directory with `--project` and a relative fixture path, and both runs are
 # bound to the same commit of the same fixture, which is then as it was; the
 # others run the turn where the project sits: outside any repository, and in a
-# subdirectory of the developer's checkout.
+# subdirectory of the developer's checkout. The last runs the coding example
+# itself, from two directories outside the project, to completion: it pins the
+# revision it was given and not the fixture's own tip, and compares the
+# fixture's refs, its worktrees and its working tree, every untracked file
+# included, once its baseline is bound and again after the change is accepted.
 run_cli a_coding_run_is_bound_to_its_fixture_and_never_touches_a_checkout
 fixture_cli a_project_outside_any_repository_runs_its_coding_step_in_the_snapshot
 fixture_cli a_project_in_a_subdirectory_of_a_checkout_runs_at_the_top_of_the_fixture
-pending: no test runs the coding example itself (`examples/02-change-request`) from outside the project: these use a one-step coding workflow a test writes, the run started from an unrelated directory stops at its gate before the coding turn, and its comparison of the fixture leaves out `git status`. A test would run the example with `--project` from an unrelated directory, with `--fixture` and `--fixture-rev`, to completion, and compare the fixture's full state.
+run_cli the_coding_example_run_from_outside_the_project_pins_its_base_and_leaves_the_fixture_as_it_was
 
 ## A bad path or a missing commit fails before any model call.
 # `fixture.path` for a path that is no repository or is inside one,
@@ -88,13 +105,16 @@ run_cli a_name_a_path_and_the_project_flag_run_the_same_atom_on_the_same_input
 
 ## A change to validation alone reuses earlier results, labelled as historical, while a change to prepared context, generation schema, tool fixtures or model settings makes the recording unusable.
 # The replay says it is a historical check; the identity is the whole request
-# body less four fields that differ between runs; and a replay needs the
-# endpoint it was recorded for.
+# body less four fields that differ between runs; a replay needs the endpoint
+# it was recorded for; and editing the atom's output schema — one property's
+# description, then a property added — leaves every case without a recording,
+# says to record it again, and calls no model.
 eval_cli atomic_eval_records_replays_offline_and_fails_ci_on_a_pass_rate_drop
 atomic_core cassette::tests::recorded_evals_replay_offline_until_the_request_changes
 atomic_core cassette::tests::the_identity_ignores_what_varies_between_runs_and_nothing_else
 eval_cli a_replay_needs_the_endpoint_it_was_recorded_for_and_no_key
-pending: no test makes a recording unusable by changing the generation schema or a tool fixture: the tests change the instructions, the model and the endpoint, and name the schema and the tool definitions only through the identity, which hashes the whole request body. A test would record once, then replay after editing the atom's output schema and one declared tool, each expecting a miss that says to record again.
+eval_cli an_edited_output_schema_makes_a_recording_unusable_and_says_to_record_again
+pending: tool fixtures and prepared context are still not shown. No tool definition reaches a recording in this version: an atom that declares any tool is refused at load, a lite atom's request carries none, and the kind that runs with tools, a Codex atom, is refused under cassettes; and a case's `prepared` values load and are then refused by the runner, so what these tests edit is the atom's instructions, not prepared context. A test would record an atom that has a declared tool and a case with prepared values, then replay after editing each, expecting the miss that says to record again.
 
 ## `atomic run` returns the same result whether the target is named from inside the project or given as a path from elsewhere.
 run_cli a_name_a_path_and_the_project_flag_run_the_same_atom_on_the_same_input

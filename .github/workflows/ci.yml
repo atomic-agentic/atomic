@@ -321,9 +321,17 @@ jobs:
       # only here, without them. The whole workspace is selected, as the
       # shards select it, so dependencies resolve the same features and the
       # cached builds serve (selecting one package rebuilds V8 differently).
+      # With the feature on, as it would be if a dependency enabled it, the
+      # doctest's twin runs in its place and passes; the step requires the
+      # compile-fail test itself to have run and passed.
       - name: Doctests without the test features
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
-        run: cargo test --workspace --locked --doc
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --workspace --locked --doc 2>&1 | tee "${RUNNER_TEMP}/doctests.log"
+          grep -E '^test crates/atomic-core/src/codex\.rs - codex::ExecSandbox \(line [0-9]+\) - compile fail \.\.\. ok$' "${RUNNER_TEMP}/doctests.log" ||
+            { echo "the compile-fail doctest of codex::ExecSandbox did not run and pass without the test features" >&2; exit 1; }
       # The graph still resolves from scratch onto the libsqlite3-sys Codex
       # locks, which both Codex and the durare fork link.
       - name: Lockfile resolves from scratch

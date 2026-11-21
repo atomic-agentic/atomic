@@ -43,6 +43,8 @@ test exec_private_state
 test second_mounts
 test exec_caches
 test exec_network
+test exec_network_fds
+test exec_proxy_raise
 test failpoints
 test fixture_cli
 test gate_prompt
@@ -53,14 +55,18 @@ test log_lines
 test retention
 test sandboxed_commit
 test self_approval
+test setup_cli
 test shell_env
+test state_cli
 test turn_workspace
+test sandbox_registry
 test worktree_step
 test golden
 test git_safety
 test cancelled_open
 test stopping_open
 test worktrees
+test model_client
 test dbos_schema
 test executor_identity
 test gates
@@ -70,6 +76,7 @@ test test_database
 test model_auth
 test model_auth_sandbox
 test stop_all
+test secret_socket
 test stop_bomb
 
 [crash]

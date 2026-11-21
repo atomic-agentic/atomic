@@ -563,6 +563,7 @@ dependencies = [
  "ignore",
  "jsonschema",
  "libc",
+ "nix 0.29.0",
  "psl",
  "regex",
  "reqwest 0.12.28",
@@ -573,6 +574,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]

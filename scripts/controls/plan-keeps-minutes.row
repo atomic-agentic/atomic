@@ -1,0 +1,1 @@
+plan-keeps-minutes|crates/atomic/src/metering.rs|                && caps.millis > millis|                && false /*CONTROL_OFF*/|-p atomic-agentic --test pipeline -- --exact a_budget_plan_above_its_minutes_or_dollar_ceilings_is_refused

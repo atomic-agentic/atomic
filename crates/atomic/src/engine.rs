@@ -66,10 +66,13 @@ pub struct EngineArgs {
     /// `ATOMIC_EXECUTOR_ID`).
     #[arg(long)]
     pub executor_id: Option<String>,
-    /// How many seconds a step waits for the execution backend to have room
-    /// for its workspace before the run stops, unfinished and with nothing
-    /// recorded, for `atomic runs resume`. Without it, a step waits for as
-    /// long as it takes (`backend_wait`, `ATOMIC_BACKEND_WAIT`).
+    /// How many seconds a step waits for room, on the execution backend for
+    /// its workspace or on the disk for atomic's own writes (its run's build
+    /// caches and its worktree's directory), before the run stops,
+    /// unfinished and with nothing recorded, for `atomic runs resume`. Each
+    /// of those waits has its own clock. A checkout git cannot finish fails
+    /// the step instead. Without it, a step waits for as long as it takes
+    /// (`backend_wait`, `ATOMIC_BACKEND_WAIT`).
     #[arg(long, value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(1..))]
     pub backend_wait: Option<u64>,
 }
@@ -112,6 +115,22 @@ pub fn runner_of(resolved: &settings::Resolved) -> anyhow::Result<RunnerKind> {
     }
 }
 
+/// The backend on this machine that `atomic run`, `atomic serve` and the
+/// evals run turns and exec atoms' commands on, unconfined and unconnected:
+/// scratch in the project's state, outside every directory a sandboxed
+/// turn may write.
+pub fn local_backend(state: &ProjectState) -> atomic_exec::LocalBackend {
+    atomic_exec::LocalBackend::in_dir(state.dir().join("scratch"))
+}
+
+/// The backend `atomic debug codex-prompt` and `atomic debug probe` run
+/// their turn on: one of its own beside [`local_backend`], since these
+/// commands take no execution lock, and connecting empties a backend's
+/// shared temporary directory, which a run's turns may be using.
+pub fn debug_backend(state: &ProjectState) -> atomic_exec::LocalBackend {
+    atomic_exec::LocalBackend::in_dir(state.dir().join("scratch-debug"))
+}
+
 /// The backend exec atoms' commands run on with `runner`: scratch in the
 /// project's state, confined like turns' commands where that is verified,
 /// connected once.
@@ -124,7 +143,7 @@ pub fn exec_backend(
     // every directory a sandboxed turn may write. Connected once: what the
     // backend states here is what runs plan on, and connecting reclaims
     // what attempts of dead processes left.
-    let local = atomic_exec::LocalBackend::in_dir(state.dir().join("scratch"));
+    let local = local_backend(state);
     // Exec atoms' commands run under the same sandbox helper as turns'
     // commands, denied atomic's private state. Elsewhere than Linux this is
     // not verified, and they run unconfined (see the availability notes).
@@ -215,6 +234,16 @@ pub fn endpoint(
     required: bool,
     personal_refused: Option<&str>,
 ) -> anyhow::Result<ModelEndpoint> {
+    // Nor anywhere the person's OPENAI_BASE_URL names that is unfit for it.
+    if required && let Some(why) = &resolved.refused_endpoint {
+        return Err(Failure::new(
+            "config.model",
+            format!("model atoms need a model endpoint, and {why}"),
+            "set OPENAI_BASE_URL to an https URL, or to http on 127.0.0.1 or [::1], or unset \
+             it to use OpenAI's API; `atomic config --explain` shows what was found",
+        )
+        .into());
+    }
     // The person's key goes nowhere the project chose: a run that calls a
     // model has no model access until they choose the endpoint.
     if required && let Some(why) = &resolved.withheld_key {
@@ -347,14 +376,16 @@ pub fn deployment() -> Deployment {
 pub struct Engine {
     /// The durable runtime, launched, with `run_pipeline` registered.
     pub rt: Durare,
-    /// Where its store is, for messages.
-    pub store: String,
+    /// Where its durable store is, for messages.
+    pub store_description: String,
     /// Whether the store is shared with other hosts' executors, which this
     /// process's execution lock does not exclude.
     pub shared: bool,
     /// Whether model atoms run on a ChatGPT sign-in, which lite atoms cannot
     /// use.
     pub signed_in: bool,
+    /// The project's artifact store, which its runs read and write.
+    pub artifacts: LocalStore,
 }
 
 impl Engine {
@@ -467,7 +498,7 @@ pub async fn open(
         &mut rt,
         Services {
             runtimes,
-            store,
+            store: store.clone(),
             deployment: deployment(),
             worktrees,
             // Each run's build caches, in a directory of its own here.
@@ -491,9 +522,10 @@ pub async fn open(
     }
     Ok(Engine {
         rt,
-        store: describe(&database),
+        store_description: describe(&database),
         shared: matches!(database, Database::Postgres { .. }),
         signed_in,
+        artifacts: store,
     })
 }
 

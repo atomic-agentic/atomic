@@ -174,7 +174,8 @@ export const config = {
 ```
 
 `network.allow` lists DNS names, each a name with at least two labels or `*.`
-and such a name for its subdomains, up to 32 of them. `network: false`, or no
+and such a name for its subdomains, as far as the Public Suffix List allows
+(see below), up to 32 of them. `network: false`, or no
 `network` at all, means none. On Linux the command then gets a network of its
 own whose only way out is a proxy atomic runs for it, which forwards a request
 only to a listed host, and only on port 80 or 443: HTTP, and HTTPS through a
@@ -192,6 +193,25 @@ process and no other user's process can use the proxy, unless it has
 process of your own user that runs outside any sandbox is not kept out: it
 can enter the command's namespaces and use the sandbox's own route to the
 proxy. Once the command ends, its token admits no new connection.
+
+Each command that declares hosts is admitted against a budget of open files:
+its sandbox keeps at most 128 connections to the proxy open at once, and
+atomic reserves two open files for each (the command's and one upstream) and a
+few to spare, and the commands that declare hosts may reserve no more than
+half of atomic's limit on open files between them. When they need more room,
+atomic first raises its own limit as far as the hard limit allows, up to
+65536, and the commands it starts afterwards inherit that; a command that
+would still pass it does not start, and says so, and its step fails rather
+than waits. To run more of them at once, raise atomic's hard limit on open
+files, or start it with a higher soft limit. The budget holds while the hosts
+a command reaches answer and close as they should; it is not a limit the proxy
+enforces. The proxy answers an HTTPS `CONNECT` before it dials and sets no
+time limit of its own on the dial (the kernel's connect timeout still
+applies), may dial more than one of a host's addresses for one connection,
+keeps a connection's files for a while after the command has dropped it, and
+keeps a tunnel open until the host closes it, so a command that keeps opening
+and abandoning connections to a host that never answers can take more than its
+share, and can leave atomic short of open files.
 
 What an atom may list is atomic's policy, checked when the atom loads and again
 before its command runs: public DNS names only. An IP address in any spelling
@@ -219,9 +239,10 @@ proxy that refuses it.
 Know what a listed host can get:
 
 - **Anything the command can read.** It can send a listed host whatever it
-  reads, which is the project and most of the filesystem, including files such
-  as `~/.ssh` and `~/.aws` reached by absolute path; only atomic's private state
-  is denied to it.
+  reads, which is the project and most of the filesystem. What is denied to it,
+  atomic's private state and, on Linux, the places where credentials are kept,
+  such as `~/.ssh` and `~/.aws`, is listed under
+  [configuration](#configuration); anything else it can read, it can send.
 - **More than the one site.** An HTTPS tunnel is opaque to the proxy, which
   checks only the name the command asked for. Other sites served from the same
   CDN edge or load balancer can be reached through it.
@@ -229,12 +250,20 @@ Know what a listed host can get:
   Public Suffix List, its ICANN section (`co.uk`) and its private one, where
   each name is someone else's (`github.io`, `s3.amazonaws.com`). A wildcard
   is refused when the atom loads if the name under it is on the list, or if
-  every name just below it is (`*.run.app`, `*.kawasaki.jp`). That refuses
+  a wildcard rule on the list makes the names just below it suffixes
+  (`*.run.app`, `*.kawasaki.jp`); an exception to such a rule is one site, so
+  `*.city.kawasaki.jp` loads. That refuses
   `*.googleapis.com`, `*.githubusercontent.com` and `*.cloudfront.net`, among
   others: name the exact hosts instead. A wildcard above a listed name, such
   as `*.amazonaws.com`, loads, but the proxy keeps it from crossing that name:
   it reaches `foo.amazonaws.com`, and not `bucket.s3.amazonaws.com`, which is
-  someone else's site under `s3.amazonaws.com`. A wildcard under a name you
+  someone else's site under `s3.amazonaws.com`. A plain HTTP request refused
+  this way carries the reason `crosses_public_suffix`, not `not_allowed`. An
+  HTTPS `CONNECT` is refused with a line of text that does not name the
+  reason: for this one it is the proxy's generic "Request blocked by network
+  policy.", not the "Domain not in allowlist." an unlisted host gets, so
+  `sts.us-east-1.amazonaws.com` under `*.amazonaws.com` is refused without
+  saying why. List it exactly to reach it. A wildcard under a name you
   hold, such as `*.example.com`, still reaches whatever is served under it,
   and a shared host missing from the list is not caught. List exact names
   where you can.
@@ -398,8 +427,23 @@ and history files of bash, zsh and fish, among others. They are denied
 under `$HOME` and under the home directory the system records for your user,
 wherever the variables that move them (`XDG_CONFIG_HOME`, `ZDOTDIR`,
 `HISTFILE`, `GNUPGHOME`, `CARGO_HOME`, `DOCKER_CONFIG`, the AWS file
-variables, `KUBECONFIG` and others) put them, and a link among them, up to
-four directory levels inside a denied directory, is denied as what it
+variables, `KUBECONFIG` and others) put them. AWS's workload token files
+are denied too: the files `AWS_WEB_IDENTITY_TOKEN_FILE` and
+`AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE` name (one named relative to
+atomic's working directory, as AWS's SDKs read it), the whole projected
+volume when such a file is in one Kubernetes mounts, found through any
+links that lead to it (so the token it rotates in next is denied as well),
+and EKS's usual token directories,
+`/var/run/secrets/eks.amazonaws.com/serviceaccount` and
+`/var/run/secrets/pods.eks.amazonaws.com/serviceaccount`, whether or not a
+variable names them. An ordinary token file is denied by its path each
+time a command starts, so one replaced there is denied to the next command.
+A token given as a value rather than a file, such as
+`AWS_CONTAINER_AUTHORIZATION_TOKEN`, never reaches a command, which gets
+only a few core variables and those its atom declares, and the credential
+endpoints AWS serves on link-local and unique-local addresses are out of its
+reach, since a command reaches no private or local address. A link among them, up to four
+directory levels inside a denied directory, is denied as what it
 points at, whoever owns it and wherever it is, under `/run`, `/etc` or
 `/opt` too. Never denied, so that commands keep working: anything under
 `/usr`, `/bin`, `/sbin`, `/lib*`, `/nix/store`, `/dev`, `/proc` or `/sys`,
@@ -427,7 +471,10 @@ any filesystem but a local one (ext2/3/4, XFS, btrfs, F2FS, tmpfs, ramfs,
 overlay) mounted more than once whose root the kernel shows as lost, as
 when a FUSE server is away or another Ceph client renamed the directory;
 or when, on such a filesystem, the place is there and its second place is
-missing or another file or directory. Otherwise FUSE (`fuse.*`), 9p,
+missing, is another file or directory, or is a link, which is not
+followed, or the place, or the part of it a second mount shows, cannot be
+looked at for a reason other than not being there. A second mount of part
+of a place is checked against that part. Otherwise FUSE (`fuse.*`), 9p,
 virtiofs and other mounts are followed as local ones are. The
 links followed and the second mounts found together come to at most 512;
 past that, nothing runs. Not covered: the same remote directory, or one

@@ -88,6 +88,19 @@ a command hands over are stored after it has run: a store held then is
 waited out a few times, and past that the step's outcome is unknown, as
 after a crash there.
 
+`atomic run` keeps the content its input names from a sweep until the input
+is recorded. Before the run starts, it holds each artifact the input names
+and marks it as just written, under the store's lock. Holding and marking
+share one wait for the lock, the store's 30 seconds: a sweep holding it is
+said once and waited for, and if it holds the lock longer the run is refused
+(`store.locked`); Ctrl-C while it waits stops the run (`run.stopped`). A field
+the workflow's input contract types as `atomic:artifact` that names content
+the store does not hold, or content a sweep removed after the store was
+listed, refuses the run (`run.input_missing`), and one naming content the
+contract does not allow there refuses it too (`input.invalid`); the first
+such field is the one named. A reference in free text is held if stored and
+otherwise left alone. Either way nothing is recorded.
+
 `atomic serve` also runs on PostgreSQL (`ATOMIC_DATABASE_URL`) when the process
 has an executor identity (`ATOMIC_EXECUTOR_ID`). `atomic runner` and
 `--runner process` run exec atoms' commands in a separate process with an
@@ -99,7 +112,16 @@ rendered, which runs the atom's helpers, it opens a workspace there before any
 model call or command, and closes it however the run ends, including a panic or
 a cancelled run, and only once a command running in it has ended. A backend
 with no room for a workspace makes the run wait, recording nothing and saying
-on stderr that it waits, and the run goes on once there is room. With the
+on stderr that it waits, and the run goes on once there is room. atomic's own
+writes for a step that find the disk or a quota full, making its run's build
+caches or the directory its worktree goes in, wait the same way. A checkout git
+cannot finish, for a full disk or anything else, fails the step with what git
+said, and the run ends failed; once space is freed, start it again. Each of
+these waits, and the wait for the backend, keeps its own clock, so a worktree
+step may wait up to three times its limit: for its caches, its worktree's
+directory and its workspace. Without a limit, a step whose own writes find the
+disk full waits for as long as it takes, saying so on stderr every ten minutes.
+With the
 `backend_wait` setting (`--backend-wait <seconds>`, `ATOMIC_BACKEND_WAIT`) it
 waits at most that long: `atomic run` and
 `atomic runs resume` then stop with exit code 75, the run unfinished and nothing
@@ -152,7 +174,11 @@ configuration directory; the places in your home directory where credentials,
 shell startup files and history are kept (under both `$HOME` and the home
 directory the system records for your user, and wherever the variables that
 move them, such as `XDG_CONFIG_HOME`, `GNUPGHOME`, `CARGO_HOME` or
-`KUBECONFIG`, put them), and what a link among them points at, up to four
+`KUBECONFIG`, put them); AWS's workload token files (the files
+`AWS_WEB_IDENTITY_TOKEN_FILE` and `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE`
+name, with the whole volume when such a file, or what a link to it leads
+to, is in a Kubernetes projected volume, so a rotated token stays denied,
+and EKS's usual token directories under `/var/run/secrets`); and what a link among them points at, up to four
 directory levels inside a denied directory (except a device, anything under
 the system's program, library and device directories, and, for a link found
 inside a credential place, a program or a directory someone else owns);
@@ -253,9 +279,12 @@ TypeScript workflows follow in v1.0.
 
 Budgets are partly built: the `budget` field on atoms and workflows, its
 configured defaults and price table, and the durable usage ledger that reserves
-each model call before it is dispatched, settles it once, and parks a run that
-reaches a cap. A released park admits the call again against the caps as stored;
+each model call before it is dispatched, and each exec atom's command, by its
+active time, before it starts, settles each once, and parks a run that reaches
+a cap. A released park admits the call again against the caps as stored;
 the command a person uses to raise a cap and release the park is not built yet.
+The caps and prices in the person's own configuration are ceilings: a project's
+files, a variable and a written `budget` block may only bring a cap down to them.
 The commands that show budgets and spend come with run inspection.
 
 ## Observability stages
