@@ -376,6 +376,34 @@ async fn engine_built(
     backend: Option<atomic_exec::Backend>,
     store: LocalStore,
 ) -> Durare {
+    engine_built_with(dir, base_url, budgets, model, backend, store, None).await
+}
+
+/// As [`engine_storing`], with exec atoms' commands handing files over to
+/// `store`, as `atomic run` has them.
+async fn engine_handing_over(dir: &Path, base_url: &str, store: LocalStore) -> Durare {
+    let artifacts = Artifacts::store(store.clone(), Default::default());
+    engine_built_with(
+        dir,
+        base_url,
+        BudgetSettings::default(),
+        "synthetic",
+        None,
+        store,
+        Some(artifacts),
+    )
+    .await
+}
+
+async fn engine_built_with(
+    dir: &Path,
+    base_url: &str,
+    budgets: BudgetSettings,
+    model: &str,
+    backend: Option<atomic_exec::Backend>,
+    store: LocalStore,
+    artifacts: Option<Artifacts>,
+) -> Durare {
     let mut rt = Durare::sqlite(&dir.join("atomic.db"))
         .await
         .expect("engine");
@@ -399,6 +427,14 @@ async fn engine_built(
             on.codex.backend = backend.clone();
             on.lite.backend = backend.clone();
             on.exec = backend;
+            Arc::new(on)
+        }
+        None => runtimes,
+    };
+    let runtimes = match artifacts {
+        Some(artifacts) => {
+            let mut on = (*runtimes).clone();
+            on.codex.artifacts = artifacts;
             Arc::new(on)
         }
         None => runtimes,
@@ -2004,6 +2040,84 @@ fn an_exec_step_runs_its_command_and_only_model_steps_call_the_model() {
             rank.contains("Export crashes on ac") && rank.contains('5'),
             "{rank}"
         );
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+/// The files an exec step's command hands over are held while its turn
+/// runs and let go once the turn has recorded the output that references
+/// them: a long-running process keeps no hold for a finished step.
+#[test]
+fn an_exec_steps_files_are_let_go_once_its_turn_is_recorded() {
+    on_codex_runtime(async {
+        let dir = scratch("exec-holds");
+        let project = dir.join("project");
+        std::fs::write(project.join("atomic.yaml"), "atomic: 1\nname: patches\n")
+            .expect("manifest");
+        std::fs::create_dir_all(project.join("tools")).expect("tools");
+        std::fs::write(
+            project.join("tools/patch.py"),
+            "import json, os, sys\njson.load(sys.stdin)\n\
+             open(os.path.join(os.environ['ATOMIC_OUTPUTS'], 'p.diff'), 'w').write('+x\\n')\n\
+             json.dump({'patch': {'$file': 'p.diff', 'mediaType': 'text/x-diff'}}, sys.stdout)\n",
+        )
+        .expect("script");
+        let atoms = project.join("atoms");
+        std::fs::write(
+            atoms.join("make-patch.atom.astro"),
+            "---\nimport type { Props, Input, Output } from '../.atomic/types/make-patch';\n\
+             import type { AtomConfig } from '../.atomic/types/authoring';\n\
+             const { input }: Props = Astro.props;\n\
+             export const config: AtomConfig<Input, Output> = { description: 'Make a patch.', kind: 'exec', exec: { command: ['python3', 'tools/patch.py'] } };\n---\n",
+        )
+        .expect("atom");
+        std::fs::write(
+            atoms.join("make-patch.input.schema.json"),
+            object(json!({"text": {"type": "string"}})).to_string(),
+        )
+        .expect("input");
+        std::fs::write(
+            atoms.join("make-patch.output.schema.json"),
+            object(json!({"patch": {"$ref": "atomic:artifact", "mediaType": "text/x-diff"}}))
+                .to_string(),
+        )
+        .expect("output");
+        let pipeline = load(
+            &project,
+            "patch.workflow.yaml",
+            "atomic: 1\nname: patch\n\
+             input: { $ref: ../atoms/make-patch.input.schema.json }\n\
+             output: { $ref: ../atoms/make-patch.output.schema.json }\n\
+             steps:\n  make:\n    atom: make-patch\n    with: { text: input.text }\n\
+             returns: steps.make.output\n",
+        );
+        let model = FakeModel::start(vec![]).await.expect("fake model");
+        let store = LocalStore::open(dir.join("artifacts")).expect("store");
+        let rt = engine_handing_over(&dir, &model.base_url(), store.clone()).await;
+        let run = PipelineRun {
+            pipeline,
+            input: json!({"text": "fix it"}),
+        };
+        rt.start(PIPELINE, "patch-1", run).await.expect("start");
+        let out: Value = rt.result("patch-1").await.expect("finishes");
+        let patch: ArtifactRef = out["patch"]
+            .as_str()
+            .expect("a reference")
+            .parse()
+            .expect("parses");
+        assert!(store.contains(&patch).expect("contains"));
+        let holds: Vec<PathBuf> = std::fs::read_dir(dir.join("artifacts/artifact-held"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .flat_map(|owner| std::fs::read_dir(owner.path()).into_iter().flatten())
+            .flatten()
+            .map(|hold| hold.path())
+            .collect();
+        assert!(holds.is_empty(), "held after its turn: {holds:?}");
+        assert_eq!(model.calls(), 0);
         rt.shutdown(std::time::Duration::from_secs(5))
             .await
             .expect("shutdown");

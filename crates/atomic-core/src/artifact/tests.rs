@@ -620,3 +620,63 @@ fn a_blob_committed_after_a_sweep_began_reading_is_kept() {
     assert!(s.contains(&m[0].artifact).expect("contains"));
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// A hold keeps content from every sweep, however old, until it is let go
+/// or its store is gone; a dead store's holds, and ones whose owner is gone
+/// once they are old, are cleared.
+#[test]
+fn a_hold_keeps_content_until_it_is_let_go_or_its_store_is_gone() {
+    let (s, dir) = store();
+    let day = std::time::Duration::from_secs(24 * 3600);
+    let put = |bytes: &[u8]| {
+        let a = s
+            .put(&mut &bytes[..], provenance("make"))
+            .expect("put")
+            .artifact;
+        written_ago(&s.blob_path(&a), day);
+        a
+    };
+    let sweep = || {
+        s.sweep(
+            &BTreeSet::new(),
+            Grace::none_for_tests(),
+            std::time::SystemTime::now(),
+        )
+        .expect("sweep")
+    };
+    let (held, dead, orphaned) = (put(b"held"), put(b"dead"), put(b"orphaned"));
+    let hold = s.hold(&held).expect("hold");
+    // A store that died a day ago, with a hold.
+    let dead_id = "d".repeat(32);
+    let dead_owner = dir.join("artifact-owners").join(&dead_id);
+    std::fs::write(&dead_owner, b"").expect("dead owner");
+    written_ago(&dead_owner, day);
+    let dead_holds = dir.join("artifact-held").join(&dead_id);
+    std::fs::create_dir_all(&dead_holds).expect("dead holds");
+    std::fs::write(dead_holds.join(format!("{}-1", dead.digest())), b"").expect("hold");
+    // Holds whose owner file is gone: a store may be opening.
+    let orphan = dir.join("artifact-held").join("e".repeat(32));
+    std::fs::create_dir_all(&orphan).expect("orphan");
+    std::fs::write(orphan.join(format!("{}-1", orphaned.digest())), b"").expect("hold");
+    let swept = sweep();
+    assert_eq!(swept.removed, vec![dead.clone()], "{swept:?}");
+    assert!(!dead_holds.exists(), "a dead store's holds were kept");
+    assert!(orphan.exists(), "a new store's holds were cleared");
+    // Once old, holds with no owner go.
+    written_ago(&orphan, day);
+    assert_eq!(sweep().removed, vec![orphaned]);
+    assert!(!orphan.exists());
+    // Let go, the content goes.
+    assert!(sweep().removed.is_empty());
+    drop(hold);
+    assert_eq!(sweep().removed, vec![held]);
+    // A store's holds go with it.
+    let other = LocalStore::open(&dir).expect("another store");
+    let mine = other.hold(&dead).expect("hold");
+    let own = other.owner.held.clone();
+    assert!(own.is_dir());
+    std::mem::forget(mine);
+    drop(other);
+    assert!(!own.exists(), "a closed store's holds were left");
+    let _ = std::fs::remove_dir_all(dir);
+}

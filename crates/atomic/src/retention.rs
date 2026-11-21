@@ -19,8 +19,11 @@
 //!
 //! It also keeps anything written within the grace period before it began
 //! reading these, however long the reading and the wait for the store's
-//! lock take. What it cannot see: a producer that stores content more than
-//! a grace period before the step that refers to it is checkpointed. And
+//! lock take, and anything an open store holds: an exec step holds the
+//! files its command handed over from before they are stored until its turn
+//! is checkpointed. What it cannot see: any other producer that stores
+//! content more than a grace period before the step that refers to it is
+//! checkpointed. And
 //! what lives in the source tree (eval cases, cassettes, reports) refers to
 //! artifacts no run records, so only the caller's keep set covers it.
 //!
