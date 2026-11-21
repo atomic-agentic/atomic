@@ -216,7 +216,11 @@ async fn run_ending(
     for (name, value) in env {
         run.env(name, value);
     }
-    let out = tokio::task::spawn_blocking(move || run.output().unwrap())
+    let at = atomic_home.with_file_name(format!(
+        "{}-run",
+        atomic_home.file_name().unwrap().to_string_lossy()
+    ));
+    let out = tokio::task::spawn_blocking(move || bounded(run, &at))
         .await
         .unwrap();
     assert_eq!(
@@ -631,7 +635,11 @@ fn an_atoms_shell_sees_none_of_the_persons_secrets() {
         for name in CANARIES {
             command.env(name, format!("canary-{}", name.to_lowercase()));
         }
-        let out = tokio::task::spawn_blocking(move || command.output().unwrap())
+        let at = atomic_home.with_file_name(format!(
+            "{}-run",
+            atomic_home.file_name().unwrap().to_string_lossy()
+        ));
+        let out = tokio::task::spawn_blocking(move || bounded(command, &at))
             .await
             .unwrap();
         assert!(
@@ -695,14 +703,68 @@ fn an_atoms_shell_sees_none_of_the_persons_secrets() {
     });
 }
 
-/// How long [`look_once`]'s run may take before the test fails instead of
-/// waiting on it: a turn of one short command takes seconds.
-const LOOK_LIMIT: std::time::Duration = std::time::Duration::from_secs(120);
+/// How long one `atomic run` here may take before the test fails instead of
+/// waiting on it: the longest, a workflow of several worktree steps, takes
+/// under a minute.
+const RUN_LIMIT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Run `run` to its end and return how it ended and what it printed, kept
+/// in `<at>.stdout` and `<at>.stderr` rather than pipes, so nothing it
+/// leaves running can hold the test. A run that has not ended within
+/// [`RUN_LIMIT`] is sent SIGKILL, with the process group it leads, and
+/// fails the test with what it printed; a command it started in a session
+/// of its own is not in that group.
+fn bounded(mut run: Command, at: &Path) -> std::process::Output {
+    let file = |ext: &str| PathBuf::from(format!("{}.{ext}", at.display()));
+    let (stdout, stderr) = (file("stdout"), file("stderr"));
+    run.stdout(std::fs::File::create(&stdout).unwrap())
+        .stderr(std::fs::File::create(&stderr).unwrap());
+    std::os::unix::process::CommandExt::process_group(&mut run, 0);
+    let mut child = run.spawn().unwrap();
+    let started = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if started.elapsed() > RUN_LIMIT {
+            // The child leads its own group, so the group's id is its pid.
+            // Signalled before it is reaped, so the id is still its own.
+            if let Ok(group) = libc::pid_t::try_from(child.id()) {
+                // SAFETY: killpg only sends a signal; a group that is gone
+                // is ESRCH.
+                #[allow(unsafe_code)]
+                unsafe {
+                    libc::killpg(group, libc::SIGKILL);
+                }
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let (stdout, stderr) = (
+        std::fs::read(&stdout).unwrap_or_default(),
+        std::fs::read(&stderr).unwrap_or_default(),
+    );
+    let Some(status) = status else {
+        panic!(
+            "the run had not ended after {RUN_LIMIT:?}, so it was killed: stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr)
+        );
+    };
+    std::process::Output {
+        status,
+        stdout,
+        stderr,
+    }
+}
 
 /// Run `look` once through `atomic run` with home `home`, its command
-/// `command`, and return what the command printed. A run that has not
-/// ended within [`LOOK_LIMIT`] is killed, with its process group, and
-/// fails the test. Its atomic home is the test's own, named after `dir`:
+/// `command`, and return what the command printed, failing the test if the
+/// run does not end in time ([`bounded`]). Its atomic home is the test's
+/// own, named after `dir`:
 /// the tests that call this run at once, and each removes its home first.
 async fn look_once(dir: &Path, home: &Path, command: &str, env: &[(&str, &str)]) -> String {
     let model = FakeModel::start(vec![
@@ -742,44 +804,16 @@ async fn look_once(dir: &Path, home: &Path, command: &str, env: &[(&str, &str)])
     for (name, value) in env {
         run.env(name, value);
     }
-    let (stdout, stderr) = (dir.join("look.stdout"), dir.join("look.stderr"));
-    run.stdout(std::fs::File::create(&stdout).unwrap())
-        .stderr(std::fs::File::create(&stderr).unwrap());
-    std::os::unix::process::CommandExt::process_group(&mut run, 0);
-    let status = tokio::task::spawn_blocking(move || {
-        let mut child = run.spawn().unwrap();
-        let started = std::time::Instant::now();
-        loop {
-            if let Some(status) = child.try_wait().unwrap() {
-                return Some(status);
-            }
-            if started.elapsed() > LOOK_LIMIT {
-                let _ = Command::new("kill")
-                    .args(["-KILL", &format!("-{}", child.id())])
-                    .status();
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-    })
-    .await
-    .unwrap();
-    let said = || {
-        format!(
-            "stdout: {}\nstderr: {}",
-            std::fs::read_to_string(&stdout).unwrap_or_default(),
-            std::fs::read_to_string(&stderr).unwrap_or_default()
-        )
-    };
-    let Some(status) = status else {
-        panic!(
-            "the run had not ended after {LOOK_LIMIT:?}, so it was killed: {}",
-            said()
-        );
-    };
-    assert!(status.success(), "{}", said());
+    let at = dir.join("look");
+    let out = tokio::task::spawn_blocking(move || bounded(run, &at))
+        .await
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
     let _ = std::fs::remove_dir_all(&atomic_home);
     model.requests()[1]["input"]
         .as_array()
@@ -915,11 +949,13 @@ fn a_secret_the_system_keeps_or_a_pipe_stays_denied_and_the_persons_programs_run
         assert!(!secret.trim().is_empty());
         std::os::unix::fs::symlink(kept, home.join(".kube/config")).unwrap();
         // A credential served through a pipe, which nothing writes to.
-        let made = Command::new("mkfifo")
-            .arg(home.join(".netrc"))
-            .status()
-            .unwrap();
-        assert!(made.success());
+        let fifo =
+            std::ffi::CString::new(home.join(".netrc").into_os_string().into_encoded_bytes())
+                .unwrap();
+        // SAFETY: mkfifo reads a NUL-terminated path and makes a pipe there.
+        #[allow(unsafe_code)]
+        let made = unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) };
+        assert_eq!(made, 0, "mkfifo: {}", std::io::Error::last_os_error());
         // A program of the person's own, linked from inside a denied
         // directory, as a virtual environment's python is.
         std::fs::create_dir_all(dir.join("tools")).unwrap();
