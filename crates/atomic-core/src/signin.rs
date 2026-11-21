@@ -164,6 +164,15 @@ fn dangling_link(dir: &Path) -> Option<&Path> {
     dir.ancestors().find(|a| a.is_symlink() && !a.exists())
 }
 
+/// Where the sign-in store `ATOMIC_CREDENTIAL_STORE` chooses keeps its
+/// directory, as written, whether or not [`SignIn::located`] accepts it
+/// there: a refused location that holds one may still hold a sign-in.
+pub fn location() -> Option<PathBuf> {
+    crate::state::credentials_dir()
+        .ok()
+        .map(|dir| dir.join("codex-auth"))
+}
+
 /// The model endpoint a sign-in's Codex atoms use: ChatGPT's Codex backend.
 pub const CODEX_BACKEND: &str = "https://chatgpt.com/backend-api/codex";
 

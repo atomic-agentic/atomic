@@ -72,7 +72,13 @@ supplied it. That includes the default location when your home directory is
 itself a git checkout (a `~/.git`) holding the project: set `ATOMIC_HOME` to a
 directory outside it. A link on the way that leads nowhere is refused too, and
 so is a checkout whose `.git` file or `commondir` is not a small regular file,
-as git writes them: that refuses your own configuration as well. A login that
+as git writes them: that refuses your own configuration as well. A `.git`
+another user owns, or one that is a hard link, still counts as a checkout, and
+is followed, through no link, when it is a well-formed worktree link, but
+nothing wrong with it refuses anything. What it names still counts, though:
+with your home itself a checkout (a `~/.git`), a well-formed link someone left
+in `/tmp` naming your home's repository refuses your default sign-in location
+for projects under `/tmp`. A login that
 makes the sign-in directory first forgets whatever the store still holds for
 it, which outlived an earlier directory and is no sign-in. It is forgotten, not
 revoked, and a later logout can no longer revoke it. Under
@@ -91,7 +97,11 @@ again; one stopped with Ctrl-C can leave it, so run `atomic model logout`
 again. A logout removes the directory once both stores are checked, so later
 runs read no store, and removes one it made itself even if the keyring cannot
 be checked. Otherwise, while the keyring cannot be checked,
-the directory stays, and atomic says the sign-in could not be read.
+the directory stays, and atomic says the sign-in could not be read. A sign-in
+whose directory is there but which cannot be used, because its store cannot be
+read or because it is kept where it is refused, refuses a run that calls a
+model: an `OPENAI_API_KEY` or a local Ollama is never used in its place, since
+model calls would then go to another account.
 
 Keeping the token out of reach has side effects on atomic's own process, and so
 on everything it starts:

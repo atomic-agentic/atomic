@@ -1,0 +1,1 @@
+openai-base-url-fragment|crates/atomic/src/settings.rs|    if parsed.fragment().is_some() {|    if parsed.fragment().is_some() && false {|-p atomic-agentic --bins settings::tests::an_openai_base_url_unfit_for_the_key_is_refused

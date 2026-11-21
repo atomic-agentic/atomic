@@ -234,6 +234,16 @@ pub fn endpoint(
     required: bool,
     personal_refused: Option<&str>,
 ) -> anyhow::Result<ModelEndpoint> {
+    // Nor anywhere the person's OPENAI_BASE_URL names that is unfit for it.
+    if required && let Some(why) = &resolved.refused_endpoint {
+        return Err(Failure::new(
+            "config.model",
+            format!("model atoms need a model endpoint, and {why}"),
+            "set OPENAI_BASE_URL to an https URL, or to http on 127.0.0.1 or [::1], or unset \
+             it to use OpenAI's API; `atomic config --explain` shows what was found",
+        )
+        .into());
+    }
     // The person's key goes nowhere the project chose: a run that calls a
     // model has no model access until they choose the endpoint.
     if required && let Some(why) = &resolved.withheld_key {
@@ -279,19 +289,29 @@ pub fn endpoint(
             _ => {}
         }
     }
+    // A sign-in that is there and cannot be used, refused where it is kept
+    // or unreadable, is never passed over for a key or a detected endpoint:
+    // model calls would go to another account with no more than a note.
+    if required && let Some(why) = &resolved.sign_in_unreadable {
+        return Err(Failure::new(
+            "config.model",
+            format!(
+                "the ChatGPT sign-in cannot be used: {why}; nothing else is used in its place, \
+                 since model calls would go to another account"
+            ),
+            "fix what it names; or forget the sign-in with `atomic model logout`, run from \
+             outside the project once the keyring can be reached; or set ATOMIC_MODEL_BASE_URL \
+             and ATOMIC_MODEL (or pass --model-base-url and --model), and \
+             ATOMIC_MODEL_API_KEY_ENV if the endpoint needs a key, to choose the endpoint \
+             yourself",
+        )
+        .into());
+    }
     match resolved.endpoint() {
         Some(endpoint) => Ok(endpoint),
         None if required => Err(Failure::new(
             "config.model",
-            match &resolved.sign_in_unreadable {
-                Some(why) => format!(
-                    "no model endpoint is configured or detected, model atoms need one, and \
-                     the ChatGPT sign-in could not be read: {why}"
-                ),
-                None => {
-                    "no model endpoint is configured or detected, and model atoms need one".into()
-                }
-            },
+            "no model endpoint is configured or detected, and model atoms need one",
             "sign in with `atomic model login` (Codex atoms only), set OPENAI_API_KEY to use \
              OpenAI's API, start Ollama on this machine, or set ATOMIC_MODEL_BASE_URL and \
              ATOMIC_MODEL (or pass --model-base-url and --model), and ATOMIC_MODEL_API_KEY_ENV \
@@ -366,14 +386,16 @@ pub fn deployment() -> Deployment {
 pub struct Engine {
     /// The durable runtime, launched, with `run_pipeline` registered.
     pub rt: Durare,
-    /// Where its store is, for messages.
-    pub store: String,
+    /// Where its durable store is, for messages.
+    pub store_description: String,
     /// Whether the store is shared with other hosts' executors, which this
     /// process's execution lock does not exclude.
     pub shared: bool,
     /// Whether model atoms run on a ChatGPT sign-in, which lite atoms cannot
     /// use.
     pub signed_in: bool,
+    /// The project's artifact store, which its runs read and write.
+    pub artifacts: LocalStore,
 }
 
 impl Engine {
@@ -486,7 +508,7 @@ pub async fn open(
         &mut rt,
         Services {
             runtimes,
-            store,
+            store: store.clone(),
             deployment: deployment(),
             worktrees,
             // Each run's build caches, in a directory of its own here.
@@ -510,9 +532,10 @@ pub async fn open(
     }
     Ok(Engine {
         rt,
-        store: describe(&database),
+        store_description: describe(&database),
         shared: matches!(database, Database::Postgres { .. }),
         signed_in,
+        artifacts: store,
     })
 }
 
