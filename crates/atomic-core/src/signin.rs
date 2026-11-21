@@ -956,7 +956,10 @@ mod tests {
                 .to_string(),
             ));
             assert!(waiting.login(true).await.is_err());
-            assert!(dir.join("auth.lock").exists(), "the other login's sign-in was tidied away");
+            assert!(
+                dir.join("auth.lock").exists(),
+                "the other login's sign-in was tidied away"
+            );
             let account = waiting
                 .account()
                 .expect("account")
