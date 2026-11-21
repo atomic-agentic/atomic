@@ -137,7 +137,9 @@ directory the system records for your user, and wherever the variables that
 move them, such as `XDG_CONFIG_HOME`, `GNUPGHOME`, `CARGO_HOME` or
 `KUBECONFIG`, put them), and the file or directory of yours that a link
 among them points at, up to four directory levels inside a denied directory;
-the kernel keyrings; the network; and sockets. Cargo's own configuration is
+the kernel keyrings; the network, unless an exec atom declares the hosts it
+reaches, and then all but those, which it reaches through atomic's proxy; and
+sockets. Cargo's own configuration is
 not among them, so a registry token kept there rather than in
 `credentials.toml` is not protected. A link to something outside your own
 files, such as a history file linked to `/dev/null`, is left alone, and a

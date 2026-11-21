@@ -1283,6 +1283,85 @@ fn exec_declarations_are_checked_at_load() {
             "kind: 'lite', effects: { external: 'read-only' }",
             "for `kind: 'exec'`",
         ),
+        // Network: only an exec atom's command, only public DNS names.
+        (
+            "kind: 'codex', network: { allow: ['api.example.com'] }",
+            "for exec atoms",
+        ),
+        (
+            "kind: 'lite', network: { allow: ['api.example.com'] }",
+            "for exec atoms",
+        ),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, network: { allow: ['localhost'] }",
+            "public DNS names",
+        ),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, network: { allow: ['127.0.0.1'] }",
+            "an IP address",
+        ),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, network: { allow: ['169.254.169.254'] }",
+            "an IP address",
+        ),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, network: { allow: ['metadata.google.internal'] }",
+            "private network",
+        ),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, network: { allow: ['*'] }",
+            "public DNS names",
+        ),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, network: { allow: ['unix:/var/run/docker.sock'] }",
+            "Unix socket",
+        ),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, network: { allow: ['api.example.com:443'] }",
+            "no scheme, port",
+        ),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, network: { allow: 'api.example.com' }",
+            "a list of host names",
+        ),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, network: { allow: ['a.example.com'], unix: true }",
+            "unknown field `unix`",
+        ),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, network: true",
+            "is `false` or",
+        ),
+        ("kind: 'codex', network: true", "is `false` or"),
+        (
+            "kind: 'lite', network: { allow: 'x.example.com' }",
+            "a list of host names",
+        ),
+        (
+            "kind: 'codex', network: { unix: true }",
+            "unknown field `unix`",
+        ),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, network: { allow: ['0x7f.1'] }",
+            "an IP address",
+        ),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, network: { allow: ['8.8.8.0x8'] }",
+            "an IP address",
+        ),
+        // Proxy variables are atomic's to set, in any case.
+        (
+            "kind: 'exec', exec: { command: ['x'] }, env: { https_proxy: 'http://evil.example.com' }",
+            "names a proxy",
+        ),
+        (
+            "kind: 'exec', exec: { command: ['x'] }, env: { NO_PROXY: '*' }",
+            "names a proxy",
+        ),
+        (
+            "kind: 'codex', env: { All_Proxy: 'socks5://x' }",
+            "names a proxy",
+        ),
     ] {
         let dir = scratch("exec-load");
         std::fs::create_dir_all(dir.join("atoms")).expect("atoms");
@@ -1307,6 +1386,25 @@ fn exec_declarations_are_checked_at_load() {
             atom::load(&dir.join("atoms/x.atom.astro"), &mut Registry::new()).expect_err(problem);
         assert!(error.message.contains(problem), "{config}: {error}");
     }
+}
+
+/// An exec atom may declare public hosts for its command, in any case and
+/// order, and they reach the command as one canonical list.
+#[test]
+fn an_exec_atom_declares_the_public_hosts_its_command_reaches() {
+    let (_, a, _) = exec_project(
+        "network-load",
+        TOTAL,
+        ", network: { allow: ['API.example.com', '*.s3.amazonaws.com'] }",
+    );
+    assert_eq!(
+        declared_network(&a),
+        ["*.s3.amazonaws.com", "api.example.com"]
+    );
+    let (_, none, _) = exec_project("network-none", TOTAL, ", network: false");
+    assert!(declared_network(&none).is_empty());
+    let (_, plain, _) = exec_project("network-plain", TOTAL, "");
+    assert!(declared_network(&plain).is_empty());
 }
 
 /// A lite atom with [`Classify`]'s contract.
