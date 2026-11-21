@@ -936,3 +936,99 @@ fn a_chat_spans_error_is_the_status_and_type_not_the_body() {
         "POST http://127.0.0.1:9/v1/chat/completions: Connection refused (os error 111)"
     );
 }
+
+#[test]
+fn an_endpoint_here_over_plain_http_is_told_from_one_elsewhere() {
+    for (base, here) in [
+        ("http://127.0.0.1:4000/v1", true),
+        ("http://127.0.0.2:4000/v1", true),
+        ("http://[::1]:4000/v1", true),
+        ("http://0.0.0.0:4000/v1", true),
+        ("http://[::]:4000/v1", true),
+        ("http://[::ffff:127.0.0.1]:4000/v1", true),
+        ("http://[::ffff:0.0.0.0]:4000/v1", true),
+        ("http://localhost:4000/v1", true),
+        ("http://LocalHost.:4000/v1", true),
+        ("http://api.localhost/v1", true),
+        ("https://127.0.0.1:4000/v1", false),
+        ("https://localhost/v1", false),
+        ("http://10.0.0.5:4000/v1", false),
+        ("http://[::ffff:10.0.0.5]:4000/v1", false),
+        ("http://[2001:db8::1]/v1", false),
+        ("http://localhost.example.com/v1", false),
+        ("http://example.com/v1", false),
+        ("not a url", false),
+    ] {
+        assert_eq!(http_loopback(base), here, "{base}");
+    }
+}
+
+/// A server on this machine that answers every request with `response`, and
+/// counts the requests it was sent.
+fn answering(response: String) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::io::{BufRead, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let address = listener.local_addr().expect("address");
+    let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = seen.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone"));
+            let mut line = String::new();
+            while reader.read_line(&mut line).is_ok_and(|n| n > 0) && line != "\r\n" {
+                line.clear();
+            }
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    (format!("http://{address}"), seen)
+}
+
+/// A lite atom's endpoint that answers with a redirect is not followed, so
+/// the key is never resent, and the error says where it points, with no
+/// query or credentials, and the base URL to set.
+#[tokio::test]
+async fn a_lite_atoms_endpoint_that_redirects_is_not_followed() {
+    let (elsewhere, followed) = answering(format!(
+        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{GOOD}",
+        GOOD.len()
+    ));
+    let moved = elsewhere.replace("http://", "http://user:secret@");
+    let (redirecting, asked) = answering(format!(
+        "HTTP/1.1 307 Temporary Redirect\r\nlocation: {moved}/v2/chat/completions?sig=abc#x\r\n\
+         content-length: 0\r\n\r\n"
+    ));
+    let mut rt = LiteRuntime::new(
+        ModelEndpoint {
+            base_url: format!("{redirecting}/v1"),
+            model: "synthetic".into(),
+            api_key_env: Some("PATH".into()),
+            sign_in: None,
+        },
+        AtomConfig::default(),
+    );
+    rt.wire = Wire::ChatCompletions;
+    match run_lite_atom(&Classify, &note(), &rt, &Default::default()).await {
+        Err(AtomError::Model(message)) => {
+            assert!(
+                message.contains(&format!(
+                    "the endpoint redirects to {elsewhere}/v2/chat/completions; atomic does not \
+                     follow a redirect with the key; set model.base_url to {elsewhere}/v2"
+                )),
+                "{message}"
+            );
+            for hidden in ["sig=abc", "secret", "#x"] {
+                assert!(!message.contains(hidden), "{hidden}: {message}");
+            }
+        }
+        other => panic!("expected a model error, got {other:?}"),
+    }
+    assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        followed.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the redirect was not followed"
+    );
+}

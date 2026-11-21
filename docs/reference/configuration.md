@@ -196,6 +196,15 @@ model:
   name: Qwen3-8B
 ```
 
+A lite atom's key goes only to the endpoint `model.base_url` names, and the same
+holds for the key `atomic eval --live` forwards while recording. The client
+follows no redirect: an endpoint that answers with one fails the call, which
+says where it points, without its query or credentials, and the base URL to set
+`model.base_url` to. An endpoint on this machine over plain `http`, a loopback
+or unspecified address or `localhost`, is reached directly, never through a
+proxy that `HTTP_PROXY` or `ALL_PROXY` names, which would see the key in
+cleartext. Any other endpoint uses the proxies the environment names.
+
 Planned is naming a **tier** instead of a model, and mapping tiers to models per
 project: `basic`, `fast`, `advanced` and `frontier`, from least to most capable,
 as [models](../models.md) describes. The names are settled and appear in the

@@ -44,8 +44,9 @@ fn serve(response: &'static str) -> (String, Arc<AtomicUsize>) {
 #[test]
 fn the_model_client_keeps_the_key_off_proxies_and_redirects() {
     let (proxy, proxied) = serve("HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\n\r\n");
-    // SAFETY: this binary's one test sets these before any thread reads
-    // the environment.
+    // SAFETY: this binary holds this one test, and the only other thread so
+    // far is the proxy's accept loop, which never reads the environment; the
+    // variables are set before any client or other thread is started.
     #[allow(unsafe_code)]
     unsafe {
         for name in ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"] {

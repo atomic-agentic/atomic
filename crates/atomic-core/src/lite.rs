@@ -77,8 +77,9 @@ pub fn model_client(
     builder.build().context("build the HTTP client")
 }
 
-/// Whether `base_url` is plain `http` to this machine: a loopback address or
-/// `localhost`.
+/// Whether `base_url` is plain `http` to this machine: a loopback address,
+/// an unspecified one (`0.0.0.0` or `[::]`, which connect here), either as
+/// an IPv4-mapped IPv6 address, or `localhost`.
 fn http_loopback(base_url: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(base_url) else {
         return false;
@@ -87,8 +88,12 @@ fn http_loopback(base_url: &str) -> bool {
         return false;
     };
     let host = host.trim_start_matches('[').trim_end_matches(']');
+    let here = |ip: std::net::IpAddr| ip.is_loopback() || ip.is_unspecified();
     match host.parse::<std::net::IpAddr>() {
-        Ok(ip) => ip.is_loopback(),
+        Ok(std::net::IpAddr::V6(v6)) if v6.to_ipv4_mapped().is_some_and(|v4| here(v4.into())) => {
+            true
+        }
+        Ok(ip) => here(ip),
         Err(_) => {
             let name = host.trim_end_matches('.').to_ascii_lowercase();
             name == "localhost" || name.ends_with(".localhost")
@@ -452,18 +457,23 @@ async fn call(
             .await
             .with_context(|| format!("POST {url}"))?;
         let status = response.status();
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
         let text = response
             .text()
             .await
             .with_context(|| format!("read the response from {url}"))?;
-        anyhow::Ok((status, text))
+        anyhow::Ok((status, location, text))
     })
     .await;
     let failed = |answer: anyhow::Error| Called {
         answer: Err(answer),
         usage: None,
     };
-    let (status, text) = match exchanged {
+    let (status, location, text) = match exchanged {
         Ok(Ok(done)) => done,
         Ok(Err(e)) => return failed(e),
         Err(_) => {
@@ -480,7 +490,15 @@ async fn call(
         Wire::Responses => usage_of(v, "input_tokens", "output_tokens"),
     });
     let answer = if !status.is_success() {
-        Err(ProviderError::answered(&url, status, &text, value.as_ref()).into())
+        let answered =
+            anyhow::Error::from(ProviderError::answered(&url, status, &text, value.as_ref()));
+        match redirected_to(base, &url, status, location.as_deref()) {
+            Some((target, moved)) => Err(answered.context(format!(
+                "POST {url}: the endpoint redirects to {target}; atomic does not follow a \
+                 redirect with the key; set model.base_url to {moved}"
+            ))),
+            None => Err(answered),
+        }
     } else {
         match &value {
             None => Err(anyhow!(
@@ -495,6 +513,33 @@ async fn call(
         }
     };
     Called { answer, usage }
+}
+
+/// Where a redirect from the call to `url`, under the endpoint `base`,
+/// points, and the base URL that would reach it directly, when `status` is a
+/// redirect with a `location`: both without a query, a fragment or
+/// credentials, which can carry a signature or a token.
+fn redirected_to(
+    base: &str,
+    url: &str,
+    status: reqwest::StatusCode,
+    location: Option<&str>,
+) -> Option<(String, String)> {
+    if !status.is_redirection() {
+        return None;
+    }
+    let mut target = reqwest::Url::parse(url).ok()?.join(location?).ok()?;
+    target.set_query(None);
+    target.set_fragment(None);
+    let _ = target.set_username("");
+    let _ = target.set_password(None);
+    let target = target.to_string();
+    let call = url.strip_prefix(base).unwrap_or_default();
+    let moved = match target.strip_suffix(call) {
+        Some(moved) if !call.is_empty() => moved.to_owned(),
+        _ => target.clone(),
+    };
+    Some((target, moved))
 }
 
 /// A provider's answer that is not a success: its status, the start of its

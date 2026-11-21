@@ -256,14 +256,16 @@ impl Cassette {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let port = listener.local_addr()?.port();
         let tally = Arc::new(Mutex::new(Tally::default()));
+        // The client a lite atom calls with: it follows no redirect, and an
+        // endpoint on this machine over plain http goes by no proxy, so the
+        // key it forwards goes nowhere the endpoint did not name.
+        let client = crate::lite::model_client(&endpoint, std::time::Duration::from_secs(600))
+            .map_err(std::io::Error::other)?;
         let shared = Arc::new(Shared {
             dir,
             mode,
             endpoint,
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(600))
-                .build()
-                .map_err(std::io::Error::other)?,
+            client,
             tally: tally.clone(),
             seen: Mutex::new(HashMap::new()),
         });
