@@ -191,7 +191,10 @@ another private suffix, a bare `*`, and anything with a scheme, a port, a path
 or a Unix socket are refused. That list of private names is a courtesy. The
 control is the proxy, which resolves each listed name before it connects and
 refuses one that resolves to an address on this machine or a private network,
-or that does not resolve.
+or that does not resolve. Every address this machine's interfaces have counts
+as this machine's, public ones included, and so does any IPv6 address that
+carries an IPv4 one inside it (NAT64's `64:ff9b::/32`, 6to4's `2002::/16`
+and Teredo's `2001:0::/32`), whatever IPv4 address it carries.
 
 Know what a listed host can get:
 

@@ -15,7 +15,10 @@
 //! names only. That list of names is a courtesy; the control is the proxy,
 //! which resolves each declared name before it connects and refuses one
 //! that resolves to this machine or a private network, or does not
-//! resolve. The proxy never goes through another proxy, even when atomic's
+//! resolve. To the addresses Codex's proxy counts as private, atomic adds
+//! the IPv6 forms that carry an IPv4 address inside them (NAT64, 6to4 and
+//! Teredo), whatever that address is, and every address this machine's
+//! interfaces have, public ones too ([`denied_addresses`]). The proxy never goes through another proxy, even when atomic's
 //! own environment names one, and speaks only HTTP and HTTPS `CONNECT`, not
 //! SOCKS.
 //!
@@ -28,12 +31,14 @@
 //! stops working when the command ends, and the proxy stops once no command
 //! needs it.
 
+use anyhow::Context as _;
 use codex_network_proxy::{
     NetworkDecision, NetworkPolicyDecider, NetworkPolicyDeciderFuture, NetworkPolicyRequest,
     NetworkProxy, NetworkProxyConfig, NetworkProxyConstraints, NetworkProxyHandle,
     NetworkProxyState, PreparedManagedNetwork,
 };
 use std::collections::{BTreeSet, HashMap};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
@@ -190,6 +195,70 @@ impl NetworkPolicyDecider for DeclaredHosts {
 struct Running {
     proxy: NetworkProxy,
     _handle: NetworkProxyHandle,
+    /// This machine's addresses when it started, which it never reaches.
+    own: BTreeSet<IpAddr>,
+}
+
+/// IPv6 addresses that carry an IPv4 address, as patterns over the way the
+/// proxy writes an address (Rust's, lowercase and compressed), for its deny
+/// list: NAT64's prefixes, well-known and local-use (`64:ff9b::/32`, which
+/// holds both), 6to4 (`2002::/16`) and Teredo (`2001:0::/32`). A route
+/// through any of them can end at an address on this machine or a private
+/// network, so none is reached, whatever IPv4 address it carries. Each has
+/// two colons: the proxy reads a pattern with one as a host and a port.
+const EMBEDDING_IPV4: &[&str] = &["64:ff9b:*", "2002:*:*", "2001:0:*", "2001::*"];
+
+/// What the proxy refuses on top of the addresses Codex's proxy already
+/// counts as private: the IPv6 forms that embed an IPv4 address, and `own`,
+/// this machine's addresses, public ones included. The proxy checks its
+/// deny list against a request's host and again, when it dials, against
+/// every address a declared name resolved to.
+fn denied_addresses(own: &BTreeSet<IpAddr>) -> Vec<String> {
+    EMBEDDING_IPV4
+        .iter()
+        .map(|p| (*p).to_owned())
+        .chain(own.iter().map(IpAddr::to_string))
+        .collect()
+}
+
+/// Every address this machine's interfaces have now.
+#[allow(unsafe_code)]
+fn own_addresses() -> anyhow::Result<BTreeSet<IpAddr>> {
+    let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs fills `list` with a list that is freed below with
+    // freeifaddrs, and only read before then.
+    if unsafe { libc::getifaddrs(&mut list) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("list this machine's network addresses");
+    }
+    let mut own = BTreeSet::new();
+    let mut entry = list;
+    while !entry.is_null() {
+        // SAFETY: `entry` is a node of the list getifaddrs returned, and an
+        // address it points at is a sockaddr of the family it names.
+        unsafe {
+            let addr = (*entry).ifa_addr;
+            if !addr.is_null() {
+                match i32::from((*addr).sa_family) {
+                    libc::AF_INET => {
+                        let sin = &*addr.cast::<libc::sockaddr_in>();
+                        own.insert(IpAddr::V4(Ipv4Addr::from(u32::from_be(
+                            sin.sin_addr.s_addr,
+                        ))));
+                    }
+                    libc::AF_INET6 => {
+                        let sin6 = &*addr.cast::<libc::sockaddr_in6>();
+                        own.insert(IpAddr::V6(Ipv6Addr::from(sin6.sin6_addr.s6_addr)));
+                    }
+                    _ => {}
+                }
+            }
+            entry = (*entry).ifa_next;
+        }
+    }
+    // SAFETY: `list` came from getifaddrs and is not used after this.
+    unsafe { libc::freeifaddrs(list) };
+    Ok(own)
 }
 
 /// What a command holds while it runs: its proxy runs until no command
@@ -270,6 +339,9 @@ impl Proxies {
     ) -> anyhow::Result<(PreparedManagedNetwork, Lease)> {
         let mut key = hosts.to_vec();
         key.extend(loopback.iter().map(|l| format!("loopback:{l}")));
+        // A proxy started before this machine's addresses changed would
+        // reach a new one: start another.
+        let own = own_addresses()?;
         let running = {
             let mut proxies = self
                 .0
@@ -279,11 +351,11 @@ impl Proxies {
             match proxies
                 .get(&key)
                 .and_then(Weak::upgrade)
-                .filter(|running| alive(running))
+                .filter(|running| running.own == own && alive(running))
             {
                 Some(running) => running,
                 None => {
-                    let running = Arc::new(runtime()?.block_on(start(hosts, loopback))?);
+                    let running = Arc::new(runtime()?.block_on(start(hosts, loopback, own))?);
                     proxies.insert(key, Arc::downgrade(&running));
                     running
                 }
@@ -327,8 +399,13 @@ impl Proxies {
 
 /// Start a proxy that forwards only to `hosts` on ports 80 and 443, never
 /// through another proxy and never over SOCKS, and reaches no address on
-/// this machine or its network but `loopback`'s.
-async fn start(hosts: &[String], loopback: &[String]) -> anyhow::Result<Running> {
+/// this machine or its network but `loopback`'s: none of `own`, this
+/// machine's addresses, and none [`denied_addresses`] names.
+async fn start(
+    hosts: &[String],
+    loopback: &[String],
+    own: BTreeSet<IpAddr>,
+) -> anyhow::Result<Running> {
     let mut config = NetworkProxyConfig {
         enabled: true,
         allow_upstream_proxy: false,
@@ -341,6 +418,13 @@ async fn start(hosts: &[String], loopback: &[String]) -> anyhow::Result<Running>
     // Nothing is on the proxy's own list but test loopback addresses, so
     // every request reaches the decider, which checks host and port.
     config.set_allowed_domains(loopback.to_vec());
+    // A test's loopback address is on this machine too, and stays reachable.
+    let denied: BTreeSet<IpAddr> = own
+        .iter()
+        .filter(|ip| !loopback.contains(&ip.to_string()))
+        .copied()
+        .collect();
+    config.set_denied_domains(denied_addresses(&denied));
     let state = codex_network_proxy::build_config_state(
         config,
         NetworkProxyConstraints::default(),
@@ -359,6 +443,7 @@ async fn start(hosts: &[String], loopback: &[String]) -> anyhow::Result<Running>
     Ok(Running {
         proxy,
         _handle: handle,
+        own,
     })
 }
 
@@ -533,6 +618,11 @@ mod tests {
     /// with `token`'s attribution frame or none: `403 <reason>`, or what
     /// went wrong.
     fn fetch(addr: &str, token: Option<&str>) -> String {
+        fetch_from(addr, token, "allowed.invalid")
+    }
+
+    /// As [`fetch`], for `http://<host>:80/`.
+    fn fetch_from(addr: &str, token: Option<&str>, host: &str) -> String {
         use std::io::{Read, Write};
         let attempt = || -> std::io::Result<String> {
             let mut stream = std::net::TcpStream::connect(addr)?;
@@ -541,7 +631,10 @@ mod tests {
                 codex_network_proxy::write_attribution_frame(&mut stream, token)?;
             }
             stream.write_all(
-                b"GET http://allowed.invalid/ HTTP/1.1\r\nHost: allowed.invalid\r\nConnection: close\r\n\r\n",
+                format!(
+                    "GET http://{host}:80/ HTTP/1.1\r\nHost: {host}:80\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
             )?;
             let mut response = Vec::new();
             stream.read_to_end(&mut response)?;
@@ -596,5 +689,50 @@ mod tests {
             "{ended}"
         );
         drop(other);
+    }
+
+    /// The proxy reaches no IPv6 address that carries an IPv4 one (NAT64,
+    /// 6to4, Teredo) and none of this machine's addresses, public ones
+    /// included. Offline, no name resolves to them, so this asks for each
+    /// address itself: the proxy checks its deny list against a request's
+    /// host this way, and against each address a name resolves to when it
+    /// dials. Each is refused as denied before the proxy looks for a token
+    /// or a declared host. `2001:db8::5` stands in for a public address of
+    /// this machine; Codex's proxy counts it as public.
+    #[test]
+    fn embedded_ipv4_and_this_machines_addresses_are_never_reached() {
+        let own: BTreeSet<IpAddr> = ["2001:db8::5".parse().expect("address")].into();
+        let running = runtime()
+            .expect("runtime")
+            .block_on(start(&["allowed.invalid".to_owned()], &[], own))
+            .expect("starts");
+        let addr = running.proxy.http_addr().to_string();
+        for (host, why) in [
+            ("[64:ff9b::7f00:1]", "NAT64 for 127.0.0.1"),
+            ("[64:ff9b::a00:1]", "NAT64 for 10.0.0.1"),
+            ("[64:ff9b::808:808]", "NAT64 for a public address"),
+            ("[64:ff9b:1::7f00:1]", "local-use NAT64"),
+            ("[2002:7f00:1::]", "6to4 for 127.0.0.1"),
+            ("[2002:a00:1::1]", "6to4 for 10.0.0.1"),
+            ("[2001:0:4136:e378:8000:63bf:3fff:fdd2]", "Teredo"),
+            ("[2001::1]", "Teredo, compressed"),
+            ("[2001:db8::5]", "this machine's public address"),
+        ] {
+            assert_eq!(fetch_from(&addr, None, host), "403 denied", "{why}: {host}");
+        }
+        // Another public address is not denied: it reaches the next check.
+        assert_eq!(
+            fetch_from(&addr, None, "[2001:db8::6]"),
+            format!("403 {UNATTRIBUTED_REFUSED}")
+        );
+    }
+
+    /// The machine's addresses are its interfaces': loopback's among them.
+    #[test]
+    fn this_machines_addresses_come_from_its_interfaces() {
+        let own = own_addresses().expect("addresses");
+        assert!(own.contains(&IpAddr::V4(Ipv4Addr::LOCALHOST)), "{own:?}");
+        let denied = denied_addresses(&own);
+        assert!(denied.contains(&"127.0.0.1".to_owned()), "{denied:?}");
     }
 }
