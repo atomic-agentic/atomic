@@ -931,6 +931,8 @@ async fn run_pipeline_in<C: WorkflowContext>(
     let store = services.store.clone();
     fits("the workflow's input", &pipeline.input, &input)?;
     plan(&pipeline, services.runtimes.codex.backend.statement())?;
+    // Every step is held to its atom's trust before the run does anything.
+    trusted(&pipeline).map_err(failed)?;
     // The budgets the run keeps: pinned before it started, or resolved now,
     // once, and recorded with its definitions.
     let planned = match &pipeline.budgets {
@@ -2204,6 +2206,107 @@ pub fn register_pipeline<R: DurableRuntime>(rt: &mut R, services: Services) {
             ),
         )
     });
+}
+
+/// Hold every atom step's bindings to its atom's trust, and its review's to
+/// the reviewer's, as the loader does, from the pipeline alone: before a run
+/// does anything, so no step's effect lands before a later step is refused.
+/// Each binding's origin is the lower of what the run recorded for it
+/// (external, when it recorded nothing) and what its expression reads,
+/// recomputed from the steps before it, so a pipeline built some other way,
+/// or a run recorded before a check existed, cannot raise one. An atom whose
+/// `trust` is none of the three accepts nothing. A resumed or served run is
+/// checked on the pipeline it recorded.
+fn trusted(pipeline: &Pipeline) -> std::result::Result<(), String> {
+    use atomic_core::workflow::{
+        accepted_trust, review_origin, trusted_sources, unknown_trust, unknown_trust_advice,
+        untrusted_binding,
+    };
+    let atom_of = |id: &str, name: &str| {
+        let atom = pipeline
+            .atoms
+            .get(name)
+            .ok_or_else(|| format!("step `{id}`: no atom `{name}`"))?;
+        let accepts = accepted_trust(atom).map_err(|_| {
+            format!(
+                "step `{id}`: {}; {}",
+                unknown_trust(atom).unwrap_or_default(),
+                unknown_trust_advice(atom)
+            )
+        })?;
+        Ok::<_, String>((atom, accepts))
+    };
+    // A binding's origin at run time: the lower of what the run recorded
+    // (external, when it recorded nothing) and what its expression reads;
+    // and, when the run's `origins` entry is what lowered it, the advice to
+    // remove that entry.
+    let origin = |recorded: Option<&String>, read: &'static str| match recorded.map(String::as_str)
+    {
+        Some(entry) if rank(entry) < rank(read) => (
+            entry.to_owned(),
+            format!(", remove the `origins` entry that marks it {entry}"),
+        ),
+        None if rank("external") < rank(read) => ("external".to_owned(), String::new()),
+        _ => (read.to_owned(), String::new()),
+    };
+    let mut kinds = BTreeMap::new();
+    for step in &pipeline.steps {
+        let step = match step {
+            Step::Gate(gate) => {
+                kinds.insert(gate.id.clone(), "gate".to_owned());
+                continue;
+            }
+            Step::Atom(step) => step,
+        };
+        let (atom, accepts) = atom_of(&step.id, &step.atom)?;
+        for (field, source) in &step.with {
+            let read = origin_of(source, &kinds).unwrap_or("external");
+            let (origin, entry) = origin(step.origins.get(field), read);
+            if let Some(refused) = untrusted_binding(atom, source, &origin) {
+                return Err(format!(
+                    "step `{}`: `with.{field}`: {refused}; bind it to {} instead{entry}, or \
+                     declare a lower `trust` on the atom if it is built for {origin} input",
+                    step.id,
+                    trusted_sources(accepts),
+                ));
+            }
+        }
+        if let Some(review) = &step.review {
+            let (reviewer, reviewer_accepts) = atom_of(&step.id, &review.reviewer)?;
+            // What the reviewer's findings carry: a model's output on what
+            // it read.
+            let mut findings = "agent".to_owned();
+            for (field, source) in &review.with {
+                let read = review_origin(source, &kinds).unwrap_or("external");
+                let (origin, entry) = origin(review.origins.get(field), read);
+                if let Some(refused) = untrusted_binding(reviewer, source, &origin) {
+                    return Err(format!(
+                        "step `{}`: `review.with.{field}`: {refused}; a candidate under review \
+                         is external data; bind it to {} instead{entry}, or declare a lower \
+                         `trust` on the reviewer if it is built for {origin} input",
+                        step.id,
+                        trusted_sources(reviewer_accepts),
+                    ));
+                }
+                if rank(&origin) < rank(&findings) {
+                    findings = origin;
+                }
+            }
+            // A repair round hands the author the reviewer's findings: no
+            // more trusted than what the reviewer read.
+            if review.rounds > 0 && rank(&findings) < rank(accepts) {
+                return Err(format!(
+                    "step `{}`: `review.rounds`: a repair round hands `{}` the reviewer's \
+                     findings, which are {findings} data, and it accepts {accepts} input at \
+                     most (`trust: '{accepts}'`); set `rounds: 0`, so a person decides on a \
+                     rejection, or review it with what it can take",
+                    step.id, step.atom,
+                ));
+            }
+        }
+        kinds.insert(step.id.clone(), atom.kind.clone());
+    }
+    Ok(())
 }
 
 /// The name a replay of a recorded run is registered under.

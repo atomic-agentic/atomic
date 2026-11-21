@@ -6141,7 +6141,17 @@ fn a_direct_run_refuses_input_its_atom_does_not_trust_before_anything_runs() {
         ranking_atom(&project, "rank-for-team", Some("team"));
         ranking_atom(&project, "rank-for-agents", Some("agent"));
         let env = model_env(&model.base_url());
-        for atom in ["rank-for-team", "rank-for-agents"] {
+        for (atom, sources) in [
+            (
+                "rank-for-team",
+                "a gate a person decides, or a literal in the workflow file",
+            ),
+            (
+                "rank-for-agents",
+                "a model step's output, a gate a person decides, or a literal in the workflow \
+                 file",
+            ),
+        ] {
             let (dir, project, env) = (dir.clone(), project.clone(), env.clone());
             let out = tokio::task::spawn_blocking(move || {
                 atomic(
@@ -6163,10 +6173,21 @@ fn a_direct_run_refuses_input_its_atom_does_not_trust_before_anything_runs() {
                 message.contains(&format!("atom `{atom}`")),
                 "{atom}: {message}"
             );
+            // The action names what the atom takes instead.
+            let action = error["action"].as_str().unwrap_or_default();
+            assert!(
+                action.contains(&format!(
+                    "run it from a workflow that binds the field to {sources}"
+                )) && action.contains("declare a lower `trust` on the atom"),
+                "{atom}: the action names what can take the field's place"
+            );
             // Refused as the run was loaded: no durable run was started,
             // which would name itself first on stderr.
             let stderr = String::from_utf8_lossy(&out.stderr);
-            assert!(!stderr.contains("run-"), "{atom}: a run started: {stderr}");
+            assert!(
+                !stderr.contains("run run-"),
+                "{atom}: a run started: {stderr}"
+            );
         }
         assert_eq!(model.calls(), 0, "a model was called");
     });
