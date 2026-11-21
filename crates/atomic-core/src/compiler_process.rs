@@ -48,15 +48,16 @@ pub(crate) fn run_interactive(
         )
     };
     let io = |e: std::io::Error| format!("running the Astro compiler: {e}");
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .env_clear()
         .envs(environment.iter().map(|(key, value)| (key, value)))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| start(e.to_string()))?;
+        .stderr(Stdio::piped());
+    new_session(&mut command);
+    let mut child = command.spawn().map_err(|e| start(e.to_string()))?;
     let input = child.stdin.take().ok_or("no compiler stdin")?;
     let stdout = child.stdout.take().ok_or("no compiler stdout")?;
     let stderr = child.stderr.take().ok_or("no compiler stderr")?;
@@ -337,4 +338,23 @@ mod tests {
         let error = shell("head -c 8388609 /dev/zero", b"", TIME_LIMIT).expect_err("too large");
         assert!(error.contains("response limit"), "{error}");
     }
+}
+
+/// Start `command` in a session of its own, with no controlling terminal,
+/// so a process running project code cannot open atomic's `/dev/tty` and
+/// type into a gate's prompt.
+pub(crate) fn new_session(command: &mut std::process::Command) {
+    #[cfg(unix)]
+    // SAFETY: setsid is async-signal-safe and the closure allocates nothing.
+    #[allow(unsafe_code)]
+    unsafe {
+        std::os::unix::process::CommandExt::pre_exec(command, || {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    #[cfg(not(unix))]
+    let _ = command;
 }

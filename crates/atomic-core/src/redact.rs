@@ -1516,6 +1516,61 @@ pub fn log(line: impl AsRef<str>) {
     eprintln!("{}", bounded(line.as_ref(), MAX_TEXT));
 }
 
+/// One log line put together from atomic's own text and values that may
+/// carry a secret, each value redacted on its own: a value's text, such as
+/// an unterminated private key, never reaches the text around it, and
+/// atomic's own words and names are written as they are, never mistaken
+/// for a secret. Each line is written by itself, so nothing one line holds
+/// changes what later lines show.
+#[derive(Debug, Default)]
+pub struct Line {
+    text: String,
+    redacted: bool,
+}
+
+impl Line {
+    /// An empty line.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Text that carries no secret: atomic's own words, a name the person
+    /// or the workflow chose (a run's id, a gate's), or a value redacted
+    /// already.
+    pub fn plain(mut self, text: &str) -> Self {
+        self.text.push_str(text);
+        self
+    }
+
+    /// A value that may carry a secret, such as a gate's title: redacted
+    /// and bounded on its own.
+    pub fn value(mut self, text: &str) -> Self {
+        let shown = bounded(text, MAX_TEXT);
+        self.redacted |= shown != text;
+        self.text.push_str(&shown);
+        self
+    }
+
+    /// Whether a value in it was redacted or cut short.
+    pub fn redacted(&self) -> bool {
+        self.redacted
+    }
+
+    /// Write it to stderr, bounded to [`MAX_TEXT`] characters.
+    pub fn log(self) {
+        eprintln!("{}", cut(&self.text, MAX_TEXT));
+    }
+
+    /// Write it to stderr with no line end, flushed, as a prompt for a
+    /// person to type after.
+    pub fn prompt(self) {
+        use std::io::Write;
+        let mut e = std::io::stderr().lock();
+        let _ = write!(e, "{}", cut(&self.text, MAX_TEXT));
+        let _ = e.flush();
+    }
+}
+
 /// A writer that redacts each line before it reaches stderr, for code that
 /// writes its log lines to a `Write` it is given. A line is written once
 /// it ends, or when the writer is flushed or dropped. The lines inside a
@@ -1524,6 +1579,13 @@ pub struct Lines {
     pending: Vec<u8>,
     in_key: bool,
     out: Box<dyn std::io::Write + Send>,
+}
+
+/// Whether this process's stderr is a terminal, for code that writes to it
+/// through [`stderr_lines`] or [`log`] and must know whether a person sees
+/// it.
+pub fn stderr_is_terminal() -> bool {
+    std::io::IsTerminal::is_terminal(&std::io::stderr())
 }
 
 /// A [`Lines`] writer to this process's stderr.

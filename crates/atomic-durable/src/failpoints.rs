@@ -67,6 +67,11 @@ pub const SITES: &[Site] = &[
         what: "mid-atom: a model call is admitted and its bound reserved; it is not dispatched",
     },
     Site {
+        name: "usage:after-progress:{request}",
+        what: "mid-turn: a Codex turn's reported usage so far is recorded, and the turn goes on; \
+               its name is the request and the record's number, `<request>:<n>`",
+    },
+    Site {
         name: "usage:before-settle:{request}",
         what: "mid-atom: the provider answered the call and its usage is not yet recorded",
     },

@@ -88,6 +88,20 @@ pub fn workflow_schema(atoms: &BTreeMap<String, Atom>, ids: &[String]) -> Value 
         let value = match *key {
             "approvers" => json!({ "type": "array", "items": { "type": "string" } }),
             "timeout" => json!({ "type": "string", "description": "Such as `2h` or `3d`." }),
+            "answer" => json!({
+                "anyOf": [{ "type": "array", "minItems": 1 }, { "type": "object" }],
+                "description": "A question gate's choices, or a JSON Schema for a free answer.",
+            }),
+            "remember" => {
+                json!({ "type": "boolean", "description": "Keep the answer in the feedback log." })
+            }
+            "on_timeout" => json!({
+                "anyOf": [
+                    { "const": "reject" },
+                    { "type": "object", "required": ["default"], "additionalProperties": false, "properties": { "default": {} } },
+                ],
+                "description": "`reject`, or a question gate's `{ default: <answer> }`.",
+            }),
             _ => json!({ "type": "string", "description": "A CEL expression." }),
         };
         gate.insert((*key).to_owned(), value);
