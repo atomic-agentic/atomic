@@ -222,6 +222,7 @@ fn runtimes_on(dir: &Path, cwd: &Path, base_url: &str, model: &str) -> Arc<Runti
             artifacts: Artifacts::none(),
             meter: atomic_core::usage::Metering::none(),
             backend: Default::default(),
+            caches: None,
         },
         lite: LiteRuntime::new(endpoint, AtomConfig::default()),
         exec: Default::default(),
@@ -678,6 +679,7 @@ async fn decide(rt: &Durare, g: &gate::Gate, verdict: Verdict, comment: &str) {
             verdict,
             comment: Some(comment.into()),
             proposal: g.proposal.clone(),
+            answer: None,
         },
     )
     .await

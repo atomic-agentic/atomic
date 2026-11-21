@@ -249,6 +249,7 @@ fn register(rt: &mut Durare) {
             tier: Tier::High,
             timeout: None,
             on_timeout: OnTimeout::Reject,
+            question: None,
         };
         gate::gate(&ctx, "accept", spec).await
     });
@@ -326,6 +327,7 @@ async fn try_sandboxed(
         meter: atomic_core::usage::Metering::none(),
         guard: guard.clone(),
         backend: atomic_exec::Backend::connect(atomic_exec::LocalBackend::in_dir(scratch)).unwrap(),
+        caches: None,
     };
     let answer = atomic_core::runtime::run_turn(
         &runtime,
@@ -535,6 +537,7 @@ fn an_atom_cannot_approve_its_own_gate_through_its_shell() {
                 verdict: Verdict::Approve,
                 comment: None,
                 proposal: opened.proposal.clone(),
+                answer: None,
             },
         )
         .await

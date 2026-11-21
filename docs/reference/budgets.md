@@ -185,7 +185,12 @@ and broke off, including a stream that Codex retried before giving up, or one
 that ended incomplete; one whose request the provider refused outright, without
 retrying, is charged what it reported. A turn's reported tokens can exceed its
 reservation, since every request sends the conversation again; the ledger
-records the overshoot, including the estimate added to it.
+records the overshoot, including the estimate added to it. A running turn records
+what it has reported each time that grows, charged the same way, with one request
+taken to be in flight, so a turn whose process is stopped by a signal or killed
+before the turn settles stays charged at least what it last recorded having
+reported and that request, never just its reservation. Usage reported after the
+last record, and before the stop, is not known.
 
 A run resolves the model each atom calls with its budget, and the atom runs on
 that model for the whole run. Under a dollar cap, a call to a model the run's

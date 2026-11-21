@@ -1,5 +1,6 @@
 # M12, cost, tracing and evals: each acceptance clause of docs/design/milestones.md
-# § M12, word for word, and the tests that show it, as `<binary> <test path>`.
+# § M12, word for word, each part of the second as a `### ` line, and the tests
+# that show them, as `<binary> <test path>`.
 # Run by scripts/acceptance.py m12; see that script for the format.
 
 ## Reaching a cap parks the workflow; it does not go on.
@@ -9,7 +10,7 @@ pipeline a_workflow_budget_parks_the_run_before_the_call_it_has_no_room_for
 pipeline a_budget_refusal_in_a_worktree_step_parks_the_run
 
 ## Usage and open reservations survive retries and resumes; a parent cap and a child cap cannot both spend the same allowance; reusing a checkpoint charges nothing; configuring a dollar cap for a model without a price is an error.
-# Usage and open reservations survive retries and resumes.
+### Usage and open reservations survive retries and resumes
 budgets a_killed_and_resumed_run_reports_the_same_usage_plus_only_real_retries
 budgets a_released_park_admits_again_against_the_caps_as_stored
 run_cli a_resumed_run_keeps_the_budget_it_already_spent
@@ -18,15 +19,17 @@ atomic_durable usage::tests::on_sqlite::an_unsettled_attempt_stays_charged_until
 atomic_durable usage::tests::on_postgres::an_unsettled_attempt_stays_charged_until_admission_refuses
 atomic_durable usage::tests::on_sqlite::caps_hold_as_first_created
 atomic_durable usage::tests::on_postgres::caps_hold_as_first_created
-# A parent cap and a child cap cannot both spend the same allowance.
+### a parent cap and a child cap cannot both spend the same allowance
 budgets parallel_children_cannot_both_take_the_last_reservation
 atomic_durable usage::tests::on_sqlite::a_call_is_reserved_before_dispatch_and_settled_once
 atomic_durable usage::tests::on_postgres::a_call_is_reserved_before_dispatch_and_settled_once
 atomic_durable usage::tests::on_sqlite::parallel_children_cannot_both_take_the_last_reservation
 atomic_durable usage::tests::on_postgres::parallel_children_cannot_both_take_the_last_reservation
-# Reusing a checkpoint charges nothing: on recovery, and in a replay.
+### reusing a checkpoint charges nothing
+# On recovery, and in a replay.
+budgets a_killed_and_resumed_run_reports_the_same_usage_plus_only_real_retries
 pipeline a_replayed_run_reuses_its_checkpoints_and_spends_nothing
-# A dollar cap on an unpriced model is a configuration error.
+### configuring a dollar cap for a model without a price is an error
 atomic_core budget::tests::a_dollar_cap_on_an_unpriced_model_fails_configuration
 budgets a_dollar_cap_on_an_unpriced_model_fails_configuration
 budgets a_call_to_a_model_the_budget_does_not_price_is_not_made_under_a_dollar_cap

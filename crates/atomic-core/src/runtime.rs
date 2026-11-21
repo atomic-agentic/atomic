@@ -126,6 +126,11 @@ pub struct CodexRuntime {
     /// The execution backend each run opens its workspace on, from
     /// [`cwd`](Self::cwd), and runs its turn's shell and file work through.
     pub backend: atomic_exec::Backend,
+    /// The build caches of a worktree step's run, which its turn shares
+    /// with the run's other worktree steps, and nothing else: its commands
+    /// are pointed at them, and may write them under `workspace-write`.
+    /// `None` outside worktree steps.
+    pub caches: Option<crate::worktree::Caches>,
 }
 
 /// The runtimes atoms run on, one for each kind of atom that calls a model.
@@ -214,6 +219,19 @@ impl Backend<'_> {
             Self::Codex(rt) => Some(rt.cwd.clone()),
             Self::Lite(_) => None,
         };
+        let (mut env, mut writable_roots) = (std::collections::BTreeMap::new(), Vec::new());
+        // A worktree step's build tools find its run's caches, and its
+        // rustup proxies the person's toolchains; what the atom declares
+        // wins.
+        if let Self::Codex(rt) = self
+            && let Some(caches) = &rt.caches
+        {
+            env.extend(caches.env());
+            if request.sandbox == crate::typed::Sandbox::WorkspaceWrite {
+                writable_roots.push(caches.dir().to_owned());
+            }
+        }
+        env.extend(request.env.clone());
         Open {
             label: request.name.to_owned(),
             run: request.place.run.clone(),
@@ -221,8 +239,8 @@ impl Backend<'_> {
             attempt: new_attempt(),
             source,
             sandbox: request.sandbox,
-            env: request.env.clone(),
-            ..Open::default()
+            writable_roots,
+            env,
         }
     }
 }
@@ -589,6 +607,32 @@ fn turn_failure(e: &anyhow::Error) -> AtomError {
     }
 }
 
+/// The build cache variables a turn's `env` may not point into the
+/// temporary directory its backend's turns share.
+const SHARED_TMP_REFUSED: &[&str] = &[
+    "ATOMIC_CACHE_DIR",
+    "XDG_CACHE_HOME",
+    "CARGO_HOME",
+    "CARGO_TARGET_DIR",
+    "npm_config_cache",
+    "PIP_CACHE_DIR",
+    "GOCACHE",
+    "GOMODCACHE",
+];
+
+/// `path` with links resolved as far as it exists, the rest as written, so
+/// a path not made yet is compared where it would be.
+fn resolved(path: &std::path::Path) -> PathBuf {
+    for ancestor in path.ancestors() {
+        if let Ok(real) = std::fs::canonicalize(ancestor) {
+            return path
+                .strip_prefix(ancestor)
+                .map_or_else(|_| real.clone(), |rest| real.join(rest));
+        }
+    }
+    path.to_owned()
+}
+
 /// Set `spec` up to run in `workspace` and return the directory its thread
 /// runs in: the sandbox, the writable roots and the environment are the
 /// workspace's, and its shell must be one this process can drive. Its
@@ -625,7 +669,50 @@ fn turn_in(workspace: &Workspace, spec: &mut TurnSpec) -> Result<PathBuf, AtomEr
     };
     private("HOME", &workspace.scratch, spec);
     private("ZDOTDIR", &workspace.scratch, spec);
+    // Cargo's home is the attempt's own, never shared and never the
+    // person's, unless the atom declares one.
+    if let Some(scratch) = &workspace.scratch {
+        spec.env
+            .entry("CARGO_HOME".into())
+            .or_insert_with(|| scratch.join(".cargo").display().to_string());
+    }
     turn_tmpdir(workspace, spec, cfg!(target_os = "linux"))?;
+    // A cache in the temporary directory every turn of the backend shares
+    // would outlive the run and reach the next one.
+    if let Some(tmp) = &workspace.tmp {
+        let tmp = resolved(tmp);
+        for name in SHARED_TMP_REFUSED {
+            if let Some(value) = spec.env.get(*name)
+                && resolved(std::path::Path::new(value)).starts_with(&tmp)
+            {
+                return Err(AtomError::Runtime(format!(
+                    "{name}={value} is in the temporary directory every turn shares, so what is \
+                     cached there would reach other runs; leave {name} to atomic"
+                )));
+            }
+        }
+    }
+    // The toolchains rustup runs are only ever read: never inside, or
+    // holding, anything the turn may write.
+    if let Some(rustup) = spec.env.get("RUSTUP_HOME").map(PathBuf::from) {
+        let real = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
+        let rustup = real(&rustup);
+        let mut writable: Vec<PathBuf> = spec.writable_roots.iter().map(|r| real(r)).collect();
+        if workspace.sandbox == crate::typed::Sandbox::WorkspaceWrite {
+            writable.push(real(&cwd));
+        }
+        if let Some(root) = writable
+            .iter()
+            .find(|r| rustup.starts_with(r) || r.starts_with(&rustup))
+        {
+            return Err(AtomError::Runtime(format!(
+                "RUSTUP_HOME {} overlaps {}, which the turn may write; the toolchains its \
+                 commands run must be read-only to them",
+                rustup.display(),
+                root.display()
+            )));
+        }
+    }
     Ok(cwd)
 }
 
