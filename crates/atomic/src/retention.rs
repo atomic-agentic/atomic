@@ -377,7 +377,8 @@ impl Wait {
     /// Pause before trying the lock again: whether the caller, or the
     /// process, was told to stop meanwhile.
     fn pause(&self) -> bool {
-        let until = std::time::Instant::now() + std::time::Duration::from_millis(20).min(self.left());
+        let until =
+            std::time::Instant::now() + std::time::Duration::from_millis(20).min(self.left());
         loop {
             if self.halt.load(std::sync::atomic::Ordering::SeqCst)
                 || atomic_core::runtime::stopping()
@@ -736,11 +737,17 @@ mod tests {
             .await
             .expect_err("refused");
             assert!(
-                matches!(error.downcast_ref::<InputRefused>(), Some(InputRefused::Locked(_))),
+                matches!(
+                    error.downcast_ref::<InputRefused>(),
+                    Some(InputRefused::Locked(_))
+                ),
                 "{error}"
             );
             assert!(rt.run_record("run-1").await.expect("record").is_none());
-            assert!(store.held().expect("held").is_empty(), "a hold outlived the refusal");
+            assert!(
+                store.held().expect("held").is_empty(),
+                "a hold outlived the refusal"
+            );
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(500));
                 drop(lock);
@@ -790,7 +797,10 @@ mod tests {
             .expect_err("stopped");
             drop(lock);
             assert!(
-                matches!(error.downcast_ref::<InputRefused>(), Some(InputRefused::Stopped)),
+                matches!(
+                    error.downcast_ref::<InputRefused>(),
+                    Some(InputRefused::Stopped)
+                ),
                 "{error}"
             );
             assert!(
@@ -798,7 +808,10 @@ mod tests {
                 "waited out the lock instead of stopping"
             );
             assert!(rt.run_record("run-1").await.expect("record").is_none());
-            assert!(store.held().expect("held").is_empty(), "a hold outlived the stop");
+            assert!(
+                store.held().expect("held").is_empty(),
+                "a hold outlived the stop"
+            );
             rt.shutdown(std::time::Duration::from_secs(5))
                 .await
                 .expect("shutdown");

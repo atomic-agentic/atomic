@@ -417,7 +417,8 @@ pub async fn run(
     // ends there; one that comes once the run is recorded stops the run.
     let halt: std::sync::Arc<std::sync::atomic::AtomicBool> = Default::default();
     let told = halt.clone();
-    let admission = admit(&engine.artifacts, &engine.rt, PIPELINE, &run_id, run, typed, told);
+    let (artifacts, rt) = (&engine.artifacts, &engine.rt);
+    let admission = admit(artifacts, rt, PIPELINE, &run_id, run, typed, told);
     tokio::pin!(admission);
     let mut signalled = None;
     let admitted = tokio::select! {

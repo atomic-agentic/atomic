@@ -2148,7 +2148,8 @@ fn a_run_told_to_stop_while_it_waits_for_the_store_stops_and_records_nothing() {
             std::os::unix::fs::PermissionsExt::from_mode(0o700),
         )
         .expect("private");
-        let store = atomic_core::artifact::LocalStore::open(state.join("artifacts")).expect("store");
+        let store =
+            atomic_core::artifact::LocalStore::open(state.join("artifacts")).expect("store");
         let stored = atomic_core::artifact::ArtifactStore::put(
             &store,
             &mut &b"named by the run"[..],
@@ -2162,7 +2163,11 @@ fn a_run_told_to_stop_while_it_waits_for_the_store_stops_and_records_nothing() {
             .write(true)
             .create(true)
             .truncate(false)
-            .open(private.join(state.file_name().expect("id")).join("artifacts.lock"))
+            .open(
+                private
+                    .join(state.file_name().expect("id"))
+                    .join("artifacts.lock"),
+            )
             .expect("lock file");
         lock.lock().expect("the sweep's lock");
         let data = json!({ "text": format!("Exporting {stored} crashes the app.") }).to_string();
@@ -2171,7 +2176,15 @@ fn a_run_told_to_stop_while_it_waits_for_the_store_stops_and_records_nothing() {
             Path::new(ATOMIC),
             &dir,
             &project,
-            &["--json", "run", "triage", "--run-id", "stopped-1", "--data", &data],
+            &[
+                "--json",
+                "run",
+                "triage",
+                "--run-id",
+                "stopped-1",
+                "--data",
+                &data,
+            ],
             &UNUSED_MODEL,
         )
         .stdin(Stdio::null())
