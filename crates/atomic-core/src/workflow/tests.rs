@@ -354,3 +354,64 @@ fn gate_approvers_are_group_names() {
     let e = err(&WORKFLOW.replace("timeout: 24h", "timeout: 24h\n      approvers: maintainers"));
     assert_eq!(e.path, "/steps/accept/gate/approvers");
 }
+
+#[test]
+fn a_question_gate_asks_for_a_typed_answer_and_a_default_that_fits() {
+    let question = |gate: &str| {
+        WORKFLOW.replace(
+            "      title: \"'Accept the reviewed summary'\"\n      show: \"{'draft': steps.summarize.output, 'review': steps.review.output}\"\n      timeout: 24h\n      on_timeout: reject\n",
+            gate,
+        )
+    };
+    let loaded = check(&question(
+        "      ask: \"'Which channel?'\"\n      answer: [stable, beta]\n      remember: true\n      timeout: 1h\n      on_timeout: { default: beta }\n",
+    ))
+    .expect("a question gate loads");
+    assert_eq!(loaded.order.len(), 3);
+    check(&question(
+        "      ask: \"'Why?'\"\n      answer: { type: string, maxLength: 200 }\n",
+    ))
+    .expect("a free answer is a schema");
+    check(&question(
+        "      ask: \"'Which?'\"\n      answer: [a, b]\n      timeout: 1h\n      on_timeout: reject\n",
+    ))
+    .expect("an unanswered question may fail closed");
+    check(&question(
+        "      ask: \"'Which?'\"\n      answer: [a, null]\n      timeout: 1h\n      on_timeout: { default: null }\n",
+    ))
+    .expect("a null default is a default");
+    for (gate, says) in [
+        (
+            "      ask: \"'Which?'\"\n      answer: [stable, beta]\n      timeout: 1h\n      on_timeout: { default: nightly }\n",
+            "is not an answer",
+        ),
+        ("      ask: \"'Which?'\"\n", "needs an `answer`"),
+        (
+            "      title: \"'Ship?'\"\n      answer: [stable]\n",
+            "belongs to a question gate's `ask`",
+        ),
+        (
+            "      title: \"'Ship?'\"\n      ask: \"'Which?'\"\n      answer: [a]\n",
+            "not both",
+        ),
+        (
+            "      ask: \"'Which?'\"\n      answer: 3\n",
+            "a list of choices",
+        ),
+        (
+            "      title: \"'Ship?'\"\n      remember: true\n",
+            "belongs to a question gate",
+        ),
+        (
+            "      ask: \"'Which?'\"\n      answer: [a]\n      on_timeout: never\n",
+            "`{ default: <answer> }`",
+        ),
+        (
+            "      ask: \"'Which?'\"\n      answer: [a]\n      on_timeout: { default: a }\n",
+            "give the gate a `timeout`",
+        ),
+    ] {
+        let e = err(&question(gate)).to_string();
+        assert!(e.contains(says), "{gate}: {e}");
+    }
+}

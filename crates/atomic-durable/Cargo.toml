@@ -28,6 +28,8 @@ postgres-tests = []
 [dependencies]
 durare = { workspace = true }
 getrandom = { workspace = true }
+# Question gates check an answer against the question's schema.
+jsonschema = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
