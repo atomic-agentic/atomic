@@ -1260,3 +1260,38 @@ fn a_cookie_line_cut_at_a_tails_start_is_not_shown() {
     assert!(!out.contains("SEEDED"), "the cookie's values were shown");
     assert!(out.starts_with('…'), "the tail does not say it was cut");
 }
+
+/// A secret used as a key under a secret's name is redacted, as a key of a
+/// known format is anywhere in it; a key that reads as a name stays.
+#[test]
+fn a_secret_used_as_a_key_under_a_secrets_name_is_redacted() {
+    let (shaped, other) = (SHAPES[2], SHAPES[0]);
+    let looks = concat!("Zx81kQ0p", "L2mN4bV6");
+    let mut held = json!({
+        "token": { shaped: 1, "openai": 2 },
+        "credentials": { "deep": { other: "x" }, looks: true },
+    });
+    value(&mut held);
+    let text = held.to_string();
+    assert!(
+        !text.contains(&shaped[7..]),
+        "a key of a known format showed"
+    );
+    assert!(
+        !text.contains(&other[4..]),
+        "a nested key of a known format showed"
+    );
+    assert!(
+        !text.contains(looks),
+        "a key that looks like a credential showed"
+    );
+    assert!(
+        text.contains("\"openai\""),
+        "a key that reads as a name was redacted: {text}"
+    );
+    assert_eq!(
+        held["credentials"].as_object().map(serde_json::Map::len),
+        Some(2),
+        "{text}"
+    );
+}

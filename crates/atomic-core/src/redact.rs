@@ -1380,18 +1380,68 @@ fn redact_held(strength: Strength, value: &mut Value, nested: usize) {
         Value::Array(items) => items
             .iter_mut()
             .for_each(|item| redact_held(strength, item, nested)),
-        // A field inside is held at least as surely as its own name says.
-        Value::Object(fields) => fields.iter_mut().for_each(|(key, field)| {
-            let own = self::strength(key);
-            let held = if own == Strength::Strong {
-                own
-            } else {
-                strength
-            };
-            redact_held(held, field, nested)
-        }),
+        Value::Object(fields) => {
+            // Its keys are redacted as any key is, and one that looks like a
+            // credential too: under a secret's name, a key can be the
+            // secret, as in `{"token": {"<key>": 1}}`.
+            let named = rename_held_keys(strength, fields);
+            // A field inside is held at least as surely as its own name says.
+            for (key, field) in fields.iter_mut() {
+                let name = named.get(key).map_or(key.as_str(), String::as_str);
+                let own = self::strength(name);
+                let held = if own == Strength::Strong {
+                    own
+                } else {
+                    strength
+                };
+                redact_held(held, field, nested);
+            }
+        }
         Value::Number(_) | Value::Null | Value::Bool(_) => {}
     }
+}
+
+/// Redact the keys of `fields`, held under a name of `strength`: a key that
+/// redacts as text does, or one that looks like a credential, is replaced,
+/// two that come out alike are numbered so neither entry is lost, and the
+/// name of each, before its number, is returned for every numbered key.
+fn rename_held_keys(
+    strength: Strength,
+    fields: &mut serde_json::Map<String, Value>,
+) -> std::collections::HashMap<String, String> {
+    let mut renamed: Vec<(String, String)> = fields
+        .keys()
+        .filter_map(|key| {
+            if strength != Strength::None && looks_like_credential(key) {
+                return Some((key.clone(), REDACTED.to_owned()));
+            }
+            match text(key) {
+                Cow::Owned(new_key) => Some((key.clone(), new_key)),
+                Cow::Borrowed(_) => None,
+            }
+        })
+        .collect();
+    renamed.sort();
+    let mut named = std::collections::HashMap::new();
+    let mut next: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (old_key, new_key) in renamed {
+        if let Some(field) = fields.remove(&old_key) {
+            let mut key = new_key.clone();
+            if fields.contains_key(&key) {
+                let n = next.entry(new_key.clone()).or_insert(2);
+                loop {
+                    key = format!("{new_key} ({n})");
+                    *n += 1;
+                    if !fields.contains_key(&key) {
+                        break;
+                    }
+                }
+                named.insert(key.clone(), new_key);
+            }
+            fields.insert(key, field);
+        }
+    }
+    named
 }
 
 /// Header names whose values are credentials.
