@@ -53,7 +53,8 @@ Rules for working a bead:
 1. Read its acceptance criteria and the design section it cites before
    writing anything.
 2. Close it only when the acceptance criteria hold and you have run the check
-   that shows it.
+   that shows it. Before you report a change as ready, go through
+   [Before you report a change](#before-you-report-a-change).
 3. File what you discover as a new bead under the same parent, linked with
    `--deps discovered-from:<id>`, and keep the current bead to its scope.
 4. Beads of type `decision` are the owner's to decide. Gather evidence, record
@@ -150,6 +151,71 @@ Release builds and packaging are described in docs/development.md.
   passes against the implementation it came from first.
 - **Crash tests kill the process** at named failpoints and assert that no
   completed step repeats.
+
+## Before you report a change
+
+Reviews of this repository keep finding the same things. Go through every
+item before you say a change is ready, fix what fails, and in your report give
+one line per item saying how you checked it. A reviewer reads those lines
+first.
+
+1. **Controls bite on production's own path.** Every new guard has a test
+   that fails when the guard is removed, and a row in
+   `scripts/controls/<name>.row`: one line, exactly four `|`, switch text that
+   matches exactly once, cargo arguments written as cargo receives them. The
+   test exercises the call production makes, not a test-only twin, a
+   hand-built helper or a constructor the real path never uses.
+2. **Tests fail for the right reason.** Assert the specific error, reason or
+   message. Never assert through a fallback that hides a missing value
+   (`unwrap_or_default`, an empty-string default, `contains` on text that
+   could be absent). A refusal test shows the refusal, not a "not found".
+3. **Claims match the code.** Docs, comments, error messages, commit messages
+   and the PR description say only what the code does. "Every", "never",
+   "any" and "always" are literally true, or the exceptions are named. A
+   change covers every path it claims: lite, Codex and exec atoms, plain and
+   `--json` output, every call site.
+4. **Fail closed.** No error path, empty set, unknown value or missing
+   component ends up allowing, showing or passing what it should refuse.
+   Unknown means refused. When narrowing or redacting, compare with main on
+   edge inputs: the result is never looser than main's. Redact before you
+   escape or transform text.
+5. **Test-only code stays out of release.** Hooks, seams and fakes sit behind
+   `cfg(test)` or a dev-only feature, and no environment variable,
+   configuration file or atom can set them.
+6. **It builds on current main.** Fetch `origin/main`, trial-merge it
+   (`git merge --no-commit --no-ff origin/main`, then `git merge --abort`) and
+   build the merged tree. A clean textual merge can still break a call whose
+   signature changed.
+7. **Resources and races.** A lock, hold, reservation or temporary directory
+   is released on every path, including errors, panics and drops. Anything
+   checked before a lock is re-read under it. A step that runs twice is safe.
+8. **No external tools in tests.** Use libc or std, not `kill`, `ps` or other
+   commands. Tests do not depend on the host's paths, path lengths or tools
+   missing from the development image.
+9. **Prove every error path fails closed.** List each place the change decides
+   between allowing and refusing: every `?`, `match` on an error, `.ok()`,
+   `unwrap_or*`, `is_ok()`, `is_file()`, `is_dir()`, `exists()`, and every
+   `break` or `continue` on a check. For each, say what happens on NotFound,
+   permission denied, a link loop or "not a directory", another I/O error, a
+   parse error, a timeout and an empty result. Only a true "it is not there"
+   counts as absent; everything else refuses. A rule that passes something
+   over because it is "someone else's", "out of reach" or "not ours" must hold
+   when the user can make it look that way: a uid they can map, a hard link, a
+   link they own, a directory they can chmod, a `PATH` entry they can write.
+   Add at least one test with an error other than NotFound, such as a mode-000
+   directory (failing loudly when run as root) or a link to itself. Put the
+   list in your report.
+10. **Prove every row bites, by running it.** Commit, run
+    `ATOMIC_DEV_SANDBOX=on scripts/dev.sh scripts/controls-check.sh <row>` for
+    each row you added or touched (in a linked worktree, see
+    [docs/development.md](docs/development.md) for the mount it needs), and
+    quote each result line. For each row, say what the
+    switched-off code then does and which assertion fails. A guard with two
+    halves (kill and reap, the terms of a count, a check and its message) is
+    switched off one half at a time; a half whose removal fails no test gets
+    its own test and row. With any control off, the test still needs no
+    network and no real provider: point every endpoint it could fall through
+    to at loopback.
 
 ## Git
 
