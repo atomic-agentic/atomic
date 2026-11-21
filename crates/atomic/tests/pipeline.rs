@@ -222,6 +222,7 @@ fn runtimes_on(dir: &Path, cwd: &Path, base_url: &str, model: &str) -> Arc<Runti
             artifacts: Artifacts::none(),
             meter: atomic_core::usage::Metering::none(),
             backend: Default::default(),
+            caches: None,
         },
         lite: LiteRuntime::new(endpoint, AtomConfig::default()),
         exec: Default::default(),
@@ -888,7 +889,14 @@ fn pipeline_child() {
     on_codex_runtime(async move {
         let dir = PathBuf::from(dir);
         let rt = engine(&dir, &url).await;
-        if role.starts_with("start") {
+        if role == "replay" {
+            // A replay of the recorded run `recorded`, noting a panic where
+            // the parent looks.
+            atomic_app::panics::keep_in(dir.join("panics"));
+            let id = std::env::var(ENV_RUN).expect("run id");
+            let replay = replay_of(&rt, "recorded").await.expect("a replay");
+            rt.start(REPLAY, &id, replay).await.expect("start");
+        } else if role.starts_with("start") {
             let project = dir.join("project");
             let run = match role.as_str() {
                 "start" => PipelineRun {
@@ -4088,6 +4096,44 @@ fn a_replay_takes_no_lock_on_the_store() {
         rt.shutdown(std::time::Duration::from_secs(5))
             .await
             .expect("shutdown");
+    });
+}
+
+/// A replay whose workflow code panics has its panic noted, as a run's is.
+#[test]
+fn a_replay_whose_workflow_code_panics_is_noted() {
+    on_codex_runtime(async {
+        let dir = scratch("replay-panics");
+        let project = project(&dir);
+        let model = FakeModel::start(vec![
+            Reply::Text(READ.into()),
+            Reply::Text(RANK.into()),
+            Reply::Text(SUMMARY.into()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        let run = PipelineRun {
+            pipeline: load(&project, "triage.workflow.yaml", TRIAGE),
+            input: json!({"text": "Exporting a file named café.txt crashes the app."}),
+        };
+        rt.start(PIPELINE, "recorded", run).await.expect("start");
+        let _: Value = rt.result("recorded").await.expect("recorded");
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+        child_in(
+            &dir,
+            &model.base_url(),
+            "replay",
+            "replayed-panics",
+            None,
+            "UTC",
+            &[("ATOMIC_FAILPOINT_PANIC", "pipeline:after:read")],
+        );
+        let kept = atomic_app::panics::kept(&dir.join("panics"), "replayed-panics")
+            .expect("the replay's panic was noted");
+        assert!(kept.contains("failpoint pipeline:after:read"), "{kept}");
     });
 }
 

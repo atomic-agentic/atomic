@@ -319,6 +319,8 @@ pub async fn open(
         atomic_core::log_line!("{line}");
     }
     let store = LocalStore::for_project(state).context("the artifact store")?;
+    // A run whose workflow code panics is noted where later processes look.
+    atomic_app::panics::keep_in(state.private_dir().join("panics"));
     let exec = exec_backend(state, paths, runner_of(&resolved)?)?;
     let runtimes = Arc::new(Runtimes {
         codex: CodexRuntime {
@@ -335,6 +337,7 @@ pub async fn open(
             // Atoms' commands are kept out of atomic's private state.
             guard: atomic_core::codex::StateGuard::for_project(state)?,
             backend: exec.clone(),
+            caches: None,
         },
         lite: LiteRuntime {
             backend: exec.clone(),

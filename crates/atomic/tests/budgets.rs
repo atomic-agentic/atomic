@@ -112,6 +112,7 @@ fn runtimes(dir: &Path, base_url: &str) -> Arc<Runtimes> {
             artifacts: Artifacts::none(),
             meter: Metering::none(),
             backend: Default::default(),
+            caches: None,
         },
         lite: LiteRuntime::new(endpoint, AtomConfig::default()),
         exec: Default::default(),
@@ -614,6 +615,26 @@ async fn child_until(
     }
 }
 
+/// How long after its admission the running attempt's last heartbeat was
+/// recorded, in milliseconds, or 0 before it has one.
+async fn beat_after_admission(dir: &Path) -> i64 {
+    let Ok(db) =
+        sqlx::SqlitePool::connect(&format!("sqlite://{}", dir.join("atomic.db").display())).await
+    else {
+        return 0;
+    };
+    let seen: Option<i64> = sqlx::query_scalar(
+        "SELECT MAX(h.seen_at - a.admitted_at) FROM atomic_usage_attempts a \
+         JOIN atomic_usage_heartbeats h ON h.request_id = a.request_id AND h.attempt = a.attempt \
+         WHERE a.state = 'reserved'",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap_or(None);
+    db.close().await;
+    seen.unwrap_or(0)
+}
+
 async fn reader(dir: &Path) -> Durare {
     Durare::sqlite(&dir.join("atomic.db"))
         .await
@@ -836,7 +857,17 @@ fn a_run_recovered_after_its_dead_turn_would_have_lapsed_is_charged_only_its_run
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        tokio::time::sleep(Duration::from_millis(900)).await;
+        // Killed once its turn has recorded a heartbeat a beat or more after
+        // admission, however slowly a loaded machine runs it: recovery
+        // charges it until a beat after that, at least 600 ms.
+        let beaten = Instant::now() + Duration::from_secs(60);
+        while beat_after_admission(&dir).await < 300 {
+            assert!(
+                Instant::now() < beaten,
+                "the review's turn never recorded a heartbeat"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         process.kill().expect("kill the child");
         let _ = process.wait();
         // Down past the whole reservation.

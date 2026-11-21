@@ -77,6 +77,31 @@ pub fn trust_rank(origin: &str) -> usize {
     TRUST.iter().position(|o| *o == origin).unwrap_or(0)
 }
 
+/// The riskiest input origin `atom` accepts: its `trust`, or external when
+/// it declares none.
+pub fn accepted_trust(atom: &Atom) -> &str {
+    atom.frontmatter
+        .get("trust")
+        .and_then(Value::as_str)
+        .unwrap_or("external")
+}
+
+/// Why `source`, which is `origin` data, may not bind an input of `atom`, if
+/// it may not: an atom takes no input less trusted than it accepts (see
+/// [`accepted_trust`]). A workflow's step and a direct run of the atom are
+/// held to this alike.
+pub fn untrusted_binding(atom: &Atom, source: &str, origin: &str) -> Option<String> {
+    let accepts = accepted_trust(atom);
+    (trust_rank(origin) < trust_rank(accepts)).then(|| {
+        format!(
+            "`{source}` is {origin} data, and atom `{}` accepts {accepts} input at most \
+             (`trust: '{accepts}'`); pass it through a step that can take it, or declare a lower trust \
+             on the atom if it is built for {origin} input",
+            atom.name
+        )
+    })
+}
+
 /// The most a binding's sources allow it to be trusted: the least trusted
 /// of what its CEL expression reads. `kinds` gives each earlier step's kind
 /// (`gate`, `lite`, `codex` or `exec`). The workflow's input is external
@@ -481,11 +506,6 @@ pub fn load(
             }
             // Each binding's origin: what its sources allow, lowered if the
             // step says so, and no less trusted than the atom accepts.
-            let accepts = atom
-                .frontmatter
-                .get("trust")
-                .and_then(Value::as_str)
-                .unwrap_or("external");
             for (field, e) in &with {
                 let wp = format!("{sp}/with/{field}");
                 let source = e.as_str().unwrap_or_default();
@@ -507,15 +527,8 @@ pub fn load(
                     Some(declared) => declared,
                     None => allowed,
                 };
-                if trust_rank(origin) < trust_rank(accepts) {
-                    return Err(fail(
-                        &wp,
-                        format!(
-                            "`{source}` is {origin} data, and atom `{atom_name}` accepts {accepts} input at most \
-                             (`trust: '{accepts}'`); pass it through a step that can take it, or declare a lower trust \
-                             on the atom if it is built for {origin} input"
-                        ),
-                    ));
+                if let Some(refused) = untrusted_binding(atom, source, origin) {
+                    return Err(fail(&wp, refused));
                 }
             }
             for r in &required {

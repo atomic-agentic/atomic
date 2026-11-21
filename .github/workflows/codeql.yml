@@ -51,6 +51,23 @@ jobs:
         if: matrix.language == 'rust'
         run: rustup show active-toolchain || rustup toolchain install
 
+      # The extractor's cargo resolves the whole graph, which fetches the
+      # Codex git sources and rusty_v8's Chromium submodules: restore them
+      # from the cache CI's Clippy job saves on main (see
+      # .github/actions/rust-setup, whose paths and key this matches). It is
+      # never saved from here, and a miss only fetches them again. Nothing
+      # here waits for CI, nor CI for this.
+      - name: Restore cargo's downloads
+        if: matrix.language == 'rust'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-home-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: cargo-home-${{ runner.os }}-
+
       - uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           languages: ${{ matrix.language }}

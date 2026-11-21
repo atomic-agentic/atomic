@@ -1701,6 +1701,8 @@ std::thread_local! {
     /// Whether this thread redacts a panic's message, whose own panic must
     /// not be redacted again.
     static REDACTING_A_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Where this thread's last panic happened, as the hook saw it.
+    static PANICKED_AT: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 
 /// How long a panic's hook waits for its message to be redacted. Redacting
@@ -1745,12 +1747,26 @@ fn hook_line(redacting: bool, message: impl FnOnce() -> String) -> Option<String
     (!redacting).then(message)
 }
 
+/// Where this thread's last panic happened (`file:line:column`), once, if
+/// the hook [`install_panic_hook`] installs saw it: for code that catches
+/// the panic and reports it.
+pub fn take_panic_location() -> Option<String> {
+    PANICKED_AT
+        .try_with(|at| at.borrow_mut().take())
+        .ok()
+        .flatten()
+}
+
 /// Make a panic write its message redacted, in place of the standard
 /// hook's unredacted text. Redaction runs on a thread of its own: if it
 /// panics, or does not finish, a fixed message is written once instead,
-/// and that panic is not redacted again. Call it first thing in `main`.
+/// and that panic is not redacted again. It also notes where the panic
+/// happened, for [`take_panic_location`]. Call it first thing in `main`.
 pub fn install_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
+        if let Some(at) = info.location() {
+            let _ = PANICKED_AT.try_with(|p| *p.borrow_mut() = Some(at.to_string()));
+        }
         if let Some(line) = hook_line(REDACTING_A_PANIC.with(std::cell::Cell::get), || {
             redact_panic(panic_text(info), |text| bounded(text, MAX_TEXT))
         }) {

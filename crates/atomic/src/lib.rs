@@ -8,6 +8,7 @@
 #![recursion_limit = "512"]
 
 pub mod metering;
+pub mod panics;
 pub mod pipeline;
 pub mod retention;
 pub mod telemetry;

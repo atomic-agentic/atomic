@@ -198,6 +198,7 @@ fn main() -> std::process::ExitCode {
 async fn flush_spans() {
     if atomic_app::telemetry::flush_unless_signalled().await {
         atomic_core::log_line!("stopping now, without sending the last spans");
+        atomic_exec::process::end_all(&mut |what| atomic_core::log_line!("atomic: {what}"));
         std::process::exit(130);
     }
 }
@@ -284,12 +285,20 @@ fn real_main() -> anyhow::Result<()> {
             Ok(state) => run(cli, paths, state).await,
             Err(e) => Err(e),
         };
+        // Nothing this process started outlives it, or the execution lock it
+        // may hold, however the command ends.
         if let Err(e) = outcome {
             failure::report(&failure::analyze(&e), json);
             flush_spans().await;
+            atomic_exec::process::end_all(&mut |what| atomic_core::log_line!("atomic: {what}"));
             std::process::exit(1);
         }
         flush_spans().await;
+        // Exit here, not by returning, when a command was still running:
+        // its thread waits for the exit, and the runtime would wait for it.
+        if atomic_exec::process::end_all(&mut |what| atomic_core::log_line!("atomic: {what}")) > 0 {
+            std::process::exit(0);
+        }
         Ok(())
     })
 }
@@ -533,7 +542,12 @@ fn check(path: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
         let tools = atomic_schema::openapi::operations(&spec)
             .map_err(|e| anyhow::anyhow!("{}: {e}", source.path.display()))?;
         for tool in &tools {
-            for schema in std::iter::once(&tool.input).chain(tool.output.as_ref()) {
+            // The executor checks each response against its own schema, so
+            // each must compile, not only the first.
+            for schema in std::iter::once(&tool.input)
+                .chain(tool.output.as_ref())
+                .chain(tool.responses.values().flatten())
+            {
                 atomic_schema::registry::Registry::new()
                     .validator_for(schema)
                     .map_err(|e| {
@@ -771,6 +785,7 @@ async fn prompt(
         meter: atomic_core::usage::Metering::none(),
         guard: codex::StateGuard::for_project(state)?,
         backend,
+        caches: None,
     };
     let spec = codex::TurnSpec {
         prompt: args.prompt.join(" "),

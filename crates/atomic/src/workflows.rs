@@ -62,6 +62,11 @@ pub const UNCONFINABLE_EXIT: i32 = 78;
 /// set aside instead of stopping the process (see [`settled`]).
 static SERVING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Whether this process is `atomic serve`.
+pub fn serving() -> bool {
+    SERVING.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Make this process `atomic serve`: from now on a step that cannot confine
 /// its commands leaves its run unfinished and the process serving.
 pub fn serve_past_unconfinable_steps() {
@@ -82,6 +87,16 @@ pub(crate) async fn settled<T>(
     place: &str,
     counted: bool,
 ) -> Result<T> {
+    // This process is stopping, and may have killed what the atom ran, its
+    // commands, a model turn's, a compiler or a helper: how the atom ended
+    // is not its result. Like a stopped command's step, it records
+    // nothing, and waits for the exit.
+    if atomic_exec::process::stopping() {
+        if counted {
+            crate::pipeline::set_aside();
+        }
+        return std::future::pending().await;
+    }
     match result {
         Err(AtomError::Unconfinable(why)) if SERVING.load(std::sync::atomic::Ordering::SeqCst) => {
             atomic_core::log_line!("atomic serve: {place}: {why}");
@@ -117,6 +132,8 @@ pub fn atom_failure(e: AtomError) -> DurableError {
                 "atomic: stopping without recording an outcome; resume the run where the sandbox \
                  can start"
             );
+            // Whatever else this process started ends first.
+            atomic_exec::process::end_all(&mut |what| atomic_core::log_line!("atomic: {what}"));
             std::process::exit(UNCONFINABLE_EXIT);
         }
         // Like a crash before the checkpoint: recovery runs the step again,
@@ -204,6 +221,7 @@ pub fn register_change_request<R: DurableRuntime>(
             let (budget, draft_caps, review_caps) =
                 (budget.clone(), draft_caps.clone(), review_caps.clone());
             let run = ctx.workflow_id().to_owned();
+            let id = run.clone();
             let span = crate::telemetry::workflow_span(CHANGE_REQUEST, &run);
             let work = async move {
                 let lite = runtimes.lite.clone();
@@ -281,7 +299,7 @@ pub fn register_change_request<R: DurableRuntime>(
                     steps: vec![draft, review],
                 })
             };
-            crate::telemetry::traced(span, work)
+            crate::panics::caught(id, crate::telemetry::traced(span, work))
         },
     );
     Ok(())

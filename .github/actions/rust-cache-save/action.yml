@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Saves the caches .github/actions/rust-setup restored, after a job's last
+# cargo command: target/ trimmed to the dependencies' artifacts
+# (scripts/cache-trim.py), and, from one job, cargo's downloads. A cache that
+# was restored from its exact key is already saved and is left alone. CI calls
+# this only on pushes to main. Actions are pinned by commit SHA.
+
+name: Rust cache save
+description: Trim target/ and save the build caches rust-setup restored
+
+inputs:
+  setup:
+    description: The rust-setup step's outputs, as toJSON(steps.<id>.outputs)
+    required: true
+  cargo-home:
+    description: '"true" to save cargo''s downloads as well'
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Trim the build cache
+      id: trim
+      if: ${{ !cancelled() && fromJSON(inputs.setup)['target-hit'] != 'true' }}
+      shell: bash
+      run: |
+        scripts/cache-trim.py
+        du -sh target
+
+    # The paths here and in rust-setup must match exactly.
+    # Never an untrimmed target/: it would not fit beside the others.
+    - name: Save the build cache
+      if: ${{ !cancelled() && steps.trim.outcome == 'success' }}
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: target
+        key: ${{ fromJSON(inputs.setup)['target-key'] }}
+
+    - name: Save cargo's downloads
+      if: ${{ !cancelled() && inputs.cargo-home == 'true' && fromJSON(inputs.setup)['cargo-home-hit'] != 'true' }}
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+        key: ${{ fromJSON(inputs.setup)['cargo-home-key'] }}
