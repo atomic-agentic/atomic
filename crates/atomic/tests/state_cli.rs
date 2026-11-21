@@ -18,6 +18,9 @@
 //!   follows links, and so is one that `..` leads into it, whether the names
 //!   it steps over are there yet or not, and one that is relative and lands in
 //!   it once read from the directory the command was run in;
+//! - a relative `ATOMIC_HOME` is read from the directory the command was run
+//!   in, so the state directory a command reports, and every directory it
+//!   makes under that home, are below that directory;
 //! - so is a home where no `ATOMIC_HOME` points, because the default data
 //!   directory is the configuration directory, and one atomic cannot place at
 //!   all, rather than running on a spelling it has not compared — and so is a
@@ -693,6 +696,38 @@ fn a_relative_xdg_config_home_gives_way_to_home() {
         PathBuf::from(String::from_utf8_lossy(&out.stdout).trim()),
         state,
         "{t}"
+    );
+    assert!(state.is_dir(), "the state directory is missing: {t}");
+    assert!(private.is_dir(), "the private directory is missing: {t}");
+}
+
+#[test]
+fn a_relative_home_is_placed_where_the_command_is_run() {
+    let dir = scratch("relative-home");
+    let project = dir.join("project");
+    // A relative `ATOMIC_HOME` names a directory below the one the command was
+    // run in, and the state home is placed there before a project's state is
+    // resolved from it: what atomic reports, and the state and private
+    // directories it makes under the home, are below this directory. Read as
+    // written, the same name would place a project's state wherever the
+    // directory it is next read from happens to be, and a state placed by
+    // spelling is a state the configuration directory was never compared with.
+    let id = project_id(&dir, &project);
+    let (state, private) = state_and_private(&project.join("home"), &id);
+    let out = atomic(
+        &dir,
+        &project,
+        &["debug", "state-dir"],
+        &[("ATOMIC_HOME", "home".to_string())],
+    );
+    let t = text(&out);
+    assert!(out.status.success(), "{t}");
+    // The whole directory as atomic reports it, so that the home as it was
+    // spelled does not pass in place of the directory below this one.
+    assert_eq!(
+        PathBuf::from(String::from_utf8_lossy(&out.stdout).trim()),
+        state,
+        "the reported state directory is not below the directory the command was run in: {t}"
     );
     assert!(state.is_dir(), "the state directory is missing: {t}");
     assert!(private.is_dir(), "the private directory is missing: {t}");
