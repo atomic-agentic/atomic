@@ -139,8 +139,8 @@ turn or an exec step starts: a place on it that appears while a command runs
 is denied only to the commands that start after it, and a link made after
 the list is not followed until the next turn or step. Credentials kept
 anywhere else are not covered. An
-exec atom's command may write only its scratch directory and the project's
-caches, and only read the artifacts it is given there; `--runner process` confines it the same way. It runs in a process
+exec atom's command may write only its scratch directory and its run's own
+build caches, which no other run sees and which go when the run ends, and only read the artifacts it is given there; `--runner process` confines it the same way. It runs in a process
 namespace of its own, so it can neither see nor signal atomic, its runner or
 any other process outside, and in a session of its own, with no controlling
 terminal and a `/dev` and `/proc` of its own, so it cannot type into, read or

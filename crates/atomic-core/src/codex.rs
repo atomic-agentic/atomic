@@ -947,7 +947,7 @@ fn keep_sandbox_off_keyrings() {
 /// atomic's private state, which is denied as it is to turns (see
 /// [`denied_paths`]), and the private state of every other project under
 /// the same atomic home; only the command's own writable directories, such
-/// as its scratch directory, and the project's caches writable; no network
+/// as its scratch directory and its run's build caches, writable; no network
 /// and no sockets, since no atom can declare network access at this version.
 /// The command still runs with exactly its environment, in its directory.
 #[derive(Clone, Debug)]
@@ -955,7 +955,33 @@ pub struct ExecSandbox {
     helper: PathBuf,
     guard: StateGuard,
     codex_home: PathBuf,
-    also_writable: Vec<PathBuf>,
+    /// For crash and durability tests only (see [`test_log_dir`]).
+    test_log: Option<PathBuf>,
+}
+
+/// For crash and durability tests only, which count across runs how often
+/// a command ran: with the `failpoints` feature, `ATOMIC_TEST_EXEC_LOG`
+/// names a directory, by one plain name inside the state directory, that
+/// every confined command may also write. Compiled out without the feature,
+/// so a build for use has none.
+fn test_log_dir(guard: &StateGuard) -> Option<PathBuf> {
+    #[cfg(feature = "failpoints")]
+    {
+        let name = std::env::var("ATOMIC_TEST_EXEC_LOG").ok()?;
+        let plain = !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        match guard {
+            StateGuard::Deny(private) if plain => Some(private.state_dir.join(name)),
+            _ => None,
+        }
+    }
+    #[cfg(not(feature = "failpoints"))]
+    {
+        let _ = guard;
+        None
+    }
 }
 
 impl ExecSandbox {
@@ -967,19 +993,16 @@ impl ExecSandbox {
             "this process has no Linux sandbox helper to confine exec atoms' commands with; \
              run atomic itself, which provides one",
         )?;
+        let test_log = test_log_dir(&guard);
+        if let Some(dir) = &test_log {
+            crate::state::private_dir(dir)?;
+        }
         Ok(Self {
             helper,
             guard,
             codex_home,
-            also_writable: Vec::new(),
+            test_log,
         })
-    }
-
-    /// The same confinement, letting every command also write `dirs`, such
-    /// as the project's build and package caches.
-    pub fn also_writing(mut self, dirs: Vec<PathBuf>) -> Self {
-        self.also_writable = dirs;
-        self
     }
 
     /// The profile for a command that may write `writable`, except the
@@ -993,16 +1016,17 @@ impl ExecSandbox {
             FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry, NetworkSandboxPolicy,
         };
         let mut writes = writable.to_vec();
-        writes.extend(self.also_writable.iter().cloned());
+        writes.extend(self.test_log.iter().cloned());
+        let writable = writes.as_slice();
         let base = permission_profile(
             crate::typed::Sandbox::ReadOnly,
             &self.guard,
             &self.codex_home,
             None,
-            &writes,
+            writable,
         )?;
         let mut policy = base.file_system_sandbox_policy();
-        for dir in writable.iter().chain(&self.also_writable) {
+        for dir in writable {
             let dir = AbsolutePathBuf::from_absolute_path(dir)
                 .with_context(|| format!("resolve the writable directory {}", dir.display()))?;
             policy.entries.push(FileSystemSandboxEntry::new(
@@ -2752,9 +2776,7 @@ mod tests {
             private: state.join("private"),
             also: vec![state.join("keys")],
         });
-        let sandbox = ExecSandbox::new(&paths, guard, state.join("codex"))
-            .expect("a helper")
-            .also_writing(vec![state.join("cache")]);
+        let sandbox = ExecSandbox::new(&paths, guard, state.join("codex")).expect("a helper");
         let tmp = state.join("scratch/.tmp");
         let confined = sandbox
             .confine(
@@ -2763,7 +2785,7 @@ mod tests {
                     args: vec!["-c".into(), "true".into()],
                     cwd: state.clone(),
                     env: vec![("HOME".into(), scratch_dir.display().to_string())],
-                    writable: vec![scratch_dir.clone()],
+                    writable: vec![scratch_dir.clone(), state.join("cache/run-1")],
                     ..Default::default()
                 },
                 &tmp,
@@ -2797,7 +2819,8 @@ mod tests {
                 "{denied:?}: {text}"
             );
         }
-        for writable in [&scratch_dir, &state.join("cache")] {
+        // Its scratch and its run's caches, as the command names them.
+        for writable in [&scratch_dir, &state.join("cache/run-1")] {
             assert!(
                 text.contains(&writable.display().to_string()),
                 "{writable:?}: {text}"

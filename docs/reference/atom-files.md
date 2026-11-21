@@ -53,7 +53,7 @@ state (every project's database and gate store under the atomic home's
 directories) and the places in your home directory where credentials are
 kept, the same ones a Codex atom's commands cannot read (see
 [configuration](#configuration)). It can write only its own scratch directory (its `HOME`
-and `TMPDIR`) and the project's build caches; a command that writes anywhere
+and `TMPDIR`) and, in a workflow, its run's own build caches; a command that writes anywhere
 else fails. It has no network and cannot use sockets, until atoms can declare
 the network they need. It also:
 
@@ -61,8 +61,11 @@ the network they need. It also:
   sandbox keeps them in every writable directory;
 - cannot gain privileges (no `sudo`, no setuid programs) and sees no GPU or
   other devices beyond the basic ones;
-- is not told where the caches are: name the directory in `env` if a tool needs
-  it;
+- finds its run's build caches through `ATOMIC_CACHE_DIR`, `XDG_CACHE_HOME`,
+  `CARGO_TARGET_DIR`, npm's, pip's and Go's cache variables, as a worktree
+  step does: they are the run's own, shared by its steps, and removed when
+  the run ends, so no run finds what another wrote (a variable the atom
+  declares in `env` wins);
 - cannot be a program whose path holds `=`.
 
 `env` cannot set `HOME` or `TMPDIR`, which are the command's own, nor

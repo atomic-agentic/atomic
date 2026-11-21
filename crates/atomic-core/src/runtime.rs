@@ -1134,20 +1134,31 @@ pub async fn run_exec(
     clock: Option<&crate::astro::StepClock>,
     artifacts: &Artifacts,
 ) -> Result<(Value, RunMetadata), AtomError> {
-    let workspace = open_exec_workspace(atom, identity, backend).await?;
+    let workspace = open_exec_workspace(atom, identity, backend, None).await?;
     run_exec_opened(atom, compiled, input, identity, workspace, clock, artifacts).await
 }
 
 /// Open the workspace an exec atom's command will run in, as [`run_exec`]
 /// does. A workflow opens it before it records the step's attempt, so an
 /// attempt whose workspace never opened never counts as one whose command
-/// may have run.
+/// may have run. With `caches`, its run's own build caches, the command is
+/// pointed at them and may write them; what the atom declares wins. None
+/// outlives the run.
 pub async fn open_exec_workspace(
     atom: &AtomFile,
     identity: &EffectIdentity,
     backend: Arc<dyn atomic_exec::ExecutionBackend>,
+    caches: Option<&crate::worktree::Caches>,
 ) -> Result<WorkspaceGuard, AtomError> {
-    let declared = declared_env(atom);
+    let (mut env, mut writable_roots) = (std::collections::BTreeMap::new(), Vec::new());
+    if let Some(caches) = caches {
+        caches
+            .create()
+            .map_err(|e| AtomError::Runtime(format!("the run's build caches: {e}")))?;
+        env.extend(caches.env());
+        writable_roots.push(caches.dir().to_owned());
+    }
+    env.extend(declared_env(atom));
     open_workspace(
         backend,
         Open {
@@ -1156,7 +1167,8 @@ pub async fn open_exec_workspace(
             step: identity.step_id.clone(),
             attempt: new_attempt(),
             source: Some(atom.program.root.clone()),
-            env: declared,
+            writable_roots,
+            env,
             ..Open::default()
         },
     )
@@ -1515,8 +1527,14 @@ async fn run_command(
         stdin,
         time_limit: EXEC_TIME_LIMIT,
         output_limit: EXEC_OUTPUT_LIMIT,
-        // A confining backend lets it write its scratch directory only.
-        writable: workspace.scratch.iter().cloned().collect(),
+        // A confining backend lets it write its scratch directory and its
+        // run's build caches only.
+        writable: workspace
+            .scratch
+            .iter()
+            .chain(&workspace.writable_roots)
+            .cloned()
+            .collect(),
         // Inside it, the inputs it is given, which it only reads.
         read_only,
     };

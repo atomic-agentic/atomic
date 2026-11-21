@@ -134,23 +134,25 @@ fn project(dir: &Path) -> PathBuf {
     }
     std::fs::write(project.join("atomic.yaml"), "atomic: 1\nname: notes\n").expect("manifest");
     // Each run logs one line. Exec commands run confined, and may write only
-    // their scratch directory and the project's caches: the log is kept in
-    // the caches of the state directory the command runs under, found from
-    // its scratch directory (its HOME, `<state>/scratch/...`). The default
-    // home's is linked from `dir/count.log`; [`count_log`] reads every
-    // home's, for processes given a state directory of their own.
+    // their scratch directory and their run's caches, which go with the run:
+    // the log is kept in the test-only directory every command of these
+    // tests may also write (`ATOMIC_TEST_EXEC_LOG`, see [`command_as`]),
+    // `<state>/exec-log` of the state directory the command runs under,
+    // found from its scratch directory (its HOME, `<state>/scratch/...`).
+    // The default home's is linked from `dir/count.log`; [`count_log`] reads
+    // every home's, for processes given a state directory of their own.
     std::fs::write(
         project.join("tools/count.py"),
         "import json, os, sys\n\
          note = json.load(sys.stdin)\n\
          at = os.environ['HOME']\n\
          while os.path.basename(at) != 'scratch' and at != '/':\n    at = os.path.dirname(at)\n\
-         open(os.path.join(os.path.dirname(at), 'cache', 'count.log'), 'a').write('ran\\n')\n\
+         open(os.path.join(os.path.dirname(at), 'exec-log', 'count.log'), 'a').write('ran\\n')\n\
          json.dump({'title': note['text'][:25], 'words': len(note['text'].split())}, sys.stdout)\n",
     )
     .expect("script");
-    let caches = state_dir(dir, &project).join("cache");
-    std::fs::create_dir_all(&caches).expect("caches");
+    let caches = state_dir(dir, &project).join("exec-log");
+    std::fs::create_dir_all(&caches).expect("the exec log");
     let log = caches.join("count.log");
     std::os::unix::fs::symlink(&log, dir.join("count.log")).expect("log link");
     write_atom(
@@ -206,7 +208,7 @@ fn count_log(dir: &Path) -> Vec<String> {
     for home in std::fs::read_dir(dir).into_iter().flatten().flatten() {
         let projects = home.path().join("projects");
         for state in std::fs::read_dir(projects).into_iter().flatten().flatten() {
-            let log = std::fs::read_to_string(state.path().join("cache/count.log"));
+            let log = std::fs::read_to_string(state.path().join("exec-log/count.log"));
             lines.extend(log.unwrap_or_default().lines().map(str::to_owned));
         }
     }
@@ -214,7 +216,7 @@ fn count_log(dir: &Path) -> Vec<String> {
 }
 
 /// A file named `name` that an exec atom's confined command may write: in
-/// the project's caches, beside `count.log`, and read through `dir/<name>`.
+/// the test-only exec log, beside `count.log`, and read through `dir/<name>`.
 fn command_log(dir: &Path, name: &str) -> PathBuf {
     let caches = std::fs::read_link(dir.join("count.log")).expect("the log link");
     let log = caches.parent().expect("the caches").join(name);
@@ -336,7 +338,11 @@ fn command_as(
         .current_dir(cwd)
         .env("HOME", dir.join("home"))
         .env("ATOMIC_HOME", dir.join("atomic-home"))
-        .env("USER", "dev");
+        .env("USER", "dev")
+        // Where exec commands log that they ran: in no run's caches, which
+        // go with the run, but in a directory these tests' builds let every
+        // confined command write.
+        .env("ATOMIC_TEST_EXEC_LOG", "exec-log");
     for name in [
         "CODEX_HOME",
         "XDG_DATA_HOME",

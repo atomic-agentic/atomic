@@ -116,21 +116,17 @@ pub fn exec_backend(
     // Exec atoms' commands run under the same sandbox helper as turns'
     // commands, denied atomic's private state. Elsewhere than Linux this is
     // not verified, and they run unconfined (see the availability notes).
-    // They may write their scratch directory and the project's caches.
+    // They may write their scratch directory and their run's own build
+    // caches, which each workspace names, and nothing shared between runs.
     #[cfg(target_os = "linux")]
-    let local = {
-        let caches = atomic_core::worktree::Caches::for_state(state);
-        caches.create().context("the project's caches")?;
-        local.confined(std::sync::Arc::new(
-            atomic_core::codex::ExecSandbox::new(
-                paths,
-                atomic_core::codex::StateGuard::for_project(state)?,
-                state.codex_home(),
-            )
-            .context("confine exec atoms' commands")?
-            .also_writing(vec![caches.dir().to_owned()]),
-        ))
-    };
+    let local = local.confined(std::sync::Arc::new(
+        atomic_core::codex::ExecSandbox::new(
+            paths,
+            atomic_core::codex::StateGuard::for_project(state)?,
+            state.codex_home(),
+        )
+        .context("confine exec atoms' commands")?,
+    ));
     match runner {
         RunnerKind::Local => atomic_exec::Backend::connect(local),
         RunnerKind::Process => atomic_exec::Backend::connect(ProcessRunner {
@@ -359,6 +355,8 @@ pub async fn open(
             store,
             deployment: deployment(),
             worktrees,
+            // Each run's build caches, in a directory of its own here.
+            caches: Some(state.dir().join("cache")),
             // Budget caps and prices, through the configuration layers.
             budgets: Arc::new(resolved.settings.budget.clone()),
             // No context settings yet: a step whose atom declares a public

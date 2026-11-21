@@ -254,6 +254,7 @@ fn the_workflow_runs_and_a_helper_validator_asks_for_one_repair() {
                 store,
                 deployment,
                 worktrees: None,
+                caches: None,
                 budgets: Arc::default(),
                 context: None,
             },
