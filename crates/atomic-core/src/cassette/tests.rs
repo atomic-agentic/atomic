@@ -450,3 +450,53 @@ async fn dropping_the_cassette_stops_its_connections() {
     assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Recording forwards the atom's key to the real endpoint with the client a
+/// lite atom calls with, so a redirect the endpoint answers is passed back,
+/// never followed with the key, and nothing is recorded.
+#[tokio::test]
+async fn recording_never_follows_a_redirect_with_the_key() {
+    use std::io::{BufRead, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let answering = |response: String| {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        let seen = Arc::new(AtomicUsize::new(0));
+        let counted = seen.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                counted.fetch_add(1, Ordering::SeqCst);
+                let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone"));
+                let mut line = String::new();
+                while reader.read_line(&mut line).is_ok_and(|n| n > 0) && line != "\r\n" {
+                    line.clear();
+                }
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (format!("http://{address}"), seen)
+    };
+    let (elsewhere, followed) =
+        answering("HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}".to_owned());
+    let (redirecting, asked) = answering(format!(
+        "HTTP/1.1 307 Temporary Redirect\r\nlocation: {elsewhere}/v1/chat/completions\r\n\
+         content-length: 0\r\n\r\n"
+    ));
+    let root = root("redirect");
+    let tapes = root.join("cassettes");
+    let recorder = Cassette::start(&tapes, &root, &format!("{redirecting}/v1"), Mode::Record)
+        .await
+        .expect("cassette");
+    let (status, _) = post(&recorder, "/v1/chat/completions", ASK, Some("sk-the-key")).await;
+    assert_eq!(status, 307, "the redirect is passed back");
+    assert_eq!(asked.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        followed.load(Ordering::SeqCst),
+        0,
+        "the redirect was not followed"
+    );
+    assert_eq!(recorder.tally().recorded, 0);
+    drop(recorder);
+    let _ = std::fs::remove_dir_all(&root);
+}

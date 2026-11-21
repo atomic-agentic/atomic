@@ -57,6 +57,120 @@ impl Wire {
     }
 }
 
+/// The HTTP client a lite atom calls the model endpoint at `base_url` with,
+/// every request bounded by `timeout`. It follows no redirect: a redirect
+/// would resend the key, and reqwest keeps the `Authorization` header across
+/// a change from `https` to `http` on the same host and port. An endpoint
+/// on this machine over plain `http` goes by no proxy, since a proxy
+/// variable such as `HTTP_PROXY` would otherwise carry the key there in
+/// cleartext; any other endpoint uses the proxies the environment names.
+pub fn model_client(
+    base_url: &str,
+    timeout: std::time::Duration,
+) -> anyhow::Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none());
+    if http_loopback(base_url) {
+        builder = builder.no_proxy();
+    }
+    builder.build().context("build the HTTP client")
+}
+
+/// Whether `base_url` is plain `http` to this machine: see
+/// [`http_loopback_host`].
+fn http_loopback(base_url: &str) -> bool {
+    http_loopback_host(base_url).is_some()
+}
+
+/// Why a model call carrying a key to `base_url` would hand that key to a
+/// proxy in cleartext, if it would: the endpoint is plain `http` on this
+/// machine (see [`http_loopback_host`]), a proxy variable (`HTTP_PROXY`,
+/// `http_proxy`, `ALL_PROXY` or `all_proxy`) names a proxy, and no entry
+/// of `NO_PROXY` covers the host. As in the client, a `NO_PROXY` that is set
+/// at all, even empty, hides `no_proxy`. `var` reads the environment. A Codex
+/// atom's client cannot be told to skip proxies, so its turn is refused
+/// rather than sent.
+pub fn proxied_key(base_url: &str, var: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    let host = http_loopback_host(base_url)?;
+    let set = |name: &str| var(name).filter(|v| !v.trim().is_empty());
+    let proxy = ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"]
+        .into_iter()
+        .find(|name| set(name).is_some())?;
+    let exempt = var("NO_PROXY")
+        .or_else(|| var("no_proxy"))
+        .is_some_and(|list| {
+            list.split(',')
+                .any(|entry| no_proxy_covers(entry.trim(), &host))
+        });
+    if exempt {
+        return None;
+    }
+    Some(format!(
+        "the model endpoint {base_url} is plain http on this machine, and {proxy} names a proxy \
+         that would carry its API key there in cleartext; set NO_PROXY to include {host}, or use \
+         an https endpoint"
+    ))
+}
+
+/// Whether one `NO_PROXY` entry covers `host`, matched as the model client
+/// matches it: an address host by the same address or a network holding it
+/// (`127.0.0.0/8`, never `[::1]` in brackets); a name host by `*`, the same
+/// name, or a domain it is under (`localhost` or `.localhost`). Anything the
+/// client would still send through the proxy is not covered.
+fn no_proxy_covers(entry: &str, host: &str) -> bool {
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        if let Some((net, bits)) = entry.split_once('/') {
+            let (Ok(net), Ok(bits)) = (net.parse::<std::net::IpAddr>(), bits.parse::<u32>()) else {
+                return false;
+            };
+            return match (ip, net) {
+                (std::net::IpAddr::V4(ip), std::net::IpAddr::V4(net)) if bits <= 32 => {
+                    let mask = u32::MAX.checked_shl(32 - bits).unwrap_or(0);
+                    u32::from(ip) & mask == u32::from(net) & mask
+                }
+                (std::net::IpAddr::V6(ip), std::net::IpAddr::V6(net)) if bits <= 128 => {
+                    let mask = u128::MAX.checked_shl(128 - bits).unwrap_or(0);
+                    u128::from(ip) & mask == u128::from(net) & mask
+                }
+                _ => false,
+            };
+        }
+        return entry.parse::<std::net::IpAddr>() == Ok(ip);
+    }
+    if entry == "*" {
+        return true;
+    }
+    let entry = entry.trim_start_matches('.').to_ascii_lowercase();
+    !entry.is_empty() && (host == entry || host.ends_with(&format!(".{entry}")))
+}
+
+/// The host of `base_url` as the client matches it against `NO_PROXY`
+/// (lower case, an address without brackets, a trailing dot kept), when it
+/// is plain `http` to this machine: a loopback address, an unspecified one
+/// (`0.0.0.0` or `[::]`, which connect here), either as an IPv4-mapped IPv6
+/// address, or `localhost`.
+fn http_loopback_host(base_url: &str) -> Option<String> {
+    let url = reqwest::Url::parse(base_url).ok()?;
+    let host = url.host_str().filter(|_| url.scheme() == "http")?;
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    let here = |ip: std::net::IpAddr| ip.is_loopback() || ip.is_unspecified();
+    let local = match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(v6)) if v6.to_ipv4_mapped().is_some_and(|v4| here(v4.into())) => {
+            true
+        }
+        Ok(ip) => here(ip),
+        Err(_) => {
+            let name = host.trim_end_matches('.');
+            name == "localhost" || name.ends_with(".localhost")
+        }
+    };
+    local.then_some(host)
+}
+
 /// Whether `base_url` is OpenAI's own API, the one endpoint known to enforce
 /// a Responses API structured-output schema in decoding. Other servers may
 /// accept the schema on that API and ignore it.
@@ -245,10 +359,7 @@ where
         ),
         None => None,
     };
-    let client = reqwest::Client::builder()
-        .timeout(runtime.timeout)
-        .build()
-        .context("build the HTTP client")?;
+    let client = model_client(&runtime.endpoint.base_url, runtime.timeout)?;
 
     let mut exchange = vec![(Role::User, first.prompt.clone())];
     let mut schema = first.output_schema.clone();
@@ -416,18 +527,23 @@ async fn call(
             .await
             .with_context(|| format!("POST {url}"))?;
         let status = response.status();
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
         let text = response
             .text()
             .await
             .with_context(|| format!("read the response from {url}"))?;
-        anyhow::Ok((status, text))
+        anyhow::Ok((status, location, text))
     })
     .await;
     let failed = |answer: anyhow::Error| Called {
         answer: Err(answer),
         usage: None,
     };
-    let (status, text) = match exchanged {
+    let (status, location, text) = match exchanged {
         Ok(Ok(done)) => done,
         Ok(Err(e)) => return failed(e),
         Err(_) => {
@@ -444,7 +560,15 @@ async fn call(
         Wire::Responses => usage_of(v, "input_tokens", "output_tokens"),
     });
     let answer = if !status.is_success() {
-        Err(ProviderError::answered(&url, status, &text, value.as_ref()).into())
+        let answered =
+            anyhow::Error::from(ProviderError::answered(&url, status, &text, value.as_ref()));
+        match redirected_to(base, &url, status, location.as_deref()) {
+            Some((target, moved)) => Err(answered.context(format!(
+                "POST {url}: the endpoint redirects to {target}; atomic does not follow a \
+                 redirect with the key; set model.base_url to {moved}"
+            ))),
+            None => Err(answered),
+        }
     } else {
         match &value {
             None => Err(anyhow!(
@@ -459,6 +583,33 @@ async fn call(
         }
     };
     Called { answer, usage }
+}
+
+/// Where a redirect from the call to `url`, under the endpoint `base`,
+/// points, and the base URL that would reach it directly, when `status` is a
+/// redirect with a `location`: both without a query, a fragment or
+/// credentials, which can carry a signature or a token.
+fn redirected_to(
+    base: &str,
+    url: &str,
+    status: reqwest::StatusCode,
+    location: Option<&str>,
+) -> Option<(String, String)> {
+    if !status.is_redirection() {
+        return None;
+    }
+    let mut target = reqwest::Url::parse(url).ok()?.join(location?).ok()?;
+    target.set_query(None);
+    target.set_fragment(None);
+    let _ = target.set_username("");
+    let _ = target.set_password(None);
+    let target = target.to_string();
+    let call = url.strip_prefix(base).unwrap_or_default();
+    let moved = match target.strip_suffix(call) {
+        Some(moved) if !call.is_empty() => moved.to_owned(),
+        _ => target.clone(),
+    };
+    Some((target, moved))
 }
 
 /// A provider's answer that is not a success: its status, the start of its
