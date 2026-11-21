@@ -370,6 +370,8 @@ pub async fn run(
                 &budgets,
                 &Budget::default(),
                 &[(atom.name.as_str(), &atom.budget, model.as_str())],
+                // An eval meters its model calls only.
+                &[],
             )
             .map_err(|(_, e)| {
                 Failure::new(
@@ -762,6 +764,7 @@ fn runtimes(
         },
         lite,
         exec: exec.clone(),
+        exec_meter: Default::default(),
         clock: None,
     })
 }

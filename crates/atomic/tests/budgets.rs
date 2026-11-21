@@ -117,6 +117,7 @@ fn runtimes(dir: &Path, base_url: &str) -> Arc<Runtimes> {
         },
         lite: LiteRuntime::new(endpoint, AtomConfig::default()),
         exec: Default::default(),
+        exec_meter: Default::default(),
         clock: None,
     })
 }
@@ -1343,6 +1344,7 @@ fn a_request_in_flight_is_estimated_at_the_larger_of_one_bound_and_the_last_requ
             &settings,
             &Budget::default(),
             &[("turn", &Budget::default(), "synthetic")],
+            &[],
         )
         .expect("a plan");
         let budget = RunBudget::pinned(rt.ledger(), &plan);
@@ -1359,6 +1361,7 @@ fn a_request_in_flight_is_estimated_at_the_larger_of_one_bound_and_the_last_requ
                 model: "synthetic".into(),
                 input_bound: None,
                 turn: true,
+                work: false,
             })
             .await
             .expect("admitted");
@@ -1477,6 +1480,101 @@ fn a_dollar_cap_on_an_unpriced_model_fails_configuration() {
         )
         .expect("priced");
         assert_eq!(r.micro_usd, Some(1_000_000));
+    });
+}
+
+/// A command admitted by a process that then died is found when its step
+/// runs again: its reservation is settled then, not held for good, at the
+/// time its last heartbeat vouches for, and a step whose command was never
+/// admitted is told apart from it.
+#[test]
+fn a_dead_commands_reservation_is_settled_when_it_is_found() {
+    use atomic_durable::usage::{Admission, Charge, Request, Scope};
+    use std::sync::atomic::{AtomicI64, Ordering};
+    on_codex_runtime(async {
+        let dir = scratch("dead-command");
+        let rt = Durare::sqlite(&dir.join("atomic.db"))
+            .await
+            .expect("engine");
+        let start = 1_800_000_000_000;
+        let now = Arc::new(AtomicI64::new(start));
+        let clock = now.clone();
+        let ledger = rt.ledger().with_clock(move || clock.load(Ordering::SeqCst));
+        let plan = atomic_app::metering::BudgetPlan::resolve(
+            &settings(10_000_000, 100_000_000),
+            &Budget::default(),
+            &[],
+            &[("nap", &Budget::default())],
+        )
+        .expect("a plan");
+        let caps = |r: &atomic_core::budget::Resolved| Caps {
+            tokens: i64::try_from(r.tokens).expect("tokens"),
+            millis: i64::try_from(r.millis).expect("millis"),
+            micro_usd: None,
+        };
+        // A command admitted as the step's work, as its meter admits one.
+        let least = Charge {
+            tokens: 0,
+            millis: 500,
+            micro_usd: 0,
+        };
+        let admitted = ledger
+            .admit(Request {
+                id: "dead:3:0".into(),
+                run: "dead".into(),
+                model: atomic_core::usage::WORK_MODEL.into(),
+                chain: vec![
+                    Scope::run("dead", caps(&plan.run)),
+                    Scope::atom("dead", 3, caps(&plan.exec["nap"])),
+                ],
+                reserve: least,
+                maximum: least,
+                turn: true,
+            })
+            .await
+            .expect("admit");
+        let Admission::Admitted {
+            request, attempt, ..
+        } = admitted
+        else {
+            panic!("refused: {admitted:?}");
+        };
+        // Its last heartbeat twenty seconds in; then its process died, and
+        // the step runs again an hour later.
+        now.store(start + 20_000, Ordering::SeqCst);
+        ledger
+            .heartbeat(&request, attempt)
+            .await
+            .expect("heartbeat");
+        now.store(start + 3_600_000, Ordering::SeqCst);
+        let budget = RunBudget::pinned(ledger.clone(), &plan);
+        let step = atomic_durable::StepInfo {
+            workflow_id: "dead".into(),
+            step_id: 3,
+        };
+        assert!(budget.command_admitted(&step).await.expect("ledger"));
+        assert!(
+            ledger.unsettled("dead").await.expect("ledger").is_empty(),
+            "the dead command's reservation is still held"
+        );
+        // Charged until a heartbeat after its last: 20 s and 5 s more, not
+        // the hour since, nor all it reserved.
+        let attempts = ledger.attempts("dead").await.expect("attempts");
+        assert_eq!(attempts.len(), 1, "{attempts:?}");
+        assert_eq!(attempts[0].state, "settled", "{attempts:?}");
+        assert_eq!(attempts[0].charged.millis, 25_000, "{attempts:?}");
+        let run = ledger
+            .allowance("run:dead")
+            .await
+            .expect("ledger")
+            .expect("the run's allowance");
+        assert_eq!(run.charged.millis, 25_000, "{run:?}");
+        let never = atomic_durable::StepInfo {
+            workflow_id: "dead".into(),
+            step_id: 5,
+        };
+        assert!(!budget.command_admitted(&never).await.expect("ledger"));
+        rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
     });
 }
 

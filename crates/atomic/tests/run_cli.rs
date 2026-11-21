@@ -1386,8 +1386,11 @@ fn a_run_stopped_mid_call_charges_the_call_only_the_time_it_ran() {
         // the time is what it ran, not the 10 minutes it reserved.
         let rt = Durare::sqlite(&database(&state)).await.expect("store");
         let attempts = rt.ledger().attempts("stopped-1").await.expect("attempts");
-        assert_eq!(attempts.len(), 1, "{attempts:?}");
-        let call = &attempts[0];
+        // The exec step before rank finished, and its command is settled.
+        let (work, calls): (Vec<_>, Vec<_>) = attempts.iter().partition(|a| a.model == "(command)");
+        assert!(work.iter().all(|a| a.state == "settled"), "{attempts:?}");
+        assert_eq!(calls.len(), 1, "{attempts:?}");
+        let call = calls[0];
         assert_eq!(call.state, "reserved");
         assert_eq!(call.reserved.millis, 600_000);
         assert!(call.charged.millis < 60_000, "{call:?}");
