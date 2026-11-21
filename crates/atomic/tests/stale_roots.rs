@@ -6,7 +6,9 @@
 //! name is first looked up through the overlay, while the bind shows the
 //! place by its new name. atomic then cannot tell from the table
 //! where that place is mounted again, and refuses the list rather than
-//! leave it readable through the bind.
+//! leave it readable through the bind. The overlay's root heals on that
+//! first lookup, so this shows the check as it must work for a filesystem
+//! whose roots do not heal.
 //!
 //! The test runs itself again in a user and mount namespace of its own,
 //! where it mounts a tmpfs, an overlay on it and a bind of one of the
@@ -204,7 +206,7 @@ fn a_second_mount_whose_root_went_stale_refuses_the_list() {
         .to_string();
     assert!(
         refused.contains(&format!("the mount at {} shows", second.display()))
-            && refused.contains("(/under) does not say"),
+            && refused.contains("(/under) names no path"),
         "{refused}"
     );
     // What was at stake: the key, by the place's new name and through the

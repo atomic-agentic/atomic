@@ -435,7 +435,10 @@ when another of its mounts is the same directory as a denied place, or as
 a directory above it on the mount the place is under, and the mount
 table's root for it does not say so: the root has gone stale with nothing
 to mark it, as an overlay's does when a lower directory under a bound
-overlay directory is renamed. Otherwise FUSE (`fuse.*`), 9p,
+overlay directory is renamed. A mount point that is not there is passed
+over, and so is one, or a place, behind a directory someone else owns that
+you may not search; behind one of your own, which a command could step
+around from a user namespace of its own, nothing runs. Otherwise FUSE (`fuse.*`), 9p,
 virtiofs and other mounts are followed as local ones are. The
 links followed and the second mounts found together come to at most 512;
 past that, nothing runs. Not covered: the same remote directory, or one
@@ -445,7 +448,8 @@ differ (each gets a superblock of its own), Ceph (one per server path), two
 SMB sessions or two FUSE daemons, neither of which is denied for the other;
 a stale root, off a local filesystem, for a place that is not there yet,
 and one, on any filesystem, that makes a mount of a directory inside a
-denied place look unrelated to it;
+denied place look unrelated to it, or, being the root of the place's own
+mount, makes a second mount of a directory above that root look so;
 a snapshot, which holds a copy, not the place itself; an overlay or FUSE
 filesystem built over a denied directory, such as an overlay whose upper or
 lower directory is inside one, which shows its files as its own; and a

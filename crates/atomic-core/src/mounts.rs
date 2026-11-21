@@ -53,7 +53,10 @@
 //!   yet: its second place is only checked against it once it is;
 //! - a stale root that makes a mount of a directory inside a denied place
 //!   look unrelated to it: mounts are checked against the place and the
-//!   directories above it, not each one below it.
+//!   directories above it, not each one below it; and a stale root of the
+//!   place's own mount, which makes a second mount of a directory above
+//!   that root look unrelated: the directories checked stop at the place's
+//!   own mount point.
 
 use anyhow::bail;
 use std::path::{Path, PathBuf};
@@ -267,6 +270,7 @@ fn aliases_of(
     listed: &std::collections::HashSet<u64>,
     path: &Path,
     out: &mut Vec<PathBuf>,
+    points: &mut Points,
 ) -> anyhow::Result<()> {
     let Some(home) = mount_of(mounts, listed, path) else {
         bail!(
@@ -348,9 +352,13 @@ fn aliases_of(
     }
     // What the table's roots say, checked against the directories the
     // mounts are of.
-    shown_unlisted(home, &same, path, &out[start..])?;
+    shown_unlisted(home, &same, path, &out[start..], points)?;
     Ok(())
 }
+
+/// What each mount point shows, looked at once for each read of the table:
+/// the file it is, or `None` when it is not there or out of reach.
+type Points = std::collections::HashMap<PathBuf, Option<(u64, u64)>>;
 
 /// Refused when another mount of `home`'s filesystem, of `same`, shows
 /// `path` with nothing in the table to say so: its mount point is the same
@@ -359,14 +367,16 @@ fn aliases_of(
 /// marker, as an overlay's does once a lower directory under a bound one is
 /// renamed, or a remote filesystem's when a directory above it is renamed
 /// on the server; the second mount then looks unrelated to the place. A
-/// mount point that is not there, or that atomic, and so a command run as
-/// the same user, cannot reach, shows nothing to it.
+/// mount point that is not there shows nothing, and nor does one, or a
+/// place, behind a directory someone else owns that this user may not
+/// search ([`out_of_reach`]); behind one of the user's own, it is refused.
 #[cfg(unix)]
 fn shown_unlisted(
     home: &Mount,
     same: &[&Mount],
     path: &Path,
     found: &[PathBuf],
+    points: &mut Points,
 ) -> anyhow::Result<()> {
     use std::os::unix::fs::MetadataExt;
     let Ok(rel) = path.strip_prefix(&home.at) else {
@@ -387,6 +397,9 @@ fn shown_unlisted(
                 above.push(((m.dev(), m.ino()), dir, below));
             }
             Err(e) if not_there(&e) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && out_of_reach(dir) => {
+                break;
+            }
             Err(e) => bail!(
                 "{} cannot be looked at ({e}), so atomic cannot check which other mounts show \
                  {}; it cannot deny it at each",
@@ -396,17 +409,31 @@ fn shown_unlisted(
         }
     }
     for other in same {
-        let shown = match std::fs::symlink_metadata(&other.at) {
-            Ok(m) => (m.dev(), m.ino()),
-            Err(e) if not_there(&e) || e.kind() == std::io::ErrorKind::PermissionDenied => {
-                continue;
+        let shown = match points.get(&other.at) {
+            Some(shown) => *shown,
+            None => {
+                let shown = match std::fs::symlink_metadata(&other.at) {
+                    Ok(m) => Some((m.dev(), m.ino())),
+                    Err(e) if not_there(&e) => None,
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::PermissionDenied
+                            && out_of_reach(&other.at) =>
+                    {
+                        None
+                    }
+                    Err(e) => bail!(
+                        "the mount at {} cannot be looked at ({e}), so atomic cannot check \
+                         whether it shows {}; it cannot deny it at each",
+                        other.at.display(),
+                        path.display()
+                    ),
+                };
+                points.insert(other.at.clone(), shown);
+                shown
             }
-            Err(e) => bail!(
-                "the mount at {} cannot be looked at ({e}), so atomic cannot check whether it \
-                 shows {}; it cannot deny it at each",
-                other.at.display(),
-                path.display()
-            ),
+        };
+        let Some(shown) = shown else {
+            continue;
         };
         for (id, dir, below) in &above {
             if shown != *id {
@@ -421,8 +448,8 @@ fn shown_unlisted(
                 continue;
             }
             bail!(
-                "the mount at {} shows {}, which its root in the mount table ({}) does not say, \
-                 so the table's word for where that filesystem's mounts are is stale; atomic \
+                "the mount at {} shows {}, though its root in the mount table ({}) names no path \
+                 to it there: the root is stale, or names another link to the same file; atomic \
                  cannot deny {} at each",
                 other.at.display(),
                 dir.display(),
@@ -438,8 +465,83 @@ fn shown_unlisted(
 }
 
 #[cfg(not(unix))]
-fn shown_unlisted(_: &Mount, _: &[&Mount], _: &Path, _: &[PathBuf]) -> anyhow::Result<()> {
+fn shown_unlisted(
+    _: &Mount,
+    _: &[&Mount],
+    _: &Path,
+    _: &[PathBuf],
+    _: &mut Points,
+) -> anyhow::Result<()> {
     Ok(())
+}
+
+/// Whether `path`, which this user may not look at, is out of reach of any
+/// command run as this user too: the directory above it that refuses the
+/// search is someone else's. One of the user's own refuses only by its
+/// mode, which a command can step around from a user namespace of its own,
+/// where the user is root over what it owns (`unshare -r`); so is the
+/// path then, and the caller refuses.
+#[cfg(unix)]
+fn out_of_reach(path: &Path) -> bool {
+    let Some(owner) = search_refused_by(path) else {
+        return false;
+    };
+    owner != this_uid()
+}
+
+/// The owner of the directory above `path` that does not let this user
+/// search it, found from the root down; `None` when looking fails for any
+/// other reason, or nothing refuses.
+#[cfg(unix)]
+fn search_refused_by(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    let mut down: Vec<&Path> = path.ancestors().collect();
+    down.reverse();
+    for pair in down.windows(2) {
+        match std::fs::symlink_metadata(pair[1]) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                return std::fs::symlink_metadata(pair[0]).ok().map(|m| m.uid());
+            }
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+/// This process's user, or, in a test, the one [`with_uid`] stands in.
+#[cfg(unix)]
+fn this_uid() -> u32 {
+    #[cfg(test)]
+    if let Some(uid) = UID.with(std::cell::Cell::get) {
+        return uid;
+    }
+    crate::state::effective_uid()
+}
+
+#[cfg(test)]
+thread_local! {
+    static UID: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Have [`this_uid`] answer `uid` on this thread until what it returns is
+/// dropped: a test's way to make its own directory someone else's.
+#[cfg(test)]
+pub(crate) fn with_uid(uid: u32) -> UidGuard {
+    UID.with(|u| u.set(Some(uid)));
+    UidGuard
+}
+
+/// Ends [`with_uid`] when dropped.
+#[cfg(test)]
+#[must_use]
+pub(crate) struct UidGuard;
+
+#[cfg(test)]
+impl Drop for UidGuard {
+    fn drop(&mut self) {
+        UID.with(|u| u.set(None));
+    }
 }
 
 /// Whether looking at a path failed because nothing is there.
@@ -503,17 +605,27 @@ fn same_file(path: &Path, alias: &Path) -> anyhow::Result<()> {
 
 /// Every other place `mounts` shows each of `denied`, which are absolute
 /// paths with no link in them, and each filesystem mounted inside one.
+#[cfg(test)]
 fn aliases(mounts: &[Mount], denied: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
+    aliases_with(mounts, denied, &mut Points::new())
+}
+
+/// [`aliases`], with what the mount points show kept in `points`.
+fn aliases_with(
+    mounts: &[Mount],
+    denied: &[PathBuf],
+    points: &mut Points,
+) -> anyhow::Result<Vec<PathBuf>> {
     let listed = ids(mounts);
     let mut out = Vec::new();
     for path in denied {
-        aliases_of(mounts, &listed, path, &mut out)?;
+        aliases_of(mounts, &listed, path, &mut out, points)?;
         // What is mounted inside a denied directory is hidden there too.
         for inner in mounts
             .iter()
             .filter(|m| m.at != *path && m.at.starts_with(path))
         {
-            aliases_of(mounts, &listed, &inner.at, &mut out)?;
+            aliases_of(mounts, &listed, &inner.at, &mut out, points)?;
         }
     }
     out.sort();
@@ -601,11 +713,12 @@ pub fn second_mounts(groups: &[&[PathBuf]]) -> anyhow::Result<Vec<Vec<PathBuf>>>
         return Ok(groups.iter().map(|_| Vec::new()).collect());
     };
     let mounts = parse(&table)?;
+    let mut points = Points::new();
     groups
         .iter()
         .map(|group| {
             let real: Vec<PathBuf> = group.iter().map(|p| real(p)).collect();
-            aliases(&mounts, &real)
+            aliases_with(&mounts, &real, &mut points)
         })
         .collect()
 }
