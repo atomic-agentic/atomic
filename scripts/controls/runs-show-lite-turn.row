@@ -1,0 +1,1 @@
+runs-show-lite-turn|crates/atomic/src/show.rs|        Some("lite") => {|        Some("lite-off") => { // CONTROL_OFF|-p atomic-agentic --bin atomic show::tests::a_recorded_turn_is_named_by_its_atoms_kind

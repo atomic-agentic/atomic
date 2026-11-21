@@ -136,7 +136,10 @@ async fn gather(rt: &Durare, id: &str) -> anyhow::Result<Option<Value>> {
         .threads(id)
         .await?
         .into_iter()
-        .map(|t| json!({"step": t.step, "thread": t.thread_id}))
+        .map(|t| {
+            let kind = atom_kind(&record.input, &t.step);
+            json!({"step": t.step, "thread": t.thread_id, "kind": kind})
+        })
         .collect();
     // run_pipeline's input names the workflow and holds the run's own input.
     let workflow = record.input["pipeline"]["name"]
@@ -157,6 +160,34 @@ async fn gather(rt: &Durare, id: &str) -> anyhow::Result<Option<Value>> {
         "gates": gates,
         "threads": threads,
     })))
+}
+
+/// The kind of the atom whose checkpoint `checkpoint` (`<step>.<part>`, as
+/// `assess.publish`) is, from the pipeline the run pinned in its `input`:
+/// `codex`, `lite` and so on. None when the run pinned no such step or atom.
+fn atom_kind(input: &Value, checkpoint: &str) -> Option<String> {
+    let step = checkpoint.rsplit_once('.').map_or(checkpoint, |(id, _)| id);
+    let pipeline = &input["pipeline"];
+    let atom = pipeline["steps"]
+        .as_array()?
+        .iter()
+        .find(|s| s["id"] == step)?["atom"]
+        .as_str()?;
+    pipeline["atoms"][atom]["kind"].as_str().map(str::to_owned)
+}
+
+/// The line that says what the id a step recorded for its turn is: a Codex
+/// thread's for a Codex atom, the provider's id for its last response for a
+/// lite atom, which keeps no transcript.
+fn recorded_turn(t: &Value) -> String {
+    let (step, id) = (field(&t["step"]), field(&t["thread"]));
+    match t["kind"].as_str() {
+        Some("codex") => format!("transcript of {step}: Codex thread {id}"),
+        Some("lite") => {
+            format!("{step}: model response {id}, from a lite atom, which keeps no transcript")
+        }
+        _ => format!("{step}: recorded turn {id}"),
+    }
 }
 
 /// `text` safe to print to a terminal: control characters, which a step's
@@ -247,11 +278,8 @@ fn render(doc: &Value) -> String {
         ));
     }
     for t in doc["threads"].as_array().into_iter().flatten() {
-        out.push_str(&format!(
-            "transcript of {}: Codex thread {}\n",
-            field(&t["step"]),
-            field(&t["thread"])
-        ));
+        out.push_str(&recorded_turn(t));
+        out.push('\n');
     }
     out
 }
@@ -296,7 +324,7 @@ pub async fn show(
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     #[test]
     fn what_a_run_recorded_cannot_drive_the_terminal() {
@@ -325,6 +353,44 @@ mod tests {
             "{said}"
         );
         assert!(said.contains("\\u{001b}[2J"), "{said}");
+    }
+
+    /// A step's recorded turn is named by its atom's kind, as the run pinned
+    /// it: a Codex atom's thread, a lite atom's last response.
+    #[test]
+    fn a_recorded_turn_is_named_by_its_atoms_kind() {
+        let input = json!({"pipeline": {
+            "steps": [
+                {"kind": "atom", "id": "assess", "atom": "assess-order"},
+                {"kind": "atom", "id": "fix", "atom": "fix-bug"},
+                {"kind": "gate", "id": "accept"},
+            ],
+            "atoms": {"assess-order": {"kind": "lite"}, "fix-bug": {"kind": "codex"}},
+        }});
+        let kind = |step| super::atom_kind(&input, step);
+        assert_eq!(kind("assess.publish").as_deref(), Some("lite"));
+        assert_eq!(kind("fix.publish").as_deref(), Some("codex"));
+        assert_eq!(kind("accept.gate"), None);
+        assert_eq!(kind("gone.publish"), None);
+        assert_eq!(
+            super::atom_kind(&json!({"text": "no pipeline"}), "assess.publish"),
+            None
+        );
+
+        let line = |kind: Value| {
+            super::recorded_turn(
+                &json!({"step": "assess.publish", "thread": "chatcmpl-1", "kind": kind}),
+            )
+        };
+        let lite = line(json!("lite"));
+        assert!(lite.contains("model response chatcmpl-1"), "{lite}");
+        assert!(!lite.contains("Codex"), "{lite}");
+        assert_eq!(
+            line(json!("codex")),
+            "transcript of assess.publish: Codex thread chatcmpl-1"
+        );
+        let unknown = line(Value::Null);
+        assert!(!unknown.contains("Codex"), "{unknown}");
     }
 
     #[test]
