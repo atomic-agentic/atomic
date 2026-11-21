@@ -1,0 +1,1 @@
+skill-dir-pack-paths|crates/atomic/src/setup.rs|            !dir.is_empty() && !name.is_empty(),|            true, // CONTROL_OFF|-p atomic-agentic --bin atomic -- a_pack_that_writes_outside_a_skill_directory_is_refused

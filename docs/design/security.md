@@ -98,7 +98,7 @@ atomic consumes identity; it does not implement an identity provider.
 - **Step-up for high-tier gates.** A gate tier can require a fresh
   authentication context (ACR), such as a passkey. A decision whose token lacks
   a fresh ACR is refused in server mode; the ACR is recorded on the decision and
-  in the audit entry (M45).
+  in the audit entry (M27a, with server identity).
 - **Terminal sign-in.** `atomic login` uses the device authorization grant and
   stores tokens in the OS keyring already used for the local gate credential
   (M27b).

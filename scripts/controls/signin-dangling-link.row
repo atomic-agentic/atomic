@@ -1,0 +1,1 @@
+signin-dangling-link|crates/atomic-core/src/signin.rs|        if let Some(link) = dangling_link(&dir) {|        if let Some(link) = None::<&Path> {|-p atomic-agentic --test model_auth a_sign_in_inside_the_checkout_holding_the_project_is_refused_and_explain_says_so

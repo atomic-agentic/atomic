@@ -13,17 +13,23 @@
 //! - a case selected by its identity runs alone, and with no atom named only
 //!   the atoms that have it run;
 //! - a call with no recording fails the eval whatever its pass rate;
+//! - editing the atom's output schema makes every recording of it unusable,
+//!   in plain output and in `--json`, and says to record it again;
 //! - a live eval is metered in the usage ledger, and a budget with no room
 //!   for a call stops it before any;
 //! - a replay reads no API key and sends none;
 //! - an atom that could write, or a Codex atom under cassettes, is refused;
 //! - JUnit holds a suite per atom, `--report` writes the reports, and
-//!   `--sample` runs a seeded sample.
+//!   `--sample` runs a seeded sample;
+//! - a project `atomic init` wrote, hand edited by nobody, records its own
+//!   sample case and replays it offline to a passing report, inside a bound on
+//!   the whole wall clock those commands take.
 
 use atomic_core::testing::{FakeModel, Reply, on_codex_runtime};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 const ATOMIC: &str = env!("CARGO_BIN_EXE_atomic");
 
@@ -185,11 +191,14 @@ fn eval(dir: &Path, project: &Path, url: &str, args: &[&str]) -> Output {
     eval_with(dir, project, url, args, &[])
 }
 
-fn eval_with(dir: &Path, project: &Path, url: &str, args: &[&str], env: &[(&str, &str)]) -> Output {
+/// `atomic <args>` run in `cwd`, with nothing configured: HOME and atomic's
+/// own state inside the test's scratch directory, no key and no endpoint from
+/// the environment, and no local Ollama for detection to find. What `env`
+/// adds is the only configuration the command sees.
+fn atomic_command(dir: &Path, cwd: &Path, args: &[&str]) -> Command {
     let mut cmd = Command::new(ATOMIC);
-    cmd.arg("eval")
-        .args(args)
-        .current_dir(project)
+    cmd.args(args)
+        .current_dir(cwd)
         .env("HOME", dir.join("home"))
         .env("ATOMIC_HOME", dir.join("atomic-home"))
         .env("USER", "dev")
@@ -201,6 +210,22 @@ fn eval_with(dir: &Path, project: &Path, url: &str, args: &[&str], env: &[(&str,
         // local Ollama and an endpoint comes only from what a test sets.
         .env("ATOMIC_DETECT_OLLAMA_ADDR", "127.0.0.1:9")
         .stdin(Stdio::null());
+    cmd
+}
+
+/// `atomic <args>` run in `cwd` on that environment, with `env` added.
+fn atomic(dir: &Path, cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
+    let mut cmd = atomic_command(dir, cwd, args);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd.output().expect("atomic")
+}
+
+fn eval_with(dir: &Path, project: &Path, url: &str, args: &[&str], env: &[(&str, &str)]) -> Output {
+    let mut argv = vec!["eval"];
+    argv.extend(args);
+    let mut cmd = atomic_command(dir, project, &argv);
     // With no URL, the endpoint comes from the project's files.
     if url.is_empty() {
         cmd.env_remove("ATOMIC_MODEL_BASE_URL")
@@ -334,6 +359,103 @@ fn atomic_eval_records_replays_offline_and_fails_ci_on_a_pass_rate_drop() {
             String::from_utf8_lossy(&one.stdout).contains("1 of 1 cases passed"),
             "{}",
             text(&one)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+/// What the tool may spend of M39a's 15 minutes for `atomic init` to a
+/// passing eval, leaving the rest to the person.
+const INIT_TO_EVAL_BOUND: Duration = Duration::from_secs(120);
+
+/// From `atomic init` to a passing eval, on what init wrote and nothing else:
+/// the sample eval case init ships records against the fake model, replays
+/// offline to a passing report, and those commands together stay inside a
+/// bound on the wall clock.
+///
+/// The clause's 15 minutes are a person's clock — reading what init wrote,
+/// deciding what to change, reading a report — and no test measures a person.
+/// What this bounds is the tool's share of that clock: the commands a new user
+/// types, which must leave the other 13 minutes and more room for the person.
+#[test]
+fn from_init_to_a_passing_eval_records_and_replays_the_sample_case_within_the_bound() {
+    on_codex_runtime(async {
+        let dir = scratch("init-eval");
+        // What init's sample case asks for is a non-empty `summary` of at
+        // most 160 characters (its output schema), so any summary passes it.
+        let model = FakeModel::respond(|_| {
+            Reply::Text(
+                json!({"summary": "Export crashes when a file name holds an accent."}).to_string(),
+            )
+        })
+        .await
+        .expect("fake model");
+        let url = model.base_url();
+        let started = Instant::now();
+
+        // A new user's first command, in an empty directory of their own.
+        let fresh = dir.join("note-tools");
+        std::fs::create_dir_all(&fresh).expect("dir");
+        let init = atomic(&dir, &fresh, &["init"], &[]);
+        assert!(init.status.success(), "{}", text(&init));
+
+        // Nothing is hand edited: the case recorded below is the one init
+        // wrote, with the expectation it ships with.
+        let case = std::fs::read_to_string(fresh.join("evals/summarize-note/export-crash.yaml"))
+            .expect("the sample case init wrote");
+        assert!(
+            case.contains("output.summary.size() > 0"),
+            "the case is init's own, not a test's: {case}"
+        );
+
+        // Recorded live against the fake model: every atom with cases runs,
+        // which is the one atom init wrote, in one model call.
+        let live = eval_async(&dir, &fresh, &url, &["--live"]).await;
+        assert!(live.status.success(), "{}", text(&live));
+        assert_eq!(model.calls(), 1, "recording the case is one model call");
+        let out = String::from_utf8_lossy(&live.stdout);
+        assert!(
+            out.contains("PASS summarize-note: 1 of 1 cases passed"),
+            "the recorded eval passes: {out}"
+        );
+
+        // The recording is in the project, beside the case it answers, which
+        // is what makes the next replay need nothing but the project.
+        let cassettes = fresh.join("evals/summarize-note/cassettes");
+        let recordings: Vec<PathBuf> = std::fs::read_dir(&cassettes)
+            .unwrap_or_else(|e| panic!("{}: {e}", cassettes.display()))
+            .map(|entry| entry.expect("entry").path())
+            .collect();
+        assert!(
+            !recordings.is_empty(),
+            "the recorded answer is kept in the project: {recordings:?}"
+        );
+
+        // Replayed: no key, no model call, the answer read off that
+        // recording. It names the endpoint it was made against, so the replay
+        // is given that same endpoint and the fake model counts whatever it
+        // is asked for.
+        let replayed = eval_async(&dir, &fresh, &url, &["--json"]).await;
+        assert!(replayed.status.success(), "{}", text(&replayed));
+        assert_eq!(model.calls(), 1, "the replay made no model call");
+        let report: Value =
+            serde_json::from_slice(&replayed.stdout).expect("one JSON report from --json");
+        assert_eq!(report["passed"], true, "the replayed report passes");
+        assert_eq!(report["source"], "recorded");
+        assert_eq!(report["refused"], json!([]), "no atom was set aside");
+        assert_eq!(report["reports"][0]["atom"], "summarize-note");
+        assert_eq!(report["reports"][0]["passed"], true);
+        assert_eq!(report["reports"][0]["cases"][0]["passed"], true);
+        assert_eq!(report["cassettes"][0]["replayed"], 1, "{report}");
+        assert_eq!(report["cassettes"][0]["missed"], 0, "{report}");
+
+        // The tool's whole share of the clause's clock, on this machine.
+        let took = started.elapsed();
+        assert!(
+            took < INIT_TO_EVAL_BOUND,
+            "`atomic init` to a passing eval took {:.1} s, over the {} s bound",
+            took.as_secs_f64(),
+            INIT_TO_EVAL_BOUND.as_secs(),
         );
         let _ = std::fs::remove_dir_all(&dir);
     });
@@ -689,6 +811,114 @@ fn a_replay_needs_the_endpoint_it_was_recorded_for_and_no_key() {
             .expect("eval");
         assert!(!none.status.success(), "{}", text(&none));
         assert!(text(&none).contains("recorded for"), "{}", text(&none));
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+/// What a recording answers is the whole request it was made for, the
+/// generation schema among it: `note`'s recordings are recorded once, and
+/// then each of two edits to its output schema — one property's description,
+/// and a property added — leaves every case without a recording, in plain
+/// output and in `--json`, with no model call to fill the gap. The schema
+/// back as it was, the same recordings answer again.
+#[test]
+fn an_edited_output_schema_makes_a_recording_unusable_and_says_to_record_again() {
+    on_codex_runtime(async {
+        let dir = scratch("schema-edit");
+        let project = project(&dir, None);
+        let model = FakeModel::respond(answer).await.expect("fake model");
+        let url = model.base_url();
+
+        // Recorded live: `note`'s two cases, two calls.
+        let out = eval_async(&dir, &project, &url, &["note", "--live"]).await;
+        assert!(out.status.success(), "{}", text(&out));
+        let recorded = model.calls();
+        assert_eq!(recorded, 2, "one call per case");
+
+        // The control: with nothing edited, the same eval is answered whole
+        // from those recordings, and says it is a historical check.
+        let out = eval_async(&dir, &project, &url, &["note"]).await;
+        assert!(out.status.success(), "{}", text(&out));
+        let said = text(&out);
+        assert!(said.contains("a historical check"), "{said}");
+        assert!(
+            said.contains("PASS note: 2 of 2 cases passed"),
+            "the recording is usable: {said}"
+        );
+        assert!(
+            said.contains("2 replayed, 0 recorded, 0 without a recording"),
+            "{said}"
+        );
+        assert_eq!(model.calls(), recorded, "a replay called the model");
+
+        let schema = project.join("atoms/note.output.schema.json");
+        let original = std::fs::read_to_string(&schema).expect("the output schema");
+        let contract: Value = serde_json::from_str(&original).expect("the schema is JSON");
+        // Neither edit changes what the recorded answers say: one writes a
+        // property's description, the other adds an optional property.
+        let mut described = contract.clone();
+        described["properties"]["ticket"]["description"] = json!("The ticket's own ID.");
+        let mut widened = contract;
+        widened["properties"]["severity"] = json!({"type": "string"});
+
+        for edited in [described, widened] {
+            std::fs::write(&schema, edited.to_string()).expect("the edited schema");
+            // Plain: each case's failure names the miss, and the eval says
+            // how many calls had no recording and how to record them.
+            let out = eval_async(&dir, &project, &url, &["note"]).await;
+            assert!(
+                !out.status.success(),
+                "the edit was accepted: {}",
+                text(&out)
+            );
+            let said = text(&out);
+            for part in [
+                "no recording answers this request",
+                "the prompt, schema, model or settings differ from every recorded one",
+                "run the eval with --live to record it",
+                "2 model call(s) had no usable recording (2 missing, 0 corrupt): \
+                 record them with --live",
+            ] {
+                assert!(said.contains(part), "{part}: {said}");
+            }
+            // `--json`: the same miss in the report, and every recording of
+            // the edited atom counted as missing, none replayed.
+            let out = eval_async(&dir, &project, &url, &["note", "--json"]).await;
+            assert!(!out.status.success(), "{}", text(&out));
+            let report: Value = serde_json::from_slice(&out.stdout).expect("one JSON report");
+            assert_eq!(report["passed"], false, "{report}");
+            assert_eq!(report["source"], "recorded", "{report}");
+            assert_eq!(report["cassettes"][0]["replayed"], 0, "{report}");
+            assert_eq!(report["cassettes"][0]["missed"], 2, "{report}");
+            assert_eq!(
+                report["cassettes"][0]["corrupt"], 0,
+                "a miss read as corrupt: {report}"
+            );
+            let cases = report["reports"][0]["cases"].as_array().expect("two cases");
+            assert_eq!(cases.len(), 2, "{report}");
+            for case in cases {
+                assert_eq!(case["passed"], false, "{case}");
+                let failures = case["failures"]
+                    .as_array()
+                    .expect("the failed case names its failures");
+                assert!(
+                    failures
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .any(|f| f.contains("run the eval with --live to record it")),
+                    "the case says to record again: {case}"
+                );
+            }
+            // The schema back as it was: those same recordings answer, which
+            // is what shows the edit alone made them useless.
+            std::fs::write(&schema, &original).expect("the schema back");
+            let out = eval_async(&dir, &project, &url, &["note", "--json"]).await;
+            assert!(out.status.success(), "{}", text(&out));
+            let report: Value = serde_json::from_slice(&out.stdout).expect("one JSON report");
+            assert_eq!(report["cassettes"][0]["replayed"], 2, "{report}");
+            assert_eq!(report["cassettes"][0]["missed"], 0, "{report}");
+        }
+        assert_eq!(model.calls(), recorded, "a miss reached the model");
         let _ = std::fs::remove_dir_all(&dir);
     });
 }

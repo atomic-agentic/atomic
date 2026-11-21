@@ -1,0 +1,1 @@
+signin-held-lock|crates/atomic-core/src/signin.rs|                        let free = file.try_lock().is_ok();|                        let free = true;|-p atomic-agentic-core --lib signin::tests::a_failed_login_keeps_a_directory_it_did_not_make
