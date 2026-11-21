@@ -986,11 +986,8 @@ mod tests {
         assert!(outside_the_checkout(&dir.join("elsewhere/codex-auth"), Some(&project)).is_ok());
         // A commondir git would not write refuses the sign-in wherever it
         // is kept, rather than counting as no checkout.
-        std::fs::write(
-            main.join(".git/worktrees/wt/commondir"),
-            "x".repeat(5000),
-        )
-        .expect("commondir");
+        std::fs::write(main.join(".git/worktrees/wt/commondir"), "x".repeat(5000))
+            .expect("commondir");
         let refused = outside_the_checkout(&dir.join("elsewhere/codex-auth"), Some(&project))
             .expect_err("refused")
             .to_string();
@@ -1050,7 +1047,10 @@ mod tests {
                 .expect("made")
                 .with_issuer("http://127.0.0.1:9");
             assert!(sign_in.login(true).await.is_err());
-            assert!(!dir.exists(), "the failed login kept the outlived entry's directory");
+            assert!(
+                !dir.exists(),
+                "the failed login kept the outlived entry's directory"
+            );
             assert!(
                 sign_in.account().expect("account").is_none(),
                 "an outlived entry reads as a sign-in"
