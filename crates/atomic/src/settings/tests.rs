@@ -1094,7 +1094,9 @@ fn the_manifest_accepts_every_setting() {
 fn the_budget_layers_like_every_other_setting_and_says_where_each_limit_came_from() {
     // Each layer sets the atom's tokens; each lower one also sets a limit
     // the layers above leave alone.
-    let (_home, home) = person("budget:\n  atom:\n    tokens: 100\n  call:\n    minutes: 3\n");
+    // Their own file sets only a limit nothing above it touches: a cap they
+    // write is a ceiling on every layer above, which is its own test.
+    let (_home, home) = person("budget:\n  call:\n    minutes: 3\n");
     let d = dir(&[
         (
             "atomic.yaml",
@@ -1147,7 +1149,7 @@ fn the_budget_layers_like_every_other_setting_and_says_where_each_limit_came_fro
     );
 
     // Without the variable, the local file wins; without that, the
-    // project's; without that, the person's own.
+    // project's; without either, the built-in default.
     let r = resolved(&d, &EngineArgs::default(), &vars[..1], &nobody);
     assert_eq!(r.settings.budget.atom.tokens, 300);
     assert_eq!(file(&r, "budget.atom.tokens"), "atomic.local.yaml");
@@ -1157,8 +1159,11 @@ fn the_budget_layers_like_every_other_setting_and_says_where_each_limit_came_fro
     assert_eq!(file(&r, "budget.atom.tokens"), "atomic.yaml");
     std::fs::write(d.join("atomic.yaml"), MANIFEST_ONLY).expect("manifest");
     let r = resolved(&d, &EngineArgs::default(), &vars[..1], &nobody);
-    assert_eq!(r.settings.budget.atom.tokens, 100);
-    assert_eq!(file(&r, "budget.atom.tokens"), "config.yaml");
+    assert_eq!(
+        r.settings.budget.atom.tokens,
+        BudgetSettings::default().atom.tokens
+    );
+    assert_eq!(source(&r, "budget.atom.tokens"), &Source::Default);
 
     // A variable that does not read as its limit is refused, by name and
     // without its value: a word, a negative count, and a word for a dollar
@@ -1176,4 +1181,671 @@ fn the_budget_layers_like_every_other_setting_and_says_where_each_limit_came_fro
         assert!(said.contains(name), "{name}={value}: {said}");
         assert!(!said.contains(value), "{name}={value}: {said}");
     }
+}
+
+/// The file a setting came from, by name, and the line it is on.
+fn file_and_line(r: &Resolved, path: &str) -> (String, usize) {
+    match source(r, path) {
+        Source::File { path, line } => (
+            path.file_name()
+                .expect("name")
+                .to_string_lossy()
+                .into_owned(),
+            *line,
+        ),
+        other => panic!("{path} came from {other:?}"),
+    }
+}
+
+/// A person's own `budget` section: a cap on what an atom and a run may spend,
+/// and a bound on one call. Its lines are named in the assertions below.
+const THEIR_OWN_CAPS: &str = "budget:\n  atom:\n    tokens: 100000\n  workflow:\n    \
+                              tokens: 200000\n  call:\n    input_tokens: 1000\n    \
+                              output_tokens: 500\n    minutes: 1\n";
+
+#[test]
+fn your_own_cap_holds_a_larger_one_in_the_projects_committed_file() {
+    let (_home, home) = person(THEIR_OWN_CAPS);
+    let d = dir(&[(
+        "atomic.yaml",
+        "atomic: 1\nname: notes\nbudget:\n  atom:\n    tokens: 400000\n  workflow:\n    \
+         tokens: 800000\n  call:\n    input_tokens: 60000\n",
+    )]);
+    let r = resolved(
+        &d,
+        &EngineArgs::default(),
+        &[("HOME", home.as_str())],
+        &nobody,
+    );
+    let budget = &r.settings.budget;
+    assert_eq!(budget.atom.tokens, 100_000);
+    assert_eq!(budget.workflow.tokens, 200_000);
+    assert_eq!(budget.call.input_tokens, 1_000);
+    assert_eq!(budget.call.output_tokens, 500);
+    assert_eq!(budget.call.minutes, 1.0);
+
+    // The ceilings travel with the settings, so a run holds an atom's or
+    // workflow's own `budget` block to them too, and `atomic config --explain`
+    // names the file the effective number came from.
+    assert_eq!(
+        budget.ceilings,
+        Ceilings {
+            atom: Caps {
+                tokens: Some(100_000),
+                minutes: None,
+                cost_usd: None,
+            },
+            workflow: Caps {
+                tokens: Some(200_000),
+                minutes: None,
+                cost_usd: None,
+            },
+            call: CallCaps {
+                input_tokens: Some(1_000),
+                output_tokens: Some(500),
+                minutes: Some(1.0),
+            },
+        }
+    );
+    assert_eq!(
+        file_and_line(&r, "budget.atom.tokens"),
+        ("config.yaml".to_owned(), 3)
+    );
+    assert_eq!(
+        file_and_line(&r, "budget.workflow.tokens"),
+        ("config.yaml".to_owned(), 5)
+    );
+    assert_eq!(
+        file_and_line(&r, "budget.call.input_tokens"),
+        ("config.yaml".to_owned(), 7)
+    );
+
+    let said = r.notes.join("\n");
+    assert!(said.contains("caps budget.atom.tokens at 100000"), "{said}");
+    assert!(said.contains("no project or variable can raise"), "{said}");
+}
+
+#[test]
+fn your_own_cap_holds_a_larger_one_in_the_projects_local_file() {
+    let (_home, home) = person(THEIR_OWN_CAPS);
+    let d = dir(&[
+        ("atomic.yaml", MANIFEST_ONLY),
+        (
+            "atomic.local.yaml",
+            "budget:\n  atom:\n    tokens: 900000\n",
+        ),
+    ]);
+    let r = resolved(
+        &d,
+        &EngineArgs::default(),
+        &[("HOME", home.as_str())],
+        &nobody,
+    );
+    assert_eq!(r.settings.budget.atom.tokens, 100_000);
+    assert_eq!(
+        file_and_line(&r, "budget.atom.tokens"),
+        ("config.yaml".to_owned(), 3)
+    );
+}
+
+#[test]
+fn your_own_cap_holds_a_larger_one_set_by_a_variable() {
+    let (_home, home) = person(THEIR_OWN_CAPS);
+    let d = dir(&[("atomic.yaml", MANIFEST_ONLY)]);
+    let r = resolved(
+        &d,
+        &EngineArgs::default(),
+        &[
+            ("HOME", home.as_str()),
+            ("ATOMIC_BUDGET_WORKFLOW_TOKENS", "900000"),
+        ],
+        &nobody,
+    );
+    assert_eq!(r.settings.budget.workflow.tokens, 200_000);
+    assert_eq!(
+        file_and_line(&r, "budget.workflow.tokens"),
+        ("config.yaml".to_owned(), 5)
+    );
+    let said = r.notes.join("\n");
+    assert!(
+        said.contains("budget.workflow.tokens at 200000, which no project or variable can raise"),
+        "{said}"
+    );
+}
+
+#[test]
+fn a_smaller_project_cap_still_tightens_yours() {
+    let (_home, home) = person(THEIR_OWN_CAPS);
+    let d = dir(&[(
+        "atomic.yaml",
+        "atomic: 1\nname: notes\nbudget:\n  atom:\n    tokens: 500\n    minutes: 2\n    \
+         cost_usd: 0.5\n",
+    )]);
+    let r = resolved(
+        &d,
+        &EngineArgs::default(),
+        &[("HOME", home.as_str())],
+        &nobody,
+    );
+    let budget = &r.settings.budget;
+    assert_eq!(budget.atom.tokens, 500);
+    assert_eq!(budget.atom.minutes, 2.0);
+    assert_eq!(budget.atom.cost_usd, Some(0.5));
+    assert_eq!(
+        file_and_line(&r, "budget.atom.tokens"),
+        ("atomic.yaml".to_owned(), 5)
+    );
+    assert_eq!(
+        file_and_line(&r, "budget.atom.minutes"),
+        ("atomic.yaml".to_owned(), 6)
+    );
+    // Nothing of theirs held, so nothing is said about it.
+    assert_eq!(r.notes, Vec::<String>::new());
+    // Their ceiling is still the ceiling a written `budget` block is held to.
+    assert_eq!(budget.ceilings.atom.tokens, Some(100_000));
+}
+
+#[test]
+fn your_own_dollar_cap_holds_a_larger_one_and_leaves_none_as_none() {
+    let (_home, home) = person("budget:\n  atom:\n    cost_usd: 1\n");
+    let d = dir(&[(
+        "atomic.yaml",
+        "atomic: 1\nname: notes\nbudget:\n  atom:\n    tokens: 999999\n    cost_usd: 5\n",
+    )]);
+    let r = resolved(
+        &d,
+        &EngineArgs::default(),
+        &[("HOME", home.as_str())],
+        &nobody,
+    );
+    let budget = &r.settings.budget;
+    assert_eq!(budget.atom.cost_usd, Some(1.0));
+    assert_eq!(
+        file_and_line(&r, "budget.atom.cost_usd"),
+        ("config.yaml".to_owned(), 3)
+    );
+    // A cap they wrote caps only what it is a cap on: a measure they left
+    // alone is the project's, and a dollar cap nothing set stays unset rather
+    // than becoming one.
+    assert_eq!(budget.atom.tokens, 999999);
+    assert_eq!(
+        file_and_line(&r, "budget.atom.tokens"),
+        ("atomic.yaml".to_owned(), 5)
+    );
+    assert_eq!(budget.workflow.cost_usd, None);
+    assert_eq!(budget.ceilings.workflow, Caps::default());
+    assert!(
+        r.notes
+            .join("\n")
+            .contains("caps budget.atom.cost_usd at 1"),
+        "{}",
+        r.notes.join("\n")
+    );
+}
+
+/// One way a layer above sets a cap to nothing: its name, the variables it
+/// sets and the project's files it writes.
+type Case<'a> = (&'a str, Vec<(&'a str, &'a str)>, Vec<(&'a str, String)>);
+
+/// A layer above the person's own configuration cannot remove their dollar
+/// cap by setting it to nothing: `null` in the project's committed file, in
+/// its local file, or from the variable, for an atom and for a run, all
+/// leave their number standing; a whole group set to `null` is refused.
+#[test]
+fn a_null_from_a_layer_above_cannot_remove_your_own_dollar_cap() {
+    let (_home, home) = person("budget:\n  atom:\n    cost_usd: 1\n  workflow:\n    cost_usd: 2\n");
+    for level in ["atom", "workflow"] {
+        let want = if level == "atom" { 1.0 } else { 2.0 };
+        let line = if level == "atom" { 3 } else { 5 };
+        let variable = format!("ATOMIC_BUDGET_{}_COST_USD", level.to_uppercase());
+        let committed =
+            format!("atomic: 1\nname: notes\nbudget:\n  {level}:\n    cost_usd: null\n");
+        let local = format!("budget:\n  {level}:\n    cost_usd: null\n");
+        let group = format!("atomic: 1\nname: notes\nbudget:\n  {level}: null\n");
+        let cases: [Case; 3] = [
+            ("committed", vec![], vec![("atomic.yaml", committed)]),
+            (
+                "local",
+                vec![],
+                vec![
+                    ("atomic.yaml", MANIFEST_ONLY.to_owned()),
+                    ("atomic.local.yaml", local),
+                ],
+            ),
+            (
+                "variable",
+                vec![(variable.as_str(), "null")],
+                vec![("atomic.yaml", MANIFEST_ONLY.to_owned())],
+            ),
+        ];
+        for (case, vars, files) in cases {
+            let files: Vec<(&str, &str)> = files.iter().map(|(n, t)| (*n, t.as_str())).collect();
+            let d = dir(&files);
+            let mut env = vec![("HOME", home.as_str())];
+            env.extend(vars);
+            let r = resolved(&d, &EngineArgs::default(), &env, &nobody);
+            let budget = &r.settings.budget;
+            let (cap, ceiling) = if level == "atom" {
+                (budget.atom.cost_usd, budget.ceilings.atom.cost_usd)
+            } else {
+                (budget.workflow.cost_usd, budget.ceilings.workflow.cost_usd)
+            };
+            assert_eq!(cap, Some(want), "{level}, {case}");
+            assert_eq!(ceiling, Some(want), "{level}, {case}");
+            assert_eq!(
+                file_and_line(&r, &format!("budget.{level}.cost_usd")),
+                ("config.yaml".to_owned(), line),
+                "{level}, {case}"
+            );
+        }
+        // A whole group set to nothing is no setting at all, and refused.
+        let d = dir(&[("atomic.yaml", group.as_str())]);
+        let said = resolved_where(
+            &d,
+            &EngineArgs::default(),
+            &[("HOME", home.as_str())],
+            &nobody,
+        )
+        .expect_err("refused")
+        .to_string();
+        assert!(
+            said.contains(&format!("budget.{level} is a section")),
+            "{level}: {said}"
+        );
+    }
+}
+
+/// Under the person's own dollar cap, a project cannot make a model they did
+/// not price free: a price of nothing for both input and output is refused,
+/// naming the model and where to price it. A price that is not nothing is
+/// the project's, and so is any price where they set no dollar cap, or for a
+/// model they priced themselves.
+#[test]
+fn under_your_own_dollar_cap_a_project_cannot_make_a_model_free() {
+    let priced = |input: &str, output: &str| {
+        format!(
+            "atomic: 1\nname: notes\nbudget:\n  pricing:\n    free-model:\n      \
+             input_usd_per_mtok: {input}\n      output_usd_per_mtok: {output}\n"
+        )
+    };
+    let free = priced("0", "0");
+    let (_home, home) = person("budget:\n  workflow:\n    cost_usd: 1\n");
+    let d = dir(&[("atomic.yaml", free.as_str())]);
+    let said = resolved_where(
+        &d,
+        &EngineArgs::default(),
+        &[("HOME", home.as_str())],
+        &nobody,
+    )
+    .expect_err("refused")
+    .to_string();
+    assert!(said.contains("budget.pricing.free-model"), "{said}");
+    assert!(
+        said.contains("price free-model in your own configuration"),
+        "{said}"
+    );
+
+    let cheap = priced("0", "0.5");
+    let d = dir(&[("atomic.yaml", cheap.as_str())]);
+    let r = resolved(
+        &d,
+        &EngineArgs::default(),
+        &[("HOME", home.as_str())],
+        &nobody,
+    );
+    assert_eq!(
+        r.settings.budget.pricing["free-model"].output_usd_per_mtok,
+        0.5
+    );
+
+    let d = dir(&[("atomic.yaml", free.as_str())]);
+    let (_theirs, priced_by_them) = person(
+        "budget:\n  atom:\n    cost_usd: 1\n  pricing:\n    free-model:\n      \
+         input_usd_per_mtok: 0\n      output_usd_per_mtok: 0\n",
+    );
+    let r = resolved(
+        &d,
+        &EngineArgs::default(),
+        &[("HOME", priced_by_them.as_str())],
+        &nobody,
+    );
+    assert_eq!(
+        r.settings.budget.pricing["free-model"].input_usd_per_mtok,
+        0.0
+    );
+    let (_capless, no_dollars) = person("budget:\n  atom:\n    tokens: 1000\n");
+    resolved(
+        &d,
+        &EngineArgs::default(),
+        &[("HOME", no_dollars.as_str())],
+        &nobody,
+    );
+}
+
+/// A cap or price in the person's own file that its setting cannot take is
+/// refused with their file and line, even where a project's layer replaces
+/// it, so a cap of theirs is never dropped without a word.
+#[test]
+fn a_cap_of_yours_that_cannot_be_read_is_refused_even_under_a_project_value() {
+    for (theirs, project, names, says) in [
+        (
+            "budget:\n  atom:\n    cost_usd: \"5\"\n",
+            "budget:\n  atom:\n    cost_usd: null\n",
+            "budget.atom.cost_usd",
+            "is not a number",
+        ),
+        (
+            "budget:\n  atom:\n    tokens: 150000.0\n",
+            "budget:\n  atom:\n    tokens: 1000\n",
+            "budget.atom.tokens",
+            "is not a whole number",
+        ),
+        (
+            "budget:\n  pricing:\n    m: null\n",
+            "budget:\n  pricing:\n    m:\n      input_usd_per_mtok: 1\n      output_usd_per_mtok: 1\n",
+            "budget.pricing.m",
+            "is not a price",
+        ),
+        (
+            "budget:\n  pricing:\n    m:\n      input_usd_per_mtok: 1\n",
+            "budget:\n  pricing:\n    m:\n      input_usd_per_mtok: 1\n      output_usd_per_mtok: 1\n",
+            "budget.pricing.m.output_usd_per_mtok",
+            "is missing: a price needs both",
+        ),
+    ] {
+        let (_home, home) = person(theirs);
+        let manifest = format!("atomic: 1\nname: notes\n{project}");
+        let d = dir(&[("atomic.yaml", manifest.as_str())]);
+        let said = resolved_where(
+            &d,
+            &EngineArgs::default(),
+            &[("HOME", home.as_str())],
+            &nobody,
+        )
+        .expect_err("refused")
+        .to_string();
+        assert!(said.contains("config.yaml:"), "{names}: {said}");
+        assert!(said.contains(&format!("{names} {says}")), "{names}: {said}");
+    }
+}
+
+/// Under the person's own dollar cap, a model only the project prices is
+/// named, with what to do, in what `atomic config --explain` shows.
+#[test]
+fn under_your_own_dollar_cap_a_model_only_the_project_prices_is_named() {
+    let (_home, home) = person("budget:\n  atom:\n    cost_usd: 1\n");
+    let d = dir(&[(
+        "atomic.yaml",
+        "atomic: 1\nname: notes\nbudget:\n  pricing:\n    cheap-model:\n      \
+         input_usd_per_mtok: 0.000001\n      output_usd_per_mtok: 0.000001\n",
+    )]);
+    let r = resolved(
+        &d,
+        &EngineArgs::default(),
+        &[("HOME", home.as_str())],
+        &nobody,
+    );
+    assert!(r.settings.budget.priced_by_project.contains("cheap-model"));
+    let said = r.notes.join("\n");
+    assert!(
+        said.contains("counts calls to cheap-model at prices only a layer above yours sets"),
+        "{said}"
+    );
+    // Without a dollar cap of theirs, nothing is named.
+    let (_capless, no_dollars) = person("budget:\n  atom:\n    tokens: 1000\n");
+    let r = resolved(
+        &d,
+        &EngineArgs::default(),
+        &[("HOME", no_dollars.as_str())],
+        &nobody,
+    );
+    assert!(r.settings.budget.priced_by_project.is_empty());
+}
+
+#[test]
+fn your_own_dollar_cap_holds_a_larger_one_across_the_levels() {
+    let (_home, home) = person("budget:\n  atom:\n    cost_usd: 0.5\n");
+    let d = dir(&[(
+        "atomic.yaml",
+        "atomic: 1\nname: notes\nbudget:\n  workflow:\n    cost_usd: 9\n",
+    )]);
+    let r = resolved(
+        &d,
+        &EngineArgs::default(),
+        &[("HOME", home.as_str())],
+        &nobody,
+    );
+    // The hold is per level: their cap on an atom says nothing about a run,
+    // and a project's own cap is nobody's ceiling.
+    assert_eq!(r.settings.budget.workflow.cost_usd, Some(9.0));
+    assert_eq!(
+        file_and_line(&r, "budget.workflow.cost_usd"),
+        ("atomic.yaml".to_owned(), 5)
+    );
+    assert_eq!(r.settings.budget.atom.cost_usd, Some(0.5));
+    assert_eq!(
+        file_and_line(&r, "budget.atom.cost_usd"),
+        ("config.yaml".to_owned(), 3)
+    );
+    assert_eq!(
+        r.settings.budget.ceilings,
+        Ceilings {
+            atom: Caps {
+                tokens: None,
+                minutes: None,
+                cost_usd: Some(0.5),
+            },
+            ..Ceilings::default()
+        }
+    );
+    assert_eq!(r.notes, Vec::<String>::new());
+}
+
+#[test]
+fn your_own_price_holds_where_a_project_writes_a_cheaper_one() {
+    let (_home, home) = person(
+        "budget:\n  pricing:\n    gpt-test:\n      input_usd_per_mtok: 2.5\n      \
+         output_usd_per_mtok: 10\n",
+    );
+    // A project's `budget.pricing` is one setting, so it can write the model
+    // at no price at all, in the committed file or in the local one.
+    let cheap = "budget:\n  pricing:\n    gpt-test:\n      input_usd_per_mtok: 0\n      \
+                output_usd_per_mtok: 0\n";
+    for name in ["atomic.yaml", "atomic.local.yaml"] {
+        let files = if name == "atomic.yaml" {
+            vec![("atomic.yaml", cheap)]
+        } else {
+            vec![("atomic.yaml", MANIFEST_ONLY), ("atomic.local.yaml", cheap)]
+        };
+        let d = dir(&files);
+        let r = resolved(
+            &d,
+            &EngineArgs::default(),
+            &[("HOME", home.as_str())],
+            &nobody,
+        );
+        let budget = &r.settings.budget;
+        assert_eq!(budget.pricing["gpt-test"].input_usd_per_mtok, 2.5, "{name}");
+        assert_eq!(
+            budget.pricing["gpt-test"].output_usd_per_mtok, 10.0,
+            "{name}"
+        );
+        // A model that looks free is how a project slips past a dollar cap.
+        assert_eq!(budget.cost("gpt-test", 1_000, 0), 2_500, "{name}");
+        assert_eq!(
+            file_and_line(&r, "budget.pricing.gpt-test.input_usd_per_mtok"),
+            ("config.yaml".to_owned(), 4),
+            "{name}"
+        );
+        let said = r.notes.join("\n");
+        assert!(
+            said.contains("gpt-test: input_usd_per_mtok, output_usd_per_mtok"),
+            "{name}: {said}"
+        );
+    }
+}
+
+#[test]
+fn a_layer_that_replaces_the_price_table_cannot_drop_your_own_price() {
+    let (_home, home) = person(
+        "budget:\n  pricing:\n    gpt-test:\n      input_usd_per_mtok: 2.5\n      \
+         output_usd_per_mtok: 10\n",
+    );
+    // A price table is open: keys atomic does not define are not merged into
+    // it, so a layer that writes `budget.pricing` replaces the whole table and
+    // leaves every model it does not name unpriced — which is how a model is
+    // made to look free under a dollar cap. A project's file and a variable
+    // both write it this way.
+    let d = dir(&[(
+        "atomic.yaml",
+        "budget:\n  pricing:\n    other:\n      input_usd_per_mtok: 0\n      \
+         output_usd_per_mtok: 0\n",
+    )]);
+    held_theirs(&resolved(
+        &d,
+        &EngineArgs::default(),
+        &[("HOME", home.as_str())],
+        &nobody,
+    ));
+    let d = dir(&[("atomic.yaml", MANIFEST_ONLY)]);
+    held_theirs(&resolved(
+        &d,
+        &EngineArgs::default(),
+        &[
+            ("HOME", home.as_str()),
+            (
+                "ATOMIC_BUDGET_PRICING",
+                r#"{"other":{"input_usd_per_mtok":0,"output_usd_per_mtok":0}}"#,
+            ),
+        ],
+        &nobody,
+    ));
+
+    /// The price they wrote holds, the layer's own model is its own, and what
+    /// holds is said and cited.
+    fn held_theirs(r: &Resolved) {
+        let budget = &r.settings.budget;
+        assert_eq!(budget.pricing["gpt-test"].input_usd_per_mtok, 2.5);
+        assert_eq!(budget.pricing["gpt-test"].output_usd_per_mtok, 10.0);
+        assert_eq!(budget.cost("gpt-test", 1_000, 0), 2_500);
+        // A model they never priced is the layer's, at the price it gave.
+        assert_eq!(budget.pricing["other"].input_usd_per_mtok, 0.0);
+        assert_eq!(
+            file_and_line(r, "budget.pricing.gpt-test.input_usd_per_mtok"),
+            ("config.yaml".to_owned(), 4)
+        );
+        let said = r.notes.join("\n");
+        assert!(said.contains("cannot change"), "{said}");
+        assert!(said.contains("gpt-test"), "{said}");
+    }
+}
+
+#[test]
+fn a_project_cannot_give_a_model_a_bigger_call_than_your_own() {
+    let (_home, home) = person("budget:\n  call:\n    output_tokens: 500\n");
+    let d = dir(&[(
+        "atomic.yaml",
+        "atomic: 1\nname: notes\nbudget:\n  pricing:\n    gpt-test:\n      \
+         input_usd_per_mtok: 1\n      output_usd_per_mtok: 1\n      max_output_tokens: 100000\n      \
+         max_input_tokens: 20\n",
+    )]);
+    let r = resolved(
+        &d,
+        &EngineArgs::default(),
+        &[("HOME", home.as_str())],
+        &nobody,
+    );
+    let budget = &r.settings.budget;
+    // A model's own maximum replaces the call bound for a call to it, so a
+    // project that writes one above their cap would loosen it for that model.
+    assert_eq!(budget.pricing["gpt-test"].max_output_tokens, Some(500));
+    // Cited from the cap that holds it, at their line, not from the file that
+    // wrote the larger number.
+    assert_eq!(
+        file_and_line(&r, "budget.pricing.gpt-test.max_output_tokens"),
+        ("config.yaml".to_owned(), 3)
+    );
+    // A maximum under their cap is the project's: only what their cap holds is
+    // cited from their file.
+    assert_eq!(budget.pricing["gpt-test"].max_input_tokens, Some(20));
+    assert_eq!(budget.reservation("gpt-test").output_tokens, 500);
+    assert!(
+        r.notes
+            .join("\n")
+            .contains("caps the most one call may use"),
+        "{}",
+        r.notes.join("\n")
+    );
+}
+
+#[test]
+fn a_project_that_writes_their_budget_section_as_a_ceiling_is_refused() {
+    let d = dir(&[(
+        "atomic.yaml",
+        "atomic: 1\nname: notes\nbudget:\n  ceilings:\n    atom:\n      tokens: 1\n",
+    )]);
+    let said = resolved_where(&d, &EngineArgs::default(), &[], &nobody)
+        .expect_err("refused")
+        .to_string();
+    assert!(said.contains("unknown setting"), "{said}");
+    assert!(said.contains("budget.ceilings"), "{said}");
+    assert!(said.contains("atomic.yaml:"), "{said}");
+}
+
+#[test]
+fn a_budget_setting_of_yours_that_cannot_be_read_is_refused_not_ignored() {
+    let d = dir(&[("atomic.yaml", MANIFEST_ONLY)]);
+    // A cap or a price that cannot be read never becomes "no cap" or "no
+    // price": a model left unpriced under a dollar cap, or a limit left at its
+    // default, is looser than what was written, so each is refused. A key of a
+    // section atomic knows is refused where it is written; a key of a model's
+    // price, which is an open table, is refused when the settings are read.
+    for (text, must, must_not) in [
+        ("budget:\n  atom:\n    part: 2\n", "budget.atom.part", ""),
+        (
+            "budget:\n  atom:\n    tokens: most\n",
+            "invalid type",
+            "most",
+        ),
+        (
+            "budget:\n  pricing:\n    gpt-test:\n      free: true\n",
+            "unknown field",
+            "free",
+        ),
+        (
+            "budget:\n  pricing:\n    gpt-test:\n      input_usd_per_mtok: soon\n",
+            "invalid type",
+            "soon",
+        ),
+    ] {
+        let (_home, home) = person(text);
+        let said = resolved_where(
+            &d,
+            &EngineArgs::default(),
+            &[("HOME", home.as_str())],
+            &nobody,
+        )
+        .expect_err("refused")
+        .to_string();
+        assert!(said.contains(must), "{text}: {said}");
+        if !must_not.is_empty() {
+            assert!(!said.contains(must_not), "{text}: {said}");
+        }
+    }
+}
+
+#[test]
+fn with_no_configuration_of_their_own_nothing_is_capped() {
+    let d = dir(&[(
+        "atomic.yaml",
+        "atomic: 1\nname: notes\nbudget:\n  atom:\n    tokens: 400000\n",
+    )]);
+    let r = resolved(&d, &EngineArgs::default(), &[], &nobody);
+    assert_eq!(r.settings.budget.atom.tokens, 400_000);
+    assert_eq!(r.settings.budget.ceilings, Ceilings::default());
+    assert_eq!(r.notes, Vec::<String>::new());
+    assert_eq!(
+        file_and_line(&r, "budget.atom.tokens"),
+        ("atomic.yaml".to_owned(), 5)
+    );
 }
