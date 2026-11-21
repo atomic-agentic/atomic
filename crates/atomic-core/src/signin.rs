@@ -368,10 +368,7 @@ impl SignIn {
             },
             Tidy::Logout { made, deleted } => match self.stored() {
                 // Trusted only once the logout's own delete went through.
-                Ok(Some(_)) => match (made, deleted) {
-                    (true, false) => false,
-                    _ => true,
-                },
+                Ok(Some(_)) => !matches!((made, deleted), (true, false)),
                 Ok(None) => false,
                 // A logout that made the directory and cannot read the store
                 // removes it whatever locks its own forgetting left: it may

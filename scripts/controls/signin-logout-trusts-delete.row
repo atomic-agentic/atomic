@@ -1,1 +1,1 @@
-signin-logout-trusts-delete|crates/atomic-core/src/signin.rs|                    (true, false) => false,|                    (true, false) => true, /*CONTROL_OFF*/|-p atomic-agentic-core --lib signin::tests::a_logout_trusts_what_it_finds_only_once_its_delete_went_through
+signin-logout-trusts-delete|crates/atomic-core/src/signin.rs|                Ok(Some(_)) => !matches!((made, deleted), (true, false)),|                Ok(Some(_)) => true, /*CONTROL_OFF*/|-p atomic-agentic-core --lib signin::tests::a_logout_trusts_what_it_finds_only_once_its_delete_went_through
