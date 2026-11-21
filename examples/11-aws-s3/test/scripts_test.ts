@@ -3,7 +3,7 @@
 // atom's declared network hosts. S3 is a local stand-in, so the tests need no
 // AWS account and send nothing off this machine.
 //
-//   deno test -A --lock=deno.lock --frozen test/
+//   deno test -A --lock=deno.lock --frozen --cached-only test/
 //
 // The test harness itself is trusted (-A). The script under test is not.
 import { MAX_BYTES } from "../tools/fetch_report.ts";
@@ -197,12 +197,16 @@ Deno.test("fetch-report reads a report of exactly the size limit", () =>
 Deno.test("fetch-report reassembles a report that arrives in pieces", () =>
   withFake(async (s3, host) => {
     // Exactly the limit again, but undeclared and in small pieces, so the
-    // bytes only come back whole if every piece was kept in order.
+    // bytes only come back whole if every piece was kept in order. The CRC32
+    // goes with the body as S3 sends it, so the SDK checks for itself that
+    // the pieces came back whole: if the fake's checksum ever stopped
+    // matching its own bytes, this is where that would be said.
     const text = "x".repeat(MAX_BYTES);
     s3.stream(BUCKET, report, {
       total: MAX_BYTES,
       chunkBytes: 4096,
       contentLength: false,
+      checksum: true,
     });
     const result = await fetchReport(s3, host);
     equal(result.code, 0, result.stderr);
@@ -254,13 +258,23 @@ Deno.test("fetch-report refuses an over-limit report without reading its body", 
       throw new Error(result.stderr);
     }
     // The declared length answers the refusal; waiting for the first byte
-    // would be reading the body after all.
+    // would be reading the body after all. Timing alone cannot tell those
+    // apart at this pace, since counting the body answers in under half a
+    // second here as well, so the byte count below is what says the body was
+    // never read, and test/fetch_report_test.ts is what says the transfer
+    // ended with the refusal rather than with this child.
     if (seconds > 1) {
       throw new Error(`returned only after ${seconds.toFixed(1)}s`);
     }
     const transfer = await settled(s3);
     if (transfer.finished || !transfer.closedEarly) {
       throw new Error(`read the body instead of its length: ${JSON.stringify(transfer)}`);
+    }
+    // Nothing went out. The fake counts a chunk only when it hands it over,
+    // and stops counting once the client has gone, so any byte here means the
+    // body was taken up and read, and the refusal came from counting it.
+    if (transfer.sent !== 0) {
+      throw new Error(`refused after ${transfer.sent} body bytes: ${JSON.stringify(transfer)}`);
     }
   }));
 
