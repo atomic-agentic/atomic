@@ -3011,6 +3011,16 @@ fn a_store_held_while_files_are_stored_leaves_the_outcome_unknown() {
     });
 }
 
+#[test]
+fn a_deny_list_that_cannot_be_made_fails_the_machine_not_the_model() {
+    let refused = anyhow::Error::new(crate::codex::DenyRefused("no".into())).context("the turn");
+    assert!(matches!(turn_failure(&refused), AtomError::Runtime(_)));
+    assert!(matches!(
+        turn_failure(&anyhow::anyhow!("the model said no")),
+        AtomError::Model(_)
+    ));
+}
+
 /// A local backend whose open waits, once it has begun, until it is let
 /// go, and that counts its closes.
 #[derive(Clone, Default)]
