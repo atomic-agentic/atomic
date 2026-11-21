@@ -157,6 +157,11 @@ fn outside_the_checkout(dir: &Path, project: Option<&Path>) -> Result<(), SignIn
     }
 }
 
+/// The first link on the way to `dir` that leads nowhere, if any.
+fn dangling_link(dir: &Path) -> Option<&Path> {
+    dir.ancestors().find(|a| a.is_symlink() && !a.exists())
+}
+
 /// The model endpoint a sign-in's Codex atoms use: ChatGPT's Codex backend.
 pub const CODEX_BACKEND: &str = "https://chatgpt.com/backend-api/codex";
 
@@ -188,10 +193,7 @@ impl SignIn {
             .join("codex-auth");
         // A link on the way that leads nowhere: making the directory would
         // fail, or make what it names, somewhere not checked here.
-        if let Some(link) = dir
-            .ancestors()
-            .find(|a| a.is_symlink() && !a.exists())
-        {
+        if let Some(link) = dangling_link(&dir) {
             return Err(SignInError::Store(CredentialError::File(format!(
                 "{} is a link to {}, which does not exist; make it, or point ATOMIC_HOME \
                  elsewhere",
@@ -263,8 +265,8 @@ impl SignIn {
     /// files and no one holds any of them. Only for a directory known to
     /// hold no sign-in: one this invocation made, or one a logout forgot
     /// in both stores. With the keyring store a live sign-in's directory
-    /// holds only lock files too. Never through a link, which would remove
-    /// what it leads to and leave the link behind.
+    /// holds only lock files too. Not when the directory is itself a link:
+    /// that would remove what it leads to and leave the link behind.
     fn tidy(&self) {
         if self.reached.is_symlink() {
             return;
@@ -811,7 +813,7 @@ mod tests {
             }
             let id_token = crate::testing::fake_id_token("dev@example.invalid", "account-1");
             KEYRING.lock().expect("keyring").push((
-                dir.clone(),
+                std::fs::canonicalize(&dir).expect("dir"),
                 serde_json::json!({"auth_mode": "chatgpt", "OPENAI_API_KEY": null, "tokens": {
                     "id_token": id_token, "access_token": "", "refresh_token": "",
                     "account_id": "account-1"}})
@@ -819,15 +821,18 @@ mod tests {
             ));
             // The issuer is the discard port on loopback: the login fails
             // there, if the keyring check before it does not.
-            let keyring = |dir: &Path, made: bool| {
-                SignIn {
+            // Made as `SignIn::configured` makes it, which finds whether
+            // the directory was there.
+            let keyring = |dir: &Path| {
+                let located = SignIn {
                     store: AuthCredentialsStoreMode::Keyring,
-                    made,
                     ..SignIn::in_files(dir)
-                }
-                .with_issuer("http://127.0.0.1:9")
+                };
+                SignIn::made_at(located, None)
+                    .expect("made")
+                    .with_issuer("http://127.0.0.1:9")
             };
-            let sign_in = keyring(&dir, false);
+            let sign_in = keyring(&dir);
             assert!(sign_in.account().expect("account").is_some());
             let failed = sign_in.login(true).await;
             assert!(failed.is_err(), "{failed:?}");
@@ -836,10 +841,11 @@ mod tests {
             assert_eq!(account.mode, "chatgpt");
 
             let made = auth_dir("keyring-made");
+            std::fs::remove_dir(&made).expect("not there yet");
+            let sign_in = keyring(&made);
             std::fs::write(made.join("auth.lock"), "").expect("lock");
             let held = std::fs::File::open(made.join("auth.lock")).expect("open");
             held.lock().expect("held");
-            let sign_in = keyring(&made, true);
             assert!(sign_in.login(true).await.is_err());
             assert!(made.join("auth.lock").exists(), "a held lock was removed");
             drop(held);

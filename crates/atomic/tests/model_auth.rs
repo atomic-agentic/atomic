@@ -312,6 +312,25 @@ fn a_login_that_fails_and_a_logout_leave_no_sign_in_directory() {
     // So no later run is told a sign-in could not be read.
     let out = f.atomic(&["config", "--explain"], &keyring);
     assert!(!text(&out).contains("could not be read"), "{}", text(&out));
+    // One that was there is kept: with the keyring store a live sign-in's
+    // directory holds only Codex's lock files.
+    std::fs::create_dir_all(&auth).unwrap();
+    for lock in ["auth.lock", "auth.json.lock"] {
+        std::fs::write(auth.join(lock), "").unwrap();
+    }
+    let env = [
+        ("ATOMIC_CREDENTIAL_STORE", "keyring"),
+        ("ATOMIC_TEST_LOGIN_ISSUER", "http://127.0.0.1:9"),
+    ];
+    let out = f
+        .atomic_within(&["model", "login", "--device-auth"], &env, 60)
+        .expect("login stopped");
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(
+        auth.join("auth.lock").exists() && auth.join("auth.json.lock").exists(),
+        "a failed login removed a sign-in's directory it did not make"
+    );
+    std::fs::remove_dir_all(&auth).unwrap();
     // Nor does a logout with no one signed in.
     let out = f.atomic(&["model", "logout"], &[]);
     assert!(out.status.success(), "{}", text(&out));
