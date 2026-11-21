@@ -743,13 +743,14 @@ fn a_signed_in_threads_command_cannot_read_the_sign_in() {
                 private: state.join("private"),
                 also: vec![dir.join("credentials")],
             }),
-            backend: atomic_exec::Backend::connect(atomic_exec::LocalBackend::in_dir(
-                dir.join("scratch-root"),
-            ))
-            .unwrap(),
         };
+        let exec = atomic_exec::Backend::connect(atomic_exec::LocalBackend::in_dir(
+            dir.join("scratch-root"),
+        ))
+        .unwrap();
         let answer = atomic_core::runtime::run_turn(
             &runtime,
+            &exec,
             &TurnSpec {
                 prompt: "Do the work.".into(),
                 sandbox: Sandbox::WorkspaceWrite,
