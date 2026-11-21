@@ -927,6 +927,7 @@ fn secret_variables_cross_only_as_well_formed_entries() {
 
 /// A secret socket's descriptor must be past the standard three, and a
 /// socket, on every Unix.
+#[cfg(unix)]
 #[test]
 fn a_secret_socket_is_past_the_standard_three_and_a_socket() {
     assert!(!process::above_stdio(&2));
