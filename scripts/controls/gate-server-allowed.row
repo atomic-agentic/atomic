@@ -1,0 +1,1 @@
+gate-server-allowed|crates/atomic-durable/src/gate/approvers.rs|                if !is_default && !allowed.contains(&group) {|                if !is_default && allowed.is_empty() {|-p atomic-agentic --test pipeline a_gate_whose_approvers_do_not_resolve_is_refused_before_it_starts

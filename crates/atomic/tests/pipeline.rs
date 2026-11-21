@@ -898,7 +898,50 @@ fn a_gate_whose_approvers_do_not_resolve_is_refused_before_it_starts() {
         default: None,
     };
     let error = prepare(&loaded, &atoms, &server).expect_err("no approvers");
-    assert!(error.message.contains("check"), "{error}");
+    assert!(
+        error.message.contains(
+            "gate check: a shared deployment needs approvers; name an allowed group or set a \
+             default approver group in project policy"
+        ),
+        "{error}"
+    );
+    // Naming a group policy allows, the same workflow loads, and that group
+    // decides its gate; a group policy does not allow is refused.
+    let naming = |group: &str| {
+        let file = project.join(format!("workflows/gated-{group}.workflow.yaml"));
+        let named = gated().replace(
+            "      timeout: 24h\n",
+            &format!("      timeout: 24h\n      approvers: [{group}]\n"),
+        );
+        assert_ne!(named, gated(), "the gate names its approvers");
+        std::fs::write(&file, named).expect("workflow");
+        let loaded = workflow::load(&file, &atoms, &mut Registry::new()).expect("a gate is valid");
+        prepare(&loaded, &atoms, &server)
+    };
+    let pipeline = naming("maintainers").expect("an allowed group loads");
+    let gates: Vec<_> = pipeline
+        .steps
+        .iter()
+        .filter_map(|s| match s {
+            Step::Gate(g) => Some(g),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(gates.len(), 1);
+    assert_eq!(
+        gates[0].approvers.as_deref(),
+        Some(&["maintainers".to_owned()][..])
+    );
+    let resolved =
+        gate::resolve(&gates[0].id, gates[0].approvers.as_deref(), &server).expect("resolves");
+    assert_eq!(resolved.principals(), [Principal::group("maintainers")]);
+    let error = naming("ops").expect_err("not an allowed group");
+    assert!(
+        error
+            .message
+            .contains("gate check: ops is not an approver group project policy allows"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -5589,6 +5632,61 @@ fn a_worktree_steps_reviewer_sees_its_commit_and_the_gate_shows_the_one_publishe
             plain_git(&project, &["rev-parse", &format!("{commit}^")]),
             base
         );
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[test]
+fn a_hand_built_review_the_loader_would_refuse_is_refused_before_any_call() {
+    on_codex_runtime(async {
+        let dir = scratch("review-hand-built");
+        let project = project(&dir);
+        let model = FakeModel::start(vec![Reply::Text(READ.into())])
+            .await
+            .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        for (n, (change, said)) in [
+            (
+                (|s: &mut atomic_app::pipeline::AtomStep| {
+                    s.review.as_mut().expect("a review").rounds = 9
+                }) as fn(&mut atomic_app::pipeline::AtomStep),
+                "more than the 5 atomic allows",
+            ),
+            (
+                (|s: &mut atomic_app::pipeline::AtomStep| s.id = "read.review".into()),
+                "has a dot in its name",
+            ),
+            (
+                (|s: &mut atomic_app::pipeline::AtomStep| {
+                    s.review.as_mut().expect("a review").reviewer = "no-such-atom".into()
+                }),
+                "is not a lite or codex atom of the run",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut pipeline = reviewed(&project, 1);
+            let Step::Atom(step) = &mut pipeline.steps[0] else {
+                panic!("an atom step");
+            };
+            change(step);
+            let id = format!("hand-built-{n}");
+            let run = PipelineRun {
+                pipeline,
+                input: json!({ "text": NOTE }),
+            };
+            rt.start(PIPELINE, &id, run).await.expect("start");
+            let error = rt
+                .result::<Value>(&id)
+                .await
+                .expect_err("refused")
+                .to_string();
+            assert!(error.contains(said), "{error}");
+        }
+        assert_eq!(model.calls(), 0, "a refused run was paid for");
         rt.shutdown(std::time::Duration::from_secs(5))
             .await
             .expect("shutdown");
