@@ -84,7 +84,9 @@ async fn run_on<A: Atom>(
                 defaults: AtomConfig::default(),
                 artifacts: atomic_core::runtime::Artifacts::none(),
                 meter: atomic_core::usage::Metering::none(),
-                backend: Default::default(),
+                // Its turns run without Codex's sandbox helper, so nothing may be
+                // denied to them: see `denying_nothing`.
+                backend: atomic_core::testing::denying_nothing(Default::default()),
                 caches: None,
             };
             run_codex_atom(atom, input, &rt).await

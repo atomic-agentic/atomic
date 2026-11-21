@@ -698,6 +698,29 @@ fn deny_also(profile: PermissionProfile, denied: &[PathBuf]) -> anyhow::Result<P
     ))
 }
 
+/// Refuse, on Linux (`linux`), a thread whose commands must be kept out of
+/// `denied` when `paths` has no Linux sandbox helper. Codex's Linux sandbox
+/// reads a profile that denies paths only through that helper, so without
+/// one the thread could not keep its commands out of other attempts' scratch
+/// directories; atomic refuses it before the thread starts rather than run it
+/// with less denied.
+fn refuse_denied_without_helper(
+    paths: &CodexPaths,
+    denied: &[PathBuf],
+    linux: bool,
+) -> anyhow::Result<()> {
+    if linux && !denied.is_empty() && paths.linux_sandbox().is_none() {
+        let denied: Vec<_> = denied.iter().map(|d| d.display().to_string()).collect();
+        bail!(
+            "this turn's commands must be kept out of {}, and on Linux only Codex's \
+             sandbox helper can do that, which this process does not have; run atomic \
+             itself, which provides one",
+            denied.join(", ")
+        );
+    }
+    Ok(())
+}
+
 /// Refuse a workspace-write thread under [`StateGuard::NoProjectState`]
 /// whose writable roots cover atomic's state or user-wide private
 /// directories, or lie inside them: nothing would deny them.
@@ -1519,6 +1542,7 @@ where
     Fut: std::future::Future<Output = Option<TurnSpec>>,
 {
     let spec = first;
+    refuse_denied_without_helper(paths, &spec.denied, cfg!(target_os = "linux"))?;
     let mut endpoint = endpoint.clone();
     if let Some(m) = &spec.model {
         endpoint.model = m.clone();
@@ -2732,6 +2756,56 @@ mod tests {
             assert_eq!(model.calls(), 1, "requests: {:#?}", model.requests());
             // The prompt reached the model.
             assert!(model.requests()[0].to_string().contains("ping"));
+        });
+    }
+
+    /// Only Codex's Linux sandbox helper keeps a thread's commands out of
+    /// the paths its profile denies, so on Linux a thread with something to
+    /// deny and no helper is refused before any model call, and is never
+    /// run with less denied.
+    #[test]
+    fn a_thread_with_paths_to_deny_and_no_sandbox_helper_is_refused_on_linux() {
+        let denied = [PathBuf::from("/scratch/root")];
+        let helperless = CodexPaths::without_helpers();
+        let why = refuse_denied_without_helper(&helperless, &denied, true)
+            .expect_err("no helper to deny with")
+            .to_string();
+        assert!(why.contains("/scratch/root") && why.contains("sandbox helper"), "{why}");
+        refuse_denied_without_helper(&helperless, &[], true).expect("nothing to deny");
+        refuse_denied_without_helper(&helperless, &denied, false).expect("not on Linux");
+        let with = CodexPaths::with_helpers("/bin/atomic".into(), "/bin/codex-linux-sandbox".into());
+        refuse_denied_without_helper(&with, &denied, true).expect("a helper denies");
+
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        on_codex_runtime(async {
+            let model = FakeModel::start(vec![Reply::Text("pong".into())])
+                .await
+                .expect("fake model");
+            let (home, cwd) = (scratch("deny-home"), scratch("deny-cwd"));
+            let endpoint = ModelEndpoint {
+                base_url: model.base_url(),
+                model: "synthetic".into(),
+                api_key_env: None,
+            };
+            let spec = TurnSpec {
+                prompt: "ping".into(),
+                denied: denied.to_vec(),
+                ..TurnSpec::default()
+            };
+            let err = run(
+                &CodexPaths::without_helpers(),
+                &home,
+                &cwd,
+                &endpoint,
+                &StateGuard::NoProjectState,
+                &spec,
+            )
+            .await
+            .expect_err("refused without a helper");
+            assert!(err.to_string().contains("sandbox helper"), "{err:#}");
+            assert_eq!(model.calls(), 0, "refused before any model call");
         });
     }
 

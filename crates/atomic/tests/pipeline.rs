@@ -221,7 +221,9 @@ fn runtimes_on(dir: &Path, cwd: &Path, base_url: &str, model: &str) -> Arc<Runti
             defaults: AtomConfig::default(),
             artifacts: Artifacts::none(),
             meter: atomic_core::usage::Metering::none(),
-            backend: Default::default(),
+            // Its turns run without Codex's sandbox helper, so nothing may be
+            // denied to them: see `denying_nothing`.
+            backend: atomic_core::testing::denying_nothing(Default::default()),
             caches: None,
         },
         lite: LiteRuntime::new(endpoint, AtomConfig::default()),
@@ -395,7 +397,8 @@ async fn engine_built(
     let runtimes = match backend {
         Some(backend) => {
             let mut on = (*runtimes).clone();
-            on.codex.backend = backend.clone();
+            // Its turns run without Codex's sandbox helper too.
+            on.codex.backend = atomic_core::testing::denying_nothing(backend.clone());
             on.lite.backend = backend.clone();
             on.exec = backend;
             Arc::new(on)

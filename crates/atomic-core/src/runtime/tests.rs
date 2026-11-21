@@ -76,7 +76,9 @@ fn runtime(model: &FakeModel, tag: &str) -> CodexRuntime {
         defaults: AtomConfig::default(),
         artifacts: Artifacts::none(),
         meter: crate::usage::Metering::none(),
-        backend: Default::default(),
+        // Its turns run without Codex's sandbox helper, so nothing may be
+        // denied to them: see `denying_nothing`.
+        backend: crate::testing::denying_nothing(Default::default()),
         caches: None,
     }
 }
@@ -1351,6 +1353,12 @@ impl Recording {
     fn backend(&self) -> atomic_exec::Backend {
         atomic_exec::Backend::connect(self.clone()).expect("connects")
     }
+
+    /// The backend for Codex turns, which run here without Codex's sandbox
+    /// helper, so nothing may be denied to them: see `denying_nothing`.
+    fn turn_backend(&self) -> atomic_exec::Backend {
+        crate::testing::denying_nothing(self.backend())
+    }
 }
 
 impl ExecutionBackend for Recording {
@@ -1440,7 +1448,7 @@ fn every_kind_of_atom_runs_through_its_execution_backend() {
 
         let codex = Recording::default();
         let mut rt = runtime(&model, "seam-codex");
-        rt.backend = codex.backend();
+        rt.backend = codex.turn_backend();
         run_codex_atom(&Classify, &note, &rt).await.expect("runs");
         assert_eq!(codex.calls(), ["open classify-note", "close classify-note"]);
         let (asked, given) = &codex.opened()[0];
@@ -1509,7 +1517,7 @@ fn a_run_whose_workspace_cannot_be_opened_sends_and_runs_nothing() {
         };
 
         let mut rt = runtime(&model, "seam-refuse");
-        rt.backend = refusing.backend();
+        rt.backend = refusing.turn_backend();
         let r = run_codex_atom(&Classify, &note, &rt).await;
         assert!(
             matches!(&r, Err(AtomError::Runtime(m)) if m.contains("no room on this backend")),
@@ -1561,7 +1569,7 @@ fn a_failed_run_closes_its_workspace() {
         .expect("fake model");
         let codex = Recording::default();
         let mut rt = runtime(&model, "seam-fail");
-        rt.backend = codex.backend();
+        rt.backend = codex.turn_backend();
         let r = run_codex_atom(&Classify, &Note { text: "n".into() }, &rt).await;
         assert!(matches!(&r, Err(AtomError::Schema { .. })), "{r:?}");
         assert_eq!(codex.calls(), ["open classify-note", "close classify-note"]);
@@ -1600,7 +1608,7 @@ fn a_codex_atom_whose_workspace_has_no_shell_sends_nothing() {
             ..Recording::default()
         };
         let mut rt = runtime(&model, "seam-no-shell");
-        rt.backend = shell_less.backend();
+        rt.backend = shell_less.turn_backend();
         let r = run_codex_atom(&Classify, &Note { text: "n".into() }, &rt).await;
         assert!(
             matches!(&r, Err(AtomError::Runtime(m)) if m.contains("no shell")),
@@ -1628,7 +1636,7 @@ fn an_unavailable_workspace_is_waited_for() {
             ..Recording::default()
         };
         let mut rt = runtime(&model, "seam-busy");
-        rt.backend = busy.backend();
+        rt.backend = busy.turn_backend();
         run_codex_atom(&Classify, &Note { text: "n".into() }, &rt)
             .await
             .expect("runs once the backend has room");
@@ -1641,7 +1649,7 @@ fn an_unavailable_workspace_is_waited_for() {
             unavailable: Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX)),
             ..Recording::default()
         };
-        rt.backend = full.backend();
+        rt.backend = full.turn_backend();
         let waiting = tokio::spawn(async move {
             run_codex_atom(&Classify, &Note { text: "n".into() }, &rt).await
         });
@@ -1685,7 +1693,7 @@ fn a_run_that_panics_closes_its_workspace() {
             .expect("fake model");
         let recorded = Recording::default();
         let mut rt = runtime(&model, "seam-panic");
-        rt.backend = recorded.backend();
+        rt.backend = recorded.turn_backend();
         let r = contained(
             async move { run_codex_atom(&Panics, &Note { text: "n".into() }, &rt).await },
         )
@@ -1799,7 +1807,7 @@ fn a_codex_atom_passes_its_declared_tool_homes_to_its_workspace() {
             .expect("fake model");
         let recorded = Recording::default();
         let mut all = runtimes(&model, "codex-env");
-        all.codex.backend = recorded.backend();
+        all.codex.backend = recorded.turn_backend();
         run_declarative(
             &a,
             &compiled,
