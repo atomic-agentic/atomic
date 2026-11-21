@@ -1,0 +1,1 @@
+exec-network-own-nonempty|crates/atomic-core/src/network.rs|        !own.is_empty(),|        true,|-p atomic-agentic-core --lib --features fake-model network::tests::this_machines_addresses_come_from_its_interfaces

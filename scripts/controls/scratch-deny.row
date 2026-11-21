@@ -1,0 +1,1 @@
+scratch-deny|crates/atomic-core/src/runtime.rs|    spec.denied = workspace.denied.clone();|    spec.denied = Vec::new(); // CONTROL_OFF|--workspace --features atomic-agentic/postgres-tests,atomic-agentic/sandbox-tests --test turn_workspace a_turn_cannot_read_another_turns_scratch_and_keeps_its_own

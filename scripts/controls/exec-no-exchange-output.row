@@ -1,0 +1,1 @@
+exec-no-exchange-output|crates/atomic-core/src/runtime.rs|    if none_given|    if std::hint::black_box(false) && none_given|-p atomic-agentic-core --lib --features fake-model a_backend_with_no_exchange_refuses_what_it_cannot_hand_over
