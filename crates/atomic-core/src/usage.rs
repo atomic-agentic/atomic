@@ -58,6 +58,10 @@ pub struct Call {
     /// atom's command: it uses no tokens and costs nothing, and, like a
     /// turn, reserves the active time left and is cut off when it runs out.
     pub work: bool,
+    /// For a turn or work, the longest it can take when it has a limit of
+    /// its own, such as a command's: it reserves no more of the time left
+    /// than that.
+    pub longest: Option<Duration>,
 }
 
 /// The model name active work that is not a model call is accounted under.

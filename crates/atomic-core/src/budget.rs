@@ -274,6 +274,50 @@ pub enum BudgetError {
     /// call.
     #[error("{0}")]
     BelowCall(Box<BelowCall>),
+    /// A minutes cap smaller than [`LEAST_WORK`], over an exec atom's
+    /// command: it could never start one.
+    #[error(
+        "the {level} minutes cap ({cap} seconds, {from}) is smaller than the {least} seconds an \
+         exec atom's command needs to start; raise the cap"
+    )]
+    BelowWork {
+        /// `atom` or `workflow`.
+        level: String,
+        /// The cap, in seconds.
+        cap: String,
+        /// Where the cap came from.
+        from: String,
+        /// [`LEAST_WORK`], in seconds.
+        least: String,
+    },
+}
+
+/// The least active time worth starting a command with: with less left, it
+/// is refused, and the run parks.
+pub const LEAST_WORK: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Where a cap came from, for a person.
+fn from_text(origin: &Origin) -> String {
+    match origin {
+        Origin::Declared => "written in its budget block".to_owned(),
+        Origin::Default(setting) => format!("the default {setting}"),
+    }
+}
+
+/// Refuse `caps` at `level` if their minutes cannot start one exec atom's
+/// command: less than [`LEAST_WORK`].
+pub fn check_work_room(caps: &Resolved, level: Level) -> Result<(), BudgetError> {
+    let least = u64::try_from(LEAST_WORK.as_millis()).unwrap_or(u64::MAX);
+    if caps.millis >= least {
+        return Ok(());
+    }
+    let seconds = |ms: u64| format!("{}", ms as f64 / 1_000.0);
+    Err(BudgetError::BelowWork {
+        level: level.key().to_owned(),
+        cap: seconds(caps.millis),
+        from: from_text(&caps.origins[1]),
+        least: seconds(least),
+    })
 }
 
 /// A cap smaller than what one call to a model reserves.
@@ -494,10 +538,7 @@ impl BudgetSettings {
                 cap,
                 need,
                 unit: unit.to_owned(),
-                from: match origin {
-                    Origin::Declared => "written in its budget block".to_owned(),
-                    Origin::Default(setting) => format!("the default {setting}"),
-                },
+                from: from_text(origin),
                 model: model.to_owned(),
                 bound,
             }))

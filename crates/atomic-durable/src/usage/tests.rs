@@ -73,6 +73,7 @@ fn request(run: &str, step: i32, call: u32, run_cap: i64, atom_cap: i64) -> Requ
         reserve: BOUND,
         maximum: BOUND,
         turn: false,
+        longest: None,
     }
 }
 
@@ -608,6 +609,107 @@ async fn a_turn_reserves_the_active_time_left<R: DurableRuntime>(rt: R) {
     assert_eq!(charged(&ledger, &format!("atom:{run}:1")).await, before);
 }
 
+async fn an_amount_a_call_reserves_none_of_is_not_held_to_its_cap<R: DurableRuntime>(rt: R) {
+    let ledger = rt.ledger();
+    let run = unique("none-of");
+    // A call that reported more tokens than it reserved takes its atom past
+    // its token cap.
+    let (req, attempt) = admitted(
+        &ledger
+            .admit(request(&run, 1, 0, 1_000, 150))
+            .await
+            .expect("admit"),
+    );
+    ledger
+        .settle(
+            &req,
+            attempt,
+            Settlement::Reported {
+                input_tokens: 150,
+                output_tokens: 50,
+                millis: 10,
+                micro_usd: 0,
+            },
+        )
+        .await
+        .expect("settle");
+    assert_eq!(charged(&ledger, &format!("atom:{run}:1")).await.tokens, 200);
+    // Another model call is refused on its tokens; work that reserves only
+    // time, such as a command, is admitted on the time left.
+    match ledger
+        .admit(request(&run, 1, 1, 1_000, 150))
+        .await
+        .expect("admit")
+    {
+        Admission::Refused { reason, .. } => assert!(reason.contains("tokens"), "{reason}"),
+        other => panic!("refused: {other:?}"),
+    }
+    let time = Charge {
+        tokens: 0,
+        millis: 500,
+        micro_usd: 0,
+    };
+    let work = Request {
+        id: format!("{run}:1:2"),
+        model: "(command)".into(),
+        reserve: time,
+        maximum: time,
+        turn: true,
+        ..request(&run, 1, 2, 1_000, 150)
+    };
+    admitted(&ledger.admit(work).await.expect("admit"));
+    assert_eq!(charged(&ledger, &format!("atom:{run}:1")).await.tokens, 200);
+}
+
+async fn a_turn_with_a_limit_of_its_own_reserves_no_more_than_it<R: DurableRuntime>(rt: R) {
+    let ledger = rt.ledger();
+    let run = unique("longest");
+    let mut turn = request(&run, 1, 0, 1_000_000, 1_000_000);
+    turn.chain[0].caps.millis = 30_000;
+    turn.chain[1].caps.millis = 20_000;
+    turn.turn = true;
+    turn.longest = Some(5_000);
+    // Its own limit, not all the 20 s its atom has left, and that limit,
+    // not an allowance, bounds it.
+    let Admission::Admitted {
+        millis, bounded_by, ..
+    } = ledger.admit(turn.clone()).await.expect("admit")
+    else {
+        panic!("admitted");
+    };
+    assert_eq!(millis, 5_000);
+    assert_eq!(bounded_by, None);
+    assert_eq!(
+        charged(&ledger, &format!("atom:{run}:1")).await.millis,
+        5_000
+    );
+    // It ran its five seconds. With less left than its limit, the next
+    // takes what is left, bounded by the allowance.
+    ledger
+        .settle(
+            &format!("{run}:1:0"),
+            1,
+            Settlement::Reported {
+                input_tokens: 0,
+                output_tokens: 0,
+                millis: 5_000,
+                micro_usd: 0,
+            },
+        )
+        .await
+        .expect("settle");
+    turn.id = format!("{run}:1:1");
+    turn.longest = Some(60_000);
+    let Admission::Admitted {
+        millis, bounded_by, ..
+    } = ledger.admit(turn).await.expect("admit")
+    else {
+        panic!("admitted");
+    };
+    assert_eq!(millis, 15_000);
+    assert_eq!(bounded_by, Some(format!("atom:{run}:1")));
+}
+
 async fn unreported_and_dead_attempts_are_charged_the_time_they_took<R: DurableRuntime>(rt: R) {
     let ledger = rt.ledger();
     let run = unique("elapsed");
@@ -1069,6 +1171,8 @@ on_sqlite!(
     unreported_and_dead_attempts_are_charged_the_time_they_took,
     a_partly_known_attempt_is_charged_its_reported_usage_and_one_more_bound,
     a_turn_reserves_the_active_time_left,
+    a_turn_with_a_limit_of_its_own_reserves_no_more_than_it,
+    an_amount_a_call_reserves_none_of_is_not_held_to_its_cap,
     amounts_out_of_range_are_refused_and_reported_usage_is_held,
     admission_refuses_on_time_and_on_dollars,
     a_reserved_attempt_is_reconciled_or_released_once,
@@ -1090,6 +1194,8 @@ on_postgres!(
     unreported_and_dead_attempts_are_charged_the_time_they_took,
     a_partly_known_attempt_is_charged_its_reported_usage_and_one_more_bound,
     a_turn_reserves_the_active_time_left,
+    a_turn_with_a_limit_of_its_own_reserves_no_more_than_it,
+    an_amount_a_call_reserves_none_of_is_not_held_to_its_cap,
     amounts_out_of_range_are_refused_and_reported_usage_is_held,
     admission_refuses_on_time_and_on_dollars,
     a_reserved_attempt_is_reconciled_or_released_once,

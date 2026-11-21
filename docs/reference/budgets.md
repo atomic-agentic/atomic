@@ -193,12 +193,20 @@ reported and that request, never just its reservation. Usage reported after the
 last record, and before the stop, is not known.
 
 An exec atom's command counts toward `minutes` the same way: its step reserves
-the active time its atom has left (or less, if the run has less), the command is
-stopped when that runs out or at its own five-minute limit, whichever is first,
-and the step is charged the time the command ran. A command uses no tokens and
-costs nothing, so an exec atom's budget needs no price, even under a dollar cap.
+the active time its atom has left (or less, if the run has less), at most the
+command's own five-minute limit and the 30 seconds its runner is allowed on top.
+The command is stopped when that time runs out or at its own limit, whichever
+is first. The step is charged from the command's admission to its settlement:
+the command itself, and also starting its runner, trying again while another
+runner held its workspace, and storing its output files. Only the command is
+stopped at the cap, so that extra time can take a run a little past it. A
+command uses no tokens and costs nothing, so an exec atom's budget needs no
+price, even under a dollar cap, and only its time is checked: a run whose
+tokens or dollars went past their caps on earlier model calls still runs it.
 With less than half a second left, the command is not started: the run parks,
-and once a person raises the cap and releases it, the command runs. A command
+and once a person raises the cap and releases it, the command runs. An exec
+atom's `minutes` cap below half a second, or a run's when it has exec atoms,
+fails configuration, since no command could ever start under it. A command
 the cap stops mid-run parks the run the same way if its atom declares
 `effects: { external: 'idempotent' }` or `'read-only'`, and once the cap is
 raised it runs again from the start; any other fails, since whether its effects happened is

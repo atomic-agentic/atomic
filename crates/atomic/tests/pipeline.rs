@@ -5165,6 +5165,7 @@ async fn spend_all_but(rt: &Durare, run: &str, left: i64) {
             reserve: charge,
             maximum: charge,
             turn: false,
+            longest: None,
         })
         .await
         .expect("admit");
