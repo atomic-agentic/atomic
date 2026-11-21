@@ -650,7 +650,45 @@ mod tests {
         let state = ProjectState::resolve(&both).expect("state");
         assert!(store_project(&state).is_err(), "both manifests");
 
-        for dir in [none, named, broken, both] {
+        // A `.atomic` that is a file holds no manifest: nothing is there.
+        let plain = project("plain-dot-atomic");
+        std::fs::write(plain.join(".atomic"), "not a directory").expect(".atomic");
+        let state = ProjectState::resolve(&plain).expect("state");
+        let dir = plain
+            .file_name()
+            .expect("name")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            store_project(&state).expect("no manifest under a plain .atomic"),
+            format!("{dir}/{}", state.id())
+        );
+
+        // A manifest that is there but cannot be looked at, or is not a file,
+        // is refused with its path: a link to itself, a link to nothing and
+        // a directory.
+        let mut odd = Vec::new();
+        #[cfg(unix)]
+        {
+            let looped = project("looped");
+            std::os::unix::fs::symlink("atomic.yaml", looped.join("atomic.yaml")).expect("link");
+            odd.push(looped);
+            let dangling = project("dangling");
+            std::os::unix::fs::symlink("gone.yaml", dangling.join("atomic.yaml")).expect("link");
+            odd.push(dangling);
+        }
+        let directory = project("directory");
+        std::fs::create_dir_all(directory.join(".atomic/atomic.yaml")).expect("directory");
+        odd.push(directory);
+        for dir in &odd {
+            let state = ProjectState::resolve(dir).expect("state");
+            let refused = store_project(&state).expect_err("a manifest that cannot be used");
+            let shown = format!("{refused:#}");
+            assert!(shown.contains("read the project's manifest"), "{shown}");
+            assert!(shown.contains("atomic.yaml"), "{shown}");
+        }
+
+        for dir in [none, named, broken, both, plain].into_iter().chain(odd) {
             let _ = std::fs::remove_dir_all(dir);
         }
     }

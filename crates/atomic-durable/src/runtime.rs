@@ -1170,11 +1170,11 @@ impl Durare {
                     if let Some(id) = id {
                         tx.execute(
                             "UPDATE atomic_park_projects SET project = ? \
-                             WHERE project <> ? AND substr(project, -?) = ?",
+                             WHERE project <> ? AND substr(project, -length(?)) = ?",
                             &[
                                 Param::Text(project.clone()),
                                 Param::Text(project),
-                                Param::Int(i64::try_from(id.len()).unwrap_or(i64::MAX)),
+                                Param::Text(id.clone()),
                                 Param::Text(id),
                             ],
                         )
@@ -1203,11 +1203,11 @@ impl Durare {
                             "SELECT p.park_id AS park_id FROM atomic_parks p \
                              LEFT JOIN atomic_park_projects pp ON pp.park_id = p.park_id \
                              WHERE pp.project IS NULL OR (? <> '' AND pp.project <> ? \
-                             AND substr(pp.project, -?) = ?) LIMIT 1",
+                             AND substr(pp.project, -length(?)) = ?) LIMIT 1",
                             &[
                                 Param::Text(id.clone()),
                                 Param::Text(project),
-                                Param::Int(i64::try_from(id.len()).unwrap_or(i64::MAX)),
+                                Param::Text(id.clone()),
                                 Param::Text(id),
                             ],
                         )

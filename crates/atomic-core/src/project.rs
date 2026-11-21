@@ -127,13 +127,8 @@ pub fn find_manifest(start: &Path) -> Result<PathBuf, ProjectError> {
         source,
     })?;
     for dir in start.ancestors() {
-        let dedicated = dir.join("atomic.yaml");
-        let embedded = dir.join(".atomic").join("atomic.yaml");
-        match (dedicated.is_file(), embedded.is_file()) {
-            (true, true) => return Err(ProjectError::BothManifests(dir.to_owned())),
-            (true, false) => return Ok(dedicated),
-            (false, true) => return Ok(embedded),
-            (false, false) => {}
+        if let Some(manifest) = manifest_in(dir)? {
+            return Ok(manifest);
         }
     }
     Err(ProjectError::NotFound(start))
@@ -322,11 +317,39 @@ pub fn load(path: &Path) -> Result<Project, ProjectError> {
 fn manifest_in(dir: &Path) -> Result<Option<PathBuf>, ProjectError> {
     let dedicated = dir.join("atomic.yaml");
     let embedded = dir.join(".atomic").join("atomic.yaml");
-    match (dedicated.is_file(), embedded.is_file()) {
+    match (is_manifest(&dedicated)?, is_manifest(&embedded)?) {
         (true, true) => Err(ProjectError::BothManifests(dir.to_owned())),
         (true, false) => Ok(Some(dedicated)),
         (false, true) => Ok(Some(embedded)),
         (false, false) => Ok(None),
+    }
+}
+
+/// Whether a manifest is at `path`. Only nothing there (`NotFound`, or a
+/// parent that is not a directory) is no manifest. Anything else that is
+/// there but cannot be looked at or is not a file, such as a directory, a
+/// link to itself or to nothing, or one behind a directory it may not
+/// search, refuses with its path, so the walk does not go on to a parent's
+/// manifest in its place.
+fn is_manifest(path: &Path) -> Result<bool, ProjectError> {
+    let refuse = |source| ProjectError::Read {
+        path: path.to_owned(),
+        source,
+    };
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_file() => Ok(true),
+        Ok(_) => Err(refuse(std::io::Error::other("it is not a file"))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotADirectory => Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::symlink_metadata(path) {
+                // A link that leads nowhere.
+                Ok(_) => Err(refuse(e)),
+                Err(gone) if gone.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(gone) if gone.kind() == std::io::ErrorKind::NotADirectory => Ok(false),
+                Err(other) => Err(refuse(other)),
+            }
+        }
+        Err(e) => Err(refuse(e)),
     }
 }
 
