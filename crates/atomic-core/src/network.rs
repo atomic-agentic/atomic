@@ -24,13 +24,14 @@
 //! `CONNECT`, not SOCKS.
 //!
 //! While a command that declared hosts runs, its proxy listens on this
-//! machine's loopback interface, and serves only that command's bridge: the
-//! sandbox helper's bridge opens each connection with a token atomic made
-//! for that command alone (Codex's attribution frame), and the proxy refuses
-//! every request on a connection without a token it issued, so another
-//! process on this machine reaches nothing through it. A command's token
-//! stops working when the command ends, and the proxy stops once no command
-//! needs it.
+//! machine's loopback interface, shared by the running commands that declared
+//! the same hosts. The sandbox helper's bridge opens each connection with a
+//! token atomic made for its command alone (Codex's attribution frame), and
+//! the proxy refuses every request on a connection without a token it issued,
+//! so a sandboxed process or another user's process reaches nothing through
+//! it. A process of the same user outside any sandbox can still read a token
+//! from the helper's environment. A command's token admits no new connection
+//! once the command ends, and the proxy stops once no command needs it.
 //!
 //! A command's bridge opens at most 128 connections to its proxy at once,
 //! and each costs atomic two file descriptors, so a command may hold

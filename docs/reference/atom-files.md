@@ -179,9 +179,11 @@ clients and SDKs read and which come on top of its `env`; a client that ignores
 them reaches nothing. An atom's `env` cannot set any of them. It can open no
 other connection, to this machine or anywhere else, and no Unix socket. The
 proxy never goes through another proxy, even when atomic's own environment
-names one. It serves only the sandbox it was started for: each connection
-must open with a token atomic gives that command's sandbox, and the command
-itself never sees, so another process on the machine cannot use the proxy.
+names one. Each connection must open with a token that atomic gives the
+command's sandbox and that the command itself never sees, so no sandboxed
+process and no other user's process can use the proxy. A process of your own
+user that runs outside any sandbox can still read the token from the sandbox
+helper's environment while the command runs.
 A command's sandbox opens at most 128 connections to its proxy at once, each
 costing atomic two open files, and the commands that declare hosts may take
 no more than half of atomic's limit on open files between them. When they
@@ -367,7 +369,7 @@ time rather than passing unchecked.
 | `kind` | `lite`, `codex` or `exec` |
 | `input`, `output` | Full JSON Schema or a local schema reference |
 | `model`, `sandbox` | Model selection and effective sandbox request |
-| `trust` | The riskiest input origin the atom accepts: `team`, `agent` or `external` (the default). A workflow that maps less trusted data into it fails to load, and `atomic run <atom>`, whose input is external data, refuses it before anything runs unless the atom accepts external input; see [where each input came from](workflow-files.md#where-each-input-came-from) |
+| `trust` | The riskiest input origin the atom accepts: `team`, `agent` or `external` (the default). A workflow that maps less trusted data into it fails to load, `atomic run <atom>`, whose input is external data, refuses it before anything runs unless the atom accepts external input, and `atomic eval` refuses a case whose [origin](eval-cases.md#where-a-cases-input-came-from) is less trusted than it accepts; see [where each input came from](workflow-files.md#where-each-input-came-from) |
 | `validate` | Expression-bodied typed callbacks over `{input, output}` |
 | `examples` | Named `{input, output}` examples checked against full contracts |
 | `case`, `judges` | Full evaluation-case and judge input/output schema declarations |
@@ -588,7 +590,7 @@ protect against a process running as you.
 
 ## Related references
 
-- [Prompt components and expressions](../guides/template-tags.md)
+- [Prompt expressions and components](../guides/template-tags.md)
 - [VS Code](../guides/vs-code.md)
 - [Workflow files](workflow-files.md)
 - [Scripts and cloud SDKs](../guides/scripts-and-cloud-sdks.md)
