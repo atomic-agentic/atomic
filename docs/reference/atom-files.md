@@ -182,6 +182,13 @@ proxy never goes through another proxy, even when atomic's own environment
 names one. It serves only the sandbox it was started for: each connection
 must open with a token atomic gives that command's sandbox, and the command
 itself never sees, so another process on the machine cannot use the proxy.
+A command's sandbox opens at most 128 connections to its proxy at once, each
+costing atomic two open files, and the commands that declare hosts may take
+no more than half of atomic's limit on open files between them. When they
+need more room, atomic first raises its own limit as far as the hard limit
+allows, up to 65536, and the commands it starts afterwards inherit that; a
+command that would still pass it does not start, and says so. Raise the hard
+limit (`ulimit -Hn`) to run more of them at once.
 
 What an atom may list is atomic's policy, checked when the atom loads and again
 before its command runs: public DNS names only. An IP address in any spelling

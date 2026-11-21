@@ -31,6 +31,13 @@
 //! process on this machine reaches nothing through it. A command's token
 //! stops working when the command ends, and the proxy stops once no command
 //! needs it.
+//!
+//! A command's bridge opens at most 128 connections to its proxy at once,
+//! and each costs atomic two file descriptors, so a command may hold
+//! [`DESCRIPTORS_PER_COMMAND`] of them. Together, the commands that declare
+//! hosts may hold no more than half of atomic's limit on open files, which
+//! atomic raises toward its hard limit when they need room: a
+//! command that would pass it does not start ([`Budget`]).
 
 use anyhow::Context as _;
 use codex_network_proxy::{
@@ -321,6 +328,105 @@ fn own_addresses() -> anyhow::Result<BTreeSet<IpAddr>> {
     Ok(own)
 }
 
+/// The most connections the sandbox helper's bridge opens to a command's
+/// proxy at once (Codex's Linux sandbox caps each route at this).
+const BRIDGE_CONNECTIONS: u64 = 128;
+
+/// The file descriptors a command's proxy connections can hold in atomic:
+/// two for each connection its bridge has open, the command's and the one
+/// upstream, and some to spare, for the proxy's own.
+pub const DESCRIPTORS_PER_COMMAND: u64 = 2 * BRIDGE_CONNECTIONS + 16;
+
+/// Room in this process's file descriptors for commands' proxy
+/// connections: half of its limit on open files, the rest left to atomic's
+/// own database, model and file work.
+struct Budget(Mutex<u64>);
+
+/// The process's budget, shared by every proxy, since the limit is the
+/// process's.
+static BUDGET: Budget = Budget(Mutex::new(0));
+
+/// One command's room in a [`Budget`], given back when it ends.
+struct Reservation(&'static Budget);
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        let mut reserved = self
+            .0
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *reserved = reserved.saturating_sub(DESCRIPTORS_PER_COMMAND);
+    }
+}
+
+impl Budget {
+    /// Room for one more command's connections within half of `limit`, or
+    /// why there is none.
+    fn reserve(&'static self, limit: u64) -> anyhow::Result<Reservation> {
+        let share = limit / 2;
+        let mut reserved = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *reserved + DESCRIPTORS_PER_COMMAND > share {
+            anyhow::bail!(
+                "{} commands that declare hosts are running, and atomic's limit of {limit} open \
+                 files leaves room for {} at once: their proxy connections may take half of it, \
+                 {DESCRIPTORS_PER_COMMAND} for each; raise the limit (`ulimit -n`) to run more \
+                 at once",
+                *reserved / DESCRIPTORS_PER_COMMAND,
+                share / DESCRIPTORS_PER_COMMAND,
+            );
+        }
+        *reserved += DESCRIPTORS_PER_COMMAND;
+        Ok(Reservation(self))
+    }
+}
+
+/// The most open files atomic raises its own limit to when its proxies
+/// need room: enough for a couple of hundred commands that declare hosts.
+const RAISED_LIMIT: u64 = 1 << 16;
+
+/// This process's limit on open files: the soft one it is held to, and the
+/// hard one it may raise that to.
+#[allow(unsafe_code)]
+fn descriptor_limits() -> anyhow::Result<libc::rlimit> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit writes one rlimit into `limit`.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("read the limit on open files");
+    }
+    Ok(limit)
+}
+
+/// Room for one more command's connections in [`BUDGET`]. Where there is
+/// none under this process's soft limit on open files, the limit is first
+/// raised as far as the hard one allows, up to [`RAISED_LIMIT`]; the
+/// commands atomic starts afterwards inherit it.
+#[allow(unsafe_code, clippy::unnecessary_cast)]
+fn reserve_room() -> anyhow::Result<Reservation> {
+    let mut limit = descriptor_limits()?;
+    let refused = match BUDGET.reserve(limit.rlim_cur as u64) {
+        Ok(room) => return Ok(room),
+        Err(why) => why,
+    };
+    let raised = (limit.rlim_max as u64).min(RAISED_LIMIT);
+    if raised <= limit.rlim_cur as u64 {
+        return Err(refused);
+    }
+    limit.rlim_cur = raised as libc::rlim_t;
+    // SAFETY: setrlimit reads one rlimit, whose soft limit is within its
+    // hard one.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
+        return Err(refused);
+    }
+    BUDGET.reserve(raised)
+}
+
 /// What a command holds while it runs: its proxy runs until no command
 /// holds it, and its token works until it lets go.
 pub(crate) type Lease = Arc<dyn std::any::Any + Send + Sync>;
@@ -331,6 +437,8 @@ struct Leased {
     /// dropped first, so the token stops working before the proxy might.
     _scope: NetworkProxy,
     _running: Arc<Running>,
+    /// Its room among the process's file descriptors.
+    _room: Reservation,
 }
 
 /// A token for one command's bridge to open its connections with: 32 random
@@ -408,6 +516,7 @@ impl Proxies {
         // A proxy started before this machine's addresses changed would
         // reach a new one: start another.
         let own = self.own()?;
+        let room = reserve_room()?;
         let running = {
             let mut proxies = self
                 .running
@@ -449,6 +558,7 @@ impl Proxies {
         let lease: Lease = Arc::new(Leased {
             _scope: scope,
             _running: running,
+            _room: room,
         });
         Ok((prepared, lease))
     }
@@ -971,5 +1081,28 @@ mod tests {
         ] {
             assert!(check_hosts(&[accepted.into()]).is_ok(), "{accepted}");
         }
+    }
+
+    /// The commands that declare hosts share half the process's limit on
+    /// open files, room for each command's connections: one that would pass
+    /// it is refused, and a command that ends gives its room back.
+    #[test]
+    fn commands_share_half_the_descriptor_limit() {
+        static OURS: Budget = Budget(Mutex::new(0));
+        let limit = 4 * DESCRIPTORS_PER_COMMAND + 1;
+        let first = OURS.reserve(limit).expect("room for one");
+        let second = OURS.reserve(limit).expect("room for two");
+        let Err(why) = OURS.reserve(limit) else {
+            panic!("room for a third");
+        };
+        assert!(why.to_string().contains("open files"), "{why}");
+        drop(first);
+        let third = OURS.reserve(limit).expect("room again");
+        drop((second, third));
+        assert_eq!(*OURS.0.lock().expect("budget"), 0);
+        assert!(
+            OURS.reserve(2 * DESCRIPTORS_PER_COMMAND - 1).is_err(),
+            "half, not all"
+        );
     }
 }

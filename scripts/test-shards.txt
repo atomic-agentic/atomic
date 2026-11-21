@@ -41,6 +41,7 @@ test entry_point
 test examples
 test exec_private_state
 test exec_network
+test exec_network_fds
 test failpoints
 test fixture_cli
 test gate_prompt
