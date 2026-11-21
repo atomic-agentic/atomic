@@ -1,0 +1,16 @@
+# M35a, the artifact store: each acceptance clause of docs/design/milestones.md
+# § M35a, word for word, and the tests that show them, as `<binary> <test path>`.
+# Run by scripts/acceptance.py m35a; see that script for the format.
+
+## A 200 MB patch reaches the next atom as a reference.
+large_results a_200_mb_patch_passes_between_atoms_by_reference
+
+## Two writes of the same bytes leave one stored copy.
+atomic_core artifact::tests::identical_content_is_stored_once
+atomic_core artifact::files::tests::two_commands_handing_over_the_same_bytes_leave_one_copy
+
+## Validation fails for a reference whose artifact does not exist.
+atomic_core artifact::tests::a_reference_to_a_missing_artifact_fails_validation
+atomic_core runtime::tests::an_output_must_reference_artifacts_that_exist_with_the_right_type
+atomic_core runtime::tests::an_exec_atom_output_names_only_artifacts_the_store_holds
+atomic_core artifact::files::tests::an_input_referencing_a_missing_artifact_is_refused

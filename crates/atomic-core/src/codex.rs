@@ -861,7 +861,10 @@ fn deny_also(profile: PermissionProfile, denied: &[PathBuf]) -> anyhow::Result<P
 /// denies paths only through that helper, and nowhere else has atomic seen a
 /// denial hold, so without one the thread could not be kept out of other
 /// attempts' scratch directories; atomic refuses it before the thread starts
-/// rather than run it with less denied.
+/// rather than run it with less denied. On macOS the denial is not verified:
+/// Seatbelt has no counterpart to the Linux sandbox reopening a writable
+/// directory inside a denied one, so it may keep a turn from reading its own
+/// scratch directory as well.
 fn refuse_denied_without_helper(
     paths: &CodexPaths,
     denied: &[PathBuf],

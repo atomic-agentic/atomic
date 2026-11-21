@@ -1,0 +1,1 @@
+artifact-hold-gather|crates/atomic-core/src/artifact/files.rs|            held.push(store.hold(&s.artifact()?)?);|            let _ = &mut held; // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model -- a_sweep_racing_a_slow_gather_keeps_the_gathered_files a_store_held_while_files_are_stored_leaves_the_outcome_unknown

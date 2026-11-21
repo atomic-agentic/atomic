@@ -1,0 +1,1 @@
+stop-look-cap|crates/atomic-exec/src/process.rs|            look.saturating_mul(2).min(LOOK_MAX)|            look.saturating_mul(2) /*CONTROL_OFF*/|-p atomic-agentic-exec --lib the_next_look_grows_only_when_one_ran_out_and_is_capped

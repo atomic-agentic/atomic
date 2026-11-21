@@ -477,6 +477,61 @@ fn a_scratch_root_a_sandboxed_turn_could_write_is_refused() {
     let _ = std::fs::remove_dir_all(&src);
 }
 
+/// No writable root may lie at or in a directory a workspace's commands are
+/// denied, its backend's scratch root or another backend's it is told to
+/// deny, where Codex's sandbox would reopen it writable; nor may a denied
+/// directory lie in a writable root. A refused workspace makes nothing.
+#[test]
+fn a_writable_root_in_a_denied_directory_is_refused() {
+    let src = source("in-denied");
+    let own = backend("in-denied");
+    let sibling = own
+        .scratch_root()
+        .with_file_name(format!("sibling-in-denied-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&sibling);
+    let local = own.clone().denying([sibling.clone()]);
+    let opening_with = |roots: Vec<PathBuf>| Open {
+        writable_roots: roots,
+        ..opening(&src, "fix", "a1")
+    };
+    for (root, says) in [
+        (sibling.join("x"), "which a workspace's commands are denied"),
+        // At the denied root itself, which it would also cover.
+        (sibling.clone(), "where a sandboxed turn may write"),
+        (
+            local.scratch_root().join("y"),
+            "which a workspace's commands are denied",
+        ),
+        (
+            sibling.parent().expect("parent").to_owned(),
+            "where a sandboxed turn may write",
+        ),
+    ] {
+        let error = local
+            .open(&opening_with(vec![root.clone()]))
+            .expect_err("refused");
+        assert!(
+            error.to_string().contains(says),
+            "{}: {error}",
+            root.display()
+        );
+        assert!(
+            !sibling.exists(),
+            "{}: the sibling root was made",
+            root.display()
+        );
+    }
+    let opened = local
+        .open(&opening_with(vec![std::env::temp_dir()]))
+        .expect("opens");
+    assert!(opened.denied.contains(&sibling), "{:?}", opened.denied);
+    assert!(sibling.is_dir(), "the sibling root was not made");
+    local.close(&opened).expect("closes");
+    let _ = workspace::remove_tree(local.scratch_root());
+    let _ = std::fs::remove_dir_all(&sibling);
+    let _ = std::fs::remove_dir_all(&src);
+}
+
 /// Every workspace on a backend shares one private temporary directory,
 /// outside every attempt's scratch.
 #[test]
