@@ -1006,4 +1006,4 @@ fn wait_for(child: &mut Child, limit: Duration) -> Result<Option<ExitStatus>, Gi
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

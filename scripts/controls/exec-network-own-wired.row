@@ -1,0 +1,1 @@
+exec-network-own-wired|crates/atomic-core/src/network.rs|        let own = self.own()?;|        let own: BTreeSet<IpAddr> = BTreeSet::new(); // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model network::tests::a_prepared_proxy_refuses_this_machines_addresses

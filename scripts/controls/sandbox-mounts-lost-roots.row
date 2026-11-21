@@ -1,0 +1,1 @@
+sandbox-mounts-lost-roots|crates/atomic-core/src/mounts.rs|    let lost_here = !local(&home.kind);|    let lost_here = false; // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model -- a_lost_fuse_root_is_refused a_lost_root_on_any_remote_kind_is_refused
