@@ -753,10 +753,7 @@ fn runtimes(
     if let Some(cassette) = cassette {
         sent.base_url = cassette.base_url(&endpoint.base_url);
     }
-    let lite = LiteRuntime {
-        backend: exec.clone(),
-        ..lite_runtime(endpoint, sent.clone())
-    };
+    let lite = lite_runtime(endpoint, sent.clone());
     Ok(Runtimes {
         codex: CodexRuntime {
             paths: paths.clone(),
@@ -767,11 +764,10 @@ fn runtimes(
             artifacts: Artifacts::new(store.clone()),
             meter: atomic_core::usage::Metering::none(),
             guard: atomic_core::codex::StateGuard::for_project(state)?,
-            backend: exec.clone(),
             caches: None,
         },
         lite,
-        exec: exec.clone(),
+        backend: exec.clone(),
         exec_meter: Default::default(),
         clock: None,
     })

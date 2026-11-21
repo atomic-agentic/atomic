@@ -252,14 +252,14 @@ async fn codex_turn() {
         artifacts: Artifacts::none(),
         meter: atomic_core::usage::Metering::none(),
         guard: atomic_core::codex::StateGuard::NoProjectState,
-        backend: atomic_exec::Backend::connect(atomic_exec::LocalBackend::in_dir(
-            scratch_root.clone(),
-        ))
-        .expect("connects"),
         caches: None,
     };
+    let backend =
+        atomic_exec::Backend::connect(atomic_exec::LocalBackend::in_dir(scratch_root.clone()))
+            .expect("connects");
     let answer = run_turn(
         &runtime,
+        &backend,
         &TurnSpec {
             prompt: "Show the environment.".into(),
             env: [("DECLARED".to_owned(), "yes".to_owned())].into(),

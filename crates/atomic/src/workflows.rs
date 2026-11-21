@@ -82,9 +82,12 @@ pub fn serve_past_unconfinable_steps() {
 /// except for a step whose commands cannot be confined on this machine:
 /// nothing ran, and nothing will here until the machine is fixed, so nothing
 /// is recorded. `atomic run` and `atomic runs resume` stop at once with
-/// [`UNCONFINABLE_EXIT`]. `atomic serve` keeps serving its other runs and
-/// leaves this one unfinished in this process, with no outcome and no
-/// recovery spent on it, for the next process that recovers it; `counted`
+/// [`UNCONFINABLE_EXIT`]. Under `atomic serve` the step is set aside where
+/// its workspace opens, trying the sandbox again now and then
+/// (`atomic_core::runtime::keep_trying_past_the_limit`), so the error does
+/// not reach here; should it, serve keeps serving its other runs and leaves
+/// this one unfinished in this process, with no outcome and no recovery
+/// spent on it, for the next process that recovers it; `counted`
 /// says the run is counted in [`crate::pipeline::steps_running`], which then
 /// stops counting it, so a stop does not wait for it.
 pub(crate) async fn settled<T>(
@@ -268,7 +271,7 @@ pub fn register_change_request<R: DurableRuntime>(
             let step_why = run_why.clone();
             let span = crate::telemetry::workflow_span(CHANGE_REQUEST, &run);
             let work = async move {
-                let lite = runtimes.lite.clone();
+                let (lite, backend) = (runtimes.lite.clone(), runtimes.backend.clone());
                 // The run's note, as each step holds it to hand its own to.
                 let (draft_run, review_run) = (step_why.clone(), step_why.clone());
                 let request = ChangeRequest {
@@ -279,7 +282,7 @@ pub fn register_change_request<R: DurableRuntime>(
                     &ctx,
                     "draft",
                     move |step| {
-                        let mut lite = lite.clone();
+                        let (mut lite, backend) = (lite.clone(), backend.clone());
                         lite.meter = meter.meter(&step, &draft_caps);
                         let request = request.clone();
                         let span =
@@ -296,7 +299,7 @@ pub fn register_change_request<R: DurableRuntime>(
                                 &run,
                                 atomic_core::usage::for_step(step_id, "draft", why, async move {
                                     propose(async move {
-                                        run_lite_atom(&DraftTask, &request, &lite).await
+                                        run_lite_atom(&DraftTask, &request, &lite, &backend).await
                                     })
                                     .await
                                 }),
@@ -310,7 +313,7 @@ pub fn register_change_request<R: DurableRuntime>(
                 failpoint("change-request:after-draft");
                 let task: DraftedTask = decode(&draft)?;
 
-                let codex = runtimes.codex.clone();
+                let (codex, backend) = (runtimes.codex.clone(), runtimes.backend.clone());
                 let review_request = ReviewRequest {
                     item: WorkItem {
                         id: format!("{}:draft", ctx.workflow_id()),
@@ -325,7 +328,7 @@ pub fn register_change_request<R: DurableRuntime>(
                     &ctx,
                     "review",
                     move |step| {
-                        let mut codex = codex.clone();
+                        let (mut codex, backend) = (codex.clone(), backend.clone());
                         codex.meter = budget.meter(&step, &review_caps);
                         let review_request = review_request.clone();
                         let span = crate::telemetry::step_span(
@@ -345,7 +348,7 @@ pub fn register_change_request<R: DurableRuntime>(
                                 &run,
                                 atomic_core::usage::for_step(step_id, "review", why, async move {
                                     propose(async move {
-                                        run_codex_atom(&ReviewPatch, &review_request, &codex).await
+                                        run_codex_atom(&ReviewPatch, &review_request, &codex, &backend).await
                                     })
                                     .await
                                 }),

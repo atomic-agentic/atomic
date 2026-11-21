@@ -78,7 +78,9 @@ async fn a_lite_atom_returns_a_valid_out_with_exactly_one_model_call() {
         .await
         .expect("fake model");
     let rt = runtime(&model, Wire::ChatCompletions);
-    let (out, meta) = run_lite_atom(&Classify, &note(), &rt).await.expect("runs");
+    let (out, meta) = run_lite_atom(&Classify, &note(), &rt, &Default::default())
+        .await
+        .expect("runs");
     assert_eq!(
         out,
         Classified {
@@ -143,7 +145,9 @@ async fn the_responses_wire_makes_one_call_with_text_format() {
         .await
         .expect("fake model");
     let rt = runtime(&model, Wire::Responses);
-    let (out, meta) = run_lite_atom(&Classify, &note(), &rt).await.expect("runs");
+    let (out, meta) = run_lite_atom(&Classify, &note(), &rt, &Default::default())
+        .await
+        .expect("runs");
     assert_eq!(out.category, "bug");
     assert_eq!(model.calls(), 1);
     assert_eq!(model.paths(), ["/v1/responses"]);
@@ -171,7 +175,7 @@ async fn a_misfit_gets_one_repair_call_then_a_schema_error() {
             .await
             .expect("fake model");
         let rt = runtime(&model, wire);
-        match run_lite_atom(&Classify, &note(), &rt).await {
+        match run_lite_atom(&Classify, &note(), &rt, &Default::default()).await {
             Err(AtomError::Schema { message, answer }) => {
                 assert!(message.contains("/category"), "{wire:?}: {message}");
                 assert_eq!(answer, bad);
@@ -212,7 +216,7 @@ async fn a_repaired_answer_is_accepted() {
     .await
     .expect("fake model");
     let rt = runtime(&model, Wire::ChatCompletions);
-    let (out, meta) = run_lite_atom(&Classify, &note(), &rt)
+    let (out, meta) = run_lite_atom(&Classify, &note(), &rt, &Default::default())
         .await
         .expect("the repair turn saves it");
     assert_eq!(out.summary, "Export crashes.");
@@ -238,7 +242,7 @@ async fn a_provider_error_is_a_model_error_with_no_retry() {
     .await
     .expect("fake model");
     let rt = runtime(&model, Wire::ChatCompletions);
-    match run_lite_atom(&Classify, &note(), &rt).await {
+    match run_lite_atom(&Classify, &note(), &rt, &Default::default()).await {
         Err(AtomError::Model(message)) => {
             assert!(
                 message.contains("503") && message.contains("loading model"),
@@ -312,7 +316,7 @@ async fn a_missing_api_key_fails_before_any_call() {
         .expect("fake model");
     let mut rt = runtime(&model, Wire::ChatCompletions);
     rt.endpoint.api_key_env = Some("ATOMIC_TEST_UNSET_API_KEY_VARIABLE".into());
-    match run_lite_atom(&Classify, &note(), &rt).await {
+    match run_lite_atom(&Classify, &note(), &rt, &Default::default()).await {
         Err(AtomError::Model(message)) => {
             assert!(
                 message.contains("ATOMIC_TEST_UNSET_API_KEY_VARIABLE"),
@@ -345,7 +349,7 @@ async fn an_atom_runs_only_as_its_own_kind() {
         .await
         .expect("fake model");
     let rt = runtime(&model, Wire::ChatCompletions);
-    match run_lite_atom(&AsCodex, &note(), &rt).await {
+    match run_lite_atom(&AsCodex, &note(), &rt, &Default::default()).await {
         Err(AtomError::Runtime(message)) => {
             assert!(message.contains("classify-on-codex"), "{message}");
         }
@@ -442,7 +446,9 @@ async fn a_reply_without_usage_settles_as_unknown_never_as_free() {
             .expect("fake model");
         let mut rt = runtime(&model, wire);
         let recorder = metered(&mut rt, Limit::default());
-        let (_, meta) = run_lite_atom(&Classify, &note(), &rt).await.expect("runs");
+        let (_, meta) = run_lite_atom(&Classify, &note(), &rt, &Default::default())
+            .await
+            .expect("runs");
         assert_eq!(settled(&recorder), [Outcome::Unknown], "{wire:?}");
         assert_eq!((meta.input_tokens, meta.output_tokens), (0, 0));
         // With usage, it settles as reported.
@@ -451,7 +457,9 @@ async fn a_reply_without_usage_settles_as_unknown_never_as_free() {
             .expect("fake model");
         let mut rt = runtime(&model, wire);
         let recorder = metered(&mut rt, Limit::default());
-        run_lite_atom(&Classify, &note(), &rt).await.expect("runs");
+        run_lite_atom(&Classify, &note(), &rt, &Default::default())
+            .await
+            .expect("runs");
         assert_eq!(
             settled(&recorder),
             [Outcome::Reported(Usage {
@@ -504,7 +512,9 @@ async fn a_call_is_sent_with_its_reserved_output_limit() {
                 time: None,
             },
         );
-        run_lite_atom(&Classify, &note(), &rt).await.expect("runs");
+        run_lite_atom(&Classify, &note(), &rt, &Default::default())
+            .await
+            .expect("runs");
         assert_eq!(model.requests()[0][field], json!(321), "{wire:?}");
         // The request's size bounds its input tokens.
         let calls = recorder.calls.lock().expect("calls").clone();
@@ -521,9 +531,14 @@ async fn a_call_is_sent_with_its_reserved_output_limit() {
     let model = FakeModel::start(vec![Reply::Text(GOOD.into())])
         .await
         .expect("fake model");
-    run_lite_atom(&Classify, &note(), &runtime(&model, Wire::ChatCompletions))
-        .await
-        .expect("runs");
+    run_lite_atom(
+        &Classify,
+        &note(),
+        &runtime(&model, Wire::ChatCompletions),
+        &Default::default(),
+    )
+    .await
+    .expect("runs");
     assert!(model.requests()[0].get("max_tokens").is_none());
 }
 
@@ -544,7 +559,7 @@ async fn a_call_is_cut_off_when_its_reserved_time_runs_out() {
         },
     );
     let began = Instant::now();
-    match run_lite_atom(&Classify, &note(), &rt).await {
+    match run_lite_atom(&Classify, &note(), &rt, &Default::default()).await {
         Err(AtomError::Model(message)) => assert!(message.contains("cut off"), "{message}"),
         other => panic!("expected the call to be cut off, got {other:?}"),
     }
@@ -564,7 +579,11 @@ async fn a_failed_call_settles_by_whether_it_could_have_been_sent() {
     .expect("fake model");
     let mut rt = runtime(&model, Wire::ChatCompletions);
     let recorder = metered(&mut rt, Limit::default());
-    assert!(run_lite_atom(&Classify, &note(), &rt).await.is_err());
+    assert!(
+        run_lite_atom(&Classify, &note(), &rt, &Default::default())
+            .await
+            .is_err()
+    );
     assert_eq!(settled(&recorder), [Outcome::Unknown]);
     // No connection was ever made: nothing was sent.
     let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -580,7 +599,11 @@ async fn a_failed_call_settles_by_whether_it_could_have_been_sent() {
         AtomConfig::default(),
     );
     let recorder = metered(&mut rt, Limit::default());
-    assert!(run_lite_atom(&Classify, &note(), &rt).await.is_err());
+    assert!(
+        run_lite_atom(&Classify, &note(), &rt, &Default::default())
+            .await
+            .is_err()
+    );
     assert_eq!(settled(&recorder), [Outcome::NotDispatched]);
 }
 
@@ -672,7 +695,9 @@ async fn a_judged_answer_still_settles_the_usage_it_reported() {
         let mut rt = runtime(&model, Wire::ChatCompletions);
         let recorder = metered(&mut rt, Limit::default());
         assert!(
-            run_lite_atom(&Classify, &note(), &rt).await.is_err(),
+            run_lite_atom(&Classify, &note(), &rt, &Default::default())
+                .await
+                .is_err(),
             "{body}"
         );
         assert_eq!(
@@ -709,7 +734,7 @@ async fn an_answer_cut_off_at_its_output_limit_is_its_own_error_with_no_repair()
             .expect("fake model");
         let mut rt = runtime(&model, wire);
         let recorder = metered(&mut rt, Limit::default());
-        match run_lite_atom(&Classify, &note(), &rt).await {
+        match run_lite_atom(&Classify, &note(), &rt, &Default::default()).await {
             Err(AtomError::Model(message)) => {
                 assert!(
                     message.contains("cut off at the call's output limit"),
@@ -779,7 +804,7 @@ async fn an_answer_a_content_filter_stopped_is_not_a_truncation() {
         .expect("fake model");
     let mut rt = runtime(&model, Wire::Responses);
     let recorder = metered(&mut rt, Limit::default());
-    match run_lite_atom(&Classify, &note(), &rt).await {
+    match run_lite_atom(&Classify, &note(), &rt, &Default::default()).await {
         Err(AtomError::Model(message)) => {
             assert!(message.contains("content_filter"), "{message}");
             assert!(!message.contains("output limit"), "{message}");
