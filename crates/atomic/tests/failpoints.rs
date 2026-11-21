@@ -105,10 +105,10 @@ async fn engine(dir: &Path) -> Durare {
             Ok(json!([one, two, three.output]))
         }
     });
-    // A transaction whose first attempt the engine must retry: its body
-    // reads, then another connection writes before the body's checkpoint
-    // does, so the checkpoint's write finds the snapshot stale (SQLite's
-    // BUSY_SNAPSHOT) and the engine rolls back and runs the body again.
+    // A transaction another connection writes beside while its body runs:
+    // the body reads, then the other connection writes. The step holds the
+    // store's writer lock while its body runs, so the other write waits for
+    // the step to commit, and the body runs once.
     let at = dir.to_owned();
     rt.register("retried", move |ctx: DurareContext, (): ()| {
         let dir = at.clone();
@@ -124,7 +124,9 @@ async fn engine(dir: &Path) -> Durare {
                         let first = !dir.join("raced").exists();
                         if first {
                             std::fs::write(dir.join("raced"), "").expect("marker");
-                            write_beside(&dir.join("atomic.db")).await;
+                            // Not awaited: it waits on this step's lock.
+                            tokio::spawn(write_beside(dir.join("atomic.db")));
+                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                         }
                         row.int("n")
                     })
@@ -173,7 +175,8 @@ async fn engine(dir: &Path) -> Durare {
 }
 
 /// Write to the store from a connection of its own.
-async fn write_beside(db: &Path) {
+async fn write_beside(db: PathBuf) {
+    let db = db.as_path();
     use sqlx::Connection;
     let mut other = sqlx::SqliteConnection::connect(&format!("sqlite://{}", db.display()))
         .await
@@ -446,19 +449,15 @@ fn every_failpoint_in_the_source_is_in_the_inventory_and_back() {
 }
 
 #[test]
-fn a_transaction_body_the_engine_retries_is_one_operation_to_its_failpoints() {
+fn a_transaction_another_connection_writes_beside_runs_once_and_reaches_its_failpoints_once() {
     let dir = scratch("retried");
     let (status, stderr) = child(&dir, "retried", None, "first.log");
     assert!(status.success(), "the run finished: {status}\n{stderr}");
-    // The engine ran the body twice: its first attempt's snapshot was stale.
-    assert_eq!(
-        lines(&dir.join("ran.log")),
-        ["race", "race"],
-        "the body was retried"
-    );
-    // Yet it is one durable operation, whose writes and checkpoint committed
-    // once: its failpoints are reached once each, so a crash test counting
-    // them does not take the retry for a second run.
+    // The other connection wrote while the body ran, and the body still ran
+    // once: the step held the writer lock, so the write waited for it.
+    assert_eq!(lines(&dir.join("ran.log")), ["race"], "the body ran again");
+    // One durable operation, whose writes and checkpoint committed once: its
+    // failpoints are reached once each.
     assert_eq!(
         lines(&dir.join("first.log")),
         ["checkpoint:before:race", "checkpoint:after:race"]
