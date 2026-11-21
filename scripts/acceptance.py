@@ -13,12 +13,24 @@ binary as cargo names it (`budgets` for crates/atomic/tests/budgets.rs,
 `atomic_core` for atomic-agentic-core's unit tests, by its library name) and
 the test's full path inside it.
 
-A clause made of several parts, separated by semicolons, can list each part
-as a `### ` line, in the clause's own words, with the tests that show that
-part under it: then every part must be listed, and each needs a test of its
-own. A clause the listed tests do not yet show in full says so with one
+A clause made of several sub-clauses, separated by semicolons, can list each
+sub-clause as a `### ` line, in the clause's own words, with the tests that
+show that sub-clause under it: then every sub-clause must be listed, and each
+needs a test of its own. ("Part" here means only a milestone's `a` and `b`
+sections.) A clause the listed tests do not yet show in full says so with one
 `pending: <reason>` line: its tests still run and must pass, and the verdict
 names it as pending rather than passed outright.
+
+In the milestones document, an Acceptance block starts at a line that begins
+`**Acceptance` and ends `:**`, with or without a title after the word, and
+holds a bullet per clause: a milestone's clauses are those of all its blocks,
+in order. A line that only looks like that marker is refused with its line
+number, not skipped, so a block in such a shape cannot go unread: outside a
+block, any line that leads with a spelling of `accept` and ends in a colon is
+refused as one, however it is wrapped. A split milestone's parts are sections
+under it. An "a" part states its own acceptance; a "b" part finishes its
+parent's work, so its clauses are its parent's, with any of its own blocks
+after them.
 
 Every listed test is run in one `cargo test` over the workspace, with CI's
 test features (FEATURES, which must match CI's test build, and which
@@ -26,10 +38,10 @@ scripts/test-shards.py shares), so nothing rebuilds after that build.
 
 The check fails when any listed test fails, is ignored, or does not run at all
 (renamed, removed, or built out by a feature), when the same name runs only in
-another binary, when a clause or part lists no test, when the clauses differ
-from the milestone's, or when cargo itself fails. A suite that cannot reach its
-backend fails its tests, so the check fails with them; it never passes with a
-backend's tests unrun.
+another binary, when a clause or sub-clause lists no test, when the clauses
+differ from the milestone's, or when cargo itself fails. A suite that cannot
+reach its backend fails its tests, so the check fails with them; it never
+passes with a backend's tests unrun.
 """
 
 import argparse
@@ -51,6 +63,36 @@ RESULT = re.compile(r"^test (\S+) \.\.\. (ok|FAILED|ignored)(?:,.*)?$")
 # What cargo prints when it, rather than a listed test, failed.
 CARGO_FAILED = re.compile(r"^error(\[E\d+\])?: ")
 HEADING = re.compile(r"^(#+)\s")
+# An Acceptance block's first line: `**Acceptance:**`, or the same with a
+# title, as `**Acceptance, the managed Deno:**`.
+ACCEPTANCE = re.compile(r"^\*\*Acceptance\b.*:\*\*$")
+# A line that means to be that marker and is not, as one whose colon sits
+# outside the bold. Refused wherever it sits, open block or not: the clauses
+# under it would be skipped in silence.
+NEAR_MARKER = re.compile(r"^\*\*Acceptance\b", re.IGNORECASE)
+# Any line shaped like that marker, whatever wrapper it is in and however the
+# word is spelt: `Acceptance:`, `__Acceptance:__`, `**Acceptence:**`,
+# `- **Acceptance, files and data:**`. The wrapper holds markdown punctuation
+# only, so a line whose first word is not a spelling of `accept` stays prose.
+# Outside a block such a line is refused too, since only a line beginning
+# `**Acceptance` opens one.
+MARKERISH = re.compile(r"^[-_*~>#\s]*accept\w*\b.*:[-_*~>#\s]*$", re.IGNORECASE)
+# A bullet: `- `, `* ` or `+ `, or a number, at the start of the line or
+# indented. Only a `- ` at the start of a line is read as a clause.
+BULLET = re.compile(r"^\s*(?:[-*+][ \t]|\d+[.)]\s)")
+# A heading's first word, which holds its id when the heading states one.
+HEADING_ID = re.compile(r"^#+\s+(\S+)")
+# A milestone id: `M11`, or `M11b` for one of its parts.
+ID = re.compile(r"[a-z][a-z0-9]*\d+[a-z]?")
+# A part id and its parent: `M11b` is part `b` of `M11`.
+PART = re.compile(r"^(.*\d)([a-z])$")
+
+
+def id_of(line):
+    """The id a heading states, lower-cased, or None as it states none."""
+    first = HEADING_ID.match(line)
+    stated = first.group(1).rstrip(":").lower() if first else None
+    return stated if stated and ID.fullmatch(stated) else None
 
 
 def plain(text):
@@ -65,8 +107,8 @@ def words(text):
 
 
 class Clause:
-    """One clause of the list: its text, its tests, its parts (each a text
-    and its tests), and why it is pending, if it is."""
+    """One clause of the list: its text, its tests, its sub-clauses (each a text
+    and its tests, held in `parts`), and why it is pending, if it is."""
 
     def __init__(self, text):
         self.text = text
@@ -79,7 +121,7 @@ class Clause:
 
 
 def segments(clause):
-    """A clause's semicolon-separated parts, as a `### ` line states each."""
+    """A clause's semicolon-separated sub-clauses, as a `### ` line states each."""
     return [words(s).rstrip(".") for s in clause.split(";")]
 
 
@@ -90,7 +132,7 @@ def manifest(path):
         for n, line in enumerate(f, 1):
             line = line.strip()
             where = f"{path}:{n}"
-            # A comment is one `#`; a clause `##`, and a part `###`.
+            # A comment is one `#`; a clause `##`, and a sub-clause `###`.
             if not line or line == "#" or line.startswith("# "):
                 continue
             if line.startswith("## "):
@@ -100,11 +142,11 @@ def manifest(path):
                 clauses.append(Clause(text))
             elif line.startswith("### "):
                 if not clauses:
-                    problems.append(f"{where}: a part before any clause")
+                    problems.append(f"{where}: a sub-clause before any clause")
                     continue
                 clauses[-1].parts.append((line[4:].strip(), []))
             elif HEADING.match(line):
-                problems.append(f"{where}: only `## ` clauses and `### ` parts: {line}")
+                problems.append(f"{where}: only `## ` clauses and `### ` sub-clauses: {line}")
             elif not clauses:
                 problems.append(f"{where}: a line before any clause")
             elif line.startswith("pending:"):
@@ -129,45 +171,119 @@ def manifest(path):
             continue
         stated = segments(c.text)
         listed = [words(p).rstrip(".") for p, _ in c.parts]
-        problems += [f"{path}: part of `{c.text}` not listed: {s}" for s in stated if s not in listed]
-        problems += [f"{path}: not a part of `{c.text}`: {p}" for p in listed if p not in stated]
+        problems += [
+            f"{path}: sub-clause of `{c.text}` not listed: {s}" for s in stated if s not in listed
+        ]
+        problems += [
+            f"{path}: not a sub-clause of `{c.text}`: {p}" for p in listed if p not in stated
+        ]
         if c.tests:
-            problems.append(f"{path}: `{c.text}` lists tests outside its parts")
+            problems.append(f"{path}: `{c.text}` lists tests outside its sub-clauses")
     return clauses, problems
+
+
+def is_part(stated, parent):
+    """`stated` and `parent`, both lower-cased ids: `stated` names one of
+    `parent`'s parts."""
+    return stated.startswith(parent) and len(stated) == len(parent) + 1 and stated[-1].isalpha()
+
+
+def own(lines, milestone, start, level, path):
+    """The clauses in the Acceptance blocks of the section `path` states for
+    `milestone` from line `start`, and what in them could not be read as one.
+
+    The section's own text ends where one of its parts' sections starts. Under
+    any other deeper heading a bullet is refused, because which block it
+    belongs to would be a guess; a block marker ends that, as it starts a block
+    of its own. A line that only looks like a block marker is refused too: open
+    block or not, one that begins `**Acceptance`, and outside a block any line
+    shaped like the marker at all. What sits under such a line is read as
+    nothing, and a "b" part, which is asked for its parent's clauses as well as
+    its own, is never then asked for a clause it states itself."""
+    clauses, problems = [], []
+    inside, deeper = False, None
+    parent = PART.match(milestone)
+    # The ids whose part sections come under this one: its own, and, as this
+    # milestone is itself a part, its parent's, whose other parts sit beside it.
+    wholes = [milestone] + ([parent.group(1)] if parent else [])
+    for n, line in enumerate(lines[start + 1:], start + 2):
+        heading = HEADING.match(line)
+        if heading:
+            if len(heading.group(1)) <= level:
+                break
+            stated = id_of(line)
+            if stated and any(is_part(stated, whole) for whole in wholes):
+                break
+            inside, deeper = False, line.strip()
+            continue
+        text = line.strip()
+        if ACCEPTANCE.match(text):
+            inside, deeper = True, None
+            continue
+        if not text:
+            continue
+        if NEAR_MARKER.match(text) or not inside and MARKERISH.match(text):
+            problems.append(
+                f"{path}:{n}: not an Acceptance block marker, so everything "
+                "under it would be skipped: a block starts at a line "
+                'that begins `**Acceptance` and ends `:**`, as `**Acceptance:**` '
+                "or `**Acceptance, beyond the full M4 test:**`: " + text
+            )
+        elif BULLET.match(line):
+            if deeper:
+                problems.append(
+                    f"{path}:{n}: not a clause: a bullet under the deeper heading "
+                    f"`{deeper}`, which states no Acceptance block: {text}"
+                )
+            elif not inside:
+                # The section's own prose, as the list under `**Delivers:**`,
+                # which states what the milestone does rather than what shows
+                # it. A block marker, or one that only looks like one, is what
+                # takes a bullet out of here.
+                continue
+            elif not line.startswith("- "):
+                problems.append(f"{path}:{n}: not a clause or its continuation: {text}")
+            else:
+                clauses.append(line[2:])
+        elif not inside:
+            continue
+        elif line.startswith("  ") and clauses and not line.lstrip().startswith(("-", "*")):
+            clauses[-1] += " " + line.strip()
+        else:
+            problems.append(f"{path}:{n}: not a clause or its continuation: {text}")
+    return [words(c) for c in clauses], problems
 
 
 def milestone_clauses(milestone, path=MILESTONES):
     """The acceptance clauses `path` states for `milestone`, and what in its
-    Acceptance block could not be read as one."""
+    Acceptance blocks could not be read as one. A "b" part finishes its
+    parent's work, so it states its parent's clauses as well as its own."""
     with open(path, encoding="utf-8") as f:
         lines = f.read().splitlines()
-    name = re.compile(rf"^(#+)\s+{re.escape(milestone)}\b", re.IGNORECASE)
-    start = next((i for i, l in enumerate(lines) if name.match(l)), None)
+    lower = milestone.lower()
+
+    def heading_at(stated):
+        """Where `path` states the heading `stated`, and at what level."""
+        name = re.compile(rf"^(#+)\s+{re.escape(stated)}\b", re.IGNORECASE)
+        start = next((i for i, l in enumerate(lines) if name.match(l)), None)
+        return (start, len(name.match(lines[start]).group(1))) if start is not None else (None, None)
+
+    start, level = heading_at(lower)
     if start is None:
         return None, [f"{path} has no section for {milestone}"]
-    level = len(name.match(lines[start]).group(1))
-    clauses, problems, inside, blocks = [], [], False, 0
-    for n, line in enumerate(lines[start + 1:], start + 2):
-        heading = HEADING.match(line)
-        if heading and len(heading.group(1)) <= level:
-            break
-        if line.strip() == "**Acceptance:**":
-            blocks += 1
-            inside = True
-            continue
-        if not inside or not line.strip():
-            continue
-        if heading:
-            inside = False
-        elif line.startswith("- "):
-            clauses.append(line[2:])
-        elif line.startswith("  ") and clauses and not line.lstrip().startswith(("-", "*")):
-            clauses[-1] += " " + line.strip()
+    clauses, problems = own(lines, lower, start, level, path)
+    part = PART.match(lower)
+    if part and part.group(2) == "b":
+        parent, at = heading_at(part.group(1))
+        if parent is None:
+            problems.append(f"{path}: {milestone} has no {part.group(1).upper()} to finish")
         else:
-            problems.append(f"{path}:{n}: not a clause or its continuation: {line.strip()}")
-    if blocks != 1:
-        problems.append(f"{path}: {milestone} has {blocks} Acceptance blocks, not one")
-    return [words(c) for c in clauses], problems
+            stated, unread = own(lines, part.group(1), parent, at, path)
+            problems += unread
+            clauses = [c for c in stated if c not in clauses] + clauses
+    if not clauses:
+        problems.append(f"{path}: {milestone} states no Acceptance clause")
+    return clauses, problems
 
 
 def results(log):
@@ -268,9 +384,9 @@ def main():
         bad = []
         if not clause.all_tests():
             bad.append("no test listed")
-        for part, tests in clause.parts:
+        for sub, tests in clause.parts:
             if not tests:
-                bad.append(f"no test listed for: {part}")
+                bad.append(f"no test listed for: {sub}")
         bad += [b for b in (judge(binary, test, seen) for binary, test in clause.all_tests()) if b]
         failed |= bool(bad)
         n = len(clause.all_tests())

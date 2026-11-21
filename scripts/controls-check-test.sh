@@ -20,10 +20,14 @@ fail() {
 # A stand-in for cargo. Each test a row names is in a test binary of its
 # own. FAKE_CARGO says how it behaves: `honest` fails every test while any
 # control is switched off, `blind` always passes them, `partial` fails only
-# the first a control names, `missing` finds no test for the second, `lose`
-# also deletes the saved originals, `unreadable` makes the manifest
-# unreadable, `kill` kills the script outright, and `hang` waits, with the
-# control off, until it is stopped. It notes its arguments in cargo-args.
+# the first a control names, `missing` finds no test for the second, `flood`
+# fails tens of thousands of others after the one named, `lose` also deletes
+# the saved originals, `unreadable` makes the manifest unreadable, `stale`
+# replaces what was saved with a state from before the commit, `rebuild` says
+# in rebuild.log how each file it edits stands against the binaries this run
+# built, `kill` kills the script outright, `hang` waits, with the control off,
+# until it is stopped, and `spaces` names a failed test as a doctest is named.
+# It notes its arguments in cargo-args.
 mkdir -p "${WORK}/bin"
 cat >"${WORK}/bin/cargo" <<'SH'
 #!/usr/bin/env bash
@@ -32,15 +36,50 @@ cat >"${WORK}/bin/cargo" <<'SH'
 off() {
     ! git diff --quiet -- crates
 }
+# What the script keeps for a file, and the file the git.rs control edits.
+state_copy() { echo "target/controls-check/$(tr / % <<<"$1")"; }
+gitrs=crates/atomic-core/src/git.rs
 case "${FAKE_CARGO}" in
 lose) rm -f target/controls-check/crates* ;;
 unreadable) chmod 000 target/controls-check/manifest ;;
+stale)
+    # A state from before the commit, recorded as the original: what a run
+    # that started from a dirty file would have saved. It restores cleanly
+    # against the manifest's own hash while leaving HEAD behind.
+    if [ ! -e stale-made ]; then
+        : >stale-made
+        printf '%s\n' '// left over from an older, uncommitted state' >"$(state_copy "${gitrs}")"
+        printf '%s %s\n' "$(git hash-object -- "$(state_copy "${gitrs}")")" "${gitrs}" \
+            >target/controls-check/manifest
+    fi
+    ;;
+rebuild)
+    # The first run is the build with the control off, so note when its
+    # binaries are made. The second runs the tests with the control back on,
+    # after the script put the file back: say how that file's time stands
+    # against those binaries, which is how cargo weighs them.
+    if [ ! -e artefacts ]; then
+        : >artefacts
+    else
+        # Only the files the script saved a copy of are ones it edited.
+        for f in crates/*/src/*.rs crates/*/src/*/*.rs; do
+            [ -e "$f" ] || continue
+            [ -e "$(state_copy "$f")" ] || continue
+            if [ "$f" -nt artefacts ]; then
+                echo "newer $f"
+            else
+                echo "not-newer $f"
+            fi
+        done >>rebuild.log
+    fi
+    ;;
 kill) kill -KILL "${PPID}"; exit 0 ;;
 hang) : >cargo-started; exec sleep 300 ;;
 esac
 # The tests the arguments name, after `--` or as positional filters, each
 # in a test binary of its own, run in order as cargo runs them: without
-# --no-fail-fast, cargo stops at the first binary that fails.
+# --no-fail-fast, cargo stops at the first binary that fails. A flag's value
+# is no test, and neither is a flag of the test binary's after `--`.
 echo "$*" >>cargo-args
 [ "${1:-}" = test ] && shift
 names=()
@@ -54,7 +93,7 @@ for a in "$@"; do
         continue
     fi
     case "${a}" in
-    --) after=1 ;;
+    --) after=1 skip=0 ;;
     --no-fail-fast) no_fail_fast=1 ;;
     -p | --package | --features | --test | --bin | --example) skip=1 ;;
     -*) ;;
@@ -78,7 +117,20 @@ for n in "${names[@]}"; do
         [ "${FAKE_CARGO}" = partial ] && [ "${i}" -gt 1 ] && fails=0
     fi
     if [ "${fails}" -eq 1 ]; then
-        echo "test tests::${n} ... FAILED"
+        # `spaces`: the test is named as a doctest is, with spaces in it.
+        if [ "${FAKE_CARGO}" = spaces ]; then
+            echo "test crates/atomic-core/src/codex.rs - ${n} (line 1) - compile fail ... FAILED"
+        else
+            echo "test tests::${n} ... FAILED"
+        fi
+        # `flood`: and so many other tests failed after it that what is left
+        # to read is far past what a pipe holds, which a check that stops at
+        # the first match pays for with a broken pipe.
+        if [ "${FAKE_CARGO}" = flood ]; then
+            awk 'BEGIN {
+                for (i = 1; i <= 40000; i++) print "test tests::another_" i " ... FAILED"
+            }'
+        fi
         echo "test result: FAILED. 0 passed; 1 failed"
         status=101
         [ "${no_fail_fast}" -eq 1 ] || exit 101
@@ -90,6 +142,18 @@ done
 exit "${status}"
 SH
 chmod +x "${WORK}/bin/cargo"
+
+# A cp that keeps the timestamp of what it copies, as `cp -p` or an alias
+# for it does. A plain cp gives the file a new mtime, so cargo rebuilds; only
+# with this cp on the PATH does the rebuild case depend on the script's own
+# touch, which is what it tests.
+mkdir -p "${WORK}/bin-oldcp"
+cp_bin="$(command -v cp)"
+cat >"${WORK}/bin-oldcp/cp" <<SH
+#!/usr/bin/env bash
+exec "${cp_bin}" -p "\$@"
+SH
+chmod +x "${WORK}/bin-oldcp/cp"
 
 # The controls the script lists, and the files they edit.
 mapfile -t CONTROL_ROWS < <(grep -E '^    "[a-z0-9-]+\|' "${ROOT}/scripts/controls-check.sh")
@@ -117,10 +181,13 @@ fresh() {
 }
 
 # run MODE ARGS...: run the script in the copy; sets `code` and `out`.
+# RUN_PATH, when set, is a directory put before the stand-in cargo's, for a
+# mode that wants a different cp.
 run() {
     local mode="$1"
     shift
-    out="$(cd "${repo}" && FAKE_CARGO="${mode}" PATH="${WORK}/bin:${PATH}" \
+    out="$(cd "${repo}" && FAKE_CARGO="${mode}" \
+        PATH="${RUN_PATH:+${RUN_PATH}:}${WORK}/bin:${PATH}" \
         scripts/controls-check.sh "$@" 2>&1)"
     code=$?
 }
@@ -160,6 +227,35 @@ run missing sandbox-writes
     fail "missing: exit ${code}: ${out}"
 untouched || fail "missing: the source is left modified"
 
+# A failed test whose name has spaces in it, as a doctest's does, is seen
+# failing.
+repo="$(fresh)"
+run spaces exec-network-loopback-feature
+[ "${code}" -eq 0 ] && grep -q "^ok exec-network-loopback-feature" <<<"${out}" ||
+    fail "spaces: exit ${code}: ${out}"
+untouched || fail "spaces: the source is left modified"
+
+# A row whose only argument after `--` is a flag of the test binary's, not a
+# test: the flag is not taken for a test that should have been seen failing.
+repo="$(fresh)"
+sed -i '/"git-dir|/ s/|-p atomic-agentic-core .*"$/|-p atomic-agentic-core --lib -- --exact"/' \
+    "${repo}/scripts/controls-check.sh"
+grep -q '"git-dir|.*-- --exact"$' "${repo}/scripts/controls-check.sh" ||
+    fail "flag after --: the row was not changed: $(grep '"git-dir|' "${repo}/scripts/controls-check.sh")"
+run honest git-dir
+[ "${code}" -eq 0 ] && grep -q "^ok git-dir" <<<"${out}" ||
+    fail "flag after --: exit ${code}: ${out}"
+untouched || fail "flag after --: the source is left modified"
+
+# Tens of thousands of other tests failed as well, after the one a row names:
+# that one is still seen failing, where a check that stopped at the first
+# match would kill whatever piped to it and read that as a test never seen.
+repo="$(fresh)"
+run flood git-dir
+[ "${code}" -eq 0 ] && grep -q "^ok git-dir" <<<"${out}" ||
+    fail "flood: exit ${code}: ${out}"
+untouched || fail "flood: the source is left modified"
+
 # Every test binary runs, so a test after a failing one is seen too.
 repo="$(fresh)"
 run honest sandbox-writes
@@ -195,6 +291,78 @@ run unreadable git-hardening
 [ "${code}" -ne 0 ] && grep -q "manifest cannot be read" <<<"${out}" ||
     fail "unreadable manifest: exit ${code}: ${out}"
 chmod 600 "${repo}/target/controls-check/manifest"
+
+# A file that already differs from HEAD is refused before anything is
+# edited: the run would save that state, put it back at the end and read as
+# a clean restore.
+repo="$(fresh)"
+printf '\n// a change that was never committed\n' >>"${repo}/crates/atomic-core/src/git.rs"
+run honest git-hardening
+[ "${code}" -ne 0 ] &&
+    grep -q "differ from HEAD: crates/atomic-core/src/git.rs" <<<"${out}" ||
+    fail "dirty at the start: exit ${code}: ${out}"
+grep -q "nothing was edited" <<<"${out}" || fail "dirty at the start: ${out}"
+grep -q "never committed" <<<"$(git -C "${repo}" diff -- crates/atomic-core/src/git.rs)" ||
+    fail "dirty at the start: the run edited the file's own change"
+[ ! -e "${repo}/target/controls-check" ] || fail "dirty at the start: state was left behind"
+[ ! -e "${repo}/cargo-args" ] || fail "dirty at the start: cargo ran"
+# A whole-suite run names every file it refuses, not just the first.
+printf '\n// a change that was never committed\n' >>"${repo}/crates/atomic-core/src/codex.rs"
+run honest
+grep -Eq "differ from HEAD:.*src/git\.rs.*src/codex\.rs" <<<"${out}" ||
+    fail "dirty at the start, all controls: exit ${code}: ${out}"
+
+# A file git does not track, or one it is told to assume unchanged, cannot
+# be shown to match HEAD, so it is refused the same way.
+repo="$(fresh)"
+git -C "${repo}" update-index --assume-unchanged crates/atomic-core/src/git.rs
+printf '\n// a change git is told not to look at\n' >>"${repo}/crates/atomic-core/src/git.rs"
+run honest git-hardening
+[ "${code}" -ne 0 ] && grep -q "nothing was edited" <<<"${out}" ||
+    fail "assume-unchanged at the start: exit ${code}: ${out}"
+[ ! -e "${repo}/cargo-args" ] || fail "assume-unchanged at the start: cargo ran"
+repo="$(fresh)"
+git -C "${repo}" rm -q --cached crates/atomic-core/src/git.rs
+git -C "${repo}" -c user.name=test -c user.email=test@example.invalid -c commit.gpgSign=false \
+    commit -qm "stop tracking git.rs"
+run honest git-hardening
+[ "${code}" -ne 0 ] && grep -q "nothing was edited" <<<"${out}" ||
+    fail "untracked at the start: exit ${code}: ${out}"
+[ ! -e "${repo}/cargo-args" ] || fail "untracked at the start: cargo ran"
+
+# A restore that leaves a file matching the copy the run made, but not HEAD,
+# fails and keeps its state: the manifest's own hash cannot see that what was
+# saved was never the commit.
+repo="$(fresh)"
+run stale git-hardening
+[ "${code}" -ne 0 ] &&
+    grep -q "crates/atomic-core/src/git.rs IS LEFT DIFFERENT FROM HEAD" <<<"${out}" ||
+    fail "stale restore: exit ${code}: ${out}"
+[ -e "${repo}/target/controls-check/manifest" ] || fail "stale restore: the state is gone"
+git -C "${repo}" diff --quiet HEAD -- crates/atomic-core/src/git.rs &&
+    fail "stale restore: nothing was left differing from HEAD, so the case tests nothing"
+
+# A file put back is newer than the binaries built from it while its control
+# was off, so cargo rebuilds it instead of running what is already there. This
+# runs with a cp that keeps the timestamp of what it copies, as `cp -p` and
+# some cp implementations do, and a source older than those binaries: that is
+# how a restore can leave a file that cargo will not look at again.
+repo="$(fresh)"
+touch -d '2000-01-01 00:00:00 UTC' "${repo}/crates/atomic-core/src/git.rs"
+RUN_PATH="${WORK}/bin-oldcp"
+run rebuild git-hardening
+RUN_PATH=
+[ "${code}" -eq 0 ] || fail "rebuild: exit ${code}: ${out}"
+untouched || fail "rebuild: the source is left modified"
+[ -e "${repo}/rebuild.log" ] || fail "rebuild: cargo never saw the file put back"
+newer="$(grep -c '^newer crates/atomic-core/src/git.rs$' "${repo}/rebuild.log")"
+older="$(grep -c '^not-newer ' "${repo}/rebuild.log")"
+[ "${newer}" -eq 1 ] && [ "${older}" -eq 0 ] ||
+    fail "rebuild: $(cat "${repo}/rebuild.log")"
+# And the same when the run ends and puts every file back, so that nothing
+# later reuses a binary built while a control was off.
+[ "${repo}/crates/atomic-core/src/git.rs" -nt "${repo}/artefacts" ] ||
+    fail "rebuild: the file left at the end is not newer than this run's build"
 
 # A TERM while cargo runs with a control off, as a time limit sends, stops
 # the script promptly and puts the source back.
@@ -233,6 +401,16 @@ run honest git-hardening
     fail "after a kill: exit ${code}: ${out}"
 cp "${repo}/target/controls-check/crates%atomic-core%src%git.rs" "${repo}/crates/atomic-core/src/git.rs"
 untouched || fail "after a kill: the saved original does not restore the file"
+
+# What each case above is the control of, in scripts/controls-check.sh. A
+# control is tested by removing it: neutralise one line at a time and its case
+# fails.
+#
+#   dirty+="${file} "                               dirty at the start
+#   *) return 1 ;;                  in head_diff    untracked, assume-unchanged
+#   head_diff "${file}" || code=$?  in restore      stale restore
+#   && touch -- "$1"                in put_back     rebuild, in rebuild.log
+#   touch -- "${file}"              in restore      rebuild, against artefacts
 
 if [ "${failures}" -ne 0 ]; then
     echo "${failures} controls-check test(s) failed" >&2

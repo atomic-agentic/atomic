@@ -48,13 +48,18 @@ Use local `.astro` components and generated Props imports. The compiler rejects
 unsupported executable syntax before a model call; changing the extension to a
 removed format does not bypass the check. See [the expression guide](../guides/template-tags.md).
 
-## A section tag is reported as unclosed
+## A prompt section is missing or mismatched
 
-An Astro section such as `<rubric>` needs a matching `</rubric>`. Opening
-and closing tags may share a line with their content. Check for a misspelled
-closing tag and for sections closed in the wrong order. Tags that start with `data-` are
-reserved and are rejected wherever you write them. See
-[section tags](../guides/template-tags.md).
+Nothing checks that section tags balance. A misspelled closing tag still closes
+a section: the innermost one that is open, whatever its name. The symptom is
+therefore text landing inside the wrong section, or after it, rather than an
+error. A closing tag with no section open is dropped, and a section still open
+at the end of the file is closed there. Render the atom and read the prompt it
+produces (`atomic render`), then compare the nesting in that output with what
+you wrote. Inside a `{…}` expression a section left open does fail the load,
+with a TypeScript syntax error such as `':' expected.` that does not name the
+tag. Tags that start with `data-` are reserved and are rejected wherever you
+write them. See [section tags](../guides/template-tags.md).
 
 ## `atomic check` says a diagram is stale
 

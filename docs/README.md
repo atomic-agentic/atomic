@@ -109,7 +109,7 @@ Read [design principles](concepts/design-principles.md) when you want the backgr
   [controlling agents](guides/controlling-agents.md),
   [project structure](guides/project-structure.md),
   [testing](guides/testing-and-evals.md),
-  [template tags](guides/template-tags.md),
+  [prompt expressions and components](guides/template-tags.md),
   [diagrams](guides/diagrams.md),
   [tools and integrations](guides/tools-and-integrations.md),
   [code and cloud SDKs](guides/scripts-and-cloud-sdks.md),

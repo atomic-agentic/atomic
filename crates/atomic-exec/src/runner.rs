@@ -399,6 +399,14 @@ impl ExecutionBackend for ProcessRunner {
         self.workspaces.close(workspace)
     }
 
+    /// Its workspaces are on this machine, so their exchange is too.
+    fn exchange(
+        &self,
+        workspace: &crate::Workspace,
+    ) -> Result<Option<Box<dyn crate::exchange::Exchange>>, ExecError> {
+        self.workspaces.exchange(workspace)
+    }
+
     /// The command is confined here, before it crosses, as its workspaces'
     /// backend confines it: the runner runs what it is sent.
     fn run(&self, command: &Command) -> Result<Completed, ExecError> {

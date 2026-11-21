@@ -100,6 +100,60 @@ pub struct Ticket {
     /// For a turn, the allowance whose time left set its time limit, such
     /// as `atom:<run>:<step>`.
     pub bounded_by: Option<String>,
+    /// What the meter does if the ticket is dropped unsettled, as when the
+    /// task that holds it panics or is cancelled.
+    pub release: Release,
+}
+
+/// What a meter does for a ticket dropped unsettled, such as stopping its
+/// call's heartbeat: run once, when the last clone of the ticket is dropped.
+/// Settling the ticket drops it too, so the meter's settlement does the
+/// same first, and running it again then changes nothing.
+#[derive(Clone, Default)]
+pub struct Release(Option<Arc<OnDrop>>);
+
+/// The action a [`Release`] runs when its last clone is dropped.
+struct OnDrop(std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>);
+
+impl Drop for OnDrop {
+    fn drop(&mut self) {
+        let release = match self.0.get_mut() {
+            Ok(release) => release.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        if let Some(release) = release {
+            release();
+        }
+    }
+}
+
+impl Release {
+    /// Run `release` when the ticket is dropped.
+    pub fn new(release: impl FnOnce() + Send + 'static) -> Self {
+        Self(Some(Arc::new(OnDrop(std::sync::Mutex::new(Some(
+            Box::new(release),
+        ))))))
+    }
+}
+
+/// Every release is alike to a ticket's equality: what it runs is not part
+/// of the call.
+impl PartialEq for Release {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for Release {}
+
+impl std::fmt::Debug for Release {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "Release(..)"
+        } else {
+            "Release(none)"
+        })
+    }
 }
 
 /// An admission: the ticket to settle, if the call is metered, and the

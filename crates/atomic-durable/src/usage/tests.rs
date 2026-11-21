@@ -893,7 +893,7 @@ async fn a_dead_call_is_never_charged_its_processs_downtime<R: DurableRuntime>(r
     // It runs two minutes, saying so, and its process dies.
     t.fetch_add(2 * MINUTE, Ordering::SeqCst);
     ledger
-        .heartbeat(&format!("{run}:1:0"), 1)
+        .heartbeat(&format!("{run}:1:0"), 1, 2 * MINUTE)
         .await
         .expect("heartbeat");
     // Recovered 25 minutes later, its atom admits its next call: the dead
@@ -943,6 +943,144 @@ async fn a_dead_call_is_never_charged_its_processs_downtime<R: DurableRuntime>(r
         charged(&ledger, &format!("atom:{run}:1")).await.millis,
         28 * MINUTE
     );
+}
+
+/// The heartbeat attempt `attempt` at `request` last recorded, if it has one.
+async fn beat_of(ledger: &Ledger, request: &str, attempt: i64) -> Option<i64> {
+    let request = request.to_owned();
+    ledger
+        .transact(move |mut tx| {
+            let request = request.clone();
+            Box::pin(async move {
+                let row = tx
+                    .query_opt(
+                        "SELECT seen_at FROM atomic_usage_heartbeats \
+                         WHERE request_id = ? AND attempt = ?",
+                        &[Param::Text(request), Param::Int(attempt)],
+                    )
+                    .await?;
+                let seen = match row {
+                    Some(row) => Some(row.int("seen_at")?),
+                    None => None,
+                };
+                Ok(End::Rollback(seen))
+            })
+        })
+        .await
+        .expect("read the heartbeat")
+}
+
+async fn a_heartbeat_is_kept_only_until_its_attempts_time_is_settled<R: DurableRuntime>(rt: R) {
+    let ledger = rt.ledger();
+    let run = unique("beats");
+    // Settled with what it reported: its heartbeat goes with it, and a
+    // heartbeat after that records nothing.
+    let (req, attempt) = admitted(
+        &ledger
+            .admit(request(&run, 1, 0, 1_000, 1_000))
+            .await
+            .expect("admit"),
+    );
+    ledger
+        .heartbeat(&req, attempt, 10)
+        .await
+        .expect("heartbeat");
+    assert!(beat_of(&ledger, &req, attempt).await.is_some());
+    ledger
+        .settle(
+            &req,
+            attempt,
+            Settlement::Reported {
+                input_tokens: 1,
+                output_tokens: 1,
+                millis: 20,
+                micro_usd: 0,
+            },
+        )
+        .await
+        .expect("settle");
+    assert_eq!(beat_of(&ledger, &req, attempt).await, None);
+    ledger
+        .heartbeat(&req, attempt, 30)
+        .await
+        .expect("heartbeat");
+    assert_eq!(beat_of(&ledger, &req, attempt).await, None);
+    // Settled as unknown, its time is settled though it stays reserved:
+    // its heartbeat goes too.
+    let (req, attempt) = admitted(
+        &ledger
+            .admit(request(&run, 1, 1, 1_000, 1_000))
+            .await
+            .expect("admit"),
+    );
+    ledger
+        .heartbeat(&req, attempt, 10)
+        .await
+        .expect("heartbeat");
+    ledger
+        .settle(&req, attempt, Settlement::Unknown)
+        .await
+        .expect("settle");
+    assert_eq!(
+        ledger.attempts(&run).await.expect("attempts")[1].state,
+        "reserved"
+    );
+    assert_eq!(beat_of(&ledger, &req, attempt).await, None);
+    ledger
+        .heartbeat(&req, attempt, 40)
+        .await
+        .expect("heartbeat");
+    assert_eq!(beat_of(&ledger, &req, attempt).await, None);
+}
+
+async fn a_machine_that_slept_is_not_charged_the_sleep<R: DurableRuntime>(rt: R) {
+    use std::sync::atomic::AtomicI64;
+    const MINUTE: i64 = 60_000;
+    let t = Arc::new(AtomicI64::new(1_000_000_000));
+    let clock = t.clone();
+    let ledger = rt.ledger().with_clock(move || clock.load(Ordering::SeqCst));
+    let run = unique("slept");
+    let mut turn = request(&run, 1, 0, 1_000_000, 1_000_000);
+    turn.chain[0].caps.millis = 60 * MINUTE;
+    turn.chain[1].caps.millis = 60 * MINUTE;
+    turn.turn = true;
+    // A turn runs two minutes of active time while the machine sleeps for
+    // twenty-five, says so, and its process dies.
+    admitted(&ledger.admit(turn.clone()).await.expect("admit"));
+    t.fetch_add(27 * MINUTE, Ordering::SeqCst);
+    ledger
+        .heartbeat(&format!("{run}:1:0"), 1, 2 * MINUTE)
+        .await
+        .expect("heartbeat");
+    // Found dead: charged until a beat after its active two minutes.
+    turn.id = format!("{run}:1:1");
+    admitted(&ledger.admit(turn.clone()).await.expect("admit"));
+    let every = heartbeat_every(60 * MINUTE);
+    let attempts = ledger.attempts(&run).await.expect("attempts");
+    assert_eq!(
+        attempts[0].charged.millis,
+        2 * MINUTE + every,
+        "{attempts:?}"
+    );
+    // The next turn's own process settles it as unknown after three minutes
+    // of active time, thirty on the wall: it is charged the three.
+    t.fetch_add(30 * MINUTE, Ordering::SeqCst);
+    ledger
+        .settle_measured(&format!("{run}:1:1"), 1, Settlement::Unknown, 3 * MINUTE)
+        .await
+        .expect("settle");
+    let attempts = ledger.attempts(&run).await.expect("attempts");
+    assert_eq!(attempts[1].charged.millis, 3 * MINUTE, "{attempts:?}");
+    // And a process stopping does the same.
+    turn.id = format!("{run}:1:2");
+    admitted(&ledger.admit(turn).await.expect("admit"));
+    t.fetch_add(30 * MINUTE, Ordering::SeqCst);
+    ledger
+        .interrupt(&format!("{run}:1:2"), 1, MINUTE)
+        .await
+        .expect("interrupt");
+    let attempts = ledger.attempts(&run).await.expect("attempts");
+    assert_eq!(attempts[2].charged.millis, MINUTE, "{attempts:?}");
 }
 
 async fn a_partly_known_attempt_is_charged_its_reported_usage_and_one_more_bound<
@@ -1215,6 +1353,8 @@ on_sqlite!(
     progress_racing_its_settlement_leaves_what_was_used,
     a_call_is_reserved_before_dispatch_and_settled_once,
     a_dead_call_is_never_charged_its_processs_downtime,
+    a_heartbeat_is_kept_only_until_its_attempts_time_is_settled,
+    a_machine_that_slept_is_not_charged_the_sleep,
     unreported_and_dead_attempts_are_charged_the_time_they_took,
     a_partly_known_attempt_is_charged_its_reported_usage_and_one_more_bound,
     a_turn_reserves_the_active_time_left,
@@ -1238,6 +1378,8 @@ on_postgres!(
     progress_racing_its_settlement_leaves_what_was_used,
     a_call_is_reserved_before_dispatch_and_settled_once,
     a_dead_call_is_never_charged_its_processs_downtime,
+    a_heartbeat_is_kept_only_until_its_attempts_time_is_settled,
+    a_machine_that_slept_is_not_charged_the_sleep,
     unreported_and_dead_attempts_are_charged_the_time_they_took,
     a_partly_known_attempt_is_charged_its_reported_usage_and_one_more_bound,
     a_turn_reserves_the_active_time_left,

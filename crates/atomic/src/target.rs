@@ -266,11 +266,18 @@ fn atom_pipeline(atom: Atom, input: &Value) -> anyhow::Result<Pipeline> {
     for (field, origin) in &origins {
         if let Some(refused) = atomic_core::workflow::untrusted_binding(&atom, &with[field], origin)
         {
+            let action = match atomic_core::workflow::accepted_trust(&atom) {
+                Ok(accepts) => format!(
+                    "run it from a workflow that binds the field to {}, or declare a lower \
+                     `trust` on the atom if it is built for external input",
+                    atomic_core::workflow::trusted_sources(accepts)
+                ),
+                Err(_) => atomic_core::workflow::unknown_trust_advice(&atom),
+            };
             return Err(Failure::new(
                 "input.untrusted",
                 format!("input field `{field}`: {refused}"),
-                "run it from a workflow that passes the field through a step the atom can trust, \
-                 or declare a lower `trust` on the atom if it is built for this input",
+                action,
             )
             .into());
         }
