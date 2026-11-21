@@ -52,11 +52,17 @@ what atomic cannot account for is refused rather than installed beside.
 
 One case is still a deliberate step. A directory written by a version of atomic
 that kept no record cannot be checked, so setup accepts it only while it holds
-exactly the current pack's files with the current pack's bytes. Upgrading from
+nothing but the current pack's files, each with the current pack's bytes.
+Upgrading from
 such a version, delete `.claude/skills/atomic-create-atom`, or its
 `.agents/skills/` counterpart, and run setup again; from then on an upgrade takes
 nothing away. Where nothing has changed, running setup again writes the same files
 and adds nothing to the instructions file.
+
+Each file is written to a temporary beside it, named `.<file>.<random>.atomic-writing`,
+and then renamed into place. A setup that was killed partway can leave one of
+those behind; in a skill directory it is refused like any other file atomic did
+not write, so remove it and run setup again.
 
 Then describe the task in a sentence, for example "write an atom that pulls the
 action items, with their owners, out of meeting notes".
