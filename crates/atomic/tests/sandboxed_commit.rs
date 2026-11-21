@@ -167,12 +167,13 @@ async fn sandboxed_with(
         artifacts: Artifacts::none(),
         meter: Metering::none(),
         guard: guard.clone(),
-        backend: atomic_exec::Backend::connect(atomic_exec::LocalBackend::in_dir(scratch_root()))
-            .unwrap(),
         caches: None,
     };
+    let backend =
+        atomic_exec::Backend::connect(atomic_exec::LocalBackend::in_dir(scratch_root())).unwrap();
     let answer = run_turn(
         &runtime,
+        &backend,
         &TurnSpec {
             prompt: "Do the work.".into(),
             ..spec
