@@ -780,6 +780,87 @@ async fn redelivery_wakes_a_run_whose_decider_stopped_early<R: DurableRuntime>(m
     rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
 }
 
+/// Two projects sharing one store, each on a runtime of its own: the
+/// second neither lists, finds nor decides the first one's gate, nor sees
+/// its run, nor wakes it, and the first does all of these for its own.
+async fn a_project_sees_and_decides_only_its_own_gates_and_runs(database: crate::Database) {
+    let open = |project: &'static str| {
+        let database = database.clone();
+        async move {
+            Durare::open(&database, None, crate::DEFAULT_VERSION, project)
+                .await
+                .expect("engine")
+        }
+    };
+    let mut mine = open("project-a").await;
+    let theirs = open("project-b").await;
+    register(&mut mine);
+    mine.launch().await.expect("launch");
+    let (run, gate) = start_gated(&mine, input(None)).await;
+    // Project B: no such gate, and no such run.
+    assert!(
+        gates(&theirs, GateFilter::default())
+            .await
+            .expect("gates")
+            .iter()
+            .all(|g| g.id != gate.id),
+        "project B lists project A's gate"
+    );
+    assert!(find(&theirs, &gate.id).await.expect("find").is_none());
+    assert_eq!(
+        decide(
+            &theirs,
+            &me(&theirs).await,
+            command(&gate, "b1", Verdict::Approve)
+        )
+        .await,
+        Err(DecideError::NoSuchGate(gate.id.clone()))
+    );
+    assert!(theirs.own_run_record(&run).await.expect("record").is_none());
+    assert!(mine.own_run_record(&run).await.expect("record").is_some());
+    let listed = gates(&mine, GateFilter::default()).await.expect("gates");
+    assert!(listed.iter().any(|g| g.id == gate.id), "{listed:?}");
+    // A decision recorded with no wake-up: only its own project's runtime
+    // wakes the run.
+    let id = gate.id.clone();
+    mine.control_transaction(move |mut tx| {
+        let id = id.clone();
+        Box::pin(async move {
+            tx.execute(
+                "UPDATE atomic_gates SET state = 'approved', decided_by = 'local:dev', \
+                 decided_at = 1, command_id = 'c1' WHERE gate_id = ?",
+                &[Param::Text(id)],
+            )
+            .await
+            .map(|_| ())
+        })
+    })
+    .await
+    .expect("decide without waking");
+    assert_eq!(redeliver(&theirs).await.expect("redeliver"), 0);
+    assert!(redeliver(&mine).await.expect("redeliver") >= 1);
+    assert!(outcome(&mine, &run).await.expect("finishes").approved());
+    mine.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+    theirs.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_project_sees_and_decides_only_its_own_gates_and_runs_on_sqlite() {
+    let path = std::env::temp_dir().join(format!("{}.db", unique("atomic_gate_projects")));
+    a_project_sees_and_decides_only_its_own_gates_and_runs(crate::Database::Sqlite(path)).await
+}
+
+#[cfg(feature = "postgres-tests")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_project_sees_and_decides_only_its_own_gates_and_runs_on_postgres() {
+    let schema = crate::testing::schema("gate_projects").await;
+    a_project_sees_and_decides_only_its_own_gates_and_runs(crate::Database::Postgres {
+        url: schema.url().to_owned(),
+        schema: schema.name().to_owned(),
+    })
+    .await
+}
+
 #[test]
 fn the_proposal_digest_ignores_key_order_and_sees_every_change() {
     let a = json!({"b": 1, "a": {"y": [1, 2], "x": null}});

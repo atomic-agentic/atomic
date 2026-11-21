@@ -753,9 +753,47 @@ fn state_dir(dir: &Path, project: &Path) -> PathBuf {
 /// opened as atomic opens it, for that project, by its manifest's name and
 /// its state id: what it lists of parks is the project's.
 async fn project_store(state: &Path) -> Durare {
+    project_store_at(&database(state)).await
+}
+
+/// [`project_store`] by the database's path, `<home>/private/<id>/atomic.db`.
+async fn project_store_at(db: &Path) -> Durare {
+    let id = db
+        .parent()
+        .and_then(Path::file_name)
+        .expect("a project id")
+        .to_string_lossy()
+        .into_owned();
+    Durare::open(
+        &atomic_durable::Database::Sqlite(db.to_owned()),
+        None,
+        atomic_app::pipeline::LAYOUT_VERSION,
+        &format!("notes/{id}"),
+    )
+    .await
+    .expect("store")
+}
+
+/// The `notes` project's store on PostgreSQL at `url` and `schema`, as
+/// atomic opens it with `env`, whose `ATOMIC_HOME` gives the project's
+/// state id: what it lists of gates, runs and parks is that project's.
+#[cfg(feature = "postgres-tests")]
+async fn postgres_project_store(
+    dir: &Path,
+    project: &Path,
+    env: &[(&str, &str)],
+    url: &str,
+    schema: &str,
+) -> Durare {
+    let out = atomic(dir, project, &["debug", "state-dir"], env, "");
+    assert!(out.status.success(), "{}", text(&out));
+    let state = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
     let id = state.file_name().expect("a project id").to_string_lossy();
     Durare::open(
-        &atomic_durable::Database::Sqlite(database(state)),
+        &atomic_durable::Database::Postgres {
+            url: url.to_owned(),
+            schema: schema.to_owned(),
+        },
         None,
         atomic_app::pipeline::LAYOUT_VERSION,
         &format!("notes/{id}"),
@@ -1703,7 +1741,7 @@ fn a_run_stopped_mid_call_charges_the_call_only_the_time_it_ran() {
         assert!(!status.success(), "stopped short of its result");
         // Its call is settled as interrupted: the tokens stay at the bound,
         // the time is what it ran, not the 10 minutes it reserved.
-        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        let rt = project_store(&state).await;
         let attempts = rt.ledger().attempts("stopped-1").await.expect("attempts");
         // The exec step before rank finished, and its command is settled.
         let (work, calls): (Vec<_>, Vec<_>) = attempts.iter().partition(|a| a.model == "(command)");
@@ -1853,7 +1891,7 @@ fn a_run_killed_at_a_gate_keeps_it_and_its_deadline_and_one_resume_runs_at_a_tim
             &with(&env, &[]),
             &dir.join("first.log"),
         );
-        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        let rt = project_store(&state).await;
         let opened = open_gate(&rt, "gated-1").await;
         assert!(opened.deadline.is_some());
         first.kill().expect("SIGKILL the run");
@@ -1942,7 +1980,7 @@ fn decider_child() {
     let store = std::env::var(DECIDER_STORE).expect("store");
     let run = std::env::var(DECIDER_RUN).expect("run");
     on_codex_runtime(async move {
-        let rt = Durare::sqlite(Path::new(&store)).await.expect("store");
+        let rt = project_store_at(Path::new(&store)).await;
         let g = open_gate(&rt, &run).await;
         approve(&rt, &g).await;
     });
@@ -1965,7 +2003,7 @@ async fn decided_while_down(
         &with(env, &[]),
         &dir.join(format!("{id}.log")),
     );
-    let rt = Durare::sqlite(&database(state)).await.expect("store");
+    let rt = project_store(state).await;
     open_gate(&rt, id).await;
     run.kill().expect("SIGKILL the run");
     run.wait().expect("reap");
@@ -1975,7 +2013,7 @@ async fn decided_while_down(
 /// Approve run `id`'s gate from a decider that stops after recording its
 /// decision and before waking the run.
 async fn decide_without_waking(state: &Path, id: &str) {
-    let rt = Durare::sqlite(&database(state)).await.expect("store");
+    let rt = project_store(state).await;
     let decider = Command::new(std::env::current_exe().expect("this test binary"))
         .args(["--exact", "decider_child", "--ignored", "--nocapture"])
         .env(DECIDER_STORE, database(state))
@@ -2063,7 +2101,7 @@ fn a_gate_decided_while_its_run_was_down_wakes_it_on_resume() {
             &dir.join("decided-3.log"),
         );
         {
-            let rt = Durare::sqlite(&database(&state)).await.expect("store");
+            let rt = project_store(&state).await;
             open_gate(&rt, "decided-3").await;
         }
         third.kill().expect("SIGKILL the run");
@@ -2075,7 +2113,7 @@ fn a_gate_decided_while_its_run_was_down_wakes_it_on_resume() {
             &with(&env, &[]),
             &dir.join("serve.log"),
         );
-        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        let rt = project_store(&state).await;
         let started = Instant::now();
         while rt.status("decided-2").await.expect("status") != Some(RunStatus::Succeeded) {
             assert!(
@@ -2169,7 +2207,7 @@ fn serve_started_after_a_kill_recovers_the_run_and_finishes_it() {
             &with(&env, &[]),
             &dir.join("serve.log"),
         );
-        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        let rt = project_store(&state).await;
         let started = Instant::now();
         while rt.status("served-1").await.expect("status") != Some(RunStatus::Succeeded) {
             assert!(
@@ -2341,7 +2379,7 @@ fn a_run_started_by_one_build_resumes_and_recovers_under_another() {
             &with(&env, &[]),
             &dir.join("serve.log"),
         );
-        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        let rt = project_store(&state).await;
         let started = Instant::now();
         while rt.status("built-2").await.expect("status") != Some(RunStatus::Succeeded) {
             assert!(
@@ -2497,7 +2535,7 @@ fn a_resumed_run_left_queued_is_taken_by_no_other_command() {
         .await
         .expect("child");
         assert!(out.status.success(), "{}", text(&out));
-        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        let rt = project_store(&state).await;
         assert_eq!(
             rt.status("left-1").await.expect("status"),
             Some(RunStatus::Pending)
@@ -3517,7 +3555,7 @@ fn serve_sets_aside_a_run_whose_commands_cannot_be_confined_and_serves_the_rest(
             &with_path,
             &dir.join("gated.log"),
         );
-        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        let rt = project_store(&state).await;
         let opened = open_gate(&rt, "gated-1").await;
         gated.kill().expect("SIGKILL the run");
         gated.wait().expect("reap");
@@ -4529,7 +4567,7 @@ fn serve_restarts_do_not_park_a_healthy_run() {
             &with(&env, &[]),
             &dir.join("first.log"),
         );
-        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        let rt = project_store(&state).await;
         let opened = open_gate(&rt, "waiting-1").await;
         first.kill().expect("SIGKILL the run");
         first.wait().expect("reap");
@@ -4708,7 +4746,7 @@ fn serve_started_on_many_queued_runs_runs_each_once() {
             &UNUSED_MODEL,
             &dir.join("serve.log"),
         );
-        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        let rt = project_store(&state).await;
         let started = Instant::now();
         for id in &ids {
             while rt.status(id).await.expect("status") != Some(RunStatus::Succeeded) {
@@ -5083,7 +5121,7 @@ fn a_coding_run_is_bound_to_its_fixture_and_never_touches_a_checkout() {
                 ],
             ),
         ];
-        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        let rt = project_store(&state).await;
         for (tag, cwd, args) in &runs {
             let id = args[args.iter().position(|a| *a == "--run-id").expect("id") + 1];
             let mut child = spawn(
@@ -5248,7 +5286,7 @@ fn a_fixture_atomic_cannot_copy_whole_or_that_is_not_its_own_repository_is_refus
         let linked = dir.join("linked");
         let own = commit_file(&linked, "price.txt", "500");
         let state = state_dir(&dir, &project);
-        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        let rt = project_store(&state).await;
         let data = json!({"base": own, "task": "multiply"}).to_string();
         let linked_arg = linked.to_string_lossy().into_owned();
         let mut child = spawn(
@@ -5683,7 +5721,7 @@ fn a_restarted_server_recovers_only_its_own_runs_on_postgres() {
             &with(&model_env, &env_a),
             &dir.join("a.log"),
         ));
-        let rt = Durare::postgres(&url, &schema).await.expect("store");
+        let rt = postgres_project_store(&dir, &project, &[], &url, &schema).await;
         let gate_a = open_gate(&rt, "run-a").await;
         let mut b = Reaped(spawn(
             &dir,
@@ -5815,7 +5853,7 @@ fn resuming_a_run_another_executor_owns_on_postgres_needs_its_owner_stopped() {
             &with(&a_env, &[]),
             &dir.join("a.log"),
         ));
-        let rt = Durare::postgres(&url, &schema).await.expect("store");
+        let rt = postgres_project_store(&dir, &project, &[], &url, &schema).await;
         let opened = open_gate(&rt, "owned-1").await;
 
         // worker-a is alive and owns the run: worker-b may not take it.
@@ -5931,7 +5969,7 @@ fn a_resumed_run_is_taken_only_by_its_resumer_on_postgres() {
             .await
             .expect("child");
         assert!(out.status.success(), "{}", text(&out));
-        let rt = Durare::postgres(&url, &schema).await.expect("store");
+        let rt = postgres_project_store(&dir, &project, &[], &url, &schema).await;
         let record = rt
             .run_record("queued-1")
             .await
@@ -5995,7 +6033,7 @@ fn gates_are_listed_and_decided_in_the_postgres_store() {
             &with(&env, &[]),
             &dir.join("run.log"),
         ));
-        let rt = Durare::postgres(&url, &schema).await.expect("store");
+        let rt = postgres_project_store(&dir, &project, &[], &url, &schema).await;
         let g = open_gate(&rt, "pg-gate-1").await;
         let gates = |args: &'static [&'static str]| {
             let (d, p, e) = (dir.clone(), project.clone(), env.clone());
@@ -6023,6 +6061,43 @@ fn gates_are_listed_and_decided_in_the_postgres_store() {
         assert!(listed.status.success(), "{}", text(&listed));
         let listed = stdout_json(&listed);
         assert_eq!(listed[0]["id"], json!(g.id), "{listed}");
+
+        // Another project on the same store neither lists nor decides the
+        // gate, nor shows the run: to it, they are not there.
+        let other_dir = dir.join("other");
+        std::fs::create_dir_all(&other_dir).expect("other");
+        let other = project(&other_dir);
+        let in_other = |args: Vec<String>| {
+            let (d, p, e) = (dir.clone(), other.clone(), env.clone());
+            tokio::task::spawn_blocking(move || {
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                atomic(&d, &p, &args, &with(&e, &[]), "")
+            })
+        };
+        let listed = in_other(vec!["gates".into(), "list".into(), "--json".into()])
+            .await
+            .expect("child");
+        assert!(listed.status.success(), "{}", text(&listed));
+        assert_eq!(stdout_json(&listed), json!([]), "another project's gate is listed");
+        let approved = in_other(vec!["gates".into(), "approve".into(), g.id.clone()])
+            .await
+            .expect("child");
+        assert!(!approved.status.success(), "{}", text(&approved));
+        assert!(text(&approved).contains(&format!("no gate {}", g.id)), "{}", text(&approved));
+        let shown = in_other(vec![
+            "--json".into(),
+            "runs".into(),
+            "show".into(),
+            "pg-gate-1".into(),
+        ])
+        .await
+        .expect("child");
+        assert!(!shown.status.success(), "{}", text(&shown));
+        assert_eq!(stdout_json(&shown)["error"]["kind"], "run.not_found", "{}", text(&shown));
+        assert!(
+            gate::find(&rt, &g.id).await.expect("find").expect("still there").resolution.is_none(),
+            "another project decided the gate"
+        );
 
         let id = g.id.clone();
         let (d, p, e) = (dir.clone(), project.clone(), env.clone());
@@ -6128,7 +6203,7 @@ async fn a_run_whose_workflow_code_panics() {
     // a server to run again.
     let state = state_dir(&dir, &project);
     {
-        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        let rt = project_store(&state).await;
         assert_eq!(
             rt.status("panicky").await.expect("status"),
             Some(RunStatus::Other("MAX_RECOVERY_ATTEMPTS_EXCEEDED".into()))

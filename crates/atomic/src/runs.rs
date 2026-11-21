@@ -439,7 +439,7 @@ pub async fn resume(
     )
     .await?;
     let id = &args.run_id;
-    let record = engine.rt.run_record(id).await?;
+    let record = engine.rt.own_run_record(id).await?;
     match record.as_ref().map(|r| &r.status) {
         None => {
             let _ = engine.rt.shutdown(SHUTDOWN).await;
