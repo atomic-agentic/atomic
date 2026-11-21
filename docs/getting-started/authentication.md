@@ -84,11 +84,13 @@ forgetting, one a save left lock files for. If the store cannot be read, a
 directory holding a lock file stays; if the forgetting itself failed, the
 directory goes regardless. One stopped with Ctrl-C once it has forgotten
 leaves the directory with nothing in the store; one stopped before that, as at a
-keyring's unlock prompt, can leave such an entry readable as a sign-in: run
-`atomic model logout` to forget it. A logout that made the directory and stops
-before it reaches the stores removes the directory again. A logout removes the directory once both stores are
-checked, so later runs read no store, and removes one it made itself even if
-the keyring cannot be checked. Otherwise, while the keyring cannot be checked,
+keyring's unlock prompt, can leave an entry that outlived an earlier directory
+readable as a sign-in: run `atomic model logout` to forget it. A logout that
+made the directory and fails before it reaches the stores removes the directory
+again; one stopped with Ctrl-C can leave it, so run `atomic model logout`
+again. A logout removes the directory once both stores are checked, so later
+runs read no store, and removes one it made itself even if the keyring cannot
+be checked. Otherwise, while the keyring cannot be checked,
 the directory stays, and atomic says the sign-in could not be read.
 
 Keeping the token out of reach has side effects on atomic's own process, and so

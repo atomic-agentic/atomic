@@ -260,6 +260,8 @@ impl SignIn {
             match builder.create(&located.auth_home) {
                 Ok(()) => existed = Some(false),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    #[cfg(test)]
+                    tests::between_create_and_check(&located.auth_home);
                     if crate::state::existing_private_dir(&located.auth_home)
                         .map_err(|e| file(e.to_string()))?
                     {
@@ -367,7 +369,12 @@ impl SignIn {
                 Err(_) => locked,
             },
             Tidy::Logout { made, deleted } => match self.stored() {
-                // Trusted only once the logout's own delete went through.
+                // Trusted once the logout's own delete went through, or when
+                // the directory was there before the logout. One it made,
+                // whose delete did not go through, goes: that disowns a
+                // concurrent login's save, even one that has finished, which
+                // stays in the store and reads as no sign-in until it logs in
+                // again.
                 Ok(Some(_)) => !matches!((made, deleted), (true, false)),
                 Ok(None) => false,
                 // A logout that made the directory and cannot read the store
@@ -986,6 +993,31 @@ mod tests {
     /// Kept for a directory whose keyring cannot be reached.
     const UNREACHABLE: &str = "unreachable";
 
+    /// Directories removed once, between a create that found them and the
+    /// check of what was found, as another invocation's tidy might.
+    static REMOVED_BETWEEN: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+    pub(super) fn between_create_and_check(dir: &Path) {
+        let mut listed = REMOVED_BETWEEN.lock().expect("removed");
+        if let Some(at) = listed.iter().position(|d| d == dir) {
+            listed.remove(at);
+            let _ = std::fs::remove_dir(dir);
+        }
+    }
+
+    /// A directory another invocation removes between this one's create,
+    /// which found it, and the check of it, is made by this one, which
+    /// knows it made it.
+    #[test]
+    fn a_directory_removed_while_it_is_found_is_made_and_known_to_be() {
+        let dir = auth_dir("removed-between");
+        REMOVED_BETWEEN.lock().expect("removed").push(dir.clone());
+        let sign_in = SignIn::made_at(SignIn::in_files(&dir), None).expect("made");
+        assert!(sign_in.made, "taken for found");
+        assert!(dir.is_dir());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Directories whose logout stops before it reaches the stores.
     static LOGOUT_FAILS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
 
@@ -1405,6 +1437,7 @@ mod tests {
             (true, false, false),
             (true, true, true),
             (false, false, true),
+            (false, true, true),
         ] {
             let dir = auth_dir(&format!("logout-trust-{made}-{deleted}"));
             keep(&dir, Some(signed_in("account-1")));
