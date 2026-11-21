@@ -206,21 +206,6 @@ fn parse(mountinfo: &[u8]) -> anyhow::Result<Vec<Mount>> {
     Ok(mounts)
 }
 
-/// The mount at the top of the stack `mount` heads at its own mount point:
-/// the one mounted on it there, and on that, and so on.
-fn top<'a>(mounts: &'a [Mount], mut mount: &'a Mount) -> &'a Mount {
-    for _ in 0..mounts.len() {
-        match mounts
-            .iter()
-            .find(|m| m.at == mount.at && m.parent == mount.id && m.id != mount.id)
-        {
-            Some(above) => mount = above,
-            None => break,
-        }
-    }
-    mount
-}
-
 /// The IDs of `mounts`.
 fn ids(mounts: &[Mount]) -> std::collections::HashSet<u64> {
     mounts.iter().map(|m| m.id).collect()
@@ -234,46 +219,99 @@ fn root_of<'a>(mounts: &'a [Mount], ids: &std::collections::HashSet<u64>) -> Opt
         .find(|m| m.at == Path::new("/") && (m.parent == m.id || !ids.contains(&m.parent)))
 }
 
-/// The mount `path` is in, as this process sees it: from the root mount,
-/// down the mounts on each directory of the path, each the top of its stack.
-fn mount_of<'a>(
-    mounts: &'a [Mount],
-    listed: &std::collections::HashSet<u64>,
-    path: &Path,
-) -> Option<&'a Mount> {
-    let root = root_of(mounts, listed)?;
-    let mut here = top(mounts, root);
-    let mut at = PathBuf::from("/");
-    for part in path.components().skip(1) {
-        at.push(part);
-        if let Some(child) = mounts.iter().find(|m| m.at == at && m.parent == here.id) {
-            here = top(mounts, child);
+/// A mount table indexed once for each read of it: each mount by the mount
+/// it is on and where, and each filesystem's mounts, so that what a path is
+/// on and where else that is mounted are found by its depth, not by the
+/// table's length.
+struct Index<'a> {
+    /// The root mount, when the table has one.
+    root: Option<&'a Mount>,
+    /// Each mount by the ID of the mount it is on and where it is.
+    on: std::collections::HashMap<(u64, &'a Path), &'a Mount>,
+    /// Each filesystem's mounts, by device.
+    by_device: std::collections::HashMap<&'a str, Vec<&'a Mount>>,
+}
+
+impl<'a> Index<'a> {
+    fn new(mounts: &'a [Mount]) -> Self {
+        let listed = ids(mounts);
+        let mut on = std::collections::HashMap::new();
+        let mut by_device: std::collections::HashMap<&str, Vec<&Mount>> =
+            std::collections::HashMap::new();
+        for m in mounts {
+            // Two on one place on one mount: the later is on top (`top`
+            // takes the first found, which is the earlier, then climbs).
+            on.entry((m.parent, m.at.as_path())).or_insert(m);
+            by_device.entry(m.device.as_str()).or_default().push(m);
+        }
+        Self {
+            root: root_of(mounts, &listed),
+            on,
+            by_device,
         }
     }
-    Some(here)
+
+    /// The mount at the top of the stack `mount` heads at its own mount
+    /// point: the one mounted on it there, and on that, and so on.
+    fn top(&self, mut mount: &'a Mount) -> &'a Mount {
+        for _ in 0..=self.on.len() {
+            match self.on.get(&(mount.id, mount.at.as_path())) {
+                Some(above) if above.id != mount.id => mount = above,
+                _ => break,
+            }
+        }
+        mount
+    }
+
+    /// The mount `path` is in, as [`mount_of`] finds it.
+    fn mount_of(&self, path: &Path) -> Option<&'a Mount> {
+        let mut here = self.top(self.root?);
+        let mut at = PathBuf::from("/");
+        for part in path.components().skip(1) {
+            at.push(part);
+            if let Some(child) = self.on.get(&(here.id, at.as_path())) {
+                here = self.top(child);
+            }
+        }
+        Some(here)
+    }
+
+    /// The other mounts of `home`'s filesystem.
+    fn same(&self, home: &Mount) -> Vec<&'a Mount> {
+        self.by_device
+            .get(home.device.as_str())
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|m| m.id != home.id)
+            .collect()
+    }
+}
+
+/// The mount `path` is in, as this process sees it: from the root mount,
+/// down the mounts on each directory of the path, each the top of its stack.
+#[cfg(test)]
+fn mount_of<'a>(
+    mounts: &'a [Mount],
+    _listed: &std::collections::HashSet<u64>,
+    path: &Path,
+) -> Option<&'a Mount> {
+    Index::new(mounts).mount_of(path)
 }
 
 /// Every other place `mounts` shows `path`, which is absolute with no link
 /// in it: under each other mount of the same filesystem whose directory
 /// holds it, the same file or directory there; and each such mount whose
 /// directory lies inside it, whole.
-fn aliases_of(
-    mounts: &[Mount],
-    listed: &std::collections::HashSet<u64>,
-    path: &Path,
-    out: &mut Vec<PathBuf>,
-) -> anyhow::Result<()> {
-    let Some(home) = mount_of(mounts, listed, path) else {
+fn aliases_of(index: &Index<'_>, path: &Path, out: &mut Vec<PathBuf>) -> anyhow::Result<()> {
+    let Some(home) = index.mount_of(path) else {
         bail!(
             "{} is under no mount in the mount table, so atomic cannot tell where else it is \
              mounted",
             path.display()
         );
     };
-    let same: Vec<&Mount> = mounts
-        .iter()
-        .filter(|m| m.device == home.device && m.id != home.id)
-        .collect();
+    let same = index.same(home);
     let Some(first) = same.first() else {
         return Ok(());
     };
@@ -400,17 +438,26 @@ fn same_file(path: &Path, alias: &Path) -> anyhow::Result<()> {
 
 /// Every other place `mounts` shows each of `denied`, which are absolute
 /// paths with no link in them, and each filesystem mounted inside one.
+#[cfg(test)]
 fn aliases(mounts: &[Mount], denied: &[PathBuf]) -> anyhow::Result<Vec<PathBuf>> {
-    let listed = ids(mounts);
+    aliases_in(&Index::new(mounts), mounts, denied)
+}
+
+/// [`aliases`], in a table already indexed.
+fn aliases_in(
+    index: &Index<'_>,
+    mounts: &[Mount],
+    denied: &[PathBuf],
+) -> anyhow::Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     for path in denied {
-        aliases_of(mounts, &listed, path, &mut out)?;
+        aliases_of(index, path, &mut out)?;
         // What is mounted inside a denied directory is hidden there too.
         for inner in mounts
             .iter()
             .filter(|m| m.at != *path && m.at.starts_with(path))
         {
-            aliases_of(mounts, &listed, &inner.at, &mut out)?;
+            aliases_of(index, &inner.at, &mut out)?;
         }
     }
     out.sort();
@@ -498,11 +545,12 @@ pub fn second_mounts(groups: &[&[PathBuf]]) -> anyhow::Result<Vec<Vec<PathBuf>>>
         return Ok(groups.iter().map(|_| Vec::new()).collect());
     };
     let mounts = parse(&table)?;
+    let index = Index::new(&mounts);
     groups
         .iter()
         .map(|group| {
             let real: Vec<PathBuf> = group.iter().map(|p| real(p)).collect();
-            aliases(&mounts, &real)
+            aliases_in(&index, &mounts, &real)
         })
         .collect()
 }

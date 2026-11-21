@@ -492,17 +492,21 @@ denied only to later commands, and so is what a link made later inside a
 denied place points at, which each command looks for again as it starts,
 in the places the list was made with, and denies at its second mounts too,
 and so is a second mount of what the list denies made since it was built,
-as each command reads the mount table again; a command whose new link or
-new second mount leads somewhere atomic would refuse to deny, or whose
-denied place has become a link atomic cannot resolve for a reason other
-than leading nowhere, does not start. As each command starts, the links up to four levels inside the
-places that lead outside them to something atomic would deny, old and new,
-each target counted once, together with the second mounts of what the new
-ones point at and the second mounts made since the list was built, come to
-at most 512; past that, the command does not start.
-A link made in the moment between that look and the sandbox's start, or
-while a long-lived command, such as a turn's unified-exec session, keeps
-running, is followed only from the next command. The file operations Codex
+or of Codex's home, whose databases are denied there too, as each command
+reads the mount table again; a command whose new link or new second mount
+leads somewhere atomic would refuse to deny, or whose denied place has
+become a link atomic cannot resolve for a reason other than leading
+nowhere, does not start. As each command starts, the links up to four
+levels inside the places that lead outside them to something atomic would
+deny, old and new, each target counted once, together with the second
+mounts of what the new
+ones point at, of everything the list denies (its own second mounts among
+them, so each pair is counted from both sides) and of Codex's home, come to
+at most 512; past that, the command does not start, and the list is
+counted the same way when the turn starts.
+A link or a mount made in the moment between that look and the sandbox's
+start, or while a long-lived command, such as a turn's unified-exec
+session, keeps running, is followed only from the next command. The file operations Codex
 makes for a turn itself, such as applying a patch, go through a helper that
 is not handed the places: it walks the list's own entries instead, so for
 them a place that was already a link when the list was made is not
