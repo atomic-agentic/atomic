@@ -347,8 +347,8 @@ pub fn deployment() -> Deployment {
 pub struct Engine {
     /// The durable runtime, launched, with `run_pipeline` registered.
     pub rt: Durare,
-    /// Where its store is, for messages.
-    pub store: String,
+    /// Where its durable store is, for messages.
+    pub store_description: String,
     /// Whether the store is shared with other hosts' executors, which this
     /// process's execution lock does not exclude.
     pub shared: bool,
@@ -493,7 +493,7 @@ pub async fn open(
     }
     Ok(Engine {
         rt,
-        store: describe(&database),
+        store_description: describe(&database),
         shared: matches!(database, Database::Postgres { .. }),
         signed_in,
         artifacts: store,

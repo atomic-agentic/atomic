@@ -89,12 +89,14 @@ after a crash there.
 
 `atomic run` keeps the content its input names from a sweep until the input
 is recorded. Before the run starts, it holds each artifact the input names
-and marks it as just written, under the store's lock: a sweep holding the
-lock is waited for once, for the store's 30-second wait, and the run is
-refused (`store.locked`) if it is held longer. An input that names, as
-`artifact://sha256/…`, content the store does not hold, or content a sweep
-removed after the store was listed, is refused (`run.input_missing`). Either
-way nothing is recorded.
+and marks it as just written, under the store's lock. Holding and marking
+share one wait for the lock, the store's 30 seconds: a sweep holding it is
+said once and waited for, and if it holds the lock longer the run is refused
+(`store.locked`); Ctrl-C while it waits stops the run (`run.stopped`). A field
+the workflow's input contract types as `atomic:artifact` that names content
+the store does not hold, or content a sweep removed after the store was
+listed, refuses the run (`run.input_missing`); a reference in free text is
+held if stored and otherwise left alone. Either way nothing is recorded.
 
 `atomic serve` also runs on PostgreSQL (`ATOMIC_DATABASE_URL`) when the process
 has an executor identity (`ATOMIC_EXECUTOR_ID`). `atomic runner` and

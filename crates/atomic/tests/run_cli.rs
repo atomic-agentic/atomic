@@ -2094,7 +2094,12 @@ fn atomic_run_keeps_what_its_input_names_from_a_sweep_that_read_the_runs_before_
             read_at: SystemTime::now(),
         };
         let (d, p, e) = (dir.clone(), project.clone(), model_env(&model.base_url()));
-        let data = json!({ "text": format!("Exporting {stored} crashes the app.") }).to_string();
+        // Its text names stored content, and content never stored, which
+        // free text may: only a field typed as an artifact must be stored.
+        let never = format!("artifact://sha256/{}", "1".repeat(64));
+        let data =
+            json!({ "text": format!("Exporting {stored} crashes the app, as {never} did.") })
+                .to_string();
         let out = tokio::task::spawn_blocking(move || {
             atomic(
                 &d,
@@ -2120,6 +2125,51 @@ fn atomic_run_keeps_what_its_input_names_from_a_sweep_that_read_the_runs_before_
             "the sweep removed what the run's input names"
         );
     });
+}
+
+/// A field the workflow's input contract types as an artifact, naming
+/// content the store does not hold, refuses the run before it is recorded,
+/// and says what to do.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[test]
+fn a_typed_input_naming_content_never_stored_is_refused() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
+    let dir = scratch("typed-absent");
+    let project = project(&dir);
+    std::fs::write(
+        project.join("workflows/attached.workflow.yaml"),
+        TRIAGE.replace("name: triage", "name: attached").replace(
+            "input: { $ref: ../atoms/count-note.input.schema.json }",
+            "input: { type: object, required: [text, file], properties: { text: { type: string }, file: { $ref: 'atomic:artifact' } } }",
+        ),
+    )
+    .expect("workflow");
+    let never = format!("artifact://sha256/{}", "1".repeat(64));
+    let data = json!({ "text": "a note", "file": never }).to_string();
+    let out = atomic(
+        &dir,
+        &project,
+        &["--json", "run", "attached", "--run-id", "typed-1", "--data", &data],
+        &UNUSED_MODEL,
+        "",
+    );
+    assert!(!out.status.success(), "{}", text(&out));
+    let error = &stdout_json(&out)["error"];
+    assert_eq!(error["kind"], "run.input_missing", "{error}");
+    assert!(
+        error["description"]
+            .as_str()
+            .is_some_and(|d| d.contains(&never)),
+        "{error}"
+    );
+    assert!(
+        error["action"]
+            .as_str()
+            .is_some_and(|a| a.contains("store the content again")),
+        "{error}"
+    );
 }
 
 // needs_sandbox

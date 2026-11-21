@@ -409,9 +409,11 @@ pub async fn run(
             f.commit
         );
     }
-    // What its input names is kept from a sweep until the input is recorded.
+    // What its input names is kept from a sweep until the input is recorded;
+    // a field its contract types as an artifact must name stored content.
     use atomic_app::retention::start_keeping_input as admit;
-    let admitted = admit(&engine.artifacts, &engine.rt, PIPELINE, &run_id, run).await;
+    let typed = Some((run.pipeline.input.clone(), run.input.clone()));
+    let admitted = admit(&engine.artifacts, &engine.rt, PIPELINE, &run_id, run, typed).await;
     if let Err(e) = admitted {
         let refused = e
             .downcast_ref::<atomic_app::retention::InputRefused>()
@@ -425,6 +427,11 @@ pub async fn run(
                     "store.locked",
                     r.to_string(),
                     "let the sweep finish, or stop it, then start the run again",
+                ),
+                atomic_app::retention::InputRefused::Stopped => Failure::new(
+                    "run.stopped",
+                    r.to_string(),
+                    "nothing was recorded; start the run again",
                 ),
             });
         let _ = engine.rt.shutdown(SHUTDOWN).await;
@@ -465,7 +472,7 @@ pub async fn resume(
             let _ = engine.rt.shutdown(SHUTDOWN).await;
             Err(Failure::new(
                 "run.not_found",
-                format!("no run {id} in this project's store ({})", engine.store),
+                format!("no run {id} in this project's store ({})", engine.store_description),
                 "give the id `atomic run` printed, from the project that ran it (or pass \
                  --project)",
             )
@@ -745,7 +752,7 @@ pub async fn serve(
     atomic_core::log_line!(
         "atomic serve: project {}, store {}, executor {}",
         state.root().display(),
-        engine.store,
+        engine.store_description,
         engine.rt.executor_id()
     );
     let parked = |records: Vec<atomic_durable::RunRecord>| -> std::collections::BTreeSet<String> {
