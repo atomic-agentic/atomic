@@ -184,8 +184,9 @@ fn a_confined_command_reaches_only_the_hosts_it_is_given() {
     let short = ShortSocketDir::new();
     let socket = short.socket("bus.sock");
     let _bus = std::os::unix::net::UnixListener::bind(&socket).expect("unix socket");
-    // The positive control: outside the sandbox the socket answers, so what
-    // the command meets below is a refusal and not a path that leads nowhere.
+    // The positive control: outside the sandbox the socket answers, so the
+    // refusal the command meets below is the sandbox's, which the probe's
+    // exact error shows.
     let _reached = std::os::unix::net::UnixStream::connect(&socket).expect("the socket answers");
     let allowed_host = allowed.split(':').next().expect("host").to_owned();
 
@@ -225,6 +226,11 @@ fn a_confined_command_reaches_only_the_hosts_it_is_given() {
         })
     };
     let refused = |v: &Value| v.as_str().is_some_and(|s| s.contains("Error"));
+    // The socket is refused by the sandbox, not missing from the command's
+    // view: seccomp answers EPERM before any path lookup, whereas a path
+    // that leads nowhere would be FileNotFoundError and a 0700 directory
+    // EACCES, so the probe must say exactly this.
+    const SOCKET_REFUSED: &str = "PermissionError: [Errno 1] Operation not permitted";
 
     // Given the first server's host, it fetches from it through the proxy,
     // and the proxy refuses the other.
@@ -232,9 +238,10 @@ fn a_confined_command_reaches_only_the_hosts_it_is_given() {
     assert_eq!(given["proxied"], true, "{given}");
     assert_eq!(given["allowed"], "from the allowed server", "{given}");
     assert_eq!(given["other"], "HTTP 403", "{given}");
-    for probe in ["direct_allowed", "direct_other", "unix"] {
+    for probe in ["direct_allowed", "direct_other"] {
         assert!(refused(&given[probe]), "{probe}: {given}");
     }
+    assert_eq!(given["unix"], SOCKET_REFUSED, "{given}");
 
     // A command naming an address the test did not allow, or any host
     // atomic's policy refuses, does not start.
@@ -251,9 +258,10 @@ fn a_confined_command_reaches_only_the_hosts_it_is_given() {
     // Given none, it has no network at all.
     let none = run(Vec::new());
     assert_eq!(none["proxied"], false, "{none}");
-    for probe in ["allowed", "other", "direct_allowed", "direct_other", "unix"] {
+    for probe in ["allowed", "other", "direct_allowed", "direct_other"] {
         assert!(refused(&none[probe]), "{probe}: {none}");
     }
+    assert_eq!(none["unix"], SOCKET_REFUSED, "{none}");
     local.close(&workspace).expect("closes");
     let _ = std::fs::remove_dir_all(&dir);
 }
