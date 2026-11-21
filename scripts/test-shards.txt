@@ -57,6 +57,7 @@ test sandboxed_commit
 test self_approval
 test shell_env
 test turn_workspace
+test sandbox_registry
 test worktree_step
 test golden
 test git_safety
