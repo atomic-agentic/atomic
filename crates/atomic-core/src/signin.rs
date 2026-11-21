@@ -237,9 +237,21 @@ impl SignIn {
     /// [`SignIn::configured`] once `located` is found: its directory made,
     /// and checked again where it was made.
     fn made_at(located: Self, project: Option<&Path>) -> Result<Self, SignInError> {
-        let existed = located.auth_home.is_dir();
-        crate::state::private_dir(&located.auth_home)
-            .map_err(|e| CredentialError::File(e.to_string()))?;
+        let file = |e: String| SignInError::Store(CredentialError::File(e));
+        // Made here, or found: decided by the one call that makes it, so two
+        // invocations never both take it for theirs.
+        if let Some(parent) = located.auth_home.parent() {
+            crate::state::private_dir(parent).map_err(|e| file(e.to_string()))?;
+        }
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        let existed = match builder.create(&located.auth_home) {
+            Ok(()) => false,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => true,
+            Err(e) => return Err(file(format!("{}: {e}", located.auth_home.display()))),
+        };
+        crate::state::private_dir(&located.auth_home).map_err(|e| file(e.to_string()))?;
         let auth_home =
             std::fs::canonicalize(&located.auth_home).unwrap_or_else(|_| located.auth_home.clone());
         // Where it was made, as it really is: a link on the way, such as a
@@ -269,10 +281,10 @@ impl SignIn {
     /// hold no sign-in: one this invocation made, or one a logout forgot
     /// in both stores. With the keyring store a live sign-in's directory
     /// holds only lock files too. Not when the directory is itself a link:
-    /// that would remove what it leads to and leave the link behind. With
-    /// `own_locks`, the locks were left by this invocation's own logout, and
-    /// say nothing about another login.
-    fn tidy(&self, own_locks: bool) {
+    /// that would remove what it leads to and leave the link behind. `after`
+    /// says what this invocation did to the store first, which decides what
+    /// a sign-in found in it means.
+    fn tidy(&self, after: Tidy) {
         if self.reached.is_symlink() {
             return;
         }
@@ -307,20 +319,35 @@ impl SignIn {
         // which is held here, and makes the directory again
         // (create_dir_all in CommittedStorage::lock) if it is gone by then.
         // A Codex update could change either.
-        match self.stored() {
-            // A login that made the directory forgot what the store held
-            // before it began (see `log_in`), so anything there now was
-            // saved since.
-            Ok(Some(_)) => return,
-            Ok(None) => {}
-            // Unknown: a directory with a lock file in it may have had a
-            // save, which Codex makes only with both locks, so it stays;
-            // unless the locks are this invocation's own logout's.
-            Err(_) => {
-                if !held.is_empty() && !own_locks {
-                    return;
-                }
-            }
+        let locked = !held.is_empty();
+        let keep = match after {
+            // The store could not be made to forget an entry that outlived
+            // the directory: whatever it reads is no sign-in of this
+            // invocation's, and the directory goes, failing closed.
+            Tidy::Login(Forgot::Failed) => false,
+            Tidy::Login(forgot) => match self.stored() {
+                // Forgotten before the flow began (see `log_in`), so a sign-in
+                // there now was saved since. Not forgotten, it is one only if
+                // a save, which leaves its locks, put it there.
+                Ok(Some(_)) => forgot.keeps_a_sign_in(locked),
+                Ok(None) => false,
+                // Unknown: a directory with a lock file in it may have had a
+                // save, which Codex makes only with both locks, so it stays.
+                Err(_) => locked,
+            },
+            Tidy::Logout { made, deleted } => match self.stored() {
+                // Trusted only once the logout's own delete went through.
+                Ok(Some(_)) => deleted || !made,
+                Ok(None) => false,
+                // A logout that made the directory and cannot read the store
+                // removes it whatever locks its own forgetting left: it may
+                // disown a sign-in another login saved in that moment, which
+                // stays in the store, deletes nothing, and fails closed.
+                Err(_) => locked && !made,
+            },
+        };
+        if keep {
+            return;
         }
         for (path, _file) in &held {
             let _ = std::fs::remove_file(path);
@@ -476,11 +503,12 @@ impl SignIn {
     /// at hand, and keep the sign-in. The keyring is checked first, so a
     /// machine without one is told so before any browser flow.
     pub async fn login(&self, device: bool) -> anyhow::Result<()> {
-        let outcome = self.log_in(device).await;
+        let mut forgot = Forgot::NotReached;
+        let outcome = self.log_in(device, &mut forgot).await;
         // Only a directory this login made: one that was here may hold a
         // sign-in the keyring keeps, which a failed login leaves as it was.
         if outcome.is_err() && self.made {
-            self.tidy(false);
+            self.tidy(Tidy::Login(forgot));
         }
         outcome
     }
@@ -496,16 +524,17 @@ impl SignIn {
         codex_login::logout(&self.auth_home, self.store, KEYRING).map(|_| ())
     }
 
-    /// Whether the store is the test keyring, which needs no probe.
-    fn faked(&self) -> bool {
+    /// Whether the OS keyring takes, gives back and forgets a value; the
+    /// test keyring answers for itself.
+    fn keyring_usable(&self) -> Result<(), CredentialError> {
         #[cfg(test)]
-        if tests::keyring_holds(&self.auth_home).is_some() {
-            return true;
+        if let Some(probed) = tests::probe(&self.auth_home) {
+            return probed;
         }
-        false
+        keyring_usable()
     }
 
-    async fn log_in(&self, device: bool) -> anyhow::Result<()> {
+    async fn log_in(&self, device: bool, forgot: &mut Forgot) -> anyhow::Result<()> {
         protected()?;
         // Codex's login restrictions, as its own login applies them: the
         // method first, then the workspaces the issuer must sign in to.
@@ -518,15 +547,19 @@ impl SignIn {
             )
             .into());
         }
-        if self.store != AuthCredentialsStoreMode::File && !self.faked() {
-            keyring_usable()?;
+        if self.store != AuthCredentialsStoreMode::File {
+            self.keyring_usable()?;
         }
         // An entry that outlived the directory it was kept for is no
         // sign-in: forgotten before the flow starts, so neither a login
         // stopped part way nor a run that refreshes it meanwhile brings it
         // back. A logout still revokes one, since it forgets, never this.
         if self.made {
-            self.forget()?;
+            if let Err(e) = self.forget() {
+                *forgot = Forgot::Failed;
+                return Err(e.into());
+            }
+            *forgot = Forgot::Done;
         }
         let mut options = codex_login::ServerOptions::new(
             self.auth_home.clone(),
@@ -595,7 +628,10 @@ impl SignIn {
         // and its directory is what says so.
         let nothing_kept = self.made || keyring.is_ok();
         if nothing_kept {
-            self.tidy(self.made);
+            self.tidy(Tidy::Logout {
+                made: self.made,
+                deleted: keyring.is_ok(),
+            });
         }
         Ok(Forgotten { file, keyring })
     }
@@ -604,6 +640,40 @@ impl SignIn {
     pub(crate) fn keyring_kind(&self) -> AuthKeyringBackendKind {
         KEYRING
     }
+}
+
+/// How far a login got in forgetting what the store held for a directory it
+/// made. It holds no token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Forgot {
+    /// It returned before it tried.
+    NotReached,
+    /// It tried, and the store did not forget.
+    Failed,
+    /// The store forgot.
+    Done,
+}
+
+impl Forgot {
+    /// Whether a sign-in found in the store after this is one to keep, the
+    /// directory holding lock files or not.
+    fn keeps_a_sign_in(self, locked: bool) -> bool {
+        match self {
+            Forgot::Done => true,
+            Forgot::NotReached => locked,
+            Forgot::Failed => false,
+        }
+    }
+}
+
+/// What a tidy follows.
+#[derive(Clone, Copy, Debug)]
+enum Tidy {
+    /// A login that failed, and how far its forgetting got.
+    Login(Forgot),
+    /// A logout: whether it made the directory, and whether its delete in
+    /// the keyring went through.
+    Logout { made: bool, deleted: bool },
 }
 
 /// For tests: told the login URL and port once the login server listens.
@@ -866,6 +936,18 @@ mod tests {
     /// Kept for a directory whose keyring cannot be reached.
     const UNREACHABLE: &str = "unreachable";
 
+    /// Directories whose keyring the probe finds unusable.
+    static PROBE_FAILS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+    /// The test keyring's probe for `dir`, if it is listed there.
+    pub(super) fn probe(dir: &Path) -> Option<Result<(), CredentialError>> {
+        keyring_holds(dir)?;
+        if PROBE_FAILS.lock().expect("probe").iter().any(|d| d == dir) {
+            return Some(Err(CredentialError::Keyring("the test keyring refuses".into())));
+        }
+        Some(Ok(()))
+    }
+
     /// What another login saves for a directory right after this one's
     /// forgets what the store held, as if it saved while this one waited.
     static SAVED_MEANWHILE: std::sync::Mutex<Vec<(PathBuf, String)>> =
@@ -874,6 +956,14 @@ mod tests {
     /// Forget what the test keyring holds for `dir`, if it is listed there.
     pub(super) fn forget(dir: &Path) -> Option<std::io::Result<()>> {
         let listed = keyring_holds(dir)?;
+        // As Codex's logout does, the locks first, then the keyring.
+        for lock in ["auth.lock", "auth.json.lock"] {
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(dir.join(lock));
+        }
         if listed.is_err() {
             return Some(Err(std::io::Error::other("the keyring cannot be reached")));
         }
@@ -1143,8 +1233,12 @@ mod tests {
     #[test]
     fn an_unreadable_keyring_keeps_a_directory_a_save_may_have_used() {
         crate::testing::on_codex_runtime(async {
-            for locked in [true, false] {
-                let dir = auth_dir(&format!("unreadable-{locked}"));
+            // Forgotten, then unreadable: the locks the forgetting left
+            // may as well be a save's, and the directory stays.
+            // Unreachable when it would forget: whatever the store reads is
+            // no sign-in, and the directory goes, its locks and all.
+            for forgotten in [true, false] {
+                let dir = auth_dir(&format!("unreadable-{forgotten}"));
                 std::fs::remove_dir(&dir).expect("not there yet");
                 let located = SignIn {
                     store: AuthCredentialsStoreMode::Keyring,
@@ -1153,14 +1247,51 @@ mod tests {
                 let sign_in = SignIn::made_at(located, None)
                     .expect("made")
                     .with_issuer("http://127.0.0.1:9");
-                if locked {
-                    std::fs::write(dir.join("auth.lock"), "").expect("lock");
+                if forgotten {
+                    keep(&dir, None);
+                    SAVED_MEANWHILE.lock().expect("saved").push((
+                        std::fs::canonicalize(&dir).expect("dir"),
+                        UNREACHABLE.into(),
+                    ));
+                } else {
+                    keep(&dir, Some(UNREACHABLE.into()));
                 }
-                keep(&dir, Some(UNREACHABLE.into()));
                 assert!(sign_in.login(true).await.is_err());
-                assert_eq!(dir.exists(), locked, "locked: {locked}");
+                assert_eq!(dir.exists(), forgotten, "forgotten: {forgotten}");
                 let _ = std::fs::remove_dir_all(&dir);
             }
+        });
+    }
+
+    /// A login refused before it forgot what the store held, as when the
+    /// keyring will not take a value, leaves an entry that outlived its
+    /// directory no sign-in: no save's locks are there, and the directory
+    /// goes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_login_refused_before_it_forgot_does_not_revive_an_entry() {
+        crate::testing::on_codex_runtime(async {
+            let dir = auth_dir("refused-early");
+            keep(&dir, Some(signed_in("account-old")));
+            std::fs::remove_dir(&dir).expect("its directory removed");
+            let located = SignIn {
+                store: AuthCredentialsStoreMode::Keyring,
+                ..SignIn::in_files(&dir)
+            };
+            let sign_in = SignIn::made_at(located, None)
+                .expect("made")
+                .with_issuer("http://127.0.0.1:9");
+            PROBE_FAILS
+                .lock()
+                .expect("probe")
+                .push(std::fs::canonicalize(&dir).expect("dir"));
+            let refused = sign_in.login(true).await.expect_err("refused");
+            assert!(refused.to_string().contains("the test keyring refuses"), "{refused}");
+            assert!(!dir.exists(), "a login refused early kept the outlived entry's directory");
+            assert!(
+                sign_in.account().expect("account").is_none(),
+                "an outlived entry reads as a sign-in"
+            );
         });
     }
 
@@ -1180,13 +1311,13 @@ mod tests {
             made: true,
             ..SignIn::in_files(&target)
         }
-        .tidy(false);
+        .tidy(Tidy::Login(Forgot::Done));
         assert!(target.join("auth.lock").exists(), "tidied through a link");
         SignIn {
             made: true,
             ..SignIn::in_files(&target)
         }
-        .tidy(false);
+        .tidy(Tidy::Login(Forgot::Done));
         assert!(!target.exists(), "reached as it is, it is tidied");
         let _ = std::fs::remove_dir_all(&dir);
     }
