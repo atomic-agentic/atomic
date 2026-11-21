@@ -167,13 +167,14 @@ review:
   from a different family than the author's. It is given the specification,
   the output or diff and the test results, and never the author's reasoning.
 - **Adversarial and evidence-backed.** Reviewers are asked to find what is
-  wrong. Their verdict is typed (`approve`, `reject` or `escalate`, with findings
-  and their severity), every finding has to point at a file and line or a test,
+  wrong. Their verdict is typed (`approve`; `request_changes` for a repair
+  turn; `reject` or `escalate` for a person; with findings and their
+  severity), every finding has to point at a file and line or a test,
   and their tools are read-only, though they can run tests in a copy of the
   worktree.
-- **Repair loop.** A rejection hands its findings to the author, who gets a
-  repair turn to address them. After `rounds` attempts the gate escalates to a
-  person. Each round is charged to the step's budget.
+- **Repair loop.** A request for changes hands its findings to the author,
+  who gets a repair turn to address them. After `rounds` attempts the gate
+  escalates to a person. Each round is charged to the step's budget.
 - **Calibrated decision atoms.** An atom of `kind: decision` puts typed
   questions to a small decision model and gets calibrated answers back: a
   probability for a yes-or-no question, or a distribution across options. The
