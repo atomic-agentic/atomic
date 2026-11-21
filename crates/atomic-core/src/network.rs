@@ -65,8 +65,10 @@ pub const UNATTRIBUTED_REFUSED: &str = "not_from_a_command";
 /// IP addresses in any spelling (dotted, decimal, hexadecimal or octal),
 /// `localhost` and names under it, single-label names (which resolve on the
 /// local network), names under `.local`, `.internal`, `.lan`, `.home.arpa`
-/// and other private suffixes, a bare `*`, and anything with a scheme, a
-/// port, a path or a Unix socket.
+/// and other private suffixes, a bare `*`, a wildcard over a public suffix
+/// (`*.co.uk`, or `*.github.io` from the list's private section, where each
+/// name below is someone else's), and anything with a scheme, a port, a
+/// path or a Unix socket.
 pub fn check_hosts(hosts: &[String]) -> Result<Vec<String>, String> {
     if hosts.len() > MAX_HOSTS {
         return Err(format!("an atom may declare at most {MAX_HOSTS} hosts"));
@@ -152,7 +154,20 @@ fn check_host(host: &str) -> Result<String, String> {
             "a name on a private network or this machine is not a host an atom may declare",
         );
     }
+    if lower.starts_with("*.") && public_suffix(name) {
+        return refuse(
+            "a wildcard over a public suffix reaches every site anyone has under it; \
+             declare the names you reach, or a wildcard under a name you control",
+        );
+    }
     Ok(lower.strip_suffix('.').unwrap_or(&lower).to_owned())
+}
+
+/// Whether `name` is a public suffix on the Public Suffix List, from its
+/// ICANN section (`co.uk`) or its private one (`github.io`,
+/// `s3.amazonaws.com`): a name under which anyone can have a site.
+fn public_suffix(name: &str) -> bool {
+    psl::suffix(name.as_bytes()).is_some_and(|suffix| suffix == name)
 }
 
 /// Whether `host`, as a request names it, is one of `declared`: the name
@@ -524,14 +539,16 @@ mod tests {
     fn only_public_dns_names_may_be_declared() {
         let ok = check_hosts(&[
             "API.example.com".into(),
-            "*.s3.amazonaws.com".into(),
+            "*.example.com".into(),
+            "*.acme.github.io".into(),
             "acme-reports.s3.us-east-1.amazonaws.com.".into(),
         ])
         .expect("public names");
         assert_eq!(
             ok,
             [
-                "*.s3.amazonaws.com",
+                "*.acme.github.io",
+                "*.example.com",
                 "acme-reports.s3.us-east-1.amazonaws.com",
                 "api.example.com"
             ]
@@ -567,6 +584,11 @@ mod tests {
             "user@example.com",
             "-bad.example.com",
             "bad_label.example.com",
+            "*.github.io",
+            "*.s3.amazonaws.com",
+            "*.S3.amazonaws.com.",
+            "*.co.uk",
+            "*.com.au",
         ] {
             assert!(check_hosts(&[refused.into()]).is_err(), "{refused:?}");
         }
@@ -852,5 +874,25 @@ mod tests {
             fetch_from(&proxy_of(&first), None, "[2001:db8::5]"),
             "403 denied"
         );
+    }
+
+    /// A wildcard over a public suffix, from the list's ICANN section or its
+    /// private one, would reach every tenant under it, and is refused; a
+    /// wildcard under one tenant's name, and an exact name that is itself a
+    /// suffix, are not.
+    #[test]
+    fn a_wildcard_over_a_public_suffix_is_refused() {
+        for refused in ["*.github.io", "*.s3.amazonaws.com", "*.co.uk"] {
+            let why = check_hosts(&[refused.into()]).expect_err(refused);
+            assert!(why.contains("public suffix"), "{refused}: {why}");
+        }
+        for accepted in [
+            "*.example.com",
+            "*.acme.github.io",
+            "github.io",
+            "allowed.invalid",
+        ] {
+            assert!(check_hosts(&[accepted.into()]).is_ok(), "{accepted}");
+        }
     }
 }

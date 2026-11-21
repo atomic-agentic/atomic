@@ -211,9 +211,12 @@ Know what a listed host can get:
 - **More than the one site.** An HTTPS tunnel is opaque to the proxy, which
   checks only the name the command asked for. Other sites served from the same
   CDN edge or load balancer can be reached through it.
-- **Every tenant under a wildcard.** `*.s3.amazonaws.com` or any wildcard over
-  a shared-hosting suffix reaches every customer's buckets and sites there, not
-  only yours. List the exact names.
+- **Every name under a wildcard.** atomic refuses a wildcard over a public
+  suffix, from the Public Suffix List's ICANN section (`*.co.uk`) or its
+  private one, where each name is someone else's (`*.github.io`,
+  `*.s3.amazonaws.com`). A wildcard under a name you hold, such as
+  `*.example.com`, still reaches whatever is served under it; a shared host
+  missing from the list is not caught. List exact names where you can.
 
 The rule is enforced on Linux only. On macOS and Windows exec commands run
 unconfined, with whatever network the machine has, and a declaration restricts
