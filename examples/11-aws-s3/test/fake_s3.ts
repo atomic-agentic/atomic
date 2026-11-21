@@ -145,6 +145,9 @@ export class FakeS3 {
     if (spec.contentLength !== false) headers["content-length"] = String(spec.total);
     let written = 0;
     let pulls = 0;
+    // Set when the client gives up, so a pull that was waiting out its delay
+    // sends nothing more and `sent` stays what went out before the end.
+    let cancelled = false;
     return new Response(
       new ReadableStream<Uint8Array>({
         async pull(controller) {
@@ -156,6 +159,7 @@ export class FakeS3 {
             ? spec.firstDelayMs ?? spec.chunkDelayMs ?? 0
             : spec.chunkDelayMs ?? 0;
           if (delay) await new Promise((r) => setTimeout(r, delay));
+          if (cancelled) return;
           if (written >= spec.total) {
             transfer.finished = true;
             controller.close();
@@ -168,6 +172,7 @@ export class FakeS3 {
           controller.enqueue(new Uint8Array(size).fill(0x78));
         },
         cancel() {
+          cancelled = true;
           // Deno ends a response this way whether the client gave up or the
           // body went out whole, so only a stream with bytes left counts, and
           // only the first such ending is timed.

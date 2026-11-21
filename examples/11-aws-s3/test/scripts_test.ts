@@ -213,6 +213,26 @@ Deno.test("fetch-report reassembles a report that arrives in pieces", () =>
     );
   }));
 
+Deno.test("fetch-report refuses a report one byte over the limit", () =>
+  withFake(async (s3, host) => {
+    // One byte past the limit, with the length declared and without it: each
+    // check refuses at the boundary, not somewhere past it.
+    for (const contentLength of [true, false]) {
+      s3.stream(BUCKET, report, {
+        total: MAX_BYTES + 1,
+        chunkBytes: 4096,
+        contentLength,
+      });
+      const result = await fetchReport(s3, host);
+      if (result.code === 0) {
+        throw new Error(`accepted ${MAX_BYTES + 1} bytes (length declared: ${contentLength})`);
+      }
+      if (!result.stderr.includes(`${report} is larger than ${MAX_BYTES} bytes`)) {
+        throw new Error(result.stderr);
+      }
+    }
+  }));
+
 Deno.test("fetch-report refuses an over-limit report without reading its body", () =>
   withFake(async (s3, host) => {
     // Well over the limit, length declared, and no byte on its way until

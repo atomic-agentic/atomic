@@ -35,8 +35,11 @@ export async function fetchReport(input: SummarizeReportInput) {
     // the server sending: see test/fetch_report_test.ts.
     const length = object.ContentLength;
     if (length !== undefined && length > MAX_BYTES) {
-      await body.cancel();
-      throw new Error(`${input.key} is larger than ${MAX_BYTES} bytes`);
+      try {
+        await body.cancel();
+      } finally {
+        throw new Error(`${input.key} is larger than ${MAX_BYTES} bytes`);
+      }
     }
     // Counts the body as it arrives, so an object whose length was not
     // declared is refused partway through instead of after all of it.
