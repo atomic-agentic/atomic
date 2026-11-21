@@ -242,6 +242,7 @@ it, and `scripts/acceptance.py` runs them as one check. CI runs it in the
 features, so nothing rebuilds:
 
 ```bash
+scripts/dev.sh scripts/acceptance.py m42a # lists no Postgres or sandbox tests
 ATOMIC_DEV_SANDBOX=on scripts/dev.sh scripts/acceptance.py m12
 ATOMIC_DEV_SANDBOX=on scripts/dev.sh scripts/acceptance.py m45
 ```
