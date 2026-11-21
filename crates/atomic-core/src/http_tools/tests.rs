@@ -371,3 +371,94 @@ async fn a_response_that_breaks_its_schema_is_an_error() {
     let error = tools.call("search", &json!({})).await.expect_err("breaks");
     assert!(matches!(error, CallError::Response { .. }), "{error}");
 }
+
+const JOBS: &str = r##"openapi: 3.1.0
+info: { title: Jobs, version: "1" }
+paths:
+  /jobs:
+    post:
+      operationId: submit
+      responses:
+        "200": { description: done, content: { application/json: { schema: { type: object, required: [result], properties: { result: { type: string } } } } } }
+        "202": { description: queued, content: { application/json: { schema: { type: object, required: [ticket], properties: { ticket: { type: integer } } } } } }
+        "204": { description: nothing to do }
+  /ping:
+    get:
+      operationId: ping
+  /lookup:
+    get:
+      operationId: lookup
+      responses:
+        "404": { description: no such thing, content: { application/json: { schema: { type: object } } } }
+"##;
+
+fn jobs(host: &str) -> HttpToolset {
+    let spec = atomic_schema::yaml::load(std::path::Path::new("jobs.yaml"), JOBS)
+        .expect("yaml")
+        .value;
+    let mut tools = toolset(host);
+    tools.base_url = format!("http://{host}/").parse().expect("url");
+    tools.operations = atomic_schema::openapi::operations(&spec)
+        .expect("spec")
+        .into_iter()
+        .map(|op| (op.name.clone(), op))
+        .collect();
+    tools
+}
+
+#[tokio::test]
+async fn each_success_is_checked_against_the_response_its_status_declares() {
+    let (host, _) = server(vec![
+        (200, r#"{"result": "ok"}"#),
+        (204, ""),
+        (202, r#"{"ticket": 7}"#),
+        // A queued reply that would pass as done, and a done one as queued.
+        (202, r#"{"result": "ok"}"#),
+        (200, r#"{"ticket": 7}"#),
+        // A success the spec does not declare.
+        (201, r#"{"result": "ok"}"#),
+        // An operation that declares no responses takes any success.
+        (200, r#"{"anything": [1, 2]}"#),
+        // One that declares only a failure declares no success.
+        (200, r#"{}"#),
+    ])
+    .await;
+    let tools = jobs(&host);
+    let args = json!({});
+    let call = || tools.call("submit", &args);
+    assert_eq!(call().await.expect("200"), json!({ "result": "ok" }));
+    assert_eq!(call().await.expect("204"), Value::Null);
+    assert_eq!(call().await.expect("202"), json!({ "ticket": 7 }));
+    for (status, key) in [(202, "202"), (200, "200")] {
+        let error = call().await.expect_err("does not fit");
+        assert!(
+            matches!(&error, CallError::Response { status: s, response, .. } if *s == status && response == key),
+            "{status}: {error}"
+        );
+        // Said with the status and the response it was checked against.
+        let said = format!("returned {status}, which does not fit its response `{key}`");
+        assert!(error.to_string().contains(&said), "{error}");
+    }
+    // Answered with a status the operation declares no response for: its
+    // own error, not to be sent again.
+    let error = call().await.expect_err("201");
+    assert!(
+        matches!(&error, CallError::Undeclared { status: 201, .. }),
+        "{error}"
+    );
+    assert_eq!(
+        tools
+            .call("ping", &args)
+            .await
+            .expect("no responses declared"),
+        json!({ "anything": [1, 2] })
+    );
+    let error = tools
+        .call("lookup", &args)
+        .await
+        .expect_err("only a 404 declared");
+    assert!(
+        matches!(&error, CallError::Undeclared { status: 200, .. }),
+        "{error}"
+    );
+}
