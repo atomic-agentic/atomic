@@ -297,6 +297,25 @@ fn real_main() -> anyhow::Result<()> {
             std::process::exit(1);
         }
     };
+    // Codex's file helper, which applies a turn's patches, keeps its sandbox's
+    // registry of mount points in this process's TMPDIR: it must be the
+    // shared one of the backend the turns run on, where their commands keep
+    // theirs. A scratch root connecting would refuse is left alone, with the
+    // TMPDIR it is checked against: no turn runs on it.
+    let backend = match &cli.command {
+        Some(Command::Debug(_)) => engine::debug_backend(&state),
+        _ => engine::local_backend(&state),
+    };
+    if backend.check_scratch_root().is_ok() {
+        match backend.shared_tmp() {
+            Ok(tmp) => codex::share_sandbox_registry(tmp),
+            Err(e) => {
+                let e = anyhow::Error::from(e).context("create the backend's shared directory");
+                failure::report(&failure::analyze(&e), cli.json);
+                std::process::exit(1);
+            }
+        }
+    }
     codex::dispatch(&state.codex_home(), move |paths| async move {
         // Only this role, the command itself, exports spans; Codex's helper
         // roles never reach here. Spans go where the standard
@@ -813,10 +832,8 @@ async fn prompt(
     // A backend of its own, beside the one `atomic run` and `atomic serve`
     // use: this command takes no execution lock, and connecting empties a
     // backend's shared temporary directory, which their turns may be using.
-    let backend = atomic_exec::Backend::connect(atomic_exec::LocalBackend::in_dir(
-        state.dir().join("scratch-debug"),
-    ))
-    .context("connect to the execution backend")?;
+    let backend = atomic_exec::Backend::connect(engine::debug_backend(state))
+        .context("connect to the execution backend")?;
     let runtime = atomic_core::runtime::CodexRuntime {
         paths: paths.clone(),
         codex_home: state.codex_home(),

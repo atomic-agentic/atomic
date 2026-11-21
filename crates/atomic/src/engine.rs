@@ -112,6 +112,22 @@ pub fn runner_of(resolved: &settings::Resolved) -> anyhow::Result<RunnerKind> {
     }
 }
 
+/// The backend on this machine that `atomic run`, `atomic serve` and the
+/// evals run turns and exec atoms' commands on, unconfined and unconnected:
+/// scratch in the project's state, outside every directory a sandboxed
+/// turn may write.
+pub fn local_backend(state: &ProjectState) -> atomic_exec::LocalBackend {
+    atomic_exec::LocalBackend::in_dir(state.dir().join("scratch"))
+}
+
+/// The backend `atomic debug codex-prompt` and `atomic debug probe` run
+/// their turn on: one of its own beside [`local_backend`], since these
+/// commands take no execution lock, and connecting empties a backend's
+/// shared temporary directory, which a run's turns may be using.
+pub fn debug_backend(state: &ProjectState) -> atomic_exec::LocalBackend {
+    atomic_exec::LocalBackend::in_dir(state.dir().join("scratch-debug"))
+}
+
 /// The backend exec atoms' commands run on with `runner`: scratch in the
 /// project's state, confined like turns' commands where that is verified,
 /// connected once.
@@ -124,7 +140,7 @@ pub fn exec_backend(
     // every directory a sandboxed turn may write. Connected once: what the
     // backend states here is what runs plan on, and connecting reclaims
     // what attempts of dead processes left.
-    let local = atomic_exec::LocalBackend::in_dir(state.dir().join("scratch"));
+    let local = local_backend(state);
     // Exec atoms' commands run under the same sandbox helper as turns'
     // commands, denied atomic's private state. Elsewhere than Linux this is
     // not verified, and they run unconfined (see the availability notes).
