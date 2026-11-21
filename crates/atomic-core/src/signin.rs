@@ -915,6 +915,17 @@ mod tests {
                 .expect("account")
                 .expect("still signed in");
             assert_eq!(account.mode, "chatgpt");
+            // Even with nothing in the store, a directory the login did not
+            // make is not its to remove.
+            let found = auth_dir("keyring-found");
+            std::fs::write(found.join("auth.lock"), "").expect("lock");
+            keep(&found, None);
+            assert!(keyring(&found).login(true).await.is_err());
+            assert!(
+                found.join("auth.lock").exists(),
+                "a failed login removed a directory it did not make"
+            );
+            let _ = std::fs::remove_dir_all(&found);
 
             let made = auth_dir("keyring-made");
             std::fs::remove_dir(&made).expect("not there yet");
