@@ -350,19 +350,24 @@ pub async fn run(
     let ledger = if source != Source::Recorded && needs_model {
         let database = crate::engine::store_of(&state, &resolved.settings);
         let executor = atomic_durable::executor_identity(resolved.settings.executor_id.as_deref())?;
-        let rt = Durare::open(&database, executor.as_deref(), LAYOUT_VERSION)
-            .await
-            .map_err(|e| {
-                Failure::new(
-                    "eval.ledger",
-                    format!(
-                        "a live eval is metered in the project's usage ledger, and it could not \
+        let rt = Durare::open(
+            &database,
+            executor.as_deref(),
+            LAYOUT_VERSION,
+            &crate::engine::store_project(&state),
+        )
+        .await
+        .map_err(|e| {
+            Failure::new(
+                "eval.ledger",
+                format!(
+                    "a live eval is metered in the project's usage ledger, and it could not \
                          be opened at {}: {e}",
-                        crate::engine::describe(&database)
-                    ),
-                    "fix the store, or replay from cassettes without --live",
-                )
-            })?;
+                    crate::engine::describe(&database)
+                ),
+                "fix the store, or replay from cassettes without --live",
+            )
+        })?;
         Some(rt.ledger())
     } else {
         None

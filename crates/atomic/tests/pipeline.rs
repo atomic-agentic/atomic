@@ -2594,6 +2594,7 @@ fn replaying_a_recorded_run_makes_no_model_call_and_runs_no_command() {
             &atomic_durable::Database::Sqlite(dir.join("atomic.db")),
             None,
             "atomic.pipeline.other",
+            "the-project",
         )
         .await
         .expect("another layout's engine");

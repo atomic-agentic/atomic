@@ -17,7 +17,7 @@
 
 use crate::gate::Principal;
 use crate::gate::credential::{self, HumanCredential, Verified};
-use crate::publication::{PARKS, Park, park_from};
+use crate::publication::{FOR_PROJECT, PARKS, Park, park_from, project_param};
 use crate::runtime::{DurableError, DurableRuntime, Param, Tx};
 use crate::usage::{Allowance, Caps};
 use serde::{Deserialize, Serialize};
@@ -148,10 +148,14 @@ fn request_digest(by: &Principal, cmd: &ReleaseCommand) -> String {
     )
 }
 
-async fn read_park(tx: &mut Tx<'_, '_>, id: &str) -> crate::runtime::Result<Option<Park>> {
+async fn read_park(
+    tx: &mut Tx<'_, '_>,
+    id: &str,
+    project: &Param,
+) -> crate::runtime::Result<Option<Park>> {
     tx.query_opt(
-        &format!("{PARKS} WHERE p.park_id = ?"),
-        &[Param::Text(id.to_owned())],
+        &format!("{PARKS} WHERE p.park_id = ? AND {FOR_PROJECT}"),
+        &[Param::Text(id.to_owned()), project.clone()],
     )
     .await?
     .as_ref()
@@ -159,12 +163,12 @@ async fn read_park(tx: &mut Tx<'_, '_>, id: &str) -> crate::runtime::Result<Opti
     .transpose()
 }
 
-/// Park `id`, released or not.
+/// Park `id` of `rt`'s project, released or not.
 pub async fn park<R: DurableRuntime>(rt: &R, id: &str) -> crate::runtime::Result<Option<Park>> {
-    let id = id.to_owned();
+    let (id, project) = (id.to_owned(), project_param(rt.project()));
     rt.control_transaction(move |mut tx| {
-        let id = id.clone();
-        Box::pin(async move { read_park(&mut tx, &id).await })
+        let (id, project) = (id.clone(), project.clone());
+        Box::pin(async move { read_park(&mut tx, &id, &project).await })
     })
     .await
 }
@@ -274,23 +278,35 @@ pub async fn release_park<R: DurableRuntime>(
     let by = credential.principal().clone();
     let request = request_digest(&by, &cmd);
     let credential = credential.clone();
+    // Only a park of the runtime's own project: on a store several projects
+    // share, another's is no park of this one's.
+    let project = project_param(rt.project());
     let recorded = rt
         .control_transaction(move |mut tx| {
-            let (cmd, by, request, credential) =
-                (cmd.clone(), by.clone(), request.clone(), credential.clone());
+            let (cmd, by, request, credential, project) = (
+                cmd.clone(),
+                by.clone(),
+                request.clone(),
+                credential.clone(),
+                project.clone(),
+            );
             Box::pin(async move {
                 match credential::verify(&mut tx, &credential).await? {
                     Verified::Yes => {}
                     Verified::NotEnrolled => return Ok(Err(ReleaseError::NotEnrolled(by))),
                     Verified::Mismatch => return Ok(Err(ReleaseError::BadCredential(by))),
                 }
-                // A replay returns what the command did.
+                // A replay returns what the command did, but only for a park
+                // of the runtime's own project: another's is no park of its.
                 if let Some(found) = journaled(&mut tx, &cmd.command_id, &request).await? {
+                    if read_park(&mut tx, &cmd.park, &project).await?.is_none() {
+                        return Ok(Err(ReleaseError::NoSuchPark(cmd.park.clone())));
+                    }
                     return Ok(found.map(|r| (r, false)));
                 }
                 #[cfg(test)]
                 tests::after_replay_check(&cmd.park).await;
-                let Some(park) = read_park(&mut tx, &cmd.park).await? else {
+                let Some(park) = read_park(&mut tx, &cmd.park, &project).await? else {
                     return Ok(Err(ReleaseError::NoSuchPark(cmd.park.clone())));
                 };
                 // A finished run has nothing to wake, released or not.
@@ -481,17 +497,20 @@ async fn wake<R: DurableRuntime>(rt: &R, park: &Park) -> crate::runtime::Result<
 /// already woke changes nothing.
 pub async fn redeliver<R: DurableRuntime>(rt: &R) -> crate::runtime::Result<usize> {
     crate::failpoint("release:redeliver");
+    // Only the runtime's own project's: another's wakes its runs itself.
+    let project = project_param(rt.project());
     let waiting: Vec<Park> = rt
-        .control_transaction(|mut tx| {
+        .control_transaction(move |mut tx| {
+            let project = project.clone();
             Box::pin(async move {
                 tx.query_all(
                     &format!(
                         "{PARKS} JOIN atomic_park_releases r ON r.park_id = p.park_id \
                          JOIN workflow_status w ON w.workflow_uuid = p.run \
-                         WHERE w.status IN ('PENDING', 'ENQUEUED') \
+                         WHERE w.status IN ('PENDING', 'ENQUEUED') AND {FOR_PROJECT} \
                          ORDER BY p.parked_at, p.park_id"
                     ),
-                    &[],
+                    &[project],
                 )
                 .await?
                 .iter()
@@ -506,7 +525,8 @@ pub async fn redeliver<R: DurableRuntime>(rt: &R) -> crate::runtime::Result<usiz
     Ok(waiting.len())
 }
 
-/// Every release recorded, oldest first.
+/// Every release recorded, oldest first, of every project that shares the
+/// store: the journal is the store's, not one project's.
 pub async fn releases<R: DurableRuntime>(rt: &R) -> crate::runtime::Result<Vec<Released>> {
     rt.control_transaction(|mut tx| {
         Box::pin(async move {
@@ -524,16 +544,19 @@ pub async fn releases<R: DurableRuntime>(rt: &R) -> crate::runtime::Result<Vec<R
     .await
 }
 
-/// Every park not yet released, oldest first.
+/// Every park of `rt`'s project not yet released, oldest first.
 pub async fn waiting<R: DurableRuntime>(rt: &R) -> crate::runtime::Result<Vec<Park>> {
-    rt.control_transaction(|mut tx| {
+    let project = project_param(rt.project());
+    rt.control_transaction(move |mut tx| {
+        let project = project.clone();
         Box::pin(async move {
             tx.query_all(
                 &format!(
-                    "{PARKS} WHERE NOT EXISTS (SELECT 1 FROM atomic_park_releases r \
-                     WHERE r.park_id = p.park_id) ORDER BY p.parked_at, p.park_id"
+                    "{PARKS} WHERE {FOR_PROJECT} AND NOT EXISTS (SELECT 1 FROM \
+                     atomic_park_releases r WHERE r.park_id = p.park_id) \
+                     ORDER BY p.parked_at, p.park_id"
                 ),
-                &[],
+                &[project],
             )
             .await?
             .iter()
@@ -544,16 +567,21 @@ pub async fn waiting<R: DurableRuntime>(rt: &R) -> crate::runtime::Result<Vec<Pa
     .await
 }
 
-/// Whether park `id` is released.
+/// Whether park `id` of `rt`'s project is released: another project's is
+/// never released, as far as this one can tell.
 pub async fn is_released<R: DurableRuntime>(rt: &R, id: &str) -> crate::runtime::Result<bool> {
-    let id = id.to_owned();
+    let (id, project) = (id.to_owned(), project_param(rt.project()));
     rt.control_transaction(move |mut tx| {
-        let id = id.clone();
+        let (id, project) = (id.clone(), project.clone());
         Box::pin(async move {
             Ok(tx
                 .query_opt(
-                    "SELECT park_id FROM atomic_park_releases WHERE park_id = ?",
-                    &[Param::Text(id)],
+                    &format!(
+                        "SELECT r.park_id FROM atomic_park_releases r \
+                         LEFT JOIN atomic_park_projects pp ON pp.park_id = r.park_id \
+                         WHERE r.park_id = ? AND {FOR_PROJECT}"
+                    ),
+                    &[Param::Text(id), project],
                 )
                 .await?
                 .is_some())

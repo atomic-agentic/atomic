@@ -115,6 +115,27 @@ pub fn runner_of(resolved: &settings::Resolved) -> anyhow::Result<RunnerKind> {
     }
 }
 
+/// The key the project's records go by in its durable store, where several
+/// projects may share one PostgreSQL schema: its manifest's name, or its
+/// directory's name with no manifest, and its state id (see
+/// [`ProjectState::id`]). Neither alone tells projects apart: the state id
+/// comes from the project's path, which projects on different machines or
+/// containers can share, and names repeat. The same project checked out at
+/// another path, or renamed, is another project there.
+pub fn store_project(state: &ProjectState) -> String {
+    let name = atomic_core::project::discover(state.root())
+        .ok()
+        .map(|p| p.name)
+        .unwrap_or_else(|| {
+            state
+                .root()
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        });
+    format!("{name}/{}", state.id())
+}
+
 /// The backend exec atoms' commands run on with `runner`: scratch in the
 /// project's state, confined like turns' commands where that is verified,
 /// connected once.
@@ -463,9 +484,14 @@ pub async fn open(
     // Never the developer's checkout: a run's worktree steps use the
     // snapshot of the fixture it is bound to (see `atomic_core::fixture`).
     let worktrees: Option<Arc<Worktrees>> = None;
-    let mut rt = Durare::open(&database, executor.as_deref(), LAYOUT_VERSION)
-        .await
-        .with_context(|| format!("open the durable store at {}", describe(&database)))?;
+    let mut rt = Durare::open(
+        &database,
+        executor.as_deref(),
+        LAYOUT_VERSION,
+        &store_project(state),
+    )
+    .await
+    .with_context(|| format!("open the durable store at {}", describe(&database)))?;
     register_pipeline(
         &mut rt,
         Services {

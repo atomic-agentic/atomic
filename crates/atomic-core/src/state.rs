@@ -239,6 +239,17 @@ impl ProjectState {
         &self.dir
     }
 
+    /// The project's id: its root's last component and a hash of its full
+    /// path, which names its state directory. A store several projects
+    /// share tells their records apart by it, so the same project checked
+    /// out at another path is another project there.
+    pub fn id(&self) -> String {
+        self.dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+
     /// What is this project's alone: denied to every atom's commands.
     pub fn private_dir(&self) -> PathBuf {
         self.private.clone()
