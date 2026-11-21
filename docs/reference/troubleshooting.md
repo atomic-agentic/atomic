@@ -50,15 +50,15 @@ removed format does not bypass the check. See [the expression guide](../guides/t
 
 ## A prompt section is missing or mismatched
 
-Section tags must balance, in the atom and in each component it uses. The load
-fails, naming the file, the line and the tag, when a closing tag names another
-section than the innermost one open (`` `</notes>` closes <section>, opened on
-line 8 ``), when a closing tag has no section open, and when a section is still
-open at the end of the file. Close the section the message names, or remove the
-stray closing tag. Inside a `{…}` expression a section left open fails the
-load with a TypeScript syntax error such as `':' expected.` that does not name
-the tag. Tags that start with `data-` are reserved and are rejected wherever
-you write them. See [section tags](../guides/template-tags.md).
+Section tags must balance, in the atom and in each component it uses, inside
+`{…}` expressions as well as outside them. The load fails, naming the file,
+the line and the tag, when a closing tag names another element than the
+innermost one open (`` `</notes>` closes <section>, opened on line 8 ``), when
+a closing tag has nothing open to close, and when an element is still open at
+the end of the file. Close the element the message names, or remove the stray
+closing tag. A void HTML element such as `<input>` has no closing tag, so it
+cannot be a section's name. Tags that start with `data-` are reserved and are
+rejected wherever you write them. See [section tags](../guides/template-tags.md).
 
 ## `atomic check` says a diagram is stale
 

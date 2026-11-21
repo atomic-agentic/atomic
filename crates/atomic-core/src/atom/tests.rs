@@ -590,9 +590,32 @@ fn an_unbalanced_section_tag_fails_the_load() {
             error.file.display()
         );
     }
-    // Balanced, the same sections load.
-    let (atom, _) = checked("<section>\n{input.text}\n<notes>a<br>b</notes>\n</section>");
+    // Balanced, the same sections load, prose with quotes and slashes in
+    // markup inside an expression included.
+    let (atom, _) = checked(
+        "<section>\n{input.text}\n<notes>a<br>b</notes>\n\
+         {input.text ? <note>Don't delay; see https://example.com/a.</note> : null}\n</section>",
+    );
     assert_eq!(atom.name, "test");
+}
+
+/// Tags balance inside an expression too.
+#[test]
+fn an_unbalanced_tag_inside_an_expression_fails_the_load() {
+    let root = project(
+        "<section>\n{input.text ? <note>Don't\ndelay.</notes> : null}\n</section>",
+        "{}",
+        None,
+    );
+    let error =
+        load(&root.join("test.atom.astro"), &mut Registry::new()).expect_err("an unbalanced tag");
+    assert_eq!(
+        (error.line, error.message.as_str()),
+        (
+            10,
+            "`</notes>` closes <note>, opened on line 9; close it with `</note>`"
+        )
+    );
 }
 
 /// A component's tags must balance too, and its own file and line are named.
