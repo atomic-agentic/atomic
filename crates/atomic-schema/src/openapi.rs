@@ -16,10 +16,37 @@
 //! with parameters or not, or a `+json` type). An operation whose required
 //! body has no JSON media type is kept, marked [`Operation::unsupported`].
 //!
-//! Each response says which of three things it declares about its body — no
-//! `content` map at all, a `content` map with no JSON schema to check
-//! against, or a JSON schema — as [`ResponseBody`]. Only the first says
-//! there is no body to read; only the last says what shape the body has.
+//! A response is held to a schema the same way, and additionally to the
+//! schema of a wildcard media type (`*/*`, `application/*`) when no JSON
+//! media type names one: such a response declares a body that may be JSON,
+//! so atomic reads it as JSON and checks it. Every JSON media type that
+//! names a schema is kept for a response, not only one of them, because a
+//! reply says which of them it is by its `Content-Type`. A request body
+//! keeps only the first, which changes nothing about it: atomic sends one
+//! JSON body under one JSON media type, never under a wildcard, so a request
+//! body declared only under a wildcard still leaves a required body
+//! unsupported.
+//!
+//! Each response a success can be checked against says which of three things
+//! it declares about its body — no `content` map at all, a `content` map with
+//! no schema to check against, or a schema under each media type it names one
+//! under — as [`ResponseBody`]. Only the first says there is no body to read;
+//! only the last says what shape the body has.
+//!
+//! A tool's `output` describes what a reply may look like, which is more than
+//! one response's schema whenever the operation's successes describe
+//! different bodies: it is the distinct schema of every response a success can
+//! reach, one schema where they all say the same thing and `anyOf` of them
+//! where they differ. A response declaring no schema contributes nothing to
+//! it, and a response no success can reach — a `default` behind a `2XX` range
+//! — is never asked, so it never describes the output either.
+//!
+//! A response declared for a
+//! status that is not a success is kept as a key with nothing beside it: what
+//! it declares about its body is never read, so its schema is never converted
+//! and can never be what makes the import of the spec fail. A key of
+//! `responses` under the `x-` prefix is the spec's own note rather than part
+//! of the operation, and declares no response at all.
 
 use serde_json::{Map, Value, json};
 
@@ -34,34 +61,56 @@ pub enum ResponseBody {
     /// It declares no `content` map at all, so it declares no body: a `204`,
     /// or a `200` written with only a description.
     NoBody,
-    /// It declares a `content` map, but one that gives atomic no JSON schema
-    /// to check against: it names only media types atomic does not read
-    /// (`*/*`, `text/plain`, `application/octet-stream`), or a JSON media
-    /// type with no `schema`. A body is declared, of a shape nothing in the
-    /// spec describes.
+    /// It declares a `content` map, but one that gives atomic no schema to
+    /// check against: it names only media types atomic does not read and
+    /// wildcards that name no schema (`text/plain`,
+    /// `application/octet-stream`, `*/*`, `application/*`), or only JSON
+    /// media types with no `schema`. A body is declared, of a shape nothing
+    /// in the spec describes.
     NoJsonSchema,
-    /// It declares a JSON media type with a schema, which its body has to
-    /// fit.
-    Json(Value),
+    /// It declares one or more schemas, each under a media type its body may
+    /// arrive with: under one or more JSON media types, or, where no JSON
+    /// media type names a schema at all, under one wildcard media type. Every
+    /// media type that names a schema is kept, keyed by how the spec writes
+    /// it, because a reply says which of them it is by its `Content-Type`,
+    /// and what atomic does when the reply names none of them is the
+    /// executor's to decide.
+    Json(std::collections::BTreeMap<String, Value>),
 }
 
 impl ResponseBody {
-    /// The schema a body of this response is checked against, when the
-    /// response declares one.
+    /// The first schema it declares, in the sorted order of the media types
+    /// they are declared under, when it declares one. That one is what the
+    /// tool's `output` describes; a reply is checked against whichever of
+    /// them its `Content-Type` names, see [`ResponseBody::schemas`].
     pub fn schema(&self) -> Option<&Value> {
         match self {
-            ResponseBody::Json(schema) => Some(schema),
+            ResponseBody::Json(schemas) => schemas.values().next(),
             ResponseBody::NoBody | ResponseBody::NoJsonSchema => None,
         }
     }
 
-    /// The schema to change in place, when there is one;
-    /// [`ResponseBody::schema`] borrows it read-only.
-    fn schema_mut(&mut self) -> Option<&mut Value> {
+    /// Every schema it declares, with the media type each is declared under
+    /// as the spec writes it, in that order. Empty for a response that
+    /// declares none to check a body against.
+    pub fn schemas(&self) -> impl Iterator<Item = (&String, &Value)> {
         match self {
-            ResponseBody::Json(schema) => Some(schema),
+            ResponseBody::Json(schemas) => Some(schemas.iter()),
             ResponseBody::NoBody | ResponseBody::NoJsonSchema => None,
         }
+        .into_iter()
+        .flatten()
+    }
+
+    /// Every schema to change in place, when there are any;
+    /// [`ResponseBody::schema`] borrows the first read-only.
+    fn schemas_mut(&mut self) -> impl Iterator<Item = &mut Value> {
+        match self {
+            ResponseBody::Json(schemas) => Some(schemas.values_mut()),
+            ResponseBody::NoBody | ResponseBody::NoJsonSchema => None,
+        }
+        .into_iter()
+        .flatten()
     }
 }
 
@@ -85,15 +134,22 @@ pub struct Operation {
     /// The tool's input: one object, a field per parameter and `body` for a
     /// JSON request body.
     pub input: Value,
-    /// The JSON schema of its success response, when it declares one: the
-    /// first success code's, else `default`'s. A tool's output, for what
-    /// describes it; a response is checked against [`Operation::response`].
+    /// What its successes describe a reply's body as: the schema each one's
+    /// response declares, distinct and in status order — that one schema where
+    /// they agree, `anyOf` of them where they differ, `None` when none of them
+    /// declares one. A tool's output, for what describes it; what a reply is
+    /// checked against is [`Operation::response`], and within it whichever
+    /// schema the reply's `Content-Type` names. `declared_output` says which
+    /// responses are asked and what each contributes.
     pub output: Option<Value>,
-    /// Each response it declares, success or not, by the status it is
-    /// declared for as the spec writes it: a code such as `200` or `404`, a
-    /// range such as `2XX`, or `default`. Each says what it declares about
-    /// its body, see [`ResponseBody`].
-    pub responses: std::collections::BTreeMap<String, ResponseBody>,
+    /// Each response it declares, by the key the spec lists it under: a code
+    /// such as `200` or `404`, a range such as `2XX`, or `default`. A success's,
+    /// and `default`'s, says what it declares about its body, see
+    /// [`ResponseBody`]; any other key is kept with nothing beside it, because
+    /// atomic reads no such reply's body and so holds it to no schema. A key
+    /// under the `x-` prefix is the spec's own note rather than part of the
+    /// operation, names no response, and is not among these.
+    pub responses: std::collections::BTreeMap<String, Option<ResponseBody>>,
     /// Why atomic cannot call it, when it cannot: a required request body
     /// with no JSON media type.
     pub unsupported: Option<String>,
@@ -102,27 +158,95 @@ pub struct Operation {
 impl Operation {
     /// The response it declares for a success with `status`, and the key it
     /// is declared under, as OpenAPI picks one: the status's own code, else
-    /// its range (`2XX`, in either case), else `default`. `None` for a
-    /// status that is not a success (outside 200 to 299), whose body atomic
-    /// never checks, and for a success it declares none of them for. What
-    /// the response declares about its body is the [`ResponseBody`] it
-    /// comes with; a status can select one that declares no body as well as
-    /// one whose body has a schema.
+    /// its range (`2XX`, in either case), else `default`. `None` for a status
+    /// that is not a success (outside 200 to 299), whose body atomic never
+    /// checks, and for a success it declares none of them for. Every response
+    /// a success can reach keeps what it declares about its body, the
+    /// [`ResponseBody`] it comes with: a status can select one that declares
+    /// no body as well as one whose body has a schema. A response that
+    /// declares a schema under more than one media type leaves which of them
+    /// governs a reply to the reply's `Content-Type`, which is not known here.
     pub fn response(&self, status: u16) -> Option<(&str, &ResponseBody)> {
-        if !(200..=299).contains(&status) {
-            return None;
+        response_declared(&self.responses, status)
+    }
+}
+
+/// What [`Operation::response`] does, over one operation's responses, so that
+/// what a tool's output describes is built from exactly the responses a reply
+/// can be checked against.
+fn response_declared(
+    responses: &std::collections::BTreeMap<String, Option<ResponseBody>>,
+    status: u16,
+) -> Option<(&str, &ResponseBody)> {
+    if !(200..=299).contains(&status) {
+        return None;
+    }
+    let range = format!("{}XX", status / 100);
+    let code = status.to_string();
+    let (key, body) = responses
+        .get_key_value(&code)
+        .or_else(|| {
+            responses
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(&range))
+        })
+        .or_else(|| responses.get_key_value("default"))?;
+    // A key kept with nothing beside it names no schema for a reply to fit,
+    // and never lends another response's. Only a failure's key is kept that
+    // way, so no status an operation answers reaches this.
+    Some((key.as_str(), body.as_ref()?))
+}
+
+/// What a tool's `output` describes: the distinct schema of every response a
+/// success can reach, each taken as [`ResponseBody::schema`] takes it — the
+/// schema of the first media type that names one, which is all a response has
+/// ever described about the tool.
+///
+/// Each success status is asked, and selects its response exactly as
+/// [`Operation::response`] does, so a response no success can reach never
+/// describes the output: a `default` behind a `2XX` range is never selected,
+/// and one with nothing shading it is the response a success the spec gives no
+/// code for is checked against. A response that declares no schema — no
+/// `content` map, or a map that names none — contributes nothing, so it neither
+/// describes the output nor widens it. The same schema written under two
+/// statuses is one schema. Where the successes agree, that one schema is the
+/// output as it stands; where they differ, `anyOf` of them is, in status order,
+/// so a reply is described whichever of them it answers with; and where none
+/// declares a shape, there is no output at all.
+fn declared_output(
+    responses: &std::collections::BTreeMap<String, Option<ResponseBody>>,
+    defs: &Map<String, Value>,
+) -> Option<Value> {
+    let mut schemas: Vec<Value> = Vec::new();
+    for status in 200..300u16 {
+        let Some((_, body)) = response_declared(responses, status) else {
+            continue;
+        };
+        // A response that declares no schema — no `content` map at all, or a
+        // map naming none — says nothing about a shape, so it contributes
+        // nothing to the union, and not even a schema that would accept
+        // anything in its place.
+        let Some(one) = body.schema() else { continue };
+        if !schemas.contains(one) {
+            schemas.push(one.clone());
         }
-        let range = format!("{}XX", status / 100);
-        let code = status.to_string();
-        self.responses
-            .get_key_value(&code)
-            .or_else(|| {
-                self.responses
-                    .iter()
-                    .find(|(key, _)| key.eq_ignore_ascii_case(&range))
-            })
-            .or_else(|| self.responses.get_key_value("default"))
-            .map(|(key, body)| (key.as_str(), body))
+    }
+    match schemas.len() {
+        0 => None,
+        1 => schemas.pop(),
+        _ => {
+            let mut union = Map::new();
+            // The union carries the component schemas too: a reference inside
+            // a member points at the document it sits in, which is now the
+            // union. Each member keeps its own copy as well, because what the
+            // executor holds a reply to is one member alone, and there that
+            // member is the whole document.
+            if !defs.is_empty() {
+                union.insert("$defs".into(), Value::Object(defs.clone()));
+            }
+            union.insert("anyOf".into(), Value::Array(schemas));
+            Some(Value::Object(union))
+        }
     }
 }
 
@@ -136,42 +260,151 @@ fn styles_for(place: &str) -> &'static [&'static str] {
     }
 }
 
-/// Whether `media` is a JSON media type: `application/json`, with or
-/// without parameters, or a structured `+json` type.
+/// Whether `media` is a JSON media type: `application/json`, with or without
+/// parameters, or a structured `+json` type of any tree (`application/`,
+/// `text/`, vendor or standards-prefixed trees alike), which is what RFC 6839
+/// says a `+json` suffix means.
 pub fn is_json_media(media: &str) -> bool {
-    let essence = media
+    let essence = media_essence(media);
+    essence == "application/json" || (essence.contains('/') && essence.ends_with("+json"))
+}
+
+/// A media type with its parameters dropped and its case folded, as media
+/// types are compared.
+pub fn media_essence(media: &str) -> String {
+    media
         .split(';')
         .next()
         .unwrap_or_default()
         .trim()
-        .to_ascii_lowercase();
-    essence == "application/json"
-        || (essence.starts_with("application/") && essence.ends_with("+json"))
+        .to_ascii_lowercase()
+}
+
+/// Whether `media` is a wildcard media type: `*/*` or `application/*`, with
+/// parameters or not. Neither names JSON, but each says its body is anything
+/// of the group it stands for, and a schema written under one says which part
+/// of that the API returns — so a body under one is read as JSON, which is
+/// what `response_content` does when no JSON media type names a schema.
+fn is_wildcard_media(media: &str) -> bool {
+    let essence = media_essence(media);
+    essence == "*/*" || essence == "application/*"
+}
+
+/// Whether a response key names a reply whose body atomic reads and so keeps
+/// a schema for: a code from `200` to `299`, a `2XX` range in either case, or
+/// `default`, which is what a success the spec gives no code for falls back
+/// to. Any other key names a reply atomic never reads the body of — another
+/// range, any other code — or names no status at all, so nothing is converted
+/// or compiled for it.
+fn success_key(code: &str) -> bool {
+    if code == "default" {
+        return true;
+    }
+    if is_range_key(code) {
+        return code.as_bytes()[0] == b'2';
+    }
+    match code.parse::<u16>() {
+        Ok(status) => (200..=299).contains(&status),
+        Err(_) => false,
+    }
+}
+
+/// Whether a response key is a range such as `2XX` or `4xx`, in either case.
+fn is_range_key(code: &str) -> bool {
+    let bytes = code.as_bytes();
+    bytes.len() == 3 && bytes[0].is_ascii_digit() && bytes[1..].eq_ignore_ascii_case(b"xx")
+}
+
+/// Whether a key of a spec's `responses` object lists a response. `x-` is the
+/// one prefix OpenAPI gives a key that is the spec's own note rather than part
+/// of the operation, so an `x-internal` or `x-openapi` key declares no
+/// response: counting one would make an operation that declares only
+/// extensions declare a response after all. Any other key counts, however the
+/// spec spells it — a key naming no status keeps nothing beside it, see
+/// [`success_key`], and still stands as a response the operation declared.
+fn is_response_key(code: &str) -> bool {
+    !code.starts_with("x-")
 }
 
 /// What a response object declares about its body.
 ///
 /// A `content` map is kept as declared even when atomic can get no schema
-/// out of it: media types it does not read, a JSON media type with no
-/// `schema`, a map that is not a map at all. Those declare a body of an
-/// unknown shape, which is not the same as declaring no body, so they are
+/// out of it: media types it does not read, a wildcard or a JSON media type
+/// with no `schema`, a map that is not a map at all. Those declare a body of
+/// an unknown shape, which is not the same as declaring no body, so they are
 /// kept apart from a response with no `content` key.
 fn declared_body(response: &Value) -> ResponseBody {
     let Some(content) = response.get("content") else {
         return ResponseBody::NoBody;
     };
-    match json_content(content) {
-        Some(schema) => ResponseBody::Json(schema.clone()),
-        None => ResponseBody::NoJsonSchema,
+    match response_content(content) {
+        schemas if schemas.is_empty() => ResponseBody::NoJsonSchema,
+        schemas => ResponseBody::Json(schemas),
     }
 }
 
-/// The schema under a `content` map's first JSON media type, if any.
+/// The schemas a response's body is held to under a `content` map: every JSON
+/// media type's, as `json_schemas` keeps them, which a wildcard never
+/// overrides; else the first wildcard media type's that names a schema, so
+/// that a response declaring a schema only under `*/*` or `application/*`
+/// holds its body to it. A content map with neither declares a body of a
+/// shape nothing describes.
+fn response_content(content: &Value) -> std::collections::BTreeMap<String, Value> {
+    let schemas = json_schemas(content);
+    if schemas.is_empty() {
+        return wildcard_content(content);
+    }
+    schemas
+}
+
+/// The schema under a `content` map's first JSON media type, if any — which
+/// is what a request body is held to, since atomic sends one JSON body under
+/// one JSON media type. `None` when the first one names no `schema`, even
+/// where a later one does, which is what leaves such a request body
+/// unsupported.
 fn json_content(content: &Value) -> Option<&Value> {
     let content = content.as_object()?;
     let mut keys: Vec<&String> = content.keys().filter(|k| is_json_media(k)).collect();
     keys.sort();
     keys.first().and_then(|k| content[k.as_str()].get("schema"))
+}
+
+/// Every schema under a `content` map's JSON media types, each keyed by the
+/// media type as the map writes it, because a reply says which of them it is
+/// by its `Content-Type`. A JSON media type naming no `schema` is kept apart
+/// from these: it names nothing to check a body against.
+fn json_schemas(content: &Value) -> std::collections::BTreeMap<String, Value> {
+    let Some(content) = content.as_object() else {
+        return std::collections::BTreeMap::new();
+    };
+    let mut types: Vec<&String> = content.keys().filter(|k| is_json_media(k)).collect();
+    types.sort();
+    types
+        .iter()
+        .filter_map(|k| {
+            content[k.as_str()]
+                .get("schema")
+                .map(|schema| ((*k).clone(), schema.clone()))
+        })
+        .collect()
+}
+
+/// The schema under a `content` map's first wildcard media type that names
+/// one, if any, the media types in sorted order, keyed by that media type.
+fn wildcard_content(content: &Value) -> std::collections::BTreeMap<String, Value> {
+    let mut out = std::collections::BTreeMap::new();
+    let Some(content) = content.as_object() else {
+        return out;
+    };
+    let mut keys: Vec<&String> = content.keys().filter(|k| is_wildcard_media(k)).collect();
+    keys.sort();
+    if let Some((key, schema)) = keys
+        .iter()
+        .find_map(|k| content[k.as_str()].get("schema").map(|s| ((*k).clone(), s)))
+    {
+        out.insert(key, schema.clone());
+    }
+    out
 }
 
 /// Why a spec cannot become a toolset.
@@ -380,34 +613,51 @@ pub fn operations(spec: &Value) -> Result<Vec<Operation>, OpenApiError> {
             if !required.is_empty() {
                 input["required"] = Value::Array(required);
             }
-            // Every response it declares, each with what it declares for its
-            // body: a reply is checked against the one for its status, never
-            // another's.
+            // Every response the spec lists, each with what it declares for
+            // its body: a reply is checked against the one for its status,
+            // never another's, and against the schema of the media type its
+            // reply names, never another one's. A key naming no status atomic
+            // reads a body for keeps nothing beside it, and a key naming no
+            // response at all is not kept.
             let mut kept = std::collections::BTreeMap::new();
             if let Some(responses) = operation.get("responses").and_then(Value::as_object) {
                 for (code, response) in responses {
+                    if !is_response_key(code) {
+                        continue;
+                    }
+                    if !success_key(code) {
+                        // Only a success's body, or the body of the default a
+                        // success falls back to, is ever checked, so this
+                        // response's schema is never converted and never
+                        // compiled: a reference in a `404` that does not
+                        // resolve cannot stop the import of the operation,
+                        // whose `200` is still checked.
+                        kept.insert(code.clone(), None);
+                        continue;
+                    }
                     let response = resolve(spec, response, &at)?;
                     let mut body = declared_body(&response);
-                    if let Some(schema) = body.schema_mut() {
+                    for schema in body.schemas_mut() {
                         *schema = convert(schema, &format!("{at}/responses/{code}"))?;
                     }
-                    kept.insert(code.clone(), body);
+                    kept.insert(code.clone(), Some(body));
                 }
             }
             if !defs.is_empty() {
                 input["$defs"] = Value::Object(defs.clone());
-                for schema in kept.values_mut().filter_map(ResponseBody::schema_mut) {
-                    if let Value::Object(map) = schema {
-                        map.insert("$defs".into(), Value::Object(defs.clone()));
+                for body in kept.values_mut().flatten() {
+                    for schema in body.schemas_mut() {
+                        if let Value::Object(map) = schema {
+                            map.insert("$defs".into(), Value::Object(defs.clone()));
+                        }
                     }
                 }
             }
-            // The first success's, in the map's sorted order, else default's.
-            let output = kept
-                .iter()
-                .find(|(code, _)| code.starts_with('2'))
-                .or_else(|| kept.get_key_value("default"))
-                .and_then(|(_, body)| body.schema().cloned());
+            // What every success a reply can reach describes, not only the
+            // first: a `200` and a `202` of different shapes both describe the
+            // tool's output, as `anyOf`. A key naming no status, such as a
+            // bare `2`, is what no status selects, so it describes nothing.
+            let output = declared_output(&kept, &defs);
             let description = operation["summary"]
                 .as_str()
                 .or_else(|| operation["description"].as_str())
