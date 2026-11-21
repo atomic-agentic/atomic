@@ -2011,3 +2011,42 @@ fn a_projects_files_cannot_set_openai_base_url() {
         assert!(refused.contains(key), "{file} set {key}: {refused}");
     }
 }
+
+/// An endpoint someone chose, in a file, a variable or a flag, comes before
+/// the sign-in; one detection found does not, so a sign-in that cannot be read
+/// is not said to be passed over for it.
+#[test]
+fn only_an_endpoint_someone_chose_comes_before_the_sign_in() {
+    let d = dir(&[("atomic.yaml", MANIFEST_ONLY)]);
+    let none = resolved(&d, &EngineArgs::default(), &[], &nobody);
+    assert!(!none.endpoint_chosen(), "no endpoint");
+    let key = resolved(
+        &d,
+        &EngineArgs::default(),
+        &[("OPENAI_API_KEY", "sk-secret-value")],
+        &nobody,
+    );
+    assert!(key.settings.model.base_url.is_some());
+    assert!(!key.endpoint_chosen(), "detected from OPENAI_API_KEY");
+    let ollama = resolved(&d, &EngineArgs::default(), &[], &|_| {
+        Some(vec!["qwen3:8b".to_owned()])
+    });
+    assert!(ollama.settings.model.base_url.is_some());
+    assert!(!ollama.endpoint_chosen(), "detected at a local Ollama");
+    let variable = resolved(
+        &d,
+        &EngineArgs::default(),
+        &[
+            ("ATOMIC_MODEL_BASE_URL", "http://127.0.0.1:9000/v1"),
+            ("ATOMIC_MODEL", "m"),
+        ],
+        &nobody,
+    );
+    assert!(variable.endpoint_chosen(), "set by a variable");
+    let file = dir(&[(
+        "atomic.yaml",
+        "atomic: 1\nname: notes\nmodel:\n  base_url: http://127.0.0.1:9000/v1\n  name: m\n",
+    )]);
+    let chosen = resolved(&file, &EngineArgs::default(), &[], &nobody);
+    assert!(chosen.endpoint_chosen(), "set in the manifest");
+}
