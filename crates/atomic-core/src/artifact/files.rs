@@ -30,7 +30,7 @@
 //! at most [`MAX_FILE_OBJECTS`] objects where its contract expects
 //! references.
 
-use super::{ArtifactError, ArtifactRef, ArtifactStore, Provenance};
+use super::{ArtifactError, ArtifactRef, ArtifactStore, Hold, Provenance};
 use atomic_schema::artifact::ArtifactLookup;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -175,6 +175,11 @@ impl Exchange {
     /// fits [`Limits`]. Then every file is read aside, one at a time, and
     /// only when all were read whole are they stored. Each name is read
     /// once, and stored with a manifest for each media type it is given.
+    ///
+    /// Each stored file is [held](ArtifactStore::hold) before it is
+    /// committed, and the holds are returned: kept until the step that
+    /// gathered them has recorded its output, they keep a sweep from
+    /// removing what the output references before anything records it.
     #[allow(clippy::too_many_arguments)] // each is one thing the check needs
     pub fn gather(
         &self,
@@ -185,7 +190,7 @@ impl Exchange {
         validate: &dyn Fn(&Value) -> Result<(), String>,
         provenance: &Provenance,
         limits: Limits,
-    ) -> Result<(), ArtifactError> {
+    ) -> Result<Vec<Hold>, ArtifactError> {
         let mut nonce = [0u8; 16];
         getrandom::fill(&mut nonce)
             .map_err(|e| refused(format!("no randomness for the stand-in references: {e}")))?;
@@ -207,11 +212,11 @@ impl Exchange {
         provenance: &Provenance,
         limits: Limits,
         nonce: &str,
-    ) -> Result<(), ArtifactError> {
+    ) -> Result<Vec<Hold>, ArtifactError> {
         let mut candidates = Vec::new();
         named_files(output, String::new(), &mut candidates, usize::MAX);
         if candidates.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         // Each candidate stands in as a reference of its own, made from a
         // nonce no output can know; the contract check says which stand
@@ -254,7 +259,7 @@ impl Exchange {
             }
         }
         if asked.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         // Only the objects that stand where references do count.
         if asked.len() > MAX_FILE_OBJECTS {
@@ -330,6 +335,7 @@ impl Exchange {
             }
         }
         let mut stored: HashMap<&str, String> = HashMap::new();
+        let mut held = Vec::with_capacity(staged.len());
         for (name, media, s) in staged {
             let each: Vec<Provenance> = media
                 .iter()
@@ -338,6 +344,9 @@ impl Exchange {
                     ..provenance.clone()
                 })
                 .collect();
+            // Held before it is stored, so no sweep finds it stored and
+            // not held, however long the rest of the step takes.
+            held.push(store.hold(&s.artifact()?)?);
             let manifests = store.commit(s, &each)?;
             if let Some(manifest) = manifests.first() {
                 stored.insert(name, manifest.artifact.to_string());
@@ -350,7 +359,7 @@ impl Exchange {
                 *slot = Value::String(reference.clone());
             }
         }
-        Ok(())
+        Ok(held)
     }
 
     /// Open the file `name` in the outputs directory, beneath the handle
