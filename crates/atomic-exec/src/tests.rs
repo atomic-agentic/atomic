@@ -15,6 +15,7 @@ fn shell(script: &str, stdin: &[u8], time: Duration) -> Result<Completed, ExecEr
         writable: Vec::new(),
         read_only: Vec::new(),
         network: Vec::new(),
+        secret_env: Default::default(),
     })
 }
 
@@ -71,6 +72,7 @@ fn no_shell_expands_the_arguments() {
             writable: Vec::new(),
             read_only: Vec::new(),
             network: Vec::new(),
+            secret_env: Default::default(),
         })
         .expect("runs");
     assert_eq!(done.stdout, b"$HOME;`id`");
@@ -90,6 +92,7 @@ fn a_missing_program_cannot_start() {
             writable: Vec::new(),
             read_only: Vec::new(),
             network: Vec::new(),
+            secret_env: Default::default(),
         })
         .expect_err("missing");
     assert!(matches!(error, ExecError::Start { .. }), "{error}");
@@ -594,6 +597,7 @@ fn a_command_in_a_local_workspace_runs_as_it_would_directly() {
         writable: Vec::new(),
         read_only: Vec::new(),
         network: Vec::new(),
+        secret_env: Default::default(),
     };
     let through = LocalBackend::default().run(&command).expect("runs");
     let direct = process::run(
@@ -844,4 +848,42 @@ fn a_leftover_that_left_the_group_holds_the_output_only_briefly() {
         started.elapsed()
     );
     assert_eq!(done.stdout, b"done");
+}
+
+/// A command's secret variables reach it on a pipe whose descriptor its
+/// environment names, and are never in its environment.
+#[test]
+fn secret_variables_reach_a_command_on_a_pipe_and_never_its_environment() {
+    let done = LocalBackend::default()
+        .run(&Command {
+            program: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                r#"printf '[%s]' "${K-unset}"; env; echo ---; tr '\0' '\n' < "/dev/fd/$ATOMIC_SECRET_ENV_FD""#
+                    .into(),
+            ],
+            cwd: std::env::temp_dir(),
+            env: vec![("ONLY".into(), "this".into())],
+            time_limit: Duration::from_secs(10),
+            output_limit: 4096,
+            secret_env: SecretEnv(vec![("K".into(), "the-secret-value".into())]),
+            ..Command::default()
+        })
+        .expect("runs");
+    assert!(done.success(), "{}", String::from_utf8_lossy(&done.stderr));
+    let out = String::from_utf8_lossy(&done.stdout);
+    let (env, piped) = out.split_once("---\n").expect("both parts");
+    assert!(env.starts_with("[unset]"), "{out}");
+    assert!(
+        !env.contains("the-secret-value"),
+        "in its environment: {out}"
+    );
+    assert!(env.contains("ONLY=this"), "{out}");
+    assert_eq!(piped, "K=the-secret-value\n");
+    // Its Debug form names the variable and hides its value.
+    let shown = format!(
+        "{:?}",
+        SecretEnv(vec![("K".into(), "the-secret-value".into())])
+    );
+    assert_eq!(shown, r#"["K=<hidden>"]"#);
 }

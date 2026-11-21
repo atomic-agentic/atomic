@@ -1022,15 +1022,15 @@ fn an_option(arg: &std::ffi::OsString) -> bool {
 /// When this process is Codex's Linux sandbox helper, keep the command it
 /// runs off the kernel keyrings, or exit: with them in reach the command
 /// could read what they hold, or plant a key. The outer stage, which stays
-/// outside the sandbox while the command runs and was started with the
-/// command's proxy token in its environment, is also made non-dumpable, so
-/// that from then on no process of the same user without `CAP_SYS_PTRACE`
-/// over its user namespace can read that environment through /proc; between
-/// its exec and this prologue, a few milliseconds, one can. Exec resets
-/// it: where the outer stage has no mounts of its own to manage it execs
-/// bubblewrap itself, by which time Codex's helper has taken the token out
-/// of its environment, and the bridges it forked first keep the token,
-/// non-dumpable.
+/// outside the sandbox while the command runs, is also made non-dumpable,
+/// and only then reads the command's proxy token from the pipe it was
+/// handed ([`take_secret_env`]): the token is never in its exec
+/// environment, and once it is in its memory only a process with
+/// `CAP_SYS_PTRACE` over its user namespace can read it through /proc.
+/// Exec resets it: where the outer stage has no mounts of its own to manage
+/// it execs bubblewrap itself, by which time Codex's helper has taken the
+/// token out of its environment, and the bridges it forked first keep the
+/// token, non-dumpable.
 fn keep_sandbox_off_keyrings() {
     #[cfg(target_os = "linux")]
     if invoked_as_linux_sandbox() {
@@ -1054,7 +1054,58 @@ fn keep_sandbox_off_keyrings() {
             );
             std::process::exit(1);
         }
+        if !inner && let Err(e) = take_secret_env() {
+            crate::log_line!(
+                "atomic: the sandbox helper cannot read the variables handed to it on a pipe: {e}"
+            );
+            std::process::exit(1);
+        }
     }
+}
+
+/// Variables, as names and values.
+type Vars = Vec<(String, String)>;
+
+/// `env` split into the proxy token's entry and the rest.
+fn split_off_token(env: Vars) -> (Vars, Vars) {
+    env.into_iter()
+        .partition(|(k, _)| k == codex_network_proxy::PROXY_ATTRIBUTION_TOKEN_ENV_KEY)
+}
+
+/// When this process is the sandbox helper's outer stage and was handed
+/// variables on a pipe ([`atomic_exec::SecretEnv`]), such as its command's
+/// proxy token, read them into its environment, where Codex's helper looks
+/// for them, and close the pipe. Called once it is non-dumpable, so no
+/// other process of its user without `CAP_SYS_PTRACE` over its user
+/// namespace can read them from it.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn take_secret_env() -> std::io::Result<()> {
+    use std::io::Read;
+    use std::os::fd::FromRawFd;
+    let Some(fd) = std::env::var_os(atomic_exec::SECRET_ENV_FD) else {
+        return Ok(());
+    };
+    let invalid = |why: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, why.to_owned());
+    let fd: std::os::fd::RawFd = fd
+        .to_str()
+        .and_then(|fd| fd.parse().ok())
+        .filter(|fd| *fd > 2)
+        .ok_or_else(|| invalid("its descriptor is not a number above 2"))?;
+    let mut bytes = Vec::new();
+    // SAFETY: the descriptor was handed to this process for this alone; it
+    // is read and closed here, once.
+    unsafe { std::fs::File::from_raw_fd(fd) }.read_to_end(&mut bytes)?;
+    let secret = atomic_exec::SecretEnv::decode(&bytes).map_err(|e| invalid(&e))?;
+    // SAFETY: the helper is single-threaded here, before Codex's helper
+    // starts and reads its environment.
+    unsafe {
+        std::env::remove_var(atomic_exec::SECRET_ENV_FD);
+        for (key, value) in &secret.0 {
+            std::env::set_var(key, value);
+        }
+    }
+    Ok(())
 }
 
 /// Make this process non-dumpable: its memory and the /proc files that show
@@ -1276,6 +1327,7 @@ impl atomic_exec::Confine for ExecSandbox {
         // command keeps those from the helper and loses the helper's others.
         let mut clear = vec!["-i".to_owned()];
         let mut held = None;
+        let mut secret = atomic_exec::SecretEnv::default();
         if !command.network.is_empty() {
             // Checked again here, whoever built the command: only atomic's
             // policy decides what a command may reach, and a loopback
@@ -1306,6 +1358,14 @@ impl atomic_exec::Confine for ExecSandbox {
                 .filter(|(k, v)| !command.env.iter().any(|(ck, cv)| ck == k && cv == v))
                 .collect();
             added.sort();
+            // The proxy token goes to the helper on a pipe, never in its exec
+            // environment, which a process of the same user could read
+            // through /proc until the helper has made itself non-dumpable.
+            let (token, added) = split_off_token(added);
+            if token.is_empty() {
+                return Err(fail("the proxy gave the command no token".to_owned()));
+            }
+            secret = atomic_exec::SecretEnv(token);
             // The helper's outer stage already drops the proxy token from
             // its environment before it starts the sandbox, so the command
             // never inherits it (the sandbox suite's token test checks
@@ -1333,6 +1393,7 @@ impl atomic_exec::Confine for ExecSandbox {
                 writable: Vec::new(),
                 read_only: Vec::new(),
                 network: Vec::new(),
+                secret_env: secret,
                 ..command.clone()
             },
             held,
@@ -3302,6 +3363,52 @@ mod tests {
             confined.args.iter().any(|a| a == "--managed-network"),
             "{:?}",
             confined.args
+        );
+    }
+
+    /// A confined command's proxy token reaches its sandbox helper on a
+    /// pipe only: it is in neither the helper's exec environment nor its
+    /// arguments, both of which other processes can read before the helper
+    /// can protect itself.
+    #[test]
+    fn a_commands_proxy_token_reaches_its_helper_on_a_pipe_only() {
+        use atomic_exec::Confine;
+        let state = scratch("exec-token-pipe");
+        let paths = CodexPaths::with_helpers(
+            PathBuf::from("/opt/atomic"),
+            PathBuf::from("/opt/bin/codex-linux-sandbox"),
+        );
+        let sandbox = ExecSandbox::new(&paths, StateGuard::NoProjectState, state.join("codex"))
+            .expect("a helper");
+        let command = atomic_exec::Command {
+            program: "sh".into(),
+            cwd: state.clone(),
+            network: vec!["allowed.invalid".into()],
+            ..Default::default()
+        };
+        let (confined, _held) = sandbox.confine_held(&command, &state).expect("confined");
+        let key = codex_network_proxy::PROXY_ATTRIBUTION_TOKEN_ENV_KEY;
+        let [(secret_key, token)] = confined.secret_env.0.as_slice() else {
+            panic!("one secret variable: {:?}", confined.secret_env);
+        };
+        assert_eq!(secret_key, key);
+        assert_eq!(token.len(), 64, "a token of 32 bytes, in hexadecimal");
+        assert!(
+            confined
+                .env
+                .iter()
+                .all(|(k, v)| k != key && !v.contains(token.as_str())),
+            "the token is in the helper's environment"
+        );
+        assert!(
+            confined.args.iter().all(|a| !a.contains(token.as_str())),
+            "the token is in the helper's arguments"
+        );
+        // The proxy variables the helper routes still are in its environment.
+        assert!(
+            confined.env.iter().any(|(k, _)| k == "HTTP_PROXY"),
+            "{:?}",
+            confined.env
         );
     }
 

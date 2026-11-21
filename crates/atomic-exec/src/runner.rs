@@ -151,6 +151,11 @@ pub struct Request {
     pub time_limit_ms: u64,
     /// The most stdout it may write, in bytes.
     pub output_limit: usize,
+    /// Its [`crate::SecretEnv`], which the runner hands it on a pipe. The
+    /// runner reads this request only after it has made itself
+    /// non-dumpable.
+    #[serde(default, skip_serializing_if = "crate::SecretEnv::is_empty")]
+    pub secret_env: crate::SecretEnv,
 }
 
 impl Request {
@@ -165,6 +170,7 @@ impl Request {
             stdin: hex(&command.stdin),
             time_limit_ms: u64::try_from(command.time_limit.as_millis()).unwrap_or(u64::MAX),
             output_limit: command.output_limit,
+            secret_env: command.secret_env.clone(),
         }
     }
 
@@ -182,6 +188,7 @@ impl Request {
             writable: Vec::new(),
             read_only: Vec::new(),
             network: Vec::new(),
+            secret_env: self.secret_env.clone(),
         })
     }
 }

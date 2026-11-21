@@ -31,15 +31,15 @@
 //! so no sandboxed process and no other user's process reaches anything
 //! through it. A process of the same user outside any sandbox is not kept
 //! out: it can enter the command's namespaces through /proc and use the
-//! bridge, which adds the token itself. Non-dumpable helpers only narrow who
-//! can read the token: the sandbox helper's outer stage and its bridges, and
-//! `atomic runner`, are non-dumpable once atomic's prologue has run, so only
-//! a process with `CAP_SYS_PTRACE` over their user namespace can read the
-//! token from the helpers' environment or from the runner's memory, where
-//! its request puts it; in the few milliseconds between the helper's exec
-//! and that prologue, a process of the same user can read it too. A
-//! command's token admits no new connection once the command ends, and the
-//! proxy stops once no command needs it.
+//! bridge, which adds the token itself. Who can read the token is narrowed
+//! too: it is never in an exec environment. The sandbox helper gets it on a
+//! pipe and reads it only once its prologue has made it non-dumpable;
+//! `atomic runner`, under `--runner process`, gets it in its request on
+//! stdin, which it reads only once it is non-dumpable. After that only a
+//! process with `CAP_SYS_PTRACE` over their user namespace can read it from
+//! them, or from the helper's bridges, which inherit it. A command's token
+//! admits no new connection once the command ends, and the proxy stops once
+//! no command needs it.
 
 use anyhow::Context as _;
 use codex_network_proxy::{
