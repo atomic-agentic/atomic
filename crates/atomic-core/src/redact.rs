@@ -1541,7 +1541,8 @@ pub fn value(value: &mut Value) {
 /// where to come back to, and a random state and PKCE challenge, which are
 /// public), but a random value can look like a token, and redacting one
 /// would break the login. Anything but such an address, on loopback or over
-/// HTTPS with no user or password in it, is redacted as any line is.
+/// HTTPS with no user or password in it, is redacted as any line is. Either
+/// is then made safe for a terminal, as every log line is.
 pub fn log_sign_in_address(address: &str) {
     eprintln!("{}", sign_in_line(address));
 }
@@ -1556,18 +1557,26 @@ pub(crate) fn sign_in_line(address: &str) -> String {
             && u.path() == "/oauth/authorize"
     });
     let line = format!("Sign in in your browser. If it did not open, go to:\n\n  {address}\n");
-    if authorize && line.chars().count() <= MAX_TEXT {
+    let line = if authorize && line.chars().count() <= MAX_TEXT {
         line
     } else {
         bounded(&line, MAX_TEXT)
-    }
+    };
+    crate::terminal::block(&line)
 }
 
-/// Write one log line to stderr, redacted and bounded to [`MAX_TEXT`]
-/// characters. atomic's own log lines go through this, never straight to
-/// `eprintln!`.
+/// Write one log line to stderr, redacted, bounded to [`MAX_TEXT`]
+/// characters and then made safe for a terminal. atomic's own log lines go
+/// through this, never straight to `eprintln!`: what they name, a run's id
+/// or a principal, and what they quote can come from a caller or a model.
 pub fn log(line: impl AsRef<str>) {
-    eprintln!("{}", bounded(line.as_ref(), MAX_TEXT));
+    eprintln!("{}", logged(line.as_ref()));
+}
+
+/// What [`log`] writes for `line`: redacted first, since redaction reads a
+/// terminal escape sequence around a token as it is written, then escaped.
+fn logged(line: &str) -> String {
+    crate::terminal::block(&bounded(line, MAX_TEXT))
 }
 
 /// One log line put together from atomic's own words, names and text made
@@ -1602,9 +1611,10 @@ impl Line {
         self
     }
 
-    /// What it writes: its text, bounded to [`MAX_TEXT`] characters.
-    fn written(&self) -> Cow<'_, str> {
-        cut(&self.text, MAX_TEXT)
+    /// What it writes: its text, bounded to [`MAX_TEXT`] characters and
+    /// safe for a terminal, whatever a part of it missed.
+    fn written(&self) -> String {
+        crate::terminal::block(&cut(&self.text, MAX_TEXT))
     }
 
     /// Write it to stderr, bounded to [`MAX_TEXT`] characters.
@@ -1666,7 +1676,7 @@ impl Lines {
             .find("-----BEGIN ")
             .is_some_and(|at| PRIVATE_KEY.is_match(&line[at..]));
         self.in_key = opens && !line.contains("-----END ");
-        writeln!(self.out, "{}", bounded(line, MAX_TEXT))
+        writeln!(self.out, "{}", logged(line))
     }
 }
 
@@ -1795,7 +1805,7 @@ pub fn install_panic_hook() {
             let _ = PANICKED_AT.try_with(|p| *p.borrow_mut() = Some(at.to_string()));
         }
         if let Some(line) = hook_line(REDACTING_A_PANIC.with(std::cell::Cell::get), || {
-            redact_panic(panic_text(info), |text| bounded(text, MAX_TEXT))
+            redact_panic(panic_text(info), logged)
         }) {
             eprintln!("{line}");
         }
