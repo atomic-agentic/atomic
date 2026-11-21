@@ -1485,10 +1485,8 @@ fn open_held_json(string: &mut String, nested: usize) -> bool {
     // As any JSON in a string is, which reads names and pairs as they are
     // written, and then as held, so it is never read less closely than it
     // would be unopened.
-    let passes: [fn(&mut Value, usize); 2] = [redact_nested, held_as_hinted];
-    for pass in passes {
-        pass(&mut inner, nested + 1);
-    }
+    redact_nested(&mut inner, nested + 1);
+    redact_held(Strength::Weak, &mut inner, nested + 1);
     if inner == before {
         return false;
     }
@@ -1501,11 +1499,6 @@ fn open_held_json(string: &mut String, nested: usize) -> bool {
         inner.to_string()
     };
     true
-}
-
-/// [`redact_held`] under a hint, as [`open_held_json`] passes it.
-fn held_as_hinted(value: &mut Value, nested: usize) {
-    redact_held(Strength::Weak, value, nested);
 }
 
 #[cfg(test)]
