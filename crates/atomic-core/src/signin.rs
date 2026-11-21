@@ -943,7 +943,9 @@ mod tests {
     pub(super) fn probe(dir: &Path) -> Option<Result<(), CredentialError>> {
         keyring_holds(dir)?;
         if PROBE_FAILS.lock().expect("probe").iter().any(|d| d == dir) {
-            return Some(Err(CredentialError::Keyring("the test keyring refuses".into())));
+            return Some(Err(CredentialError::Keyring(
+                "the test keyring refuses".into(),
+            )));
         }
         Some(Ok(()))
     }
@@ -1286,8 +1288,14 @@ mod tests {
                 .expect("probe")
                 .push(std::fs::canonicalize(&dir).expect("dir"));
             let refused = sign_in.login(true).await.expect_err("refused");
-            assert!(refused.to_string().contains("the test keyring refuses"), "{refused}");
-            assert!(!dir.exists(), "a login refused early kept the outlived entry's directory");
+            assert!(
+                refused.to_string().contains("the test keyring refuses"),
+                "{refused}"
+            );
+            assert!(
+                !dir.exists(),
+                "a login refused early kept the outlived entry's directory"
+            );
             assert!(
                 sign_in.account().expect("account").is_none(),
                 "an outlived entry reads as a sign-in"
