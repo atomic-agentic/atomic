@@ -221,6 +221,10 @@ pub fn install(agent: Agent, root: &Path) -> anyhow::Result<Vec<PathBuf>> {
     };
     let updated = with_section(current.as_deref(), &section())
         .with_context(|| format!("update {}", instructions.display()))?;
+    // Checked now, as the write will check it again, so a file removed or put
+    // there since it was read refuses before any of the pack is written.
+    at::check(&root, &instructions_target, expect)
+        .with_context(|| format!("write {}", instructions.display()))?;
     for (dir, stale) in &owned {
         let mut emptied: BTreeSet<&str> = BTreeSet::new();
         for gone in stale {
@@ -1071,8 +1075,11 @@ fn with_section(text: Option<&str>, section: &str) -> anyhow::Result<String> {
 /// which is then renamed over the file. A rename replaces whatever stands
 /// there, a link included, without following it, and it puts the whole file
 /// down at once, so a run that stops halfway leaves the file before it or the
-/// file after it, never half of either. The file keeps its permissions; a
-/// hard link to it is severed, since what stands at the name is a new file.
+/// file after it, never half of either. The file keeps the permission bits of
+/// the plain file it replaces, never setuid, setgid or sticky; a hard link to
+/// it is severed, since what stands at the name is a new file. Through
+/// [`write_expecting`], the file must still be the one read, and keeps the
+/// narrower of the permissions it had then and has now.
 ///
 /// [`link_to_own_file`] is asked of the instructions file before anything is
 /// written, and `install` hands over where that link leads when there is one, so
@@ -1138,6 +1145,9 @@ mod at {
         ino: u64,
         /// Its permission bits, without setuid, setgid or sticky.
         mode: u32,
+        /// Who owned it, which a setup run as root gives the file it writes.
+        uid: libc::uid_t,
+        gid: libc::gid_t,
     }
 
     /// A file read through [`read_plain`], and which file it was.
@@ -1174,6 +1184,8 @@ mod at {
             dev: st.st_dev as u64,
             ino: st.st_ino as u64,
             mode: permission_bits(st),
+            uid: st.st_uid,
+            gid: st.st_gid,
         }
     }
 
@@ -1385,25 +1397,20 @@ mod at {
         Err(e).with_context(|| format!("remove {shown}"))
     }
 
-    /// Put `contents` at `name` in `dir`: written to a temporary made new
-    /// beside it, under a name no one could have prepared, then renamed over
-    /// it. The file's permissions, if it is a plain file now, carry over. Only
-    /// the temporary this call made is ever removed.
-    pub(super) fn replace(
-        dir: &OwnedFd,
-        name: &OsStr,
-        contents: &[u8],
-        expect: Expect,
-    ) -> anyhow::Result<()> {
-        let target = c_name(name)?;
-        // What stands there now: only "nothing" is taken for nothing.
-        let now = match stat_at(dir.as_fd(), &target) {
+    /// Whether what stands at `target` in `dir` is what `expect` says, and
+    /// the permission bits the file written there is to have: a pack file's,
+    /// those of the plain file it replaces, if one is there; the instructions
+    /// file's, the narrower of those it had when it was read and has now. Only
+    /// "nothing there" is taken for nothing; any other failure to look
+    /// refuses.
+    fn expected(dir: &OwnedFd, target: &CString, expect: Expect) -> anyhow::Result<Option<u32>> {
+        let now = match stat_at(dir.as_fd(), target) {
             Ok(st) => Some(st),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(e).context("inspect what stands there"),
         };
         let plain = now.filter(|st| st.st_mode & libc::S_IFMT == libc::S_IFREG);
-        let mode = match expect {
+        Ok(match expect {
             Expect::Any => plain.as_ref().map(permission_bits),
             Expect::Absent => {
                 anyhow::ensure!(now.is_none(), "a file was put there since it was read");
@@ -1415,10 +1422,63 @@ mod at {
                     still.is_some(),
                     "the file read there was removed or replaced since"
                 );
-                Some(id.mode)
+                still.map(|st| narrower(id.mode, permission_bits(&st)))
             }
-        };
+        })
+    }
+
+    /// The narrower of two sets of permission bits: what both allow.
+    /// `scripts/controls/skill-dir-write-narrower.row` switches this off.
+    fn narrower(then: u32, now: u32) -> u32 {
+        then & now
+    }
+
+    /// Whether `relative` below `root` is still what `expect` says, checked
+    /// as a write there would check it, without writing.
+    pub(super) fn check(root: &Path, relative: &Path, expect: Expect) -> anyhow::Result<()> {
+        let name = c_name(relative.file_name().context("a file has a name")?)?;
+        match find_chain(root, relative)? {
+            Some(dir) => expected(&dir, &name, expect).map(drop),
+            None => match expect {
+                Expect::Same(_) => bail!("the file read there was removed or replaced since"),
+                Expect::Any | Expect::Absent => Ok(()),
+            },
+        }
+    }
+
+    /// Put `contents` at `name` in `dir`: written to a temporary made new
+    /// beside it, under a name no one could have prepared, then renamed over
+    /// it, with the permission bits [`expected`] gives and, for a setup run as
+    /// root over a file it read, that file's owner. Only the temporary this
+    /// call made is ever removed.
+    pub(super) fn replace(
+        dir: &OwnedFd,
+        name: &OsStr,
+        contents: &[u8],
+        expect: Expect,
+    ) -> anyhow::Result<()> {
+        let target = c_name(name)?;
+        let mode = expected(dir, &target, expect)?;
         let (temp, made) = make_temp(dir.as_fd(), name, mode)?;
+        // A setup run as root leaves the file it rewrote its owner's, as it
+        // was, rather than root's.
+        // SAFETY: geteuid takes nothing and cannot fail.
+        #[allow(unsafe_code)]
+        let root_runs = unsafe { libc::geteuid() } == 0;
+        if let (true, Expect::Same(id)) = (root_runs, expect) {
+            // SAFETY: `made` is an open descriptor this call owns.
+            #[allow(unsafe_code)]
+            let r = unsafe { libc::fchown(made.as_raw_fd(), id.uid, id.gid) };
+            if r != 0 {
+                let e = std::io::Error::last_os_error();
+                // SAFETY: `temp` is valid for the call, and `dir` is open.
+                #[allow(unsafe_code)]
+                unsafe {
+                    libc::unlinkat(dir.as_raw_fd(), temp.as_ptr(), 0);
+                }
+                return Err(e).context("give the file its owner back");
+            }
+        }
         let unmade = |e: anyhow::Error| {
             // SAFETY: `temp` is valid for the call, and `dir` is open.
             #[allow(unsafe_code)]
@@ -1554,6 +1614,16 @@ mod at {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    pub(super) fn check(root: &Path, relative: &Path, expect: Expect) -> anyhow::Result<()> {
+        let there = root.join(relative).symlink_metadata().is_ok();
+        match expect {
+            Expect::Absent => anyhow::ensure!(!there, "a file was put there since it was read"),
+            Expect::Same(FileId) => anyhow::ensure!(there, "the file read there was removed"),
+            Expect::Any => {}
+        }
+        Ok(())
     }
 
     pub(super) fn remove(root: &Path, relative: &Path, dir: bool) -> anyhow::Result<bool> {
@@ -3065,6 +3135,43 @@ mod tests {
             "write AGENTS.md: a file was put there since it was read"
         );
         assert_eq!(std::fs::read_to_string(&file).expect("read"), "another\n");
+    }
+
+    /// An owner who narrowed the instructions file's permissions between the
+    /// read and the write keeps the narrower ones; and a file removed since
+    /// the read is refused by the check made before anything is written.
+    #[cfg(unix)]
+    #[test]
+    fn the_narrower_permissions_win_and_the_file_is_checked_before_the_pack() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::fs::canonicalize(scratch("narrower")).expect("canonical root");
+        let file = root.join("AGENTS.md");
+        std::fs::write(&file, "theirs\n").expect("file");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).expect("mode");
+        let id = at::read_plain(&root, Path::new("AGENTS.md"), 1024)
+            .expect("read")
+            .expect("there")
+            .id;
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).expect("mode");
+        write_expecting(
+            &root,
+            Path::new("AGENTS.md"),
+            b"new\n",
+            at::Expect::Same(id),
+        )
+        .expect("written");
+        let mode = std::fs::metadata(&file).expect("meta").permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o600);
+        let id = at::read_plain(&root, Path::new("AGENTS.md"), 1024)
+            .expect("read")
+            .expect("there")
+            .id;
+        std::fs::remove_file(&file).expect("removed");
+        let refused = at::check(&root, Path::new("AGENTS.md"), at::Expect::Same(id))
+            .err()
+            .map(|e| format!("{e:#}"))
+            .unwrap_or_default();
+        assert_eq!(refused, "the file read there was removed or replaced since");
     }
 
     /// A file with other names, as a hard link to someone's file has, is not
