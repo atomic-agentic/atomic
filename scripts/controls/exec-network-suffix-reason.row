@@ -1,0 +1,1 @@
+exec-network-suffix-reason|crates/atomic-core/src/network.rs|                SUFFIX_REFUSED|                HOST_REFUSED|-p atomic-agentic-core --lib --features fake-model network::tests::a_wildcard_does_not_reach_across_a_public_suffix_below_it

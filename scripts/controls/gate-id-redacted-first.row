@@ -1,0 +1,1 @@
+gate-id-redacted-first|crates/atomic/src/gates.rs|    let missing = format!("no gate {gate_id}");|    let missing = format!("no gate {}", shown::line(gate_id)); /*CONTROL_OFF*/|-p atomic-agentic --test gates_cli a_coloured_token_in_a_gate_id_is_redacted

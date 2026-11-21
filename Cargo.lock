@@ -563,6 +563,7 @@ dependencies = [
  "ignore",
  "jsonschema",
  "libc",
+ "nix 0.29.0",
  "psl",
  "regex",
  "reqwest 0.12.28",

@@ -1,0 +1,1 @@
+registry-relative-home|crates/atomic-core/src/state.rs|    if home.is_absolute() {|    if !home.as_os_str().is_empty() {|--workspace --features atomic-agentic/postgres-tests,atomic-agentic/sandbox-tests --test shell_env a_relative_atomic_home_keeps_patches_and_their_registry_working

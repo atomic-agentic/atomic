@@ -1,0 +1,1 @@
+span-why-codex|crates/atomic-core/src/codex.rs|            crate::usage::note_step_failure(e);|            // CONTROL_OFF: the turn says nothing to its step's spans.|--workspace --features atomic-agentic/postgres-tests,atomic-agentic/sandbox-tests --test telemetry_sandbox a_codex_steps_span_says_what_its_turn_said_and_never_the_failure_whole

@@ -1,0 +1,1 @@
+sandbox-mounts-namespace-files|crates/atomic-core/src/mounts.rs|                root: root.is_absolute().then_some(root),|                root: Some(root.is_absolute().then_some(root)?), // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model a_real_table_parses_and_finds_what_it_should

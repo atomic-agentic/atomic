@@ -54,7 +54,9 @@ Layer 2 is the operator's own file: the person who runs the command, not the
 project. No project supplies it, and atomic refuses to read one that lies inside
 the project or inside the checkout that holds it, since the project could have
 supplied it; point `XDG_CONFIG_HOME`, or `HOME`, outside it. It holds the same
-settings as `atomic.yaml`, and the project's files override it.
+settings as `atomic.yaml`, and the project's files override it — except the
+`budget` caps and prices, which are ceilings a project can only tighten, as
+[Budgets](budgets.md#your-own-caps-are-ceilings) describes.
 
 Selecting a configuration profile is planned. The loader reads
 `atomic.<profile>.yaml` when a profile is named and refuses the run when the
@@ -141,6 +143,8 @@ waits for as long as it takes.
 The budget settings are the `budget` section: `budget.atom.*`,
 `budget.workflow.*`, `budget.call.*` and the `budget.pricing` table.
 [Budgets](budgets.md) gives the complete section and what each limit covers.
+Written in your own configuration file, a cap or a price there is a ceiling on
+every layer above it; written in a project's file, it is the project's own ask.
 
 ## What limits a setting
 
@@ -149,7 +153,10 @@ Three separate things constrain a setting. Only the first two are built.
 ### Precedence
 
 A higher layer wins over a lower one, layer by layer, as the table above orders
-them. That decides *which value* atomic uses, and nothing else.
+them. That decides *which value* atomic uses, and nothing else. The one exception
+runs the other way: the `budget` caps and prices in your own configuration cap
+what any layer above may ask for, so the number that binds is the smaller of the
+two.
 
 ### Settings only the operator may set
 
@@ -174,11 +181,16 @@ other override.
 
 ### Managed ceilings
 
-Planned. Nothing today limits what a layer may *ask for*: no policy file and no
-managed configuration narrows the choice a layer can express. The committed
-`atomic.policy.lock` is planned for v1.0, as [availability](availability.md)
-records it. Two things are true today and do not depend on it: detection grants
-nothing, and the settings above cannot come from a project.
+Partly built. The `budget` caps and prices in your own configuration narrow what
+every layer above may ask for: a project's file, an `ATOMIC_*` variable and a
+written `budget` block can bring a cap down to yours, never above it, and a price
+you wrote holds where a project's table would replace it
+([Budgets](budgets.md#your-own-caps-are-ceilings)). Nothing else limits what a
+layer may ask for: no policy file and no managed configuration narrows the choice
+a layer can express. The committed `atomic.policy.lock` is planned for v1.0, as
+[availability](availability.md) records it. Two things are true today and do not
+depend on it: detection grants nothing, and the settings above cannot come from a
+project.
 
 ## Models: one endpoint today
 
@@ -267,7 +279,7 @@ process environment does.
 
 | Variable | Sets |
 | --- | --- |
-| `ATOMIC_HOME` | where every project's state is kept, instead of the platform's user data directory |
+| `ATOMIC_HOME` | where every project's state is kept, instead of the platform's user data directory; it may not be your own atomic configuration directory (`$XDG_CONFIG_HOME/atomic`, by default `~/.config/atomic`) or a directory inside it, which every atom's commands are denied. A home that leads there is refused at start, before anything is created in it — whether it leads there directly, by a link, by `..`, or from the directory the command was run in — and so is a home whose path atomic cannot resolve. So is a configuration directory atomic cannot resolve: if `HOME`, or `XDG_CONFIG_HOME`, names a directory that is missing, unreadable, or a link that leads nowhere, atomic cannot tell where its state would go relative to it and refuses to run, and only fixing `HOME` or `XDG_CONFIG_HOME` helps there, not `ATOMIC_HOME`. Every `atomic` command refuses it but `atomic model`, which keeps nothing in a project's state, the `runner` role, which runs one command for a control plane, and the help and version output, which run nothing |
 | `ATOMIC_CREDENTIAL_STORE` | `file`, to keep credentials in your own atomic directory; the OS keyring is the default, and `keyring` says so |
 | `ATOMIC_DETECT_OLLAMA_ADDR` | the loopback address to probe for Ollama |
 | `ATOMIC_EXEC_MAX_FILE_BYTES`, `ATOMIC_EXEC_MAX_STEP_BYTES` | how much an exec atom's command may hand over by reference: 1 GiB a file and 4 GiB a step by default, in bytes; see [large results go by reference](atom-files.md#large-results-go-by-reference) |
