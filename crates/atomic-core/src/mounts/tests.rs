@@ -476,6 +476,21 @@ fn a_place_that_cannot_be_looked_at_is_refused() {
         aliases(&mounts, std::slice::from_ref(&place))
             .is_err_and(|e| e.to_string().contains("cannot be looked at"))
     );
+    // The place there, but the part of it a second mount shows looked at
+    // through a link to itself: what that mount shows cannot be checked.
+    let host = dir.0.join("host2");
+    let place = host.join("home/u/.ssh");
+    std::fs::create_dir_all(&place).expect("dir");
+    std::fs::create_dir_all(dir.0.join("also2")).expect("dir");
+    std::os::unix::fs::symlink("loop", place.join("loop")).expect("link");
+    let mounts = ninep(&host, &dir.0.join("also2"), "/home/u/.ssh/loop/keys");
+    assert!(
+        aliases(&mounts, std::slice::from_ref(&place)).is_err_and(|e| e.to_string().contains(
+            &format!("{} cannot be looked at", place.join("loop/keys").display())
+        ) && e
+            .to_string()
+            .contains("so atomic cannot check that its second mount"))
+    );
 }
 
 /// Another mount of the place's filesystem whose mount point is the place,
