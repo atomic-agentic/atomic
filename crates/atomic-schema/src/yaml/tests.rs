@@ -88,9 +88,10 @@ fn an_unquoted_yes_in_an_enum_is_refused_with_its_line() {
 #[test]
 fn keys_must_be_strings() {
     for (text, column) in [
-        ("1: a\n", 1),
         ("x: 1\ntrue: b\n", 1),
         ("null: c\n", 1),
+        ("1.5: d\n", 1),
+        ("1e3: e\n", 1),
         ("? [a]\n: d\n", 3),
     ] {
         let e = err(text);
@@ -101,6 +102,50 @@ fn keys_must_be_strings() {
         ok("'1': a\n\"true\": b\n").value,
         json!({"1": "a", "true": "b"})
     );
+}
+
+#[test]
+fn an_unquoted_integer_key_reads_as_a_string() {
+    let unquoted = ok("responses:\n  200: ok\n  404: gone\n");
+    // The same document with the keys quoted is the same document.
+    let quoted = ok("responses:\n  \"200\": ok\n  \"404\": gone\n");
+    assert_eq!(unquoted.value, quoted.value);
+    assert_eq!(
+        unquoted.value,
+        json!({"responses": {"200": "ok", "404": "gone"}})
+    );
+    // Same JSON Pointer, so positions and the errors that cite them agree too.
+    assert_eq!(unquoted.position("/responses/200"), Some(at(2, 8)));
+    assert_eq!(quoted.position("/responses/200"), Some(at(2, 10)));
+    // An integer key is the string the core schema gives that integer.
+    assert_eq!(
+        ok("-3: a\n+2: b\n0x1F: c\n0o17: d\n").value,
+        json!({"-3": "a", "2": "b", "31": "c", "15": "d"})
+    );
+    // An integer JSON cannot hold exactly is not an integer key; quoted, it
+    // is the exact digits.
+    let e = err("123456789012345678901234567890: a\n");
+    assert!(e.message.contains("keys must be strings"), "{e}");
+    assert_eq!(
+        ok("\"123456789012345678901234567890\": a\n").value,
+        json!({"123456789012345678901234567890": "a"})
+    );
+}
+
+#[test]
+fn an_integer_key_and_its_quoted_form_are_one_key() {
+    let e = err("responses:\n  200: ok\n  \"200\": fine\n");
+    assert_eq!(e.at, at(3, 3));
+    assert!(
+        e.message
+            .contains("duplicate key \"200\" (first at line 2)"),
+        "{e}"
+    );
+    // Either order, and the same integer spelled another way.
+    let e = err("200: ok\n\"200\": fine\n");
+    assert_eq!(e.at, at(2, 1));
+    let e = err("0x1F: a\n31: b\n");
+    assert!(e.message.contains("duplicate key \"31\""), "{e}");
 }
 
 #[test]

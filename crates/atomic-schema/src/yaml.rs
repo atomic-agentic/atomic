@@ -6,7 +6,10 @@
 //! different YAML versions read differently, is refused at load with the file,
 //! line and column. The loader uses the YAML 1.2 core schema and rejects:
 //!
-//! - duplicate keys, and keys that are not strings (`1:`, `true:`, `null:`);
+//! - duplicate keys, and keys that are neither strings nor integers
+//!   (`true:`, `null:`, `1.5:`); an integer key is read as its string form, so
+//!   `200:` and `"200":` are one key and both in one map are a duplicate —
+//!   OpenAPI specs write status codes unquoted;
 //! - explicit tags (`!!str`, `!custom`), anchors (`&a`) and aliases (`*a`);
 //! - more than one document in a file;
 //! - plain (unquoted) `yes`, `no`, `on` and `off` in any letter case, which
@@ -244,9 +247,14 @@ impl<'a> Loader<'a> {
             Event::Scalar(text, style, anchor, tag) => {
                 self.reject_extras(at, anchor, &tag)?;
                 if style == ScalarStyle::Plain {
-                    // A plain key must read as a string under the core schema.
+                    // A plain key must read as a string under the core schema,
+                    // or as an integer, which is then read as its string form:
+                    // OpenAPI specs write status codes unquoted, so `200:` is
+                    // the key `"200"`, and the mapping's duplicate check sees
+                    // the two spellings as one key.
                     match self.scalar(at, &text, style)? {
                         Value::String(s) => Ok((s, at)),
+                        Value::Number(n) if n.is_i64() || n.is_u64() => Ok((n.to_string(), at)),
                         other => Err(self.error(
                             at,
                             format!(
