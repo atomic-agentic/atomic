@@ -723,6 +723,21 @@ fn state_dir(dir: &Path, project: &Path) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(&out.stdout).trim())
 }
 
+/// The store of the project whose state directory is `state`, opened as
+/// atomic opens it, for that project: what it lists of parks is the
+/// project's.
+async fn project_store(state: &Path) -> Durare {
+    let id = state.file_name().expect("a project id").to_string_lossy();
+    Durare::open(
+        &atomic_durable::Database::Sqlite(database(state)),
+        None,
+        atomic_app::pipeline::LAYOUT_VERSION,
+        &id,
+    )
+    .await
+    .expect("store")
+}
+
 /// The database of the project whose state directory is `state`
 /// (`<home>/projects/<id>`): `<home>/private/<id>/atomic.db`.
 fn database(state: &Path) -> PathBuf {
@@ -1716,7 +1731,7 @@ fn a_resumed_run_keeps_the_budget_it_already_spent() {
             &with(&env, &[]),
             &dir.join("resumed.log"),
         );
-        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        let rt = project_store(&state).await;
         let started = Instant::now();
         let park = loop {
             if let Some(p) = atomic_durable::parks(&rt, "budget-1")
@@ -5248,7 +5263,7 @@ fn a_budget_in_the_projects_configuration_reaches_its_runs() {
             &with(&env, &[]),
             &dir.join("run.log"),
         );
-        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        let rt = project_store(&state).await;
         let started = Instant::now();
         let park = loop {
             if let Some(p) = atomic_durable::parks(&rt, "configured-1")

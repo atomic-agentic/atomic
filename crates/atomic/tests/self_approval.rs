@@ -765,13 +765,21 @@ fn an_atom_cannot_release_a_park_or_raise_a_cap_through_its_shell() {
         // A park, and the allowance that parked it, as a run leaves them;
         // and the operator's credential, enrolled, in the file store.
         let rt = Durare::sqlite(&private.join("atomic.db")).await.unwrap();
-        rt.control_transaction(|mut tx| {
+        let of = id.clone();
+        rt.control_transaction(move |mut tx| {
+            let of = of.clone();
             Box::pin(async move {
                 tx.execute(
                     "INSERT INTO atomic_parks (park_id, run, step, reason, parked_at) \
                      VALUES ('parked-run:3', 'parked-run', 'draft.park', \
                      'the allowance run:parked-run has no room', 1)",
                     &[],
+                )
+                .await?;
+                // The project's, as its run records it.
+                tx.execute(
+                    "INSERT INTO atomic_park_projects (park_id, project) VALUES ('parked-run:3', ?)",
+                    &[atomic_durable::Param::Text(of)],
                 )
                 .await?;
                 tx.execute(
