@@ -20,6 +20,28 @@ fn declared_media(body: &ResponseBody) -> Vec<&str> {
     body.schemas().map(|(media, _)| media.as_str()).collect()
 }
 
+/// What a tool's `output` describes, one item per schema it says a reply may
+/// have: the schema itself where it says one, the distinct schemas of each
+/// success that declares one where it says several. The component schemas the
+/// output carries are dropped from each, being the same map everywhere and not
+/// part of what a schema describes.
+fn described(output: Option<&Value>) -> Vec<Value> {
+    let Some(output) = output else {
+        return Vec::new();
+    };
+    let parts = |schema: &Value| {
+        let mut schema = schema.clone();
+        if let Value::Object(map) = &mut schema {
+            map.remove("$defs");
+        }
+        schema
+    };
+    match output.get("anyOf").and_then(Value::as_array) {
+        Some(members) => members.iter().map(parts).collect(),
+        None => vec![parts(output)],
+    }
+}
+
 /// What `op` keeps beside the response key `code`, which must be there and
 /// must keep something: only a status whose reply atomic never reads keeps
 /// nothing beside its key.
@@ -384,10 +406,24 @@ paths:
     let validator = Registry::new().validator_for(queued).expect("compiles");
     assert!(validator.is_valid(&json!({ "ticket": 7 })));
     assert!(!validator.is_valid(&json!({ "result": "done" })));
-    // The tool's output is the first success's, as before.
+    // The tool's output describes every success a reply can be checked
+    // against, not only the first: its own `200`, the `2xx` a 201 or a 299
+    // falls to, and the `202`, in status order. The `204` declares no body and
+    // so says nothing about a shape, and no success reaches `default` while a
+    // `2XX` range covers them, so its number describes nothing here.
     assert_eq!(
-        op.output.as_ref().map(|s| s["required"].clone()),
-        Some(json!(["result"]))
+        described(op.output.as_ref()),
+        vec![
+            json!({
+                "type": "object",
+                "required": ["result"],
+                "properties": { "result": { "type": "string" } }
+            }),
+            json!({ "type": "string" }),
+            json!({ "$ref": "#/$defs/Ticket" }),
+        ],
+        "{}",
+        op.output.as_ref().expect("a union of the successes")
     );
 }
 
@@ -459,10 +495,17 @@ paths:
         "a wildcard with no `schema` declares a body nothing describes"
     );
     // Selection by status is the test above; what it hands over is one of
-    // these three. The tool's output is still the first success's
-    // declaration, and that one declares no content, so the tool describes
-    // no output.
-    assert_eq!(op.output, None);
+    // these three. What the tool's output describes is all of them together:
+    // the two responses naming a schema describe a reply of either shape, and
+    // the five that name none — the one with no `content` and the four with a
+    // `content` map that names no schema — add nothing, so they neither
+    // describe a shape nor widen what the output accepts.
+    assert_eq!(
+        described(op.output.as_ref()),
+        vec![json!({ "type": "object" }), json!({ "type": "array" })],
+        "{}",
+        op.output.as_ref().expect("a union of what it describes")
+    );
 }
 
 // Which media type's schema a response is held to. A response declaring both
@@ -537,9 +580,10 @@ paths:
 // say. Every schema it declares is kept, under the media type as the spec
 // writes it, because a reply says which of them it is by its `Content-Type`:
 // keeping only one would leave a reply of another declared type checked against
-// a schema nothing wrote for it. The first in sorted order is still what the
-// tool's `output` describes, and a component schema reference resolves in every
-// one of them, not only in the first.
+// a schema nothing wrote for it. What one response contributes to the tool's
+// `output` is still the first in sorted order — the media type a reply naming
+// no `Content-Type` is held to — and a component schema reference resolves in
+// every one of them, not only in the first.
 #[test]
 fn every_json_media_types_schema_is_kept_for_a_response() {
     let ops = operations(&yaml(
@@ -610,10 +654,19 @@ components:
         !validator.is_valid(&json!({ "thing": "x" })),
         "the two schemas are the same schema"
     );
+    // Each success describes the output by the first media type it names one
+    // under, and the tool describes all three: a `200`'s Thing, the ack a `201`
+    // answers with, the boolean a `202` does. The `203` names no schema, so it
+    // describes nothing, and a `204` has no response to describe.
     assert_eq!(
-        op.output.as_ref().map(|s| s["$ref"].clone()),
-        Some(json!("#/$defs/Thing")),
-        "the tool describes the first media type's schema, as it did"
+        described(op.output.as_ref()),
+        vec![
+            json!({ "$ref": "#/$defs/Thing" }),
+            json!({ "type": "object" }),
+            json!({ "type": "boolean" }),
+        ],
+        "{}",
+        op.output.as_ref().expect("a union of the successes")
     );
     // A JSON media type that names no schema adds nothing to keep; the one
     // beside it is kept, and the wildcard stays preempted by any JSON media
@@ -712,9 +765,18 @@ components:
         .expect("default compiles");
     assert!(validator.is_valid(&json!({ "title": "no such order" })));
     assert!(!validator.is_valid(&json!({ "order": "A-1" })));
+    // The output describes both, because a success is checked against both:
+    // its own `200` for a 200, `default` for any other success the spec gives
+    // no code for. What it does not describe is the `404`'s — that schema is
+    // not kept at all, broken or not.
     assert_eq!(
-        op.output.as_ref().map(|s| s["$ref"].clone()),
-        Some(json!("#/$defs/Order"))
+        described(op.output.as_ref()),
+        vec![
+            json!({ "$ref": "#/$defs/Order" }),
+            json!({ "$ref": "#/$defs/Problem" }),
+        ],
+        "{}",
+        op.output.as_ref().expect("a union of Order and default")
     );
     // A 3.0 failure schema is not converted either: what the 3.0 dialect
     // cannot convert stays out of the import, as long as it sits under a
@@ -815,4 +877,180 @@ paths:
         "only an extension key is skipped"
     );
     assert_eq!(ops[2].responses.get("latest"), Some(&None));
+}
+
+// A tool's `output` describes what a reply may look like, and an operation may
+// answer with more than one shape: a `200` that carries the finished result and
+// a `202` that carries a ticket are both successes, and a reply of either one is
+// described. So the output is the distinct schema of every success a reply can
+// be checked against — one schema where they agree, unwrapped as it always was,
+// `anyOf` of them where they differ. A success that declares no body says
+// nothing about a shape: it contributes nothing, and in particular it does not
+// make the output accept anything. What a reply is *held to* is still the one
+// response its status selects, by the media type its `Content-Type` names; this
+// is the description the model and an atom's checks see.
+#[test]
+fn a_tools_output_is_the_union_of_its_success_responses() {
+    let result = json!({
+        "type": "object",
+        "required": ["result"],
+        "properties": { "result": { "type": "string" } }
+    });
+    let ticket = json!({
+        "type": "object",
+        "required": ["ticket"],
+        "properties": { "ticket": { "type": "integer" } }
+    });
+    let ops = operations(&yaml(
+        r##"openapi: 3.1.0
+info: { title: Jobs, version: "1" }
+paths:
+  /jobs:
+    post:
+      operationId: twoShapes
+      responses:
+        "200":
+          description: done at once
+          content:
+            application/json: { schema: { type: object, required: [result], properties: { result: { type: string } } } }
+        "202":
+          description: queued instead
+          content:
+            application/json: { schema: { type: object, required: [ticket], properties: { ticket: { type: integer } } } }
+  /echo:
+    post:
+      operationId: sameShape
+      responses:
+        "200":
+          description: done at once
+          content:
+            application/json: { schema: { type: object, required: [result], properties: { result: { type: string } } } }
+        "202":
+          description: queued, and it describes the same shape
+          content:
+            application/json: { schema: { type: object, required: [result], properties: { result: { type: string } } } }
+  /nothing:
+    post:
+      operationId: noContent
+      responses:
+        "204":
+          description: accepted, with nothing to return
+        "200":
+          description: the only success that has a body
+          content:
+            application/json: { schema: { type: object, required: [result], properties: { result: { type: string } } } }
+"##,
+    ))
+    .expect("spec");
+    let by = |name: &str| ops.iter().find(|op| op.name == name).expect(name);
+    assert_eq!(
+        ops.iter().map(|op| op.name.as_str()).collect::<Vec<_>>(),
+        ["sameShape", "twoShapes", "noContent"],
+        "three operations, one per shape claim"
+    );
+    // Two successes, two shapes: both describe the output, in status order,
+    // and nothing else does — a third alternative would say a reply of a shape
+    // the spec never wrote is described too.
+    assert_eq!(
+        by("twoShapes").output,
+        Some(json!({ "anyOf": [result.clone(), ticket] })),
+        "{:?}",
+        by("twoShapes").output
+    );
+    // Two successes describing one shape: that schema, as it stands, not an
+    // `anyOf` holding it once.
+    assert_eq!(
+        by("sameShape").output,
+        Some(result.clone()),
+        "{:?}",
+        by("sameShape").output
+    );
+    // A success declaring no body describes no shape, so the one that does is
+    // the whole output — the `204` neither adds a member nor widens it.
+    assert_eq!(
+        by("noContent").output,
+        Some(result.clone()),
+        "{:?}",
+        by("noContent").output
+    );
+}
+
+// The union is a schema like any other: it must compile, and what it accepts is
+// exactly one of the shapes the successes declare. A component schema reference
+// resolves inside a member of it — a member points at the document it sits in,
+// which is now the union, so the union carries the components beside its
+// members — while each member keeps its own copy, because what a reply is held
+// to is one member alone.
+#[test]
+fn the_union_of_component_schemas_validates_a_reply_of_either_shape() {
+    let ops = operations(&yaml(
+        r##"openapi: 3.1.0
+info: { title: Orders, version: "1" }
+paths:
+  /orders:
+    post:
+      operationId: order
+      responses:
+        "200":
+          description: the order
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Order" } }
+        "202":
+          description: the order, still being made
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Queued" } }
+components:
+  schemas:
+    Order: { type: object, required: [order], properties: { order: { type: string } } }
+    Queued: { type: object, required: [ticket], properties: { ticket: { type: integer } } }
+"##,
+    ))
+    .expect("spec");
+    let op = &ops[0];
+    let union = op.output.as_ref().expect("a union of the two successes");
+    let components = json!({
+        "Order": { "type": "object", "required": ["order"], "properties": { "order": { "type": "string" } } },
+        "Queued": { "type": "object", "required": ["ticket"], "properties": { "ticket": { "type": "integer" } } },
+    });
+    assert_eq!(
+        union["$defs"], components,
+        "the union carries the components its members reference"
+    );
+    assert_eq!(
+        union["anyOf"],
+        json!([
+            { "$ref": "#/$defs/Order", "$defs": components.clone() },
+            { "$ref": "#/$defs/Queued", "$defs": components },
+        ]),
+        "each member keeps its own copy too, being what a reply is held to alone"
+    );
+    let validator = Registry::new()
+        .validator_for(union)
+        .expect("the union compiles, references and all");
+    assert!(
+        validator.is_valid(&json!({ "order": "A-1" })),
+        "the shape a `200` answers with"
+    );
+    assert!(
+        validator.is_valid(&json!({ "ticket": 7 })),
+        "the shape a `202` answers with"
+    );
+    assert!(
+        !validator.is_valid(&json!({ "other": 1 })),
+        "a body matching neither shape is not described by them"
+    );
+    // What a reply is held to is unchanged: the response its status selects,
+    // not the union that describes them all.
+    let held = |status: u16| {
+        let schema = op
+            .response(status)
+            .expect("a response")
+            .1
+            .schema()
+            .expect("a schema");
+        let validator = Registry::new().validator_for(schema).expect("compiles");
+        validator.is_valid(&json!({ "order": "A-1" }))
+    };
+    assert!(held(200), "a `200` body fits the `200`");
+    assert!(!held(202), "the same body does not fit the `202`");
 }

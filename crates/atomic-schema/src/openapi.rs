@@ -31,7 +31,17 @@
 //! it declares about its body — no `content` map at all, a `content` map with
 //! no schema to check against, or a schema under each media type it names one
 //! under — as [`ResponseBody`]. Only the first says there is no body to read;
-//! only the last says what shape the body has. A response declared for a
+//! only the last says what shape the body has.
+//!
+//! A tool's `output` describes what a reply may look like, which is more than
+//! one response's schema whenever the operation's successes describe
+//! different bodies: it is the distinct schema of every response a success can
+//! reach, one schema where they all say the same thing and `anyOf` of them
+//! where they differ. A response declaring no schema contributes nothing to
+//! it, and a response no success can reach — a `default` behind a `2XX` range
+//! — is never asked, so it never describes the output either.
+//!
+//! A response declared for a
 //! status that is not a success is kept as a key with nothing beside it: what
 //! it declares about its body is never read, so its schema is never converted
 //! and can never be what makes the import of the spec fail. A key of
@@ -124,11 +134,13 @@ pub struct Operation {
     /// The tool's input: one object, a field per parameter and `body` for a
     /// JSON request body.
     pub input: Value,
-    /// The JSON schema of its success response, when it declares one: the
-    /// first schema the first success code declares, else `default`'s. A
-    /// tool's output, for what describes it; what a reply is checked against
-    /// is [`Operation::response`], and within it whichever schema the reply's
-    /// `Content-Type` names.
+    /// What its successes describe a reply's body as: the schema each one's
+    /// response declares, distinct and in status order — that one schema where
+    /// they agree, `anyOf` of them where they differ, `None` when none of them
+    /// declares one. A tool's output, for what describes it; what a reply is
+    /// checked against is [`Operation::response`], and within it whichever
+    /// schema the reply's `Content-Type` names. `declared_output` says which
+    /// responses are asked and what each contributes.
     pub output: Option<Value>,
     /// Each response it declares, by the key the spec lists it under: a code
     /// such as `200` or `404`, a range such as `2XX`, or `default`. A success's,
@@ -155,24 +167,86 @@ impl Operation {
     /// declares a schema under more than one media type leaves which of them
     /// governs a reply to the reply's `Content-Type`, which is not known here.
     pub fn response(&self, status: u16) -> Option<(&str, &ResponseBody)> {
-        if !(200..=299).contains(&status) {
-            return None;
+        response_declared(&self.responses, status)
+    }
+}
+
+/// What [`Operation::response`] does, over one operation's responses, so that
+/// what a tool's output describes is built from exactly the responses a reply
+/// can be checked against.
+fn response_declared(
+    responses: &std::collections::BTreeMap<String, Option<ResponseBody>>,
+    status: u16,
+) -> Option<(&str, &ResponseBody)> {
+    if !(200..=299).contains(&status) {
+        return None;
+    }
+    let range = format!("{}XX", status / 100);
+    let code = status.to_string();
+    let (key, body) = responses
+        .get_key_value(&code)
+        .or_else(|| {
+            responses
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(&range))
+        })
+        .or_else(|| responses.get_key_value("default"))?;
+    // A key kept with nothing beside it names no schema for a reply to fit,
+    // and never lends another response's. Only a failure's key is kept that
+    // way, so no status an operation answers reaches this.
+    Some((key.as_str(), body.as_ref()?))
+}
+
+/// What a tool's `output` describes: the distinct schema of every response a
+/// success can reach, each taken as [`ResponseBody::schema`] takes it — the
+/// schema of the first media type that names one, which is all a response has
+/// ever described about the tool.
+///
+/// Each success status is asked, and selects its response exactly as
+/// [`Operation::response`] does, so a response no success can reach never
+/// describes the output: a `default` behind a `2XX` range is never selected,
+/// and one with nothing shading it is the response a success the spec gives no
+/// code for is checked against. A response that declares no schema — no
+/// `content` map, or a map that names none — contributes nothing, so it neither
+/// describes the output nor widens it. The same schema written under two
+/// statuses is one schema. Where the successes agree, that one schema is the
+/// output as it stands; where they differ, `anyOf` of them is, in status order,
+/// so a reply is described whichever of them it answers with; and where none
+/// declares a shape, there is no output at all.
+fn declared_output(
+    responses: &std::collections::BTreeMap<String, Option<ResponseBody>>,
+    defs: &Map<String, Value>,
+) -> Option<Value> {
+    let mut schemas: Vec<Value> = Vec::new();
+    for status in 200..300u16 {
+        let Some((_, body)) = response_declared(responses, status) else {
+            continue;
+        };
+        // A response that declares no schema — no `content` map at all, or a
+        // map naming none — says nothing about a shape, so it contributes
+        // nothing to the union, and not even a schema that would accept
+        // anything in its place.
+        let Some(one) = body.schema() else { continue };
+        if !schemas.contains(one) {
+            schemas.push(one.clone());
         }
-        let range = format!("{}XX", status / 100);
-        let code = status.to_string();
-        let (key, body) = self
-            .responses
-            .get_key_value(&code)
-            .or_else(|| {
-                self.responses
-                    .iter()
-                    .find(|(key, _)| key.eq_ignore_ascii_case(&range))
-            })
-            .or_else(|| self.responses.get_key_value("default"))?;
-        // A key kept with nothing beside it names no schema for a reply to
-        // fit, and never lends another response's. Only a failure's key is
-        // kept that way, so no status an operation answers reaches this.
-        Some((key.as_str(), body.as_ref()?))
+    }
+    match schemas.len() {
+        0 => None,
+        1 => schemas.pop(),
+        _ => {
+            let mut union = Map::new();
+            // The union carries the component schemas too: a reference inside
+            // a member points at the document it sits in, which is now the
+            // union. Each member keeps its own copy as well, because what the
+            // executor holds a reply to is one member alone, and there that
+            // member is the whole document.
+            if !defs.is_empty() {
+                union.insert("$defs".into(), Value::Object(defs.clone()));
+            }
+            union.insert("anyOf".into(), Value::Array(schemas));
+            Some(Value::Object(union))
+        }
     }
 }
 
@@ -579,17 +653,11 @@ pub fn operations(spec: &Value) -> Result<Vec<Operation>, OpenApiError> {
                     }
                 }
             }
-            // The schema of the first key beginning with `2`, in the map's
-            // sorted order, else `default`'s: the first success, for any spec
-            // that spells its codes as OpenAPI says. Only a key naming a
-            // success keeps a schema, so an odd key such as a bare `2`
-            // describes no output.
-            let output = kept
-                .iter()
-                .find(|(code, _)| code.starts_with('2'))
-                .or_else(|| kept.get_key_value("default"))
-                .and_then(|(_, body)| body.as_ref())
-                .and_then(|body| body.schema().cloned());
+            // What every success a reply can reach describes, not only the
+            // first: a `200` and a `202` of different shapes both describe the
+            // tool's output, as `anyOf`. A key naming no status, such as a
+            // bare `2`, is what no status selects, so it describes nothing.
+            let output = declared_output(&kept, &defs);
             let description = operation["summary"]
                 .as_str()
                 .or_else(|| operation["description"].as_str())

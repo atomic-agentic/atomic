@@ -584,7 +584,9 @@ fn check(path: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
             // The executor checks each success against the schema of the
             // media type its reply names, so every schema a response declares
             // must compile, not only the first. The tool's own `output` is one
-            // of those response schemas, so it is not compiled again.
+            // of these same schemas or an `anyOf` of them, each one listed
+            // here, and the components they reference travel in the input's
+            // `$defs`, which is listed too.
             let mut schemas: Vec<&serde_json::Value> = vec![&tool.input];
             for body in tool.responses.values().flatten() {
                 schemas.extend(body.schemas().map(|(_media, schema)| schema));
