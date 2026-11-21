@@ -2215,33 +2215,27 @@ fn a_value_past_a_backslash_stays_hidden() {
     assert_eq!(text(&input), REDACTED);
 }
 
-/// Reading text until it settles hides at least everything one reading
-/// hides: over generated strings with planted secrets, none that one
-/// reading of the rules hides is shown.
+/// Reading text until it settles hides every secret that follows a
+/// header, a scheme, a flag or an assignment, with only backslashes or
+/// escaped slashes between: over generated strings the test plants such
+/// secrets among other parts and checks each is absent from the result,
+/// with no reading of the rules as its oracle.
 #[test]
-fn reading_until_settled_hides_all_one_reading_hides() {
-    const PARTS: &[&str] = &[
+fn reading_until_settled_hides_every_planted_secret() {
+    const PREFIXES: &[&str] = &[
         "password=",
         "token=",
+        "api_key=",
         "Authorization: ",
-        "Bearer ",
-        "Cookie: ",
-        "sid=",
+        "Authorization: Bearer ",
+        "Proxy-Authorization: Bearer ",
+        "Cookie: sid=",
         "x-api-key: ",
         "--password ",
-        " ",
-        "\\",
-        "\\/",
-        "\\ab ",
-        "=",
-        ":",
-        ";",
-        "\"",
-        "api_key=",
-        "Proxy-Authorization: ",
         "--token ",
-        "abcd1234efgh",
     ];
+    const BETWEEN: &[&str] = &["\\", "\\/"];
+    const NOISE: &[&str] = &[" ", "\\", "\\/", "\\ab ", "abcd1234efgh", "note", "\n"];
     let mut seed: u64 = 9001;
     let mut next = move |n: u64| {
         seed = seed
@@ -2249,31 +2243,62 @@ fn reading_until_settled_hides_all_one_reading_hides() {
             .wrapping_add(1_442_695_040_888_963_407);
         (seed >> 33) % n
     };
+    let alphabet = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
     let mut shown = 0;
     for _ in 0..30_000 {
         let mut input = String::new();
         let mut planted = Vec::new();
-        for _ in 0..=next(7) {
-            if next(3) == 0 {
-                let alphabet = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
-                let mut secret = String::from("Q");
-                for _ in 0..15 {
-                    secret.push(char::from(alphabet[next(alphabet.len() as u64) as usize]));
-                }
-                input.push_str(&secret);
-                planted.push(secret);
-            } else {
-                input.push_str(PARTS[next(PARTS.len() as u64) as usize]);
+        for _ in 0..=next(5) {
+            if next(2) == 0 {
+                input.push_str(NOISE[next(NOISE.len() as u64) as usize]);
+                continue;
             }
+            input.push(' ');
+            input.push_str(PREFIXES[next(PREFIXES.len() as u64) as usize]);
+            for _ in 0..next(3) {
+                input.push_str(BETWEEN[next(BETWEEN.len() as u64) as usize]);
+            }
+            let mut secret = String::from("Q7");
+            for _ in 0..22 {
+                secret.push(char::from(alphabet[next(alphabet.len() as u64) as usize]));
+            }
+            input.push_str(&secret);
+            input.push(' ');
+            planted.push(secret);
         }
-        let one = text_once(&input).into_owned();
         let settled = text(&input).into_owned();
         shown += planted
             .iter()
-            .filter(|p| !one.contains(p.as_str()) && settled.contains(p.as_str()))
+            .filter(|p| settled.contains(p.as_str()))
             .count();
     }
-    assert_eq!(shown, 0, "reading until settled shows what one reading hid");
+    assert_eq!(shown, 0, "a planted secret showed");
+}
+
+/// JSON in a string that text redaction breaks is hidden whole: the rules
+/// that read its names and pairs can no longer read it, and what they
+/// would hide must not show as text redaction left it.
+#[test]
+fn json_that_text_redaction_breaks_is_hidden_whole() {
+    let inner = json!({
+        "headers": [{"name": "X-Api-Key", "value": "Qk9Lx3sR2tY7uV8w"}],
+        "note": "Authorization: \\Bearer \\\\",
+    })
+    .to_string();
+    // Under an ordinary name and under a hint, where held JSON is opened.
+    for parent in ["body", "key"] {
+        let mut out = json!({ parent: inner.clone() });
+        value(&mut out);
+        assert!(
+            !out.to_string().contains("Qk9Lx3sR2tY7uV8w"),
+            "under {parent}: the header's value showed"
+        );
+        let body = out[parent].as_str().expect("a string");
+        assert!(
+            body == REDACTED || serde_json::from_str::<Value>(body).is_ok(),
+            "under {parent}: neither hidden whole nor JSON"
+        );
+    }
 }
 
 /// Text still changing when the readings run out is hidden whole.

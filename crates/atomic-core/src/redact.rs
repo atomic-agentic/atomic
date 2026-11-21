@@ -1421,9 +1421,17 @@ pub fn tail(input: &str, chars: usize) -> String {
 }
 
 fn redact_string(string: &mut String, nested: usize) {
+    // Whether the string read as JSON before text redaction touched it.
+    let was_json = |s: &str| {
+        nested < MAX_NESTED_JSON
+            && s.trim_start().starts_with(['{', '['])
+            && serde_json::from_str::<serde::de::IgnoredAny>(s).is_ok()
+    };
+    let mut opened = false;
     if string.len() > MAX_TEXT {
         *string = bounded(string, MAX_TEXT);
     } else if let Cow::Owned(redacted) = text(string) {
+        opened = redacted != *string && was_json(string);
         *string = redacted;
     }
     // JSON inside a string, such as a model's raw tool arguments: an escape
@@ -1438,6 +1446,11 @@ fn redact_string(string: &mut String, nested: usize) {
         if inner != before {
             *string = inner.to_string();
         }
+    } else if opened {
+        // JSON that text redaction broke: the rules that read its names
+        // and pairs cannot read it, and text redaction alone may leave
+        // their secrets, so it is hidden whole.
+        *string = REDACTED.to_owned();
     }
 }
 
@@ -1545,7 +1558,8 @@ fn open_held_json(string: &mut String, nested: usize) -> bool {
     // Redacted as text first, as it is unopened: what that finds in the
     // string as written, an escaped `\/` before a token say, stays hidden
     // once the JSON is written back without the escape. Text that no
-    // longer reads as JSON is left to be redacted as any string is.
+    // longer reads as JSON is left to [`redact_string`], which hides JSON
+    // that text redaction broke whole.
     let texted = text(string);
     let Ok(mut inner) = serde_json::from_str::<Value>(&texted) else {
         return false;
