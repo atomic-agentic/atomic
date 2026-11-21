@@ -222,7 +222,7 @@ fn a_sign_in_that_cannot_be_used_refuses_a_run_and_nothing_takes_its_place() {
     let closed_home = closed.to_str().unwrap().to_owned();
     let t = refused(&[("ATOMIC_HOME", closed_home.as_str())]);
     assert!(t.contains("the ChatGPT sign-in cannot be used"), "{t}");
-    assert!(t.contains("Permission denied"), "{t}");
+    assert!(t.contains("denied (os error 13)"), "{t}");
     std::fs::create_dir_all(f.dir.join(".git")).unwrap();
     let inside_closed = f.dir.join("closed-inside");
     std::fs::create_dir_all(inside_closed.join("credentials/codex-auth")).unwrap();
