@@ -734,6 +734,7 @@ fn a_signed_in_threads_command_cannot_read_the_sign_in() {
             },
             defaults: Default::default(),
             artifacts: atomic_core::runtime::Artifacts::none(),
+            caches: None,
             meter: atomic_core::usage::Metering::none(),
             guard: StateGuard::Deny(PrivateState {
                 state_dir: state.clone(),
