@@ -1180,8 +1180,9 @@ fn harden() {
 /// still dumpable. Until it has run, the request is exposed in the stdin
 /// pipe: another process of the same user can reopen that pipe through /proc
 /// and read the request, its program, arguments, directory and whole
-/// environment among it, or replace it; the socket's digest refuses a
-/// replaced request, but does not stop one being read.
+/// environment among it, or replace it. When a secret was handed, the
+/// socket's digest refuses a replaced request; it does not stop one being
+/// read, and with no secret handed there is no digest to refuse with.
 pub fn harden_runner() {
     // The runner holds commands' environments, proxy tokens among them.
     codex_process_hardening::pre_main_hardening();
