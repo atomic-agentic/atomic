@@ -55,6 +55,7 @@ CONTROLS=(
     "stop-kill-on-sight|crates/atomic-exec/src/process.rs|                if watched.insert(process) {|                if /*CONTROL_OFF*/ false && watched.insert(process) {|-p atomic-agentic-exec --test stop_all stopping_ends_every_process_a_command_started_before_it_returns"
     "stop-own-tool|crates/atomic-exec/src/process.rs|                let own = own(&all, &tools);|                let own = own(&all, &[] /*CONTROL_OFF*/);|-p atomic-agentic-exec --test stop_all stopping_ends_every_process_a_command_started_before_it_returns"
     "stop-look-cap|crates/atomic-exec/src/process.rs|            look.saturating_mul(2).min(LOOK_MAX)|            look.saturating_mul(2) /*CONTROL_OFF*/|-p atomic-agentic-exec --lib the_next_look_grows_only_when_one_ran_out_and_is_capped"
+    "redact-numbered-name|crates/atomic-core/src/redact.rs|        surer(strength(key), strength(base))|        strength(base) /*CONTROL_OFF*/|-p atomic-agentic-core --lib redact::tests::a_key_that_looks_numbered_holds_its_value_as_its_whole_name_says"
     "exec-confinement|crates/atomic-exec/src/lib.rs|            Some(confine) => confine.confine(command, &self.tmp),|            Some(confine) if std::hint::black_box(false) => confine.confine(command, &self.tmp), Some(_) => Ok(command.clone()),|--workspace --features ${FEATURES} --test exec_private_state --test run_cli -- an_exec_atom_cannot_reach_atomics_private_state atomic_run_confines_an_exec_atoms_command"
 )
 

@@ -1626,3 +1626,30 @@ fn a_flag_value_under_a_secrets_name_is_redacted() {
     value(&mut held);
     assert_eq!(held, json!({"token": ["--password", REDACTED]}));
 }
+
+/// A key that only looks numbered is read whole too, so a secret's name
+/// with a number after it holds its value as surely as the name alone
+/// would, at the top level and under a secret's name.
+#[test]
+fn a_key_that_looks_numbered_holds_its_value_as_its_whole_name_says() {
+    for held in [
+        json!({"token (2)": "hunter2", "pass (2)": "abc"}),
+        json!({"secrets": {"token (2)": "hunter2", "pass (2)": "abc"}}),
+    ] {
+        let mut out = held.clone();
+        value(&mut out);
+        assert!(!out.to_string().contains("hunter2"), "{out}");
+        assert!(!out.to_string().contains("\"abc\""), "{out}");
+    }
+}
+
+/// Under a secret's name, a key that names a secret and had its value
+/// redacted stays so when redacted again.
+#[test]
+fn a_held_name_and_value_key_redacted_again_stays() {
+    let mut once = json!({"token": {"password= hunter2x": 1}});
+    value(&mut once);
+    let mut twice = once.clone();
+    value(&mut twice);
+    assert_eq!(once, twice);
+}

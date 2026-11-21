@@ -1482,12 +1482,23 @@ fn base_name(key: &str) -> &str {
 /// what its name says, before any number.
 fn judged(key: &str, renamed: &std::collections::HashMap<String, Renamed>, held: bool) -> Strength {
     match renamed.get(key) {
-        Some(r) if held => surer(
-            strength(base_name(&r.original)),
-            strength(base_name(&r.name)),
-        ),
-        Some(r) => strength(base_name(&r.name)),
-        None => strength(base_name(key)),
+        Some(r) if held => surer(name_strength(&r.original), name_strength(&r.name)),
+        Some(r) => name_strength(&r.name),
+        None => name_strength(key),
+    }
+}
+
+/// How surely a key, which may carry a number, names a secret. Only a key
+/// redacted already is numbered by redaction, so only there is its number
+/// dropped before it is read; any other is read both whole and without what
+/// looks like a number, and the surer reading taken, so `token (2)` is never
+/// weaker than its whole name says.
+fn name_strength(key: &str) -> Strength {
+    let base = base_name(key);
+    if base.contains(REDACTED) {
+        strength(base)
+    } else {
+        surer(strength(key), strength(base))
     }
 }
 
@@ -1508,8 +1519,10 @@ fn surer(a: Strength, b: Strength) -> Strength {
 /// it, so redacting again changes nothing, and still redacts as text.
 fn held_key(key: &str) -> Option<String> {
     let base = base_name(key);
+    // What is left once the marker and the separators around it go: of
+    // `password= [REDACTED]`, the name `password`.
     let rest = base.replace(REDACTED, "");
-    let rest = rest.trim();
+    let rest = rest.trim_matches(|c: char| c.is_whitespace() || matches!(c, '=' | ':' | ';' | ','));
     if base != REDACTED && !rest.is_empty() && key_looks_like_credential(rest) {
         return Some(REDACTED.to_owned());
     }
