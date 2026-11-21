@@ -3221,6 +3221,13 @@ fn a_pinned_plan_without_ceilings_is_held_to_your_own() {
         if let Some(plan) = over_caps.budgets.as_mut() {
             plan.run.tokens = 20_000;
         }
+        // Carrying ceilings of its own, looser than theirs: only the check
+        // against theirs, before the plan is pinned, holds it.
+        let mut loose = pinned();
+        if let Some(plan) = loose.budgets.as_mut() {
+            plan.run.tokens = 20_000;
+            plan.ceilings.atom.tokens = Some(1_000_000);
+        }
         let mut over_call = pinned();
         if let Some(plan) = over_call.budgets.as_mut() {
             for caps in plan.atoms.values_mut() {
@@ -3259,6 +3266,14 @@ fn a_pinned_plan_without_ceilings_is_held_to_your_own() {
             let said = plan_refused(&rt, run, pipeline).await;
             assert!(said.contains(says), "{run}: {said}");
         }
+        let said = plan_refused(&rt, "loose", loose).await;
+        assert!(
+            said.contains(
+                "its pinned budget: atom rank-note: its tokens cap (10000) is above the cap of \
+                 6000 tokens your own configuration's ceilings"
+            ),
+            "loose: {said}"
+        );
         assert_eq!(model.calls(), 0, "every plan was refused before any call");
         rt.shutdown(std::time::Duration::from_secs(5))
             .await
