@@ -297,7 +297,10 @@ fn a_sign_in_inside_the_checkout_holding_the_project_is_refused_and_explain_says
     std::os::unix::fs::symlink(f.dir.join("not-yet"), &dangling).unwrap();
     let t = login(&dangling);
     assert!(t.contains("which does not exist"), "{t}");
-    assert!(!f.dir.join("not-yet").exists(), "the link's target was made");
+    assert!(
+        !f.dir.join("not-yet").exists(),
+        "the link's target was made"
+    );
 }
 
 #[test]

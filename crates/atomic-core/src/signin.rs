@@ -243,7 +243,8 @@ impl SignIn {
         // Where it was made, as it really is: a link on the way, such as a
         // linked home, could have put it somewhere the checks above did not
         // see. Refused there, it is removed again.
-        let mut placed = crate::credential::placed_apart(&auth_home, project).map_err(SignInError::from);
+        let mut placed =
+            crate::credential::placed_apart(&auth_home, project).map_err(SignInError::from);
         if placed.is_ok() {
             placed = outside_the_checkout(&auth_home, project);
         }
@@ -836,8 +837,14 @@ mod tests {
             assert!(sign_in.account().expect("account").is_some());
             let failed = sign_in.login(true).await;
             assert!(failed.is_err(), "{failed:?}");
-            assert!(dir.join("auth.lock").exists(), "a failed login removed a sign-in");
-            let account = sign_in.account().expect("account").expect("still signed in");
+            assert!(
+                dir.join("auth.lock").exists(),
+                "a failed login removed a sign-in"
+            );
+            let account = sign_in
+                .account()
+                .expect("account")
+                .expect("still signed in");
             assert_eq!(account.mode, "chatgpt");
 
             let made = auth_dir("keyring-made");
