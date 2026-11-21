@@ -21,13 +21,17 @@
 # the check: update the switch here with the code. Each control costs a rebuild
 # of the crates it is in.
 #
-# The source is edited in place, so the script guards it. Before any edit it
-# copies every file it will touch to target/controls-check/ and checks each
-# copy against the file's git hash-object; if that fails, nothing is edited. On
-# exit, however it ends, it copies the originals back and checks each file's
-# hash again, and fails loudly, keeping the copies, if one does not match. A run
-# killed outright leaves target/controls-check/ behind, and the next run refuses
-# to start until someone has looked. scripts/controls-check-test.sh tests this.
+# The source is edited in place, so the script guards it. It refuses to start
+# when a file a control names differs from HEAD, because it would restore that
+# dirty state and read as clean. Before any edit it copies every file it will
+# touch to target/controls-check/ and checks each copy against the file's git
+# hash-object; if that fails, nothing is edited. On exit, however it ends, it
+# copies the originals back, checks each file's hash again and asks git that the
+# file no longer differs from HEAD, and fails loudly, keeping the copies, if
+# either fails. Each file put back is touched, so cargo rebuilds it rather than
+# reusing an artefact built with the control off. A run killed outright leaves
+# target/controls-check/ behind, and the next run refuses to start until someone
+# has looked. scripts/controls-check-test.sh tests this.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -89,6 +93,12 @@ CONTROLS=(
     "error-keeps-lines|crates/atomic/src/failure.rs|crate::shown::block(&atomic_core::redact::text(text))|crate::shown::line(&atomic_core::redact::text(text)) /*CONTROL_OFF*/|-p atomic-agentic --bin atomic failure::tests::a_multi_line_error_keeps_its_lines_and_tabs"
     "eval-failure-escaped|crates/atomic/src/evals.rs|shown::line(&case.failures.join(\"; \"))|case.failures.join(\"; \") /*CONTROL_OFF*/|-p atomic-agentic --test eval_cli a_plain_evals_hostile_answer_reaches_no_terminal_raw"
     "principal-escaped|crates/atomic/src/gates.rs|shown::line(principal.as_str())|principal.as_str() /*CONTROL_OFF*/|-p atomic-agentic --test gates_cli a_hostile_account_name_is_shown_escaped"
+    "artifact-hold-gather|crates/atomic-core/src/artifact/files.rs|            held.push(store.hold(&s.artifact()?)?);|            let _ = &mut held; // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model -- a_sweep_racing_a_slow_gather_keeps_the_gathered_files a_store_held_while_files_are_stored_leaves_the_outcome_unknown"
+    "artifact-hold-sweep|crates/atomic-core/src/artifact.rs|        let (held, gone) = holds(self.held_dir(), self.owners(), &dead, STAGING_GRACE, now)?;|        let (_held, gone) = holds(self.held_dir(), self.owners(), &dead, STAGING_GRACE, now)?; let held = std::collections::HashSet::<String>::new(); // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model -- a_sweep_racing_a_slow_gather_keeps_the_gathered_files a_hold_keeps_content_until_it_is_let_go_or_its_store_is_gone"
+    "artifact-hold-dead|crates/atomic-core/src/artifact.rs|            gone.push(path);|            let _ = path; // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model -- a_hold_keeps_content_until_it_is_let_go_or_its_store_is_gone opening_a_store_sweeps_only_dead_stores_leftovers"
+    "artifact-hold-release|crates/atomic/src/pipeline.rs|    drop(release);|    std::mem::forget(release); // CONTROL_OFF|-p atomic-agentic --test pipeline an_exec_steps_files_are_let_go_once_its_turn_is_recorded"
+    "artifact-hold-release-on-drop|crates/atomic-core/src/runtime.rs|        self.artifacts.release(&self.identity);|        let _ = &self.identity; // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model a_store_held_while_files_are_stored_leaves_the_outcome_unknown"
+    "artifact-hold-snapshot|crates/atomic/src/retention.rs|    artifacts.extend(held);|    let _ = held; // CONTROL_OFF|-p atomic-agentic --test retention a_hold_let_go_while_a_sweep_reads_the_runs_still_keeps_its_content"
 )
 
 die() {
@@ -105,6 +115,29 @@ die_unedited() {
 # Where a file's original is kept.
 copy_of() {
     echo "${STATE}/$(tr / % <<<"$1")"
+}
+
+# Put a file's saved original back, and make its mtime now. A plain cp already
+# does that, so cargo rebuilds what it built with the control off; the touch
+# keeps that true for a cp that preserves timestamps (cp -p, or an alias).
+put_back() {
+    cp -- "$(copy_of "$1")" "$1" && touch -- "$1"
+}
+
+# git's answer for how a file stands against HEAD: 0 when it matches the
+# commit, 1 when it differs, and anything else when git could not be asked --
+# in a linked worktree whose main checkout's .git is not mounted, for instance.
+# A file git does not track, or one marked assume-unchanged or skip-worktree,
+# counts as differing: git diff would say nothing about it either way.
+head_diff() {
+    local code=0 listed
+    listed="$(git ls-files -v -- "$1")" || return 2
+    case "${listed}" in
+        "H "*) ;;
+        *) return 1 ;;
+    esac
+    git diff --quiet HEAD -- "$1" || code=$?
+    return "${code}"
 }
 
 # The controls to check: all of them, or the one named.
@@ -128,6 +161,28 @@ if [ -e "${STATE}" ]; then
     die "${STATE} is left from a run that did not finish. Its manifest names each file that run edited, with the file's original hash, and the directory holds the originals: compare them with the files (git diff), put them back, then remove ${STATE}."
 fi
 
+# Refuse to start on a file that already differs from HEAD. The run saves what
+# it finds and puts that back, so a file dirty before the start would end the
+# run dirty again and read as a clean restore; and a switch applied to someone
+# else's uncommitted change is not this control. HEAD is the baseline for the
+# whole run, so ask for it before anything is edited.
+dirty=" "
+seen=" "
+for row in "${selected[@]}"; do
+    IFS='|' read -r _ file _ <<<"${row}"
+    case "${seen}" in *" ${file} "*) continue ;; esac
+    code=0
+    head_diff "${file}" || code=$?
+    if [ "${code}" -eq 1 ]; then
+        dirty+="${file} "
+    elif [ "${code}" -ne 0 ]; then
+        die_unedited "cannot compare ${file} with HEAD"
+    fi
+    seen+="${file} "
+done
+[ "${dirty}" = " " ] ||
+    die_unedited "these files differ from HEAD:${dirty% *} (a file git does not track as committed counts). A run edits them and puts back what it found, so it would restore that state and read as a clean restore; commit them or put them back first"
+
 # Save every file the selected controls edit, and check each copy, before
 # editing anything.
 mkdir -p "${STATE}" || die_unedited "cannot create ${STATE}"
@@ -146,9 +201,13 @@ for row in "${selected[@]}"; do
 done
 
 # Put every saved file back and check it. A file that cannot be put back is
-# named, and the originals stay.
+# named, and the originals stay. The saved copies and the manifest are this
+# script's own state, so neither is asked what the source should be: after the
+# hash, git says whether the file matches HEAD, and a restore that leaves it
+# differing is a failure even when it matches the copy. Each file is touched on
+# the way back, so the next cargo run rebuilds it.
 restore() {
-    local bad=0 hash file
+    local bad=0 hash file code
     if [ ! -r "${STATE}/manifest" ]; then
         echo "scripts/controls-check.sh: ${STATE}/manifest cannot be read, so no file can be checked. Compare the files with git and ${STATE} by hand." >&2
         return 1
@@ -158,7 +217,20 @@ restore() {
         if [ "$(git hash-object -- "${file}" 2>/dev/null)" != "${hash}" ]; then
             echo "scripts/controls-check.sh: ${file} IS LEFT MODIFIED: it does not match its original, ${hash}. Put it back by hand; ${STATE} keeps what was saved." >&2
             bad=1
+            continue
         fi
+        code=0
+        head_diff "${file}" || code=$?
+        if [ "${code}" -ne 0 ]; then
+            if [ "${code}" -eq 1 ]; then
+                echo "scripts/controls-check.sh: ${file} IS LEFT DIFFERENT FROM HEAD: it matches the copy made at the start, which was not HEAD. Put it back from HEAD; ${STATE} keeps what was saved." >&2
+            else
+                echo "scripts/controls-check.sh: cannot compare ${file} with HEAD, so it cannot be shown to be back as committed." >&2
+            fi
+            bad=1
+            continue
+        fi
+        touch -- "${file}" 2>/dev/null
     done <"${STATE}/manifest"
     if [ "${bad}" -eq 0 ]; then
         rm -rf "${STATE}"
@@ -252,7 +324,7 @@ for row in "${selected[@]}"; do
     switch_off "${file}" "${text}" "${replacement}" || die "cannot switch ${name} off"
     run_cargo "${args}"
     removed=$?
-    cp -- "$(copy_of "${file}")" "${file}" || die "cannot put ${file} back"
+    put_back "${file}" || die "cannot put ${file} back"
     if grep -q "^error\(\[E[0-9]*\]\)\?: could not compile\|^error: could not compile" "${LOG}"; then
         echo "FAIL ${name}: with the control off the code does not build" >&2
         grep -m5 -E "^error" "${LOG}" >&2
