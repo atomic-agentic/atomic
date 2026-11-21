@@ -338,7 +338,7 @@ in turn:
 | Clippy | `cargo fmt --check`, and clippy with and without the test features |
 | Test (1/3), Test (2/3), Test (3/3) | The workspace's tests, with Postgres and the sandbox, one shard each |
 | Crash suite | `crates/atomic/tests/crash.rs`, the shard `crash` |
-| Acceptance and backends | Builds every test, checks that the shards run each test exactly once, runs the M12 acceptance check, and runs the Postgres and sandbox suites without their backends |
+| Acceptance and backends | Builds every test, checks that the shards run each test exactly once, runs the M12, M35a and M45 acceptance checks, and runs the Postgres and sandbox suites without their backends |
 | Build, lockfile and SBOM | `cargo build`, `scripts/lock-resolves.sh`, `scripts/lock-check.sh v8-built` and `scripts/sbom.sh` |
 | Rust (ubuntu-24.04) | Passes only when every job above passes |
 
