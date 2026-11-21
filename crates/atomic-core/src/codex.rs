@@ -3636,10 +3636,13 @@ mod tests {
                 replaced: vec![netrc.clone()],
             }
         );
+        // As the list was built while the place was a link: what it pointed
+        // at, so that only the place, walked again, can refuse.
+        let built = [std::fs::canonicalize(&kept).expect("real")];
         // Now leading to the root, which holds what the command needs.
         std::fs::remove_file(&netrc).expect("unlink");
         link(Path::new("/"), &netrc);
-        let refused = late_link_targets(only, Some(only), &[dir.join("work")], &[])
+        let refused = late_link_targets(&built, Some(only), &[dir.join("work")], &[])
             .expect_err("refused")
             .to_string();
         assert!(
@@ -3651,7 +3654,7 @@ mod tests {
         std::fs::write(dir.join("work/deep/netrc"), "machine y").expect("netrc");
         std::fs::remove_file(&netrc).expect("unlink");
         link(&dir.join("work/deep/netrc"), &netrc);
-        let refused = late_link_targets(only, Some(only), &[], &[dir.join("work")])
+        let refused = late_link_targets(&built, Some(only), &[], &[dir.join("work")])
             .expect_err("refused")
             .to_string();
         assert!(
