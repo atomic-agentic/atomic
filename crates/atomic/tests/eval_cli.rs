@@ -284,7 +284,8 @@ fn eval_with(dir: &Path, project: &Path, url: &str, args: &[&str], env: &[(&str,
     for (k, v) in env {
         cmd.env(k, v);
     }
-    cmd.output().expect("atomic eval")
+    // Waited for under the same bound as every other command this suite runs.
+    run_and_capture(&mut cmd, "", "atomic eval")
 }
 
 fn text(out: &Output) -> String {

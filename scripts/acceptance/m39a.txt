@@ -79,8 +79,8 @@ pipeline an_interrupted_exec_step_with_no_effects_declaration_parks
 # directory with `--project` and a relative fixture path, and both runs are
 # bound to the same commit of the same fixture, which is then as it was — and,
 # because a comparison of two equal states proves nothing on its own, that test
-# then plants one change of each kind the comparison covers (a ref, a file, an
-# entry in the repository's configuration, an object) and shows it notices each.
+# then plants a ref, a file, an entry in the repository's configuration and an
+# object in the fixture, and shows the comparison notices each in turn.
 # The others run the turn where the project sits: outside any repository, and in
 # a subdirectory of the developer's checkout. The last runs the coding example
 # itself, from two directories outside the project, to completion: its fixture

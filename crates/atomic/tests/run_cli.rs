@@ -5520,10 +5520,10 @@ fn a_coding_run_is_bound_to_its_fixture_and_never_touches_a_checkout() {
         // worktree, changed a file or wrote a loose object.
         assert_eq!(git_state(&project), checkout, "the checkout is as it was");
         assert_eq!(git_state(&fixture), source, "the fixture is as it was");
-        // And that comparison is not vacuous: a change of every kind it
-        // covers shows in it, so the equality above says what it claims. Each
-        // of these plants one thing a run that may only read a fixture must
-        // never leave behind.
+        // And that comparison is not vacuous: a ref, a working-tree file, an
+        // entry in the fixture's own configuration and a loose object each show
+        // in it, so the equality above says what it claims. Each of these is one
+        // thing a run that may only read a fixture must never leave behind.
         git_in(&fixture, &["tag", "decoy-ref"]);
         let with_ref = git_state(&fixture);
         assert_ne!(with_ref, source, "a ref the fixture did not have");
