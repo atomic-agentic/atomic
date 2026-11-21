@@ -301,6 +301,12 @@ jobs:
       - name: Build
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: cargo build --workspace --locked
+      # A compile-fail doctest checks that a test-only method is absent
+      # without its feature, which the test shards' features turn on; it runs
+      # only here, without them.
+      - name: atomic-core doctests without the test features
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: cargo test -p atomic-agentic-core --locked --doc
       # The graph still resolves from scratch onto the libsqlite3-sys Codex
       # locks, which both Codex and the durare fork link.
       - name: Lockfile resolves from scratch

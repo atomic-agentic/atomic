@@ -858,6 +858,15 @@ fn harden() {
     }
 }
 
+/// Harden `atomic runner` as [`dispatch`] hardens atomic: the commands it
+/// runs arrive on its stdin with their environments, and a confined one's
+/// with its proxy token, so no process of the same user may read its memory
+/// or its /proc files. Call it first, before the request is read.
+pub fn harden_runner() {
+    // The runner holds commands' environments, proxy tokens among them.
+    codex_process_hardening::pre_main_hardening();
+}
+
 /// The process entry point.
 ///
 /// The same executable re-runs itself as Codex's helpers (the Linux sandbox,
@@ -1022,11 +1031,18 @@ fn keep_sandbox_off_keyrings() {
             // Inside the sandbox, just before the command runs.
             deny_keyrings()
         } else {
-            leave_session_keyring().and(not_dumpable())
+            leave_session_keyring()
         };
         if let Err(e) = kept_off {
             crate::log_line!(
                 "atomic: cannot keep a sandboxed command off the kernel keyrings: {e}"
+            );
+            std::process::exit(1);
+        }
+        if !inner && let Err(e) = not_dumpable() {
+            crate::log_line!(
+                "atomic: cannot make the sandbox helper, which holds the command's proxy \
+                 token, non-dumpable: {e}"
             );
             std::process::exit(1);
         }
@@ -1060,7 +1076,20 @@ fn not_dumpable() -> std::io::Result<()> {
 Only a build with the `exec-loopback-tests` feature, for the sandbox suites,
 can let a command reach this machine's loopback interface:
 
-```compile_fail
+```compile_fail,E0599
+fn widen(sandbox: atomic_core::codex::ExecSandbox) -> atomic_core::codex::ExecSandbox {
+    sandbox.reaching_loopback_for_tests(vec!["127.0.0.1".into()])
+}
+```
+"#
+)]
+#[cfg_attr(
+    feature = "exec-loopback-tests",
+    doc = r#"
+With the `exec-loopback-tests` feature, for the sandbox suites, a command
+may reach this machine's loopback interface:
+
+```
 fn widen(sandbox: atomic_core::codex::ExecSandbox) -> atomic_core::codex::ExecSandbox {
     sandbox.reaching_loopback_for_tests(vec!["127.0.0.1".into()])
 }

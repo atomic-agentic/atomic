@@ -22,8 +22,9 @@ fail() {
 # control is switched off, `blind` always passes them, `partial` fails only
 # the first a control names, `missing` finds no test for the second, `lose`
 # also deletes the saved originals, `unreadable` makes the manifest
-# unreadable, `kill` kills the script outright, and `hang` waits, with the
-# control off, until it is stopped. It notes its arguments in cargo-args.
+# unreadable, `kill` kills the script outright, `hang` waits, with the
+# control off, until it is stopped, and `spaces` names a failed test as a
+# doctest is named. It notes its arguments in cargo-args.
 mkdir -p "${WORK}/bin"
 cat >"${WORK}/bin/cargo" <<'SH'
 #!/usr/bin/env bash
@@ -78,7 +79,12 @@ for n in "${names[@]}"; do
         [ "${FAKE_CARGO}" = partial ] && [ "${i}" -gt 1 ] && fails=0
     fi
     if [ "${fails}" -eq 1 ]; then
-        echo "test tests::${n} ... FAILED"
+        # `spaces`: the test is named as a doctest is, with spaces in it.
+        if [ "${FAKE_CARGO}" = spaces ]; then
+            echo "test crates/atomic-core/src/codex.rs - ${n} (line 1) - compile fail ... FAILED"
+        else
+            echo "test tests::${n} ... FAILED"
+        fi
         echo "test result: FAILED. 0 passed; 1 failed"
         status=101
         [ "${no_fail_fast}" -eq 1 ] || exit 101
@@ -159,6 +165,14 @@ run missing sandbox-writes
 [ "${code}" -ne 0 ] && grep -q "FAIL sandbox-writes: with the control off, these tests were not seen failing: a_project_under_the_system_temporary_directory_stays_out_of_reach" <<<"${out}" ||
     fail "missing: exit ${code}: ${out}"
 untouched || fail "missing: the source is left modified"
+
+# A failed test whose name has spaces in it, as a doctest's does, is seen
+# failing.
+repo="$(fresh)"
+run spaces exec-network-loopback-feature
+[ "${code}" -eq 0 ] && grep -q "^ok exec-network-loopback-feature" <<<"${out}" ||
+    fail "spaces: exit ${code}: ${out}"
+untouched || fail "spaces: the source is left modified"
 
 # Every test binary runs, so a test after a failing one is seen too.
 repo="$(fresh)"

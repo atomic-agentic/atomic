@@ -336,25 +336,43 @@ json.dump({
 }, sys.stdout)
 "#;
 
-/// The processes whose parent is this one and whose name is `name`'s first
-/// 15 bytes, as the kernel keeps it.
-fn children_named(name: &str) -> Vec<u32> {
-    let me = std::process::id().to_string();
-    let comm = &name[..name.len().min(15)];
-    std::fs::read_dir("/proc")
+/// This process's children that are Codex's sandbox helper (by the name
+/// the kernel keeps, its first 15 bytes) for a command run in `dir`, which
+/// its command line names, with the helper processes they forked, its
+/// bridges among them.
+fn sandbox_helpers_in(dir: &Path) -> Vec<u32> {
+    let comm = "(codex-linux-san";
+    let dir = dir.display().to_string();
+    // pid, parent, name, for every process.
+    let all: Vec<(u32, u32, String)> = std::fs::read_dir("/proc")
         .expect("proc")
         .flatten()
         .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
-        .filter(|pid| {
-            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+        .filter_map(|pid| {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
             // pid (comm) state ppid ...
-            let Some((head, rest)) = stat.rsplit_once(") ") else {
-                return false;
-            };
-            head.ends_with(&format!("({comm}"))
-                && rest.split(' ').nth(1).is_some_and(|ppid| ppid == me)
+            let (head, rest) = stat.rsplit_once(") ")?;
+            let ppid = rest.split(' ').nth(1)?.parse().ok()?;
+            Some((pid, ppid, head.to_owned()))
         })
-        .collect()
+        .collect();
+    let mut found: Vec<u32> = all
+        .iter()
+        .filter(|(pid, ppid, head)| {
+            *ppid == std::process::id()
+                && head.ends_with(comm)
+                && std::fs::read(format!("/proc/{pid}/cmdline"))
+                    .is_ok_and(|c| String::from_utf8_lossy(&c).contains(&dir))
+        })
+        .map(|(pid, _, _)| *pid)
+        .collect();
+    let forked: Vec<u32> = all
+        .iter()
+        .filter(|(_, ppid, head)| found.contains(ppid) && head.ends_with(comm))
+        .map(|(pid, _, _)| *pid)
+        .collect();
+    found.extend(forked);
+    found
 }
 
 /// A confined command's proxy token is its bridge's, never the command's:
@@ -427,7 +445,7 @@ fn a_confined_command_never_holds_its_proxy_token() {
             );
             std::thread::sleep(Duration::from_millis(100));
         }
-        let helpers: Vec<(u32, std::io::Result<Vec<u8>>)> = children_named("codex-linux-sandbox")
+        let helpers: Vec<(u32, std::io::Result<Vec<u8>>)> = sandbox_helpers_in(&scratch)
             .into_iter()
             .map(|pid| (pid, std::fs::read(format!("/proc/{pid}/environ"))))
             .collect();

@@ -230,6 +230,7 @@ fn real_main() -> anyhow::Result<()> {
     // The runner role needs no state directory and no Codex: it runs one
     // command for a control plane and exits with a code from its contract.
     if std::env::args_os().nth(1).is_some_and(|a| a == "runner") {
+        codex::harden_runner();
         std::process::exit(runner());
     }
     let parsed = Cli::try_parse();
@@ -253,6 +254,7 @@ fn real_main() -> anyhow::Result<()> {
         ..
     }) = &parsed
     {
+        codex::harden_runner();
         std::process::exit(atomic_exec::runner::serve_stdio(
             &mut atomic_core::redact::stderr_lines(),
         ));

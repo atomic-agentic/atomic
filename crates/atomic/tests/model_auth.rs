@@ -384,3 +384,46 @@ fn model_commands_load_no_codex_home_from_the_temporary_directory() {
     assert!(out.status.success(), "{t}");
     assert!(!t.contains("planted"), "a planted .env was loaded: {t}");
 }
+
+/// `atomic runner` receives the commands it runs with their environments,
+/// a confined command's proxy token among them, so a process of its own
+/// user cannot read it through /proc either, once it has started.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_runner_cannot_be_read_through_proc_by_its_own_user() {
+    let mut runner = std::process::Command::new(env!("CARGO_BIN_EXE_atomic"))
+        .arg("runner")
+        .env("ATOMIC_TEST_CANARY", "canary-in-the-runners-environment")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("atomic runner");
+    // It waits for its request on stdin; once its prologue has run, its
+    // environment is closed to this process.
+    let environ = format!("/proc/{}/environ", runner.id());
+    let started = std::time::Instant::now();
+    let read = loop {
+        match std::fs::read(&environ) {
+            Ok(_) if started.elapsed() < std::time::Duration::from_secs(10) => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            other => break other,
+        }
+    };
+    let _ = runner.kill();
+    let _ = runner.wait();
+    assert!(std::fs::read("/proc/self/environ").is_ok());
+    match read {
+        Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}"),
+        Ok(env) => panic!(
+            "read the runner's environment through /proc ({} bytes, the canary {})",
+            env.len(),
+            if String::from_utf8_lossy(&env).contains("canary-in-the-runners-environment") {
+                "in it"
+            } else {
+                "not in it"
+            }
+        ),
+    }
+}

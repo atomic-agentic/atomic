@@ -24,13 +24,17 @@
 //! the same hosts. The sandbox helper's bridge opens each connection with a
 //! token atomic made for its command alone (Codex's attribution frame), and
 //! the proxy refuses every request on a connection without a token it issued,
-//! so no other process on this machine reaches anything through it. The
-//! token is in no environment but that of the sandbox helper's outer stage
-//! and its bridges, outside the sandbox, which atomic makes non-dumpable: a
-//! process of the same user can neither read their environment through
-//! /proc nor attach to them, and only one with `CAP_SYS_PTRACE`, such as
-//! root's, can. A command's token admits no new connection once the command
-//! ends, and the proxy stops once no command needs it.
+//! so no sandboxed process and no other user's process reaches anything
+//! through it. A process of the same user outside any sandbox is not kept
+//! out: it can enter the command's namespaces through /proc and use the
+//! bridge, which adds the token itself. Non-dumpable helpers only narrow who
+//! can read the token: the sandbox helper's outer stage and its bridges, and
+//! `atomic runner`, are non-dumpable once atomic's prologue has run, so only
+//! a process with `CAP_SYS_PTRACE` over their user namespace can read their
+//! environment; in the few milliseconds between the helper's exec and that
+//! prologue, a process of the same user can read it too. A command's token
+//! admits no new connection once the command ends, and the proxy stops once
+//! no command needs it.
 
 use codex_network_proxy::{
     NetworkDecision, NetworkPolicyDecider, NetworkPolicyDeciderFuture, NetworkPolicyRequest,
