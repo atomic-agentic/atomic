@@ -5398,19 +5398,21 @@ fn a_run_with_no_minutes_left_parks_before_the_next_command() {
         let model = FakeModel::start(Vec::new()).await.expect("fake model");
         let rt = engine(&dir, &model.base_url()).await;
         assert_eq!(rt.recover().await.expect("recover"), 1, "the parked run");
-        rt.ledger()
-            .raise(
-                "run:naps-3",
-                Caps {
+        // An operator raises the run's minutes and releases the park.
+        release_raising(
+            &rt,
+            &park,
+            Some(atomic_durable::release::Raise {
+                scope: "run:naps-3".into(),
+                caps: Caps {
                     tokens: 0,
                     millis: 600_000,
                     micro_usd: None,
                 },
-            )
-            .await
-            .expect("raise")
-            .expect("exists");
-        atomic_durable::release(&rt, &park).await.expect("release");
+            }),
+        )
+        .await
+        .expect("release");
         let out: Value = rt.result("naps-3").await.expect("finishes");
         assert_eq!(out["slept"].as_f64(), Some(0.0), "{out}");
         let ran = commands(&rt, "naps-3").await;
