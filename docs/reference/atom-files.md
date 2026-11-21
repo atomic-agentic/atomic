@@ -55,7 +55,7 @@ state (every project's database and gate store under the atomic home's
 directories) and the places in your home directory where credentials are
 kept, the same ones a Codex atom's commands cannot read (see
 [configuration](#configuration)). It can write only its own scratch directory (its `HOME`
-and `TMPDIR`) and the project's build caches; a command that writes anywhere
+and `TMPDIR`) and, in a workflow, its run's own build caches; a command that writes anywhere
 else fails. It has no network and cannot use sockets unless the atom declares
 the hosts it reaches (see [Network access](#network-access)). It also:
 
@@ -63,8 +63,14 @@ the hosts it reaches (see [Network access](#network-access)). It also:
   sandbox keeps them in every writable directory;
 - cannot gain privileges (no `sudo`, no setuid programs) and sees no GPU or
   other devices beyond the basic ones;
-- is not told where the caches are: name the directory in `env` if a tool needs
-  it;
+- finds its run's build caches through `ATOMIC_CACHE_DIR`, `XDG_CACHE_HOME`,
+  `CARGO_TARGET_DIR`, npm's, pip's and Go's cache variables, and your rustup
+  toolchains, read-only, through `RUSTUP_HOME`, as a worktree step does. The
+  caches are the run's own, shared by its steps except for `CARGO_TARGET_DIR`,
+  which is the step's own, and removed when the run ends. No other run's
+  command may write them, though one can still read them by their path while
+  they last, so keep nothing secret there. A variable the atom declares in
+  `env` wins. An eval gives the command no caches;
 - cannot be a program whose path holds `=`.
 
 `env` cannot set `HOME` or `TMPDIR`, which are the command's own, nor
@@ -193,7 +199,16 @@ another private suffix, a bare `*`, and anything with a scheme, a port, a path
 or a Unix socket are refused. That list of private names is a courtesy. The
 control is the proxy, which resolves each listed name before it connects and
 refuses one that resolves to an address on this machine or a private network,
-or that does not resolve.
+or that does not resolve. Every address the interfaces of atomic's network
+namespace have counts as this machine's, public ones included; a container's
+or a virtual machine's addresses on another namespace are refused only when
+they are private. Three IPv6 prefixes that carry an IPv4 address inside them
+are refused too, whatever IPv4 address they carry: NAT64's `64:ff9b::/32`
+(which holds the well-known `64:ff9b::/96` and the local-use
+`64:ff9b:1::/48`), 6to4's `2002::/16` and Teredo's `2001:0::/32`. On an
+IPv6-only network that reaches IPv4 through DNS64, a listed host with only
+an IPv4 address therefore cannot be reached: its request fails when the
+proxy dials, with all resolved addresses blocked.
 
 Know what a listed host can get:
 
