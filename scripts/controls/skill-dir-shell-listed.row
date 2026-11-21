@@ -1,0 +1,1 @@
+skill-dir-shell-listed|crates/atomic/src/setup.rs|                    if empty && lists_under(manifest, &relative) {|                    if empty {|-p atomic-agentic --bin atomic -- an_empty_directory_no_record_accounts_for_is_refused_and_kept
