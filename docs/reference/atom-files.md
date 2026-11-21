@@ -560,7 +560,7 @@ protect against a process running as you.
 
 ## Related references
 
-- [Prompt components and expressions](../guides/template-tags.md)
+- [Prompt expressions and components](../guides/template-tags.md)
 - [VS Code](../guides/vs-code.md)
 - [Workflow files](workflow-files.md)
 - [Scripts and cloud SDKs](../guides/scripts-and-cloud-sdks.md)
