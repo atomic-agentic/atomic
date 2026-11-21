@@ -1064,10 +1064,14 @@ fn assigned(input: &str) -> Option<String> {
         };
         // What the operating system said of the path before it, as Rust
         // writes it, `Permission denied (os error 13)`: no secret, whatever
-        // the path's last name is. Only a bare value: a quoted one runs to
-        // its closing quote, and whatever follows the error in it is the
-        // value's.
-        let bare = value_from == start;
+        // the path's last name is. Only a bare value set off by a blank, as
+        // `path: Permission denied` is: a quoted one runs to its closing
+        // quote, and whatever follows the error in it is the value's; and
+        // one written hard against its name, `passwd:Permission denied …`,
+        // or inside `Some(`, is no error message's shape. The byte after the
+        // separator is tested itself, since `value_start` skips `Some(` too.
+        let set_off = bytes.get(sep + sep_len).is_some_and(is_blank);
+        let bare = value_from == start && set_off;
         if bare && is_os_error(&input[value_from..]) {
             at = at.max(value_to);
             continue;
@@ -1124,6 +1128,11 @@ const OS_ERRORS: &[&str] = &[
     "Resource temporarily unavailable",
     "Connection refused",
 ];
+
+/// Whether `byte` is a space or a tab.
+fn is_blank(byte: &u8) -> bool {
+    matches!(byte, b' ' | b'\t')
+}
 
 /// Whether `text` starts with one of [`OS_ERRORS`] and its ` (os error N)`.
 fn is_os_error(text: &str) -> bool {

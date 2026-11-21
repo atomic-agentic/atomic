@@ -2253,6 +2253,19 @@ fn planted_secrets_after_a_secret_name_stay_hidden_beside_os_errors() {
                 }
             }
         }
+        // A header's value that leads with a secret's name and an operating
+        // system's error, hard against the name: a credential, not an error.
+        for _ in 0..8 {
+            let secret = planted.secret();
+            let mut header = serde_json::json!({
+                "Authorization": format!("{name}:Permission denied (os error 13) {secret}")
+            });
+            value(&mut header);
+            if header.to_string().contains(&secret) {
+                shown.push(n);
+            }
+            n += 1;
+        }
     }
     assert!(
         shown.is_empty(),
