@@ -153,9 +153,9 @@ directory the system records for your user, and wherever the variables that
 move them, such as `XDG_CONFIG_HOME`, `GNUPGHOME`, `CARGO_HOME` or
 `KUBECONFIG`, put them); AWS's workload token files (the files
 `AWS_WEB_IDENTITY_TOKEN_FILE` and `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE`
-name, with the whole volume when such a file is in a Kubernetes projected
-volume, so a rotated token stays denied, and EKS's usual token directories
-under `/var/run/secrets`); and what a link among them points at, up to four
+name, with the whole volume when such a file, or what a link to it leads
+to, is in a Kubernetes projected volume, so a rotated token stays denied,
+and EKS's usual token directories under `/var/run/secrets`); and what a link among them points at, up to four
 directory levels inside a denied directory (except a device, anything under
 the system's program, library and device directories, and, for a link found
 inside a credential place, a program or a directory someone else owns);

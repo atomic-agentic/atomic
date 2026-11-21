@@ -992,6 +992,75 @@ fn a_secret_the_system_keeps_or_a_pipe_stays_denied_and_the_persons_programs_run
     });
 }
 
+/// Credential places named through a directory that is an absolute link, as
+/// `/var/run` links to `/run`, stay denied under both spellings, and every
+/// command still starts: a projected volume reached by a link to its token's
+/// link, the version it rotates in next, an item nested in one of its
+/// directories, and a moved key directory.
+#[test]
+fn credentials_behind_an_absolutely_linked_directory_stay_denied() {
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let dir = std::env::temp_dir().join(format!("atomic-aws-linked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let (real, linked) = (dir.join("real"), dir.join("linked"));
+        std::fs::create_dir_all(real.join("gnupg")).unwrap();
+        std::fs::write(real.join("gnupg/key"), "canary-gnupg\n").unwrap();
+        std::os::unix::fs::symlink(&real, &linked).unwrap();
+        let now = "..2026_01_01_00_00_00.1";
+        let next = "..2026_01_01_01_00_00.2";
+        for volume in ["sa", "nested"] {
+            for version in [now, next] {
+                let at = real.join(volume).join(version);
+                std::fs::create_dir_all(at.join("aws")).unwrap();
+                std::fs::write(at.join("token"), format!("canary-{volume}{version}\n")).unwrap();
+                std::fs::write(at.join("aws/token"), format!("canary-{volume}-aws\n")).unwrap();
+            }
+            std::os::unix::fs::symlink(now, real.join(volume).join("..data")).unwrap();
+            std::os::unix::fs::symlink("..data/token", real.join(volume).join("token")).unwrap();
+            std::os::unix::fs::symlink("..data/aws", real.join(volume).join("aws")).unwrap();
+        }
+        std::fs::create_dir_all(dir.join("etc")).unwrap();
+        std::os::unix::fs::symlink(linked.join("sa/token"), dir.join("etc/token")).unwrap();
+        let mut reads = vec![dir.join("etc/token")];
+        for root in [&real, &linked] {
+            reads.push(root.join("gnupg/key"));
+            for volume in ["sa", "nested"] {
+                for item in ["token", "aws/token"] {
+                    reads.push(root.join(volume).join(item));
+                    for version in [now, next] {
+                        reads.push(root.join(volume).join(version).join(item));
+                    }
+                }
+            }
+        }
+        let reads: Vec<String> = reads.iter().map(|p| p.display().to_string()).collect();
+        let command = format!("cat {} 2>/dev/null; echo looked", reads.join(" "));
+        let gnupg = linked.join("gnupg").display().to_string();
+        let web = dir.join("etc/token").display().to_string();
+        let nested = linked.join("nested/aws/token").display().to_string();
+        let printed = look_once(
+            &dir,
+            &home,
+            &command,
+            &[
+                ("GNUPGHOME", gnupg.as_str()),
+                ("AWS_WEB_IDENTITY_TOKEN_FILE", web.as_str()),
+                ("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE", nested.as_str()),
+            ],
+        )
+        .await;
+        assert!(printed.contains("looked"), "the command ran: {printed}");
+        assert!(
+            !printed.contains("canary"),
+            "a credential was read: {printed}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
 /// AWS's workload token files stay denied to a turn's commands, whether a
 /// variable in atomic's environment names an ordinary file or a token in a
 /// projected volume, as Kubernetes mounts one: the token there now, the
