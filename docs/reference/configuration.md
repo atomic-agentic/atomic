@@ -7,7 +7,7 @@ configuration when you need to change a decision, and read back what you got:
 atomic config --explain
 ```
 
-Everything here is marked **built** or **planned**.
+Everything below is built unless it says otherwise.
 [Availability](availability.md) is the summary for the whole product.
 
 ## Reading what resolved
@@ -46,7 +46,7 @@ setting by setting.
 | 2 | Your own configuration: `$XDG_CONFIG_HOME/atomic/config.yaml`, by default `~/.config/atomic/config.yaml` | you, on this machine | yes |
 | 3 | `atomic.yaml` | the project, committed | yes |
 | 4 | `atomic.local.yaml`, personal and not committed | whoever holds the checkout | yes |
-| 5 | `atomic.<profile>.yaml`, when a profile is selected | you | the file is read; **nothing selects a profile yet** |
+| 5 | `atomic.<profile>.yaml`, when a profile is named | the project | the loader supports it; **nothing selects a profile yet** |
 | 6 | `ATOMIC_*` environment variables | whoever runs the command | yes |
 | 7 | Command-line flags | whoever runs the command | yes |
 
@@ -104,7 +104,8 @@ A model endpoint set in a file, a variable or a flag turns detection off, and so
 does a ChatGPT sign-in (`atomic model login`): a configured endpoint comes first,
 then the sign-in, for Codex atoms, then detection. A sign-in is personal, so
 atomic declines to use it where the store is shared or under `atomic serve`,
-rather than quietly falling back to something else.
+rather than quietly falling back to something else, and a sign-in works on
+Linux only.
 
 When the endpoint was detected, or set by a project's files rather than by
 whoever runs it, `atomic run`, `atomic runs resume` and `atomic serve` say where
@@ -112,8 +113,9 @@ model calls go, in one line on stderr.
 
 ## The settings a command resolves
 
-These are what `atomic run`, `atomic runs resume`, `atomic serve`, `atomic gates`,
-`atomic runs show` and `atomic check` resolve:
+These are what `atomic run`, `atomic runs resume`, `atomic serve`, `atomic
+gates`, `atomic runs show`, `atomic check`, `atomic eval` and `atomic config`
+resolve:
 
 | Setting | Variable | Flag |
 | --- | --- | --- |
@@ -153,9 +155,10 @@ them. That decides *which value* atomic uses, and nothing else.
 
 Some settings send something of yours wherever they point, or move your records.
 They come only from your own configuration, an `ATOMIC_*` variable or a flag. A
-project's file that sets one is refused: `atomic.yaml`, and `atomic.local.yaml`
-whether git tracks it or not, since either can arrive with a project.
-`atomic.local.yaml` keeps every other override.
+project's file that sets one is refused, unless your own variable or flag
+overrides it: `atomic.yaml`, and `atomic.local.yaml` whether git tracks it or
+not, since either can arrive with a project. `atomic.local.yaml` keeps every
+other override.
 
 - `model.api_key_env` names the variable whose value is sent to the endpoint as
   its key. Its value must be a variable's name, never the key itself.
@@ -175,15 +178,17 @@ Planned. Nothing today limits what a layer may *ask for*: no policy file and no
 managed configuration narrows the choice a layer can express. The committed
 `atomic.policy.lock` is planned for v1.0, as [availability](availability.md)
 records it. Two things are true today and do not depend on it: detection grants
-nothing, and the settings above simply cannot come from a project.
+nothing, and the settings above cannot come from a project.
 
 ## Models: one endpoint today
 
 Built is one model endpoint per command: an OpenAI-compatible API at
-`model.base_url`, serving the model named by `model.name`, keyed by the variable
-named by `model.api_key_env`. A Codex atom can instead run on your ChatGPT
-sign-in. A local server such as Ollama, llama.cpp, vLLM or Lemonade is reached
-the same way, by its URL, and the model is named as that endpoint spells it:
+`model.base_url`, serving the model named by `model.name`, unless an atom's own
+`model` names another, keyed by the variable named by `model.api_key_env`. That
+model value is sent to the endpoint as written; a tier name is not mapped yet. A
+Codex atom can instead run on your ChatGPT sign-in, which works on Linux only.
+A local server such as Ollama, llama.cpp, vLLM or Lemonade is reached the same
+way, by its URL, and the model is named as that endpoint spells it:
 
 ```yaml
 model:
@@ -194,9 +199,10 @@ model:
 Planned is naming a **tier** instead of a model, and mapping tiers to models per
 project: `basic`, `fast`, `advanced` and `frontier`, from least to most capable,
 as [models](../models.md) describes. The names are settled and appear in the
-authoring guidance, but no routing is built: atomic sends the one model name it
-resolved, and the manifest's `models` key is refused by name as not supported
-yet. The full mapping arrives with broader model routing at v0.7.
+authoring guidance, but no routing is built: atomic sends whichever model name
+it resolved for the atom, the endpoint's or the atom's own, as written, and the
+manifest's `models` key is refused by name as not supported yet. The full
+mapping arrives with broader model routing at v0.7.
 
 ## Storage
 
@@ -216,8 +222,8 @@ are planned with the manifest's `datasources` key at v0.7.
 ## Where settings live
 
 Settings share the project's manifest, `atomic.yaml`, or `.atomic/atomic.yaml`
-for an embedded project. The manifest's own keys — `atomic`, `name`,
-`collections`, `ignore`, `generated` and `workspace` — are not settings; the
+for an embedded project. The manifest's own keys (`atomic`, `name`,
+`collections`, `ignore`, `generated` and `workspace`) are not settings; the
 configuration carries them through for the project loader. A key that shares the
 file and is not supported yet, `models` or `packages` among them, is refused by
 name rather than ignored. See [the manifest](manifest.md).
@@ -244,7 +250,7 @@ Conventions that need no configuration:
 
 | Choice | Default |
 | --- | --- |
-| Model access | one endpoint, or your ChatGPT sign-in for Codex atoms; a lite atom says so when there is no endpoint |
+| Model access | one endpoint, or your ChatGPT sign-in for Codex atoms on Linux; a lite atom says so when there is no endpoint |
 | Storage | SQLite in the project's state directory, no PostgreSQL to configure |
 | An atom's sandbox and network | read-only, and no network, unless the atom declares more |
 | Generated editor types | the project's `.atomic/types`, which is not runtime state |
@@ -265,6 +271,7 @@ process environment does.
 | `ATOMIC_CREDENTIAL_STORE` | `file`, to keep credentials in your own atomic directory; the OS keyring is the default, and `keyring` says so |
 | `ATOMIC_DETECT_OLLAMA_ADDR` | the loopback address to probe for Ollama |
 | `ATOMIC_EXEC_MAX_FILE_BYTES`, `ATOMIC_EXEC_MAX_STEP_BYTES` | how much an exec atom's command may hand over by reference: 1 GiB a file and 4 GiB a step by default, in bytes; see [large results go by reference](atom-files.md#large-results-go-by-reference) |
+| `ATOMIC_DENO` | the Deno that runs the Astro compiler, instead of the `deno` found on `PATH` |
 
 ## Keep credentials out of definitions
 

@@ -21,11 +21,11 @@ frontmatter, contracts, helpers and the resource limits.
 | `<slot name="policy">fallback</slot>` | one named part of a layout, with fallback content | yes |
 | `<rubric>…</rubric>` | a literal prompt section | yes |
 | a frontmatter `const` local | bind a supported expression, evaluated when the component renders | yes |
-| `config.examples` | named examples, each checked against the complete contracts | yes |
-| `config.validate` | interpreted typed validators over `{input, output, case}` | yes |
+| `config.examples` | named examples, checked against the complete contracts and appended to every prompt | yes |
+| `config.validate` | interpreted typed validators over `{input, output}`; `case` is typed, but a run never supplies it | yes |
 | `context.config`, `context.env` | read verified public host context | in the compiler and `atomic render`; see [Public context](#public-context) |
 | a ` ```mermaid ` fence in the body | a diagram, read as literal text | yes |
-| Markdown and MDX atoms | — | removed; `.atom.md` and `.atom.mdx` are refused by name |
+| Markdown and MDX atoms | a Markdown or MDX prompt body | removed; `.atom.md` and `.atom.mdx` are refused by name |
 
 ## Start from generated types
 
@@ -117,11 +117,13 @@ parameter language. A component used without being imported is an error.
 ## Sections and grouping
 
 Lowercase section tags such as `<criteria>` and `<rubric>` organize the prompt;
-the model reads them as prompt structure, and they must be balanced. A literal
-section takes no attributes. `<Fragment>` groups content without adding a
-section, and takes only a `slot` attribute. The `<data-…>` prefix is reserved
-for atomic's own value wrappers, and `<data-…>`, `<script>` and `<style>` are
-rejected wherever you write them.
+the model reads them as prompt structure. Nothing checks that they balance: the
+parser closes a section you left open and ignores a closing tag that opens
+nothing, and the load fails only on what the parser reports as an error, so a
+mismatch is repaired rather than refused. A literal section takes no attributes.
+`<Fragment>` groups content without adding a section, and takes only a `slot`
+attribute. The `<data-…>` prefix is reserved for atomic's own value wrappers,
+and `<data-…>`, `<script>` and `<style>` are rejected wherever you write them.
 
 ## Data and prompt text
 
@@ -166,16 +168,20 @@ AST and interpreted; they must return booleans, and a rejection quotes the rule
 that failed into the repair turn. Quoted CEL validators are rejected. CEL stays
 the language of YAML workflow mappings, gate titles and eval assertions.
 
-`config.examples` declares and checks examples; nothing sends them to a model.
-Few-shot prompting from them is not built.
+Examples are prompt content as well as check fixtures. Every render appends each
+declared example after the atom's own content: `Example "clean"`, then its
+`input` and its `output`, bound in the user turn as team-origin data, the way
+every interpolated value is. An example is therefore shown to the model, so it
+must hold nothing the model should not see, and nothing keeps examples out of
+the prompt.
 
 ## Public context
 
-`context.profile`, `context.config`, `context.env`, `context.run` and
-`context.step` are built in the compiler and in the types, and `atomic render
---context-settings` renders with them, checkpointing a context under a
-`--run-id` and restoring it later. A validator may read `context` too. See
-[context schemas](../reference/atom-files.md#context-schemas).
+`context.profile`, `context.config`, `context.env`, `context.project`,
+`context.run` and `context.step` are built in the compiler and in the types, and
+`atomic render --context-settings` renders with them, checkpointing a context
+under a `--run-id` and restoring it later. A validator may read `context` too.
+See [context schemas](../reference/atom-files.md#context-schemas).
 
 Nothing hands a running workflow its context settings yet. `atomic run` and
 `atomic serve` pass none, so a step whose atom declares a context is refused
@@ -193,8 +199,8 @@ before a model call, and changing an extension does not bypass that.
 
 ## Related
 
-- [Atom files](../reference/atom-files.md) — frontmatter, contracts, TypeScript
-  helpers, resource limits
+- [Atom files](../reference/atom-files.md) for frontmatter, contracts,
+  TypeScript helpers and resource limits
 - [How Atomic runs and confines atom code](atom-code-runtime.md)
 - [Test and improve an atom](testing-and-evals.md)
 - [VS Code](vs-code.md)
