@@ -1364,8 +1364,17 @@ pub fn is_helper(mut args: impl Iterator<Item = std::ffi::OsString>) -> bool {
 /// A helper never returns; anything else is an error, and nothing was
 /// touched.
 pub fn run_helper() -> anyhow::Result<()> {
+    // The outer stage, started as atomic itself or by the helper's bare
+    // name, as Codex starts it when it could not link atomic under that
+    // name, runs again under one that is a path: a bubblewrap without
+    // `--argv0` runs the inner stage by the outer stage's own name, and a
+    // bare one it would look for along PATH. The inner stage is left as it
+    // is, already past bubblewrap.
     #[cfg(target_os = "linux")]
-    if !invoked_as_linux_sandbox() && linux_sandbox_args() {
+    if linux_sandbox_args()
+        && !is_inner_stage(std::env::args_os())
+        && (!invoked_as_linux_sandbox() || started_by_bare_name())
+    {
         return Err(run_as_linux_sandbox());
     }
     // A helper of another system's, which Codex's dispatch here would not
@@ -2136,6 +2145,15 @@ fn scrub(mut remove: impl FnMut(&str)) {
 /// command of its own. No command line of atomic's own starts with it.
 #[cfg(target_os = "linux")]
 const LINUX_SANDBOX_ARG1: &str = "--sandbox-policy-cwd";
+
+/// Whether this process was started under a name with no `/` in it, which
+/// a program it runs by that name would be looked for along PATH.
+/// `scripts/controls/sandbox-helper-bare-name.row` switches this off.
+#[cfg(target_os = "linux")]
+fn started_by_bare_name() -> bool {
+    let argv0 = std::env::args_os().next().unwrap_or_default();
+    !argv0.as_encoded_bytes().contains(&b'/')
+}
 
 /// Whether this process was given the Linux sandbox helper's arguments,
 /// under a name that is not one of Codex's other helpers'.

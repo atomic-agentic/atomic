@@ -1,0 +1,1 @@
+sandbox-helper-bare-name|crates/atomic-core/src/codex.rs|    !argv0.as_encoded_bytes().contains(&b'/')|    argv0.is_empty()|--workspace --features atomic-agentic/postgres-tests,atomic-agentic/sandbox-tests --test turn_workspace a_turns_helper_started_by_its_bare_name_is_never_found_along_path

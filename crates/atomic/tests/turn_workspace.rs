@@ -655,3 +655,104 @@ fn a_tmp_codex_that_comes_and_goes_does_not_break_a_turn() {
         "/tmp/.codex came and went during the turn"
     );
 }
+
+/// Set in the process [`a_turns_helper_started_by_its_bare_name_is_never_found_along_path`]
+/// starts again, to its directory: that process runs the turn.
+const BARE_HELPER_IN: &str = "ATOMIC_TEST_BARE_HELPER_IN";
+
+/// When Codex's links to atomic are missing, it starts its Linux sandbox
+/// helper for a turn's command as atomic itself under the helper's bare
+/// name, and a bubblewrap without `--argv0` runs the inner stage by that
+/// name: a program a command put on `PATH` under it is never run in the
+/// inner stage's place. The turn runs in a process of its own, whose `PATH`
+/// leads to such a bubblewrap and to the planted program.
+#[test]
+fn a_turns_helper_started_by_its_bare_name_is_never_found_along_path() {
+    use std::os::unix::fs::PermissionsExt;
+    // The turn's own process, whose PATH leads to the old bubblewrap.
+    if let Some(dir) = std::env::var_os(BARE_HELPER_IN) {
+        return turn_with_a_bare_helper(Path::new(&dir));
+    }
+    support::require_sandbox();
+    let dir = scratch("bare-helper");
+    let script = |path: &Path, text: &str| {
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        std::fs::write(path, text).expect("script");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    };
+    // A bubblewrap from before `--argv0`: it runs what follows `--` as it is
+    // named, looking a bare name up along PATH.
+    script(
+        &dir.join("old-bwrap/bwrap"),
+        "#!/bin/sh\n\
+         case \"$1\" in --help) echo 'usage: bwrap --as-pid-1 --perms --ro-bind-fd'; exit 0;; esac\n\
+         while [ \"$#\" -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n\
+         shift\n\
+         if command -v \"$1\" >/dev/null 2>&1; then exec \"$@\"; fi\n\
+         echo \"bwrap: execvp $1: Not a directory\" >&2\n\
+         exit 1\n",
+    );
+    let ran = dir.join("planted-ran");
+    script(
+        &dir.join("planted/codex-linux-sandbox"),
+        &format!("#!/bin/sh\ntouch '{}'\n", ran.display()),
+    );
+    let path = format!(
+        "{}:{}:{}",
+        dir.join("old-bwrap").display(),
+        dir.join("planted").display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = std::process::Command::new(std::env::current_exe().expect("this test"))
+        .args([
+            "--exact",
+            "a_turns_helper_started_by_its_bare_name_is_never_found_along_path",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(BARE_HELPER_IN, &dir)
+        .env("PATH", path)
+        .output()
+        .expect("the turn's process");
+    assert!(
+        out.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !ran.exists(),
+        "the planted program ran in the inner stage's place:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A `workspace-write` turn in `dir` running one command, with atomic itself
+/// as Codex's Linux sandbox helper, as when Codex could not link it under
+/// the helper's name: Codex then starts it by that bare name.
+fn turn_with_a_bare_helper(dir: &Path) {
+    let dir = dir.to_owned();
+    on_codex_runtime(async move {
+        let backend = Backend::connect(LocalBackend::in_dir(shared_scratch())).expect("connects");
+        let model = FakeModel::start(vec![tool("echo looked"), Reply::Text("Done.".into())])
+            .await
+            .expect("fake model");
+        let mut rt = runtime(&dir, &model);
+        rt.paths = CodexPaths::with_helpers(
+            PathBuf::from(env!("CARGO_BIN_EXE_atomic")),
+            PathBuf::from(env!("CARGO_BIN_EXE_atomic")),
+        );
+        // The command may fail where the helper cannot be found; the turn
+        // ends either way.
+        let _ = run_turn(
+            &rt,
+            &backend,
+            &TurnSpec {
+                prompt: "Do the work.".into(),
+                sandbox: Sandbox::WorkspaceWrite,
+                ..TurnSpec::default()
+            },
+        )
+        .await;
+    });
+}
