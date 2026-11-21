@@ -20,6 +20,11 @@
 //!   nothing to take times out;
 //! - a control transaction outside any workflow commits its writes, or
 //!   nothing.
+//!
+//! Two of these take [`Durare`] itself rather than the trait, since they
+//! resume a run after its panic through Durare's own resume:
+//! `a_step_runs_once_and_is_replayed_after_a_crash` and
+//! `a_message_is_received_once_and_replayed_after_a_crash`.
 
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};

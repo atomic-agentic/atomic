@@ -271,9 +271,14 @@ ignores the stop signals a command in its group might send it.
 
 One process recovers a run at most five times at the same step before it fails
 it as dead-lettered (a run that gets further counts afresh), so a step whose process keeps dying stops soon; restarting
-`atomic serve` does not count against a run. A run the engine parks after many
-restarts (`MAX_RECOVERY_ATTEMPTS_EXCEEDED`) is named by `atomic serve` and goes
-on with `atomic runs resume`.
+`atomic serve` does not count against a run. The engine parks a run
+(`MAX_RECOVERY_ATTEMPTS_EXCEEDED`) when it stops without finishing more times than
+the engine allows, and at once when atomic's own workflow code panics: a panic is
+a bug in atomic, and would likely happen again. `atomic run`, `atomic runs resume`
+and `atomic serve` (when it happens while serving, and when it starts) name the
+cause, with the panic's message redacted; the message is kept in the project's
+private state. A parked run goes on with `atomic runs resume`, once the cause is
+fixed.
 
 A resumed run goes on a queue of the resuming executor's own: only
 `atomic runs resume` and `atomic serve` of that executor run it, and

@@ -348,6 +348,7 @@ fn command_as(
         "DBOS__VMID",
         "DBOS__APPVERSION",
         "ATOMIC_FAILPOINT",
+        "ATOMIC_FAILPOINT_PANIC",
         "ATOMIC_MODEL_BASE_URL",
         "ATOMIC_MODEL",
         "ATOMIC_MODEL_API_KEY_ENV",
@@ -4998,6 +4999,182 @@ fn help_and_the_version_create_nothing_even_from_a_deleted_directory() {
     assert!(out.status.success(), "{}", text(&out));
     assert!(out.stderr.is_empty(), "no warnings: {}", text(&out));
     assert!(!dir.join("atomic-home").exists(), "nothing was created");
+}
+
+/// A panic in atomic's own workflow code (made at a step's failpoint, for
+/// the test) is named as the cause, with its message, by `atomic run`,
+/// `atomic runs resume` and `atomic serve`, and kept in the project's
+/// private state; the resume hint says the panic will likely happen again.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[test]
+fn a_run_whose_workflow_code_panics_is_reported_as_a_panic() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
+    on_codex_runtime(a_run_whose_workflow_code_panics());
+}
+
+async fn a_run_whose_workflow_code_panics() {
+    let dir = scratch("panicked");
+    let project = project(&dir);
+    // An exec atom only: the endpoint is never called, but resuming and
+    // serving need one configured.
+    let panic = [
+        ("ATOMIC_FAILPOINT_PANIC", "pipeline:after:count"),
+        ("ATOMIC_MODEL_BASE_URL", "http://127.0.0.1:9/v1"),
+        ("ATOMIC_MODEL", "synthetic"),
+    ];
+    let said = |out: &Output| {
+        let t = text(out);
+        assert!(!out.status.success(), "{t}");
+        assert!(t.contains("atomic's own workflow code panicked"), "{t}");
+        assert!(
+            t.contains("failpoint pipeline:after:count"),
+            "the panic's message: {t}"
+        );
+        assert!(t.contains("will likely happen again"), "{t}");
+        assert!(!t.contains("more times than the engine allows"), "{t}");
+        assert!(t.contains("so the run is parked, not retried"), "{t}");
+        t
+    };
+    let out = atomic(
+        &dir,
+        &project,
+        &["run", "count-only", "--run-id", "panicky", "--data", NOTE],
+        &panic,
+        "",
+    );
+    said(&out);
+    // Parked by the engine before `atomic run` stopped, not left pending for
+    // a server to run again.
+    let state = state_dir(&dir, &project);
+    {
+        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        assert_eq!(
+            rt.status("panicky").await.expect("status"),
+            Some(RunStatus::Other("MAX_RECOVERY_ATTEMPTS_EXCEEDED".into()))
+        );
+    }
+    assert_eq!(count_log(&dir).len(), 1, "the count ran once");
+    // Kept where a later process, or the run's inspection, finds it.
+    let private = state
+        .parent()
+        .and_then(Path::parent)
+        .expect("the atomic home")
+        .join("private")
+        .join(state.file_name().expect("the project's id"));
+    let kept = atomic_app::panics::kept(&private.join("panics"), "panicky").expect("kept");
+    assert!(kept.contains("failpoint pipeline:after:count"), "{kept}");
+
+    // Resumed as it is, it panics again, and says so before and after.
+    let out = atomic(&dir, &project, &["runs", "resume", "panicky"], &panic, "");
+    let t = said(&out);
+    assert!(
+        t.contains("was parked because atomic's own workflow code panicked"),
+        "{t}"
+    );
+
+    // A server started later names it, from what was kept.
+    let log = dir.join("serve.log");
+    let mut serve = spawn(&dir, &project, &["serve"], &panic, &log);
+    wait_until("serve to name the panicked run", || {
+        std::fs::read_to_string(&log).is_ok_and(|l| {
+            l.contains("serving until stopped")
+                && l.contains("run panicky stopped: atomic's own workflow code panicked")
+        })
+    });
+    terminate(&serve);
+    let _ = wait_child(&mut serve, "serve");
+    // The server recovered nothing: the run was parked, not left pending.
+    let served = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        served.contains("recovered 0 unfinished run(s)"),
+        "serve recovered the panicked run: {served}"
+    );
+
+    // One that panics while serving: killed where it would panic, then
+    // recovered by a server, which says so as it happens.
+    let killed = [
+        ("ATOMIC_FAILPOINT", "pipeline:after:count"),
+        ("ATOMIC_MODEL_BASE_URL", "http://127.0.0.1:9/v1"),
+        ("ATOMIC_MODEL", "synthetic"),
+    ];
+    let out = atomic(
+        &dir,
+        &project,
+        &[
+            "run",
+            "count-only",
+            "--run-id",
+            "panics-later",
+            "--data",
+            NOTE,
+        ],
+        &killed,
+        "",
+    );
+    assert!(!out.status.success(), "{}", text(&out));
+    let log = dir.join("serve-2.log");
+    let mut serve = spawn(&dir, &project, &["serve"], &panic, &log);
+    wait_until(
+        "serve to name the run that panicked while it served",
+        || {
+            std::fs::read_to_string(&log).is_ok_and(|l| {
+                l.contains(
+                    "atomic serve: run panics-later stopped: atomic's own workflow code panicked",
+                ) && l.contains("failpoint pipeline:after:count")
+            })
+        },
+    );
+    terminate(&serve);
+    let _ = wait_child(&mut serve, "serve");
+}
+
+/// A panic noted by an earlier process is not the cause of a later run's
+/// own failure under the same id: it fails as any run does.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[test]
+fn a_note_kept_from_before_is_not_a_later_failures_cause() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
+    let dir = scratch("stale-note");
+    let project = project(&dir);
+    let state = state_dir(&dir, &project);
+    let panics = state
+        .parent()
+        .and_then(Path::parent)
+        .expect("the atomic home")
+        .join("private")
+        .join(state.file_name().expect("the project's id"))
+        .join("panics");
+    std::fs::create_dir_all(&panics).expect("panics");
+    let name = {
+        use sha2::Digest;
+        format!("{:x}.json", sha2::Sha256::digest(b"reused"))
+    };
+    std::fs::write(
+        panics.join(name),
+        json!({"run": "reused", "message": "a panic long ago", "at": 1}).to_string(),
+    )
+    .expect("an old note");
+    // A command that fails: an ordinary failure of the run.
+    std::fs::write(project.join("tools/count.py"), "import sys\nsys.exit(3)\n")
+        .expect("a failing command");
+    let out = atomic(
+        &dir,
+        &project,
+        &["run", "count-only", "--run-id", "reused", "--data", NOTE],
+        &[],
+        "",
+    );
+    let t = text(&out);
+    assert!(!out.status.success(), "{t}");
+    assert!(
+        !t.contains("panicked"),
+        "an old note was taken for the cause: {t}"
+    );
+    assert!(t.contains("run reused failed"), "{t}");
 }
 
 // needs_sandbox

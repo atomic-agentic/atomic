@@ -31,6 +31,10 @@ const REDELIVERY: Duration = Duration::from_secs(5);
 /// The state of a run the engine parked for its recovery count.
 const PARKED: &str = "MAX_RECOVERY_ATTEMPTS_EXCEEDED";
 
+/// How long a command follows a run whose workflow code panicked until the
+/// engine has parked it.
+const PARKING: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// How long a stopping process gives running work to reach a checkpoint.
 const SHUTDOWN: Duration = Duration::from_secs(10);
 
@@ -194,8 +198,28 @@ async fn finish(
     signals: &mut Signals,
     who: &str,
 ) -> anyhow::Result<()> {
+    // Whether the engine was seen to park a run whose workflow code
+    // panicked, before this command stopped.
+    let parked_seen = std::cell::Cell::new(false);
     let follow = async {
         let outcome = engine.rt.result::<Value>(run_id).await;
+        // A panic in atomic's own workflow code parks the run: there is no
+        // outcome to wait for, but the engine parks it a moment later, and
+        // stopping first would leave it to run again. Follow it there, for a
+        // bounded time even if the store stops answering.
+        if outcome.is_err() && atomic_app::panics::noted(run_id).is_some() {
+            let parked = tokio::time::timeout(PARKING, async {
+                while !matches!(
+                    engine.rt.status(run_id).await,
+                    Ok(Some(RunStatus::Other(ref state))) if state == PARKED
+                ) {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            })
+            .await;
+            parked_seen.set(parked.is_ok());
+            return outcome;
+        }
         if matches!(outcome, Err(DurableError::Interrupted(_))) {
             // This execution stopped without an outcome, as one whose exec
             // command's result was lost does, and the engine recovers it in
@@ -231,8 +255,23 @@ async fn finish(
         stop(signals, who, Exit::Signalled).await
     };
     let _ = engine.rt.shutdown(SHUTDOWN).await;
+    // Only a panic this process saw: a note kept from an earlier run of the
+    // same id is not this outcome's cause.
+    let panicked = match &outcome {
+        Err(_) => atomic_app::panics::noted(run_id),
+        Ok(_) => None,
+    };
     match outcome {
         Ok(output) => print_result(run_id, &output, json),
+        Err(_) if panicked.is_some() => {
+            let message = panicked.unwrap_or_default();
+            let cause = if parked_seen.get() {
+                atomic_app::panics::cause(run_id, &message)
+            } else {
+                atomic_app::panics::unparked(run_id, &message)
+            };
+            Err(Failure::new("run.panicked", cause, atomic_app::panics::hint(run_id)).into())
+        }
         Err(DurableError::Failed(why)) if atomic_app::pipeline::dead_lettered(run_id) => {
             Err(Failure::new(
                 "run.dead_lettered",
@@ -258,10 +297,13 @@ async fn finish(
             Err(Failure::new(
                 "run.parked",
                 format!(
-                    "run {run_id} was recovered more times than the engine allows, so it is \
-                     parked: {e}"
+                    "run {run_id} stopped without finishing more times than the engine allows, \
+                     so it is parked: {e}"
                 ),
-                format!("continue it with `atomic runs resume {run_id}`"),
+                format!(
+                    "find why it keeps stopping, then continue it with `atomic runs resume \
+                     {run_id}`"
+                ),
             )
             .into())
         }
@@ -435,6 +477,16 @@ pub async fn resume(
                 )
                 .into());
             }
+            // A run parked because atomic's own workflow code panicked will
+            // likely panic again: say so, and note afresh what this resume
+            // finds.
+            if let Some(message) = atomic_app::panics::of(id) {
+                atomic_core::log_line!(
+                    "run {id}: it was parked because atomic's own workflow code panicked \
+                     ({message}); resuming it, the panic will likely happen again unless this \
+                     atomic has it fixed"
+                );
+            }
             // The execution lock covers this host only. On a shared store
             // another live process may own the run, and nothing fences it.
             let owner = record.owner().unwrap_or_default();
@@ -462,6 +514,8 @@ pub async fn resume(
                 .log();
             // Queued before this engine dispatches, so it takes the run once.
             engine.rt.resume(id).await?;
+            // Resumed: what it does now is noted afresh.
+            atomic_app::panics::forget(id);
             atomic_durable::failpoint("resume:queued");
             engine.launch().await?;
             // A gate decided while the run was down may never have woken it.
@@ -654,13 +708,26 @@ pub async fn serve(
     let before = parked(engine.rt.runs_in(PARKED).await?);
     let recovered = engine.rt.recover().await?;
     engine.launch().await?;
-    // The engine parks a run it has recovered too often instead of
-    // recovering it once more: name each one.
-    for id in parked(engine.rt.runs_in(PARKED).await?).difference(&before) {
-        atomic_core::log_line!(
-            "atomic serve: run {id} was recovered more times than the engine allows, so it is \
-             parked; continue it with `atomic runs resume {id}`"
-        );
+    // The engine parks a run whose workflow code panicked, and one it has
+    // recovered too often, instead of recovering it once more: name each,
+    // with its cause.
+    let now = parked(engine.rt.runs_in(PARKED).await?);
+    for id in &now {
+        match atomic_app::panics::of(id) {
+            // Whenever it panicked, in this process's recovery or an
+            // earlier process.
+            Some(message) => atomic_core::log_line!(
+                "atomic serve: {}; {}",
+                atomic_app::panics::cause(id, &message),
+                atomic_app::panics::hint(id)
+            ),
+            None if before.contains(id) => {}
+            None => atomic_core::log_line!(
+                "atomic serve: run {id} stopped without finishing more times than the engine \
+                 allows, so it is parked; find why, then continue it with `atomic runs resume \
+                 {id}`"
+            ),
+        }
     }
     // A gate decided while its run was down may never have woken it.
     atomic_durable::gate::redeliver(&engine.rt).await?;
