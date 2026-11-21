@@ -409,9 +409,11 @@ fn a_read_only_turn_in_a_worktree_sees_its_checkout() {
 
 /// Whether `dir` holds a file ending in `.sqlite`.
 fn holds_databases(dir: &Path) -> bool {
-    std::fs::read_dir(dir).into_iter().flatten().flatten().any(|e| {
-        e.file_name().to_string_lossy().ends_with(".sqlite")
-    })
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|e| e.file_name().to_string_lossy().ends_with(".sqlite"))
 }
 
 /// What Codex records of a project's threads, its state databases and its
@@ -433,10 +435,7 @@ fn codex_records_go_with_the_projects_private_state() {
             private: private.clone(),
             also: Vec::new(),
         });
-        let command = format!(
-            "exec 2>&1; cat {}; echo records-exit=$?",
-            other.display()
-        );
+        let command = format!("exec 2>&1; cat {}; echo records-exit=$?", other.display());
         let output = sandboxed_with(
             &f,
             &f.project,

@@ -320,7 +320,10 @@ fn check_by_reference(dir: &Path, out: &Output, size: u64, stored: usize) {
     // Nothing is left in the commands' scratch space, the project's in the
     // home's `scratch/`.
     let id = state.file_name().expect("a project id");
-    let home = state.parent().and_then(Path::parent).expect("the atomic home");
+    let home = state
+        .parent()
+        .and_then(Path::parent)
+        .expect("the atomic home");
     let scratch = home.join("scratch").join(id);
     assert!(scratch.is_dir(), "no scratch at {}", scratch.display());
     let left = size_of(&scratch);

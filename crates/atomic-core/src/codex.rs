@@ -871,8 +871,7 @@ fn codex_records(guard: &StateGuard) -> anyhow::Result<Option<PathBuf>> {
         .file_name()
         .context("the state directory has no name to keep its Codex records by")?;
     let records = private.private.join(id).join("codex");
-    crate::state::private_dir(&records)
-        .with_context(|| format!("create {}", records.display()))?;
+    crate::state::private_dir(&records).with_context(|| format!("create {}", records.display()))?;
     Ok(Some(records))
 }
 

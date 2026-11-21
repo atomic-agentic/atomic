@@ -6433,10 +6433,22 @@ fn run_and_debug_prompt_turns_cannot_read_each_others_scratch() {
         };
         // Every project's scratch roots are in the home's `scratch/`, by
         // project id.
-        let id = state.file_name().expect("a project id").to_string_lossy().into_owned();
-        let home = state.parent().and_then(Path::parent).expect("the atomic home").to_owned();
+        let id = state
+            .file_name()
+            .expect("a project id")
+            .to_string_lossy()
+            .into_owned();
+        let home = state
+            .parent()
+            .and_then(Path::parent)
+            .expect("the atomic home")
+            .to_owned();
         let plant = |project: &str, root: &str| {
-            let secret = home.join("scratch").join(project).join(root).join("planted/secret");
+            let secret = home
+                .join("scratch")
+                .join(project)
+                .join(root)
+                .join("planted/secret");
             std::fs::create_dir_all(secret.parent().expect("planted")).expect("planted");
             std::fs::write(&secret, format!("secret-in-{project}-{root}")).expect("secret");
             secret
@@ -6493,9 +6505,12 @@ fn run_and_debug_prompt_turns_cannot_read_each_others_scratch() {
         );
 
         // A debug prompt's turn looks in the runs' scratch root.
-        let model = FakeModel::start(vec![look(&[&in_run, &in_other]), Reply::Text("Done.".into())])
-            .await
-            .expect("fake model");
+        let model = FakeModel::start(vec![
+            look(&[&in_run, &in_other]),
+            Reply::Text("Done.".into()),
+        ])
+        .await
+        .expect("fake model");
         let url = model.base_url();
         let out = {
             let (d, p) = (dir.clone(), project.clone());

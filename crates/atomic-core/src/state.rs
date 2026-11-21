@@ -713,7 +713,8 @@ mod tests {
     /// the state is created; what a turn's shell needs there stays.
     #[test]
     fn codex_records_move_out_of_the_codex_home() {
-        let home = std::env::temp_dir().join(format!("atomic-codex-records-{}", std::process::id()));
+        let home =
+            std::env::temp_dir().join(format!("atomic-codex-records-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         let root = home.join("project");
         std::fs::create_dir_all(&root).expect("project");
@@ -721,17 +722,33 @@ mod tests {
         let codex = state.codex_home();
         std::fs::create_dir_all(codex.join("log")).expect("log");
         std::fs::create_dir_all(codex.join("tmp/arg0-linux")).expect("arg0");
-        for name in ["state_5.sqlite", "state_5.sqlite-wal", "logs_2.sqlite", "log/codex.log"] {
+        for name in [
+            "state_5.sqlite",
+            "state_5.sqlite-wal",
+            "logs_2.sqlite",
+            "log/codex.log",
+        ] {
             std::fs::write(codex.join(name), "records").expect("record");
         }
         state.create().expect("created");
         let records = state.codex_records();
         assert!(records.starts_with(state.private_dir()));
-        for name in ["state_5.sqlite", "state_5.sqlite-wal", "logs_2.sqlite", "log/codex.log"] {
-            assert!(!codex.join(name).exists(), "{name} is still in the Codex home");
+        for name in [
+            "state_5.sqlite",
+            "state_5.sqlite-wal",
+            "logs_2.sqlite",
+            "log/codex.log",
+        ] {
+            assert!(
+                !codex.join(name).exists(),
+                "{name} is still in the Codex home"
+            );
             assert!(records.join(name).exists(), "{name} did not move");
         }
-        assert!(codex.join("tmp/arg0-linux").is_dir(), "the helper links went too");
+        assert!(
+            codex.join("tmp/arg0-linux").is_dir(),
+            "the helper links went too"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -849,6 +866,7 @@ mod tests {
             root: dir.clone(),
             dir: dir.join("state"),
             private: dir.join("private/p"),
+            scratch: dir.join("scratch/p"),
         };
         state.create().expect("state");
         let held = state.lock_execution("atomic serve").expect("free");
@@ -877,6 +895,7 @@ mod tests {
             root: dir.clone(),
             dir: dir.join("state"),
             private: dir.join("private/p"),
+            scratch: dir.join("scratch/p"),
         };
         state.create().expect("state");
         // A previous holder's words, left in the file, and a new holder that
@@ -917,6 +936,7 @@ mod tests {
             root: dir.join("project"),
             dir: dir.join("state"),
             private: dir.join("private/p"),
+            scratch: dir.join("scratch/p"),
         };
         std::fs::create_dir_all(state.dir().join("context")).expect("old layout");
         std::fs::write(state.dir().join("atomic.db"), "db").expect("old database");
@@ -950,6 +970,7 @@ mod tests {
             root: dir.join("project"),
             dir: dir.join("home/projects/p"),
             private: dir.join("home/private/p"),
+            scratch: dir.join("home/scratch/p"),
         };
         let old = state.dir().join("private");
         std::fs::create_dir_all(old.join("context")).expect("old layout");
@@ -1012,6 +1033,7 @@ mod tests {
             root: dir.join("project"),
             dir: dir.join("home/projects/p"),
             private: dir.join("home/private/p"),
+            scratch: dir.join("home/scratch/p"),
         };
         state.create().expect("the current layout");
         std::fs::write(state.database(), "current").expect("current database");
