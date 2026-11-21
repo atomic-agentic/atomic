@@ -19,7 +19,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Tokens one model call used, as the provider reported them.
@@ -308,15 +308,18 @@ pub(crate) fn meter_failure(e: &anyhow::Error) -> Option<&MeterError> {
     e.chain().find_map(|c| c.downcast_ref::<MeterError>())
 }
 
-/// The run and step a model call is made for, which its span names. Set by
-/// the workflow code that runs a step, around the step's work; see
-/// [`for_step`].
+/// The run and step a model call is made for, which its span names, and where
+/// a call that failed says so. Set by the workflow code that runs a step,
+/// around the step's work; see [`for_step`].
 #[derive(Clone, Debug)]
 pub struct Caller {
     /// The run's workflow ID.
     pub run: String,
     /// The step's ID.
     pub step: String,
+    /// What this step's spans say of a call of its own that failed, and what
+    /// its run's say once the step failed (see [`Why`]).
+    pub why: Why,
 }
 
 tokio::task_local! {
@@ -324,15 +327,20 @@ tokio::task_local! {
 }
 
 /// Run `work` as step `step` of run `run`: model calls it makes name them on
-/// their spans.
+/// their spans, and one that fails notes on `why` what its own span says, for
+/// this step's span and its run's to say in turn. Give each step a handle of
+/// its own (see [`Why::for_step`]), and hand it to the run only when the step
+/// itself failed (see [`Why::note_step`]).
 pub async fn for_step<F: std::future::Future>(
     run: impl Into<String>,
     step: impl Into<String>,
+    why: Why,
     work: F,
 ) -> F::Output {
     let caller = Caller {
         run: run.into(),
         step: step.into(),
+        why,
     };
     CALLER.scope(caller, work).await
 }
@@ -350,6 +358,16 @@ pub(crate) async fn with_caller<F: std::future::Future>(
     match caller {
         Some(caller) => CALLER.scope(caller, work).await,
         None => work.await,
+    }
+}
+
+/// Note on the step the current task runs that one of its model calls failed,
+/// as that call's own span says it (see [`Why`]): the step's span and its
+/// run's cannot hear the call's error. A call made outside a step notes
+/// nothing, since no span outlives it to repeat this.
+pub(crate) fn note_step_failure(error: &anyhow::Error) {
+    if let Some(caller) = caller() {
+        caller.why.note_call(error);
     }
 }
 
@@ -401,7 +419,7 @@ pub(crate) fn record_usage(span: &tracing::Span, usage: &Usage) {
 
 /// The most characters of a failed call's error a span carries, with the
 /// `…` that ends one that was cut. The run's stored error keeps the whole.
-pub(crate) const MAX_SPAN_ERROR: usize = 200;
+pub const MAX_SPAN_ERROR: usize = 200;
 
 /// What a call's span says of why it failed, redacted and at most
 /// [`MAX_SPAN_ERROR`] characters: for an error a provider answered with,
@@ -423,7 +441,71 @@ pub(crate) fn span_error(error: &anyhow::Error) -> (String, Option<u16>) {
     }
 }
 
-/// Record on `span` why a call failed (see [`span_error`]).
+/// What a span may say about why the thing it covers failed, kept between the
+/// model call that knows and the spans that outlive it.
+///
+/// A durable step's failure travels as text: the engine records the text and
+/// hands workflow code new text of its own, so what a step's failure was
+/// *caused* by — a provider's answer, with its status and the type of error it
+/// named — cannot reach the step's own span, still less its run's, which only
+/// ever sees the run's error. So a call that failed notes here what its own
+/// span says; the step's span says that, and when the step fails the run takes
+/// the note and says the same. The whole failure is never noted: it stays in
+/// the run's stored error, where a person reads it.
+///
+/// A handle says for one thing: [`Why::for_step`] gives a step one, which
+/// reaches its model calls as the run and step do (see [`for_step`]), and the
+/// run's own is what its workflow passes to its spans. A note lives in this
+/// process only: a run resumed after a restart has nothing noted, and its
+/// spans say what the failure it recorded says, cut short.
+#[derive(Clone, Debug, Default)]
+pub struct Why(Arc<Mutex<Option<String>>>);
+
+impl Why {
+    /// A note of one step's own, for [`for_step`] and [`Why::note_step`].
+    pub fn for_step() -> Self {
+        Self::default()
+    }
+
+    /// Note that a call this covers failed with `error`, as a span may say it
+    /// (see [`span_error`]). The first note is the one kept: it came from the
+    /// call that failed first, which is what failed the step.
+    pub fn note_call(&self, error: &anyhow::Error) {
+        let (message, _) = span_error(error);
+        self.note(message);
+    }
+
+    /// Note on this what one of its steps noted on a handle of its own, so
+    /// that the run's span says what that step's said. Call it when that step
+    /// itself failed; a step that succeeded or parked is left to say nothing.
+    pub fn note_step(&self, step: &Why) {
+        if let Some(message) = step.noted() {
+            self.note(message);
+        }
+    }
+
+    /// Keep the first message noted, and no other. A note is never worth
+    /// stopping over: a poisoned lock loses it, and the spans then say what
+    /// the run's own error says, cut short.
+    fn note(&self, message: String) {
+        if let Ok(mut why) = self.0.lock()
+            && why.is_none()
+        {
+            *why = Some(message);
+        }
+    }
+
+    /// What was noted, or `None` when nothing here failed near a call or a
+    /// step.
+    pub fn noted(&self) -> Option<String> {
+        self.0.lock().ok().and_then(|why| why.clone())
+    }
+}
+
+/// Record on `span` why a call failed (see [`span_error`]). A call that fails
+/// inside a step notes the same text for the step's span and its run's, which
+/// cannot hear this error; the call's site does that, as both runtimes do (see
+/// [`Why`]).
 pub(crate) fn record_error(span: &tracing::Span, error: &anyhow::Error) {
     span.record("otel.status_code", "ERROR");
     span.record(

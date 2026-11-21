@@ -402,6 +402,16 @@ fn ran(dir: &Path, atom: &str) -> usize {
 /// and its scratch directory, and the caches go when the run ends. A path
 /// that does not exist when none has.
 fn run_file(dir: &Path, name: &str) -> PathBuf {
+    run_files(dir, name)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| dir.join("no-run-has").join(name))
+}
+
+/// Every file named `name` in the caches of the runs that still have them,
+/// under any of the atomic homes in `dir` (see [`run_file`]).
+fn run_files(dir: &Path, name: &str) -> Vec<PathBuf> {
+    let mut found = Vec::new();
     for home in std::fs::read_dir(dir).into_iter().flatten().flatten() {
         for state in std::fs::read_dir(home.path().join("projects"))
             .into_iter()
@@ -415,12 +425,28 @@ fn run_file(dir: &Path, name: &str) -> PathBuf {
             {
                 let file = run.path().join(name);
                 if file.exists() {
-                    return file;
+                    found.push(file);
                 }
             }
         }
     }
-    dir.join("no-run-has").join(name)
+    found
+}
+
+/// That the counting atom's command ran exactly once in each of `runs`
+/// runs that still have their caches, by the tally it keeps there: one
+/// tally file a run, of one line. A later execution that ran it again
+/// would add a line, or, on another executor, a file of its own.
+fn ran_once_live(dir: &Path, runs: usize) {
+    let tallies = run_files(dir, "count-note.tally");
+    assert_eq!(tallies.len(), runs, "live tallies: {tallies:?}");
+    for tally in &tallies {
+        let lines = std::fs::read_to_string(tally)
+            .expect("tally")
+            .lines()
+            .count();
+        assert_eq!(lines, 1, "{} ran {lines} times", tally.display());
+    }
 }
 
 /// What an exec atom's command names on its command line for a file of its
@@ -1938,11 +1964,13 @@ fn a_run_killed_at_a_gate_keeps_it_and_its_deadline_and_one_resume_runs_at_a_tim
         first.kill().expect("SIGKILL the run");
         first.wait().expect("reap");
 
+        // Killed after its last step, so the run still has its caches when
+        // it is looked at below.
         let mut resumed = spawn(
             &dir,
             &project,
             &["runs", "resume", "gated-1"],
-            &with(&env, &[]),
+            &with(&env, &[("ATOMIC_FAILPOINT", "pipeline:after:summarize")]),
             &dir.join("resumed.log"),
         );
         wait_until("the resume to start", || {
@@ -1983,15 +2011,26 @@ fn a_run_killed_at_a_gate_keeps_it_and_its_deadline_and_one_resume_runs_at_a_tim
             .await
             .expect("child");
         assert!(
-            status.success(),
-            "{}",
+            !status.success(),
+            "killed at the failpoint: {}",
             std::fs::read_to_string(dir.join("resumed.log")).unwrap_or_default()
         );
+        // The resumed execution ran summarize and nothing it had: count's
+        // tally, still in the run's caches, says count ran once.
+        assert_eq!(model.calls(), 2, "rank once, summarize once");
+        ran_once_live(&dir, 1);
+        let (d, p, e) = (dir.clone(), project.clone(), env.clone());
+        let out = tokio::task::spawn_blocking(move || {
+            atomic(&d, &p, &["runs", "resume", "gated-1"], &with(&e, &[]), "")
+        })
+        .await
+        .expect("child");
+        assert!(out.status.success(), "{}", text(&out));
         assert_eq!(
             rt.status("gated-1").await.expect("status"),
             Some(RunStatus::Succeeded)
         );
-        assert_eq!(model.calls(), 2, "rank once, summarize once");
+        assert_eq!(model.calls(), 2, "nothing ran again");
         assert_eq!(count_log(&dir), 1);
     });
 }
@@ -2207,6 +2246,27 @@ fn serve_started_after_a_kill_recovers_the_run_and_finishes_it() {
             text(&out)
         );
 
+        // Killed after its last step, so the run still has its caches: the
+        // recovering execution ran summarize and nothing the killed one
+        // had, by count's tally there.
+        let mut killed = spawn(
+            &dir,
+            &project,
+            &["serve"],
+            &with(&env, &[("ATOMIC_FAILPOINT", "pipeline:after:summarize")]),
+            &dir.join("serve-killed.log"),
+        );
+        let status = tokio::task::spawn_blocking(move || wait_child(&mut killed, "serve"))
+            .await
+            .expect("child");
+        assert!(
+            !status.success(),
+            "killed at the failpoint: {}",
+            std::fs::read_to_string(dir.join("serve-killed.log")).unwrap_or_default()
+        );
+        assert_eq!(model.calls(), 2, "rank once, summarize once");
+        ran_once_live(&dir, 1);
+
         let serve = spawn(
             &dir,
             &project,
@@ -2310,6 +2370,28 @@ fn a_run_started_by_one_build_resumes_and_recovers_under_another() {
         tokio::task::spawn_blocking(move || killed_after_rank(&d, &p, &e, "built-1"))
             .await
             .expect("child");
+        // First killed after its last step, so the run still has its caches
+        // and count's tally there: the other build ran nothing it had.
+        let (d, p, e, o) = (dir.clone(), project.clone(), env.clone(), other.clone());
+        let out = tokio::task::spawn_blocking(move || {
+            atomic_as(
+                &o,
+                &d,
+                &p,
+                &["runs", "resume", "built-1"],
+                &with(&e, &[("ATOMIC_FAILPOINT", "pipeline:after:summarize")]),
+                "",
+            )
+        })
+        .await
+        .expect("child");
+        assert!(
+            !out.status.success(),
+            "killed at the failpoint: {}",
+            text(&out)
+        );
+        assert_eq!(model.calls(), 2, "rank once, summarize once");
+        ran_once_live(&dir, 1);
         let (d, p, e, o) = (dir.clone(), project.clone(), env.clone(), other.clone());
         let out = tokio::task::spawn_blocking(move || {
             atomic_as(
@@ -2335,6 +2417,27 @@ fn a_run_started_by_one_build_resumes_and_recovers_under_another() {
         tokio::task::spawn_blocking(move || killed_after_rank(&d, &p, &e, "built-2"))
             .await
             .expect("child");
+        // Killed after its last step first, so built-2 still has its caches
+        // and count's tally there: the other build's server ran nothing
+        // the killed run had.
+        let mut killed = spawn_as(
+            &other,
+            &dir,
+            &project,
+            &["serve"],
+            &with(&env, &[("ATOMIC_FAILPOINT", "pipeline:after:summarize")]),
+            &dir.join("serve-killed.log"),
+        );
+        let status = tokio::task::spawn_blocking(move || wait_child(&mut killed, "serve"))
+            .await
+            .expect("child");
+        assert!(
+            !status.success(),
+            "killed at the failpoint: {}",
+            std::fs::read_to_string(dir.join("serve-killed.log")).unwrap_or_default()
+        );
+        assert_eq!(model.calls(), 4, "each run's rank and summarize once");
+        ran_once_live(&dir, 1);
         let mut serve = spawn_as(
             &other,
             &dir,
@@ -2437,6 +2540,8 @@ fn a_run_of_another_durable_layout_is_reported_not_resumed() {
             .expect("child");
         assert!(status.success());
         assert_eq!(model.calls(), 1, "nothing ran again");
+        // Never resumed, the run keeps its caches, and count's tally there.
+        ran_once_live(&dir, 1);
         assert_eq!(count_log(&dir), 1);
     });
 }
@@ -2518,7 +2623,26 @@ fn a_resumed_run_left_queued_is_taken_by_no_other_command() {
         );
         assert_eq!(model.calls(), 3, "only other-1's summary");
 
-        // serve takes it from the queue and finishes it.
+        // serve takes it from the queue, and is killed after its last step,
+        // so the run still has its caches: by count's tally there, nothing
+        // the killed run had ran again. Then serve finishes it.
+        let mut killed = spawn(
+            &dir,
+            &project,
+            &["serve"],
+            &with(&env, &[("ATOMIC_FAILPOINT", "pipeline:after:summarize")]),
+            &dir.join("serve-killed.log"),
+        );
+        let status = tokio::task::spawn_blocking(move || wait_child(&mut killed, "serve"))
+            .await
+            .expect("child");
+        assert!(
+            !status.success(),
+            "killed at the failpoint: {}",
+            std::fs::read_to_string(dir.join("serve-killed.log")).unwrap_or_default()
+        );
+        assert_eq!(model.calls(), 4);
+        ran_once_live(&dir, 1);
         let mut serve = spawn(
             &dir,
             &project,
@@ -5833,11 +5957,12 @@ fn resuming_a_run_another_executor_owns_on_postgres_needs_its_owner_stopped() {
         // the run at the gate it opened.
         a.kill().expect("SIGKILL worker-a");
         a.wait().expect("reap");
+        // Killed after its last step, so the run still has its caches.
         let mut b = Reaped(spawn(
             &dir,
             &project,
             &["runs", "resume", "owned-1", "--owner-stopped"],
-            &with(&b_env, &[]),
+            &with(&b_env, &[("ATOMIC_FAILPOINT", "pipeline:after:summarize")]),
             &dir.join("b.log"),
         ));
         wait_until("worker-b to resume", || {
@@ -5850,11 +5975,17 @@ fn resuming_a_run_another_executor_owns_on_postgres_needs_its_owner_stopped() {
             .await
             .expect("child");
         assert!(
-            status.success(),
-            "{}",
+            !status.success(),
+            "killed at the failpoint: {}",
             std::fs::read_to_string(dir.join("b.log")).unwrap_or_default()
         );
         assert_eq!(model.calls(), 2, "rank once, summarize once");
+        // Count ran once, in worker-a's caches: worker-b, whose caches are
+        // in its own home, ran it nowhere.
+        ran_once_live(&dir, 1);
+        let out = resume(&[]).await.expect("child");
+        assert!(out.status.success(), "{}", text(&out));
+        assert_eq!(model.calls(), 2, "nothing ran again");
         assert_eq!(counted_in(&rt).await, 1, "count once");
     });
 }
@@ -5915,7 +6046,18 @@ fn a_resumed_run_is_taken_only_by_its_resumer_on_postgres() {
         assert_eq!(record.owner(), Some("worker-b"), "{record:?}");
         assert_eq!(model.calls(), 1, "worker-c did not run it");
 
-        // worker-b again, which owns it now, finishes it from its queue.
+        // worker-b again, which owns it now, takes it from its queue, and is
+        // killed after its last step, so the run still has its caches:
+        // count ran once, in worker-a's, and nowhere since. Then worker-b
+        // finishes it.
+        let mut killed = b.clone();
+        killed.push(("ATOMIC_FAILPOINT", "pipeline:after:summarize".into()));
+        let out = call(killed, &["runs", "resume", "queued-1"])
+            .await
+            .expect("child");
+        assert!(!out.status.success(), "killed: {}", text(&out));
+        assert_eq!(model.calls(), 2, "rank once, summarize once");
+        ran_once_live(&dir, 1);
         let out = call(b, &["--json", "runs", "resume", "queued-1"])
             .await
             .expect("child");

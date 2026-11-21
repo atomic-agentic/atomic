@@ -1,0 +1,1 @@
+sandbox-mounts-place-unreadable|crates/atomic-core/src/mounts.rs|            Err(e) if not_there(&e) => return Ok(()),|            Err(_) => return Ok(()), // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model a_place_that_cannot_be_looked_at_is_refused

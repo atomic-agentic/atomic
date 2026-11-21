@@ -309,6 +309,9 @@ where
             crate::usage::record_usage(&span, usage);
         }
         if let (Err(e), Some(span)) = (&called.answer, span.span()) {
+            // What this call says of itself, for this step's span and its
+            // run's, which never hear this error (see [`crate::usage::Why`]).
+            crate::usage::note_step_failure(e);
             crate::usage::record_error(&span, e);
         }
         span.end();
@@ -442,14 +445,7 @@ async fn call(
         Wire::Responses => usage_of(v, "input_tokens", "output_tokens"),
     });
     let answer = if !status.is_success() {
-        Err(ProviderError {
-            url: url.clone(),
-            status: status.to_string(),
-            code: status.as_u16(),
-            kind: value.as_ref().and_then(error_kind),
-            excerpt: excerpt(&text),
-        }
-        .into())
+        Err(ProviderError::answered(&url, status, &text, value.as_ref()).into())
     } else {
         match &value {
             None => Err(anyhow!(
@@ -483,6 +479,21 @@ pub(crate) struct ProviderError {
 }
 
 impl ProviderError {
+    /// A provider's failure as its status and body say it: `value` is the
+    /// body read as JSON, when it is, and names the error's type if it names
+    /// one (see [`error_kind`]); `body` is its text, of which the excerpt is
+    /// the start. One constructor for the answer that came in and for the
+    /// one a test wants without a server.
+    fn answered(url: &str, status: reqwest::StatusCode, body: &str, value: Option<&Value>) -> Self {
+        ProviderError {
+            url: url.to_owned(),
+            status: status.to_string(),
+            code: status.as_u16(),
+            kind: value.and_then(error_kind),
+            excerpt: excerpt(body),
+        }
+    }
+
     /// What a trace says of it: the status and the error's type, none of
     /// the provider's own text.
     pub(crate) fn summary(&self) -> String {
@@ -491,6 +502,18 @@ impl ProviderError {
             None => self.status.clone(),
         }
     }
+}
+
+/// A provider's failure as [`post`] makes it of a status and a body, for a
+/// test that wants one without a server to answer it. A number that is not a
+/// status is the test's mistake, and is said as one rather than answered with
+/// another.
+#[cfg(any(test, feature = "fake-model"))]
+pub(crate) fn provider_failure(url: &str, status: u16, body: &str) -> anyhow::Error {
+    let answered = reqwest::StatusCode::from_u16(status)
+        .unwrap_or_else(|_| panic!("{status} is not a status a provider can answer with"));
+    let value = serde_json::from_str::<Value>(body).ok();
+    ProviderError::answered(url, answered, body, value.as_ref()).into()
 }
 
 /// The type of error an OpenAI-style body names, `error.type` or else
