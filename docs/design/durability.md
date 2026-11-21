@@ -204,8 +204,10 @@ outputs and telemetry (M12).
 - **Settle once** by request ID when trusted usage arrives. The attempt record
   stays even when the turn fails or its candidate is rejected.
 - **Uncertain usage stays charged.** A crash after the provider consumed tokens
-  keeps the reservation charged at its full bound, and only a supported usage
-  query can later correct it. A fresh retry gets a new reservation; if the
+  keeps the reservation charged at its full bound, or, for a Codex turn that
+  recorded its progress, at what it last recorded having reported and one
+  request in flight, if that is more; only a person entering the real usage
+  can later correct it. A fresh retry gets a new reservation; if the
   allowance is gone, the run parks. Allowance goes back into the pool in two
   cases only: the request provably never left, or reconciliation showed it
   unused.

@@ -556,6 +556,7 @@ async fn approve_gates(rt: Arc<Durare>) {
                     verdict: Verdict::Approve,
                     comment: Some("the crash suite approves".into()),
                     proposal: g.proposal.clone(),
+                    answer: None,
                 },
             )
             .await;

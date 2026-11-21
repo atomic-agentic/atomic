@@ -58,8 +58,10 @@ from a snapshot of that commit in the state directory, never from your
 checkout. One process at a time executes a project's runs. Errors carry a
 description and an action, separately in `--json` output. `atomic gates enroll`,
 `list`, `approve` and `reject` decide gates from a second terminal; a gate
-decision counts only with the credential its person enrolled. The terminal
-prompt for gates in `atomic run` is not wired up yet.
+decision counts only with the credential its person enrolled. `atomic run` and
+`atomic runs resume` prompt at the terminal for each gate their run reaches, and
+question gates (`ask` with a typed `answer`, `remember`, and a default when time
+runs out) are built; `atomic gates answer` answers one from another terminal.
 
 A project's artifact store takes a lock in its private state while it is
 written or swept. A run that finds it held by another process, such as a sweep,

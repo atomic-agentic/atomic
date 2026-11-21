@@ -269,6 +269,33 @@ pub struct GateStep {
     pub timeout: Option<u64>,
     /// The approver groups the workflow file names, if it names any.
     pub approvers: Option<Vec<String>>,
+    /// For a question gate (`ask` in the workflow file, which is then the
+    /// `title` above), what it asks for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question: Option<QuestionStep>,
+}
+
+/// What a question gate asks for.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct QuestionStep {
+    /// The JSON Schema the answer must fit.
+    pub answer: Value,
+    /// Whether the answer goes into the feedback log.
+    pub remember: bool,
+    /// The answer the step resumes with if nobody answers in time; without
+    /// one, an unanswered question stops the run as an expired gate does.
+    /// `Some(null)` is a null default.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    pub default: Option<Value>,
+}
+
+/// A field that is present, even as `null`, is `Some`.
+fn present<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<Value>, D::Error> {
+    <Value as serde::Deserialize>::deserialize(d).map(Some)
 }
 
 /// One step of a pipeline.
@@ -548,7 +575,24 @@ fn gate_step(
     deployment: &Deployment,
 ) -> std::result::Result<GateStep, String> {
     let text = |key: &str| gate.get(key).and_then(Value::as_str).map(str::to_owned);
-    let title = text("title").ok_or_else(|| format!("gate `{id}` has no `title`"))?;
+    let title = text("title")
+        .or_else(|| text("ask"))
+        .ok_or_else(|| format!("gate `{id}` has no `title`"))?;
+    let question = match gate.get("answer") {
+        None => None,
+        Some(answer) => Some(QuestionStep {
+            answer: atomic_core::workflow::gate_answer(answer)
+                .map_err(|e| format!("gate `{id}`: {e}"))?,
+            remember: gate
+                .get("remember")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            default: gate
+                .get("on_timeout")
+                .and_then(|t| t.get("default"))
+                .cloned(),
+        }),
+    };
     let timeout = text("timeout")
         .map(|t| atomic_core::workflow::parse_timeout(&t))
         .transpose()
@@ -569,6 +613,7 @@ fn gate_step(
         show: text("show"),
         timeout,
         approvers,
+        question,
     })
 }
 
@@ -1532,14 +1577,40 @@ async fn run_gate<C: WorkflowContext>(
         approvers,
         tier: Tier::High,
         timeout: step.timeout.map(std::time::Duration::from_secs),
-        on_timeout: Default::default(),
+        on_timeout: match step.question.as_ref().and_then(|q| q.default.as_ref()) {
+            Some(_) => gate::OnTimeout::Default,
+            None => gate::OnTimeout::Reject,
+        },
+        question: step.question.as_ref().map(|q| gate::Question {
+            answer: q.answer.clone(),
+            remember: q.remember,
+            default: q.default.clone(),
+        }),
     };
     match gate::gate(ctx, &step.id, spec).await? {
-        Resolution::Decided(d) if d.verdict == gate::Verdict::Approve => Ok(json!({
-            "verdict": "approve",
-            "by": d.by.as_str(),
-            "comment": d.comment,
-            "at": d.at,
+        Resolution::Decided(d) if d.verdict == gate::Verdict::Approve => {
+            let mut decision = json!({
+                "verdict": "approve",
+                "by": d.by.as_str(),
+                "comment": d.comment,
+                "at": d.at,
+            });
+            if step.question.is_some() {
+                // The store checked the answer against the question.
+                decision["answer"] = d
+                    .answer
+                    .ok_or_else(|| at("its decision carries no answer".into()))?;
+            }
+            Ok(decision)
+        }
+        // Nobody answered in time: silence selected the question's default,
+        // as the gate store recorded it.
+        Resolution::Defaulted { at: when, answer } => Ok(json!({
+            "verdict": "default",
+            "answer": answer,
+            "by": null,
+            "comment": null,
+            "at": when,
         })),
         Resolution::Decided(d) => Err(at(format!(
             "rejected by {}{}, so no step after it runs",

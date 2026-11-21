@@ -48,6 +48,19 @@ pub fn failpoint(name: &str) {
     let _ = name;
 }
 
+/// A named point where a test can hold this thread up, as a busy machine's
+/// scheduler might: with the `failpoints` feature,
+/// `ATOMIC_FAILPOINT_PAUSE=<name>` makes it wait a second there. Without the
+/// feature it does nothing. It kills nothing, so it is not a crash site.
+pub fn pause(name: &str) {
+    #[cfg(feature = "failpoints")]
+    if std::env::var("ATOMIC_FAILPOINT_PAUSE").is_ok_and(|f| f == name) {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    #[cfg(not(feature = "failpoints"))]
+    let _ = name;
+}
+
 /// End the process as a crash would: SIGKILL, which runs nothing on the way
 /// out and leaves no core dump.
 #[cfg(feature = "failpoints")]
