@@ -222,9 +222,15 @@ pub fn register_change_request<R: DurableRuntime>(
                 (budget.clone(), draft_caps.clone(), review_caps.clone());
             let run = ctx.workflow_id().to_owned();
             let id = run.clone();
+            let why = atomic_core::usage::Why::default();
+            let run_why = why.clone();
             let span = crate::telemetry::workflow_span(CHANGE_REQUEST, &run);
             let work = async move {
-                let lite = runtimes.lite.clone();
+                let mut lite = runtimes.lite.clone();
+                // Its draft atom's failed calls say why on this run's spans,
+                // which cannot hear them (see [`atomic_core::usage::Why`]).
+                lite.why = why.clone();
+                let (draft_why, review_why) = (why.clone(), why.clone());
                 let request = ChangeRequest {
                     request: input.request.clone(),
                 };
@@ -241,6 +247,7 @@ pub fn register_change_request<R: DurableRuntime>(
                         let step_id = step.workflow_id.clone();
                         crate::telemetry::traced(
                             span,
+                            draft_why.clone(),
                             atomic_core::usage::for_step(step_id, "draft", async move {
                                 propose(
                                     async move { run_lite_atom(&DraftTask, &request, &lite).await },
@@ -281,6 +288,7 @@ pub fn register_change_request<R: DurableRuntime>(
                         let step_id = step.workflow_id.clone();
                         crate::telemetry::traced(
                             span,
+                            review_why.clone(),
                             atomic_core::usage::for_step(step_id, "review", async move {
                                 propose(async move {
                                     run_codex_atom(&ReviewPatch, &review_request, &codex).await
@@ -299,7 +307,7 @@ pub fn register_change_request<R: DurableRuntime>(
                     steps: vec![draft, review],
                 })
             };
-            crate::panics::caught(id, crate::telemetry::traced(span, work))
+            crate::panics::caught(id, crate::telemetry::traced(span, run_why, work))
         },
     );
     Ok(())

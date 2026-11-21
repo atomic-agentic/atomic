@@ -87,6 +87,10 @@ pub struct LiteRuntime {
     pub artifacts: crate::runtime::Artifacts,
     /// What admits and settles each call (see [`crate::usage`]).
     pub meter: crate::usage::Metering,
+    /// What this run's spans say of a call that failed (see
+    /// [`crate::usage::Why`]). The workflow that runs the step sets it, as it
+    /// sets [`meter`](Self::meter).
+    pub why: crate::usage::Why,
     /// The execution backend each run opens its workspace on. A lite atom's
     /// workspace has no files and no shell.
     pub backend: atomic_exec::Backend,
@@ -107,6 +111,7 @@ impl LiteRuntime {
             timeout: DEFAULT_TIMEOUT,
             artifacts: crate::runtime::Artifacts::none(),
             meter: crate::usage::Metering::none(),
+            why: crate::usage::Why::default(),
             backend: atomic_exec::Backend::default(),
             limit_field: None,
         }
@@ -311,6 +316,9 @@ where
             crate::usage::record_usage(&span, usage);
         }
         if let (Err(e), Some(span)) = (&called.answer, span.span()) {
+            // What this call says of itself, for the step's span and its
+            // run's, which never hear this error (see [`crate::usage::Why`]).
+            runtime.why.note_call(e);
             crate::usage::record_error(&span, e);
         }
         span.end();
@@ -493,6 +501,25 @@ impl ProviderError {
             None => self.status.clone(),
         }
     }
+}
+
+/// A provider's failure as [`post`] makes it of a status and a body, for a
+/// test that wants one without a server to answer it.
+#[cfg(any(test, feature = "fake-model"))]
+pub(crate) fn provider_failure(url: &str, status: u16, body: &str) -> anyhow::Error {
+    let code =
+        reqwest::StatusCode::from_u16(status).unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+    ProviderError {
+        url: url.to_owned(),
+        status: code.to_string(),
+        code: code.as_u16(),
+        kind: serde_json::from_str::<Value>(body)
+            .ok()
+            .as_ref()
+            .and_then(error_kind),
+        excerpt: excerpt(body),
+    }
+    .into()
 }
 
 /// The type of error an OpenAI-style body names, `error.type` or else

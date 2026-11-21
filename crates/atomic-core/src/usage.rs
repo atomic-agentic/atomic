@@ -18,7 +18,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Tokens one model call used, as the provider reported them.
@@ -335,7 +335,7 @@ pub(crate) fn record_usage(span: &tracing::Span, usage: &Usage) {
 
 /// The most characters of a failed call's error a span carries, with the
 /// `…` that ends one that was cut. The run's stored error keeps the whole.
-pub(crate) const MAX_SPAN_ERROR: usize = 200;
+pub const MAX_SPAN_ERROR: usize = 200;
 
 /// What a call's span says of why it failed, redacted and at most
 /// [`MAX_SPAN_ERROR`] characters: for an error a provider answered with,
@@ -357,7 +357,54 @@ pub(crate) fn span_error(error: &anyhow::Error) -> (String, Option<u16>) {
     }
 }
 
-/// Record on `span` why a call failed (see [`span_error`]).
+/// What a run's spans say about why it failed, kept between the step that
+/// failed and the spans that outlive it.
+///
+/// A durable step's failure travels as text: the engine records the text and
+/// hands workflow code new text of its own, so what a step's failure was
+/// *caused* by — a provider's answer, with its status and the type of error it
+/// named — cannot reach the step's own span, still less its run's, which only
+/// ever sees the run's error. So the step notes here what a span may say, and
+/// the step's span and the run's span both say that. The whole failure is
+/// never noted: it stays in the run's stored error, where a person reads it.
+///
+/// One per run's execution, made by the workflow that runs it and riding with
+/// the runtime its steps call a model on, just as [`Metering`] does: a lite
+/// call notes its own failure there, since it is the call that knows what the
+/// provider answered.
+#[derive(Clone, Debug, Default)]
+pub struct Why(Arc<Mutex<Option<String>>>);
+
+impl Why {
+    /// Note that a call this run made failed with `error`, as a span may say
+    /// it (see [`span_error`]). A run's first note is the one its spans carry:
+    /// it came from the call that failed first, which is what failed the step.
+    pub fn note_call(&self, error: &anyhow::Error) {
+        let (message, _) = span_error(error);
+        self.note(message);
+    }
+
+    /// Keep the first message noted, and no other. A note is never worth
+    /// stopping over: a poisoned lock loses it, and the spans then say what
+    /// the run's own error says, cut short.
+    fn note(&self, message: String) {
+        if let Ok(mut why) = self.0.lock()
+            && why.is_none()
+        {
+            *why = Some(message);
+        }
+    }
+
+    /// What was noted, or `None` when nothing of this run failed near a call
+    /// or a step.
+    pub fn noted(&self) -> Option<String> {
+        self.0.lock().ok().and_then(|why| why.clone())
+    }
+}
+
+/// Record on `span` why a call failed (see [`span_error`]). A call that
+/// failed in a step notes `error` for that run's spans too, which cannot hear
+/// it on their own (see [`Why`]).
 pub(crate) fn record_error(span: &tracing::Span, error: &anyhow::Error) {
     span.record("otel.status_code", "ERROR");
     span.record(

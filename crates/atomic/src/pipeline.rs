@@ -838,10 +838,11 @@ async fn run_pipeline<C: WorkflowContext>(
     services: Arc<Services>,
     ledger: Ledger,
     replay: Option<Arc<Replay>>,
+    why: atomic_core::usage::Why,
 ) -> Result<Value> {
     let id = ctx.workflow_id().to_owned();
     let mut caches = None;
-    let result = run_pipeline_in(ctx, run, services, ledger, replay, &mut caches).await;
+    let result = run_pipeline_in(ctx, run, services, ledger, replay, &why, &mut caches).await;
     if let Some(caches) = caches {
         settle_caches(&id, caches, &result).await;
     }
@@ -886,6 +887,7 @@ async fn run_pipeline_in<C: WorkflowContext>(
     services: Arc<Services>,
     ledger: Ledger,
     replay: Option<Arc<Replay>>,
+    why: &atomic_core::usage::Why,
     run_caches: &mut Option<atomic_core::worktree::Caches>,
 ) -> Result<Value> {
     let PipelineRun { pipeline, input } = run;
@@ -1071,6 +1073,7 @@ async fn run_pipeline_in<C: WorkflowContext>(
                 );
                 let decision = crate::telemetry::traced(
                     crate::telemetry::gate_span(&g.id, ctx.workflow_id()),
+                    why.clone(),
                     decision,
                 )
                 .await?;
@@ -1101,6 +1104,7 @@ async fn run_pipeline_in<C: WorkflowContext>(
             worktrees: run_worktrees.as_ref(),
             accepted: &accepted,
             caches: run_caches.as_ref(),
+            why,
         };
         used_worktrees |= step.worktree;
         let (candidate, told) = turn(
@@ -1243,6 +1247,9 @@ struct RunScope<'a> {
     accepted: &'a [String],
     /// The run's build caches, once a worktree step needs them.
     caches: Option<&'a atomic_core::worktree::Caches>,
+    /// What this run's spans say of a step that failed (see
+    /// [`atomic_core::usage::Why`]).
+    why: &'a atomic_core::usage::Why,
 }
 
 /// One turn of an atom: a step's author, a reviewer, or the author's repair
@@ -1285,6 +1292,7 @@ async fn turn<C: WorkflowContext>(
         models,
         replay,
         pinned,
+        why,
         ..
     } = *run;
     // A fixture is its own repository (see `in_worktree`).
@@ -1295,6 +1303,11 @@ async fn turn<C: WorkflowContext>(
         .cloned()
         .ok_or_else(|| failed(format!("step `{}`: no atom `{}`", t.name, t.atom)))?;
     let mut runtimes = (*services.runtimes).clone();
+    // A model call this atom makes notes on the run's why, which its step's
+    // span and the run's read when they say why they failed: neither can hear
+    // the call's own error (see [`atomic_core::usage::Why`]).
+    let why = (*why).clone();
+    runtimes.lite.why = why.clone();
     // An atom with captured helpers gets its step's logical time and seed
     // from a step of its own, recorded once and read back on every retry,
     // so its helpers render the same prompt and reach the same validator
@@ -1589,8 +1602,13 @@ async fn turn<C: WorkflowContext>(
             failpoint(&ran);
             Ok(proposal)
         };
-        // Model calls name the run and step on their spans.
-        crate::telemetry::traced(span, atomic_core::usage::for_step(caller.0, caller.1, work))
+        // Model calls name the run and step on their spans, and say why they
+        // failed on this step's span and its run's (see `mark_failed`).
+        crate::telemetry::traced(
+            span,
+            why.clone(),
+            atomic_core::usage::for_step(caller.0, caller.1, work),
+        )
     })
     .await
 }
@@ -1786,6 +1804,7 @@ async fn reviewed<C: WorkflowContext>(
     *working = None;
     let resolution = crate::telemetry::traced(
         crate::telemetry::gate_span(&id, ctx.workflow_id()),
+        (*run.why).clone(),
         gate::gate(ctx, &id, spec),
     )
     .await?;
@@ -2094,31 +2113,34 @@ pub fn register_pipeline<R: DurableRuntime>(rt: &mut R, services: Services) {
     rt.register(PIPELINE, move |ctx: R::Context, run: PipelineRun| {
         let span = crate::telemetry::workflow_span(&run.pipeline.name, ctx.workflow_id());
         let id = ctx.workflow_id().to_owned();
-        crate::panics::caught(
-            id,
-            crate::telemetry::traced(
-                span,
-                run_pipeline(ctx, run, services.clone(), ledger.clone(), None),
-            ),
-        )
+        // One for this execution of the run, which its steps note when a
+        // model call of theirs fails (see [`atomic_core::usage::Why`]).
+        let why = atomic_core::usage::Why::default();
+        let traced = crate::telemetry::traced(
+            span,
+            why.clone(),
+            run_pipeline(ctx, run, services.clone(), ledger.clone(), None, why),
+        );
+        crate::panics::caught(id, traced)
     });
     rt.register(REPLAY, move |ctx: R::Context, replay: ReplayRun| {
         let ReplayRun { of, run, recorded } = replay;
         let span = crate::telemetry::workflow_span(&run.pipeline.name, ctx.workflow_id());
         let id = ctx.workflow_id().to_owned();
-        crate::panics::caught(
-            id,
-            crate::telemetry::traced(
-                span,
-                run_pipeline(
-                    ctx,
-                    run,
-                    replaying.clone(),
-                    replay_ledger.clone(),
-                    Some(Arc::new(Replay { of, recorded })),
-                ),
+        let why = atomic_core::usage::Why::default();
+        let traced = crate::telemetry::traced(
+            span,
+            why.clone(),
+            run_pipeline(
+                ctx,
+                run,
+                replaying.clone(),
+                replay_ledger.clone(),
+                Some(Arc::new(Replay { of, recorded })),
+                why,
             ),
-        )
+        );
+        crate::panics::caught(id, traced)
     });
 }
 

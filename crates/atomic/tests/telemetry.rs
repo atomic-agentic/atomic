@@ -349,6 +349,15 @@ fn a_key_a_lite_provider_echoes_is_redacted_in_its_excerpt() {
                 Some("atomic.failed"),
                 "{span}"
             );
+            // What the step's span and its run's say of why they failed is
+            // what the call that failed said — its status and the type the
+            // provider named — and none of what the provider wrote, which
+            // only the run's stored error keeps.
+            let why = span["status"]["message"].as_str().unwrap_or_default();
+            assert!(
+                !why.contains("Incorrect API key provided"),
+                "{span} carries the provider's own text: {why}"
+            );
         }
     }
 }

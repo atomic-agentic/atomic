@@ -59,19 +59,24 @@ step's, a client span. A Codex atom's call is one turn, which may make several
 requests to the provider, and its span covers them all. `gen_ai.provider.name`
 is `openai` for OpenAI's API and `openai_compatible` for any other endpoint.
 
-A step or run that fails ends its span with an error status, the failure's
-message and `error.type` (`atomic.failed`, `atomic.interrupted`, or for a
-model call `atomic.model_call` or `atomic.meter`). A model call's
-`error.message` is redacted and at most 200 characters, with a `…` if it was
-cut. When the provider answered a lite atom's call with an error status, it
+A step or run that fails ends its span with an error status, why it failed
+and `error.type` (`atomic.failed`, `atomic.interrupted`, or for a model call
+`atomic.model_call` or `atomic.meter`). A step's span and its run's say the
+same thing, and no span carries the whole failure: what one says of it is
+redacted and at most 200 characters, with a `…` on one that was cut. A model
+call says it in `error.message`. When the provider answered a lite atom's
+call with an error status, it
 holds only that status and the type of error the provider named, such as
 `401 Unauthorized: invalid_request_error`, and `http.response.status_code`
 holds the code. A type that does not read as one, such as `BadRequestError`,
 `DeploymentNotFound` or `"429"`, gives the status alone. Any other failure is what failed and its innermost cause,
 which can quote the provider or the model: a Codex atom's provider error, a
-lite answer that is not JSON, a refusal or an answer the provider stopped.
-The run's stored error keeps the whole, redacted. A failed step's or run's
-own span still carries its whole failure as its status message. A process that stops while
+lite answer that is not JSON, a refusal or an answer the provider stopped. A
+step's span and its run's say what the model call that failed said, so a
+provider's body never reaches them; a step that failed nowhere near a model
+call — an output that misfits its schema, a command that stopped — says its
+own error, cut to the same length. The run's stored error keeps the whole,
+redacted, which is where a person reads it. A process that stops while
 runs are still going, such as one stopped while it waits at a gate, ends the
 spans still open with `atomic.stopped` set and exports them before it exits.
 
