@@ -307,15 +307,27 @@ pub async fn run(
     state.create()?;
     let _lock = state.lock_execution("atomic eval")?;
     let needs_model = chosen.atoms.iter().any(|(a, _, _)| calls_model(a));
-    // The settings `atomic run` resolves: files, variables and flags.
-    let resolved = crate::engine::settings(&state, &args.engine)?;
+    // The settings `atomic run` resolves: files, variables and flags; the
+    // sign-in only for a live eval, since a replay reads no credential.
+    let live = source != Source::Recorded && needs_model;
+    let resolved = crate::engine::settings(&state, &args.engine, live)?;
     // A recording answers only the request it was made for, endpoint and
     // model included, so replaying needs them configured as they were; it
     // needs no key, so none is read. A live eval calls the endpoint as a
     // run would.
     let endpoint = match (source, needs_model) {
         (Source::Recorded, true) => crate::engine::identity(&resolved)?,
-        _ => crate::engine::endpoint(&resolved, needs_model)?,
+        // An eval is the person's own, as `atomic run` is: its sign-in is
+        // refused when the ledger it is metered in is a shared store.
+        _ => crate::engine::endpoint(
+            &resolved,
+            needs_model,
+            matches!(
+                crate::engine::store_of(&state, &resolved.settings),
+                atomic_durable::Database::Postgres { .. }
+            )
+            .then_some(crate::engine::SHARED_STORE),
+        )?,
     };
     if source != Source::Recorded
         && needs_model
@@ -571,6 +583,7 @@ pub async fn run(
     } else if json {
         // The report above is the one JSON document on stdout; it says it
         // failed.
+        atomic_exec::process::end_all(&mut |what| atomic_core::log_line!("atomic: {what}"));
         std::process::exit(1);
     } else {
         Err(Failure::new(
@@ -834,6 +847,7 @@ mod tests {
             base_url: "https://api.openai.com/v1".into(),
             model: "m".into(),
             api_key_env: None,
+            sign_in: None,
         };
         let mut sent = endpoint.clone();
         sent.base_url = "http://127.0.0.1:4000/v1".into();

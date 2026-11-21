@@ -72,6 +72,7 @@ fn runtime(model: &FakeModel, tag: &str) -> CodexRuntime {
             base_url: model.base_url(),
             model: "synthetic".into(),
             api_key_env: None,
+            sign_in: None,
         },
         defaults: AtomConfig::default(),
         artifacts: Artifacts::none(),
@@ -829,6 +830,7 @@ fn an_output_must_reference_artifacts_that_exist_with_the_right_type() {
                     base_url: model.base_url(),
                     model: "synthetic".into(),
                     api_key_env: None,
+                    sign_in: None,
                 },
                 AtomConfig::default(),
             );
@@ -2152,6 +2154,241 @@ fn an_exec_output_cel_cannot_read_fails() {
     });
 }
 
+/// A ChatGPT sign-in, as Codex's login keeps it in a file store, with a
+/// token no real backend would take, refreshed now.
+fn signed_in(dir: &std::path::Path, backend: &str) -> crate::signin::SignIn {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("time")
+        .as_secs();
+    signed_in_at(dir, backend, now)
+}
+
+/// The same, last refreshed `refreshed` seconds after the epoch. Its issuer
+/// is the test backend's host, so a refresh, on a stale sign-in or a 401,
+/// goes there and never to OpenAI's.
+fn signed_in_at(dir: &std::path::Path, backend: &str, refreshed: u64) -> crate::signin::SignIn {
+    std::fs::create_dir_all(dir).expect("auth home");
+    let id_token = crate::testing::fake_id_token("dev@example.invalid", "account-1");
+    let issuer = backend.trim_end_matches("/backend-api");
+    std::fs::write(
+        dir.join("auth.json"),
+        json!({
+            "auth_mode": "chatgpt",
+            "OPENAI_API_KEY": null,
+            "tokens": {
+                "id_token": id_token,
+                "access_token": "synthetic-access-token",
+                "refresh_token": "synthetic-refresh-token",
+                "account_id": "account-1",
+                "oauth_provenance": {"issuer": issuer, "client_id": codex_login::CLIENT_ID},
+            },
+            "last_refresh": chrono_like(refreshed),
+        })
+        .to_string(),
+    )
+    .expect("auth.json");
+    crate::signin::SignIn::in_files(dir).with_backend(backend)
+}
+
+/// `secs` since the epoch as an RFC 3339 UTC time.
+fn chrono_like(secs: u64) -> String {
+    let days = secs / 86_400;
+    let rem = secs % 86_400;
+    // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}
+
+// Sign-ins are kept, and used, on Linux only.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_codex_atom_runs_on_a_chatgpt_sign_in_with_no_api_key() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(
+            r#"{"category": "bug", "summary": "Export crashes.", "line": null}"#.into(),
+        )])
+        .await
+        .expect("fake model");
+        let mut rt = runtime(&model, "signed-in");
+        let backend = model.base_url().replace("/v1", "/backend-api");
+        let auth = rt.codex_home.with_file_name("auth");
+        rt.endpoint = ModelEndpoint {
+            base_url: "unused".into(),
+            model: "synthetic".into(),
+            api_key_env: None,
+            sign_in: Some(signed_in(&auth, &backend)),
+        };
+        // A key in the environment does not replace the sign-in. Only this
+        // test reads or writes CODEX_API_KEY.
+        // SAFETY: as above; nothing else in this binary touches it.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var("CODEX_API_KEY", "sk-from-the-environment");
+        }
+        let (out, _) = run_codex_atom(
+            &Classify,
+            &Note {
+                text: "Export crashes on é.".into(),
+            },
+            &rt,
+        )
+        .await
+        .expect("runs on the sign-in");
+        assert_eq!(out.category, "bug");
+        assert_eq!(model.calls(), 1);
+        assert_eq!(model.paths(), ["/backend-api/codex/responses"]);
+        let headers = &model.headers()[0];
+        let header = |name: &str| {
+            headers
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(
+            header("authorization"),
+            Some("Bearer synthetic-access-token")
+        );
+        assert_eq!(header("chatgpt-account-id"), Some("account-1"));
+        // Everything the thread asked of the backend: the model, and nothing
+        // that reaches the account's apps, connectors or plugins.
+        eprintln!("every request: {:?}", model.every_request());
+        assert_eq!(model.every_request(), expected_backend_requests());
+        // SAFETY: as above.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::remove_var("CODEX_API_KEY");
+        }
+    });
+}
+
+/// A stale sign-in is refreshed at its own issuer, here the test backend,
+/// before the thread uses it: nothing reaches OpenAI's.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_stale_sign_in_is_refreshed_at_the_test_issuer() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(
+            r#"{"category": "bug", "summary": "Export crashes.", "line": null}"#.into(),
+        )])
+        .await
+        .expect("fake model");
+        let mut rt = runtime(&model, "stale-sign-in");
+        let backend = model.base_url().replace("/v1", "/backend-api");
+        let auth = rt.codex_home.with_file_name("auth");
+        rt.endpoint = ModelEndpoint {
+            base_url: "unused".into(),
+            model: "synthetic".into(),
+            api_key_env: None,
+            sign_in: Some(signed_in_at(&auth, &backend, 0)),
+        };
+        // The fake has no token endpoint, so the refresh fails; whether the
+        // turn then runs on the old token is Codex's to decide.
+        let _ = run_codex_atom(&Classify, &Note { text: "n".into() }, &rt).await;
+        let asked = model.every_request();
+        assert!(
+            asked.contains(&("POST".to_owned(), "/oauth/token".to_owned())),
+            "{asked:?}"
+        );
+    });
+}
+
+/// Codex's login restrictions hold for the sign-in when a thread starts: a
+/// workspace other than the sign-in's, or API keys only, refuse it before
+/// any model call.
+#[cfg(target_os = "linux")]
+#[test]
+fn codex_login_restrictions_refuse_a_sign_in_they_do_not_allow() {
+    on_codex_runtime(async {
+        for (tag, config, said) in [
+            (
+                "workspace",
+                "forced_chatgpt_workspace_id = \"another-workspace\"\n",
+                "allow ChatGPT workspace(s) another-workspace only",
+            ),
+            (
+                "method",
+                "forced_login_method = \"api\"\n",
+                "do not allow a chatgpt sign-in",
+            ),
+        ] {
+            let model = FakeModel::start(Vec::new()).await.expect("fake model");
+            let mut rt = runtime(&model, &format!("restricted-{tag}"));
+            std::fs::write(rt.codex_home.join("config.toml"), config).expect("config");
+            let backend = model.base_url().replace("/v1", "/backend-api");
+            let auth = rt.codex_home.with_file_name("auth");
+            rt.endpoint = ModelEndpoint {
+                base_url: "unused".into(),
+                model: "synthetic".into(),
+                api_key_env: None,
+                sign_in: Some(signed_in(&auth, &backend)),
+            };
+            let refused = run_codex_atom(&Classify, &Note { text: "n".into() }, &rt)
+                .await
+                .expect_err("refused");
+            assert!(refused.to_string().contains(said), "{tag}: {refused}");
+            assert_eq!(model.calls(), 0, "{tag}");
+        }
+    });
+}
+
+/// The requests a signed-in thread makes of the Codex backend, in order.
+fn expected_backend_requests() -> Vec<(String, String)> {
+    // The model catalog, then the turn.
+    [
+        ("GET", "/backend-api/codex/models"),
+        ("POST", "/backend-api/codex/responses"),
+    ]
+    .into_iter()
+    .map(|(m, p)| (m.to_owned(), p.to_owned()))
+    .collect()
+}
+
+#[test]
+fn a_lite_atom_says_a_sign_in_is_not_for_it() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(Vec::new()).await.expect("fake model");
+        let codex = runtime(&model, "lite-signed-in");
+        let auth = codex.codex_home.with_file_name("auth");
+        let endpoint = ModelEndpoint {
+            base_url: model.base_url(),
+            model: "synthetic".into(),
+            api_key_env: None,
+            sign_in: Some(signed_in(
+                &auth,
+                &model.base_url().replace("/v1", "/backend-api"),
+            )),
+        };
+        let lite = crate::lite::LiteRuntime::new(endpoint, AtomConfig::default());
+        let refused = run_lite_atom(
+            &Patch,
+            &Note {
+                text: "Export crashes.".into(),
+            },
+            &lite,
+        )
+        .await
+        .expect_err("refused");
+        let said = refused.to_string();
+        assert!(said.contains("serves Codex atoms only"), "{said}");
+        assert!(said.contains("ATOMIC_MODEL_BASE_URL"), "{said}");
+        assert_eq!(model.calls(), 0);
+    });
+}
+
 #[tokio::test]
 async fn a_worktree_steps_turn_finds_its_runs_caches_and_only_it_may_write_them() {
     let model = FakeModel::start(vec![]).await.expect("model");
@@ -2615,4 +2852,266 @@ fn a_deny_list_that_cannot_be_made_fails_the_machine_not_the_model() {
         turn_failure(&anyhow::anyhow!("the model said no")),
         AtomError::Model(_)
     ));
+}
+
+/// A local backend whose open waits, once it has begun, until it is let
+/// go, and that counts its closes.
+#[derive(Clone, Default)]
+struct HeldOpen {
+    state: Arc<(std::sync::Mutex<(bool, bool)>, std::sync::Condvar)>,
+    closes: Arc<std::sync::atomic::AtomicUsize>,
+    opened: Arc<std::sync::Mutex<Option<Workspace>>>,
+}
+
+impl HeldOpen {
+    fn begun(&self) -> bool {
+        self.state.0.lock().expect("state").0
+    }
+
+    fn let_go(&self) {
+        let (lock, wake) = &*self.state;
+        if let Ok(mut state) = lock.lock() {
+            state.1 = true;
+        }
+        wake.notify_all();
+    }
+
+    fn closes(&self) -> usize {
+        self.closes.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Lets a [`HeldOpen`] go when dropped, as when a test fails while the
+/// open is held, so the test fails rather than hangs.
+struct LetOpenGo(HeldOpen);
+
+impl Drop for LetOpenGo {
+    fn drop(&mut self) {
+        self.0.let_go();
+    }
+}
+
+impl ExecutionBackend for HeldOpen {
+    fn connect(&self) -> Result<atomic_exec::Statement, atomic_exec::ExecError> {
+        Ok(atomic_exec::LocalBackend::STATEMENT)
+    }
+
+    fn open(&self, request: &atomic_exec::Open) -> Result<Workspace, atomic_exec::ExecError> {
+        let (lock, wake) = &*self.state;
+        let mut state = lock.lock().expect("state");
+        state.0 = true;
+        wake.notify_all();
+        while !state.1 {
+            state = wake.wait(state).expect("state");
+        }
+        drop(state);
+        let ws = atomic_exec::LocalBackend::default().open(request)?;
+        *self.opened.lock().expect("opened") = Some(ws.clone());
+        Ok(ws)
+    }
+
+    fn run(
+        &self,
+        command: &atomic_exec::Command,
+    ) -> Result<atomic_exec::Completed, atomic_exec::ExecError> {
+        atomic_exec::LocalBackend::default().run(command)
+    }
+
+    fn close(&self, workspace: &Workspace) -> Result<(), atomic_exec::ExecError> {
+        self.closes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        atomic_exec::LocalBackend::default().close(workspace)
+    }
+}
+
+/// A run cancelled while its workspace is still opening leaves nothing
+/// open: the open finishes, and the workspace it made is closed, once.
+#[test]
+fn a_workspace_that_opens_after_its_run_was_cancelled_is_closed() {
+    on_codex_runtime(async {
+        let dir = scratch("cancelled-open");
+        std::fs::create_dir_all(&dir).expect("source");
+        let backend = HeldOpen::default();
+        let _let_go = LetOpenGo(backend.clone());
+        let shared: Arc<dyn ExecutionBackend> = Arc::new(backend.clone());
+        let request = atomic_exec::Open {
+            label: "held".into(),
+            run: "run-1".into(),
+            step: "held".into(),
+            attempt: "attempt-1".into(),
+            source: Some(dir.clone()),
+            ..atomic_exec::Open::default()
+        };
+        let opening = tokio::spawn(open_workspace(shared, request));
+        for _ in 0..500 {
+            if backend.begun() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(backend.begun(), "the open never began");
+        opening.abort();
+        assert!(matches!(opening.await, Err(e) if e.is_cancelled()));
+        // The open succeeds once no one waits for it.
+        backend.let_go();
+        for _ in 0..500 {
+            if backend.closes() > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(backend.closes(), 1, "the workspace was left open");
+        let scratch = backend
+            .opened
+            .lock()
+            .expect("opened")
+            .as_ref()
+            .and_then(|ws| ws.scratch.clone())
+            .expect("a scratch directory");
+        for _ in 0..200 {
+            if !scratch.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(!scratch.exists(), "its scratch directory is left");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(backend.closes(), 1, "closed more than once");
+    });
+}
+
+/// Run `body` on a runtime of its own on a thread of its own, then drop the
+/// runtime: whether the drop returned within `within`, and did not hang.
+fn runtime_drop_returns(
+    within: std::time::Duration,
+    body: impl FnOnce(&tokio::runtime::Runtime) + Send + 'static,
+) -> bool {
+    let (done, dropped) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        body(&rt);
+        drop(rt);
+        let _ = done.send(());
+    });
+    dropped.recv_timeout(within).is_ok()
+}
+
+/// A runtime dropped while a workspace is still opening shuts down: the
+/// open finishes as the blocking pool winds down, and the workspace it
+/// made is left for the backend to reclaim rather than closed from there.
+#[test]
+fn a_runtime_dropped_while_a_workspace_opens_shuts_down() {
+    let backend = HeldOpen::default();
+    let _let_go = LetOpenGo(backend.clone());
+    let held = backend.clone();
+    let returned = runtime_drop_returns(std::time::Duration::from_secs(30), move |rt| {
+        let dir = scratch("dropped-open");
+        std::fs::create_dir_all(&dir).expect("source");
+        let shared: Arc<dyn ExecutionBackend> = Arc::new(held.clone());
+        rt.spawn(open_workspace(
+            shared,
+            atomic_exec::Open {
+                label: "held".into(),
+                run: "run-1".into(),
+                step: "held".into(),
+                attempt: "attempt-1".into(),
+                source: Some(dir),
+                ..atomic_exec::Open::default()
+            },
+        ));
+        for _ in 0..500 {
+            if held.begun() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(held.begun(), "the open never began");
+        // Let go once the runtime is shutting down.
+        let late = held.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            late.let_go();
+        });
+    });
+    assert!(returned, "the runtime's drop hung");
+}
+
+/// A runtime dropped while a command runs in its workspace, or while a task
+/// holds an open workspace, shuts down.
+#[test]
+fn a_runtime_dropped_under_a_running_command_or_a_held_workspace_shuts_down() {
+    // A command that holds its workspace open until it ends.
+    let (_, a, compiled) = exec_project(
+        "dropped-command",
+        "import json, sys, time\njson.load(sys.stdin)\ntime.sleep(1)\njson.dump({'total': 1}, sys.stdout)\n",
+        "",
+    );
+    let recorded = Recording::default();
+    let calls = recorded.clone();
+    let returned = runtime_drop_returns(std::time::Duration::from_secs(30), move |rt| {
+        let backend: Arc<dyn ExecutionBackend> = Arc::new(calls.clone());
+        rt.spawn(async move {
+            let _ = run_exec(
+                &a,
+                &compiled,
+                &json!({"cents": [1]}),
+                &EffectIdentity {
+                    run_id: "run-1".into(),
+                    step_id: "total".into(),
+                },
+                backend,
+                None,
+                &Artifacts::none(),
+            )
+            .await;
+        });
+        for _ in 0..500 {
+            if calls.calls().iter().any(|c| c.starts_with("run ")) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            calls.calls().iter().any(|c| c.starts_with("run ")),
+            "{:?}",
+            calls.calls()
+        );
+    });
+    assert!(returned, "the runtime's drop hung under a running command");
+    // A task that holds an open workspace and never lets go of it.
+    let holding = Recording::default();
+    let opened = holding.clone();
+    let returned = runtime_drop_returns(std::time::Duration::from_secs(30), move |rt| {
+        let dir = scratch("dropped-guard");
+        std::fs::create_dir_all(&dir).expect("source");
+        let backend: Arc<dyn ExecutionBackend> = Arc::new(opened.clone());
+        rt.spawn(async move {
+            let guard = open_workspace(
+                backend,
+                atomic_exec::Open {
+                    label: "kept".into(),
+                    run: "run-1".into(),
+                    step: "kept".into(),
+                    attempt: "attempt-1".into(),
+                    source: Some(dir),
+                    ..atomic_exec::Open::default()
+                },
+            )
+            .await;
+            std::future::pending::<()>().await;
+            drop(guard);
+        });
+        for _ in 0..500 {
+            if !opened.opened().is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!opened.opened().is_empty(), "the workspace never opened");
+    });
+    assert!(returned, "the runtime's drop hung under a held workspace");
 }

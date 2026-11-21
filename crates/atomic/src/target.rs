@@ -289,6 +289,7 @@ fn atom_pipeline(atom: Atom, input: &Value) -> anyhow::Result<Pipeline> {
             origins,
             with,
             worktree: false,
+            review: None,
         })],
         returns: "steps.run.output".into(),
         input: input_contract,
@@ -369,6 +370,16 @@ pub fn needs_model(run: &PipelineRun) -> bool {
         .atoms
         .values()
         .any(|a| matches!(a.kind.as_str(), "lite" | "codex"))
+}
+
+/// The lite atoms the run calls, which a ChatGPT sign-in does not serve.
+pub fn lite_atoms(run: &PipelineRun) -> Vec<String> {
+    run.pipeline
+        .atoms
+        .values()
+        .filter(|a| a.kind == "lite")
+        .map(|a| a.name.clone())
+        .collect()
 }
 
 /// The run's input: the file `--input` names (`-` for stdin), or `--data`.

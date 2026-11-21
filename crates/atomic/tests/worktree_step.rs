@@ -106,6 +106,7 @@ fn register(rt: &mut Durare, dir: &Path, base_url: &str) {
             base_url: base_url.to_owned(),
             model: "synthetic".into(),
             api_key_env: None,
+            sign_in: None,
         },
         AtomConfig::default(),
     );

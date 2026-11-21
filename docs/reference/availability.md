@@ -42,7 +42,11 @@ The workflow interpreter is built: a workflow file runs as one durable run, with
 no rebuild, through sequential atom steps (Codex, lite and exec atoms), local
 gates and `worktree: true` steps, which run a Codex atom in its own worktree at
 the step's `base` and record atomic's commit in `steps.<id>.metadata.commit`.
-A run keeps the definitions it started with.
+A run keeps the definitions it started with. An atom step's `review` is built
+for one reviewer atom with a typed verdict: a request for changes gives the
+author repair rounds, and any other verdict but an approval, or a request for
+changes with no rounds left, goes to a person at a gate. Several reviewers, `require: majority`, `ai-then-human` gate policy
+and calibrated decision atoms are not built yet.
 
 `atomic init`, `atomic run`, `atomic runs resume`, `atomic runs show`,
 `atomic config --explain` and a local foreground `atomic serve` are built.
@@ -62,6 +66,11 @@ decision counts only with the credential its person enrolled. `atomic run` and
 `atomic runs resume` prompt at the terminal for each gate their run reaches, and
 question gates (`ask` with a typed `answer`, `remember`, and a default when time
 runs out) are built; `atomic gates answer` answers one from another terminal.
+
+Codex atoms can run on a ChatGPT sign-in (`atomic model login`, `model status`,
+`model logout`), kept in the OS keyring or the opt-in credential file store, on Linux
+only, for the developer's own runs: a shared store and `atomic serve` refuse it.
+Lite atoms need a model endpoint and say so.
 
 A project's artifact store takes a lock in its private state while it is
 written or swept. A run that finds it held by another process, such as a sweep,
@@ -154,7 +163,12 @@ before the step runs and without recording an outcome, and the run continues
 when resumed where the sandbox can start. `atomic serve` instead leaves that run
 unfinished, says so, and goes on serving the others; the run continues when a
 later process recovers it. A sandbox that fails in a way that may pass, such as
-on a full disk, makes the step wait, as a backend with no room does. Atoms that run no commands run as usual. On macOS and
+on a full disk, makes the step wait, as a backend with no room does. Atoms that run no commands run as usual. When atomic
+stops with commands still running, on Linux it ends every process they
+started, inside their sandboxes too, before it exits and frees the project's
+execution lock. On macOS and Windows it kills each command's process group and
+does not wait, so a process that left its group may outlive atomic and the
+lock. On macOS and
 Windows this has not been verified: exec atoms' commands run unconfined there,
 so atomic keeps no operator credential and refuses credentialed gate decisions.
 

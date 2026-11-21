@@ -21,8 +21,8 @@ own. A clause the listed tests do not yet show in full says so with one
 names it as pending rather than passed outright.
 
 Every listed test is run in one `cargo test` over the workspace, with CI's
-test features (FEATURES, which must match CI's test step), so nothing
-rebuilds after that step.
+test features (FEATURES, which must match CI's test build, and which
+scripts/test-shards.py shares), so nothing rebuilds after that build.
 
 The check fails when any listed test fails, is ignored, or does not run at all
 (renamed, removed, or built out by a feature), when the same name runs only in
