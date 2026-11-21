@@ -347,8 +347,9 @@ for row in "${selected[@]}"; do
         # And read all of it, so `grep -F` does not stop at the first match:
         # an earlier stage of the pipe would then die of SIGPIPE, which
         # pipefail reports as a failure of the pipeline, and a test that did
-        # fail would read as one that was not seen.
-        if ! grep -E '^test [^ ]+ \.\.\. FAILED$' "${LOG}" | cut -d' ' -f2 |
+        # fail would read as one that was not seen. A name may have spaces
+        # in it, as a doctest's does.
+        if ! grep -E '^test .+ \.\.\. FAILED$' "${LOG}" | sed -E 's/^test (.+) \.\.\. FAILED$/\1/' |
             grep -F -- "${test}" >/dev/null; then
             unfailed="${unfailed} ${test}"
         fi

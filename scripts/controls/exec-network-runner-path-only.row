@@ -1,0 +1,1 @@
+exec-network-runner-path-only|crates/atomic/src/engine.rs|        ..ProcessRunner::atomic(atomic)|        env: std::env::vars().collect(), ..ProcessRunner::atomic(atomic)|-p atomic-agentic --bins the_process_runner_gets_only_path_from_atomics_environment
