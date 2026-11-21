@@ -181,6 +181,7 @@ impl Request {
             // Confined, if at all, before it was sent.
             writable: Vec::new(),
             read_only: Vec::new(),
+            network: Vec::new(),
         })
     }
 }
@@ -401,7 +402,8 @@ impl ExecutionBackend for ProcessRunner {
     /// The command is confined here, before it crosses, as its workspaces'
     /// backend confines it: the runner runs what it is sent.
     fn run(&self, command: &Command) -> Result<Completed, ExecError> {
-        let command = &self.workspaces.prepare(command)?;
+        let (command, _held) = self.workspaces.prepare(command)?;
+        let command = &command;
         let request = serde_json::to_vec(&Request::new(command)).map_err(|e| ExecError::Io {
             program: command.program.clone(),
             message: format!("encode the runner request: {e}"),

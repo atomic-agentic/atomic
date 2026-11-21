@@ -48,14 +48,20 @@ CONTROLS=(
     "sandbox-private-state|crates/atomic-core/src/codex.rs|    for p in paths {|    for p in paths.into_iter().take(0) {|--workspace --features ${FEATURES} --test sandboxed_commit --test exec_private_state -- a_read_only_turn_in_a_worktree_sees_its_checkout an_exec_atom_cannot_reach_atomics_private_state"
     "turn-tmp|crates/atomic-core/src/codex.rs|            std::env::set_var(\"TMPDIR\", own);|            let _ = own;|--workspace --features ${FEATURES} --test turn_workspace concurrent_turns_in_one_directory_never_break_each_others_sandbox"
     "helper-stage|crates/atomic-core/src/codex.rs|    arg != \"--\"|    { let _ = arg; true }|--workspace --features ${FEATURES} --test turn_workspace a_command_naming_the_inner_stage_leaves_the_registry_shared"
-    "sandbox-network|crates/atomic-core/src/codex.rs|    codex_protocol::permissions::NetworkSandboxPolicy::Restricted;|    codex_protocol::permissions::NetworkSandboxPolicy::Enabled;|--workspace --features ${FEATURES} --test self_approval an_atom_cannot_approve_its_own_gate_through_its_shell"
+    "exec-confinement|crates/atomic-exec/src/lib.rs|            Some(confine) => confine.confine_held(command, &self.tmp),|            Some(confine) if std::hint::black_box(false) => confine.confine_held(command, &self.tmp), Some(_) => Ok((command.clone(), None)),|--workspace --features ${FEATURES} --test exec_private_state --test run_cli -- an_exec_atom_cannot_reach_atomics_private_state atomic_run_confines_an_exec_atoms_command a_confined_command_has_no_controlling_terminal"
+    "sandbox-network|crates/atomic-core/src/codex.rs|    codex_protocol::permissions::NetworkSandboxPolicy::Restricted;|    codex_protocol::permissions::NetworkSandboxPolicy::Enabled;|--workspace --features ${FEATURES} --test self_approval --test exec_network -- an_atom_cannot_approve_its_own_gate_through_its_shell a_confined_command_reaches_only_the_hosts_it_is_given"
+    "exec-network-attribution|crates/atomic-core/src/network.rs|        let decision = if req.execution_id.is_none() {|        let decision = if /*CONTROL_OFF*/ false {|-p atomic-agentic-core --lib --features fake-model network::tests::only_a_commands_bridge_can_use_its_proxy"
+    "exec-network-allowlist|crates/atomic-core/src/network.rs|        } else if !declared(&self.0, &req.host) {|        } else if /*CONTROL_OFF*/ false {|--workspace --features ${FEATURES} --test run_cli an_exec_atom_reaches_only_the_hosts_it_declares"
+    "exec-network-ports|crates/atomic-core/src/network.rs|        } else if !PORTS.contains(&req.port) {|        } else if /*CONTROL_OFF*/ false {|--workspace --features ${FEATURES} --test run_cli an_exec_atom_reaches_only_the_hosts_it_declares"
+    "exec-network-upstream|crates/atomic-core/src/network.rs|        allow_upstream_proxy: false,|        allow_upstream_proxy: /*CONTROL_OFF*/ true,|-p atomic-agentic-core --lib --features fake-model network::tests::a_proxy_uses_no_upstream_proxy_and_no_socks"
+    "exec-network-recheck|crates/atomic-core/src/codex.rs|            let hosts = crate::network::check_hosts(&hosts)|            let hosts = /*CONTROL_OFF*/ Ok::<Vec<String>, String>(hosts)|--workspace --features ${FEATURES} --test exec_network a_confined_command_reaches_only_the_hosts_it_is_given"
+    "exec-network-policy|crates/atomic-core/src/atom.rs|            if let Err(why) = crate::network::check_hosts(&hosts) {|            if let Err(why) = /*CONTROL_OFF*/ Ok::<(), String>(()) { let _ = &hosts;|-p atomic-agentic-core --lib --features fake-model exec_declarations_are_checked_at_load"
     "stop-subreaper|crates/atomic-exec/src/process.rs|            libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);|            let _ = libc::PR_SET_CHILD_SUBREAPER; // CONTROL_OFF|-p atomic-agentic-exec --test stop_all stopping_ends_every_process_a_command_started_before_it_returns"
     "stop-wait-complete|crates/atomic-exec/src/process.rs|            if left.is_empty() && complete {|            if left.is_empty() /*CONTROL_OFF*/ {|-p atomic-agentic-exec --lib the_wait_ends_only_after_a_complete_look"
     "stop-keep-found|crates/atomic-exec/src/process.rs|                found.insert(process);|                let _ = &process; // CONTROL_OFF|-p atomic-agentic-exec --lib the_stop_phase_is_bounded_and_keeps_what_it_found"
     "stop-kill-on-sight|crates/atomic-exec/src/process.rs|                if watched.insert(process) {|                if /*CONTROL_OFF*/ false && watched.insert(process) {|-p atomic-agentic-exec --test stop_all stopping_ends_every_process_a_command_started_before_it_returns"
     "stop-own-tool|crates/atomic-exec/src/process.rs|                let own = own(&all, &tools);|                let own = own(&all, &[] /*CONTROL_OFF*/);|-p atomic-agentic-exec --test stop_all stopping_ends_every_process_a_command_started_before_it_returns"
     "stop-look-cap|crates/atomic-exec/src/process.rs|            look.saturating_mul(2).min(LOOK_MAX)|            look.saturating_mul(2) /*CONTROL_OFF*/|-p atomic-agentic-exec --lib the_next_look_grows_only_when_one_ran_out_and_is_capped"
-    "exec-confinement|crates/atomic-exec/src/lib.rs|            Some(confine) => confine.confine(command, &self.tmp),|            Some(confine) if std::hint::black_box(false) => confine.confine(command, &self.tmp), Some(_) => Ok(command.clone()),|--workspace --features ${FEATURES} --test exec_private_state --test run_cli -- an_exec_atom_cannot_reach_atomics_private_state atomic_run_confines_an_exec_atoms_command"
     "signin-personal-only|crates/atomic/src/engine.rs|            (Some(why), true) => {|            (Some(why), true) if std::hint::black_box(false) => {|-p atomic-agentic --test model_auth -- a_shared_store_or_serve_refuses_the_personal_sign_in where_the_sign_in_is_refused_nothing_takes_its_place_and_it_says_what_to_do"
     "process-hardening|crates/atomic-core/src/codex.rs|        codex_process_hardening::pre_main_hardening();|        let _ = codex_process_hardening::pre_main_hardening;|-p atomic-agentic --test model_auth a_running_atomic_cannot_be_read_through_proc_by_its_own_user"
     "signin-restrictions|crates/atomic-core/src/codex.rs|        sign_in.allowed_by(&config.auth_config())?;|        let _ = sign_in;|-p atomic-agentic-core --lib --features fake-model codex_login_restrictions_refuse_a_sign_in_they_do_not_allow"
@@ -165,13 +171,43 @@ on_signal() {
 trap on_signal INT TERM HUP
 run_cargo() {
     # shellcheck disable=SC2086
-    cargo test --locked ${1} >"${LOG}" 2>&1 &
+    # Every test binary runs, however an earlier one ends: a row may name
+    # tests in several, and each must be seen to fail.
+    cargo test --locked --no-fail-fast ${1} >"${LOG}" 2>&1 &
     cargo_pid=$!
     wait "${cargo_pid}"
     local code=$?
     cargo_pid=""
     return "${code}"
 }
+# The tests a row's cargo arguments name: those after `--`, or else its
+# positional filters.
+named_tests() {
+    local after=0 skip=0 a
+    # shellcheck disable=SC2086
+    for a in ${1}; do
+        if [ "${skip}" -eq 1 ]; then
+            skip=0
+            continue
+        fi
+        # After `--`, the test binary's own flags, such as `--nocapture`, are
+        # not tests.
+        if [ "${after}" -eq 1 ]; then
+            case "${a}" in
+            -*) ;;
+            *) echo "${a}" ;;
+            esac
+            continue
+        fi
+        case "${a}" in
+        --) after=1 ;;
+        -p | --package | --features | --test | --bin | --example) skip=1 ;;
+        -*) ;;
+        *) echo "${a}" ;;
+        esac
+    done
+}
+
 # Keep a failing control's cargo output, which the exit would delete.
 keep_log() {
     cp -- "${LOG}" "${ROOT}/target/controls-check-$1.log" 2>/dev/null &&
@@ -218,6 +254,20 @@ for row in "${selected[@]}"; do
     passed="$(awk '/^test result:/ { p += $4 } END { print p + 0 }' "${LOG}")"
     if [ "${removed}" -eq 0 ] || [ "${passed}" -ne 0 ] || ! grep -q "^test .* FAILED$" "${LOG}"; then
         echo "FAIL ${name}: its test passed with the control off" >&2
+        keep_log "${name}"
+        status=1
+        continue
+    fi
+    # And each one it names is seen failing: one that matched no test, or
+    # was never run, is not a test that caught the control's removal.
+    unfailed=""
+    while read -r test; do
+        # The name as it is, not as a pattern: a failed test's path holds it.
+        grep -E '^test [^ ]+ \.\.\. FAILED$' "${LOG}" | cut -d' ' -f2 | grep -qF -- "${test}" ||
+            unfailed="${unfailed} ${test}"
+    done < <(named_tests "${args}")
+    if [ -n "${unfailed}" ]; then
+        echo "FAIL ${name}: with the control off, these tests were not seen failing:${unfailed}" >&2
         keep_log "${name}"
         status=1
         continue
