@@ -77,6 +77,7 @@ fn runtime(model: &FakeModel, tag: &str) -> CodexRuntime {
         artifacts: Artifacts::none(),
         meter: crate::usage::Metering::none(),
         backend: Default::default(),
+        caches: None,
     }
 }
 
@@ -2151,6 +2152,121 @@ fn an_exec_output_cel_cannot_read_fails() {
     });
 }
 
+#[tokio::test]
+async fn a_worktree_steps_turn_finds_its_runs_caches_and_only_it_may_write_them() {
+    let model = FakeModel::start(vec![]).await.expect("model");
+    let mut rt = runtime(&model, "caches");
+    let contract = json!({"type": "object"});
+    let validator = jsonschema::validator_for(&contract).expect("schema");
+    let request = |sandbox, env: &[(&str, &str)]| Request {
+        developer: String::new(),
+        prompt: String::new(),
+        model: None,
+        sandbox,
+        contract: &contract,
+        validator: &validator,
+        name: "fix",
+        place: Place::of("run-1", "fix"),
+        env: env
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect(),
+    };
+    use crate::typed::Sandbox::{ReadOnly, WorkspaceWrite};
+    // Outside a worktree step, nothing of the caches.
+    let open = Backend::Codex(&rt).open(&request(WorkspaceWrite, &[]));
+    assert!(
+        open.env.is_empty() && open.writable_roots.is_empty(),
+        "{open:?}"
+    );
+    let caches = crate::worktree::Caches::new(std::env::temp_dir().join("atomic-caches-x"));
+    rt.caches = Some(caches.clone());
+    let open = Backend::Codex(&rt).open(&request(WorkspaceWrite, &[("CARGO_TARGET_DIR", "/mine")]));
+    assert!(
+        !open.env.contains_key("CARGO_HOME"),
+        "cargo's home is the attempt's own: {open:?}"
+    );
+    for name in [
+        "PIP_CACHE_DIR",
+        "GOMODCACHE",
+        "XDG_CACHE_HOME",
+        "ATOMIC_CACHE_DIR",
+    ] {
+        let at = open
+            .env
+            .get(name)
+            .unwrap_or_else(|| panic!("{name}: {open:?}"));
+        assert!(
+            std::path::Path::new(at).starts_with(caches.dir()),
+            "{name}={at}"
+        );
+    }
+    assert!(!open.env.contains_key("HOME"), "HOME is the attempt's own");
+    assert_eq!(
+        open.env["CARGO_TARGET_DIR"], "/mine",
+        "what the atom declares wins"
+    );
+    assert_eq!(open.writable_roots, [caches.dir().to_owned()]);
+    // A read-only turn finds them, and writes nothing.
+    let open = Backend::Codex(&rt).open(&request(ReadOnly, &[]));
+    assert!(open.env.contains_key("XDG_CACHE_HOME"));
+    assert!(open.writable_roots.is_empty(), "{open:?}");
+}
+
+#[test]
+fn a_turns_cargo_home_is_its_own_and_its_toolchains_are_only_read() {
+    use crate::typed::Sandbox::WorkspaceWrite;
+    let dir = std::env::temp_dir().join(format!("atomic-turn-in-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for sub in ["tree", "scratch", "tmp", "caches", "toolchains"] {
+        std::fs::create_dir_all(dir.join(sub)).expect("dir");
+    }
+    let workspace = |rustup: &std::path::Path| atomic_exec::Workspace {
+        label: "fix".into(),
+        root: Some(dir.join("tree")),
+        scratch: Some(dir.join("scratch")),
+        tmp: Some(dir.join("tmp")),
+        shell: Shell::Local,
+        sandbox: WorkspaceWrite,
+        writable_roots: vec![dir.join("caches")],
+        env: [("RUSTUP_HOME".to_owned(), rustup.display().to_string())].into(),
+    };
+    let mut spec = TurnSpec::default();
+    turn_in(&workspace(&dir.join("toolchains")), &mut spec).expect("toolchains apart");
+    assert_eq!(
+        spec.env["CARGO_HOME"],
+        dir.join("scratch/.cargo").display().to_string()
+    );
+    // Toolchains inside, or holding, anything the turn may write.
+    for inside in ["caches/rustup", "tree/rustup", "scratch/.rustup", ""] {
+        let mut spec = TurnSpec::default();
+        let refused = turn_in(&workspace(&dir.join(inside)), &mut spec).expect_err(inside);
+        assert!(refused.to_string().contains("RUSTUP_HOME"), "{refused}");
+    }
+    // A cache an atom points into the temporary directory every turn
+    // shares.
+    let mut shared = workspace(&dir.join("toolchains"));
+    shared.env.insert(
+        "GOMODCACHE".into(),
+        dir.join("tmp/go").display().to_string(),
+    );
+    let refused = turn_in(&shared, &mut TurnSpec::default()).expect_err("shared");
+    assert!(refused.to_string().contains("GOMODCACHE"), "{refused}");
+    // Through a link to it, too.
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(dir.join("tmp"), dir.join("alias")).expect("link");
+        let mut linked = workspace(&dir.join("toolchains"));
+        linked.env.insert(
+            "XDG_CACHE_HOME".into(),
+            dir.join("alias/xdg").display().to_string(),
+        );
+        let refused = turn_in(&linked, &mut TurnSpec::default()).expect_err("linked");
+        assert!(refused.to_string().contains("XDG_CACHE_HOME"), "{refused}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // A turn's commands get a TMPDIR of their own turn's on every platform: on
 // Linux by way of atomic's sandbox helper, which takes it from
 // ATOMIC_TURN_TMPDIR while Codex's helper keeps the backend's shared
@@ -2489,4 +2605,266 @@ fn a_store_held_while_files_are_stored_leaves_the_outcome_unknown() {
         );
         sweep.join().expect("sweep");
     });
+}
+
+/// A local backend whose open waits, once it has begun, until it is let
+/// go, and that counts its closes.
+#[derive(Clone, Default)]
+struct HeldOpen {
+    state: Arc<(std::sync::Mutex<(bool, bool)>, std::sync::Condvar)>,
+    closes: Arc<std::sync::atomic::AtomicUsize>,
+    opened: Arc<std::sync::Mutex<Option<Workspace>>>,
+}
+
+impl HeldOpen {
+    fn begun(&self) -> bool {
+        self.state.0.lock().expect("state").0
+    }
+
+    fn let_go(&self) {
+        let (lock, wake) = &*self.state;
+        if let Ok(mut state) = lock.lock() {
+            state.1 = true;
+        }
+        wake.notify_all();
+    }
+
+    fn closes(&self) -> usize {
+        self.closes.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Lets a [`HeldOpen`] go when dropped, as when a test fails while the
+/// open is held, so the test fails rather than hangs.
+struct LetOpenGo(HeldOpen);
+
+impl Drop for LetOpenGo {
+    fn drop(&mut self) {
+        self.0.let_go();
+    }
+}
+
+impl ExecutionBackend for HeldOpen {
+    fn connect(&self) -> Result<atomic_exec::Statement, atomic_exec::ExecError> {
+        Ok(atomic_exec::LocalBackend::STATEMENT)
+    }
+
+    fn open(&self, request: &atomic_exec::Open) -> Result<Workspace, atomic_exec::ExecError> {
+        let (lock, wake) = &*self.state;
+        let mut state = lock.lock().expect("state");
+        state.0 = true;
+        wake.notify_all();
+        while !state.1 {
+            state = wake.wait(state).expect("state");
+        }
+        drop(state);
+        let ws = atomic_exec::LocalBackend::default().open(request)?;
+        *self.opened.lock().expect("opened") = Some(ws.clone());
+        Ok(ws)
+    }
+
+    fn run(
+        &self,
+        command: &atomic_exec::Command,
+    ) -> Result<atomic_exec::Completed, atomic_exec::ExecError> {
+        atomic_exec::LocalBackend::default().run(command)
+    }
+
+    fn close(&self, workspace: &Workspace) -> Result<(), atomic_exec::ExecError> {
+        self.closes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        atomic_exec::LocalBackend::default().close(workspace)
+    }
+}
+
+/// A run cancelled while its workspace is still opening leaves nothing
+/// open: the open finishes, and the workspace it made is closed, once.
+#[test]
+fn a_workspace_that_opens_after_its_run_was_cancelled_is_closed() {
+    on_codex_runtime(async {
+        let dir = scratch("cancelled-open");
+        std::fs::create_dir_all(&dir).expect("source");
+        let backend = HeldOpen::default();
+        let _let_go = LetOpenGo(backend.clone());
+        let shared: Arc<dyn ExecutionBackend> = Arc::new(backend.clone());
+        let request = atomic_exec::Open {
+            label: "held".into(),
+            run: "run-1".into(),
+            step: "held".into(),
+            attempt: "attempt-1".into(),
+            source: Some(dir.clone()),
+            ..atomic_exec::Open::default()
+        };
+        let opening = tokio::spawn(open_workspace(shared, request));
+        for _ in 0..500 {
+            if backend.begun() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(backend.begun(), "the open never began");
+        opening.abort();
+        assert!(matches!(opening.await, Err(e) if e.is_cancelled()));
+        // The open succeeds once no one waits for it.
+        backend.let_go();
+        for _ in 0..500 {
+            if backend.closes() > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(backend.closes(), 1, "the workspace was left open");
+        let scratch = backend
+            .opened
+            .lock()
+            .expect("opened")
+            .as_ref()
+            .and_then(|ws| ws.scratch.clone())
+            .expect("a scratch directory");
+        for _ in 0..200 {
+            if !scratch.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(!scratch.exists(), "its scratch directory is left");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(backend.closes(), 1, "closed more than once");
+    });
+}
+
+/// Run `body` on a runtime of its own on a thread of its own, then drop the
+/// runtime: whether the drop returned within `within`, and did not hang.
+fn runtime_drop_returns(
+    within: std::time::Duration,
+    body: impl FnOnce(&tokio::runtime::Runtime) + Send + 'static,
+) -> bool {
+    let (done, dropped) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        body(&rt);
+        drop(rt);
+        let _ = done.send(());
+    });
+    dropped.recv_timeout(within).is_ok()
+}
+
+/// A runtime dropped while a workspace is still opening shuts down: the
+/// open finishes as the blocking pool winds down, and the workspace it
+/// made is left for the backend to reclaim rather than closed from there.
+#[test]
+fn a_runtime_dropped_while_a_workspace_opens_shuts_down() {
+    let backend = HeldOpen::default();
+    let _let_go = LetOpenGo(backend.clone());
+    let held = backend.clone();
+    let returned = runtime_drop_returns(std::time::Duration::from_secs(30), move |rt| {
+        let dir = scratch("dropped-open");
+        std::fs::create_dir_all(&dir).expect("source");
+        let shared: Arc<dyn ExecutionBackend> = Arc::new(held.clone());
+        rt.spawn(open_workspace(
+            shared,
+            atomic_exec::Open {
+                label: "held".into(),
+                run: "run-1".into(),
+                step: "held".into(),
+                attempt: "attempt-1".into(),
+                source: Some(dir),
+                ..atomic_exec::Open::default()
+            },
+        ));
+        for _ in 0..500 {
+            if held.begun() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(held.begun(), "the open never began");
+        // Let go once the runtime is shutting down.
+        let late = held.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            late.let_go();
+        });
+    });
+    assert!(returned, "the runtime's drop hung");
+}
+
+/// A runtime dropped while a command runs in its workspace, or while a task
+/// holds an open workspace, shuts down.
+#[test]
+fn a_runtime_dropped_under_a_running_command_or_a_held_workspace_shuts_down() {
+    // A command that holds its workspace open until it ends.
+    let (_, a, compiled) = exec_project(
+        "dropped-command",
+        "import json, sys, time\njson.load(sys.stdin)\ntime.sleep(1)\njson.dump({'total': 1}, sys.stdout)\n",
+        "",
+    );
+    let recorded = Recording::default();
+    let calls = recorded.clone();
+    let returned = runtime_drop_returns(std::time::Duration::from_secs(30), move |rt| {
+        let backend: Arc<dyn ExecutionBackend> = Arc::new(calls.clone());
+        rt.spawn(async move {
+            let _ = run_exec(
+                &a,
+                &compiled,
+                &json!({"cents": [1]}),
+                &EffectIdentity {
+                    run_id: "run-1".into(),
+                    step_id: "total".into(),
+                },
+                backend,
+                None,
+                &Artifacts::none(),
+            )
+            .await;
+        });
+        for _ in 0..500 {
+            if calls.calls().iter().any(|c| c.starts_with("run ")) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            calls.calls().iter().any(|c| c.starts_with("run ")),
+            "{:?}",
+            calls.calls()
+        );
+    });
+    assert!(returned, "the runtime's drop hung under a running command");
+    // A task that holds an open workspace and never lets go of it.
+    let holding = Recording::default();
+    let opened = holding.clone();
+    let returned = runtime_drop_returns(std::time::Duration::from_secs(30), move |rt| {
+        let dir = scratch("dropped-guard");
+        std::fs::create_dir_all(&dir).expect("source");
+        let backend: Arc<dyn ExecutionBackend> = Arc::new(opened.clone());
+        rt.spawn(async move {
+            let guard = open_workspace(
+                backend,
+                atomic_exec::Open {
+                    label: "kept".into(),
+                    run: "run-1".into(),
+                    step: "kept".into(),
+                    attempt: "attempt-1".into(),
+                    source: Some(dir),
+                    ..atomic_exec::Open::default()
+                },
+            )
+            .await;
+            std::future::pending::<()>().await;
+            drop(guard);
+        });
+        for _ in 0..500 {
+            if !opened.opened().is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!opened.opened().is_empty(), "the workspace never opened");
+    });
+    assert!(returned, "the runtime's drop hung under a held workspace");
 }
