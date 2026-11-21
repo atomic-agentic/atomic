@@ -2812,7 +2812,8 @@ fn a_turns_cargo_home_is_its_own_and_its_toolchains_are_only_read() {
 // ATOMIC_TURN_TMPDIR while Codex's helper keeps the backend's shared
 // directory for its registry; elsewhere directly, with no handoff variable
 // left for the command to see. The shared directory is never a turn's
-// writable root, and a Linux turn without one is refused.
+// writable root, and a Linux turn without one, or with one but no scratch
+// directory to make its own in, is refused.
 #[test]
 fn a_turns_tmpdir_is_its_own_on_every_platform() {
     let base = std::env::temp_dir().join(format!("atomic-turn-tmpdir-{}", std::process::id()));
@@ -2852,7 +2853,6 @@ fn a_turns_tmpdir_is_its_own_on_every_platform() {
     }
     assert_eq!(linux.env["TMPDIR"], shared.display().to_string());
     assert_eq!(linux.env[codex::TURN_TMPDIR], own);
-    assert!(!linux.writable_roots.contains(&shared));
 
     let other = built(false, &workspace).expect("elsewhere");
     assert_eq!(other.env["TMPDIR"], own);
@@ -2861,7 +2861,18 @@ fn a_turns_tmpdir_is_its_own_on_every_platform() {
         "{:?}",
         other.env
     );
-    assert!(!other.writable_roots.contains(&shared));
+    // Nor does the turn's whole setup make the shared directory writable.
+    let mut whole = TurnSpec::default();
+    let shelled = Workspace {
+        shell: atomic_exec::Shell::Local,
+        ..workspace.clone()
+    };
+    turn_in(&shelled, &mut whole).expect("set up");
+    assert!(
+        !whole.writable_roots.contains(&shared),
+        "{:?}",
+        whole.writable_roots
+    );
 
     assert!(std::path::Path::new(&own).is_dir(), "{own} was not made");
     let without = Workspace {
@@ -2874,6 +2885,22 @@ fn a_turns_tmpdir_is_its_own_on_every_platform() {
     assert_eq!(
         built(false, &without).expect("elsewhere").env["TMPDIR"],
         own
+    );
+    // A shared directory with no scratch directory would leave the command
+    // the shared one.
+    let unscratched = Workspace {
+        scratch: None,
+        ..workspace.clone()
+    };
+    assert!(
+        matches!(built(true, &unscratched), Err(AtomError::Runtime(m)) if m.contains("no scratch directory")),
+        "a Linux turn with a shared directory and no scratch runs"
+    );
+    assert!(
+        !built(false, &unscratched)
+            .expect("elsewhere")
+            .env
+            .contains_key("TMPDIR")
     );
     let _ = std::fs::remove_dir_all(&base);
 }

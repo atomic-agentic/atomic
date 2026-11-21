@@ -1159,6 +1159,16 @@ fn turn_tmpdir(workspace: &Workspace, spec: &mut TurnSpec, linux: bool) -> Resul
     // Only atomic hands a sandbox helper a socket; a turn's never names one.
     spec.env.remove(atomic_exec::SECRET_ENV_FD);
     let Some(scratch) = &workspace.scratch else {
+        // On Linux a shared directory goes to Codex's helper, and the
+        // command's own comes from its scratch directory: with no scratch,
+        // the command would be left the shared one.
+        if linux && workspace.tmp.is_some() {
+            return Err(AtomError::Runtime(format!(
+                "the backend gave {}'s turn a shared temporary directory but no scratch \
+                 directory of its own, where its commands' TMPDIR is made",
+                workspace.label
+            )));
+        }
         return Ok(());
     };
     let own = scratch.join("tmp");
