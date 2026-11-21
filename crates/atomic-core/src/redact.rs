@@ -1380,15 +1380,25 @@ fn redact_string_held(string: &mut String, nested: usize, held: Option<Strength>
 /// its shape: under `password`, every string and number; under `token`,
 /// strings that look like credentials.
 fn redact_held(strength: Strength, value: &mut Value, nested: usize) {
+    // The rules any value has: a name and value pair's secret.
+    if let Some(secret) = header_pair(value) {
+        *secret = Value::String(REDACTED.into());
+    }
     match value {
-        Value::String(string) if is_secret_value(strength, string) => {
+        // JSON in a string is redacted as JSON, not taken whole for a
+        // credential: its compact form, as redaction writes it back, can
+        // look like one.
+        Value::String(string) if !is_json(string) && is_secret_value(strength, string) => {
             *string = REDACTED.into();
         }
         Value::String(string) => redact_string_held(string, nested, Some(strength)),
         Value::Number(_) if strength == Strength::Strong => *value = Value::String(REDACTED.into()),
-        Value::Array(items) => items
-            .iter_mut()
-            .for_each(|item| redact_held(strength, item, nested)),
+        Value::Array(items) => {
+            redact_flag_values(items);
+            items
+                .iter_mut()
+                .for_each(|item| redact_held(strength, item, nested));
+        }
         Value::Object(fields) => {
             // Its keys are redacted as any key is, and one that looks like a
             // credential too: under a secret's name, a key can be the
@@ -1396,6 +1406,16 @@ fn redact_held(strength: Strength, value: &mut Value, nested: usize) {
             let renamed = rename_keys(fields, held_key);
             // A field inside is held at least as surely as its own name says.
             for (key, field) in fields.iter_mut() {
+                // A header's value, such as `"Authorization": "Bearer …"`.
+                let name = renamed
+                    .get(key)
+                    .map_or_else(|| base_name(key), |r| base_name(&r.original));
+                if HEADERS.iter().any(|h| name.eq_ignore_ascii_case(h))
+                    && field.as_str().is_some_and(|v| is_header_secret(name, v))
+                {
+                    *field = Value::String(REDACTED.into());
+                    continue;
+                }
                 let own = judged(key, &renamed, true);
                 let held = if own == Strength::Strong {
                     own
@@ -1407,6 +1427,13 @@ fn redact_held(strength: Strength, value: &mut Value, nested: usize) {
         }
         Value::Number(_) | Value::Null | Value::Bool(_) => {}
     }
+}
+
+/// Whether `text` is a JSON object or array.
+fn is_json(text: &str) -> bool {
+    text.trim_start().starts_with(['{', '['])
+        && text.len() <= MAX_TEXT
+        && serde_json::from_str::<Value>(text).is_ok()
 }
 
 /// A key [`rename_keys`] renamed: what it was, and its new name before any
@@ -1474,8 +1501,11 @@ fn base_name(key: &str) -> &str {
 /// what its name says, before any number.
 fn judged(key: &str, renamed: &std::collections::HashMap<String, Renamed>, held: bool) -> Strength {
     match renamed.get(key) {
-        Some(r) if held => surer(strength(&r.original), strength(&r.name)),
-        Some(r) => strength(&r.name),
+        Some(r) if held => surer(
+            strength(base_name(&r.original)),
+            strength(base_name(&r.name)),
+        ),
+        Some(r) => strength(base_name(&r.name)),
         None => strength(base_name(key)),
     }
 }
@@ -1490,16 +1520,16 @@ fn surer(a: Strength, b: Strength) -> Strength {
     if rank(a) >= rank(b) { a } else { b }
 }
 
-/// What a key under a secret's name becomes, if anything: as any key
-/// redacts, or wholly when it looks like a credential itself, as in
-/// `{"token": {"<key>": 1}}`. A key that names a secret, such as
-/// `DB_PASSWORD`, stays to say so; one redacted already is left.
+/// What a key under a secret's name becomes, if anything: wholly
+/// [`REDACTED`] when it looks like a credential itself, as in
+/// `{"token": {"<key>": 1}}`, whatever word it spells, else as any key
+/// redacts. A key redacted in part already is judged by what is left of
+/// it, so redacting again changes nothing, and still redacts as text.
 fn held_key(key: &str) -> Option<String> {
     let base = base_name(key);
-    if base.contains(REDACTED) {
-        return None;
-    }
-    if strength(base) == Strength::None && key_looks_like_credential(base) {
+    let rest = base.replace(REDACTED, "");
+    let rest = rest.trim();
+    if base != REDACTED && !rest.is_empty() && key_looks_like_credential(rest) {
         return Some(REDACTED.to_owned());
     }
     match text(key) {
@@ -1509,31 +1539,55 @@ fn held_key(key: &str) -> Option<String> {
 }
 
 /// Whether a key looks like a credential rather than a name: not a
-/// reference, a placeholder, an email, a UUID, or words and numbers joined
-/// by `-`, `_`, `.`, `/` or `:`, where a word may be all capitals, as an
-/// environment variable's (`DATABASE_URL`, `gpt-4o-2024-08-06`).
+/// reference, a placeholder, an email, or words and numbers joined by `-`,
+/// `_`, `.`, `/` or `:`, where a word may be all capitals, as an
+/// environment variable's (`DATABASE_URL`), and either kind may end in a
+/// digit or two (`OAUTH2`, `S3`, `oauth2ClientSecret`), and a number may be
+/// as long as a date (`claude-3-5-sonnet-20241022`). When it is not plain
+/// which a key is, it is taken for a credential: a key hidden is better
+/// than a secret shown.
 fn key_looks_like_credential(key: &str) -> bool {
-    let caps_or_digits = |s: &str| {
-        !s.is_empty()
-            && s.bytes()
-                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+    // Letters, then at most two digits, as in `OAUTH2` or `S3`.
+    let caps_word = |s: &str| {
+        let letters = s.bytes().take_while(u8::is_ascii_uppercase).count();
+        let digits = s.len() - letters;
+        letters > 0 && digits <= 2 && s.bytes().skip(letters).all(|b| b.is_ascii_digit())
+    };
+    // A word, a short number or a date, with a word's digit or two dropped
+    // after a letter: `oauth2ClientSecret` reads as `oauthClientSecret`.
+    let word = |s: &str| {
+        if !s.is_empty() && s.len() <= 8 && s.bytes().all(|b| b.is_ascii_digit()) {
+            return true;
+        }
+        let mut plain = String::with_capacity(s.len());
+        let mut chars = s.chars().peekable();
+        let mut after_letter = false;
+        while let Some(c) = chars.next() {
+            if c.is_ascii_digit() && after_letter {
+                let mut run = String::from(c);
+                while let Some(d) = chars.next_if(char::is_ascii_digit) {
+                    run.push(d);
+                }
+                // Dropped only at the word's end, or before the capital of
+                // the next: within a word, digits are not a word's.
+                let ends = chars.peek().is_none_or(char::is_ascii_uppercase);
+                if run.len() <= 2 && ends {
+                    after_letter = false;
+                    continue;
+                }
+                plain.push_str(&run);
+                after_letter = false;
+                continue;
+            }
+            after_letter = c.is_ascii_alphabetic();
+            plain.push(c);
+        }
+        is_wordlike(&plain) || caps_word(s)
     };
     let email = key
         .split_once('@')
         .is_some_and(|(user, host)| !user.is_empty() && host.contains('.'));
-    let uuid = {
-        let parts: Vec<&str> = key.split('-').collect();
-        parts.iter().map(|p| p.len()).eq([8, 4, 4, 4, 12])
-            && parts
-                .iter()
-                .all(|p| p.bytes().all(|b| b.is_ascii_hexdigit()))
-    };
-    !(is_not_a_secret(key)
-        || email
-        || uuid
-        || key
-            .split(['-', '_', '.', '/', ':'])
-            .all(|s| is_wordlike(s) || caps_or_digits(s)))
+    !(is_not_a_secret(key) || email || key.split(['-', '_', '.', '/', ':']).all(word))
         && looks_like_credential(key)
 }
 
@@ -1591,6 +1645,21 @@ fn header_pair(value: &mut Value) -> Option<&mut Value> {
     }
 }
 
+/// In an argument list, the value after a secret-named flag.
+fn redact_flag_values(items: &mut [Value]) {
+    for i in 1..items.len() {
+        let flag = items[i - 1]
+            .as_str()
+            .and_then(|f| f.strip_prefix("--").or_else(|| f.strip_prefix('-')))
+            .filter(|f| !f.contains('='))
+            .map(strength)
+            .unwrap_or(Strength::None);
+        if flag != Strength::None && items[i].as_str().is_some_and(|v| is_secret_value(flag, v)) {
+            items[i] = Value::String(REDACTED.into());
+        }
+    }
+}
+
 fn redact_nested(value: &mut Value, nested: usize) {
     if let Some(secret) = header_pair(value) {
         *secret = Value::String(REDACTED.into());
@@ -1598,20 +1667,7 @@ fn redact_nested(value: &mut Value, nested: usize) {
     match value {
         Value::String(string) => redact_string(string, nested),
         Value::Array(items) => {
-            // An argument list: the value after a secret-named flag.
-            for i in 1..items.len() {
-                let flag = items[i - 1]
-                    .as_str()
-                    .and_then(|f| f.strip_prefix("--").or_else(|| f.strip_prefix('-')))
-                    .filter(|f| !f.contains('='))
-                    .map(strength)
-                    .unwrap_or(Strength::None);
-                if flag != Strength::None
-                    && items[i].as_str().is_some_and(|v| is_secret_value(flag, v))
-                {
-                    items[i] = Value::String(REDACTED.into());
-                }
-            }
+            redact_flag_values(items);
             items
                 .iter_mut()
                 .for_each(|item| redact_nested(item, nested));

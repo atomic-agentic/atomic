@@ -1446,8 +1446,8 @@ fn a_held_key_that_names_a_secret_stays_and_holds_its_value() {
 }
 
 /// Under a secret's name, keys that are names stay: environment variables,
-/// model ids, emails, UUIDs and references, so a person sees which secrets
-/// a step is given.
+/// model ids, emails and references, so a person sees which secrets a step
+/// is given.
 #[test]
 fn held_keys_that_are_names_stay() {
     let names = [
@@ -1456,10 +1456,11 @@ fn held_keys_that_are_names_stay() {
         "AWS_SECRET_ACCESS_KEY",
         "DATABASE_URL",
         "NODE_ENV",
-        "gpt-4o-2024-08-06",
+        "S3_BUCKET",
+        "OAUTH2_SCOPE",
+        "claude-3-5-sonnet-20241022",
         "dev@example.com",
-        "123e4567-e89b-12d3-a456-426614174000",
-        "${GITHUB_TOKEN}",
+        "${DATABASE_URL}",
     ];
     let fields: serde_json::Map<String, Value> = names
         .iter()
@@ -1488,10 +1489,17 @@ fn held_keys_redact_as_text_and_are_numbered_alike() {
         format!("{b} dbpassword"): "hunter3",
     }});
     value(&mut held);
-    let inner = held["token"].as_object().expect("an object");
-    assert!(inner.contains_key("Bearer [REDACTED]"), "{held}");
-    assert_eq!(inner["[REDACTED] dbpassword"], REDACTED, "{held}");
-    assert_eq!(inner["[REDACTED] dbpassword (2)"], REDACTED, "{held}");
+    // A key that starts with a known format is hidden whole, the others
+    // numbered after it, and each value held as its original key's name
+    // says: `dbpassword` names a secret.
+    assert_eq!(
+        held,
+        json!({"token": {
+            "Bearer [REDACTED]": 1,
+            "[REDACTED]": "[REDACTED]",
+            "[REDACTED] (2)": "[REDACTED]",
+        }}),
+    );
     // A numbered key that comes in so, as from an output redacted before,
     // is judged by its name before its number too.
     let mut again = json!({"token": {"[REDACTED] dbpassword (2)": "hunter3"}});
@@ -1521,9 +1529,81 @@ fn held_keys_redacted_again_change_nothing() {
     let mut kept = partly.clone();
     value(&mut kept);
     assert_eq!(kept, partly);
-    let mut once = json!({"secrets": {"pwd=abc": 1, "k": {"pwd=def": 2}}, "pwd=ghi": 3});
+    let mut once = json!({"secrets": {"pwd=abc": 1, "k": {"pwd=def": 2}}, "pwd=ghi": 3,
+                          "token": "{ \"Zx81kQ0pL2mN4bV6\" : 1, \"pwd=jkl\": 2 }"});
     value(&mut once);
     let mut twice = once.clone();
     value(&mut twice);
     assert_eq!(once, twice);
+}
+
+/// Under a secret's name, a key that looks like a credential is redacted
+/// whatever word it spells, as vendors' keys do, and so is a UUID, a TOTP
+/// seed or an upper-case hex key: a key hidden is better than a secret
+/// shown. A secret's name still holds its value.
+#[test]
+fn held_keys_shaped_like_credentials_are_redacted_whatever_they_spell() {
+    let keys = [
+        concat!("secret_", "Zx81kQ0pL2mN4bV6Zx81kQ0pL2mN4bV6Zx81kQ0pL2m"),
+        concat!("key-", "3f9a1c7e5b2d46803f9a1c7e5b2d4680"),
+        concat!("pat-na1-", "3f9a1c7e-5b2d-4680-9a1c-7e5b2d46803f"),
+        concat!("API_KEY_", "Zx81kQ0pL2mN4bV6"),
+        "123e4567-e89b-12d3-a456-426614174000",
+        concat!("JBSWY3DP", "EHPK3PXP"),
+        concat!("DEADBEEF", "0123456789ABCDEF"),
+    ];
+    let fields: serde_json::Map<String, Value> = keys
+        .iter()
+        .map(|k| ((*k).to_owned(), json!("hunter2")))
+        .collect();
+    let mut held = json!({ "token": Value::Object(fields) });
+    value(&mut held);
+    let shown = held.to_string();
+    let wrong: Vec<usize> = keys
+        .iter()
+        .enumerate()
+        .filter(|(_, k)| shown.contains(*k))
+        .map(|(i, _)| i)
+        .collect();
+    assert!(wrong.is_empty(), "keys {wrong:?} showed");
+    // A secret's name stays readable, and holds its value.
+    let mut named =
+        json!({"credentials": {"DB_PASSWORD": "hunter2", "oauth2ClientSecret": "hunter3"}});
+    value(&mut named);
+    assert_eq!(
+        named,
+        json!({"credentials": {"DB_PASSWORD": "[REDACTED]", "oauth2ClientSecret": "[REDACTED]"}})
+    );
+}
+
+/// A held key redacted in part already still redacts as text: what is left
+/// of it, a key of a known format, is redacted too.
+#[test]
+fn a_held_key_redacted_in_part_still_redacts_what_is_left() {
+    let (a, b) = (SHAPES[2], SHAPES[0]);
+    let mut held = json!({"token": {
+        format!("[REDACTED] {a}"): 1,
+        format!("sid=[REDACTED]; tok={b}"): 2,
+    }});
+    value(&mut held);
+    let shown = held.to_string();
+    assert!(!shown.contains(&a[7..]), "a key's remainder showed");
+    assert!(!shown.contains(&b[4..]), "a key's remainder showed");
+}
+
+/// JSON in a string held under a secret's name has a name and value pair's
+/// secret redacted, as anywhere else: the pair rules hold under a secret's
+/// name too.
+#[test]
+fn a_pair_in_json_held_under_a_secrets_name_is_redacted() {
+    let mut held =
+        json!({"credentials": "[ { \"name\": \"DB_PASSWORD\", \"value\": \"hunter2\" } ]"});
+    value(&mut held);
+    assert!(!held.to_string().contains("hunter2"), "{held}");
+    let mut real = json!({"credentials": [{"name": "DB_PASSWORD", "value": "hunter2"}],
+                          "token": {"Cookie": "sid=q9z"}});
+    value(&mut real);
+    assert!(!real.to_string().contains("hunter2"), "{real}");
+    // A header's value, which only the header's rule takes for a secret.
+    assert!(!real.to_string().contains("q9z"), "{real}");
 }
