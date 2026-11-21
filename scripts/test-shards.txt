@@ -41,6 +41,7 @@ test command_environment
 test entry_point
 test examples
 test exec_private_state
+test late_links
 test second_mounts
 test stale_roots
 test exec_caches
