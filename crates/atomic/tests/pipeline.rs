@@ -5695,8 +5695,9 @@ impl atomic_exec::ExecutionBackend for LocksTheStoreOnOpen {
 
 /// An exec step whose inputs cannot be given while the artifact store is
 /// held elsewhere waits a bounded time, then stops the run to be run again,
-/// recording nothing as failed and running nothing; once the store is free,
-/// the run finishes, its command run once.
+/// recording nothing as failed and running nothing, however many times it
+/// stops: it is never dead-lettered for it. Once the store is free, the run
+/// finishes, its command run once.
 #[test]
 fn an_exec_step_whose_store_is_held_while_its_inputs_are_given_is_run_again() {
     on_codex_runtime(async {
@@ -5769,12 +5770,15 @@ fn an_exec_step_whose_store_is_held_while_its_inputs_are_given_is_run_again() {
             input: json!({"patch": patch.to_string()}),
         };
         rt.start(PIPELINE, "held-1", run).await.expect("start");
-        // Stopped once, with nothing failed, and opened again.
+        // Stopped more times than dead-lettering allows, with nothing
+        // failed, and opened again each time.
+        let executions = atomic_app::pipeline::RECOVERY_LIMIT as usize + 2;
         let started = std::time::Instant::now();
-        while opens.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+        while opens.load(std::sync::atomic::Ordering::SeqCst) < executions {
             assert!(
-                started.elapsed() < std::time::Duration::from_secs(60),
-                "never run again"
+                started.elapsed() < std::time::Duration::from_secs(240),
+                "{} executions so far",
+                opens.load(std::sync::atomic::Ordering::SeqCst)
             );
             assert_eq!(
                 rt.status("held-1").await.expect("status"),

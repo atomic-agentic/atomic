@@ -138,7 +138,9 @@ fn reached(id: &str, position: usize) -> Result<()> {
             *top = position;
             *entries = 0;
         }
-        if position == *top {
+        // A step that stopped for an artifact store held elsewhere, as a pin
+        // does, takes nothing toward dead-lettering, nor does it get further.
+        if position == *top && !atomic_core::runtime::take_held_stop(id) {
             *entries += 1;
         }
         *entries
@@ -757,7 +759,7 @@ fn put_waiting_out_the_lock(
     let mut retries = 0;
     loop {
         match store.put(&mut &content[..], provenance.clone()) {
-            Err(ArtifactError::Locked { .. }) if retries < LOCKED_RETRIES => {
+            Err(e @ ArtifactError::Locked { .. }) if retries < LOCKED_RETRIES => {
                 let waits = {
                     let mut all = STORE_WAITS.lock().unwrap_or_else(|e| e.into_inner());
                     let n = all.entry(id.to_owned()).or_insert(0);
@@ -771,7 +773,11 @@ fn put_waiting_out_the_lock(
                     );
                 }
                 retries += 1;
-                std::thread::sleep(backoff);
+                // A stopping process waits no longer: the run stops as it
+                // does once the tries run out.
+                if atomic_core::runtime::sleep_unless_stopping(backoff) {
+                    return Err(e);
+                }
                 backoff = (backoff * 2).min(cap);
             }
             stored => return stored,
@@ -1504,7 +1510,7 @@ async fn turn<C: WorkflowContext>(
                 if let (Ok(workspace), Ok(compiled)) =
                     (&opened, compile::compile(&opening, &Registry::new()))
                     && let Err(e) = atomic_core::runtime::give_exec_inputs(
-                        &opening, &compiled, &giving, workspace, &artifacts,
+                        &opening, &compiled, &giving, &who, workspace, &artifacts,
                     )
                     .await
                 {

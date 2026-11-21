@@ -380,6 +380,42 @@ pub fn limit_backend_wait(limit: Option<std::time::Duration>) {
     OPEN_WAIT_LIMIT_MS.store(ms, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// Whether this process is stopping (see [`stop_waiting_for_backend`]).
+pub fn stopping() -> bool {
+    STOP_WAITING.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Sleep for `wait`, or until this process stops, whichever comes first:
+/// whether it stopped.
+pub fn sleep_unless_stopping(wait: std::time::Duration) -> bool {
+    let until = std::time::Instant::now() + wait;
+    loop {
+        if stopping() {
+            return true;
+        }
+        let left = until.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        std::thread::sleep(left.min(std::time::Duration::from_millis(50)));
+    }
+}
+
+/// The runs a step of which stopped, to be run again, because the artifact
+/// store was held while its command's inputs were given.
+static HELD_STOPS: std::sync::Mutex<std::collections::BTreeSet<String>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Whether a step of run `run` stopped for a held store since this was last
+/// asked, which it then forgets: such a stop is not the run's doing, and a
+/// durable runner does not count it toward giving the run up.
+pub fn take_held_stop(run: &str) -> bool {
+    HELD_STOPS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(run)
+}
+
 /// This process is stopping: every step waiting for a workspace gives up
 /// within [`OPEN_WAIT_SLICE`], with [`AtomError::Stopping`], and none waits
 /// again.
@@ -1523,6 +1559,7 @@ pub async fn give_exec_inputs(
     atom: &AtomFile,
     compiled: &Compiled,
     input: &Value,
+    identity: &EffectIdentity,
     workspace: &WorkspaceGuard,
     artifacts: &Artifacts,
 ) -> Result<(), AtomError> {
@@ -1530,7 +1567,7 @@ pub async fn give_exec_inputs(
         // The step itself says what is wrong.
         return Ok(());
     };
-    let given = exchange_for(atom, contract, input, workspace, artifacts).await;
+    let given = exchange_for(atom, contract, input, identity, workspace, artifacts).await;
     if let Err(e @ AtomError::StoreHeld(_)) = given {
         return Err(e);
     }
@@ -1544,11 +1581,14 @@ pub async fn give_exec_inputs(
 /// backend that hands no files over gives none: an input that references
 /// artifacts is then refused, and so is an output that names a file (see
 /// `finish_exec`). An input that references an artifact the store does not
-/// hold is refused.
+/// hold is refused. A wait for a held store ends early when this process
+/// stops, with [`AtomError::Stopping`]; one that runs out is noted for
+/// [`take_held_stop`].
 async fn exchange_for(
     atom: &AtomFile,
     contract: &Value,
     input: &Value,
+    identity: &EffectIdentity,
     workspace: &WorkspaceGuard,
     artifacts: &Artifacts,
 ) -> Result<Given, AtomError> {
@@ -1558,7 +1598,7 @@ async fn exchange_for(
     let (store, input, contract) = (store.clone(), input.clone(), contract.clone());
     let lookup = artifacts.0.clone();
     let (backend, opened) = (workspace.backend(), workspace.workspace().clone());
-    let name = atom.name.clone();
+    let (name, run) = (atom.name.clone(), identity.run_id.clone());
     // The workspace stays open while its inputs are copied in, even when the
     // run is cancelled meanwhile.
     let held = workspace.hold();
@@ -1596,10 +1636,16 @@ async fn exchange_for(
                         );
                     }
                     retries += 1;
-                    std::thread::sleep(wait);
+                    if sleep_unless_stopping(wait) {
+                        return Err(AtomError::Stopping);
+                    }
                     wait = (wait * 2).min(cap);
                 }
                 Err(e @ crate::artifact::ArtifactError::Locked { .. }) => {
+                    HELD_STOPS
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(run.clone());
                     return Err(AtomError::StoreHeld(format!(
                         "{name}: give the command its input files: {e}; its command did not \
                          run, and the step is run again"
@@ -1670,7 +1716,17 @@ pub async fn run_exec_opened(
     // now.
     let exchange = match workspace.take_inputs() {
         Some(given) => given?,
-        None => exchange_for(atom, contract("Input")?, input, &workspace, artifacts).await?,
+        None => {
+            exchange_for(
+                atom,
+                contract("Input")?,
+                input,
+                identity,
+                &workspace,
+                artifacts,
+            )
+            .await?
+        }
     };
     let (exchange_env, read_only) = match exchange.as_ref().and_then(Option::as_ref) {
         Some(x) => (
