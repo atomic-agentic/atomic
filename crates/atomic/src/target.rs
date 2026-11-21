@@ -252,6 +252,29 @@ fn atom_pipeline(atom: Atom, input: &Value) -> anyhow::Result<Pipeline> {
         .keys()
         .map(|k| (k.clone(), format!("input[{}]", Value::String(k.clone()))))
         .collect();
+    // Each field is the run's input, external data, so an atom that accepts
+    // nothing that risky refuses it here, before anything runs, as a
+    // workflow step mapping the same field would at load.
+    let origins: BTreeMap<String, String> = with
+        .iter()
+        .map(|(field, source)| {
+            let origin = atomic_core::workflow::binding_origin(source, &BTreeMap::new())
+                .unwrap_or("external");
+            (field.clone(), origin.to_owned())
+        })
+        .collect();
+    for (field, origin) in &origins {
+        if let Some(refused) = atomic_core::workflow::untrusted_binding(&atom, &with[field], origin)
+        {
+            return Err(Failure::new(
+                "input.untrusted",
+                format!("input field `{field}`: {refused}"),
+                "run it from a workflow that passes the field through a step the atom can trust, \
+                 or declare a lower `trust` on the atom if it is built for this input",
+            )
+            .into());
+        }
+    }
     let pins = atom
         .program
         .sources
@@ -263,14 +286,7 @@ fn atom_pipeline(atom: Atom, input: &Value) -> anyhow::Result<Pipeline> {
         steps: vec![Step::Atom(AtomStep {
             id: "run".into(),
             atom: atom.name.clone(),
-            origins: with
-                .iter()
-                .map(|(field, source)| {
-                    let origin = atomic_core::workflow::binding_origin(source, &BTreeMap::new())
-                        .unwrap_or("external");
-                    (field.clone(), origin.to_owned())
-                })
-                .collect(),
+            origins,
             with,
             worktree: false,
             review: None,
