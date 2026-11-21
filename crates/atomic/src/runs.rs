@@ -173,11 +173,13 @@ fn new_run_id() -> anyhow::Result<String> {
 
 /// Print a run's result: its output alone, or with `json`, an object that
 /// names the run too.
+/// What a model or a command wrote is in it: escaped for the terminal, and
+/// still the same JSON.
 fn print_result(run_id: &str, output: &Value, json: bool) -> anyhow::Result<()> {
     let text = if json {
-        serde_json::to_string(&json!({"run": run_id, "status": "succeeded", "output": output}))?
+        crate::shown::compact(&json!({"run": run_id, "status": "succeeded", "output": output}))?
     } else {
-        serde_json::to_string_pretty(output)?
+        crate::shown::pretty(output)?
     };
     println!("{text}");
     Ok(())

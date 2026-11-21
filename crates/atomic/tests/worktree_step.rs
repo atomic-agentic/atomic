@@ -140,9 +140,10 @@ fn register(rt: &mut Durare, dir: &Path, base_url: &str) {
                                 let ask = ChangeRequest {
                                     request: "Two units at 1.25 should cost 2.50.".into(),
                                 };
-                                let (task, metadata) = run_lite_atom(&DraftTask, &ask, &lite)
-                                    .await
-                                    .map_err(failed)?;
+                                let (task, metadata) =
+                                    run_lite_atom(&DraftTask, &ask, &lite, &Default::default())
+                                        .await
+                                        .map_err(failed)?;
                                 failpoint("worktree-step:mid-atom");
                                 std::fs::remove_file(tree.join("half-edit.txt")).map_err(failed)?;
                                 std::fs::write(

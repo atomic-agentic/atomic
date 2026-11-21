@@ -79,9 +79,9 @@ fn a_workspace_that_opens_after_its_run_was_cancelled_is_closed() {
             artifacts: Artifacts::none(),
             meter: Metering::none(),
             caches: None,
-            backend,
         };
-        let turn = tokio::spawn(async move { run_turn(&runtime, &TurnSpec::default()).await });
+        let turn =
+            tokio::spawn(async move { run_turn(&runtime, &backend, &TurnSpec::default()).await });
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         // The run is cancelled while its workspace is opening; then it opens.
         turn.abort();
