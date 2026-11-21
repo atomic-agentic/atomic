@@ -583,6 +583,7 @@ pub async fn run(
     } else if json {
         // The report above is the one JSON document on stdout; it says it
         // failed.
+        atomic_exec::process::end_all(&mut |what| atomic_core::log_line!("atomic: {what}"));
         std::process::exit(1);
     } else {
         Err(Failure::new(

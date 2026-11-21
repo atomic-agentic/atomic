@@ -387,7 +387,8 @@ impl Git {
             })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = command.spawn()?;
+        // Atomic's own: stopping waits for it rather than kill it mid-commit.
+        let (mut child, _own) = atomic_exec::process::spawn_own_tool(&mut command)?;
         if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
             // On its own thread, so that git filling stdout cannot stall it,
             // nor it git.
@@ -984,9 +985,10 @@ fn printable(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// Stop git, with everything it started: it runs in a process group of
+/// its own (see `atomic_exec::process::spawn_own_tool`).
 fn stop(child: &mut Child) {
-    let _ = child.kill();
-    let _ = child.wait();
+    atomic_exec::process::kill_own_tool(child);
 }
 
 /// The child's exit, if it comes within `limit`.
