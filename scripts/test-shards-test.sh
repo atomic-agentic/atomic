@@ -85,7 +85,7 @@ sys.exit(code)
 PY
 chmod +x "${WORK}/bin/cargo"
 export PATH="${WORK}/bin:${PATH}" FAKE_LOG="${WORK}/cargo.log" FAKE_WS="${WORK}/ws.json"
-unset FAKE_HIDDEN FAKE_FAIL
+unset FAKE_HIDDEN FAKE_FAIL GITHUB_ACTIONS
 
 cat >"${WORK}/ws.json" <<'EOF'
 {"packages": [
@@ -147,13 +147,34 @@ expect 1 "shard [1] is defined twice" check-table
 table "${GOOD[@]}" '[4]'
 expect 1 "shard [4] runs nothing" check-table
 
+# Targets that cargo's output cannot tell apart are refused: two integration
+# tests of one name, which `--test` selects together, and two libraries of
+# one name, whose doctests carry no hash.
+cp "${WORK}/ws.json" "${WORK}/ws-good.json"
+table "${GOOD[@]}"
+python3 - "${WORK}/ws-good.json" "${WORK}/ws.json" '{"name": "quick", "kind": ["test"], "tests": ["q2"]}' <<'EOF'
+import json, sys
+ws = json.load(open(sys.argv[1]))
+ws["packages"][1]["targets"].append(json.loads(sys.argv[3]))
+json.dump(ws, open(sys.argv[2], "w"))
+EOF
+expect 1 "test target quick is in pkg-a, pkg-b" check-table
+python3 - "${WORK}/ws-good.json" "${WORK}/ws.json" <<'EOF'
+import json, sys
+ws = json.load(open(sys.argv[1]))
+ws["packages"][1]["targets"][0]["name"] = "pkg_a"
+json.dump(ws, open(sys.argv[2], "w"))
+EOF
+expect 1 "library pkg_a is in pkg-a, pkg-b" check-table
+cp "${WORK}/ws-good.json" "${WORK}/ws.json"
+
 # Tests cargo runs that no shard selects, which the table cannot see, fail
 # the list check: the hidden target is left out of the metadata, so the table
 # passes, but the unsplit run still lists its tests.
 table '[1]' 'test slow' '' '[2]' 'lib' 'bins' 'doc' 'examples' '' '[crash]' 'test crash'
 FAKE_HIDDEN=quick expect 0 "the shard table: ok" check-table
 FAKE_HIDDEN=quick expect 1 "tests the unsplit run lists that no shard runs:" check
-FAKE_HIDDEN=quick expect 1 "quick: 1 test (q1)" check
+FAKE_HIDDEN=quick expect 1 "quick-0123456789abcdef: 1 test (q1)" check
 
 table "${GOOD[@]}"
 
@@ -183,7 +204,7 @@ root = sys.argv[1]
 packages = []
 for crate in sorted(glob.glob(os.path.join(root, "crates", "*", "Cargo.toml"))):
     d = os.path.dirname(crate)
-    t = [{"name": "lib", "kind": ["lib"], "tests": []}]
+    t = [{"name": os.path.basename(d).replace("-", "_"), "kind": ["lib"], "tests": []}]
     if os.path.exists(os.path.join(d, "src", "main.rs")):
         t.append({"name": "main", "kind": ["bin"], "tests": []})
     t += [{"name": os.path.basename(f)[:-3], "kind": ["test"], "tests": []} for f in sorted(glob.glob(os.path.join(d, "tests", "*.rs")))]
@@ -209,6 +230,10 @@ if sorted(matrix + ["crash"]) != sorted(table):
     problems.append(f"the test job's matrix {matrix} and the crash job are not the table's shards {table}")
 if f"name: Test (${{{{ matrix.shard }}}}/{len(matrix)})" not in ci:
     problems.append(f"the test job's name does not count its {len(matrix)} shards")
+# The summary job ends failed, never skipped, when the run is cancelled.
+summary = re.search(r"(?ms)^  rust:\n(.*?)(?=^  \S)", ci)
+if not summary or "    if: ${{ always() }}" not in summary.group(1):
+    problems.append("the summary job \"Rust (ubuntu-24.04)\" does not run with always()")
 for shard in ("${{ matrix.shard }}", "crash"):
     if f"scripts/test-shards.py run {shard}" not in ci:
         problems.append(f"no step runs `scripts/test-shards.py run {shard}`")
@@ -229,10 +254,66 @@ touch "${T}/debug/deps/libserde-1111.rlib" "${T}/debug/deps/serde-1111.d" "${T}/
     "${T}/CACHEDIR.TAG" "${T}/tmp/scratch" "${T}/release/deps/libpkg_a-4444.rlib" "${T}/release/deps/libserde-5555.rlib"
 mkdir -p "${T}/release/.fingerprint/pkg-a-4444" "${T}/release/.fingerprint/serde-5555"
 printf '{"target_directory": "%s", "packages": [{"name": "pkg-a"}, {"name": "pkg-b"}]}' "${T}" >"${WORK}/meta.json"
-python3 "${ROOT}/scripts/cache-trim.py" --metadata "${WORK}/meta.json" >/dev/null || fail "cache-trim.py failed"
+# Outside CI, and without --force, it refuses and removes nothing.
+before="$(cd "${T}" && find . | LC_ALL=C sort)"
+python3 "${ROOT}/scripts/cache-trim.py" --metadata "${WORK}/meta.json" >/dev/null 2>&1
+[ $? -eq 2 ] || fail "cache-trim.py ran outside CI without --force"
+[ "$(cd "${T}" && find . | LC_ALL=C sort)" = "${before}" ] || fail "cache-trim.py removed files when it refused"
+GITHUB_ACTIONS=true python3 "${ROOT}/scripts/cache-trim.py" --metadata "${WORK}/meta.json" >/dev/null || fail "cache-trim.py failed in CI"
+python3 "${ROOT}/scripts/cache-trim.py" --force --metadata "${WORK}/meta.json" >/dev/null || fail "cache-trim.py --force failed"
 got="$(cd "${T}" && find . -mindepth 1 | LC_ALL=C sort | tr '\n' ' ')"
 want="./CACHEDIR.TAG ./debug ./debug/.fingerprint ./debug/.fingerprint/serde-1111 ./debug/build ./debug/build/serde-1111 ./debug/build/serde-1111/out ./debug/deps ./debug/deps/libserde-1111.rlib ./debug/deps/serde-1111.d ./release ./release/.fingerprint ./release/.fingerprint/serde-5555 ./release/deps ./release/deps/libserde-5555.rlib ./v8-mirror ./v8-mirror/v1 ./v8-mirror/v1/librusty_v8.a "
 [ "${got}" = "${want}" ] || fail "cache-trim.py left: ${got}"
+
+# Only pushes to main save caches: every use of rust-cache-save in ci.yml is
+# gated on main, and nothing else in the workflows or rust-setup saves one,
+# whether by actions/cache/save, by actions/cache's own post step, or by
+# another cache action. Checked against the repository's files, then against
+# copies with the gate removed and with a save added, which must fail.
+cat >"${WORK}/saves.py" <<'EOF'
+import re, sys
+problems = []
+ci = sys.argv[1]
+text = open(ci, encoding="utf-8").read()
+# The steps of ci.yml's jobs, each from its `      - ` line to the next.
+steps = re.split(r"(?m)^(?=      - )", text)
+saves = [s for s in steps if "uses: ./.github/actions/rust-cache-save" in s]
+if not saves:
+    problems.append(f"{ci}: no step uses rust-cache-save")
+for step in saves:
+    m = re.search(r"(?m)^\s+if: (.*)$", step)
+    cond = m.group(1) if m else ""
+    if "github.ref == 'refs/heads/main'" not in cond or "||" in cond:
+        problems.append(f"{ci}: a rust-cache-save step is not gated on main: {step.strip().splitlines()[0]}")
+    # Nor saved before the build it saves has succeeded: gated on a step that
+    # builds, not only on the setup.
+    if not re.search(r"steps\.(?!setup\.)[\w-]+\.outcome == 'success'", cond):
+        problems.append(f"{ci}: a rust-cache-save step is not gated on its build: {cond}")
+for path in sys.argv[1:]:
+    for n, line in enumerate(open(path, encoding="utf-8"), 1):
+        if re.search(r"uses:\s*(actions/cache(/save)?@|Swatinem/rust-cache|mozilla-actions/sccache)", line):
+            problems.append(f"{path}:{n}: saves a cache outside rust-cache-save: {line.strip()}")
+print("\n".join(problems))
+sys.exit(1 if problems else 0)
+EOF
+CI="${ROOT}/.github/workflows/ci.yml"
+SETUP="${ROOT}/.github/actions/rust-setup/action.yml"
+CODEQL="${ROOT}/.github/workflows/codeql.yml"
+out="$(python3 "${WORK}/saves.py" "${CI}" "${SETUP}" "${CODEQL}" 2>&1)" || fail "cache saves: ${out}"
+sed "s/ \&\& github.ref == 'refs\/heads\/main'//" "${CI}" >"${WORK}/ci-ungated.yml"
+cmp -s "${CI}" "${WORK}/ci-ungated.yml" && fail "the control found no main gate to remove"
+python3 "${WORK}/saves.py" "${WORK}/ci-ungated.yml" "${SETUP}" "${CODEQL}" >/dev/null 2>&1 &&
+    fail "a rust-cache-save step not gated on main passed"
+sed "s/ \&\& steps.clippy.outcome == 'success' \&\& steps.clippy-features.outcome == 'success'/ \&\& steps.setup.outcome == 'success'/" "${CI}" >"${WORK}/ci-early.yml"
+cmp -s "${CI}" "${WORK}/ci-early.yml" && fail "the control found no clippy gate to replace"
+python3 "${WORK}/saves.py" "${WORK}/ci-early.yml" "${SETUP}" "${CODEQL}" >/dev/null 2>&1 &&
+    fail "a save gated only on the setup passed"
+sed 's|actions/cache/restore@|actions/cache/save@|' "${SETUP}" >"${WORK}/setup-saves.yml"
+python3 "${WORK}/saves.py" "${CI}" "${WORK}/setup-saves.yml" "${CODEQL}" >/dev/null 2>&1 &&
+    fail "a cache save in rust-setup passed"
+sed 's|actions/cache/restore@|actions/cache@|' "${CODEQL}" >"${WORK}/codeql-saves.yml"
+python3 "${WORK}/saves.py" "${CI}" "${SETUP}" "${WORK}/codeql-saves.yml" >/dev/null 2>&1 &&
+    fail "actions/cache, which saves in its post step, passed in codeql.yml"
 
 if [ "${failures}" -ne 0 ]; then
     echo "scripts/test-shards-test.sh: ${failures} failure(s)" >&2

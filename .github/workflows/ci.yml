@@ -162,17 +162,22 @@ jobs:
         with:
           target-cache: check
           warm: "true"
+          warm-downloads: "true"
       - run: cargo fmt --all --check
       - name: Clippy
+        id: clippy
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       # The suites behind the test features (the crash suite, the sandbox and
       # Postgres variants) only compile with them.
       - name: Clippy with the test features
+        id: clippy-features
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: cargo clippy --workspace --all-targets --locked --features atomic-agentic/postgres-tests,atomic-agentic/sandbox-tests -- -D warnings
+      # Only after both clippy passes, so that the cache saved under the
+      # exact key, which no later run saves again, is complete.
       - name: Save the caches (main only)
-        if: ${{ !cancelled() && github.ref == 'refs/heads/main' && steps.setup.outcome == 'success' }}
+        if: ${{ !cancelled() && github.ref == 'refs/heads/main' && steps.clippy.outcome == 'success' && steps.clippy-features.outcome == 'success' }}
         uses: ./.github/actions/rust-cache-save
         with:
           setup: ${{ toJSON(steps.setup.outputs) }}
@@ -309,7 +314,10 @@ jobs:
   # name the single Rust job had.
   rust:
     name: Rust (ubuntu-24.04)
-    if: ${{ !cancelled() }}
+    # always(), not !cancelled(): a cancelled run must end this check as a
+    # failure, not as skipped, which a required check would count as passed.
+    # The step fails on any result but success, cancelled and skipped too.
+    if: ${{ always() }}
     needs: [clippy, test, crash, acceptance, build]
     runs-on: ubuntu-24.04
     steps:

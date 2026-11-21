@@ -305,9 +305,13 @@ build and one for clippy's. A checkout gives every source file a new time, so
 the workspace's own crates rebuild in every job; the cached `target/` holds
 only the dependencies, trimmed by `scripts/cache-trim.py`, which keeps it near
 1.5 GB compressed beside about 3 GB of downloads, inside the repository's
-10 GB of cache. Only pushes to main save the caches, from Clippy (the
-downloads and clippy's build) and "Acceptance and backends" (the test build);
-pull requests restore main's, so they never push main's caches out. A
+10 GB of cache. The trim deletes everything else in `target/`, so it runs only
+in CI, or with `--force`.
+
+Only pushes to main save the caches: Clippy saves the downloads and clippy's
+build once both clippy passes have passed, and "Acceptance and backends" saves
+the test build. `scripts/test-shards-test.sh` fails if any other step saves a
+cache. Pull requests restore main's, so they never push main's caches out. A
 miss falls back to the newest cache of the same kind, or builds everything,
 which takes a few minutes longer.
 

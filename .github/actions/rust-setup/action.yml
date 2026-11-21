@@ -28,8 +28,15 @@ inputs:
     default: "false"
   warm:
     description: >-
-      "true" for the job that saves the caches on main. On main it restores
-      only an exact match, so that a cache it saves holds nothing stale.
+      "true" for a job that saves its build cache on main. On main it restores
+      target/ only from an exact match, so that a cache it saves holds nothing
+      stale.
+    default: "false"
+  warm-downloads:
+    description: >-
+      "true" for the one job that saves cargo's downloads on main, which then
+      restores them only from an exact match, for the same reason. Other jobs
+      fall back to the newest downloads after a lockfile change.
     default: "false"
 
 outputs:
@@ -84,10 +91,19 @@ runs:
         docker run -d --name atomic-test-postgres -p 127.0.0.1:5432:5432 \
           -e POSTGRES_USER=atomic -e POSTGRES_PASSWORD=atomic -e POSTGRES_DB=atomic \
           postgres:18.7-trixie@sha256:2ea8630df176ad090ec92136dee850397c5af8781e4bcf2e4162593691c61bbc
+        ready=""
         for _ in $(seq 1 60); do
-          docker exec atomic-test-postgres pg_isready -q -h 127.0.0.1 -U atomic && break
+          if docker exec atomic-test-postgres pg_isready -q -h 127.0.0.1 -U atomic; then
+            ready=yes
+            break
+          fi
           sleep 1
         done
+        if [ -z "${ready}" ]; then
+          echo "::error::the test Postgres did not accept connections within 60 seconds"
+          docker logs atomic-test-postgres
+          exit 1
+        fi
         echo "ATOMIC_TEST_DATABASE_URL=postgres://atomic:atomic@127.0.0.1:5432/atomic" >>"$GITHUB_ENV"
 
     - name: Pinned Astro compiler host
@@ -111,7 +127,7 @@ runs:
           ~/.cargo/registry/cache
           ~/.cargo/git/db
         key: cargo-home-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
-        restore-keys: ${{ !(inputs.warm == 'true' && github.ref == 'refs/heads/main') && format('cargo-home-{0}-', runner.os) || '' }}
+        restore-keys: ${{ !(inputs.warm-downloads == 'true' && github.ref == 'refs/heads/main') && format('cargo-home-{0}-', runner.os) || '' }}
 
     - name: Restore the build cache
       id: target

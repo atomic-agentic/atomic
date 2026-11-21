@@ -32,9 +32,14 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
-from acceptance import FEATURES, RUNNING, plain  # noqa: E402
+from acceptance import FEATURES, plain  # noqa: E402
 
 TABLE = os.path.join(ROOT, "scripts", "test-shards.txt")
+# A test binary, by the name and hash cargo gives its file, so that two
+# targets of one name in different packages stay apart.
+RUNNING = re.compile(r"^\s*Running .*[/\\]deps[/\\]([A-Za-z0-9_]+-[0-9a-f]+)(?:\.exe)?\)\s*$")
+# Doctests carry no hash, only their library's name, which units_needed()
+# requires to be unique.
 DOCTESTS = re.compile(r"^\s*Doc-tests (\S+)\s*$")
 LISTED = re.compile(r"^(.+): (test|bench)$")
 # The units a table line can name, besides `test <name>`.
@@ -87,13 +92,14 @@ def metadata():
 def units_needed(packages):
     """{unit: where it comes from} for every unit a plain `cargo test
     --workspace` runs or builds, and what the table cannot express."""
-    needed, problems, tests = {}, [], {}
+    needed, problems, tests, libs = {}, [], {}, {}
     for pkg in packages:
         for target in pkg["targets"]:
             kinds = set(target["kind"])
             name = target["name"]
             where = f"{pkg['name']} {'/'.join(sorted(kinds))} {name}"
             if kinds & LIB_KINDS:
+                libs.setdefault(name.replace("-", "_"), []).append(pkg["name"])
                 if target.get("test", True):
                     needed.setdefault("lib", where)
                 if target.get("doctest", True):
@@ -116,6 +122,9 @@ def units_needed(packages):
     for name, pkgs in sorted(tests.items()):
         if len(pkgs) > 1:
             problems.append(f"test target {name} is in {', '.join(pkgs)}; `--test {name}` cannot tell them apart")
+    for name, pkgs in sorted(libs.items()):
+        if len(pkgs) > 1:
+            problems.append(f"library {name} is in {', '.join(pkgs)}; their doctests cannot be told apart")
     return needed, problems
 
 

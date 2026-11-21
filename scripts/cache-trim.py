@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Trim target/ to what CI's build cache keeps: the dependencies.
 
-    scripts/cache-trim.py                     # trim the workspace's target directory
+    scripts/cache-trim.py                     # in CI: trim the workspace's target directory
+    scripts/cache-trim.py --force             # the same outside CI
     scripts/cache-trim.py --metadata FILE     # with `cargo metadata --no-deps` output from FILE
 
 CI saves target/ in its cache so that a job rebuilds only the workspace's own
@@ -12,6 +13,10 @@ make the cache larger. This keeps each profile's deps/, build/ and
 .fingerprint/ entries for dependencies and the V8 mirror, and removes the
 workspace's own entries (found by the hashes in their .fingerprint/
 directories), incremental state, linked binaries and everything else.
+
+Everything else means everything: logs, scripts or notes kept under a local
+target/ go too. So it runs only where GITHUB_ACTIONS is set, as on a CI
+runner, unless given --force.
 """
 
 import argparse
@@ -72,7 +77,12 @@ def trim_profile(profile, members):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--metadata", help="read `cargo metadata --no-deps` output from this file")
+    parser.add_argument("--force", action="store_true", help="trim outside CI too")
     args = parser.parse_args()
+    if not (args.force or os.environ.get("GITHUB_ACTIONS")):
+        print("scripts/cache-trim.py: this deletes everything in target/ but the dependencies' "
+              "artifacts; it runs only in CI (GITHUB_ACTIONS set) or with --force", file=sys.stderr)
+        return 2
     if args.metadata:
         with open(args.metadata, encoding="utf-8") as f:
             meta = json.load(f)
