@@ -280,6 +280,23 @@ async fn sandboxed(
     cwd: &Path,
     command: &str,
 ) -> String {
+    let (output, answer) = try_sandboxed(dir, state, guard, cwd, command).await;
+    assert_eq!(answer.unwrap(), "Done.");
+    output()
+}
+
+/// [`sandboxed`], returning the turn's answer, and what the command printed
+/// once asked for.
+async fn try_sandboxed(
+    dir: &Path,
+    state: &Path,
+    guard: &StateGuard,
+    cwd: &Path,
+    command: &str,
+) -> (
+    impl FnOnce() -> String,
+    Result<String, atomic_core::AtomError>,
+) {
     let model = FakeModel::start(vec![
         Reply::Tool {
             name: "exec_command".into(),
@@ -319,10 +336,57 @@ async fn sandboxed(
             ..TurnSpec::default()
         },
     )
-    .await
-    .unwrap();
-    assert_eq!(answer, "Done.");
-    command_output(&model)
+    .await;
+    (move || command_output(&model), answer)
+}
+
+/// A turn that may write a directory holding the gate store two levels
+/// down, where a command could move it away from its denial, never starts:
+/// the turn fails as the machine's doing, and its command never runs.
+#[test]
+fn a_turn_that_could_move_the_private_state_away_never_starts() {
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("atomic-movable-private-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for sub in [
+            "project",
+            "state/codex",
+            "state/keep/private",
+            "bin",
+            "credentials",
+        ] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        let dir = std::fs::canonicalize(dir).unwrap();
+        let state = dir.join("state");
+        std::os::unix::fs::symlink(
+            env!("CARGO_BIN_EXE_atomic"),
+            dir.join("bin/codex-linux-sandbox"),
+        )
+        .unwrap();
+        let guard = StateGuard::Deny(PrivateState {
+            state_dir: state.clone(),
+            private: state.join("keep/private"),
+            also: vec![dir.join("credentials")],
+        });
+        let (_, answer) = try_sandboxed(
+            &dir,
+            &state,
+            &guard,
+            &dir.join("project"),
+            "echo the-command-ran",
+        )
+        .await;
+        match answer {
+            Err(atomic_core::AtomError::Runtime(why)) => {
+                assert!(why.contains("may write"), "{why}")
+            }
+            other => panic!("the turn was not refused as the machine's: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    });
 }
 
 #[test]

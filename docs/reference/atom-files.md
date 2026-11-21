@@ -303,16 +303,22 @@ wherever the variables that move them (`XDG_CONFIG_HOME`, `ZDOTDIR`,
 variables, `KUBECONFIG` and others) put them, and a link among them, up to
 four directory levels inside a denied directory, is denied as what it
 points at, whoever owns it and wherever it is, under `/run`, `/etc` or
-`/opt` too, with three exceptions that keep commands working: anything
-under `/usr`, `/bin`, `/sbin`, `/lib*`, `/nix/store`, `/dev`, `/proc` or
-`/sys`; a device, such as `/dev/null`; and a program (a file anyone may run)
-or a directory someone else owns. So a history file linked to `/dev/null`,
-or a virtual environment's `python` linked to a toolchain's, stays usable,
-while a key linked to one a secrets manager keeps under `/run` is denied. A
-pipe or socket in a credential place is denied like a file. A turn does not
-start when a denial would cover its working directory or a directory it may
-write, or when a denied place, or a linked secret, lies inside a directory
-it may write, where a command could move it away from its denial. The model chooses the
+`/opt` too. Never denied, so that commands keep working: anything under
+`/usr`, `/bin`, `/sbin`, `/lib*`, `/nix/store`, `/dev`, `/proc` or `/sys`,
+and any device, such as `/dev/null`. A credential place that is itself a
+link, such as a `~/.netrc` kept with your dotfiles, is otherwise always
+denied as what it points at, whatever its mode or owner, unless that is the
+root or one of the system's top-level directories. A link found inside a
+credential place is also left alone when it leads to a program (a file with
+any execute bit that starts as a binary or a `#!` script does) or to a
+directory someone else owns, so a virtual environment's `python` linked to
+a toolchain's keeps working; what it leads to stays readable. A key linked
+to one a secrets manager keeps under `/run` is denied. A pipe or socket in a
+credential place is denied like a file. A turn does not start when a denial
+would cover its working directory or a directory it may write, or when a
+denied place, or a linked secret, lies two or more levels inside a directory
+it may write, where a command could move the directory above it away from
+its denial. The model chooses the
 commands, so none of these reach it through them. atomic makes the list
 when the turn starts: a place on it that appears while a command runs is
 denied only to later commands, and a link made after the list is not

@@ -390,6 +390,41 @@ fn a_secret_place_linked_to_a_device_or_a_system_program_leaves_both_usable() {
     });
 }
 
+/// A credential place kept with the person's dotfiles on a file system
+/// that marks every file executable stays denied: it is no program.
+#[test]
+fn a_linked_secret_marked_executable_stays_denied() {
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let dir = std::env::temp_dir().join(format!("atomic-marked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
+        std::fs::create_dir_all(home.join("dotfiles")).unwrap();
+        std::fs::write(
+            home.join("dotfiles/netrc"),
+            "machine example.com login dev password canary-marked\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            home.join("dotfiles/netrc"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(home.join("dotfiles/netrc"), home.join(".netrc")).unwrap();
+        let command = format!(
+            "cat {h}/.netrc {h}/dotfiles/netrc; echo looked",
+            h = home.display()
+        );
+        let printed = look_once(&dir, &home, &command, &[]).await;
+        assert!(printed.contains("looked"), "{printed}");
+        assert!(
+            !printed.contains("canary"),
+            "the marked secret was read: {printed}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
 #[test]
 fn a_secret_the_system_keeps_or_a_pipe_stays_denied_and_the_persons_programs_run() {
     support::require_sandbox();

@@ -443,25 +443,42 @@ fn links_in(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// What a link resolved to, if it should be denied: anything outside the
-/// system's program, library and device directories ([`SYSTEM_PREFIXES`])
-/// but a device, a program (a file anyone may execute) or a directory
-/// someone else owns. A history file linked to `/dev/null`, or a virtual
-/// environment's `python` linked to a toolchain's, is left alone, since
-/// denying it would break commands; a key linked to one a secrets manager
-/// keeps under `/run`, or a cluster's credentials under `/etc`, are denied
-/// whoever owns them.
-fn deniable(target: &Path) -> bool {
+/// Directories a credential place that is a link may point at and still not
+/// be denied, since every command needs them: the root and the system's
+/// top-level directories, each exactly.
+const NEVER_DENIED: &[&str] = &[
+    "/", "/bin", "/boot", "/dev", "/etc", "/home", "/lib", "/lib32", "/lib64", "/libx32", "/media",
+    "/mnt", "/nix", "/opt", "/proc", "/root", "/run", "/sbin", "/srv", "/sys", "/tmp", "/usr",
+    "/var",
+];
+
+/// What a link resolved to, if it should be denied.
+///
+/// Never a device, nor anything under the system's program, library and
+/// device directories ([`SYSTEM_PREFIXES`]). A credential place that is
+/// itself a link (`listed`), such as `~/.netrc` kept with a person's
+/// dotfiles, is otherwise denied as what it points at, whoever owns it and
+/// whatever its mode, but for the system's top-level directories
+/// ([`NEVER_DENIED`]). A link found inside a credential place is also left
+/// alone when it leads to a program (a file with an execute bit that starts
+/// as one does) or to a directory someone else owns: a virtual
+/// environment's `python` linked to a toolchain's keeps working. A key
+/// linked to one a secrets manager keeps under `/run`, or a cluster's
+/// credentials under `/etc`, are denied whoever owns them.
+fn deniable(target: &Path, listed: bool) -> bool {
     let Ok(meta) = std::fs::metadata(target) else {
         return false;
     };
     if device(&meta) || SYSTEM_PREFIXES.iter().any(|p| target.starts_with(p)) {
         return false;
     }
+    if listed {
+        return !NEVER_DENIED.iter().any(|p| target == Path::new(p));
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        if meta.is_file() && meta.permissions().mode() & 0o111 != 0 {
+        if meta.is_file() && meta.permissions().mode() & 0o111 != 0 && program(target) {
             return false;
         }
         if meta.is_dir() && meta.uid() != crate::state::effective_uid() {
@@ -469,6 +486,28 @@ fn deniable(target: &Path) -> bool {
         }
     }
     true
+}
+
+/// Whether the file at `path` starts as a program does: an ELF or Mach-O
+/// binary, or a script with `#!`.
+fn program(path: &Path) -> bool {
+    use std::io::Read;
+    let mut start = [0u8; 4];
+    let Ok(read) = std::fs::File::open(path).and_then(|mut f| f.read(&mut start)) else {
+        return false;
+    };
+    let start = &start[..read];
+    start.starts_with(b"#!")
+        || start.starts_with(b"\x7fELF")
+        || [
+            [0xfe, 0xed, 0xfa, 0xce],
+            [0xfe, 0xed, 0xfa, 0xcf],
+            [0xce, 0xfa, 0xed, 0xfe],
+            [0xcf, 0xfa, 0xed, 0xfe],
+            [0xca, 0xfe, 0xba, 0xbe],
+        ]
+        .iter()
+        .any(|magic| start == magic)
 }
 
 /// Every path a profile denies under `guard`, for a thread whose Codex home
@@ -521,12 +560,18 @@ fn denied_paths(
             needed.display()
         ))
     };
-    // A denied place inside a directory the thread may write could be
-    // renamed out from under its denial by a command.
+    // A denied place two or more levels inside a directory the thread may
+    // write could be moved out from under its denial by a command renaming
+    // a directory above it; one directly inside cannot, since the sandbox's
+    // mount on it is busy.
     let movable = |path: &Path, real_path: &Path, within: &[PathBuf]| {
         within
             .iter()
-            .find(|w| real_path.starts_with(w) && real_path != w.as_path())
+            .find(|w| {
+                real_path
+                    .strip_prefix(w)
+                    .is_ok_and(|rest| rest.components().count() >= 2)
+            })
             .map(|root| {
                 refuse(format!(
                     "{} is inside {}, which atoms' commands may write, so a command could move \
@@ -557,7 +602,7 @@ fn denied_paths(
         .filter_map(|p| {
             let meta = std::fs::symlink_metadata(p).ok()?;
             let target = real(p);
-            (!meta.file_type().is_symlink() || deniable(&target)).then_some(target)
+            (!meta.file_type().is_symlink() || deniable(&target, true)).then_some(target)
         })
         .collect();
     let mut links = Vec::new();
@@ -568,7 +613,7 @@ fn denied_paths(
     // the cap.
     links.retain(|link| {
         std::fs::canonicalize(link)
-            .is_ok_and(|t| deniable(&t) && !places.iter().any(|p| t.starts_with(p)))
+            .is_ok_and(|t| deniable(&t, false) && !places.iter().any(|p| t.starts_with(p)))
     });
     if links.len() > MAX_LINK_TARGETS {
         return Err(refuse(format!(
@@ -620,7 +665,10 @@ fn denied_paths(
             // to, if that should be denied, and never what the thread
             // needs or may write. A target inside another denied place is
             // denied with it.
-            let Some(target) = std::fs::canonicalize(&path).ok().filter(|t| deniable(t)) else {
+            let Some(target) = std::fs::canonicalize(&path)
+                .ok()
+                .filter(|t| deniable(t, !found))
+            else {
                 continue;
             };
             if found && places.iter().any(|p| target.starts_with(p)) {
@@ -2443,11 +2491,20 @@ mod tests {
         let project = home.join("project");
         assert!(refused(vec![home.clone()], Some(&project), &[]).contains("need"));
         assert!(refused(vec![dir.clone()], None, &[]).contains("need"));
-        // A secret linked into a directory the thread may write.
-        std::fs::write(work.join("creds"), "x").expect("creds");
-        link(&work.join("creds"), &home.join(".aws/credentials"));
+        // A secret linked two levels into a directory the thread may write,
+        // where a command could rename the directory above it; directly
+        // inside, the sandbox's mount on it cannot be moved.
+        std::fs::create_dir_all(work.join("deep")).expect("deep");
+        std::fs::write(work.join("deep/creds"), "x").expect("creds");
+        link(&work.join("deep/creds"), &home.join(".aws/credentials"));
         let message = refused(vec![home.join(".aws")], None, std::slice::from_ref(&work));
         assert!(message.contains("may write"), "{message}");
+        std::fs::write(work.join("creds"), "x").expect("creds");
+        link(&work.join("creds"), &home.join(".aws/credentials"));
+        assert_eq!(
+            refused(vec![home.join(".aws")], None, std::slice::from_ref(&work)),
+            ""
+        );
         // Too many links to follow.
         std::fs::remove_file(home.join(".aws/credentials")).expect("unlink");
         let many = home.join(".kube");
@@ -2469,8 +2526,14 @@ mod tests {
         // away from its denial; a link inside a place, to the place, is
         // no reason to refuse.
         link(&home.join(".aws"), &home.join(".aws/current"));
-        let message = refused(vec![home.join(".aws")], None, std::slice::from_ref(&home));
+        let message = refused(vec![home.join(".aws")], None, std::slice::from_ref(&dir));
         assert!(message.contains("may write"), "{message}");
+        // With the home itself the working directory a turn may write, as a
+        // project at the home's top is, its places directly inside stay.
+        assert_eq!(
+            refused(vec![home.join(".aws")], None, std::slice::from_ref(&home)),
+            ""
+        );
         std::fs::remove_file(home.join(".aws/current")).expect("unlink");
         // And the same places, safely, run.
         assert_eq!(refused(vec![home.join(".aws")], Some(&project), &[]), "");
@@ -2510,25 +2573,72 @@ mod tests {
         std::fs::write(dir.join("key"), "x").expect("key");
         link(&dir.join("tools/python3"), &home.join(".ssh/bin/python3"));
         link(&dir.join("key"), &home.join(".ssh/id"));
+        // Files with an execute bit that are no programs, as on a file
+        // system that marks everything executable: one found by the walk,
+        // and one a credential place itself links to.
+        for name in ["marked-key", "marked-pgpass"] {
+            std::fs::write(dir.join(name), "machine example.com password x\n").expect("file");
+            std::fs::set_permissions(dir.join(name), std::fs::Permissions::from_mode(0o777))
+                .expect("mode");
+        }
+        link(&dir.join("marked-key"), &home.join(".ssh/marked"));
+        link(&dir.join("marked-pgpass"), &home.join(".pgpass"));
+        // A credential place that links to a program is still denied.
+        link(&dir.join("tools/python3"), &home.join(".vault-token"));
         let private = PrivateState {
             state_dir: dir.join("state"),
             private: dir.join("private"),
-            also: vec![fifo.clone(), home.join(".ssh")],
+            also: vec![
+                fifo.clone(),
+                home.join(".ssh"),
+                home.join(".pgpass"),
+                home.join(".vault-token"),
+            ],
         };
         let (denied, _) = denied_paths(&private, &dir.join("codex"), None, &[]).expect("denied");
         assert!(denied.contains(&fifo), "{denied:?}");
         let real = |p: &Path| std::fs::canonicalize(p).expect("real");
         assert!(denied.contains(&real(&dir.join("key"))), "{denied:?}");
+        for marked in ["marked-key", "marked-pgpass"] {
+            assert!(
+                denied.contains(&real(&dir.join(marked))),
+                "{marked}: {denied:?}"
+            );
+        }
+        // Found by the walk, the program is left; linked to by a credential
+        // place, it is denied.
         assert!(
-            !denied.contains(&real(&dir.join("tools/python3"))),
+            denied.contains(&real(&dir.join("tools/python3"))),
             "{denied:?}"
         );
+        assert!(!deniable(&real(&dir.join("tools/python3")), false));
         // Whoever owns them: what the system keeps outside its program and
         // device directories, such as a cluster's credentials under /etc.
-        assert!(deniable(Path::new("/etc/hostname")) || !Path::new("/etc/hostname").is_file());
-        assert!(!deniable(Path::new("/usr/bin/env")));
-        assert!(!deniable(Path::new("/dev/null")));
-        assert!(!deniable(Path::new("/")), "a directory someone else owns");
+        assert!(
+            Path::new("/etc/hostname").is_file(),
+            "a file the system keeps"
+        );
+        assert!(deniable(Path::new("/etc/hostname"), false));
+        assert!(!deniable(Path::new("/usr/bin/env"), false));
+        assert!(!deniable(Path::new("/dev/null"), true));
+        // A directory someone else owns, found by the walk, stays; one a
+        // credential place links to is denied, but for the system's own.
+        if crate::state::effective_uid() != 0 {
+            assert!(
+                !deniable(Path::new("/etc"), false),
+                "root's, found by the walk"
+            );
+        }
+        assert!(!deniable(Path::new("/etc"), true), "the system's own");
+        // A directory under them that a credential place links to, such as
+        // a cluster's, is denied whoever owns it.
+        if Path::new("/etc/ssl").is_dir() {
+            let ssl = std::fs::canonicalize("/etc/ssl").expect("real");
+            if !SYSTEM_PREFIXES.iter().any(|p| ssl.starts_with(p)) {
+                assert!(deniable(&ssl, true), "{ssl:?}");
+            }
+        }
+        assert!(!deniable(Path::new("/"), true), "the root");
     }
 
     #[cfg(unix)]
