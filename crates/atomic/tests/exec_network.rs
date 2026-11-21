@@ -80,6 +80,67 @@ fn serve(ip: &str, body: &'static str) -> String {
     address
 }
 
+/// The longest path a Unix socket may have: `sockaddr_un`'s `sun_path`,
+/// which `bind()` copies the path into, holds 107 bytes and the NUL. Past
+/// that `bind()` fails with "path must be shorter than SUN_LEN", so a test
+/// whose scratch directory sits deep — a linked worktree's target directory
+/// alone takes most of the budget — fails before it checks anything.
+const SUN_PATH_LIMIT: usize = 107;
+
+/// A short directory under `/tmp` that one test makes for its Unix socket
+/// alone and removes when dropped, even when the test fails. The socket is
+/// the only thing that lives there; the test's other scratch stays where it
+/// was, however deep that is.
+///
+/// The socket stays a filesystem one, not an abstract one: a confined command
+/// has a network namespace of its own, and an abstract socket is named inside
+/// one, so it would be out of the command's reach whatever the sandbox let
+/// sockets do, and the probe would prove nothing.
+struct ShortSocketDir(PathBuf);
+
+impl ShortSocketDir {
+    /// Make the directory, its owner's alone, named with this process's pid
+    /// and a nonce, so a run or a checkout sharing `/tmp` cannot collide with
+    /// it; a name already taken is tried again.
+    fn new() -> Self {
+        let mut last = String::from("/tmp");
+        for _ in 0..8 {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0);
+            let dir = Path::new("/tmp").join(format!(
+                "atomic-exec-network-{}-{nonce:08x}",
+                std::process::id()
+            ));
+            let mut builder = std::fs::DirBuilder::new();
+            std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+            match builder.create(&dir) {
+                Ok(()) => return Self(dir),
+                Err(e) => last = format!("{}: {e}", dir.display()),
+            }
+        }
+        panic!("could not make a short directory for the test's Unix socket: {last}");
+    }
+
+    /// Where a socket named `name` goes here, short enough for `bind()`.
+    fn socket(&self, name: &str) -> PathBuf {
+        let socket = self.0.join(name);
+        assert!(
+            socket.as_os_str().as_encoded_bytes().len() <= SUN_PATH_LIMIT,
+            "{} is longer than a Unix socket path may be",
+            socket.display()
+        );
+        socket
+    }
+}
+
+impl Drop for ShortSocketDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 #[test]
 fn a_confined_command_reaches_only_the_hosts_it_is_given() {
     support::require_sandbox();
@@ -117,8 +178,15 @@ fn a_confined_command_reaches_only_the_hosts_it_is_given() {
 
     let allowed = serve("127.0.0.1", "from the allowed server");
     let other = serve("127.0.0.2", "from the other server");
-    let socket = dir.join("bus.sock");
+    // A Unix socket a confined command must not reach, such as a bus. Only
+    // the socket moves, into a short directory of its own; the rest of the
+    // scratch stays under the target directory, however deep that is.
+    let short = ShortSocketDir::new();
+    let socket = short.socket("bus.sock");
     let _bus = std::os::unix::net::UnixListener::bind(&socket).expect("unix socket");
+    // The positive control: outside the sandbox the socket answers, so what
+    // the command meets below is a refusal and not a path that leads nowhere.
+    let _reached = std::os::unix::net::UnixStream::connect(&socket).expect("the socket answers");
     let allowed_host = allowed.split(':').next().expect("host").to_owned();
 
     let command = |network: Vec<String>| -> Command {
