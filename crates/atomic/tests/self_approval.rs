@@ -722,6 +722,144 @@ fn a_turn_through_atomics_own_entry_point_runs_with_its_helper_in_the_state_dire
     }
 }
 
+/// An atom's shell cannot release a parked run or raise its cap. `atomic
+/// parks release`, run from inside the sandbox with a writable root over the
+/// whole atomic home, and the operator's credential enrolled in the file
+/// store there, is refused: the guard denies the store and the credential,
+/// and nothing else stands in the way. The park and the cap stay as they
+/// were. The same command run outside the sandbox releases it.
+#[test]
+fn an_atom_cannot_release_a_park_or_raise_a_cap_through_its_shell() {
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("atomic-park-shell-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for sub in ["project", "home", "bin"] {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+        let dir = std::fs::canonicalize(dir).unwrap();
+        let (project, home) = (dir.join("project"), dir.join("home"));
+        std::os::unix::fs::symlink(
+            env!("CARGO_BIN_EXE_atomic"),
+            dir.join("bin/codex-linux-sandbox"),
+        )
+        .unwrap();
+        let atomic = |args: &[&str]| {
+            Command::new(env!("CARGO_BIN_EXE_atomic"))
+                .args(args)
+                .current_dir(&project)
+                .env("ATOMIC_HOME", &home)
+                .env("ATOMIC_CREDENTIAL_STORE", "file")
+                .env("USER", "dev")
+                .output()
+                .unwrap()
+        };
+        let out = atomic(&["debug", "state-dir"]);
+        assert!(out.status.success(), "{out:?}");
+        let state = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+        let id = state.file_name().unwrap().to_string_lossy().into_owned();
+        // The project's private state, where its store is.
+        let private_root = home.join("private");
+        let private = private_root.join(&id);
+        std::fs::create_dir_all(&private).unwrap();
+
+        // A park, and the allowance that parked it, as a run leaves them;
+        // and the operator's credential, enrolled, in the file store.
+        let rt = Durare::sqlite(&private.join("atomic.db")).await.unwrap();
+        rt.control_transaction(|mut tx| {
+            Box::pin(async move {
+                tx.execute(
+                    "INSERT INTO atomic_parks (park_id, run, step, reason, parked_at) \
+                     VALUES ('parked-run:3', 'parked-run', 'draft.park', \
+                     'the allowance run:parked-run has no room', 1)",
+                    &[],
+                )
+                .await?;
+                tx.execute(
+                    "INSERT INTO atomic_usage_allowances (scope, parent, tokens_cap, millis_cap, \
+                     micro_usd_cap, tokens_charged, millis_charged, micro_usd_charged) \
+                     VALUES ('run:parked-run', NULL, 100, 60000, NULL, 100, 0, 0)",
+                    &[],
+                )
+                .await
+                .map(|_| ())
+            })
+        })
+        .await
+        .unwrap();
+        let secret = "the operator's secret";
+        let store = credential::FileSecrets::open(&home.join("credentials"), &project).unwrap();
+        credential::SecretStore::save(&store, &format!("operator:dev@{id}"), secret).unwrap();
+        gate::enroll(&rt, &HumanCredential::new(Principal::local("dev"), secret))
+            .await
+            .unwrap();
+
+        let release = [
+            "parks",
+            "release",
+            "parked-run:3",
+            "--scope",
+            "run:parked-run",
+            "--tokens",
+            "1000000",
+        ];
+        let guard = StateGuard::Deny(PrivateState {
+            state_dir: state.clone(),
+            private: private_root.clone(),
+            also: vec![home.join("credentials")],
+        });
+        let command = format!(
+            "ATOMIC_HOME={home} ATOMIC_CREDENTIAL_STORE=file USER=dev {atomic} {args}; \
+             echo release-exit=$?",
+            home = home.display(),
+            atomic = env!("CARGO_BIN_EXE_atomic"),
+            args = release.join(" "),
+        );
+        // With a writable root over the whole atomic home: only the guard
+        // denies the store and the credential.
+        let output = sandboxed(&dir, &home, &guard, &project, &command).await;
+        assert!(output.contains("release-exit="), "{output}");
+        assert!(
+            !output.contains("release-exit=0"),
+            "the shell released the park: {output}"
+        );
+        let cap = || async {
+            rt.control_transaction(|mut tx| {
+                Box::pin(async move {
+                    tx.query_one(
+                        "SELECT tokens_cap FROM atomic_usage_allowances WHERE scope = 'run:parked-run'",
+                        &[],
+                    )
+                    .await?
+                    .int("tokens_cap")
+                })
+            })
+            .await
+            .unwrap()
+        };
+        assert!(
+            !atomic_durable::release::is_released(&rt, "parked-run:3")
+                .await
+                .unwrap(),
+            "the park was released"
+        );
+        assert_eq!(cap().await, 100, "the cap was raised");
+
+        // The positive control: the same command, outside the sandbox, as
+        // the operator, releases the park and raises the cap.
+        let out = atomic(&release);
+        assert!(out.status.success(), "{out:?}");
+        assert!(
+            atomic_durable::release::is_released(&rt, "parked-run:3")
+                .await
+                .unwrap()
+        );
+        assert_eq!(cap().await, 1_000_000);
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
 /// A signed-in thread's command cannot read the sign-in: the credential
 /// directory is denied to the sandbox, while Codex, outside it, sends the
 /// token to the (test) backend.

@@ -1115,6 +1115,7 @@ pub(crate) fn above_stdio(fd: &std::os::fd::RawFd) -> bool {
 
 /// The most a secret socket holds: what the sender hands at most, and what
 /// the reader takes at most.
+#[cfg(unix)]
 const MAX_SECRET_BYTES: usize = 4096;
 
 /// Keep the open descriptor `fd` from the programs this process starts,
@@ -1140,10 +1141,9 @@ fn keep_from_children(fd: std::os::fd::RawFd) {
 ///
 /// # Safety
 ///
-/// `fd` must name a descriptor handed to this process for this alone, which
-/// nothing else in it holds or uses, and this must be called while the
-/// process has one thread: an open descriptor is taken as this process's own
-/// and closed.
+/// `fd` must name a descriptor handed to this process for this alone: one
+/// nothing else in this process holds, uses or can be handed while this
+/// runs, since an open descriptor is taken as this process's own and closed.
 #[cfg(unix)]
 #[allow(unsafe_code)]
 pub unsafe fn read_secret_socket(fd: &std::ffi::OsStr) -> std::io::Result<crate::SecretEnv> {
@@ -1156,7 +1156,7 @@ pub unsafe fn read_secret_socket(fd: &std::ffi::OsStr) -> std::io::Result<crate:
         .filter(above_stdio)
         .ok_or_else(|| invalid("its descriptor is not a number above 2".to_owned()))?;
     if still_dumpable() {
-        keep_from_children(fd);
+        keep_from_children(fd); // a process still dumpable
         return Err(invalid(
             "this process is still dumpable; it reads secret variables only once hardened"
                 .to_owned(),
@@ -1197,10 +1197,13 @@ pub unsafe fn read_secret_socket(fd: &std::ffi::OsStr) -> std::io::Result<crate:
 /// The [`crate::SecretEnv`] this process was handed, if its environment
 /// names a socket in [`crate::SECRET_ENV_FD`] (see [`read_secret_socket`]);
 /// none if it names none. The variable is gone from its environment after.
-/// Call it while this process has one thread.
+/// Only `atomic runner` calls it, first thing, while it has one thread, and
+/// the descriptor the variable names is the one the control plane handed
+/// it: the contract [`read_secret_socket`] asks of its caller holds there,
+/// and nowhere this could be called from outside the crate.
 #[cfg(unix)]
 #[allow(unsafe_code)]
-pub fn take_inherited_secret_env() -> std::io::Result<crate::SecretEnv> {
+pub(crate) fn take_inherited_secret_env() -> std::io::Result<crate::SecretEnv> {
     let Some(fd) = std::env::var_os(crate::SECRET_ENV_FD) else {
         return Ok(crate::SecretEnv::default());
     };

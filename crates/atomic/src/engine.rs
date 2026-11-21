@@ -289,19 +289,29 @@ pub fn endpoint(
             _ => {}
         }
     }
+    // A sign-in that is there and cannot be used, refused where it is kept
+    // or unreadable, is never passed over for a key or a detected endpoint:
+    // model calls would go to another account with no more than a note.
+    if required && let Some(why) = &resolved.sign_in_unreadable {
+        return Err(Failure::new(
+            "config.model",
+            format!(
+                "the ChatGPT sign-in cannot be used: {why}; nothing else is used in its place, \
+                 since model calls would go to another account"
+            ),
+            "fix what it names; or forget the sign-in with `atomic model logout`, run from \
+             outside the project once the keyring can be reached; or set ATOMIC_MODEL_BASE_URL \
+             and ATOMIC_MODEL (or pass --model-base-url and --model), and \
+             ATOMIC_MODEL_API_KEY_ENV if the endpoint needs a key, to choose the endpoint \
+             yourself",
+        )
+        .into());
+    }
     match resolved.endpoint() {
         Some(endpoint) => Ok(endpoint),
         None if required => Err(Failure::new(
             "config.model",
-            match &resolved.sign_in_unreadable {
-                Some(why) => format!(
-                    "no model endpoint is configured or detected, model atoms need one, and \
-                     the ChatGPT sign-in could not be read: {why}"
-                ),
-                None => {
-                    "no model endpoint is configured or detected, and model atoms need one".into()
-                }
-            },
+            "no model endpoint is configured or detected, and model atoms need one",
             "sign in with `atomic model login` (Codex atoms only), set OPENAI_API_KEY to use \
              OpenAI's API, start Ollama on this machine, or set ATOMIC_MODEL_BASE_URL and \
              ATOMIC_MODEL (or pass --model-base-url and --model), and ATOMIC_MODEL_API_KEY_ENV \

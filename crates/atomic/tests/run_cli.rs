@@ -3380,6 +3380,110 @@ fn a_cancelled_run_is_not_resumed_and_a_parked_one_is() {
     });
 }
 
+/// When Codex cannot make its links to atomic under its helpers' names, as
+/// when another atomic process sweeping the same Codex home takes their
+/// directory away, it runs atomic itself as its Linux sandbox helper: an
+/// exec atom's confined command still runs, rather than its run waiting for
+/// a sandbox that never starts.
+#[cfg(target_os = "linux")]
+// needs_sandbox
+#[cfg(feature = "sandbox-tests")]
+#[test]
+fn an_exec_atom_runs_when_codex_cannot_link_its_helpers() {
+    support::require_sandbox();
+    let dir = scratch("no-helper-links");
+    let project = project(&dir);
+    let state = state_dir(&dir, &project);
+    // Where Codex makes its links, made unusable: a file where their
+    // directory goes.
+    let links = state.join("codex/tmp/arg0-linux");
+    let _ = std::fs::remove_dir_all(&links);
+    std::fs::create_dir_all(links.parent().expect("parent")).expect("dir");
+    std::fs::write(&links, "not a directory").expect("file");
+    let out = atomic(
+        &dir,
+        &project,
+        &["run", "count-only", "--data", NOTE],
+        // A sandbox that never starts fails the run soon, not after minutes.
+        &[("ATOMIC_BACKEND_WAIT", "5")],
+        "",
+    );
+    let said = text(&out);
+    assert!(
+        said.contains("could not create PATH aliases"),
+        "Codex made its links after all: {said}"
+    );
+    assert!(out.status.success(), "{said}");
+    assert_eq!(count_log(&dir), 1, "the command ran once");
+}
+
+/// With Codex's links unmade and a bubblewrap without `--argv0`, which runs
+/// the helper's inner stage by the name it was started under, a program a
+/// command put on `PATH` under the helper's name is never run in its place:
+/// the name is a path that cannot exist, so the run fails at once instead,
+/// saying the helper could not be set up.
+#[cfg(target_os = "linux")]
+// needs_sandbox
+#[cfg(feature = "sandbox-tests")]
+#[test]
+fn a_helper_run_by_name_is_never_found_along_path() {
+    use std::os::unix::fs::PermissionsExt;
+    support::require_sandbox();
+    let dir = scratch("helper-by-name");
+    let project = project(&dir);
+    let state = state_dir(&dir, &project);
+    let links = state.join("codex/tmp/arg0-linux");
+    let _ = std::fs::remove_dir_all(&links);
+    std::fs::create_dir_all(links.parent().expect("parent")).expect("dir");
+    std::fs::write(&links, "not a directory").expect("file");
+    let script = |path: &Path, text: &str| {
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        std::fs::write(path, text).expect("script");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    };
+    // A bubblewrap from before `--argv0`: it runs what follows `--` as it
+    // is named, looking a bare name up along PATH.
+    script(
+        &dir.join("bwrap/bwrap"),
+        "#!/bin/sh\n\
+         case \"$1\" in --help) echo 'usage: bwrap --as-pid-1 --perms --ro-bind-fd'; exit 0;; esac\n\
+         while [ \"$#\" -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n\
+         shift\n\
+         if command -v \"$1\" >/dev/null 2>&1; then exec \"$@\"; fi\n\
+         echo \"bwrap: execvp $1: Not a directory\" >&2\n\
+         exit 1\n",
+    );
+    let ran = dir.join("planted-ran");
+    script(
+        &dir.join("planted/codex-linux-sandbox"),
+        &format!("#!/bin/sh\ntouch '{}'\n", ran.display()),
+    );
+    let path = format!(
+        "{}:{}:{}",
+        dir.join("bwrap").display(),
+        dir.join("planted").display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = atomic(
+        &dir,
+        &project,
+        &["run", "count-only", "--data", NOTE],
+        &[("PATH", path.as_str()), ("ATOMIC_BACKEND_WAIT", "5")],
+        "",
+    );
+    assert!(!ran.exists(), "the planted program ran: {}", text(&out));
+    assert!(!out.status.success(), "{}", text(&out));
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        said.contains(
+            "Codex's Linux sandbox helper could not be set up: what ran in its place was not \
+             the helper (a trial command exited with code 1: bwrap: execvp \
+             /dev/null/codex-linux-sandbox: Not a directory)"
+        ),
+        "{said}"
+    );
+}
+
 /// `atomic run` confines an exec atom's command: through the engine as it
 /// is wired, the command cannot read the project's database or the
 /// credential store, write a gate decision, or open a socket, and can still
@@ -7311,6 +7415,118 @@ fn the_debug_prompt_says_its_turn_is_not_metered() {
     });
 }
 
+/// Released parks whose wake-up was lost are redelivered wherever gate
+/// decisions are: when a run is resumed, after a gate decision, when
+/// `atomic serve` starts and every few seconds while it serves. Each
+/// reaches `release:redeliver`, which the failpoint log records.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[test]
+fn every_place_that_redelivers_gate_decisions_redelivers_park_releases() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
+            .await
+            .expect("fake model");
+        let dir = scratch("redelivered");
+        let project = project(&dir);
+        let mut env = model_env(&model.base_url()).to_vec();
+        env.push(("ATOMIC_CREDENTIAL_STORE", "file".into()));
+        let redelivered = |log: &Path| {
+            std::fs::read_to_string(log)
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| *l == "release:redeliver")
+                .count()
+        };
+        // A run waiting at its gate, then stopped where it waits.
+        let mut run = spawn(
+            &dir,
+            &project,
+            &["run", "gated", "--run-id", "redelivered", "--data", NOTE],
+            &with(&env, &[]),
+            &dir.join("run.log"),
+        );
+        wait_until("the run to wait at its gate", || {
+            std::fs::read_to_string(dir.join("run.log"))
+                .is_ok_and(|l| l.contains("decide it from a terminal"))
+        });
+        let _ = run.kill();
+        let _ = run.wait();
+        // Resumed.
+        let resumed_log = dir.join("resume.failpoints");
+        let resumed_at = resumed_log.to_string_lossy().into_owned();
+        let mut resumed = spawn(
+            &dir,
+            &project,
+            &["runs", "resume", "redelivered"],
+            &with(&env, &[("ATOMIC_FAILPOINT_LOG", &resumed_at)]),
+            &dir.join("resume.log"),
+        );
+        wait_until("the resume to redeliver", || redelivered(&resumed_log) >= 1);
+        let _ = resumed.kill();
+        let _ = resumed.wait();
+        // A gate decided from the command line.
+        let (d, p, e) = (dir.clone(), project.clone(), env.clone());
+        let enrolled = tokio::task::spawn_blocking(move || {
+            let mut script = command_as(Path::new("/usr/bin/script"), &d, &p, &[], &with(&e, &[]));
+            script
+                .args(["-qec", &format!("{ATOMIC} gates enroll"), "/dev/null"])
+                .output()
+                .expect("script")
+        })
+        .await
+        .expect("child");
+        assert!(enrolled.status.success(), "{}", text(&enrolled));
+        let decided_log = dir.join("approve.failpoints");
+        let decided_at = decided_log.to_string_lossy().into_owned();
+        let (d, p, e) = (dir.clone(), project.clone(), env.clone());
+        let approved = tokio::task::spawn_blocking(move || {
+            atomic(
+                &d,
+                &p,
+                &["gates", "approve", "redelivered:check"],
+                &with(&e, &[("ATOMIC_FAILPOINT_LOG", &decided_at)]),
+                "",
+            )
+        })
+        .await
+        .expect("child");
+        assert!(approved.status.success(), "{}", text(&approved));
+        assert!(
+            redelivered(&decided_log) >= 1,
+            "the gate decision redelivered nothing"
+        );
+        // Served: at start, and again a few seconds later.
+        let served_log = dir.join("serve.failpoints");
+        let served_at = served_log.to_string_lossy().into_owned();
+        let mut serve = spawn(
+            &dir,
+            &project,
+            &["serve"],
+            &with(&env, &[("ATOMIC_FAILPOINT_LOG", &served_at)]),
+            &dir.join("serve.log"),
+        );
+        // Once at start, before it says it serves.
+        wait_until("serve to say it serves", || {
+            std::fs::read_to_string(dir.join("serve.log"))
+                .is_ok_and(|l| l.contains("serving until stopped"))
+        });
+        assert!(
+            redelivered(&served_log) >= 1,
+            "serve redelivered nothing at start"
+        );
+        // And again while it serves.
+        let at_start = redelivered(&served_log);
+        wait_until("serve to redeliver while serving", || {
+            redelivered(&served_log) > at_start
+        });
+        terminate(&serve);
+        let _ = wait_child(&mut serve, "serve");
+    });
+}
+
 /// A copy of `rank-note` named `name`, declaring `trust` if one is given.
 fn ranking_atom(project: &Path, name: &str, trust: Option<&str>) {
     let config = match trust {
@@ -7425,6 +7641,38 @@ fn a_direct_run_takes_external_input_into_an_atom_that_accepts_it() {
         }
         assert_eq!(model.calls(), 2);
     });
+}
+
+/// `atomic parks release` refuses a negative cap before anything, and a
+/// park that does not exist with how to find the ones that do.
+#[test]
+fn a_release_names_what_is_wrong_with_its_park_or_its_cap() {
+    let dir = scratch("parks-refused");
+    let project = project(&dir);
+    let out = atomic(
+        &dir,
+        &project,
+        &["parks", "release", "no-such-run:1", "--tokens=-5"],
+        &[],
+        "",
+    );
+    let t = text(&out);
+    assert!(!out.status.success(), "{t}");
+    assert!(
+        t.contains("--tokens must be a whole number, zero or more"),
+        "{t}"
+    );
+    let out = atomic(
+        &dir,
+        &project,
+        &["parks", "release", "no-such-run:1"],
+        &[],
+        "",
+    );
+    let t = text(&out);
+    assert!(!out.status.success(), "{t}");
+    assert!(t.contains("no park no-such-run:1"), "{t}");
+    assert!(t.contains("`atomic parks list`"), "{t}");
 }
 
 /// What a run's input and output carry, as a model's or a command's text

@@ -477,3 +477,185 @@ fn a_place_that_cannot_be_looked_at_is_refused() {
             .is_err_and(|e| e.to_string().contains("cannot be looked at"))
     );
 }
+
+/// Another mount of the place's filesystem whose mount point is the place,
+/// or a directory above it, shows the place there whatever its root says:
+/// where the table yields that second place it passes, and where its root
+/// says another directory, the table is stale and the list is refused. (A
+/// mount point reached through a linked directory stands in here for a
+/// mount of the same directory; the sandbox suite's `stale_roots` makes
+/// real ones.)
+#[test]
+fn a_mount_of_a_directory_above_the_place_is_checked_whatever_its_root_says() {
+    let dir = scratch("above");
+    let home = dir.0.join("host/home");
+    let place = home.join("u/.ssh");
+    std::fs::create_dir_all(&place).expect("dir");
+    std::os::unix::fs::symlink(&home, dir.0.join("link")).expect("link");
+    let shown = dir.0.join("link/u");
+    let table = |root: &Path| {
+        format!(
+            "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n2 1 8:1 {} {} rw - ext4 /dev/sda1 rw\n",
+            root.display(),
+            shown.display()
+        )
+    };
+    // Its root names the directory it is: the table yields it, and it passes.
+    let mounts = parse(table(&home.join("u")).as_bytes()).expect("parses");
+    assert_eq!(
+        aliases(&mounts, std::slice::from_ref(&place)).expect("yielded"),
+        [shown.join(".ssh")]
+    );
+    // Its root names another: refused.
+    let mounts = parse(table(Path::new("/elsewhere")).as_bytes()).expect("parses");
+    assert!(
+        aliases(&mounts, std::slice::from_ref(&place)).is_err_and(|e| {
+            let e = e.to_string();
+            e.contains(&format!("the mount at {} shows", shown.display()))
+                && e.contains("(/elsewhere) names no path")
+        })
+    );
+}
+
+/// Gives a directory its mode back when dropped, so that its scratch can
+/// be removed whatever the test came to.
+struct Unlocked(PathBuf);
+
+impl Drop for Unlocked {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+    }
+}
+
+/// A directory this user may not search, and the dropping of it.
+fn locked(dir: &Path) -> Unlocked {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(dir).expect("dir");
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o000)).expect("lock");
+    assert!(
+        std::fs::symlink_metadata(dir.join("x"))
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied),
+        "this test needs a user that file modes stop, not root"
+    );
+    Unlocked(dir.to_owned())
+}
+
+/// A mount point, or a place, behind a directory this user may not search
+/// is out of reach only when that directory is someone else's: one of the
+/// user's own stops it by its mode alone, which a command can step around
+/// from a user namespace of its own, so the list is refused.
+#[test]
+fn what_hides_behind_the_users_own_locked_directory_is_refused() {
+    // Whatever the host's own subordinate uids are.
+    let _no_subuid = with_subuid(Err(std::io::ErrorKind::NotFound));
+    let _no_nsswitch = with_nsswitch(Err(std::io::ErrorKind::NotFound));
+    let dir = scratch("locked-own");
+    let place = dir.0.join("home/.ssh");
+    std::fs::create_dir_all(&place).expect("dir");
+    let elsewhere = dir.0.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).expect("dir");
+    let table = |at: &Path| {
+        format!(
+            "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n2 1 8:1 /x {} rw - ext4 /dev/sda1 rw\n",
+            at.display()
+        )
+    };
+    // A second mount of the place's filesystem behind it.
+    let _unlocked = locked(&dir.0.join("locked"));
+    let mounts = parse(table(&dir.0.join("locked/m")).as_bytes()).expect("parses");
+    assert!(
+        aliases(&mounts, std::slice::from_ref(&place)).is_err_and(|e| e.to_string().contains(
+            &format!(
+                "the mount at {} cannot be looked at",
+                dir.0.join("locked/m").display()
+            )
+        ))
+    );
+    // A place behind it, with a second mount of its filesystem elsewhere.
+    let hidden = dir.0.join("locked/.kube");
+    let mounts = parse(table(&elsewhere).as_bytes()).expect("parses");
+    assert!(
+        aliases(&mounts, std::slice::from_ref(&hidden)).is_err_and(|e| e
+            .to_string()
+            .contains(&format!("{} cannot be looked at", hidden.display())))
+    );
+    // The same directory, someone else's, by a uid the user cannot map: a
+    // mount point behind it is out of reach of the user's commands too,
+    // and passed over; a place behind it still refuses, since what shows it
+    // elsewhere cannot be checked.
+    let me = crate::state::effective_uid();
+    let _other = with_uid(me + 1);
+    let behind = parse(table(&dir.0.join("locked/m")).as_bytes()).expect("parses");
+    assert_eq!(
+        aliases(&behind, std::slice::from_ref(&place)).expect("out of reach"),
+        Vec::<PathBuf>::new()
+    );
+    let mounts = parse(table(&elsewhere).as_bytes()).expect("parses");
+    assert!(
+        aliases(&mounts, std::slice::from_ref(&hidden)).is_err_and(|e| e
+            .to_string()
+            .contains(&format!("{} cannot be looked at", hidden.display())))
+    );
+}
+
+/// A directory someone else owns is out of reach only by a uid the user
+/// cannot map into a user namespace of its own (`/etc/subuid`): one the
+/// user may map counts as the user's, and a subordinate-uid file that
+/// cannot be read or is not one refuses.
+#[test]
+fn a_directory_of_a_uid_the_user_may_map_is_the_users_own() {
+    let dir = scratch("locked-mapped");
+    let place = dir.0.join("home/.ssh");
+    std::fs::create_dir_all(&place).expect("dir");
+    let _unlocked = locked(&dir.0.join("locked"));
+    let table = format!(
+        "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n2 1 8:1 /x {} rw - ext4 /dev/sda1 rw\n",
+        dir.0.join("locked/m").display()
+    );
+    let mounts = parse(table.as_bytes()).expect("parses");
+    // The directory is this process's; the test stands in another user, so
+    // it is someone else's by a uid that user may or may not map.
+    let owner = crate::state::effective_uid();
+    let user = owner + 1;
+    let _other = with_uid(user);
+    let _no_nsswitch = with_nsswitch(Err(std::io::ErrorKind::NotFound));
+    let refused = |given: Result<&str, std::io::ErrorKind>| {
+        let _subuid = with_subuid(given);
+        aliases(&mounts, std::slice::from_ref(&place)).is_err_and(|e| {
+            e.to_string().contains(&format!(
+                "the mount at {} cannot be looked at",
+                dir.0.join("locked/m").display()
+            ))
+        })
+    };
+    // A range of the user's, by uid, that holds the owner: refused.
+    assert!(refused(Ok(&format!("{user}:{owner}:1\n"))));
+    // One that does not, or another user's: passed over.
+    assert!(!refused(Ok(&format!(
+        "{user}:{}:10\n{}:{owner}:1\n",
+        owner + 1,
+        user + 1
+    ))));
+    // No file: the user maps only itself.
+    assert!(!refused(Err(std::io::ErrorKind::NotFound)));
+    // A file that cannot be read, or is not one: refused.
+    assert!(refused(Err(std::io::ErrorKind::PermissionDenied)));
+    assert!(refused(Ok("not a subordinate uid file\n")));
+    // The stand-in user has no name in the password database: a range by
+    // any name may be its own.
+    assert!(refused(Ok(&format!("someone:{owner}:1\n"))));
+    // No file, but subordinate uids from a directory service: refused; from
+    // files only, or with no such line: passed over.
+    let nss = |given: Result<&str, std::io::ErrorKind>| {
+        let _nsswitch = with_nsswitch(given);
+        refused(Err(std::io::ErrorKind::NotFound))
+    };
+    assert!(nss(Ok("passwd: files\nsubid: sss\n")));
+    assert!(nss(Ok(
+        "subid: files [NOTFOUND=return] sss # and the rest\n"
+    )));
+    assert!(!nss(Ok("subid: files [NOTFOUND=return]\n")));
+    assert!(!nss(Ok("passwd: files sss\n# subid: sss\n")));
+    assert!(nss(Err(std::io::ErrorKind::PermissionDenied)));
+}

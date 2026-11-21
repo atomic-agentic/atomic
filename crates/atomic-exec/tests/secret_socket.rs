@@ -25,10 +25,21 @@ fn a_secret_socket_is_read_only_once_hardened_and_only_from_a_socket() {
     // SAFETY: each descriptor here was made for this test alone, which runs
     // on one thread of its own binary.
     let read = |fd: &str| unsafe { read_secret_socket(std::ffi::OsStr::new(fd)) };
-    // Still dumpable: refused before the socket is touched.
+    // Still dumpable: refused before the socket is touched, and the socket,
+    // handed inheritable, is kept from the programs this process starts.
     let fd = socket_holding(b"K=v\0");
+    let raw: std::os::fd::RawFd = fd.parse().expect("a number");
+    // SAFETY: fcntl with F_SETFD takes an integer and touches no memory.
+    assert_eq!(unsafe { libc::fcntl(raw, libc::F_SETFD, 0) }, 0);
     let refused = read(&fd).expect_err("a dumpable process reads no secret");
     assert!(refused.to_string().contains("dumpable"), "{refused}");
+    // SAFETY: as above.
+    let flags = unsafe { libc::fcntl(raw, libc::F_GETFD) };
+    assert_eq!(
+        flags & libc::FD_CLOEXEC,
+        libc::FD_CLOEXEC,
+        "the socket refused while dumpable stays inheritable"
+    );
     // Hardened, as the runner and the sandbox helper are before they read.
     // SAFETY: PR_SET_DUMPABLE takes an integer and touches no memory.
     assert_eq!(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) }, 0);
