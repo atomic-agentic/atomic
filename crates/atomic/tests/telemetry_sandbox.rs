@@ -54,6 +54,62 @@ fn a_secret_a_codex_provider_echoes_is_redacted_from_its_error_event() {
     );
 }
 
+/// What a Codex turn says of a provider's failure on its own span is what its
+/// step's span and its run's say: that text, bounded, never the whole failure,
+/// whose tail quotes the provider beyond what a span may carry.
+#[test]
+fn a_codex_steps_span_says_what_its_turn_said_and_never_the_failure_whole() {
+    const SEEDED: &str = concat!("sk-ant-", "api03-CODEXspanSEEDED0123456789abcdef");
+    support::require_sandbox();
+    let dir = scratch("codex-span");
+    project(&dir);
+    // A 400 ends the turn; Codex answers a 401 by trying to sign in again.
+    // The provider's message runs past what any span may carry, and ends with
+    // a phrase that must not reach one.
+    let body = format!(
+        r#"{{"error": {{"message": "Refused the key {SEEDED} {} ENDOFTHEPROVIDER", "type": "invalid_request_error"}}}}"#,
+        "waste ".repeat(60)
+    );
+    let (model, _rt) = model(vec![Reply::Http { status: 400, body }; 8]);
+    let (url, received) = collector();
+    let out = run(
+        &dir,
+        &model.base_url(),
+        "review",
+        NOTE,
+        &exporting(&url, "http/json"),
+    );
+    assert!(!out.status.success(), "the turn failed: {}", text(&out));
+    let spans = received.spans();
+    // The turn's own span: the class, and what it may say of the provider.
+    let call = named(&spans, "chat synthetic");
+    assert!(failed(call), "{call}");
+    let said = attribute(call, "error.message").expect("the turn says why it failed");
+    assert!(
+        !said.contains(SEEDED) && said.contains("[REDACTED]"),
+        "the key reached the turn's span: {said}"
+    );
+    // Its step's span and its run's say exactly that, cut short, and carry
+    // neither the provider's end nor the rest of the chain the run keeps.
+    for name in ["invoke_agent review-note", "invoke_workflow review"] {
+        let span = named(&spans, name);
+        assert!(failed(span), "{span}");
+        let why = span["status"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{span} carries no status message: {span}"));
+        assert_eq!(why, said, "{span} says other than the turn did");
+        assert!(
+            !why.contains("ENDOFTHEPROVIDER"),
+            "{span} carries the provider's own words: {why}"
+        );
+        assert!(
+            why.chars().count() <= atomic_core::usage::MAX_SPAN_ERROR,
+            "{} characters on {span}: {why}",
+            why.chars().count()
+        );
+    }
+}
+
 /// A Codex atom's commands see none of the exporter's settings, its
 /// collector credential among them, while the run exports over gRPC.
 #[test]

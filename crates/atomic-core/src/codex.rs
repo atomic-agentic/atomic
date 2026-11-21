@@ -1040,6 +1040,35 @@ pub fn harden_runner() {
     codex_process_hardening::pre_main_hardening();
 }
 
+/// Point this process's `TMPDIR` at `tmp`, the shared temporary directory of
+/// the backend its turns run on ([`atomic_exec::LocalBackend::shared_tmp`]).
+///
+/// Codex's sandbox keeps a registry of the mount points it makes in a turn's
+/// writable roots, such as the empty `.git` it mounts read-only where there
+/// is none, in its helper's `TMPDIR`, so that a sandbox never removes one
+/// another sandbox is still using. A turn's commands give their helper the
+/// backend's shared directory. Codex's file helper, which applies a turn's
+/// patches under the same sandbox, takes its `TMPDIR` from this process
+/// instead: pointed here, the two keep one registry. Elsewhere than Linux
+/// Codex keeps no such registry, and this does nothing.
+///
+/// Whatever this process and its helpers keep in their temporary directory
+/// is then kept there, which connecting the backend empties: give it only
+/// for a command that runs turns on that backend, before it connects.
+///
+/// Call it in `main` before [`dispatch`], while the process has one thread.
+pub fn share_sandbox_registry(tmp: &Path) {
+    #[cfg(target_os = "linux")]
+    // SAFETY: called at the start of main, while the process has one thread,
+    // so no other thread can read the environment concurrently.
+    #[allow(unsafe_code)]
+    unsafe {
+        std::env::set_var("TMPDIR", tmp);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = tmp;
+}
+
 /// The process entry point.
 ///
 /// The same executable re-runs itself as Codex's helpers (the Linux sandbox,
@@ -2165,6 +2194,9 @@ where
             .run(run_turn(&thread, &current, limit.time, &mut recorder))
             .await;
         if let (Err(e), Some(span)) = (&turn, span.span()) {
+            // What this turn says of itself, for this step's span and its
+            // run's, which never hear this error (see [`crate::usage::Why`]).
+            crate::usage::note_step_failure(e);
             crate::usage::record_error(&span, e);
         }
         let totals = progress.totals(seen);
