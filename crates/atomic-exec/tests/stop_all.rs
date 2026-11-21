@@ -138,7 +138,12 @@ fn stopping_ends_every_process_a_command_started_before_it_returns() {
     .unwrap();
     // And a process started once the stop has begun, as a model turn's
     // command may be: killed on sight.
-    let marker = late_started.clone();
+    // And, a little later, a process that leaves an orphan, killing itself:
+    // the orphan comes to this process, which the stop makes a subreaper,
+    // so it is found and killed too, where it would go to the system's
+    // first process and be lost.
+    let orphan_file = dir.join("orphan");
+    let (marker, orphaned) = (late_started.clone(), orphan_file.clone());
     let late = std::thread::spawn(move || {
         while !stopping() {
             std::thread::sleep(Duration::from_millis(5));
@@ -147,6 +152,20 @@ fn stopping_ends_every_process_a_command_started_before_it_returns() {
             .arg("300")
             .spawn()
             .unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        let mut leaver = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                &format!("sleep 300 & echo $! > {}; kill -9 $$", orphaned.display()),
+            ])
+            .spawn()
+            .unwrap();
+        let _ = leaver.wait();
+        let started = Instant::now();
+        while std::fs::read_to_string(&orphaned).map_or(true, |t| t.trim().is_empty()) {
+            assert!(started.elapsed() < Duration::from_secs(10), "no orphan");
+            std::thread::sleep(Duration::from_millis(10));
+        }
         std::fs::write(&marker, "").unwrap();
         child
     });
@@ -154,6 +173,14 @@ fn stopping_ends_every_process_a_command_started_before_it_returns() {
     let stopped = stop_all(&mut |what| reported.push(what.to_owned()));
     assert!(done.exists(), "the tool was killed, not let finish");
     let mut late = late.join().unwrap();
+    let orphan = std::fs::read_to_string(&orphan_file)
+        .unwrap()
+        .trim()
+        .to_owned();
+    assert!(
+        !alive(&orphan),
+        "process {orphan}, orphaned during the stop, outlived it"
+    );
     let late_pid = late.id().to_string();
     assert!(
         !alive(&late_pid) || late.try_wait().unwrap().is_some(),

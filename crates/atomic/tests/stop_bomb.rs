@@ -7,14 +7,15 @@
 //! lock it holds, outlasts it all.
 //!
 //! The bomb takes every process the container allows, so this runs only
-//! with a feature of its own, alone, and needs the sandbox:
+//! when asked, alone, and needs unprivileged user namespaces, as the
+//! sandbox does:
 //!
 //!   ATOMIC_DEV_SANDBOX=on scripts/dev.sh cargo test --locked -p atomic-agentic \
-//!       --features fork-bomb-tests --test stop_bomb
+//!       --test stop_bomb -- --ignored
 //!
 //! In a test binary of its own: once stopped, this process starts nothing
 //! more.
-#![cfg(all(target_os = "linux", feature = "fork-bomb-tests"))]
+#![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used)]
 
 mod support;
@@ -61,6 +62,7 @@ fn with_marker(marker: &str, deadline: Option<Instant>) -> Vec<String> {
 }
 
 #[test]
+#[ignore = "takes every process the container allows: run alone, with --ignored"]
 fn stopping_ends_a_fork_bomb_and_its_namespace() {
     support::require_sandbox();
     let marker = format!("atomic-stop-bomb-{}", std::process::id());

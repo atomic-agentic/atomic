@@ -486,31 +486,84 @@ mod descendants {
         }
         // Wait, killing whatever appears, until nothing descending from
         // this one runs.
+        let report = std::cell::RefCell::new(report);
+        wait_phase(
+            &mut watched,
+            &mut |deadline| {
+                let (all, complete) = found(
+                    &mut |what| (report.borrow_mut())(what),
+                    &mut unreadable,
+                    deadline,
+                );
+                let own = own(&all, &tools);
+                let others = all
+                    .into_iter()
+                    .map(|(p, _)| p)
+                    .filter(|p| !own.contains(p))
+                    .collect();
+                (others, own.into_iter().collect(), complete)
+            },
+            &mut |process| signal(process, libc::SIGKILL),
+            &mut |process| alive(process),
+            &mut |what| (report.borrow_mut())(what),
+            &|process| process.pid.to_string(),
+            begun,
+        );
+    }
+
+    /// Wait until nothing `find` finds, nor anything in `watched`, is
+    /// `alive`, killing each process found that is not yet watched, and
+    /// watching it: `find` gives what runs that may be killed, the processes
+    /// of atomic's own tools, which are only waited for, and whether its look
+    /// was complete. Only a complete look can show that nothing runs: after
+    /// one cut short, the next may take twice as long. `report` is told what
+    /// is left after ten seconds from `begun`, and every thirty after.
+    fn wait_phase<P: Copy + Eq + std::hash::Hash>(
+        watched: &mut HashSet<P>,
+        find: &mut dyn FnMut(Instant) -> (Vec<P>, Vec<P>, bool),
+        kill: &mut dyn FnMut(&P),
+        alive: &mut dyn FnMut(&P) -> bool,
+        report: &mut dyn FnMut(&str),
+        name: &dyn Fn(&P) -> String,
+        begun: Instant,
+    ) {
+        let mut look = STOP_PHASE;
         let mut next = FIRST_REPORT;
         loop {
-            let (all, complete) = found(report, &mut unreadable, Instant::now() + STOP_PHASE);
-            let own = own(&all, &tools);
-            for (process, _) in all.iter().filter(|(p, _)| !own.contains(p)) {
-                if watched.insert(*process) {
-                    signal(process, libc::SIGKILL);
+            let (others, own, complete) = find(Instant::now() + look);
+            for process in others {
+                if watched.insert(process) {
+                    kill(&process);
                 }
             }
-            let left: Vec<libc::pid_t> = watched
+            let left: Vec<String> = watched
                 .iter()
                 .chain(&own)
                 .filter(|p| alive(p))
-                .map(|p| p.pid)
+                .map(name)
                 .collect();
-            // Only a look that saw all of /proc can show that nothing runs.
             if left.is_empty() && complete {
                 return;
             }
+            if left.is_empty() {
+                look *= 2;
+            }
             if begun.elapsed() >= next {
-                report(&format!(
-                    "processes {left:?} of stopped commands, or of atomic's own tools, have not \
-                     ended yet; the execution lock stays held until they do, and only SIGKILL \
-                     ends this wait"
-                ));
+                if left.is_empty() {
+                    report(&format!(
+                        "a look through /proc for the processes of stopped commands did not \
+                         finish in time; looking again, for up to {}s, and the execution lock \
+                         stays held until one does",
+                        look.as_secs()
+                    ));
+                } else {
+                    report(&format!(
+                        "processes [{}] of stopped commands, or of atomic's own tools, have not \
+                         ended yet; the execution lock stays held until they do, and only \
+                         SIGKILL ends this wait",
+                        left.join(", ")
+                    ));
+                }
                 next += REPORT_EVERY;
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -520,8 +573,8 @@ mod descendants {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use std::sync::Arc;
         use std::sync::atomic::AtomicUsize;
+        use std::sync::{Arc, Mutex};
 
         /// Run `stop_phase` with `find` and `stop`, on a thread, giving it
         /// `within`.
@@ -633,6 +686,46 @@ mod descendants {
             );
             assert_eq!(found, HashSet::from([1, 2, 11, 12]));
             assert!(settled);
+        }
+
+        /// A look cut short that finds nothing running is no proof that
+        /// nothing runs: the wait looks again, and kills what a complete
+        /// look finds.
+        #[test]
+        fn the_wait_ends_only_after_a_complete_look() {
+            let killed = Arc::new(Mutex::new(Vec::new()));
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let marked = killed.clone();
+            std::thread::spawn(move || {
+                let mut rounds = 0;
+                let mut watched = HashSet::new();
+                let dead = marked.clone();
+                wait_phase(
+                    &mut watched,
+                    &mut |_| {
+                        rounds += 1;
+                        if rounds < 3 {
+                            (Vec::new(), Vec::new(), false)
+                        } else {
+                            (vec![7u32], Vec::new(), true)
+                        }
+                    },
+                    &mut |p| marked.lock().expect("killed").push(*p),
+                    &mut |p| !dead.lock().expect("killed").contains(p),
+                    &mut |_| {},
+                    &|p| p.to_string(),
+                    Instant::now(),
+                );
+                let _ = sender.send(());
+            });
+            receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the wait ended");
+            assert_eq!(
+                *killed.lock().expect("killed"),
+                vec![7],
+                "what the complete look found was killed"
+            );
         }
     }
 }
