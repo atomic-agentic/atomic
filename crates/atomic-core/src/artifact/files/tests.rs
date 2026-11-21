@@ -887,6 +887,13 @@ fn two_commands_handing_over_the_same_bytes_leave_one_copy() {
     assert_eq!(first_output["patch"], json!(reference_of(bytes)));
     assert_eq!(f.blobs(), 1, "the same bytes were stored twice");
     assert_eq!(f.staged(), 0);
+    // One copy, with a manifest for each step that handed it over.
+    let artifact: ArtifactRef = first_output["patch"]
+        .as_str()
+        .expect("a reference")
+        .parse()
+        .expect("parses");
+    assert_eq!(f.store.manifests(&artifact).expect("manifests").len(), 2);
 }
 
 /// An exchange that fails every give with invalid data of its own.

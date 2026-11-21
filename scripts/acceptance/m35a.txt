@@ -13,3 +13,4 @@ atomic_core artifact::files::tests::two_commands_handing_over_the_same_bytes_lea
 atomic_core artifact::tests::a_reference_to_a_missing_artifact_fails_validation
 atomic_core runtime::tests::an_output_must_reference_artifacts_that_exist_with_the_right_type
 atomic_core runtime::tests::an_exec_atom_output_names_only_artifacts_the_store_holds
+atomic_core artifact::files::tests::an_input_referencing_a_missing_artifact_is_refused
