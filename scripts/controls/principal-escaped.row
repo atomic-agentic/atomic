@@ -1,0 +1,1 @@
+principal-escaped|crates/atomic/src/gates.rs|shown::line(principal.as_str())|principal.as_str() /*CONTROL_OFF*/|-p atomic-agentic --test gates_cli a_hostile_account_name_is_shown_escaped
