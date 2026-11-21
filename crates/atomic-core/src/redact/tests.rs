@@ -2137,3 +2137,112 @@ fn rewritten_held_json_settles_in_one_pass() {
         assert_eq!(twice, once, "case {case}: a second pass changed it");
     }
 }
+
+/// What `io::Error` writes for an operating system's error, alone and after
+/// the path it is about, is kept whole, whatever the path's last name: a
+/// sign-in's directory, `credentials`, `secrets`, `token`.
+#[test]
+fn an_os_error_after_a_path_is_kept_whole() {
+    let denied = std::io::Error::from_raw_os_error(libc::EACCES).to_string();
+    let missing = std::io::Error::from_raw_os_error(libc::ENOENT).to_string();
+    let looped = std::io::Error::from_raw_os_error(libc::ELOOP).to_string();
+    let mut kept = vec![denied.clone(), missing.clone(), looped.clone()];
+    for name in [
+        "codex-auth",
+        "credentials",
+        "secrets",
+        "token",
+        "auth.json",
+        "api_key",
+        "DB_PASSWORD",
+    ] {
+        for error in [&denied, &missing, &looped] {
+            kept.push(format!(
+                "/home/dev/.config/atomic/credentials/{name}: {error}"
+            ));
+            kept.push(format!("open {name}: {error}"));
+            kept.push(format!("error: {name}: {error}; try again"));
+        }
+    }
+    let kept: Vec<&str> = kept.iter().map(String::as_str).collect();
+    assert_kept(&kept);
+}
+
+/// A deterministic stream of numbers, so the planted secrets below are the
+/// same on every run, and on main, where the same cases are hidden.
+struct Planted(u64);
+
+impl Planted {
+    fn next(&mut self) -> u64 {
+        // xorshift64*
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+
+    /// A secret no rule could take for a word: letters and digits, with at
+    /// least one of each, 16 to 40 long.
+    fn secret(&mut self) -> String {
+        const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        let len = 16 + (self.next() % 25) as usize;
+        let mut s: String = (0..len)
+            .map(|_| CHARS[(self.next() % CHARS.len() as u64) as usize] as char)
+            .collect();
+        s.replace_range(0..1, "q");
+        s.push('7');
+        s
+    }
+}
+
+/// Secrets planted after a secret's name, however the text around them
+/// looks like an operating system's error, stay hidden: the oracle is the
+/// planted value itself, not what redaction makes of it. The same cases
+/// pass on main, so keeping an operating system's error whole shows no
+/// secret main hides.
+#[test]
+fn planted_secrets_after_a_secret_name_stay_hidden_beside_os_errors() {
+    let mut planted = Planted(0x5eed_a70c_0000_0013);
+    let names = [
+        "password",
+        "DB_PASSWORD",
+        "client_secret",
+        "secrets",
+        "api_key",
+        "apikey",
+        "access_token",
+        "AUTH_TOKEN",
+        "github_token",
+    ];
+    let seps = [": ", "=", " = ", ": \"", "='"];
+    let mut shown = Vec::new();
+    let mut n = 0;
+    for name in names {
+        for sep in seps {
+            for _ in 0..8 {
+                let secret = planted.secret();
+                let close = match sep {
+                    ": \"" => "\"",
+                    "='" => "'",
+                    _ => "",
+                };
+                for input in [
+                    format!("{name}{sep}{secret}{close}"),
+                    format!("/srv/app/{name}{sep}{secret}{close} (os error 13)"),
+                    format!("{name}{sep}{secret}{close} denied (os error 13)"),
+                    format!("{name}{sep}{secret}{close}: Permission denied (os error 13)"),
+                    format!("open /srv/{name}{sep}{secret}{close}"),
+                ] {
+                    if text(&input).contains(&secret) {
+                        shown.push(n);
+                    }
+                    n += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        shown.is_empty(),
+        "planted secrets shown in cases {shown:?} of {n}"
+    );
+}

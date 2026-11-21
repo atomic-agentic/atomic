@@ -1062,6 +1062,13 @@ fn assigned(input: &str) -> Option<String> {
         let Some((value_from, mut value_to)) = value_after(input, start) else {
             continue;
         };
+        // What the operating system said of the path before it, as Rust
+        // writes it, `Permission denied (os error 13)`: no secret, whatever
+        // the path's last name is.
+        if is_os_error(&input[value_from..]) {
+            at = at.max(value_to);
+            continue;
+        }
         // `authorization=Bearer abc`: the scheme and its credential.
         let value = &input[value_from..value_to];
         if SCHEMES.iter().any(|s| value.eq_ignore_ascii_case(s))
@@ -1086,6 +1093,43 @@ fn assigned(input: &str) -> Option<String> {
     }
     out.push_str(&input[copied..]);
     Some(out)
+}
+
+/// What the operating system says of a failed file or socket operation, as
+/// Rust's `io::Error` writes it: one of these words, then ` (os error N)`.
+/// Only these exact words, so nothing else that ends in such a suffix is
+/// taken for one.
+const OS_ERRORS: &[&str] = &[
+    "Permission denied",
+    "Operation not permitted",
+    "No such file or directory",
+    "Not a directory",
+    "Is a directory",
+    "File exists",
+    "Directory not empty",
+    "Read-only file system",
+    "Too many levels of symbolic links",
+    "No space left on device",
+    "Device or resource busy",
+    "Resource busy",
+    "Text file busy",
+    "Input/output error",
+    "Bad file descriptor",
+    "Invalid argument",
+    "No such device or address",
+    "File name too long",
+    "Resource temporarily unavailable",
+    "Connection refused",
+];
+
+/// Whether `text` starts with one of [`OS_ERRORS`] and its ` (os error N)`.
+fn is_os_error(text: &str) -> bool {
+    OS_ERRORS.iter().any(|words| {
+        text.strip_prefix(words)
+            .and_then(|rest| rest.strip_prefix(" (os error "))
+            .and_then(|rest| rest.split_once(')'))
+            .is_some_and(|(code, _)| !code.is_empty() && code.bytes().all(|b| b.is_ascii_digit()))
+    })
 }
 
 fn redact_flag(captures: &Captures<'_>) -> String {
