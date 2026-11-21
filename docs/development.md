@@ -189,7 +189,10 @@ of `/tmp`, and its denial of atomic's private state, to turns and to exec
 atoms' commands; the confinement of exec atoms' commands itself; and their
 network: none unless declared, and through the proxy only the declared hosts,
 on ports 80 and 443, never through another proxy, with the declaration checked
-when the atom loads and again before the command runs), it
+when the atom loads and again before the command runs; and the artifact store's
+holds, which keep the files an exec step hands over from every sweep until its
+turn is recorded; and that an exec atom's files move only through its
+workspace's backend), it
 switches the control off in the source, requires the control's test to fail,
 puts the source back and requires the test to pass. Each control costs a rebuild, so it
 runs by hand rather than in CI:
@@ -201,9 +204,33 @@ ATOMIC_DEV_SANDBOX=on scripts/dev.sh scripts/controls-check.sh
 In a linked worktree, also mount the main checkout's `.git` with
 `ATOMIC_DEV_MOUNTS`, since the script hashes files with git. It puts every
 file it edits back, even when interrupted, and `scripts/controls-check-test.sh`
-(in CI) tests that.
+(in CI) tests that. It refuses to start while a file a selected control edits
+differs from HEAD, including a file git does not track or is told to assume
+unchanged, so commit or put back changes to those files first; changes to
+other files do not matter.
 
-A control added later gets a row in the script. A row whose code has moved
+Each control is one file under `scripts/controls/`, named `<name>.row` and
+holding one line:
+
+```
+name|file|text to replace|replacement|cargo test arguments
+```
+
+`name` is what you pass to the script and must equal the file's name; `file` is
+where the control lives; the script switches the control off by replacing the
+first `text to replace` there with `replacement`; the rest are the arguments
+given to `cargo test`, with every test the control has named after `--`, each of
+which must fail with the control off. The arguments are taken as written, with
+no variable expanded, so a control that needs the sandbox and Postgres suites
+names `--features atomic-agentic/postgres-tests,atomic-agentic/sandbox-tests`
+itself. Only the first `text to replace` is switched, so a control with two
+sites has a row for each, and the text of each is unlike the other's. Add a
+control by adding a file: the script
+reads the directory in file-name order and refuses a file whose row names a
+different control, a file holding anything but one row, a second file naming a
+control again, and anything there that is not a `*.row` regular file. That is
+why a control is a file rather than a line in the script: two branches adding a
+control add two files and never edit the same line. A row whose code has moved
 fails until it is updated.
 
 ## Milestone acceptance
@@ -216,19 +243,45 @@ features, so nothing rebuilds:
 
 ```bash
 ATOMIC_DEV_SANDBOX=on scripts/dev.sh scripts/acceptance.py m12
+ATOMIC_DEV_SANDBOX=on scripts/dev.sh scripts/acceptance.py m45
 ```
 
 Each clause is written as the milestones state it, and a clause of several
-parts, separated by semicolons, can list each part on a `### ` line with tests
-of its own. The check fails when the list's clauses and the milestone's differ,
-when anything in the milestone's Acceptance block cannot be read as a clause,
-when a listed test fails, is ignored or does not run (renamed, removed, or
-built out by a feature), when a clause or part lists no test, or when cargo
-fails. A clause its tests do not yet show in full is marked `pending:` with the
-reason, and the verdict names it. The
-Postgres and sandbox tests it lists need their backends, as in the test jobs,
-hence `ATOMIC_DEV_SANDBOX=on`. `scripts/acceptance-test.sh` (in CI) tests the
-check itself.
+sub-clauses, separated by semicolons, can list each sub-clause on a `### ` line
+with tests of its own. Dropping those `### ` lines drops that requirement with
+them: the clause's tests, taken together, then need only show the clause, and no
+sub-clause needs one of its own. Sub-clauses are split on `;` alone, so a clause
+whose sub-clauses are joined with `, and` cannot be listed one by one. A
+sub-clause is not a part: a milestone's parts are the `a` and `b` sections under
+it, which are milestones of their own.
+
+A milestone's clauses are those of every Acceptance block under its heading, a
+titled block such as `**Acceptance, the managed Deno:**` included. A split
+milestone is asked only for the clauses of its own text, which ends where its
+first part's section starts, so none of a part's clauses is counted as its
+parent's. A "b" part finishes its parent's work, so its list states its parent's
+clauses as well as its own; an "a" part states only its own. Only a line that
+states a marker opens a block, and only a block holds clauses, so what is
+written under a line that opens none, or under a deeper heading that states
+none, is read as nothing. Each such line is refused with its line number:
+outside a block, every line that leads with a spelling of `accept` and ends in
+a colon, however it is wrapped or spelt (`Acceptance:`, `__Acceptance:__`,
+`**Acceptence:**`, `- **Acceptance, files and data:**`); within a block, every
+line that begins `**Acceptance` and is not a marker; and under a deeper
+heading, every bullet, of whatever shape. A clause carried onto its next line
+is read as one clause only when that line is indented by at least two spaces
+and begins with neither a bullet nor a number, so a hard-wrapped clause whose
+continuation begins with a number, as `  100. The run then waits.`, is refused
+too.
+
+The check fails when the list's clauses and the milestone's differ, when
+anything in a milestone's Acceptance block cannot be read as a clause, when a
+listed test fails, is ignored or does not run (renamed, removed, or built out
+by a feature), when a clause or sub-clause lists no test, or when cargo fails. A
+clause its tests do not yet show in full is marked `pending:` with the reason,
+and the verdict names it. The Postgres and sandbox tests it lists need their
+backends, as in the test jobs, hence `ATOMIC_DEV_SANDBOX=on`.
+`scripts/acceptance-test.sh` (in CI) tests the check itself.
 
 ## The crash suite
 
@@ -285,7 +338,7 @@ in turn:
 | Clippy | `cargo fmt --check`, and clippy with and without the test features |
 | Test (1/3), Test (2/3), Test (3/3) | The workspace's tests, with Postgres and the sandbox, one shard each |
 | Crash suite | `crates/atomic/tests/crash.rs`, the shard `crash` |
-| Acceptance and backends | Builds every test, checks that the shards run each test exactly once, runs the M12 acceptance check, and runs the Postgres and sandbox suites without their backends |
+| Acceptance and backends | Builds every test, checks that the shards run each test exactly once, runs the M12, M35a and M45 acceptance checks, and runs the Postgres and sandbox suites without their backends |
 | Build, lockfile and SBOM | `cargo build`, `scripts/lock-resolves.sh`, `scripts/lock-check.sh v8-built` and `scripts/sbom.sh` |
 | Rust (ubuntu-24.04) | Passes only when every job above passes |
 

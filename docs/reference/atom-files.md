@@ -55,7 +55,7 @@ state (every project's database and gate store under the atomic home's
 directories) and the places in your home directory where credentials are
 kept, the same ones a Codex atom's commands cannot read (see
 [configuration](#configuration)). It can write only its own scratch directory (its `HOME`
-and `TMPDIR`) and the project's build caches; a command that writes anywhere
+and `TMPDIR`) and, in a workflow, its run's own build caches; a command that writes anywhere
 else fails. It has no network and cannot use sockets unless the atom declares
 the hosts it reaches (see [Network access](#network-access)). It also:
 
@@ -63,8 +63,14 @@ the hosts it reaches (see [Network access](#network-access)). It also:
   sandbox keeps them in every writable directory;
 - cannot gain privileges (no `sudo`, no setuid programs) and sees no GPU or
   other devices beyond the basic ones;
-- is not told where the caches are: name the directory in `env` if a tool needs
-  it;
+- finds its run's build caches through `ATOMIC_CACHE_DIR`, `XDG_CACHE_HOME`,
+  `CARGO_TARGET_DIR`, npm's, pip's and Go's cache variables, and your rustup
+  toolchains, read-only, through `RUSTUP_HOME`, as a worktree step does. The
+  caches are the run's own, shared by its steps except for `CARGO_TARGET_DIR`,
+  which is the step's own, and removed when the run ends. No other run's
+  command may write them, though one can still read them by their path while
+  they last, so keep nothing secret there. A variable the atom declares in
+  `env` wins. An eval gives the command no caches;
 - cannot be a program whose path holds `=`.
 
 `env` cannot set `HOME` or `TMPDIR`, which are the command's own, nor
@@ -182,9 +188,12 @@ other connection, to this machine or anywhere else, and no Unix socket. The
 proxy never goes through another proxy, even when atomic's own environment
 names one. Each connection must open with a token that atomic gives the
 command's sandbox and that the command itself never sees, so no sandboxed
-process and no other user's process can use the proxy. A process of your own
-user that runs outside any sandbox can still read the token from the sandbox
-helper's environment while the command runs.
+process and no other user's process can use the proxy, unless it has
+`CAP_SYS_PTRACE` over the sandbox helper's user namespace, as root does. A
+process of your own user that runs outside any sandbox is not kept out: it
+can enter the command's namespaces and use the sandbox's own route to the
+proxy. Once the command ends, its token admits no new connection.
+
 Each command that declares hosts is admitted against a budget of open files:
 its sandbox keeps at most 128 connections to the proxy open at once, and
 atomic reserves two open files for each (the command's and one upstream) and a
@@ -389,7 +398,7 @@ time rather than passing unchecked.
 | `kind` | `lite`, `codex` or `exec` |
 | `input`, `output` | Full JSON Schema or a local schema reference |
 | `model`, `sandbox` | Model selection and effective sandbox request |
-| `trust` | The riskiest input origin the atom accepts: `team`, `agent` or `external` (the default). A workflow that maps less trusted data into it fails to load, `atomic run <atom>`, whose input is external data, refuses it before anything runs unless the atom accepts external input, and `atomic eval` refuses a case whose [origin](eval-cases.md#where-a-cases-input-came-from) is less trusted than it accepts; see [where each input came from](workflow-files.md#where-each-input-came-from) |
+| `trust` | The riskiest input origin the atom accepts: `team`, `agent` or `external` (the default); any other value fails the load. A workflow that maps less trusted data into it fails to load, `atomic run <atom>`, whose input is external data, refuses it before anything runs unless the atom accepts external input, and `atomic eval` refuses a case whose [origin](eval-cases.md#where-a-cases-input-came-from) is less trusted than it accepts. Before a run's first step, every step is checked again, on what the run recorded and what its bindings read; a resumed or served run is checked on its recorded data. See [where each input came from](workflow-files.md#where-each-input-came-from) |
 | `validate` | Expression-bodied typed callbacks over `{input, output}` |
 | `examples` | Named `{input, output}` examples checked against full contracts |
 | `case`, `judges` | Full evaluation-case and judge input/output schema declarations |
@@ -418,12 +427,24 @@ under `$HOME` and under the home directory the system records for your user,
 wherever the variables that move them (`XDG_CONFIG_HOME`, `ZDOTDIR`,
 `HISTFILE`, `GNUPGHOME`, `CARGO_HOME`, `DOCKER_CONFIG`, the AWS file
 variables, `KUBECONFIG` and others) put them, and a link among them, up to
-four directory levels inside a denied directory, is denied as the file or
-directory it points at, when that is yours and outside the system's
-directories: a history file linked to `/dev/null`, or a tool linked to the
-system's `python3`, stays usable. A turn does not start when a denial would
-cover its working directory or a directory it may write, or when a linked
-secret lies inside a directory it may write. The model chooses the
+four directory levels inside a denied directory, is denied as what it
+points at, whoever owns it and wherever it is, under `/run`, `/etc` or
+`/opt` too. Never denied, so that commands keep working: anything under
+`/usr`, `/bin`, `/sbin`, `/lib*`, `/nix/store`, `/dev`, `/proc` or `/sys`,
+and any device, such as `/dev/null`. A credential place that is itself a
+link, such as a `~/.netrc` kept with your dotfiles, is otherwise always
+denied as what it points at, whatever its mode or owner, unless that is the
+root or one of the system's top-level directories. A link found inside a
+credential place is also left alone when it leads to a program (a file with
+any execute bit that starts as a binary or a `#!` script does) or to a
+directory someone else owns, so a virtual environment's `python` linked to
+a toolchain's keeps working; what it leads to stays readable. A key linked
+to one a secrets manager keeps under `/run` is denied. A pipe or socket in a
+credential place is denied like a file. A turn does not start when a denial
+would cover its working directory or a directory it may write, or when a
+denied place, or a linked secret, lies two or more levels inside a directory
+it may write, where a command could move the directory above it away from
+its denial. The model chooses the
 commands, so none of these reach it through them. atomic makes the list
 when the turn starts: a place on it that appears while a command runs is
 denied only to later commands, and a link made after the list is not

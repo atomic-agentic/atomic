@@ -28,10 +28,18 @@
 //! the same hosts. The sandbox helper's bridge opens each connection with a
 //! token atomic made for its command alone (Codex's attribution frame), and
 //! the proxy refuses every request on a connection without a token it issued,
-//! so a sandboxed process or another user's process reaches nothing through
-//! it. A process of the same user outside any sandbox can still read a token
-//! from the helper's environment. A command's token admits no new connection
-//! once the command ends, and the proxy stops once no command needs it.
+//! so no sandboxed process and no other user's process reaches anything
+//! through it. A process of the same user outside any sandbox is not kept
+//! out: it can enter the command's namespaces through /proc and use the
+//! bridge, which adds the token itself. Non-dumpable helpers only narrow who
+//! can read the token: the sandbox helper's outer stage and its bridges, and
+//! `atomic runner`, are non-dumpable once atomic's prologue has run, so only
+//! a process with `CAP_SYS_PTRACE` over their user namespace can read the
+//! token from the helpers' environment or from the runner's memory, where
+//! its request puts it; in the few milliseconds between the helper's exec
+//! and that prologue, a process of the same user can read it too. A
+//! command's token admits no new connection once the command ends, and the
+//! proxy stops once no command needs it.
 //!
 //! Each command that declares hosts is admitted against a budget of file
 //! descriptors ([`Budget`]): it reserves [`DESCRIPTORS_PER_COMMAND`], two for
@@ -960,9 +968,14 @@ mod tests {
             .prepare(&hosts, &[], HashMap::new())
             .expect("starts");
         // Another command keeps the proxy running after the first ends.
-        let (_, other) = proxies
+        let (other_env, other) = proxies
             .prepare(&hosts, &[], HashMap::new())
             .expect("reused");
+        let other_token =
+            other_env.env[codex_network_proxy::PROXY_ATTRIBUTION_TOKEN_ENV_KEY].clone();
+        // A connection dropped at the frame: the proxy accepted it and
+        // answered nothing.
+        let dropped = |got: &str| matches!(got, "none" | "ConnectionReset" | "BrokenPipe");
         let addr = prepared.env["HTTP_PROXY"]
             .trim_start_matches("http://")
             .trim_end_matches('/')
@@ -971,18 +984,17 @@ mod tests {
 
         assert_eq!(fetch(&addr, None), format!("403 {UNATTRIBUTED_REFUSED}"));
         let forged = fetch(&addr, Some(&"0".repeat(64)));
-        assert!(
-            !forged.starts_with("403") && !forged.starts_with("200"),
-            "{forged}"
-        );
+        assert!(dropped(&forged), "{forged}");
         assert_eq!(fetch(&addr, Some(&token)), "403 not_allowed_local");
 
         drop(lease);
         assert_eq!(proxies.running(), 1, "the other command holds it");
         let ended = fetch(&addr, Some(&token));
-        assert!(
-            !ended.starts_with("403") && !ended.starts_with("200"),
-            "{ended}"
+        assert!(dropped(&ended), "{ended}");
+        assert_eq!(
+            fetch(&addr, Some(&other_token)),
+            "403 not_allowed_local",
+            "the other command's token still works"
         );
         drop(other);
     }

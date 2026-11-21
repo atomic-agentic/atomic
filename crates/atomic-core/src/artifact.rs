@@ -42,6 +42,15 @@
 //! process writing it died: opening the store removes such files once no
 //! one holds their owner's lock and they are [`STAGING_GRACE`] old, and a
 //! sweep leaves alone every staging file whose owner is held.
+//!
+//! A store can also [`hold`](ArtifactStore::hold) content: a sweep keeps
+//! it, however old, while the [`Hold`] is kept and the store that took it
+//! is open. A hold is taken under the store's shared lock, as a write is, so
+//! it waits for a sweep in progress and can fail with
+//! [`ArtifactError::Locked`]. A gather holds each file it stores until its step has recorded
+//! the reference, so a sweep between the two never removes it, however long
+//! the step takes to get there. A hold is a file in `artifact-held/<owner>/`
+//! beside the owners; a dead store's holds go with its staging files.
 
 pub mod files;
 
@@ -163,6 +172,13 @@ pub trait ArtifactStore {
     /// Drop what [`stage`](Self::stage) read, storing nothing.
     fn discard(&self, staged: Staged);
 
+    /// Keep `artifact` from every sweep, however old it is and whether or
+    /// not it is stored yet, until the [`Hold`] is dropped or this store is
+    /// no longer open. Once it returns, every sweep either had finished
+    /// before it, so content that sweep removed is gone, or keeps the
+    /// content while the hold is kept.
+    fn hold(&self, artifact: &ArtifactRef) -> Result<Hold, ArtifactError>;
+
     /// Whether the content is present.
     fn contains(&self, artifact: &ArtifactRef) -> Result<bool, ArtifactError>;
 
@@ -171,6 +187,12 @@ pub trait ArtifactStore {
 
     /// Every manifest recorded for the content, in a stable order.
     fn manifests(&self, artifact: &ArtifactRef) -> Result<Vec<Manifest>, ArtifactError>;
+
+    /// How long a write, a hold or a sweep waits for the store's lock before
+    /// it fails with [`ArtifactError::Locked`].
+    fn lock_wait(&self) -> std::time::Duration {
+        LOCK_WAIT
+    }
 }
 
 /// Content [`ArtifactStore::stage`] read aside, not yet stored. Dropped
@@ -191,6 +213,14 @@ impl Staged {
         self.size
     }
 
+    /// The reference it is stored under once committed.
+    pub fn artifact(&self) -> Result<ArtifactRef, ArtifactError> {
+        ArtifactRef::from_digest(&self.digest).map_err(|e| ArtifactError::Io {
+            path: self.path.clone(),
+            source: std::io::Error::other(e.to_string()),
+        })
+    }
+
     /// Its path, which it no longer removes.
     fn take(&mut self) -> PathBuf {
         std::mem::take(&mut self.path)
@@ -202,6 +232,21 @@ impl Drop for Staged {
         if !self.path.as_os_str().is_empty() {
             let _ = std::fs::remove_file(&self.path);
         }
+    }
+}
+
+/// A store's word that every sweep keeps an artifact while this is kept
+/// and the store that gave it is open (see [`ArtifactStore::hold`]).
+/// Dropped, it lets go.
+#[derive(Debug)]
+pub struct Hold {
+    /// The file that records it, removed when it is dropped.
+    path: PathBuf,
+}
+
+impl Drop for Hold {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -225,13 +270,16 @@ pub struct LocalStore {
 struct Owner {
     id: String,
     path: PathBuf,
+    /// Where its holds are, `artifact-held/<id>`.
+    held: PathBuf,
     _lock: std::fs::File,
 }
 
 impl Owner {
-    /// A new owner in `owners`, locked. Only a sweep passing by can hold a
-    /// new owner's lock, and only while it looks, so this waits for it.
-    fn take(owners: &Path) -> Result<Self, ArtifactError> {
+    /// A new owner in `owners`, locked, with its holds in `held`. Only a
+    /// sweep passing by can hold a new owner's lock, and only while it
+    /// looks, so this waits for it.
+    fn take(owners: &Path, held: &Path) -> Result<Self, ArtifactError> {
         let id = random_name()?;
         let path = owners.join(&id);
         let lock = std::fs::OpenOptions::new()
@@ -241,6 +289,7 @@ impl Owner {
             .map_err(io(&path))?;
         lock.lock().map_err(io(&path))?;
         Ok(Self {
+            held: held.join(&id),
             id,
             path,
             _lock: lock,
@@ -250,6 +299,8 @@ impl Owner {
 
 impl Drop for Owner {
     fn drop(&mut self) {
+        // Its holds first: holds with no owner file are kept a while.
+        let _ = std::fs::remove_dir_all(&self.held);
         let _ = std::fs::remove_file(&self.path);
     }
 }
@@ -310,15 +361,78 @@ fn staged_by(name: &str) -> &str {
     name.split('-').next().unwrap_or_default()
 }
 
+/// The holds in `held` a sweep keeps to, by digest, and the owners' hold
+/// directories it may remove. Every owner's holds are kept to but those of
+/// the `dead`, which the caller has locked, and those whose owner file is
+/// gone and that are `grace` old: a store just opening may write its holds
+/// after the caller looked at the owners. A directory it cannot read fails
+/// it, rather than leave what it holds out of what a sweep keeps.
+fn holds(
+    held: &Path,
+    owners: &Path,
+    dead: &[(PathBuf, std::fs::File)],
+    grace: std::time::Duration,
+    now: std::time::SystemTime,
+) -> Result<(std::collections::HashSet<String>, Vec<PathBuf>), ArtifactError> {
+    let dead: std::collections::HashSet<_> = dead
+        .iter()
+        .filter_map(|(path, _)| path.file_name())
+        .collect();
+    let mut kept = std::collections::HashSet::new();
+    let mut gone = Vec::new();
+    let entries = match std::fs::read_dir(held) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((kept, gone)),
+        Err(e) => return Err(io(held)(e)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(io(held))?;
+        let (path, name) = (entry.path(), entry.file_name());
+        let orphan = || {
+            std::fs::symlink_metadata(owners.join(&name))
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+                && older_than(&path, grace, now)
+        };
+        if dead.contains(name.as_os_str()) || orphan() {
+            gone.push(path);
+            continue;
+        }
+        if !entry.file_type().map_err(io(&path))?.is_dir() {
+            continue;
+        }
+        // A store closing meanwhile takes its holds with it.
+        let each = match std::fs::read_dir(&path) {
+            Ok(each) => each,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(io(&path)(e)),
+        };
+        for hold in each {
+            let hold = match hold {
+                Ok(hold) => hold,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                Err(e) => return Err(io(&path)(e)),
+            };
+            kept.insert(staged_by(&hold.file_name().to_string_lossy()).to_owned());
+        }
+    }
+    Ok((kept, gone))
+}
+
 /// Remove what dead stores left in `staging`: each file at least `grace`
-/// old whose owner, in `owners`, no one holds, and each such owner's file.
-fn sweep_staging(owners: &Path, staging: &Path, grace: std::time::Duration) {
+/// old whose owner, in `owners`, no one holds, each such owner's holds in
+/// `held`, and its file.
+fn sweep_staging(owners: &Path, held: &Path, staging: &Path, grace: std::time::Duration) {
     let now = std::time::SystemTime::now();
     let (live, dead) = live_owners(owners, grace, now);
     for entry in std::fs::read_dir(staging).into_iter().flatten().flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         if !live.contains(staged_by(&name)) && older_than(&entry.path(), grace, now) {
             let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    if let Ok((_, gone)) = holds(held, owners, &dead, grace, now) {
+        for path in gone {
+            let _ = std::fs::remove_dir_all(path);
         }
     }
     // Removed while locked, so no one judges it again meanwhile.
@@ -402,6 +516,24 @@ impl LocalStore {
         Ok(all)
     }
 
+    /// Everything any store holds now, whether that store is open or not:
+    /// a sweep's caller reads this before it reads what records reference,
+    /// since a hold may be let go once its reference is recorded. Takes no
+    /// lock. A hold it cannot read fails it.
+    pub fn held(&self) -> Result<BTreeSet<ArtifactRef>, ArtifactError> {
+        let (digests, _) = holds(
+            self.held_dir(),
+            self.owners(),
+            &[],
+            std::time::Duration::MAX,
+            std::time::SystemTime::now(),
+        )?;
+        Ok(digests
+            .iter()
+            .filter_map(|d| ArtifactRef::from_digest(d).ok())
+            .collect())
+    }
+
     /// Mark `artifact` as just written, so a sweep's grace covers it,
     /// without waiting for the store's lock.
     pub fn refresh(&self, artifact: &ArtifactRef) -> Result<Refreshed, ArtifactError> {
@@ -451,8 +583,9 @@ impl LocalStore {
         }
         let owners = lock.with_file_name("artifact-owners");
         std::fs::create_dir_all(&owners).map_err(io(&owners))?;
-        let owner = std::sync::Arc::new(Owner::take(&owners)?);
-        sweep_staging(&owners, &root.join("staging"), grace);
+        let held = lock.with_file_name("artifact-held");
+        let owner = std::sync::Arc::new(Owner::take(&owners, &held)?);
+        sweep_staging(&owners, &held, &root.join("staging"), grace);
         Ok(Self {
             root,
             lock,
@@ -464,6 +597,11 @@ impl LocalStore {
     /// Where the owners of this store's staging files are.
     fn owners(&self) -> &Path {
         self.owner.path.parent().unwrap_or(&self.root)
+    }
+
+    /// Where every open store's holds are.
+    fn held_dir(&self) -> &Path {
+        self.owner.held.parent().unwrap_or(&self.root)
     }
 
     /// A new staging file, created here and nowhere else, named after this
@@ -772,8 +910,8 @@ fn is_prefix(name: &str) -> bool {
 }
 
 impl LocalStore {
-    /// Remove every blob, and its manifests, that `keep` does not name and
-    /// that was last written more than `grace` before `read_at`, the time the
+    /// Remove every blob, and its manifests, that `keep` does not name, that
+    /// no open store [holds](ArtifactStore::hold), and that was last written more than `grace` before `read_at`, the time the
     /// caller began reading what to keep; and partial writes as old whose
     /// store is no longer open. Entries
     /// in the blob tree that are not content (a stray file, a prefix
@@ -786,7 +924,7 @@ impl LocalStore {
     /// lock while it runs, so a write waits for it and another sweep runs
     /// after it; content a write kept or added is then as recent as that
     /// write. What it keeps is the caller's to say: a sweep keeps nothing
-    /// another caller needs unless that is in `keep` or recent.
+    /// another caller needs unless that is in `keep`, held or recent.
     pub fn sweep(
         &self,
         keep: &BTreeSet<ArtifactRef>,
@@ -794,6 +932,12 @@ impl LocalStore {
         read_at: std::time::SystemTime,
     ) -> Result<Swept, ArtifactError> {
         let _lock = StoreLock::take(&self.lock, true, self.lock_wait)?;
+        // Who is open, and what they hold, before any blob is judged: a hold
+        // is written under the store's shared lock, so none is taken while
+        // this sweep runs.
+        let now = std::time::SystemTime::now();
+        let (live, dead) = live_owners(self.owners(), STAGING_GRACE, now);
+        let (held, gone) = holds(self.held_dir(), self.owners(), &dead, STAGING_GRACE, now)?;
         let cutoff = read_at
             .checked_sub(grace.0)
             .unwrap_or(std::time::UNIX_EPOCH);
@@ -827,7 +971,10 @@ impl LocalStore {
                         continue;
                     }
                 };
-                if keep.contains(&artifact) || !old(&blob.path())? {
+                if keep.contains(&artifact)
+                    || held.contains(artifact.digest())
+                    || !old(&blob.path())?
+                {
                     swept.kept += 1;
                     continue;
                 }
@@ -846,8 +993,6 @@ impl LocalStore {
         }
         // A partial write is left while its store is open, however long it
         // has taken: a gather stages every file before it commits any.
-        let (live, dead) = live_owners(self.owners(), STAGING_GRACE, std::time::SystemTime::now());
-        drop(dead);
         let staging = self.root.join("staging");
         for partial in std::fs::read_dir(&staging).map_err(io(&staging))?.flatten() {
             let name = partial.file_name().to_string_lossy().into_owned();
@@ -856,12 +1001,21 @@ impl LocalStore {
                 swept.partial += 1;
             }
         }
+        // The holds of stores that are gone, while the dead are locked.
+        for path in gone {
+            let _ = std::fs::remove_dir_all(path);
+        }
+        drop(dead);
         swept.removed.sort();
         Ok(swept)
     }
 }
 
 impl ArtifactStore for LocalStore {
+    fn lock_wait(&self) -> std::time::Duration {
+        self.lock_wait
+    }
+
     fn stage(&self, content: &mut dyn Read) -> Result<Staged, ArtifactError> {
         // Stream to staging while hashing; committing moves it into place
         // under its digest. A sweep leaves it while this store is open.
@@ -966,6 +1120,24 @@ impl ArtifactStore for LocalStore {
     fn discard(&self, staged: Staged) {
         drop(staged);
     }
+
+    fn hold(&self, artifact: &ArtifactRef) -> Result<Hold, ArtifactError> {
+        // Written under the store's shared lock, so a sweep, which reads the
+        // holds under it alone, either finished before or sees this one.
+        let _ordered = StoreLock::take(&self.lock, false, self.lock_wait)?;
+        // Named after the content, so a sweep reads the digest from the
+        // name; each hold its own, so letting one go keeps the others.
+        let dir = &self.owner.held;
+        std::fs::create_dir_all(dir).map_err(io(dir))?;
+        let path = dir.join(format!("{}-{}", artifact.digest(), random_name()?));
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(io(&path))?;
+        Ok(Hold { path })
+    }
+
     fn contains(&self, artifact: &ArtifactRef) -> Result<bool, ArtifactError> {
         let p = self.blob_path(artifact);
         match std::fs::metadata(&p) {

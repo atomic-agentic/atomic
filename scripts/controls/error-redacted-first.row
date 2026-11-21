@@ -1,0 +1,1 @@
+error-redacted-first|crates/atomic/src/failure.rs|crate::shown::block(&atomic_core::redact::text(text))|atomic_core::redact::text(&crate::shown::block(text)).into_owned() /*CONTROL_OFF*/|-p atomic-agentic --bin atomic failure::tests::a_coloured_token_in_an_error_is_redacted_before_it_is_escaped
