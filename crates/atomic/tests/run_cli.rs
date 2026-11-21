@@ -2151,7 +2151,9 @@ fn a_typed_input_naming_content_never_stored_is_refused() {
     let out = atomic(
         &dir,
         &project,
-        &["--json", "run", "attached", "--run-id", "typed-1", "--data", &data],
+        &[
+            "--json", "run", "attached", "--run-id", "typed-1", "--data", &data,
+        ],
         &UNUSED_MODEL,
         "",
     );

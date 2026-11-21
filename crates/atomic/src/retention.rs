@@ -38,8 +38,8 @@
 use atomic_core::artifact::{
     ArtifactError, ArtifactRef, ArtifactStore, Grace, Hold, LocalStore, Refreshed, Swept,
 };
-use atomic_schema::artifact::ArtifactCheckError;
 use atomic_durable::{DurableRuntime, Durare};
+use atomic_schema::artifact::ArtifactCheckError;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeSet, HashSet};
@@ -335,7 +335,8 @@ struct Wait {
 impl Wait {
     /// What is left of it.
     fn left(&self) -> std::time::Duration {
-        self.until.saturating_duration_since(std::time::Instant::now())
+        self.until
+            .saturating_duration_since(std::time::Instant::now())
     }
 
     /// Say, once, that the run waits for the store.
@@ -648,7 +649,10 @@ mod tests {
                 rt.run_record("run-1").await.expect("record").is_none(),
                 "recorded"
             );
-            assert!(store.held().expect("held").is_empty(), "a hold outlived the refusal");
+            assert!(
+                store.held().expect("held").is_empty(),
+                "a hold outlived the refusal"
+            );
             rt.shutdown(std::time::Duration::from_secs(5))
                 .await
                 .expect("shutdown");

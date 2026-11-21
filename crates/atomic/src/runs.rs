@@ -472,7 +472,10 @@ pub async fn resume(
             let _ = engine.rt.shutdown(SHUTDOWN).await;
             Err(Failure::new(
                 "run.not_found",
-                format!("no run {id} in this project's store ({})", engine.store_description),
+                format!(
+                    "no run {id} in this project's store ({})",
+                    engine.store_description
+                ),
                 "give the id `atomic run` printed, from the project that ran it (or pass \
                  --project)",
             )
