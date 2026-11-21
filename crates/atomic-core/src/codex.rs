@@ -861,10 +861,7 @@ fn deny_also(profile: PermissionProfile, denied: &[PathBuf]) -> anyhow::Result<P
 /// denies paths only through that helper, and nowhere else has atomic seen a
 /// denial hold, so without one the thread could not be kept out of other
 /// attempts' scratch directories; atomic refuses it before the thread starts
-/// rather than run it with less denied. On macOS the denial is not verified:
-/// Seatbelt has no counterpart to the Linux sandbox reopening a writable
-/// directory inside a denied one, so it may keep a turn from reading its own
-/// scratch directory as well.
+/// rather than run it with less denied. On macOS the denial is not verified.
 fn refuse_denied_without_helper(
     paths: &CodexPaths,
     denied: &[PathBuf],
@@ -3517,6 +3514,74 @@ mod tests {
             assert!(err.to_string().contains("sandbox helper"), "{err:#}");
             assert_eq!(model.calls(), 0, "refused before any model call");
         });
+    }
+
+    /// A turn's profile, as atomic builds it, denies the scratch root and
+    /// so never reads the whole disk: what it reads are its readable roots,
+    /// the deepest entry for a path winning. Its own scratch directory, a
+    /// writable root inside the denied one, is one of them, and the scratch
+    /// root is unreadable. (Codex's macOS sandbox builds its reads from these
+    /// roots; that it then reads its own scratch is not verified on macOS.)
+    #[test]
+    fn a_turns_profile_reads_its_own_scratch_inside_a_denied_root() {
+        // Outside the system's temporary directory, as atomic keeps scratch
+        // roots.
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/atomic-core-tests")
+            .join(format!("profile-reads-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dir = {
+            std::fs::create_dir_all(&dir).expect("dir");
+            std::fs::canonicalize(&dir).expect("canonical")
+        };
+        let (home, cwd, root) = (dir.join("home"), dir.join("cwd"), dir.join("state/scratch"));
+        let own = root.join("step/attempt");
+        for d in [&home, &cwd, &own] {
+            std::fs::create_dir_all(d).expect("dir");
+        }
+        let profile = deny_also(
+            permission_profile(
+                crate::typed::Sandbox::WorkspaceWrite,
+                &StateGuard::NoProjectState,
+                &home,
+                Some(&cwd),
+                &[own.clone(), cwd.clone()],
+            )
+            .expect("profile"),
+            std::slice::from_ref(&root),
+        )
+        .expect("denied");
+        // With the turn's writable roots as its workspace roots, as
+        // `converse_async` sets them, and resolved as Codex's macOS sandbox
+        // resolves it.
+        let roots: Vec<AbsolutePathBuf> = [&cwd, &own]
+            .into_iter()
+            .map(|r| AbsolutePathBuf::from_absolute_path(r).expect("absolute"))
+            .collect();
+        let resolved = profile
+            .materialize_project_roots_with_workspace_roots(&roots)
+            .file_system_sandbox_policy()
+            .resolve_for_enforcement(
+                &cwd,
+                codex_protocol::permissions::FileSystemPolicyProjection::PreserveMutableRoots,
+            )
+            .expect("resolved");
+        assert!(!resolved.has_full_disk_read_access);
+        assert!(
+            resolved.readable_roots.iter().any(|r| r.as_path() == own),
+            "{:?}, writable {:?}",
+            resolved.readable_roots,
+            resolved.writable_roots
+        );
+        assert!(
+            resolved
+                .unreadable_roots
+                .iter()
+                .any(|r| r.as_path() == root),
+            "{:?}",
+            resolved.unreadable_roots
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Codex sends TurnComplete before it marks the thread idle; a follow-up

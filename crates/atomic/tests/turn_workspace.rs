@@ -506,19 +506,24 @@ fn a_turn_cut_off_while_a_command_keeps_running_is_charged_as_one_in_flight() {
 fn a_turn_cannot_read_another_turns_scratch_and_keeps_its_own() {
     support::require_sandbox();
     on_codex_runtime(async {
-        let dir = scratch("scratch-deny");
-        let root = shared_scratch();
-        let sibling = root.with_file_name("scratch-debug");
+        // Scratch roots of this test's own, not the shared one: connecting
+        // a backend empties its shared temporary directory, which other
+        // tests' turns use. The neighbour, on the other backend, works in a
+        // directory of its own: turns that share a writable directory must
+        // share their backend's temporary directory too.
+        let (dir, apart) = (scratch("scratch-deny"), scratch("scratch-deny-apart"));
+        let root = dir.join("state/scratch");
+        let sibling = dir.join("state/scratch-debug");
         // Two backends of one project, as `atomic run` and `atomic debug
-        // prompt` have, each told to deny the other's scratch root.
+        // codex-prompt` have, each told to deny the other's scratch root.
         let backend =
             Backend::connect(LocalBackend::in_dir(root.clone()).denying([sibling.clone()]))
                 .expect("connects");
         let neighbours =
             Backend::connect(LocalBackend::in_dir(sibling.clone()).denying([root.clone()]))
                 .expect("connects");
-        let turn = |commands: Vec<String>, sandbox: Sandbox, backend: &Backend| {
-            let (dir, backend) = (dir.clone(), backend.clone());
+        let turn = |commands: Vec<String>, sandbox: Sandbox, backend: &Backend, dir: &Path| {
+            let (dir, backend) = (dir.to_owned(), backend.clone());
             async move {
                 let mut script: Vec<Reply> = commands.iter().map(|c| tool(c)).collect();
                 script.push(Reply::Text("Done.".into()));
@@ -544,11 +549,23 @@ fn a_turn_cannot_read_another_turns_scratch_and_keeps_its_own() {
                     .to_string()
             }
         };
-        // The markers are in the shared working directory, outside every
-        // scratch root; a look starts once they are there, and gives up
-        // after 30 s.
-        let wait = |marker: &str| {
-            format!("for i in $(seq 300); do [ -e {marker} ] && break; sleep 0.1; done")
+        // The markers are in the turns' working directories, outside every
+        // scratch root; a look starts once they are there, gives up after
+        // 30 s, and says whether it saw them.
+        let (first_wrote, neighbour_wrote) = (
+            dir.join("project/first-wrote"),
+            apart.join("project/neighbour-wrote"),
+        );
+        let (neighbour_looked, release) = (
+            apart.join("project/neighbour-looked"),
+            dir.join("project/release"),
+        );
+        let wait = |marker: &Path, saw: &str| {
+            let m = marker.display();
+            format!(
+                "for i in $(seq 300); do [ -e '{m}' ] && break; sleep 0.1; done; \
+                 [ -e '{m}' ] && echo saw-{saw}"
+            )
         };
         let look = |name: &str, under: &Path, secret: &str| {
             format!(
@@ -561,14 +578,12 @@ fn a_turn_cannot_read_another_turns_scratch_and_keeps_its_own() {
         // `release`: in calls of up to 8 s, under the 10 s a command may run
         // before its turn goes on, and up to 64 s in all.
         let hold = |who: &str| {
-            let mut calls = vec![
-                "for i in $(seq 80); do [ -e release ] && break; sleep 0.1; done"
-                    .to_owned();
-                7
-            ];
+            let r = release.display();
+            let mut calls =
+                vec![format!("for i in $(seq 80); do [ -e '{r}' ] && break; sleep 0.1; done"); 7];
             calls.push(format!(
-                "for i in $(seq 80); do [ -e release ] && break; sleep 0.1; done; \
-                 [ -e release ] && echo {who}-held"
+                "for i in $(seq 80); do [ -e '{r}' ] && break; sleep 0.1; done; \
+                 [ -e '{r}' ] && echo {who}-held"
             ));
             calls
         };
@@ -585,13 +600,14 @@ fn a_turn_cannot_read_another_turns_scratch_and_keeps_its_own() {
             .concat(),
             Sandbox::WorkspaceWrite,
             &backend,
+            &dir,
         ));
         let neighbour = tokio::spawn(turn(
             [
                 vec![format!(
                     "echo secret-of-the-neighbour > \"$HOME/secret\" && touch neighbour-wrote; \
                      {}; {}; touch neighbour-looked",
-                    wait("first-wrote"),
+                    wait(&first_wrote, "first"),
                     look("neighbour-found", &root, "secret-of-the-first"),
                 )],
                 hold("neighbour"),
@@ -599,6 +615,7 @@ fn a_turn_cannot_read_another_turns_scratch_and_keeps_its_own() {
             .concat(),
             Sandbox::WorkspaceWrite,
             &neighbours,
+            &apart,
         ));
         let writer = tokio::spawn(turn(
             vec![format!(
@@ -606,13 +623,14 @@ fn a_turn_cannot_read_another_turns_scratch_and_keeps_its_own() {
                  echo mine > \"$HOME/m\" && cat \"$HOME/m\" && \
                  echo also > \"$TMPDIR/m\" && cat \"$TMPDIR/m\" && echo writer-own-ok; \
                  echo writer-home-own=$(ls -A \"$HOME\" | grep -cxE 'm|tmp')",
-                wait("first-wrote"),
-                wait("neighbour-wrote"),
+                wait(&first_wrote, "first"),
+                wait(&neighbour_wrote, "neighbour"),
                 look("writer-found", &root, "secret-of-the-first"),
                 look("writer-sibling-found", &sibling, "secret-of-the-neighbour"),
             )],
             Sandbox::WorkspaceWrite,
             &backend,
+            &dir,
         ));
         let reader = tokio::spawn(turn(
             vec![format!(
@@ -620,26 +638,23 @@ fn a_turn_cannot_read_another_turns_scratch_and_keeps_its_own() {
                  if ls -A \"$HOME\" >/dev/null 2>&1; then echo reader-home=listed; \
                  else echo reader-home=unreachable; fi; \
                  echo reader-home-says=$(ls -A \"$HOME\" 2>&1 | head -1)",
-                wait("first-wrote"),
+                wait(&first_wrote, "first"),
                 look("reader-found", &root, "secret-of-the-first"),
             )],
             Sandbox::ReadOnly,
             &backend,
+            &dir,
         ));
         let (writer, reader) = (writer.await.expect("writer"), reader.await.expect("reader"));
-        let cwd = dir.join("project");
         for _ in 0..300 {
-            if cwd.join("neighbour-looked").exists() {
+            if neighbour_looked.exists() {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         // Every look has ended, and what it looked for is still there: the
         // holders still hold their attempts.
-        assert!(
-            cwd.join("neighbour-looked").exists(),
-            "the neighbour never looked"
-        );
+        assert!(neighbour_looked.exists(), "the neighbour never looked");
         assert!(
             holds(&root, "secret-of-the-first"),
             "the first's secret was gone"
@@ -648,7 +663,7 @@ fn a_turn_cannot_read_another_turns_scratch_and_keeps_its_own() {
             holds(&sibling, "secret-of-the-neighbour"),
             "the neighbour's secret was gone"
         );
-        std::fs::write(cwd.join("release"), "").expect("release");
+        std::fs::write(&release, "").expect("release");
         let (first, neighbour) = (
             first.await.expect("first"),
             neighbour.await.expect("neighbour"),
@@ -658,12 +673,16 @@ fn a_turn_cannot_read_another_turns_scratch_and_keeps_its_own() {
             "{first}"
         );
         assert!(
-            neighbour.contains("neighbour-found=0\\n") && neighbour.contains("neighbour-held"),
+            neighbour.contains("saw-first")
+                && neighbour.contains("neighbour-found=0\\n")
+                && neighbour.contains("neighbour-held"),
             "the neighbour read the first's scratch: {neighbour}"
         );
         // Its own scratch directory holds its TMPDIR and what it wrote.
         assert!(
-            writer.contains("writer-found=0\\n")
+            writer.contains("saw-first")
+                && writer.contains("saw-neighbour")
+                && writer.contains("writer-found=0\\n")
                 && writer.contains("writer-sibling-found=0\\n")
                 && writer.contains("writer-own-ok")
                 && writer.contains("writer-home-own=2\\n"),
@@ -671,7 +690,8 @@ fn a_turn_cannot_read_another_turns_scratch_and_keeps_its_own() {
         );
         // Not an empty directory: one it may not open at all.
         assert!(
-            reader.contains("reader-found=0\\n")
+            reader.contains("saw-first")
+                && reader.contains("reader-found=0\\n")
                 && reader.contains("reader-home=unreachable")
                 && reader.contains("Permission denied"),
             "the read-only turn read the first's scratch, or reached its own: {reader}"
