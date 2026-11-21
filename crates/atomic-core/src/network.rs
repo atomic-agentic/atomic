@@ -40,11 +40,14 @@
 //! that is not its ancestor, and at `ptrace_scope` 0 allows. `atomic
 //! runner`, under `--runner process`, gets it on a socket of its own beside
 //! its request, with the digest of that request, and reads it once it is
-//! non-dumpable. Its request waits in its stdin, a pipe another process of
-//! the same user can reopen and replace before then; the runner refuses a
-//! request the digest does not name, so a replaced one never gets the
-//! token, though a replaced request without one still runs as that user's
-//! own command. Once
+//! non-dumpable; at `ptrace_scope` 0 that socket is open to the same attach
+//! as the helper's, before then. Its request waits in its stdin, a pipe
+//! another process of the same user can reopen through /proc before then,
+//! to read the request (its program, arguments, directory and whole
+//! environment) or replace it; the runner refuses a request the digest does
+//! not name, so a replaced one never gets the token, though a replaced
+//! request without one still runs as that user's own command, and a request
+//! read and written back unchanged still runs. Once
 //! they are non-dumpable, no process of the same user without
 //! `CAP_SYS_PTRACE` over their user namespace can newly read it from them,
 //! or from the helper's bridges, which inherit it; but one that attached

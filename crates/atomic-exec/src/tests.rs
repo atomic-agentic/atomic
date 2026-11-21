@@ -924,3 +924,15 @@ fn secret_variables_cross_only_as_well_formed_entries() {
     assert!(SecretEnv::decode(b"K=v\0\0").is_err(), "an empty entry");
     assert!(SecretEnv::decode(b"Kv\0").is_err(), "no `=`");
 }
+
+/// A secret socket's descriptor must be past the standard three, and a
+/// socket, on every Unix.
+#[test]
+fn a_secret_socket_is_past_the_standard_three_and_a_socket() {
+    assert!(!process::above_stdio(&2));
+    assert!(!process::above_stdio(&-1));
+    assert!(process::above_stdio(&3));
+    assert!(process::is_socket_mode(libc::S_IFSOCK | 0o600));
+    assert!(!process::is_socket_mode(libc::S_IFIFO | 0o600));
+    assert!(!process::is_socket_mode(libc::S_IFREG | 0o600));
+}

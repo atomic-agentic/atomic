@@ -1071,7 +1071,7 @@ fn secret_socket(secret: &crate::SecretEnv) -> std::io::Result<Option<std::os::f
     let bytes = secret.encode().map_err(std::io::Error::other)?;
     // A socket's buffer holds this much without a reader; the entries are a
     // token or two, far less.
-    if bytes.len() > 4096 {
+    if bytes.len() > MAX_SECRET_BYTES {
         return Err(std::io::Error::other(
             "the secret variables are too long to hand over",
         ));
@@ -1103,60 +1103,95 @@ fn still_dumpable() -> bool {
 
 /// Whether `mode`, as fstat gives it, is a socket's.
 #[cfg(unix)]
-fn is_socket_mode(mode: libc::mode_t) -> bool {
+pub(crate) fn is_socket_mode(mode: libc::mode_t) -> bool {
     mode & libc::S_IFMT == libc::S_IFSOCK
 }
 
 /// Whether `fd` is past the standard three, as a handed socket must be.
 #[cfg(unix)]
-fn above_stdio(fd: &std::os::fd::RawFd) -> bool {
+pub(crate) fn above_stdio(fd: &std::os::fd::RawFd) -> bool {
     *fd > 2
+}
+
+/// The most a secret socket holds: what the sender hands at most, and what
+/// the reader takes at most.
+const MAX_SECRET_BYTES: usize = 4096;
+
+/// Keep the open descriptor `fd` from the programs this process starts,
+/// when it is refused rather than read.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn keep_from_children(fd: std::os::fd::RawFd) {
+    // SAFETY: fcntl with F_SETFD takes an integer and touches no memory;
+    // on a descriptor that is not open it only fails.
+    unsafe {
+        libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+    }
 }
 
 /// The [`crate::SecretEnv`] this process was handed on the socket whose
 /// descriptor `fd` names, as [`run_in_with_secret`] hands it: read to its
 /// end, and closed. Refused when `fd` is not a number above 2 or not a
-/// socket, or what it holds is not well formed, and on Linux while this
-/// process is still dumpable: it must first be hardened so that no other
-/// process of its user can read what it is about to hold.
+/// socket, or the socket holds nothing, more than the sender ever hands, or
+/// what is not well formed, and on Linux while this process is still
+/// dumpable: it must first be hardened so that no other process of its user
+/// can read what it is about to hold. A descriptor it refuses is kept from
+/// the programs this process starts.
+///
+/// # Safety
+///
+/// `fd` must name a descriptor handed to this process for this alone, which
+/// nothing else in it holds or uses, and this must be called while the
+/// process has one thread: an open descriptor is taken as this process's own
+/// and closed.
 #[cfg(unix)]
-pub fn read_secret_socket(fd: &std::ffi::OsStr) -> std::io::Result<crate::SecretEnv> {
+#[allow(unsafe_code)]
+pub unsafe fn read_secret_socket(fd: &std::ffi::OsStr) -> std::io::Result<crate::SecretEnv> {
     use std::io::Read;
     use std::os::fd::FromRawFd;
     let invalid = |why: String| std::io::Error::new(std::io::ErrorKind::InvalidData, why);
-    if still_dumpable() {
-        return Err(invalid(
-            "this process is still dumpable; it reads secret variables only once hardened"
-                .to_owned(),
-        ));
-    }
     let fd: std::os::fd::RawFd = fd
         .to_str()
         .and_then(|fd| fd.parse().ok())
         .filter(above_stdio)
         .ok_or_else(|| invalid("its descriptor is not a number above 2".to_owned()))?;
+    if still_dumpable() {
+        keep_from_children(fd);
+        return Err(invalid(
+            "this process is still dumpable; it reads secret variables only once hardened"
+                .to_owned(),
+        ));
+    }
     // Looked at before it is taken as this process's own: a descriptor that
     // is not open must not be owned, or closing it would close another's.
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
     // SAFETY: fstat writes one stat into `stat`, and only reads `fd`.
-    #[allow(unsafe_code)]
     if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
     // SAFETY: fstat succeeded, so it wrote the whole stat.
-    #[allow(unsafe_code)]
     let mode = unsafe { stat.assume_init() }.st_mode;
     if !is_socket_mode(mode) {
+        keep_from_children(fd); // a descriptor that is not a socket
         return Err(invalid("its descriptor is not a socket".to_owned()));
     }
-    // SAFETY: the descriptor is open, and was handed to this process for
-    // this alone; it is read and closed here, once.
-    #[allow(unsafe_code)]
-    let mut socket = unsafe { std::fs::File::from_raw_fd(fd) };
-    let mut bytes = Vec::new();
-    socket.read_to_end(&mut bytes)?;
-    drop(socket);
-    crate::SecretEnv::decode(&bytes).map_err(invalid)
+    // SAFETY: the descriptor is open, and the caller handed it for this
+    // alone; it is read and closed here, once.
+    let socket = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mut held = Vec::new();
+    socket
+        .take(MAX_SECRET_BYTES as u64 + 1)
+        .read_to_end(&mut held)?;
+    if held.len() > MAX_SECRET_BYTES {
+        return Err(invalid(format!(
+            "its socket holds more than the {MAX_SECRET_BYTES} bytes ever handed"
+        )));
+    }
+    // The control plane never hands an empty socket: one is no secret.
+    if held.is_empty() {
+        return Err(invalid("its socket holds nothing".to_owned()));
+    }
+    crate::SecretEnv::decode(&held).map_err(invalid)
 }
 
 /// The [`crate::SecretEnv`] this process was handed, if its environment
@@ -1170,9 +1205,12 @@ pub fn take_inherited_secret_env() -> std::io::Result<crate::SecretEnv> {
         return Ok(crate::SecretEnv::default());
     };
     // SAFETY: called before this process starts any thread, so nothing
-    // reads the environment concurrently.
-    unsafe { std::env::remove_var(crate::SECRET_ENV_FD) };
-    read_secret_socket(&fd)
+    // reads the environment concurrently; the descriptor the variable names
+    // was handed to this process for this alone.
+    unsafe {
+        std::env::remove_var(crate::SECRET_ENV_FD);
+        read_secret_socket(&fd)
+    }
 }
 
 /// [`run_in`], with `secret` on a socket the child inherits, whose

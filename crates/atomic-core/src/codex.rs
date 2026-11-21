@@ -976,7 +976,11 @@ fn harden() {
 /// `mem`, unless it has `CAP_SYS_PTRACE` over the runner's user namespace;
 /// its `cmdline` and `stat` stay readable. Call it first, before the request
 /// or the socket is read; the socket's reader refuses while the runner is
-/// still dumpable.
+/// still dumpable. Until it has run, the request is exposed in the stdin
+/// pipe: another process of the same user can reopen that pipe through /proc
+/// and read the request, its program, arguments, directory and whole
+/// environment among it, or replace it; the socket's digest refuses a
+/// replaced request, but does not stop one being read.
 pub fn harden_runner() {
     // The runner holds commands' environments, proxy tokens among them.
     codex_process_hardening::pre_main_hardening();
@@ -1214,7 +1218,9 @@ fn take_secret_env() -> std::io::Result<()> {
         return Ok(());
     };
     let invalid = |why: String| std::io::Error::new(std::io::ErrorKind::InvalidData, why);
-    let secret = atomic_exec::process::read_secret_socket(&fd)?;
+    // SAFETY: the helper is single-threaded here, and the descriptor was
+    // handed to it for this alone.
+    let secret = unsafe { atomic_exec::process::read_secret_socket(&fd) }?;
     let token = the_proxy_token(secret).map_err(invalid)?;
     // SAFETY: the helper is single-threaded here, before Codex's helper
     // starts and reads its environment.
@@ -1230,16 +1236,16 @@ fn take_secret_env() -> std::io::Result<()> {
 #[cfg(any(target_os = "linux", test))]
 fn the_proxy_token(secret: atomic_exec::SecretEnv) -> Result<String, String> {
     let mut entries = secret.0.into_iter();
-    let (Some((name, token)), None) = (entries.next(), entries.next()) else {
+    let (Some((name, handed)), None) = (entries.next(), entries.next()) else {
         return Err("it was handed other than one variable".to_owned());
     };
     if name != codex_network_proxy::PROXY_ATTRIBUTION_TOKEN_ENV_KEY {
         return Err(format!("it was handed {name}, not the proxy token"));
     }
-    if token.is_empty() {
+    if handed.is_empty() {
         return Err("it was handed an empty proxy token".to_owned());
     }
-    Ok(token)
+    Ok(handed)
 }
 
 /// Make this process non-dumpable: its memory and the /proc files that show
