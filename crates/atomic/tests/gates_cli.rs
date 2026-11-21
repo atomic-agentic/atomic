@@ -53,6 +53,15 @@ impl Terminal {
         self.command().args(args).output().unwrap()
     }
 
+    /// [`Self::atomic`], as the account `user`.
+    fn atomic_as(&self, user: &str, args: &[&str]) -> Output {
+        self.command()
+            .env("USER", user)
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
     /// `atomic` with `args` on a pseudo-terminal, as a person types it.
     fn at_terminal(&self, args: &str) -> Output {
         self.at_terminal_as("dev", args)
@@ -226,4 +235,132 @@ fn a_hostile_account_name_is_shown_escaped() {
         shown.contains("enrolled local:dev\\u{001b}]0;owned\\u{0007}"),
         "{shown:?}"
     );
+}
+
+/// A fresh pair of terminals in a directory of their own.
+fn terminals(name: &str) -> (PathBuf, Terminal) {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("atomic-gates-cli-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for sub in ["project", "home"] {
+        std::fs::create_dir_all(dir.join(sub)).unwrap();
+    }
+    let dir = std::fs::canonicalize(dir).unwrap();
+    let t = Terminal {
+        project: dir.join("project"),
+        home: dir.join("home"),
+    };
+    (dir, t)
+}
+
+/// A gate id that quotes a coloured token is redacted before it is
+/// escaped, in the error that says there is no such gate.
+#[test]
+fn a_coloured_token_in_a_gate_id_is_redacted() {
+    let (dir, t) = terminals("token-id");
+    let token = concat!("ghp_", "SAMPLE0123456789", "abcdefghijklmnopqrstuv");
+    // Coloured, and after a vertical tab that redaction reads as the space
+    // between a secret's flag and its value, which escaping first would
+    // write out.
+    let id = format!(
+        "\u{1b}[1;33m{token}\u{1b}[0m --password\u{b}{}",
+        concat!("SAMPLE", "q7Lm2Vx9Rk4Tz8")
+    );
+    for json in [false, true] {
+        let mut args = vec!["gates", "approve", id.as_str()];
+        if json {
+            args.insert(0, "--json");
+        }
+        let out = t.atomic(&args);
+        assert!(!out.status.success());
+        let shown = text(&out);
+        assert!(
+            !shown.contains("SAMPLE0123456789"),
+            "json {json}: the token showed"
+        );
+        assert!(
+            !shown.contains("q7Lm2Vx9Rk4Tz8"),
+            "json {json}: the secret after the vertical tab showed"
+        );
+        assert!(
+            !shown.contains('\u{1b}'),
+            "json {json}: an escape reached the terminal"
+        );
+        assert!(shown.contains("[REDACTED]"), "json {json}: {shown:?}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The principal who decided and the command id they sent reach the
+/// terminal escaped, in `gates approve` and in `gates list`.
+#[test]
+fn a_hostile_principal_and_command_are_shown_escaped() {
+    on_codex_runtime(async {
+        let (dir, t) = terminals("hostile-decision");
+        let user = "dev\u{1b}]0;owned\u{7}";
+        let out = t.atomic(&["debug", "state-dir"]);
+        assert!(out.status.success(), "{}", text(&out));
+        let state = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+        let db = t
+            .home
+            .join("private")
+            .join(state.file_name().unwrap())
+            .join("atomic.db");
+        let mut rt = Durare::sqlite(&db).await.unwrap();
+        rt.register("gated", move |ctx: DurareContext, (): ()| async move {
+            let spec = GateSpec {
+                workflow: "gated".into(),
+                title: "Ship it".into(),
+                show: json!({}),
+                evidence: Vec::new(),
+                approvers: gate::resolve(
+                    "ship",
+                    None,
+                    &Deployment::Local {
+                        operator: Principal::local("dev\u{1b}]0;owned\u{7}"),
+                    },
+                )
+                .map_err(|e| atomic_durable::DurableError::Failed(e.to_string()))?,
+                tier: Tier::High,
+                timeout: None,
+                on_timeout: OnTimeout::Reject,
+                question: None,
+            };
+            gate::gate(&ctx, "ship", spec).await
+        });
+        rt.launch().await.unwrap();
+        let run = format!("hostile-{}", std::process::id());
+        rt.start("gated", &run, ()).await.unwrap();
+        let id = gate::gate_id(&run, "ship");
+        while gate::find(&rt, &id).await.unwrap().is_none() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let enrolled = t.at_terminal_as(user, "gates enroll");
+        assert!(enrolled.status.success(), "{:?}", text(&enrolled));
+        let approved = t.atomic_as(
+            user,
+            &["gates", "approve", &id, "--command-id", "cmd\u{1b}[2J"],
+        );
+        assert!(approved.status.success(), "{:?}", text(&approved));
+        let listed = t.atomic_as(user, &["gates", "list", "--all"]);
+        assert!(listed.status.success(), "{:?}", text(&listed));
+        for (what, out) in [("approve", &approved), ("list", &listed)] {
+            let shown = text(out);
+            assert!(
+                !shown.contains('\u{1b}') && !shown.contains('\u{7}'),
+                "{what}: a control reached the terminal: {shown:?}"
+            );
+            assert!(
+                shown.contains("by local:dev\\u{001b}]0;owned\\u{0007}"),
+                "{what}: {shown:?}"
+            );
+        }
+        assert!(
+            text(&approved).contains("(cmd\\u{001b}[2J)"),
+            "{:?}",
+            text(&approved)
+        );
+        rt.shutdown(Duration::from_secs(5)).await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    });
 }

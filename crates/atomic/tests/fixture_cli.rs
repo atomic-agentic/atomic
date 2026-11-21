@@ -36,6 +36,11 @@ fn text(out: &Output) -> String {
     )
 }
 
+/// `--json` output, read back as JSON.
+fn stdout_json(out: &Output) -> Value {
+    serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("{e}: {}", text(out)))
+}
+
 /// git in `dir`, as a person runs it.
 fn git_in(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
@@ -509,6 +514,249 @@ fn a_project_in_a_subdirectory_of_a_checkout_runs_at_the_top_of_the_fixture() {
         coding_run_at_the_top(&dir, &project, &dir.join("fixture"), &base).await;
         assert_eq!(git_state(&checkout), before, "the checkout is as it was");
     });
+}
+
+/// The typed text of the `target.unsafe` refusal, and its advice, as
+/// `refuse_writes_outside_a_worktree` words them: asserted in full so the
+/// tests fail if the refusal is removed or its wording changes.
+const UNSAFE: &str = "which may write files, outside a worktree, so it would write in the \
+                      project's own checkout";
+const UNSAFE_ADVICE: &str = "run it from a workflow step with `worktree: true` and a `base` \
+                            commit, or make the atom read-only";
+
+/// A `workspace-write` Codex atom named directly is a step with no worktree,
+/// so it would write in the developer's checkout: `atomic run` refuses it with
+/// `target.unsafe` before the run starts, and the checkout is left exactly as
+/// it was.
+#[test]
+fn a_writing_codex_atom_run_directly_in_a_checkout_is_refused() {
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let dir = scratch("unsafe-direct");
+        let checkout = dir.join("dev");
+        let project = project(&checkout.join("examples/coding"));
+        git_in(&checkout, &["init", "-q"]);
+        git_in(&checkout, &["add", "."]);
+        git_in(&checkout, &["commit", "-q", "-m", "project"]);
+        // A JSON object, so the run reaches the write control; its missing
+        // `base` is never checked, because the control refuses before the
+        // input is. With the control removed, the run stops at the input
+        // check — it never reaches a model.
+        let data = json!({"task": "multiply"}).to_string();
+        let before = git_state(&checkout);
+        let atom_file = project.join("atoms/fix-code.atom.astro");
+        let written_before = std::fs::read(&atom_file).unwrap();
+        let out = atomic(
+            &dir,
+            &project,
+            &["--json", "run", "fix-code", "--data", &data],
+            "http://127.0.0.1:9/v1",
+            &[],
+        )
+        .await;
+        assert!(!out.status.success(), "{}", text(&out));
+        let error = &stdout_json(&out)["error"];
+        assert_eq!(error["kind"], "target.unsafe", "{error}");
+        let description = error["description"].as_str().expect("a description");
+        assert_eq!(
+            description,
+            format!("step `run` runs atom `fix-code`, {UNSAFE}"),
+            "{error}"
+        );
+        assert_eq!(error["action"], UNSAFE_ADVICE, "{error}");
+        // Nothing ran, so the checkout is as it was: its refs, its worktree
+        // list, its working tree with every untracked file, and the bytes of
+        // the very atom that was refused.
+        assert_eq!(git_state(&checkout), before, "the checkout is as it was");
+        assert_eq!(
+            std::fs::read(&atom_file).unwrap(),
+            written_before,
+            "the refused atom's file is unchanged"
+        );
+        // And without `--json`, the same refusal reaches a person: a
+        // description naming the write, and its advice on its own line.
+        let out = atomic(
+            &dir,
+            &project,
+            &["run", "fix-code", "--data", &data],
+            "http://127.0.0.1:9/v1",
+            &[],
+        )
+        .await;
+        assert!(!out.status.success(), "{}", text(&out));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("error: step `run` runs atom `fix-code`,")
+                && stderr.contains(UNSAFE)
+                && stderr.contains(&format!("\n  to fix: {UNSAFE_ADVICE}")),
+            "{stderr}"
+        );
+        assert_eq!(
+            git_state(&checkout),
+            before,
+            "the plain run left the checkout as it was"
+        );
+        let _ = std::fs::remove_dir_all(&checkout);
+    });
+}
+
+/// The same `workspace-write` Codex atom as a workflow step that names no
+/// `worktree: true`: refused with `target.unsafe`, and the checkout is left as
+/// it was.
+#[test]
+fn a_writing_codex_atom_in_a_step_without_a_worktree_is_refused() {
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let dir = scratch("unsafe-step");
+        let checkout = dir.join("dev");
+        let project = project(&checkout.join("examples/coding"));
+        // `coding`, but its step names no worktree: the same atom, run in a
+        // step that would write in the checkout.
+        write(
+            &project.join("workflows/writable.workflow.yaml"),
+            "atomic: 1\nname: writable\n\
+             input: { $ref: ../atoms/fix-code.input.schema.json }\n\
+             output: { $ref: ../atoms/fix-code.output.schema.json }\n\
+             steps:\n  fix:\n    atom: fix-code\n    with: { base: input.base, task: input.task }\n\
+             returns: steps.fix.output\n",
+        );
+        git_in(&checkout, &["init", "-q"]);
+        git_in(&checkout, &["add", "."]);
+        git_in(&checkout, &["commit", "-q", "-m", "project"]);
+        // A JSON object, so the step reaches the write control; its missing
+        // `base` is never checked, because the control refuses before the
+        // input is. With the control removed the run stops at the input check.
+        let data = json!({"task": "multiply"}).to_string();
+        let before = git_state(&checkout);
+        let out = atomic(
+            &dir,
+            &project,
+            &["--json", "run", "writable", "--data", &data],
+            "http://127.0.0.1:9/v1",
+            &[],
+        )
+        .await;
+        assert!(!out.status.success(), "{}", text(&out));
+        let error = &stdout_json(&out)["error"];
+        assert_eq!(error["kind"], "target.unsafe", "{error}");
+        assert_eq!(
+            error["description"],
+            format!("step `fix` runs atom `fix-code`, {UNSAFE}"),
+            "{error}"
+        );
+        assert_eq!(error["action"], UNSAFE_ADVICE, "{error}");
+        assert_eq!(git_state(&checkout), before, "the checkout is as it was");
+        let _ = std::fs::remove_dir_all(&checkout);
+    });
+}
+
+/// `atomic run` executes a Codex atom that writes — its turn runs a command
+/// that creates a file — and the developer's checkout is left exactly as it
+/// was: the write lands in the step's worktree, which atomic commits in the
+/// fixture's snapshot, never in the checkout.
+#[test]
+fn running_a_writing_codex_atom_leaves_the_checkout_exactly_as_it_was() {
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let dir = scratch("wrote");
+        let checkout = dir.join("dev");
+        let project = project(&checkout.join("examples/coding"));
+        git_in(&checkout, &["init", "-q"]);
+        git_in(&checkout, &["add", "."]);
+        git_in(&checkout, &["commit", "-q", "-m", "project"]);
+        let before = git_state(&checkout);
+        let base = fixture(&dir.join("fixture"));
+        // The turn writes a file in its worktree and prints it, then answers.
+        let model = FakeModel::start(vec![
+            Reply::Tool {
+                name: "exec_command".into(),
+                arguments: json!({"cmd": "echo written > note.txt; cat note.txt", "yield_time_ms": 20000}),
+            },
+            Reply::Text(r#"{"done": true}"#.into()),
+        ])
+        .await
+        .unwrap();
+        let data = json!({"base": base, "task": "write a note"}).to_string();
+        let fixture_arg = dir.join("fixture").to_string_lossy().into_owned();
+        let out = atomic(
+            &dir,
+            &project,
+            &[
+                "--json",
+                "run",
+                "coding",
+                "--run-id",
+                "wrote-1",
+                "--data",
+                &data,
+                "--fixture",
+                &fixture_arg,
+                "--fixture-rev",
+                "main",
+            ],
+            &model.base_url(),
+            &[],
+        )
+        .await;
+        assert!(out.status.success(), "{}", text(&out));
+        let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(doc["output"], json!({"done": true}), "{doc}");
+        // The turn's command ran at the top of its worktree and wrote there.
+        assert!(
+            printed(&model).contains("written"),
+            "the turn did not write: {}",
+            printed(&model)
+        );
+        let snapshots = snapshots(&dir);
+        assert_eq!(snapshots.len(), 1, "{snapshots:?}");
+        let commit = accepted(&snapshots[0], "wrote-1", "fix");
+        assert_eq!(
+            git_in(&snapshots[0], &["show", &format!("{commit}:note.txt")]),
+            "written",
+            "the file the turn wrote is in the commit atomic accepted"
+        );
+        // The developer's checkout is as it was: refs, worktree list, the
+        // working tree with every untracked file, and no copy of the file the
+        // turn wrote anywhere in it.
+        assert_eq!(
+            git_state(&checkout),
+            before,
+            "the checkout is exactly as it was"
+        );
+        let strayed: Vec<_> = working_files(&checkout)
+            .into_iter()
+            .filter(|p| p.file_name().is_some_and(|n| n == "note.txt"))
+            .collect();
+        assert!(
+            strayed.is_empty(),
+            "the turn's file reached the checkout: {strayed:?}"
+        );
+        let _ = std::fs::remove_dir_all(&checkout);
+    });
+}
+
+/// Every working file under `dir`, the checkout's own; only its `.git`
+/// metadata is skipped, which holds no file the turn could have written.
+fn working_files(dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![dir.to_owned()];
+    while let Some(at) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&at) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.file_name().is_some_and(|n| n == ".git") {
+                continue;
+            }
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                found.push(path);
+            }
+        }
+    }
+    found
 }
 
 #[test]

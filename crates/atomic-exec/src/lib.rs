@@ -503,6 +503,27 @@ impl LocalBackend {
     pub fn scratch_root(&self) -> &std::path::Path {
         &self.scratch_root
     }
+
+    /// The temporary directory every turn on this backend shares, created
+    /// private to this user if it is not there: the `TMPDIR` of Codex's
+    /// sandbox helper outside the sandbox, where it keeps its registry of
+    /// the mount points it makes in a turn's writable roots.
+    pub fn shared_tmp(&self) -> std::io::Result<&std::path::Path> {
+        workspace::ensure_private(&self.tmp)?;
+        Ok(&self.tmp)
+    }
+
+    /// Refuse a scratch root inside the system's temporary directories,
+    /// which sandboxed turns may write, as
+    /// [`connect`](ExecutionBackend::connect) does.
+    pub fn check_scratch_root(&self) -> Result<(), ExecError> {
+        workspace::check_outside(&self.scratch_root, &workspace::temporary_roots()).map_err(
+            |message| ExecError::Workspace {
+                label: "connect".into(),
+                message,
+            },
+        )
+    }
 }
 
 impl Default for LocalBackend {
@@ -543,12 +564,7 @@ impl ExecutionBackend for LocalBackend {
     /// there. Each workspace it opens is also checked against the turn's own
     /// writable directories.
     fn connect(&self) -> Result<Statement, ExecError> {
-        workspace::check_outside(&self.scratch_root, &workspace::temporary_roots()).map_err(
-            |message| ExecError::Workspace {
-                label: "connect".into(),
-                message,
-            },
-        )?;
+        self.check_scratch_root()?;
         workspace::sweep_local(&self.scratch_root);
         // No turn of this backend runs yet: what earlier turns left in the
         // shared temporary directory goes.

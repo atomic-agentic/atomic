@@ -898,7 +898,50 @@ fn a_gate_whose_approvers_do_not_resolve_is_refused_before_it_starts() {
         default: None,
     };
     let error = prepare(&loaded, &atoms, &server).expect_err("no approvers");
-    assert!(error.message.contains("check"), "{error}");
+    assert!(
+        error.message.contains(
+            "gate check: a shared deployment needs approvers; name an allowed group or set a \
+             default approver group in project policy"
+        ),
+        "{error}"
+    );
+    // Naming a group policy allows, the same workflow loads, and that group
+    // decides its gate; a group policy does not allow is refused.
+    let naming = |group: &str| {
+        let file = project.join(format!("workflows/gated-{group}.workflow.yaml"));
+        let named = gated().replace(
+            "      timeout: 24h\n",
+            &format!("      timeout: 24h\n      approvers: [{group}]\n"),
+        );
+        assert_ne!(named, gated(), "the gate names its approvers");
+        std::fs::write(&file, named).expect("workflow");
+        let loaded = workflow::load(&file, &atoms, &mut Registry::new()).expect("a gate is valid");
+        prepare(&loaded, &atoms, &server)
+    };
+    let pipeline = naming("maintainers").expect("an allowed group loads");
+    let gates: Vec<_> = pipeline
+        .steps
+        .iter()
+        .filter_map(|s| match s {
+            Step::Gate(g) => Some(g),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(gates.len(), 1);
+    assert_eq!(
+        gates[0].approvers.as_deref(),
+        Some(&["maintainers".to_owned()][..])
+    );
+    let resolved =
+        gate::resolve(&gates[0].id, gates[0].approvers.as_deref(), &server).expect("resolves");
+    assert_eq!(resolved.principals(), [Principal::group("maintainers")]);
+    let error = naming("ops").expect_err("not an allowed group");
+    assert!(
+        error
+            .message
+            .contains("gate check: ops is not an approver group project policy allows"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -2240,6 +2283,16 @@ fn small_calls() -> BudgetSettings {
     s
 }
 
+/// The caps of the person who runs atomic, as their own configuration hands
+/// them to a run through `BudgetSettings::ceilings`: one on the run and one on
+/// an atom, and nothing on the most one call may use.
+fn their_caps() -> BudgetSettings {
+    let mut budgets = small_calls();
+    budgets.ceilings.workflow.tokens = Some(20_000);
+    budgets.ceilings.atom.tokens = Some(6_000);
+    budgets
+}
+
 /// A git worktree somewhere under `root`.
 fn find_worktree(root: &Path) -> Option<PathBuf> {
     let mut queue = vec![(root.to_owned(), 0)];
@@ -2930,6 +2983,613 @@ fn an_atom_that_calls_another_model_than_its_budget_was_resolved_for_fails() {
     });
 }
 
+/// Give one of the project's atoms a `budget` block of its own.
+fn atom_asks(project: &Path, name: &str, tokens: u64) {
+    let file = project.join(format!("atoms/{name}.atom.astro"));
+    let text = std::fs::read_to_string(&file).expect("atom");
+    std::fs::write(
+        &file,
+        text.replace(
+            &format!("description: '{name}'"),
+            &format!("description: '{name}', budget: {{ tokens: {tokens} }}"),
+        ),
+    )
+    .expect("atom");
+}
+
+#[test]
+fn a_run_holds_a_workflows_and_an_atoms_own_budget_block_to_their_own_caps() {
+    on_codex_runtime(async {
+        let dir = scratch("person-ceilings");
+        let project = project(&dir);
+        // One atom asks for far more than they allow, and one for less.
+        atom_asks(&project, "read-note", 100_000);
+        atom_asks(&project, "rank-note", 3_000);
+        let model = FakeModel::start(vec![
+            Reply::Text(READ.into()),
+            Reply::Text(RANK.into()),
+            Reply::Text(SUMMARY.into()),
+        ])
+        .await
+        .expect("fake model");
+        let url = model.base_url();
+        let rt = engine_with(&dir, &url, their_caps()).await;
+        let pipeline = load(
+            &project,
+            "held.workflow.yaml",
+            &format!("{TRIAGE}budget:\n  tokens: 400000\n"),
+        );
+        rt.start(
+            PIPELINE,
+            "held",
+            PipelineRun {
+                pipeline,
+                input: json!({"text": "Exporting a file named café.txt crashes the app."}),
+            },
+        )
+        .await
+        .expect("start");
+        let finished = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            rt.result::<Value>("held"),
+        )
+        .await
+        .expect("the run ended");
+        assert!(
+            finished.is_ok(),
+            "held to their caps, the run finishes: {finished:?}"
+        );
+        assert_eq!(model.calls(), 3);
+
+        // The caps the run recorded for itself and for each atom are the
+        // smaller of what was written and what they allowed.
+        let pin = rt
+            .steps("held")
+            .await
+            .expect("steps")
+            .into_iter()
+            .find(|s| s.name == "pin")
+            .and_then(|s| s.output)
+            .expect("a pin step");
+        let plan = serde_json::from_value::<Pinned>(pin)
+            .expect("pinned")
+            .budgets;
+        assert_eq!(plan.run.tokens, 20_000, "the workflow's 400000 is held");
+        assert_eq!(
+            plan.atoms["read-note"].tokens, 6_000,
+            "the atom's own 100000 is held"
+        );
+        assert_eq!(
+            plan.atoms["rank-note"].tokens, 3_000,
+            "a block under their cap tightens it, as any project's may"
+        );
+        assert_eq!(
+            plan.atoms["summarize-note"].tokens, 6_000,
+            "an atom writing nothing is held too"
+        );
+        // They are recorded with the plan, so a resumed run keeps them and a
+        // plan changed elsewhere is held to them.
+        assert_eq!(plan.ceilings.workflow.tokens, Some(20_000));
+        assert_eq!(plan.ceilings.atom.tokens, Some(6_000));
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[test]
+fn a_budget_plan_above_the_caps_it_was_resolved_under_is_refused() {
+    on_codex_runtime(async {
+        let dir = scratch("plan-ceilinged");
+        let project = project(&dir);
+        let model = FakeModel::start(vec![Reply::Text(READ.into())])
+            .await
+            .expect("fake model");
+        let url = model.base_url();
+        let budgets = their_caps();
+        let rt = engine_with(&dir, &url, budgets.clone()).await;
+        let pinned = || {
+            let mut pipeline = load(&project, "ceilinged.workflow.yaml", TRIAGE);
+            pin_budgets(&mut pipeline, &runtimes(&dir, &url), &budgets).expect("pinned");
+            pipeline
+        };
+        // A plan recorded elsewhere, or changed since, is held to the ceilings
+        // it says it was resolved under, at every level.
+        let mut over_run = pinned();
+        if let Some(plan) = over_run.budgets.as_mut() {
+            plan.run.tokens = 40_000_000;
+        }
+        let mut over_atom = pinned();
+        if let Some(plan) = over_atom.budgets.as_mut() {
+            plan.atoms.get_mut("read-note").expect("an atom").tokens = 60_000;
+        }
+        for (run, pipeline, says) in [
+            (
+                "over-run",
+                over_run,
+                "the run: its tokens cap (40000000) is above the cap of 20000 tokens",
+            ),
+            (
+                "over-atom",
+                over_atom,
+                "atom read-note: its tokens cap (60000) is above the cap of 6000 tokens",
+            ),
+        ] {
+            rt.start(
+                PIPELINE,
+                run,
+                PipelineRun {
+                    pipeline,
+                    input: json!({"text": "Exporting a file named café.txt crashes the app."}),
+                },
+            )
+            .await
+            .expect("start");
+            let failed =
+                tokio::time::timeout(std::time::Duration::from_secs(60), rt.result::<Value>(run))
+                    .await
+                    .expect("the run ended");
+            assert!(
+                matches!(&failed, Err(atomic_durable::DurableError::Failed(m)) if m.contains(says)),
+                "{run}: {failed:?}"
+            );
+        }
+        assert_eq!(model.calls(), 0, "both plans were refused before any call");
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+/// Start `pipeline` as run `run` on `rt` and return what it failed with,
+/// which it must, before any model call.
+async fn plan_refused(rt: &Durare, run: &str, pipeline: atomic_app::pipeline::Pipeline) -> String {
+    rt.start(
+        PIPELINE,
+        run,
+        PipelineRun {
+            pipeline,
+            input: json!({"text": "Exporting a file named café.txt crashes the app."}),
+        },
+    )
+    .await
+    .expect("start");
+    let failed = tokio::time::timeout(std::time::Duration::from_secs(60), rt.result::<Value>(run))
+        .await
+        .expect("the run ended");
+    match failed {
+        Err(atomic_durable::DurableError::Failed(m)) => m,
+        other => panic!("{run}: {other:?}"),
+    }
+}
+
+/// A price for the test model, so a dollar cap has a model to sit on.
+fn priced_synthetic(budgets: &mut BudgetSettings, max_input_tokens: Option<u64>) {
+    budgets.pricing.insert(
+        "synthetic".into(),
+        Price {
+            input_usd_per_mtok: 1.0,
+            output_usd_per_mtok: 2.0,
+            max_input_tokens,
+            max_output_tokens: None,
+        },
+    );
+}
+
+#[test]
+fn a_budget_plan_above_its_minutes_or_dollar_ceilings_is_refused() {
+    on_codex_runtime(async {
+        let dir = scratch("plan-ceilinged-measures");
+        let project = project(&dir);
+        let model = FakeModel::start(vec![Reply::Text(READ.into())])
+            .await
+            .expect("fake model");
+        let url = model.base_url();
+        let mut budgets = small_calls();
+        priced_synthetic(&mut budgets, None);
+        budgets.ceilings.workflow.minutes = Some(30.0);
+        budgets.ceilings.atom.cost_usd = Some(1.0);
+        let rt = engine_with(&dir, &url, budgets.clone()).await;
+        let pinned = || {
+            let mut pipeline = load(&project, "measures.workflow.yaml", TRIAGE);
+            pin_budgets(&mut pipeline, &runtimes(&dir, &url), &budgets).expect("pinned");
+            pipeline
+        };
+        let mut over_minutes = pinned();
+        if let Some(plan) = over_minutes.budgets.as_mut() {
+            plan.run.millis = 3_600_000;
+        }
+        let mut over_cost = pinned();
+        if let Some(plan) = over_cost.budgets.as_mut() {
+            plan.atoms.get_mut("read-note").expect("an atom").micro_usd = Some(5_000_000);
+        }
+        let mut no_cost = pinned();
+        if let Some(plan) = no_cost.budgets.as_mut() {
+            plan.atoms.get_mut("read-note").expect("an atom").micro_usd = None;
+        }
+        for (run, pipeline, says) in [
+            (
+                "over-minutes",
+                over_minutes,
+                "the run: its minutes cap (60) is above the cap of 30 the ceilings",
+            ),
+            (
+                "over-cost",
+                over_cost,
+                "atom read-note: its cost_usd cap (5.000000) is above the cap of 1.000000",
+            ),
+            (
+                "no-cost",
+                no_cost,
+                "atom read-note: its cost_usd cap (none) is above the cap of 1.000000",
+            ),
+        ] {
+            let said = plan_refused(&rt, run, pipeline).await;
+            assert!(said.contains(says), "{run}: {said}");
+        }
+        assert_eq!(model.calls(), 0, "every plan was refused before any call");
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+/// A plan pinned under no ceilings, with no `ceilings` key at all, is held
+/// to the ceilings of the person running it: its caps, its call bound and
+/// its prices' per-call maxima.
+#[test]
+fn a_pinned_plan_without_ceilings_is_held_to_your_own() {
+    on_codex_runtime(async {
+        let dir = scratch("plan-no-ceilings");
+        let project = project(&dir);
+        let model = FakeModel::start(vec![Reply::Text(READ.into())])
+            .await
+            .expect("fake model");
+        let url = model.base_url();
+        let mut theirs = their_caps();
+        theirs.ceilings.call.input_tokens = Some(60);
+        let rt = engine_with(&dir, &url, theirs).await;
+        // Pinned elsewhere, with none of their ceilings, and the key gone.
+        let mut elsewhere = small_calls();
+        priced_synthetic(&mut elsewhere, Some(100));
+        let pinned = || {
+            let mut pipeline = load(&project, "uncapped.workflow.yaml", TRIAGE);
+            pin_budgets(&mut pipeline, &runtimes(&dir, &url), &elsewhere).expect("pinned");
+            let plan = pipeline.budgets.take().expect("a plan");
+            let mut stored = serde_json::to_value(&plan).expect("encode");
+            stored.as_object_mut().expect("a plan").remove("ceilings");
+            pipeline.budgets = Some(serde_json::from_value(stored).expect("reads"));
+            pipeline
+        };
+        let mut over_caps = pinned();
+        if let Some(plan) = over_caps.budgets.as_mut() {
+            plan.run.tokens = 20_000;
+        }
+        // Carrying ceilings of its own, looser than theirs: only the check
+        // against theirs, before the plan is pinned, holds it.
+        let mut loose = pinned();
+        if let Some(plan) = loose.budgets.as_mut() {
+            plan.run.tokens = 20_000;
+            plan.ceilings.atom.tokens = Some(1_000_000);
+        }
+        let mut over_call = pinned();
+        if let Some(plan) = over_call.budgets.as_mut() {
+            for caps in plan.atoms.values_mut() {
+                caps.tokens = 6_000;
+            }
+            plan.run.tokens = 20_000;
+        }
+        let mut over_price = pinned();
+        if let Some(plan) = over_price.budgets.as_mut() {
+            for caps in plan.atoms.values_mut() {
+                caps.tokens = 6_000;
+            }
+            plan.run.tokens = 20_000;
+            plan.call.input_tokens = 50;
+        }
+        for (run, pipeline, says) in [
+            (
+                "over-caps",
+                over_caps,
+                "atom rank-note: its tokens cap (10000) is above the cap of 6000 tokens your own \
+                 configuration's ceilings",
+            ),
+            (
+                "over-call",
+                over_call,
+                "the call bound: its input_tokens cap (100) is above the cap of 60 tokens your \
+                 own configuration's ceilings",
+            ),
+            (
+                "over-price",
+                over_price,
+                "the price of synthetic: its max_input_tokens cap (100) is above the cap of 60 \
+                 tokens your own configuration's ceilings",
+            ),
+        ] {
+            let said = plan_refused(&rt, run, pipeline).await;
+            assert!(said.contains(says), "{run}: {said}");
+        }
+        let said = plan_refused(&rt, "loose", loose).await;
+        assert!(
+            said.contains(
+                "its pinned budget: atom rank-note: its tokens cap (10000) is above the cap of \
+                 6000 tokens your own configuration's ceilings"
+            ),
+            "loose: {said}"
+        );
+        assert_eq!(model.calls(), 0, "every plan was refused before any call");
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+/// A pinned plan may not price a call below what it costs here: a price
+/// under the current table's is refused, and under a dollar ceiling, so is a
+/// model the current table does not price.
+#[test]
+fn a_pinned_plan_priced_below_yours_is_refused() {
+    on_codex_runtime(async {
+        let dir = scratch("plan-priced");
+        let project = project(&dir);
+        let model = FakeModel::start(vec![Reply::Text(READ.into())])
+            .await
+            .expect("fake model");
+        let url = model.base_url();
+        let mut ours = small_calls();
+        priced_synthetic(&mut ours, None);
+        let rt = engine_with(&dir, &url, ours.clone()).await;
+        let pinned = |budgets: &BudgetSettings, file: &str| {
+            let mut pipeline = load(&project, file, TRIAGE);
+            pin_budgets(&mut pipeline, &runtimes(&dir, &url), budgets).expect("pinned");
+            pipeline
+        };
+        let mut cheaper = pinned(&ours, "cheaper.workflow.yaml");
+        if let Some(plan) = cheaper.budgets.as_mut() {
+            plan.pricing
+                .get_mut("synthetic")
+                .expect("a price")
+                .input_usd_per_mtok = 0.0;
+        }
+        let said = plan_refused(&rt, "cheaper", cheaper).await;
+        assert!(
+            said.contains(
+                "the price of synthetic: its input_usd_per_mtok (0) is below your price of 1"
+            ),
+            "{said}"
+        );
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+
+        // Under their dollar ceiling, with no price of theirs for the model.
+        let dir = scratch("plan-unpriced");
+        let other = crate::project(&dir);
+        let mut theirs = small_calls();
+        theirs.ceilings.atom.cost_usd = Some(1.0);
+        let rt = engine_with(&dir, &url, theirs).await;
+        let mut elsewhere = small_calls();
+        priced_synthetic(&mut elsewhere, None);
+        elsewhere.atom.cost_usd = Some(1.0);
+        let mut pipeline = load(&other, "unpriced.workflow.yaml", TRIAGE);
+        pin_budgets(&mut pipeline, &runtimes(&dir, &url), &elsewhere).expect("pinned");
+        let said = plan_refused(&rt, "unpriced", pipeline).await;
+        assert!(
+            said.contains("the price of synthetic: your price table has none for it, under your own dollar cap"),
+            "{said}"
+        );
+        assert_eq!(model.calls(), 0, "both plans were refused before any call");
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+/// Start the gated triage as run `id` under `budgets`, on a runtime of its
+/// own, and leave it waiting at its gate when that runtime ends.
+fn parked_at_its_gate(dir: &Path, project: &Path, id: &str, budgets: BudgetSettings) {
+    let (dir, project, id) = (dir.to_owned(), project.to_owned(), id.to_owned());
+    on_codex_runtime(async move {
+        let model = FakeModel::start(vec![Reply::Text(READ.into()), Reply::Text(RANK.into())])
+            .await
+            .expect("fake model");
+        let rt = engine_with(&dir, &model.base_url(), budgets).await;
+        let pipeline = load(&project, &format!("{id}.workflow.yaml"), &gated());
+        rt.start(
+            PIPELINE,
+            &id,
+            PipelineRun {
+                pipeline,
+                input: json!({"text": NOTE}),
+            },
+        )
+        .await
+        .expect("start");
+        let _ = open_gate(&rt, &id).await;
+        assert_eq!(model.calls(), 2, "read and rank, then the gate");
+    });
+}
+
+/// `bytes` as standard base64, as durare keeps a step's output.
+fn base64_encode(bytes: &[u8]) -> String {
+    const ABC: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, b)| n | (u32::from(*b) << (16 - 8 * i)));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(char::from(ABC[((n >> (18 - 6 * i)) & 63) as usize]));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// Standard base64 `text`, back to its bytes.
+fn base64_decode(text: &str) -> Vec<u8> {
+    const ABC: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let digits: Vec<u32> = text
+        .bytes()
+        .filter(|b| *b != b'=')
+        .map(|b| ABC.iter().position(|a| *a == b).expect("base64") as u32)
+        .collect();
+    let mut out = Vec::new();
+    for chunk in digits.chunks(4) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, d)| n | (d << (18 - 6 * i)));
+        for i in 0..chunk.len().saturating_sub(1) {
+            out.push((n >> (16 - 8 * i)) as u8);
+        }
+    }
+    out
+}
+
+/// Make run `id`'s recorded plan one recorded before plans were held to a
+/// person's ceilings and prices: its pin step's output, as durare keeps it,
+/// with no `held`.
+async fn as_an_old_plan(rt: &Durare, id: &str) {
+    let id = id.to_owned();
+    rt.control_transaction(move |mut tx| {
+        let id = id.clone();
+        Box::pin(async move {
+            let row = tx
+                .query_one(
+                    "SELECT output FROM operation_outputs \
+                     WHERE workflow_uuid = ? AND function_name = 'pin'",
+                    &[atomic_durable::Param::Text(id.clone())],
+                )
+                .await?;
+            let stored = row.text("output")?;
+            let mut pinned: Value =
+                serde_json::from_slice(&base64_decode(&stored)).expect("a pinned plan");
+            pinned["budgets"]
+                .as_object_mut()
+                .expect("a plan")
+                .remove("held");
+            let again = base64_encode(&serde_json::to_vec(&pinned).expect("encode"));
+            tx.execute(
+                "UPDATE operation_outputs SET output = ? \
+                 WHERE workflow_uuid = ? AND function_name = 'pin'",
+                &[
+                    atomic_durable::Param::Text(again),
+                    atomic_durable::Param::Text(id),
+                ],
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await
+    .expect("an old plan");
+}
+
+/// Recover run `id` on `rt` and return what it failed with.
+async fn recovered_refused(rt: &Durare, id: &str) -> String {
+    rt.recover().await.expect("recover");
+    let failed = tokio::time::timeout(std::time::Duration::from_secs(60), rt.result::<Value>(id))
+        .await
+        .expect("the run ended");
+    match failed {
+        Err(atomic_durable::DurableError::Failed(m)) => m,
+        other => panic!("{id}: {other:?}"),
+    }
+}
+
+/// A run whose plan was recorded before plans were held to a person's
+/// ceilings and prices is held to those of the person running it when it is
+/// recovered: it stops, saying to start it again, and calls nothing more.
+#[test]
+fn a_run_recovered_with_a_plan_recorded_before_plans_were_held_is_held_to_yours() {
+    let dir = scratch("recovered-unheld");
+    let project = project(&dir);
+    parked_at_its_gate(&dir, &project, "unheld-1", small_calls());
+    on_codex_runtime(async move {
+        let model = FakeModel::start(Vec::new()).await.expect("fake model");
+        let rt = engine_with(&dir, &model.base_url(), their_caps()).await;
+        as_an_old_plan(&rt, "unheld-1").await;
+        let said = recovered_refused(&rt, "unheld-1").await;
+        assert!(
+            said.contains("recorded before budgets were held to your own ceilings and prices")
+                && said.contains("your own configuration's ceilings")
+                && said.contains("start the run again"),
+            "{said}"
+        );
+        assert_eq!(model.calls(), 0, "nothing more was called");
+    });
+}
+
+/// The settings an old plan is held to on recovery are checked first: a
+/// dollar ceiling out of range refuses the run rather than capping nothing.
+#[test]
+fn a_run_recovered_with_an_old_plan_under_settings_out_of_range_is_refused() {
+    let dir = scratch("recovered-out-of-range");
+    let project = project(&dir);
+    parked_at_its_gate(&dir, &project, "ranged-1", small_calls());
+    on_codex_runtime(async move {
+        let model = FakeModel::start(Vec::new()).await.expect("fake model");
+        let mut broken = small_calls();
+        broken.ceilings.atom.cost_usd = Some(-1.0);
+        let rt = engine_with(&dir, &model.base_url(), broken).await;
+        as_an_old_plan(&rt, "ranged-1").await;
+        let said = recovered_refused(&rt, "ranged-1").await;
+        assert!(
+            said.contains("recorded before budgets were held to your own ceilings and prices")
+                && said.contains("cost_usd"),
+            "{said}"
+        );
+        assert_eq!(model.calls(), 0, "nothing more was called");
+    });
+}
+
+/// A person with no caps of their own has a run waiting at a gate when a
+/// price is raised: the run's plan was held when it was made, so it is
+/// resumed under the plan it began with, and finishes.
+#[test]
+fn a_run_of_a_person_with_no_caps_resumes_after_a_price_change() {
+    let dir = scratch("resumed-repriced");
+    let project = project(&dir);
+    let mut before = small_calls();
+    priced_synthetic(&mut before, None);
+    parked_at_its_gate(&dir, &project, "repriced-1", before);
+    on_codex_runtime(async move {
+        let model = FakeModel::start(vec![Reply::Text(SUMMARY.into())])
+            .await
+            .expect("fake model");
+        // The project raises the price meanwhile.
+        let mut after = small_calls();
+        after.pricing.insert(
+            "synthetic".into(),
+            Price {
+                input_usd_per_mtok: 5.0,
+                output_usd_per_mtok: 5.0,
+                max_input_tokens: None,
+                max_output_tokens: None,
+            },
+        );
+        let rt = engine_with(&dir, &model.base_url(), after).await;
+        rt.recover().await.expect("recover");
+        let g = open_gate(&rt, "repriced-1").await;
+        decide(&rt, &g, Verdict::Approve, "fine").await;
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            rt.result::<Value>("repriced-1"),
+        )
+        .await
+        .expect("the run ended")
+        .expect("the run finished");
+        assert_eq!(out, json!({"line": "P1: Export crashes on accents"}));
+        assert_eq!(model.calls(), 1, "only summarize ran after the gate");
+    });
+}
+
 #[test]
 fn a_stored_budget_plan_reads_past_fields_a_later_version_adds() {
     let dir = scratch("plan-later");
@@ -2946,6 +3606,9 @@ fn a_stored_budget_plan_reads_past_fields_a_later_version_adds() {
     stored["later"] = json!(1);
     stored["call"]["later"] = json!(true);
     stored["run"]["later"] = json!("x");
+    stored["ceilings"]["later"] = json!(1);
+    stored["ceilings"]["atom"]["later"] = json!(1);
+    stored["ceilings"]["call"]["later"] = json!(1);
     let read: atomic_app::metering::BudgetPlan =
         serde_json::from_value(stored).expect("a later plan still reads");
     assert_eq!(read, plan);

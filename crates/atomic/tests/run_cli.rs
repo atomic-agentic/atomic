@@ -763,6 +763,29 @@ fn database(state: &Path) -> PathBuf {
         .join("atomic.db")
 }
 
+/// Wait until what `atomic` wrote to `log` (stderr) or `out` (stdout) holds
+/// `says`, and fail with everything it printed when it never does: a run
+/// names what it pinned before anything of it runs, and what it refuses with
+/// arrives on stdout as JSON.
+fn wait_for_line(log: &Path, out: &Path, says: &str, what: &str) {
+    let started = Instant::now();
+    loop {
+        let shown = format!(
+            "{}{}",
+            std::fs::read_to_string(log).unwrap_or_default(),
+            std::fs::read_to_string(out).unwrap_or_default()
+        );
+        if shown.contains(says) {
+            return;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "{what}: never said {says:?}; it printed:\n{shown}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
     let started = Instant::now();
     while !done() {
@@ -789,6 +812,39 @@ async fn open_gate(rt: &Durare, run: &str) -> gate::Gate {
         if let Some(g) = open.into_iter().next() {
             return g;
         }
+        assert!(
+            started.elapsed() < Duration::from_secs(120),
+            "{run} never opened a gate"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// [`open_gate`] while reading the run's status: a run that ends on the way
+/// says so at once, with the status it ended on, rather than the wait running
+/// out for a gate that could never open.
+async fn await_gate(rt: &Durare, run: &str) -> gate::Gate {
+    let started = Instant::now();
+    loop {
+        let open = gate::gates(
+            rt,
+            GateFilter {
+                open_only: true,
+                run: Some(run.to_owned()),
+            },
+        )
+        .await
+        .expect("gates");
+        if let Some(g) = open.into_iter().next() {
+            return g;
+        }
+        // No row yet is a run still being admitted: its admission line is
+        // printed before the row is written.
+        let status = rt.status(run).await.expect("status");
+        assert!(
+            matches!(status, None | Some(RunStatus::Pending)),
+            "{run} ended before it opened a gate: {status:?}"
+        );
         assert!(
             started.elapsed() < Duration::from_secs(120),
             "{run} never opened a gate"
@@ -975,6 +1031,134 @@ fn address_of(model: &FakeModel) -> String {
         .trim_start_matches("http://")
         .trim_end_matches("/v1")
         .to_owned()
+}
+
+/// The person's own configuration, at `~/.config/atomic/config.yaml`, caps a
+/// run made with `atomic run`: the project's larger cap, and its `null` for
+/// their dollar cap, leave their caps the ones the run's plan records, with
+/// their ceilings beside them.
+#[test]
+fn your_own_configuration_caps_what_atomic_run_records() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(RANK.into())])
+            .await
+            .expect("fake model");
+        let dir = scratch("person-caps");
+        let project = project(&dir);
+        // Their home outside the checkout that holds the project, as a
+        // configuration inside it could have come with the project.
+        let home = std::env::temp_dir().join(format!("atomic-person-caps-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let config = home.join(".config/atomic");
+        std::fs::create_dir_all(&config).expect("config dir");
+        std::fs::write(
+            config.join("config.yaml"),
+            "budget:\n  atom:\n    tokens: 150000\n    cost_usd: 1\n  workflow:\n    \
+             tokens: 300000\n  pricing:\n    synthetic:\n      input_usd_per_mtok: 1\n      \
+             output_usd_per_mtok: 1\n",
+        )
+        .expect("their configuration");
+        std::fs::write(
+            project.join("atomic.yaml"),
+            "atomic: 1\nname: notes\nbudget:\n  workflow:\n    tokens: 900000\n  atom:\n    \
+             cost_usd: null\n",
+        )
+        .expect("manifest");
+        let env = model_env(&model.base_url());
+        let (d, p, h) = (dir.clone(), project.clone(), home.display().to_string());
+        let out = tokio::task::spawn_blocking(move || {
+            atomic(
+                &d,
+                &p,
+                &[
+                    "run",
+                    "rank-note",
+                    "--run-id",
+                    "capped-1",
+                    "--data",
+                    r#"{"title": "Export crashes", "words": 2}"#,
+                ],
+                &with(&env, &[("HOME", h.as_str())]),
+                "",
+            )
+        })
+        .await
+        .expect("child");
+        assert!(out.status.success(), "{}", text(&out));
+        let state = state_dir(&dir, &project);
+        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        // The plan is what the run's first step, `pin`, recorded.
+        let steps = rt.steps("capped-1").await.expect("steps");
+        let pin = steps
+            .iter()
+            .find(|s| s.name == "pin")
+            .and_then(|s| s.output.clone())
+            .expect("the run pinned its plan");
+        let plan = &pin["budgets"];
+        assert_eq!(plan["run"]["tokens"], 300_000, "{plan}");
+        assert_eq!(plan["atoms"]["rank-note"]["tokens"], 150_000, "{plan}");
+        assert_eq!(plan["atoms"]["rank-note"]["micro_usd"], 1_000_000, "{plan}");
+        assert_eq!(plan["ceilings"]["workflow"]["tokens"], 300_000, "{plan}");
+        assert_eq!(plan["ceilings"]["atom"]["cost_usd"], 1.0, "{plan}");
+        let _ = std::fs::remove_dir_all(&home);
+    });
+}
+
+/// Under the person's own dollar cap, a run that calls a model only the
+/// project prices says so on stderr at its start.
+#[test]
+fn a_run_says_which_models_only_the_project_prices_under_your_dollar_cap() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(RANK.into())])
+            .await
+            .expect("fake model");
+        let dir = scratch("project-priced");
+        let project = project(&dir);
+        let home =
+            std::env::temp_dir().join(format!("atomic-project-priced-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let config = home.join(".config/atomic");
+        std::fs::create_dir_all(&config).expect("config dir");
+        std::fs::write(
+            config.join("config.yaml"),
+            "budget:\n  atom:\n    cost_usd: 1\n",
+        )
+        .expect("their configuration");
+        std::fs::write(
+            project.join("atomic.yaml"),
+            "atomic: 1\nname: notes\nbudget:\n  pricing:\n    synthetic:\n      \
+             input_usd_per_mtok: 0.000001\n      output_usd_per_mtok: 0.000001\n",
+        )
+        .expect("manifest");
+        let env = model_env(&model.base_url());
+        let (d, p, h) = (dir.clone(), project.clone(), home.display().to_string());
+        let out = tokio::task::spawn_blocking(move || {
+            atomic(
+                &d,
+                &p,
+                &[
+                    "run",
+                    "rank-note",
+                    "--data",
+                    r#"{"title": "Export crashes", "words": 2}"#,
+                ],
+                &with(&env, &[("HOME", h.as_str())]),
+                "",
+            )
+        })
+        .await
+        .expect("child");
+        assert!(out.status.success(), "{}", text(&out));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(
+                "under your own dollar cap, the run calls synthetic at prices only a layer \
+                 above your own configuration sets"
+            ),
+            "{stderr}"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    });
 }
 
 #[test]
@@ -2230,6 +2414,119 @@ fn a_gate_decided_while_its_run_was_down_wakes_it_on_resume() {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         assert_eq!(model.calls(), 6, "each run ranked and summarized once");
+        terminate(&serve);
+        let status = tokio::task::spawn_blocking(move || wait_child(&mut serve, "serve"))
+            .await
+            .expect("child");
+        assert!(status.success());
+    });
+}
+
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[test]
+fn a_gate_recovered_by_serve_keeps_its_first_deadline_and_is_approved_from_another_terminal() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
+            .await
+            .expect("fake model");
+        let dir = scratch("serve-gate");
+        let project = project(&dir);
+        let state = state_dir(&dir, &project);
+        let env = model_env(&model.base_url());
+        // Killed at its gate.
+        let mut first = spawn(
+            &dir,
+            &project,
+            &["run", "gated", "--run-id", "served-gate", "--data", NOTE],
+            &with(&env, &[]),
+            &dir.join("first.log"),
+        );
+        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        let opened = open_gate(&rt, "served-gate").await;
+        assert!(opened.deadline.is_some(), "the gate has a deadline");
+        first.kill().expect("SIGKILL the run");
+        first.wait().expect("reap");
+
+        // The operator's credential, enrolled and kept in the file store, as
+        // `atomic gates enroll` leaves it.
+        let secret = "the operator's secret";
+        let store = atomic_core::credential::FileSecrets::open(
+            &dir.join("atomic-home/credentials"),
+            &project,
+        )
+        .expect("the file store");
+        let account = format!(
+            "operator:dev@{}",
+            state.file_name().expect("a project id").to_string_lossy()
+        );
+        atomic_core::credential::SecretStore::save(&store, &account, secret).expect("kept");
+        gate::enroll(
+            &rt,
+            &gate::HumanCredential::new(Principal::local("dev"), secret),
+        )
+        .await
+        .expect("enrolled");
+
+        // A local serve recovers it.
+        let mut serve = spawn(
+            &dir,
+            &project,
+            &["serve"],
+            &with(&env, &[]),
+            &dir.join("serve.log"),
+        );
+        wait_until("serve to start", || {
+            std::fs::read_to_string(dir.join("serve.log"))
+                .is_ok_and(|l| l.contains("recovered 1 unfinished run(s); serving until stopped"))
+        });
+        let again = open_gate(&rt, "served-gate").await;
+        assert_eq!(
+            (again.id.clone(), again.opened_at, again.deadline),
+            (opened.id.clone(), opened.opened_at, opened.deadline),
+            "serve's recovery changed the gate"
+        );
+
+        // Another terminal approves it, with the operator's credential.
+        let (d, p, e, id) = (dir.clone(), project.clone(), env.clone(), opened.id.clone());
+        let out = tokio::task::spawn_blocking(move || {
+            atomic(
+                &d,
+                &p,
+                &["gates", "approve", &id],
+                &with(&e, &[("ATOMIC_CREDENTIAL_STORE", "file")]),
+                "",
+            )
+        })
+        .await
+        .expect("child");
+        assert!(out.status.success(), "{}", text(&out));
+        let started = Instant::now();
+        while rt.status("served-gate").await.expect("status") != Some(RunStatus::Succeeded) {
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "serve did not finish the approved run: {}",
+                std::fs::read_to_string(dir.join("serve.log")).unwrap_or_default()
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // Decided as it was first opened, and by the operator.
+        let decided = gate::find(&rt, &opened.id)
+            .await
+            .expect("gate")
+            .expect("exists");
+        assert_eq!(
+            (decided.opened_at, decided.deadline),
+            (opened.opened_at, opened.deadline)
+        );
+        let Some(gate::Resolution::Decided(decision)) = &decided.resolution else {
+            panic!("{:?}", decided.resolution);
+        };
+        assert_eq!(decision.verdict, Verdict::Approve);
+        assert_eq!(decision.by, Principal::local("dev"));
+        assert_eq!(model.calls(), 2, "rank once, summarize once");
         terminate(&serve);
         let status = tokio::task::spawn_blocking(move || wait_child(&mut serve, "serve"))
             .await
@@ -5047,6 +5344,85 @@ fn git_state(dir: &Path) -> String {
     )
 }
 
+/// What `git status` sees in the repository at `dir`: every change and every
+/// untracked file, which [`git_state`]'s refs and worktree list do not cover.
+fn git_status(dir: &Path) -> String {
+    git_in(dir, &["status", "--porcelain", "--untracked-files=all"])
+}
+
+/// The coding example in the catalog, as written.
+fn example() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/02-change-request")
+}
+
+/// The JSON in `path`.
+fn read_json(path: &Path) -> Value {
+    let text = std::fs::read_to_string(path).expect("read");
+    serde_json::from_str(&text).expect("JSON")
+}
+
+/// `source`'s tree under `destination`, as a person copies a project: git's
+/// own metadata stays behind, and so do atomic's generated declarations,
+/// which `atomic check` writes afresh.
+fn copy_tree(source: &Path, destination: &Path) {
+    std::fs::create_dir_all(destination).expect("directory");
+    for entry in std::fs::read_dir(source).expect("source") {
+        let entry = entry.expect("entry");
+        let name = entry.file_name();
+        if [".git", ".atomic"].contains(&name.to_string_lossy().as_ref()) {
+            continue;
+        }
+        let target = destination.join(name);
+        if entry.file_type().expect("type").is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).expect("copy");
+        }
+    }
+}
+
+/// A directory of the test's own outside every git repository, under the
+/// system's temporary directory: the target directory sits inside the
+/// checkout atomic is built from. Checked, so the test fails rather than run
+/// inside a repository if that ever changes.
+fn outside_repository(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("atomic-run-cli-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("directory");
+    let dir = std::fs::canonicalize(&dir).expect("canonical");
+    let inside = Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(&dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .expect("git");
+    assert!(
+        !inside.status.success(),
+        "{} is inside a git work tree: {}",
+        dir.display(),
+        text(&inside)
+    );
+    dir
+}
+
+/// [`spawn`], with the run's stdout in `out` beside its stderr in `log`.
+fn spawn_logged(
+    dir: &Path,
+    cwd: &Path,
+    args: &[&str],
+    env: &[(&str, &str)],
+    log: &Path,
+    out: &Path,
+) -> Child {
+    command_as(Path::new(ATOMIC), dir, cwd, args, env)
+        .stdin(Stdio::null())
+        .stdout(std::fs::File::create(out).expect("stdout"))
+        .stderr(std::fs::File::create(log).expect("stderr"))
+        .spawn()
+        .expect("start atomic")
+}
+
 /// A workflow whose second step changes code in a worktree, after a gate.
 fn write_coding(project: &Path) {
     write_atom(
@@ -5244,6 +5620,242 @@ fn a_coding_run_is_bound_to_its_fixture_and_never_touches_a_checkout() {
         // worktree.
         assert_eq!(git_state(&project), checkout, "the checkout is as it was");
         assert_eq!(git_state(&fixture), source, "the fixture is as it was");
+    });
+}
+
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[test]
+fn the_coding_example_run_from_outside_the_project_pins_its_base_and_leaves_the_fixture_as_it_was()
+{
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let dir = scratch("example-outside");
+        let outside = outside_repository("example-outside");
+        // The example as written, kept as the project, and separately the
+        // code it works on, in a repository of its own: the fixture an
+        // operator prepared, with the baseline the example names and a
+        // deliberate commit after it.
+        let project = outside.join("project");
+        copy_tree(&example(), &project);
+        let fixture = outside.join("fixture");
+        copy_tree(&example().join("fixtures/repo"), &fixture);
+        git_in(&fixture, &["init", "-q"]);
+        git_in(&fixture, &["add", "."]);
+        git_in(
+            &fixture,
+            &[
+                "commit",
+                "-q",
+                "-m",
+                "Curated baseline with the quantity bug",
+            ],
+        );
+        let base = git_in(&fixture, &["rev-parse", "HEAD"]);
+        git_in(&fixture, &["tag", "baseline", &base]);
+        let seed = std::fs::read_to_string(fixture.join("pricing.py")).expect("pricing.py");
+        let incomplete = seed.replace(
+            "return unit_cents",
+            "return unit_cents  # Quantity handling is still incomplete.",
+        );
+        assert_ne!(incomplete, seed, "the seed holds the quantity bug");
+        std::fs::write(fixture.join("pricing.py"), &incomplete).expect("pricing.py");
+        git_in(&fixture, &["add", "pricing.py"]);
+        git_in(
+            &fixture,
+            &["commit", "-q", "-m", "Deliberately incomplete candidate"],
+        );
+        let candidate = git_in(&fixture, &["rev-parse", "HEAD"]);
+        git_in(&fixture, &["tag", "candidate"]);
+        git_in(&fixture, &["checkout", "-q", "--detach", &base]);
+        assert_ne!(candidate, base, "the fixture's tip is not its baseline");
+        let source = format!("{}\n{}", git_state(&fixture), git_status(&fixture));
+        // The example checks as written, from a directory outside it, which
+        // is also where atomic writes the declarations its atoms import.
+        let project_arg = project.to_string_lossy().into_owned();
+        let checked = atomic(&dir, &outside, &["check", &project_arg], &[], "");
+        assert!(checked.status.success(), "{}", text(&checked));
+        let state = state_dir(&dir, &project);
+        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        // The example's own input, with the fixture's real baseline for the
+        // placeholder, and the answers each step is scripted to give.
+        let mut task =
+            read_json(&example().join("fixtures/plan-task/quantity.input.json"))["task"].clone();
+        task["base"] = json!(base);
+        let task = task.to_string();
+        let plan = read_json(&example().join("fixtures/plan-task/quantity.output.json"));
+        let implemented =
+            read_json(&example().join("fixtures/implement-step/quantity.output.json"));
+        let review = json!({
+            "verdict": "approve",
+            "summary": "Two units now total 250 cents; one unit is unchanged.",
+            "findings": []
+        });
+        // Started from directories that are neither the project nor the
+        // fixture, each naming the fixture by a path of its own.
+        let runs = [
+            ("first", "elsewhere", "../fixture"),
+            ("second", "somewhere-else/again", "../../fixture"),
+        ];
+        let mut pinned = Vec::new();
+        for (tag, cwd, fixture_arg) in runs {
+            let cwd = outside.join(cwd);
+            std::fs::create_dir_all(&cwd).expect("current directory");
+            let model = FakeModel::start(vec![
+                Reply::Text(plan.to_string()),
+                // The implementing model fixes the bug with a command in its
+                // working directory, the step's worktree of the fixture.
+                Reply::Tool {
+                    name: "exec_command".into(),
+                    arguments: json!({
+                        "cmd": "sed 's/return unit_cents$/return unit_cents * quantity/' pricing.py > pricing.py.new && mv pricing.py.new pricing.py",
+                        "yield_time_ms": 10000
+                    }),
+                },
+                Reply::Text(implemented.to_string()),
+                Reply::Text(review.to_string()),
+            ])
+            .await
+            .expect("fake model");
+            let env = model_env(&model.base_url());
+            let id = format!("change-{tag}");
+            let (log, out) = (
+                dir.join(format!("{tag}.log")),
+                dir.join(format!("{tag}.out")),
+            );
+            let mut child = spawn_logged(
+                &dir,
+                &cwd,
+                &[
+                    "--json",
+                    "--project",
+                    &project_arg,
+                    "run",
+                    "change-request",
+                    "--run-id",
+                    &id,
+                    "--data",
+                    task.as_str(),
+                    "--fixture",
+                    fixture_arg,
+                    "--fixture-rev",
+                    "baseline",
+                ],
+                &with(&env, &[]),
+                &log,
+                &out,
+            );
+            // Admitted from a directory that is neither the project nor the
+            // fixture: the fixture found from there by a relative path, at
+            // the revision it was given, pinned to its commit — which the
+            // run names before anything of it runs.
+            let top = std::fs::canonicalize(&fixture).expect("fixture");
+            wait_for_line(
+                &log,
+                &out,
+                &format!(
+                    "run {id}: fixture {} at baseline pinned to commit {base}",
+                    top.display()
+                ),
+                &format!("{tag}: admitted the fixture named from outside the project"),
+            );
+            // Finding the fixture from another directory and copying its
+            // baseline into a snapshot of atomic's own leave the repository
+            // as they found it.
+            assert_eq!(
+                format!("{}\n{}", git_state(&fixture), git_status(&fixture)),
+                source,
+                "{tag}: binding the fixture leaves it as it was found"
+            );
+            // Planned, then stopped at the first gate, which shows the plan.
+            let g = await_gate(&rt, &id).await;
+            assert_eq!(g.step, "approve-plan", "{tag}");
+            assert_eq!(g.title, "Approve bounded plan", "{tag}");
+            assert_eq!(g.show, plan, "{tag}");
+            approve(&rt, &g).await;
+            // Implemented in a worktree of the fixture's snapshot and
+            // reviewed, then stopped at the second gate.
+            let g = await_gate(&rt, &id).await;
+            assert_eq!(g.step, "accept-change", "{tag}");
+            assert_eq!(
+                model.calls(),
+                4,
+                "{tag}: plan, one command, its report, review"
+            );
+            let commit = g.show["commit"]
+                .as_str()
+                .expect("the candidate commit")
+                .to_owned();
+            assert_eq!(g.show["review"], review, "{tag}");
+            approve(&rt, &g).await;
+            let status = tokio::task::spawn_blocking(move || wait_child(&mut child, "the run"))
+                .await
+                .expect("child");
+            let shown = std::fs::read_to_string(&log).unwrap_or_default();
+            let printed = std::fs::read_to_string(&out).unwrap_or_default();
+            assert!(status.success(), "{tag}: {shown}\n{printed}");
+            // The run finished, returned the review, and called the model no
+            // more than the four times its four steps needed.
+            let doc = read_json(&out);
+            assert_eq!(doc["run"], id, "{tag}");
+            assert_eq!(doc["status"], "succeeded", "{tag}: {doc}");
+            assert_eq!(doc["output"], review, "{tag}: {doc}");
+            assert_eq!(model.calls(), 4, "{tag}: nothing ran after the last gate");
+            let record = rt.run_record(&id).await.expect("record").expect("run");
+            let bound = &record.input["pipeline"]["fixture"];
+            assert_eq!(bound["rev"], "baseline", "{tag}: {bound}");
+            assert_eq!(bound["commit"], base, "{tag}: the baseline is pinned");
+            assert_eq!(
+                bound["source"].as_str().map(PathBuf::from),
+                Some(top),
+                "{tag}: the fixture named from the other directory"
+            );
+            let snapshot = PathBuf::from(bound["snapshot"].as_str().expect("snapshot"));
+            assert!(
+                snapshot.starts_with(&state),
+                "{tag}: the snapshot is atomic's own"
+            );
+            // The candidate is atomic's commit on the pinned base, and it
+            // holds the edit the model ran; the reviewer was given both.
+            assert_eq!(
+                git_in(&snapshot, &["rev-parse", &format!("{commit}^")]),
+                base,
+                "{tag}"
+            );
+            let fixed = git_in(&snapshot, &["show", &format!("{commit}:pricing.py")]);
+            assert!(
+                fixed.contains("return unit_cents * quantity"),
+                "{tag}: the commit holds the model's edit: {fixed}"
+            );
+            let asked = model.requests()[3].to_string();
+            assert!(
+                asked.contains(&commit) && asked.contains(&base),
+                "{tag}: the reviewer was given {commit} on {base}: {asked}"
+            );
+            pinned.push(bound["commit"].as_str().expect("commit").to_owned());
+            // The fixture repository is exactly as it was: its refs, its
+            // worktrees and its working tree, every untracked file included.
+            assert_eq!(
+                format!("{}\n{}", git_state(&fixture), git_status(&fixture)),
+                source,
+                "{tag}: the fixture repository is as it was"
+            );
+        }
+        // Started from two unrelated directories, both runs pinned the same
+        // commit of the same fixture: the revision they were given, and not
+        // the repository's tip.
+        assert_eq!(pinned.len(), runs.len());
+        assert!(
+            pinned.iter().all(|c| c == &pinned[0]),
+            "{pinned:?}: the same base commit every time"
+        );
+        assert_eq!(pinned[0], base, "{pinned:?}");
+        assert!(
+            pinned.iter().all(|c| c != &candidate),
+            "{pinned:?}: the pin is the named revision, not the tip"
+        );
+        let _ = std::fs::remove_dir_all(&outside);
     });
 }
 
