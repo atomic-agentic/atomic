@@ -88,13 +88,16 @@ run_cli a_name_a_path_and_the_project_flag_run_the_same_atom_on_the_same_input
 
 ## A change to validation alone reuses earlier results, labelled as historical, while a change to prepared context, generation schema, tool fixtures or model settings makes the recording unusable.
 # The replay says it is a historical check; the identity is the whole request
-# body less four fields that differ between runs; and a replay needs the
-# endpoint it was recorded for.
+# body less four fields that differ between runs; a replay needs the endpoint
+# it was recorded for; and editing the atom's output schema — one property's
+# description, then a property added — leaves every case without a recording,
+# says to record it again, and calls no model.
 eval_cli atomic_eval_records_replays_offline_and_fails_ci_on_a_pass_rate_drop
 atomic_core cassette::tests::recorded_evals_replay_offline_until_the_request_changes
 atomic_core cassette::tests::the_identity_ignores_what_varies_between_runs_and_nothing_else
 eval_cli a_replay_needs_the_endpoint_it_was_recorded_for_and_no_key
-pending: no test makes a recording unusable by changing the generation schema or a tool fixture: the tests change the instructions, the model and the endpoint, and name the schema and the tool definitions only through the identity, which hashes the whole request body. A test would record once, then replay after editing the atom's output schema and one declared tool, each expecting a miss that says to record again.
+eval_cli an_edited_output_schema_makes_a_recording_unusable_and_says_to_record_again
+pending: tool fixtures and prepared context are still not shown. No tool definition reaches a recording in this version: an atom that declares any tool is refused at load, a lite atom's request carries none, and the kind that runs with tools, a Codex atom, is refused under cassettes; and a case's `prepared` values load and are then refused by the runner, so what these tests edit is the atom's instructions, not prepared context. A test would record an atom that has a declared tool and a case with prepared values, then replay after editing each, expecting the miss that says to record again.
 
 ## `atomic run` returns the same result whether the target is named from inside the project or given as a path from elsewhere.
 run_cli a_name_a_path_and_the_project_flag_run_the_same_atom_on_the_same_input

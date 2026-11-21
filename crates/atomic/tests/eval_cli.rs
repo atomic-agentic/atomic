@@ -13,6 +13,8 @@
 //! - a case selected by its identity runs alone, and with no atom named only
 //!   the atoms that have it run;
 //! - a call with no recording fails the eval whatever its pass rate;
+//! - editing the atom's output schema makes every recording of it unusable,
+//!   in plain output and in `--json`, and says to record it again;
 //! - a live eval is metered in the usage ledger, and a budget with no room
 //!   for a call stops it before any;
 //! - a replay reads no API key and sends none;
@@ -689,6 +691,114 @@ fn a_replay_needs_the_endpoint_it_was_recorded_for_and_no_key() {
             .expect("eval");
         assert!(!none.status.success(), "{}", text(&none));
         assert!(text(&none).contains("recorded for"), "{}", text(&none));
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+/// What a recording answers is the whole request it was made for, the
+/// generation schema among it: `note`'s recordings are recorded once, and
+/// then each of two edits to its output schema — one property's description,
+/// and a property added — leaves every case without a recording, in plain
+/// output and in `--json`, with no model call to fill the gap. The schema
+/// back as it was, the same recordings answer again.
+#[test]
+fn an_edited_output_schema_makes_a_recording_unusable_and_says_to_record_again() {
+    on_codex_runtime(async {
+        let dir = scratch("schema-edit");
+        let project = project(&dir, None);
+        let model = FakeModel::respond(answer).await.expect("fake model");
+        let url = model.base_url();
+
+        // Recorded live: `note`'s two cases, two calls.
+        let out = eval_async(&dir, &project, &url, &["note", "--live"]).await;
+        assert!(out.status.success(), "{}", text(&out));
+        let recorded = model.calls();
+        assert_eq!(recorded, 2, "one call per case");
+
+        // The control: with nothing edited, the same eval is answered whole
+        // from those recordings, and says it is a historical check.
+        let out = eval_async(&dir, &project, &url, &["note"]).await;
+        assert!(out.status.success(), "{}", text(&out));
+        let said = text(&out);
+        assert!(said.contains("a historical check"), "{said}");
+        assert!(
+            said.contains("PASS note: 2 of 2 cases passed"),
+            "the recording is usable: {said}"
+        );
+        assert!(
+            said.contains("2 replayed, 0 recorded, 0 without a recording"),
+            "{said}"
+        );
+        assert_eq!(model.calls(), recorded, "a replay called the model");
+
+        let schema = project.join("atoms/note.output.schema.json");
+        let original = std::fs::read_to_string(&schema).expect("the output schema");
+        let contract: Value = serde_json::from_str(&original).expect("the schema is JSON");
+        // Neither edit changes what the recorded answers say: one writes a
+        // property's description, the other adds an optional property.
+        let mut described = contract.clone();
+        described["properties"]["ticket"]["description"] = json!("The ticket's own ID.");
+        let mut widened = contract;
+        widened["properties"]["severity"] = json!({"type": "string"});
+
+        for edited in [described, widened] {
+            std::fs::write(&schema, edited.to_string()).expect("the edited schema");
+            // Plain: each case's failure names the miss, and the eval says
+            // how many calls had no recording and how to record them.
+            let out = eval_async(&dir, &project, &url, &["note"]).await;
+            assert!(
+                !out.status.success(),
+                "the edit was accepted: {}",
+                text(&out)
+            );
+            let said = text(&out);
+            for part in [
+                "no recording answers this request",
+                "the prompt, schema, model or settings differ from every recorded one",
+                "run the eval with --live to record it",
+                "2 model call(s) had no usable recording (2 missing, 0 corrupt): \
+                 record them with --live",
+            ] {
+                assert!(said.contains(part), "{part}: {said}");
+            }
+            // `--json`: the same miss in the report, and every recording of
+            // the edited atom counted as missing, none replayed.
+            let out = eval_async(&dir, &project, &url, &["note", "--json"]).await;
+            assert!(!out.status.success(), "{}", text(&out));
+            let report: Value = serde_json::from_slice(&out.stdout).expect("one JSON report");
+            assert_eq!(report["passed"], false, "{report}");
+            assert_eq!(report["source"], "recorded", "{report}");
+            assert_eq!(report["cassettes"][0]["replayed"], 0, "{report}");
+            assert_eq!(report["cassettes"][0]["missed"], 2, "{report}");
+            assert_eq!(
+                report["cassettes"][0]["corrupt"], 0,
+                "a miss read as corrupt: {report}"
+            );
+            let cases = report["reports"][0]["cases"].as_array().expect("two cases");
+            assert_eq!(cases.len(), 2, "{report}");
+            for case in cases {
+                assert_eq!(case["passed"], false, "{case}");
+                let failures = case["failures"]
+                    .as_array()
+                    .expect("the failed case names its failures");
+                assert!(
+                    failures
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .any(|f| f.contains("run the eval with --live to record it")),
+                    "the case says to record again: {case}"
+                );
+            }
+            // The schema back as it was: those same recordings answer, which
+            // is what shows the edit alone made them useless.
+            std::fs::write(&schema, &original).expect("the schema back");
+            let out = eval_async(&dir, &project, &url, &["note", "--json"]).await;
+            assert!(out.status.success(), "{}", text(&out));
+            let report: Value = serde_json::from_slice(&out.stdout).expect("one JSON report");
+            assert_eq!(report["cassettes"][0]["replayed"], 2, "{report}");
+            assert_eq!(report["cassettes"][0]["missed"], 0, "{report}");
+        }
+        assert_eq!(model.calls(), recorded, "a miss reached the model");
         let _ = std::fs::remove_dir_all(&dir);
     });
 }
