@@ -28,7 +28,10 @@ on:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # A newer push to a pull request makes its older run moot. A run on main,
+  # or on a merge group, is the check of what main holds, and it saves the
+  # caches, so it always runs to the end.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
