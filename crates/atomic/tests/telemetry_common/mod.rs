@@ -544,15 +544,119 @@ pub fn signal(child: &std::process::Child, name: &str) {
     assert_eq!(sent, 0, "kill -{name}: {}", std::io::Error::last_os_error());
 }
 
-/// How long [`wait_for_gate`] waits for a run to reach its gate: far more
-/// than a run of one model call takes, however loaded the machine.
+/// A command a test started and must leave ended: as this goes out of
+/// scope, however the test ends, the command is killed if it still runs and
+/// then reaped, so a test that panicked part way through leaves nothing
+/// running and nothing unreaped.
+pub struct Child(std::process::Child);
+
+impl Child {
+    /// Wrap `child`, which this then takes responsibility for ending.
+    pub fn new(child: std::process::Child) -> Self {
+        Self(child)
+    }
+}
+
+impl std::ops::Deref for Child {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Child {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for Child {
+    fn drop(&mut self) {
+        // What a test that reaped the command itself leaves here is one
+        // `try_wait` and one `wait`, both of which answer at once.
+        if self.0.try_wait().unwrap_or(None).is_none() {
+            signal(&self.0, "KILL");
+        }
+        let _ = self.0.wait();
+    }
+}
+
+/// How long [`wait_for_gate`] waits for a run to reach its gate, and with
+/// it each `atomic gates list` it runs: far more than a run of one model
+/// call takes, however loaded the machine.
 pub const GATE_LIMIT: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// The lines a run has written to stderr, as its reader read them: each
+/// with its line end, and the whitespace before it, off the end. The channel
+/// hands each line out once, so every line read is kept in `seen`: a test
+/// that waits for one can still be told all the run wrote, whether or not an
+/// earlier wait took it first.
+struct Lines {
+    unread: std::sync::mpsc::Receiver<String>,
+    seen: Vec<String>,
+}
+
+impl Lines {
+    /// Move every line read so far into `seen`, without waiting for more.
+    fn drain(&mut self) {
+        while let Ok(line) = self.unread.try_recv() {
+            self.seen.push(line);
+        }
+    }
+
+    /// Every line read so far, whether an earlier call looked at it or not.
+    fn so_far(&mut self) -> Vec<String> {
+        self.drain();
+        self.seen.clone()
+    }
+
+    /// Whether a line read so far holds `needle`. A line the run is still
+    /// writing is not counted until its end arrives.
+    fn holds(&mut self, needle: &str) -> bool {
+        self.drain();
+        self.seen.iter().any(|l| l.contains(needle))
+    }
+
+    /// Wait until a line holds `needle`, panicking with every line read so
+    /// far once `limit` has passed, or as soon as the run's stderr closes
+    /// without it. A line that came before this call counts: the run may
+    /// have said it already.
+    fn wait_for(&mut self, needle: &str, limit: std::time::Duration) {
+        let by = std::time::Instant::now() + limit;
+        loop {
+            if self.holds(needle) {
+                return;
+            }
+            match self
+                .unread
+                .recv_timeout(std::time::Duration::from_millis(50))
+            {
+                // Nothing new yet: the line the run is writing now may be
+                // the one.
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                // The run's last word.
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Ok(line) => self.seen.push(line),
+            }
+            if std::time::Instant::now() >= by {
+                break;
+            }
+        }
+        let seen = self.so_far();
+        panic!(
+            "no stderr line holds {needle:?} within {limit:?}; the run had written:\n{}",
+            seen.join("\n"),
+        );
+    }
+}
+
 /// What a run started with piped output printed, read as it goes so the
-/// run never blocks on a full pipe.
+/// run never blocks on a full pipe. Each stderr line it reads goes to a
+/// channel too, so a test can act on what the run says while it still runs.
 pub struct Drained {
     stdout: std::thread::JoinHandle<Vec<u8>>,
     stderr: std::thread::JoinHandle<Vec<u8>>,
+    lines: Lines,
 }
 
 impl Drained {
@@ -567,6 +671,36 @@ impl Drained {
                 all
             })
         };
+        let (sent, unread) = std::sync::mpsc::channel();
+        let read_stderr = |pipe: Option<Box<dyn Read + Send>>| {
+            std::thread::spawn(move || {
+                let mut all = Vec::new();
+                let Some(mut pipe) = pipe else { return all };
+                let mut partial: Vec<u8> = Vec::new();
+                let mut chunk = [0u8; 4096];
+                // A read error ends the lines as surely as the end of the
+                // pipe; either way what was read is all there is.
+                while let Ok(read) = pipe.read(&mut chunk) {
+                    if read == 0 {
+                        break;
+                    }
+                    all.extend_from_slice(&chunk[..read]);
+                    for byte in &chunk[..read] {
+                        if *byte != b'\n' {
+                            partial.push(*byte);
+                            continue;
+                        }
+                        let line = String::from_utf8_lossy(&partial).trim_end().to_owned();
+                        partial.clear();
+                        let _ = sent.send(line);
+                    }
+                }
+                if !partial.is_empty() {
+                    let _ = sent.send(String::from_utf8_lossy(&partial).into_owned());
+                }
+                all
+            })
+        };
         let stdout = child
             .stdout
             .take()
@@ -577,33 +711,111 @@ impl Drained {
             .map(|p| Box::new(p) as Box<dyn Read + Send>);
         Self {
             stdout: read(stdout),
-            stderr: read(stderr),
+            stderr: read_stderr(stderr),
+            lines: Lines {
+                unread,
+                seen: Vec::new(),
+            },
         }
     }
 
-    /// Wait for `child` to end and return how it ended and all it printed.
+    /// Wait for `child` to end and return how it ended and all it printed:
+    /// the readers go on to the end of the pipes, so these bytes are the
+    /// run's whole output. A test that has to act on a line the run writes
+    /// before it ends uses [`Drained::wait_for_stderr`].
     pub fn wait(self, child: &mut std::process::Child) -> Output {
         let status = child.wait().unwrap();
+        let Self {
+            stdout,
+            stderr,
+            lines,
+        } = self;
+        let stdout = stdout.join().unwrap();
+        let stderr = stderr.join().unwrap();
+        // Dropped last: the readers send here until the pipes close, and a
+        // channel with no receiver on the other side loses their lines.
+        drop(lines);
         Output {
             status,
-            stdout: self.stdout.join().unwrap(),
-            stderr: self.stderr.join().unwrap(),
+            stdout,
+            stderr,
         }
+    }
+
+    /// Block until one of the run's stderr lines holds `needle`, or fail the
+    /// test with every line the run had written once `limit` passes. A line
+    /// it wrote before this call counts: the run may have said it already.
+    /// Once the run has ended, its whole stderr is in the bytes
+    /// [`Drained::wait`] returns, and that is what to test against.
+    pub fn wait_for_stderr(&mut self, needle: &str, limit: std::time::Duration) {
+        self.lines.wait_for(needle, limit);
     }
 }
 
+/// How long one `atomic gates list` inside [`wait_for_gate`] is waited for
+/// before it is killed and tried again: far more than that command takes,
+/// however loaded the machine, and far less than [`GATE_LIMIT`], so a CLI
+/// stuck on a lock costs one poll rather than the whole wait.
+const POLL_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Wait until the run `child` runs in `dir`'s project waits at a gate, as
 /// `atomic gates list` shows, reading its output meanwhile. A run that ends
-/// first, or has not reached its gate within [`GATE_LIMIT`], fails the
-/// test with how it ended and what it printed; one still running then is
-/// killed first.
-pub fn wait_for_gate(dir: &Path, model: &str, child: &mut std::process::Child) -> Drained {
+/// first, or has not reached its gate within [`GATE_LIMIT`], fails the test
+/// with how it ended and what it printed; one still running then is killed
+/// first.
+///
+/// Each poll is spawned and waited for with `try_wait`, under a
+/// [`POLL_LIMIT`] of its own that never runs past [`GATE_LIMIT`]: one that
+/// stops answering is killed, reaped and tried again. How many polls ran,
+/// how long the last one took, and how many had to be killed, are in the
+/// message that then fails the test.
+///
+/// No row under `scripts/controls/` switches this bound off, because a row
+/// needs a test that fails with the control off and nothing in the
+/// repository makes `atomic gates list` stop answering on its own. It is
+/// measured by hand: with the poll replaced by a command that never ends,
+/// the wait kills it, counts it and tries again, and with the bound removed
+/// the same wait does not come back at all.
+pub fn wait_for_gate(dir: &Path, model: &str, child: &mut Child) -> Drained {
     let drained = Drained::of(child);
     let deadline = std::time::Instant::now() + GATE_LIMIT;
+    let mut polls = 0usize;
+    let mut killed = 0usize;
     loop {
-        let listed = command(dir, model, &["gates", "list", "--json"], &[])
-            .output()
-            .unwrap();
+        let started = std::time::Instant::now();
+        let mut poll = Child::new(
+            command(dir, model, &["gates", "list", "--json"], &[])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        // The poll's pipes are read as they fill, as the run's are, so a
+        // poll is never held up by output nobody is taking either.
+        let printed = Drained::of(&mut poll);
+        let by =
+            started + POLL_LIMIT.min(deadline.saturating_duration_since(std::time::Instant::now()));
+        while poll.try_wait().unwrap().is_none() && std::time::Instant::now() < by {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let took = started.elapsed();
+        polls += 1;
+        if poll.try_wait().unwrap().is_none() {
+            // Not going to answer: killed and reaped here, and tried again
+            // next time round. What it printed so far is what this poll has.
+            signal(&poll, "KILL");
+            killed += 1;
+        }
+        let listed = printed.wait(&mut poll);
+        let counted = format!(
+            "({polls} poll(s), the last took {} ms{})",
+            took.as_millis(),
+            if killed == 0 {
+                String::new()
+            } else {
+                format!(", {killed} killed")
+            },
+        );
         let open: Value = serde_json::from_slice(&listed.stdout).unwrap_or(json!([]));
         if open.as_array().is_some_and(|g| !g.is_empty()) {
             return drained;
@@ -619,7 +831,7 @@ pub fn wait_for_gate(dir: &Path, model: &str, child: &mut std::process::Child) -
             };
             let out = drained.wait(child);
             panic!(
-                "{why}; it ended {}: {}\n`atomic gates list` last said: {}",
+                "{why}; it ended {}: {}\n`atomic gates list` last said: {} {counted}",
                 out.status,
                 text(&out),
                 text(&listed)
