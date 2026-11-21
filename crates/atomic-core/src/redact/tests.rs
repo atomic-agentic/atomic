@@ -2235,3 +2235,53 @@ fn reading_pairs_as_written_never_shows_what_was_hidden() {
     );
     assert!(hidden_more > 0, "nothing is hidden that was shown before");
 }
+
+/// JSON held in a string inside JSON held in a string is read by its names
+/// as written too, two and three levels deep.
+#[test]
+fn a_pair_in_json_nested_in_strings_is_read_by_the_name_written() {
+    let pair = json!({"env": [{"key": "DB_PASSWORD", "value": "hunter2 x"}]}).to_string();
+    let two = json!({"body": pair}).to_string();
+    let three = json!({"body": two.clone()}).to_string();
+    for (depth, doc) in [
+        (2, json!({"arguments": two})),
+        (3, json!({"arguments": three})),
+    ] {
+        let mut out = doc;
+        value(&mut out);
+        assert!(
+            !out.to_string().contains("hunter2 x"),
+            "depth {depth}: the value showed"
+        );
+        let mut again = out.clone();
+        value(&mut again);
+        assert_eq!(again, out, "depth {depth}: a second pass changed it");
+    }
+}
+
+/// Under a hint, held JSON opened as held is read by its names as written
+/// too, not only after text redaction hid them.
+#[test]
+fn held_json_is_read_by_the_names_written() {
+    let doc = json!({"key": json!([
+        {"key": "DB_PASSWORD", "value": "correct horse"},
+        {"note": concat!("Zx81", "kQ0pL2mN4bV6")},
+    ]).to_string()});
+    let mut out = doc;
+    value(&mut out);
+    let shown = out.to_string();
+    assert!(!shown.contains("correct horse"), "the value showed");
+    assert!(!shown.contains("kQ0pL2mN4bV6"), "the credential showed");
+}
+
+/// A string held under a hint that text redaction leaves reading as a
+/// credential whole is hidden in the same pass, as a second pass would hide
+/// it.
+#[test]
+fn a_held_string_that_redacts_to_a_credential_settles_in_one_pass() {
+    let mut once = json!({"token": "pwd=\"a b\""});
+    value(&mut once);
+    let mut twice = once.clone();
+    value(&mut twice);
+    assert_eq!(twice, once, "a second pass changed it");
+}
