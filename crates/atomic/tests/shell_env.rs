@@ -1058,8 +1058,12 @@ async fn patch_keeps_its_registry(tag: &str, relative: bool) {
         .into_iter()
         .map(|r| r.parent().unwrap().to_owned())
         .collect();
+    // In the shared directory of the backend runs use: the project's `run`
+    // root in the home's `scratch/`.
     assert!(
-        shared.len() == 1 && shared[0].ends_with("scratch/.tmp"),
+        shared.len() == 1
+            && shared[0].ends_with("run/.tmp")
+            && shared[0].starts_with(state.join("scratch")),
         "registries: {shared:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
