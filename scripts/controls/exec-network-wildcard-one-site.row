@@ -1,0 +1,1 @@
+exec-network-wildcard-one-site|crates/atomic-core/src/network.rs|                    && within_one_site(&host, parent)|                    && true|-p atomic-agentic-core --lib --features fake-model network::tests::a_wildcard_does_not_reach_across_a_public_suffix_below_it

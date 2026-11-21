@@ -1,0 +1,1 @@
+review-checked-first|crates/atomic/src/pipeline.rs|    check_reviews(&pipeline)?;|    let _ = check_reviews;|-p atomic-agentic --test pipeline a_hand_built_review_the_loader_would_refuse_is_refused_before_any_call

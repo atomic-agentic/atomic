@@ -380,3 +380,189 @@ fn a_confined_command_with_hosts_and_read_only_inputs_keeps_both() {
     local.close(&workspace).expect("closes");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// What a command given a declared host checks about its proxy token.
+const TOKEN: &str = r#"import json, os, sys, time, urllib.request
+ready, done = sys.argv[1:]
+key = 'CODEX_NETWORK_PROXY_ATTRIBUTION'
+seen = []
+for pid in os.listdir('/proc'):
+    if pid.isdigit():
+        try:
+            if key.encode() in open('/proc/' + pid + '/environ', 'rb').read():
+                seen.append(pid)
+        except Exception:
+            pass
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({'http': os.environ['HTTP_PROXY']}))
+try:
+    opener.open('http://allowed.invalid/', timeout=20).read()
+    fetched = 'ok'
+except urllib.error.HTTPError as e:
+    fetched = 'HTTP ' + str(e.code) + ' ' + json.loads(e.read()).get('reason', '')
+except Exception as e:
+    fetched = type(e).__name__ + ': ' + str(e)
+open(ready, 'w').close()
+while not os.path.exists(done):
+    time.sleep(0.1)
+json.dump({
+    'env': key in os.environ,
+    'self': key.encode() in open('/proc/self/environ', 'rb').read(),
+    'seen': seen,
+    'fetched': fetched,
+}, sys.stdout)
+"#;
+
+/// This process's children that are Codex's sandbox helper (by the name
+/// the kernel keeps, its first 15 bytes) for a command run in `dir`, which
+/// its command line names, with the helper processes they forked, its
+/// bridges among them.
+fn sandbox_helpers_in(dir: &Path) -> Vec<u32> {
+    let comm = "(codex-linux-san";
+    let dir = dir.display().to_string();
+    // pid, parent, name, for every process.
+    let all: Vec<(u32, u32, String)> = std::fs::read_dir("/proc")
+        .expect("proc")
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+        .filter_map(|pid| {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            // pid (comm) state ppid ...
+            let (head, rest) = stat.rsplit_once(") ")?;
+            let ppid = rest.split(' ').nth(1)?.parse().ok()?;
+            Some((pid, ppid, head.to_owned()))
+        })
+        .collect();
+    let mut found: Vec<u32> = all
+        .iter()
+        .filter(|(pid, ppid, head)| {
+            *ppid == std::process::id()
+                && head.ends_with(comm)
+                && std::fs::read(format!("/proc/{pid}/cmdline"))
+                    .is_ok_and(|c| String::from_utf8_lossy(&c).contains(&dir))
+        })
+        .map(|(pid, _, _)| *pid)
+        .collect();
+    let forked: Vec<u32> = all
+        .iter()
+        .filter(|(_, ppid, head)| found.contains(ppid) && head.ends_with(comm))
+        .map(|(pid, _, _)| *pid)
+        .collect();
+    found.extend(forked);
+    found
+}
+
+/// A confined command's proxy token is its bridge's, never the command's:
+/// not in its environment, nor in that of any process it can see, and the
+/// helper outside the sandbox that started with it cannot be read through
+/// /proc by another process of the same user. The bridge's token still
+/// works: the command's request for its declared host, which never
+/// resolves, passes the proxy's token and host checks and is refused only
+/// by the address check (`not_allowed_local`). No loopback address is on
+/// the proxy's list here, so every request goes through the token check.
+#[test]
+fn a_confined_command_never_holds_its_proxy_token() {
+    support::require_sandbox();
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("atomic-exec-network-token-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("bin")).expect("scratch");
+    std::fs::create_dir_all(dir.join("project")).expect("project");
+    let dir = std::fs::canonicalize(dir).expect("canonical");
+    std::os::unix::fs::symlink(
+        env!("CARGO_BIN_EXE_atomic"),
+        dir.join("bin/codex-linux-sandbox"),
+    )
+    .expect("sandbox helper");
+    let paths = CodexPaths::with_helpers(
+        PathBuf::from(env!("CARGO_BIN_EXE_atomic")),
+        dir.join("bin/codex-linux-sandbox"),
+    );
+    let sandbox = ExecSandbox::new(&paths, StateGuard::NoProjectState, dir.join("codex"))
+        .expect("confinement");
+    let local = LocalBackend::in_dir(dir.join("scratch")).confined(Arc::new(sandbox));
+    local.connect().expect("connects");
+    let workspace = local
+        .open(&atomic_exec::Open {
+            label: "network-token".into(),
+            source: Some(dir.join("project")),
+            ..atomic_exec::Open::default()
+        })
+        .expect("opens");
+    let scratch = dir.join("cwd");
+    std::fs::create_dir_all(&scratch).expect("cwd");
+    let ready = scratch.join("ready");
+    let done = scratch.join("done");
+    let command = Command {
+        program: "python3".into(),
+        args: vec![
+            "-c".into(),
+            TOKEN.into(),
+            ready.display().to_string(),
+            done.display().to_string(),
+        ],
+        cwd: scratch.clone(),
+        env: vec![
+            ("HOME".into(), scratch.display().to_string()),
+            ("PATH".into(), "/usr/bin:/bin".into()),
+        ],
+        time_limit: Duration::from_secs(60),
+        output_limit: 1 << 16,
+        writable: vec![scratch.clone()],
+        network: vec!["allowed.invalid".into()],
+        ..Command::default()
+    };
+    let (done_run, helpers) = std::thread::scope(|s| {
+        let run = s.spawn(|| local.run(&command));
+        let started = std::time::Instant::now();
+        while !ready.exists() {
+            assert!(
+                started.elapsed() < Duration::from_secs(50) && !run.is_finished(),
+                "the command did not start"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let helpers: Vec<(u32, std::io::Result<Vec<u8>>)> = sandbox_helpers_in(&scratch)
+            .into_iter()
+            .map(|pid| (pid, std::fs::read(format!("/proc/{pid}/environ"))))
+            .collect();
+        std::fs::write(&done, "").expect("done");
+        (run.join().expect("the command"), helpers)
+    });
+    let done_run = done_run.expect("the command runs");
+    assert!(
+        done_run.success(),
+        "{}",
+        String::from_utf8_lossy(&done_run.stderr)
+    );
+    let got: Value = serde_json::from_slice(&done_run.stdout).unwrap_or_else(|e| {
+        panic!(
+            "{e}: {}{}",
+            String::from_utf8_lossy(&done_run.stdout),
+            String::from_utf8_lossy(&done_run.stderr)
+        )
+    });
+    assert_eq!(got["env"], false, "{got}");
+    assert_eq!(got["self"], false, "{got}");
+    assert_eq!(got["seen"], serde_json::json!([]), "{got}");
+    assert_eq!(got["fetched"], "HTTP 403 not_allowed_local", "{got}");
+    assert!(
+        !helpers.is_empty(),
+        "found no sandbox helper of this process"
+    );
+    for (pid, read) in helpers {
+        match read {
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{pid}: {e}"),
+            Ok(env) => panic!(
+                "read the sandbox helper {pid}'s environment ({} bytes, {} the token)",
+                env.len(),
+                if String::from_utf8_lossy(&env).contains("CODEX_NETWORK_PROXY_ATTRIBUTION") {
+                    "with"
+                } else {
+                    "without"
+                }
+            ),
+        }
+    }
+    local.close(&workspace).expect("closes");
+    let _ = std::fs::remove_dir_all(&dir);
+}

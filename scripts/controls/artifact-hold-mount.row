@@ -1,0 +1,1 @@
+artifact-hold-mount|crates/atomic-core/src/artifact/files.rs|            held.push(store.hold(artifact)?);|            let _ = (&mut held, artifact); // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model a_sweep_racing_a_mount_keeps_the_inputs

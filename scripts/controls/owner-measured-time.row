@@ -1,0 +1,1 @@
+owner-measured-time|crates/atomic-durable/src/usage.rs|            let took = active.unwrap_or(now - admitted).clamp(0, reserved);|            let took = active.and(/*CONTROL_OFF*/ None).unwrap_or(now - admitted).clamp(0, reserved);|-p atomic-agentic-durable --lib a_machine_that_slept_is_not_charged_the_sleep

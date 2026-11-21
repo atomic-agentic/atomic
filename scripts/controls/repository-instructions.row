@@ -1,0 +1,1 @@
+repository-instructions|crates/atomic-core/src/codex.rs|    (0, Some(TrustLevel::Untrusted))|    (32 * 1024, None) // CONTROL_OFF: as Codex was configured before|-p atomic-agentic-core --lib --features fake-model -- no_threads_configuration_discovers_repository_instructions a_turn_is_sent_no_instruction_file_of_the_checkout_it_runs_in

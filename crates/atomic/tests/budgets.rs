@@ -150,11 +150,10 @@ fn runtimes(dir: &Path, base_url: &str) -> Arc<Runtimes> {
             defaults: AtomConfig::default(),
             artifacts: Artifacts::none(),
             meter: Metering::none(),
-            backend: Default::default(),
             caches: None,
         },
         lite: LiteRuntime::new(endpoint, AtomConfig::default()),
-        exec: Default::default(),
+        backend: Default::default(),
         exec_meter: Default::default(),
         clock: None,
     })
@@ -1159,7 +1158,10 @@ fn parallel_children_cannot_both_take_the_last_reservation() {
                             let request = ChangeRequest {
                                 request: name.clone(),
                             };
-                            propose(async move { run_lite_atom(&DraftTask, &request, &lite).await })
+                            propose(async move {
+                                run_lite_atom(&DraftTask, &request, &lite, &Default::default())
+                                    .await
+                            })
                         },
                         Vec::new(),
                     )
@@ -1243,9 +1245,13 @@ fn a_lite_call_that_fails_is_charged_by_whether_it_could_have_been_sent() {
         .expect("fake model");
         let mut lite = runtimes(&dir, &model.base_url()).lite.clone();
         lite.meter = budget.meter(&step("sent"), &caps);
-        assert!(run_lite_atom(&DraftTask, &request, &lite).await.is_err());
+        assert!(
+            run_lite_atom(&DraftTask, &request, &lite, &Default::default())
+                .await
+                .is_err()
+        );
         lite.meter = budget.meter(&step("silent"), &caps);
-        run_lite_atom(&DraftTask, &request, &lite)
+        run_lite_atom(&DraftTask, &request, &lite, &Default::default())
             .await
             .expect("an answer without usage");
         for run in ["sent", "silent"] {
@@ -1264,7 +1270,11 @@ fn a_lite_call_that_fails_is_charged_by_whether_it_could_have_been_sent() {
             .lite
             .clone();
         lite.meter = budget.meter(&step("unsent"), &caps);
-        assert!(run_lite_atom(&DraftTask, &request, &lite).await.is_err());
+        assert!(
+            run_lite_atom(&DraftTask, &request, &lite, &Default::default())
+                .await
+                .is_err()
+        );
         assert_eq!(
             requests("unsent", &attempts(&rt, "unsent").await),
             [("0:0".to_owned(), 1, "released".to_owned())]
@@ -1592,7 +1602,7 @@ fn a_call_to_a_model_the_budget_does_not_price_is_not_made_under_a_dollar_cap() 
         let request = ChangeRequest {
             request: "Two units at 1.25 should cost 2.50.".into(),
         };
-        let refused = run_lite_atom(&DraftTask, &request, &lite)
+        let refused = run_lite_atom(&DraftTask, &request, &lite, &Default::default())
             .await
             .expect_err("refused");
         assert!(refused.to_string().contains("has no price"), "{refused}");

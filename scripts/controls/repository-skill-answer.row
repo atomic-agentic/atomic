@@ -1,0 +1,1 @@
+repository-skill-answer|crates/atomic-core/src/codex.rs|const ATOMIC_NEEDS_HOST_SKILLS: bool = false;|const ATOMIC_NEEDS_HOST_SKILLS: bool = true; // CONTROL_OFF: Codex's own default, which keeps the search|-p atomic-agentic-core --lib --features fake-model -- a_turn_is_sent_no_skill_of_the_checkout_it_runs_in

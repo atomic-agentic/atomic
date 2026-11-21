@@ -234,9 +234,9 @@ fn a_run_stopped_at_a_gate_ends_and_exports_its_spans() {
     .stderr(Stdio::piped())
     .spawn()
     .unwrap();
-    wait_for_gate(&dir, &model.base_url(), &mut child);
+    let drained = wait_for_gate(&dir, &model.base_url(), &mut child);
     signal(&child, "TERM");
-    let out = child.wait_with_output().unwrap();
+    let out = drained.wait(&mut child);
     assert!(!out.status.success(), "{}", text(&out));
 
     let spans = received.spans();
@@ -338,9 +338,10 @@ fn a_key_a_lite_provider_echoes_is_redacted_in_its_excerpt() {
             .and_then(|v| v.get("intValue"))
             .map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_owned));
         assert_eq!(int.as_deref(), Some("401"), "{call}");
-        if index > 0 {
-            continue;
-        }
+        // What the step's span and its run's say of why they failed is just
+        // what the call that failed said — its status and the type the
+        // provider named, or the status alone when it named none — and no
+        // part of what the provider wrote, which the run's stored error keeps.
         for name in ["invoke_agent rank-note", "invoke_workflow triage"] {
             let span = named(&spans, name);
             assert!(failed(span), "{span}");
@@ -349,6 +350,10 @@ fn a_key_a_lite_provider_echoes_is_redacted_in_its_excerpt() {
                 Some("atomic.failed"),
                 "{span}"
             );
+            let why = span["status"]["message"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{span} carries no status message: {span}"));
+            assert_eq!(why, expected, "{span} says other than the call did");
         }
     }
 }
@@ -664,13 +669,13 @@ fn a_second_signal_stops_at_once_while_spans_are_sent() {
     .stderr(Stdio::piped())
     .spawn()
     .unwrap();
-    wait_for_gate(&dir, &model.base_url(), &mut child);
+    let drained = wait_for_gate(&dir, &model.base_url(), &mut child);
     signal(&child, "TERM");
     // The gate's wait is no running step, so the flush starts at once: the
     // second signal comes well inside its deadline.
     std::thread::sleep(std::time::Duration::from_millis(300));
     signal(&child, "TERM");
-    let out = child.wait_with_output().unwrap();
+    let out = drained.wait(&mut child);
     assert!(!out.status.success(), "{}", text(&out));
     assert!(text(&out).contains(STOPPED_FLUSH), "{}", text(&out));
 }

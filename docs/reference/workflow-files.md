@@ -242,11 +242,15 @@ terminal and take the decision there: `a` or `r`, then a comment if you like.
 The decision carries your enrolled operator credential, as `atomic gates
 approve` does. Only what you type after a gate is shown decides it: input typed
 earlier is discarded, and commands that atoms run have no terminal to type into.
-Titles and what a gate shows can come from a model, so control characters in
-them are shown escaped, in `atomic gates list --json` too, where they are
-written as JSON escapes and read back as the same text. When standard input or standard error is not a terminal,
-or the run is in the background, the run prints how to decide the gate from
-another terminal and waits.
+Titles and what a gate shows can come from a model, so control characters and
+the marks that reorder or hide text are shown escaped. So is what atomic
+prints from a run: its result, `atomic runs show`, `atomic gates list`,
+`atomic eval` and an error, and the `--json` form of each, where they are JSON
+escapes and read back as the same text. atomic's log lines on standard error
+are redacted first and then escaped, keeping their line breaks and tabs. When
+standard input or standard error is not a
+terminal, or the run is in the background, the run prints how to decide the
+gate from another terminal and waits.
 
 ### Question gates
 

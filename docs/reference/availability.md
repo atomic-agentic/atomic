@@ -45,8 +45,9 @@ the step's `base` and record atomic's commit in `steps.<id>.metadata.commit`.
 A run keeps the definitions it started with. An atom step's `review` is built
 for one reviewer atom with a typed verdict: a request for changes gives the
 author repair rounds, and any other verdict but an approval, or a request for
-changes with no rounds left, goes to a person at a gate. Several reviewers, `require: majority`, `ai-then-human` gate policy
-and calibrated decision atoms are not built yet.
+changes with no rounds left, goes to a person at a gate. Several reviewers,
+`require: majority`, `ai-then-human` gate policy and calibrated decision atoms
+are not built yet.
 
 `atomic init`, `atomic run`, `atomic runs resume`, `atomic runs show`,
 `atomic config --explain` and a local foreground `atomic serve` are built.
@@ -74,11 +75,18 @@ Lite atoms need a model endpoint and say so.
 
 A project's artifact store takes a lock in its private state while it is
 written or swept. A run that finds it held by another process, such as a sweep,
-says so once, waits and tries again for a bounded time (about 7.4 minutes with
-the store's 30-second wait: 11 tries and the pauses between them), then stops
-and is run again. Each stop spends one
-of durare's recoveries of the run, and once they run out the run waits for
-`atomic runs resume`.
+as it pins its definitions or gives an exec atom's command the artifacts its
+input references, says so (a pin once a run, an exec step once each time it
+waits), waits and tries again for a bounded time (about 7.4 minutes with the
+store's 30-second wait: 11 tries and the pauses between them), then stops,
+recording nothing and running nothing, and is run again. A process that is
+stopping waits out no more pauses between tries, though a try already
+waiting on the store's lock runs to the end of that lock's wait. Such stops never count toward dead-lettering the
+run, however many there are; each spends one of durare's recoveries of the
+run, and once they run out the run waits for `atomic runs resume`. The files
+a command hands over are stored after it has run: a store held then is
+waited out a few times, and past that the step's outcome is unknown, as
+after a crash there.
 
 `atomic serve` also runs on PostgreSQL (`ATOMIC_DATABASE_URL`) when the process
 has an executor identity (`ATOMIC_EXECUTOR_ID`). `atomic runner` and
@@ -91,7 +99,16 @@ rendered, which runs the atom's helpers, it opens a workspace there before any
 model call or command, and closes it however the run ends, including a panic or
 a cancelled run, and only once a command running in it has ended. A backend
 with no room for a workspace makes the run wait, recording nothing and saying
-on stderr that it waits, and the run goes on once there is room. With the
+on stderr that it waits, and the run goes on once there is room. atomic's own
+writes for a step that find the disk or a quota full, making its run's build
+caches or the directory its worktree goes in, wait the same way. A checkout git
+cannot finish, for a full disk or anything else, fails the step with what git
+said, and the run ends failed; once space is freed, start it again. Each of
+these waits, and the wait for the backend, keeps its own clock, so a worktree
+step may wait up to three times its limit: for its caches, its worktree's
+directory and its workspace. Without a limit, a step whose own writes find the
+disk full waits for as long as it takes, saying so on stderr every ten minutes.
+With the
 `backend_wait` setting (`--backend-wait <seconds>`, `ATOMIC_BACKEND_WAIT`) it
 waits at most that long: `atomic run` and
 `atomic runs resume` then stop with exit code 75, the run unfinished and nothing
@@ -171,9 +188,10 @@ terminal's path in `/dev/pts` or another process's descriptors. A step that runs
 needs bubblewrap and unprivileged user namespaces there: where the sandbox
 cannot start, `atomic run` and `atomic runs resume` stop, saying what it needs,
 before the step runs and without recording an outcome, and the run continues
-when resumed where the sandbox can start. `atomic serve` instead leaves that run
-unfinished, says so, and goes on serving the others; the run continues when a
-later process recovers it. A sandbox that fails in a way that may pass, such as
+when resumed where the sandbox can start. `atomic serve` instead sets that run
+aside, unfinished, says so, and goes on serving the others; it tries the
+sandbox again, first after a few seconds and then at most a minute apart, and
+the run goes on once the sandbox starts. A sandbox that fails in a way that may pass, such as
 on a full disk, makes the step wait, as a backend with no room does. Atoms that run no commands run as usual. When atomic
 stops with commands still running, on Linux it ends every process they
 started, inside their sandboxes too, before it exits and frees the project's

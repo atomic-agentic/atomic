@@ -1,0 +1,1 @@
+stop-own-tool-wait|crates/atomic-exec/src/process.rs|                let waited = own(&all, &tools);|                let waited = own(&all, &[] /*CONTROL_OFF*/);|-p atomic-agentic-exec --test stop_all stopping_ends_every_process_a_command_started_before_it_returns
