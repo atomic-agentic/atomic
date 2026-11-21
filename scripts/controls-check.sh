@@ -42,7 +42,9 @@ LOG="${STATE}/cargo.log"
 
 # name | file | text to replace | replacement | cargo test arguments. A
 # control guarded by several tests names them all after `--`; each must fail
-# with the control off.
+# with the control off. A row switches off the first place its text is found,
+# so where one control has two sites the text of each is unlike the other's
+# (stop-own-tool and stop-own-tool-wait), and there is a row for each.
 CONTROLS=(
     "git-hardening|crates/atomic-core/src/git.rs|        for setting in HARDENING {|        for setting in HARDENING.iter().take(0) {|-p atomic-agentic-core --test git_safety nothing_in_the_worktree_or_the_repository_runs"
     "git-filters|crates/atomic-core/src/git.rs|        let mut overrides = (*self.overrides).clone();|        let mut overrides = (*self.overrides).clone(); let names: Vec<String> = { let _ = names; Vec::new() };|-p atomic-agentic-core --test git_safety nothing_in_the_worktree_or_the_repository_runs"
@@ -73,6 +75,7 @@ CONTROLS=(
     "stop-keep-found|crates/atomic-exec/src/process.rs|                found.insert(process);|                let _ = &process; // CONTROL_OFF|-p atomic-agentic-exec --lib the_stop_phase_is_bounded_and_keeps_what_it_found"
     "stop-kill-on-sight|crates/atomic-exec/src/process.rs|                if watched.insert(process) {|                if /*CONTROL_OFF*/ false && watched.insert(process) {|-p atomic-agentic-exec --test stop_all stopping_ends_every_process_a_command_started_before_it_returns"
     "stop-own-tool|crates/atomic-exec/src/process.rs|                let own = own(&all, &tools);|                let own = own(&all, &[] /*CONTROL_OFF*/);|-p atomic-agentic-exec --test stop_all stopping_ends_every_process_a_command_started_before_it_returns"
+    "stop-own-tool-wait|crates/atomic-exec/src/process.rs|                let waited = own(&all, &tools);|                let waited = own(&all, &[] /*CONTROL_OFF*/);|-p atomic-agentic-exec --test stop_all stopping_ends_every_process_a_command_started_before_it_returns"
     "stop-look-cap|crates/atomic-exec/src/process.rs|            look.saturating_mul(2).min(LOOK_MAX)|            look.saturating_mul(2) /*CONTROL_OFF*/|-p atomic-agentic-exec --lib the_next_look_grows_only_when_one_ran_out_and_is_capped"
     "exec-caches-own|crates/atomic-core/src/runtime.rs|    env.extend(declared_env(atom));|    writable_roots.extend(caches.map(crate::worktree::Caches::dir).and_then(std::path::Path::parent).map(std::path::Path::to_path_buf)); env.extend(declared_env(atom));|--workspace --features ${FEATURES} --test exec_caches an_exec_steps_caches_are_its_runs_alone_and_go_with_it"
     "signin-personal-only|crates/atomic/src/engine.rs|            (Some(why), true) => {|            (Some(why), true) if std::hint::black_box(false) => {|-p atomic-agentic --test model_auth -- a_shared_store_or_serve_refuses_the_personal_sign_in where_the_sign_in_is_refused_nothing_takes_its_place_and_it_says_what_to_do"
@@ -354,8 +357,14 @@ for row in "${selected[@]}"; do
     unfailed=""
     while read -r test; do
         # The name as it is, not as a pattern: a failed test's path holds it.
-        grep -E '^test [^ ]+ \.\.\. FAILED$' "${LOG}" | cut -d' ' -f2 | grep -qF -- "${test}" ||
+        # And read all of it, so `grep -F` does not stop at the first match:
+        # an earlier stage of the pipe would then die of SIGPIPE, which
+        # pipefail reports as a failure of the pipeline, and a test that did
+        # fail would read as one that was not seen.
+        if ! grep -E '^test [^ ]+ \.\.\. FAILED$' "${LOG}" | cut -d' ' -f2 |
+            grep -F -- "${test}" >/dev/null; then
             unfailed="${unfailed} ${test}"
+        fi
     done < <(named_tests "${args}")
     if [ -n "${unfailed}" ]; then
         echo "FAIL ${name}: with the control off, these tests were not seen failing:${unfailed}" >&2

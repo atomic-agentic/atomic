@@ -152,6 +152,7 @@ mod descendants {
     use super::OWN_TOOLS;
     use std::collections::{HashMap, HashSet};
     use std::io::ErrorKind;
+    use std::path::Path;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
@@ -266,21 +267,32 @@ mod descendants {
     /// started no earlier than its parent, as far as `/proc` can be read by
     /// `deadline`: processes that keep starting others cannot hold one look
     /// past it. Says whether the look was complete; reports those that
-    /// cannot be read.
+    /// cannot be read, telling `unreadable` which have been reported
+    /// already. That `proc` cannot be listed at all is reported once for a
+    /// whole stop, which `listed` records: the wait looks again every few
+    /// milliseconds and the reason never changes.
     fn found(
+        proc: &Path,
         report: &mut dyn FnMut(&str),
         unreadable: &mut HashSet<libc::pid_t>,
+        listed: &mut bool,
         deadline: Instant,
     ) -> (Vec<(Process, libc::pid_t)>, bool) {
         let me = libc::pid_t::try_from(std::process::id()).unwrap_or(0);
         let mut children: HashMap<libc::pid_t, Vec<(Process, libc::pid_t)>> = HashMap::new();
         let mut own_start = 0;
-        let entries = match std::fs::read_dir("/proc") {
+        let entries = match std::fs::read_dir(proc) {
             Ok(entries) => entries,
             Err(e) => {
-                report(&format!(
-                    "cannot list /proc, so the processes this one started cannot be found: {e}"
-                ));
+                // Once for the whole stop: the wait looks again every few
+                // milliseconds, and the reason never changes.
+                if !*listed {
+                    *listed = true;
+                    report(&format!(
+                        "cannot list {}, so the processes this one started cannot be found: {e}",
+                        proc.display()
+                    ));
+                }
                 return (Vec::new(), false);
             }
         };
@@ -458,10 +470,17 @@ mod descendants {
             libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
         }
         let mut unreadable = HashSet::new();
+        let mut listed = false;
         let begun = Instant::now();
         let (mut watched, settled) = stop_phase(
             &mut |deadline| {
-                let (all, complete) = found(report, &mut unreadable, deadline);
+                let (all, complete) = found(
+                    Path::new("/proc"),
+                    report,
+                    &mut unreadable,
+                    &mut listed,
+                    deadline,
+                );
                 let own = own(&all, &tools);
                 let others = all
                     .into_iter()
@@ -494,17 +513,21 @@ mod descendants {
             &mut watched,
             &mut |deadline| {
                 let (all, complete) = found(
+                    Path::new("/proc"),
                     &mut |what| (report.borrow_mut())(what),
                     &mut unreadable,
+                    &mut listed,
                     deadline,
                 );
-                let own = own(&all, &tools);
+                // The wait's own: waited for, never killed, unlike the
+                // others it finds.
+                let waited = own(&all, &tools);
                 let others = all
                     .into_iter()
                     .map(|(p, _)| p)
-                    .filter(|p| !own.contains(p))
+                    .filter(|p| !waited.contains(p))
                     .collect();
-                (others, own.into_iter().collect(), complete)
+                (others, waited.into_iter().collect(), complete)
             },
             &mut |process| signal(process, libc::SIGKILL),
             &mut |process| alive(process),
@@ -745,6 +768,78 @@ mod descendants {
                 !handle.is_finished(),
                 "the wait ended, or panicked, with no look complete"
             );
+        }
+
+        /// A look that cannot list the process directory fails at once, so
+        /// the wait comes round to it every few milliseconds: that it cannot
+        /// be listed is told once for the whole wait, not once a look.
+        #[test]
+        fn the_notice_that_proc_cannot_be_listed_is_told_once_per_wait() {
+            // How many looks fail before one gets through, which is more
+            // than the ten seconds after which the wait reports what is
+            // left, so that a report of those would show in the notices.
+            const LOOKS: u32 = 20;
+            // A regular file is nothing to list: every look of it fails at
+            // once, as one does where /proc is not mounted.
+            let proc =
+                std::env::temp_dir().join(format!("atomic-exec-no-proc-{}", std::process::id()));
+            std::fs::write(&proc, "").expect("the stand-in for /proc is a file");
+            let why = std::fs::read_dir(&proc).expect_err("a regular file cannot be listed");
+            let notes = Arc::new(Mutex::new(Vec::new()));
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let (listing, told) = (proc.clone(), notes.clone());
+            let handle = std::thread::spawn(move || {
+                let mut watched = HashSet::<Process>::new();
+                let mut unreadable = HashSet::new();
+                let mut listed = false;
+                let mut looks = 0;
+                wait_phase(
+                    &mut watched,
+                    &mut |deadline| {
+                        looks += 1;
+                        if looks > LOOKS {
+                            // One look that gets through and finds nothing
+                            // ends the wait, so that no thread is left.
+                            let _ = sender.send(looks);
+                            return (Vec::new(), Vec::new(), true);
+                        }
+                        let mut telling = |what: &str| {
+                            told.lock().expect("the notices").push(what.to_owned());
+                        };
+                        let (all, complete) = found(
+                            &listing,
+                            &mut telling,
+                            &mut unreadable,
+                            &mut listed,
+                            deadline,
+                        );
+                        (
+                            all.into_iter().map(|(process, _)| process).collect(),
+                            Vec::new(),
+                            complete,
+                        )
+                    },
+                    &mut |_| {},
+                    &mut |_| false,
+                    &mut |_| {},
+                    &|process| process.pid.to_string(),
+                    Instant::now(),
+                );
+            });
+            let looks = receiver
+                .recv_timeout(Duration::from_secs(60))
+                .expect("the wait never ended once a look got through");
+            handle.join().expect("the wait panicked");
+            assert!(looks > LOOKS, "the wait looked only {looks} times");
+            assert_eq!(
+                *notes.lock().expect("the notices"),
+                vec![format!(
+                    "cannot list {}, so the processes this one started cannot be found: {why}",
+                    proc.display()
+                )],
+                "the wait was told that {proc:?} cannot be listed once a look"
+            );
+            std::fs::remove_file(&proc).expect("the stand-in for /proc goes");
         }
 
         /// A look cut short that finds nothing running is no proof that
