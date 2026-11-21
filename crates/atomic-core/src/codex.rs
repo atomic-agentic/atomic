@@ -2365,6 +2365,15 @@ async fn new_config(
         // provider, pointed at another base URL, with no OpenAI sign-in and
         // no websockets.
         None => {
+            // A key to an endpoint on this machine over plain http would go
+            // to a proxy in cleartext, and Codex's client cannot be told to
+            // skip proxies: the turn is refused, saying how to fix it.
+            if endpoint.api_key_env.is_some()
+                && let Some(why) =
+                    crate::lite::proxied_key(&endpoint.base_url, &|name| std::env::var(name).ok())
+            {
+                anyhow::bail!(why);
+            }
             model_provider.name = "atomic endpoint".to_string();
             model_provider.base_url = Some(endpoint.base_url.clone());
             model_provider.env_key = endpoint.api_key_env.clone();

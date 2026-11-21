@@ -936,3 +936,90 @@ fn a_chat_spans_error_is_the_status_and_type_not_the_body() {
         "POST http://127.0.0.1:9/v1/chat/completions: Connection refused (os error 111)"
     );
 }
+
+/// A key to an endpoint on this machine over plain http is refused while a
+/// proxy variable would carry it there, unless NO_PROXY covers the host;
+/// nothing else is refused.
+#[test]
+fn a_key_a_proxy_would_carry_to_a_local_http_endpoint_is_refused() {
+    let env = |pairs: &'static [(&'static str, &'static str)]| {
+        move |name: &str| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| (*v).to_owned())
+        }
+    };
+    let local = "http://127.0.0.1:4000/v1";
+    for proxy in ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"] {
+        let pairs: &'static [(&'static str, &'static str)] =
+            Box::leak(vec![(proxy, "http://proxy.example:3128")].into_boxed_slice());
+        let why = proxied_key(local, &env(pairs)).unwrap_or_default();
+        assert!(why.contains(proxy), "{proxy}: {why}");
+        assert!(
+            why.contains("set NO_PROXY to include 127.0.0.1, or use an https endpoint"),
+            "{why}"
+        );
+    }
+    let proxied: &'static [(&str, &str)] = &[("HTTP_PROXY", "http://proxy.example:3128")];
+    // Not plain http on this machine: no proxy sees anything in cleartext
+    // that it would not see anyway.
+    for base in [
+        "https://127.0.0.1:4000/v1",
+        "http://example.com/v1",
+        "http://10.0.0.5:4000/v1",
+    ] {
+        assert_eq!(proxied_key(base, &env(proxied)), None, "{base}");
+    }
+    // Every local spelling is local.
+    for base in [
+        "http://localhost:4000/v1",
+        "http://api.localhost:4000/v1",
+        "http://[::1]:4000/v1",
+        "http://127.0.0.2:4000/v1",
+        "http://localhost.:4000/v1",
+    ] {
+        assert!(proxied_key(base, &env(proxied)).is_some(), "{base}");
+    }
+    // No proxy, or an empty one: nothing to refuse.
+    assert_eq!(proxied_key(local, &env(&[])), None);
+    assert_eq!(proxied_key(local, &env(&[("HTTP_PROXY", " ")])), None);
+    // NO_PROXY entries that cover the host, and ones that do not, as the
+    // model client matches them: what it would still proxy is not covered.
+    for (base, no_proxy, covered) in [
+        (local, "127.0.0.1", true),
+        (local, "example.com, 127.0.0.1", true),
+        (local, "127.0.0.0/8", true),
+        (local, "*", false),
+        (local, "localhost", false),
+        (local, "10.0.0.0/8", false),
+        (local, "127.0.0.2", false),
+        ("http://localhost:4000/v1", "localhost", true),
+        ("http://localhost:4000/v1", "*", true),
+        ("http://localhost.:4000/v1", "localhost", false),
+        ("http://api.localhost:4000/v1", ".localhost", true),
+        ("http://api.localhost:4000/v1", "other.localhost", false),
+        ("http://[::1]:4000/v1", "::1", true),
+        ("http://[::1]:4000/v1", "::1/128", true),
+        ("http://[::1]:4000/v1", "[::1]", false),
+    ] {
+        for name in ["NO_PROXY", "no_proxy"] {
+            let pairs: &'static [(&'static str, &'static str)] = Box::leak(
+                vec![("HTTP_PROXY", "http://proxy.example:3128"), (name, no_proxy)]
+                    .into_boxed_slice(),
+            );
+            assert_eq!(
+                proxied_key(base, &env(pairs)).is_none(),
+                covered,
+                "{base} with {name}={no_proxy}"
+            );
+        }
+    }
+    // A NO_PROXY that is set, even empty, hides no_proxy, as in the client.
+    let hidden: &'static [(&str, &str)] = &[
+        ("HTTP_PROXY", "http://proxy.example:3128"),
+        ("NO_PROXY", ""),
+        ("no_proxy", "127.0.0.1"),
+    ];
+    assert!(proxied_key(local, &env(hidden)).is_some());
+}

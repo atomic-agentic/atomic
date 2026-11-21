@@ -57,6 +57,85 @@ impl Wire {
     }
 }
 
+/// Why a model call carrying a key to `base_url` would hand that key to a
+/// proxy in cleartext, if it would: the endpoint is plain `http` on this
+/// machine (see [`http_loopback_host`]), a proxy variable (`HTTP_PROXY`,
+/// `http_proxy`, `ALL_PROXY` or `all_proxy`) names a proxy, and no entry
+/// of `NO_PROXY` covers the host. As in the client, a `NO_PROXY` that is set
+/// at all, even empty, hides `no_proxy`. `var` reads the environment. A Codex
+/// atom's client cannot be told to skip proxies, so its turn is refused
+/// rather than sent.
+pub fn proxied_key(base_url: &str, var: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    let host = http_loopback_host(base_url)?;
+    let set = |name: &str| var(name).filter(|v| !v.trim().is_empty());
+    let proxy = ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"]
+        .into_iter()
+        .find(|name| set(name).is_some())?;
+    let exempt = var("NO_PROXY")
+        .or_else(|| var("no_proxy"))
+        .is_some_and(|list| list.split(',').any(|entry| no_proxy_covers(entry.trim(), &host)));
+    if exempt {
+        return None;
+    }
+    Some(format!(
+        "the model endpoint {base_url} is plain http on this machine, and {proxy} names a proxy \
+         that would carry its API key there in cleartext; set NO_PROXY to include {host}, or use \
+         an https endpoint"
+    ))
+}
+
+/// Whether one `NO_PROXY` entry covers `host`, matched as the model client
+/// matches it: an address host by the same address or a network holding it
+/// (`127.0.0.0/8`, never `[::1]` in brackets); a name host by `*`, the same
+/// name, or a domain it is under (`localhost` or `.localhost`). Anything the
+/// client would still send through the proxy is not covered.
+fn no_proxy_covers(entry: &str, host: &str) -> bool {
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        if let Some((net, bits)) = entry.split_once('/') {
+            let (Ok(net), Ok(bits)) = (net.parse::<std::net::IpAddr>(), bits.parse::<u32>()) else {
+                return false;
+            };
+            return match (ip, net) {
+                (std::net::IpAddr::V4(ip), std::net::IpAddr::V4(net)) if bits <= 32 => {
+                    let mask = u32::MAX.checked_shl(32 - bits).unwrap_or(0);
+                    u32::from(ip) & mask == u32::from(net) & mask
+                }
+                (std::net::IpAddr::V6(ip), std::net::IpAddr::V6(net)) if bits <= 128 => {
+                    let mask = u128::MAX.checked_shl(128 - bits).unwrap_or(0);
+                    u128::from(ip) & mask == u128::from(net) & mask
+                }
+                _ => false,
+            };
+        }
+        return entry.parse::<std::net::IpAddr>() == Ok(ip);
+    }
+    if entry == "*" {
+        return true;
+    }
+    let entry = entry.trim_start_matches('.').to_ascii_lowercase();
+    !entry.is_empty() && (host == entry || host.ends_with(&format!(".{entry}")))
+}
+
+/// The host of `base_url` as the client matches it against `NO_PROXY`
+/// (lower case, an address without brackets, a trailing dot kept), when it
+/// is plain `http` to this machine: a loopback address or `localhost`.
+fn http_loopback_host(base_url: &str) -> Option<String> {
+    let url = reqwest::Url::parse(base_url).ok()?;
+    let host = url.host_str().filter(|_| url.scheme() == "http")?;
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    let local = match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => {
+            let name = host.trim_end_matches('.');
+            name == "localhost" || name.ends_with(".localhost")
+        }
+    };
+    local.then_some(host)
+}
+
 /// Whether `base_url` is OpenAI's own API, the one endpoint known to enforce
 /// a Responses API structured-output schema in decoding. Other servers may
 /// accept the schema on that API and ignore it.
