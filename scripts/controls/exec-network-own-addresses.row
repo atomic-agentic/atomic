@@ -1,0 +1,1 @@
+exec-network-own-addresses|crates/atomic-core/src/network.rs|        .chain(own.iter().map(IpAddr::to_string))|        .chain(own.iter().take(0).map(IpAddr::to_string))|-p atomic-agentic-core --lib --features fake-model network::tests::embedded_ipv4_and_this_machines_addresses_are_never_reached

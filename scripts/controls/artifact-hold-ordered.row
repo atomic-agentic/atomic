@@ -1,0 +1,1 @@
+artifact-hold-ordered|crates/atomic-core/src/artifact.rs|        let _ordered = StoreLock::take(&self.lock, false, self.lock_wait)?;|        let _ordered = (); // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model a_hold_waits_out_a_sweep_in_progress
