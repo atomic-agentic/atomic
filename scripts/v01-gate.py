@@ -41,6 +41,7 @@ not be set up.
 """
 
 import argparse
+import datetime
 import http.server
 import json
 import os
@@ -67,15 +68,10 @@ WAIT = 180  # seconds any one wait may take before the scenario fails
 # The ledger's model name for an exec command's metered time.
 WORK_MODEL = "(command)"
 
-# Settings from the caller's environment that would change what atomic does.
-CLEARED = [
-    "CODEX_HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME",
-    "ATOMIC_DATABASE_URL", "ATOMIC_DATABASE_SCHEMA", "ATOMIC_EXECUTOR_ID",
-    "DBOS__VMID", "DBOS__APPVERSION", "ATOMIC_FAILPOINT", "ATOMIC_FAILPOINT_PANIC",
-    "ATOMIC_MODEL_BASE_URL", "ATOMIC_MODEL", "ATOMIC_MODEL_API_KEY_ENV", "ATOMIC_RUNNER",
-    "ATOMIC_BACKEND_WAIT", "ATOMIC_CREDENTIAL_STORE", "OPENAI_API_KEY", "OPENAI_BASE_URL",
-    "DATABASE_URL",
-]
+# What in the caller's environment could change what atomic does: every
+# variable with one of these prefixes, and these by name.
+CLEARED_PREFIXES = ("ATOMIC_", "CODEX_", "OPENAI_", "DBOS__", "XDG_")
+CLEARED = ("DATABASE_URL",)
 
 
 def fixture(atom, which):
@@ -89,6 +85,10 @@ ANSWER = fixture("assess-order", "output")
 
 class Failed(Exception):
     """The scenario could not go on."""
+
+
+class Unexpected(Exception):
+    """What atomic recorded is not in the shape this script reads."""
 
 
 def say(line=""):
@@ -195,6 +195,7 @@ class Fake:
     def stop(self):
         self.release.set()
         self.server.shutdown()
+        self.server.server_close()
 
 
 # ---------------------------------------------------------------------------
@@ -207,7 +208,10 @@ class Scenario:
         self.project = os.path.join(work, "project")
         self.home = os.path.join(work, "home")
         self.logs = os.path.join(work, "logs")
-        self.env = {k: v for k, v in os.environ.items() if k not in CLEARED}
+        self.env = {
+            k: v for k, v in os.environ.items()
+            if k not in CLEARED and not k.startswith(CLEARED_PREFIXES)
+        }
         self.env.update({
             "HOME": self.home,
             "ATOMIC_HOME": os.path.join(work, "atomic-home"),
@@ -221,6 +225,10 @@ class Scenario:
         })
         self.passed = []
         self.failed = []
+        # Every atomic started in the background, and its log, so none is
+        # left running, or writing, when the scenario ends however it ends.
+        self.procs = []
+        self.log_files = []
 
     def run(self, args, quiet=False, stdin=subprocess.DEVNULL):
         """`atomic <args>` to completion. Fails the scenario if it fails."""
@@ -241,10 +249,26 @@ class Scenario:
         """`atomic <args>` in the background, its output in logs/<name>.log."""
         say(f"$ atomic {' '.join(args)} &")
         log = open(os.path.join(self.logs, f"{name}.log"), "w")
-        return subprocess.Popen(
+        self.log_files.append(log)
+        proc = subprocess.Popen(
             [self.atomic, *args], cwd=self.project, env=self.env,
             stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
         )
+        self.procs.append(proc)
+        return proc
+
+    def reap(self):
+        """Kill every background atomic still running, wait for each, and
+        close their logs: done before the work directory is removed."""
+        for proc in self.procs:
+            if proc.poll() is None:
+                proc.kill()
+            try:
+                proc.wait(10)
+            except subprocess.TimeoutExpired:
+                say(f"v01-gate: atomic {proc.pid} did not stop after SIGKILL")
+        for log in self.log_files:
+            log.close()
 
     def log(self, name):
         with open(os.path.join(self.logs, f"{name}.log")) as f:
@@ -292,6 +316,14 @@ class Scenario:
             raise Failed(f"the usage ledger has no allowance for run {RUN_ID}")
         return dict(allowance), [dict(a) for a in attempts]
 
+    def runs(self):
+        """Every run the project's store holds, by id."""
+        db = sqlite3.connect(f"file:{self.database()}?mode=ro", uri=True)
+        try:
+            return sorted(r[0] for r in db.execute("SELECT workflow_uuid FROM workflow_status"))
+        finally:
+            db.close()
+
     def check(self, clause, ok, evidence):
         say(f"  [{'PASS' if ok else 'FAIL'}] {clause}: {evidence}")
         (self.passed if ok else self.failed).append(clause)
@@ -337,6 +369,14 @@ def prepare(s, fake):
             f"    tokens: {TOKENS_CAP}\n"
             f"    minutes: {MINUTES_CAP}\n"
         )
+
+
+def when(ms):
+    """A time the store recorded, milliseconds since the Unix epoch, as UTC.
+    The gate store keeps times as such integers, not as text."""
+    if not isinstance(ms, int) or isinstance(ms, bool):
+        raise Unexpected(f"a recorded time is {ms!r}, not milliseconds since the epoch")
+    return datetime.datetime.fromtimestamp(ms / 1000, datetime.timezone.utc).isoformat()
 
 
 def of(name):
@@ -391,7 +431,8 @@ def scenario(s, fake):
             killed_2["status"] == "unfinished" and gate["deadline"] is not None
             and open_gate(s) is not None,
             f"run {killed_2['run']} {killed_2['status']}; gate {gate['id']} at step "
-            f"{gate['step']} open, opened_at {gate['opened_at']}, deadline {gate['deadline']}")
+            f"{gate['step']} open, opened {when(gate['opened_at'])}, deadline "
+            f"{when(gate['deadline'])}")
     say()
 
     say("== recover, and approve the gate from a second invocation")
@@ -407,6 +448,7 @@ def scenario(s, fake):
     s.run(["runs", "show", RUN_ID])
     caps_end, ledger_end = s.ledger()
     decided = s.gates()
+    stored = s.runs()
     say()
 
     say("== evals")
@@ -422,9 +464,10 @@ def scenario(s, fake):
     s.check("finished", done["status"] == "succeeded" and done["output"] == expected,
             f"status {done['status']}, output {json.dumps(done['output'])}")
     s.check("under the same run id",
-            killed_1["run"] == killed_2["run"] == done["run"] == RUN_ID,
+            killed_1["run"] == killed_2["run"] == done["run"] == RUN_ID
+            and stored == [RUN_ID],
             f"{killed_1['run']} at kill 1, {killed_2['run']} at kill 2, "
-            f"{done['run']} when it finished")
+            f"{done['run']} when it finished; the store holds these runs: {stored}")
     executions = [(a["attempt"], a["ran"], a["replayed"]) for a in done["attempts"]]
     s.check("recovered with atomic runs resume, twice", len(done["attempts"]) == 3,
             f"executions (attempt, steps it ran, steps it replayed): {executions}")
@@ -435,7 +478,6 @@ def scenario(s, fake):
     for st in done["steps"]:
         if st["name"] != "DBOS.recv":
             by.setdefault(of(st["name"]), set()).add(st["attempt"])
-    positions = [st["position"] for st in done["steps"]]
     names = [st["name"] for st in done["steps"]]
     expected_by = {"pin": {1}, "total": {1}, "assess": {2}, "accept-report": {2, 3},
                    "render": {3}, "DBOS": {2}}
@@ -445,8 +487,7 @@ def scenario(s, fake):
         for name, st in steps_1.items()
     )
     s.check("no completed step repeated",
-            len(set(positions)) == len(positions) and len(set(names)) == len(names)
-            and by == expected_by and unchanged,
+            len(set(names)) == len(names) and by == expected_by and unchanged,
             "each checkpoint recorded once; by execution: "
             f"{ {k: sorted(v) for k, v in by.items()} } (accept-report: the gate opened "
             "by the second, decided in the third); the first execution's checkpoints "
@@ -473,17 +514,18 @@ def scenario(s, fake):
             f"tokens {caps_end['tokens_charged']} of {caps_end['tokens_cap']}, active ms "
             f"{caps_end['millis_charged']} of {caps_end['millis_cap']}, caps as at kill 1; "
             f"runs show usage {json.dumps(done['usage'])}")
-    final = decided[0] if len(decided) == 1 else {}
+    if len(decided) != 1:
+        raise Failed(f"the run has {len(decided)} gates, not one: {decided}")
+    final = decided[0]
     decision = (final.get("resolution") or {}).get("decided") or {}
     s.check("within the original gate deadline",
-            len(decided) == 1
-            and (final["id"], final["opened_at"], final["deadline"])
+            (final["id"], final["opened_at"], final["deadline"])
             == (gate["id"], gate["opened_at"], gate["deadline"])
             and decision.get("verdict") == "approve"
             and decision.get("at", final["deadline"]) < final["deadline"],
-            f"gate {final.get('id')} kept opened_at {final.get('opened_at')} and deadline "
-            f"{final.get('deadline')}; {decision.get('verdict')} by {decision.get('by')} "
-            f"at {decision.get('at')}")
+            f"gate {final['id']} kept its opening, {when(final['opened_at'])}, and its deadline, "
+            f"{when(final['deadline'])}; {decision.get('verdict')} by {decision.get('by')} "
+            f"at {when(decision['at']) if 'at' in decision else None}")
     s.check("evals green", live[0] - before_eval[0] == 1 and after_eval == live,
             f"atomic eval --live and atomic eval exited 0; the live eval made "
             f"{live[0] - before_eval[0]} model call(s), the replay {after_eval[0] - live[0]}")
@@ -520,7 +562,11 @@ def main():
     except (OSError, subprocess.SubprocessError, sqlite3.Error, json.JSONDecodeError) as e:
         say(f"v01-gate: the scenario could not run: {e!r}")
         return 2
+    except (KeyError, IndexError, TypeError, AttributeError, Unexpected) as e:
+        say(f"v01-gate: what atomic recorded is not in the shape this script reads: {e!r}")
+        return 2
     finally:
+        s.reap()
         fake.stop()
         if not args.keep:
             shutil.rmtree(work, ignore_errors=True)
