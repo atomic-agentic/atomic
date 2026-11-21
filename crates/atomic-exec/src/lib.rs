@@ -36,6 +36,7 @@
 //! [`quiescence`] is the runner's side of a sandbox backend that suspends:
 //! whether its sandbox is safe to suspend.
 
+pub mod exchange;
 pub mod process;
 pub mod quiescence;
 pub mod runner;
@@ -411,6 +412,20 @@ pub trait ExecutionBackend: Send + Sync {
 
     /// Release `workspace`. Closing one that is closed already succeeds.
     fn close(&self, workspace: &Workspace) -> Result<(), ExecError>;
+
+    /// The exchange of `workspace`, which this backend opened: the
+    /// directories an exec atom's command is given artifacts in and hands
+    /// files over in (see [`exchange`]), made new before the command runs.
+    /// The control plane moves those files only through it. A backend that
+    /// hands no files over gives none, the default: its commands are given
+    /// no artifacts, and an output that names a file is refused.
+    fn exchange(
+        &self,
+        workspace: &Workspace,
+    ) -> Result<Option<Box<dyn exchange::Exchange>>, ExecError> {
+        let _ = workspace;
+        Ok(None)
+    }
 }
 
 /// A connected backend, shared by everything that runs atoms, such as the
@@ -481,6 +496,13 @@ impl ExecutionBackend for Backend {
 
     fn close(&self, workspace: &Workspace) -> Result<(), ExecError> {
         self.inner.close(workspace)
+    }
+
+    fn exchange(
+        &self,
+        workspace: &Workspace,
+    ) -> Result<Option<Box<dyn exchange::Exchange>>, ExecError> {
+        self.inner.exchange(workspace)
     }
 }
 
@@ -651,6 +673,26 @@ impl ExecutionBackend for LocalBackend {
 
     fn close(&self, workspace: &Workspace) -> Result<(), ExecError> {
         workspace::close_local(workspace)
+    }
+
+    /// The exchange in the workspace's scratch directory, on Unix
+    /// ([`exchange::LocalExchange`]); none for a workspace with no scratch
+    /// directory, or elsewhere.
+    fn exchange(
+        &self,
+        workspace: &Workspace,
+    ) -> Result<Option<Box<dyn exchange::Exchange>>, ExecError> {
+        #[cfg(unix)]
+        if let Some(scratch) = &workspace.scratch {
+            let made =
+                exchange::LocalExchange::create(scratch).map_err(|e| ExecError::Workspace {
+                    label: workspace.label.clone(),
+                    message: format!("make its exchange in {}: {e}", scratch.display()),
+                })?;
+            return Ok(Some(Box::new(made)));
+        }
+        let _ = workspace;
+        Ok(None)
     }
 
     /// Runs `command` under this backend's confinement, if it has one, in a
