@@ -278,10 +278,9 @@ async fn decide(
     verdict: Verdict,
     answer: Option<String>,
 ) -> anyhow::Result<()> {
-    let found = gate::find(rt, gate_id)
-        .await?
-        // Raw: an error is redacted, then escaped, where it is reported.
-        .with_context(|| format!("no gate {gate_id}"))?;
+    // Raw: an error is redacted, then escaped, where it is reported.
+    let missing = format!("no gate {gate_id}");
+    let found = gate::find(rt, gate_id).await?.context(missing)?;
     // Read as the prompt reads it.
     let answer = answer.map(|text| match &found.question {
         Some(q) => shown::answer(q, &text),

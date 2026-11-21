@@ -257,7 +257,13 @@ fn terminals(name: &str) -> (PathBuf, Terminal) {
 fn a_coloured_token_in_a_gate_id_is_redacted() {
     let (dir, t) = terminals("token-id");
     let token = concat!("ghp_", "SAMPLE0123456789", "abcdefghijklmnopqrstuv");
-    let id = format!("\u{1b}[1;33m{token}\u{1b}[0m");
+    // Coloured, and after a vertical tab that redaction reads as the space
+    // between a secret's flag and its value, which escaping first would
+    // write out.
+    let id = format!(
+        "\u{1b}[1;33m{token}\u{1b}[0m --password\u{b}{}",
+        concat!("SAMPLE", "q7Lm2Vx9Rk4Tz8")
+    );
     for json in [false, true] {
         let mut args = vec!["gates", "approve", id.as_str()];
         if json {
@@ -269,6 +275,10 @@ fn a_coloured_token_in_a_gate_id_is_redacted() {
         assert!(
             !shown.contains("SAMPLE0123456789"),
             "json {json}: the token showed"
+        );
+        assert!(
+            !shown.contains("q7Lm2Vx9Rk4Tz8"),
+            "json {json}: the secret after the vertical tab showed"
         );
         assert!(
             !shown.contains('\u{1b}'),
