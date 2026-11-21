@@ -41,7 +41,8 @@
 //! limit. A command that would pass it does not start. The budget holds
 //! while upstreams answer and close as they should; it is not a limit the
 //! proxy enforces. Codex's proxy answers `CONNECT` before it dials, with no
-//! dial timeout, may dial more than once for one connection, keeps a
+//! dial timeout of its own (the kernel's connect timeout still applies), may
+//! dial more than once for one connection, keeps a
 //! connection's descriptors for a while after the bridge has dropped it, and
 //! keeps a tunnel open until the upstream closes it, so a command that keeps
 //! opening and abandoning connections to a host that never answers can hold
@@ -386,7 +387,7 @@ impl Budget {
                  files leaves room for {} at once: their proxy connections may take half of it, \
                  {DESCRIPTORS_PER_COMMAND} for each. atomic raises its own limit only as far as \
                  its hard limit and at most to {RAISED_LIMIT}; to run more at once, raise its \
-                 hard limit or start it with a soft limit above {RAISED_LIMIT}",
+                 hard limit or start it with a higher soft limit",
                 *reserved / DESCRIPTORS_PER_COMMAND,
                 share / DESCRIPTORS_PER_COMMAND,
             );
