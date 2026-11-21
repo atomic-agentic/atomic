@@ -1297,6 +1297,8 @@ mod at {
             let shown = || line(&below.to_string_lossy());
             let name = c_name(part.as_os_str())?;
             let opened = match openat(dir.as_fd(), &name, flags, 0) {
+                // Only a name not there is absent: any other error refuses.
+                // `scripts/controls/skill-dir-walk-not-there.row` switches this off.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound && !make => return Ok(None),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     // SAFETY: `name` is valid for the call, and `dir` is open.
@@ -3453,6 +3455,32 @@ mod tests {
             at::subdir(&held, std::ffi::OsStr::new("references")).is_err(),
             "a link was gone into as a directory"
         );
+    }
+
+    /// Only a name that is not there reads as absent on the check's walk:
+    /// any other error opening a directory on the way refuses.
+    #[cfg(unix)]
+    #[test]
+    fn the_check_walk_refuses_every_error_but_not_there() {
+        let root = std::fs::canonicalize(scratch("check-errors")).expect("canonical root");
+        assert!(
+            at::open_dirs(&root, Path::new(".agents/skills"))
+                .expect("walked")
+                .is_none(),
+            "a directory not there"
+        );
+        let long = "a".repeat(300);
+        let refused = at::open_dirs(&root, &Path::new(&long).join("skills"))
+            .err()
+            .map(|e| format!("{e:#}"))
+            .unwrap_or_default();
+        assert!(refused.contains("File name too long"), "{refused:?}");
+        std::fs::write(root.join(".agents"), "").expect("a file");
+        let refused = at::open_dirs(&root, Path::new(".agents/skills"))
+            .err()
+            .map(|e| format!("{e:#}"))
+            .unwrap_or_default();
+        assert_eq!(refused, ".agents is not a directory");
     }
 
     /// The instructions file's read does not wait on a fifo standing there.
