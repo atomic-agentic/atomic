@@ -46,7 +46,7 @@ use atomic_core::lite::LiteRuntime;
 use atomic_core::runtime::{Artifacts, CodexRuntime, Runtimes, run_lite_atom};
 use atomic_core::testing::{FakeModel, Reply, on_codex_runtime};
 use atomic_core::usage::Metering;
-use atomic_durable::usage::{Attempt, Caps, Settlement};
+use atomic_durable::usage::{Attempt, Caps, Settlement, heartbeat_every};
 use atomic_durable::{DurableRuntime, Durare, RunStatus, parks, release, run_atom_at};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -618,23 +618,20 @@ async fn child_until(
 }
 
 /// How long after its admission the running attempt's last heartbeat was
-/// recorded, in milliseconds, or 0 before it has one.
-async fn beat_after_admission(dir: &Path) -> i64 {
-    let Ok(db) =
-        sqlx::SqlitePool::connect(&format!("sqlite://{}", dir.join("atomic.db").display())).await
-    else {
-        return 0;
-    };
-    let seen: Option<i64> = sqlx::query_scalar(
+/// recorded, in milliseconds, or 0 before it has one. A database that cannot
+/// be opened or queried is an error, not 0.
+async fn beat_after_admission(dir: &Path) -> Result<i64, sqlx::Error> {
+    let db =
+        sqlx::SqlitePool::connect(&format!("sqlite://{}", dir.join("atomic.db").display())).await?;
+    let seen: Result<Option<i64>, sqlx::Error> = sqlx::query_scalar(
         "SELECT MAX(h.seen_at - a.admitted_at) FROM atomic_usage_attempts a \
          JOIN atomic_usage_heartbeats h ON h.request_id = a.request_id AND h.attempt = a.attempt \
          WHERE a.state = 'reserved'",
     )
     .fetch_one(&db)
-    .await
-    .unwrap_or(None);
+    .await;
     db.close().await;
-    seen.unwrap_or(0)
+    Ok(seen?.unwrap_or(0))
 }
 
 async fn reader(dir: &Path) -> Durare {
@@ -833,10 +830,10 @@ fn killing_the_process_during_a_codex_turn_lets_the_recovered_run_finish() {
 fn a_run_recovered_after_its_dead_turn_would_have_lapsed_is_charged_only_its_run_time() {
     on_codex_runtime(async {
         // Scaled down: the review's turn reserves its atom's 3 s and beats
-        // every 300 ms. Killed about 0.9 s in and recovered after the 3 s
-        // have passed, the dead turn is charged the time it ran, up to a
-        // beat after its last heartbeat, and the review has the rest of its
-        // time to run again.
+        // every 300 ms. Killed at its first heartbeat, about 0.3 s in, and
+        // recovered after the 3 s have passed, the dead turn is charged the
+        // time it ran, up to a beat after its last heartbeat, and the review
+        // has the rest of its time to run again.
         let model = FakeModel::start(vec![
             Reply::Text(DRAFT.into()),
             Reply::Delayed {
@@ -861,9 +858,17 @@ fn a_run_recovered_after_its_dead_turn_would_have_lapsed_is_charged_only_its_run
         }
         // Killed once its turn has recorded a heartbeat a beat or more after
         // admission, however slowly a loaded machine runs it: recovery
-        // charges it until a beat after that, at least 600 ms.
+        // charges it until a beat after that, at least two beats.
+        let every = heartbeat_every(3_000);
         let beaten = Instant::now() + Duration::from_secs(60);
-        while beat_after_admission(&dir).await < 300 {
+        while beat_after_admission(&dir)
+            .await
+            .unwrap_or_else(|e| panic!("could not read the review's heartbeats: {e}"))
+            < every
+        {
+            if let Some(status) = process.try_wait().expect("check on the child") {
+                panic!("the child exited ({status}) before the review's turn recorded a heartbeat");
+            }
             assert!(
                 Instant::now() < beaten,
                 "the review's turn never recorded a heartbeat"
@@ -890,7 +895,7 @@ fn a_run_recovered_after_its_dead_turn_would_have_lapsed_is_charged_only_its_run
         // Its heartbeats carried it past the first beat: it is charged the
         // time it ran.
         assert!(
-            dead.charged.millis >= 600,
+            dead.charged.millis >= 2 * every,
             "the time it ran was charged: {dead:?}"
         );
     });
