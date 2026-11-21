@@ -2967,6 +2967,12 @@ fn a_store_held_while_files_are_stored_leaves_the_outcome_unknown() {
         assert!(held[0].to_string_lossy().contains(&digest), "{held:?}");
         artifacts.release(&identity);
         assert!(holds().is_empty(), "still held once released");
+        // A step dropped before it recorded its output lets go too.
+        let releasing = artifacts.releasing(identity.clone());
+        run().await.expect("runs again");
+        assert_eq!(holds().len(), 1);
+        drop(releasing);
+        assert!(holds().is_empty(), "still held once the step was dropped");
     });
 }
 

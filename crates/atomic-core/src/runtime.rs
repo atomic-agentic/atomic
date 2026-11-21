@@ -69,6 +69,19 @@ pub struct Artifacts(
     Arc<Holding>,
 );
 
+/// Lets go of what a step's command handed over when dropped (see
+/// [`Artifacts::releasing`]).
+pub struct Releasing {
+    artifacts: Artifacts,
+    identity: EffectIdentity,
+}
+
+impl Drop for Releasing {
+    fn drop(&mut self) {
+        self.artifacts.release(&self.identity);
+    }
+}
+
 /// The holds on what each step's command handed over, by the step's effect
 /// key, until the step lets them go.
 #[derive(Default)]
@@ -110,6 +123,16 @@ impl Artifacts {
             .unwrap_or_else(|e| e.into_inner())
             .remove(&identity.key());
         drop(gone);
+    }
+
+    /// A guard that [releases](Self::release) the step `identity` names when
+    /// it is dropped, however the step ends: when it has recorded its output,
+    /// or when the step is dropped, cancelled or panics on the way.
+    pub fn releasing(&self, identity: EffectIdentity) -> Releasing {
+        Releasing {
+            artifacts: self.clone(),
+            identity,
+        }
     }
 
     /// Keep `holds` for the step `identity` names, until it is released.

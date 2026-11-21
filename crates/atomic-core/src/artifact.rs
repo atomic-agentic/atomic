@@ -390,8 +390,18 @@ fn holds(
         if !entry.file_type().map_err(io(&path))?.is_dir() {
             continue;
         }
-        for hold in std::fs::read_dir(&path).map_err(io(&path))? {
-            let hold = hold.map_err(io(&path))?;
+        // A store closing meanwhile takes its holds with it.
+        let each = match std::fs::read_dir(&path) {
+            Ok(each) => each,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(io(&path)(e)),
+        };
+        for hold in each {
+            let hold = match hold {
+                Ok(hold) => hold,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                Err(e) => return Err(io(&path)(e)),
+            };
             kept.insert(staged_by(&hold.file_name().to_string_lossy()).to_owned());
         }
     }
@@ -496,6 +506,24 @@ impl LocalStore {
         Ok(all)
     }
 
+    /// Everything any store holds now, whether that store is open or not:
+    /// a sweep's caller reads this before it reads what records reference,
+    /// since a hold may be let go once its reference is recorded. Takes no
+    /// lock. A hold it cannot read fails it.
+    pub fn held(&self) -> Result<BTreeSet<ArtifactRef>, ArtifactError> {
+        let (digests, _) = holds(
+            self.held_dir(),
+            self.owners(),
+            &[],
+            std::time::Duration::MAX,
+            std::time::SystemTime::now(),
+        )?;
+        Ok(digests
+            .iter()
+            .filter_map(|d| ArtifactRef::from_digest(d).ok())
+            .collect())
+    }
+
     /// Mark `artifact` as just written, so a sweep's grace covers it,
     /// without waiting for the store's lock.
     pub fn refresh(&self, artifact: &ArtifactRef) -> Result<Refreshed, ArtifactError> {
@@ -562,7 +590,7 @@ impl LocalStore {
     }
 
     /// Where every open store's holds are.
-    fn held(&self) -> &Path {
+    fn held_dir(&self) -> &Path {
         self.owner.held.parent().unwrap_or(&self.root)
     }
 
@@ -899,7 +927,7 @@ impl LocalStore {
         // and a commit waits for this sweep.
         let now = std::time::SystemTime::now();
         let (live, dead) = live_owners(self.owners(), STAGING_GRACE, now);
-        let (held, gone) = holds(self.held(), self.owners(), &dead, STAGING_GRACE, now)?;
+        let (held, gone) = holds(self.held_dir(), self.owners(), &dead, STAGING_GRACE, now)?;
         let cutoff = read_at
             .checked_sub(grace.0)
             .unwrap_or(std::time::UNIX_EPOCH);

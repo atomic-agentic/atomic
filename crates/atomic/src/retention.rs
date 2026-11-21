@@ -19,9 +19,9 @@
 //!
 //! It also keeps anything written within the grace period before it began
 //! reading these, however long the reading and the wait for the store's
-//! lock take, and anything an open store holds: an exec step holds the
-//! files its command handed over from before they are stored until its turn
-//! is checkpointed. What it cannot see: any other producer that stores
+//! lock take, and anything a store holds as it begins reading or as it
+//! sweeps: an exec step holds the files its command handed over from before
+//! they are stored until its turn is checkpointed. What it cannot see: any other producer that stores
 //! content more than a grace period before the step that refers to it is
 //! checkpointed. And
 //! what lives in the source tree (eval cases, cassettes, reports) refers to
@@ -47,8 +47,14 @@ pub struct Kept {
     pub read_at: std::time::SystemTime,
 }
 
-/// Read what a sweep of `store` keeps: `keep` and everything
-/// [`referenced`] finds, with the time the reading began.
+/// Read what a sweep of `store` keeps: `keep`, everything held as the
+/// reading begins, and everything [`referenced`] finds, with the time the
+/// reading began.
+///
+/// The holds are read first: a step lets its hold go once it has recorded
+/// the reference, which the reading of the runs may already have passed,
+/// so the holds the sweep reads later under the store's lock may no longer
+/// show it.
 pub async fn read_kept(
     store: &LocalStore,
     rt: &Durare,
@@ -56,6 +62,11 @@ pub async fn read_kept(
 ) -> anyhow::Result<Kept> {
     let read_at = std::time::SystemTime::now();
     let mut artifacts = keep.clone();
+    let held = {
+        let store = store.clone();
+        tokio::task::spawn_blocking(move || store.held()).await??
+    };
+    artifacts.extend(held);
     artifacts.extend(referenced(store, rt).await?);
     Ok(Kept { artifacts, read_at })
 }
