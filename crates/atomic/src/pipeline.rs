@@ -2093,22 +2093,30 @@ pub fn register_pipeline<R: DurableRuntime>(rt: &mut R, services: Services) {
     let (replaying, replay_ledger) = (services.clone(), ledger.clone());
     rt.register(PIPELINE, move |ctx: R::Context, run: PipelineRun| {
         let span = crate::telemetry::workflow_span(&run.pipeline.name, ctx.workflow_id());
-        crate::telemetry::traced(
-            span,
-            run_pipeline(ctx, run, services.clone(), ledger.clone(), None),
+        let id = ctx.workflow_id().to_owned();
+        crate::panics::caught(
+            id,
+            crate::telemetry::traced(
+                span,
+                run_pipeline(ctx, run, services.clone(), ledger.clone(), None),
+            ),
         )
     });
     rt.register(REPLAY, move |ctx: R::Context, replay: ReplayRun| {
         let ReplayRun { of, run, recorded } = replay;
         let span = crate::telemetry::workflow_span(&run.pipeline.name, ctx.workflow_id());
-        crate::telemetry::traced(
-            span,
-            run_pipeline(
-                ctx,
-                run,
-                replaying.clone(),
-                replay_ledger.clone(),
-                Some(Arc::new(Replay { of, recorded })),
+        let id = ctx.workflow_id().to_owned();
+        crate::panics::caught(
+            id,
+            crate::telemetry::traced(
+                span,
+                run_pipeline(
+                    ctx,
+                    run,
+                    replaying.clone(),
+                    replay_ledger.clone(),
+                    Some(Arc::new(Replay { of, recorded })),
+                ),
             ),
         )
     });

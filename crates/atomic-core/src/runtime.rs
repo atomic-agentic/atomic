@@ -309,20 +309,26 @@ pub(crate) async fn open_workspace(
     let mut reported: Option<std::time::Instant> = None;
     loop {
         let (b, r) = (backend.clone(), request.clone());
-        let opened = tokio::task::spawn_blocking(move || b.open(&r))
-            .await
-            .map_err(|e| AtomError::Runtime(format!("{label}: open its workspace: {e}")))?;
+        // The workspace's closer is made where it opens, on the blocking
+        // pool: if the run that awaits it is cancelled meanwhile, the open
+        // still finishes there, and its closer, dropped with the result no
+        // one takes, closes it.
+        let opened = tokio::task::spawn_blocking(move || {
+            b.open(&r).map(|workspace| Closer {
+                backend: b,
+                workspace: Some(workspace),
+            })
+        })
+        .await
+        .map_err(|e| AtomError::Runtime(format!("{label}: open its workspace: {e}")))?;
         match opened {
-            Ok(workspace) => {
+            Ok(closer) => {
                 if reported.is_some() {
                     crate::log_line!(
                         "atomic: {label}: the execution backend can open its workspace again"
                     );
                 }
-                return Ok(WorkspaceGuard(Some(Arc::new(Closer {
-                    backend,
-                    workspace: Some(workspace),
-                }))));
+                return Ok(WorkspaceGuard(Some(Arc::new(closer))));
             }
             Err(e @ atomic_exec::ExecError::Unavailable { .. }) => {
                 if reported.is_none_or(|at| at.elapsed() >= OPEN_WAIT_REPORT) {
@@ -382,9 +388,11 @@ impl WorkspaceGuard {
     /// holds it, which then closes it when it lets go.
     pub(crate) async fn close(mut self) {
         if let Some(closer) = self.0.take()
-            && let Ok(closer) = Arc::try_unwrap(closer)
+            && let Ok(mut closer) = Arc::try_unwrap(closer)
+            && let Some((backend, workspace)) = closer.take()
         {
-            let _ = tokio::task::spawn_blocking(move || closer.close_now()).await;
+            let _ =
+                tokio::task::spawn_blocking(move || close_workspace(&*backend, &workspace)).await;
         }
     }
 }
@@ -395,34 +403,44 @@ impl Drop for WorkspaceGuard {
     }
 }
 
+/// Close `workspace` on `backend`, saying so if that fails: the backend
+/// reclaims what it left when it next connects.
+fn close_workspace(backend: &dyn ExecutionBackend, workspace: &Workspace) {
+    if let Err(e) = backend.close(workspace) {
+        crate::log_line!(
+            "atomic: could not close a workspace, which its backend reclaims later: {e}"
+        );
+    }
+}
+
 impl Closer {
-    fn close_now(mut self) {
-        if let Some(workspace) = self.workspace.take()
-            && let Err(e) = self.backend.close(&workspace)
-        {
-            crate::log_line!(
-                "atomic: could not close a workspace, which its backend reclaims later: {e}"
-            );
-        }
+    /// Its backend and its workspace, which it then no longer closes.
+    fn take(&mut self) -> Option<(Arc<dyn ExecutionBackend>, Workspace)> {
+        self.workspace
+            .take()
+            .map(|workspace| (self.backend.clone(), workspace))
     }
 }
 
 impl Drop for Closer {
     fn drop(&mut self) {
-        // Already closed by `close_now`, which takes the workspace.
-        let Some(workspace) = self.workspace.take() else {
+        // Already closed, which takes the workspace.
+        let Some((backend, workspace)) = self.take() else {
             return;
         };
-        let closer = Closer {
-            backend: self.backend.clone(),
-            workspace: Some(workspace),
-        };
+        // What goes to the blocking pool owns the backend and the workspace
+        // only, never a closer: a pool shutting down drops a task it will
+        // not run while it holds its own lock, and a closer dropped there
+        // would spawn again, take that lock again and hang the shutdown.
+        // Dropped unrun, this closes nothing; the backend reclaims the
+        // workspace when it next connects.
+        let close = move || close_workspace(&*backend, &workspace);
         // Off the executor when there is one; here, when there is not.
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
-                handle.spawn_blocking(move || closer.close_now());
+                handle.spawn_blocking(close);
             }
-            Err(_) => closer.close_now(),
+            Err(_) => close(),
         }
     }
 }
