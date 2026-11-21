@@ -588,7 +588,11 @@ fn check(path: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
             // each must compile, not only the first.
             for schema in std::iter::once(&tool.input)
                 .chain(tool.output.as_ref())
-                .chain(tool.responses.values().flatten())
+                .chain(
+                    tool.responses
+                        .values()
+                        .filter_map(atomic_schema::openapi::ResponseBody::schema),
+                )
             {
                 atomic_schema::registry::Registry::new()
                     .validator_for(schema)

@@ -174,7 +174,8 @@ export const config = {
 ```
 
 `network.allow` lists DNS names, each a name with at least two labels or `*.`
-and such a name for its subdomains, up to 32 of them. `network: false`, or no
+and such a name for its subdomains, as far as the Public Suffix List allows
+(see below), up to 32 of them. `network: false`, or no
 `network` at all, means none. On Linux the command then gets a network of its
 own whose only way out is a proxy atomic runs for it, which forwards a request
 only to a listed host, and only on port 80 or 443: HTTP, and HTTPS through a
@@ -192,6 +193,25 @@ process and no other user's process can use the proxy, unless it has
 process of your own user that runs outside any sandbox is not kept out: it
 can enter the command's namespaces and use the sandbox's own route to the
 proxy. Once the command ends, its token admits no new connection.
+
+Each command that declares hosts is admitted against a budget of open files:
+its sandbox keeps at most 128 connections to the proxy open at once, and
+atomic reserves two open files for each (the command's and one upstream) and a
+few to spare, and the commands that declare hosts may reserve no more than
+half of atomic's limit on open files between them. When they need more room,
+atomic first raises its own limit as far as the hard limit allows, up to
+65536, and the commands it starts afterwards inherit that; a command that
+would still pass it does not start, and says so, and its step fails rather
+than waits. To run more of them at once, raise atomic's hard limit on open
+files, or start it with a higher soft limit. The budget holds while the hosts
+a command reaches answer and close as they should; it is not a limit the proxy
+enforces. The proxy answers an HTTPS `CONNECT` before it dials and sets no
+time limit of its own on the dial (the kernel's connect timeout still
+applies), may dial more than one of a host's addresses for one connection,
+keeps a connection's files for a while after the command has dropped it, and
+keeps a tunnel open until the host closes it, so a command that keeps opening
+and abandoning connections to a host that never answers can take more than its
+share, and can leave atomic short of open files.
 
 What an atom may list is atomic's policy, checked when the atom loads and again
 before its command runs: public DNS names only. An IP address in any spelling
@@ -229,12 +249,20 @@ Know what a listed host can get:
   Public Suffix List, its ICANN section (`co.uk`) and its private one, where
   each name is someone else's (`github.io`, `s3.amazonaws.com`). A wildcard
   is refused when the atom loads if the name under it is on the list, or if
-  every name just below it is (`*.run.app`, `*.kawasaki.jp`). That refuses
+  a wildcard rule on the list makes the names just below it suffixes
+  (`*.run.app`, `*.kawasaki.jp`); an exception to such a rule is one site, so
+  `*.city.kawasaki.jp` loads. That refuses
   `*.googleapis.com`, `*.githubusercontent.com` and `*.cloudfront.net`, among
   others: name the exact hosts instead. A wildcard above a listed name, such
   as `*.amazonaws.com`, loads, but the proxy keeps it from crossing that name:
   it reaches `foo.amazonaws.com`, and not `bucket.s3.amazonaws.com`, which is
-  someone else's site under `s3.amazonaws.com`. A wildcard under a name you
+  someone else's site under `s3.amazonaws.com`. A plain HTTP request refused
+  this way carries the reason `crosses_public_suffix`, not `not_allowed`. An
+  HTTPS `CONNECT` is refused with a line of text that does not name the
+  reason: for this one it is the proxy's generic "Request blocked by network
+  policy.", not the "Domain not in allowlist." an unlisted host gets, so
+  `sts.us-east-1.amazonaws.com` under `*.amazonaws.com` is refused without
+  saying why. List it exactly to reach it. A wildcard under a name you
   hold, such as `*.example.com`, still reaches whatever is served under it,
   and a shared host missing from the list is not caught. List exact names
   where you can.
@@ -412,11 +440,45 @@ any execute bit that starts as a binary or a `#!` script does) or to a
 directory someone else owns, so a virtual environment's `python` linked to
 a toolchain's keeps working; what it leads to stays readable. A key linked
 to one a secrets manager keeps under `/run` is denied. A pipe or socket in a
-credential place is denied like a file. A turn does not start when a denial
-would cover its working directory or a directory it may write, or when a
-denied place, or a linked secret, lies two or more levels inside a directory
-it may write, where a command could move the directory above it away from
-its denial. The model chooses the
+credential place is denied like a file. Each is denied too wherever else
+the same directory is mounted, as it is with your home bound at a second
+path, inside toolbox or distrobox (the host's files under `/run/host`), or
+with a btrfs top-level subvolume mounted elsewhere, and so is each
+filesystem mounted inside a denied directory wherever else it is mounted.
+atomic reads the mount table for this when it makes the list, and nothing
+runs when it cannot read it, or when the table has no root mount (as under
+a chroot whose root is not a mount point) or lists a mount on one it does
+not list; when a denied place is on NFS or SMB and that filesystem is
+mounted more than once, since the table cannot be trusted to say which
+directory each such mount shows (NFS gives every mount `/`); when it is on
+any filesystem but a local one (ext2/3/4, XFS, btrfs, F2FS, tmpfs, ramfs,
+overlay) mounted more than once whose root the kernel shows as lost, as
+when a FUSE server is away or another Ceph client renamed the directory;
+or when, on such a filesystem, the place is there and its second place is
+missing or another file or directory. Otherwise FUSE (`fuse.*`), 9p,
+virtiofs and other mounts are followed as local ones are. The
+links followed and the second mounts found together come to at most 512;
+past that, nothing runs. Not covered: the same remote directory, or one
+inside another, mounted twice as two filesystems, each with a device of its
+own, such as with 9p, NFS with `nosharecache` or with mount options that
+differ (each gets a superblock of its own), Ceph (one per server path), two
+SMB sessions or two FUSE daemons, neither of which is denied for the other;
+a stale root, off a local filesystem, for a place that is not there yet,
+and one, on any filesystem, that makes a second mount look unrelated to a
+denied place, such as a bound overlay directory whose lower directory was
+renamed beneath it;
+a snapshot, which holds a copy, not the place itself; an overlay or FUSE
+filesystem built over a denied directory, such as an overlay whose upper or
+lower directory is inside one, which shows its files as its own; and a
+mount made after the list, or a root that goes stale after it, such as a
+mount an automount makes when a path is
+first used, even from inside the sandbox, which sees the host's new mounts
+until the next turn. A turn does
+not start when a denial would cover its working directory or a directory it
+may write, or when a denied place, a linked secret or a second mount of a
+denied place lies two or more levels inside a directory it may write, where
+a command could move the directory above it away from its denial. The model
+chooses the
 commands, so none of these reach it through them. atomic makes the list
 when the turn starts: a place on it that appears while a command runs is
 denied only to later commands, and a link made after the list is not

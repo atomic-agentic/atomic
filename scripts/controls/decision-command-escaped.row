@@ -1,0 +1,1 @@
+decision-command-escaped|crates/atomic/src/gates.rs|        shown::line(&decision.command)|        decision.command /*CONTROL_OFF*/|-p atomic-agentic --test gates_cli a_hostile_principal_and_command_are_shown_escaped

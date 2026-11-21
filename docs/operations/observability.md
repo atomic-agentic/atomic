@@ -59,21 +59,33 @@ step's, a client span. A Codex atom's call is one turn, which may make several
 requests to the provider, and its span covers them all. `gen_ai.provider.name`
 is `openai` for OpenAI's API and `openai_compatible` for any other endpoint.
 
-A step or run that fails ends its span with an error status, the failure's
-message and `error.type` (`atomic.failed`, `atomic.interrupted`, or for a
-model call `atomic.model_call` or `atomic.meter`). A model call's
-`error.message` is redacted and at most 200 characters, with a `…` if it was
-cut. When the provider answered a lite atom's call with an error status, it
-holds only that status and the type of error the provider named, such as
-`401 Unauthorized: invalid_request_error`, and `http.response.status_code`
-holds the code. A type that does not read as one, such as `BadRequestError`,
-`DeploymentNotFound` or `"429"`, gives the status alone. Any other failure is what failed and its innermost cause,
-which can quote the provider or the model: a Codex atom's provider error, a
-lite answer that is not JSON, a refusal or an answer the provider stopped.
-The run's stored error keeps the whole, redacted. A failed step's or run's
-own span still carries its whole failure as its status message. A process that stops while
-runs are still going, such as one stopped while it waits at a gate, ends the
-spans still open with `atomic.stopped` set and exports them before it exits.
+A step or run that fails ends its span with an error status, why it failed
+and `error.type` (`atomic.failed`, `atomic.interrupted`, or for a model call
+`atomic.model_call` or `atomic.meter`). No span carries the whole failure: what
+one says of it is redacted and at most 200 characters, with a `…` on one that
+was cut. A model call says it in `error.message`. When the provider answered
+a lite atom's call with an error status, `error.message` holds only that
+status and the type of error the provider named, such as `401 Unauthorized: invalid_request_error`,
+and `http.response.status_code` holds the code. A type that does not read as
+one, such as `BadRequestError`, `DeploymentNotFound` or `"429"`, gives the
+status alone. Any other failure is what failed and its innermost cause, which
+can quote the provider or the model: a Codex atom's provider error, a lite
+answer that is not JSON, a refusal or an answer the provider stopped.
+
+The step whose model call failed says just what that call said, and so does
+its run — `401 Unauthorized: invalid_request_error` for a provider's answer,
+and otherwise the same bounded line the call's own span carries, which can
+quote the provider as the call's does. A step that failed nowhere near a model
+call — an output that misfits its schema, a command that stopped — says its own
+error, cut to the same length. Each step keeps a note of its own, which its
+run takes up only when that step fails, so a step that parked and ran again
+starts with a fresh one. Nothing a step noted crosses a restart: a run that resumes and
+then fails on a failure its engine had recorded has nothing noted near a model
+call, so its span says that failure, cut to the same length.
+The run's stored error keeps the whole, redacted, which is where a person reads
+it. A process that stops while runs are still going, such as one stopped while
+it waits at a gate, ends the spans still open with `atomic.stopped` set and
+exports them before it exits.
 
 A process sends its last spans before it exits, waiting at most two seconds
 for them: spans not sent by then are dropped, and atomic says so on stderr. So a collector that accepts the
