@@ -637,7 +637,7 @@ fn atomic_home() -> Result<Option<PathBuf>, StateError> {
 /// `path` as it really is: its nearest existing ancestor with every link
 /// resolved, and the rest of it as written. A directory not made yet is
 /// where making it would put it, a linked parent followed.
-pub fn real_path(path: &Path) -> PathBuf {
+pub fn as_it_really_is(path: &Path) -> PathBuf {
     let mut rest = Vec::new();
     let mut at = path;
     loop {
