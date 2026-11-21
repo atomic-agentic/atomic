@@ -56,7 +56,11 @@ the line and the tag, when a closing tag names another element than the
 innermost one open (`` `</notes>` closes <section>, opened on line 8 ``), when
 a closing tag has nothing open to close, and when an element is still open at
 the end of the file. Close the element the message names, or remove the stray
-closing tag. A void HTML element such as `<input>` has no closing tag, so it
+closing tag. The load fails too when Astro does not read a closing tag as the
+end of the element it is written for, as with a `<slot>` or `<head>` after
+leading text, or a closing tag inside a `{…}` expression the element did not
+open in; the message names the element, both lines and what to change. A void
+HTML element such as `<input>` has no closing tag, so it
 cannot be a section's name. Tags that start with `data-` are reserved and are
 rejected wherever you write them. See [section tags](../guides/template-tags.md).
 

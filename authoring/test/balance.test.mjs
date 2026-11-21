@@ -52,6 +52,7 @@ test('generated templates: balanced pass, and each mutation is refused', async (
       else if (k === 2) out += '<br>';
       else if (k < 5) { const t = NAMES[next(NAMES.length)]; out += `<${t}>${generate(depth + 1)}</${t}>`; }
       else if (k === 5) out += `{input.text && <note>${generate(depth + 1)}</note>}`;
+      else if (k === 6 && next(2)) out += `<Note title={'it\\'s'} x={"5\\" disk"} y={/* don't */ 1} />`;
       else out += '<Note title="a>b" x={1 > 2} />';
     }
     return out;
@@ -59,7 +60,7 @@ test('generated templates: balanced pass, and each mutation is refused', async (
   for (let i = 0; i < 1000; i++) {
     const body = generate(0);
     assert.equal(await checked(body), null, body);
-    const closes = [...body.matchAll(/<\/[^\s/>]+>/g)];
+    const closes = [...body.matchAll(/<\/[^\t\n\f\r />]+>/g)];
     if (!closes.length) continue;
     const m = closes[next(closes.length)];
     for (const mutated of [

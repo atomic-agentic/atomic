@@ -7,15 +7,22 @@
 // they are written in. Tags are a prompt's structure, so each of these is
 // refused, naming the line and the tag.
 //
-// The parse gives each element where it starts and, when the source closes
-// it, where its closing tag ends; an element the source never closes has no
-// end. A self-closing tag and a void element have an end, but not one in
-// the source: what follows them is read from where they start.
+// The parse gives each element where it starts and, for most elements the
+// source closes, where a closing tag of its own name would end; an element
+// it closed itself has no end. Its positions for void and self-closing
+// tags, fragments and elements it re-reads are not the source's, so where
+// a start tag ends is read from the source: a scan of the start tag alone,
+// its quoted values and braced expressions passed over.
 
 const VOID = new Set(['area', 'base', 'br', 'col', 'command', 'embed', 'hr', 'img', 'input', 'keygen', 'link', 'meta', 'param', 'source', 'track', 'wbr']);
 const TAGS = new Set(['element', 'component', 'custom-element', 'fragment']);
+// HTML's white space, not JavaScript's: the source is read a byte a
+// character, and `\s` would take a byte such as 0xA0 for a space.
+const SPACE = '\\t\\n\\f\\r ';
+const isSpace = (c) => c === ' ' || c === '\t' || c === '\n' || c === '\f' || c === '\r';
 
 const shown = (name) => `<${name}>`;
+const voidMessage = (name) => `\`</${name}>\` closes nothing: <${name}> is a void HTML element, which has no closing tag and cannot be a section's name`;
 
 // The first unbalanced tag in `text`, as parsed into `ast`, if any:
 // `{ line, message }`. The parse counts in bytes, so the source is read as
@@ -38,7 +45,9 @@ function check(source, ast, named) {
       const start = child.position?.start?.offset;
       const end = child.position?.end?.offset;
       if (TAGS.has(child.type)) {
-        const tag = { node: child, name: child.name ?? '', raw: '', start, end, parent };
+        const name = child.name ?? '';
+        const raw = Array.from(new TextEncoder().encode(name), (b) => String.fromCharCode(b)).join('');
+        const tag = { node: child, name, raw, start, end, parent };
         tags.push(tag);
         walk(child, tag);
       } else {
@@ -48,58 +57,59 @@ function check(source, ast, named) {
     }
   };
   walk(ast, null);
-  // Each tag's end in the source: its closing tag, or none.
+  // Where each tag starts and its start tag ends, and the closing tag that
+  // ends it: its own, another's, or none the parse reads.
   for (const tag of tags) {
-    tag.raw = Array.from(new TextEncoder().encode(tag.name), (b) => String.fromCharCode(b)).join('');
-  }
-  for (const tag of tags) {
-    const { name, raw, end } = tag;
     // The parse can place a tag's start a byte off its `<`.
-    const start = [tag.start, tag.start - 1, tag.start + 1].find((at) => source[at] === '<') ?? tag.start;
-    tag.start = start;
-    const open = openEnd(source, start);
-    const selfClosing = source[open - 2] === '/';
-    if (VOID.has(name) || selfClosing) {
-      // Nothing to close.
-      tag.point = true;
-      tag.open = open;
-      continue;
-    }
+    tag.start = [tag.start, tag.start - 1, tag.start + 1].find((at) => source[at] === '<') ?? tag.start;
+    const { open, selfClosing } = startTag(source, tag.start);
     tag.open = open;
-    if (end === undefined) {
-      // Closed by Astro at the end, or by an ancestor's end: unclosed here,
-      // or closed where Astro does not read the closing tag as its own.
-      const later = source.indexOf(`</${raw}>`, open);
-      const message = later < 0
-        ? `${shown(name)} is never closed; close it with \`</${name}>\``
-        : `${shown(name)} is closed on line ${lineOf(source, later)}, but Astro does not read that \`</${name}>\` as its end; move ${shown(name)} into an element of its own`;
-      return { offset: start, message };
-    }
-    // The parse ends a tag where a closing tag of its own name's length
-    // would end, so the closing tag that closed it starts there; a
-    // fragment's `</>` one byte before its end.
-    const at = tag.node.type === 'fragment' && name === '' ? end - 1 : end - (raw.length + 3);
-    const closing = new RegExp(`^</${escapeRegExp(raw)}\\s*>`).exec(source.slice(at, at + raw.length + 256));
-    if (closing) {
-      tag.close = at;
-      tag.to = at + closing[0].length;
-      covered.push([at, tag.to]);
+    if (VOID.has(tag.name) || selfClosing) {
+      tag.point = true;
       continue;
     }
-    // A closing tag of another name closed it.
-    const other = /^<\/([^\s/>]*)/.exec(source.slice(at, at + 4096));
-    const written = other ? named(other[1]) : '';
-    return { offset: at, message: `\`</${written}>\` closes ${shown(name)}, opened on line ${lineOf(source, start)}; close it with \`</${name}>\`` };
+    if (tag.end === undefined) continue;
+    // The parse ends a tag where a closing tag of its own name's length
+    // would end, so the closing tag that ended it starts there; a
+    // fragment's `</>` one byte before its end.
+    const at = tag.node.type === 'fragment' && tag.name === '' ? tag.end - 1 : tag.end - (tag.raw.length + 3);
+    if (at < tag.open) continue;
+    const closer = closerAt(source, at);
+    if (!closer) continue;
+    if (closer.raw === tag.raw) {
+      tag.close = at;
+      tag.to = at + closer.length;
+      covered.push([at, tag.to]);
+    } else {
+      tag.closer = { at, name: named(closer.raw) };
+    }
+  }
+  // A closing tag of another name that ended a tag: the tag it closed is
+  // the one to close, at the closing tag's line.
+  const mismatched = tags.filter((t) => t.closer).sort((a, b) => a.closer.at - b.closer.at)[0];
+  if (mismatched) {
+    const { at, name } = mismatched.closer;
+    return { offset: at, message: `\`</${name}>\` closes ${shown(mismatched.name)}, opened on line ${lineOf(source, mismatched.start)}; close it with \`</${mismatched.name}>\`` };
+  }
+  // A tag with no closing tag the parse reads as its own: never closed, or
+  // closed where Astro does not read the closing tag as its end.
+  const endless = tags.find((t) => !t.point && t.close === undefined);
+  if (endless) {
+    const later = findCloser(source, endless.raw, endless.open);
+    const message = later < 0
+      ? `${shown(endless.name)} is never closed; close it with \`</${endless.name}>\``
+      : `${shown(endless.name)} is closed on line ${lineOf(source, later)}, but Astro does not read that \`</${endless.name}>\` as its end; close it in the same expression it opens in, and put no text or expression before an element Astro moves, such as <slot>, <head> or <template>`;
+    return { offset: endless.start, message };
   }
   // A closing tag the parse dropped: one that is no element's end and is in
   // no text, comment or frontmatter, nor inside a start tag.
   for (const tag of tags) covered.push([tag.start, tag.open]);
-  covered.sort((a, b) => a[0] - b[0]);
   const inside = (offset) => covered.some(([s, e]) => s <= offset && offset < e);
   const closes = new Set(tags.filter((t) => t.close !== undefined).map((t) => t.close));
-  for (const match of source.matchAll(/<\/([^\s/>]*)\s*>/g)) {
+  for (const match of source.matchAll(new RegExp(`</([^${SPACE}/>]+)[^>]*>|</>`, 'g'))) {
     if (closes.has(match.index) || inside(match.index)) continue;
-    return { offset: match.index, message: `\`</${named(match[1])}>\` closes no open element; remove it` };
+    const name = named(match[1] ?? '');
+    return { offset: match.index, message: VOID.has(name) ? voidMessage(name) : `\`</${name}>\` closes no open element; remove it` };
   }
   // Moved: a tag whose parent in the parse is not the tag it is written in.
   const ranged = tags
@@ -118,22 +128,102 @@ function check(source, ast, named) {
   return null;
 }
 
-// Where the start tag that begins at `start` ends, its quoted values and
-// braced expressions passed over.
-function openEnd(source, start) {
-  let depth = 0, quote = null;
-  for (let i = start + 1; i < source.length; i++) {
+// The closing tag at `at`, if one starts there: its name, a byte a
+// character, and its length.
+function closerAt(source, at) {
+  const match = new RegExp(`^</([^${SPACE}/>]*)[^>]*>`).exec(source.slice(at, at + 4096));
+  return match && { raw: match[1], length: match[0].length };
+}
+
+// Where the next closing tag for `raw` starts from `from`, or -1.
+function findCloser(source, raw, from) {
+  const pattern = new RegExp(`</${escapeRegExp(raw)}(?=[${SPACE}/>])`, 'g');
+  pattern.lastIndex = from;
+  return pattern.exec(source)?.index ?? -1;
+}
+
+// Where the start tag that begins at `start` ends, and whether it closes
+// itself. Attribute values are quoted text, read to the matching quote, or
+// braced expressions, read as TypeScript to the matching brace: quotes,
+// escapes, template literals and comments inside passed over. A quote
+// outside a value is part of an attribute's name.
+function startTag(source, start) {
+  let i = start + 1;
+  const ends = (at) => source[at] === '>' || (source[at] === '/' && source[at + 1] === '>');
+  // The tag's name.
+  while (i < source.length && !isSpace(source[i]) && !ends(i)) i++;
+  while (i < source.length) {
     const c = source[i];
-    if (quote) { if (c === quote) quote = null; continue; }
-    if (depth > 0) {
-      if (c === '{') depth++;
-      else if (c === '}') depth--;
-      else if (c === '"' || c === "'" || c === '`') quote = c;
+    if (isSpace(c)) { i++; continue; }
+    if (c === '>') return { open: i + 1, selfClosing: false };
+    if (c === '/' && source[i + 1] === '>') return { open: i + 2, selfClosing: true };
+    if (c === '{') { i = pastExpression(source, i); continue; }
+    if (c === '=') {
+      i++;
+      while (i < source.length && isSpace(source[i])) i++;
+      const v = source[i];
+      if (v === '"' || v === "'") {
+        const close = source.indexOf(v, i + 1);
+        i = close < 0 ? source.length : close + 1;
+      } else if (v === '{') {
+        i = pastExpression(source, i);
+      } else if (v === '`') {
+        i = pastTemplate(source, i + 1);
+      } else {
+        while (i < source.length && !isSpace(source[i]) && source[i] !== '>') i++;
+      }
       continue;
     }
-    if (c === '"' || c === "'" || c === '`') quote = c;
-    else if (c === '{') depth = 1;
-    else if (c === '>') return i + 1;
+    // An attribute's name, to white space, `=`, `>` or `/>`.
+    i++;
+    while (i < source.length && !isSpace(source[i]) && source[i] !== '=' && !ends(i)) i++;
+  }
+  return { open: source.length, selfClosing: false };
+}
+
+// Past the braced expression that starts at `i`.
+function pastExpression(source, i) {
+  return pastScript(source, i, []);
+}
+
+// Past a template literal from just after its opening backtick.
+function pastTemplate(source, i) {
+  return pastScript(source, i, ['`']);
+}
+
+// Past TypeScript from `i` until what `open` holds, and whatever opens on
+// the way, is closed: braces, and template literals with their `${…}`
+// parts, kept on a stack of their own rather than by recursion, so no
+// source is deep enough to exhaust the call stack. Strings, with their
+// escapes, and comments are passed over.
+function pastScript(source, i, open) {
+  const stack = [...open];
+  while (i < source.length) {
+    const c = source[i];
+    if (stack.at(-1) === '`') {
+      if (c === '\\') i += 2;
+      else if (c === '`') { stack.pop(); i++; if (!stack.length) return i; }
+      else if (c === '$' && source[i + 1] === '{') { stack.push('{'); i += 2; }
+      else i++;
+      continue;
+    }
+    if (c === '{') { stack.push('{'); i++; }
+    else if (c === '}') { stack.pop(); i++; if (!stack.length) return i; }
+    else if (c === '"' || c === "'") i = pastString(source, i);
+    else if (c === '`') { stack.push('`'); i++; }
+    else if (c === '/' && source[i + 1] === '/') { const e = source.indexOf('\n', i); i = e < 0 ? source.length : e + 1; }
+    else if (c === '/' && source[i + 1] === '*') { const e = source.indexOf('*/', i + 2); i = e < 0 ? source.length : e + 2; }
+    else i++;
+  }
+  return source.length;
+}
+
+// Past the quoted string that starts at `i`, its escapes passed over.
+function pastString(source, i) {
+  const quote = source[i];
+  for (i++; i < source.length; i++) {
+    if (source[i] === '\\') i++;
+    else if (source[i] === quote || source[i] === '\n') return i + 1;
   }
   return source.length;
 }
