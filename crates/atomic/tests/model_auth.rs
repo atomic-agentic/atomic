@@ -334,12 +334,14 @@ fn a_login_that_fails_and_a_logout_leave_no_sign_in_directory() {
         "a failed login removed a sign-in's directory it did not make"
     );
     std::fs::remove_dir_all(&auth).unwrap();
-    // Nor does a logout with no one signed in: the directory it made holds
-    // no lock file, since nothing was saved or forgotten in it, so even a
-    // keyring that cannot be checked leaves nothing behind.
-    let out = f.atomic(&["--json", "model", "logout"], &[]);
-    assert!(out.status.success(), "{}", text(&out));
-    assert!(!auth.exists(), "a logout left {}", auth.display());
+    // Nor does a logout with no one signed in, whichever store: the
+    // directory it made is its own to remove, whatever lock files its own
+    // forgetting left in it, even with a keyring that cannot be checked.
+    for store in [&[][..], &keyring[..]] {
+        let out = f.atomic(&["--json", "model", "logout"], store);
+        assert!(out.status.success(), "{}", text(&out));
+        assert!(!auth.exists(), "a logout left {} ({store:?})", auth.display());
+    }
     // Signed in, a logout leaves the directory only when the keyring could
     // not be checked, which may still keep the sign-in: the directory is
     // what says so.

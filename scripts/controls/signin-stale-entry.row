@@ -1,1 +1,0 @@
-signin-stale-entry|crates/atomic-core/src/signin.rs|                if saved_since {|                if true /*CONTROL_OFF*/ {|-p atomic-agentic-core --lib signin::tests::a_failed_login_does_not_revive_an_entry_that_outlived_its_directory

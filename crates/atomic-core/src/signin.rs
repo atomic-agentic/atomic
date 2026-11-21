@@ -44,10 +44,6 @@ pub struct SignIn {
     reached: PathBuf,
     /// Whether this invocation made the directory, and so may remove it.
     made: bool,
-    /// What the store held when this invocation made the directory, as
-    /// JSON: an entry that outlived its directory, which is no sign-in and
-    /// is not made one by a login that fails.
-    stale: Option<String>,
     store: AuthCredentialsStoreMode,
     backend: Option<String>,
     issuer: Option<String>,
@@ -225,7 +221,6 @@ impl SignIn {
             reached: located,
             auth_home: dir,
             made: false,
-            stale: None,
             store,
             backend: None,
             issuer: None,
@@ -261,23 +256,11 @@ impl SignIn {
             }
             return Err(e);
         }
-        let made = Self {
+        Ok(Self {
             auth_home,
             made: !existed,
             ..located
-        };
-        // What the store holds now, in a directory made just now, is no
-        // sign-in of this invocation's: a keyring entry that outlived its
-        // directory.
-        let stale = if made.made {
-            made.stored()
-                .ok()
-                .flatten()
-                .and_then(|a| serde_json::to_string(&a).ok())
-        } else {
-            None
-        };
-        Ok(Self { stale, ..made })
+        })
     }
 
     /// Remove the sign-in's directory, so no store is read (see
@@ -286,8 +269,10 @@ impl SignIn {
     /// hold no sign-in: one this invocation made, or one a logout forgot
     /// in both stores. With the keyring store a live sign-in's directory
     /// holds only lock files too. Not when the directory is itself a link:
-    /// that would remove what it leads to and leave the link behind.
-    fn tidy(&self) {
+    /// that would remove what it leads to and leave the link behind. With
+    /// `own_locks`, the locks were left by this invocation's own logout, and
+    /// say nothing about another login.
+    fn tidy(&self, own_locks: bool) {
         if self.reached.is_symlink() {
             return;
         }
@@ -323,20 +308,16 @@ impl SignIn {
         // (create_dir_all in CommittedStorage::lock) if it is gone by then.
         // A Codex update could change either.
         match self.stored() {
-            // Only what the store held when this invocation made the
-            // directory is no sign-in; anything else was saved since.
-            Ok(Some(found)) => {
-                let same = serde_json::to_string(&found).ok();
-                let saved_since = !self.made || same.is_none() || same != self.stale;
-                if saved_since {
-                    return;
-                }
-            }
+            // A login that made the directory forgot what the store held
+            // before it began (see `log_in`), so anything there now was
+            // saved since.
+            Ok(Some(_)) => return,
             Ok(None) => {}
             // Unknown: a directory with a lock file in it may have had a
-            // save, which Codex makes only with both locks, so it stays.
+            // save, which Codex makes only with both locks, so it stays;
+            // unless the locks are this invocation's own logout's.
             Err(_) => {
-                if !held.is_empty() {
+                if !held.is_empty() && !own_locks {
                     return;
                 }
             }
@@ -354,7 +335,6 @@ impl SignIn {
             auth_home: dir.to_owned(),
             reached: dir.to_owned(),
             made: false,
-            stale: None,
             store: AuthCredentialsStoreMode::File,
             backend: None,
             issuer: None,
@@ -500,9 +480,29 @@ impl SignIn {
         // Only a directory this login made: one that was here may hold a
         // sign-in the keyring keeps, which a failed login leaves as it was.
         if outcome.is_err() && self.made {
-            self.tidy();
+            self.tidy(false);
         }
         outcome
+    }
+
+    /// Forget what the store holds for this directory, without revoking
+    /// it: for a directory this invocation made, whatever the store holds
+    /// outlived the directory it was kept for, and is no sign-in.
+    fn forget(&self) -> std::io::Result<()> {
+        #[cfg(test)]
+        if let Some(forgot) = tests::forget(&self.auth_home) {
+            return forgot;
+        }
+        codex_login::logout(&self.auth_home, self.store, KEYRING).map(|_| ())
+    }
+
+    /// Whether the store is the test keyring, which needs no probe.
+    fn faked(&self) -> bool {
+        #[cfg(test)]
+        if tests::keyring_holds(&self.auth_home).is_some() {
+            return true;
+        }
+        false
     }
 
     async fn log_in(&self, device: bool) -> anyhow::Result<()> {
@@ -518,8 +518,15 @@ impl SignIn {
             )
             .into());
         }
-        if self.store != AuthCredentialsStoreMode::File {
+        if self.store != AuthCredentialsStoreMode::File && !self.faked() {
             keyring_usable()?;
+        }
+        // An entry that outlived the directory it was kept for is no
+        // sign-in: forgotten before the flow starts, so neither a login
+        // stopped part way nor a run that refreshes it meanwhile brings it
+        // back. A logout still revokes one, since it forgets, never this.
+        if self.made {
+            self.forget()?;
         }
         let mut options = codex_login::ServerOptions::new(
             self.auth_home.clone(),
@@ -588,7 +595,7 @@ impl SignIn {
         // and its directory is what says so.
         let nothing_kept = self.made || keyring.is_ok();
         if nothing_kept {
-            self.tidy();
+            self.tidy(self.made);
         }
         Ok(Forgotten { file, keyring })
     }
@@ -859,6 +866,31 @@ mod tests {
     /// Kept for a directory whose keyring cannot be reached.
     const UNREACHABLE: &str = "unreachable";
 
+    /// What another login saves for a directory right after this one's
+    /// forgets what the store held, as if it saved while this one waited.
+    static SAVED_MEANWHILE: std::sync::Mutex<Vec<(PathBuf, String)>> =
+        std::sync::Mutex::new(Vec::new());
+
+    /// Forget what the test keyring holds for `dir`, if it is listed there.
+    pub(super) fn forget(dir: &Path) -> Option<std::io::Result<()>> {
+        let listed = keyring_holds(dir)?;
+        if listed.is_err() {
+            return Some(Err(std::io::Error::other("the keyring cannot be reached")));
+        }
+        let meanwhile = SAVED_MEANWHILE
+            .lock()
+            .expect("saved")
+            .iter()
+            .rev()
+            .find(|(d, _)| d == dir)
+            .map(|(_, json)| json.clone());
+        KEYRING
+            .lock()
+            .expect("keyring")
+            .push((dir.to_owned(), meanwhile));
+        Some(Ok(()))
+    }
+
     /// Keep `json` (or nothing) in the test keyring for `dir`.
     fn keep(dir: &Path, json: Option<String>) {
         KEYRING
@@ -1022,12 +1054,17 @@ mod tests {
             let waiting = SignIn::made_at(located, None)
                 .expect("made")
                 .with_issuer("http://127.0.0.1:9");
-            // The other login's sign-in, kept in the keyring, and the locks
-            // its save left behind.
+            // An entry that outlived the directory, then the other login's
+            // sign-in, kept once this one has forgotten that entry, and the
+            // locks its save left behind.
+            keep(&dir, Some(signed_in("account-old")));
+            SAVED_MEANWHILE.lock().expect("saved").push((
+                std::fs::canonicalize(&dir).expect("dir"),
+                signed_in("account-1"),
+            ));
             for lock in ["auth.lock", "auth.json.lock"] {
                 std::fs::write(dir.join(lock), "").expect("lock");
             }
-            keep(&dir, Some(signed_in("account-1")));
             assert!(waiting.login(true).await.is_err());
             assert!(
                 dir.join("auth.lock").exists(),
@@ -1038,6 +1075,35 @@ mod tests {
                 .expect("account")
                 .expect("still signed in");
             assert_eq!(account.mode, "chatgpt");
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    /// A login stopped part way, as by Ctrl-C at the browser step, after
+    /// it made the directory, leaves no entry that outlived the directory
+    /// standing as a sign-in: it was forgotten before the flow began.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_login_stopped_part_way_does_not_revive_an_entry_that_outlived_its_directory() {
+        crate::testing::on_codex_runtime(async {
+            let dir = auth_dir("stopped");
+            keep(&dir, Some(signed_in("account-old")));
+            std::fs::remove_dir(&dir).expect("its directory removed");
+            let located = SignIn {
+                store: AuthCredentialsStoreMode::Keyring,
+                ..SignIn::in_files(&dir)
+            };
+            let sign_in = SignIn::made_at(located, None)
+                .expect("made")
+                .with_issuer("http://127.0.0.1:9");
+            // The browser flow waits for a browser that never comes back.
+            let stopped =
+                tokio::time::timeout(std::time::Duration::from_secs(2), sign_in.login(false)).await;
+            assert!(stopped.is_err(), "the login finished: {stopped:?}");
+            assert!(
+                sign_in.account().expect("account").is_none(),
+                "an outlived entry reads as a sign-in"
+            );
             let _ = std::fs::remove_dir_all(&dir);
         });
     }
@@ -1114,13 +1180,13 @@ mod tests {
             made: true,
             ..SignIn::in_files(&target)
         }
-        .tidy();
+        .tidy(false);
         assert!(target.join("auth.lock").exists(), "tidied through a link");
         SignIn {
             made: true,
             ..SignIn::in_files(&target)
         }
-        .tidy();
+        .tidy(false);
         assert!(!target.exists(), "reached as it is, it is tidied");
         let _ = std::fs::remove_dir_all(&dir);
     }

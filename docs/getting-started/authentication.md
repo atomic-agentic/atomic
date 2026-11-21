@@ -73,12 +73,15 @@ itself a git checkout (a `~/.git`) holding the project: set `ATOMIC_HOME` to a
 directory outside it. A link on the way that leads nowhere is refused too, and
 so is a checkout whose `.git` file or `commondir` is not a small regular file,
 as git writes them: that refuses your own configuration as well. A login that
-fails removes the sign-in directory it made, unless the store then holds a
-sign-in saved since it made it, or the store cannot be read and the directory
-holds a lock file a save may have left; one stopped with Ctrl-C leaves it. A
-logout removes the directory once both stores are checked, so later runs read
-no store; while the keyring cannot be checked, the directory stays, and atomic
-says the sign-in could not be read.
+makes the sign-in directory first forgets whatever the store still holds for
+it, which outlived an earlier directory and is no sign-in. A login that fails
+removes the directory it made, unless the store then holds a sign-in another
+login saved meanwhile, or the store cannot be read and the directory holds a
+lock file a save may have left; one stopped with Ctrl-C leaves the directory,
+with nothing in the store. A logout removes the directory once both stores
+are checked, so later runs read no store, and removes one it made itself even
+if the keyring cannot be checked. Otherwise, while the keyring cannot be
+checked, the directory stays, and atomic says the sign-in could not be read.
 
 Keeping the token out of reach has side effects on atomic's own process, and so
 on everything it starts:
