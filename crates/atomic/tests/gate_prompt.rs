@@ -796,7 +796,8 @@ fn without_a_terminal_the_start_of_a_private_key_in_a_title_hides_how_to_decide_
 fn a_hostile_title_reaches_the_terminal_escaped() {
     let p = Project::new("hostile");
     p.enroll();
-    let data = json!({"text": "\u{1b}]0;owned\u{7}\u{1b}[2J\u{202e}gpj.exe"}).to_string();
+    let text_in = "\u{1b}]0;owned\u{7}\u{1b}[2J\u{7f}\u{9b}31m\u{202e}gpj.exe";
+    let data = json!({ "text": text_in }).to_string();
     let run = p.spawn(&["run", "approval", "--run-id", "hostile", "--data", &data]);
     let until = Instant::now() + Duration::from_secs(60);
     let listed = loop {
@@ -814,6 +815,16 @@ fn a_hostile_title_reaches_the_terminal_escaped() {
         "{raw:?}"
     );
     assert!(raw.contains("\\u{001b}]0;owned"), "{raw}");
+    // The JSON form too: every unsafe character escaped, and the title
+    // still reads back whole.
+    let listed = p.atomic(&["gates", "list", "--json"]);
+    let raw = String::from_utf8_lossy(&listed.stdout).into_owned();
+    for c in ['\u{1b}', '\u{7}', '\u{7f}', '\u{9b}', '\u{202e}'] {
+        assert!(!raw.contains(c), "{c:?} reached the terminal: {raw:?}");
+    }
+    let gates: Value = serde_json::from_str(&raw).expect("JSON");
+    let title = gates[0]["title"].as_str().unwrap_or_default();
+    assert!(title.ends_with(text_in), "{title:?}");
 }
 
 #[test]
