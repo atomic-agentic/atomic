@@ -311,6 +311,13 @@ pub async fn run(
     // sign-in only for a live eval, since a replay reads no credential.
     let live = source != Source::Recorded && needs_model;
     let resolved = crate::engine::settings(&state, &args.engine, live)?;
+    // A case waits for the execution backend no longer than a run would.
+    atomic_core::runtime::limit_backend_wait(
+        resolved
+            .settings
+            .backend_wait()
+            .map(std::time::Duration::from_secs),
+    );
     // A recording answers only the request it was made for, endpoint and
     // model included, so replaying needs them configured as they were; it
     // needs no key, so none is read. A live eval calls the endpoint as a

@@ -707,6 +707,9 @@ pub async fn serve(
     // One run whose commands cannot be confined here does not stop the
     // others: it stays unfinished, and serve goes on.
     atomic_app::workflows::serve_past_unconfinable_steps();
+    // A step that has waited its limit for room is set aside, and keeps
+    // trying, rather than stopping serve or waiting for a restart.
+    atomic_core::runtime::keep_trying_past_the_limit();
     let state = state(project)?;
     let engine = engine::open(
         &state,

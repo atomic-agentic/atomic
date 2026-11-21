@@ -66,6 +66,12 @@ pub struct EngineArgs {
     /// `ATOMIC_EXECUTOR_ID`).
     #[arg(long)]
     pub executor_id: Option<String>,
+    /// How many seconds a step waits for the execution backend to have room
+    /// for its workspace before the run stops, unfinished and with nothing
+    /// recorded, for `atomic runs resume`. Without it, a step waits for as
+    /// long as it takes (`backend_wait`, `ATOMIC_BACKEND_WAIT`).
+    #[arg(long, value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(1..))]
+    pub backend_wait: Option<u64>,
 }
 
 /// The settings for the project at `state`, with `args` on top. The
@@ -365,6 +371,12 @@ pub async fn open(
     // started still runs must not let another process recover that run.
     state.lock_execution(command)?.hold_until_exit();
     let resolved = settings(state, args, needs_model)?;
+    atomic_core::runtime::limit_backend_wait(
+        resolved
+            .settings
+            .backend_wait()
+            .map(std::time::Duration::from_secs),
+    );
     let database = store_of(state, &resolved.settings);
     let executor = atomic_durable::executor_identity(resolved.settings.executor_id.as_deref())?;
     if matches!(database, Database::Postgres { .. }) && executor.is_none() {
