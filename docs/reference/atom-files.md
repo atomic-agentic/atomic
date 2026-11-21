@@ -398,8 +398,19 @@ and history files of bash, zsh and fish, among others. They are denied
 under `$HOME` and under the home directory the system records for your user,
 wherever the variables that move them (`XDG_CONFIG_HOME`, `ZDOTDIR`,
 `HISTFILE`, `GNUPGHOME`, `CARGO_HOME`, `DOCKER_CONFIG`, the AWS file
-variables, `KUBECONFIG` and others) put them, and a link among them, up to
-four directory levels inside a denied directory, is denied as what it
+variables, `KUBECONFIG` and others) put them. AWS's workload token files
+are denied too: the files `AWS_WEB_IDENTITY_TOKEN_FILE` and
+`AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE` name, the whole projected volume
+when Kubernetes mounts such a file in one (so the token it rotates in next
+is denied as well), and EKS's usual token directories,
+`/var/run/secrets/eks.amazonaws.com/serviceaccount` and
+`/var/run/secrets/pods.eks.amazonaws.com/serviceaccount`, whether or not a
+variable names them. A token given as a value rather than a file, such as
+`AWS_CONTAINER_AUTHORIZATION_TOKEN`, never reaches a command, which gets
+only a few core variables and those its atom declares, and the credential
+endpoints AWS serves on link-local addresses are out of its reach, since a
+command reaches no private or local address. A link among them, up to four
+directory levels inside a denied directory, is denied as what it
 points at, whoever owns it and wherever it is, under `/run`, `/etc` or
 `/opt` too. Never denied, so that commands keep working: anything under
 `/usr`, `/bin`, `/sbin`, `/lib*`, `/nix/store`, `/dev`, `/proc` or `/sys`,

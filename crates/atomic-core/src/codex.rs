@@ -240,12 +240,40 @@ const MOVED_SECRETS: &[(&str, &[&str])] = &[
     ("DOCKER_CONFIG", &["config.json"]),
     ("AWS_SHARED_CREDENTIALS_FILE", &[""]),
     ("AWS_CONFIG_FILE", &[""]),
+    ("AWS_WEB_IDENTITY_TOKEN_FILE", &[""]),
+    ("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE", &[""]),
     ("NETRC", &[""]),
     ("NPM_CONFIG_USERCONFIG", &[""]),
     ("npm_config_userconfig", &[""]),
     ("PASSWORD_STORE_DIR", &[""]),
     ("CODEX_HOME", &[""]),
 ];
+
+/// Where AWS's workload identities put their token files on Kubernetes when
+/// no variable says otherwise (IAM roles for service accounts, and EKS Pod
+/// Identity): denied whether or not atomic's environment names them.
+const AWS_TOKEN_DIRS: &[&str] = &[
+    "/var/run/secrets/eks.amazonaws.com/serviceaccount",
+    "/var/run/secrets/pods.eks.amazonaws.com/serviceaccount",
+];
+
+/// The variables that name a workload token file an AWS SDK reads.
+const AWS_TOKEN_FILES: &[&str] = &[
+    "AWS_WEB_IDENTITY_TOKEN_FILE",
+    "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+];
+
+/// The directory that holds `file` when it is in a projected volume, as
+/// Kubernetes mounts a service account's token: a link through a `..data`
+/// link to the volume's current version, which Kubernetes swaps for a new
+/// one each time it rotates the token. Denying the directory, not only the
+/// file the link points at now, keeps the next token denied too.
+fn projected_volume(file: PathBuf) -> Option<PathBuf> {
+    let dir = file.parent()?;
+    std::fs::symlink_metadata(dir.join("..data"))
+        .is_ok_and(|m| m.file_type().is_symlink())
+        .then(|| dir.to_owned())
+}
 
 /// The home directories whose credential places are denied, as `env` reads
 /// `HOME` and with `passwd` the password database's home for this user:
@@ -318,6 +346,15 @@ pub fn home_secrets(
     if let Some(list) = env("KUBECONFIG") {
         out.extend(std::env::split_paths(&list).filter(|p| p.is_absolute()));
     }
+    // AWS's workload token files: where they usually are, and, for one a
+    // variable names in a projected volume, the volume itself.
+    out.extend(AWS_TOKEN_DIRS.iter().map(PathBuf::from));
+    out.extend(
+        AWS_TOKEN_FILES
+            .iter()
+            .filter_map(|name| absolute(name))
+            .filter_map(projected_volume),
+    );
     out.sort();
     out.dedup();
     Ok(out)
@@ -2923,6 +2960,11 @@ mod tests {
                 ("KUBECONFIG", "/k/a:/k/b:relative"),
                 ("DOCKER_CONFIG", "/dock"),
                 ("AWS_SHARED_CREDENTIALS_FILE", "/aws/creds"),
+                ("AWS_WEB_IDENTITY_TOKEN_FILE", "/aws/web-identity-token"),
+                (
+                    "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+                    "/aws/pod-identity-token",
+                ),
                 ("NETRC", "/n/netrc"),
                 ("PASSWORD_STORE_DIR", "/pass"),
             ]),
@@ -2946,6 +2988,10 @@ mod tests {
             "/k/b",
             "/dock/config.json",
             "/aws/creds",
+            "/aws/web-identity-token",
+            "/aws/pod-identity-token",
+            "/var/run/secrets/eks.amazonaws.com/serviceaccount",
+            "/var/run/secrets/pods.eks.amazonaws.com/serviceaccount",
             "/n/netrc",
             "/pass",
         ] {
@@ -2953,6 +2999,44 @@ mod tests {
         }
         assert!(!has(&secrets, "relative"));
         assert!(!has(&secrets, "/opt/cargo/config.toml"), "{secrets:?}");
+    }
+
+    /// A workload token file a variable names in a projected volume, as
+    /// Kubernetes mounts one, is denied with the volume that holds it, so the
+    /// token it rotates in next is denied too; an ordinary token file is
+    /// denied alone.
+    #[cfg(unix)]
+    #[test]
+    fn a_projected_token_volume_is_denied_whole() {
+        let dir = scratch("projected-token");
+        let volume = dir.join("serviceaccount");
+        std::fs::create_dir_all(volume.join("..2026_01_01_00_00_00.1")).expect("version");
+        std::fs::write(volume.join("..2026_01_01_00_00_00.1/token"), "t").expect("token");
+        std::os::unix::fs::symlink("..2026_01_01_00_00_00.1", volume.join("..data"))
+            .expect("..data");
+        std::os::unix::fs::symlink("..data/token", volume.join("token")).expect("token link");
+        std::fs::write(dir.join("plain-token"), "t").expect("plain");
+        let projected = volume.join("token").display().to_string();
+        let plain = dir.join("plain-token").display().to_string();
+        let home = dir.display().to_string();
+        let env = |name: &str| {
+            match name {
+                "HOME" => Some(home.clone()),
+                "AWS_WEB_IDENTITY_TOKEN_FILE" => Some(projected.clone()),
+                "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE" => Some(plain.clone()),
+                _ => None,
+            }
+            .map(std::ffi::OsString::from)
+        };
+        let secrets = home_secrets(&env, None).expect("homes");
+        assert!(secrets.contains(&volume), "the volume: {secrets:?}");
+        assert!(secrets.contains(&volume.join("token")), "{secrets:?}");
+        assert!(secrets.contains(&dir.join("plain-token")), "{secrets:?}");
+        assert!(
+            !secrets.contains(&dir),
+            "an ordinary token's directory stays readable: {secrets:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A link at `link` to `target`, replacing what was there.
