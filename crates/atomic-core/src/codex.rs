@@ -804,16 +804,31 @@ fn denied_paths(
             // needs or may write. A target inside another denied place is
             // denied with it. A place that is a link atomic cannot resolve
             // for a reason other than leading nowhere yet refuses the
-            // thread here, as each of its commands would refuse it.
-            if !found && let Err(e) = resolved(&path) {
-                return Err(refuse(format!(
+            // thread here, as each of its commands would where the sandbox
+            // helper walks the places again (Linux); one that leads nowhere
+            // yet refuses it when where it leads lies in what the thread may
+            // write, where a command could put a file for what reads the
+            // place to find.
+            let unresolved = |e: anyhow::Error| {
+                refuse(format!(
                     "{e:#}; remove the link, or point it at something atomic can reach"
-                )));
-            }
-            let Some(target) = std::fs::canonicalize(&path)
-                .ok()
-                .filter(|t| deniable(t, !found))
-            else {
+                ))
+            };
+            let target = if found {
+                std::fs::canonicalize(&path).ok()
+            } else {
+                match resolved(&path) {
+                    Ok(Some(target)) => Some(target),
+                    Ok(None) => {
+                        if let Some(refused) = dangling_into(&path, &writable) {
+                            return Err(refused);
+                        }
+                        None
+                    }
+                    Err(e) => return Err(unresolved(e)),
+                }
+            };
+            let Some(target) = target.filter(|t| deniable(t, !found)) else {
                 continue;
             };
             if found && places.iter().any(|p| target.starts_with(p)) {
@@ -968,6 +983,85 @@ const GLOB_SPECIAL: &[char] = &['*', '?', '[', ']', '{', '}', '\\'];
 
 /// The databases Codex keeps in its home, as a pattern inside it.
 const SQLITE_FILES: &str = "*.sqlite*";
+
+/// Why a denied place that is a link leading nowhere yet cannot be left as
+/// it is: where it would lead, followed through each further link, lies in
+/// one of `writable`, where a command could put a file for what reads the
+/// place to find, or cannot be told. `None` when it leads elsewhere.
+fn dangling_into(path: &Path, writable: &[PathBuf]) -> Option<anyhow::Error> {
+    let refuse = |why: String| Some(anyhow::Error::new(DenyRefused(why)));
+    let mut at = path.to_owned();
+    for _ in 0..=LINK_HOPS {
+        let link = match std::fs::symlink_metadata(&at) {
+            Ok(meta) => meta.file_type().is_symlink(),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                false
+            }
+            Err(e) => {
+                return refuse(format!(
+                    "{} leads to {}, which cannot be looked at ({e}); point the link at \
+                     something atomic can reach",
+                    path.display(),
+                    at.display()
+                ));
+            }
+        };
+        if !link {
+            // Where it leads, as far as anything is there.
+            let unsettled = at.components().any(|c| {
+                matches!(
+                    c,
+                    std::path::Component::ParentDir | std::path::Component::CurDir
+                )
+            });
+            if unsettled {
+                return refuse(format!(
+                    "{} is a link to {}, which is not there yet, and atomic cannot tell where \
+                     that would be; point the link elsewhere",
+                    path.display(),
+                    at.display()
+                ));
+            }
+            let root = writable.iter().find(|w| at.starts_with(w))?;
+            return refuse(format!(
+                "{} is a link to {}, which is not there yet and lies in {}, which atoms' \
+                 commands may write, so a command could put a file there for what reads {} to \
+                 find; point the link elsewhere, or make what it leads to first",
+                path.display(),
+                at.display(),
+                root.display(),
+                path.display()
+            ));
+        }
+        let to = match std::fs::read_link(&at) {
+            Ok(to) => to,
+            Err(e) => {
+                return refuse(format!(
+                    "{} is a link atomic cannot read ({e}); remove it, or point it at something \
+                     atomic can reach",
+                    at.display()
+                ));
+            }
+        };
+        let to = match at.parent() {
+            Some(dir) if to.is_relative() => dir.join(to),
+            _ => to,
+        };
+        at = real_spelling(&to);
+    }
+    refuse(format!(
+        "{} leads through more than {LINK_HOPS} links; atomic cannot tell where",
+        path.display()
+    ))
+}
+
+/// The most links [`dangling_into`] follows, as the kernel does.
+const LINK_HOPS: usize = 40;
 
 /// `path` with the links among the directories above it, and itself,
 /// resolved as far as it exists, and the rest as it is named.
@@ -3953,7 +4047,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_file_behind_a_link_in_a_denied_directory_is_denied_too() {
-        let dir = scratch("linked-deny");
+        let dir_scratch = Scratch::new("linked-deny");
+        let dir = dir_scratch.0.clone();
         let config = dir.join("config/atomic");
         std::fs::create_dir_all(&config).expect("config dir");
         std::fs::create_dir_all(dir.join("kept")).expect("kept");
@@ -4070,7 +4165,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_projected_token_volume_is_denied_whole() {
-        let dir = scratch("projected-token");
+        let dir_scratch = Scratch::new("projected-token");
+        let dir = dir_scratch.0.clone();
         let volume = dir.join("serviceaccount");
         std::fs::create_dir_all(volume.join("..2026_01_01_00_00_00.1")).expect("version");
         std::fs::write(volume.join("..2026_01_01_00_00_00.1/token"), "t").expect("token");
@@ -4114,7 +4210,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_projected_volume_is_found_through_links_and_for_nested_items() {
-        let dir = std::fs::canonicalize(scratch("projected-links")).expect("real");
+        let dir_scratch = Scratch::new("projected-links");
+        let dir = dir_scratch.0.clone();
         let version = "..2026_01_01_00_00_00.1";
         let volume = |name: &str| {
             let volume = dir.join(name);
@@ -4173,7 +4270,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_place_behind_a_linked_directory_is_denied_by_its_real_path() {
-        let dir = std::fs::canonicalize(scratch("real-spelling")).expect("real");
+        let dir_scratch = Scratch::new("real-spelling");
+        let dir = dir_scratch.0.clone();
         std::fs::create_dir_all(dir.join("real/gnupg")).expect("gnupg");
         std::fs::create_dir_all(dir.join("codex")).expect("codex home");
         link(&dir.join("real"), &dir.join("linked"));
@@ -4212,7 +4310,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn only_the_persons_own_files_and_directories_are_denied_behind_links() {
-        let dir = scratch("deniable");
+        let dir_scratch = Scratch::new("deniable");
+        let dir = dir_scratch.0.clone();
         let home = dir.join("home");
         std::fs::create_dir_all(dir.join("codex")).expect("codex home");
         std::fs::create_dir_all(home.join(".ssh")).expect("ssh");
@@ -4251,7 +4350,8 @@ mod tests {
     #[test]
     fn a_late_link_is_found_and_one_that_cannot_be_denied_refuses() {
         let _table = crate::mounts::with_table(ONE_MOUNT);
-        let dir = scratch("late-links");
+        let dir_scratch = Scratch::new("late-links");
+        let dir = dir_scratch.0.clone();
         let place = dir.join("home/.aws");
         let work = dir.join("work");
         for d in [&place, &work.join("deep"), &dir.join("elsewhere")] {
@@ -4299,7 +4399,8 @@ mod tests {
     #[test]
     fn a_static_chain_of_links_finds_nothing_new() {
         let _table = crate::mounts::with_table(ONE_MOUNT);
-        let dir = scratch("late-static");
+        let dir_scratch = Scratch::new("late-static");
+        let dir = dir_scratch.0.clone();
         let place = dir.join("home/.codex");
         let skills = dir.join("dev/skills");
         let store = dir.join("dev/store");
@@ -4328,7 +4429,8 @@ mod tests {
     #[test]
     fn a_place_that_became_a_link_is_replaced_by_its_target() {
         let _table = crate::mounts::with_table(ONE_MOUNT);
-        let dir = scratch("late-place");
+        let dir_scratch = Scratch::new("late-place");
+        let dir = dir_scratch.0.clone();
         let home = dir.join("home");
         std::fs::create_dir_all(dir.join("elsewhere")).expect("dir");
         std::fs::create_dir_all(dir.join("work/deep")).expect("dir");
@@ -4381,7 +4483,8 @@ mod tests {
     #[test]
     fn nested_late_targets_collapse_to_the_outer() {
         let _table = crate::mounts::with_table(ONE_MOUNT);
-        let dir = scratch("late-nested");
+        let dir_scratch = Scratch::new("late-nested");
+        let dir = dir_scratch.0.clone();
         let home = dir.join("home");
         let kept = dir.join("dev/kept");
         std::fs::create_dir_all(kept.join("b")).expect("dir");
@@ -4456,7 +4559,8 @@ mod tests {
     #[test]
     fn a_carried_place_is_walked_through_a_link() {
         let _table = crate::mounts::with_table(ONE_MOUNT);
-        let dir = scratch("late-carried");
+        let dir_scratch = Scratch::new("late-carried");
+        let dir = dir_scratch.0.clone();
         let ssh = dir.join("home/.ssh");
         let gnupg = dir.join("dev/gnupg");
         std::fs::create_dir_all(&ssh).expect("dir");
@@ -4478,7 +4582,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_late_target_is_denied_at_its_second_mounts() {
-        let dir = scratch("late-aliases");
+        let dir_scratch = Scratch::new("late-aliases");
+        let dir = dir_scratch.0.clone();
         let place = dir.join("home/.aws");
         std::fs::create_dir_all(&place).expect("dir");
         std::fs::create_dir_all(dir.join("elsewhere")).expect("dir");
@@ -4513,7 +4618,8 @@ mod tests {
     #[test]
     fn a_denied_entry_that_became_a_link_is_replaced_however_it_is_spelled() {
         let _table = crate::mounts::with_table(ONE_MOUNT);
-        let dir = scratch("late-spelled");
+        let dir_scratch = Scratch::new("late-spelled");
+        let dir = dir_scratch.0.clone();
         let real_home = dir.join("data/u");
         std::fs::create_dir_all(&real_home).expect("dir");
         std::fs::create_dir_all(dir.join("elsewhere")).expect("dir");
@@ -5043,7 +5149,8 @@ mod tests {
     fn a_place_under_a_linked_directory_that_became_a_link_leaves_no_link_denied() {
         use codex_protocol::permissions::{FileSystemAccessMode, FileSystemPath};
         let _table = crate::mounts::with_table(ONE_MOUNT);
-        let dir = scratch("relisted-spelled");
+        let dir_scratch = Scratch::new("relisted-spelled");
+        let dir = dir_scratch.0.clone();
         let real_home = dir.join("data/u");
         let work = dir.join("work");
         let codex = dir.join("codex");
@@ -5129,7 +5236,8 @@ mod tests {
     fn a_denial_inside_a_late_target_is_taken_out() {
         use codex_protocol::permissions::{FileSystemAccessMode, FileSystemPath};
         let _table = crate::mounts::with_table(ONE_MOUNT);
-        let dir = scratch("relisted-inner");
+        let dir_scratch = Scratch::new("relisted-inner");
+        let dir = dir_scratch.0.clone();
         let place = dir.join("home/.aws");
         let kept = dir.join("dev/kept");
         let work = dir.join("work");
@@ -5195,7 +5303,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_second_mount_in_the_list_is_not_walked_as_a_place() {
-        let dir = scratch("late-inferred-alias");
+        let dir_scratch = Scratch::new("late-inferred-alias");
+        let dir = dir_scratch.0.clone();
         let place = dir.join("home/.config/gh");
         let shown = dir.join("dev/gh");
         let again = dir.join("again/gh");
@@ -5253,7 +5362,8 @@ mod tests {
     #[test]
     fn the_helper_relists_a_turns_profile() {
         let _table = crate::mounts::with_table(ONE_MOUNT);
-        let dir = scratch("relisted");
+        let dir_scratch = Scratch::new("relisted");
+        let dir = dir_scratch.0.clone();
         let place = dir.join("home/.aws");
         let work = dir.join("work");
         let codex = dir.join("codex");
@@ -5316,7 +5426,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_second_mount_that_cannot_be_denied_refuses_the_list() {
-        let dir = scratch("second-mounts");
+        let dir_scratch = Scratch::new("second-mounts");
+        let dir = dir_scratch.0.clone();
         let codex = dir.join("codex");
         for d in [&codex, &dir.join("home/.aws")] {
             std::fs::create_dir_all(d).expect("dir");
@@ -5404,7 +5515,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn nothing_runs_when_a_denial_would_cover_what_commands_need_or_may_write() {
-        let dir = scratch("covering");
+        let dir_scratch = Scratch::new("covering");
+        let dir = dir_scratch.0.clone();
         let home = dir.join("home");
         let codex = dir.join("codex");
         let work = dir.join("work");
@@ -5488,7 +5600,8 @@ mod tests {
     #[test]
     fn a_pipe_is_denied_and_only_programs_devices_and_others_directories_are_left() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = scratch("pipes");
+        let dir_scratch = Scratch::new("pipes");
+        let dir = dir_scratch.0.clone();
         let home = dir.join("home");
         std::fs::create_dir_all(home.join(".ssh")).expect("ssh");
         std::fs::create_dir_all(dir.join("codex")).expect("codex home");
@@ -5609,10 +5722,83 @@ mod tests {
         denied_paths(&private, &dir.0.join("codex"), None, &[]).expect("passed over");
     }
 
+    /// A place that is a link leading nowhere yet refuses the thread when
+    /// where it would lead, through each further link, lies in what the
+    /// thread may write or in atomic's state, where a command could put a
+    /// file for what reads the place to find, or cannot be told; one that
+    /// leads elsewhere is passed over.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_place_link_into_what_the_thread_may_write_refuses_it() {
+        let dir = Scratch::new("place-dangling");
+        let home = dir.0.join("home");
+        let work = dir.0.join("work");
+        let codex = dir.0.join("codex");
+        let state = dir.0.join("state");
+        for d in [&home, &work, &codex, &state] {
+            std::fs::create_dir_all(d).expect("dir");
+        }
+        let _table = crate::mounts::with_table(ONE_MOUNT);
+        let place = home.join(".aws");
+        let private = PrivateState {
+            state_dir: state.clone(),
+            private: dir.0.join("private"),
+            also: vec![place.clone()],
+        };
+        let refused = |writable: &[PathBuf]| {
+            denied_paths(&private, &codex, Some(&work), writable)
+                .err()
+                .map(|e| e.to_string())
+        };
+        let writable = std::slice::from_ref(&work);
+        // Into what the thread may write.
+        link(&work.join("aws"), &place);
+        let why = refused(writable).expect("refused");
+        assert!(
+            why.contains(&format!(
+                "{} is a link to {}, which is not there yet and lies in {}",
+                place.display(),
+                work.join("aws").display(),
+                work.display()
+            )),
+            "{why}"
+        );
+        // Into atomic's state, for a thread that writes nothing.
+        std::fs::remove_file(&place).expect("unlink");
+        link(&state.join("aws"), &place);
+        let why = refused(&[]).expect("refused");
+        assert!(
+            why.contains(&format!("lies in {}", state.display())),
+            "{why}"
+        );
+        // Through a further link, also leading nowhere yet.
+        std::fs::remove_file(&place).expect("unlink");
+        link(&work.join("aws"), &dir.0.join("hop"));
+        link(&dir.0.join("hop"), &place);
+        let why = refused(writable).expect("refused");
+        assert!(
+            why.contains(&format!("lies in {}", work.display())),
+            "{why}"
+        );
+        // Somewhere it cannot tell: up from what is not there.
+        std::fs::remove_file(&place).expect("unlink");
+        link(&dir.0.join("missing/../aws"), &place);
+        let why = refused(writable).expect("refused");
+        assert!(
+            why.contains("atomic cannot tell where that would be"),
+            "{why}"
+        );
+        // Elsewhere: passed over, as before.
+        std::fs::remove_file(&place).expect("unlink");
+        link(&dir.0.join("elsewhere/aws"), &place);
+        assert_eq!(refused(writable), None);
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_linked_secret_is_denied_as_what_it_points_at_and_links_are_followed_deep() {
-        let dir = scratch("linked-secrets");
+        let dir_scratch = Scratch::new("linked-secrets");
+        let dir = dir_scratch.0.clone();
         let home = dir.join("home");
         std::fs::create_dir_all(home.join("dotfiles")).expect("dotfiles");
         std::fs::create_dir_all(home.join("keys")).expect("keys");
@@ -5656,7 +5842,8 @@ mod tests {
 
     #[test]
     fn a_denied_path_inside_another_is_left_to_it() {
-        let dir = scratch("nested-deny");
+        let dir_scratch = Scratch::new("nested-deny");
+        let dir = dir_scratch.0.clone();
         let config = dir.join("config/atomic");
         let credentials = config.join("credentials");
         std::fs::create_dir_all(&credentials).expect("dirs");
@@ -5754,7 +5941,9 @@ mod tests {
     #[test]
     fn a_sign_in_sends_no_organization_or_project_headers() {
         on_codex_runtime(async {
-            let (home, auth) = (scratch("home-headers"), scratch("auth-headers"));
+            let (home_scratch, auth_scratch) =
+                (Scratch::new("home-headers"), Scratch::new("auth-headers"));
+            let (home, auth) = (home_scratch.0.clone(), auth_scratch.0.clone());
             let signed_in = ModelEndpoint {
                 base_url: crate::signin::CODEX_BACKEND.into(),
                 model: "synthetic".into(),
@@ -5810,12 +5999,6 @@ mod tests {
         }
     }
 
-    fn scratch(tag: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("atomic-codex-{tag}-{}", std::process::id()));
-        std::fs::create_dir_all(&d).expect("mkdir");
-        d
-    }
-
     /// A scratch directory this call alone has: named by a counter and the
     /// clock as well as the pid, and made with `create_dir`, so a second run
     /// says so instead of planting its canaries where the first left them.
@@ -5859,7 +6042,8 @@ mod tests {
             let model = FakeModel::start(vec![Reply::Text("pong".into())])
                 .await
                 .expect("fake model");
-            let (home, cwd) = (scratch("home"), scratch("cwd"));
+            let (home_scratch, cwd_scratch) = (Scratch::new("home"), Scratch::new("cwd"));
+            let (home, cwd) = (home_scratch.0.clone(), cwd_scratch.0.clone());
             let endpoint = ModelEndpoint {
                 base_url: model.base_url(),
                 model: "synthetic".into(),
@@ -5889,7 +6073,8 @@ mod tests {
     #[test]
     fn no_threads_configuration_discovers_repository_instructions() {
         on_codex_runtime(async {
-            let home = scratch("home-docs");
+            let home_scratch = Scratch::new("home-docs");
+            let home = home_scratch.0.clone();
             let endpoint = ModelEndpoint {
                 base_url: "http://127.0.0.1:9/unused".into(),
                 model: "synthetic".into(),
@@ -6118,7 +6303,8 @@ mod tests {
         on_codex_runtime(async {
             let replies = (0..TURNS).map(|i| Reply::Text(format!("r{i}"))).collect();
             let model = FakeModel::start(replies).await.expect("fake model");
-            let (home, cwd) = (scratch("home3"), scratch("cwd3"));
+            let (home_scratch, cwd_scratch) = (Scratch::new("home3"), Scratch::new("cwd3"));
+            let (home, cwd) = (home_scratch.0.clone(), cwd_scratch.0.clone());
             let endpoint = ModelEndpoint {
                 base_url: model.base_url(),
                 model: "synthetic".into(),
@@ -6160,7 +6346,8 @@ mod tests {
     #[test]
     fn an_exec_command_is_confined_under_the_sandbox_helper() {
         use atomic_exec::Confine;
-        let state = scratch("exec-sandbox");
+        let state_scratch = Scratch::new("exec-sandbox");
+        let state = state_scratch.0.clone();
         let scratch_dir = state.join("scratch/a1");
         std::fs::create_dir_all(&scratch_dir).expect("scratch");
         let paths = CodexPaths::with_helpers(
@@ -6233,7 +6420,8 @@ mod tests {
     #[test]
     fn a_command_with_hosts_is_confined_only_with_its_proxy_held() {
         use atomic_exec::Confine;
-        let state = scratch("exec-held");
+        let state_scratch = Scratch::new("exec-held");
+        let state = state_scratch.0.clone();
         let paths = CodexPaths::with_helpers(
             PathBuf::from("/opt/atomic"),
             PathBuf::from("/opt/bin/codex-linux-sandbox"),
@@ -6266,7 +6454,8 @@ mod tests {
     #[test]
     fn a_commands_proxy_token_reaches_its_helper_on_a_socket_only() {
         use atomic_exec::Confine;
-        let state = scratch("exec-token-socket");
+        let state_scratch = Scratch::new("exec-token-socket");
+        let state = state_scratch.0.clone();
         let paths = CodexPaths::with_helpers(
             PathBuf::from("/opt/atomic"),
             PathBuf::from("/opt/bin/codex-linux-sandbox"),
@@ -6335,7 +6524,8 @@ mod tests {
     #[test]
     fn the_profile_stays_bounded_however_many_projects_there_are() {
         use atomic_exec::Confine;
-        let home = scratch("many-projects");
+        let home_scratch = Scratch::new("many-projects");
+        let home = home_scratch.0.clone();
         let paths =
             CodexPaths::with_helpers("/opt/atomic".into(), "/opt/codex-linux-sandbox".into());
         let profile_len = |home: &Path| {
@@ -6576,7 +6766,8 @@ mod tests {
     fn private_state_is_denied_and_the_rest_of_the_state_directory_is_not() {
         use crate::typed::Sandbox;
         use codex_protocol::permissions::FileSystemAccessMode::*;
-        let dir = scratch("private");
+        let dir_scratch = Scratch::new("private");
+        let dir = dir_scratch.0.clone();
         let state = dir.join("state");
         let home = state.join("codex");
         for sub in [
@@ -6712,7 +6903,8 @@ mod tests {
 
     #[test]
     fn turn_directories_of_dead_processes_are_swept() {
-        let state = scratch("sweep");
+        let state_scratch = Scratch::new("sweep");
+        let state = state_scratch.0.clone();
         let tmp = state.join("tmp");
         std::fs::create_dir_all(&tmp).expect("tmp");
         // A pid that no process has: above the kernel's pid limit.
@@ -6754,7 +6946,8 @@ mod tests {
             ])
             .await
             .expect("fake model");
-            let (home, cwd) = (scratch("home2"), scratch("cwd2"));
+            let (home_scratch, cwd_scratch) = (Scratch::new("home2"), Scratch::new("cwd2"));
+            let (home, cwd) = (home_scratch.0.clone(), cwd_scratch.0.clone());
             let endpoint = ModelEndpoint {
                 base_url: model.base_url(),
                 model: "synthetic".into(),
@@ -7037,10 +7230,11 @@ mod tests {
         limit: Limit,
     ) -> (anyhow::Result<(String, ThreadReport)>, Vec<Outcome>, usize) {
         let model = FakeModel::start(replies).await.expect("fake model");
-        let (home, cwd) = (
-            scratch(&format!("home-{tag}")),
-            scratch(&format!("cwd-{tag}")),
+        let (home_scratch, cwd_scratch) = (
+            Scratch::new(&format!("home-{tag}")),
+            Scratch::new(&format!("cwd-{tag}")),
         );
+        let (home, cwd) = (home_scratch.0.clone(), cwd_scratch.0.clone());
         let endpoint = ModelEndpoint {
             base_url: model.base_url(),
             model: "synthetic".into(),
