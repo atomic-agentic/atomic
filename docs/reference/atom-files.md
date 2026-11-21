@@ -469,8 +469,11 @@ while a long-lived command, such as a turn's unified-exec session, keeps
 running, is followed only from the next command. The file operations Codex
 makes for a turn itself, such as applying a patch, go through a helper that
 is not handed the places: it walks the list's own entries instead, so for
-them a place that was already a link when the list was made, and has been
-pointed elsewhere since, is not followed again. Credentials kept anywhere else are not covered.
+them a place that was already a link when the list was made is not
+followed again: not when it has been pointed elsewhere since, not when it
+led nowhere then and leads somewhere now, and not for new links inside it
+when it leads to a directory atomic never denies. Credentials kept
+anywhere else are not covered.
 
 Cargo's own configuration (`.cargo/config.toml`) is not denied, since cargo
 reads it in every directory above a project: a registry token kept there,

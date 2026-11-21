@@ -456,6 +456,45 @@ const NEVER_DENIED: &[&str] = &[
     "/var",
 ];
 
+/// Whether `target` is one of [`NEVER_DENIED`], or, in a test, the
+/// directory [`with_never_denied`] adds.
+fn never_denied(target: &Path) -> bool {
+    #[cfg(test)]
+    if ALSO_NEVER_DENIED.with(|d| d.borrow().as_deref() == Some(target)) {
+        return true;
+    }
+    NEVER_DENIED.iter().any(|p| target == Path::new(p))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A directory a test has [`never_denied`] treat as one of
+    /// [`NEVER_DENIED`], on its own thread.
+    static ALSO_NEVER_DENIED: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Have [`never_denied`] treat `dir` as one of [`NEVER_DENIED`] on this
+/// thread, until what it returns is dropped: a test's stand-in for a
+/// top-level directory, without walking a real one.
+#[cfg(test)]
+pub(crate) fn with_never_denied(dir: &Path) -> NeverDeniedGuard {
+    ALSO_NEVER_DENIED.with(|d| *d.borrow_mut() = Some(dir.to_owned()));
+    NeverDeniedGuard
+}
+
+/// Ends [`with_never_denied`] when dropped.
+#[cfg(test)]
+#[must_use]
+pub(crate) struct NeverDeniedGuard;
+
+#[cfg(test)]
+impl Drop for NeverDeniedGuard {
+    fn drop(&mut self) {
+        ALSO_NEVER_DENIED.with(|d| *d.borrow_mut() = None);
+    }
+}
+
 /// What a link resolved to, if it should be denied.
 ///
 /// Never a device, nor anything under the system's program, library and
@@ -477,7 +516,7 @@ fn deniable(target: &Path, listed: bool) -> bool {
         return false;
     }
     if listed {
-        return !NEVER_DENIED.iter().any(|p| target == Path::new(p));
+        return !never_denied(target);
     }
     #[cfg(unix)]
     {
@@ -1146,9 +1185,11 @@ pub fn run_helper() -> anyhow::Result<()> {
 /// session, keeps running, since the walk is made once as each command
 /// starts. Codex's own file helper, which it starts for a turn's file
 /// operations with only PATH, TMPDIR, TMP and TEMP, is not handed
-/// [`PLACES`]: it walks the places inferred from the list's entries, so for
-/// it a place that was already a link when the list was built, and has been
-/// pointed elsewhere since, is not followed again.
+/// [`PLACES`]: it walks the places inferred from the list's entries, which
+/// hold no place that was a link when the list was built, so for it such a
+/// place is not followed again: one pointed elsewhere since, one that led
+/// nowhere then and leads somewhere now, and new links inside one that
+/// leads to a directory never denied.
 fn deny_links_made_since_the_list() {
     #[cfg(target_os = "linux")]
     if invoked_as_linux_sandbox() && !is_inner_stage(std::env::args_os()) {
@@ -1378,6 +1419,23 @@ fn relisted(
     Ok(Some(again))
 }
 
+/// What the link `link` leads to; `None` when that is not there, as for a
+/// link made before what it points at, and refused when it cannot be
+/// resolved for any other reason, such as a loop or a filesystem that has
+/// gone away, since then what it leads to is unknown.
+#[cfg(any(target_os = "linux", test))]
+fn resolved(link: &Path) -> anyhow::Result<Option<PathBuf>> {
+    match std::fs::canonicalize(link) {
+        Ok(target) => Ok(Some(target)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(DenyRefused(format!(
+            "{} is a link atomic cannot resolve ({e}), so it cannot tell what to deny",
+            link.display()
+        ))
+        .into()),
+    }
+}
+
 /// What [`late_link_targets`] found to deny since the list was built.
 #[cfg(any(target_os = "linux", test))]
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -1468,7 +1526,7 @@ fn late_link_targets(
             continue;
         }
         late.replaced.push(entry.clone());
-        let Ok(target) = std::fs::canonicalize(entry) else {
+        let Some(target) = resolved(entry)? else {
             continue;
         };
         refuse(entry, &target)?;
@@ -1490,7 +1548,7 @@ fn late_link_targets(
             // A place that is a link: refused when it leads to what the
             // command needs, whatever that is, or deep inside a directory it
             // may write, as when the list is built.
-            let Ok(target) = std::fs::canonicalize(place) else {
+            let Some(target) = resolved(place)? else {
                 continue;
             };
             refuse(place, &target)?;
@@ -3695,7 +3753,9 @@ mod tests {
     #[test]
     fn the_late_cap_counts_only_links_that_lead_out() {
         let _table = crate::mounts::with_table(ONE_MOUNT);
-        let dir = scratch("late-cap");
+        // Over a thousand links: removed when the test ends, however.
+        let scratch = Scratch::new("late-cap");
+        let dir = scratch.0.clone();
         let place = dir.join("home/.password-store");
         std::fs::create_dir_all(place.join("files")).expect("dir");
         std::fs::create_dir_all(dir.join("out")).expect("dir");
@@ -3837,6 +3897,54 @@ mod tests {
             refused.contains(&format!("{} now leads to", entry.display()))
                 && refused.contains("which this command needs"),
             "{refused}"
+        );
+    }
+
+    /// A denied entry, or a carried place, that has become a link that
+    /// cannot be resolved for a reason other than leading nowhere, such as
+    /// a loop, refuses the command; one that leads nowhere is dropped.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_that_cannot_be_resolved_refuses() {
+        let _table = crate::mounts::with_table(ONE_MOUNT);
+        let dir = Scratch::new("late-unresolved");
+        let home = dir.0.join("home");
+        std::fs::create_dir_all(&home).expect("dir");
+        let netrc = home.join(".netrc");
+        // A link to itself: ELOOP.
+        link(&netrc, &netrc);
+        let only = std::slice::from_ref(&netrc);
+        // As a denied entry, with no place to walk.
+        let refused = late_link_targets(only, Some(&[]), &[], &[])
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            refused.contains(&format!(
+                "{} is a link atomic cannot resolve",
+                netrc.display()
+            )),
+            "{refused}"
+        );
+        // As a carried place, not among the entries.
+        let refused = late_link_targets(&[], Some(only), &[], &[])
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            refused.contains(&format!(
+                "{} is a link atomic cannot resolve",
+                netrc.display()
+            )),
+            "{refused}"
+        );
+        // Leading nowhere: the entry is dropped, nothing to deny.
+        std::fs::remove_file(&netrc).expect("unlink");
+        link(&home.join("not-there"), &netrc);
+        assert_eq!(
+            late_link_targets(only, Some(only), &[], &[]).expect("walked"),
+            Late {
+                targets: Vec::new(),
+                replaced: vec![netrc.clone()],
+            }
         );
     }
 
@@ -4032,27 +4140,23 @@ mod tests {
     #[test]
     fn a_place_linked_to_a_never_denied_directory_covers_nothing() {
         let _table = crate::mounts::with_table(ONE_MOUNT);
-        let dir = std::fs::canonicalize(scratch("late-top")).expect("real");
-        let top: PathBuf = dir.components().take(2).collect();
-        assert!(
-            NEVER_DENIED.iter().any(|p| Path::new(p) == top),
-            "{} is not under one of the system's top-level directories",
-            dir.display()
-        );
-        let place = dir.join("home/.aws");
+        let dir = Scratch::new("late-top");
+        // The test's own stand-in for one of the system's top-level
+        // directories, so the walk through the linked place stays in it.
+        let top = dir.0.join("top");
+        std::fs::create_dir_all(top.join("elsewhere")).expect("dir");
+        let _never = with_never_denied(&top);
+        let place = dir.0.join("home/.aws");
         std::fs::create_dir_all(&place).expect("dir");
-        std::fs::create_dir_all(dir.join("elsewhere")).expect("dir");
-        let linked = dir.join("home/.docker");
+        let linked = dir.0.join("home/.docker");
         link(&top, &linked);
         let places = [place.clone(), linked];
-        let creds = dir.join("elsewhere/creds");
+        let creds = top.join("elsewhere/creds");
         std::fs::write(&creds, "x").expect("creds");
         link(&creds, &place.join("credentials"));
         let late = late_link_targets(std::slice::from_ref(&place), Some(&places), &[], &[])
             .expect("walked");
-        // Through the linked place the walk goes over all of that directory,
-        // as the builder's does: what else it finds there is not this test's.
-        assert!(late.targets.contains(&creds), "{late:?}");
+        assert_eq!(late.targets, [creds], "{late:?}");
     }
 
     /// The helper's own reading of its arguments: a turn's workspace-write
@@ -4556,6 +4660,25 @@ mod tests {
                 .expect("config");
             assert!(config.model_provider.env_http_headers.is_some());
         });
+    }
+
+    /// A scratch directory of the test's own, removed when dropped,
+    /// whatever the test came to.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let d = scratch(tag);
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).expect("mkdir");
+            Self(std::fs::canonicalize(d).expect("real"))
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     fn scratch(tag: &str) -> std::path::PathBuf {
