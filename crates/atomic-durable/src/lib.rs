@@ -19,8 +19,8 @@ pub mod usage;
 pub use failpoints::failpoint;
 pub use publication::{
     Acceptance, Candidate, Park, Precondition, Proposal, Published, Write, execute_candidate,
-    execute_candidate_at, parks, publish_candidate, release, review_candidate, run_atom,
-    run_atom_at,
+    execute_candidate_at, execute_candidate_told, parks, publish_candidate, release,
+    review_candidate, run_atom, run_atom_at,
 };
 pub use runtime::{
     DEFAULT_VERSION, Database, DurableError, DurableRuntime, Durare, DurareContext,

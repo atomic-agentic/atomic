@@ -13,7 +13,7 @@
 //! Codex home, all naming exec-servers that do not exist, the command still
 //! runs on this machine. And no shell startup file runs: with a `HOME` whose
 //! profiles export a marker, the command does not see it, and its `HOME` and
-//! `TMPDIR` are its workspace's scratch directory.
+//! `TMPDIR` are its workspace's scratch directory and a directory inside it.
 //!
 //! The Codex turn needs Codex's Linux sandbox, so that part runs with the
 //! `sandbox-tests` feature; with the feature on, a sandbox that cannot
@@ -255,6 +255,7 @@ async fn codex_turn() {
             scratch_root.clone(),
         ))
         .expect("connects"),
+        caches: None,
     };
     let answer = run_turn(
         &runtime,
@@ -310,11 +311,12 @@ async fn codex_turn() {
     );
     assert!(output.contains("login=no"), "a login shell ran: {output}");
     // HOME and ZDOTDIR are the attempt's own scratch directory, so no
-    // shell, zsh included, finds startup files there; TMPDIR is the
-    // backend's shared one, beside it.
+    // shell, zsh included, finds startup files there; TMPDIR is the turn's
+    // own too, inside it, and not the backend's shared one.
     let (home, zdotdir, tmp) = (value("HOME"), value("ZDOTDIR"), value("TMPDIR"));
     assert_eq!(home, zdotdir);
-    assert_ne!(home, tmp);
+    assert_eq!(tmp, format!("{home}/tmp"));
+    assert!(!output.contains("ATOMIC_TURN_TMPDIR"), "{output}");
     for dir in [&home, &tmp] {
         assert!(
             Path::new(dir).starts_with(&scratch_root),

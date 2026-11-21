@@ -169,6 +169,7 @@ async fn sandboxed_with(
         guard: guard.clone(),
         backend: atomic_exec::Backend::connect(atomic_exec::LocalBackend::in_dir(scratch_root()))
             .unwrap(),
+        caches: None,
     };
     let answer = run_turn(
         &runtime,
@@ -342,12 +343,14 @@ fn a_project_under_the_system_temporary_directory_stays_out_of_reach() {
             .and_then(|rest| rest.split("\\n").next())
             .expect("mktemp printed its file")
             .to_owned();
-        // The project's private temporary directory, which every turn of
-        // its backend shares (Codex's sandbox keeps a registry there), outside
-        // /tmp; it is emptied when the backend next connects.
+        // The turn's own temporary directory, inside its scratch directory
+        // under the backend's root, outside /tmp; not the directory every
+        // turn of the backend shares, where Codex's sandbox keeps a registry.
         assert!(
-            Path::new(&temp).starts_with(scratch_root().join(".tmp")),
-            "{temp} is not in the backend's private temporary directory"
+            Path::new(&temp).starts_with(scratch_root())
+                && !Path::new(&temp).starts_with(scratch_root().join(".tmp"))
+                && temp.contains("/tmp/tmp."),
+            "{temp} is not in the turn's own temporary directory"
         );
         assert!(!temp.starts_with("/tmp/"), "{temp}");
     });

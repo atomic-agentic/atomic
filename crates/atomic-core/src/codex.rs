@@ -10,7 +10,7 @@
 //! read from the user's Codex configuration: Codex's home is the project's
 //! state directory (see [`crate::state`]).
 
-use crate::usage::{Call, Exhausted, MeterError, Metering, Outcome, Usage, meter_error};
+use crate::usage::{Call, Exhausted, MeterError, Metering, Outcome, Ticket, Usage, meter_error};
 use anyhow::Context;
 use anyhow::bail;
 use codex_core_api::AbsolutePathBuf;
@@ -872,6 +872,7 @@ where
 {
     keep_sandbox_off_keyrings();
     harden();
+    give_the_command_its_own_tmpdir();
     // The person's own Codex home stays denied to atoms' commands.
     let _ = PERSON_CODEX_HOME.set(std::env::var_os("CODEX_HOME"));
     // SAFETY: called at the start of main, while the process has one thread,
@@ -954,9 +955,56 @@ pub fn is_helper(mut args: impl Iterator<Item = std::ffi::OsString>) -> bool {
 /// touched.
 pub fn run_helper() -> anyhow::Result<()> {
     keep_sandbox_off_keyrings();
+    give_the_command_its_own_tmpdir();
     arg0_dispatch_or_else(|_| async {
         bail!("this process was started as a Codex helper Codex does not know")
     })
+}
+
+/// The variable that carries a turn's own temporary directory past Codex's
+/// sandbox helper to the command (see [`give_the_command_its_own_tmpdir`]).
+pub(crate) const TURN_TMPDIR: &str = "ATOMIC_TURN_TMPDIR";
+
+/// When this process is the inner stage of Codex's Linux sandbox helper,
+/// just before the command runs, give the command its own `TMPDIR`: the
+/// directory in [`TURN_TMPDIR`], private to its turn. The helper's outer
+/// stage keeps the backend's shared `TMPDIR`, where Codex keeps its registry
+/// of the mount points it makes, which every turn sharing a writable root
+/// must share; the command never writes there.
+fn give_the_command_its_own_tmpdir() {
+    #[cfg(target_os = "linux")]
+    if invoked_as_linux_sandbox()
+        && is_inner_stage(std::env::args_os())
+        && let Some(own) = std::env::var_os(TURN_TMPDIR)
+    {
+        // SAFETY: the helper is single-threaded here, before it applies its
+        // restrictions and executes the command.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var("TMPDIR", own);
+            std::env::remove_var(TURN_TMPDIR);
+        }
+    }
+}
+
+/// Whether the Linux sandbox helper's arguments `args` (the first being its
+/// own name) are its inner stage's: `--apply-seccomp-then-exec` among its
+/// options, before the `--` that ends them. After that `--` is the command,
+/// whose own arguments, the model's to choose, say nothing about the stage;
+/// Codex's own launcher reads them the same way.
+#[cfg(any(target_os = "linux", test))]
+fn is_inner_stage(args: impl IntoIterator<Item = std::ffi::OsString>) -> bool {
+    args.into_iter()
+        .skip(1)
+        .take_while(an_option)
+        .any(|a| a == "--apply-seccomp-then-exec")
+}
+
+/// Whether `arg`, read in order from the helper's arguments, is still one
+/// of its options: not the `--` after which the command begins.
+#[cfg(any(target_os = "linux", test))]
+fn an_option(arg: &std::ffi::OsString) -> bool {
+    arg != "--"
 }
 
 /// When this process is Codex's Linux sandbox helper, keep the command it
@@ -965,7 +1013,7 @@ pub fn run_helper() -> anyhow::Result<()> {
 fn keep_sandbox_off_keyrings() {
     #[cfg(target_os = "linux")]
     if invoked_as_linux_sandbox() {
-        let inner = std::env::args_os().any(|a| a == "--apply-seccomp-then-exec");
+        let inner = is_inner_stage(std::env::args_os());
         let kept_off = if inner {
             // Inside the sandbox, just before the command runs.
             deny_keyrings()
@@ -1728,7 +1776,17 @@ where
         let bounded_by = ticket.as_ref().and_then(|t| t.bounded_by.clone());
         // A turn is cut off when its reserved time runs out; a failed or cut
         // off turn still reports the usage seen before it stopped.
-        let (turn, progress) = span.run(run_turn(&thread, &current, limit.time)).await;
+        let mut recorder = ProgressLog {
+            meter,
+            ticket: ticket.as_ref(),
+            seen,
+            recorded: seen,
+            records: 0,
+            warned: false,
+        };
+        let (turn, progress) = span
+            .run(run_turn(&thread, &current, limit.time, &mut recorder))
+            .await;
         if let (Err(e), Some(span)) = (&turn, span.span()) {
             crate::usage::record_error(&span, e);
         }
@@ -2284,24 +2342,113 @@ impl Progress {
     }
 }
 
-/// Run one turn, cut off after `time` if one is given. Returns how it ended
-/// and where it got to, the thread's running totals as last reported among
-/// it, whether or not it succeeded.
+/// Where a running turn's reported usage is recorded as it grows, so that a
+/// turn whose process is stopped or killed before it settles stays charged
+/// at least what it reported (see [`crate::usage::Meter::progress`]).
+struct ProgressLog<'a> {
+    meter: &'a Metering,
+    ticket: Option<&'a Ticket>,
+    /// The thread's totals before the turn.
+    seen: (i64, i64),
+    /// The totals as last recorded.
+    recorded: (i64, i64),
+    /// How many times it recorded.
+    records: u32,
+    /// Whether a record failed, and was said to.
+    warned: bool,
+}
+
+/// How long a turn waits on one record of its progress before it goes on
+/// without it: a store held by another writer must not hold up the turn.
+const PROGRESS_PATIENCE: std::time::Duration = std::time::Duration::from_secs(1);
+
+impl ProgressLog<'_> {
+    /// Record `progress` if the turn reported more since it last recorded:
+    /// what it reported, and one request in flight, since it may be making
+    /// one. A record that fails, or takes longer than [`PROGRESS_PATIENCE`],
+    /// leaves the turn charged as it was, at its reservation or its last
+    /// record, is retried at the next token event, and is said once a turn.
+    async fn note(&mut self, progress: &Progress) {
+        let Some((input, output, _)) = progress.totals(self.seen) else {
+            return;
+        };
+        if input <= self.recorded.0 && output <= self.recorded.1 {
+            return;
+        }
+        let outcome = Outcome::Partial {
+            reported: Usage {
+                input_tokens: (input - self.seen.0).max(0),
+                output_tokens: (output - self.seen.1).max(0),
+            },
+            last: progress.last.map(|(input_tokens, output_tokens)| Usage {
+                input_tokens,
+                output_tokens,
+            }),
+        };
+        let recorded =
+            tokio::time::timeout(PROGRESS_PATIENCE, self.meter.progress(self.ticket, outcome))
+                .await;
+        match recorded {
+            Ok(Ok(())) => {
+                self.recorded = (input, output);
+                self.records += 1;
+                if crate::failpoint::armed()
+                    && let Some(ticket) = self.ticket
+                {
+                    // A crash here leaves the turn charged what it recorded.
+                    crate::failpoint::failpoint(&format!(
+                        "usage:after-progress:{}:{}",
+                        ticket.request, self.records
+                    ));
+                }
+            }
+            failed if !self.warned => {
+                self.warned = true;
+                let why = match failed {
+                    Ok(Err(e)) => e.to_string(),
+                    _ => format!("the store did not answer within {PROGRESS_PATIENCE:?}"),
+                };
+                // The meter's request id is `<run>:<step>:<call>`.
+                let (run, request) = match self.ticket {
+                    Some(t) => (
+                        t.request.rsplitn(3, ':').nth(2).unwrap_or(&t.request),
+                        t.request.as_str(),
+                    ),
+                    None => ("?", "?"),
+                };
+                crate::log_line!(
+                    "run {run}: a Codex turn's usage so far was not recorded for request \
+                     {request} ({why}); until it is, a stop before the turn settles leaves it \
+                     charged at its last record"
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Run one turn, cut off after `time` if one is given, recording its
+/// reported usage through `recorder` as it grows. Returns how it ended and
+/// where it got to, the thread's running totals as last reported among it,
+/// whether or not it succeeded.
 async fn run_turn(
     thread: &CodexThread,
     spec: &TurnSpec,
     time: Option<std::time::Duration>,
+    recorder: &mut ProgressLog<'_>,
 ) -> (anyhow::Result<String>, Progress) {
     let mut progress = Progress::default();
     let ended = match time {
-        None => turn(thread, spec, &mut progress).await,
-        Some(time) => match tokio::time::timeout(time, turn(thread, spec, &mut progress)).await {
-            Ok(ended) => ended,
-            Err(_) => {
-                interrupt(thread, &mut progress).await;
-                Err(anyhow::Error::new(CutOff(time)))
+        None => turn(thread, spec, &mut progress, recorder).await,
+        Some(time) => {
+            match tokio::time::timeout(time, turn(thread, spec, &mut progress, recorder)).await {
+                Ok(ended) => ended,
+                Err(_) => {
+                    interrupt(thread, &mut progress).await;
+                    Err(anyhow::Error::new(CutOff(time)))
+                }
             }
-        },
+        }
     };
     (ended, progress)
 }
@@ -2336,6 +2483,7 @@ async fn turn(
     thread: &CodexThread,
     spec: &TurnSpec,
     progress: &mut Progress,
+    recorder: &mut ProgressLog<'_>,
 ) -> anyhow::Result<String> {
     // Codex sends TurnComplete before it marks the thread idle, so a follow-up
     // turn submitted straight after one can be declined as NotIdle. That
@@ -2367,6 +2515,12 @@ async fn turn(
     loop {
         let event = thread.next_event().await.context("read Codex event")?;
         progress.observe(&event.msg);
+        if matches!(
+            event.msg,
+            EventMsg::TokenCount(_) | EventMsg::RawResponseCompleted(_)
+        ) {
+            recorder.note(progress).await;
+        }
         match event.msg {
             EventMsg::TurnComplete(done) => {
                 return done
@@ -2989,6 +3143,46 @@ mod tests {
         }
     }
 
+    /// The helper's stage is read from its own options only: a command that
+    /// is, or holds, the inner stage's flag leaves the outer stage outer.
+    #[test]
+    fn only_the_helpers_own_options_name_its_inner_stage() {
+        let args = |a: &[&str]| a.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
+        let helper = "/x/codex-linux-sandbox";
+        for inner in [
+            &[
+                helper,
+                "--sandbox-policy-cwd",
+                "/w",
+                "--apply-seccomp-then-exec",
+                "--",
+                "ls",
+            ][..],
+            &[
+                helper,
+                "--apply-seccomp-then-exec",
+                "--",
+                "--apply-seccomp-then-exec",
+            ][..],
+        ] {
+            assert!(is_inner_stage(args(inner)), "{inner:?}");
+        }
+        for outer in [
+            &[
+                helper,
+                "--sandbox-policy-cwd",
+                "/w",
+                "--",
+                "--apply-seccomp-then-exec",
+            ][..],
+            &[helper, "--", "/bin/bash", "-c", "--apply-seccomp-then-exec"][..],
+            &[helper, "--sandbox-policy-cwd", "/w", "--", "ls"][..],
+            &["--apply-seccomp-then-exec"][..],
+        ] {
+            assert!(!is_inner_stage(args(outer)), "{outer:?}");
+        }
+    }
+
     #[test]
     fn commands_get_only_core_and_declared_variables() {
         let inherited = [
@@ -3399,6 +3593,116 @@ mod tests {
                 Ok(())
             })
         }
+    }
+
+    /// A meter whose progress records fail `failing` times, or never
+    /// answer, counting each record it is asked for.
+    #[derive(Default)]
+    struct Flaky {
+        failing: std::sync::atomic::AtomicUsize,
+        hangs: bool,
+        records: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Meter for Flaky {
+        fn admit(&self, _: Call) -> MeterFuture<'_, Ticket> {
+            Box::pin(async { Err(MeterError::Store("not used".into())) })
+        }
+
+        fn settle(&self, _: Ticket, _: Outcome) -> MeterFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn progress<'a>(&'a self, _: &'a Ticket, _: Outcome) -> MeterFuture<'a, ()> {
+            use std::sync::atomic::Ordering::SeqCst;
+            Box::pin(async move {
+                self.records.fetch_add(1, SeqCst);
+                if self.hangs {
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                }
+                if self.failing.load(SeqCst) > 0 {
+                    self.failing.fetch_sub(1, SeqCst);
+                    return Err(MeterError::Store("the store is down".into()));
+                }
+                Ok(())
+            })
+        }
+    }
+
+    fn progress_ticket() -> Ticket {
+        Ticket {
+            request: "run-1:2:0".into(),
+            attempt: 1,
+            model: "synthetic".into(),
+            admitted: std::time::Instant::now(),
+            limit: Limit::default(),
+            bounded_by: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_progress_record_advances_only_once_written_and_a_failure_is_said_once() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let meter = Arc::new(Flaky {
+            failing: 2.into(),
+            ..Flaky::default()
+        });
+        let metering = Metering::new(meter.clone());
+        let ticket = progress_ticket();
+        let mut log = ProgressLog {
+            meter: &metering,
+            ticket: Some(&ticket),
+            seen: (0, 0),
+            recorded: (0, 0),
+            records: 0,
+            warned: false,
+        };
+        let grown = Progress {
+            usage: Some((3, 2, 5)),
+            ..Progress::default()
+        };
+        // A failed record does not advance, so the next token event, though
+        // it reports nothing new, tries it again; the failure is said once.
+        log.note(&grown).await;
+        assert_eq!((log.recorded, log.records, log.warned), ((0, 0), 0, true));
+        log.note(&grown).await;
+        assert_eq!(meter.records.load(SeqCst), 2);
+        assert_eq!((log.recorded, log.records), ((0, 0), 0));
+        // Written, it advances; with nothing new, nothing is asked again.
+        log.note(&grown).await;
+        assert_eq!((log.recorded, log.records), ((3, 2), 1));
+        log.note(&grown).await;
+        assert_eq!(meter.records.load(SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn a_progress_record_the_store_does_not_answer_is_given_up_after_its_patience() {
+        let meter = Arc::new(Flaky {
+            hangs: true,
+            ..Flaky::default()
+        });
+        let metering = Metering::new(meter.clone());
+        let ticket = progress_ticket();
+        let mut log = ProgressLog {
+            meter: &metering,
+            ticket: Some(&ticket),
+            seen: (0, 0),
+            recorded: (0, 0),
+            records: 0,
+            warned: false,
+        };
+        let started = std::time::Instant::now();
+        log.note(&Progress {
+            usage: Some((3, 2, 5)),
+            ..Progress::default()
+        })
+        .await;
+        let waited = started.elapsed();
+        assert!(
+            waited >= PROGRESS_PATIENCE && waited < PROGRESS_PATIENCE * 3,
+            "{waited:?}"
+        );
+        assert_eq!((log.records, log.warned), (0, true));
     }
 
     async fn metered_conversation(

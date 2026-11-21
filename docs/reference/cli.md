@@ -36,7 +36,9 @@ for gate deadlines, budgets and recovery limits.
 workflow, status, input and output; each attempt, which is each time the run
 executed, from its start or from its checkpoints; each recorded step with the
 attempt that ran it, so after a kill and a resume it shows which steps the
-resume found checkpointed and which it ran again; its model calls and tokens;
+resume found checkpointed and which it ran again; its model calls and tokens,
+counting what a Codex turn still running, or stopped before it settled, last
+recorded having reported;
 its gates; and the Codex threads that hold its transcripts. `--json` gives the
 same as one document, with each step's output. It reads the store alone, and
 runs nothing: it needs no model, does not take the project's execution lock,
@@ -95,13 +97,49 @@ serving, it fails and suggests `atomic run`.
 
 ## Coding fixture selection
 
-In the v0.1 target, `--project` selects a project explicitly, by its manifest directory or manifest file.
-Repository-backed development runs/evals also require paired `--fixture <repo>`
-and `--fixture-rev <revision>` options. The runtime pins the resolved commit and
-uses private snapshot worktrees; invalid/missing commits fail before a model call.
-See [fixture repositories](eval-cases.md#coding-fixture-repositories) for setup and
-an example that works from an unrelated directory. These flags do not change the
-minimal lite-atom quickstart.
+`--project` selects a project explicitly, by its manifest directory or
+manifest file. A workflow that changes code, one with a `worktree: true` step,
+also needs its repository named, with the pair `--fixture <repo>` and
+`--fixture-rev <revision>`:
+
+```sh
+atomic --project /path/to/project run change-request --input request.json \
+  --fixture ../seed-repository --fixture-rev main
+```
+
+`--fixture` is resolved from the directory you run the command in, so the same
+command from an unrelated directory binds the same repository and commit.
+When the run is admitted, atomic resolves the revision to its commit, copies
+the objects that commit reaches into a snapshot in the project's state
+directory, and runs every worktree step in a worktree of that snapshot. The
+repository you named and your own checkout are never written to, and a branch
+that moves later does not change an admitted run. Nothing is fetched, and
+nothing the repository's own configuration names, its hooks, file system
+monitor, filter drivers or remotes, ever runs.
+
+`--fixture` names a repository's top, or a bare repository, never a directory
+inside one. A revision such as `HEAD` is that checkout's own, so a linked
+worktree binds at its own `HEAD`. The atom works at the top of its worktree of
+the snapshot, wherever the project itself is. Each worktree step starts from
+the bound commit or from a commit an earlier step of the same run made; a
+step whose base is anything else, such as a commit another run made on the
+same fixture, fails before its turn. Commit fields in the input name commits
+of the fixture's history, and one whose schema allows `null` may be `null`.
+
+Before anything runs, atomic refuses, with the kind of failure in `--json`:
+
+| Kind | When |
+| --- | --- |
+| `fixture.required` | The workflow changes code and no fixture is named |
+| `fixture.path` | `--fixture` is not a git repository on this machine, or is a directory inside one rather than its top |
+| `fixture.revision` | `--fixture-rev` is not a commit, branch or tag of it |
+| `fixture.unsupported` | Its commit has submodules or Git LFS content; the repository borrows objects from another (alternates), is shallow or has grafts, is missing objects its commit reaches (as a partial clone may be), or names its objects with SHA-256 |
+| `fixture.schema` | The workflow's input types a commit where atomic does not check it, such as under `oneOf` |
+| `fixture.input` | An input field typed `format: git-commit` is not in the fixture's history at the revision, or its `base` is not the bound commit |
+| `fixture.snapshot` | The snapshot could not be made, or something atomic did not make is where it goes; atomic never removes it |
+
+Lite atoms and workflows that change no code need neither flag. `atomic eval`
+takes the same pair when it is built.
 
 ## Model access
 
@@ -124,6 +162,8 @@ authentication](../getting-started/authentication.md).
 | `atomic gates list` | Inspect durable gates | v0.1 local |
 | `atomic gates approve <gate-id>` | Approve a recorded proposal as the local operator | v0.1 local |
 | `atomic gates reject <gate-id>` | Reject a recorded proposal as the local operator | v0.1 local |
+| `atomic gates answer <gate-id> <answer>` | Answer a question gate as the local operator | v0.1 local |
+| The prompt in `atomic run` and `atomic runs resume` | Decide or answer each gate the run reaches, at the terminal | v0.1 local |
 | `atomic workflows show <name>` | Inspect a workflow definition and its steps | v0.5 |
 | `atomic graph` | Inspect work items, status and blocking dependencies | v0.5 |
 | Live thread controls | Answer, steer, stop and take over work | v0.5 CLI |
@@ -226,10 +266,22 @@ project's runs. The lock is released only when its process exits.
 `atomic serve`, `atomic run` and `atomic runs resume` stop on SIGTERM, SIGINT,
 SIGHUP or SIGQUIT, except one they were started ignoring, as under `nohup` or
 as a shell's background job, which they keep ignoring. No step starts after the first signal, and running steps get
-up to 10 seconds to reach a checkpoint; a second signal stops the process at
+up to 10 seconds to reach a checkpoint; a second signal ends that wait at
 once. A command still running then is killed, with everything it
 started, also under `--runner process`, and the process exits without recording
-how the command ended: `atomic serve` with status 1, `atomic run` and
+how the command ended. On Linux it exits, freeing the project's execution lock,
+only once every process it started has ended, one in another process group or
+session, such as a sandboxed command, included; atomic's own git is let finish,
+within its ten-minute time limit, rather than killed. A step whose atom ends
+while atomic stops records nothing, whatever ended it, a killed command, a
+model turn's or a compiler's included, so it stays unfinished too. It names any process still running after ten seconds, and
+again every thirty, and goes on waiting: only SIGKILL ends that wait, as it
+ends atomic at once. The same holds however the command ends, by an error
+included, though not when atomic itself panics. A process that left atomic's
+descendants, as one that daemonizes outside its sandbox's process namespace
+does, is not found. Elsewhere than Linux, atomic kills each command's process
+group and exits without waiting, so a process that left the group may outlive
+it and its lock. Then it exits: `atomic serve` with status 1, `atomic run` and
 `atomic runs resume` with status 130, leaving the run for `atomic runs resume`. Unfinished work stays recorded for the
 next `serve` or `runs resume`, and an interrupted command runs again only if it
 declares `effects.external` as `read-only` or `idempotent`; any other is parked
@@ -239,14 +291,19 @@ Whatever a command leaves running in its group when it ends is stopped then
 (under `--runner process`, when its runner ends). Output that arrives more than
 two seconds after a command exits is not its output, so a process that left
 its group, such as one started with `setsid`, cannot hold the step open,
-though atomic cannot stop it. A runner
+though atomic stops it only when it stops itself. A runner
 ignores the stop signals a command in its group might send it.
 
 One process recovers a run at most five times at the same step before it fails
 it as dead-lettered (a run that gets further counts afresh), so a step whose process keeps dying stops soon; restarting
-`atomic serve` does not count against a run. A run the engine parks after many
-restarts (`MAX_RECOVERY_ATTEMPTS_EXCEEDED`) is named by `atomic serve` and goes
-on with `atomic runs resume`.
+`atomic serve` does not count against a run. The engine parks a run
+(`MAX_RECOVERY_ATTEMPTS_EXCEEDED`) when it stops without finishing more times than
+the engine allows, and at once when atomic's own workflow code panics: a panic is
+a bug in atomic, and would likely happen again. `atomic run`, `atomic runs resume`
+and `atomic serve` (when it happens while serving, and when it starts) name the
+cause, with the panic's message redacted; the message is kept in the project's
+private state. A parked run goes on with `atomic runs resume`, once the cause is
+fixed.
 
 A resumed run goes on a queue of the resuming executor's own: only
 `atomic runs resume` and `atomic serve` of that executor run it, and

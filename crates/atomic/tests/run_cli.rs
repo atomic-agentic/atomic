@@ -243,6 +243,13 @@ fn pids_with(marker: &str) -> Vec<String> {
     pids
 }
 
+/// The session of process `pid`, from field 6 of `/proc/<pid>/stat`.
+fn session_of(pid: &str) -> Option<String> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let session = stat.rsplit(')').next()?.split_whitespace().nth(3)?;
+    Some(session.to_owned())
+}
+
 /// The parent of process `pid`, from field 4 of `/proc/<pid>/stat`.
 fn parent_of(pid: &str) -> Option<String> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
@@ -348,6 +355,7 @@ fn command_as(
         "DBOS__VMID",
         "DBOS__APPVERSION",
         "ATOMIC_FAILPOINT",
+        "ATOMIC_FAILPOINT_PANIC",
         "ATOMIC_MODEL_BASE_URL",
         "ATOMIC_MODEL",
         "ATOMIC_MODEL_API_KEY_ENV",
@@ -529,6 +537,7 @@ async fn approve(rt: &Durare, g: &gate::Gate) {
             verdict: Verdict::Approve,
             comment: None,
             proposal: g.proposal.clone(),
+            answer: None,
         },
     )
     .await
@@ -884,19 +893,6 @@ fn no_secret_reaches_stderr_or_json_whatever_atomic_is_given() {
         let all = text(&out).replace("leak-free-id", "");
         assert!(!all.contains("leak"), "{args:?}: {all}");
     }
-}
-
-/// Run git in `dir` for a test's setup, with no user or system config.
-fn git_in(dir: &Path, args: &[&str]) {
-    let ok = Command::new(atomic_core::git::Git::find().expect("git").program())
-        .args(args)
-        .current_dir(dir)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .status()
-        .expect("git")
-        .success();
-    assert!(ok, "git {args:?}");
 }
 
 #[test]
@@ -3190,6 +3186,108 @@ fn serve_stopped_mid_command_holds_the_lock_until_it_exits_and_runs_nothing_twic
     assert_eq!(slow_starts(&dir), 2, "started twice, never at once");
 }
 
+/// The slow command made stubborn: it and the grandchild it starts ignore
+/// SIGTERM, and the grandchild leaves its process group and session and
+/// holds a gigabyte it has written, which takes the kernel a while to free
+/// once it is killed, so a process that exits before it has ended is seen.
+const STUBBORN: &str = "import json, os, signal, subprocess, sys, time\n\
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n\
+    note = json.load(sys.stdin)\n\
+    log = sys.argv[1]\n\
+    child = subprocess.Popen(['python3', '-c', 'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); held = bytearray(1 << 30); held[::4096] = b\\'x\\' * (1 << 18); time.sleep(60)', log], start_new_session=True)\n\
+    open(log, 'a').write('start\\n')\n\
+    time.sleep(60)\n\
+    open(log, 'a').write('end\\n')\n\
+    json.dump({'title': note['text'][:25], 'words': len(note['text'].split())}, sys.stdout)\n";
+
+/// A stopped serve holds the execution lock until every process of the
+/// command it stopped has ended, under either runner: one that ignores
+/// SIGTERM and one that left the command's process group and session
+/// included. The lock is probed first and the processes checked after, so
+/// a process alive after a probe that found the lock free was alive
+/// during it.
+// needs_sandbox
+#[cfg(all(target_os = "linux", feature = "sandbox-tests"))]
+#[test]
+fn serve_holds_the_lock_until_every_process_of_a_stopped_command_has_ended() {
+    support::require_sandbox();
+    for runner in ["local", "process"] {
+        let dir = scratch(&format!("serve-stubborn-{runner}"));
+        let project = project(&dir);
+        let state = slow_run_killed_mid_command(&dir, &project, "stubborn-1");
+        std::fs::write(project.join("tools/slow.py"), STUBBORN).expect("script");
+        let log = dir.join("serve.log");
+        let mut serve = spawn(
+            &dir,
+            &project,
+            &["serve", "--runner", runner],
+            &UNUSED_MODEL,
+            &log,
+        );
+        wait_until("serve to start the command again", || {
+            slow_starts(&dir) == 2 || serve_ended(&dir)
+        });
+        let text = || std::fs::read_to_string(&log).unwrap_or_default();
+        assert_eq!(slow_starts(&dir), 2, "{runner}: {}", text());
+        // The grandchild is in a session of its own.
+        let started = Instant::now();
+        let pids = loop {
+            let pids = slow_pids(&dir);
+            let sessions: std::collections::BTreeSet<String> =
+                pids.iter().filter_map(|pid| session_of(pid)).collect();
+            if sessions.len() >= 2 {
+                break pids;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "{runner}: no process of the command in a session of its own: {pids:?}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        terminate(&serve);
+        let stopping = Instant::now();
+        let status = loop {
+            let held = lock_held(&state);
+            let running: Vec<&String> = pids.iter().filter(|pid| alive(pid)).collect();
+            assert!(
+                held || running.is_empty(),
+                "{runner}: the lock was free while {running:?} still ran: {}",
+                text()
+            );
+            if let Some(status) = serve.try_wait().expect("wait") {
+                break status;
+            }
+            assert!(
+                stopping.elapsed() < Duration::from_secs(30),
+                "{runner}: serve did not stop: {}",
+                text()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(
+            !status.success(),
+            "{runner}: a command was stopped: {}",
+            text()
+        );
+        assert!(
+            text().contains("stopped 1 command(s)"),
+            "{runner}: {}",
+            text()
+        );
+        all_gone(&pids, "the stopped command and its grandchild");
+        assert!(
+            !text().contains("have not ended yet"),
+            "{runner}: every process ended at its kill: {}",
+            text()
+        );
+        let ends = std::fs::read_to_string(dir.join("slow.log")).expect("log");
+        assert!(
+            !ends.contains("end"),
+            "{runner}: no command ran to its end: {ends}"
+        );
+    }
+}
+
 // needs_sandbox
 #[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
@@ -3840,6 +3938,407 @@ fn a_run_that_gets_further_each_time_is_not_dead_lettered() {
     for i in 0..n {
         assert_eq!(lines(&dir.join(format!("bump-{i}.log"))), 2, "step {i}");
     }
+}
+
+/// git in `dir`, as a person runs it, with an identity of its own.
+fn git_in(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .args([
+            "-c",
+            "user.name=dev",
+            "-c",
+            "user.email=dev@example.com",
+            "-c",
+            "init.defaultBranch=main",
+        ])
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .expect("git");
+    assert!(out.status.success(), "git {args:?}: {}", text(&out));
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+/// A commit of `file` with `text` in the repository at `dir`, returning it.
+fn commit_file(dir: &Path, file: &str, text: &str) -> String {
+    std::fs::write(dir.join(file), text).expect("file");
+    git_in(dir, &["add", file]);
+    git_in(dir, &["commit", "-q", "-m", text]);
+    git_in(dir, &["rev-parse", "HEAD"])
+}
+
+/// Everything git records about a repository's refs and worktrees.
+fn git_state(dir: &Path) -> String {
+    format!(
+        "{}\n{}",
+        git_in(dir, &["for-each-ref"]),
+        git_in(dir, &["worktree", "list", "--porcelain"])
+    )
+}
+
+/// A workflow whose second step changes code in a worktree, after a gate.
+fn write_coding(project: &Path) {
+    write_atom(
+        project,
+        "fix-code",
+        "description: 'Fix the code.', kind: 'codex', sandbox: 'workspace-write'",
+        "Fix this: {input.task}",
+        object(
+            json!({"base": {"type": "string", "format": "git-commit"}, "task": {"type": "string"}}),
+        ),
+        object(json!({"done": {"type": "boolean"}})),
+    );
+    std::fs::write(
+        project.join("workflows/coding.workflow.yaml"),
+        "atomic: 1\nname: coding\n\
+         input: { $ref: ../atoms/fix-code.input.schema.json }\n\
+         output: { $ref: ../atoms/fix-code.output.schema.json }\n\
+         steps:\n  check:\n    gate:\n      title: \"'Start on ' + input.task\"\n      timeout: 24h\n\
+         \x20 fix:\n    after: [check]\n    atom: fix-code\n    with: { base: input.base, task: input.task }\n    worktree: true\n\
+         returns: steps.fix.output\n",
+    )
+    .expect("workflow");
+}
+
+#[test]
+fn a_coding_run_is_bound_to_its_fixture_and_never_touches_a_checkout() {
+    on_codex_runtime(async {
+        let dir = scratch("fixture");
+        let project = project(&dir);
+        write_coding(&project);
+        // The developer's checkout holds the project.
+        git_in(&project, &["init", "-q"]);
+        git_in(&project, &["add", "."]);
+        git_in(&project, &["commit", "-q", "-m", "project"]);
+        // The fixture the operator prepared.
+        let fixture = dir.join("fixture");
+        std::fs::create_dir_all(&fixture).expect("fixture");
+        git_in(&fixture, &["init", "-q"]);
+        let first = commit_file(&fixture, "price.txt", "125");
+        let second = commit_file(&fixture, "price.txt", "250");
+        let (checkout, source) = (git_state(&project), git_state(&fixture));
+        let state = state_dir(&dir, &project);
+
+        let data = |base: &str| json!({"base": base, "task": "multiply by quantity"}).to_string();
+        let fixture_arg = fixture.to_string_lossy().into_owned();
+        // Each of these fails before anything runs.
+        let refused = |args: Vec<String>, kind: &str| {
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let out = atomic(&dir, &project, &args, &UNUSED_MODEL, "");
+            assert!(!out.status.success(), "{args:?}: {}", text(&out));
+            let error = stdout_json(&out)["error"].clone();
+            assert_eq!(error["kind"], kind, "{args:?}: {error}");
+            assert!(
+                !String::from_utf8_lossy(&out.stderr).contains("run run-"),
+                "{args:?}: no run was started"
+            );
+            error
+        };
+        let args = |rest: &[&str]| -> Vec<String> {
+            ["--json", "run", "coding"]
+                .iter()
+                .chain(rest)
+                .map(|s| (*s).to_owned())
+                .collect()
+        };
+        let good = data(&second);
+        refused(args(&["--data", &good]), "fixture.required");
+        refused(
+            args(&[
+                "--data",
+                &good,
+                "--fixture",
+                "/no/such/repo",
+                "--fixture-rev",
+                "main",
+            ]),
+            "fixture.path",
+        );
+        refused(
+            args(&[
+                "--data",
+                &good,
+                "--fixture",
+                &fixture_arg,
+                "--fixture-rev",
+                "no-such-branch",
+            ]),
+            "fixture.revision",
+        );
+        let placeholder = data("1111111111111111111111111111111111111111");
+        let error = refused(
+            args(&[
+                "--data",
+                &placeholder,
+                "--fixture",
+                &fixture_arg,
+                "--fixture-rev",
+                "main",
+            ]),
+            "fixture.input",
+        );
+        assert!(
+            error["description"]
+                .as_str()
+                .is_some_and(|d| d.contains("placeholder")),
+            "{error}"
+        );
+        let stale = data(&first);
+        let error = refused(
+            args(&[
+                "--data",
+                &stale,
+                "--fixture",
+                &fixture_arg,
+                "--fixture-rev",
+                "main",
+            ]),
+            "fixture.input",
+        );
+        assert!(
+            error["description"]
+                .as_str()
+                .is_some_and(|d| d.contains("is not the fixture's revision")),
+            "{error}"
+        );
+
+        // Admitted from the project, and from an unrelated directory with
+        // --project and a relative fixture path: the same pinned commit.
+        let project_arg = project.to_string_lossy().into_owned();
+        let runs = [
+            (
+                "from-project",
+                project.clone(),
+                vec![
+                    "run",
+                    "coding",
+                    "--run-id",
+                    "fix-1",
+                    "--data",
+                    &good,
+                    "--fixture",
+                    &fixture_arg,
+                    "--fixture-rev",
+                    "main",
+                ],
+            ),
+            (
+                "from-elsewhere",
+                dir.join("elsewhere"),
+                vec![
+                    "--project",
+                    &project_arg,
+                    "run",
+                    "coding",
+                    "--run-id",
+                    "fix-2",
+                    "--data",
+                    &good,
+                    "--fixture",
+                    "../fixture",
+                    "--fixture-rev",
+                    "main",
+                ],
+            ),
+        ];
+        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        for (tag, cwd, args) in &runs {
+            let id = args[args.iter().position(|a| *a == "--run-id").expect("id") + 1];
+            let mut child = spawn(
+                &dir,
+                cwd,
+                args,
+                &UNUSED_MODEL,
+                &dir.join(format!("{tag}.log")),
+            );
+            open_gate(&rt, id).await;
+            child.kill().expect("stop the run at its gate");
+            child.wait().expect("reap");
+            let record = rt.run_record(id).await.expect("record").expect("run");
+            let bound = &record.input["pipeline"]["fixture"];
+            assert_eq!(bound["commit"], second, "{tag}: {bound}");
+            assert_eq!(bound["rev"], "main", "{tag}");
+            assert_eq!(
+                bound["source"].as_str().map(PathBuf::from),
+                Some(std::fs::canonicalize(&fixture).expect("fixture")),
+                "{tag}"
+            );
+            let snapshot = PathBuf::from(bound["snapshot"].as_str().expect("snapshot"));
+            assert!(
+                snapshot.starts_with(&state),
+                "{tag}: the snapshot is atomic's own"
+            );
+        }
+        // Neither the developer's checkout nor the fixture gained a ref or a
+        // worktree.
+        assert_eq!(git_state(&project), checkout, "the checkout is as it was");
+        assert_eq!(git_state(&fixture), source, "the fixture is as it was");
+    });
+}
+
+#[test]
+fn a_fixture_atomic_cannot_copy_whole_or_that_is_not_its_own_repository_is_refused() {
+    on_codex_runtime(async {
+        let dir = scratch("fixture-refused");
+        let project = project(&dir);
+        write_coding(&project);
+        let repo = |name: &str, extra: &[&str]| -> (PathBuf, String) {
+            let at = dir.join(name);
+            std::fs::create_dir_all(&at).expect("repo");
+            let mut init = vec!["init", "-q"];
+            init.extend_from_slice(extra);
+            git_in(&at, &init);
+            let commit = commit_file(&at, "price.txt", "125");
+            (at, commit)
+        };
+        let (fixture, first) = repo("fixture", &[]);
+        let second = commit_file(&fixture, "price.txt", "250");
+        let refused = |fixture: &Path, base: &str, kind: &str, says: &str| {
+            let data = json!({"base": base, "task": "multiply"}).to_string();
+            let fixture = fixture.to_string_lossy().into_owned();
+            let out = atomic(
+                &dir,
+                &project,
+                &[
+                    "--json",
+                    "run",
+                    "coding",
+                    "--data",
+                    &data,
+                    "--fixture",
+                    &fixture,
+                    "--fixture-rev",
+                    "HEAD",
+                ],
+                &UNUSED_MODEL,
+                "",
+            );
+            assert!(!out.status.success(), "{fixture}: {}", text(&out));
+            let error = stdout_json(&out)["error"].clone();
+            assert_eq!(error["kind"], kind, "{fixture}: {error}");
+            assert!(
+                error["description"]
+                    .as_str()
+                    .is_some_and(|d| d.contains(says)),
+                "{fixture}: {error}"
+            );
+        };
+        // Not a repository, or a directory inside one. The plain directory
+        // is made under the system's temporary directory, outside every
+        // repository: the test's own scratch directory may sit inside the
+        // checkout atomic is built from.
+        let plain = std::env::temp_dir().join(format!(
+            "atomic-run-cli-plain-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&plain).expect("plain");
+        refused(&plain, &first, "fixture.path", "not a git repository");
+        std::fs::remove_dir_all(&plain).expect("remove the plain directory");
+        std::fs::create_dir_all(fixture.join("sub")).expect("sub");
+        refused(
+            &fixture.join("sub"),
+            &second,
+            "fixture.path",
+            "inside the git repository",
+        );
+        // What atomic does not copy whole.
+        let (submodule, _) = repo("submodule", &[]);
+        git_in(
+            &submodule,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{first},vendor"),
+            ],
+        );
+        git_in(&submodule, &["commit", "-q", "-m", "vendor"]);
+        let head = git_in(&submodule, &["rev-parse", "HEAD"]);
+        refused(&submodule, &head, "fixture.unsupported", "submodule");
+        let (lfs, _) = repo("lfs", &[]);
+        let head = commit_file(&lfs, ".gitattributes", "*.bin filter=lfs diff=lfs -text\n");
+        refused(&lfs, &head, "fixture.unsupported", "Git LFS");
+        git_in(&dir, &["clone", "-q", "--shared", "fixture", "borrowing"]);
+        refused(
+            &dir.join("borrowing"),
+            &second,
+            "fixture.unsupported",
+            "borrows objects",
+        );
+        git_in(
+            &dir,
+            &[
+                "clone",
+                "-q",
+                "--depth",
+                "1",
+                &format!("file://{}", fixture.display()),
+                "shallow",
+            ],
+        );
+        refused(
+            &dir.join("shallow"),
+            &second,
+            "fixture.unsupported",
+            "cut-short",
+        );
+        let (grafted, head) = repo("grafted", &[]);
+        std::fs::create_dir_all(grafted.join(".git/info")).expect("info");
+        std::fs::write(grafted.join(".git/info/grafts"), format!("{head}\n")).expect("grafts");
+        refused(&grafted, &head, "fixture.unsupported", "cut-short");
+        let (sha256, _) = repo("sha256", &["--object-format=sha256"]);
+        refused(&sha256, &first, "fixture.unsupported", "SHA-1");
+        // A base that is not in the fixture's history.
+        git_in(&fixture, &["checkout", "-q", "-b", "elsewhere", &first]);
+        let elsewhere = commit_file(&fixture, "price.txt", "999");
+        git_in(&fixture, &["checkout", "-q", "main"]);
+        refused(&fixture, &elsewhere, "fixture.input", "not in the history");
+
+        // A linked worktree is bound at its own HEAD, not its repository's.
+        git_in(
+            &fixture,
+            &["worktree", "add", "-q", "-b", "linked", "../linked", &first],
+        );
+        let linked = dir.join("linked");
+        let own = commit_file(&linked, "price.txt", "500");
+        let state = state_dir(&dir, &project);
+        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        let data = json!({"base": own, "task": "multiply"}).to_string();
+        let linked_arg = linked.to_string_lossy().into_owned();
+        let mut child = spawn(
+            &dir,
+            &project,
+            &[
+                "run",
+                "coding",
+                "--run-id",
+                "linked-1",
+                "--data",
+                &data,
+                "--fixture",
+                &linked_arg,
+                "--fixture-rev",
+                "HEAD",
+            ],
+            &UNUSED_MODEL,
+            &dir.join("linked.log"),
+        );
+        open_gate(&rt, "linked-1").await;
+        child.kill().expect("stop the run at its gate");
+        child.wait().expect("reap");
+        let record = rt
+            .run_record("linked-1")
+            .await
+            .expect("record")
+            .expect("run");
+        assert_eq!(record.input["pipeline"]["fixture"]["commit"], own);
+    });
 }
 
 // needs_sandbox
@@ -4623,6 +5122,182 @@ fn help_and_the_version_create_nothing_even_from_a_deleted_directory() {
     assert!(!dir.join("atomic-home").exists(), "nothing was created");
 }
 
+/// A panic in atomic's own workflow code (made at a step's failpoint, for
+/// the test) is named as the cause, with its message, by `atomic run`,
+/// `atomic runs resume` and `atomic serve`, and kept in the project's
+/// private state; the resume hint says the panic will likely happen again.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[test]
+fn a_run_whose_workflow_code_panics_is_reported_as_a_panic() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
+    on_codex_runtime(a_run_whose_workflow_code_panics());
+}
+
+async fn a_run_whose_workflow_code_panics() {
+    let dir = scratch("panicked");
+    let project = project(&dir);
+    // An exec atom only: the endpoint is never called, but resuming and
+    // serving need one configured.
+    let panic = [
+        ("ATOMIC_FAILPOINT_PANIC", "pipeline:after:count"),
+        ("ATOMIC_MODEL_BASE_URL", "http://127.0.0.1:9/v1"),
+        ("ATOMIC_MODEL", "synthetic"),
+    ];
+    let said = |out: &Output| {
+        let t = text(out);
+        assert!(!out.status.success(), "{t}");
+        assert!(t.contains("atomic's own workflow code panicked"), "{t}");
+        assert!(
+            t.contains("failpoint pipeline:after:count"),
+            "the panic's message: {t}"
+        );
+        assert!(t.contains("will likely happen again"), "{t}");
+        assert!(!t.contains("more times than the engine allows"), "{t}");
+        assert!(t.contains("so the run is parked, not retried"), "{t}");
+        t
+    };
+    let out = atomic(
+        &dir,
+        &project,
+        &["run", "count-only", "--run-id", "panicky", "--data", NOTE],
+        &panic,
+        "",
+    );
+    said(&out);
+    // Parked by the engine before `atomic run` stopped, not left pending for
+    // a server to run again.
+    let state = state_dir(&dir, &project);
+    {
+        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        assert_eq!(
+            rt.status("panicky").await.expect("status"),
+            Some(RunStatus::Other("MAX_RECOVERY_ATTEMPTS_EXCEEDED".into()))
+        );
+    }
+    assert_eq!(count_log(&dir).len(), 1, "the count ran once");
+    // Kept where a later process, or the run's inspection, finds it.
+    let private = state
+        .parent()
+        .and_then(Path::parent)
+        .expect("the atomic home")
+        .join("private")
+        .join(state.file_name().expect("the project's id"));
+    let kept = atomic_app::panics::kept(&private.join("panics"), "panicky").expect("kept");
+    assert!(kept.contains("failpoint pipeline:after:count"), "{kept}");
+
+    // Resumed as it is, it panics again, and says so before and after.
+    let out = atomic(&dir, &project, &["runs", "resume", "panicky"], &panic, "");
+    let t = said(&out);
+    assert!(
+        t.contains("was parked because atomic's own workflow code panicked"),
+        "{t}"
+    );
+
+    // A server started later names it, from what was kept.
+    let log = dir.join("serve.log");
+    let mut serve = spawn(&dir, &project, &["serve"], &panic, &log);
+    wait_until("serve to name the panicked run", || {
+        std::fs::read_to_string(&log).is_ok_and(|l| {
+            l.contains("serving until stopped")
+                && l.contains("run panicky stopped: atomic's own workflow code panicked")
+        })
+    });
+    terminate(&serve);
+    let _ = wait_child(&mut serve, "serve");
+    // The server recovered nothing: the run was parked, not left pending.
+    let served = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        served.contains("recovered 0 unfinished run(s)"),
+        "serve recovered the panicked run: {served}"
+    );
+
+    // One that panics while serving: killed where it would panic, then
+    // recovered by a server, which says so as it happens.
+    let killed = [
+        ("ATOMIC_FAILPOINT", "pipeline:after:count"),
+        ("ATOMIC_MODEL_BASE_URL", "http://127.0.0.1:9/v1"),
+        ("ATOMIC_MODEL", "synthetic"),
+    ];
+    let out = atomic(
+        &dir,
+        &project,
+        &[
+            "run",
+            "count-only",
+            "--run-id",
+            "panics-later",
+            "--data",
+            NOTE,
+        ],
+        &killed,
+        "",
+    );
+    assert!(!out.status.success(), "{}", text(&out));
+    let log = dir.join("serve-2.log");
+    let mut serve = spawn(&dir, &project, &["serve"], &panic, &log);
+    wait_until(
+        "serve to name the run that panicked while it served",
+        || {
+            std::fs::read_to_string(&log).is_ok_and(|l| {
+                l.contains(
+                    "atomic serve: run panics-later stopped: atomic's own workflow code panicked",
+                ) && l.contains("failpoint pipeline:after:count")
+            })
+        },
+    );
+    terminate(&serve);
+    let _ = wait_child(&mut serve, "serve");
+}
+
+/// A panic noted by an earlier process is not the cause of a later run's
+/// own failure under the same id: it fails as any run does.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[test]
+fn a_note_kept_from_before_is_not_a_later_failures_cause() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
+    let dir = scratch("stale-note");
+    let project = project(&dir);
+    let state = state_dir(&dir, &project);
+    let panics = state
+        .parent()
+        .and_then(Path::parent)
+        .expect("the atomic home")
+        .join("private")
+        .join(state.file_name().expect("the project's id"))
+        .join("panics");
+    std::fs::create_dir_all(&panics).expect("panics");
+    let name = {
+        use sha2::Digest;
+        format!("{:x}.json", sha2::Sha256::digest(b"reused"))
+    };
+    std::fs::write(
+        panics.join(name),
+        json!({"run": "reused", "message": "a panic long ago", "at": 1}).to_string(),
+    )
+    .expect("an old note");
+    // A command that fails: an ordinary failure of the run.
+    std::fs::write(project.join("tools/count.py"), "import sys\nsys.exit(3)\n")
+        .expect("a failing command");
+    let out = atomic(
+        &dir,
+        &project,
+        &["run", "count-only", "--run-id", "reused", "--data", NOTE],
+        &[],
+        "",
+    );
+    let t = text(&out);
+    assert!(!out.status.success(), "{t}");
+    assert!(
+        !t.contains("panicked"),
+        "an old note was taken for the cause: {t}"
+    );
+    assert!(t.contains("run reused failed"), "{t}");
+}
+
 // needs_sandbox
 #[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
@@ -4663,5 +5338,100 @@ fn the_debug_prompt_says_its_turn_is_not_metered() {
             "the unmetered turn was silent: {stderr}"
         );
         assert_eq!(model.calls(), 1);
+    });
+}
+
+/// A copy of `rank-note` named `name`, declaring `trust` if one is given.
+fn ranking_atom(project: &Path, name: &str, trust: Option<&str>) {
+    let config = match trust {
+        Some(trust) => format!("description: '{name}', trust: '{trust}'"),
+        None => format!("description: '{name}'"),
+    };
+    write_atom(
+        project,
+        name,
+        &config,
+        "Rank the note from 1 (urgent) to 3.\nTitle: {input.title}\nWords: {input.words}",
+        object(json!({"title": {"type": "string"}, "words": {"type": "integer"}})),
+        object(json!({"priority": {"type": "integer", "minimum": 1, "maximum": 3}})),
+    );
+}
+
+const RANK_INPUT: &str = r#"{"title": "Export crashes on accents", "words": 7}"#;
+
+#[test]
+fn a_direct_run_refuses_input_its_atom_does_not_trust_before_anything_runs() {
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(RANK.into())])
+            .await
+            .expect("fake model");
+        let dir = scratch("untrusted-input");
+        let project = project(&dir);
+        ranking_atom(&project, "rank-for-team", Some("team"));
+        ranking_atom(&project, "rank-for-agents", Some("agent"));
+        let env = model_env(&model.base_url());
+        for atom in ["rank-for-team", "rank-for-agents"] {
+            let (dir, project, env) = (dir.clone(), project.clone(), env.clone());
+            let out = tokio::task::spawn_blocking(move || {
+                atomic(
+                    &dir,
+                    &project,
+                    &["--json", "run", atom, "--data", RANK_INPUT],
+                    &with(&env, &[]),
+                    "",
+                )
+            })
+            .await
+            .expect("atomic");
+            assert!(!out.status.success(), "{atom}: {}", text(&out));
+            let error = &stdout_json(&out)["error"];
+            assert_eq!(error["kind"], "input.untrusted", "{atom}: {}", text(&out));
+            let message = error["description"].as_str().unwrap_or_default();
+            assert!(message.contains("external data"), "{atom}: {message}");
+            assert!(
+                message.contains(&format!("atom `{atom}`")),
+                "{atom}: {message}"
+            );
+            // Refused as the run was loaded: no durable run was started,
+            // which would name itself first on stderr.
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(!stderr.contains("run-"), "{atom}: a run started: {stderr}");
+        }
+        assert_eq!(model.calls(), 0, "a model was called");
+    });
+}
+
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[test]
+fn a_direct_run_takes_external_input_into_an_atom_that_accepts_it() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(RANK.into())])
+            .await
+            .expect("fake model");
+        let dir = scratch("external-input");
+        let project = project(&dir);
+        ranking_atom(&project, "rank-anything", Some("external"));
+        let env = model_env(&model.base_url());
+        // No trust declared, and external declared, both take the run's input.
+        for atom in ["rank-note", "rank-anything"] {
+            let (dir, project, env) = (dir.clone(), project.clone(), env.clone());
+            let out = tokio::task::spawn_blocking(move || {
+                atomic(
+                    &dir,
+                    &project,
+                    &["run", atom, "--data", RANK_INPUT],
+                    &with(&env, &[]),
+                    "",
+                )
+            })
+            .await
+            .expect("atomic");
+            assert!(out.status.success(), "{atom}: {}", text(&out));
+            assert_eq!(stdout_json(&out), json!({"priority": 1}), "{atom}");
+        }
+        assert_eq!(model.calls(), 2);
     });
 }

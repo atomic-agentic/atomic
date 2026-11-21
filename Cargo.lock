@@ -513,6 +513,7 @@ dependencies = [
  "atomic-agentic-schema",
  "clap",
  "getrandom 0.3.4",
+ "libc",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
@@ -579,6 +580,7 @@ version = "0.0.0"
 dependencies = [
  "durare",
  "getrandom 0.3.4",
+ "jsonschema",
  "libc",
  "serde",
  "serde_json",

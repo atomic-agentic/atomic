@@ -89,6 +89,7 @@ fn runtimes(model: &FakeModel, root: &Path) -> Runtimes {
             artifacts: Artifacts::none(),
             meter: crate::usage::Metering::none(),
             backend: Default::default(),
+            caches: None,
         },
         lite: crate::lite::LiteRuntime::new(endpoint, AtomConfig::default()),
         exec: Default::default(),

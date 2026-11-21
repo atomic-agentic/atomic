@@ -20,6 +20,9 @@
 //!                 helper links Codex's shell needs)
 //!   worktrees/    one worktree per code-changing step
 //!   cache/        build caches shared by a project's steps
+//!   fixtures/     a bare snapshot of each commit a coding run is bound to
+//!                 (see [`crate::fixture`]), each made whole before it
+//!                 appears
 //!   tmp/          each turn's own temporary directory
 //!   scratch/      each atom attempt's scratch directory, and the
 //!                 temporary directory its backend's turns share
@@ -107,6 +110,17 @@ pub enum StateError {
 }
 
 impl ProjectState {
+    /// The state of a project at `root` kept under `home` as an atomic home,
+    /// for tests that must not touch the real one.
+    #[cfg(test)]
+    pub(crate) fn under(home: &Path, root: &Path) -> Self {
+        Self {
+            root: root.to_owned(),
+            dir: home.join("projects/test"),
+            private: home.join("private/test"),
+        }
+    }
+
     /// Resolve the state directory for the project rooted at `root`, without
     /// touching the filesystem beyond resolving `root`.
     pub fn resolve(root: &Path) -> Result<Self, StateError> {

@@ -31,6 +31,10 @@ const REDELIVERY: Duration = Duration::from_secs(5);
 /// The state of a run the engine parked for its recovery count.
 const PARKED: &str = "MAX_RECOVERY_ATTEMPTS_EXCEEDED";
 
+/// How long a command follows a run whose workflow code panicked until the
+/// engine has parked it.
+const PARKING: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// How long a stopping process gives running work to reach a checkpoint.
 const SHUTDOWN: Duration = Duration::from_secs(10);
 
@@ -49,8 +53,89 @@ pub struct RunArgs {
     /// The id to give the run; by default a new one.
     #[arg(long)]
     pub run_id: Option<String>,
+    /// For a workflow that changes code: the repository, already on disk,
+    /// its worktrees are made from. The run never writes to it.
+    #[arg(long, value_name = "REPO", requires = "fixture_rev")]
+    pub fixture: Option<PathBuf>,
+    /// The revision of `--fixture` the run starts from: a commit ID or a
+    /// branch or tag name, pinned to its commit when the run is admitted.
+    #[arg(long, value_name = "REV", requires = "fixture")]
+    pub fixture_rev: Option<String>,
     #[command(flatten)]
     pub engine: EngineArgs,
+}
+
+/// Bind `run` to its fixture, as `args` name one, before anything runs:
+/// a run that changes code needs one, and every git-commit input must fit
+/// it.
+fn bind_fixture(
+    run: &mut atomic_app::pipeline::PipelineRun,
+    args: &RunArgs,
+    state: &ProjectState,
+    cwd: &Path,
+) -> anyhow::Result<()> {
+    use atomic_core::fixture::{self, FixtureError};
+    let (Some(repo), Some(rev)) = (&args.fixture, &args.fixture_rev) else {
+        if run.pipeline.changes_code() {
+            return Err(Failure::new(
+                "fixture.required",
+                format!(
+                    "workflow `{}` changes code in a worktree, and no fixture repository is \
+                     named; atomic never works in your own checkout",
+                    run.pipeline.name
+                ),
+                "name the repository and the revision to start from: --fixture <repo> \
+                 --fixture-rev <commit or branch>",
+            )
+            .into());
+        }
+        return Ok(());
+    };
+    let repo = if repo.is_absolute() {
+        repo.clone()
+    } else {
+        cwd.join(repo)
+    };
+    let fail = |e: FixtureError| -> anyhow::Error {
+        let (kind, action) = match &e {
+            FixtureError::Path { .. } => (
+                "fixture.path",
+                "give --fixture the path of a git repository on this machine",
+            ),
+            FixtureError::Revision { .. } => (
+                "fixture.revision",
+                "give --fixture-rev a commit ID, or a branch or tag name, of that repository",
+            ),
+            FixtureError::Unsupported(_) => (
+                "fixture.unsupported",
+                "prepare the fixture so its commit holds everything as files, then bind it again",
+            ),
+            FixtureError::Schema(_) => (
+                "fixture.schema",
+                "fix the workflow's input schema: type each commit field through `properties` \
+                 and `items` only",
+            ),
+            FixtureError::Occupied(_) => (
+                "fixture.snapshot",
+                "move what is there out of the way, after checking no run is working in it, \
+                 then run again",
+            ),
+            FixtureError::Input { .. } => (
+                "fixture.input",
+                "give each git-commit field of the input a commit of the fixture, and its base \
+                 the fixture's revision",
+            ),
+            FixtureError::Git(_) | FixtureError::Io { .. } => (
+                "fixture.snapshot",
+                "fix what the description names, then run again",
+            ),
+        };
+        Failure::new(kind, e.to_string(), action).into()
+    };
+    let binding = fixture::bind(state, &repo, rev).map_err(fail)?;
+    fixture::check_commits(&binding, &run.pipeline.input, &run.input).map_err(fail)?;
+    run.pipeline.fixture = Some(binding);
+    Ok(())
 }
 
 /// `atomic runs resume`.
@@ -102,15 +187,39 @@ fn print_result(run_id: &str, output: &Value, json: bool) -> anyhow::Result<()> 
 ///
 /// A signal stops the command as one stops `atomic serve` (see [`stop`]):
 /// the run stays unfinished, for `atomic runs resume`.
+///
+/// While it waits, the terminal prompt shows each gate the run opens, so the
+/// person running the command can decide it there (see [`crate::prompt`]).
 async fn finish(
     engine: &engine::Engine,
+    state: &ProjectState,
     run_id: &str,
     json: bool,
     signals: &mut Signals,
     who: &str,
 ) -> anyhow::Result<()> {
+    // Whether the engine was seen to park a run whose workflow code
+    // panicked, before this command stopped.
+    let parked_seen = std::cell::Cell::new(false);
     let follow = async {
         let outcome = engine.rt.result::<Value>(run_id).await;
+        // A panic in atomic's own workflow code parks the run: there is no
+        // outcome to wait for, but the engine parks it a moment later, and
+        // stopping first would leave it to run again. Follow it there, for a
+        // bounded time even if the store stops answering.
+        if outcome.is_err() && atomic_app::panics::noted(run_id).is_some() {
+            let parked = tokio::time::timeout(PARKING, async {
+                while !matches!(
+                    engine.rt.status(run_id).await,
+                    Ok(Some(RunStatus::Other(ref state))) if state == PARKED
+                ) {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            })
+            .await;
+            parked_seen.set(parked.is_ok());
+            return outcome;
+        }
         if matches!(outcome, Err(DurableError::Interrupted(_))) {
             // This execution stopped without an outcome, as one whose exec
             // command's result was lost does, and the engine recovers it in
@@ -120,13 +229,27 @@ async fn finish(
         }
         outcome
     };
+    let follow = async {
+        tokio::select! {
+            outcome = follow => outcome,
+            () = crate::prompt::at_gates(&engine.rt, state, run_id) => {
+                unreachable!("the prompt runs until the run ends")
+            }
+        }
+    };
     let outcome = tokio::select! {
         outcome = follow => Some(outcome),
         signal = signals.next() => {
-            atomic_core::log_line!(
-                "{who}: {signal}: run {run_id} stays unfinished; continue it with \
-                 `atomic runs resume {run_id}`"
-            );
+            // Names and atomic's words only, not redacted, since a run id
+            // such as `rotate-secret` is not a secret, but escaped for the
+            // terminal.
+            let run_id = crate::shown::line(run_id);
+            atomic_core::redact::Line::new()
+                .shown(&format!(
+                    "{who}: {signal}: run {run_id} stays unfinished; continue it with \
+                     `atomic runs resume {run_id}`"
+                ))
+                .log();
             None
         }
     };
@@ -134,8 +257,23 @@ async fn finish(
         stop(signals, who, Exit::Signalled).await
     };
     let _ = engine.rt.shutdown(SHUTDOWN).await;
+    // Only a panic this process saw: a note kept from an earlier run of the
+    // same id is not this outcome's cause.
+    let panicked = match &outcome {
+        Err(_) => atomic_app::panics::noted(run_id),
+        Ok(_) => None,
+    };
     match outcome {
         Ok(output) => print_result(run_id, &output, json),
+        Err(_) if panicked.is_some() => {
+            let message = panicked.unwrap_or_default();
+            let cause = if parked_seen.get() {
+                atomic_app::panics::cause(run_id, &message)
+            } else {
+                atomic_app::panics::unparked(run_id, &message)
+            };
+            Err(Failure::new("run.panicked", cause, atomic_app::panics::hint(run_id)).into())
+        }
         Err(DurableError::Failed(why)) if atomic_app::pipeline::dead_lettered(run_id) => {
             Err(Failure::new(
                 "run.dead_lettered",
@@ -161,10 +299,13 @@ async fn finish(
             Err(Failure::new(
                 "run.parked",
                 format!(
-                    "run {run_id} was recovered more times than the engine allows, so it is \
-                     parked: {e}"
+                    "run {run_id} stopped without finishing more times than the engine allows, \
+                     so it is parked: {e}"
                 ),
-                format!("continue it with `atomic runs resume {run_id}`"),
+                format!(
+                    "find why it keeps stopping, then continue it with `atomic runs resume \
+                     {run_id}`"
+                ),
             )
             .into())
         }
@@ -188,9 +329,13 @@ pub async fn run(
     let found = target::project_for(project, Some(&args.target), &cwd)?;
     let state = ProjectState::resolve(found.root())?;
     let input = target::input(args.input.as_deref(), args.data.as_deref(), &cwd)?;
-    // After the input is read: until then a signal stops atomic as usual.
+    let mut run = target::load(&found, &args.target, &cwd, input, &engine::deployment())?;
+    // Before any model is called, and before the run is recorded.
+    state.create()?;
+    bind_fixture(&mut run, &args, &state, &cwd)?;
+    // Once the input is read and the run admitted: until then, a fixture's
+    // copy included, a signal stops atomic as usual.
     let mut signals = Signals::new()?;
-    let run = target::load(&found, &args.target, &cwd, input, &engine::deployment())?;
     let engine = engine::open(
         &state,
         paths,
@@ -244,13 +389,26 @@ pub async fn run(
     }
     engine.launch().await?;
     // Before anything runs, so a run cut short can be resumed by its id.
-    atomic_core::log_line!(
-        "run {run_id}: {} in project {}",
-        run.pipeline.name,
-        found.name
-    );
+    // Names only, not redacted, since a run id such as `rotate-secret` is
+    // not a secret, but escaped for the terminal.
+    atomic_core::redact::Line::new()
+        .shown(&format!(
+            "run {}: {} in project {}",
+            crate::shown::line(&run_id),
+            crate::shown::line(&run.pipeline.name),
+            crate::shown::line(&found.name)
+        ))
+        .log();
+    if let Some(f) = &run.pipeline.fixture {
+        atomic_core::log_line!(
+            "run {run_id}: fixture {} at {} pinned to commit {}",
+            f.source.display(),
+            f.rev,
+            f.commit
+        );
+    }
     engine.rt.start(PIPELINE, &run_id, run).await?;
-    finish(&engine, &run_id, json, &mut signals, "atomic run").await
+    finish(&engine, &state, &run_id, json, &mut signals, "atomic run").await
 }
 
 /// The state of the project a command that names no target works on.
@@ -302,7 +460,15 @@ pub async fn resume(
         }
         Some(RunStatus::Succeeded) => {
             engine.launch().await?;
-            finish(&engine, id, json, &mut signals, "atomic runs resume").await
+            finish(
+                &engine,
+                &state,
+                id,
+                json,
+                &mut signals,
+                "atomic runs resume",
+            )
+            .await
         }
         Some(RunStatus::Other(state)) if state != PARKED => {
             let _ = engine.rt.shutdown(SHUTDOWN).await;
@@ -332,6 +498,16 @@ pub async fn resume(
                 )
                 .into());
             }
+            // A run parked because atomic's own workflow code panicked will
+            // likely panic again: say so, and note afresh what this resume
+            // finds.
+            if let Some(message) = atomic_app::panics::of(id) {
+                atomic_core::log_line!(
+                    "run {id}: it was parked because atomic's own workflow code panicked \
+                     ({message}); resuming it, the panic will likely happen again unless this \
+                     atomic has it fixed"
+                );
+            }
             // The execution lock covers this host only. On a shared store
             // another live process may own the run, and nothing fences it.
             let owner = record.owner().unwrap_or_default();
@@ -354,14 +530,26 @@ pub async fn resume(
                 )
                 .into());
             }
-            atomic_core::log_line!("run {id}: resuming");
+            atomic_core::redact::Line::new()
+                .shown(&format!("run {}: resuming", crate::shown::line(id)))
+                .log();
             // Queued before this engine dispatches, so it takes the run once.
             engine.rt.resume(id).await?;
+            // Resumed: what it does now is noted afresh.
+            atomic_app::panics::forget(id);
             atomic_durable::failpoint("resume:queued");
             engine.launch().await?;
             // A gate decided while the run was down may never have woken it.
             atomic_durable::gate::redeliver(&engine.rt).await?;
-            finish(&engine, id, json, &mut signals, "atomic runs resume").await
+            finish(
+                &engine,
+                &state,
+                id,
+                json,
+                &mut signals,
+                "atomic runs resume",
+            )
+            .await
         }
     }
 }
@@ -463,7 +651,11 @@ async fn stop(signals: &mut Signals, who: &str, exit: Exit) -> ! {
     // The engine's drain ends at its time limit whether or not its steps
     // did, so whatever still runs is stopped here, and its end is never
     // recorded: this process exits first.
-    let stopped = atomic_exec::process::stop_all();
+    // It returns once every process this one started has ended, so the
+    // execution lock, which goes with this process, outlasts them all.
+    let stopped = atomic_exec::process::stop_all(&mut |what| {
+        atomic_core::log_line!("{who}: {what}");
+    });
     if stopped > 0 {
         atomic_core::log_line!(
             "{who}: stopped {stopped} command(s) that had not finished; their runs continue with \
@@ -491,6 +683,8 @@ async fn stop(signals: &mut Signals, who: &str, exit: Exit) -> ! {
             atomic_core::log_line!("{who}: {again}: stopping now, without sending the last spans");
         }
     }
+    // Once more, for what started since, such as a model turn's command.
+    atomic_exec::process::end_all(&mut |what| atomic_core::log_line!("{who}: {what}"));
     // Exit here, not by returning: the runtime would wait for the blocked
     // threads of the stopped commands, which never return.
     std::process::exit(match exit {
@@ -541,13 +735,26 @@ pub async fn serve(
     let before = parked(engine.rt.runs_in(PARKED).await?);
     let recovered = engine.rt.recover().await?;
     engine.launch().await?;
-    // The engine parks a run it has recovered too often instead of
-    // recovering it once more: name each one.
-    for id in parked(engine.rt.runs_in(PARKED).await?).difference(&before) {
-        atomic_core::log_line!(
-            "atomic serve: run {id} was recovered more times than the engine allows, so it is \
-             parked; continue it with `atomic runs resume {id}`"
-        );
+    // The engine parks a run whose workflow code panicked, and one it has
+    // recovered too often, instead of recovering it once more: name each,
+    // with its cause.
+    let now = parked(engine.rt.runs_in(PARKED).await?);
+    for id in &now {
+        match atomic_app::panics::of(id) {
+            // Whenever it panicked, in this process's recovery or an
+            // earlier process.
+            Some(message) => atomic_core::log_line!(
+                "atomic serve: {}; {}",
+                atomic_app::panics::cause(id, &message),
+                atomic_app::panics::hint(id)
+            ),
+            None if before.contains(id) => {}
+            None => atomic_core::log_line!(
+                "atomic serve: run {id} stopped without finishing more times than the engine \
+                 allows, so it is parked; find why, then continue it with `atomic runs resume \
+                 {id}`"
+            ),
+        }
     }
     // A gate decided while its run was down may never have woken it.
     atomic_durable::gate::redeliver(&engine.rt).await?;

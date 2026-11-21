@@ -176,6 +176,25 @@ async fn assert_refused(engine: &Durare, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// The engine parks a run whose workflow panicked, shortly after the panic,
+/// for an explicit resume, never an automatic retry: recovering it before
+/// the park lands would race the park. Wait for the park, then resume it.
+async fn resume_after_its_panic(engine: &Durare, id: &str) -> Result<()> {
+    let until = Instant::now() + Duration::from_secs(20);
+    loop {
+        let status = engine.status(id).await?;
+        if matches!(&status, Some(RunStatus::Other(s)) if s == "MAX_RECOVERY_ATTEMPTS_EXCEEDED") {
+            break;
+        }
+        assert!(
+            Instant::now() < until,
+            "the panicked run {id} was never parked: {status:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    engine.resume(id).await
+}
+
 async fn setup(engine: &Durare, epoch: i64) -> Result<()> {
     let id = unique("setup");
     engine.start("setup", &id, epoch).await?;
@@ -222,8 +241,9 @@ async fn candidate_survives_a_crash_before_publication(mut engine: Durare) -> Re
             })
             .await?;
             if runs.fetch_add(1, Ordering::SeqCst) == 0 {
-                // The engine treats a panic in a workflow body as a crash: the run
-                // stays PENDING with its checkpoints, and recovery re-dispatches it.
+                // A panic in a workflow body stops it as a crash would: the run
+                // keeps its checkpoints, and the engine parks it for an explicit
+                // resume (see `resume_after_its_panic`).
                 panic!("crash after the candidate checkpoint, before publication");
             }
             publish_candidate(
@@ -236,6 +256,8 @@ async fn candidate_survives_a_crash_before_publication(mut engine: Durare) -> Re
             .await
         }
     });
+    // Resumed by hand once it is parked after its panic.
+    engine.take_resumed_runs(Some("atom-1")).await?;
     engine.launch().await?;
     setup(&engine, 1).await?;
 
@@ -247,7 +269,7 @@ async fn candidate_survives_a_crash_before_publication(mut engine: Durare) -> Re
     // Nothing reached the tables before publication.
     assert_eq!(counts(&engine).await?, (0, 0));
 
-    engine.recover().await?;
+    resume_after_its_panic(&engine, "atom-1").await?;
     let output: Value = engine.result("atom-1").await?;
     assert_eq!(output, json!({"answer": 42}));
     assert_eq!(
@@ -646,6 +668,7 @@ async fn run_atom_records_sibling_steps_in_a_stable_order(mut engine: Durare) ->
             Ok((plan, review))
         }
     });
+    engine.take_resumed_runs(Some("two-atoms-1")).await?;
     engine.launch().await?;
     setup(&engine, 1).await?;
     engine.start("two-atoms", "two-atoms-1", ()).await?;
@@ -659,7 +682,7 @@ async fn run_atom_records_sibling_steps_in_a_stable_order(mut engine: Durare) ->
         .into_iter()
         .map(|s| (s.step_id, s.name))
         .collect();
-    engine.recover().await?;
+    resume_after_its_panic(&engine, "two-atoms-1").await?;
     let (plan, review): (Published, Published) = engine.result("two-atoms-1").await?;
     let after: Vec<(i32, String)> = engine
         .steps("two-atoms-1")
@@ -713,30 +736,34 @@ async fn a_released_park_runs_the_turn_again(mut engine: Durare) -> Result<()> {
     engine.register("parks", move |ctx: DurareContext, (): ()| {
         let t = t.clone();
         async move {
-            run_atom_at(
-                &ctx,
-                "plan",
-                move |step| {
-                    let t = t.clone();
-                    async move {
-                        let turns = {
-                            let mut told = t.lock().expect("told");
-                            told.push(step.step_id);
-                            told.len()
-                        };
-                        if turns < 3 {
-                            return Err(DurableError::Parked(format!("no room, turn {turns}")));
-                        }
-                        Ok(Proposal {
-                            output: json!("planned"),
-                            metadata: json!({}),
-                            writes: Vec::new(),
-                        })
+            let (candidate, told) = execute_candidate_told(&ctx, "plan.turn", move |step| {
+                let t = t.clone();
+                async move {
+                    let turns = {
+                        let mut told = t.lock().expect("told");
+                        told.push(step.step_id);
+                        told.len()
+                    };
+                    if turns < 3 {
+                        return Err(DurableError::Parked(format!("no room, turn {turns}")));
                     }
-                },
+                    Ok(Proposal {
+                        output: json!("planned"),
+                        metadata: json!({}),
+                        writes: Vec::new(),
+                    })
+                }
+            })
+            .await?;
+            let output = publish_candidate(
+                &ctx,
+                "plan.publish",
+                &candidate,
+                &review_candidate(&candidate),
                 Vec::new(),
             )
-            .await
+            .await?;
+            Ok((output, told))
         }
     });
     engine.launch().await?;
@@ -771,8 +798,8 @@ async fn a_released_park_runs_the_turn_again(mut engine: Durare) -> Result<()> {
     assert_ne!(second[1].id, first[0].id);
     assert_eq!(second[1].reason, "no room, turn 2");
     release(&engine, &second[1]).await?;
-    let published: Published = engine.result(&run).await?;
-    assert_eq!(published.output, json!("planned"));
+    let (output, told_back): (Value, i32) = engine.result(&run).await?;
+    assert_eq!(output, json!("planned"));
     // Every turn was told the first turn's position.
     let told = told.lock().expect("told").clone();
     assert_eq!(
@@ -781,6 +808,8 @@ async fn a_released_park_runs_the_turn_again(mut engine: Durare) -> Result<()> {
         "one turn per release; the repeat release did nothing"
     );
     assert!(told.iter().all(|p| *p == told[0]), "{told:?}");
+    // And the caller is given that position, not the last turn's.
+    assert_eq!(told_back, told[0]);
     let names: Vec<String> = engine
         .steps(&run)
         .await?
@@ -836,12 +865,13 @@ async fn a_pre_upgrade_turn_checkpoint_still_decodes(mut engine: Durare) -> Resu
             .await
         }
     });
+    let run = unique("legacy");
+    engine.take_resumed_runs(Some(&run)).await?;
     engine.launch().await?;
     setup(&engine, 1).await?;
-    let run = unique("legacy");
     engine.start("legacy", &run, ()).await?;
     assert!(engine.result::<Value>(&run).await.is_err(), "crashed");
-    engine.recover().await?;
+    resume_after_its_panic(&engine, &run).await?;
     let published: Published = engine.result(&run).await?;
     assert_eq!(published.output, json!("from before"));
     assert_eq!(

@@ -6,8 +6,9 @@
 //! every site in atomic, these included; this crate does not depend on that
 //! one, so it carries its own copy of the switch. With the `failpoints`
 //! feature, `ATOMIC_FAILPOINT=<name>` kills the process (SIGKILL) at the first
-//! failpoint of that name, and `ATOMIC_FAILPOINT_LOG=<file>`
-//! appends every failpoint reached to `<file>`, one name per line. Without the
+//! failpoint of that name, `ATOMIC_FAILPOINT_PANIC=<name>` makes the code
+//! that reaches it panic there, and `ATOMIC_FAILPOINT_LOG=<file>` appends
+//! every failpoint reached to `<file>`, one name per line. Without the
 //! feature, [`failpoint`] does nothing and [`armed`] is false.
 
 /// Whether failpoints are compiled in. Callers that build a name check this
@@ -43,6 +44,22 @@ pub fn failpoint(name: &str) {
             eprintln!("failpoint {name}: killing the process");
             kill_self();
         }
+        if std::env::var("ATOMIC_FAILPOINT_PANIC").is_ok_and(|f| f == name) {
+            panic!("failpoint {name}: atomic's own code panicked here, as a test asked");
+        }
+    }
+    #[cfg(not(feature = "failpoints"))]
+    let _ = name;
+}
+
+/// A named point where a test can hold this thread up, as a busy machine's
+/// scheduler might: with the `failpoints` feature,
+/// `ATOMIC_FAILPOINT_PAUSE=<name>` makes it wait a second there. Without the
+/// feature it does nothing. It kills nothing, so it is not a crash site.
+pub fn pause(name: &str) {
+    #[cfg(feature = "failpoints")]
+    if std::env::var("ATOMIC_FAILPOINT_PAUSE").is_ok_and(|f| f == name) {
+        std::thread::sleep(std::time::Duration::from_secs(1));
     }
     #[cfg(not(feature = "failpoints"))]
     let _ = name;

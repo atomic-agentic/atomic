@@ -86,6 +86,7 @@ async fn run_on<A: Atom>(
                 artifacts: atomic_core::runtime::Artifacts::none(),
                 meter: atomic_core::usage::Metering::none(),
                 backend: Default::default(),
+                caches: None,
             };
             run_codex_atom(atom, input, &rt).await
         }

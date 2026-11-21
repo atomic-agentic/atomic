@@ -479,6 +479,7 @@ fn runtimes(dir: &Path, cwd: &Path, base_url: &str) -> Arc<Runtimes> {
             artifacts: Artifacts::none(),
             meter: atomic_core::usage::Metering::none(),
             backend: Default::default(),
+            caches: None,
         },
         lite: LiteRuntime::new(endpoint, AtomConfig::default()),
         exec: Default::default(),
@@ -556,6 +557,7 @@ async fn approve_gates(rt: Arc<Durare>) {
                     verdict: Verdict::Approve,
                     comment: Some("the crash suite approves".into()),
                     proposal: g.proposal.clone(),
+                    answer: None,
                 },
             )
             .await;

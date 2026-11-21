@@ -155,6 +155,17 @@ pub trait Meter: Send + Sync {
     /// Settle `ticket` with how its call ended. Settling a ticket again
     /// changes nothing.
     fn settle(&self, ticket: Ticket, outcome: Outcome) -> MeterFuture<'_, ()>;
+
+    /// Record what the call of `ticket`, still running, has reported so far,
+    /// as an [`Outcome::Partial`]: so that a call whose process stops or dies
+    /// before it is settled stays charged at least that, and the request it
+    /// may have in flight. Recording it again with more replaces it; the
+    /// call's settlement replaces it in turn. A meter that keeps nothing
+    /// between admission and settlement records nothing.
+    fn progress<'a>(&'a self, ticket: &'a Ticket, outcome: Outcome) -> MeterFuture<'a, ()> {
+        let _ = (ticket, outcome);
+        Box::pin(async { Ok(()) })
+    }
 }
 
 /// The meter a runtime's calls go through, if any.
@@ -185,6 +196,19 @@ impl Metering {
                 (Some(t), limit)
             }),
             None => Ok((None, Limit::default())),
+        }
+    }
+
+    /// Record what the call of `ticket` has reported so far, if it is
+    /// metered (see [`Meter::progress`]).
+    pub async fn progress(
+        &self,
+        ticket: Option<&Ticket>,
+        outcome: Outcome,
+    ) -> Result<(), MeterError> {
+        match (&self.0, ticket) {
+            (Some(meter), Some(ticket)) => meter.progress(ticket, outcome).await,
+            _ => Ok(()),
         }
     }
 
@@ -281,6 +305,7 @@ pub(crate) fn call_span(model: &str, provider: &str) -> tracing::Span {
         gen_ai.usage.input_tokens = tracing::field::Empty,
         gen_ai.usage.output_tokens = tracing::field::Empty,
         error.message = tracing::field::Empty,
+        http.response.status_code = tracing::field::Empty,
         atomic.workflow.id = tracing::field::Empty,
         atomic.step = tracing::field::Empty,
         atomic.stopped = tracing::field::Empty,
@@ -308,7 +333,31 @@ pub(crate) fn record_usage(span: &tracing::Span, usage: &Usage) {
     span.record("gen_ai.usage.output_tokens", usage.output_tokens);
 }
 
-/// Record on `span` why a call failed. The exporter redacts it.
+/// The most characters of a failed call's error a span carries, with the
+/// `…` that ends one that was cut. The run's stored error keeps the whole.
+pub(crate) const MAX_SPAN_ERROR: usize = 200;
+
+/// What a call's span says of why it failed, redacted and at most
+/// [`MAX_SPAN_ERROR`] characters: for an error a provider answered with,
+/// its status and the type of error it names, with its HTTP status code;
+/// else what failed and its innermost cause, such as a connection's
+/// `Connection refused`, rather than every context between, which can
+/// repeat the URL.
+pub(crate) fn span_error(error: &anyhow::Error) -> (String, Option<u16>) {
+    let bounded = |text: &str| crate::redact::bounded(text, MAX_SPAN_ERROR - 1);
+    match error
+        .chain()
+        .find_map(|e| e.downcast_ref::<crate::lite::ProviderError>())
+    {
+        Some(provider) => (bounded(&provider.summary()), Some(provider.code)),
+        None if error.chain().count() > 1 => {
+            (bounded(&format!("{error}: {}", error.root_cause())), None)
+        }
+        None => (bounded(&error.to_string()), None),
+    }
+}
+
+/// Record on `span` why a call failed (see [`span_error`]).
 pub(crate) fn record_error(span: &tracing::Span, error: &anyhow::Error) {
     span.record("otel.status_code", "ERROR");
     span.record(
@@ -319,8 +368,9 @@ pub(crate) fn record_error(span: &tracing::Span, error: &anyhow::Error) {
             "atomic.model_call"
         },
     );
-    span.record(
-        "error.message",
-        tracing::field::display(format!("{error:#}")),
-    );
+    let (message, status) = span_error(error);
+    span.record("error.message", message.as_str());
+    if let Some(status) = status {
+        span.record("http.response.status_code", i64::from(status));
+    }
 }

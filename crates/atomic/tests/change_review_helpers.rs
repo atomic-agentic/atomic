@@ -205,6 +205,7 @@ fn runtimes(dir: &Path, base_url: &str) -> Arc<Runtimes> {
             artifacts: Artifacts::none(),
             meter: atomic_core::usage::Metering::none(),
             backend: Default::default(),
+            caches: None,
         },
         lite: LiteRuntime::new(endpoint, AtomConfig::default()),
         exec: Default::default(),
