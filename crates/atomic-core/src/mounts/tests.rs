@@ -92,7 +92,12 @@ fn a_real_table_parses_and_finds_what_it_should() {
     assert_eq!(mounts.len(), 19);
     assert!(mounts.iter().any(|m| m.kind == "nsfs" && m.root.is_none()));
     // A FUSE mount under the user's runtime directory is found where it is.
-    let gvfs = mount_of(&mounts, Path::new("/run/user/1000/gvfs/share")).expect("a mount");
+    let gvfs = mount_of(
+        &mounts,
+        &ids(&mounts),
+        Path::new("/run/user/1000/gvfs/share"),
+    )
+    .expect("a mount");
     assert_eq!(
         (gvfs.kind.as_str(), gvfs.at.as_path()),
         ("fuse.gvfsd-fuse", Path::new("/run/user/1000/gvfs"))
@@ -175,7 +180,7 @@ fn the_mount_at_a_path_is_the_top_of_its_stack() {
 6 1 8:2 / /mnt/b rw - ext4 /dev/sdb1 rw
 ";
     let mounts = parse(stacked).expect("parses");
-    let home = mount_of(&mounts, Path::new("/home/u")).expect("a mount");
+    let home = mount_of(&mounts, &ids(&mounts), Path::new("/home/u")).expect("a mount");
     assert_eq!(home.id, 5);
     // Through the mount on top, sdb1, not the one it covers.
     assert_eq!(found(&mounts, "/home/u"), [PathBuf::from("/mnt/b/u")]);
@@ -284,4 +289,90 @@ fn smb_mounted_twice_is_refused() {
         aliases(&mounts, &[PathBuf::from("/home/u/.ssh")])
             .is_err_and(|e| e.to_string().contains("cifs filesystem seen at /home/u"))
     );
+}
+
+/// A lost root on a filesystem that is not local is refused, whatever kind
+/// it is, such as Ceph's when another client renames the bound directory.
+#[test]
+fn a_lost_root_on_any_remote_kind_is_refused() {
+    for kind in ["ceph", "9p", "virtiofs", "afs"] {
+        let table = format!(
+            "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n\
+             2 1 0:80 / /mnt/r rw - {kind} r rw\n\
+             3 1 0:80 /home/u//deleted /home/u rw - {kind} r rw\n"
+        );
+        let mounts = parse(table.as_bytes()).expect("parses");
+        assert!(
+            aliases(&mounts, &[PathBuf::from("/home/u/.ssh")])
+                .is_err_and(|e| e.to_string().contains("the kernel no longer knows")),
+            "{kind}"
+        );
+    }
+}
+
+/// On a local filesystem a lost root is a file or directory replaced since
+/// it was bound, as a container's resolv.conf is: the bind still shows the
+/// old one, which is denied whole when the denied place is that file or a
+/// directory above it.
+#[test]
+fn a_lost_root_on_a_local_kind_is_denied_whole() {
+    let table = b"\
+1 0 8:1 / / rw - ext4 /dev/sda1 rw
+2 1 8:1 /data/creds//deleted /mnt/r rw - ext4 /dev/sda1 rw
+";
+    let mounts = parse(table).expect("parses");
+    assert!(mounts[1].lost);
+    assert_eq!(mounts[1].root.as_deref(), Some(Path::new("/data/creds")));
+    for denied in ["/data/creds", "/data"] {
+        assert_eq!(
+            found(&mounts, denied),
+            [PathBuf::from("/mnt/r")],
+            "{denied}"
+        );
+    }
+}
+
+/// A 9p filesystem bound in part is followed as a local one is.
+#[test]
+fn a_9p_filesystem_bound_in_part_is_followed() {
+    let table = b"\
+1 0 8:1 / / rw - ext4 /dev/sda1 rw
+2 1 0:90 / /mnt/host rw - 9p host rw
+3 1 0:90 /home/u /home/u rw - 9p host rw
+";
+    let mounts = parse(table).expect("parses");
+    assert_eq!(
+        found(&mounts, "/home/u/.ssh"),
+        [PathBuf::from("/mnt/host/home/u/.ssh")]
+    );
+}
+
+/// Off a local filesystem, a second place that is not the same directory
+/// as the place, when the place is there, is refused: the table's root for
+/// it is stale.
+#[test]
+fn a_stale_remote_root_is_refused_where_the_place_is_there() {
+    let dir = std::env::temp_dir().join(format!("atomic-mounts-stale-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for d in ["place", "elsewhere", "same"] {
+        std::fs::create_dir_all(dir.join(d)).expect("dir");
+    }
+    let place = std::fs::canonicalize(dir.join("place")).expect("real");
+    let elsewhere = std::fs::canonicalize(dir.join("elsewhere")).expect("real");
+    let at = |path: &Path| path.display().to_string();
+    // The place's mount, and another of the same 9p filesystem whose root
+    // claims to show it but is another directory.
+    let table = format!(
+        "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n\
+         2 1 0:91 / {} rw - 9p host rw\n\
+         3 1 0:91 / {} rw - 9p host rw\n",
+        at(&place),
+        at(&elsewhere)
+    );
+    let mounts = parse(table.as_bytes()).expect("parses");
+    assert!(
+        aliases(&mounts, std::slice::from_ref(&place))
+            .is_err_and(|e| e.to_string().contains("is stale"))
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
