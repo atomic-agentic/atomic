@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! An exec atom's command cannot read another live attempt's scratch
-//! directory, its `HOME` and `TMPDIR`, though it reads and writes its own:
-//! the backend's scratch directories are denied to a confined command, its
-//! own apart, on the local backend and through a runner process.
+//! directory, its `HOME` and `TMPDIR`, nor what another backend of the
+//! project keeps in its scratch root, though it reads and writes its own:
+//! the project's scratch roots are denied to a confined command, its own
+//! directory apart, on the local backend and through a runner process.
 //!
 //! Needs bubblewrap and unprivileged user namespaces, so it runs with the
 //! `sandbox-tests` feature; with the feature on, a sandbox that cannot start
@@ -23,31 +24,38 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// Leaves a secret in its `HOME` and `TMPDIR`, then holds its attempt open.
+/// Leaves a secret in its `HOME` and `TMPDIR`, then holds its attempt open
+/// until the test leaves the file `RELEASE` names, for up to 60 s.
 const KEEPER: &str = r#"import json, os, sys, time
 json.load(sys.stdin)
 for var in ['HOME', 'TMPDIR']:
     with open(os.path.join(os.environ[var], 'secret-' + var), 'w') as f:
         f.write('secret-of-the-keeper')
-time.sleep(8)
-json.dump({'kept': 'yes'}, sys.stdout)
+for _ in range(600):
+    if os.path.exists(os.environ['RELEASE']):
+        break
+    time.sleep(0.1)
+json.dump({'kept': 'yes' if os.path.exists(os.environ['RELEASE']) else 'no'}, sys.stdout)
 "#;
 
 /// Looks for the keeper's secret everywhere under the backend's scratch
-/// root, while the keeper still holds its attempt open, and uses its own
-/// `HOME` and `TMPDIR`.
-const PROBER: &str = r#"import json, os, sys, time
+/// root, and for the one planted in another backend's, while the keeper
+/// still holds its attempt open, and uses its own `HOME` and `TMPDIR`.
+const PROBER: &str = r#"import json, os, sys
 json.load(sys.stdin)
-time.sleep(3)
 root = os.environ['SCRATCH_ROOT']
-found = 0
-for top, dirs, files in os.walk(root):
-    for name in files:
-        try:
-            with open(os.path.join(top, name)) as f:
-                found += 'secret-of-the-keeper' in f.read()
-        except Exception:
-            pass
+def count(under, secret):
+    found = 0
+    for top, dirs, files in os.walk(under):
+        for name in files:
+            try:
+                with open(os.path.join(top, name)) as f:
+                    found += secret in f.read()
+            except Exception:
+                pass
+    return found
+found = count(root, 'secret-of-the-keeper')
+sibling_found = count(os.environ['SIBLING_ROOT'], 'secret-in-the-sibling')
 try:
     listed = str(sorted(os.listdir(root)))
 except Exception as e:
@@ -59,7 +67,8 @@ for var in ['HOME', 'TMPDIR']:
         f.write('mine')
     with open(path) as f:
         own.append(f.read())
-json.dump({'found': found, 'listed': listed, 'own': ' '.join(own)}, sys.stdout)
+json.dump({'found': found, 'sibling_found': sibling_found, 'listed': listed,
+           'own': ' '.join(own)}, sys.stdout)
 "#;
 
 /// Write exec atom `name`, whose command runs `script`, with `env`
@@ -127,6 +136,21 @@ async fn run(project: &Path, name: &str, step: &str, backend: Arc<dyn ExecutionB
     out
 }
 
+/// Whether a file under `dir` holds `needle`.
+fn holds(dir: &Path, needle: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.filter_map(Result::ok).any(|entry| {
+        let path = entry.path();
+        if path.is_dir() {
+            holds(&path, needle)
+        } else {
+            std::fs::read_to_string(&path).is_ok_and(|text| text.contains(needle))
+        }
+    })
+}
+
 #[test]
 fn an_exec_command_cannot_read_another_attempts_scratch_and_keeps_its_own() {
     support::require_sandbox();
@@ -139,14 +163,30 @@ fn an_exec_command_cannot_read_another_attempts_scratch_and_keeps_its_own() {
         let state = dir.join("state");
         let root = state.join("scratch");
         std::fs::create_dir_all(&root).expect("scratch root");
+        // Another backend's scratch root, as `atomic debug prompt` has, with
+        // a secret in it.
+        let sibling = state.join("scratch-debug");
+        std::fs::create_dir_all(sibling.join("planted")).expect("sibling root");
+        std::fs::write(sibling.join("planted/secret"), "secret-in-the-sibling").expect("planted");
+        let release = dir.join("release");
         let project = dir.join("project");
-        exec_atom(&project, "keeper", KEEPER, "", &["kept"]);
+        exec_atom(
+            &project,
+            "keeper",
+            KEEPER,
+            &format!("RELEASE: '{}'", release.display()),
+            &["kept"],
+        );
         exec_atom(
             &project,
             "prober",
             PROBER,
-            &format!("SCRATCH_ROOT: '{}'", root.display()),
-            &["found", "listed", "own"],
+            &format!(
+                "SCRATCH_ROOT: '{}', SIBLING_ROOT: '{}'",
+                root.display(),
+                sibling.display()
+            ),
+            &["found", "sibling_found", "listed", "own"],
         );
         std::os::unix::fs::symlink(
             env!("CARGO_BIN_EXE_atomic"),
@@ -165,7 +205,9 @@ fn an_exec_command_cannot_read_another_attempts_scratch_and_keeps_its_own() {
             )
             .expect("confinement"),
         );
-        let local = LocalBackend::in_dir(root.clone()).confined(sandbox);
+        let local = LocalBackend::in_dir(root.clone())
+            .denying([sibling.clone()])
+            .confined(sandbox);
         let backends: [(&str, Arc<dyn ExecutionBackend>); 2] = [
             ("the local backend", Arc::new(local.clone())),
             (
@@ -179,11 +221,36 @@ fn an_exec_command_cannot_read_another_attempts_scratch_and_keeps_its_own() {
             ),
         ];
         for (what, backend) in backends {
-            let (kept, probed) = tokio::join!(
-                run(&project, "keeper", "keep", backend.clone()),
-                run(&project, "prober", "probe", backend),
+            let _ = std::fs::remove_file(&release);
+            let keeper = {
+                let (project, backend) = (project.clone(), backend.clone());
+                tokio::spawn(async move { run(&project, "keeper", "keep", backend).await })
+            };
+            // The keeper's secret is there before the prober looks, as this
+            // test, which no sandbox confines, sees it.
+            for _ in 0..300 {
+                if holds(&root, "secret-of-the-keeper") {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            assert!(
+                holds(&root, "secret-of-the-keeper"),
+                "{what}: the keeper wrote nothing"
             );
+            let probed = run(&project, "prober", "probe", backend).await;
+            // And still there after it looked: the keeper held its attempt.
+            assert!(
+                holds(&root, "secret-of-the-keeper"),
+                "{what}: the keeper's secret was gone when the prober ended"
+            );
+            std::fs::write(&release, "").expect("release");
+            let kept = keeper.await.expect("keeper");
             assert_eq!(kept["kept"], "yes", "{what}");
+            assert_eq!(
+                probed["sibling_found"], 0,
+                "{what}: the prober read the other backend's scratch: {probed}"
+            );
             assert_eq!(
                 probed["found"], 0,
                 "{what}: the prober read the keeper's scratch: {probed}"
