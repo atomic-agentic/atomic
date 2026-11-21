@@ -1568,7 +1568,7 @@ pub async fn give_exec_inputs(
         return Ok(());
     };
     let given = exchange_for(atom, contract, input, identity, workspace, artifacts).await;
-    if let Err(e @ AtomError::StoreHeld(_)) = given {
+    if let Err(e @ (AtomError::StoreHeld(_) | AtomError::Stopping)) = given {
         return Err(e);
     }
     workspace.keep_inputs(given);

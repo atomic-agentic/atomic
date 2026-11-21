@@ -78,8 +78,9 @@ as it pins its definitions or gives an exec atom's command the artifacts its
 input references, says so (a pin once a run, an exec step once each time it
 waits), waits and tries again for a bounded time (about 7.4 minutes with the
 store's 30-second wait: 11 tries and the pauses between them), then stops,
-recording nothing and running nothing, and is run again; a process that is
-stopping waits no longer. Such stops never count toward dead-lettering the
+recording nothing and running nothing, and is run again. A process that is
+stopping waits out no more pauses between tries, though a try already
+waiting on the store's lock runs to the end of that lock's wait. Such stops never count toward dead-lettering the
 run, however many there are; each spends one of durare's recoveries of the
 run, and once they run out the run waits for `atomic runs resume`. The files
 a command hands over are stored after it has run: a store held then is
