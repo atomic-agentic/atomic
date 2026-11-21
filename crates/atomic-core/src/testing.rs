@@ -440,6 +440,58 @@ pub fn on_codex_runtime<F: std::future::Future<Output = ()> + Send + 'static>(f:
     }
 }
 
+/// `backend` with nothing denied to its workspaces' commands, and in every
+/// other way the same backend, for tests whose
+/// Codex turns run without Codex's Linux sandbox helper
+/// ([`crate::codex::CodexPaths::without_helpers`]). Atomic refuses such a
+/// turn on Linux when its workspace has paths to deny, the backend's scratch
+/// directories, since only the helper can deny them. A test that uses this
+/// gives that denial up, and its turns' commands may read other attempts'
+/// scratch directories; the tests that run turns with the helper show the
+/// denial holds. This module is built only for tests (the `fake-model`
+/// feature, which only dev-dependencies enable), so no atomic binary can
+/// reach it.
+pub fn denying_nothing(backend: atomic_exec::Backend) -> atomic_exec::Backend {
+    atomic_exec::Backend::connect(DenyingNothing(backend))
+        .expect("a connected backend states what it stated before")
+}
+
+/// See [`denying_nothing`].
+struct DenyingNothing(atomic_exec::Backend);
+
+impl atomic_exec::ExecutionBackend for DenyingNothing {
+    fn connect(&self) -> Result<atomic_exec::Statement, atomic_exec::ExecError> {
+        Ok(self.0.statement())
+    }
+
+    fn open(
+        &self,
+        request: &atomic_exec::Open,
+    ) -> Result<atomic_exec::Workspace, atomic_exec::ExecError> {
+        let mut workspace = self.0.shared().open(request)?;
+        workspace.denied.clear();
+        Ok(workspace)
+    }
+
+    fn run(
+        &self,
+        command: &atomic_exec::Command,
+    ) -> Result<atomic_exec::Completed, atomic_exec::ExecError> {
+        self.0.shared().run(command)
+    }
+
+    fn close(&self, workspace: &atomic_exec::Workspace) -> Result<(), atomic_exec::ExecError> {
+        self.0.shared().close(workspace)
+    }
+
+    fn exchange(
+        &self,
+        workspace: &atomic_exec::Workspace,
+    ) -> Result<Option<Box<dyn atomic_exec::exchange::Exchange>>, atomic_exec::ExecError> {
+        self.0.shared().exchange(workspace)
+    }
+}
+
 /// Unpadded base64url, for a test token.
 pub fn b64url(bytes: &[u8]) -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";

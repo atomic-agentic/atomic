@@ -128,6 +128,14 @@ pub struct TurnSpec {
     /// Directories a `workspace-write` thread may write besides its working
     /// directory, such as its run's build caches. Absolute paths.
     pub writable_roots: Vec<PathBuf>,
+    /// Directories the thread's commands may neither read nor write, apart
+    /// from those inside them it may write: the scratch roots of the
+    /// project's backends, a `workspace-write` thread's own directory
+    /// excepted. Absolute paths. Codex's Linux sandbox reopens only writable
+    /// directories inside a denied one, so a `read-only` thread's own scratch
+    /// directory, which it may not write, is out of its reach too: it cannot
+    /// even list it.
+    pub denied: Vec<PathBuf>,
 }
 
 /// What a thread's commands are kept out of. It has no default: every
@@ -1092,6 +1100,55 @@ pub(crate) fn permission_profile(
         &policy,
         SANDBOX_NETWORK,
     ))
+}
+
+/// `profile` with `denied` denied as well: the backend's scratch
+/// directories. What the thread may write inside a denied directory, such as
+/// its own scratch directory, stays writable, as a writable root of its own.
+fn deny_also(profile: PermissionProfile, denied: &[PathBuf]) -> anyhow::Result<PermissionProfile> {
+    use codex_protocol::permissions::{
+        FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry,
+    };
+    if denied.is_empty() {
+        return Ok(profile);
+    }
+    let mut policy = profile.file_system_sandbox_policy();
+    for dir in denied {
+        let dir = AbsolutePathBuf::from_absolute_path(dir)
+            .with_context(|| format!("resolve the sandbox path {}", dir.display()))?;
+        policy.entries.push(FileSystemSandboxEntry::new(
+            FileSystemPath::from(dir),
+            FileSystemAccessMode::Deny,
+        ));
+    }
+    Ok(PermissionProfile::from_runtime_permissions(
+        &policy,
+        SANDBOX_NETWORK,
+    ))
+}
+
+/// Refuse a thread whose commands must be kept out of `denied` when `paths`
+/// has no Linux sandbox helper, except on macOS (`macos`), whose own sandbox
+/// denies paths itself. On Linux, Codex's sandbox reads a profile that
+/// denies paths only through that helper, and nowhere else has atomic seen a
+/// denial hold, so without one the thread could not be kept out of other
+/// attempts' scratch directories; atomic refuses it before the thread starts
+/// rather than run it with less denied. On macOS the denial is not verified.
+fn refuse_denied_without_helper(
+    paths: &CodexPaths,
+    denied: &[PathBuf],
+    macos: bool,
+) -> anyhow::Result<()> {
+    if !macos && !denied.is_empty() && paths.linux_sandbox().is_none() {
+        let denied: Vec<_> = denied.iter().map(|d| d.display().to_string()).collect();
+        bail!(
+            "this turn's commands must be kept out of {}, and apart from macOS only \
+             Codex's Linux sandbox helper can do that, which this process does not have; \
+             run atomic itself, which provides one",
+            denied.join(", ")
+        );
+    }
+    Ok(())
 }
 
 /// Refuse a workspace-write thread under [`StateGuard::NoProjectState`]
@@ -3045,6 +3102,7 @@ where
     Fut: std::future::Future<Output = Option<TurnSpec>>,
 {
     let spec = first;
+    refuse_denied_without_helper(paths, &spec.denied, cfg!(target_os = "macos"))?;
     let mut endpoint = endpoint.clone();
     if let Some(m) = &spec.model {
         endpoint.model = m.clone();
@@ -3053,19 +3111,22 @@ where
     config.developer_instructions = spec.developer_instructions.clone();
     config.permissions = Permissions::from_approval_and_profile(
         Constrained::allow_any(AskForApproval::Never),
-        Constrained::allow_any(permission_profile(
-            spec.sandbox,
-            guard,
-            codex_home,
-            Some(cwd),
-            &match spec.sandbox {
-                crate::typed::Sandbox::ReadOnly => Vec::new(),
-                crate::typed::Sandbox::WorkspaceWrite => {
-                    let mut roots = spec.writable_roots.clone();
-                    roots.push(cwd.to_owned());
-                    roots
-                }
-            },
+        Constrained::allow_any(deny_also(
+            permission_profile(
+                spec.sandbox,
+                guard,
+                codex_home,
+                Some(cwd),
+                &match spec.sandbox {
+                    crate::typed::Sandbox::ReadOnly => Vec::new(),
+                    crate::typed::Sandbox::WorkspaceWrite => {
+                        let mut roots = spec.writable_roots.clone();
+                        roots.push(cwd.to_owned());
+                        roots
+                    }
+                },
+            )?,
+            &spec.denied,
         )?),
     )?;
     let mut writable_roots = spec.writable_roots.clone();
@@ -5862,6 +5923,129 @@ mod tests {
                 );
             }
         });
+    }
+
+    /// Only Codex's Linux sandbox helper keeps a thread's commands out of
+    /// the paths its profile denies, apart from macOS's own sandbox, so
+    /// anywhere but macOS a thread with something to deny and no helper is
+    /// refused before any model call, and is never run with less denied.
+    #[test]
+    fn a_thread_with_paths_to_deny_and_no_sandbox_helper_is_refused_except_on_macos() {
+        let denied = [PathBuf::from("/scratch/root")];
+        let helperless = CodexPaths::without_helpers();
+        let why = refuse_denied_without_helper(&helperless, &denied, false)
+            .expect_err("no helper to deny with")
+            .to_string();
+        assert!(
+            why.contains("/scratch/root") && why.contains("sandbox helper"),
+            "{why}"
+        );
+        refuse_denied_without_helper(&helperless, &[], false).expect("nothing to deny");
+        refuse_denied_without_helper(&helperless, &denied, true).expect("macOS denies itself");
+        let with =
+            CodexPaths::with_helpers("/bin/atomic".into(), "/bin/codex-linux-sandbox".into());
+        refuse_denied_without_helper(&with, &denied, false).expect("a helper denies");
+
+        if cfg!(target_os = "macos") {
+            return;
+        }
+        on_codex_runtime(async move {
+            let model = FakeModel::start(vec![Reply::Text("pong".into())])
+                .await
+                .expect("fake model");
+            let (home, cwd) = (scratch("deny-home"), scratch("deny-cwd"));
+            let endpoint = ModelEndpoint {
+                base_url: model.base_url(),
+                model: "synthetic".into(),
+                api_key_env: None,
+                sign_in: None,
+            };
+            let spec = TurnSpec {
+                prompt: "ping".into(),
+                denied: denied.to_vec(),
+                ..TurnSpec::default()
+            };
+            let err = run(
+                &CodexPaths::without_helpers(),
+                &home,
+                &cwd,
+                &endpoint,
+                &StateGuard::NoProjectState,
+                &spec,
+            )
+            .await
+            .expect_err("refused without a helper");
+            assert!(err.to_string().contains("sandbox helper"), "{err:#}");
+            assert_eq!(model.calls(), 0, "refused before any model call");
+        });
+    }
+
+    /// A turn's profile, as atomic builds it, denies the scratch root and
+    /// so never reads the whole disk: what it reads are its readable roots,
+    /// the deepest entry for a path winning. Its own scratch directory, a
+    /// writable root inside the denied one, is one of them, and the scratch
+    /// root is unreadable. (Codex's macOS sandbox builds its reads from these
+    /// roots; that it then reads its own scratch is not verified on macOS.)
+    #[test]
+    fn a_turns_profile_reads_its_own_scratch_inside_a_denied_root() {
+        // Outside the system's temporary directory, as atomic keeps scratch
+        // roots.
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/atomic-core-tests")
+            .join(format!("profile-reads-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dir = {
+            std::fs::create_dir_all(&dir).expect("dir");
+            std::fs::canonicalize(&dir).expect("canonical")
+        };
+        let (home, cwd, root) = (dir.join("home"), dir.join("cwd"), dir.join("state/scratch"));
+        let own = root.join("step/attempt");
+        for d in [&home, &cwd, &own] {
+            std::fs::create_dir_all(d).expect("dir");
+        }
+        let profile = deny_also(
+            permission_profile(
+                crate::typed::Sandbox::WorkspaceWrite,
+                &StateGuard::NoProjectState,
+                &home,
+                Some(&cwd),
+                &[own.clone(), cwd.clone()],
+            )
+            .expect("profile"),
+            std::slice::from_ref(&root),
+        )
+        .expect("denied");
+        // With the turn's writable roots as its workspace roots, as
+        // `converse_async` sets them, and resolved as Codex's macOS sandbox
+        // resolves it.
+        let roots: Vec<AbsolutePathBuf> = [&cwd, &own]
+            .into_iter()
+            .map(|r| AbsolutePathBuf::from_absolute_path(r).expect("absolute"))
+            .collect();
+        let resolved = profile
+            .materialize_project_roots_with_workspace_roots(&roots)
+            .file_system_sandbox_policy()
+            .resolve_for_enforcement(
+                &cwd,
+                codex_protocol::permissions::FileSystemPolicyProjection::PreserveMutableRoots,
+            )
+            .expect("resolved");
+        assert!(!resolved.has_full_disk_read_access);
+        assert!(
+            resolved.readable_roots.iter().any(|r| r.as_path() == own),
+            "{:?}, writable {:?}",
+            resolved.readable_roots,
+            resolved.writable_roots
+        );
+        assert!(
+            resolved
+                .unreadable_roots
+                .iter()
+                .any(|r| r.as_path() == root),
+            "{:?}",
+            resolved.unreadable_roots
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Codex sends TurnComplete before it marks the thread idle; a follow-up

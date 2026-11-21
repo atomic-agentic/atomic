@@ -1,0 +1,1 @@
+scratch-deny-sibling|crates/atomic-exec/src/workspace.rs|    for dir in denying {|    for dir in denying.iter().take(0) {|--workspace --features atomic-agentic/postgres-tests,atomic-agentic/sandbox-tests --test turn_workspace a_turn_cannot_read_another_turns_scratch_and_keeps_its_own

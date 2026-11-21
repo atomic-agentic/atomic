@@ -7854,3 +7854,126 @@ fn the_debug_prompt_escapes_its_answer() {
         assert!(said.contains("Second line."), "{said}");
     });
 }
+
+/// What the commands of the turn that answered `model`'s first call printed.
+fn first_command_output(model: &FakeModel) -> String {
+    let requests = model.requests();
+    let follow_up = requests.get(1).expect("Codex answered the tool call");
+    follow_up["input"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| item["type"] == "function_call_output")
+        .map(|item| item["output"].as_str().unwrap_or_default().to_owned())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A turn of `atomic run` cannot read what an attempt of `atomic debug
+/// codex-prompt` keeps in its scratch directory, nor the other way round: as
+/// atomic wires each command's backend, each denies its turns both of the
+/// project's scratch roots. What each looks for is there all along.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[cfg(target_os = "linux")]
+#[test]
+fn run_and_debug_prompt_turns_cannot_read_each_others_scratch() {
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let dir = scratch("scratch-roots");
+        let project = project(&dir);
+        let state = {
+            let (d, p) = (dir.clone(), project.clone());
+            tokio::task::spawn_blocking(move || state_dir(&d, &p))
+                .await
+                .expect("state")
+        };
+        let plant = |root: &str| {
+            let secret = state.join(root).join("planted").join("secret");
+            std::fs::create_dir_all(secret.parent().expect("planted")).expect("planted");
+            std::fs::write(&secret, format!("secret-in-{root}")).expect("secret");
+            secret
+        };
+        let (in_run, in_debug) = (plant("scratch"), plant("scratch-debug"));
+        let look = |secret: &Path| Reply::Tool {
+            name: "exec_command".into(),
+            arguments: json!({
+                "cmd": format!("cat '{}' 2>&1; echo cat-exit=$?", secret.display()),
+                "yield_time_ms": 10000,
+            }),
+        };
+
+        // A run's turn looks in the debug prompt's scratch root.
+        write_atom(
+            &project,
+            "look",
+            "description: 'Look.', kind: 'codex'",
+            "Look around.",
+            object(json!({})),
+            object(json!({"done": {"type": "boolean"}})),
+        );
+        let model = FakeModel::start(vec![
+            look(&in_debug),
+            Reply::Text(r#"{"done": true}"#.into()),
+        ])
+        .await
+        .expect("fake model");
+        let env = model_env(&model.base_url());
+        let out = {
+            let (d, p) = (dir.clone(), project.clone());
+            tokio::task::spawn_blocking(move || {
+                atomic(
+                    &d,
+                    &p,
+                    &["run", "look", "--data", "{}"],
+                    &with(&env, &[]),
+                    "",
+                )
+            })
+            .await
+            .expect("atomic")
+        };
+        assert!(out.status.success(), "{}", text(&out));
+        let said = first_command_output(&model);
+        assert!(
+            !said.contains("secret-in-scratch-debug") && said.contains("cat-exit=1"),
+            "a run's turn read the debug prompt's scratch: {said}"
+        );
+
+        // A debug prompt's turn looks in the runs' scratch root.
+        let model = FakeModel::start(vec![look(&in_run), Reply::Text("Done.".into())])
+            .await
+            .expect("fake model");
+        let url = model.base_url();
+        let out = {
+            let (d, p) = (dir.clone(), project.clone());
+            tokio::task::spawn_blocking(move || {
+                atomic(
+                    &d,
+                    &p,
+                    &[
+                        "debug",
+                        "codex-prompt",
+                        "--base-url",
+                        &url,
+                        "--model",
+                        "synthetic",
+                        "Look.",
+                    ],
+                    &[],
+                    "",
+                )
+            })
+            .await
+            .expect("atomic")
+        };
+        assert!(out.status.success(), "{}", text(&out));
+        let said = first_command_output(&model);
+        assert!(
+            !said.contains("secret-in-scratch") && said.contains("cat-exit=1"),
+            "a debug prompt's turn read the runs' scratch: {said}"
+        );
+        // The denial kept them out, not the secrets' absence.
+        assert!(in_run.exists() && in_debug.exists());
+    });
+}
