@@ -163,6 +163,7 @@ async fn engine(dir: &Path) -> Durare {
             tier: gate::Tier::High,
             timeout: None,
             on_timeout: Default::default(),
+            question: None,
         };
         let resolution = gate::gate(&ctx, "check", spec).await?;
         Ok(json!(resolution.approved()))
@@ -524,6 +525,7 @@ fn a_redelivered_wake_up_is_the_same_wake_up() {
                     verdict: gate::Verdict::Approve,
                     comment: None,
                     proposal: g.proposal.clone(),
+                    answer: None,
                 },
             )
             .await

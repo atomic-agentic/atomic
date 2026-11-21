@@ -52,11 +52,16 @@ workflow and an eval case: at the top of an empty directory, or under
 local Ollama running, the new project runs with no configuration. `atomic run` takes an atom or workflow by name, by file or with
 `--project`, and input from a file, standard input or `--data`; a run cut short
 continues with `atomic runs resume <run-id>`, or under `atomic serve`, from its
-checkpoints. One process at a time executes a project's runs. Errors carry a
+checkpoints. A workflow that changes code runs only bound to a fixture
+repository and revision (`--fixture`, `--fixture-rev`): its worktrees come
+from a snapshot of that commit in the state directory, never from your
+checkout. One process at a time executes a project's runs. Errors carry a
 description and an action, separately in `--json` output. `atomic gates enroll`,
 `list`, `approve` and `reject` decide gates from a second terminal; a gate
-decision counts only with the credential its person enrolled. The terminal
-prompt for gates in `atomic run` is not wired up yet.
+decision counts only with the credential its person enrolled. `atomic run` and
+`atomic runs resume` prompt at the terminal for each gate their run reaches, and
+question gates (`ask` with a typed `answer`, `remember`, and a default when time
+runs out) are built; `atomic gates answer` answers one from another terminal.
 
 A project's artifact store takes a lock in its private state while it is
 written or swept. A run that finds it held by another process, such as a sweep,
@@ -86,10 +91,13 @@ A command an atom runs, whether an exec atom's or one a model runs in a Codex
 turn, gets the platform's core variables and what the atom declares, never
 atomic's own environment or its credentials. A turn's commands run with no
 login shell; their `HOME` (and `ZDOTDIR`) is a private scratch directory of the
-attempt's own, and their `TMPDIR` is one private directory every turn of the
-project shares (Codex's sandbox keeps a registry there that turns sharing a
-writable root must share), so no shell startup file runs. Tools found through `HOME` are
-therefore not found: rustup, cargo, pyenv, nvm, Maven's `~/.m2` and the like.
+attempt's own, and their `TMPDIR` a directory inside it, so no shell startup
+file runs and no other turn can add, change or remove what a turn keeps in its
+temporary directory. Another turn of the project can still read it, by its path
+under the project's scratch directory: do not rely on it for secrets. (Codex's
+sandbox keeps its registry of the mount points it makes in a directory every
+turn of the project shares, which no turn's command may write.) Tools found
+through `HOME` are therefore not found: rustup, cargo, pyenv, nvm, Maven's `~/.m2` and the like.
 A codex or exec atom names them in its `env`, as in
 `env: { RUSTUP_HOME: '/home/me/.rustup', CARGO_HOME: '/home/me/.cargo' }`. An
 exec atom's command gets its own scratch directory as `HOME` and `TMPDIR`.
@@ -108,11 +116,28 @@ Codex's sandbox, which denies them the atomic home's `private/` directory, where
 every project keeps its database, its execution lock and its context
 checkpoints; the current project's
 Codex records; the credential and key directories; the default atomic home's
-data and configuration when `ATOMIC_HOME` points elsewhere; the kernel keyrings;
-the network, unless an exec atom declares the hosts it reaches, and then all but
-those, which it reaches through atomic's proxy; and sockets. Other projects' Codex records are not denied yet. An
+data and configuration when `ATOMIC_HOME` points elsewhere; your own atomic
+configuration directory; the places in your home directory where credentials,
+shell startup files and history are kept (under both `$HOME` and the home
+directory the system records for your user, and wherever the variables that
+move them, such as `XDG_CONFIG_HOME`, `GNUPGHOME`, `CARGO_HOME` or
+`KUBECONFIG`, put them), and the file or directory of yours that a link
+among them points at, up to four directory levels inside a denied directory;
+the kernel keyrings; the network, unless an exec atom declares the hosts it
+reaches, and then all but those, which it reaches through atomic's proxy; and
+sockets. Cargo's own configuration is
+not among them, so a registry token kept there rather than in
+`credentials.toml` is not protected. A link to something outside your own
+files, such as a history file linked to `/dev/null`, is left alone, and a
+command does not start when a denial would cover its working directory or a
+directory it may write, or a linked secret lies inside one. Other projects'
+Codex records are not denied yet. atomic makes the list when a
+turn or an exec step starts: a place on it that appears while a command runs
+is denied only to the commands that start after it, and a link made after
+the list is not followed until the next turn or step. Credentials kept
+anywhere else are not covered. An
 exec atom's command may write only its scratch directory and the project's
-caches; `--runner process` confines it the same way. It runs in a process
+caches, and only read the artifacts it is given there; `--runner process` confines it the same way. It runs in a process
 namespace of its own, so it can neither see nor signal atomic, its runner or
 any other process outside, and in a session of its own, with no controlling
 terminal and a `/dev` and `/proc` of its own, so it cannot type into, read or
@@ -128,8 +153,16 @@ on a full disk, makes the step wait, as a backend with no room does. Atoms that 
 Windows this has not been verified: exec atoms' commands run unconfined there,
 so atomic keeps no operator credential and refuses credentialed gate decisions.
 
+An exec atom's command hands large results over by reference: it writes a
+file to its outputs directory and names it in its output, and the next step's
+command reads it from its inputs directory, a read-only copy (see
+[atom files](atom-files.md#large-results-go-by-reference)). A file may be 1 GiB
+and a step's files 4 GiB, unless `ATOMIC_EXEC_MAX_FILE_BYTES` and
+`ATOMIC_EXEC_MAX_STEP_BYTES` say otherwise. Only exec atoms hand files over;
+a Codex atom's turn does not yet.
+
 A `workspace-write` atom cannot write `/tmp`, `/var/tmp` or `$TMPDIR` as atomic
-found them: its commands' `TMPDIR` is the project's private one above. A tool
+found them: its commands' `TMPDIR` is the turn's own one above. A tool
 that ignores `TMPDIR` and writes to `/tmp` directly, such as a JVM's default
 `java.io.tmpdir`, fails there; point it at `$TMPDIR` (for the JVM,
 `-Djava.io.tmpdir=$TMPDIR`).
@@ -137,7 +170,15 @@ that ignores `TMPDIR` and writes to `/tmp` directly, such as a JVM's default
 Several authoring aids arrive in stages. Eval cases, in YAML and in JSONL files,
 are loaded and checked, and the eval runner reports pass rates against each
 atom's threshold and scorer means against their minimums and a baseline; the
-`atomic eval` command that runs it from the terminal is not built yet. A
+`atomic eval` command runs it from the terminal, from cassettes or `--live`, and
+fails CI below an atom's threshold. It has no judge to run scorers with yet, so an
+atom with scorers fails unless `--allow-unscored` is given, and `--baseline` is
+refused. Its live calls are metered in the usage ledger under each atom's budget.
+Until fixture worktrees exist it refuses an atom that could write: a Codex atom
+with a `workspace-write` sandbox, and an exec atom that does not declare
+`effects: { external: 'read-only' }`, whether it declares `idempotent` or
+nothing. It runs Codex atoms only live, with `--no-cassettes`. It lists what it
+refuses, runs the rest, and fails unless `--skip-refused` is given. A
 recorded workflow-file run can be replayed from its checkpoints as a new run:
 each atom step is served the result it published, with no model call and no
 command run, while gates open again, titled as a replay's, and wait. A replay

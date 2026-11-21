@@ -269,6 +269,33 @@ pub struct GateStep {
     pub timeout: Option<u64>,
     /// The approver groups the workflow file names, if it names any.
     pub approvers: Option<Vec<String>>,
+    /// For a question gate (`ask` in the workflow file, which is then the
+    /// `title` above), what it asks for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question: Option<QuestionStep>,
+}
+
+/// What a question gate asks for.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct QuestionStep {
+    /// The JSON Schema the answer must fit.
+    pub answer: Value,
+    /// Whether the answer goes into the feedback log.
+    pub remember: bool,
+    /// The answer the step resumes with if nobody answers in time; without
+    /// one, an unanswered question stops the run as an expired gate does.
+    /// `Some(null)` is a null default.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    pub default: Option<Value>,
+}
+
+/// A field that is present, even as `null`, is `Some`.
+fn present<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<Value>, D::Error> {
+    <Value as serde::Deserialize>::deserialize(d).map(Some)
 }
 
 /// One step of a pipeline.
@@ -318,6 +345,41 @@ pub struct Pipeline {
     /// every source of every atom, as they were read when the run was
     /// prepared.
     pub pins: BTreeMap<String, String>,
+    /// The fixture repository a coding run is bound to (see
+    /// [`atomic_core::fixture`]): its worktree steps run in worktrees of the
+    /// fixture's snapshot, never of the developer's checkout. Absent for a
+    /// run that changes no code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixture: Option<atomic_core::fixture::FixtureBinding>,
+}
+
+impl Pipeline {
+    /// Whether a step of it changes code, in a worktree.
+    pub fn changes_code(&self) -> bool {
+        self.steps
+            .iter()
+            .any(|s| matches!(s, Step::Atom(a) if a.worktree))
+    }
+}
+
+/// The worktrees a run's worktree steps use: those of its fixture's
+/// snapshot when it is bound to one, else the services' own.
+fn worktrees_for(pipeline: &Pipeline, services: &Services) -> Result<Option<Arc<Worktrees>>> {
+    match &pipeline.fixture {
+        Some(fixture) => {
+            let git = atomic_core::git::Git::find()
+                .map_err(|e| failed(format!("the fixture's snapshot: {e}")))?;
+            let repo = git
+                .repo(&fixture.snapshot)
+                .without_filters()
+                .map_err(|e| failed(format!("the fixture's snapshot: {e}")))?;
+            Ok(Some(Arc::new(Worktrees::new(
+                repo,
+                fixture.worktrees.clone(),
+            ))))
+        }
+        None => Ok(services.worktrees.clone()),
+    }
 }
 
 /// The media type a pipeline snapshot is stored under.
@@ -467,6 +529,7 @@ pub fn prepare(
         budget: workflow.budget,
         budgets: None,
         pins,
+        fixture: None,
     })
 }
 
@@ -494,7 +557,24 @@ fn gate_step(
     deployment: &Deployment,
 ) -> std::result::Result<GateStep, String> {
     let text = |key: &str| gate.get(key).and_then(Value::as_str).map(str::to_owned);
-    let title = text("title").ok_or_else(|| format!("gate `{id}` has no `title`"))?;
+    let title = text("title")
+        .or_else(|| text("ask"))
+        .ok_or_else(|| format!("gate `{id}` has no `title`"))?;
+    let question = match gate.get("answer") {
+        None => None,
+        Some(answer) => Some(QuestionStep {
+            answer: atomic_core::workflow::gate_answer(answer)
+                .map_err(|e| format!("gate `{id}`: {e}"))?,
+            remember: gate
+                .get("remember")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            default: gate
+                .get("on_timeout")
+                .and_then(|t| t.get("default"))
+                .cloned(),
+        }),
+    };
     let timeout = text("timeout")
         .map(|t| atomic_core::workflow::parse_timeout(&t))
         .transpose()
@@ -515,6 +595,7 @@ fn gate_step(
         show: text("show"),
         timeout,
         approvers,
+        question,
     })
 }
 
@@ -789,6 +870,18 @@ async fn run_pipeline<C: WorkflowContext>(
     }});
     let decision_schema = json!({"type": "object", "properties": {"at": {"type": "integer"}}});
     let mut used_worktrees = false;
+    // Whether the run is bound to a fixture repository of its own.
+    let bound = pipeline.fixture.is_some();
+    // The run's worktrees, found once and off the async workers, since
+    // finding them runs git.
+    let run_worktrees = if pipeline.changes_code() {
+        let (p, s) = (pipeline.clone(), services.clone());
+        tokio::task::spawn_blocking(move || worktrees_for(&p, &s))
+            .await
+            .map_err(|e| failed(format!("the run's worktrees: {e}")))??
+    } else {
+        None
+    };
     let mut accepted = Vec::new();
     for (position, step) in pipeline.steps.iter().enumerate() {
         // Before its attempt is recorded: a stopping process begins nothing.
@@ -919,9 +1012,11 @@ async fn run_pipeline<C: WorkflowContext>(
             }
         }
         let tree = if step.worktree {
-            let worktrees = services.worktrees.clone().ok_or_else(|| {
+            let worktrees = run_worktrees.clone().ok_or_else(|| {
                 failed(format!(
-                    "step `{}` asks for a worktree, and this project is not in a git repository",
+                    "step `{}` asks for a worktree, and the run is bound to no fixture \
+                     repository: a run started before atomic bound coding runs to one cannot \
+                     continue; start it again with --fixture and --fixture-rev",
                     step.id
                 ))
             })?;
@@ -929,6 +1024,18 @@ async fn run_pipeline<C: WorkflowContext>(
                 .get("base")
                 .and_then(Value::as_str)
                 .ok_or_else(|| failed(format!("step `{}`: `base` is not a commit", step.id)))?;
+            // A bound run starts each worktree from its fixture's commit or
+            // one an earlier step of its own made, never from another commit
+            // the snapshot holds, such as another run's.
+            if let Some(fixture) = &pipeline.fixture {
+                let (fixture, base, own) = (fixture.clone(), base.to_owned(), accepted.clone());
+                tokio::task::spawn_blocking(move || {
+                    atomic_core::fixture::check_base(&fixture, &base, &own)
+                })
+                .await
+                .map_err(|e| failed(format!("check the step's base: {e}")))?
+                .map_err(|e| failed(format!("step `{}`: {e}", step.id)))?;
+            }
             used_worktrees = true;
             Some((
                 worktrees,
@@ -1095,7 +1202,7 @@ async fn run_pipeline<C: WorkflowContext>(
                             snapshot,
                             run_id,
                         };
-                        in_worktree(worktrees, request, call, runtimes, &place).await
+                        in_worktree(worktrees, request, call, runtimes, &place, bound).await
                     }
                 }?;
                 let mut proposal = proposal;
@@ -1157,7 +1264,7 @@ async fn run_pipeline<C: WorkflowContext>(
     )
     .map_err(|e| failed(format!("`returns`: {e}")))?;
     fits("the workflow's result", &pipeline.output, &result)?;
-    if used_worktrees && let Some(worktrees) = services.worktrees.clone() {
+    if used_worktrees && let Some(worktrees) = run_worktrees.clone() {
         // The run's worktrees go; its accepted commits keep their refs. A
         // repeat finds less to remove and removes it.
         let run_id = ctx.workflow_id().to_owned();
@@ -1258,6 +1365,7 @@ async fn in_worktree(
     call: StepCall,
     runtimes: Arc<Runtimes>,
     place: &str,
+    bound: bool,
 ) -> Result<Proposal> {
     let StepCall {
         atom,
@@ -1268,7 +1376,14 @@ async fn in_worktree(
     } = call;
     let step = request.step.clone();
     let finished = contained(async move {
-        let subdirectory = source_subdirectory(runtimes.codex.cwd.clone()).await?;
+        // A fixture is its own repository: the atom works at the top of its
+        // worktree, wherever the project is. Otherwise the worktree is of
+        // the project's own checkout, at the project's place in it.
+        let subdirectory = if bound {
+            PathBuf::new()
+        } else {
+            source_subdirectory(runtimes.codex.cwd.clone()).await?
+        };
         worktrees
             .run_step(request, |tree| async move {
                 let mut here = (*runtimes).clone();
@@ -1360,14 +1475,40 @@ async fn run_gate<C: WorkflowContext>(
         approvers,
         tier: Tier::High,
         timeout: step.timeout.map(std::time::Duration::from_secs),
-        on_timeout: Default::default(),
+        on_timeout: match step.question.as_ref().and_then(|q| q.default.as_ref()) {
+            Some(_) => gate::OnTimeout::Default,
+            None => gate::OnTimeout::Reject,
+        },
+        question: step.question.as_ref().map(|q| gate::Question {
+            answer: q.answer.clone(),
+            remember: q.remember,
+            default: q.default.clone(),
+        }),
     };
     match gate::gate(ctx, &step.id, spec).await? {
-        Resolution::Decided(d) if d.verdict == gate::Verdict::Approve => Ok(json!({
-            "verdict": "approve",
-            "by": d.by.as_str(),
-            "comment": d.comment,
-            "at": d.at,
+        Resolution::Decided(d) if d.verdict == gate::Verdict::Approve => {
+            let mut decision = json!({
+                "verdict": "approve",
+                "by": d.by.as_str(),
+                "comment": d.comment,
+                "at": d.at,
+            });
+            if step.question.is_some() {
+                // The store checked the answer against the question.
+                decision["answer"] = d
+                    .answer
+                    .ok_or_else(|| at("its decision carries no answer".into()))?;
+            }
+            Ok(decision)
+        }
+        // Nobody answered in time: silence selected the question's default,
+        // as the gate store recorded it.
+        Resolution::Defaulted { at: when, answer } => Ok(json!({
+            "verdict": "default",
+            "answer": answer,
+            "by": null,
+            "comment": null,
+            "at": when,
         })),
         Resolution::Decided(d) => Err(at(format!(
             "rejected by {}{}, so no step after it runs",

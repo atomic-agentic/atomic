@@ -13,6 +13,7 @@ fn shell(script: &str, stdin: &[u8], time: Duration) -> Result<Completed, ExecEr
         time_limit: time,
         output_limit: 1024,
         writable: Vec::new(),
+        read_only: Vec::new(),
         network: Vec::new(),
     })
 }
@@ -68,6 +69,7 @@ fn no_shell_expands_the_arguments() {
             time_limit: Duration::from_secs(10),
             output_limit: 1024,
             writable: Vec::new(),
+            read_only: Vec::new(),
             network: Vec::new(),
         })
         .expect("runs");
@@ -86,6 +88,7 @@ fn a_missing_program_cannot_start() {
             time_limit: Duration::from_secs(10),
             output_limit: 1024,
             writable: Vec::new(),
+            read_only: Vec::new(),
             network: Vec::new(),
         })
         .expect_err("missing");
@@ -456,6 +459,7 @@ fn a_command_in_a_local_workspace_runs_as_it_would_directly() {
         time_limit: Duration::from_secs(10),
         output_limit: 1024,
         writable: Vec::new(),
+        read_only: Vec::new(),
         network: Vec::new(),
     };
     let through = LocalBackend::default().run(&command).expect("runs");
@@ -629,6 +633,26 @@ fn a_command_runs_in_a_process_group_of_its_own() {
     let text = String::from_utf8_lossy(&done.stdout).into_owned();
     let (pid, group) = text.split_once(' ').expect("two fields");
     assert_eq!(pid, group, "{text}");
+}
+
+/// /proc/<pid>/stat gives the session and terminal on Linux only.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_command_runs_in_a_session_of_its_own_with_no_terminal() {
+    // Fields 1, 6 and 7 of /proc/<pid>/stat: the process, its session and
+    // its controlling terminal (0 for none).
+    let done = shell(
+        "read -r pid _ _ _ _ session tty _ < /proc/self/stat; printf '%s %s %s ' \
+         \"$pid\" \"$session\" \"$tty\"; (exec 3</dev/tty) 2>/dev/null && printf tty || printf none",
+        b"",
+        Duration::from_secs(10),
+    )
+    .expect("runs");
+    let text = String::from_utf8_lossy(&done.stdout).into_owned();
+    let fields: Vec<&str> = text.split(' ').collect();
+    assert_eq!(fields[0], fields[1], "its own session: {text}");
+    assert_eq!(fields[2], "0", "no controlling terminal: {text}");
+    assert_eq!(fields[3], "none", "/dev/tty opened: {text}");
 }
 
 #[test]

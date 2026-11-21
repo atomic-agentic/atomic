@@ -415,6 +415,15 @@ const ENV_CAPS: &str = "ATOMIC_BUDGETS_CAPS";
 const ENV_PARKS: &str = "ATOMIC_BUDGETS_PARKS";
 /// `<call minutes>,<atom minutes>`, for a child with those time caps.
 const ENV_TIMES: &str = "ATOMIC_BUDGETS_TIMES";
+/// `<input tokens>,<output tokens>`, for a child with that call bound.
+const ENV_CALL: &str = "ATOMIC_BUDGETS_CALL";
+/// `<request>,<input tokens>,<output tokens>`: once that request's attempt
+/// has recorded that usage, the child stops as atomic does on a signal,
+/// settling the calls it has in flight as interrupted, and exits
+/// [`STOPPED`].
+const ENV_STOP_AT: &str = "ATOMIC_BUDGETS_STOP_AT";
+/// How a child stopped by [`ENV_STOP_AT`] exits.
+const STOPPED: i32 = 3;
 
 /// Not a test on its own: the crash tests run it in a child process.
 #[test]
@@ -441,10 +450,44 @@ fn budgets_child() {
         budgets.call.minutes = call.parse().expect("call minutes");
         budgets.atom.minutes = atom.parse().expect("atom minutes");
     }
+    if let Some((input, output)) = std::env::var(ENV_CALL)
+        .ok()
+        .and_then(|t| t.split_once(',').map(|(i, o)| (i.to_owned(), o.to_owned())))
+    {
+        budgets.call.input_tokens = input.parse().expect("call input tokens");
+        budgets.call.output_tokens = output.parse().expect("call output tokens");
+    }
     on_codex_runtime(async move {
         let dir = PathBuf::from(dir);
         let rt = engine(&dir, &url, budgets).await;
         rt.launch().await.expect("launch");
+        if let Ok(stop) = std::env::var(ENV_STOP_AT) {
+            let mut parts = stop.split(',');
+            let (request, usage) = (
+                parts.next().expect("request").to_owned(),
+                (
+                    parts.next().and_then(|n| n.parse().ok()).expect("input"),
+                    parts.next().and_then(|n| n.parse().ok()).expect("output"),
+                ),
+            );
+            let ledger = rt.ledger();
+            let watched = run.clone();
+            tokio::spawn(async move {
+                loop {
+                    let reported = ledger
+                        .attempts(&watched)
+                        .await
+                        .ok()
+                        .and_then(|a| a.into_iter().find(|a| a.request == request))
+                        .and_then(|a| a.usage);
+                    if reported == Some(usage) {
+                        atomic_app::metering::interrupt_in_flight().await;
+                        std::process::exit(STOPPED);
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            });
+        }
         if role == "start" {
             rt.start(CHANGE_REQUEST, &run, input())
                 .await
@@ -676,7 +719,7 @@ fn killing_after_the_call_and_before_settlement_ends_parked_at_the_cap() {
         assert!(seen.contains("450 of 450 tokens"), "{seen}");
         assert_eq!(model.calls(), 3);
 
-        // A usage query reconciles the three attempts at what they used;
+        // A person enters the three attempts' real usage;
         // released again, the run goes on.
         let rt = reader(&dir).await;
         for a in rt.ledger().unsettled("unsettled").await.expect("unsettled") {
@@ -1151,6 +1194,10 @@ fn a_codex_turn_longer_than_a_request_bound_runs_within_its_atoms_time() {
         assert_eq!(journal[0].reserved.millis, 600);
         assert_eq!(journal[1].reserved.millis, 6_000, "{:?}", journal[1]);
         assert!(journal[1].charged.millis >= 1_500, "{:?}", journal[1]);
+        // A turn that completed is charged what it reported: one input and
+        // one output token from its one request.
+        assert_eq!(journal[1].usage, Some((1, 1)), "{:?}", journal[1]);
+        assert_eq!(journal[1].charged.tokens, 2, "{:?}", journal[1]);
         rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
     });
 }
@@ -1184,6 +1231,126 @@ fn a_codex_turn_that_runs_out_of_its_atoms_time_parks_the_run() {
         let park = parks(&rt, "outoftime").await.expect("parks")[0].clone();
         assert_eq!(park.step, "review.park");
         rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+    });
+}
+
+#[test]
+fn a_codex_turn_cut_off_with_a_request_in_flight_is_charged_what_it_reported_and_one_bound() {
+    on_codex_runtime(async {
+        // One request is bounded at two tokens. The review turn's first two
+        // requests report two tokens each and call a tool, past its
+        // reservation; its third is in flight when the atom's time runs out.
+        let tool = || Reply::Tool {
+            name: "no_such_tool".into(),
+            arguments: serde_json::json!({}),
+        };
+        let model = FakeModel::start(vec![
+            Reply::Text(DRAFT.into()),
+            tool(),
+            tool(),
+            // Held well past the cut-off, so the turn is always stopped
+            // waiting on it, however slow the runner.
+            Reply::Delayed {
+                after: Duration::from_secs(120),
+                reply: Box::new(Reply::Text(REVIEW.into())),
+            },
+        ])
+        .await
+        .expect("fake model");
+        let dir = scratch("inflight");
+        // Nine seconds for the turn: ample for its first two requests.
+        let mut budgets = timed(0.01, 0.15);
+        budgets.call.input_tokens = 1;
+        budgets.call.output_tokens = 1;
+        let rt = engine(&dir, &model.base_url(), budgets).await;
+        rt.launch().await.expect("launch");
+        rt.start(CHANGE_REQUEST, "inflight", input())
+            .await
+            .expect("start");
+        let Outcome::Parked(reason) = outcome(&rt, "inflight").await else {
+            panic!("the run should park");
+        };
+        assert!(reason.contains("cut off"), "{reason}");
+        assert_eq!(model.calls(), 4, "the turn's third request was made");
+        let journal = attempts(&rt, "inflight").await;
+        let turn = &journal[1];
+        assert_eq!(turn.reserved.tokens, 2, "{turn:?}");
+        // What its requests reported, and the bound of the one in flight;
+        // the reported usage is kept, and the attempt left open.
+        assert_eq!(turn.usage, Some((2, 2)), "{turn:?}");
+        assert_eq!(turn.charged.tokens, 4 + 2, "{turn:?}");
+        assert_eq!(turn.overshoot(), 4, "{turn:?}");
+        assert_eq!(turn.state, "reserved", "{turn:?}");
+        rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+    });
+}
+
+#[test]
+fn a_request_in_flight_is_estimated_at_the_larger_of_one_bound_and_the_last_request() {
+    on_codex_runtime(async {
+        let dir = scratch("estimate");
+        let rt = Durare::sqlite(&dir.join("atomic.db"))
+            .await
+            .expect("engine");
+        // One request is bounded at 10 input and 5 output tokens, at one
+        // micro-dollar an input token and two an output token: 15 tokens and
+        // 20 micro-dollars.
+        let mut settings = settings(10_000_000, 100_000_000);
+        settings.call.input_tokens = 10;
+        settings.call.output_tokens = 5;
+        settings.pricing.insert(
+            "synthetic".into(),
+            Price {
+                input_usd_per_mtok: 1.0,
+                output_usd_per_mtok: 2.0,
+                max_input_tokens: None,
+                max_output_tokens: None,
+            },
+        );
+        let plan = atomic_app::metering::BudgetPlan::resolve(
+            &settings,
+            &Budget::default(),
+            &[("turn", &Budget::default(), "synthetic")],
+        )
+        .expect("a plan");
+        let budget = RunBudget::pinned(rt.ledger(), &plan);
+        let meter = budget.meter(
+            &atomic_durable::StepInfo {
+                workflow_id: "estimate".into(),
+                step_id: 1,
+            },
+            &plan.atoms["turn"],
+        );
+        let (ticket, _) = meter
+            .admit(atomic_core::usage::Call {
+                index: 0,
+                model: "synthetic".into(),
+                input_bound: None,
+                turn: true,
+            })
+            .await
+            .expect("admitted");
+        // It reported 100 and 20, and its last request 60 and 30: larger
+        // than one request's bound in tokens (90 to 15) and in dollars (120
+        // to 20 micro-dollars).
+        let usage = |input_tokens, output_tokens| atomic_core::usage::Usage {
+            input_tokens,
+            output_tokens,
+        };
+        meter
+            .settle(
+                ticket,
+                atomic_core::usage::Outcome::Partial {
+                    reported: usage(100, 20),
+                    last: Some(usage(60, 30)),
+                },
+            )
+            .await
+            .expect("settled");
+        let attempt = &rt.ledger().attempts("estimate").await.expect("attempts")[0];
+        assert_eq!(attempt.usage, Some((100, 20)));
+        assert_eq!(attempt.charged.tokens, 120 + 90, "{attempt:?}");
+        assert_eq!(attempt.charged.micro_usd, 140 + 120, "{attempt:?}");
     });
 }
 
@@ -1278,5 +1445,173 @@ fn a_dollar_cap_on_an_unpriced_model_fails_configuration() {
         )
         .expect("priced");
         assert_eq!(r.micro_usd, Some(1_000_000));
+    });
+}
+
+// ---------------------------------------------------------------------------
+// A Codex turn stopped or killed before it settles.
+
+/// Replies for a review turn whose first two requests each report two
+/// tokens and call a tool, past a call bound of two tokens, and whose third
+/// is answered after `third`.
+fn reporting_turn(third: Reply) -> Vec<Reply> {
+    let tool = || Reply::Tool {
+        name: "no_such_tool".into(),
+        arguments: serde_json::json!({}),
+    };
+    vec![Reply::Text(DRAFT.into()), tool(), tool(), third]
+}
+
+/// The child, starting run `run` with a call bound of two tokens.
+fn reporting_child(dir: &Path, url: &str, run: &str) -> Command {
+    reporting_child_as(dir, url, run, "start")
+}
+
+/// [`reporting_child`], as `role`.
+fn reporting_child_as(dir: &Path, url: &str, run: &str, role: &str) -> Command {
+    let mut cmd = Command::new(std::env::current_exe().expect("this test binary"));
+    cmd.args(["--exact", "budgets_child", "--ignored", "--nocapture"])
+        .env(ENV_ROLE, role)
+        .env(ENV_DIR, dir)
+        .env(ENV_URL, url)
+        .env(ENV_RUN, run)
+        .env(ENV_CAPS, "10000,100000")
+        .env(ENV_PARKS, "1")
+        .env(ENV_CALL, "1,1")
+        .env_remove("ATOMIC_FAILPOINT")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    cmd
+}
+
+/// Run `cmd` for at most a minute: how it exited, or `None` if it was still
+/// running then and was killed.
+async fn bounded(mut cmd: Command) -> Option<std::process::ExitStatus> {
+    let mut process = cmd.spawn().expect("start the child");
+    let until = Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Some(status) = process.try_wait().expect("the child") {
+            return Some(status);
+        }
+        if Instant::now() > until {
+            let _ = process.kill();
+            let _ = process.wait();
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// The review turn's first attempt in run `run`.
+async fn review_turn(rt: &Durare, run: &str) -> Option<Attempt> {
+    attempts(rt, run)
+        .await
+        .into_iter()
+        .find(|a| a.request == format!("{run}:2:0") && a.attempt == 1)
+}
+
+#[test]
+fn a_codex_turn_stopped_by_a_signal_is_charged_what_it_reported() {
+    on_codex_runtime(async {
+        // The third request is held long past the test: the process stops
+        // while it is in flight, as on a signal, once the turn has recorded
+        // both requests' usage.
+        let model = FakeModel::start(reporting_turn(Reply::Delayed {
+            after: Duration::from_secs(120),
+            reply: Box::new(Reply::Text(REVIEW.into())),
+        }))
+        .await
+        .expect("fake model");
+        let dir = scratch("signalled");
+        let run = "signalled";
+        let mut cmd = reporting_child(&dir, &model.base_url(), run);
+        cmd.env(ENV_STOP_AT, format!("{run}:2:0,2,2"));
+        let status = bounded(cmd).await;
+        assert_eq!(
+            status.and_then(|s| s.code()),
+            Some(STOPPED),
+            "the child did not stop mid-turn: {status:?}"
+        );
+
+        let rt = reader(&dir).await;
+        let turn = review_turn(&rt, run).await.expect("the turn");
+        assert_eq!(turn.reserved.tokens, 2, "{turn:?}");
+        // What it reported, and one request's bound for the one in flight:
+        // not its reservation.
+        assert_eq!(turn.usage, Some((2, 2)), "{turn:?}");
+        assert_eq!(turn.charged.tokens, 4 + 2, "{turn:?}");
+        assert_eq!(turn.state, "reserved", "{turn:?}");
+        assert_eq!(charged(&rt, &format!("run:{run}")).await, 2 + 4 + 2);
+    });
+}
+
+#[test]
+fn a_codex_turn_killed_mid_turn_is_charged_what_it_reported() {
+    on_codex_runtime(async {
+        // The turn's third request, if the killed process made it, and the
+        // recovered turn's answer.
+        let mut replies = reporting_turn(Reply::Text(REVIEW.into()));
+        replies.push(Reply::Text(REVIEW.into()));
+        let model = FakeModel::start(replies).await.expect("fake model");
+        let dir = scratch("killed-mid-turn");
+        let url = model.base_url();
+        // Killed as the turn records what its second request reported.
+        let run = "killed-mid-turn";
+        let mut cmd = reporting_child(&dir, &url, run);
+        cmd.env(
+            "ATOMIC_FAILPOINT",
+            format!("usage:after-progress:{run}:2:0:2"),
+        );
+        let status = bounded(cmd).await;
+        assert!(
+            status.is_some_and(|s| !s.success()),
+            "the child was not killed mid-turn: {status:?}"
+        );
+
+        let rt = reader(&dir).await;
+        let turn = review_turn(&rt, run).await.expect("the turn");
+        assert_eq!(turn.reserved.tokens, 2, "{turn:?}");
+        assert_eq!(turn.usage, Some((2, 2)), "{turn:?}");
+        assert_eq!(turn.charged.tokens, 4 + 2, "{turn:?}");
+        assert_eq!(turn.state, "reserved", "{turn:?}");
+        drop(rt);
+
+        // Recovered, the review runs again as a second attempt with its own
+        // reservation; the dead one keeps what it recorded.
+        let mut cmd = reporting_child_as(&dir, &url, run, "recover");
+        cmd.stdout(Stdio::null());
+        let status = bounded(cmd).await;
+        assert!(
+            status.is_some_and(|s| s.success()),
+            "the recovered run: {status:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("outcome")).expect("outcome"),
+            "finished"
+        );
+        let rt = reader(&dir).await;
+        let review: Vec<Attempt> = attempts(&rt, run)
+            .await
+            .into_iter()
+            .filter(|a| a.request == format!("{run}:2:0"))
+            .collect();
+        assert_eq!(review.len(), 2, "{review:?}");
+        let (dead, again) = (&review[0], &review[1]);
+        assert_eq!(
+            (dead.attempt, dead.state.as_str()),
+            (1, "reserved"),
+            "{dead:?}"
+        );
+        assert_eq!(dead.charged.tokens, 4 + 2, "{dead:?}");
+        assert_eq!(
+            (again.attempt, again.state.as_str()),
+            (2, "settled"),
+            "{again:?}"
+        );
+        assert_eq!(again.usage, Some((1, 1)), "{again:?}");
+        // The draft's two tokens, the dead turn's six, the new turn's two.
+        assert_eq!(charged(&rt, &format!("run:{run}")).await, 2 + 6 + 2);
+        assert_eq!(charged(&rt, &format!("atom:{run}:2")).await, 6 + 2);
     });
 }

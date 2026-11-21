@@ -7,7 +7,9 @@
 //!   gave, not the ones the run asked for;
 //! - an exec atom's scratch directory, which its command, unsandboxed, uses
 //!   as `HOME` and `TMPDIR`, is outside everything a `workspace-write` turn
-//!   may write: a turn that tries to plant a file in a live one fails.
+//!   may write: a turn that tries to plant a file in a live one fails;
+//! - turns at once on one backend share Codex's registry of mount points and
+//!   nothing else: each command's `TMPDIR` is its own turn's.
 //!
 //! Needs bubblewrap and unprivileged user namespaces, so it runs with the
 //! `sandbox-tests` feature; with the feature on, a sandbox that cannot start
@@ -46,10 +48,9 @@ fn scratch(tag: &str) -> PathBuf {
     dir
 }
 
-/// One scratch root for every test here, as one project's backend has:
-/// tests run at once, and turns that share a writable root (here `/tmp`,
-/// which `workspace-write` leaves writable at this Codex revision) must
-/// share the TMPDIR where Codex's sandbox keeps its mount-point registry.
+/// One scratch root, and so one backend directory for Codex's registry of
+/// the mount points its sandbox makes, for every test here, as one
+/// project's turns share theirs: the tests' turns run at once.
 fn shared_scratch() -> PathBuf {
     static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     ROOT.get_or_init(|| {
@@ -257,10 +258,12 @@ fn a_turn_cannot_plant_files_in_a_live_exec_scratch() {
 }
 
 /// Several `workspace-write` turns at once on one backend, in the same
-/// directory, each running many commands: Codex's sandbox creates and
+/// directory, each running many commands. Codex's sandbox creates and
 /// removes mount points for the paths it protects in their shared writable
-/// root, and keeps a registry of them in TMPDIR, so the turns share one
-/// TMPDIR and never remove a mount point the other is using.
+/// root, and keeps a registry of them in its helper's TMPDIR, the backend's
+/// shared directory, so the turns never remove a mount point another is
+/// using. Each command's own TMPDIR is its turn's alone: no command finds
+/// another turn's file there, and no turn can write the shared directory.
 #[test]
 fn concurrent_turns_in_one_directory_never_break_each_others_sandbox() {
     support::require_sandbox();
@@ -273,9 +276,22 @@ fn concurrent_turns_in_one_directory_never_break_each_others_sandbox() {
             let dir = dir.clone();
             let backend = backend.clone();
             async move {
+                // Each command leaves a file in its TMPDIR and counts what it
+                // finds there that is not its own turn's.
                 let mut script: Vec<Reply> = (0..COMMANDS)
-                    .map(|i| tool(&format!("echo turn{n}-ok-{i}")))
+                    .map(|i| {
+                        tool(&format!(
+                            "touch \"$TMPDIR/turn{n}-{i}\" && echo turn{n}-ok-{i} \
+                             others=$(ls -A \"$TMPDIR\" | grep -vc '^turn{n}-')"
+                        ))
+                    })
                     .collect();
+                // And last, it tries to write the backend's shared directory.
+                let shared = shared_scratch().join(".tmp").join(format!("turn{n}"));
+                script.push(tool(&format!(
+                    "touch '{}' 2>/dev/null; echo shared-write-{n}=$?",
+                    shared.display()
+                )));
                 script.push(Reply::Text("Done.".into()));
                 let model = FakeModel::start(script).await.expect("fake model");
                 let rt = runtime(&dir, &model, backend);
@@ -291,18 +307,181 @@ fn concurrent_turns_in_one_directory_never_break_each_others_sandbox() {
                 .expect("the turn runs");
                 assert_eq!(answer, "Done.");
                 // Each request after the first carries every command's output
-                // so far; the last one carries them all.
+                // so far; the last one carries them all. What failed is
+                // returned, not asserted here, so that every turn ends first.
                 let last = model.requests().last().cloned().expect("requests");
-                (0..COMMANDS)
-                    .filter(|i| !last.to_string().contains(&format!("turn{n}-ok-{i}\\n")))
-                    .count()
+                let failed = (0..COMMANDS)
+                    .filter(|i| {
+                        !last
+                            .to_string()
+                            .contains(&format!("turn{n}-ok-{i} others=0\\n"))
+                    })
+                    .count();
+                let wrote_shared =
+                    !last.to_string().contains(&format!("shared-write-{n}=1")) || shared.exists();
+                (failed, wrote_shared)
             }
         };
         let turns: Vec<_> = (0..TURNS).map(|n| tokio::spawn(turn(n))).collect();
-        let mut failed = Vec::new();
+        let (mut failed, mut wrote_shared) = (Vec::new(), Vec::new());
         for t in turns {
-            failed.push(t.await.expect("the turn"));
+            let (f, w) = t.await.expect("the turn");
+            failed.push(f);
+            wrote_shared.push(w);
         }
-        assert_eq!(failed, vec![0; TURNS], "commands that failed in each turn");
+        assert_eq!(
+            wrote_shared,
+            vec![false; TURNS],
+            "turns that could write the backend's shared directory"
+        );
+        assert_eq!(
+            failed,
+            vec![0; TURNS],
+            "commands in each turn that failed, or found another turn's files in their TMPDIR"
+        );
+        // Nor was anything made there to protect, as it would be in a
+        // writable root.
+        let shared = shared_scratch().join(".tmp");
+        for name in [".git", ".agents", ".codex", ".aws"] {
+            assert!(
+                !shared.join(name).exists(),
+                "{name} appeared in the backend's shared {}",
+                shared.display()
+            );
+        }
+    });
+}
+
+/// A command that is exactly the flag naming the sandbox helper's inner
+/// stage leaves the helper's outer stage outer: Codex's registry of mount
+/// points stays in the backend's shared directory, out of the turn's reach,
+/// and does not move into the turn's own TMPDIR, which the turn may write.
+#[test]
+fn a_command_naming_the_inner_stage_leaves_the_registry_shared() {
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let dir = scratch("inner-flag");
+        let backend = Backend::connect(LocalBackend::in_dir(shared_scratch())).expect("connects");
+        let model = FakeModel::start(vec![
+            tool("--apply-seccomp-then-exec"),
+            tool("ls -A \"$TMPDIR\"; echo listed"),
+            Reply::Text("Done.".into()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = runtime(&dir, &model, backend);
+        let answer = run_turn(
+            &rt,
+            &TurnSpec {
+                prompt: "Do the work.".into(),
+                sandbox: Sandbox::WorkspaceWrite,
+                ..TurnSpec::default()
+            },
+        )
+        .await
+        .expect("the turn runs");
+        assert_eq!(answer, "Done.");
+        let last = model
+            .requests()
+            .last()
+            .cloned()
+            .expect("requests")
+            .to_string();
+        assert!(last.contains("listed"), "{last}");
+        assert!(
+            !last.contains("codex-bwrap-synthetic-mount-targets"),
+            "Codex's registry moved into the turn's own TMPDIR: {last}"
+        );
+    });
+}
+
+/// Admits every call with `limit` and records each settlement.
+struct Recorder {
+    limit: atomic_core::usage::Limit,
+    settled: std::sync::Mutex<Vec<atomic_core::usage::Outcome>>,
+}
+
+impl atomic_core::usage::Meter for Recorder {
+    fn admit(
+        &self,
+        call: atomic_core::usage::Call,
+    ) -> atomic_core::usage::MeterFuture<'_, atomic_core::usage::Ticket> {
+        Box::pin(async move {
+            Ok(atomic_core::usage::Ticket {
+                request: format!("r:{}", call.index),
+                attempt: 1,
+                model: call.model,
+                admitted: std::time::Instant::now(),
+                limit: self.limit,
+                bounded_by: None,
+            })
+        })
+    }
+
+    fn settle(
+        &self,
+        _: atomic_core::usage::Ticket,
+        outcome: atomic_core::usage::Outcome,
+    ) -> atomic_core::usage::MeterFuture<'_, ()> {
+        Box::pin(async move {
+            self.settled.lock().expect("settled").push(outcome);
+            Ok(())
+        })
+    }
+}
+
+#[test]
+fn a_turn_cut_off_while_a_command_keeps_running_is_charged_as_one_in_flight() {
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let dir = scratch("yielding");
+        // The model starts a command that keeps running and yields back at
+        // once, so Codex reports its start and not its end; the turn's next
+        // request is then in flight when its time runs out.
+        let model = FakeModel::start(vec![
+            Reply::Tool {
+                name: "exec_command".into(),
+                arguments: json!({"cmd": "sleep 60", "yield_time_ms": 300}),
+            },
+            Reply::Delayed {
+                after: std::time::Duration::from_secs(120),
+                reply: Box::new(Reply::Text(r#"{"done": true}"#.into())),
+            },
+        ])
+        .await
+        .expect("fake model");
+        let recorder = std::sync::Arc::new(Recorder {
+            limit: atomic_core::usage::Limit {
+                output_tokens: None,
+                time: Some(std::time::Duration::from_secs(8)),
+            },
+            settled: std::sync::Mutex::new(Vec::new()),
+        });
+        let mut rt = runtime(
+            &dir,
+            &model,
+            Backend::connect(LocalBackend::in_dir(shared_scratch())).expect("connects"),
+        );
+        rt.meter = Metering::new(recorder.clone());
+        let spec = TurnSpec {
+            prompt: "build it".into(),
+            ..TurnSpec::default()
+        };
+        let ended = run_turn(&rt, &spec).await;
+        let e = ended.expect_err("cut off");
+        assert!(format!("{e}").contains("cut off"), "{e}");
+        assert_eq!(model.calls(), 2, "the request after the command was made");
+        let one = atomic_core::usage::Usage {
+            input_tokens: 1,
+            output_tokens: 1,
+        };
+        assert_eq!(
+            *recorder.settled.lock().expect("settled"),
+            [atomic_core::usage::Outcome::Partial {
+                reported: one,
+                last: Some(one),
+            }],
+            "the request in flight while the command ran is charged"
+        );
     });
 }

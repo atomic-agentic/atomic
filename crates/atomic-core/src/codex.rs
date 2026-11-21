@@ -10,7 +10,7 @@
 //! read from the user's Codex configuration: Codex's home is the project's
 //! state directory (see [`crate::state`]).
 
-use crate::usage::{Call, Exhausted, MeterError, Metering, Outcome, Usage, meter_error};
+use crate::usage::{Call, Exhausted, MeterError, Metering, Outcome, Ticket, Usage, meter_error};
 use anyhow::Context;
 use anyhow::bail;
 use codex_core_api::AbsolutePathBuf;
@@ -146,11 +146,177 @@ pub struct PrivateState {
     /// (`<home>/private`): denied whole, by one entry, so a project made
     /// while a thread runs is covered too.
     pub private: PathBuf,
-    /// Other directories denied whole: the context key, the credential file
-    /// store, another atomic home's state, and the person's own
-    /// configuration, which can name a store with its password or an
-    /// endpoint with its credential.
+    /// Other paths denied whole: the context key, the credential file
+    /// store, another atomic home's state, the person's own configuration,
+    /// which can name a store with its password or an endpoint with its
+    /// credential, and the well-known places in the home directory that
+    /// hold credentials ([`HOME_SECRETS`]). A path that does not exist when
+    /// a command starts has nothing to deny, and is never created; one made
+    /// while the command runs is denied to the commands that start after.
+    /// Links among them are followed when the list is made, not later.
     pub also: Vec<PathBuf>,
+}
+
+/// Where, under the home directory, people and their tools keep
+/// credentials: denied to every atom's commands, which a model chooses.
+/// Shell startup files and history are among them, since they often export
+/// a token or hold one typed at the prompt. Entries under `.config/`,
+/// `.local/share/` and `.cache/` are denied where `XDG_CONFIG_HOME`,
+/// `XDG_DATA_HOME` and `XDG_CACHE_HOME` move them as well.
+pub const HOME_SECRETS: &[&str] = &[
+    ".ssh",
+    ".aws",
+    ".netrc",
+    ".codex",
+    ".claude",
+    ".claude.json",
+    ".config/gcloud",
+    ".azure",
+    ".kube",
+    ".docker/config.json",
+    ".config/containers/auth.json",
+    ".gnupg",
+    ".npmrc",
+    ".pypirc",
+    ".git-credentials",
+    ".config/git/credentials",
+    ".config/gh",
+    ".cargo/credentials",
+    ".cargo/credentials.toml",
+    ".m2/settings.xml",
+    ".gradle/gradle.properties",
+    ".gem/credentials",
+    ".pgpass",
+    ".vault-token",
+    ".terraform.d/credentials.tfrc.json",
+    ".cache/huggingface/token",
+    ".config/sops/age/keys.txt",
+    ".config/rclone/rclone.conf",
+    ".password-store",
+    ".local/share/keyrings",
+    ".profile",
+    ".bash_profile",
+    ".bash_login",
+    ".bashrc",
+    ".bashrc.d",
+    ".bash_aliases",
+    ".bash_logout",
+    ".bash_history",
+    ".zshenv",
+    ".zprofile",
+    ".zshrc",
+    ".zlogin",
+    ".zlogout",
+    ".zsh_history",
+    ".zsh_sessions",
+    ".python_history",
+    ".psql_history",
+    ".config/fish",
+    ".local/share/fish",
+];
+
+/// Variables that move a credential file or directory elsewhere, each with
+/// what of the place it names is denied: `""` for the place itself.
+const MOVED_SECRETS: &[(&str, &[&str])] = &[
+    (
+        "ZDOTDIR",
+        &[
+            ".zshenv",
+            ".zprofile",
+            ".zshrc",
+            ".zlogin",
+            ".zlogout",
+            ".zsh_history",
+            ".zsh_sessions",
+        ],
+    ),
+    ("HISTFILE", &[""]),
+    ("GNUPGHOME", &[""]),
+    ("CARGO_HOME", &["credentials", "credentials.toml"]),
+    ("DOCKER_CONFIG", &["config.json"]),
+    ("AWS_SHARED_CREDENTIALS_FILE", &[""]),
+    ("AWS_CONFIG_FILE", &[""]),
+    ("NETRC", &[""]),
+    ("NPM_CONFIG_USERCONFIG", &[""]),
+    ("npm_config_userconfig", &[""]),
+    ("PASSWORD_STORE_DIR", &[""]),
+    ("CODEX_HOME", &[""]),
+];
+
+/// The home directories whose credential places are denied, as `env` reads
+/// `HOME` and with `passwd` the password database's home for this user:
+/// both, when they differ, so overriding `HOME` hides nothing. An error,
+/// so nothing runs, when neither is an absolute path.
+pub fn real_homes(
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+    passwd: Option<PathBuf>,
+) -> Result<Vec<PathBuf>, String> {
+    let mut homes: Vec<PathBuf> = env("HOME")
+        .map(PathBuf::from)
+        .filter(|h| h.is_absolute())
+        .into_iter()
+        .collect();
+    if let Some(passwd) = passwd.filter(|p| p.is_absolute())
+        && !homes.contains(&passwd)
+    {
+        homes.push(passwd);
+    }
+    if homes.is_empty() {
+        return Err(
+            "the home directory is unknown (HOME is unset or not an absolute path, and the user \
+             has no home in the password database), so the credentials kept there could not be \
+             denied to atoms' commands; set HOME"
+                .into(),
+        );
+    }
+    Ok(homes)
+}
+
+/// Every credential place denied to atoms' commands, as `env` reads the
+/// variables: [`HOME_SECRETS`] under each of [`real_homes`], those under
+/// `.config/`, `.local/share/` and `.cache/` where the XDG variables move
+/// them too, and what the variables that move a credential name.
+pub fn home_secrets(
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+    passwd: Option<PathBuf>,
+) -> Result<Vec<PathBuf>, String> {
+    let absolute = |name: &str| env(name).map(PathBuf::from).filter(|p| p.is_absolute());
+    let mut out = Vec::new();
+    for home in real_homes(env, passwd)? {
+        out.extend(HOME_SECRETS.iter().map(|p| home.join(p)));
+    }
+    for (prefix, variable) in [
+        (".config/", "XDG_CONFIG_HOME"),
+        (".local/share/", "XDG_DATA_HOME"),
+        (".cache/", "XDG_CACHE_HOME"),
+    ] {
+        if let Some(moved) = absolute(variable) {
+            out.extend(
+                HOME_SECRETS
+                    .iter()
+                    .filter_map(|p| p.strip_prefix(prefix))
+                    .map(|rest| moved.join(rest)),
+            );
+        }
+    }
+    for (variable, inside) in MOVED_SECRETS {
+        if let Some(place) = absolute(variable) {
+            out.extend(inside.iter().map(|p| {
+                if p.is_empty() {
+                    place.clone()
+                } else {
+                    place.join(p)
+                }
+            }));
+        }
+    }
+    // KUBECONFIG names a list of files.
+    if let Some(list) = env("KUBECONFIG") {
+        out.extend(std::env::split_paths(&list).filter(|p| p.is_absolute()));
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
 }
 
 impl StateGuard {
@@ -174,6 +340,12 @@ impl StateGuard {
         for dir in &also {
             crate::state::private_dir(dir)?;
         }
+        // The person's real home, whatever the shell is given as its own,
+        // and the credential places atomic's own environment moves; none is
+        // made, and with no home known nothing runs.
+        also.extend(
+            home_secrets(&person_env, crate::state::passwd_home()).map_err(anyhow::Error::msg)?,
+        );
         // With ATOMIC_HOME set, the default home's state, credentials and
         // keys are another atomic's: denied too, where they exist.
         if std::env::var_os("ATOMIC_HOME").is_some_and(|h| !h.is_empty()) {
@@ -191,17 +363,159 @@ impl StateGuard {
     }
 }
 
+/// The person's `CODEX_HOME`, as the process was started with it, before
+/// [`dispatch`] points it at atomic's own.
+static PERSON_CODEX_HOME: std::sync::OnceLock<Option<std::ffi::OsString>> =
+    std::sync::OnceLock::new();
+
+/// The person's environment, as atomic was started with it: `CODEX_HOME`
+/// as it was before [`dispatch`] replaced it.
+fn person_env(name: &str) -> Option<std::ffi::OsString> {
+    match (name, PERSON_CODEX_HOME.get()) {
+        ("CODEX_HOME", Some(theirs)) => theirs.clone(),
+        _ => std::env::var_os(name),
+    }
+}
+
+/// How many directory levels inside a denied directory links are followed
+/// to the files and directories they point at, which are denied too.
+const LINK_DEPTH: usize = 4;
+
+/// The most link targets denied besides the fixed places. The whole list
+/// goes to the sandbox helper in one argument, which has a size limit, so
+/// past this nothing runs.
+const MAX_LINK_TARGETS: usize = 512;
+
+/// Where the system keeps what every command needs: a link into one of
+/// these is never followed to deny its target.
+const SYSTEM_PREFIXES: &[&str] = &[
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib32",
+    "/lib64",
+    "/libx32",
+    "/etc",
+    "/opt",
+    "/nix/store",
+    "/dev",
+    "/proc",
+    "/sys",
+    "/run",
+];
+
+/// The links up to [`LINK_DEPTH`] directory levels inside `dir`. Links to
+/// directories are not walked into.
+fn links_in(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    if depth == 0 {
+        return;
+    }
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_symlink() {
+            out.push(entry.path());
+        } else if kind.is_dir() {
+            links_in(&entry.path(), depth - 1, out);
+        }
+    }
+}
+
+/// What a link or a variable resolved to, if it should be denied: only a
+/// regular file or a directory, the person's own, outside the system's
+/// directories. A history file linked to `/dev/null`, or a tool linked to
+/// the system's `python3`, is left alone, since denying it would break
+/// every command.
+fn deniable(target: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(target) else {
+        return false;
+    };
+    if !(meta.is_file() || meta.is_dir()) {
+        return false;
+    }
+    if SYSTEM_PREFIXES.iter().any(|p| target.starts_with(p)) {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.uid() != crate::state::effective_uid() {
+            return false;
+        }
+    }
+    true
+}
+
 /// Every path a profile denies under `guard`, for a thread whose Codex home
-/// is `codex_home`: the state directory's `private/`, the user-wide private
-/// directories, and everything in Codex's home but the shell snapshots and
-/// helper links its shell needs. Each is denied whole, never re-opened
-/// below, so the sandbox needs no mount inside a denied directory. Both
-/// spellings of a path reached through a link are denied.
-fn denied_paths(private: &PrivateState, codex_home: &Path) -> (Vec<PathBuf>, Vec<String>) {
+/// is `codex_home`: the state directory's `private/`, the paths in
+/// [`PrivateState::also`], and everything in Codex's home but the helper
+/// links its shell needs. Each is denied whole, never re-opened below, so
+/// the sandbox needs no mount inside a denied directory. A path reached
+/// through a linked directory is denied under both spellings; one that is
+/// itself a link, such as a `~/.bashrc` kept with a person's dotfiles, is
+/// denied as the file or directory it points at, since the sandbox cannot
+/// mount on a link, and a read through the link lands on the denied target.
+/// The real file or directory behind each link up to [`LINK_DEPTH`] levels
+/// inside a denied directory is denied too, such as a `config.yaml` linked
+/// to one kept elsewhere.
+///
+/// A resolved target is denied only if [`deniable`]. Nothing runs when a
+/// denied path would cover what the thread needs (its working directory
+/// `cwd`, the directories it may write, `writable`, the state directory,
+/// its Codex home or atomic's own program), or when a link's target lies in
+/// a directory the thread may write, where a command could rename it out
+/// from under its denial.
+///
+/// The list is made when a thread starts. A path that does not exist then
+/// is denied only once it does, when a later command starts: one made while
+/// a command runs can be read by that command.
+fn denied_paths(
+    private: &PrivateState,
+    codex_home: &Path,
+    cwd: Option<&Path>,
+    writable: &[PathBuf],
+) -> anyhow::Result<(Vec<PathBuf>, Vec<String>)> {
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
+    let writable: Vec<PathBuf> = writable.iter().map(|p| real(p)).collect();
+    // atomic's state holds what the thread may write (its worktrees,
+    // scratch and temporary directories): no denied link may point there.
+    let mut writable = writable;
+    writable.push(real(&private.state_dir));
+    let mut needed = writable.clone();
+    needed.extend(cwd.map(real));
+    needed.push(real(codex_home));
+    needed.extend(std::env::current_exe().ok().map(|p| real(&p)));
+    let covers = |denied: &Path| needed.iter().find(|n| n.starts_with(denied)).cloned();
     // Every project's private state, by one entry, however many projects
     // the home holds.
     let mut denied = vec![private.private.clone()];
     denied.extend(private.also.iter().cloned());
+    // Before anything is walked: a place that covers what the thread needs,
+    // such as a variable naming the root.
+    for path in &denied {
+        if let Some(needed) = covers(&real(path)).or_else(|| covers(path)) {
+            bail!(
+                "{} holds {}, which atoms' commands need, so atomic cannot deny it; check \
+                 the variables that name credential places, such as HISTFILE or CODEX_HOME",
+                path.display(),
+                needed.display()
+            );
+        }
+    }
+    let mut links = Vec::new();
+    for dir in &private.also {
+        links_in(dir, LINK_DEPTH, &mut links);
+    }
+    if links.len() > MAX_LINK_TARGETS {
+        bail!(
+            "the places denied to atoms' commands hold {} links, more than the {MAX_LINK_TARGETS} \
+             atomic follows; remove some, or keep the files they point at inside those places",
+            links.len()
+        );
+    }
+    denied.extend(links);
     let children = |dir: &Path, keep: &str| -> Vec<PathBuf> {
         std::fs::read_dir(dir)
             .into_iter()
@@ -212,19 +526,74 @@ fn denied_paths(private: &PrivateState, codex_home: &Path) -> (Vec<PathBuf>, Vec
             .collect()
     };
     let arg0 = format!("arg0-{}", std::env::consts::OS);
-    for entry in children(codex_home, "shell_snapshots") {
+    let mut all = Vec::new();
+    // Shell snapshots are off (see `converse_async`): none is kept open.
+    // The Codex home is atomic's own, so what is in it is denied as it is,
+    // a link as what it points at.
+    let mut own = Vec::new();
+    for entry in children(codex_home, "") {
         if entry.file_name().is_some_and(|n| n == "tmp") {
-            denied.extend(children(&entry, &arg0));
+            own.extend(children(&entry, &arg0));
         } else {
-            denied.push(entry);
+            own.push(entry);
         }
     }
-    let mut all = Vec::new();
+    for entry in own {
+        if std::fs::symlink_metadata(&entry).is_ok_and(|m| m.file_type().is_symlink()) {
+            all.extend(std::fs::canonicalize(&entry).ok());
+        } else {
+            all.push(entry);
+        }
+    }
     for path in denied {
-        if let Ok(real) = std::fs::canonicalize(&path)
-            && real != path
-        {
-            all.push(real);
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            // Nothing there yet: denied once it is.
+            all.push(path);
+            continue;
+        };
+        let target = std::fs::canonicalize(&path).ok();
+        if meta.file_type().is_symlink() || target.as_ref().is_some_and(|t| *t != path) {
+            // A link, or a path through one: what it resolves to, if that
+            // is a file or directory of the person's, and never what the
+            // thread needs or may write.
+            let Some(target) = target.filter(|t| deniable(t)) else {
+                continue;
+            };
+            if let Some(needed) = covers(&target) {
+                bail!(
+                    "{} resolves to {}, which holds {}, which atoms' commands need; atomic \
+                     cannot deny it",
+                    path.display(),
+                    target.display(),
+                    needed.display()
+                );
+            }
+            if let Some(root) = writable.iter().find(|w| target.starts_with(w)) {
+                bail!(
+                    "{} resolves to {}, inside {}, which atoms' commands may write, so a command \
+                     could move it out from under its denial; keep it elsewhere",
+                    path.display(),
+                    target.display(),
+                    root.display()
+                );
+            }
+            all.push(target.clone());
+            if !meta.file_type().is_symlink() {
+                all.push(path);
+            }
+            continue;
+        }
+        if !(meta.is_file() || meta.is_dir()) {
+            // A device or socket, such as a variable naming /dev/null.
+            continue;
+        }
+        if let Some(needed) = covers(&path) {
+            bail!(
+                "{} holds {}, which atoms' commands need, so atomic cannot deny it; check \
+                 the variables that name credential places, such as HISTFILE or CODEX_HOME",
+                path.display(),
+                needed.display()
+            );
         }
         all.push(path);
     }
@@ -239,7 +608,7 @@ fn denied_paths(private: &PrivateState, codex_home: &Path) -> (Vec<PathBuf>, Vec
     // the list above is made: a pattern, expanded when each command starts,
     // covers it.
     let globs = vec![format!("{}/*.sqlite*", codex_home.display())];
-    (all, globs)
+    Ok((all, globs))
 }
 
 /// The network every sandbox has: none, local sockets included.
@@ -254,6 +623,8 @@ pub(crate) fn permission_profile(
     sandbox: crate::typed::Sandbox,
     guard: &StateGuard,
     codex_home: &Path,
+    cwd: Option<&Path>,
+    writable: &[PathBuf],
 ) -> anyhow::Result<PermissionProfile> {
     use codex_protocol::permissions::{
         FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry,
@@ -274,7 +645,7 @@ pub(crate) fn permission_profile(
         return Ok(base);
     };
     let mut policy = base.file_system_sandbox_policy();
-    let (paths, globs) = denied_paths(private, codex_home);
+    let (paths, globs) = denied_paths(private, codex_home, cwd, writable)?;
     for p in paths {
         let p = AbsolutePathBuf::from_absolute_path(&p)
             .with_context(|| format!("resolve the sandbox path {}", p.display()))?;
@@ -444,8 +815,11 @@ where
     Fut: Future<Output = anyhow::Result<()>>,
 {
     keep_sandbox_off_keyrings();
+    give_the_command_its_own_tmpdir();
     // SAFETY: called at the start of main, while the process has one thread,
     // so no other thread can read the environment concurrently.
+    // The person's own Codex home stays denied to atoms' commands.
+    let _ = PERSON_CODEX_HOME.set(std::env::var_os("CODEX_HOME"));
     #[allow(unsafe_code)]
     unsafe {
         std::env::set_var("CODEX_HOME", codex_home);
@@ -494,9 +868,56 @@ pub fn is_helper(mut args: impl Iterator<Item = std::ffi::OsString>) -> bool {
 /// touched.
 pub fn run_helper() -> anyhow::Result<()> {
     keep_sandbox_off_keyrings();
+    give_the_command_its_own_tmpdir();
     arg0_dispatch_or_else(|_| async {
         bail!("this process was started as a Codex helper Codex does not know")
     })
+}
+
+/// The variable that carries a turn's own temporary directory past Codex's
+/// sandbox helper to the command (see [`give_the_command_its_own_tmpdir`]).
+pub(crate) const TURN_TMPDIR: &str = "ATOMIC_TURN_TMPDIR";
+
+/// When this process is the inner stage of Codex's Linux sandbox helper,
+/// just before the command runs, give the command its own `TMPDIR`: the
+/// directory in [`TURN_TMPDIR`], private to its turn. The helper's outer
+/// stage keeps the backend's shared `TMPDIR`, where Codex keeps its registry
+/// of the mount points it makes, which every turn sharing a writable root
+/// must share; the command never writes there.
+fn give_the_command_its_own_tmpdir() {
+    #[cfg(target_os = "linux")]
+    if invoked_as_linux_sandbox()
+        && is_inner_stage(std::env::args_os())
+        && let Some(own) = std::env::var_os(TURN_TMPDIR)
+    {
+        // SAFETY: the helper is single-threaded here, before it applies its
+        // restrictions and executes the command.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var("TMPDIR", own);
+            std::env::remove_var(TURN_TMPDIR);
+        }
+    }
+}
+
+/// Whether the Linux sandbox helper's arguments `args` (the first being its
+/// own name) are its inner stage's: `--apply-seccomp-then-exec` among its
+/// options, before the `--` that ends them. After that `--` is the command,
+/// whose own arguments, the model's to choose, say nothing about the stage;
+/// Codex's own launcher reads them the same way.
+#[cfg(any(target_os = "linux", test))]
+fn is_inner_stage(args: impl IntoIterator<Item = std::ffi::OsString>) -> bool {
+    args.into_iter()
+        .skip(1)
+        .take_while(an_option)
+        .any(|a| a == "--apply-seccomp-then-exec")
+}
+
+/// Whether `arg`, read in order from the helper's arguments, is still one
+/// of its options: not the `--` after which the command begins.
+#[cfg(any(target_os = "linux", test))]
+fn an_option(arg: &std::ffi::OsString) -> bool {
+    arg != "--"
 }
 
 /// When this process is Codex's Linux sandbox helper, keep the command it
@@ -505,7 +926,7 @@ pub fn run_helper() -> anyhow::Result<()> {
 fn keep_sandbox_off_keyrings() {
     #[cfg(target_os = "linux")]
     if invoked_as_linux_sandbox() {
-        let inner = std::env::args_os().any(|a| a == "--apply-seccomp-then-exec");
+        let inner = is_inner_stage(std::env::args_os());
         let kept_off = if inner {
             // Inside the sandbox, just before the command runs.
             deny_keyrings()
@@ -584,23 +1005,41 @@ impl ExecSandbox {
         self
     }
 
-    /// The profile for a command that may write `writable`.
-    fn profile(&self, writable: &[PathBuf]) -> anyhow::Result<PermissionProfile> {
+    /// The profile for a command that may write `writable`, except the
+    /// directories in `read_only` inside them.
+    fn profile(
+        &self,
+        writable: &[PathBuf],
+        read_only: &[PathBuf],
+    ) -> anyhow::Result<PermissionProfile> {
         use codex_protocol::permissions::{
             FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry,
         };
-        let read_only = permission_profile(
+        let mut writes = writable.to_vec();
+        writes.extend(self.also_writable.iter().cloned());
+        let base = permission_profile(
             crate::typed::Sandbox::ReadOnly,
             &self.guard,
             &self.codex_home,
+            None,
+            &writes,
         )?;
-        let mut policy = read_only.file_system_sandbox_policy();
+        let mut policy = base.file_system_sandbox_policy();
         for dir in writable.iter().chain(&self.also_writable) {
             let dir = AbsolutePathBuf::from_absolute_path(dir)
                 .with_context(|| format!("resolve the writable directory {}", dir.display()))?;
             policy.entries.push(FileSystemSandboxEntry::new(
                 FileSystemPath::from(dir),
                 FileSystemAccessMode::Write,
+            ));
+        }
+        // A narrower entry that only reads carves a writable one out.
+        for dir in read_only {
+            let dir = AbsolutePathBuf::from_absolute_path(dir)
+                .with_context(|| format!("resolve the read-only directory {}", dir.display()))?;
+            policy.entries.push(FileSystemSandboxEntry::new(
+                FileSystemPath::from(dir),
+                FileSystemAccessMode::Read,
             ));
         }
         // No network of its own: a command whose atom declares hosts reaches
@@ -650,7 +1089,7 @@ impl atomic_exec::Confine for ExecSandbox {
             )));
         }
         let profile = self
-            .profile(&command.writable)
+            .profile(&command.writable, &command.read_only)
             .and_then(|p| serde_json::to_string(&p).context("encode the sandbox profile"))
             .map_err(|e| fail(format!("{e:#}")))?;
         let cwd = text(&command.cwd)?;
@@ -730,6 +1169,7 @@ impl atomic_exec::Confine for ExecSandbox {
                 args,
                 env: helper_env,
                 writable: Vec::new(),
+                read_only: Vec::new(),
                 network: Vec::new(),
                 ..command.clone()
             },
@@ -804,12 +1244,13 @@ pub(crate) fn sandbox_refused(stderr: &str) -> bool {
         "retained effective or permitted capabilities",
         "error applying Linux sandbox restrictions",
     ];
-    const BWRAP: [&str; 5] = [
+    const BWRAP: [&str; 6] = [
         "namespace",
         "uid map",
         "gid map",
         "Operation not permitted",
         "Permission denied",
+        "Can't mount on symlink destination",
     ];
     stderr.lines().any(|line| {
         HELPER.iter().any(|s| line.contains(s))
@@ -1141,7 +1582,20 @@ where
     config.developer_instructions = spec.developer_instructions.clone();
     config.permissions = Permissions::from_approval_and_profile(
         Constrained::allow_any(AskForApproval::Never),
-        Constrained::allow_any(permission_profile(spec.sandbox, guard, codex_home)?),
+        Constrained::allow_any(permission_profile(
+            spec.sandbox,
+            guard,
+            codex_home,
+            Some(cwd),
+            &match spec.sandbox {
+                crate::typed::Sandbox::ReadOnly => Vec::new(),
+                crate::typed::Sandbox::WorkspaceWrite => {
+                    let mut roots = spec.writable_roots.clone();
+                    roots.push(cwd.to_owned());
+                    roots
+                }
+            },
+        )?),
     )?;
     let mut writable_roots = spec.writable_roots.clone();
     writable_roots.push(cwd.to_owned());
@@ -1266,15 +1720,32 @@ where
         let bounded_by = ticket.as_ref().and_then(|t| t.bounded_by.clone());
         // A turn is cut off when its reserved time runs out; a failed or cut
         // off turn still reports the usage seen before it stopped.
-        let (turn, totals) = span.run(run_turn(&thread, &current, limit.time)).await;
+        let mut recorder = ProgressLog {
+            meter,
+            ticket: ticket.as_ref(),
+            seen,
+            recorded: seen,
+            records: 0,
+            warned: false,
+        };
+        let (turn, progress) = span
+            .run(run_turn(&thread, &current, limit.time, &mut recorder))
+            .await;
         if let (Err(e), Some(span)) = (&turn, span.span()) {
             crate::usage::record_error(&span, e);
         }
+        let totals = progress.totals(seen);
         // Codex repeats the last totals in every token count, so a turn
         // whose requests reported nothing shows them unchanged; a request
         // that reports usage always grows them. A turn with nothing reported
         // spent something unknown and stays charged at its reservation.
         let fresh = totals.filter(|(input, output, _)| *input > seen.0 || *output > seen.1);
+        // A turn stopped with a provider request in flight, which has
+        // reported nothing yet, spent more than the thread grew by: it is
+        // charged the growth and one more request's bound (see
+        // [`Progress::in_flight`]).
+        let cut_off = matches!(&turn, Err(e) if e.downcast_ref::<CutOff>().is_some());
+        let in_flight = progress.in_flight(cut_off, turn.is_err());
         let outcome = match fresh {
             Some((input, output, total)) => {
                 let grown = Usage {
@@ -1288,7 +1759,17 @@ where
                 report.input_tokens = input;
                 report.output_tokens = output;
                 report.total_tokens = total;
-                Outcome::Reported(grown)
+                if in_flight {
+                    Outcome::Partial {
+                        reported: grown,
+                        last: progress.last.map(|(input_tokens, output_tokens)| Usage {
+                            input_tokens,
+                            output_tokens,
+                        }),
+                    }
+                } else {
+                    Outcome::Reported(grown)
+                }
             }
             None => Outcome::Unknown,
         };
@@ -1631,45 +2112,213 @@ struct CutOff(std::time::Duration);
 /// How long an interrupted turn has to wind down.
 const INTERRUPT_PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Run one turn, cut off after `time` if one is given. Returns how it ended
-/// and the thread's running totals (input, output, total) as last reported,
+/// Where a turn got to, as its events show.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Progress {
+    /// The thread's running token totals (input, output, total), as last
+    /// reported.
+    usage: Option<(i64, i64, i64)>,
+    /// What this turn's completed responses reported, input and output,
+    /// summed: Codex sends a response's totals only after its tools drain,
+    /// so a turn stopped before then has them only here.
+    responses: (i64, i64),
+    /// What the last completed response reported, input and output: the
+    /// size of the turn's requests at its end.
+    last: Option<(i64, i64)>,
+    /// Whether a provider response has begun streaming and not completed.
+    streaming: bool,
+    /// Whether the turn completed.
+    completed: bool,
+}
+
+impl Progress {
+    /// Follow one event of the turn.
+    fn observe(&mut self, msg: &EventMsg) {
+        match msg {
+            EventMsg::TokenCount(count) => {
+                // Sent after every response, broken ones too, repeating the
+                // totals when nothing new was reported.
+                if let Some(info) = &count.info {
+                    let t = &info.total_token_usage;
+                    self.usage = Some((t.input_tokens, t.output_tokens, t.total_tokens));
+                }
+            }
+            // A response completed, with its own usage.
+            EventMsg::RawResponseCompleted(done) => {
+                self.streaming = false;
+                if let Some(u) = &done.token_usage {
+                    self.responses.0 += u.input_tokens.max(0);
+                    self.responses.1 += u.output_tokens.max(0);
+                    self.last = Some((u.input_tokens.max(0), u.output_tokens.max(0)));
+                }
+            }
+            EventMsg::AgentMessageContentDelta(_)
+            | EventMsg::ReasoningContentDelta(_)
+            | EventMsg::ReasoningRawContentDelta(_)
+            | EventMsg::PlanDelta(_)
+            | EventMsg::StreamError(_) => self.streaming = true,
+            EventMsg::TurnComplete(_) => self.completed = true,
+            _ => {}
+        }
+    }
+
+    /// The thread's input and output totals, the larger of what its token
+    /// counts said and what the turn's responses reported on top of `seen`,
+    /// the totals before the turn.
+    fn totals(&self, seen: (i64, i64)) -> Option<(i64, i64, i64)> {
+        let from_responses = (seen.0 + self.responses.0, seen.1 + self.responses.1);
+        match self.usage {
+            Some((input, output, _)) => {
+                let (input, output) = (input.max(from_responses.0), output.max(from_responses.1));
+                Some((input, output, input + output))
+            }
+            None if self.responses != (0, 0) => Some((
+                from_responses.0,
+                from_responses.1,
+                from_responses.0 + from_responses.1,
+            )),
+            None => None,
+        }
+    }
+
+    /// Whether the turn stopped with a provider request in flight: one sent
+    /// whose usage is not in the totals. A turn cut off at its time is taken
+    /// to be waiting on one unless it had completed: a tool that yields to
+    /// the model while it runs, as a unified exec session does, leaves no
+    /// sign of the requests made meanwhile, so a turn cut off while a tool
+    /// ran may be charged one request too many, never one too few. A turn
+    /// that failed was, only if a response had begun streaming and broke
+    /// off, not if the provider refused the request outright.
+    fn in_flight(&self, cut_off: bool, failed: bool) -> bool {
+        if self.completed {
+            return false;
+        }
+        cut_off || (failed && self.streaming)
+    }
+}
+
+/// Where a running turn's reported usage is recorded as it grows, so that a
+/// turn whose process is stopped or killed before it settles stays charged
+/// at least what it reported (see [`crate::usage::Meter::progress`]).
+struct ProgressLog<'a> {
+    meter: &'a Metering,
+    ticket: Option<&'a Ticket>,
+    /// The thread's totals before the turn.
+    seen: (i64, i64),
+    /// The totals as last recorded.
+    recorded: (i64, i64),
+    /// How many times it recorded.
+    records: u32,
+    /// Whether a record failed, and was said to.
+    warned: bool,
+}
+
+/// How long a turn waits on one record of its progress before it goes on
+/// without it: a store held by another writer must not hold up the turn.
+const PROGRESS_PATIENCE: std::time::Duration = std::time::Duration::from_secs(1);
+
+impl ProgressLog<'_> {
+    /// Record `progress` if the turn reported more since it last recorded:
+    /// what it reported, and one request in flight, since it may be making
+    /// one. A record that fails, or takes longer than [`PROGRESS_PATIENCE`],
+    /// leaves the turn charged as it was, at its reservation or its last
+    /// record, is tried again at the next growth, and is said once a turn.
+    async fn note(&mut self, progress: &Progress) {
+        let Some((input, output, _)) = progress.totals(self.seen) else {
+            return;
+        };
+        if input <= self.recorded.0 && output <= self.recorded.1 {
+            return;
+        }
+        let outcome = Outcome::Partial {
+            reported: Usage {
+                input_tokens: (input - self.seen.0).max(0),
+                output_tokens: (output - self.seen.1).max(0),
+            },
+            last: progress.last.map(|(input_tokens, output_tokens)| Usage {
+                input_tokens,
+                output_tokens,
+            }),
+        };
+        let recorded =
+            tokio::time::timeout(PROGRESS_PATIENCE, self.meter.progress(self.ticket, outcome))
+                .await;
+        match recorded {
+            Ok(Ok(())) => {
+                self.recorded = (input, output);
+                self.records += 1;
+                if crate::failpoint::armed()
+                    && let Some(ticket) = self.ticket
+                {
+                    // A crash here leaves the turn charged what it recorded.
+                    crate::failpoint::failpoint(&format!(
+                        "usage:after-progress:{}:{}",
+                        ticket.request, self.records
+                    ));
+                }
+            }
+            failed if !self.warned => {
+                self.warned = true;
+                let why = match failed {
+                    Ok(Err(e)) => e.to_string(),
+                    _ => format!("the store did not answer within {PROGRESS_PATIENCE:?}"),
+                };
+                crate::log_line!(
+                    "a Codex turn's usage so far was not recorded ({why}); until it is, a stop \
+                     before the turn settles leaves it charged at its last record"
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Run one turn, cut off after `time` if one is given, recording its
+/// reported usage through `recorder` as it grows. Returns how it ended and
+/// where it got to, the thread's running totals as last reported among it,
 /// whether or not it succeeded.
 async fn run_turn(
     thread: &CodexThread,
     spec: &TurnSpec,
     time: Option<std::time::Duration>,
-) -> (anyhow::Result<String>, Option<(i64, i64, i64)>) {
-    let mut usage = None;
+    recorder: &mut ProgressLog<'_>,
+) -> (anyhow::Result<String>, Progress) {
+    let mut progress = Progress::default();
     let ended = match time {
-        None => turn(thread, spec, &mut usage).await,
-        Some(time) => match tokio::time::timeout(time, turn(thread, spec, &mut usage)).await {
-            Ok(ended) => ended,
-            Err(_) => {
-                interrupt(thread, &mut usage).await;
-                Err(anyhow::Error::new(CutOff(time)))
+        None => turn(thread, spec, &mut progress, recorder).await,
+        Some(time) => {
+            match tokio::time::timeout(time, turn(thread, spec, &mut progress, recorder)).await {
+                Ok(ended) => ended,
+                Err(_) => {
+                    interrupt(thread, &mut progress).await;
+                    Err(anyhow::Error::new(CutOff(time)))
+                }
             }
-        },
+        }
     };
-    (ended, usage)
+    (ended, progress)
 }
 
 /// Interrupt the running turn and wait, briefly, for it to stop, keeping
-/// any usage it reports on the way.
-async fn interrupt(thread: &CodexThread, usage: &mut Option<(i64, i64, i64)>) {
+/// any usage it reports on the way. A turn that completed before the
+/// interrupt took says so; one aborted keeps where it was when stopped.
+async fn interrupt(thread: &CodexThread, progress: &mut Progress) {
     if thread.submit(Op::Interrupt).await.is_err() {
         return;
     }
     let _ = tokio::time::timeout(INTERRUPT_PATIENCE, async {
         while let Ok(event) = thread.next_event().await {
-            match event.msg {
-                EventMsg::TokenCount(count) => {
-                    if let Some(info) = count.info {
-                        let t = info.total_token_usage;
-                        *usage = Some((t.input_tokens, t.output_tokens, t.total_tokens));
-                    }
-                }
-                EventMsg::TurnAborted(_) | EventMsg::TurnComplete(_) => break,
+            match &event.msg {
+                EventMsg::TokenCount(_)
+                | EventMsg::RawResponseCompleted(_)
+                | EventMsg::TurnComplete(_) => progress.observe(&event.msg),
                 _ => {}
+            }
+            if matches!(
+                event.msg,
+                EventMsg::TurnAborted(_) | EventMsg::TurnComplete(_)
+            ) {
+                break;
             }
         }
     })
@@ -1679,7 +2328,8 @@ async fn interrupt(thread: &CodexThread, usage: &mut Option<(i64, i64, i64)>) {
 async fn turn(
     thread: &CodexThread,
     spec: &TurnSpec,
-    usage: &mut Option<(i64, i64, i64)>,
+    progress: &mut Progress,
+    recorder: &mut ProgressLog<'_>,
 ) -> anyhow::Result<String> {
     // Codex sends TurnComplete before it marks the thread idle, so a follow-up
     // turn submitted straight after one can be declined as NotIdle. That
@@ -1710,13 +2360,14 @@ async fn turn(
 
     loop {
         let event = thread.next_event().await.context("read Codex event")?;
+        progress.observe(&event.msg);
+        if matches!(
+            event.msg,
+            EventMsg::TokenCount(_) | EventMsg::RawResponseCompleted(_)
+        ) {
+            recorder.note(progress).await;
+        }
         match event.msg {
-            EventMsg::TokenCount(count) => {
-                if let Some(info) = count.info {
-                    let t = info.total_token_usage;
-                    *usage = Some((t.input_tokens, t.output_tokens, t.total_tokens));
-                }
-            }
             EventMsg::TurnComplete(done) => {
                 return done
                     .last_agent_message
@@ -1740,6 +2391,242 @@ mod tests {
     use super::*;
     use crate::testing::{FakeModel, Reply};
 
+    #[cfg(unix)]
+    #[test]
+    fn the_file_behind_a_link_in_a_denied_directory_is_denied_too() {
+        let dir = scratch("linked-deny");
+        let config = dir.join("config/atomic");
+        std::fs::create_dir_all(&config).expect("config dir");
+        std::fs::create_dir_all(dir.join("kept")).expect("kept");
+        std::fs::create_dir_all(dir.join("codex")).expect("codex home");
+        std::fs::write(dir.join("kept/config.yaml"), "x").expect("kept file");
+        let _ = std::fs::remove_file(config.join("config.yaml"));
+        std::os::unix::fs::symlink(dir.join("kept/config.yaml"), config.join("config.yaml"))
+            .expect("link");
+        let private = PrivateState {
+            state_dir: dir.join("state"),
+            private: dir.join("private"),
+            also: vec![config.clone()],
+        };
+        let (denied, _) = denied_paths(&private, &dir.join("codex"), None, &[]).expect("denied");
+        let kept = std::fs::canonicalize(dir.join("kept/config.yaml")).expect("real");
+        assert!(denied.contains(&kept), "{denied:?}");
+        assert!(
+            !denied.contains(&std::fs::canonicalize(dir.join("kept")).expect("real")),
+            "only the file the link names: {denied:?}"
+        );
+    }
+
+    #[test]
+    fn the_credential_places_are_found_wherever_the_environment_moves_them() {
+        let env = |vars: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                vars.iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, v)| std::ffi::OsString::from(v))
+            }
+        };
+        let has = |secrets: &[PathBuf], path: &str| secrets.contains(&PathBuf::from(path));
+        // HOME and the password database's home, when they differ.
+        let secrets =
+            home_secrets(&env(&[("HOME", "/srv/home")]), Some("/home/dev".into())).expect("homes");
+        for path in [
+            "/srv/home/.ssh",
+            "/home/dev/.ssh",
+            "/home/dev/.cargo/credentials.toml",
+        ] {
+            assert!(has(&secrets, path), "{path}: {secrets:?}");
+        }
+        // Cargo reads its config in every directory above a project, so it
+        // stays readable; the tokens are in its credentials.
+        assert!(
+            !has(&secrets, "/home/dev/.cargo/config.toml"),
+            "{secrets:?}"
+        );
+        // With no home at all, nothing runs.
+        assert!(home_secrets(&env(&[]), None).is_err());
+        assert!(home_secrets(&env(&[("HOME", "relative")]), None).is_err());
+        // What the variables move.
+        let secrets = home_secrets(
+            &env(&[
+                ("HOME", "/home/dev"),
+                ("XDG_CONFIG_HOME", "/cfg"),
+                ("XDG_CACHE_HOME", "/cch"),
+                ("XDG_DATA_HOME", "/dat"),
+                ("CODEX_HOME", "/cdx"),
+                ("AWS_CONFIG_FILE", "/aws/config"),
+                ("npm_config_userconfig", "/npm/rc"),
+                ("CARGO_HOME", "/opt/cargo"),
+                ("ZDOTDIR", "/zdot"),
+                ("HISTFILE", "/hist/bash"),
+                ("GNUPGHOME", "/gpg"),
+                ("KUBECONFIG", "/k/a:/k/b:relative"),
+                ("DOCKER_CONFIG", "/dock"),
+                ("AWS_SHARED_CREDENTIALS_FILE", "/aws/creds"),
+                ("NETRC", "/n/netrc"),
+                ("PASSWORD_STORE_DIR", "/pass"),
+            ]),
+            None,
+        )
+        .expect("homes");
+        for path in [
+            "/cfg/gh",
+            "/cfg/git/credentials",
+            "/cch/huggingface/token",
+            "/opt/cargo/credentials.toml",
+            "/dat/keyrings",
+            "/dat/fish",
+            "/cdx",
+            "/aws/config",
+            "/npm/rc",
+            "/zdot/.zshrc",
+            "/hist/bash",
+            "/gpg",
+            "/k/a",
+            "/k/b",
+            "/dock/config.json",
+            "/aws/creds",
+            "/n/netrc",
+            "/pass",
+        ] {
+            assert!(has(&secrets, path), "{path}: {secrets:?}");
+        }
+        assert!(!has(&secrets, "relative"));
+        assert!(!has(&secrets, "/opt/cargo/config.toml"), "{secrets:?}");
+    }
+
+    /// A link at `link` to `target`, replacing what was there.
+    #[cfg(unix)]
+    fn link(target: &Path, link: &Path) {
+        let _ = std::fs::remove_file(link);
+        std::fs::create_dir_all(link.parent().expect("parent")).expect("parent");
+        std::os::unix::fs::symlink(target, link).expect("link");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_the_persons_own_files_and_directories_are_denied_behind_links() {
+        let dir = scratch("deniable");
+        let home = dir.join("home");
+        std::fs::create_dir_all(dir.join("codex")).expect("codex home");
+        std::fs::create_dir_all(home.join(".ssh")).expect("ssh");
+        // A history kept nowhere, a known-hosts file thrown away, and a
+        // tool linked to the system's: denying any would break commands.
+        link(Path::new("/dev/null"), &home.join(".bash_history"));
+        link(Path::new("/dev/null"), &home.join(".ssh/known_hosts"));
+        link(Path::new("/usr/bin/env"), &home.join(".ssh/bin/env"));
+        std::fs::write(home.join(".ssh/kept"), "x").expect("kept");
+        link(&home.join(".ssh/kept"), &home.join(".ssh/deep/key"));
+        let private = PrivateState {
+            state_dir: dir.join("state"),
+            private: dir.join("private"),
+            // A variable naming /dev/null, too.
+            also: vec![
+                home.join(".bash_history"),
+                home.join(".ssh"),
+                PathBuf::from("/dev/null"),
+            ],
+        };
+        let (denied, _) = denied_paths(&private, &dir.join("codex"), None, &[]).expect("denied");
+        for system in ["/dev/null", "/usr/bin/env"] {
+            assert!(
+                !denied.iter().any(|d| Path::new(system).starts_with(d)),
+                "{system}: {denied:?}"
+            );
+        }
+        assert!(denied.contains(&home.join(".ssh")), "{denied:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nothing_runs_when_a_denial_would_cover_what_commands_need_or_may_write() {
+        let dir = scratch("covering");
+        let home = dir.join("home");
+        let codex = dir.join("codex");
+        let work = dir.join("work");
+        for d in [&codex, &work, &home.join(".aws"), &home.join("project")] {
+            std::fs::create_dir_all(d).expect("dir");
+        }
+        let refused = |also: Vec<PathBuf>, cwd: Option<&Path>, writable: &[PathBuf]| {
+            let private = PrivateState {
+                state_dir: dir.join("state"),
+                private: dir.join("private"),
+                also,
+            };
+            denied_paths(&private, &codex, cwd, writable)
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default()
+        };
+        // A variable naming the root, or a directory the thread works in,
+        // or the thread's Codex home.
+        assert!(refused(vec!["/".into()], None, &[]).contains("need"));
+        let project = home.join("project");
+        assert!(refused(vec![home.clone()], Some(&project), &[]).contains("need"));
+        assert!(refused(vec![dir.clone()], None, &[]).contains("need"));
+        // A secret linked into a directory the thread may write.
+        std::fs::write(work.join("creds"), "x").expect("creds");
+        link(&work.join("creds"), &home.join(".aws/credentials"));
+        let message = refused(vec![home.join(".aws")], None, std::slice::from_ref(&work));
+        assert!(message.contains("may write"), "{message}");
+        // Too many links to follow.
+        std::fs::remove_file(home.join(".aws/credentials")).expect("unlink");
+        let many = home.join(".kube");
+        std::fs::create_dir_all(&many).expect("kube");
+        std::fs::write(dir.join("one"), "x").expect("one");
+        for i in 0..=MAX_LINK_TARGETS {
+            link(&dir.join("one"), &many.join(format!("l{i}")));
+        }
+        assert!(refused(vec![many], None, &[]).contains("links"));
+        // And the same places, safely, run.
+        assert_eq!(refused(vec![home.join(".aws")], Some(&project), &[]), "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_secret_is_denied_as_what_it_points_at_and_links_are_followed_deep() {
+        let dir = scratch("linked-secrets");
+        let home = dir.join("home");
+        std::fs::create_dir_all(home.join("dotfiles")).expect("dotfiles");
+        std::fs::create_dir_all(home.join("keys")).expect("keys");
+        std::fs::create_dir_all(home.join(".aws/deep")).expect("aws");
+        std::fs::create_dir_all(dir.join("elsewhere")).expect("elsewhere");
+        std::fs::create_dir_all(dir.join("codex")).expect("codex home");
+        std::fs::write(home.join("dotfiles/bashrc"), "x").expect("bashrc");
+        std::fs::write(dir.join("elsewhere/credentials"), "x").expect("creds");
+        let _ = std::fs::remove_file(home.join(".bashrc"));
+        std::os::unix::fs::symlink(home.join("dotfiles/bashrc"), home.join(".bashrc"))
+            .expect("link");
+        let _ = std::fs::remove_file(home.join(".ssh"));
+        std::os::unix::fs::symlink(home.join("keys"), home.join(".ssh")).expect("link");
+        let _ = std::fs::remove_file(home.join(".aws/deep/credentials"));
+        std::os::unix::fs::symlink(
+            dir.join("elsewhere/credentials"),
+            home.join(".aws/deep/credentials"),
+        )
+        .expect("link");
+        let private = PrivateState {
+            state_dir: dir.join("state"),
+            private: dir.join("private"),
+            also: vec![home.join(".bashrc"), home.join(".ssh"), home.join(".aws")],
+        };
+        let (denied, _) = denied_paths(&private, &dir.join("codex"), None, &[]).expect("denied");
+        let real = |p: &Path| std::fs::canonicalize(p).expect("real");
+        assert!(
+            denied.contains(&real(&home.join("dotfiles/bashrc"))),
+            "{denied:?}"
+        );
+        assert!(denied.contains(&real(&home.join("keys"))), "{denied:?}");
+        // No mount on a link: the links themselves are not in the list.
+        assert!(!denied.contains(&home.join(".bashrc")), "{denied:?}");
+        assert!(!denied.contains(&home.join(".ssh")), "{denied:?}");
+        // A link two levels down, to a file outside the denied directory.
+        assert!(
+            denied.contains(&real(&dir.join("elsewhere/credentials"))),
+            "{denied:?}"
+        );
+    }
+
     #[test]
     fn a_denied_path_inside_another_is_left_to_it() {
         let dir = scratch("nested-deny");
@@ -1752,7 +2639,7 @@ mod tests {
             private: dir.join("private"),
             also: vec![credentials.clone(), dir.join("key"), config.clone()],
         };
-        let (denied, _) = denied_paths(&private, &dir.join("codex"));
+        let (denied, _) = denied_paths(&private, &dir.join("codex"), None, &[]).expect("denied");
         assert!(denied.contains(&config), "{denied:?}");
         assert!(denied.contains(&dir.join("key")), "{denied:?}");
         assert!(
@@ -2071,6 +2958,46 @@ mod tests {
         }
     }
 
+    /// The helper's stage is read from its own options only: a command that
+    /// is, or holds, the inner stage's flag leaves the outer stage outer.
+    #[test]
+    fn only_the_helpers_own_options_name_its_inner_stage() {
+        let args = |a: &[&str]| a.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
+        let helper = "/x/codex-linux-sandbox";
+        for inner in [
+            &[
+                helper,
+                "--sandbox-policy-cwd",
+                "/w",
+                "--apply-seccomp-then-exec",
+                "--",
+                "ls",
+            ][..],
+            &[
+                helper,
+                "--apply-seccomp-then-exec",
+                "--",
+                "--apply-seccomp-then-exec",
+            ][..],
+        ] {
+            assert!(is_inner_stage(args(inner)), "{inner:?}");
+        }
+        for outer in [
+            &[
+                helper,
+                "--sandbox-policy-cwd",
+                "/w",
+                "--",
+                "--apply-seccomp-then-exec",
+            ][..],
+            &[helper, "--", "/bin/bash", "-c", "--apply-seccomp-then-exec"][..],
+            &[helper, "--sandbox-policy-cwd", "/w", "--", "ls"][..],
+            &["--apply-seccomp-then-exec"][..],
+        ] {
+            assert!(!is_inner_stage(args(outer)), "{outer:?}");
+        }
+    }
+
     #[test]
     fn commands_get_only_core_and_declared_variables() {
         let inherited = [
@@ -2145,7 +3072,8 @@ mod tests {
         use crate::typed::Sandbox;
         let home = Path::new("/state/codex");
         let profile = |sandbox| {
-            permission_profile(sandbox, &StateGuard::NoProjectState, home).expect("profile")
+            permission_profile(sandbox, &StateGuard::NoProjectState, home, None, &[])
+                .expect("profile")
         };
         assert_eq!(profile(Sandbox::ReadOnly), PermissionProfile::read_only());
         assert_eq!(
@@ -2216,8 +3144,9 @@ mod tests {
             private: state.join("private"),
             also: vec![dir.join("keys"), dir.join("credentials")],
         });
-        let write = permission_profile(Sandbox::WorkspaceWrite, &guard, &home).expect("rw");
-        let read = permission_profile(Sandbox::ReadOnly, &guard, &home).expect("ro");
+        let write =
+            permission_profile(Sandbox::WorkspaceWrite, &guard, &home, None, &[]).expect("rw");
+        let read = permission_profile(Sandbox::ReadOnly, &guard, &home, None, &[]).expect("ro");
         let p = |rel: &str| state.join(rel).display().to_string();
         let worktree = p("worktrees/run/step");
         let cache = p("cache");
@@ -2233,8 +3162,9 @@ mod tests {
             assert_eq!(at(&p("codex/auth.json")), Deny);
             assert_eq!(at(&p("codex/log/x")), Deny);
             assert_eq!(at(&p("codex/tmp/other/x")), Deny);
+            // Shell snapshots are off, and none is readable.
+            assert_eq!(at(&p("codex/shell_snapshots/t.sh")), Deny);
             // What Codex's shell needs, and the thread's own checkout.
-            assert_eq!(at(&p("codex/shell_snapshots/t.sh")), Read);
             assert_eq!(at(&p("codex/tmp/arg0-linux/codex-linux-sandbox")), Read);
             assert_eq!(at(&format!("{worktree}/src/lib.rs")), own);
             assert_eq!(at("/usr/bin/git"), Read);
@@ -2385,6 +3315,7 @@ mod tests {
             "bwrap: Creating new namespace failed: Operation not permitted",
             "bwrap: Can't mount proc on /newroot/proc: Operation not permitted",
             "bwrap: setting up uid map: Permission denied",
+            "bwrap: Can't mount on symlink destination /home/dev/.bashrc: Invalid argument",
             "thread 'main' panicked at linux-sandbox/src/launcher.rs:60:13:\nbubblewrap is \
              unavailable: no system bwrap was found on PATH",
             "thread 'main' panicked at x.rs:1:1:\nfailed to exec system bubblewrap /usr/bin/bwrap: \
@@ -2489,10 +3420,11 @@ mod tests {
         (ended, settled, model.calls())
     }
 
-    const ONE: Outcome = Outcome::Reported(Usage {
+    const ONE_USAGE: Usage = Usage {
         input_tokens: 1,
         output_tokens: 1,
-    });
+    };
+    const ONE: Outcome = Outcome::Reported(ONE_USAGE);
 
     #[test]
     fn each_turn_settles_with_what_the_thread_grew_by_and_a_silent_turn_as_unknown() {
@@ -2568,6 +3500,109 @@ mod tests {
             assert!(format!("{e:#}").contains("cut off"), "{e:#}");
             assert!(began.elapsed() < std::time::Duration::from_secs(20));
             assert_eq!(settled, [Outcome::Unknown]);
+        });
+    }
+
+    #[test]
+    fn a_turn_whose_last_response_breaks_off_is_charged_as_one_in_flight() {
+        on_codex_runtime(async {
+            // The first request reports its usage and calls a tool; every
+            // later response begins and breaks off, Codex's retries too.
+            let mut replies = vec![Reply::Tool {
+                name: "no_such_tool".into(),
+                arguments: serde_json::json!({}),
+            }];
+            replies.extend((0..12).map(|_| Reply::Broken("par".into())));
+            let (ended, settled, calls) =
+                metered_conversation("broken", replies, 1, Limit::default()).await;
+            assert!(ended.is_err(), "the turn failed");
+            assert!((3..=13).contains(&calls), "{calls}");
+            assert_eq!(
+                settled,
+                [Outcome::Partial {
+                    reported: ONE_USAGE,
+                    last: Some(ONE_USAGE),
+                }]
+            );
+        });
+    }
+
+    #[test]
+    fn a_request_is_in_flight_unless_the_turn_completed_or_was_refused() {
+        let at = |streaming, completed| Progress {
+            streaming,
+            completed,
+            ..Progress::default()
+        };
+        // Cut off at any point but after completing: waiting on a request,
+        // as a response streamed, or while a tool ran, which may have
+        // yielded to further requests.
+        assert!(at(false, false).in_flight(true, true));
+        assert!(at(true, false).in_flight(true, true));
+        assert!(!at(false, true).in_flight(true, true));
+        // A failure is in flight only if a response broke off midway, not
+        // when a request was refused outright.
+        assert!(at(true, false).in_flight(false, true));
+        assert!(!at(false, false).in_flight(false, true));
+        // A completed turn never is.
+        assert!(!at(false, true).in_flight(false, false));
+    }
+
+    #[test]
+    fn a_turns_totals_count_responses_whose_token_count_never_came() {
+        // A response completed, and the turn stopped before its totals.
+        let p = Progress {
+            usage: Some((10, 4, 14)),
+            responses: (30, 9),
+            ..Progress::default()
+        };
+        assert_eq!(p.totals((10, 4)), Some((40, 13, 53)));
+        // The totals already count it: nothing twice.
+        let p = Progress {
+            usage: Some((40, 13, 53)),
+            responses: (30, 9),
+            ..Progress::default()
+        };
+        assert_eq!(p.totals((10, 4)), Some((40, 13, 53)));
+        assert_eq!(Progress::default().totals((10, 4)), None);
+    }
+
+    #[test]
+    fn a_turn_cut_off_with_a_request_in_flight_is_settled_in_part() {
+        on_codex_runtime(async {
+            // The turn's first request reports its usage and calls a tool;
+            // the second is still in flight when its time runs out.
+            let (ended, settled, calls) = metered_conversation(
+                "inflight",
+                vec![
+                    Reply::Tool {
+                        name: "no_such_tool".into(),
+                        arguments: serde_json::json!({}),
+                    },
+                    Reply::Delayed {
+                        after: std::time::Duration::from_secs(30),
+                        reply: Box::new(Reply::Text("late".into())),
+                    },
+                ],
+                1,
+                Limit {
+                    output_tokens: None,
+                    time: Some(std::time::Duration::from_secs(3)),
+                },
+            )
+            .await;
+            let e = ended.expect_err("cut off");
+            assert!(format!("{e:#}").contains("cut off"), "{e:#}");
+            assert_eq!(calls, 2, "the second request was made");
+            // The first request's usage and one more request's bound: the
+            // second spent something no one has reported.
+            assert_eq!(
+                settled,
+                [Outcome::Partial {
+                    reported: ONE_USAGE,
+                    last: Some(ONE_USAGE),
+                }]
+            );
         });
     }
 }
