@@ -420,6 +420,11 @@ paths:
       operationId: lookup
       responses:
         "404": { description: no such thing, content: { application/json: { schema: { type: object } } } }
+  /extonly:
+    get:
+      operationId: extonly
+      responses:
+        x-internal: true
   /anything:
     get:
       operationId: anything
@@ -568,6 +573,50 @@ async fn each_success_is_checked_against_the_response_its_status_declares() {
     assert!(
         matches!(&error, CallError::Undeclared { status: 200, .. }),
         "{error}"
+    );
+}
+
+// A failure is a failure whatever the spec declares for it: its body is the
+// error the server sent, not a result, and it is held to no schema. atomic
+// keeps nothing of what an operation declares for its `404`, so a reply that
+// would break that declared schema still reaches the caller as the status
+// failure it is, carrying the body as the server sent it.
+#[tokio::test]
+async fn a_declared_failure_response_is_still_reported_as_a_failure() {
+    // An array is no `object`, which is what `lookup` declares for its 404.
+    let (host, seen) = server(vec![(404, "[1, 2]")]).await;
+    let error = jobs(&host)
+        .call("lookup", &json!({}))
+        .await
+        .expect_err("a 404 is a failure");
+    match error {
+        CallError::Status {
+            operation,
+            status,
+            body,
+        } => {
+            assert_eq!(operation, "lookup");
+            assert_eq!(status, 404);
+            assert_eq!(body, "[1, 2]", "the error the server sent, as it sent it");
+        }
+        other => panic!("expected a failure of the status the server answered, got {other:?}"),
+    }
+    assert_eq!(seen.lock().expect("log").len(), 1, "a 404 is sent once");
+}
+
+// A key of `responses` that names no status declares no response, so an
+// operation whose only such key is an extension declares no response at all:
+// its reply is passed through as an operation with no `responses` map has
+// always passed its own, not refused as a status nobody declared.
+#[tokio::test]
+async fn an_extension_under_responses_declares_nothing_to_check_a_reply_against() {
+    let (host, _) = server(vec![(200, r#"{"anything": 1}"#)]).await;
+    assert_eq!(
+        jobs(&host)
+            .call("extonly", &json!({}))
+            .await
+            .expect("no response declared"),
+        json!({ "anything": 1 })
     );
 }
 

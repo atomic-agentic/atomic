@@ -27,11 +27,16 @@
 //! body declared only under a wildcard still leaves a required body
 //! unsupported.
 //!
-//! Each response says which of three things it declares about its body — no
-//! `content` map at all, a `content` map with no schema to check against, or
-//! a schema under each media type it names one under — as [`ResponseBody`].
-//! Only the first says there is no body to read; only the last says what
-//! shape the body has.
+//! Each response a success can be checked against says which of three things
+//! it declares about its body — no `content` map at all, a `content` map with
+//! no schema to check against, or a schema under each media type it names one
+//! under — as [`ResponseBody`]. Only the first says there is no body to read;
+//! only the last says what shape the body has. A response declared for a
+//! status that is not a success is kept as a key with nothing beside it: what
+//! it declares about its body is never read, so its schema is never converted
+//! and can never be what makes the import of the spec fail. A key of
+//! `responses` under the `x-` prefix is the spec's own note rather than part
+//! of the operation, and declares no response at all.
 
 use serde_json::{Map, Value, json};
 
@@ -125,11 +130,14 @@ pub struct Operation {
     /// is [`Operation::response`], and within it whichever schema the reply's
     /// `Content-Type` names.
     pub output: Option<Value>,
-    /// Each response it declares, success or not, by the status it is
-    /// declared for as the spec writes it: a code such as `200` or `404`, a
-    /// range such as `2XX`, or `default`. Each says what it declares about
-    /// its body, see [`ResponseBody`].
-    pub responses: std::collections::BTreeMap<String, ResponseBody>,
+    /// Each response it declares, by the key the spec lists it under: a code
+    /// such as `200` or `404`, a range such as `2XX`, or `default`. A success's,
+    /// and `default`'s, says what it declares about its body, see
+    /// [`ResponseBody`]; any other key is kept with nothing beside it, because
+    /// atomic reads no such reply's body and so holds it to no schema. A key
+    /// under the `x-` prefix is the spec's own note rather than part of the
+    /// operation, names no response, and is not among these.
+    pub responses: std::collections::BTreeMap<String, Option<ResponseBody>>,
     /// Why atomic cannot call it, when it cannot: a required request body
     /// with no JSON media type.
     pub unsupported: Option<String>,
@@ -138,29 +146,33 @@ pub struct Operation {
 impl Operation {
     /// The response it declares for a success with `status`, and the key it
     /// is declared under, as OpenAPI picks one: the status's own code, else
-    /// its range (`2XX`, in either case), else `default`. `None` for a
-    /// status that is not a success (outside 200 to 299), whose body atomic
-    /// never checks, and for a success it declares none of them for. What
-    /// the response declares about its body is the [`ResponseBody`] it
-    /// comes with; a status can select one that declares no body as well as
-    /// one whose body has a schema. A response that declares a schema under
-    /// more than one media type leaves which of them governs a reply to the
-    /// reply's `Content-Type`, which is not known here.
+    /// its range (`2XX`, in either case), else `default`. `None` for a status
+    /// that is not a success (outside 200 to 299), whose body atomic never
+    /// checks, and for a success it declares none of them for. Every response
+    /// a success can reach keeps what it declares about its body, the
+    /// [`ResponseBody`] it comes with: a status can select one that declares
+    /// no body as well as one whose body has a schema. A response that
+    /// declares a schema under more than one media type leaves which of them
+    /// governs a reply to the reply's `Content-Type`, which is not known here.
     pub fn response(&self, status: u16) -> Option<(&str, &ResponseBody)> {
         if !(200..=299).contains(&status) {
             return None;
         }
         let range = format!("{}XX", status / 100);
         let code = status.to_string();
-        self.responses
+        let (key, body) = self
+            .responses
             .get_key_value(&code)
             .or_else(|| {
                 self.responses
                     .iter()
                     .find(|(key, _)| key.eq_ignore_ascii_case(&range))
             })
-            .or_else(|| self.responses.get_key_value("default"))
-            .map(|(key, body)| (key.as_str(), body))
+            .or_else(|| self.responses.get_key_value("default"))?;
+        // A key kept with nothing beside it names no schema for a reply to
+        // fit, and never lends another response's. Only a failure's key is
+        // kept that way, so no status an operation answers reaches this.
+        Some((key.as_str(), body.as_ref()?))
     }
 }
 
@@ -202,6 +214,42 @@ pub fn media_essence(media: &str) -> String {
 fn is_wildcard_media(media: &str) -> bool {
     let essence = media_essence(media);
     essence == "*/*" || essence == "application/*"
+}
+
+/// Whether a response key names a reply whose body atomic reads and so keeps
+/// a schema for: a code from `200` to `299`, a `2XX` range in either case, or
+/// `default`, which is what a success the spec gives no code for falls back
+/// to. Any other key names a reply atomic never reads the body of — another
+/// range, any other code — or names no status at all, so nothing is converted
+/// or compiled for it.
+fn success_key(code: &str) -> bool {
+    if code == "default" {
+        return true;
+    }
+    if is_range_key(code) {
+        return code.as_bytes()[0] == b'2';
+    }
+    match code.parse::<u16>() {
+        Ok(status) => (200..=299).contains(&status),
+        Err(_) => false,
+    }
+}
+
+/// Whether a response key is a range such as `2XX` or `4xx`, in either case.
+fn is_range_key(code: &str) -> bool {
+    let bytes = code.as_bytes();
+    bytes.len() == 3 && bytes[0].is_ascii_digit() && bytes[1..].eq_ignore_ascii_case(b"xx")
+}
+
+/// Whether a key of a spec's `responses` object lists a response. `x-` is the
+/// one prefix OpenAPI gives a key that is the spec's own note rather than part
+/// of the operation, so an `x-internal` or `x-openapi` key declares no
+/// response: counting one would make an operation that declares only
+/// extensions declare a response after all. Any other key counts, however the
+/// spec spells it — a key naming no status keeps nothing beside it, see
+/// [`success_key`], and still stands as a response the operation declared.
+fn is_response_key(code: &str) -> bool {
+    !code.starts_with("x-")
 }
 
 /// What a response object declares about its body.
@@ -491,24 +539,39 @@ pub fn operations(spec: &Value) -> Result<Vec<Operation>, OpenApiError> {
             if !required.is_empty() {
                 input["required"] = Value::Array(required);
             }
-            // Every response it declares, each with what it declares for its
-            // body: a reply is checked against the one for its status, never
-            // another's, and against the schema of the media type its reply
-            // names, never another one's.
+            // Every response the spec lists, each with what it declares for
+            // its body: a reply is checked against the one for its status,
+            // never another's, and against the schema of the media type its
+            // reply names, never another one's. A key naming no status atomic
+            // reads a body for keeps nothing beside it, and a key naming no
+            // response at all is not kept.
             let mut kept = std::collections::BTreeMap::new();
             if let Some(responses) = operation.get("responses").and_then(Value::as_object) {
                 for (code, response) in responses {
+                    if !is_response_key(code) {
+                        continue;
+                    }
+                    if !success_key(code) {
+                        // Only a success's body, or the body of the default a
+                        // success falls back to, is ever checked, so this
+                        // response's schema is never converted and never
+                        // compiled: a reference in a `404` that does not
+                        // resolve cannot stop the import of the operation,
+                        // whose `200` is still checked.
+                        kept.insert(code.clone(), None);
+                        continue;
+                    }
                     let response = resolve(spec, response, &at)?;
                     let mut body = declared_body(&response);
                     for schema in body.schemas_mut() {
                         *schema = convert(schema, &format!("{at}/responses/{code}"))?;
                     }
-                    kept.insert(code.clone(), body);
+                    kept.insert(code.clone(), Some(body));
                 }
             }
             if !defs.is_empty() {
                 input["$defs"] = Value::Object(defs.clone());
-                for body in kept.values_mut() {
+                for body in kept.values_mut().flatten() {
                     for schema in body.schemas_mut() {
                         if let Value::Object(map) = schema {
                             map.insert("$defs".into(), Value::Object(defs.clone()));
@@ -516,13 +579,17 @@ pub fn operations(spec: &Value) -> Result<Vec<Operation>, OpenApiError> {
                     }
                 }
             }
-            // The first schema of the first success, in the map's sorted
-            // order, else default's.
+            // The schema of the first key beginning with `2`, in the map's
+            // sorted order, else `default`'s: the first success, for any spec
+            // that spells its codes as OpenAPI says. Only a key naming a
+            // success keeps a schema, so an odd key such as a bare `2`
+            // describes no output.
             let output = kept
                 .iter()
                 .find(|(code, _)| code.starts_with('2'))
                 .or_else(|| kept.get_key_value("default"))
-                .and_then(|(_, body)| body.schema().cloned());
+                .and_then(|(_, body)| body.as_ref())
+                .and_then(|body| body.schema().cloned());
             let description = operation["summary"]
                 .as_str()
                 .or_else(|| operation["description"].as_str())

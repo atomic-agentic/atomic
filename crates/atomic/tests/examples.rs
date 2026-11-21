@@ -435,6 +435,27 @@ fn atomic_check_reads_openapi_toolsets() {
         "{error}"
     );
     std::fs::remove_file(dir.join("toolsets/media.openapi.yaml")).expect("remove");
+    // A failure response is not one a reply is checked against, so nothing of
+    // it is compiled: a `404` whose schema reaches for a component that is not
+    // in the spec does not fail the check, and the operation beside it is
+    // imported with its `200`.
+    std::fs::write(
+        dir.join("toolsets/failed.openapi.yaml"),
+        "openapi: 3.1.0\ninfo: { title: Failed, version: '1' }\npaths:\n  /thing:\n    get:\n      operationId: thing\n      responses:\n        '200': { description: ok, content: { application/json: { schema: { type: object } } } }\n        '404': { description: no such thing, content: { application/json: { schema: { $ref: '#/components/schemas/Nowhere' } } } }\n        '500': { description: broken, content: { application/json: { schema: { type: 12 } } } }\n",
+    )
+    .expect("spec");
+    let output = check();
+    assert!(
+        output.status.success(),
+        "a failure response's broken schema failed the check: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("2 toolset operations"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    std::fs::remove_file(dir.join("toolsets/failed.openapi.yaml")).expect("remove");
     std::fs::write(
         dir.join("toolsets/broken.openapi.yaml"),
         "swagger: '2.0'\npaths: {}\n",

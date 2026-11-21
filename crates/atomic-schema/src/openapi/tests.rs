@@ -20,6 +20,17 @@ fn declared_media(body: &ResponseBody) -> Vec<&str> {
     body.schemas().map(|(media, _)| media.as_str()).collect()
 }
 
+/// What `op` keeps beside the response key `code`, which must be there and
+/// must keep something: only a status whose reply atomic never reads keeps
+/// nothing beside its key.
+fn kept<'a>(op: &'a Operation, code: &str) -> &'a ResponseBody {
+    op.responses
+        .get(code)
+        .unwrap_or_else(|| panic!("`{code}` is not declared"))
+        .as_ref()
+        .unwrap_or_else(|| panic!("`{code}` keeps nothing beside its key"))
+}
+
 /// One forecast API, written once for OpenAPI 3.0 and once for 3.1, in
 /// each version's own dialect.
 const V30: &str = r##"openapi: 3.0.3
@@ -192,7 +203,7 @@ fn an_operation_becomes_one_input_object_with_its_parameters_and_body() {
         }
         // Every schema a response declares, not only the first: the executor
         // checks a reply against whichever media type it names.
-        for body in op.responses.values() {
+        for body in op.responses.values().flatten() {
             for (_, schema) in body.schemas() {
                 registry.validator_for(schema).expect("response schema");
             }
@@ -312,10 +323,22 @@ components:
     );
     let ops = operations(&spec).expect("spec");
     let op = &ops[0];
-    // Every declared response is kept, a failure's too.
+    // Every declared response is kept, a failure's too, but a failure keeps
+    // nothing beside its key: its schema is never read, so it is never what
+    // makes the import fail.
     assert_eq!(
         op.responses.keys().map(String::as_str).collect::<Vec<_>>(),
         ["200", "202", "204", "2xx", "404", "default"]
+    );
+    assert_eq!(
+        op.responses.get("404"),
+        Some(&None),
+        "the 404's schema is not kept"
+    );
+    assert_eq!(
+        kept(op, "200").schema().map(|s| s["required"].clone()),
+        Some(json!(["result"])),
+        "the success's schema is kept"
     );
     let picked = |status: u16| op.response(status).map(|(key, body)| (key, body.clone()));
     assert_eq!(
@@ -332,8 +355,10 @@ components:
         Some(("2xx", Some(json!("string")))),
         "a range, in either case"
     );
-    // A success outside every code and range takes default; a failure is
-    // never picked, whatever it declares.
+    // 299 has no code of its own, but it is inside the `2xx` range, which is
+    // what picks it; only a success outside every code and every range takes
+    // `default`, as the spec after this one shows. A failure is never picked,
+    // whatever it declares.
     assert_eq!(picked(299).map(|(k, _)| k), Some("2xx"));
     let only_codes = operations(&yaml(
         r#"openapi: 3.1.0
@@ -396,7 +421,7 @@ paths:
     ))
     .expect("spec");
     let op = &ops[0];
-    let declared = |code: &str| op.responses.get(code).expect("declared");
+    let declared = |code: &str| kept(op, code);
     assert_eq!(*declared("200"), ResponseBody::NoBody);
     assert_eq!(
         *declared("201"),
@@ -558,7 +583,7 @@ components:
     ))
     .expect("spec");
     let op = ops.iter().find(|op| op.name == "thing").expect("the get");
-    let thing = op.responses.get("200").expect("200");
+    let thing = kept(op, "200");
     assert_eq!(
         declared_media(thing),
         [
@@ -594,14 +619,14 @@ components:
     // beside it is kept, and the wildcard stays preempted by any JSON media
     // type that names a schema.
     assert_eq!(
-        declared_media(op.responses.get("201").expect("201")),
+        declared_media(kept(op, "201")),
         ["application/vnd.acme.ack+json"],
         "the only schema it declares"
     );
     // The media type is kept as written, so a spec that spells the same type
     // two ways keeps both, in the order the executor walks them.
     assert_eq!(
-        declared_media(op.responses.get("202").expect("202")),
+        declared_media(kept(op, "202")),
         [
             "Application/JSON; charset=utf-8",
             "application/problem+json"
@@ -610,10 +635,7 @@ components:
     );
     // A response whose only JSON media type names no schema still declares a
     // body nothing describes.
-    assert_eq!(
-        *op.responses.get("203").expect("203"),
-        ResponseBody::NoJsonSchema
-    );
+    assert_eq!(*kept(op, "203"), ResponseBody::NoJsonSchema);
     // A `+json` type is a JSON media type whichever tree it sits under, so a
     // request body declared under one is one atomic can send: the operation
     // stays callable, with that schema as its `body`.
@@ -626,4 +648,171 @@ components:
         echo.input["properties"]["body"],
         json!({ "type": "object" })
     );
+}
+
+// atomic never reads the body of a reply that is not a success, so a failure
+// response keeps no schema: nothing of it is converted, resolved or compiled.
+// That is what keeps a `404` whose reference does not resolve from refusing
+// the whole spec — and the operation's own `200`, which is what a reply is
+// checked against, is kept and compiles all the same. `default` is the
+// exception: a success the spec gives no code for is checked against it, so a
+// schema that cannot be resolved there still refuses the spec.
+#[test]
+fn a_failure_response_keeps_no_schema_so_its_broken_schema_cannot_refuse_the_spec() {
+    let ops = operations(&yaml(
+        r##"openapi: 3.1.0
+info: { title: Orders, version: "1" }
+paths:
+  /orders/{id}:
+    get:
+      operationId: order
+      responses:
+        "200":
+          description: the order
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Order" } }
+        "404":
+          description: no such order, described by a schema that is not here
+          content:
+            application/json: { schema: { $ref: "#/components/schemas/Nowhere" } }
+        "5XX":
+          description: a range, with a body no schema describes
+          content:
+            application/json: {}
+        default:
+          description: the problem it carries
+          content:
+            application/problem+json: { schema: { $ref: "#/components/schemas/Problem" } }
+components:
+  schemas:
+    Order: { type: object, required: [order], properties: { order: { type: string } } }
+    Problem: { type: object, required: [title], properties: { title: { type: string } } }
+"##,
+    ))
+    .expect("a broken failure schema does not refuse the spec");
+    let op = &ops[0];
+    assert_eq!(
+        op.responses.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["200", "404", "5XX", "default"],
+        "each is still declared, so a status the spec gives no success for is refused"
+    );
+    assert_eq!(op.responses.get("404"), Some(&None));
+    assert_eq!(op.responses.get("5XX"), Some(&None));
+    assert_eq!(op.response(404), None, "a failure is never checked");
+    // What a success is checked against is untouched: its own `200`, and
+    // `default` for a success no code names.
+    let order = op.response(200).expect("200").1.schema().expect("a schema");
+    let registry = Registry::new();
+    let validator = registry.validator_for(order).expect("the 200 compiles");
+    assert!(validator.is_valid(&json!({ "order": "A-1" })));
+    assert!(!validator.is_valid(&json!({ "title": "not an order" })));
+    let default = kept(op, "default");
+    let validator = registry
+        .validator_for(default.schema().expect("a schema"))
+        .expect("default compiles");
+    assert!(validator.is_valid(&json!({ "title": "no such order" })));
+    assert!(!validator.is_valid(&json!({ "order": "A-1" })));
+    assert_eq!(
+        op.output.as_ref().map(|s| s["$ref"].clone()),
+        Some(json!("#/$defs/Order"))
+    );
+    // A 3.0 failure schema is not converted either: what the 3.0 dialect
+    // cannot convert stays out of the import, as long as it sits under a
+    // failure. The same schema under `default` is refused, because a success
+    // is checked against `default`.
+    let broken = r##"openapi: 3.0.3
+info: { title: Orders, version: "1" }
+paths:
+  /orders/{id}:
+    get:
+      operationId: order
+      responses:
+        "200": { description: ok, content: { application/json: { schema: { type: object } } } }
+        "422": { description: unprocessable, content: { application/json: { schema: { type: number, exclusiveMinimum: true } } } }
+"##;
+    let ops = operations(&yaml(broken)).expect("an unconvertible failure schema is kept out");
+    assert_eq!(ops[0].responses.get("422"), Some(&None));
+    let error = operations(&yaml(
+        r##"openapi: 3.0.3
+info: { title: Orders, version: "1" }
+paths:
+  /orders/{id}:
+    get:
+      operationId: order
+      responses:
+        default: { description: unprocessable, content: { application/json: { schema: { type: number, exclusiveMinimum: true } } } }
+"##,
+    ))
+    .expect_err("the same schema under default is converted, and cannot be");
+    assert!(
+        error.message.contains("without `minimum`"),
+        "{error} — a default schema is still converted"
+    );
+}
+
+// An `x-` key under `responses` is the spec's own note about the operation:
+// `x-` is the one prefix OpenAPI writes for a key that is not part of the
+// operation, so an extension declares no response. Counting one would make an
+// operation that declares only extensions declare a response after all, which
+// is what refuses a success the spec never described. Any other key counts,
+// however the spec spells it, and one naming no status keeps no schema.
+#[test]
+fn an_extension_key_under_responses_is_not_a_declared_response() {
+    let ops = operations(&yaml(
+        r##"openapi: 3.1.0
+info: { title: Notes, version: "1" }
+paths:
+  /notes:
+    get:
+      operationId: onlyExtensions
+      responses:
+        x-internal: true
+        x-openapi: { primaryMediaTypes: [application/json] }
+        "200": { description: ok, content: { application/json: { schema: { type: object } } } }
+  /nothing:
+    get:
+      operationId: nothingYet
+      responses:
+        x-internal: true
+  /odd:
+    get:
+      operationId: oddKey
+      responses:
+        latest: { description: no status spells this }
+"##,
+    ))
+    .expect("spec");
+    let op = &ops[0];
+    assert_eq!(
+        op.responses.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["200"],
+        "the extensions are not among what it declares"
+    );
+    assert_eq!(
+        *kept(op, "200"),
+        one("application/json", json!({ "type": "object" })),
+        "the response it does declare is kept as it was"
+    );
+    // An operation whose only `responses` key is an extension declares no
+    // response at all, which is what an operation with no `responses` map
+    // declares too.
+    assert!(
+        ops[1].responses.is_empty(),
+        "{:?}",
+        ops[1].responses.keys().collect::<Vec<_>>()
+    );
+    // A key that is no extension names no status either, but it is still a key
+    // of `responses`, so the operation declares a response and a success the
+    // spec gives none is refused rather than passed through. It keeps no
+    // schema, because it names no reply whose body atomic reads.
+    assert_eq!(
+        ops[2]
+            .responses
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["latest"],
+        "only an extension key is skipped"
+    );
+    assert_eq!(ops[2].responses.get("latest"), Some(&None));
 }

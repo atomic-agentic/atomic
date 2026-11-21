@@ -581,12 +581,12 @@ fn check(path: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
         let tools = atomic_schema::openapi::operations(&spec)
             .map_err(|e| anyhow::anyhow!("{}: {e}", source.path.display()))?;
         for tool in &tools {
-            // The executor checks each response against the schema of the
+            // The executor checks each success against the schema of the
             // media type its reply names, so every schema a response declares
-            // must compile, not only the first.
+            // must compile, not only the first. The tool's own `output` is one
+            // of those response schemas, so it is not compiled again.
             let mut schemas: Vec<&serde_json::Value> = vec![&tool.input];
-            schemas.extend(tool.output.as_ref());
-            for body in tool.responses.values() {
+            for body in tool.responses.values().flatten() {
                 schemas.extend(body.schemas().map(|(_media, schema)| schema));
             }
             for schema in schemas {

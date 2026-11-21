@@ -719,6 +719,11 @@ impl HttpToolset {
             }
             // Declares a body, declares no schema to fit it: passed through.
             Some((_, _)) => return Ok(value),
+            // Declares no response at all. The map is empty, which is what an
+            // operation whose `responses` held only extensions has too, since
+            // a key naming no status is no response. A failure's key is kept,
+            // so a map holding only those is not empty and its success is
+            // refused below, as every success no response covers is.
             None if operation.responses.is_empty() => return Ok(value),
             None => {
                 return Err(CallError::Undeclared {
