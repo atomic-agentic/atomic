@@ -898,7 +898,50 @@ fn a_gate_whose_approvers_do_not_resolve_is_refused_before_it_starts() {
         default: None,
     };
     let error = prepare(&loaded, &atoms, &server).expect_err("no approvers");
-    assert!(error.message.contains("check"), "{error}");
+    assert!(
+        error.message.contains(
+            "gate check: a shared deployment needs approvers; name an allowed group or set a \
+             default approver group in project policy"
+        ),
+        "{error}"
+    );
+    // Naming a group policy allows, the same workflow loads, and that group
+    // decides its gate; a group policy does not allow is refused.
+    let naming = |group: &str| {
+        let file = project.join(format!("workflows/gated-{group}.workflow.yaml"));
+        let named = gated().replace(
+            "      timeout: 24h\n",
+            &format!("      timeout: 24h\n      approvers: [{group}]\n"),
+        );
+        assert_ne!(named, gated(), "the gate names its approvers");
+        std::fs::write(&file, named).expect("workflow");
+        let loaded = workflow::load(&file, &atoms, &mut Registry::new()).expect("a gate is valid");
+        prepare(&loaded, &atoms, &server)
+    };
+    let pipeline = naming("maintainers").expect("an allowed group loads");
+    let gates: Vec<_> = pipeline
+        .steps
+        .iter()
+        .filter_map(|s| match s {
+            Step::Gate(g) => Some(g),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(gates.len(), 1);
+    assert_eq!(
+        gates[0].approvers.as_deref(),
+        Some(&["maintainers".to_owned()][..])
+    );
+    let resolved =
+        gate::resolve(&gates[0].id, gates[0].approvers.as_deref(), &server).expect("resolves");
+    assert_eq!(resolved.principals(), [Principal::group("maintainers")]);
+    let error = naming("ops").expect_err("not an allowed group");
+    assert!(
+        error
+            .message
+            .contains("gate check: ops is not an approver group project policy allows"),
+        "{error}"
+    );
 }
 
 #[test]

@@ -2050,6 +2050,119 @@ fn a_gate_decided_while_its_run_was_down_wakes_it_on_resume() {
 // needs_sandbox
 #[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
 #[test]
+fn a_gate_recovered_by_serve_keeps_its_first_deadline_and_is_approved_from_another_terminal() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
+            .await
+            .expect("fake model");
+        let dir = scratch("serve-gate");
+        let project = project(&dir);
+        let state = state_dir(&dir, &project);
+        let env = model_env(&model.base_url());
+        // Killed at its gate.
+        let mut first = spawn(
+            &dir,
+            &project,
+            &["run", "gated", "--run-id", "served-gate", "--data", NOTE],
+            &with(&env, &[]),
+            &dir.join("first.log"),
+        );
+        let rt = Durare::sqlite(&database(&state)).await.expect("store");
+        let opened = open_gate(&rt, "served-gate").await;
+        assert!(opened.deadline.is_some(), "the gate has a deadline");
+        first.kill().expect("SIGKILL the run");
+        first.wait().expect("reap");
+
+        // The operator's credential, enrolled and kept in the file store, as
+        // `atomic gates enroll` leaves it.
+        let secret = "the operator's secret";
+        let store = atomic_core::credential::FileSecrets::open(
+            &dir.join("atomic-home/credentials"),
+            &project,
+        )
+        .expect("the file store");
+        let account = format!(
+            "operator:dev@{}",
+            state.file_name().expect("a project id").to_string_lossy()
+        );
+        atomic_core::credential::SecretStore::save(&store, &account, secret).expect("kept");
+        gate::enroll(
+            &rt,
+            &gate::HumanCredential::new(Principal::local("dev"), secret),
+        )
+        .await
+        .expect("enrolled");
+
+        // A local serve recovers it.
+        let mut serve = spawn(
+            &dir,
+            &project,
+            &["serve"],
+            &with(&env, &[]),
+            &dir.join("serve.log"),
+        );
+        wait_until("serve to start", || {
+            std::fs::read_to_string(dir.join("serve.log"))
+                .is_ok_and(|l| l.contains("recovered 1 unfinished run(s); serving until stopped"))
+        });
+        let again = open_gate(&rt, "served-gate").await;
+        assert_eq!(
+            (again.id.clone(), again.opened_at, again.deadline),
+            (opened.id.clone(), opened.opened_at, opened.deadline),
+            "serve's recovery changed the gate"
+        );
+
+        // Another terminal approves it, with the operator's credential.
+        let (d, p, e, id) = (dir.clone(), project.clone(), env.clone(), opened.id.clone());
+        let out = tokio::task::spawn_blocking(move || {
+            atomic(
+                &d,
+                &p,
+                &["gates", "approve", &id],
+                &with(&e, &[("ATOMIC_CREDENTIAL_STORE", "file")]),
+                "",
+            )
+        })
+        .await
+        .expect("child");
+        assert!(out.status.success(), "{}", text(&out));
+        let started = Instant::now();
+        while rt.status("served-gate").await.expect("status") != Some(RunStatus::Succeeded) {
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "serve did not finish the approved run: {}",
+                std::fs::read_to_string(dir.join("serve.log")).unwrap_or_default()
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // Decided as it was first opened, and by the operator.
+        let decided = gate::find(&rt, &opened.id)
+            .await
+            .expect("gate")
+            .expect("exists");
+        assert_eq!(
+            (decided.opened_at, decided.deadline),
+            (opened.opened_at, opened.deadline)
+        );
+        let Some(gate::Resolution::Decided(decision)) = &decided.resolution else {
+            panic!("{:?}", decided.resolution);
+        };
+        assert_eq!(decision.verdict, Verdict::Approve);
+        assert_eq!(decision.by, Principal::local("dev"));
+        assert_eq!(model.calls(), 2, "rank once, summarize once");
+        terminate(&serve);
+        let status = tokio::task::spawn_blocking(move || wait_child(&mut serve, "serve"))
+            .await
+            .expect("child");
+        assert!(status.success());
+    });
+}
+
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[test]
 fn serve_started_after_a_kill_recovers_the_run_and_finishes_it() {
     #[cfg(target_os = "linux")]
     support::require_sandbox();
