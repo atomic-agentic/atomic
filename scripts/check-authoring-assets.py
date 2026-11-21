@@ -15,21 +15,12 @@ for base, entries in [(root,manifest['sources']),(assets,manifest['assets'])]:
 # text the minifier wrote; a rebuild can rename it. Each such switch must
 # still occur exactly once, or its control would no longer switch anything.
 def control_rows():
-    rows = sorted((root / 'scripts/controls').glob('*.row')) if (root / 'scripts/controls').is_dir() else []
-    if rows:
-        for row in rows:
-            yield row.name, row.read_text().strip()
-        return
-    script = (root / 'scripts/controls-check.sh').read_text()
-    body = script.split('CONTROLS=(', 1)[1].split('\n)', 1)[0]
-    for line in body.splitlines():
-        line = line.strip()
-        if line.startswith('"') and line.endswith('"'):
-            text = line[1:-1]
-            # Bash's double-quoted escapes.
-            for escaped, plain in [('\\"', '"'), ('\\`', '`'), ('\\$', '$'), ('\\\\', '\\')]:
-                text = text.replace(escaped, plain)
-            yield text.split('|', 1)[0], text
+    rows = sorted((root / 'scripts/controls').glob('*.row'))
+    if not rows:
+        raise SystemExit('scripts/controls holds no controls rows; the bundled worker\'s switches cannot be checked')
+    for row in rows:
+        text = row.read_text().strip()
+        yield text.split('|', 1)[0], text
 worker = (assets / 'worker.mjs').read_text()
 for name, row in control_rows():
     fields = row.split('|')

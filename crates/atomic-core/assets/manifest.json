@@ -11,13 +11,13 @@
     "authoring/src/intrinsics.mjs": "1998f7bcfb276501618e48635e9f26731197a29fab362727eb0682e60f3b6995",
     "authoring/src/capture.mjs": "d667165af6d3803738aa71a3e1d344727c95f96468d57376e187280c2c0d1cd7",
     "authoring/src/fences.mjs": "90fa798848e0db3b538466bf88d26eaa2bda9dad8991727b6e518785b9f627c0",
-    "authoring/src/balance.mjs": "6ad9dfc7ba4c29af67d921aa34d58dd2455614b047adfac15a14c0824c77b052",
+    "authoring/src/balance.mjs": "b28995c6eaabf58eb9ffdee04db1363bf720565cacacddb60881d4995cc73a0c",
     "authoring/authoring.d.ts": "0fc50932695142a995e3ab3f02cf3690c44d7e9b0b9df021dfcb64c920cf394a",
     "authoring/package.json": "6e093c23679caafc5c476e18c2b903a64eaecbf0437d4fe01d38ed74989b6036",
     "authoring/package-lock.json": "9aa4288a0c0f6c7d44c63d081d5eb8d510cf54c41c337e147d0cf60265f67346"
   },
   "assets": {
-    "worker.mjs": "d76ff15f0d14fcbf8679d17288ad32355281540506c4b7d7b4b4688604eb0d14",
+    "worker.mjs": "984113f02a6318404920c9c5f0102fcc7bbe1dc1a7819aa5c02597e4ba74136b",
     "worker.mjs.LEGAL.txt": "ab1fbb4a8cd93f8da2ecaf67e418c748cd6c2ef00609e7d60923fc46aa5745da",
     "astro.wasm": "a4ed5ef260d401dba6f172d52a3c27dbd933bfcd9b1698e91b430214c9701313",
     "TYPESCRIPT-LICENSE.txt": "a7d00bfd54525bc694b6e32f64c7ebcf5e6b7ae3657be5cc12767bce74654a47",

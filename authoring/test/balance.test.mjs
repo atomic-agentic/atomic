@@ -70,3 +70,12 @@ test('generated templates: balanced pass, and each mutation is refused', async (
     ]) assert.notEqual(await checked(mutated), null, mutated);
   }
 });
+
+// A closing tag's scan is linear: a long run of `</a` with no `>` after
+// it finishes at once.
+test('closing tags are scanned in linear time', () => {
+  const source = '</a'.repeat(262144 / 3);
+  const started = performance.now();
+  assert.equal(unbalanced(source, { type: 'root', children: [] }), null);
+  assert.ok(performance.now() - started < 1000, `took ${performance.now() - started} ms`);
+});

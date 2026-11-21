@@ -270,5 +270,29 @@
  [
   "<a>\r\nx\r\n</b>",
   "`</b>` closes <a>"
+ ],
+ [
+  "<section>\nintro\n<section>\ninner\n</section>\n",
+  "<section> is never closed; close it with `</section>`"
+ ],
+ [
+  "<notes>a\n<notes>b</notes>",
+  "<notes> is never closed; close it with `</notes>`"
+ ],
+ [
+  "<section>\ntext\n<!-- </section> -->",
+  "<section> is never closed; close it with `</section>`"
+ ],
+ [
+  "<section>{'</section>'}",
+  "<section> is never closed; close it with `</section>`"
+ ],
+ [
+  "<section>\n<Note hint=\"</section>\" />",
+  "<section> is never closed; close it with `</section>`"
+ ],
+ [
+  "<Style/x=\"/>\">\n{input.text}",
+  "<Style> is never closed; close it with `</Style>`"
  ]
 ]

@@ -91,11 +91,18 @@ function check(source, ast, named) {
     const { at, name } = mismatched.closer;
     return { offset: at, message: `\`</${name}>\` closes ${shown(mismatched.name)}, opened on line ${lineOf(source, mismatched.start)}; close it with \`</${mismatched.name}>\`` };
   }
+  // What a closing tag cannot be read from: text, comments, frontmatter,
+  // start tags, and the closing tags that are other elements' ends.
+  for (const tag of tags) covered.push([tag.start, tag.open]);
+  const inside = (offset) => covered.some(([s, e]) => s <= offset && offset < e);
+  const closes = new Set(tags.filter((t) => t.close !== undefined).map((t) => t.close));
+  const free = (offset) => !closes.has(offset) && !inside(offset);
   // A tag with no closing tag the parse reads as its own: never closed, or
-  // closed where Astro does not read the closing tag as its end.
+  // closed by a closing tag Astro does not read as its end, one that is no
+  // other element's and in nothing else.
   const endless = tags.find((t) => !t.point && t.close === undefined);
   if (endless) {
-    const later = findCloser(source, endless.raw, endless.open);
+    const later = findCloser(source, endless.raw, endless.open, free);
     const message = later < 0
       ? `${shown(endless.name)} is never closed; close it with \`</${endless.name}>\``
       : `${shown(endless.name)} is closed on line ${lineOf(source, later)}, but Astro does not read that \`</${endless.name}>\` as its end; close it in the same expression it opens in, and put no text or expression before an element Astro moves, such as <slot>, <head> or <template>`;
@@ -103,13 +110,10 @@ function check(source, ast, named) {
   }
   // A closing tag the parse dropped: one that is no element's end and is in
   // no text, comment or frontmatter, nor inside a start tag.
-  for (const tag of tags) covered.push([tag.start, tag.open]);
-  const inside = (offset) => covered.some(([s, e]) => s <= offset && offset < e);
-  const closes = new Set(tags.filter((t) => t.close !== undefined).map((t) => t.close));
-  for (const match of source.matchAll(new RegExp(`</([^${SPACE}/>]+)[^>]*>|</>`, 'g'))) {
-    if (closes.has(match.index) || inside(match.index)) continue;
-    const name = named(match[1] ?? '');
-    return { offset: match.index, message: VOID.has(name) ? voidMessage(name) : `\`</${name}>\` closes no open element; remove it` };
+  for (const closer of closers(source)) {
+    if (!free(closer.at)) continue;
+    const name = named(closer.raw);
+    return { offset: closer.at, message: VOID.has(name) ? voidMessage(name) : `\`</${name}>\` closes no open element; remove it` };
   }
   // Moved: a tag whose parent in the parse is not the tag it is written in.
   const ranged = tags
@@ -135,11 +139,31 @@ function closerAt(source, at) {
   return match && { raw: match[1], length: match[0].length };
 }
 
-// Where the next closing tag for `raw` starts from `from`, or -1.
-function findCloser(source, raw, from) {
-  const pattern = new RegExp(`</${escapeRegExp(raw)}(?=[${SPACE}/>])`, 'g');
-  pattern.lastIndex = from;
-  return pattern.exec(source)?.index ?? -1;
+// Where the next closing tag for `raw` from `from` that `free` allows
+// starts, or -1.
+function findCloser(source, raw, from, free) {
+  for (const closer of closers(source, from)) {
+    if (closer.raw === raw && free(closer.at)) return closer.at;
+  }
+  return -1;
+}
+
+// Every closing tag from `from` on, `</name …>` or `</>`, with where it
+// starts and its name, a byte a character: one pass, each `>` found once,
+// so no source makes the scan quadratic.
+function* closers(source, from = 0) {
+  let gt = -1;
+  for (let at = source.indexOf('</', from); at >= 0; at = source.indexOf('</', at + 2)) {
+    if (gt < at) {
+      gt = source.indexOf('>', at);
+      if (gt < 0) return;
+    }
+    let end = at + 2;
+    while (end < gt && !isSpace(source[end]) && source[end] !== '/') end++;
+    const raw = source.slice(at + 2, end);
+    if (raw === '' && gt !== at + 2) continue;
+    yield { at, raw };
+  }
 }
 
 // Where the start tag that begins at `start` ends, and whether it closes
@@ -150,8 +174,8 @@ function findCloser(source, raw, from) {
 function startTag(source, start) {
   let i = start + 1;
   const ends = (at) => source[at] === '>' || (source[at] === '/' && source[at + 1] === '>');
-  // The tag's name.
-  while (i < source.length && !isSpace(source[i]) && !ends(i)) i++;
+  // The tag's name, to white space, `/` or `>`.
+  while (i < source.length && !isSpace(source[i]) && source[i] !== '/' && source[i] !== '>') i++;
   while (i < source.length) {
     const c = source[i];
     if (isSpace(c)) { i++; continue; }
@@ -226,10 +250,6 @@ function pastString(source, i) {
     else if (source[i] === quote || source[i] === '\n') return i + 1;
   }
   return source.length;
-}
-
-function escapeRegExp(text) {
-  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 export function lineOf(source, offset) {
