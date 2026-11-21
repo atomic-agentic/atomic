@@ -3666,7 +3666,7 @@ mod tests {
         let (confined, _held) = sandbox.confine_held(&command, &state).expect("confined");
         let key = codex_network_proxy::PROXY_ATTRIBUTION_TOKEN_ENV_KEY;
         let [(secret_key, token)] = confined.secret_env.0.as_slice() else {
-            panic!("one secret variable, not {}", confined.secret_env.0.len());
+            panic!("the confined command holds exactly one secret variable");
         };
         assert_eq!(secret_key, key);
         assert_eq!(token.len(), 64, "a token of 32 bytes, in hexadecimal");
