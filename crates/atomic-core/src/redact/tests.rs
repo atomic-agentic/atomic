@@ -1379,6 +1379,31 @@ fn a_line_is_written_as_it_was_put_together() {
     assert!(long.written().ends_with('…'));
 }
 
+/// What a line quotes, such as an error, is redacted on its own, and the
+/// names beside it are not: a run named for a secret still reads as it is
+/// when the error after it holds one.
+#[test]
+fn a_lines_quoted_text_is_redacted_on_its_own() {
+    let line = Line::new()
+        .plain("run ")
+        .shown("rotate-secret")
+        .plain(" failed: ")
+        .redacted(&format!("the push said {SAMPLE}"))
+        .plain("; continue it with `atomic runs resume ")
+        .shown("rotate-secret")
+        .plain("`");
+    let written = line.written();
+    assert!(
+        !written.contains(&SAMPLE[4..]),
+        "the token showed: {written}"
+    );
+    assert_eq!(
+        written,
+        "run rotate-secret failed: the push said [REDACTED]; continue it with `atomic runs \
+         resume rotate-secret`"
+    );
+}
+
 /// A log line names what a caller or a model chose, such as a run's id, so
 /// it reaches the terminal escaped; it is redacted first, so a token a
 /// terminal escape sequence colours is still found. Its lines and tabs

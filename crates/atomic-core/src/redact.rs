@@ -1919,6 +1919,14 @@ impl Line {
         self
     }
 
+    /// Text that may hold a secret, such as an error or what a model or a
+    /// command said: redacted on its own, so nothing in it changes how the
+    /// names beside it are shown.
+    pub fn redacted(mut self, value: &str) -> Self {
+        self.text.push_str(&text(value));
+        self
+    }
+
     /// What it writes: its text, bounded to [`MAX_TEXT`] characters, then
     /// made safe for a terminal, whatever a part of it missed, which can
     /// lengthen it.

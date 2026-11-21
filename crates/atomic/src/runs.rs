@@ -402,12 +402,16 @@ pub async fn run(
         ))
         .log();
     if let Some(f) = &run.pipeline.fixture {
-        atomic_core::log_line!(
-            "run {run_id}: fixture {} at {} pinned to commit {}",
-            f.source.display(),
-            f.rev,
-            f.commit
-        );
+        atomic_core::redact::Line::new()
+            .plain("run ")
+            .shown(&run_id)
+            .plain(": fixture ")
+            .redacted(&f.source.display().to_string())
+            .plain(" at ")
+            .redacted(&f.rev)
+            .plain(" pinned to commit ")
+            .shown(&f.commit)
+            .log();
     }
     // What its input names is kept from a sweep until the input is recorded;
     // a field its contract types as an artifact must name stored content.
@@ -564,11 +568,16 @@ pub async fn resume(
             // likely panic again: say so, and note afresh what this resume
             // finds.
             if let Some(message) = atomic_app::panics::of(id) {
-                atomic_core::log_line!(
-                    "run {id}: it was parked because atomic's own workflow code panicked \
-                     ({message}); resuming it, the panic will likely happen again unless this \
-                     atomic has it fixed"
-                );
+                atomic_core::redact::Line::new()
+                    .plain("run ")
+                    .shown(id)
+                    .plain(": it was parked because atomic's own workflow code panicked (")
+                    .redacted(&message)
+                    .plain(
+                        "); resuming it, the panic will likely happen again unless this atomic \
+                         has it fixed",
+                    )
+                    .log();
             }
             // The execution lock covers this host only. On a shared store
             // another live process may own the run, and nothing fences it.
@@ -812,17 +821,18 @@ pub async fn serve(
         match atomic_app::panics::of(id) {
             // Whenever it panicked, in this process's recovery or an
             // earlier process.
-            Some(message) => atomic_core::log_line!(
-                "atomic serve: {}; {}",
-                atomic_app::panics::cause(id, &message),
-                atomic_app::panics::hint(id)
-            ),
+            Some(message) => atomic_app::panics::served(id, &message).log(),
             None if before.contains(id) => {}
-            None => atomic_core::log_line!(
-                "atomic serve: run {id} stopped without finishing more times than the engine \
-                 allows, so it is parked; find why, then continue it with `atomic runs resume \
-                 {id}`"
-            ),
+            None => atomic_core::redact::Line::new()
+                .plain("atomic serve: run ")
+                .shown(id)
+                .plain(
+                    " stopped without finishing more times than the engine allows, so it is \
+                     parked; find why, then continue it with `atomic runs resume ",
+                )
+                .shown(id)
+                .plain("`")
+                .log(),
         }
     }
     // A gate decided, or a park released, while its run was down may never
@@ -840,14 +850,18 @@ pub async fn serve(
         .map(|r| format!("{} (layout {})", r.id, r.version))
         .collect();
     if !stranded.is_empty() {
-        atomic_core::log_line!(
-            "atomic serve: left {} unfinished run(s) started by an atomic of another durable step \
-             layout, which this one ({}) cannot continue: {}; continue them with an atomic of \
-             their layout",
-            stranded.len(),
-            engine.rt.version(),
-            stranded.join(", ")
-        );
+        atomic_core::redact::Line::new()
+            .plain("atomic serve: left ")
+            .shown(&stranded.len().to_string())
+            .plain(
+                " unfinished run(s) started by an atomic of another durable step layout, which \
+                 this one (",
+            )
+            .shown(engine.rt.version())
+            .plain(") cannot continue: ")
+            .shown(&stranded.join(", "))
+            .plain("; continue them with an atomic of their layout")
+            .log();
     }
     atomic_core::log_line!(
         "atomic serve: recovered {recovered} unfinished run(s); serving until stopped"
