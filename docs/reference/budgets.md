@@ -115,15 +115,17 @@ free either: a project price of nothing, input and output both, for a model you
 did not price is refused at load, naming the model and saying to price it in your
 own configuration. A project price above nothing for such a model is the
 project's, and atomic sets no floor under it: instead, under a dollar cap of yours,
-`atomic config --explain` names every model only a project prices, and a run that
-calls one says so on stderr at its start, so a price you did not set is never
+`atomic config --explain` names every model only a layer above yours prices (the
+project's files or `ATOMIC_BUDGET_PRICING`), and a run or a live `atomic eval`
+that calls one says so on stderr at its start, so a price you did not set is never
 counted unseen. A model only you priced stays priced when another layer replaces
 the table below it.
 
 Your own `budget` section is read on its own, as well as merged: a cap there that
 is neither a number nor `null` (or, for a count, not a whole number), or a price
-that is not one, is refused with your file and line, even where a project's file
-writes a value of its own over it.
+that is not one (a price needs both `input_usd_per_mtok` and
+`output_usd_per_mtok`), is refused with your file and line, even where a project's
+file writes a value of its own over it.
 
 What holds is never shown without its reason: `atomic config --explain` shows the
 effective number with your file and line as its source, and says in a remark that
@@ -135,10 +137,11 @@ Ceilings come only from your own configuration file, which no project supplies:
 `budget.ceilings` is no setting, and a file that writes it is refused as an
 unknown setting. A run resolves them with its caps and records them with its plan,
 so a run resumed or recovered keeps the ceilings it began under, whatever your
-configuration says by then. A plan recorded before plans kept their ceilings has
-none: a run resumed or recovered with one is held, before it goes on, to the
-ceilings and prices of your own configuration now, as a pinned plan is below, and
-stops if it is above them, saying to start it again.
+configuration says by then. A plan records that it was held to your ceilings and
+prices when it was made or pinned; one recorded before plans were has no such
+record, and a run resumed or recovered with one is held, before it goes on, to the
+settings, ceilings and prices of your own configuration now, as a pinned plan is
+below, and stops if it is above them, saying to start it again.
 
 A plan pinned in a run's input is held, before its first call, both to the
 ceilings it carries and to those of your own configuration now: its run's and

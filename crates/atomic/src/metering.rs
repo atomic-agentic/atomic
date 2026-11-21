@@ -80,6 +80,13 @@ pub struct BudgetPlan {
     /// which caps nothing.
     #[serde(default)]
     pub ceilings: Ceilings,
+    /// Whether the plan was held to the ceilings and prices of the person
+    /// it ran for when it was made or pinned. A plan recorded before plans
+    /// were has `false`, and a run resumed or recovered with one is held to
+    /// the person's ceilings and prices then; a plan held already keeps its
+    /// own, whatever the configuration says by then.
+    #[serde(default)]
+    pub held: bool,
 }
 
 /// [`atomic_core::budget::CallBound`], as a plan keeps it.
@@ -170,6 +177,7 @@ impl BudgetPlan {
                 })
                 .collect(),
             ceilings: settings.ceilings.clone(),
+            held: true,
         })
     }
 
@@ -838,4 +846,65 @@ pub async fn interrupt_in_flight() -> usize {
         let _ = ledger.interrupt(&request, attempt, active(admitted)).await;
     }
     n
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn priced(input: f64, output: f64) -> Price {
+        Price {
+            input_usd_per_mtok: input,
+            output_usd_per_mtok: output,
+            max_input_tokens: None,
+            max_output_tokens: None,
+        }
+    }
+
+    /// A plan's prices are held to the table here: none below it, and under
+    /// a dollar ceiling, none the table does not price, priced or called.
+    #[test]
+    fn a_plans_prices_are_held_to_the_table_here() {
+        let mut ours = BudgetSettings::default();
+        ours.pricing.insert("m".into(), priced(1.0, 2.0));
+        let plan = BudgetPlan::resolve(
+            &ours,
+            &Budget::default(),
+            &[("a", &Budget::default(), "m")],
+            &[],
+        )
+        .expect("resolves");
+        assert_eq!(plan.priced_no_lower(&ours), Ok(()));
+
+        let mut cheaper = plan.clone();
+        cheaper.pricing.get_mut("m").expect("m").output_usd_per_mtok = 1.0;
+        assert_eq!(
+            cheaper.priced_no_lower(&ours),
+            Err("the price of m: its output_usd_per_mtok (1) is below your price of 2".into())
+        );
+
+        // Under a dollar ceiling, a model the table here does not price.
+        let mut capped = BudgetSettings::default();
+        capped.ceilings.workflow.cost_usd = Some(1.0);
+        assert_eq!(
+            plan.priced_no_lower(&capped),
+            Err(
+                "the price of m: your price table has none for it, under your own dollar cap"
+                    .into()
+            )
+        );
+        let mut unpriced = plan.clone();
+        unpriced.pricing.clear();
+        assert_eq!(
+            unpriced.priced_no_lower(&capped),
+            Err(
+                "the run calls m, which your price table does not price, under your own dollar \
+                 cap"
+                .into()
+            )
+        );
+        // With no dollar ceiling, a model the table here does not price is
+        // the plan's to price.
+        assert_eq!(unpriced.priced_no_lower(&BudgetSettings::default()), Ok(()));
+    }
 }

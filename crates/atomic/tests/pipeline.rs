@@ -3342,24 +3342,19 @@ fn a_pinned_plan_priced_below_yours_is_refused() {
     });
 }
 
-/// A run whose plan carries no ceilings, as one pinned before plans kept
-/// them, is held to the ceilings of the person running it when it is
-/// recovered: it stops, saying to start it again, and calls nothing more.
-#[test]
-fn a_run_recovered_with_a_plan_of_no_ceilings_is_held_to_yours() {
-    on_codex_runtime(async {
-        let dir = scratch("recovered-unceilinged");
-        let project = project(&dir);
+/// Start the gated triage as run `id` under `budgets`, on a runtime of its
+/// own, and leave it waiting at its gate when that runtime ends.
+fn parked_at_its_gate(dir: &Path, project: &Path, id: &str, budgets: BudgetSettings) {
+    let (dir, project, id) = (dir.to_owned(), project.to_owned(), id.to_owned());
+    on_codex_runtime(async move {
         let model = FakeModel::start(vec![Reply::Text(READ.into()), Reply::Text(RANK.into())])
             .await
             .expect("fake model");
-        let url = model.base_url();
-        // Started with no ceilings at all, and stopped at its gate.
-        let rt = engine_with(&dir, &url, small_calls()).await;
-        let pipeline = load(&project, "gated.workflow.yaml", &gated());
+        let rt = engine_with(&dir, &model.base_url(), budgets).await;
+        let pipeline = load(&project, &format!("{id}.workflow.yaml"), &gated());
         rt.start(
             PIPELINE,
-            "unceilinged-1",
+            &id,
             PipelineRun {
                 pipeline,
                 input: json!({"text": NOTE}),
@@ -3367,32 +3362,187 @@ fn a_run_recovered_with_a_plan_of_no_ceilings_is_held_to_yours() {
         )
         .await
         .expect("start");
-        let _ = open_gate(&rt, "unceilinged-1").await;
-        rt.shutdown(std::time::Duration::from_secs(5))
-            .await
-            .expect("shutdown");
-        let called = model.calls();
+        let _ = open_gate(&rt, &id).await;
+        assert_eq!(model.calls(), 2, "read and rank, then the gate");
+    });
+}
 
-        // Recovered by a process whose person caps an atom below the plan.
-        let rt = engine_with(&dir, &url, their_caps()).await;
-        rt.recover().await.expect("recover");
-        let failed = tokio::time::timeout(
-            std::time::Duration::from_secs(60),
-            rt.result::<Value>("unceilinged-1"),
-        )
+/// `bytes` as standard base64, as durare keeps a step's output.
+fn base64_encode(bytes: &[u8]) -> String {
+    const ABC: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, b)| n | (u32::from(*b) << (16 - 8 * i)));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(char::from(ABC[((n >> (18 - 6 * i)) & 63) as usize]));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// Standard base64 `text`, back to its bytes.
+fn base64_decode(text: &str) -> Vec<u8> {
+    const ABC: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let digits: Vec<u32> = text
+        .bytes()
+        .filter(|b| *b != b'=')
+        .map(|b| ABC.iter().position(|a| *a == b).expect("base64") as u32)
+        .collect();
+    let mut out = Vec::new();
+    for chunk in digits.chunks(4) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, d)| n | (d << (18 - 6 * i)));
+        for i in 0..chunk.len().saturating_sub(1) {
+            out.push((n >> (16 - 8 * i)) as u8);
+        }
+    }
+    out
+}
+
+/// Make run `id`'s recorded plan one recorded before plans were held to a
+/// person's ceilings and prices: its pin step's output, as durare keeps it,
+/// with no `held`.
+async fn as_an_old_plan(rt: &Durare, id: &str) {
+    let id = id.to_owned();
+    rt.control_transaction(move |mut tx| {
+        let id = id.clone();
+        Box::pin(async move {
+            let row = tx
+                .query_one(
+                    "SELECT output FROM operation_outputs \
+                     WHERE workflow_uuid = ? AND function_name = 'pin'",
+                    &[atomic_durable::Param::Text(id.clone())],
+                )
+                .await?;
+            let stored = row.text("output")?;
+            let mut pinned: Value =
+                serde_json::from_slice(&base64_decode(&stored)).expect("a pinned plan");
+            pinned["budgets"]
+                .as_object_mut()
+                .expect("a plan")
+                .remove("held");
+            let again = base64_encode(&serde_json::to_vec(&pinned).expect("encode"));
+            tx.execute(
+                "UPDATE operation_outputs SET output = ? \
+                 WHERE workflow_uuid = ? AND function_name = 'pin'",
+                &[
+                    atomic_durable::Param::Text(again),
+                    atomic_durable::Param::Text(id),
+                ],
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await
+    .expect("an old plan");
+}
+
+/// Recover run `id` on `rt` and return what it failed with.
+async fn recovered_refused(rt: &Durare, id: &str) -> String {
+    rt.recover().await.expect("recover");
+    let failed = tokio::time::timeout(std::time::Duration::from_secs(60), rt.result::<Value>(id))
         .await
         .expect("the run ended");
+    match failed {
+        Err(atomic_durable::DurableError::Failed(m)) => m,
+        other => panic!("{id}: {other:?}"),
+    }
+}
+
+/// A run whose plan was recorded before plans were held to a person's
+/// ceilings and prices is held to those of the person running it when it is
+/// recovered: it stops, saying to start it again, and calls nothing more.
+#[test]
+fn a_run_recovered_with_a_plan_recorded_before_plans_were_held_is_held_to_yours() {
+    let dir = scratch("recovered-unheld");
+    let project = project(&dir);
+    parked_at_its_gate(&dir, &project, "unheld-1", small_calls());
+    on_codex_runtime(async move {
+        let model = FakeModel::start(Vec::new()).await.expect("fake model");
+        let rt = engine_with(&dir, &model.base_url(), their_caps()).await;
+        as_an_old_plan(&rt, "unheld-1").await;
+        let said = recovered_refused(&rt, "unheld-1").await;
         assert!(
-            matches!(&failed, Err(atomic_durable::DurableError::Failed(m))
-                if m.contains("pinned before budgets kept their ceilings")
-                    && m.contains("your own configuration's ceilings")
-                    && m.contains("start the run again")),
-            "{failed:?}"
+            said.contains("recorded before budgets were held to your own ceilings and prices")
+                && said.contains("your own configuration's ceilings")
+                && said.contains("start the run again"),
+            "{said}"
         );
-        assert_eq!(model.calls(), called, "nothing more was called");
-        rt.shutdown(std::time::Duration::from_secs(5))
+        assert_eq!(model.calls(), 0, "nothing more was called");
+    });
+}
+
+/// The settings an old plan is held to on recovery are checked first: a
+/// dollar ceiling out of range refuses the run rather than capping nothing.
+#[test]
+fn a_run_recovered_with_an_old_plan_under_settings_out_of_range_is_refused() {
+    let dir = scratch("recovered-out-of-range");
+    let project = project(&dir);
+    parked_at_its_gate(&dir, &project, "ranged-1", small_calls());
+    on_codex_runtime(async move {
+        let model = FakeModel::start(Vec::new()).await.expect("fake model");
+        let mut broken = small_calls();
+        broken.ceilings.atom.cost_usd = Some(-1.0);
+        let rt = engine_with(&dir, &model.base_url(), broken).await;
+        as_an_old_plan(&rt, "ranged-1").await;
+        let said = recovered_refused(&rt, "ranged-1").await;
+        assert!(
+            said.contains("recorded before budgets were held to your own ceilings and prices")
+                && said.contains("cost_usd"),
+            "{said}"
+        );
+        assert_eq!(model.calls(), 0, "nothing more was called");
+    });
+}
+
+/// A person with no caps of their own has a run waiting at a gate when a
+/// price is raised: the run's plan was held when it was made, so it is
+/// resumed under the plan it began with, and finishes.
+#[test]
+fn a_run_of_a_person_with_no_caps_resumes_after_a_price_change() {
+    let dir = scratch("resumed-repriced");
+    let project = project(&dir);
+    let mut before = small_calls();
+    priced_synthetic(&mut before, None);
+    parked_at_its_gate(&dir, &project, "repriced-1", before);
+    on_codex_runtime(async move {
+        let model = FakeModel::start(vec![Reply::Text(SUMMARY.into())])
             .await
-            .expect("shutdown");
+            .expect("fake model");
+        // The project raises the price meanwhile.
+        let mut after = small_calls();
+        after.pricing.insert(
+            "synthetic".into(),
+            Price {
+                input_usd_per_mtok: 5.0,
+                output_usd_per_mtok: 5.0,
+                max_input_tokens: None,
+                max_output_tokens: None,
+            },
+        );
+        let rt = engine_with(&dir, &model.base_url(), after).await;
+        rt.recover().await.expect("recover");
+        let g = open_gate(&rt, "repriced-1").await;
+        decide(&rt, &g, Verdict::Approve, "fine").await;
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            rt.result::<Value>("repriced-1"),
+        )
+        .await
+        .expect("the run ended")
+        .expect("the run finished");
+        assert_eq!(out, json!({"line": "P1: Export crashes on accents"}));
+        assert_eq!(model.calls(), 1, "only summarize ran after the gate");
     });
 }
 
