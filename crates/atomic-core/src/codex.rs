@@ -247,6 +247,66 @@ const MOVED_SECRETS: &[(&str, &[&str])] = &[
     ("CODEX_HOME", &[""]),
 ];
 
+/// Where AWS's workload identities put their token files on Kubernetes when
+/// no variable says otherwise (IAM roles for service accounts, and EKS Pod
+/// Identity): denied whether or not atomic's environment names them.
+const AWS_TOKEN_DIRS: &[&str] = &[
+    "/var/run/secrets/eks.amazonaws.com/serviceaccount",
+    "/var/run/secrets/pods.eks.amazonaws.com/serviceaccount",
+];
+
+/// The variables that name a workload token file an AWS SDK reads.
+const AWS_TOKEN_FILES: &[&str] = &[
+    "AWS_WEB_IDENTITY_TOKEN_FILE",
+    "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+];
+
+/// The projected volume `file` is in, if it is in one, as Kubernetes mounts
+/// a service account's token: the volume holds a `..data` link to its
+/// current version, a hidden `..<time>` directory beside it, and each item
+/// is a link through `..data`, which Kubernetes swaps for a new version each
+/// time it rotates the token. Denying the volume, not only the version the
+/// token resolves to now, keeps the next token denied too.
+///
+/// Found by what `file` resolves to, so a link to the token, through any
+/// number of links, and an item nested in a directory of the volume are
+/// found too: the volume is the directory above an ancestor of that path
+/// which its `..data` resolves to, or which is hidden as a version is,
+/// beside a `..data` link. A file that does not resolve through such a
+/// version, even beside a `..data`, is in no volume. Where `..data`, or the
+/// file, cannot be read for any reason but that it is not there, the
+/// directory holding it is denied whole.
+fn projected_volume(file: PathBuf) -> Option<PathBuf> {
+    let missing = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
+    let target = match std::fs::canonicalize(&file) {
+        Ok(target) => target,
+        Err(e) if missing(&e) => return None,
+        Err(_) => return file.parent().map(Path::to_owned),
+    };
+    for version in target.ancestors().skip(1) {
+        let Some(volume) = version.parent() else {
+            break;
+        };
+        let data = volume.join("..data");
+        match std::fs::symlink_metadata(&data) {
+            Ok(meta) if meta.file_type().is_symlink() => {}
+            Ok(_) => continue,
+            Err(e) if missing(&e) => continue,
+            Err(_) => return Some(volume.to_owned()),
+        }
+        let hidden = version
+            .file_name()
+            .is_some_and(|n| n.as_encoded_bytes().starts_with(b".."));
+        match std::fs::canonicalize(&data) {
+            Ok(current) if current == version || hidden => return Some(volume.to_owned()),
+            Ok(_) => {}
+            Err(e) if missing(&e) && !hidden => {}
+            Err(_) => return Some(volume.to_owned()),
+        }
+    }
+    None
+}
+
 /// The home directories whose credential places are denied, as `env` reads
 /// `HOME` and with `passwd` the password database's home for this user:
 /// both, when they differ, so overriding `HOME` hides nothing. An error,
@@ -318,6 +378,31 @@ pub fn home_secrets(
     if let Some(list) = env("KUBECONFIG") {
         out.extend(std::env::split_paths(&list).filter(|p| p.is_absolute()));
     }
+    // AWS's workload token files: where they usually are, those the
+    // variables name, a relative one resolved against atomic's working
+    // directory as an AWS SDK resolves it, and, for one in a projected
+    // volume, the volume itself.
+    out.extend(AWS_TOKEN_DIRS.iter().map(PathBuf::from));
+    let here = |name: &str| {
+        std::env::current_dir().map_err(|e| {
+            format!(
+                "{name} names a token file relative to the working directory, which is unknown \
+                 ({e}), so the token could not be denied to atoms' commands"
+            )
+        })
+    };
+    let mut tokens = Vec::new();
+    for name in AWS_TOKEN_FILES {
+        let Some(file) = env(name).filter(|v| !v.is_empty()).map(PathBuf::from) else {
+            continue;
+        };
+        tokens.push(match file.is_absolute() {
+            true => file,
+            false => here(name)?.join(file),
+        });
+    }
+    out.extend(tokens.iter().cloned());
+    out.extend(tokens.into_iter().filter_map(projected_volume));
     out.sort();
     out.dedup();
     Ok(out)
@@ -519,8 +604,8 @@ fn program(path: &Path) -> bool {
 /// [`PrivateState::also`], and everything in Codex's home but the helper
 /// links its shell needs. Each is denied whole, never re-opened below, so
 /// the sandbox needs no mount inside a denied directory. A path reached
-/// through a linked directory is denied under both spellings; one that is
-/// itself a link, such as a `~/.bashrc` kept with a person's dotfiles, is
+/// through a linked directory is denied under its real spelling, which
+/// denies it under every other; one that is itself a link, such as a `~/.bashrc` kept with a person's dotfiles, is
 /// denied as the file or directory it points at, since the sandbox cannot
 /// mount on a link, and a read through the link lands on the denied target.
 /// The real file or directory behind each link up to [`LINK_DEPTH`] levels
@@ -700,8 +785,7 @@ fn denied_paths(
             all.push(target);
             continue;
         }
-        // A place as it is named, under both spellings when a directory
-        // above it is a link; only a device, such as a variable naming
+        // A place as it is; only a device, such as a variable naming
         // /dev/null, is left out. A pipe or socket is denied like a file.
         if device(&meta) {
             continue;
@@ -713,11 +797,29 @@ fn denied_paths(
         if let Some(refused) = movable(&path, &real_path, &roots) {
             return Err(refused);
         }
-        if real_path != path {
-            all.push(real_path);
-        }
         all.push(path);
     }
+    // Each place goes to the sandbox under its real spelling alone, the
+    // directories above it resolved: an older bubblewrap, such as 0.10,
+    // cannot mount on a path that crosses an absolute link, as
+    // /var/run/secrets crosses /var/run -> /run, and no command would start.
+    // A mount on the real path denies it under every spelling. Through a
+    // link a command may rewrite, the path could later lead elsewhere, so
+    // that is refused, as Codex refuses it.
+    let mut spelled = Vec::with_capacity(all.len());
+    for path in all {
+        if let Some(link) = rewritable_link(&path, &roots) {
+            return Err(refuse(format!(
+                "{} is reached through the link {}, which atoms' commands may write, so a \
+                 command could point it elsewhere; run with a working directory that does not \
+                 hold it",
+                path.display(),
+                link.display()
+            )));
+        }
+        spelled.push(real_spelling(&path));
+    }
+    let mut all = spelled;
     // The same places wherever else they are mounted, such as a home bound
     // at a second path or the host's files under /run/host: denied there
     // too, or nothing runs (see `crate::mounts`).
@@ -770,6 +872,37 @@ fn denied_paths(
         globs.push(format!("{}/*.sqlite*", alias.display()));
     }
     Ok((all, globs))
+}
+
+/// `path` with the links among the directories above it, and itself,
+/// resolved as far as it exists, and the rest as it is named.
+fn real_spelling(path: &Path) -> PathBuf {
+    let mut rest = Vec::new();
+    let mut existing = path;
+    loop {
+        if let Ok(real) = std::fs::canonicalize(existing) {
+            return rest.iter().rev().fold(real, |p, part| p.join(part));
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_owned());
+                existing = parent;
+            }
+            _ => return path.to_owned(),
+        }
+    }
+}
+
+/// The first of the directories above `path` that is a link inside one of
+/// `writable`, which a command could point elsewhere.
+fn rewritable_link(path: &Path, writable: &[PathBuf]) -> Option<PathBuf> {
+    path.ancestors().skip(1).find_map(|dir| {
+        let (parent, name) = (dir.parent()?, dir.file_name()?);
+        std::fs::symlink_metadata(dir)
+            .is_ok_and(|m| m.file_type().is_symlink())
+            .then(|| real_spelling(parent).join(name))
+            .filter(|at| writable.iter().any(|w| at.starts_with(w)))
+    })
 }
 
 /// Whether `path` lies two or more levels inside a directory of `within`,
@@ -2979,6 +3112,11 @@ mod tests {
                 ("KUBECONFIG", "/k/a:/k/b:relative"),
                 ("DOCKER_CONFIG", "/dock"),
                 ("AWS_SHARED_CREDENTIALS_FILE", "/aws/creds"),
+                ("AWS_WEB_IDENTITY_TOKEN_FILE", "/aws/web-identity-token"),
+                (
+                    "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+                    "/aws/pod-identity-token",
+                ),
                 ("NETRC", "/n/netrc"),
                 ("PASSWORD_STORE_DIR", "/pass"),
             ]),
@@ -3002,6 +3140,10 @@ mod tests {
             "/k/b",
             "/dock/config.json",
             "/aws/creds",
+            "/aws/web-identity-token",
+            "/aws/pod-identity-token",
+            "/var/run/secrets/eks.amazonaws.com/serviceaccount",
+            "/var/run/secrets/pods.eks.amazonaws.com/serviceaccount",
             "/n/netrc",
             "/pass",
         ] {
@@ -3009,6 +3151,144 @@ mod tests {
         }
         assert!(!has(&secrets, "relative"));
         assert!(!has(&secrets, "/opt/cargo/config.toml"), "{secrets:?}");
+    }
+
+    /// A workload token file a variable names in a projected volume, as
+    /// Kubernetes mounts one, is denied with the volume that holds it, so the
+    /// token it rotates in next is denied too; an ordinary token file is
+    /// denied alone.
+    #[cfg(unix)]
+    #[test]
+    fn a_projected_token_volume_is_denied_whole() {
+        let dir = scratch("projected-token");
+        let volume = dir.join("serviceaccount");
+        std::fs::create_dir_all(volume.join("..2026_01_01_00_00_00.1")).expect("version");
+        std::fs::write(volume.join("..2026_01_01_00_00_00.1/token"), "t").expect("token");
+        std::os::unix::fs::symlink("..2026_01_01_00_00_00.1", volume.join("..data"))
+            .expect("..data");
+        std::os::unix::fs::symlink("..data/token", volume.join("token")).expect("token link");
+        std::fs::write(dir.join("plain-token"), "t").expect("plain");
+        let projected = volume.join("token").display().to_string();
+        let plain = dir.join("plain-token").display().to_string();
+        let home = dir.display().to_string();
+        let env = |name: &str| {
+            match name {
+                "HOME" => Some(home.clone()),
+                "AWS_WEB_IDENTITY_TOKEN_FILE" => Some(projected.clone()),
+                "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE" => Some(plain.clone()),
+                _ => None,
+            }
+            .map(std::ffi::OsString::from)
+        };
+        let places = home_secrets(&env, None).expect("homes");
+        assert!(places.contains(&volume), "the volume is denied");
+        assert!(
+            places.contains(&volume.join("token")),
+            "the token link is denied"
+        );
+        assert!(
+            places.contains(&dir.join("plain-token")),
+            "the ordinary token is denied"
+        );
+        assert!(
+            !places.contains(&dir),
+            "an ordinary token's directory stays readable"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A projected volume is found by where its token resolves to: through
+    /// a link to a link to the token, and for an item nested in one of the
+    /// volume's directories. A file beside a `..data` that does not resolve
+    /// through it is in no volume.
+    #[cfg(unix)]
+    #[test]
+    fn a_projected_volume_is_found_through_links_and_for_nested_items() {
+        let dir = std::fs::canonicalize(scratch("projected-links")).expect("real");
+        let version = "..2026_01_01_00_00_00.1";
+        let volume = |name: &str| {
+            let volume = dir.join(name);
+            std::fs::create_dir_all(volume.join(version).join("aws")).expect("version");
+            std::fs::write(volume.join(version).join("token"), "t").expect("token");
+            std::fs::write(volume.join(version).join("aws/token"), "t").expect("nested");
+            link(Path::new(version), &volume.join("..data"));
+            link(Path::new("..data/token"), &volume.join("token"));
+            link(Path::new("..data/aws"), &volume.join("aws"));
+            volume
+        };
+        let (linked, nested) = (volume("linked"), volume("nested"));
+        // A token named through a link to the volume's link to it.
+        link(&linked.join("token"), &dir.join("etc/token"));
+        assert_eq!(
+            projected_volume(dir.join("etc/token")),
+            Some(linked.clone())
+        );
+        assert_eq!(
+            projected_volume(nested.join("aws/token")),
+            Some(nested.clone())
+        );
+        // A plain file beside the `..data` link, and one nowhere near one.
+        std::fs::write(linked.join("plain"), "p").expect("plain");
+        assert_eq!(projected_volume(linked.join("plain")), None);
+        std::fs::write(dir.join("ordinary"), "o").expect("ordinary");
+        assert_eq!(projected_volume(dir.join("ordinary")), None);
+        assert_eq!(projected_volume(dir.join("missing")), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A token file named relative to atomic's working directory is denied
+    /// where an AWS SDK started there would read it.
+    #[test]
+    fn a_relative_token_file_is_denied_from_the_working_directory() {
+        let env = |name: &str| {
+            match name {
+                "HOME" => Some("/srv/home"),
+                "AWS_WEB_IDENTITY_TOKEN_FILE" => Some("tokens/web"),
+                _ => None,
+            }
+            .map(std::ffi::OsString::from)
+        };
+        let places = home_secrets(&env, None).expect("homes");
+        let here = std::env::current_dir().expect("cwd");
+        assert!(
+            places.contains(&here.join("tokens/web")),
+            "the relative token is denied from the working directory"
+        );
+    }
+
+    /// A place named through a directory that is an absolute link goes to
+    /// the sandbox under its real spelling alone, existing or not: an older
+    /// bubblewrap cannot mount on the other. One reached through a link a
+    /// command may write is refused.
+    #[cfg(unix)]
+    #[test]
+    fn a_place_behind_a_linked_directory_is_denied_by_its_real_path() {
+        let dir = std::fs::canonicalize(scratch("real-spelling")).expect("real");
+        std::fs::create_dir_all(dir.join("real/gnupg")).expect("gnupg");
+        std::fs::create_dir_all(dir.join("codex")).expect("codex home");
+        link(&dir.join("real"), &dir.join("linked"));
+        let private = |also: Vec<PathBuf>| PrivateState {
+            state_dir: dir.join("state"),
+            private: dir.join("private"),
+            also,
+        };
+        let named = private(vec![dir.join("linked/gnupg"), dir.join("linked/missing")]);
+        let (denied, _) = denied_paths(&named, &dir.join("codex"), None, &[]).expect("denied");
+        assert!(denied.contains(&dir.join("real/gnupg")), "{denied:?}");
+        assert!(denied.contains(&dir.join("real/missing")), "{denied:?}");
+        assert!(
+            !denied.iter().any(|d| d.starts_with(dir.join("linked"))),
+            "a spelling through the link: {denied:?}"
+        );
+        let work = dir.join("work");
+        link(&dir.join("real"), &work.join("link"));
+        let through = private(vec![work.join("link/gnupg")]);
+        let refused = denied_paths(&through, &dir.join("codex"), None, &[work])
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(refused.contains("may write"), "{refused}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A link at `link` to `target`, replacing what was there.

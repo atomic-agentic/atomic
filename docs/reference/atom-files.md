@@ -219,9 +219,10 @@ proxy that refuses it.
 Know what a listed host can get:
 
 - **Anything the command can read.** It can send a listed host whatever it
-  reads, which is the project and most of the filesystem, including files such
-  as `~/.ssh` and `~/.aws` reached by absolute path; only atomic's private state
-  is denied to it.
+  reads, which is the project and most of the filesystem. What is denied to it,
+  atomic's private state and, on Linux, the places where credentials are kept,
+  such as `~/.ssh` and `~/.aws`, is listed under
+  [configuration](#configuration); anything else it can read, it can send.
 - **More than the one site.** An HTTPS tunnel is opaque to the proxy, which
   checks only the name the command asked for. Other sites served from the same
   CDN edge or load balancer can be reached through it.
@@ -398,8 +399,23 @@ and history files of bash, zsh and fish, among others. They are denied
 under `$HOME` and under the home directory the system records for your user,
 wherever the variables that move them (`XDG_CONFIG_HOME`, `ZDOTDIR`,
 `HISTFILE`, `GNUPGHOME`, `CARGO_HOME`, `DOCKER_CONFIG`, the AWS file
-variables, `KUBECONFIG` and others) put them, and a link among them, up to
-four directory levels inside a denied directory, is denied as what it
+variables, `KUBECONFIG` and others) put them. AWS's workload token files
+are denied too: the files `AWS_WEB_IDENTITY_TOKEN_FILE` and
+`AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE` name (one named relative to
+atomic's working directory, as AWS's SDKs read it), the whole projected
+volume when such a file is in one Kubernetes mounts, found through any
+links that lead to it (so the token it rotates in next is denied as well),
+and EKS's usual token directories,
+`/var/run/secrets/eks.amazonaws.com/serviceaccount` and
+`/var/run/secrets/pods.eks.amazonaws.com/serviceaccount`, whether or not a
+variable names them. An ordinary token file is denied by its path each
+time a command starts, so one replaced there is denied to the next command.
+A token given as a value rather than a file, such as
+`AWS_CONTAINER_AUTHORIZATION_TOKEN`, never reaches a command, which gets
+only a few core variables and those its atom declares, and the credential
+endpoints AWS serves on link-local and unique-local addresses are out of its
+reach, since a command reaches no private or local address. A link among them, up to four
+directory levels inside a denied directory, is denied as what it
 points at, whoever owns it and wherever it is, under `/run`, `/etc` or
 `/opt` too. Never denied, so that commands keep working: anything under
 `/usr`, `/bin`, `/sbin`, `/lib*`, `/nix/store`, `/dev`, `/proc` or `/sys`,
