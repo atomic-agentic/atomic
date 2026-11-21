@@ -337,7 +337,10 @@ async fn try_sandboxed(
         &TurnSpec {
             prompt: "Do the work.".into(),
             sandbox: Sandbox::WorkspaceWrite,
-            writable_roots: vec![state.to_owned()],
+            // By its real path: a writable directory given through a link,
+            // as the system's temporary directory is on some machines, with
+            // a denied place inside it, would be refused.
+            writable_roots: vec![std::fs::canonicalize(state).unwrap()],
             ..TurnSpec::default()
         },
     )
