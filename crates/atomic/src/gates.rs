@@ -161,7 +161,9 @@ async fn list(rt: &Durare, all: bool, json: bool) -> anyhow::Result<()> {
     )
     .await?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&gates)?);
+        // For a program, but often read on a terminal: what a model wrote
+        // in a gate is escaped there too, and reads as the same JSON.
+        println!("{}", shown::json(&serde_json::to_string_pretty(&gates)?));
         return Ok(());
     }
     // Titles, what gates show and their choices can come from a model: all

@@ -92,6 +92,16 @@ pub(crate) async fn settled<T>(
     place: &str,
     counted: bool,
 ) -> Result<T> {
+    // This process is stopping, and may have killed what the atom ran, its
+    // commands, a model turn's, a compiler or a helper: how the atom ended
+    // is not its result. Like a stopped command's step, it records
+    // nothing, and waits for the exit.
+    if atomic_exec::process::stopping() {
+        if counted {
+            crate::pipeline::set_aside();
+        }
+        return std::future::pending().await;
+    }
     match result {
         // This process is stopping: the step gives up its wait for a
         // workspace, records nothing, and is not one a stop waits for.
@@ -146,6 +156,8 @@ pub fn atom_failure(e: AtomError) -> DurableError {
                 "atomic: stopping without recording an outcome; resume the run where the sandbox \
                  can start"
             );
+            // Whatever else this process started ends first.
+            atomic_exec::process::end_all(&mut |what| atomic_core::log_line!("atomic: {what}"));
             std::process::exit(UNCONFINABLE_EXIT);
         }
         // As above: a run that waited too long for room stops, recording
