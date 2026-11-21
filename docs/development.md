@@ -222,6 +222,7 @@ features, so nothing rebuilds:
 
 ```bash
 ATOMIC_DEV_SANDBOX=on scripts/dev.sh scripts/acceptance.py m12
+ATOMIC_DEV_SANDBOX=on scripts/dev.sh scripts/acceptance.py m45
 ```
 
 Each clause is written as the milestones state it, and a clause of several

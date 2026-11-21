@@ -267,6 +267,9 @@ jobs:
       - name: M12 acceptance
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: python3 scripts/acceptance.py m12
+      - name: M45 acceptance
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: python3 scripts/acceptance.py m45
       # A suite that cannot reach its backend fails; it never skips. The
       # Postgres and sandbox suites run once more with their backend missing,
       # and every one of their tests must fail, naming it. The sandbox half
