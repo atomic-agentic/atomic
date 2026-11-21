@@ -295,6 +295,15 @@ fn check_env(kind: &str, fm: &serde_json::Map<String, Value>) -> Result<(), (Str
                         ),
                     );
                 }
+                if name == atomic_exec::SECRET_ENV_FD {
+                    return refuse(
+                        &format!("/env/{name}"),
+                        &format!(
+                            "`{name}` is set by atomic: it names the socket a sandbox helper \
+                             reads its command's proxy token from; an atom cannot declare it"
+                        ),
+                    );
+                }
                 if name == crate::codex::TURN_TMPDIR {
                     return refuse(
                         &format!("/env/{name}"),
