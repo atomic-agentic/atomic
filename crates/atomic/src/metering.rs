@@ -384,6 +384,11 @@ impl Meter for LedgerMeter {
                 micro_usd: int(self.settings.cost(&call.model, input, bound.output_tokens)),
             };
             let request = Request {
+                // The shape `<run>:<step>:<call>`. A turn whose progress
+                // record fails reads the run back off its request id (see
+                // `run_of_request` in atomic-core's `codex`), so the run
+                // keeps whatever colons it has and the step and the call
+                // are the last two fields.
                 id: format!("{}:{}:{}", self.run, self.step, call.index),
                 run: self.run.clone(),
                 model: call.model.clone(),
