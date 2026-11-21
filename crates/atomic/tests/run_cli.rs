@@ -3303,8 +3303,8 @@ fn serve_stopped_mid_command_holds_the_lock_until_it_exits_and_runs_nothing_twic
 const STUBBORN: &str = "import json, os, signal, subprocess, sys, time\n\
     signal.signal(signal.SIGTERM, signal.SIG_IGN)\n\
     note = json.load(sys.stdin)\n\
-    log = sys.argv[1]\n\
-    child = subprocess.Popen(['python3', '-c', 'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); held = bytearray(1 << 30); held[::4096] = b\\'x\\' * (1 << 18); time.sleep(60)', log], start_new_session=True)\n\
+    log = os.path.join(os.environ['ATOMIC_CACHE_DIR'], os.path.basename(sys.argv[1]))\n\
+    child = subprocess.Popen(['python3', '-c', 'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); held = bytearray(1 << 30); held[::4096] = b\\'x\\' * (1 << 18); time.sleep(60)', sys.argv[1]], start_new_session=True)\n\
     open(log, 'a').write('start\\n')\n\
     time.sleep(60)\n\
     open(log, 'a').write('end\\n')\n\
@@ -3390,7 +3390,7 @@ fn serve_holds_the_lock_until_every_process_of_a_stopped_command_has_ended() {
             "{runner}: every process ended at its kill: {}",
             text()
         );
-        let ends = std::fs::read_to_string(dir.join("slow.log")).expect("log");
+        let ends = std::fs::read_to_string(run_file(&dir, "slow.log")).expect("log");
         assert!(
             !ends.contains("end"),
             "{runner}: no command ran to its end: {ends}"
@@ -4047,9 +4047,9 @@ fn a_run_that_gets_further_each_time_is_not_dead_lettered() {
         "",
     );
     assert!(out.status.success(), "{}", text(&out));
-    for i in 0..n {
+    for (i, log) in logs.iter().enumerate() {
         // Killed once, then run again to its end.
-        assert_eq!(watch.acted(&logs[i]), 1, "step {i}");
+        assert_eq!(watch.acted(log), 1, "step {i}");
     }
 }
 
