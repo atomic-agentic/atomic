@@ -21,7 +21,8 @@
 //! one private directory (mode 0700), normally in the project's state
 //! directory, which is outside every directory a sandboxed turn may write.
 //! Each attempt's is named by its run and step, so opening an attempt removes
-//! what an earlier attempt of the same step left, and connecting removes what
+//! what earlier attempts of the same step left, except the scratch of any
+//! attempt this process still has open, and connecting removes what
 //! attempts of processes that no longer run left.
 
 use crate::ExecError;
@@ -237,7 +238,8 @@ fn started(pid: u32) -> Option<u64> {
 /// `scratch_root` and sharing `tmp` with every other turn of the backend:
 /// the source directory is the root, as it is; a fresh
 /// scratch directory replaces whatever an earlier attempt of the same run
-/// and step left; a turn's shell runs here, under Codex's own sandbox.
+/// and step left, except an attempt this process still has open; a turn's
+/// shell runs here, under Codex's own sandbox.
 pub(crate) fn open_local(
     scratch_root: &Path,
     tmp: &Path,
@@ -277,24 +279,42 @@ pub(crate) fn open_local(
     let tmp = tmp.to_owned();
     private_dir(&tmp).map_err(|e| failed("create the shared temporary directory", e))?;
     let step = step_dir(scratch_root, &request.run, &request.step);
-    // An earlier attempt of this step, finished or not, is replaced. What
-    // cannot be removed is left, with a warning: the new attempt's own
-    // directory is fresh either way.
-    if let Err(e) = remove_tree(&step) {
-        warn(&format!(
-            "could not remove an earlier attempt's scratch under {}: {e}",
-            step.display()
-        ));
-    }
-    private_dir(&step).map_err(|e| failed("create the step's scratch directory", e))?;
     let scratch = step.join(format!("{}-{}", owner(), slug(&request.attempt)));
-    if scratch.exists() {
-        return Err(fail(format!(
-            "{} exists already: an attempt is opened only once",
-            scratch.display()
-        )));
+    // What earlier attempts of this step left is replaced, but never an
+    // attempt this process still has open: one whose run was cancelled
+    // while it opened can finish opening after its step's next attempt,
+    // and must not take that one's directory from under it. Under the lock
+    // of the open attempts, so none opens or closes meanwhile, what goes is
+    // only moved aside; it is removed after.
+    let (aside, opened) = {
+        let mut open = OPEN.lock().unwrap_or_else(|e| e.into_inner());
+        let aside = set_aside(scratch_root, &step, &open);
+        let opened = (|| {
+            private_dir(&step).map_err(|e| failed("create the step's scratch directory", e))?;
+            if scratch.exists() {
+                return Err(fail(format!(
+                    "{} exists already: an attempt is opened only once",
+                    scratch.display()
+                )));
+            }
+            private_dir(&scratch).map_err(|e| failed("create its scratch directory", e))?;
+            open.insert(scratch.clone());
+            Ok(())
+        })();
+        (aside, opened)
+    };
+    // What was set aside goes whether or not this attempt opened: on a full
+    // disk, that space is what lets the next try succeed. What cannot be
+    // removed is left, with a warning.
+    for left in aside {
+        if let Err(e) = remove_entry(&left) {
+            warn(&format!(
+                "could not remove an earlier attempt's scratch {}: {e}",
+                left.display()
+            ));
+        }
     }
-    private_dir(&scratch).map_err(|e| failed("create its scratch directory", e))?;
+    opened?;
     Ok(Workspace {
         label: request.label.clone(),
         root: Some(source.clone()),
@@ -307,21 +327,83 @@ pub(crate) fn open_local(
     })
 }
 
+/// The scratch directories of this process's attempts that are open: an
+/// attempt opening never removes one of them.
+static OPEN: std::sync::Mutex<std::collections::BTreeSet<PathBuf>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Move what is in `step` aside, under `scratch_root`, except the scratch
+/// directories in `open`, and return where each went. One that cannot be
+/// moved is left, with a warning.
+fn set_aside(
+    scratch_root: &Path,
+    step: &Path,
+    open: &std::collections::BTreeSet<PathBuf>,
+) -> Vec<PathBuf> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let Ok(entries) = std::fs::read_dir(step) else {
+        return Vec::new();
+    };
+    let mut aside = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if open.contains(&path) {
+            continue;
+        }
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let to = scratch_root.join(format!("{REMOVING}{}-{n}", owner()));
+        // One that cannot be moved, such as a directory nobody may write,
+        // is removed where it is.
+        match std::fs::rename(&path, &to) {
+            Ok(()) => aside.push(to),
+            Err(_) => {
+                if let Err(e) = remove_entry(&path) {
+                    warn(&format!(
+                        "could not remove an earlier attempt's scratch {}: {e}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+    }
+    aside
+}
+
+/// Remove `path`, a directory and everything under it, or a file.
+fn remove_entry(path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => remove_tree(path),
+        Ok(_) => std::fs::remove_file(path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// How a scratch directory moved aside to be removed is named, then its
+/// owner: hidden, so it is never taken for a step's.
+const REMOVING: &str = ".removing-";
+
 /// Close a workspace [`open_local`] opened: its scratch directory goes, and
 /// its root, which the control plane owns, stays.
 pub(crate) fn close_local(workspace: &Workspace) -> Result<(), ExecError> {
     let Some(scratch) = &workspace.scratch else {
         return Ok(());
     };
-    remove_tree(scratch).map_err(|e| ExecError::Workspace {
+    let removed = remove_tree(scratch).map_err(|e| ExecError::Workspace {
         label: workspace.label.clone(),
         message: format!("remove its scratch directory: {e}"),
-    })?;
-    // The step's directory goes once its last attempt has.
-    if let Some(step) = scratch.parent() {
+    });
+    // No longer open, and the step's directory goes once its last attempt
+    // has, both under the lock an opening attempt holds.
+    let mut open = OPEN.lock().unwrap_or_else(|e| e.into_inner());
+    open.remove(scratch);
+    if removed.is_ok()
+        && let Some(step) = scratch.parent()
+    {
         let _ = std::fs::remove_dir(step);
     }
-    Ok(())
+    drop(open);
+    removed
 }
 
 /// Remove what attempts of processes that no longer run left under
@@ -335,11 +417,28 @@ pub(crate) fn sweep_local(scratch_root: &Path) -> usize {
     };
     for step in steps.flatten() {
         let step = step.path();
-        let hidden = step
+        let name = step
             .file_name()
             .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with('.'));
-        if hidden || !step.is_dir() {
+            .unwrap_or_default();
+        // What a process moved aside to remove and did not, as it was killed.
+        if let Some(tag) = name
+            .strip_prefix(REMOVING)
+            .and_then(|rest| rest.rsplit_once('-'))
+            .map(|(tag, _)| tag)
+            && tag != owner()
+            && !owner_may_run(tag)
+        {
+            match remove_entry(&step) {
+                Ok(()) => removed += 1,
+                Err(e) => warn(&format!(
+                    "could not remove a dead attempt's scratch {}: {e}",
+                    step.display()
+                )),
+            }
+            continue;
+        }
+        if name.starts_with('.') || !step.is_dir() {
             continue;
         }
         let Ok(attempts) = std::fs::read_dir(&step) else {
