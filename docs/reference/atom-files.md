@@ -465,7 +465,13 @@ until the next turn. A turn does
 not start when a denial would cover its working directory or a directory it
 may write, or when a denied place, a linked secret or a second mount of a
 denied place lies two or more levels inside a directory it may write, where
-a command could move the directory above it away from its denial. The model
+a command could move the directory above it away from its denial. Nor
+does it start when a denied place is named through a link inside a
+directory it may write, which a command could point elsewhere; when a
+denied place lies in a directory it may write that it is given through a
+link, rather than by its real path; or when a token file is named relative
+while atomic's own working directory is unknown. Each place is denied under
+its real path, which denies it under every spelling. The model
 chooses the
 commands, so none of these reach it through them. atomic makes the list
 when the turn starts: a place on it that appears while a command runs is

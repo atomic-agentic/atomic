@@ -1,0 +1,1 @@
+aws-token-unreadable|crates/atomic-core/src/codex.rs|        Err(_) => return file.parent().map(Path::to_owned),|        Err(_) => return None,|-p atomic-agentic-core --lib --features fake-model an_unreadable_token_or_data_link_denies_its_directory
