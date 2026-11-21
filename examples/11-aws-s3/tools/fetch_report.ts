@@ -25,9 +25,14 @@ export async function fetchReport(input: SummarizeReportInput) {
       }),
     );
     // The body is taken up as one web stream whether it gets read or dropped:
-    // giving up on that stream is what ends the transfer. Under Deno the SDK's
-    // body is Node's IncomingMessage, and cancelling this web view of it is
-    // what makes the server stop sending.
+    // giving up on that stream is what ends the transfer. What is under the
+    // web view depends on the answer. S3 sends a checksum with a whole object
+    // and the SDK asks for checksum mode by default, so the body then is the
+    // SDK's checksum stream, which wraps what came off the socket; an answer
+    // with no checksum leaves Node's IncomingMessage. Either way it is a Node
+    // readable, transformToWebStream is Node's Readable.toWeb, and cancelling
+    // this web view destroys the readable under it — the checksum stream and
+    // the response with it — which is what makes the server stop sending.
     const body = object.Body!.transformToWebStream();
     // When S3 declares the length, an object that is already too big is
     // refused before its body is read, and the transfer is given up on rather

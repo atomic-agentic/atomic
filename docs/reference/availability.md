@@ -297,7 +297,26 @@ active time, before it starts, settles each once, and parks a run that reaches
 a cap. A released park admits the call again against the caps as stored.
 `atomic parks list` and `atomic parks release` let the local operator, with
 their enrolled credential, raise a cap and release a park, recorded with who did
-it.
+it. Each park is recorded with the project whose run parked, and on a
+PostgreSQL store several projects share, both commands see only the current
+project's parks: releasing another project's park is refused as a park that
+does not exist. A project is told apart there by its manifest's name (its
+directory's name, with no manifest) together with an id that comes from its
+path. Two projects are the same project only when both match, so a project
+renamed, or checked out at another path, is another project, whose parks the
+old one's commands no longer list or release. Two different projects that
+share both a name and a path, such as the same `/app` in two containers, are
+one project there: give them different names. A manifest that is there but
+cannot be read or is not valid stops these commands, rather than have them
+use another key. A local SQLite store is the project's own, so a park recorded
+there before atomic kept parks' projects, or under an older name of the
+project's at the same path, becomes the project's when atomic opens the store:
+on one, a rename strands no parked run. On a shared PostgreSQL store
+such a park is no project's: no atomic command lists or releases it, its run
+stays parked with its record kept in the store, and the work goes on only as a
+new run, started again with `atomic run`. Stop every atomic process that uses a
+shared store before upgrading it, so that none goes on recording parks without
+their project.
 The caps and prices in the person's own configuration are ceilings: a project's
 files, a variable and a written `budget` block may only bring a cap down to them.
 The commands that show budgets and spend come with run inspection.
