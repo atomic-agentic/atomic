@@ -543,6 +543,104 @@ fn a_replay_reads_no_api_key_and_sends_none() {
     });
 }
 
+/// A ChatGPT sign-in in the file store of the configuration directory
+/// `config`, outside the checkout (atomic refuses a sign-in the repository
+/// could have supplied), with the variables that choose it; state stays in
+/// `dir`, outside /tmp.
+fn signed_in(dir: &Path, config: &Path) -> Vec<(String, String)> {
+    let auth = config.join("atomic/credentials/codex-auth");
+    std::fs::create_dir_all(&auth).expect("auth home");
+    let id_token = atomic_core::testing::fake_id_token("dev@example.invalid", "account-1");
+    std::fs::write(
+        auth.join("auth.json"),
+        json!({"auth_mode": "chatgpt", "OPENAI_API_KEY": null, "tokens": {
+            "id_token": id_token, "access_token": "synthetic-access-token",
+            "refresh_token": "synthetic-refresh-token", "account_id": "account-1"},
+            "last_refresh": "2099-01-01T00:00:00Z"})
+        .to_string(),
+    )
+    .expect("auth.json");
+    vec![
+        // Empty is unset: state and credentials in the XDG directories.
+        ("ATOMIC_HOME".into(), String::new()),
+        (
+            "XDG_DATA_HOME".into(),
+            dir.join("data").display().to_string(),
+        ),
+        ("XDG_CONFIG_HOME".into(), config.display().to_string()),
+        ("ATOMIC_CREDENTIAL_STORE".into(), "file".into()),
+    ]
+}
+
+#[test]
+fn signed_in_a_replay_still_finds_what_detection_recorded_and_a_shared_ledger_refuses_it() {
+    on_codex_runtime(async {
+        let dir = scratch("signed-in");
+        let project = project(&dir, None);
+        let model = FakeModel::respond(answer).await.expect("fake model");
+        // Detected: the fake answers Ollama's model list.
+        let addr = model
+            .base_url()
+            .trim_start_matches("http://")
+            .trim_end_matches("/v1")
+            .to_owned();
+        let detect = ("ATOMIC_DETECT_OLLAMA_ADDR".to_owned(), addr);
+        let (d, p, e) = (dir.clone(), project.clone(), detect.clone());
+        let live = tokio::task::spawn_blocking(move || {
+            eval_with(&d, &p, "", &["note", "--live"], &[(&e.0, &e.1)])
+        })
+        .await
+        .expect("eval");
+        assert!(live.status.success(), "{}", text(&live));
+        let recorded = model.calls();
+        // Signed in now: a replay reads no sign-in, and finds the recording.
+        let home =
+            std::env::temp_dir().join(format!("atomic-eval-signed-in-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let mut env = signed_in(&dir, &home);
+        env.push(detect.clone());
+        env.push(("ATOMIC_MODEL".into(), "synthetic".into()));
+        let (d, p, e) = (dir.clone(), project.clone(), env.clone());
+        let replay = tokio::task::spawn_blocking(move || {
+            let e: Vec<(&str, &str)> = e.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            eval_with(&d, &p, "", &["note", "--json"], &e)
+        })
+        .await
+        .expect("eval");
+        assert!(replay.status.success(), "{}", text(&replay));
+        let report: Value = serde_json::from_slice(&replay.stdout).expect("one JSON report");
+        assert_eq!(report["cassettes"][0]["replayed"], 2, "{report}");
+        assert_eq!(model.calls(), recorded, "a replay called the model");
+        // A live eval metered in a shared ledger refuses the sign-in.
+        env.push((
+            "ATOMIC_DATABASE_URL".into(),
+            "postgres://atomic:atomic@127.0.0.1:9/atomic".into(),
+        ));
+        env.push(("ATOMIC_EXECUTOR_ID".into(), "host-1".into()));
+        let (d, p, e) = (dir.clone(), project.clone(), env.clone());
+        let shared = tokio::task::spawn_blocking(move || {
+            let e: Vec<(&str, &str)> = e.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            eval_with(&d, &p, "", &["note", "--live"], &e)
+        })
+        .await
+        .expect("eval");
+        assert!(!shared.status.success(), "{}", text(&shared));
+        assert!(
+            text(&shared).contains("a sign-in is personal"),
+            "{}",
+            text(&shared)
+        );
+        assert!(
+            text(&shared).contains("the store is shared"),
+            "{}",
+            text(&shared)
+        );
+        assert_eq!(model.calls(), recorded, "a refused eval called the model");
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
 #[test]
 fn a_replay_needs_the_endpoint_it_was_recorded_for_and_no_key() {
     on_codex_runtime(async {
@@ -806,5 +904,72 @@ fn selection_sampling_reports_and_junit_cover_every_atom() {
             text(&out)
         );
         let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+#[test]
+fn a_team_atom_refuses_a_case_of_the_default_origin_before_any_call() {
+    on_codex_runtime(async {
+        let dir = scratch("case-origin");
+        let project = project(&dir, None);
+        // An atom that takes only team input, and a case that does not say
+        // where its input came from: external, by default.
+        add_atom(
+            &project,
+            "reviewed",
+            "trust: 'team'",
+            &[("Export crashes", "output.ticket.size() > 0")],
+        );
+        let model = FakeModel::respond(answer).await.expect("fake model");
+        let out = eval_async(
+            &dir,
+            &project,
+            &model.base_url(),
+            &["reviewed", "--no-cassettes"],
+        )
+        .await;
+        assert!(!out.status.success(), "{}", text(&out));
+        let said = text(&out);
+        for part in [
+            "cases.jsonl:1",
+            "is external data",
+            "atom `reviewed` accepts team input at most",
+        ] {
+            assert!(said.contains(part), "{part}: {said}");
+        }
+        assert_eq!(model.calls(), 0, "a model was called");
+    });
+}
+
+#[test]
+fn naming_several_atoms_refuses_an_untrusted_case_before_any_atom_runs() {
+    on_codex_runtime(async {
+        let dir = scratch("case-origin-several");
+        let project = project(&dir, None);
+        // `note` comes first and would run live; `reviewed` takes only team
+        // input and has a case of the default origin.
+        add_atom(
+            &project,
+            "reviewed",
+            "trust: 'team'",
+            &[("Export crashes", "output.ticket.size() > 0")],
+        );
+        let model = FakeModel::respond(answer).await.expect("fake model");
+        let out = eval_async(
+            &dir,
+            &project,
+            &model.base_url(),
+            &["note", "reviewed", "--live"],
+        )
+        .await;
+        assert!(!out.status.success(), "{}", text(&out));
+        assert!(
+            text(&out).contains("atom `reviewed` accepts team input at most"),
+            "{}",
+            text(&out)
+        );
+        // Refused before `note` ran: no call, and nothing recorded for it.
+        assert_eq!(model.calls(), 0, "an atom ran before the refusal");
+        assert!(!project.join("evals/note/cassettes").exists());
     });
 }

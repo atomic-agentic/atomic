@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 #
-# Linux and macOS are first-class platforms. Every push to main and every pull
-# request runs the checks on Linux. macOS is opt-in while atomic is built out:
+# Linux and macOS are first-class platforms. Every push to main, every pull
+# request and every merge group of the merge queue runs the checks on Linux.
+# macOS is opt-in while atomic is built out:
 # start the workflow by hand (Actions > CI > Run workflow) and tick "macos" to
 # add it. Actions are pinned by commit SHA.
 #
@@ -16,6 +17,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # The merge queue builds each queued pull request on top of main, and
+  # merges it only when these checks pass there.
+  merge_group:
   workflow_dispatch:
     inputs:
       macos:
@@ -25,7 +29,10 @@ on:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # A newer run on a pull request or a merge group makes its older run moot.
+  # A run on main is the check of what main holds, and it saves the caches,
+  # so once started it runs to the end.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
   contents: read
@@ -203,6 +210,10 @@ jobs:
           target-cache: test
           backends: "true"
       - name: Test shard ${{ matrix.shard }} (with Postgres and the sandbox)
+        # The runner's /tmp belongs to this job alone, so a test may create
+        # and remove entries there (turn_workspace.rs).
+        env:
+          ATOMIC_TEST_PRIVATE_TMP: "1"
         run: scripts/test-shards.py run ${{ matrix.shard }}
 
   # The crash suite: every failpoint, triggered in turn, against real

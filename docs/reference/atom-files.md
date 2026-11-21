@@ -43,8 +43,10 @@ export const config = {
 
 `exec.command` is the program and its arguments, run with no shell from the
 project root. The command reads its input as JSON on stdin and writes its output
-as JSON on stdout; a nonzero exit fails the step. It receives only the variables
-in `env`, plus its own `HOME` and `TMPDIR` and the effect variables below.
+as JSON on stdout; a nonzero exit fails the step. It receives the variables in
+`env`, its own `HOME` and `TMPDIR`, the effect variables below and, when the atom
+declares network access, the proxy variables that come with it; nothing else of
+atomic's environment.
 
 On Linux the command runs under the same sandbox as a Codex atom's commands. It
 can read the project and the rest of the filesystem except atomic's private
@@ -53,16 +55,22 @@ state (every project's database and gate store under the atomic home's
 directories) and the places in your home directory where credentials are
 kept, the same ones a Codex atom's commands cannot read (see
 [configuration](#configuration)). It can write only its own scratch directory (its `HOME`
-and `TMPDIR`) and the project's build caches; a command that writes anywhere
-else fails. It has no network and cannot use sockets, until atoms can declare
-the network they need. It also:
+and `TMPDIR`) and, in a workflow, its run's own build caches; a command that writes anywhere
+else fails. It has no network and cannot use sockets unless the atom declares
+the hosts it reaches (see [Network access](#network-access)). It also:
 
 - finds `.aws`, `.codex`, `.git` and `.agents` in its `HOME` read-only, as the
   sandbox keeps them in every writable directory;
 - cannot gain privileges (no `sudo`, no setuid programs) and sees no GPU or
   other devices beyond the basic ones;
-- is not told where the caches are: name the directory in `env` if a tool needs
-  it;
+- finds its run's build caches through `ATOMIC_CACHE_DIR`, `XDG_CACHE_HOME`,
+  `CARGO_TARGET_DIR`, npm's, pip's and Go's cache variables, and your rustup
+  toolchains, read-only, through `RUSTUP_HOME`, as a worktree step does. The
+  caches are the run's own, shared by its steps except for `CARGO_TARGET_DIR`,
+  which is the step's own, and removed when the run ends. No other run's
+  command may write them, though one can still read them by their path while
+  they last, so keep nothing secret there. A variable the atom declares in
+  `env` wins. An eval gives the command no caches;
 - cannot be a program whose path holds `=`.
 
 `env` cannot set `HOME` or `TMPDIR`, which are the command's own, nor
@@ -147,6 +155,80 @@ Both directories are inside the command's scratch directory, in the project's
 state directory, and go when the step ends; what a killed process left is
 removed when atomic next starts. An atom's `env` cannot set `ATOMIC_RUN_ID`,
 `ATOMIC_STEP_ID`, `ATOMIC_EFFECT_KEY`, `ATOMIC_OUTPUTS` or `ATOMIC_INPUTS`.
+
+### Network access
+
+An exec atom names the hosts its command reaches; with none, the command has no
+network at all.
+
+```astro
+---
+export const config = {
+  description: 'Fetch one operations report.',
+  kind: 'exec',
+  exec: {command: ['python3', 'tools/fetch_report.py']},
+  network: {allow: ['acme-reports.s3.us-east-1.amazonaws.com', '*.example.com']},
+  effects: {external: 'read-only'},
+};
+---
+```
+
+`network.allow` lists DNS names, each a name with at least two labels or `*.`
+and such a name for its subdomains, up to 32 of them. `network: false`, or no
+`network` at all, means none. On Linux the command then gets a network of its
+own whose only way out is a proxy atomic runs for it, which forwards a request
+only to a listed host, and only on port 80 or 443: HTTP, and HTTPS through a
+`CONNECT` tunnel. No SOCKS, and no other port, so listing `github.com` does
+not give the command SSH. The command finds the proxy in `HTTP_PROXY`,
+`HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY` and similar variables, which most HTTP
+clients and SDKs read and which come on top of its `env`; a client that ignores
+them reaches nothing. An atom's `env` cannot set any of them. It can open no
+other connection, to this machine or anywhere else, and no Unix socket. The
+proxy never goes through another proxy, even when atomic's own environment
+names one. Each connection must open with a token that atomic gives the
+command's sandbox and that the command itself never sees, so no sandboxed
+process and no other user's process can use the proxy. A process of your own
+user that runs outside any sandbox can still read the token from the sandbox
+helper's environment while the command runs.
+
+What an atom may list is atomic's policy, checked when the atom loads and again
+before its command runs: public DNS names only. An IP address in any spelling
+(`127.0.0.1`, `2130706433`, `0x7f.1`), `localhost` or a name under it, a
+single-label name, a name under `.local`, `.internal`, `.lan`, `.home.arpa` or
+another private suffix, a bare `*`, and anything with a scheme, a port, a path
+or a Unix socket are refused. That list of private names is a courtesy. The
+control is the proxy, which resolves each listed name before it connects and
+refuses one that resolves to an address on this machine or a private network,
+or that does not resolve. Every address the interfaces of atomic's network
+namespace have counts as this machine's, public ones included; a container's
+or a virtual machine's addresses on another namespace are refused only when
+they are private. Three IPv6 prefixes that carry an IPv4 address inside them
+are refused too, whatever IPv4 address they carry: NAT64's `64:ff9b::/32`
+(which holds the well-known `64:ff9b::/96` and the local-use
+`64:ff9b:1::/48`), 6to4's `2002::/16` and Teredo's `2001:0::/32`. On an
+IPv6-only network that reaches IPv4 through DNS64, a listed host with only
+an IPv4 address therefore cannot be reached: its request fails when the
+proxy dials, with all resolved addresses blocked.
+
+Know what a listed host can get:
+
+- **Anything the command can read.** It can send a listed host whatever it
+  reads, which is the project and most of the filesystem, including files such
+  as `~/.ssh` and `~/.aws` reached by absolute path; only atomic's private state
+  is denied to it.
+- **More than the one site.** An HTTPS tunnel is opaque to the proxy, which
+  checks only the name the command asked for. Other sites served from the same
+  CDN edge or load balancer can be reached through it.
+- **Every tenant under a wildcard.** `*.s3.amazonaws.com` or any wildcard over
+  a shared-hosting suffix reaches every customer's buckets and sites there, not
+  only yours. List the exact names.
+
+The rule is enforced on Linux only. On macOS and Windows exec commands run
+unconfined, with whatever network the machine has, and a declaration restricts
+nothing.
+
+Only exec atoms declare network access at this version; a codex or lite atom
+that declares `network.allow` is refused, and its commands run with none.
 
 ## Schema locations
 
@@ -272,7 +354,7 @@ time rather than passing unchecked.
 | `kind` | `lite`, `codex` or `exec` |
 | `input`, `output` | Full JSON Schema or a local schema reference |
 | `model`, `sandbox` | Model selection and effective sandbox request |
-| `trust` | The riskiest input origin the atom accepts: `team`, `agent` or `external` (the default). A workflow that maps less trusted data into it fails to load, and `atomic run <atom>`, whose input is external data, refuses it before anything runs unless the atom accepts external input; see [where each input came from](workflow-files.md#where-each-input-came-from) |
+| `trust` | The riskiest input origin the atom accepts: `team`, `agent` or `external` (the default). A workflow that maps less trusted data into it fails to load, `atomic run <atom>`, whose input is external data, refuses it before anything runs unless the atom accepts external input, and `atomic eval` refuses a case whose [origin](eval-cases.md#where-a-cases-input-came-from) is less trusted than it accepts; see [where each input came from](workflow-files.md#where-each-input-came-from) |
 | `validate` | Expression-bodied typed callbacks over `{input, output}` |
 | `examples` | Named `{input, output}` examples checked against full contracts |
 | `case`, `judges` | Full evaluation-case and judge input/output schema declarations |
@@ -493,7 +575,7 @@ protect against a process running as you.
 
 ## Related references
 
-- [Prompt components and expressions](../guides/template-tags.md)
+- [Prompt expressions and components](../guides/template-tags.md)
 - [VS Code](../guides/vs-code.md)
 - [Workflow files](workflow-files.md)
 - [Scripts and cloud SDKs](../guides/scripts-and-cloud-sdks.md)

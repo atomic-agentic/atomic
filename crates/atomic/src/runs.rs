@@ -345,6 +345,23 @@ pub async fn run(
         engine::Takes::Own,
     )
     .await?;
+    // Refused before it starts, not at its first lite step.
+    let lite = target::lite_atoms(&run);
+    if engine.signed_in && !lite.is_empty() {
+        let _ = engine.rt.shutdown(SHUTDOWN).await;
+        return Err(Failure::new(
+            "config.model",
+            format!(
+                "{} calls a model API itself (lite: {}), and the ChatGPT sign-in serves Codex \
+                 atoms only",
+                run.pipeline.name,
+                lite.join(", ")
+            ),
+            "set ATOMIC_MODEL_BASE_URL and ATOMIC_MODEL to an OpenAI-compatible endpoint, and \
+             ATOMIC_MODEL_API_KEY_ENV to the variable holding its key if it needs one",
+        )
+        .into());
+    }
     let run_id = match args.run_id {
         Some(id) => id,
         None => new_run_id()?,
@@ -654,7 +671,9 @@ async fn stop(signals: &mut Signals, who: &str, exit: Exit) -> ! {
     .await
     .unwrap_or(0);
     if interrupted > 0 {
-        atomic_core::log_line!("{who}: settled {interrupted} model call(s) that had not finished");
+        atomic_core::log_line!(
+            "{who}: settled {interrupted} model call(s) or command(s) that had not finished"
+        );
     }
     // Spans still open end and are sent; a collector that does not answer
     // holds this up until another signal or the flush's deadline, whichever
@@ -688,6 +707,9 @@ pub async fn serve(
     // One run whose commands cannot be confined here does not stop the
     // others: it stays unfinished, and serve goes on.
     atomic_app::workflows::serve_past_unconfinable_steps();
+    // A step that has waited its limit for room is set aside, and keeps
+    // trying, rather than stopping serve or waiting for a restart.
+    atomic_core::runtime::keep_trying_past_the_limit();
     let state = state(project)?;
     let engine = engine::open(
         &state,
