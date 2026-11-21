@@ -1,0 +1,1 @@
+persons-cap-over-null|crates/atomic/src/settings.rs|            let have = at(budget, inside(&dotted)).and_then(Value::as_f64);|            let have = at(budget, inside(&dotted)).and_then(Value::as_f64); if have.is_none() { continue; }|-p atomic-agentic --bins -- --exact settings::tests::a_null_from_a_layer_above_cannot_remove_your_own_dollar_cap

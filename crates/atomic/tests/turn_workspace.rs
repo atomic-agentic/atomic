@@ -67,6 +67,17 @@ fn shared_scratch() -> PathBuf {
     .clone()
 }
 
+/// The backend on [`shared_scratch`], connected once for every test here:
+/// connecting empties the backend's shared temporary directory, where
+/// Codex's sandbox keeps its registry and markers, which turns of other
+/// tests may be using.
+fn shared_backend() -> Backend {
+    static BACKEND: std::sync::OnceLock<Backend> = std::sync::OnceLock::new();
+    BACKEND
+        .get_or_init(|| Backend::connect(LocalBackend::in_dir(shared_scratch())).expect("connects"))
+        .clone()
+}
+
 fn runtime(dir: &Path, model: &FakeModel) -> CodexRuntime {
     CodexRuntime {
         paths: CodexPaths::with_helpers(
@@ -114,33 +125,34 @@ fn tool(command: &str) -> Reply {
 /// else than the run asked: another directory, a writable sandbox and an
 /// environment of its own.
 struct Relocating {
-    local: LocalBackend,
+    /// The backend it opens on, connected already (see [`shared_backend`]).
+    local: Backend,
     root: PathBuf,
 }
 
 impl ExecutionBackend for Relocating {
     fn connect(&self) -> Result<atomic_exec::Statement, ExecError> {
-        self.local.connect()
+        Ok(self.local.statement())
     }
     fn open(&self, request: &Open) -> Result<Workspace, ExecError> {
-        let mut ws = self.local.open(request)?;
+        let mut ws = self.local.shared().open(request)?;
         ws.root = Some(self.root.clone());
         ws.sandbox = Sandbox::WorkspaceWrite;
         ws.env = [("PLACED".to_owned(), "by-the-backend".to_owned())].into();
         Ok(ws)
     }
     fn run(&self, command: &atomic_exec::Command) -> Result<atomic_exec::Completed, ExecError> {
-        self.local.run(command)
+        self.local.shared().run(command)
     }
     fn close(&self, workspace: &Workspace) -> Result<(), ExecError> {
-        self.local.close(workspace)
+        self.local.shared().close(workspace)
     }
 
     fn exchange(
         &self,
         workspace: &Workspace,
     ) -> Result<Option<Box<dyn atomic_exec::exchange::Exchange>>, ExecError> {
-        self.local.exchange(workspace)
+        self.local.shared().exchange(workspace)
     }
 }
 
@@ -175,7 +187,7 @@ fn a_turn_runs_where_its_workspace_says() {
         .await
         .expect("fake model");
         let backend = Backend::connect(Relocating {
-            local: LocalBackend::in_dir(shared_scratch()),
+            local: shared_backend(),
             root: dir.join("elsewhere"),
         })
         .expect("connects");
@@ -201,10 +213,12 @@ fn a_turn_runs_where_its_workspace_says() {
 }
 
 /// Plant a file in a live exec scratch directory from a `workspace-write`
-/// turn, and say whether it landed.
-async fn plant_in_live_exec_scratch(dir: &Path, scratch_root: PathBuf) -> (bool, String) {
-    // An exec atom's workspace, open while the turn runs.
-    let exec = LocalBackend::in_dir(scratch_root.clone());
+/// turn on the shared backend, and say whether it landed.
+async fn plant_in_live_exec_scratch(dir: &Path) -> (bool, String) {
+    // An exec atom's workspace, open while the turn runs, among the shared
+    // backend's: opened without connecting, which would empty the shared
+    // temporary directory.
+    let exec = LocalBackend::in_dir(shared_scratch());
     let live = exec
         .open(&Open {
             label: "total".into(),
@@ -225,7 +239,7 @@ async fn plant_in_live_exec_scratch(dir: &Path, scratch_root: PathBuf) -> (bool,
     ])
     .await
     .expect("fake model");
-    let backend = Backend::connect(LocalBackend::in_dir(scratch_root)).expect("connects");
+    let backend = shared_backend();
     let rt = runtime(dir, &model);
     let answer = run_turn(
         &rt,
@@ -251,7 +265,7 @@ fn a_turn_cannot_plant_files_in_a_live_exec_scratch() {
         let dir = scratch("plant");
         // Where atomic keeps scratch directories: the project's state
         // directory, outside every root a sandboxed turn may write.
-        let (landed, output) = plant_in_live_exec_scratch(&dir, shared_scratch()).await;
+        let (landed, output) = plant_in_live_exec_scratch(&dir).await;
         assert!(
             !landed,
             "the turn planted a file in the exec scratch: {output}"
@@ -278,7 +292,7 @@ fn concurrent_turns_in_one_directory_never_break_each_others_sandbox() {
     const COMMANDS: usize = 80;
     on_codex_runtime(async {
         let dir = scratch("concurrent");
-        let backend = Backend::connect(LocalBackend::in_dir(shared_scratch())).expect("connects");
+        let backend = shared_backend();
         let turn = |n: usize| {
             let dir = dir.clone();
             let backend = backend.clone();
@@ -300,7 +314,9 @@ fn concurrent_turns_in_one_directory_never_break_each_others_sandbox() {
                     shared.display()
                 )));
                 script.push(Reply::Text("Done.".into()));
-                let model = FakeModel::start(script).await.expect("fake model");
+                let model = FakeModel::start(script)
+                    .await
+                    .map_err(|e| format!("turn {n}'s fake model: {e}"))?;
                 let rt = runtime(&dir, &model);
                 let answer = run_turn(
                     &rt,
@@ -312,12 +328,18 @@ fn concurrent_turns_in_one_directory_never_break_each_others_sandbox() {
                     },
                 )
                 .await
-                .expect("the turn runs");
-                assert_eq!(answer, "Done.");
+                .map_err(|e| format!("turn {n} did not run: {e}"))?;
+                if answer != "Done." {
+                    return Err(format!("turn {n} answered {answer:?}"));
+                }
                 // Each request after the first carries every command's output
                 // so far; the last one carries them all. What failed is
                 // returned, not asserted here, so that every turn ends first.
-                let last = model.requests().last().cloned().expect("requests");
+                let last = model
+                    .requests()
+                    .last()
+                    .cloned()
+                    .ok_or(format!("turn {n} made no request"))?;
                 let failed = (0..COMMANDS)
                     .filter(|i| {
                         !last
@@ -327,16 +349,28 @@ fn concurrent_turns_in_one_directory_never_break_each_others_sandbox() {
                     .count();
                 let wrote_shared =
                     !last.to_string().contains(&format!("shared-write-{n}=1")) || shared.exists();
-                (failed, wrote_shared)
+                Ok::<_, String>((failed, wrote_shared))
             }
         };
+        // Every turn ends, whatever any other did, before anything is
+        // asserted: a failed turn is returned, not panicked in its task.
         let turns: Vec<_> = (0..TURNS).map(|n| tokio::spawn(turn(n))).collect();
-        let (mut failed, mut wrote_shared) = (Vec::new(), Vec::new());
+        let mut ended = Vec::new();
         for t in turns {
-            let (f, w) = t.await.expect("the turn");
-            failed.push(f);
-            wrote_shared.push(w);
+            ended.push(t.await);
         }
+        let (mut failed, mut wrote_shared, mut broken) = (Vec::new(), Vec::new(), Vec::new());
+        for (n, end) in ended.into_iter().enumerate() {
+            match end {
+                Ok(Ok((f, w))) => {
+                    failed.push(f);
+                    wrote_shared.push(w);
+                }
+                Ok(Err(why)) => broken.push(why),
+                Err(e) => broken.push(format!("turn {n}'s task: {e}")),
+            }
+        }
+        assert!(broken.is_empty(), "turns that did not run: {broken:?}");
         assert_eq!(
             wrote_shared,
             vec![false; TURNS],
@@ -369,7 +403,7 @@ fn a_command_naming_the_inner_stage_leaves_the_registry_shared() {
     support::require_sandbox();
     on_codex_runtime(async {
         let dir = scratch("inner-flag");
-        let backend = Backend::connect(LocalBackend::in_dir(shared_scratch())).expect("connects");
+        let backend = shared_backend();
         let model = FakeModel::start(vec![
             tool("--apply-seccomp-then-exec"),
             tool("ls -A \"$TMPDIR\"; echo listed"),
@@ -396,11 +430,23 @@ fn a_command_naming_the_inner_stage_leaves_the_registry_shared() {
             .cloned()
             .expect("requests")
             .to_string();
-        assert!(last.contains("listed"), "{last}");
+        // The listing ran: its output, not the command echoed back.
+        assert!(last.contains("listed\\n"), "{last}");
         assert!(
             !last.contains("codex-bwrap-synthetic-mount-targets"),
             "Codex's registry moved into the turn's own TMPDIR: {last}"
         );
+        // It is in the backend's shared directory, where it belongs.
+        let shared = shared_scratch().join(".tmp");
+        let registry = std::fs::read_dir(&shared)
+            .expect("the shared directory")
+            .filter_map(Result::ok)
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("codex-bwrap-synthetic-mount-targets-")
+            });
+        assert!(registry, "no registry in {}", shared.display());
     });
 }
 
@@ -468,7 +514,7 @@ fn a_turn_cut_off_while_a_command_keeps_running_is_charged_as_one_in_flight() {
             settled: std::sync::Mutex::new(Vec::new()),
         });
         let mut rt = runtime(&dir, &model);
-        let backend = Backend::connect(LocalBackend::in_dir(shared_scratch())).expect("connects");
+        let backend = shared_backend();
         rt.meter = Metering::new(recorder.clone());
         let spec = TurnSpec {
             prompt: "build it".into(),
@@ -573,7 +619,7 @@ fn a_tmp_codex_that_comes_and_goes_does_not_break_a_turn() {
     let toggler = TmpCodexToggler::start();
     on_codex_runtime(async {
         let dir = scratch("tmp-codex");
-        let backend = Backend::connect(LocalBackend::in_dir(shared_scratch())).expect("connects");
+        let backend = shared_backend();
         let mut script: Vec<Reply> = (0..COMMANDS)
             .map(|i| tool(&format!("echo still-ok-{i}")))
             .collect();

@@ -1,0 +1,1 @@
+persons-dollar-clamp|crates/atomic-core/src/budget.rs|        (Some(c), Some(k)) if k < c => (Some(k), Origin::Ceiled(path("cost_usd"))),|        (Some(c), Some(k)) if std::hint::black_box(false) && k < c => (Some(k), Origin::Ceiled(path("cost_usd"))),|-p atomic-agentic-core --lib --features fake-model -- a_persons_cap_binds_its_own_level_by_its_own_setting

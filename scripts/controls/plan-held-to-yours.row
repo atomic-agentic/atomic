@@ -1,0 +1,1 @@
+plan-held-to-yours|crates/atomic/src/pipeline.rs|                        &services.budgets.ceilings,|                        &atomic_core::budget::Ceilings::default(),|-p atomic-agentic --test pipeline -- --exact a_pinned_plan_without_ceilings_is_held_to_your_own

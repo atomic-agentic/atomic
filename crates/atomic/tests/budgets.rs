@@ -1377,6 +1377,7 @@ fn a_request_in_flight_is_estimated_at_the_larger_of_one_bound_and_the_last_requ
                 input_bound: None,
                 turn: true,
                 work: false,
+                longest: None,
             })
             .await
             .expect("admitted");
@@ -1455,6 +1456,7 @@ fn a_call_whose_task_panics_stops_its_heartbeat() {
                 input_bound: None,
                 turn: false,
                 work: true,
+                longest: None,
             })
             .await
             .expect("admitted");
@@ -1478,6 +1480,108 @@ fn a_call_whose_task_panics_stops_its_heartbeat() {
         assert_eq!(seen(&dir, "panicked:1:0").await, before, "it beat on");
         let attempt = &rt.ledger().attempts("panicked").await.expect("attempts")[0];
         assert_eq!(attempt.state, "reserved", "{attempt:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+#[test]
+fn an_exec_cap_too_small_to_start_a_command_fails_configuration() {
+    use atomic_app::metering::BudgetPlan;
+    let settings = settings(10_000_000, 100_000_000);
+    let small = Budget {
+        millis: Some(400),
+        ..Budget::default()
+    };
+    // An exec atom's own cap.
+    let (atom, e) = BudgetPlan::resolve(&settings, &Budget::default(), &[], &[("nap", &small)])
+        .expect_err("refused");
+    assert_eq!(atom.as_deref(), Some("nap"));
+    assert!(matches!(e, BudgetError::BelowWork { .. }), "{e}");
+    assert!(
+        e.to_string().contains(
+            "the atom minutes cap (0.4 seconds, written in its budget block) is smaller than \
+             the 0.5 seconds"
+        ),
+        "{e}"
+    );
+    // The run's, over an exec atom; with none, nothing needs to start.
+    let (atom, e) = BudgetPlan::resolve(&settings, &small, &[], &[("nap", &Budget::default())])
+        .expect_err("refused");
+    assert_eq!(atom, None);
+    assert!(matches!(e, BudgetError::BelowWork { .. }), "{e}");
+    BudgetPlan::resolve(&settings, &small, &[], &[]).expect("no command to start");
+    // A plan that came from outside is held to the same.
+    let mut plan = BudgetPlan::resolve(
+        &settings,
+        &Budget::default(),
+        &[],
+        &[("nap", &Budget::default())],
+    )
+    .expect("a plan");
+    plan.validate().expect("valid");
+    let mut run_small = plan.clone();
+    plan.exec.get_mut("nap").expect("nap").millis = 400;
+    let refused = plan.validate().expect_err("refused");
+    assert!(
+        refused.starts_with("atom nap: the atom minutes cap (0.4 seconds"),
+        "{refused}"
+    );
+    // The run's cap, under its exec atom's.
+    run_small.run.millis = 400;
+    let refused = run_small.validate().expect_err("refused");
+    assert!(
+        refused.starts_with("the run: the workflow minutes cap (0.4 seconds"),
+        "{refused}"
+    );
+}
+
+#[test]
+fn a_command_reserves_no_more_than_its_own_limit() {
+    on_codex_runtime(async {
+        let dir = scratch("command-longest");
+        let rt = Durare::sqlite(&dir.join("atomic.db"))
+            .await
+            .expect("engine");
+        let plan = atomic_app::metering::BudgetPlan::resolve(
+            &settings(10_000_000, 100_000_000),
+            &Budget::default(),
+            &[],
+            &[("nap", &Budget::default())],
+        )
+        .expect("a plan");
+        assert!(plan.exec["nap"].millis > 60_000, "{plan:?}");
+        let budget = RunBudget::pinned(rt.ledger(), &plan);
+        let meter = budget.meter(
+            &atomic_durable::StepInfo {
+                workflow_id: "longest".into(),
+                step_id: 1,
+            },
+            &plan.exec["nap"],
+        );
+        let (ticket, limit) = meter
+            .admit(atomic_core::usage::Call {
+                index: 0,
+                model: atomic_core::usage::WORK_MODEL.into(),
+                input_bound: None,
+                turn: false,
+                work: true,
+                longest: Some(Duration::from_secs(10)),
+            })
+            .await
+            .expect("admitted");
+        // Ten seconds, not the minutes its atom has left: its own limit
+        // bounds it, so a cut-off is not the cap's.
+        assert_eq!(limit.time, Some(Duration::from_secs(10)));
+        assert_eq!(ticket.as_ref().and_then(|t| t.bounded_by.clone()), None);
+        let attempt = &rt.ledger().attempts("longest").await.expect("attempts")[0];
+        assert_eq!(attempt.reserved.millis, 10_000, "{attempt:?}");
+        meter
+            .settle(
+                ticket,
+                atomic_core::usage::Outcome::Reported(Default::default()),
+            )
+            .await
+            .expect("settled");
         let _ = std::fs::remove_dir_all(&dir);
     });
 }
@@ -1623,6 +1727,7 @@ fn a_dead_commands_reservation_is_settled_when_it_is_found() {
                 reserve: least,
                 maximum: least,
                 turn: true,
+                longest: None,
             })
             .await
             .expect("admit");

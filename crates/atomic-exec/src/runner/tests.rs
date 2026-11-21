@@ -15,6 +15,7 @@ fn command(program: &str, args: &[&str], stdin: &[u8]) -> Command {
         writable: Vec::new(),
         read_only: Vec::new(),
         network: Vec::new(),
+        secret_env: Default::default(),
     }
 }
 
@@ -322,4 +323,20 @@ fn a_runner_has_only_path_from_the_control_planes_environment() {
         .filter_map(|line| line.split_once('=').map(|(name, _)| name.to_owned()))
         .collect();
     assert_eq!(names, ["PATH"]);
+}
+
+/// A request carries its command's secret variables to the runner, and
+/// shows them in no `Debug` form.
+#[test]
+fn a_request_carries_secret_variables_and_hides_them() {
+    let mut sent = command("true", &[], b"");
+    sent.secret_env = crate::SecretEnv(vec![("K".into(), "the-secret-value".into())]);
+    let request = Request::new(&sent);
+    assert!(!format!("{request:?}").contains("the-secret-value"));
+    let json = serde_json::to_vec(&request).expect("json");
+    let back: Request = serde_json::from_slice(&json).expect("read back");
+    assert_eq!(back.command().expect("command").secret_env, sent.secret_env);
+    // A request with none says nothing of them.
+    let plain = serde_json::to_string(&Request::new(&command("true", &[], b""))).expect("json");
+    assert!(!plain.contains("secret_env"), "{plain}");
 }

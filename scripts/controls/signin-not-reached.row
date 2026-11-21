@@ -1,0 +1,1 @@
+signin-not-reached|crates/atomic-core/src/signin.rs|                Ok(Some(_)) => forgot.keeps_a_sign_in(locked),|                Ok(Some(_)) => true, /*CONTROL_OFF*/|-p atomic-agentic-core --lib signin::tests::a_login_refused_before_it_forgot_does_not_revive_an_entry

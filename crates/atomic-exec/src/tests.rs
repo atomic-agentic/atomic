@@ -15,6 +15,7 @@ fn shell(script: &str, stdin: &[u8], time: Duration) -> Result<Completed, ExecEr
         writable: Vec::new(),
         read_only: Vec::new(),
         network: Vec::new(),
+        secret_env: Default::default(),
     })
 }
 
@@ -71,6 +72,7 @@ fn no_shell_expands_the_arguments() {
             writable: Vec::new(),
             read_only: Vec::new(),
             network: Vec::new(),
+            secret_env: Default::default(),
         })
         .expect("runs");
     assert_eq!(done.stdout, b"$HOME;`id`");
@@ -90,6 +92,7 @@ fn a_missing_program_cannot_start() {
             writable: Vec::new(),
             read_only: Vec::new(),
             network: Vec::new(),
+            secret_env: Default::default(),
         })
         .expect_err("missing");
     assert!(matches!(error, ExecError::Start { .. }), "{error}");
@@ -594,6 +597,7 @@ fn a_command_in_a_local_workspace_runs_as_it_would_directly() {
         writable: Vec::new(),
         read_only: Vec::new(),
         network: Vec::new(),
+        secret_env: Default::default(),
     };
     let through = LocalBackend::default().run(&command).expect("runs");
     let direct = process::run(
@@ -844,4 +848,79 @@ fn a_leftover_that_left_the_group_holds_the_output_only_briefly() {
         started.elapsed()
     );
     assert_eq!(done.stdout, b"done");
+}
+
+/// A command's secret variables reach it on a Unix socket whose descriptor
+/// its environment names, and are never in its environment. The socket,
+/// unlike a pipe, cannot be reopened through /proc.
+#[test]
+fn secret_variables_reach_a_command_on_a_socket_and_never_its_environment() {
+    const PROBE: &str = r#"import errno, json, os, stat, sys
+fd = int(os.environ['ATOMIC_SECRET_ENV_FD'])
+try:
+    open('/proc/self/fd/%d' % fd, 'rb').read()
+    reopened = 'reopened'
+except OSError as e:
+    reopened = errno.errorcode.get(e.errno, str(e.errno))
+data = b''
+while True:
+    chunk = os.read(fd, 4096)
+    if not chunk:
+        break
+    data += chunk
+json.dump({
+    'k': os.environ.get('K'),
+    'value_in_env': any('the-secret-value' in v for v in os.environ.values()),
+    'socket': stat.S_ISSOCK(os.fstat(fd).st_mode),
+    'reopened': reopened,
+    'read': data.decode(),
+    'only': os.environ.get('ONLY'),
+}, sys.stdout)
+"#;
+    let done = LocalBackend::default()
+        .run(&Command {
+            program: "python3".into(),
+            args: vec!["-c".into(), PROBE.into()],
+            cwd: std::env::temp_dir(),
+            env: vec![("ONLY".into(), "this".into())],
+            time_limit: Duration::from_secs(10),
+            output_limit: 4096,
+            secret_env: SecretEnv(vec![("K".into(), "the-secret-value".into())]),
+            ..Command::default()
+        })
+        .expect("runs");
+    assert!(done.success(), "{}", String::from_utf8_lossy(&done.stderr));
+    let got: serde_json::Value = serde_json::from_slice(&done.stdout).expect("json");
+    assert_eq!(got["k"], serde_json::Value::Null, "{got}");
+    assert_eq!(got["value_in_env"], false, "{got}");
+    assert_eq!(got["only"], "this", "{got}");
+    assert_eq!(got["socket"], true, "{got}");
+    assert_eq!(got["read"], "K=the-secret-value\u{0}", "{got}");
+    #[cfg(target_os = "linux")]
+    assert_eq!(got["reopened"], "ENXIO", "{got}");
+    // Its Debug form names the variable and hides its value.
+    let shown = format!(
+        "{:?}",
+        SecretEnv(vec![("K".into(), "the-secret-value".into())])
+    );
+    assert_eq!(shown, r#"["K=<hidden>"]"#);
+}
+
+/// Secret variables cross as `KEY=VALUE` entries each ended by NUL: a name
+/// that is empty or holds `=` or NUL, or a value that holds NUL, cannot be
+/// sent, and what is read must end with its terminator.
+#[test]
+fn secret_variables_cross_only_as_well_formed_entries() {
+    let one = SecretEnv(vec![("K".into(), "v=w".into())]);
+    let bytes = one.encode().expect("encodes");
+    assert_eq!(bytes, b"K=v=w\0");
+    assert_eq!(SecretEnv::decode(&bytes).expect("decodes"), one);
+    assert_eq!(SecretEnv::decode(b"").expect("none"), SecretEnv::default());
+    for bad in [("", "v"), ("K=", "v"), ("K\0", "v"), ("K", "v\0")] {
+        let bad = SecretEnv(vec![(bad.0.into(), bad.1.into())]);
+        assert!(bad.encode().is_err(), "{bad:?}");
+    }
+    assert!(SecretEnv::decode(b"K=v").is_err(), "no terminator");
+    assert!(SecretEnv::decode(b"K=v\0\0").is_err(), "an empty entry");
+    assert!(SecretEnv::decode(b"Kv\0").is_err(), "no `=`");
 }
