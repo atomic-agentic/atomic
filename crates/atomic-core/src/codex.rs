@@ -1098,7 +1098,51 @@ where
         std::env::set_var("CODEX_HOME", codex_home);
     }
     scrub_overrides();
-    arg0_dispatch_or_else(move |paths| main_fn(CodexPaths(paths)))
+    let links = hold_helper_links(codex_home);
+    arg0_dispatch_or_else(move |paths| {
+        drop(links);
+        main_fn(CodexPaths(paths))
+    })
+}
+
+/// How long one atomic process waits for another to finish making Codex's
+/// links in the same Codex home before it makes its own regardless.
+const HELPER_LINKS_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A lock on making Codex's links to atomic under its helpers' names, in a
+/// file of `codex_home` that atoms' commands are denied, held from just
+/// before Codex's dispatch until the command itself starts: or none, when
+/// it cannot be taken within [`HELPER_LINKS_WAIT`] or made at all.
+///
+/// Codex makes those links in a new directory of its home, after sweeping
+/// away every such directory no running process holds, and a directory
+/// another process is still making is not yet held: two atomic processes
+/// starting at once in one Codex home can take each other's away, and the
+/// one that loses warns that it "could not create PATH aliases" and runs
+/// atomic itself as its helper (see [`run_as_linux_sandbox`]). One at a time
+/// they cannot. The same warning has other causes this does not touch: a
+/// Codex home under the system's temporary directory, which a release build
+/// of Codex refuses to make links in, and a home that cannot be written or
+/// is full.
+fn hold_helper_links(codex_home: &Path) -> Option<std::fs::File> {
+    let dir = codex_home.join("tmp");
+    std::fs::create_dir_all(&dir).ok()?;
+    let lock = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join("atomic-helper-links.lock"))
+        .ok()?;
+    let deadline = std::time::Instant::now() + HELPER_LINKS_WAIT;
+    loop {
+        match lock.try_lock() {
+            Ok(()) => return Some(lock),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(_) => return None,
+        }
+    }
 }
 
 /// The entry point for a command that starts no Codex thread, such as
@@ -1600,8 +1644,9 @@ impl atomic_exec::Confine for ExecSandbox {
                 if not_the_helper(&stderr) {
                     Err(atomic_exec::ExecError::Unconfinable {
                         message: format!(
-                            "Codex's Linux sandbox helper could not be set up: it ran \
-                             atomic's own command line in the helper's place ({why})"
+                            "Codex's Linux sandbox helper could not be set up: what ran in \
+                             its place was not the helper ({why}); run atomic again, and if \
+                             this repeats, install a bubblewrap that supports --argv0"
                         ),
                     })
                 } else if sandbox_refused(&stderr) {
@@ -1624,12 +1669,16 @@ impl atomic_exec::Confine for ExecSandbox {
 }
 
 /// Whether a sandbox trial that failed with `stderr` failed because what
-/// ran in the helper's place was atomic's own command line, which refuses
-/// the helper's arguments: a trial run again would only fail again.
+/// ran in the helper's place was not the helper: atomic's own command line,
+/// refusing the helper's arguments, or bubblewrap, unable to run the helper
+/// by its name, as one without `--argv0` tries to. Waiting would not change
+/// either.
 pub(crate) fn not_the_helper(stderr: &str) -> bool {
-    stderr
-        .lines()
-        .any(|line| line.starts_with("Usage: atomic "))
+    stderr.lines().any(|line| {
+        line.contains("unexpected argument '--sandbox-policy-cwd'")
+            || (line.trim_start().starts_with("bwrap:")
+                && line.contains("execvp codex-linux-sandbox"))
+    })
 }
 
 /// Whether a sandbox trial that failed with `stderr` failed because this
@@ -1812,15 +1861,24 @@ fn scrub(mut remove: impl FnMut(&str)) {
     }
 }
 
-/// The first argument Codex gives its Linux sandbox helper, at the pinned
-/// revision, for both of its stages.
+/// The first argument Codex passes its Linux sandbox helper at the pinned
+/// revision, to its outer stage and to its inner one alike. No command line
+/// of atomic's own starts with it.
 #[cfg(target_os = "linux")]
 const LINUX_SANDBOX_ARG1: &str = "--sandbox-policy-cwd";
 
-/// Whether this process was given the Linux sandbox helper's arguments.
+/// Whether this process was given the Linux sandbox helper's arguments,
+/// under a name that is not one of Codex's other helpers'.
 #[cfg(target_os = "linux")]
 fn linux_sandbox_args() -> bool {
-    std::env::args_os().nth(1).as_deref() == Some(LINUX_SANDBOX_ARG1.as_ref())
+    let mut args = std::env::args_os();
+    let patch = args
+        .next()
+        .as_deref()
+        .map(Path::new)
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == "apply_patch" || name == "applypatch");
+    !patch && args.next().as_deref() == Some(LINUX_SANDBOX_ARG1.as_ref())
 }
 
 /// Run this executable again, with the same arguments, under the Linux
@@ -1833,6 +1891,11 @@ fn linux_sandbox_args() -> bool {
 #[cfg(target_os = "linux")]
 fn run_as_linux_sandbox() -> anyhow::Error {
     use std::os::unix::process::CommandExt;
+    // Its environment may already hold a command's proxy token, before the
+    // helper this becomes makes itself non-dumpable.
+    if let Err(e) = not_dumpable() {
+        return anyhow::Error::new(e).context("make the sandbox helper non-dumpable");
+    }
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(e) => return anyhow::Error::new(e).context("find atomic's own executable"),
@@ -4589,11 +4652,15 @@ mod tests {
     fn a_trial_run_by_atomics_command_line_is_not_the_helper() {
         assert!(not_the_helper(
             "error: unexpected argument '--sandbox-policy-cwd' found\n\n\
-             Usage: atomic [OPTIONS] [COMMAND]\n\nFor more information, try '--help'.\n"
+             Usage: atomic-x86_64 [OPTIONS] [COMMAND]\n\nFor more information, try '--help'.\n"
+        ));
+        assert!(not_the_helper(
+            "bwrap: execvp codex-linux-sandbox: No such file or directory"
         ));
         for other in [
             "",
             "bwrap: Can't make directory /tmp/x: No space left on device",
+            "error: unexpected argument '--other' found",
         ] {
             assert!(!not_the_helper(other), "{other}");
         }

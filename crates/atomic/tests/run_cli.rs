@@ -2813,10 +2813,6 @@ fn a_cancelled_run_is_not_resumed_and_a_parked_one_is() {
     });
 }
 
-/// `atomic run` confines an exec atom's command: through the engine as it
-/// is wired, the command cannot read the project's database or the
-/// credential store, write a gate decision, or open a socket, and can still
-/// read the project.
 /// When Codex cannot make its links to atomic under its helpers' names, as
 /// when another atomic process sweeping the same Codex home takes their
 /// directory away, it runs atomic itself as its Linux sandbox helper: an
@@ -2854,6 +2850,10 @@ fn an_exec_atom_runs_when_codex_cannot_link_its_helpers() {
     assert_eq!(count_log(&dir), 1, "the command ran once");
 }
 
+/// `atomic run` confines an exec atom's command: through the engine as it
+/// is wired, the command cannot read the project's database or the
+/// credential store, write a gate decision, or open a socket, and can still
+/// read the project.
 #[cfg(target_os = "linux")]
 // needs_sandbox
 #[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
