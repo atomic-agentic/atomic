@@ -190,7 +190,7 @@ fn a_second_mount_whose_root_went_stale_refuses_the_list() {
         );
     }
     assert_eq!(root_of(&second), "/under");
-    let found = atomic_core::mounts::second_mounts(&[&[place.clone()]]).expect("found");
+    let found = atomic_core::mounts::second_mounts(&[std::slice::from_ref(&place)]).expect("found");
     assert_eq!(found, [vec![second.join(".ssh")]]);
     // The lower directory renamed under the bind: the table keeps the old
     // root, with nothing to say it is stale, until the new name is first
@@ -199,7 +199,7 @@ fn a_second_mount_whose_root_went_stale_refuses_the_list() {
     std::fs::rename(t.join("lower/under"), t.join("lower/moved")).expect("rename");
     let place = t.join("merged/moved/.ssh");
     assert_eq!(root_of(&second), "/under");
-    let refused = atomic_core::mounts::second_mounts(&[&[place.clone()]])
+    let refused = atomic_core::mounts::second_mounts(&[std::slice::from_ref(&place)])
         .expect_err("refused")
         .to_string();
     assert!(
