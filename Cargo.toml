@@ -35,7 +35,7 @@ atomic-schema = { path = "crates/atomic-schema", package = "atomic-agentic-schem
 
 # atomic's fork of durare, at the revision in deps/forks.toml. Only
 # atomic-durable may depend on it.
-durare = { git = "https://github.com/atomic-agentic/durare", rev = "cbfc49374f5312f9ef176e0dffe512ba3c160b71", default-features = false, features = ["sqlite", "postgres"] }
+durare = { git = "https://github.com/atomic-agentic/durare", rev = "7c37126d3abfc53c17fa6876fe26e5384b168547", default-features = false, features = ["sqlite", "postgres"] }
 
 # Third-party crates.
 anyhow = "1"
@@ -66,6 +66,8 @@ sha2 = "0.10"
 hmac = "0.12.1"
 getrandom = "0.3.4"
 libc = "0.2.186"
+# The Public Suffix List, at the version Codex locks.
+psl = "2.1.184"
 # The filter that keeps a sandboxed command off the kernel keyrings; Codex's version.
 seccompiler = "0.5.0"
 # The same sqlx Codex and the durare fork use (the patch block pins its source).

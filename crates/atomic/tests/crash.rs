@@ -483,6 +483,7 @@ fn runtimes(dir: &Path, cwd: &Path, base_url: &str) -> Arc<Runtimes> {
         },
         lite: LiteRuntime::new(endpoint, AtomConfig::default()),
         exec: Default::default(),
+        exec_meter: Default::default(),
         clock: None,
     })
 }
@@ -505,6 +506,7 @@ async fn engine(scenario: Scenario, dir: &Path, base_url: &str) -> Durare {
                     store: LocalStore::open(dir.join("artifacts")).expect("artifact store"),
                     deployment: local(),
                     worktrees: Some(Arc::new(Worktrees::new(repo, dir.join("state/worktrees")))),
+                    caches: None,
                     budgets: Arc::new(if scenario == Scenario::Parked {
                         // Each call reserves 150 tokens: the workflow's cap
                         // has room for one at a time.

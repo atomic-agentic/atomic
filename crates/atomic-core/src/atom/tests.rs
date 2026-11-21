@@ -114,6 +114,59 @@ fn source_cannot_execute_and_cel_rules_are_rejected() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// The atom's file, with its config written without the `AtomConfig` type,
+/// so the type check does not see what it holds.
+fn untyped(config: &str) -> PathBuf {
+    let root = project("{input.text}", config, None);
+    let file = root.join("test.atom.astro");
+    let source = std::fs::read_to_string(&file).expect("source");
+    std::fs::write(
+        &file,
+        source.replace(
+            "export const config: AtomConfig<Input, Output> =",
+            "export const config =",
+        ),
+    )
+    .expect("source");
+    root
+}
+
+#[test]
+fn a_trust_other_than_the_three_origins_fails_where_it_is_written() {
+    // Typed, the config's type refuses it first; untyped, the load does.
+    for config in [
+        "{trust:'Team'}",
+        "{trust:'internal'}",
+        "{trust:''}",
+        "{trust:1}",
+    ] {
+        for root in [project("{input.text}", config, None), untyped(config)] {
+            load(&root.join("test.atom.astro"), &mut Registry::new()).expect_err(config);
+            let _ = std::fs::remove_dir_all(root);
+        }
+        let root = untyped(config);
+        let error = load(&root.join("test.atom.astro"), &mut Registry::new())
+            .expect_err(config)
+            .to_string();
+        let _ = std::fs::remove_dir_all(root);
+        assert!(
+            error.contains("/trust") && error.contains("`trust` is external, agent or team, not"),
+            "{config}: {error}"
+        );
+    }
+    for config in [
+        "{trust:'team'}",
+        "{trust:'agent'}",
+        "{trust:'external'}",
+        "{}",
+    ] {
+        for root in [project("{input.text}", config, None), untyped(config)] {
+            load(&root.join("test.atom.astro"), &mut Registry::new()).expect(config);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+}
+
 #[test]
 fn unknown_fields_and_unavailable_permissions_fail_closed() {
     for config in [
@@ -125,6 +178,7 @@ fn unknown_fields_and_unavailable_permissions_fail_closed() {
     ] {
         let root = project("{input.text}", config, None);
         load(&root.join("test.atom.astro"), &mut Registry::new()).expect_err(config);
+        let _ = std::fs::remove_dir_all(root);
     }
 }
 

@@ -46,7 +46,7 @@ use atomic_core::lite::LiteRuntime;
 use atomic_core::runtime::{Artifacts, CodexRuntime, Runtimes, run_lite_atom};
 use atomic_core::testing::{FakeModel, Reply, on_codex_runtime};
 use atomic_core::usage::Metering;
-use atomic_durable::usage::{Attempt, Caps, Settlement};
+use atomic_durable::usage::{Attempt, Caps, Settlement, heartbeat_every};
 use atomic_durable::{DurableRuntime, Durare, RunStatus, parks, release, run_atom_at};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -117,6 +117,7 @@ fn runtimes(dir: &Path, base_url: &str) -> Arc<Runtimes> {
         },
         lite: LiteRuntime::new(endpoint, AtomConfig::default()),
         exec: Default::default(),
+        exec_meter: Default::default(),
         clock: None,
     })
 }
@@ -617,23 +618,20 @@ async fn child_until(
 }
 
 /// How long after its admission the running attempt's last heartbeat was
-/// recorded, in milliseconds, or 0 before it has one.
-async fn beat_after_admission(dir: &Path) -> i64 {
-    let Ok(db) =
-        sqlx::SqlitePool::connect(&format!("sqlite://{}", dir.join("atomic.db").display())).await
-    else {
-        return 0;
-    };
-    let seen: Option<i64> = sqlx::query_scalar(
+/// recorded, in milliseconds, or 0 before it has one. A database that cannot
+/// be opened or queried is an error, not 0.
+async fn beat_after_admission(dir: &Path) -> Result<i64, sqlx::Error> {
+    let db =
+        sqlx::SqlitePool::connect(&format!("sqlite://{}", dir.join("atomic.db").display())).await?;
+    let seen: Result<Option<i64>, sqlx::Error> = sqlx::query_scalar(
         "SELECT MAX(h.seen_at - a.admitted_at) FROM atomic_usage_attempts a \
          JOIN atomic_usage_heartbeats h ON h.request_id = a.request_id AND h.attempt = a.attempt \
          WHERE a.state = 'reserved'",
     )
     .fetch_one(&db)
-    .await
-    .unwrap_or(None);
+    .await;
     db.close().await;
-    seen.unwrap_or(0)
+    Ok(seen?.unwrap_or(0))
 }
 
 async fn reader(dir: &Path) -> Durare {
@@ -831,11 +829,11 @@ fn killing_the_process_during_a_codex_turn_lets_the_recovered_run_finish() {
 #[test]
 fn a_run_recovered_after_its_dead_turn_would_have_lapsed_is_charged_only_its_run_time() {
     on_codex_runtime(async {
-        // Scaled down: the review's turn reserves its atom's 3 s and beats
-        // every 300 ms. Killed about 0.9 s in and recovered after the 3 s
-        // have passed, the dead turn is charged the time it ran, up to a
-        // beat after its last heartbeat, and the review has the rest of its
-        // time to run again.
+        // Scaled down: the review's turn reserves its atom's 6 s and beats
+        // every 600 ms. Killed at its first heartbeat, about 0.6 s in, and
+        // recovered after the 6 s have passed, the dead turn is charged the
+        // time it ran, up to a beat after its last heartbeat, and the review
+        // has the rest of its time, most of it, to run again.
         let model = FakeModel::start(vec![
             Reply::Text(DRAFT.into()),
             Reply::Delayed {
@@ -849,7 +847,7 @@ fn a_run_recovered_after_its_dead_turn_would_have_lapsed_is_charged_only_its_run
         let dir = scratch("lapsed");
         let url = model.base_url();
         let caps = "10000,100000";
-        let mut process = spawn_child_with(&dir, &url, "lapsed", "start", caps, "0.01,0.05");
+        let mut process = spawn_child_with(&dir, &url, "lapsed", "start", caps, "0.01,0.1");
         let until = Instant::now() + Duration::from_secs(60);
         while model.calls() < 2 {
             assert!(
@@ -860,9 +858,17 @@ fn a_run_recovered_after_its_dead_turn_would_have_lapsed_is_charged_only_its_run
         }
         // Killed once its turn has recorded a heartbeat a beat or more after
         // admission, however slowly a loaded machine runs it: recovery
-        // charges it until a beat after that, at least 600 ms.
+        // charges it until a beat after that, at least two beats.
+        let every = heartbeat_every(6_000);
         let beaten = Instant::now() + Duration::from_secs(60);
-        while beat_after_admission(&dir).await < 300 {
+        while beat_after_admission(&dir)
+            .await
+            .unwrap_or_else(|e| panic!("could not read the review's heartbeats: {e}"))
+            < every
+        {
+            if let Some(status) = process.try_wait().expect("check on the child") {
+                panic!("the child exited ({status}) before the review's turn recorded a heartbeat");
+            }
             assert!(
                 Instant::now() < beaten,
                 "the review's turn never recorded a heartbeat"
@@ -872,8 +878,8 @@ fn a_run_recovered_after_its_dead_turn_would_have_lapsed_is_charged_only_its_run
         process.kill().expect("kill the child");
         let _ = process.wait();
         // Down past the whole reservation.
-        tokio::time::sleep(Duration::from_secs(4)).await;
-        let seen = child_timed(&dir, &url, "lapsed", "recover", caps, "0.01,0.05")
+        tokio::time::sleep(Duration::from_secs(7)).await;
+        let seen = child_timed(&dir, &url, "lapsed", "recover", caps, "0.01,0.1")
             .await
             .expect("the recovered run");
         assert_eq!(seen, "finished");
@@ -881,15 +887,15 @@ fn a_run_recovered_after_its_dead_turn_would_have_lapsed_is_charged_only_its_run
         let review = attempts(&rt, "lapsed").await;
         let dead = &review[1];
         assert_eq!(dead.state, "reserved");
-        assert_eq!(dead.reserved.millis, 3_000, "{dead:?}");
+        assert_eq!(dead.reserved.millis, 6_000, "{dead:?}");
         assert!(
-            dead.charged.millis < 2_000,
+            dead.charged.millis < 4_000,
             "the downtime was not charged: {dead:?}"
         );
         // Its heartbeats carried it past the first beat: it is charged the
         // time it ran.
         assert!(
-            dead.charged.millis >= 600,
+            dead.charged.millis >= 2 * every,
             "the time it ran was charged: {dead:?}"
         );
     });
@@ -1343,6 +1349,7 @@ fn a_request_in_flight_is_estimated_at_the_larger_of_one_bound_and_the_last_requ
             &settings,
             &Budget::default(),
             &[("turn", &Budget::default(), "synthetic")],
+            &[],
         )
         .expect("a plan");
         let budget = RunBudget::pinned(rt.ledger(), &plan);
@@ -1359,6 +1366,7 @@ fn a_request_in_flight_is_estimated_at_the_larger_of_one_bound_and_the_last_requ
                 model: "synthetic".into(),
                 input_bound: None,
                 turn: true,
+                work: false,
             })
             .await
             .expect("admitted");
@@ -1383,6 +1391,84 @@ fn a_request_in_flight_is_estimated_at_the_larger_of_one_bound_and_the_last_requ
         assert_eq!(attempt.usage, Some((100, 20)));
         assert_eq!(attempt.charged.tokens, 120 + 90, "{attempt:?}");
         assert_eq!(attempt.charged.micro_usd, 140 + 120, "{attempt:?}");
+    });
+}
+
+/// The heartbeat attempt 1 at `request` last recorded in the run database
+/// under `dir`, if it has one.
+async fn seen(dir: &Path, request: &str) -> Option<i64> {
+    let db = sqlx::SqlitePool::connect(&format!("sqlite://{}", dir.join("atomic.db").display()))
+        .await
+        .expect("open the database");
+    let seen: Option<i64> = sqlx::query_scalar(
+        "SELECT seen_at FROM atomic_usage_heartbeats WHERE request_id = ? AND attempt = 1",
+    )
+    .bind(request)
+    .fetch_optional(&db)
+    .await
+    .expect("read the heartbeat");
+    db.close().await;
+    seen
+}
+
+#[test]
+fn a_call_whose_task_panics_stops_its_heartbeat() {
+    on_codex_runtime(async {
+        let dir = scratch("panicked");
+        let rt = Durare::sqlite(&dir.join("atomic.db"))
+            .await
+            .expect("engine");
+        // A command that may take two seconds beats every 200 ms.
+        let two_seconds = Budget {
+            millis: Some(2_000),
+            ..Budget::default()
+        };
+        let plan = atomic_app::metering::BudgetPlan::resolve(
+            &settings(10_000_000, 100_000_000),
+            &Budget::default(),
+            &[],
+            &[("nap", &two_seconds)],
+        )
+        .expect("a plan");
+        let budget = RunBudget::pinned(rt.ledger(), &plan);
+        let meter = budget.meter(
+            &atomic_durable::StepInfo {
+                workflow_id: "panicked".into(),
+                step_id: 1,
+            },
+            &plan.exec["nap"],
+        );
+        let (ticket, _) = meter
+            .admit(atomic_core::usage::Call {
+                index: 0,
+                model: atomic_core::usage::WORK_MODEL.into(),
+                input_bound: None,
+                turn: false,
+                work: true,
+            })
+            .await
+            .expect("admitted");
+        // The task holding the ticket panics half a second in, before it
+        // settles.
+        let held = tokio::spawn(async move {
+            let _ticket = ticket;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            panic!("the call's task panics");
+        });
+        assert!(
+            held.await.expect_err("the task panicked").is_panic(),
+            "the task panicked"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let before = seen(&dir, "panicked:1:0").await;
+        assert!(before.is_some(), "it beat while it ran");
+        // Its heartbeat stopped with it: nothing more is recorded, though
+        // its reservation runs on to two seconds.
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert_eq!(seen(&dir, "panicked:1:0").await, before, "it beat on");
+        let attempt = &rt.ledger().attempts("panicked").await.expect("attempts")[0];
+        assert_eq!(attempt.state, "reserved", "{attempt:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     });
 }
 
@@ -1477,6 +1563,101 @@ fn a_dollar_cap_on_an_unpriced_model_fails_configuration() {
         )
         .expect("priced");
         assert_eq!(r.micro_usd, Some(1_000_000));
+    });
+}
+
+/// A command admitted by a process that then died is found when its step
+/// runs again: its reservation is settled then, not held for good, at the
+/// time its last heartbeat vouches for, and a step whose command was never
+/// admitted is told apart from it.
+#[test]
+fn a_dead_commands_reservation_is_settled_when_it_is_found() {
+    use atomic_durable::usage::{Admission, Charge, Request, Scope};
+    use std::sync::atomic::{AtomicI64, Ordering};
+    on_codex_runtime(async {
+        let dir = scratch("dead-command");
+        let rt = Durare::sqlite(&dir.join("atomic.db"))
+            .await
+            .expect("engine");
+        let start = 1_800_000_000_000;
+        let now = Arc::new(AtomicI64::new(start));
+        let clock = now.clone();
+        let ledger = rt.ledger().with_clock(move || clock.load(Ordering::SeqCst));
+        let plan = atomic_app::metering::BudgetPlan::resolve(
+            &settings(10_000_000, 100_000_000),
+            &Budget::default(),
+            &[],
+            &[("nap", &Budget::default())],
+        )
+        .expect("a plan");
+        let caps = |r: &atomic_core::budget::Resolved| Caps {
+            tokens: i64::try_from(r.tokens).expect("tokens"),
+            millis: i64::try_from(r.millis).expect("millis"),
+            micro_usd: None,
+        };
+        // A command admitted as the step's work, as its meter admits one.
+        let least = Charge {
+            tokens: 0,
+            millis: 500,
+            micro_usd: 0,
+        };
+        let admitted = ledger
+            .admit(Request {
+                id: "dead:3:0".into(),
+                run: "dead".into(),
+                model: atomic_core::usage::WORK_MODEL.into(),
+                chain: vec![
+                    Scope::run("dead", caps(&plan.run)),
+                    Scope::atom("dead", 3, caps(&plan.exec["nap"])),
+                ],
+                reserve: least,
+                maximum: least,
+                turn: true,
+            })
+            .await
+            .expect("admit");
+        let Admission::Admitted {
+            request, attempt, ..
+        } = admitted
+        else {
+            panic!("refused: {admitted:?}");
+        };
+        // Its last heartbeat twenty seconds in; then its process died, and
+        // the step runs again an hour later.
+        now.store(start + 20_000, Ordering::SeqCst);
+        ledger
+            .heartbeat(&request, attempt, 20_000)
+            .await
+            .expect("heartbeat");
+        now.store(start + 3_600_000, Ordering::SeqCst);
+        let budget = RunBudget::pinned(ledger.clone(), &plan);
+        let step = atomic_durable::StepInfo {
+            workflow_id: "dead".into(),
+            step_id: 3,
+        };
+        assert!(budget.command_admitted(&step).await.expect("ledger"));
+        assert!(
+            ledger.unsettled("dead").await.expect("ledger").is_empty(),
+            "the dead command's reservation is still held"
+        );
+        // Charged until a heartbeat after its last: 20 s and 5 s more, not
+        // the hour since, nor all it reserved.
+        let attempts = ledger.attempts("dead").await.expect("attempts");
+        assert_eq!(attempts.len(), 1, "{attempts:?}");
+        assert_eq!(attempts[0].state, "settled", "{attempts:?}");
+        assert_eq!(attempts[0].charged.millis, 25_000, "{attempts:?}");
+        let run = ledger
+            .allowance("run:dead")
+            .await
+            .expect("ledger")
+            .expect("the run's allowance");
+        assert_eq!(run.charged.millis, 25_000, "{run:?}");
+        let never = atomic_durable::StepInfo {
+            workflow_id: "dead".into(),
+            step_id: 5,
+        };
+        assert!(!budget.command_admitted(&never).await.expect("ledger"));
+        rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
     });
 }
 

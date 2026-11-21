@@ -33,6 +33,7 @@ expect:
 | `expect` | Required nonempty list of CEL expressions; every expression must evaluate to `true` |
 | `case` | Optional metadata for the atom's [scorers](#scorers-and-baselines), checked against the atom's `case` schema |
 | `prepared` | Reserved for the values an atom [computes in code](atom-files.md) before its model call, from v0.7; the runner refuses a case that sets it today |
+| `origin` | Optional: how far the case's input may be trusted, `external` (the default), `agent` or `team`; see [where a case's input came from](#where-a-cases-input-came-from) |
 
 A case missing `input` or `expect`, with an empty `expect`, with any other key,
 with an input that does not fit the atom's input schema, or with an assertion
@@ -46,6 +47,24 @@ is an `int`, and a `number` field is a `double`.
 An atom whose code declares a write to an outside system has no eval cases:
 Atomic never runs such code in an eval. Cover it with code tests and
 `atomic test`.
+
+## Where a case's input came from
+
+A case's input is external data unless its own file says otherwise with
+`origin: agent` or `origin: team`. A committed case file is not, by being
+committed, reviewed input: it can hold text copied from a ticket, a page or a
+model's answer, so only an explicit label raises it, and only in the case's own
+file. A case captured from a run keeps the origin its input was recorded with.
+
+The origin decides two things, the same way a workflow's binding does. An
+atom's `trust` is the riskiest origin it accepts, so a `trust: team` atom takes
+only team cases and a `trust: agent` atom takes agent and team cases; a case
+less trusted than its atom accepts fails the load, before any model call or
+command, naming the case, the atom, its trust and the case's origin. And the
+case's input is labelled with that origin in the atom's prompt, as data, never
+as instructions. Relabelling a case changes the prompt its atom is sent, so a
+recording of its answer no longer matches: re-record the case's cassette with
+`atomic eval <atom> --live`.
 
 The format uses these keys; there is no per-case `atomic`, `atom` or `output`
 field. Use JSON-compatible YAML values, quote CEL expressions and avoid duplicate
@@ -93,8 +112,8 @@ A run can be limited to chosen cases (a file's name selects all its cases) and t
 seeded sample of them; the same seed picks the same cases. A selector that names
 no case fails the run rather than run fewer cases than asked.
 
-Each case's input is rendered as external input, as anything that did not come
-from a person on the team is: a case file may hold text copied from anywhere.
+Each case's input is rendered with its [origin](#where-a-cases-input-came-from),
+external unless the case's file says otherwise.
 
 ## Scorers and baselines
 
@@ -208,9 +227,9 @@ effects are all that stands between it and the project. It refuses:
 
 - a Codex atom with a `workspace-write` sandbox;
 - an exec atom that does not declare `effects: { external: 'read-only' }`. Its
-  command runs in the project, under the same confinement as in `atomic run`, for
-  every case and every replay, so only a command declared to read and nothing more
-  is run. One that declares `idempotent` writes to an outside system and is never
+  command runs in the project, under the same confinement as in `atomic run` but
+  with no build caches, so it may write only its scratch directory, for every case
+  and every replay, and only a command declared to read and nothing more is run. One that declares `idempotent` writes to an outside system and is never
   run; one that declares nothing could do anything. If a command only reads its
   input, declare it `read-only`, as the order-report example's atoms do;
 - a Codex atom under cassettes: it runs only with `--no-cassettes`, since cassettes
