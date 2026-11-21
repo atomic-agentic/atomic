@@ -1172,20 +1172,21 @@ impl Durare {
 
     /// Whether a park recorded for no project is in the store.
     async fn has_parks_of_none(&self) -> Result<bool> {
-        self.reads.read(|mut tx| {
-            Box::pin(async move {
-                Ok(tx
-                    .query_opt(
-                        "SELECT p.park_id AS park_id FROM atomic_parks p WHERE NOT EXISTS \
+        self.reads
+            .read(|mut tx| {
+                Box::pin(async move {
+                    Ok(tx
+                        .query_opt(
+                            "SELECT p.park_id AS park_id FROM atomic_parks p WHERE NOT EXISTS \
                          (SELECT 1 FROM atomic_park_projects pp WHERE pp.park_id = p.park_id) \
                          LIMIT 1",
-                        &[],
-                    )
-                    .await?
-                    .is_some())
+                            &[],
+                        )
+                        .await?
+                        .is_some())
+                })
             })
-        })
-        .await
+            .await
     }
 
     async fn open_for_none(
