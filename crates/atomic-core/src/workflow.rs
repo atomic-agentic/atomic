@@ -77,6 +77,31 @@ pub fn trust_rank(origin: &str) -> usize {
     TRUST.iter().position(|o| *o == origin).unwrap_or(0)
 }
 
+/// The riskiest input origin `atom` accepts: its `trust`, or external when
+/// it declares none.
+pub fn accepted_trust(atom: &Atom) -> &str {
+    atom.frontmatter
+        .get("trust")
+        .and_then(Value::as_str)
+        .unwrap_or("external")
+}
+
+/// Why `source`, which is `origin` data, may not bind an input of `atom`, if
+/// it may not: an atom takes no input less trusted than it accepts (see
+/// [`accepted_trust`]). A workflow's step and a direct run of the atom are
+/// held to this alike.
+pub fn untrusted_binding(atom: &Atom, source: &str, origin: &str) -> Option<String> {
+    let accepts = accepted_trust(atom);
+    (trust_rank(origin) < trust_rank(accepts)).then(|| {
+        format!(
+            "`{source}` is {origin} data, and atom `{}` accepts {accepts} input at most \
+             (`trust: '{accepts}'`); pass it through a step that can take it, or declare a lower trust \
+             on the atom if it is built for {origin} input",
+            atom.name
+        )
+    })
+}
+
 /// The most a binding's sources allow it to be trusted: the least trusted
 /// of what its CEL expression reads. `kinds` gives each earlier step's kind
 /// (`gate`, `lite`, `codex` or `exec`). The workflow's input is external
@@ -111,7 +136,16 @@ pub(crate) const TOP: &[&str] = &[
     "atomic", "name", "version", "input", "output", "steps", "returns", "budget",
 ];
 pub(crate) const STEP: &[&str] = &["atom", "gate", "after", "with", "origins", "worktree"];
-pub(crate) const GATE: &[&str] = &["title", "show", "timeout", "on_timeout", "approvers"];
+pub(crate) const GATE: &[&str] = &[
+    "title",
+    "ask",
+    "answer",
+    "remember",
+    "show",
+    "timeout",
+    "on_timeout",
+    "approvers",
+];
 const LATER_STEP: &[&str] = &["foreach", "concurrency", "merge_queue", "review", "retry"];
 
 /// Load the workflow at `file`, checking it against `atoms` (by name).
@@ -472,11 +506,6 @@ pub fn load(
             }
             // Each binding's origin: what its sources allow, lowered if the
             // step says so, and no less trusted than the atom accepts.
-            let accepts = atom
-                .frontmatter
-                .get("trust")
-                .and_then(Value::as_str)
-                .unwrap_or("external");
             for (field, e) in &with {
                 let wp = format!("{sp}/with/{field}");
                 let source = e.as_str().unwrap_or_default();
@@ -498,15 +527,8 @@ pub fn load(
                     Some(declared) => declared,
                     None => allowed,
                 };
-                if trust_rank(origin) < trust_rank(accepts) {
-                    return Err(fail(
-                        &wp,
-                        format!(
-                            "`{source}` is {origin} data, and atom `{atom_name}` accepts {accepts} input at most \
-                             (`trust: '{accepts}'`); pass it through a step that can take it, or declare a lower trust \
-                             on the atom if it is built for {origin} input"
-                        ),
-                    ));
+                if let Some(refused) = untrusted_binding(atom, source, origin) {
+                    return Err(fail(&wp, refused));
                 }
             }
             for r in &required {
@@ -560,15 +582,54 @@ pub fn load(
                     ));
                 }
             }
-            for key in ["title", "show"] {
+            // An approval gate has a `title`; a question gate an `ask` and
+            // the `answer` it takes.
+            let question = match (g.get("title"), g.get("ask"), g.get("answer")) {
+                (Some(_), None, None) => None,
+                (None, Some(_), Some(answer)) => {
+                    Some(gate_answer(answer).map_err(|e| fail(&format!("{gp}/answer"), e))?)
+                }
+                (None, Some(_), None) => {
+                    return Err(fail(&gp, "a question gate needs an `answer`".into()));
+                }
+                (Some(_), Some(_), _) => {
+                    return Err(fail(
+                        &gp,
+                        "a gate has a `title` (approve or reject) or an `ask` (a question), \
+                         not both"
+                            .into(),
+                    ));
+                }
+                (_, None, Some(_)) => {
+                    return Err(fail(
+                        &gp,
+                        "`answer` belongs to a question gate's `ask`".into(),
+                    ));
+                }
+                (None, None, _) => {
+                    return Err(fail(
+                        &gp,
+                        "a gate needs a `title` (a CEL expression), or an `ask` and an `answer` \
+                         for a question"
+                            .into(),
+                    ));
+                }
+            };
+            if g.get("remember").is_some_and(|r| !r.is_boolean()) {
+                return Err(fail(
+                    &format!("{gp}/remember"),
+                    "`remember` is true or false".into(),
+                ));
+            }
+            if g.contains_key("remember") && question.is_none() {
+                return Err(fail(
+                    &format!("{gp}/remember"),
+                    "`remember` belongs to a question gate".into(),
+                ));
+            }
+            for key in ["title", "ask", "show"] {
                 let kp = format!("{gp}/{key}");
                 match g.get(key) {
-                    None if key == "title" => {
-                        return Err(fail(
-                            &gp,
-                            "a gate needs a `title` (a CEL expression)".into(),
-                        ));
-                    }
                     None => {}
                     Some(e) => {
                         let source = e
@@ -595,17 +656,59 @@ pub fn load(
                     ));
                 }
             }
-            if let Some(t) = g.get("on_timeout")
-                && !matches!(t.as_str(), Some("reject"))
-            {
-                return Err(fail(
-                    &format!("{gp}/on_timeout"),
-                    "`on_timeout` is `reject`: an expired gate never approves".into(),
-                ));
+            let tp = format!("{gp}/on_timeout");
+            match (g.get("on_timeout"), &question) {
+                (None, _) => {}
+                (Some(t), None) if t.as_str() == Some("reject") => {}
+                (Some(_), None) => {
+                    return Err(fail(
+                        &tp,
+                        "`on_timeout` is `reject`: an expired gate never approves".into(),
+                    ));
+                }
+                (Some(t), Some(_)) if t.as_str() == Some("reject") => {}
+                (Some(t), Some(answer)) => {
+                    let default = t
+                        .as_object()
+                        .filter(|o| o.len() == 1)
+                        .and_then(|o| o.get("default"))
+                        .ok_or_else(|| {
+                            fail(
+                                &tp,
+                                "a question gate's `on_timeout` is `reject` or \
+                                 `{ default: <answer> }`"
+                                    .into(),
+                            )
+                        })?;
+                    if !g.contains_key("timeout") {
+                        return Err(fail(
+                            &tp,
+                            "a default answer takes effect when the `timeout` passes: give the \
+                             gate a `timeout`"
+                                .into(),
+                        ));
+                    }
+                    let fits = jsonschema::validator_for(answer)
+                        .map(|v| v.is_valid(default))
+                        .unwrap_or(false);
+                    if !fits {
+                        return Err(fail(
+                            &format!("{tp}/default"),
+                            format!("the default {default} is not an answer `answer` allows"),
+                        ));
+                    }
+                }
             }
+            let decision = match &question {
+                None => json!({"type": "object"}),
+                Some(answer) => json!({
+                    "type": "object",
+                    "properties": {"answer": answer},
+                }),
+            };
             step_schemas.insert(
                 id.clone(),
-                json!({"type": "object", "properties": {"decision": {"type": "object"}}, "additionalProperties": false}),
+                json!({"type": "object", "properties": {"decision": decision}, "additionalProperties": false}),
             );
         }
     }
@@ -662,6 +765,20 @@ pub fn load(
 }
 
 /// Steps in an order respecting `after`, or a step on a cycle.
+/// A question gate's `answer` as the JSON Schema an answer must fit: a list
+/// of choices is shorthand for an `enum` of them; a mapping is a schema.
+pub fn gate_answer(answer: &Value) -> Result<Value, String> {
+    let schema = match answer {
+        Value::Array(choices) if !choices.is_empty() => json!({"enum": choices}),
+        Value::Object(_) => answer.clone(),
+        _ => {
+            return Err("`answer` is a list of choices or a JSON Schema for a free answer".into());
+        }
+    };
+    jsonschema::validator_for(&schema).map_err(|e| format!("`answer` is not a schema: {e}"))?;
+    Ok(schema)
+}
+
 /// A gate's `timeout`: a whole number and a unit, `s`, `m`, `h` or `d`,
 /// such as `90s`, `30m`, `24h` or `7d`.
 pub fn parse_timeout(text: &str) -> Result<std::time::Duration, String> {

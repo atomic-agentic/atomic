@@ -777,13 +777,14 @@ fn a_runner_atomic_does_not_know_is_refused_when_read() {
 }
 
 /// `backend_wait` comes from a file, a variable or the flag, the flag
-/// first; an empty variable sets nothing, and anything but a whole number
-/// of seconds of at least one is refused, from wherever it came.
+/// first; an empty variable sets nothing. Anything but a whole number of
+/// seconds of at least one is refused wherever it came from, an explicit
+/// null or blank included, and the refusal names its source.
 #[test]
 fn the_backend_wait_is_a_setting_of_at_least_a_second() {
     let d = dir(&[("atomic.yaml", "atomic: 1\nname: notes\nbackend_wait: 300\n")]);
     let r = resolved(&d, &EngineArgs::default(), &[], &nobody);
-    assert_eq!(r.settings.backend_wait, Some(300));
+    assert_eq!(r.settings.backend_wait(), Some(300));
     assert!(matches!(source(&r, "backend_wait"), Source::File { .. }));
     let r = resolved(
         &d,
@@ -791,7 +792,7 @@ fn the_backend_wait_is_a_setting_of_at_least_a_second() {
         &[("ATOMIC_BACKEND_WAIT", "5")],
         &nobody,
     );
-    assert_eq!(r.settings.backend_wait, Some(5));
+    assert_eq!(r.settings.backend_wait(), Some(5));
     assert_eq!(
         source(&r, "backend_wait"),
         &Source::Env("ATOMIC_BACKEND_WAIT".into())
@@ -803,7 +804,7 @@ fn the_backend_wait_is_a_setting_of_at_least_a_second() {
         &nobody,
     );
     assert_eq!(
-        r.settings.backend_wait,
+        r.settings.backend_wait(),
         Some(300),
         "an empty variable sets nothing"
     );
@@ -812,35 +813,177 @@ fn the_backend_wait_is_a_setting_of_at_least_a_second() {
         ..EngineArgs::default()
     };
     let r = resolved(&d, &flag, &[("ATOMIC_BACKEND_WAIT", "5")], &nobody);
-    assert_eq!(r.settings.backend_wait, Some(9));
+    assert_eq!(r.settings.backend_wait(), Some(9));
     assert_eq!(
         source(&r, "backend_wait"),
         &Source::Flag("--backend-wait".into())
     );
+    let quoted = dir(&[(
+        "atomic.yaml",
+        "atomic: 1\nname: notes\nbackend_wait: '30'\n",
+    )]);
+    let r = resolved(&quoted, &EngineArgs::default(), &[], &nobody);
+    assert_eq!(
+        r.settings.backend_wait(),
+        Some(30),
+        "a quoted number is that number"
+    );
     let none = dir(&[("atomic.yaml", MANIFEST_ONLY)]);
     let r = resolved(&none, &EngineArgs::default(), &[], &nobody);
     assert_eq!(
-        r.settings.backend_wait, None,
+        r.settings.backend_wait(),
+        None,
         "without one, a step waits as long as it takes"
     );
     for (file, var) in [
         ("backend_wait: 0\n", None),
+        ("backend_wait: '0'\n", None),
         ("backend_wait: -3\n", None),
         ("backend_wait: 1.5\n", None),
         ("backend_wait: soon\n", None),
+        ("backend_wait: ~\n", None),
+        ("backend_wait: null\n", None),
+        ("backend_wait: [1]\n", None),
         ("", Some("0")),
         ("", Some("ten")),
+        ("", Some("  ")),
+        ("", Some("~")),
+        ("", Some("null")),
+        ("backend_wait: 300\n", Some("~")),
     ] {
         let d = dir(&[("atomic.yaml", &format!("{MANIFEST_ONLY}{file}"))]);
         let vars: Vec<(&str, &str)> = var
             .map(|v| ("ATOMIC_BACKEND_WAIT", v))
             .into_iter()
             .collect();
-        let e = resolved_where(&d, &EngineArgs::default(), &vars, &nobody).expect_err("refused");
+        let e = resolved_where(&d, &EngineArgs::default(), &vars, &nobody)
+            .expect_err("refused")
+            .to_string();
+        let from = match var {
+            Some(_) => "from environment variable ATOMIC_BACKEND_WAIT".to_owned(),
+            None => format!("from {}", d.join("atomic.yaml").display()),
+        };
         assert!(
-            e.to_string()
-                .contains("backend_wait is a whole number of seconds, at least 1"),
+            e.contains(&format!("backend_wait, {from}"))
+                && e.contains("a whole number of seconds, at least 1"),
             "{file:?} {var:?}: {e}"
         );
+    }
+}
+
+/// Every setting may be written in the manifest, which shares its file with
+/// the settings: the project loader knows each top-level key.
+#[test]
+fn the_manifest_accepts_every_setting() {
+    let Value::Object(defaults) = serde_json::to_value(Settings::default()).expect("defaults")
+    else {
+        panic!("the settings are a mapping");
+    };
+    let mut manifest = serde_json::Map::new();
+    manifest.insert("atomic".into(), Value::from(1));
+    manifest.insert("name".into(), Value::from("notes"));
+    let mut settings = Vec::new();
+    for (key, value) in defaults {
+        if MANIFEST.contains(&key.as_str()) {
+            continue;
+        }
+        settings.push(key.clone());
+        manifest.insert(key, value);
+    }
+    assert!(
+        settings.contains(&"backend_wait".to_owned()),
+        "{settings:?}"
+    );
+    let text = serde_json::to_string(&Value::Object(manifest)).expect("json");
+    let d = dir(&[("atomic.yaml", &text)]);
+    atomic_core::project::load(&d.join("atomic.yaml"))
+        .unwrap_or_else(|e| panic!("the manifest refuses a setting of {settings:?}: {e}"));
+}
+
+#[test]
+fn the_budget_layers_like_every_other_setting_and_says_where_each_limit_came_from() {
+    // Each layer sets the atom's tokens; each lower one also sets a limit
+    // the layers above leave alone.
+    let (_home, home) = person("budget:\n  atom:\n    tokens: 100\n  call:\n    minutes: 3\n");
+    let d = dir(&[
+        (
+            "atomic.yaml",
+            "atomic: 1\nname: notes\nbudget:\n  atom:\n    tokens: 200\n  workflow:\n    \
+             minutes: 45\n  pricing:\n    m:\n      input_usd_per_mtok: 1\n      \
+             output_usd_per_mtok: 2\n",
+        ),
+        (
+            "atomic.local.yaml",
+            "budget:\n  atom:\n    tokens: 300\n  workflow:\n    tokens: 9000\n",
+        ),
+    ]);
+    let vars = [
+        ("HOME", home.as_str()),
+        ("ATOMIC_BUDGET_ATOM_TOKENS", "400"),
+        ("ATOMIC_BUDGET_CALL_INPUT_TOKENS", "5000"),
+        ("ATOMIC_BUDGET_WORKFLOW_COST_USD", "1.5"),
+    ];
+    let r = resolved(&d, &EngineArgs::default(), &vars, &nobody);
+    let budget = &r.settings.budget;
+    let defaults = BudgetSettings::default();
+    assert_eq!(budget.atom.tokens, 400);
+    assert_eq!(budget.call.input_tokens, 5000);
+    assert_eq!(budget.workflow.cost_usd, Some(1.5));
+    assert_eq!(budget.workflow.tokens, 9000);
+    assert_eq!(budget.workflow.minutes, 45.0);
+    assert_eq!(budget.call.minutes, 3.0);
+    assert_eq!(budget.call.output_tokens, defaults.call.output_tokens);
+    assert_eq!(budget.atom.minutes, defaults.atom.minutes);
+    assert_eq!(budget.pricing["m"].output_usd_per_mtok, 2.0);
+    let file = |r: &Resolved, path: &str| match source(r, path) {
+        Source::File { path, .. } => path.file_name().expect("name").to_owned(),
+        other => panic!("{path} came from {other:?}"),
+    };
+    assert_eq!(
+        source(&r, "budget.atom.tokens"),
+        &Source::Env("ATOMIC_BUDGET_ATOM_TOKENS".into())
+    );
+    assert_eq!(
+        source(&r, "budget.call.input_tokens"),
+        &Source::Env("ATOMIC_BUDGET_CALL_INPUT_TOKENS".into())
+    );
+    assert_eq!(file(&r, "budget.workflow.tokens"), "atomic.local.yaml");
+    assert_eq!(file(&r, "budget.workflow.minutes"), "atomic.yaml");
+    assert_eq!(file(&r, "budget.call.minutes"), "config.yaml");
+    assert_eq!(source(&r, "budget.atom.minutes"), &Source::Default);
+    assert_eq!(
+        source(&r, "budget.workflow.cost_usd"),
+        &Source::Env("ATOMIC_BUDGET_WORKFLOW_COST_USD".into())
+    );
+
+    // Without the variable, the local file wins; without that, the
+    // project's; without that, the person's own.
+    let r = resolved(&d, &EngineArgs::default(), &vars[..1], &nobody);
+    assert_eq!(r.settings.budget.atom.tokens, 300);
+    assert_eq!(file(&r, "budget.atom.tokens"), "atomic.local.yaml");
+    std::fs::remove_file(d.join("atomic.local.yaml")).expect("remove");
+    let r = resolved(&d, &EngineArgs::default(), &vars[..1], &nobody);
+    assert_eq!(r.settings.budget.atom.tokens, 200);
+    assert_eq!(file(&r, "budget.atom.tokens"), "atomic.yaml");
+    std::fs::write(d.join("atomic.yaml"), MANIFEST_ONLY).expect("manifest");
+    let r = resolved(&d, &EngineArgs::default(), &vars[..1], &nobody);
+    assert_eq!(r.settings.budget.atom.tokens, 100);
+    assert_eq!(file(&r, "budget.atom.tokens"), "config.yaml");
+
+    // A variable that does not read as its limit is refused, by name and
+    // without its value: a word, a negative count, and a word for a dollar
+    // cap, which has no default to read it by.
+    for (name, value) in [
+        ("ATOMIC_BUDGET_ATOM_TOKENS", "lots"),
+        ("ATOMIC_BUDGET_ATOM_TOKENS", "-5"),
+        ("ATOMIC_BUDGET_CALL_MINUTES", "soon"),
+        ("ATOMIC_BUDGET_ATOM_COST_USD", "lots"),
+        ("ATOMIC_BUDGET_WORKFLOW_COST_USD", "plenty"),
+    ] {
+        let said = resolved_where(&d, &EngineArgs::default(), &[(name, value)], &nobody)
+            .expect_err("refused")
+            .to_string();
+        assert!(said.contains(name), "{name}={value}: {said}");
+        assert!(!said.contains(value), "{name}={value}: {said}");
     }
 }

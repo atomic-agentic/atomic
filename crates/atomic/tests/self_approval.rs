@@ -249,6 +249,7 @@ fn register(rt: &mut Durare) {
             tier: Tier::High,
             timeout: None,
             on_timeout: OnTimeout::Reject,
+            question: None,
         };
         gate::gate(&ctx, "accept", spec).await
     });
@@ -308,6 +309,7 @@ async fn sandboxed(
         artifacts: atomic_core::runtime::Artifacts::none(),
         meter: atomic_core::usage::Metering::none(),
         guard: guard.clone(),
+        caches: None,
     };
     let backend =
         atomic_exec::Backend::connect(atomic_exec::LocalBackend::in_dir(scratch)).unwrap();
@@ -397,6 +399,8 @@ fn an_atom_cannot_approve_its_own_gate_through_its_shell() {
                 .unwrap_or(0)
         ));
         std::os::unix::fs::symlink(&dir, &short).unwrap();
+        // Gone however the test ends, a panic included.
+        let _short = Removed(short.clone());
         let sock = short.join("admin.sock");
         let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
         assert!(
@@ -434,7 +438,6 @@ fn an_atom_cannot_approve_its_own_gate_through_its_shell() {
             .unwrap();
         unlink_from_session_keyring(&key);
         drop(listener);
-        let _ = std::fs::remove_file(&short);
 
         // The step still works in its worktree...
         assert!(output.contains("wrote-exit=0"), "{output}");
@@ -451,6 +454,12 @@ fn an_atom_cannot_approve_its_own_gate_through_its_shell() {
                 "{attempt} was not refused: {output}"
             );
         }
+        // Refused by the sandbox's filter, not by a path the sandbox hid:
+        // a missing path or a denied file would be another error.
+        assert!(
+            output.contains("connect=refused:PermissionError: [Errno 1]"),
+            "the socket was not refused by the sandbox: {output}"
+        );
         assert!(!output.contains(&secret), "the secret leaked: {output}");
         assert!(
             !String::from_utf8_lossy(&planted.stdout).contains("atomic:planted"),
@@ -469,6 +478,7 @@ fn an_atom_cannot_approve_its_own_gate_through_its_shell() {
                 verdict: Verdict::Approve,
                 comment: None,
                 proposal: opened.proposal.clone(),
+                answer: None,
             },
         )
         .await
@@ -483,8 +493,20 @@ fn an_atom_cannot_approve_its_own_gate_through_its_shell() {
     });
 }
 
+/// A path removed when dropped.
+struct Removed(PathBuf);
+
+impl Drop for Removed {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// A `bwrap` that logs how it was called, and, with `argv0` false, hides
-/// `--argv0` from its help, as bubblewrap before 0.9 has none.
+/// `--argv0` from its help, as bubblewrap before 0.9 has none. Each call
+/// goes to a file of its own in the returned directory: a call's arguments
+/// can pass the size the system writes to one file at once, and calls made
+/// at the same time would interleave in one.
 fn wrapped_bwrap(bin: &Path, argv0: bool) -> PathBuf {
     let real = Command::new("sh")
         .args(["-c", "command -v bwrap"])
@@ -494,10 +516,10 @@ fn wrapped_bwrap(bin: &Path, argv0: bool) -> PathBuf {
     assert!(!real.is_empty(), "no bubblewrap on PATH");
     let filter = if argv0 { "cat" } else { "grep -v -- --argv0" };
     let log = bin.join("bwrap.log");
-    std::fs::create_dir_all(bin).unwrap();
+    std::fs::create_dir_all(&log).unwrap();
     let script = format!(
         "#!/bin/sh\n\
-         echo \"$@\" >> {log}\n\
+         printf '%s ' \"$@\" > {log}/$$\n\
          if [ \"$1\" = --help ]; then {real} --help 2>&1 | {filter}; exit 0; fi\n\
          exec {real} \"$@\"\n",
         log = log.display(),
@@ -586,7 +608,10 @@ fn a_turn_through_atomics_own_entry_point_runs_with_its_helper_in_the_state_dire
                 "argv0 {argv0}: the turn did not see the project: {output}"
             );
             assert!(!output.contains("SQLite format"), "{output}");
-            let calls = std::fs::read_to_string(&log).unwrap_or_default();
+            let calls: String = std::fs::read_dir(&log)
+                .unwrap()
+                .map(|call| std::fs::read_to_string(call.unwrap().path()).unwrap() + "\n")
+                .collect();
             let ran: Vec<&str> = calls
                 .lines()
                 .filter(|l| l.contains("--apply-seccomp-then-exec"))

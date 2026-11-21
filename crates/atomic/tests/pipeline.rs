@@ -221,6 +221,7 @@ fn runtimes_on(dir: &Path, cwd: &Path, base_url: &str, model: &str) -> Arc<Runti
             defaults: AtomConfig::default(),
             artifacts: Artifacts::none(),
             meter: atomic_core::usage::Metering::none(),
+            caches: None,
         },
         lite: LiteRuntime::new(endpoint, AtomConfig::default()),
         backend: Default::default(),
@@ -675,6 +676,7 @@ async fn decide(rt: &Durare, g: &gate::Gate, verdict: Verdict, comment: &str) {
             verdict,
             comment: Some(comment.into()),
             proposal: g.proposal.clone(),
+            answer: None,
         },
     )
     .await
@@ -884,7 +886,14 @@ fn pipeline_child() {
     on_codex_runtime(async move {
         let dir = PathBuf::from(dir);
         let rt = engine(&dir, &url).await;
-        if role.starts_with("start") {
+        if role == "replay" {
+            // A replay of the recorded run `recorded`, noting a panic where
+            // the parent looks.
+            atomic_app::panics::keep_in(dir.join("panics"));
+            let id = std::env::var(ENV_RUN).expect("run id");
+            let replay = replay_of(&rt, "recorded").await.expect("a replay");
+            rt.start(REPLAY, &id, replay).await.expect("start");
+        } else if role.starts_with("start") {
             let project = dir.join("project");
             let run = match role.as_str() {
                 "start" => PipelineRun {
@@ -2066,6 +2075,145 @@ fn replaying_a_recorded_run_opens_no_workspace() {
         assert_eq!(opens(), live, "the replay opened a workspace");
         assert_eq!(sends(&dir), 1, "the replay ran no command");
     });
+}
+
+#[test]
+fn a_pipeline_execution_that_loses_a_step_race_takes_the_winners_outcome() {
+    on_codex_runtime(async {
+        tokio::time::timeout(std::time::Duration::from_secs(120), the_race())
+            .await
+            .expect("the race ended in time");
+    });
+}
+
+/// Creates its files when dropped, releasing the fake model's held answers.
+struct Release(Vec<PathBuf>);
+
+impl Drop for Release {
+    fn drop(&mut self) {
+        for file in &self.0 {
+            let _ = std::fs::write(file, "");
+        }
+    }
+}
+
+async fn the_race() {
+    {
+        let dir = scratch("race");
+        let project = project(&dir);
+        let pipeline = load(&project, "triage.workflow.yaml", TRIAGE);
+        // Each atom is answered by its prompt. The first execution's read is
+        // held until the second has recorded its own, and the second's rank
+        // until the test has watched the first lose.
+        let (first_read, winner_rank) = (dir.join("release-read"), dir.join("release-rank"));
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (gate_read, gate_rank, counted) =
+            (first_read.clone(), winner_rank.clone(), reads.clone());
+        let model = FakeModel::respond(move |request| {
+            let text = request.to_string();
+            if text.contains("Give the note a short title") {
+                let reply = Reply::Text(READ.into());
+                if counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    return Reply::Gated {
+                        file: gate_read.clone(),
+                        reply: Box::new(reply),
+                    };
+                }
+                reply
+            } else if text.contains("Rank the note") {
+                Reply::Gated {
+                    file: gate_rank.clone(),
+                    reply: Box::new(Reply::Text(RANK.into())),
+                }
+            } else {
+                Reply::Text(SUMMARY.into())
+            }
+        })
+        .await
+        .expect("fake model");
+        let first = engine(&dir, &model.base_url()).await;
+        let second = engine(&dir, &model.base_url()).await;
+        first.launch().await.expect("launch");
+        second.launch().await.expect("launch");
+        // Declared after the engines, so dropped before them: a failure
+        // below lets every held answer go, so nothing waits on the engines
+        // as they are dropped and the test fails rather than hangs.
+        let _release = Release(vec![first_read.clone(), winner_rank.clone()]);
+        first
+            .start(
+                PIPELINE,
+                "raced",
+                PipelineRun {
+                    pipeline,
+                    input: json!({"text": "Exporting a file named café.txt crashes the app."}),
+                },
+            )
+            .await
+            .expect("start");
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let wait = |calls: usize, what: &'static str| {
+            let model = &model;
+            async move {
+                while model.calls() < calls {
+                    assert!(std::time::Instant::now() < until, "{what}");
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            }
+        };
+        wait(1, "the first execution never asked for its read").await;
+        // A second engine recovers the run while the first still runs it.
+        second.recover().await.expect("recover");
+        // The second records its read and asks for its rank.
+        wait(3, "the second execution never reached its rank").await;
+        std::fs::write(&first_read, "").expect("release the first read");
+        // The first now finishes its read's turn and loses the race to record
+        // it: it must record nothing while the winner waits.
+        let watch = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut recorded = None;
+        while std::time::Instant::now() < watch && recorded.is_none() {
+            let status = first.status("raced").await.expect("status");
+            if status != Some(RunStatus::Pending) {
+                recorded = Some(status);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        std::fs::write(&winner_rank, "").expect("release the rank");
+        let status = loop {
+            let status = first.status("raced").await.expect("status");
+            if matches!(status, Some(RunStatus::Succeeded | RunStatus::Failed(_)))
+                || std::time::Instant::now() > until
+            {
+                break status;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        let result = second.result::<Value>("raced").await;
+        let reads = first
+            .steps("raced")
+            .await
+            .expect("steps")
+            .into_iter()
+            .filter(|s| s.name == "read.turn")
+            .count();
+        let calls = model.calls();
+        // Both engines stop before anything is judged, so a failure below
+        // fails the test instead of leaving work for the runtime to wait on.
+        drop(_release);
+        for rt in [first, second] {
+            let _ = rt.shutdown(std::time::Duration::from_secs(5)).await;
+        }
+        assert_eq!(
+            recorded, None,
+            "the execution that lost the race recorded an outcome"
+        );
+        assert_eq!(status, Some(RunStatus::Succeeded));
+        assert_eq!(
+            result.expect("the winner's result"),
+            serde_json::from_str::<Value>(SUMMARY).expect("summary")
+        );
+        assert_eq!(calls, 4, "the loser made no call after its read");
+        assert_eq!(reads, 1, "one read recorded");
+    }
 }
 
 #[test]
@@ -3265,16 +3413,20 @@ fn another_run_gets_another_effect_key_and_atoms_cannot_set_it() {
 
         let atom = project.join("atoms/send-note.atom.astro");
         let source = std::fs::read_to_string(&atom).expect("atom");
-        std::fs::write(
-            &atom,
-            source.replace(
-                "env: { SENT_LOG:",
-                "env: { ATOMIC_EFFECT_KEY: 'mine', SENT_LOG:",
-            ),
-        )
-        .expect("atom");
-        let error = atomic_core::atom::load(&atom, &mut Registry::new()).expect_err("refused");
-        assert!(error.message.contains("set by atomic"), "{error}");
+        // Nor the directories its command hands files over in and reads its
+        // artifacts from.
+        for name in ["ATOMIC_EFFECT_KEY", "ATOMIC_OUTPUTS", "ATOMIC_INPUTS"] {
+            std::fs::write(
+                &atom,
+                source.replace(
+                    "env: { SENT_LOG:",
+                    &format!("env: {{ {name}: 'mine', SENT_LOG:"),
+                ),
+            )
+            .expect("atom");
+            let error = atomic_core::atom::load(&atom, &mut Registry::new()).expect_err("refused");
+            assert!(error.message.contains("set by atomic"), "{name}: {error}");
+        }
     });
 }
 
@@ -3938,6 +4090,128 @@ fn a_replay_takes_no_lock_on_the_store() {
         assert_eq!(replayed, recorded);
         assert_eq!(atomic_app::pipeline::store_waits("replayed-unlocked"), 0);
         drop(holder);
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+/// A replay whose workflow code panics has its panic noted, as a run's is.
+#[test]
+fn a_replay_whose_workflow_code_panics_is_noted() {
+    on_codex_runtime(async {
+        let dir = scratch("replay-panics");
+        let project = project(&dir);
+        let model = FakeModel::start(vec![
+            Reply::Text(READ.into()),
+            Reply::Text(RANK.into()),
+            Reply::Text(SUMMARY.into()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        let run = PipelineRun {
+            pipeline: load(&project, "triage.workflow.yaml", TRIAGE),
+            input: json!({"text": "Exporting a file named café.txt crashes the app."}),
+        };
+        rt.start(PIPELINE, "recorded", run).await.expect("start");
+        let _: Value = rt.result("recorded").await.expect("recorded");
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+        child_in(
+            &dir,
+            &model.base_url(),
+            "replay",
+            "replayed-panics",
+            None,
+            "UTC",
+            &[("ATOMIC_FAILPOINT_PANIC", "pipeline:after:read")],
+        );
+        let kept = atomic_app::panics::kept(&dir.join("panics"), "replayed-panics")
+            .expect("the replay's panic was noted");
+        assert!(kept.contains("failpoint pipeline:after:read"), "{kept}");
+    });
+}
+
+#[test]
+fn a_replayed_run_reuses_its_checkpoints_and_spends_nothing() {
+    on_codex_runtime(async {
+        let dir = scratch("replay-spend");
+        let project = project(&dir);
+        // Answers for a second run too, so a replay that ran live would
+        // finish and be caught by what it spent.
+        let answers = [READ, RANK, SUMMARY, READ, RANK, SUMMARY];
+        let model = FakeModel::start(answers.iter().map(|a| Reply::Text((*a).into())).collect())
+            .await
+            .expect("fake model");
+        let rt = engine_with(&dir, &model.base_url(), small_calls()).await;
+        let pipeline = load(
+            &project,
+            "spend.workflow.yaml",
+            &format!("{TRIAGE}budget:\n  tokens: 10000\n"),
+        );
+        let input = json!({"text": "Exporting a file named café.txt crashes the app."});
+        rt.start(PIPELINE, "recorded", PipelineRun { pipeline, input })
+            .await
+            .expect("start");
+        let recorded: Value = rt.result("recorded").await.expect("finishes");
+        let ledger = rt.ledger();
+        let charged = |scope: String| {
+            let ledger = ledger.clone();
+            async move {
+                ledger
+                    .allowance(&scope)
+                    .await
+                    .expect("allowance")
+                    .map_or_else(atomic_durable::usage::Charge::default, |a| a.charged)
+            }
+        };
+
+        // The recorded run made and paid for its three calls.
+        assert_eq!(model.calls(), 3);
+        let attempts = rt.ledger().attempts("recorded").await.expect("attempts");
+        assert_eq!(attempts.len(), 3, "{attempts:?}");
+        let spent = charged("run:recorded".into()).await;
+        assert_eq!(
+            spent.tokens, 6,
+            "three calls of one input and one output token"
+        );
+
+        // Its replay is served each step's checkpoint: the same result, no
+        // attempt, nothing charged anywhere, and no model call.
+        let replay = replay_of(&rt, "recorded").await.expect("a replay");
+        rt.start(REPLAY, "replayed", replay).await.expect("start");
+        let replayed: Value = rt.result("replayed").await.expect("the replay finishes");
+        assert_eq!(replayed, recorded);
+        let none = atomic_durable::usage::Charge::default();
+        let replay_attempts = rt.ledger().attempts("replayed").await.expect("attempts");
+        assert!(
+            replay_attempts.is_empty(),
+            "the replay was admitted: {replay_attempts:?}"
+        );
+        assert_eq!(charged("run:replayed".into()).await, none);
+        // Each recorded call's atom allowance, `atom:<run>:<position>`, has
+        // no counterpart charged in the replay.
+        for a in &attempts {
+            let position = a
+                .request
+                .rsplit(':')
+                .nth(1)
+                .expect("<run>:<position>:<call>");
+            assert_ne!(charged(format!("atom:recorded:{position}")).await, none);
+            assert_eq!(
+                charged(format!("atom:replayed:{position}")).await,
+                none,
+                "position {position}"
+            );
+        }
+        assert_eq!(
+            charged("run:recorded".into()).await,
+            spent,
+            "the replay charged the run it replays"
+        );
+        assert_eq!(model.calls(), 3, "the replay made no model call");
         rt.shutdown(std::time::Duration::from_secs(5))
             .await
             .expect("shutdown");

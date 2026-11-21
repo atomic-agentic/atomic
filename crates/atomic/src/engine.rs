@@ -92,8 +92,87 @@ pub fn settings(state: &ProjectState, args: &EngineArgs) -> anyhow::Result<setti
     })
 }
 
+/// Where exec atoms' commands run, as the settings say.
+pub fn runner_of(resolved: &settings::Resolved) -> anyhow::Result<RunnerKind> {
+    match resolved.settings.runner.as_str() {
+        "local" => Ok(RunnerKind::Local),
+        "process" => Ok(RunnerKind::Process),
+        other => Err(Failure::new(
+            "config.invalid",
+            format!("runner is `{other}`, and atomic knows `local` and `process`"),
+            "set runner (ATOMIC_RUNNER, or --runner) to local or process",
+        )
+        .into()),
+    }
+}
+
+/// The backend exec atoms' commands run on with `runner`: scratch in the
+/// project's state, confined like turns' commands where that is verified,
+/// connected once.
+pub fn exec_backend(
+    state: &ProjectState,
+    paths: &CodexPaths,
+    runner: RunnerKind,
+) -> anyhow::Result<atomic_exec::Backend> {
+    // Scratch directories live in the project's state directory, outside
+    // every directory a sandboxed turn may write. Connected once: what the
+    // backend states here is what runs plan on, and connecting reclaims
+    // what attempts of dead processes left.
+    let local = atomic_exec::LocalBackend::in_dir(state.dir().join("scratch"));
+    // Exec atoms' commands run under the same sandbox helper as turns'
+    // commands, denied atomic's private state. Elsewhere than Linux this is
+    // not verified, and they run unconfined (see the availability notes).
+    // They may write their scratch directory and the project's caches.
+    #[cfg(target_os = "linux")]
+    let local = {
+        let caches = atomic_core::worktree::Caches::for_state(state);
+        caches.create().context("the project's caches")?;
+        local.confined(std::sync::Arc::new(
+            atomic_core::codex::ExecSandbox::new(
+                paths,
+                atomic_core::codex::StateGuard::for_project(state)?,
+                state.codex_home(),
+            )
+            .context("confine exec atoms' commands")?
+            .also_writing(vec![caches.dir().to_owned()]),
+        ))
+    };
+    match runner {
+        RunnerKind::Local => atomic_exec::Backend::connect(local),
+        RunnerKind::Process => atomic_exec::Backend::connect(ProcessRunner {
+            workspaces: local,
+            ..ProcessRunner::atomic(
+                std::env::current_exe().context("find atomic's own executable for its runners")?,
+            )
+        }),
+    }
+    .context("connect to the execution backend")
+}
+
+/// The endpoint a replay of recorded model calls names: where the calls
+/// were recorded for, and the model, with no key, since no call reaches it.
+/// A key the project's files may not send is never read either, so a
+/// withheld key does not refuse a replay.
+pub fn identity(resolved: &settings::Resolved) -> anyhow::Result<ModelEndpoint> {
+    match resolved.endpoint() {
+        Some(endpoint) => Ok(ModelEndpoint {
+            api_key_env: None,
+            ..endpoint
+        }),
+        None => Err(Failure::new(
+            "config.model",
+            "a replay answers each call by the endpoint and model it was recorded for, and \
+             none is configured or detected",
+            "set the endpoint and model the recordings were made with (ATOMIC_MODEL_BASE_URL \
+             and ATOMIC_MODEL, or --model-base-url and --model); no call reaches them and no \
+             key is read",
+        )
+        .into()),
+    }
+}
+
 /// The model endpoint, or with `required`, a failure saying how to set one.
-fn endpoint(resolved: &settings::Resolved, required: bool) -> anyhow::Result<ModelEndpoint> {
+pub fn endpoint(resolved: &settings::Resolved, required: bool) -> anyhow::Result<ModelEndpoint> {
     // The person's key goes nowhere the project chose: a run that calls a
     // model has no model access until they choose the endpoint.
     if required && let Some(why) = &resolved.withheld_key {
@@ -129,7 +208,7 @@ fn endpoint(resolved: &settings::Resolved, required: bool) -> anyhow::Result<Mod
 }
 
 /// The store the resolved settings name.
-fn store_of(state: &ProjectState, settings: &settings::Settings) -> Database {
+pub fn store_of(state: &ProjectState, settings: &settings::Settings) -> Database {
     match settings.database.url.clone().filter(|u| !u.is_empty()) {
         Some(url) => Database::Postgres {
             url,
@@ -227,7 +306,7 @@ pub async fn open(
     atomic_core::runtime::limit_backend_wait(
         resolved
             .settings
-            .backend_wait
+            .backend_wait()
             .map(std::time::Duration::from_secs),
     );
     let database = store_of(state, &resolved.settings);
@@ -252,51 +331,9 @@ pub async fn open(
         atomic_core::log_line!("{line}");
     }
     let store = LocalStore::for_project(state).context("the artifact store")?;
-    let runner = match resolved.settings.runner.as_str() {
-        "local" => RunnerKind::Local,
-        "process" => RunnerKind::Process,
-        other => {
-            return Err(Failure::new(
-                "config.invalid",
-                format!("runner is `{other}`, and atomic knows `local` and `process`"),
-                "set runner (ATOMIC_RUNNER, or --runner) to local or process",
-            )
-            .into());
-        }
-    };
-    // Scratch directories live in the project's state directory, outside
-    // every directory a sandboxed turn may write. Connected once: what the
-    // backend states here is what runs plan on, and connecting reclaims
-    // what attempts of dead processes left.
-    let local = atomic_exec::LocalBackend::in_dir(state.dir().join("scratch"));
-    // Exec atoms' commands run under the same sandbox helper as turns'
-    // commands, denied atomic's private state. Elsewhere than Linux this is
-    // not verified, and they run unconfined (see the availability notes).
-    // They may write their scratch directory and the project's caches.
-    #[cfg(target_os = "linux")]
-    let local = {
-        let caches = atomic_core::worktree::Caches::for_state(state);
-        caches.create().context("the project's caches")?;
-        local.confined(std::sync::Arc::new(
-            atomic_core::codex::ExecSandbox::new(
-                paths,
-                atomic_core::codex::StateGuard::for_project(state)?,
-                state.codex_home(),
-            )
-            .context("confine exec atoms' commands")?
-            .also_writing(vec![caches.dir().to_owned()]),
-        ))
-    };
-    let exec = match runner {
-        RunnerKind::Local => atomic_exec::Backend::connect(local),
-        RunnerKind::Process => atomic_exec::Backend::connect(ProcessRunner {
-            workspaces: local,
-            ..ProcessRunner::atomic(
-                std::env::current_exe().context("find atomic's own executable for its runners")?,
-            )
-        }),
-    }
-    .context("connect to the execution backend")?;
+    // A run whose workflow code panics is noted where later processes look.
+    atomic_app::panics::keep_in(state.private_dir().join("panics"));
+    let exec = exec_backend(state, paths, runner_of(&resolved)?)?;
     let runtimes = Arc::new(Runtimes {
         codex: CodexRuntime {
             paths: paths.clone(),
@@ -304,17 +341,22 @@ pub async fn open(
             cwd: state.root().to_owned(),
             endpoint: endpoint.clone(),
             defaults: AtomConfig::default(),
-            artifacts: Artifacts::new(store.clone()),
+            artifacts: Artifacts::store(store.clone(), file_limits()?),
+            // Each step's meter comes from the run's pinned caps, set where
+            // the step runs; a step whose atom calls a model and has none is
+            // refused there, never run unmetered.
             meter: atomic_core::usage::Metering::none(),
             // Atoms' commands are kept out of atomic's private state.
             guard: atomic_core::codex::StateGuard::for_project(state)?,
+            caches: None,
         },
         lite: LiteRuntime::new(endpoint, AtomConfig::default()),
         backend: exec,
         clock: None,
     });
-    // A project in a git repository gets worktrees for its worktree steps.
-    let worktrees = Worktrees::open(state).ok().map(Arc::new);
+    // Never the developer's checkout: a run's worktree steps use the
+    // snapshot of the fixture it is bound to (see `atomic_core::fixture`).
+    let worktrees: Option<Arc<Worktrees>> = None;
     let mut rt = Durare::open(&database, executor.as_deref(), LAYOUT_VERSION)
         .await
         .with_context(|| format!("open the durable store at {}", describe(&database)))?;
@@ -347,4 +389,22 @@ pub async fn open(
         store: describe(&database),
         shared: matches!(database, Database::Postgres { .. }),
     })
+}
+
+/// How much an exec atom's command may hand over: the defaults, or
+/// `ATOMIC_EXEC_MAX_FILE_BYTES` and `ATOMIC_EXEC_MAX_STEP_BYTES`.
+fn file_limits() -> anyhow::Result<atomic_core::artifact::files::Limits> {
+    let mut limits = atomic_core::artifact::files::Limits::default();
+    for (var, slot) in [
+        ("ATOMIC_EXEC_MAX_FILE_BYTES", &mut limits.per_file),
+        ("ATOMIC_EXEC_MAX_STEP_BYTES", &mut limits.per_step),
+    ] {
+        if let Ok(text) = std::env::var(var) {
+            *slot = text
+                .trim()
+                .parse()
+                .with_context(|| format!("{var} is {text:?}, not a number of bytes"))?;
+        }
+    }
+    Ok(limits)
 }

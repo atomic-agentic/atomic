@@ -53,6 +53,12 @@ The settings `atomic run`, `atomic runs resume` and `atomic serve` resolve:
 | `backend_wait` | `ATOMIC_BACKEND_WAIT` | `--backend-wait` |
 | `budget.*` | `ATOMIC_BUDGET_*` | |
 
+`backend_wait` is a whole number of seconds, at least 1. An empty
+`ATOMIC_BACKEND_WAIT` sets nothing, but a null, `~` or blank value, in a file
+or a variable, is refused, so a higher layer cannot remove a limit a lower one
+set: to override it, set a larger number. Without any, a step waits for as
+long as it takes.
+
 Your own configuration is `$XDG_CONFIG_HOME/atomic/config.yaml`, by default
 `~/.config/atomic/config.yaml`. No project supplies it. It holds the same
 settings as `atomic.yaml`, and the project's files override it.
@@ -146,6 +152,13 @@ on. Application data sources are separately declared capabilities.
 
 For upstream subscription support and Atomic login status, see
 [subscriptions and authentication](../getting-started/authentication.md).
+
+## Limit what exec atoms hand over
+
+`ATOMIC_EXEC_MAX_FILE_BYTES` and `ATOMIC_EXEC_MAX_STEP_BYTES` bound the files an
+exec atom's command hands over by reference: 1 GiB a file and 4 GiB a step by
+default, in bytes. See
+[large results go by reference](atom-files.md#large-results-go-by-reference).
 
 ## Keep credentials out of definitions
 

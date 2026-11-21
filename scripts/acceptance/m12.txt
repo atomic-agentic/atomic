@@ -1,0 +1,89 @@
+# M12, cost, tracing and evals: each acceptance clause of docs/design/milestones.md
+# § M12, word for word, each part of the second as a `### ` line, and the tests
+# that show them, as `<binary> <test path>`.
+# Run by scripts/acceptance.py m12; see that script for the format.
+
+## Reaching a cap parks the workflow; it does not go on.
+budgets a_cap_parks_the_run_before_the_call_and_keeps_rejected_spend
+budgets a_codex_turn_that_runs_out_of_its_atoms_time_parks_the_run
+pipeline a_workflow_budget_parks_the_run_before_the_call_it_has_no_room_for
+pipeline a_budget_refusal_in_a_worktree_step_parks_the_run
+
+## Usage and open reservations survive retries and resumes; a parent cap and a child cap cannot both spend the same allowance; reusing a checkpoint charges nothing; configuring a dollar cap for a model without a price is an error.
+### Usage and open reservations survive retries and resumes
+budgets a_killed_and_resumed_run_reports_the_same_usage_plus_only_real_retries
+budgets a_released_park_admits_again_against_the_caps_as_stored
+run_cli a_resumed_run_keeps_the_budget_it_already_spent
+pipeline a_resumed_run_keeps_the_budgets_its_first_step_recorded
+atomic_durable usage::tests::on_sqlite::an_unsettled_attempt_stays_charged_until_admission_refuses
+atomic_durable usage::tests::on_postgres::an_unsettled_attempt_stays_charged_until_admission_refuses
+atomic_durable usage::tests::on_sqlite::caps_hold_as_first_created
+atomic_durable usage::tests::on_postgres::caps_hold_as_first_created
+### a parent cap and a child cap cannot both spend the same allowance
+budgets parallel_children_cannot_both_take_the_last_reservation
+atomic_durable usage::tests::on_sqlite::a_call_is_reserved_before_dispatch_and_settled_once
+atomic_durable usage::tests::on_postgres::a_call_is_reserved_before_dispatch_and_settled_once
+atomic_durable usage::tests::on_sqlite::parallel_children_cannot_both_take_the_last_reservation
+atomic_durable usage::tests::on_postgres::parallel_children_cannot_both_take_the_last_reservation
+### reusing a checkpoint charges nothing
+# On recovery, and in a replay.
+budgets a_killed_and_resumed_run_reports_the_same_usage_plus_only_real_retries
+pipeline a_replayed_run_reuses_its_checkpoints_and_spends_nothing
+### configuring a dollar cap for a model without a price is an error
+atomic_core budget::tests::a_dollar_cap_on_an_unpriced_model_fails_configuration
+budgets a_dollar_cap_on_an_unpriced_model_fails_configuration
+budgets a_call_to_a_model_the_budget_does_not_price_is_not_made_under_a_dollar_cap
+pipeline a_budget_that_cannot_hold_fails_before_any_model_call
+
+## A recorded workflow replays with no model calls at all.
+pipeline replaying_a_recorded_run_makes_no_model_call_and_runs_no_command
+pipeline a_replayed_run_reuses_its_checkpoints_and_spends_nothing
+
+## When an atom's eval pass rate falls under its threshold, CI goes red.
+atomic_core eval::tests::a_pass_rate_below_the_threshold_fails_the_report
+eval_cli atomic_eval_records_replays_offline_and_fails_ci_on_a_pass_rate_drop
+eval_cli a_pass_rate_exactly_at_its_threshold_passes
+
+## Each fixture's seed fails its checker and each reference solution passes it.
+coding_tasks every_seed_fails_its_checker_and_every_solution_passes
+
+## Killing the process again and again after the provider has billed a call but before the ledger settles it eventually parks admission at the cap.
+budgets killing_after_the_call_and_before_settlement_ends_parked_at_the_cap
+
+## Two parallel children cannot both win the last reservation.
+budgets parallel_children_cannot_both_take_the_last_reservation
+atomic_durable usage::tests::on_sqlite::parallel_children_cannot_both_take_the_last_reservation
+atomic_durable usage::tests::on_postgres::parallel_children_cannot_both_take_the_last_reservation
+
+## Attempts that failed or were rejected keep their spend, and the declared bound on how far a request can overshoot is enforced.
+budgets a_cap_parks_the_run_before_the_call_and_keeps_rejected_spend
+budgets a_lite_call_that_fails_is_charged_by_whether_it_could_have_been_sent
+budgets every_model_call_has_an_attempt_admitted_first_and_settled_once
+atomic_core codex::tests::a_failed_turn_settles_with_the_usage_seen_before_it_failed
+atomic_core codex::tests::a_turn_is_cut_off_when_its_reserved_time_runs_out
+atomic_core lite::tests::a_failed_call_settles_by_whether_it_could_have_been_sent
+atomic_core lite::tests::a_call_is_sent_with_its_reserved_output_limit
+atomic_core lite::tests::a_call_is_cut_off_when_its_reserved_time_runs_out
+atomic_durable usage::tests::on_sqlite::usage_past_the_reservation_is_recorded_against_its_bound
+atomic_durable usage::tests::on_postgres::usage_past_the_reservation_is_recorded_against_its_bound
+# A Codex turn cut off with a request in flight keeps what it reported and one more bound.
+budgets a_codex_turn_cut_off_with_a_request_in_flight_is_charged_what_it_reported_and_one_bound
+budgets a_request_in_flight_is_estimated_at_the_larger_of_one_bound_and_the_last_request
+turn_workspace a_turn_cut_off_while_a_command_keeps_running_is_charged_as_one_in_flight
+atomic_core codex::tests::a_turn_cut_off_with_a_request_in_flight_is_settled_in_part
+atomic_core codex::tests::a_turn_whose_last_response_breaks_off_is_charged_as_one_in_flight
+atomic_durable usage::tests::on_sqlite::a_partly_known_attempt_is_charged_its_reported_usage_and_one_more_bound
+atomic_durable usage::tests::on_postgres::a_partly_known_attempt_is_charged_its_reported_usage_and_one_more_bound
+
+## CI fails when a scorer's mean drops below its declared floor, or falls further than its allowed tolerance relative to a baseline revision.
+# For v0.1 this clause is shown by the eval runner, which fails a report on a
+# scorer below its floor or past its tolerance, and by atomic eval, which exits
+# non-zero on a failed report and fails an atom whose scorers it cannot run. A
+# judged run through atomic eval comes with model-judged scorers.
+atomic_core eval::tests::a_scorer_below_its_minimum_or_past_its_tolerance_fails_the_report
+atomic_core eval::tests::scorers_score_passing_cases_against_a_comparable_baseline
+eval_cli atomic_eval_records_replays_offline_and_fails_ci_on_a_pass_rate_drop
+eval_cli declared_scorers_fail_the_atom_unless_allowed_and_a_baseline_is_refused
+
+## Cases kept many to a JSONL file behave like cases kept one to a file.
+atomic_core eval::tests::cases_in_a_jsonl_file_run_the_same_as_cases_one_to_a_file

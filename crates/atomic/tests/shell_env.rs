@@ -11,10 +11,10 @@
 //! settings and database connections, and its shell profiles exporting a
 //! variable no pattern names. None reaches the command, and the platform's
 //! core variables do. The command cannot read the person's own
-//! configuration file either.
-//!
-//! This covers what the shell inherits and its configuration; files a
-//! command can read elsewhere in the home directory are another matter.
+//! configuration file, nor the file a linked one points to, nor any of the
+//! places in the home directory where credentials are kept, and none of
+//! the functions or aliases the person's shell startup files define reach
+//! it.
 //!
 //! Needs bubblewrap and unprivileged user namespaces, so it runs with the
 //! `sandbox-tests` feature (and `ATOMIC_DEV_SANDBOX=on` in the development
@@ -27,7 +27,7 @@ mod support;
 
 use atomic_core::testing::{FakeModel, Reply, on_codex_runtime};
 use serde_json::json;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 /// Variables that carry credentials, each set to a value holding `canary`.
@@ -46,25 +46,69 @@ const CANARIES: &[&str] = &[
     "UNRELATED_CANARY",
 ];
 
+/// The project: `look`, a read-only codex atom, and `tidy`, one that may
+/// write its workspace.
 fn write_project(project: &Path) {
     std::fs::create_dir_all(project.join("atoms")).unwrap();
     std::fs::write(project.join("atomic.yaml"), "atomic: 1\nname: env-check\n").unwrap();
+    write_codex_atom(project, "look", "read-only");
+    write_codex_atom(project, "peek", "read-only");
+    write_codex_atom(project, "tidy", "workspace-write");
+    // `tidy` may write, so it runs as a worktree step at a base commit;
+    // `peek` runs as one too, and may not write; `tidy-twice` runs `tidy`
+    // in two worktrees, the second on the first's commit.
+    std::fs::create_dir_all(project.join("workflows")).unwrap();
+    for (name, atom) in [("tidy-up", "tidy"), ("peek-in", "peek")] {
+        std::fs::write(
+            project.join(format!("workflows/{name}.workflow.yaml")),
+            format!(
+                "atomic: 1\nname: {name}\n\
+                 input: {{ $ref: ../atoms/{atom}.input.schema.json }}\n\
+                 output: {{ $ref: ../atoms/{atom}.output.schema.json }}\n\
+                 steps:\n  step:\n    atom: {atom}\n    with: {{ base: input.base, text: input.text }}\n    \
+                 worktree: true\n\
+                 returns: steps.step.output\n"
+            ),
+        )
+        .unwrap();
+    }
     std::fs::write(
-        project.join("atoms/look.atom.astro"),
-        "---\nimport type { Props, Input, Output } from '../.atomic/types/look';\n\
-         import type { AtomConfig } from '../.atomic/types/authoring';\n\
-         const { input }: Props = Astro.props;\n\
-         export const config: AtomConfig<Input, Output> = { description: 'Look around.', \
-         kind: 'codex', sandbox: 'read-only' };\n\
-         ---\nLook around: {input.text}\n",
+        project.join("workflows/tidy-twice.workflow.yaml"),
+        "atomic: 1\nname: tidy-twice\n\
+         input: { $ref: ../atoms/tidy.input.schema.json }\n\
+         output: { $ref: ../atoms/tidy.output.schema.json }\n\
+         steps:\n  first:\n    atom: tidy\n    with: { base: input.base, text: input.text }\n    \
+         worktree: true\n\
+         \x20 second:\n    after: [first]\n    atom: tidy\n    \
+         with: { base: steps.first.metadata.commit, text: input.text }\n    worktree: true\n\
+         returns: steps.second.output\n",
     )
     .unwrap();
-    for (role, schema) in [
-        (
-            "input",
-            json!({"type": "object", "additionalProperties": false, "required": ["text"],
-                   "properties": {"text": {"type": "string"}}}),
+}
+
+fn write_codex_atom(project: &Path, name: &str, sandbox: &str) {
+    std::fs::write(
+        project.join(format!("atoms/{name}.atom.astro")),
+        format!(
+            "---\nimport type {{ Props, Input, Output }} from '../.atomic/types/{name}';\n\
+             import type {{ AtomConfig }} from '../.atomic/types/authoring';\n\
+             const {{ input }}: Props = Astro.props;\n\
+             export const config: AtomConfig<Input, Output> = {{ description: 'Look around.', \
+             kind: 'codex', sandbox: '{sandbox}' }};\n\
+             ---\nLook around: {{input.text}}\n"
         ),
+    )
+    .unwrap();
+    let input = if name != "look" {
+        json!({"type": "object", "additionalProperties": false, "required": ["base", "text"],
+               "properties": {"base": {"type": "string", "format": "git-commit"},
+                              "text": {"type": "string"}}})
+    } else {
+        json!({"type": "object", "additionalProperties": false, "required": ["text"],
+               "properties": {"text": {"type": "string"}}})
+    };
+    for (role, schema) in [
+        ("input", input),
         (
             "output",
             json!({"type": "object", "additionalProperties": false, "required": ["done"],
@@ -72,11 +116,422 @@ fn write_project(project: &Path) {
         ),
     ] {
         std::fs::write(
-            project.join(format!("atoms/look.{role}.schema.json")),
+            project.join(format!("atoms/{name}.{role}.schema.json")),
             schema.to_string(),
         )
         .unwrap();
     }
+}
+
+/// Where [`run_steps`] keeps the atomic home for `target`.
+fn atomic_home_for(project: &Path, target: &str) -> PathBuf {
+    // Tests run at once, so each project's run has its own.
+    let test = project
+        .parent()
+        .and_then(Path::file_name)
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "atomic-shell-env-{}-{target}-{test}",
+        std::process::id()
+    ))
+}
+
+/// Run `target` of `project` through `atomic run` as a person with home
+/// `home` and the variables `env` would, on a model whose turns each run
+/// one of `commands`, and return what each printed.
+async fn run_steps(
+    home: &Path,
+    project: &Path,
+    target: &str,
+    data: &str,
+    commands: &[String],
+    env: &[(&str, &str)],
+) -> Vec<String> {
+    run_ending(home, project, target, data, commands, env, true).await
+}
+
+/// [`run_steps`], with each turn answering as it should when `succeeds`,
+/// or with what its atom's output schema refuses, so the run fails.
+async fn run_ending(
+    home: &Path,
+    project: &Path,
+    target: &str,
+    data: &str,
+    commands: &[String],
+    env: &[(&str, &str)],
+    succeeds: bool,
+) -> Vec<String> {
+    let answer = if succeeds {
+        r#"{"done": true}"#
+    } else {
+        r#"{"done": "no"}"#
+    };
+    let replies = commands
+        .iter()
+        .flat_map(|command| {
+            [
+                Reply::Tool {
+                    name: "exec_command".into(),
+                    arguments: json!({"cmd": command, "yield_time_ms": 20000}),
+                },
+                Reply::Text(answer.into()),
+            ]
+        })
+        .chain(
+            (!succeeds)
+                .then(|| (0..8).map(|_| Reply::Text(answer.into())))
+                .into_iter()
+                .flatten(),
+        )
+        .collect();
+    let model = FakeModel::start(replies).await.unwrap();
+    let atomic_home = atomic_home_for(project, target);
+    let _ = std::fs::remove_dir_all(&atomic_home);
+    let mut run = Command::new(env!("CARGO_BIN_EXE_atomic"));
+    // Every workflow here runs a worktree step, so it is bound to the
+    // project's own repository as its fixture.
+    run.args(["run", target, "--data", data])
+        .arg("--fixture")
+        .arg(project)
+        .args(["--fixture-rev", "main"])
+        .current_dir(project)
+        .env("HOME", home)
+        .env("XDG_DATA_HOME", &atomic_home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("ATOMIC_DETECT_OLLAMA_ADDR", "127.0.0.1:9")
+        .env("ATOMIC_MODEL_BASE_URL", model.base_url())
+        .env("ATOMIC_MODEL", "synthetic")
+        .stdin(Stdio::null());
+    for name in [
+        "CODEX_HOME",
+        "ATOMIC_HOME",
+        "ATOMIC_DATABASE_URL",
+        "ATOMIC_EXECUTOR_ID",
+        "ATOMIC_MODEL_API_KEY_ENV",
+        "RUSTUP_HOME",
+    ] {
+        run.env_remove(name);
+    }
+    for (name, value) in env {
+        run.env(name, value);
+    }
+    let out = tokio::task::spawn_blocking(move || run.output().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        out.status.success(),
+        succeeds,
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let requests = model.requests();
+    assert!(
+        requests.len() >= 2 * commands.len(),
+        "{} model calls; stderr: {}",
+        requests.len(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (0..commands.len())
+        .map(|i| {
+            requests[2 * i + 1]["input"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|item| item["type"] == "function_call_output")
+                .map(|item| item["output"].as_str().unwrap_or_default().to_owned())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .collect()
+}
+
+/// [`run_steps`] for a workflow of one step.
+async fn run_once(
+    home: &Path,
+    project: &Path,
+    target: &str,
+    data: &str,
+    command: &str,
+    env: &[(&str, &str)],
+) -> String {
+    run_steps(home, project, target, data, &[command.to_owned()], env)
+        .await
+        .remove(0)
+}
+
+/// The value of `name=` that a command printed on a line of its own.
+fn printed_value(output: &str, name: &str) -> String {
+    output
+        .lines()
+        .find_map(|l| l.strip_prefix(&format!("{name}=")))
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// The directory of the one run's build caches, under `target`'s atomic
+/// home, from a path inside it that a command printed.
+fn run_caches(project: &Path, target: &str, inside: &str) -> PathBuf {
+    let path = Path::new(inside);
+    let at = path
+        .ancestors()
+        .find(|a| {
+            a.parent()
+                .and_then(Path::file_name)
+                .is_some_and(|n| n == "cache")
+        })
+        .unwrap_or_else(|| panic!("{inside} is in no run's caches"))
+        .to_owned();
+    assert!(at.starts_with(atomic_home_for(project, target)), "{inside}");
+    at
+}
+
+#[test]
+fn a_turn_writes_a_home_of_its_own_and_still_reads_nothing_of_the_persons() {
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let dir = std::env::temp_dir().join(format!("atomic-turn-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::write(home.join(".ssh/id_ed25519"), "canary-key\n").unwrap();
+        std::fs::write(home.join(".profile"), "export TOKEN=canary-profile\n").unwrap();
+        std::fs::create_dir_all(home.join(".rustup")).unwrap();
+        let project = dir.join("project");
+        write_project(&project);
+        let base = git(&project);
+        let command = format!(
+            "ls -A \"$HOME\"; echo listed; find \"$HOME\" -type l; echo linked; \
+             for d in {PROTECTED}; do ls -A \"$HOME/$d\" 2>/dev/null; done; echo protected; \
+             mkdir -p \"$HOME/.cache\" && echo cached > \"$HOME/.cache/x\" && cat \"$HOME/.cache/x\"; \
+             cat {0}/.ssh/id_ed25519 {0}/.profile; echo \"home=$HOME\"; \
+             echo \"cargo=$CARGO_HOME\"; echo \"rustup=$RUSTUP_HOME\"; echo \"gomod=$GOMODCACHE\"; \
+             echo \"target=$CARGO_TARGET_DIR\"; \
+             mkdir -p \"$XDG_CACHE_HOME\" && touch \"$XDG_CACHE_HOME/w\" && echo cache-written; \
+             touch \"$RUSTUP_HOME/w\" 2>/dev/null && echo rustup-written; \
+             mkdir -p \"$GOMODCACHE/m@v1\" && touch \"$GOMODCACHE/m@v1/go.mod\" && \
+             chmod 0500 \"$GOMODCACHE/m@v1\" \"$GOMODCACHE\"; \
+             echo looked",
+            home.display(),
+            PROTECTED = PROTECTED.join(" ")
+        );
+        let data = json!({"base": base, "text": "the note"}).to_string();
+        let printed = run_once(&home, &project, "tidy-up", &data, &command, &[]).await;
+        let output = printed
+            .split_once("Output:\n")
+            .map_or(printed.as_str(), |(_, o)| o);
+        // It starts empty but for the sandbox's own read-only placeholders,
+        // which are empty too, and the turn's own temporary directory, with
+        // no link anywhere in it.
+        let (listing, rest) = output.split_once("listed\n").expect("listed");
+        assert!(
+            listing
+                .lines()
+                .all(|name| PROTECTED.contains(&name) || name == "tmp"),
+            "the turn's home started with: {listing}"
+        );
+        let (links, rest) = rest.split_once("linked\n").expect("linked");
+        assert_eq!(links.trim(), "", "links in the turn's home: {links}");
+        let (inside, rest) = rest.split_once("protected\n").expect("protected");
+        assert_eq!(inside.trim(), "", "the placeholders hold: {inside}");
+        // The turn may write it.
+        assert!(rest.contains("cached\n"), "{printed}");
+        // And reads nothing of the person's.
+        assert!(!rest.contains("canary"), "{printed}");
+        assert!(
+            !rest.contains(&format!("home={}\n", home.display())),
+            "{printed}"
+        );
+        // A worktree step's tools find its run's own caches, which it may
+        // write and which go when the run ends; cargo's home is its own
+        // home's; and the toolchains rustup has, which it may only read.
+        let value = |name: &str| printed_value(rest, name);
+        assert_eq!(
+            value("cargo"),
+            format!("{}/.cargo", value("home")),
+            "{printed}"
+        );
+        let caches = run_caches(&project, "tidy-up", &value("gomod"));
+        assert_eq!(Path::new(&value("gomod")), caches.join("go-mod"));
+        assert!(
+            Path::new(&value("target")).starts_with(caches.join("cargo-target")),
+            "{printed}"
+        );
+        // Gone, read-only directories and all.
+        assert!(!caches.exists(), "the run's caches outlived it");
+        assert_eq!(
+            value("rustup"),
+            home.join(".rustup").display().to_string(),
+            "{printed}"
+        );
+        assert!(rest.contains("cache-written"), "{printed}");
+        assert!(!rest.contains("rustup-written"), "{printed}");
+        assert!(rest.contains("looked"), "{printed}");
+        // RUSTUP_HOME, where the person sets it.
+        let toolchains = dir.join("toolchains");
+        std::fs::create_dir_all(&toolchains).unwrap();
+        let toolchains = toolchains.display().to_string();
+        let printed = run_once(
+            &home,
+            &project,
+            "tidy-up",
+            &data,
+            "echo \"rustup=$RUSTUP_HOME\"; touch \"$RUSTUP_HOME/w\" 2>/dev/null && echo rustup-written",
+            &[("RUSTUP_HOME", &toolchains)],
+        )
+        .await;
+        assert_eq!(printed_value(&printed, "rustup"), toolchains, "{printed}");
+        assert!(!printed.contains("rustup-written"), "{printed}");
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+#[test]
+fn a_read_only_worktree_step_finds_its_caches_and_writes_nothing_there() {
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let dir = std::env::temp_dir().join(format!("atomic-peek-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let project = dir.join("project");
+        write_project(&project);
+        let base = git(&project);
+        let data = json!({"base": base, "text": "the note"}).to_string();
+        let command = "echo \"xdg=$XDG_CACHE_HOME\"; \
+                       mkdir -p \"$XDG_CACHE_HOME/x\" 2>/dev/null && echo cache-written; \
+                       mkdir -p \"$CARGO_TARGET_DIR\" 2>/dev/null && echo target-written; echo looked";
+        let printed = run_once(&home, &project, "peek-in", &data, command, &[]).await;
+        run_caches(&project, "peek-in", &printed_value(&printed, "xdg"));
+        assert!(printed.contains("looked"), "{printed}");
+        for wrote in ["cache-written", "target-written"] {
+            assert!(!printed.contains(wrote), "{wrote}: {printed}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+#[test]
+fn a_run_that_fails_leaves_no_build_caches() {
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let dir = std::env::temp_dir().join(format!("atomic-failed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let project = dir.join("project");
+        write_project(&project);
+        let base = git(&project);
+        let data = json!({"base": base, "text": "the note"}).to_string();
+        let build = "mkdir -p \"$XDG_CACHE_HOME\" && echo built > \"$XDG_CACHE_HOME/x\"; \
+                     echo \"xdg=$XDG_CACHE_HOME\"";
+        let printed = run_ending(
+            &home,
+            &project,
+            "tidy-up",
+            &data,
+            &[build.to_owned()],
+            &[],
+            false,
+        )
+        .await;
+        let caches = run_caches(&project, "tidy-up", &printed_value(&printed[0], "xdg"));
+        assert!(!caches.exists(), "a failed run's caches stayed: {caches:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+#[test]
+fn each_worktree_builds_in_a_target_directory_of_its_own() {
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let dir = std::env::temp_dir().join(format!("atomic-twice-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let project = dir.join("project");
+        write_project(&project);
+        let base = git(&project);
+        let data = json!({"base": base, "text": "the note"}).to_string();
+        let build = "mkdir -p \"$CARGO_TARGET_DIR\" && ls -A \"$CARGO_TARGET_DIR\"; echo listed; \
+                     echo built > \"$CARGO_TARGET_DIR/built-here\"; echo \"target=$CARGO_TARGET_DIR\"";
+        let printed = run_steps(
+            &home,
+            &project,
+            "tidy-twice",
+            &data,
+            &[build.to_owned(), build.to_owned()],
+            &[],
+        )
+        .await;
+        let (first, second) = (&printed[0], &printed[1]);
+        let output = |p: &str| p.split_once("Output:\n").map_or(p, |(_, o)| o).to_owned();
+        let (listing, _) = output(second)
+            .split_once("listed\n")
+            .map(|(l, r)| (l.to_owned(), r.to_owned()))
+            .expect("listed");
+        assert_eq!(
+            listing.trim(),
+            "",
+            "the second worktree found the first's build: {second}"
+        );
+        let (one, two) = (
+            printed_value(first, "target"),
+            printed_value(second, "target"),
+        );
+        assert_ne!(one, two, "{first}\n{second}");
+        assert_eq!(
+            run_caches(&project, "tidy-twice", &one),
+            run_caches(&project, "tidy-twice", &two)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+/// The entries of [`atomic_core::codex::HOME_SECRETS`] that are directories;
+/// the rest are files.
+const SECRET_DIRS: &[&str] = &[
+    ".ssh",
+    ".aws",
+    ".codex",
+    ".config/gcloud",
+    ".azure",
+    ".kube",
+    ".gnupg",
+    ".config/gh",
+    ".password-store",
+    ".local/share/keyrings",
+    ".config/fish",
+    ".local/share/fish",
+    ".claude",
+    ".bashrc.d",
+    ".zsh_sessions",
+];
+
+/// The names Codex's sandbox keeps read-only, and empty, in a directory a
+/// turn may write, such as its home.
+const PROTECTED: &[&str] = &[".agents", ".aws", ".codex", ".git"];
+
+/// Make `project` a repository with one commit, and return it.
+fn git(project: &Path) -> String {
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(["-c", "user.name=dev", "-c", "user.email=dev@example.com"])
+            .args(["-c", "init.defaultBranch=main"])
+            .args(args)
+            .current_dir(project)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    };
+    git(&["init", "-q"]);
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "project"]);
+    git(&["rev-parse", "HEAD"])
 }
 
 /// The person's shell profiles, each exporting a variable whose name no
@@ -99,17 +554,44 @@ fn an_atoms_shell_sees_none_of_the_persons_secrets() {
         let _ = std::fs::remove_dir_all(&atomic_home);
         let home = dir.join("home");
         std::fs::create_dir_all(home.join(".config/atomic")).unwrap();
+        // Every place credentials are kept, holding a canary: a file, or a
+        // directory with a file in it.
+        let mut secrets = Vec::new();
+        for path in atomic_core::codex::HOME_SECRETS {
+            let at = home.join(path);
+            std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+            if SECRET_DIRS.contains(path) {
+                std::fs::create_dir_all(&at).unwrap();
+                std::fs::write(at.join("secret"), "canary-secret\n").unwrap();
+            } else {
+                std::fs::write(&at, "canary-secret\n").unwrap();
+            }
+            secrets.push(at);
+        }
         for profile in PROFILES {
             std::fs::write(
                 home.join(profile),
-                format!("export PROFILE_CANARY_PASSWORD=canary-profile-{profile}\n"),
+                format!(
+                    "export PROFILE_CANARY_PASSWORD=canary-profile-{profile}\n\
+                     canary_fn() {{ echo canary-function; }}\n\
+                     alias canary_alias='echo canary-alias'\n"
+                ),
             )
             .unwrap();
         }
-        // The person's own configuration, which only they may read.
+        // The person's own configuration, which only they may read, linked
+        // to a file kept elsewhere.
+        std::fs::create_dir_all(dir.join("kept")).unwrap();
+        let kept = dir.join("kept/config.yaml");
+        std::fs::write(&kept, "# canary-config\nrunner: local\n").unwrap();
         let config = home.join(".config/atomic/config.yaml");
-        std::fs::write(&config, "# canary-config\nrunner: local\n").unwrap();
-        let command = format!("env; cat {}; echo looked", config.display());
+        std::os::unix::fs::symlink(&kept, &config).unwrap();
+        let reads: String = secrets
+            .iter()
+            .chain([&config, &kept])
+            .map(|p| format!("cat '{0}' '{0}/secret';", p.display()))
+            .collect();
+        let command = format!("env; {reads} type canary_fn; alias; echo looked");
         let model = FakeModel::start(vec![
             Reply::Tool {
                 name: "exec_command".into(),
@@ -193,11 +675,152 @@ fn an_atoms_shell_sees_none_of_the_persons_secrets() {
             !printed.contains("canary-config"),
             "the command read the person's configuration: {printed}"
         );
+        assert!(
+            !printed.contains("canary-secret"),
+            "the command read a credential in the home directory: {printed}"
+        );
+        assert!(
+            !printed.contains("canary-function")
+                && !printed.contains("canary-alias")
+                && !printed.contains("canary_fn ()"),
+            "the shell's startup functions or aliases reached the command: {printed}"
+        );
         for name in CANARIES {
             assert!(
-                !printed.contains(&format!("{name}=")) && !printed.contains("canary"),
+                !printed.contains(&format!("{name}="))
+                    && !printed.contains(&format!("canary-{}", name.to_lowercase())),
                 "{name} reached the atom's shell: {printed}"
             );
         }
+    });
+}
+
+/// Run `look` once through `atomic run` with home `home`, its command
+/// `command`, and return what the command printed.
+async fn look_once(dir: &Path, home: &Path, command: &str, env: &[(&str, &str)]) -> String {
+    let model = FakeModel::start(vec![
+        Reply::Tool {
+            name: "exec_command".into(),
+            arguments: json!({"cmd": command, "yield_time_ms": 20000}),
+        },
+        Reply::Text(r#"{"done": true}"#.into()),
+    ])
+    .await
+    .unwrap();
+    let project = dir.join("project");
+    write_project(&project);
+    let atomic_home = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("atomic-shell-env-linked-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&atomic_home);
+    let mut run = Command::new(env!("CARGO_BIN_EXE_atomic"));
+    run.args(["run", "look", "--data", r#"{"text": "the note"}"#])
+        .current_dir(&project)
+        .env("HOME", home)
+        .env("XDG_DATA_HOME", &atomic_home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("ATOMIC_DETECT_OLLAMA_ADDR", "127.0.0.1:9")
+        .env("ATOMIC_MODEL_BASE_URL", model.base_url())
+        .env("ATOMIC_MODEL", "synthetic")
+        .stdin(Stdio::null());
+    for name in [
+        "CODEX_HOME",
+        "ATOMIC_HOME",
+        "ATOMIC_DATABASE_URL",
+        "ATOMIC_EXECUTOR_ID",
+    ] {
+        run.env_remove(name);
+    }
+    for (name, value) in env {
+        run.env(name, value);
+    }
+    let out = tokio::task::spawn_blocking(move || run.output().unwrap())
+        .await
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    model.requests()[1]["input"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| item["type"] == "function_call_output")
+        .map(|item| item["output"].as_str().unwrap_or_default().to_owned())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn a_secret_kept_behind_a_link_stays_denied_and_commands_still_run() {
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let dir = std::env::temp_dir().join(format!("atomic-linked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
+        // A startup file kept with the person's dotfiles, a key directory
+        // linked from elsewhere, and a credential two levels inside a
+        // denied directory that is a link to a file outside it.
+        std::fs::create_dir_all(home.join("dotfiles")).unwrap();
+        std::fs::write(home.join("dotfiles/bashrc"), "canary-linked-file\n").unwrap();
+        std::os::unix::fs::symlink(home.join("dotfiles/bashrc"), home.join(".bashrc")).unwrap();
+        std::fs::create_dir_all(dir.join("keys")).unwrap();
+        std::fs::write(dir.join("keys/id_ed25519"), "canary-linked-dir\n").unwrap();
+        std::os::unix::fs::symlink(dir.join("keys"), home.join(".ssh")).unwrap();
+        std::fs::create_dir_all(home.join(".aws/deep")).unwrap();
+        std::fs::create_dir_all(dir.join("elsewhere")).unwrap();
+        std::fs::write(dir.join("elsewhere/credentials"), "canary-deep-link\n").unwrap();
+        std::os::unix::fs::symlink(
+            dir.join("elsewhere/credentials"),
+            home.join(".aws/deep/credentials"),
+        )
+        .unwrap();
+        // The person's own Codex home, moved, which atomic replaces with
+        // its own for the turn.
+        std::fs::create_dir_all(dir.join("their-codex")).unwrap();
+        std::fs::write(dir.join("their-codex/auth.json"), "canary-codex-auth\n").unwrap();
+        let command = format!(
+            "cat {h}/.bashrc {h}/dotfiles/bashrc {h}/.ssh/id_ed25519 {d}/keys/id_ed25519 \
+             {h}/.aws/deep/credentials {d}/elsewhere/credentials {d}/their-codex/auth.json; \
+             echo looked",
+            h = home.display(),
+            d = dir.display()
+        );
+        let theirs = dir.join("their-codex").display().to_string();
+        let printed = look_once(&dir, &home, &command, &[("CODEX_HOME", &theirs)]).await;
+        assert!(printed.contains("looked"), "the command ran: {printed}");
+        assert!(
+            !printed.contains("canary"),
+            "a linked secret was read: {printed}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    });
+}
+
+#[test]
+fn a_secret_place_linked_to_a_device_or_a_system_program_leaves_both_usable() {
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let dir = std::env::temp_dir().join(format!("atomic-unlinked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::create_dir_all(home.join(".config/fish/bin")).unwrap();
+        // History kept nowhere, hosts thrown away, a variable naming
+        // /dev/null, and a tool in a denied directory linked to the
+        // system's python.
+        let null = Path::new("/dev/null");
+        std::os::unix::fs::symlink(null, home.join(".bash_history")).unwrap();
+        std::os::unix::fs::symlink(null, home.join(".ssh/known_hosts")).unwrap();
+        let python = std::fs::canonicalize("/usr/bin/python3").unwrap();
+        std::os::unix::fs::symlink(&python, home.join(".config/fish/bin/python3")).unwrap();
+        let command = "echo x > /dev/null && echo null-written; cat /dev/null && echo null-read; \
+                       /usr/bin/python3 -c 'print(\"python-ran\")'; echo looked";
+        let printed = look_once(&dir, &home, command, &[("HISTFILE", "/dev/null")]).await;
+        for ran in ["null-written", "null-read", "python-ran", "looked"] {
+            assert!(printed.contains(ran), "{ran}: {printed}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     });
 }

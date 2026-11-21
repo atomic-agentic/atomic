@@ -104,6 +104,7 @@ fn main() {
                         defaults: AtomConfig::default(),
                         artifacts: Artifacts::none(),
                         meter: atomic_core::usage::Metering::none(),
+                        caches: None,
                     };
                     let input = ChangeRequest {
                         request: (*request).to_owned(),

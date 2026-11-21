@@ -82,6 +82,30 @@ const WEAK_PARTS: &[&str] = &[
     "cookie",
     "authorization",
 ];
+/// Words that make the `token` right after them a count of tokens or a kind
+/// of token rather than a credential: `max_token`, `prompt_token`,
+/// `error_token`, `next_token`.
+const TOKEN_KINDS: &[&str] = &[
+    "max",
+    "min",
+    "count",
+    "total",
+    "limit",
+    "num",
+    "used",
+    "prompt",
+    "completion",
+    "reasoning",
+    "error",
+    "next",
+    "eos",
+    "bos",
+    "special",
+];
+/// Words that make the `tokens` right after them a count, though `token`
+/// alone after them may be a credential: `input_tokens`, but
+/// `--input-token`.
+const COUNTED_KINDS: &[&str] = &["input", "output", "cached"];
 /// What makes `key` a secret's name: `api_key`, `AccountKey`,
 /// `Ocp-Apim-Subscription-Key`. `key` alone, `primary_key` or `KeyError`
 /// are not.
@@ -302,10 +326,12 @@ static REFERENCE: LazyLock<Regex> = LazyLock::new(|| {
     )
 });
 /// Webhook URLs whose path is their secret: Slack's, Discord's and
-/// Microsoft Teams'. The host is kept, the path redacted.
+/// Microsoft Teams', and Telegram's bot URLs, whose token is a number, a
+/// colon and the secret (`/botinfo` is not one). The host is kept, the path
+/// redacted.
 static WEBHOOK: LazyLock<Regex> = LazyLock::new(|| {
     regex(
-        r"(?i)\b(https?://(?:hooks\.slack\.com/(?:services|workflows|triggers)/|(?:canary\.|ptb\.)?discord(?:app)?\.com/api/(?:v[0-9]+/)?webhooks/|[a-z0-9-]+\.webhook\.office\.com/webhookb2/|outlook\.office\.com/webhook/|api\.telegram\.org/(?:file/)?bot))([A-Za-z0-9@/_.%:-]+)",
+        r"(?i)\b(https?://(?:hooks\.slack\.com/(?:services|workflows|triggers)/|(?:canary\.|ptb\.)?discord(?:app)?\.com/api/(?:v[0-9]+/)?webhooks/|[a-z0-9-]+\.webhook\.office\.com/webhookb2/|outlook\.office\.com/webhook/))[A-Za-z0-9@/_.%:-]+|\b(https?://api\.telegram\.org/(?:file/)?bot)[0-9]+:[A-Za-z0-9@/_.%:-]+",
     )
 });
 static PRIVATE_KEY: LazyLock<Regex> =
@@ -379,8 +405,24 @@ fn strength(name: &str) -> Strength {
     }
     let weak =
         parts.iter().any(|part| WEAK_PARTS.contains(&part.as_str())) || joined.ends_with("token");
+    // `max_token`, `prompt_token`, `input_tokens`, `nextToken`: a count or a
+    // kind of token, which only hints, said by the word right before
+    // `token`. Never in an all-upper-case name, an environment variable's,
+    // where `INPUT_TOKEN` is how GitHub Actions passes a token, and never
+    // for `pass` or `auth`: `INPUT_PASS` and `PROVIDER_TOKEN` are secrets'
+    // names.
+    let upper = !last.bytes().any(|b| b.is_ascii_lowercase());
+    let about = !upper
+        && parts.windows(2).any(|pair| match pair[1].as_str() {
+            "token" => TOKEN_KINDS.contains(&pair[0].as_str()),
+            "tokens" => {
+                TOKEN_KINDS.contains(&pair[0].as_str()) || COUNTED_KINDS.contains(&pair[0].as_str())
+            }
+            _ => false,
+        });
     match (weak, parts.len()) {
         (false, _) => Strength::None,
+        (true, 2..) if about => Strength::Weak,
         // `DB_PASS`, `GH_PAT`, `accessToken`: qualified.
         (true, 2..) => Strength::Strong,
         (true, _) => Strength::Weak,
@@ -476,6 +518,22 @@ fn escape_len(after: &str) -> usize {
     }
 }
 
+std::thread_local! {
+    /// How many steps this thread's scans have taken, for the tests that
+    /// check a scan stays linear.
+    #[cfg(test)]
+    static STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Count `n` steps of a scan (see [`STEPS`]); nothing outside tests.
+#[inline]
+fn step(n: usize) {
+    #[cfg(test)]
+    STEPS.with(|steps| steps.set(steps.get() + n as u64));
+    #[cfg(not(test))]
+    let _ = n;
+}
+
 /// How long the terminal escape sequence starting `rest` is, if one does: a
 /// control sequence (`ESC[1;33m`, `ESC[38:5:196m`, `ESC[1 q`), the
 /// introducer of a title, link or clipboard write (`ESC]`), or a character
@@ -504,6 +562,12 @@ fn escape_sequence_len(rest: &str) -> Option<usize> {
                 .take_while(|b| (0x20..=0x2f).contains(*b))
                 .count();
             let fin = *bytes.get(1 + params + inter)?;
+            // A backslash starts an escape, `\n` say, not the sequence's
+            // end: the sequence stops before it, so what follows the escape
+            // starts a token.
+            if fin == b'\\' {
+                return Some(introducer.len() + 1 + params + inter);
+            }
             (0x40..=0x7e)
                 .contains(&fin)
                 .then_some(introducer.len() + 2 + params + inter)
@@ -514,6 +578,10 @@ fn escape_sequence_len(rest: &str) -> Option<usize> {
         b']' => Some(introducer.len() + 1),
         b'(' | b')' | b'*' | b'+' | b'-' | b'.' | b'/' => {
             let set = *bytes.get(1)?;
+            // A backslash starts an escape, as after `ESC[`.
+            if set == b'\\' {
+                return Some(introducer.len() + 1);
+            }
             (0x30..=0x7e).contains(&set).then_some(introducer.len() + 2)
         }
         _ => None,
@@ -531,6 +599,7 @@ fn shapes(input: &str) -> Option<String> {
     // or base64 text, such as after `/` or `+`.
     let mut boundary = true;
     while at < input.len() {
+        step(1);
         let rest = &input[at..];
         // Checked only where a block starts, so the scan stays linear.
         if let Some(found) = rest
@@ -540,6 +609,7 @@ fn shapes(input: &str) -> Option<String> {
         {
             let end = format!("-----END {}-----", &found[1]);
             let len = rest.find(&end).map_or(rest.len(), |i| i + end.len());
+            step(len);
             out.push_str(&input[copied..at]);
             out.push_str(REDACTED);
             at += len;
@@ -812,6 +882,7 @@ fn quoted_len(rest: &str, quote: u8, level: usize) -> Option<usize> {
     let bytes = rest.as_bytes();
     let mut backslashes = 0;
     for (i, b) in bytes.iter().enumerate() {
+        step(1);
         match *b {
             b'\n' => return None,
             b'\\' => backslashes += 1,
@@ -1073,7 +1144,10 @@ pub fn text(input: &str) -> Cow<'_, str> {
         }
     });
     apply(&URL_USERINFO, &redact_userinfo);
-    apply(&WEBHOOK, &|c| format!("{}{REDACTED}", &c[1]));
+    apply(&WEBHOOK, &|c| {
+        let host = c.get(1).or_else(|| c.get(2)).map_or("", |m| m.as_str());
+        format!("{host}{REDACTED}")
+    });
     // The whole value, even when part of it was redacted already: the rest
     // of a cookie is as secret as its first part.
     apply(&HEADER, &|c| {
@@ -1100,7 +1174,9 @@ fn cut(input: &str, chars: usize) -> Cow<'_, str> {
 }
 
 /// How much of a text to redact so that `chars` of it survive: enough to
-/// spare that what redaction shrinks never brings the cut into view.
+/// spare that the cut stays out of view unless redaction shrinks the window
+/// a great deal, when the line at the cut is dropped (see
+/// [`cut_came_into_view`]).
 fn margin(chars: usize) -> usize {
     chars.saturating_mul(2).saturating_add(16 * 1024)
 }
@@ -1163,13 +1239,61 @@ fn window_end(input: &str, chars: usize) -> &str {
     window_end_at(input, margin(chars))
 }
 
+/// How far before a window's cut, in characters, a secret whose rule needs
+/// what lies across the cut may start: as long as a realistic secret, or a
+/// header line at a common cap.
+const REACH: usize = 8 * 1024;
+
+/// Whether redacting a window of `window` characters into `redacted`
+/// brought its cut into view: the window was longer than `chars` and the
+/// reach of a secret, and redaction shrank it to within them. A window
+/// that was short already, as one whose cut dropped a long token, did not.
+fn cut_came_into_view(window: &str, redacted: &str, chars: usize) -> bool {
+    let room = chars.saturating_add(REACH);
+    window.chars().count() > room && redacted.chars().count() <= room
+}
+
+/// `redacted`, a window that cut its input at its end, less its last line
+/// if redaction brought the cut into view: a secret whose rule needs what
+/// the cut took (the `@` after a URL's password, the quote that ends a JSON
+/// value) is kept whole there.
+fn less_cut_line_at_end<'a>(window: &str, redacted: &'a str, chars: usize) -> &'a str {
+    if !cut_came_into_view(window, redacted, chars) {
+        return redacted;
+    }
+    redacted.rfind('\n').map_or("", |i| &redacted[..=i])
+}
+
+/// `redacted`, a window that cut its input at its start, less its first
+/// line if redaction brought the cut into view (see
+/// [`less_cut_line_at_end`]): a token whose `Authorization: Bearer ` the
+/// cut took, say.
+fn less_cut_line_at_start<'a>(window: &str, redacted: &'a str, chars: usize) -> &'a str {
+    if !cut_came_into_view(window, redacted, chars) {
+        return redacted;
+    }
+    redacted.find('\n').map_or("", |i| &redacted[i + 1..])
+}
+
+/// `shown`, ending `…` if anything of `input` was left out, as a window's
+/// cut or a dropped token, so a cut never reads as the whole.
+fn marked_end(shown: Cow<'_, str>, left_out: bool) -> String {
+    let mut shown = shown.into_owned();
+    if left_out && !shown.ends_with('…') {
+        shown.push('…');
+    }
+    shown
+}
+
 /// The start of `input`, at most `chars` characters, redacted. Only a
 /// window with room to spare is redacted, so a huge input costs little,
-/// less any token the window cuts in half; then the result is cut. JSON is
-/// redacted as JSON (see [`value`]), so its escapes hide no secret, and
-/// then as text.
+/// less any token the window cuts in half, and less the line at the cut
+/// when redaction shrank the window enough to show it; then the result is
+/// cut, and ends `…` when anything was left out. JSON is redacted as JSON
+/// (see [`value`]), so its escapes hide no secret, and then as text.
 pub fn excerpt(input: &str, chars: usize) -> String {
     let window = window_start(input, chars);
+    let left_out = window.len() < input.len();
     let trimmed = window.trim_start();
     let json = match serde_json::from_str::<Value>(trimmed) {
         Ok(mut doc) if trimmed.starts_with(['{', '[']) => {
@@ -1179,23 +1303,47 @@ pub fn excerpt(input: &str, chars: usize) -> String {
         }
         _ => None,
     };
-    let redacted = text(json.as_deref().unwrap_or(window)).into_owned();
-    cut(&redacted, chars).into_owned()
+    let redacted = text(json.as_deref().unwrap_or(window));
+    let shown = if left_out {
+        less_cut_line_at_end(window, &redacted, chars)
+    } else {
+        &redacted
+    };
+    marked_end(cut(shown, chars), left_out)
 }
 
 /// The start of `input`, at most `chars` characters, redacted as text: as
 /// [`excerpt`], for a log line or a span's attribute.
 pub fn bounded(input: &str, chars: usize) -> String {
-    let redacted = text(window_start(input, chars));
-    cut(&redacted, chars).into_owned()
+    let window = window_start(input, chars);
+    let left_out = window.len() < input.len();
+    let redacted = text(window);
+    let shown = if left_out {
+        less_cut_line_at_end(window, &redacted, chars)
+    } else {
+        &redacted
+    };
+    marked_end(cut(shown, chars), left_out)
 }
 
 /// The end of `input`, at most `chars` characters, redacted: as
-/// [`excerpt`], for the tail of a command's stderr.
+/// [`excerpt`], for the tail of a command's stderr, starting `…` when
+/// anything was left out.
 pub fn tail(input: &str, chars: usize) -> String {
-    let redacted = text(window_end(input, chars));
-    let count = redacted.chars().count();
-    redacted.chars().skip(count.saturating_sub(chars)).collect()
+    let window = window_end(input, chars);
+    let cut_off = window.len() < input.len();
+    let redacted = text(window);
+    let shown = if cut_off {
+        less_cut_line_at_start(window, &redacted, chars)
+    } else {
+        &redacted
+    };
+    let count = shown.chars().count();
+    let mut out: String = shown.chars().skip(count.saturating_sub(chars)).collect();
+    if (cut_off || count > chars) && !out.starts_with('…') {
+        out.insert(0, '…');
+    }
+    out
 }
 
 fn redact_string(string: &mut String, nested: usize) {
@@ -1368,6 +1516,61 @@ pub fn log(line: impl AsRef<str>) {
     eprintln!("{}", bounded(line.as_ref(), MAX_TEXT));
 }
 
+/// One log line put together from atomic's own text and values that may
+/// carry a secret, each value redacted on its own: a value's text, such as
+/// an unterminated private key, never reaches the text around it, and
+/// atomic's own words and names are written as they are, never mistaken
+/// for a secret. Each line is written by itself, so nothing one line holds
+/// changes what later lines show.
+#[derive(Debug, Default)]
+pub struct Line {
+    text: String,
+    redacted: bool,
+}
+
+impl Line {
+    /// An empty line.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Text that carries no secret: atomic's own words, a name the person
+    /// or the workflow chose (a run's id, a gate's), or a value redacted
+    /// already.
+    pub fn plain(mut self, text: &str) -> Self {
+        self.text.push_str(text);
+        self
+    }
+
+    /// A value that may carry a secret, such as a gate's title: redacted
+    /// and bounded on its own.
+    pub fn value(mut self, text: &str) -> Self {
+        let shown = bounded(text, MAX_TEXT);
+        self.redacted |= shown != text;
+        self.text.push_str(&shown);
+        self
+    }
+
+    /// Whether a value in it was redacted or cut short.
+    pub fn redacted(&self) -> bool {
+        self.redacted
+    }
+
+    /// Write it to stderr, bounded to [`MAX_TEXT`] characters.
+    pub fn log(self) {
+        eprintln!("{}", cut(&self.text, MAX_TEXT));
+    }
+
+    /// Write it to stderr with no line end, flushed, as a prompt for a
+    /// person to type after.
+    pub fn prompt(self) {
+        use std::io::Write;
+        let mut e = std::io::stderr().lock();
+        let _ = write!(e, "{}", cut(&self.text, MAX_TEXT));
+        let _ = e.flush();
+    }
+}
+
 /// A writer that redacts each line before it reaches stderr, for code that
 /// writes its log lines to a `Write` it is given. A line is written once
 /// it ends, or when the writer is flushed or dropped. The lines inside a
@@ -1376,6 +1579,13 @@ pub struct Lines {
     pending: Vec<u8>,
     in_key: bool,
     out: Box<dyn std::io::Write + Send>,
+}
+
+/// Whether this process's stderr is a terminal, for code that writes to it
+/// through [`stderr_lines`] or [`log`] and must know whether a person sees
+/// it.
+pub fn stderr_is_terminal() -> bool {
+    std::io::IsTerminal::is_terminal(&std::io::stderr())
 }
 
 /// A [`Lines`] writer to this process's stderr.
@@ -1467,36 +1677,76 @@ std::thread_local! {
     /// Whether this thread redacts a panic's message, whose own panic must
     /// not be redacted again.
     static REDACTING_A_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Where this thread's last panic happened, as the hook saw it.
+    static PANICKED_AT: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
+
+/// How long a panic's hook waits for its message to be redacted. Redacting
+/// a bounded message takes far less; a redaction that waits on what the
+/// panicking thread holds, such as a rule it was building when it panicked,
+/// never ends.
+const PANIC_REDACTION_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// `text` redacted by `redact` on a thread of its own, so a panic in
 /// redaction is that thread's and not one inside this panic's hook; if it
-/// panics, [`UNREDACTED_PANIC`].
+/// panics, or has not finished within [`PANIC_REDACTION_WAIT`],
+/// [`UNREDACTED_PANIC`].
 fn redact_panic(text: String, redact: fn(&str) -> String) -> String {
-    std::thread::Builder::new()
+    redact_panic_within(text, redact, PANIC_REDACTION_WAIT)
+}
+
+/// [`redact_panic`], waiting at most `wait`.
+fn redact_panic_within(
+    text: String,
+    redact: fn(&str) -> String,
+    wait: std::time::Duration,
+) -> String {
+    let (done, redacted) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
         .name("atomic-panic-redaction".into())
         .spawn(move || {
             REDACTING_A_PANIC.with(|r| r.set(true));
-            redact(&text)
-        })
+            let _ = done.send(redact(&text));
+        });
+    match spawned {
+        // A thread that panics drops its sender, so this ends at once.
+        Ok(_) => redacted
+            .recv_timeout(wait)
+            .unwrap_or_else(|_| UNREDACTED_PANIC.to_owned()),
+        Err(_) => UNREDACTED_PANIC.to_owned(),
+    }
+}
+
+/// What the hook writes for a panic: nothing for one in redaction itself,
+/// whose hook writes the fixed message for it, and `message` otherwise.
+fn hook_line(redacting: bool, message: impl FnOnce() -> String) -> Option<String> {
+    (!redacting).then(message)
+}
+
+/// Where this thread's last panic happened (`file:line:column`), once, if
+/// the hook [`install_panic_hook`] installs saw it: for code that catches
+/// the panic and reports it.
+pub fn take_panic_location() -> Option<String> {
+    PANICKED_AT
+        .try_with(|at| at.borrow_mut().take())
         .ok()
-        .and_then(|redacting| redacting.join().ok())
-        .unwrap_or_else(|| UNREDACTED_PANIC.to_owned())
+        .flatten()
 }
 
 /// Make a panic write its message redacted, in place of the standard
 /// hook's unredacted text. Redaction runs on a thread of its own: if it
-/// panics, a fixed message is written instead, and that panic is not
-/// redacted again. Call it first thing in `main`.
+/// panics, or does not finish, a fixed message is written once instead,
+/// and that panic is not redacted again. It also notes where the panic
+/// happened, for [`take_panic_location`]. Call it first thing in `main`.
 pub fn install_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
-        if REDACTING_A_PANIC.with(std::cell::Cell::get) {
-            eprintln!("{UNREDACTED_PANIC}");
-            return;
+        if let Some(at) = info.location() {
+            let _ = PANICKED_AT.try_with(|p| *p.borrow_mut() = Some(at.to_string()));
         }
-        eprintln!(
-            "{}",
+        if let Some(line) = hook_line(REDACTING_A_PANIC.with(std::cell::Cell::get), || {
             redact_panic(panic_text(info), |text| bounded(text, MAX_TEXT))
-        );
+        }) {
+            eprintln!("{line}");
+        }
     }));
 }

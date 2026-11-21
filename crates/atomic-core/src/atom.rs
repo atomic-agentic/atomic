@@ -223,6 +223,18 @@ fn loads_code(name: &str) -> bool {
         || matches!(name, "GCONV_PATH" | "GLIBC_TUNABLES")
 }
 
+/// Variables that make a shell run a file or a command as it starts, or
+/// before each prompt. A codex atom's commands run in a shell the model
+/// drives, so one of these would have that shell source any file named,
+/// such as the person's own startup file, by its absolute path.
+fn runs_at_shell_start(name: &str) -> bool {
+    // ZDOTDIR is atomic's own, refused before this is asked.
+    matches!(
+        name,
+        "BASH_ENV" | "ENV" | "PROMPT_COMMAND" | "SHELLOPTS" | "PS4"
+    )
+}
+
 /// Check an atom's `env`: variable names mapped to literal string values,
 /// none that atomic sets itself or, for a codex atom, that loads code.
 fn check_env(kind: &str, fm: &serde_json::Map<String, Value>) -> Result<(), (String, String)> {
@@ -254,6 +266,15 @@ fn check_env(kind: &str, fm: &serde_json::Map<String, Value>) -> Result<(), (Str
                         ),
                     );
                 }
+                if name == crate::codex::TURN_TMPDIR {
+                    return refuse(
+                        &format!("/env/{name}"),
+                        &format!(
+                            "`{name}` is set by atomic: it carries a turn's own TMPDIR past \
+                             Codex's sandbox helper; an atom cannot declare it"
+                        ),
+                    );
+                }
                 if kind == "codex" && loads_code(name) {
                     return refuse(
                         &format!("/env/{name}"),
@@ -263,7 +284,18 @@ fn check_env(kind: &str, fm: &serde_json::Map<String, Value>) -> Result<(), (Str
                         ),
                     );
                 }
-                if crate::runtime::EFFECT_VARIABLES.contains(&name.as_str()) {
+                if kind == "codex" && runs_at_shell_start(name) {
+                    return refuse(
+                        &format!("/env/{name}"),
+                        &format!(
+                            "`{name}` would make the turn's shell run a file or command as it \
+                             starts; a codex atom cannot declare it"
+                        ),
+                    );
+                }
+                if crate::runtime::EFFECT_VARIABLES.contains(&name.as_str())
+                    || crate::runtime::EXCHANGE_VARIABLES.contains(&name.as_str())
+                {
                     return refuse(
                         &format!("/env/{name}"),
                         &format!(

@@ -56,7 +56,26 @@ commit its mapped `base` names; the step must map `base`. Every attempt starts
 again from that commit. When the atom's turn ends, Atomic commits what it left,
 outside the sandbox, and records the commit in `steps.<id>.metadata.commit`,
 beside `base` and `commit_ref`. The worktrees are removed when the run finishes;
-accepted commits keep their refs.
+accepted commits keep their refs. A run that fails keeps its worktrees and
+their refs, so it can be inspected and resumed.
+
+No build cache an atom writes outlives its run. A worktree step's commands
+get build caches of the run's own, which they may write and which are
+removed when the run ends, whether it finishes or fails. A run stopped to
+be resumed, parked, or taken over by another process keeps them; one
+resumed after they went builds cold:
+`XDG_CACHE_HOME`, npm's, pip's and Go's caches
+(`GOCACHE`, `GOMODCACHE`) and `ATOMIC_CACHE_DIR` all point into one private
+directory in the state directory, shared by the run's worktree steps.
+`CARGO_TARGET_DIR` is each worktree's own, so no worktree runs what another
+built. Their `HOME` is the attempt's own, empty, directory, which they may
+write, and `CARGO_HOME` is `.cargo` inside it, never shared and never yours.
+`RUSTUP_HOME` points at the toolchains installed for you (your `RUSTUP_HOME`,
+or `~/.rustup`), which the commands may only read: a step does not start if
+it is inside, or holds, a directory the turn may write. A read-only step finds
+the same variables and writes nothing. A variable the atom declares in `env`
+wins over these, except that no build cache variable may point into the
+temporary directory every turn shares. Each run therefore builds from cold.
 
 ### Where each input came from
 
@@ -158,6 +177,46 @@ Atomic is offline; resume applies expiry before proceeding.
 
 `after: [review]` means the review finished, not that its verdict was `approve`.
 Use a review policy or a deliberate human gate to decide what happens next.
+
+`atomic run` and `atomic runs resume` show each gate their run reaches at the
+terminal and take the decision there: `a` or `r`, then a comment if you like.
+The decision carries your enrolled operator credential, as `atomic gates
+approve` does. Only what you type after a gate is shown decides it: input typed
+earlier is discarded, and commands that atoms run have no terminal to type into.
+Titles and what a gate shows can come from a model, so control characters in
+them are shown escaped, in `atomic gates list --json` too, where they are
+written as JSON escapes and read back as the same text. When standard input or standard error is not a terminal,
+or the run is in the background, the run prints how to decide the gate from
+another terminal and waits.
+
+### Question gates
+
+A gate can ask a question instead of asking for approval. It has an `ask` in
+place of `title`, and the `answer` it takes: a list of choices, or a JSON Schema
+for a free answer.
+
+```yaml
+  channel:
+    after: [build]
+    gate:
+      ask: "'Which channel should ' + steps.build.output.version + ' ship to?'"
+      answer: [stable, beta]
+      remember: true
+      timeout: 4h
+      on_timeout: { default: beta }
+```
+
+The answer is the gate's decision, and later steps read it as
+`steps.channel.decision.answer`, typed by `answer`. Type a choice by its value
+or by the letter shown beside it, at the prompt and in `atomic gates answer
+<gate-id> <answer>` alike; an answer that `answer` does not allow is refused in
+both. With `remember: true`, the answer is also kept as a dated entry in the
+project's feedback log, in atomic's state. `on_timeout: { default: ... }` needs a
+`timeout`, and is the answer silence selects: when nobody answers in time the
+gate store records the gate as resumed with it (and remembers it, if asked), the
+prompt and `atomic gates list` say so beforehand, and the step resumes with it.
+Without a default (or with `on_timeout: reject`), an unanswered question stops
+the run, as an expired gate does.
 
 ## View a workflow as a diagram
 

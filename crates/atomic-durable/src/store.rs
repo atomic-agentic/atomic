@@ -146,10 +146,89 @@ const MIGRATIONS: &[Migration] = &[
                 PRIMARY KEY (run, attempt)
             )"],
     },
+    Migration {
+        version: 7,
+        // Question gates (see `gate`): the question a gate asks, as JSON,
+        // and the answer its decision gave; and the feedback log, a dated
+        // entry for each answer a question gate asked to remember.
+        sql: &[
+            "CREATE TABLE IF NOT EXISTS atomic_gate_questions (
+                gate_id TEXT PRIMARY KEY,
+                question TEXT NOT NULL,
+                answer TEXT
+            )",
+            "CREATE TABLE IF NOT EXISTS atomic_feedback (
+                gate_id TEXT PRIMARY KEY,
+                workflow TEXT NOT NULL,
+                step TEXT NOT NULL,
+                ask TEXT NOT NULL,
+                answer TEXT NOT NULL,
+                decided_by TEXT NOT NULL,
+                recorded_at BIGINT NOT NULL
+            )",
+        ],
+    },
 ];
 
-/// The store version this binary writes and understands.
-pub const STORE_VERSION: i64 = 6;
+/// The store version this binary writes and understands: its last
+/// migration's.
+pub const STORE_VERSION: i64 = last_version(MIGRATIONS);
+
+// The migrations are versions 1 to the last, once each and in order, or this
+// does not build: a store migrated across a missing version would be marked
+// at the newer one without it, and never get it.
+const _: () = assert!(
+    contiguous(MIGRATIONS),
+    "MIGRATIONS must be versions 1 to the last, once each and in order"
+);
+
+/// The last of `migrations`' versions, 0 for none.
+const fn last_version(migrations: &[Migration]) -> i64 {
+    match migrations.last() {
+        Some(m) => m.version,
+        None => 0,
+    }
+}
+
+/// Whether `migrations` are exactly versions 1 to the last, in order, once
+/// each.
+const fn contiguous(migrations: &[Migration]) -> bool {
+    let mut i = 0;
+    while i < migrations.len() {
+        if migrations[i].version != i as i64 + 1 {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// The first version after `found`, up to the last of `migrations`, that
+/// they do not provide exactly once. Migrations repeated or out of order
+/// are refused outright, whatever the store's version: the first version
+/// after `found`. A store at `found` may be migrated only when there is
+/// none.
+fn first_gap(migrations: &[Migration], found: i64) -> Option<i64> {
+    if !migrations.windows(2).all(|w| w[0].version < w[1].version) {
+        return Some(found + 1);
+    }
+    ((found + 1)..=last_version(migrations))
+        .find(|v| migrations.iter().filter(|m| m.version == *v).count() != 1)
+}
+
+/// Refuse to migrate the store at `path` from `found` across a gap in
+/// `migrations`.
+fn no_gap(path: &str, found: i64, migrations: &[Migration]) -> Result<(), StoreError> {
+    match first_gap(migrations, found) {
+        Some(missing) => Err(StoreError::Gap {
+            path: path.to_owned(),
+            found,
+            supported: last_version(migrations),
+            missing,
+        }),
+        None => Ok(()),
+    }
+}
 
 /// Why the store could not be opened.
 #[derive(Debug, thiserror::Error)]
@@ -167,6 +246,24 @@ pub enum StoreError {
         /// The newest version this binary knows.
         supported: i64,
     },
+    /// This binary's migrations skip a version between the store's and its
+    /// own: a store migrated across the gap would be marked at the newer
+    /// version without the skipped one, and never get it.
+    #[error(
+        "the store at {path} is at version {found}, and this atomic's migrations to version \
+         {supported} skip version {missing}; it migrates nothing, so the store keeps every \
+         migration it is owed. Use an atomic built with every migration"
+    )]
+    Gap {
+        /// The database file.
+        path: String,
+        /// Its version.
+        found: i64,
+        /// The version this binary would migrate it to.
+        supported: i64,
+        /// The first version no migration provides.
+        missing: i64,
+    },
     /// The database failed.
     #[error("the store at {path}: {source}")]
     Database {
@@ -180,6 +277,11 @@ pub enum StoreError {
 /// Open the SQLite store at `database`, creating it if needed, check its
 /// version and migrate it forward. Returns the version it is now at.
 pub async fn open_sqlite(database: &Path) -> Result<i64, StoreError> {
+    open_sqlite_with(database, MIGRATIONS).await
+}
+
+/// [`open_sqlite`], migrating with `migrations`.
+async fn open_sqlite_with(database: &Path, migrations: &[Migration]) -> Result<i64, StoreError> {
     let path = database.display().to_string();
     let db = |source| StoreError::Database {
         path: path.clone(),
@@ -189,7 +291,7 @@ pub async fn open_sqlite(database: &Path) -> Result<i64, StoreError> {
         .map_err(db)?
         .create_if_missing(true);
     let mut conn = SqliteConnection::connect_with(&options).await.map_err(db)?;
-    let result = migrate(&mut conn, &path).await;
+    let result = migrate(&mut conn, &path, migrations).await;
     let _ = conn.close().await;
     result
 }
@@ -199,6 +301,16 @@ pub async fn open_sqlite(database: &Path) -> Result<i64, StoreError> {
 /// schema and the version table if needed and migrate forward. Returns the
 /// version it is now at.
 pub async fn open_postgres(url: &str, schema: &str) -> Result<i64, StoreError> {
+    open_postgres_with(url, schema, MIGRATIONS).await
+}
+
+/// [`open_postgres`], migrating with `migrations`.
+async fn open_postgres_with(
+    url: &str,
+    schema: &str,
+    migrations: &[Migration],
+) -> Result<i64, StoreError> {
+    let to = last_version(migrations);
     let path = format!("postgres schema {schema}");
     let db = |source| StoreError::Database {
         path: path.clone(),
@@ -245,13 +357,14 @@ pub async fn open_postgres(url: &str, schema: &str) -> Result<i64, StoreError> {
         } else {
             0
         };
-        if found > STORE_VERSION {
+        if found > to {
             return Err(StoreError::Newer {
                 path: path.clone(),
                 found,
-                supported: STORE_VERSION,
+                supported: to,
             });
         }
+        no_gap(&path, found, migrations)?;
         for sql in [
             format!("CREATE SCHEMA IF NOT EXISTS {schema}"),
             format!("CREATE TABLE IF NOT EXISTS {table} (version BIGINT NOT NULL)"),
@@ -262,12 +375,12 @@ pub async fn open_postgres(url: &str, schema: &str) -> Result<i64, StoreError> {
                 .await
                 .map_err(db)?;
         }
-        for m in MIGRATIONS.iter().filter(|m| m.version > found) {
+        for m in migrations.iter().filter(|m| m.version > found) {
             for sql in m.sql {
                 sqlx::query(*sql).execute(&mut *tx).await.map_err(db)?;
             }
         }
-        if found < STORE_VERSION {
+        if found < to {
             sqlx::query(sqlx::AssertSqlSafe(format!("DELETE FROM {table}")))
                 .execute(&mut *tx)
                 .await
@@ -275,20 +388,25 @@ pub async fn open_postgres(url: &str, schema: &str) -> Result<i64, StoreError> {
             sqlx::query(sqlx::AssertSqlSafe(format!(
                 "INSERT INTO {table} (version) VALUES ($1)"
             )))
-            .bind(STORE_VERSION)
+            .bind(to)
             .execute(&mut *tx)
             .await
             .map_err(db)?;
         }
         tx.commit().await.map_err(db)?;
-        Ok(STORE_VERSION)
+        Ok(to)
     }
     .await;
     let _ = conn.close().await;
     result
 }
 
-async fn migrate(conn: &mut SqliteConnection, path: &str) -> Result<i64, StoreError> {
+async fn migrate(
+    conn: &mut SqliteConnection,
+    path: &str,
+    migrations: &[Migration],
+) -> Result<i64, StoreError> {
+    let to = last_version(migrations);
     let db = |source| StoreError::Database {
         path: path.to_owned(),
         source,
@@ -322,30 +440,31 @@ async fn migrate(conn: &mut SqliteConnection, path: &str) -> Result<i64, StoreEr
                 .map_err(db)?
                 .try_get("v")
                 .map_err(db)?;
-        if found > STORE_VERSION {
+        if found > to {
             return Err(StoreError::Newer {
                 path: path.to_owned(),
                 found,
-                supported: STORE_VERSION,
+                supported: to,
             });
         }
-        for m in MIGRATIONS.iter().filter(|m| m.version > found) {
+        no_gap(path, found, migrations)?;
+        for m in migrations.iter().filter(|m| m.version > found) {
             for sql in m.sql {
                 sqlx::query(*sql).execute(&mut *conn).await.map_err(db)?;
             }
         }
-        if found < STORE_VERSION {
+        if found < to {
             sqlx::query("DELETE FROM atomic_store_version")
                 .execute(&mut *conn)
                 .await
                 .map_err(db)?;
             sqlx::query("INSERT INTO atomic_store_version (version) VALUES (?)")
-                .bind(STORE_VERSION)
+                .bind(to)
                 .execute(&mut *conn)
                 .await
                 .map_err(db)?;
         }
-        Ok(STORE_VERSION)
+        Ok(to)
     }
     .await;
     let end = if outcome.is_ok() {
@@ -385,6 +504,158 @@ mod tests {
             .expect("update");
     }
 
+    /// The migrations are versions 1 to the store version, each once, in
+    /// order (the build checks this too).
+    #[test]
+    fn the_migrations_are_every_version_once_in_order() {
+        let versions: Vec<i64> = MIGRATIONS.iter().map(|m| m.version).collect();
+        assert!(
+            contiguous(MIGRATIONS) && STORE_VERSION == MIGRATIONS.len() as i64,
+            "migrations {versions:?} are not exactly 1..={STORE_VERSION}"
+        );
+    }
+
+    const fn m(version: i64, sql: &'static [&'static str]) -> Migration {
+        Migration { version, sql }
+    }
+
+    #[test]
+    fn the_first_gap_is_found_wherever_it_is() {
+        let whole = [m(1, &[]), m(2, &[]), m(3, &[])];
+        assert_eq!(first_gap(&whole, 0), None);
+        assert_eq!(first_gap(&whole, 2), None);
+        let gapped = [m(1, &[]), m(2, &[]), m(4, &[])];
+        // A fresh store, or one below the gap, would skip version 3.
+        assert_eq!(first_gap(&gapped, 0), Some(3));
+        assert_eq!(first_gap(&gapped, 2), Some(3));
+        // A store already past it has nothing to skip.
+        assert_eq!(first_gap(&gapped, 3), None);
+        // Repeated or out of order, no store below the last is migrated.
+        let twice = [m(1, &[]), m(2, &[]), m(2, &[]), m(3, &[])];
+        assert_eq!(first_gap(&twice, 1), Some(2));
+        let swapped = [m(1, &[]), m(3, &[]), m(2, &[])];
+        assert_eq!(first_gap(&swapped, 0), Some(1));
+        // Even for a store at the last version, whose range is empty.
+        assert_eq!(first_gap(&swapped, 2), Some(3));
+        assert_eq!(first_gap(&twice, 3), Some(4));
+        assert!(contiguous(&whole));
+        assert!(!contiguous(&gapped) && !contiguous(&twice) && !contiguous(&swapped));
+    }
+
+    /// Two migrations with version 2 missing between them.
+    const GAPPED: &[Migration] = &[
+        m(1, &["CREATE TABLE gap_one (x INTEGER)"]),
+        m(3, &["CREATE TABLE gap_three (x INTEGER)"]),
+    ];
+
+    async fn tables(path: &Path) -> Vec<String> {
+        let mut c = SqliteConnection::connect(&format!("sqlite://{}", path.display()))
+            .await
+            .expect("connect");
+        sqlx::query("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .fetch_all(&mut c)
+            .await
+            .expect("tables")
+            .iter()
+            .map(|r| r.get::<String, _>("name"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_store_is_never_migrated_across_a_gap() {
+        // Fresh: refused, and nothing is created.
+        let p = db("gap-fresh");
+        match open_sqlite_with(&p, GAPPED).await {
+            Err(StoreError::Gap {
+                found: 0,
+                missing: 2,
+                supported: 3,
+                ..
+            }) => {}
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(tables(&p).await.is_empty(), "{:?}", tables(&p).await);
+        let _ = std::fs::remove_file(&p);
+        // At version 1: refused, and left at version 1.
+        let p = db("gap-one");
+        assert_eq!(open_sqlite_with(&p, &GAPPED[..1]).await.expect("to 1"), 1);
+        assert!(matches!(
+            open_sqlite_with(&p, GAPPED).await,
+            Err(StoreError::Gap {
+                found: 1,
+                missing: 2,
+                ..
+            })
+        ));
+        assert_eq!(tables(&p).await, ["atomic_store_version", "gap_one"]);
+        assert_eq!(
+            open_sqlite_with(&p, &GAPPED[..1]).await.expect("still 1"),
+            1
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[cfg(feature = "postgres-tests")]
+    #[tokio::test]
+    async fn a_postgres_store_is_never_migrated_across_a_gap() {
+        let schema = crate::testing::schema("gap").await;
+        let (url, name) = (schema.url(), schema.name());
+        match open_postgres_with(url, name, GAPPED).await {
+            Err(StoreError::Gap {
+                found: 0,
+                missing: 2,
+                ..
+            }) => {}
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        let mut c = sqlx::PgConnection::connect(url).await.expect("connect");
+        // Not even the schema was made.
+        let schemas: i64 = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*)::BIGINT AS n FROM information_schema.schemata \
+             WHERE schema_name = '{name}'"
+        )))
+        .fetch_one(&mut c)
+        .await
+        .expect("count")
+        .get("n");
+        assert_eq!(schemas, 0, "the schema was created");
+        let count = |table: &'static str| {
+            format!(
+                "SELECT COUNT(*)::BIGINT AS n FROM information_schema.tables \
+                 WHERE table_schema = '{name}' AND table_name = '{table}'"
+            )
+        };
+        for table in ["atomic_store_version", "gap_one"] {
+            let n: i64 = sqlx::query(sqlx::AssertSqlSafe(count(table)))
+                .fetch_one(&mut c)
+                .await
+                .expect("count")
+                .get("n");
+            assert_eq!(n, 0, "{table} was created");
+        }
+        assert_eq!(
+            open_postgres_with(url, name, &GAPPED[..1])
+                .await
+                .expect("to 1"),
+            1
+        );
+        assert!(matches!(
+            open_postgres_with(url, name, GAPPED).await,
+            Err(StoreError::Gap {
+                found: 1,
+                missing: 2,
+                ..
+            })
+        ));
+        let n: i64 = sqlx::query(sqlx::AssertSqlSafe(count("gap_three")))
+            .fetch_one(&mut c)
+            .await
+            .expect("count")
+            .get("n");
+        assert_eq!(n, 0, "the migration past the gap ran");
+        let _ = c.close().await;
+    }
+
     #[tokio::test]
     async fn a_new_store_migrates_to_the_current_version_and_reopens() {
         let p = db("new");
@@ -400,6 +671,43 @@ mod tests {
         set_version(&p, 0).await;
         assert_eq!(open_sqlite(&p).await.expect("migrate"), STORE_VERSION);
         let _ = std::fs::remove_file(&p);
+    }
+
+    /// Question gates' tables (migration 7) reach a store at 5, which gets
+    /// the executions table (6) on the way, and one at 6.
+    #[tokio::test]
+    async fn question_gates_migrate_onto_a_store_at_5_or_6() {
+        for from in [5, 6] {
+            let p = db(&format!("from-{from}"));
+            open_sqlite(&p).await.expect("open");
+            {
+                use sqlx::Connection;
+                let mut c = sqlx::SqliteConnection::connect(&format!("sqlite://{}", p.display()))
+                    .await
+                    .expect("connect");
+                for table in ["atomic_gate_questions", "atomic_feedback"] {
+                    sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE {table}")))
+                        .execute(&mut c)
+                        .await
+                        .expect("drop");
+                }
+            }
+            set_version(&p, from).await;
+            assert_eq!(open_sqlite(&p).await.expect("migrate"), STORE_VERSION);
+            {
+                use sqlx::Connection;
+                let mut c = sqlx::SqliteConnection::connect(&format!("sqlite://{}", p.display()))
+                    .await
+                    .expect("connect");
+                for table in ["atomic_gate_questions", "atomic_feedback"] {
+                    sqlx::query(sqlx::AssertSqlSafe(format!("SELECT * FROM {table}")))
+                        .fetch_all(&mut c)
+                        .await
+                        .unwrap_or_else(|e| panic!("{table} after migrating from {from}: {e}"));
+                }
+            }
+            let _ = std::fs::remove_file(&p);
+        }
     }
 
     #[tokio::test]

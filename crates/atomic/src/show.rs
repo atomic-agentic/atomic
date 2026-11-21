@@ -108,6 +108,8 @@ async fn gather(rt: &Durare, id: &str) -> anyhow::Result<Option<Value>> {
         _ => None,
     };
     let calls = rt.ledger().attempts(id).await?;
+    // Every call that reported usage: settled, known in part, or a turn
+    // still running, or whose process died, by what it last recorded.
     let settled: Vec<_> = calls.iter().filter(|a| a.usage.is_some()).collect();
     let usage = json!({
         "calls": settled.len(),

@@ -27,8 +27,9 @@ mkdir -p "${WORK}/bin"
 cat >"${WORK}/bin/cargo" <<'SH'
 #!/usr/bin/env bash
 off() {
-    grep -qE 'HARDENING\.iter\(\)\.take\(0\)|ATOMIC_CONTROL_REMOVED|let names: Vec<String> = \{ let _ = names|PermissionProfile::Disabled|exclude_slash_tmp\*/ false|paths\.into_iter\(\)\.take\(0\)|black_box\(false\)' \
-        crates/atomic-core/src/git.rs crates/atomic-core/src/codex.rs crates/atomic-exec/src/lib.rs
+    grep -qE 'HARDENING\.iter\(\)\.take\(0\)|ATOMIC_CONTROL_REMOVED|let names: Vec<String> = \{ let _ = names|PermissionProfile::Disabled|exclude_slash_tmp\*/ false|paths\.into_iter\(\)\.take\(0\)|black_box\(false\)|let _ = own;|let _ = arg; true|NetworkSandboxPolicy::Enabled;|CONTROL_OFF' \
+        crates/atomic-core/src/git.rs crates/atomic-core/src/codex.rs crates/atomic-exec/src/lib.rs \
+        crates/atomic-exec/src/process.rs
 }
 case "${FAKE_CARGO}" in
 lose) rm -f target/controls-check/crates* ;;
@@ -63,7 +64,8 @@ fresh() {
     cp "${ROOT}/scripts/controls-check.sh" "${repo}/scripts/"
     cp "${ROOT}/crates/atomic-core/src/git.rs" "${ROOT}/crates/atomic-core/src/codex.rs" \
         "${repo}/crates/atomic-core/src/"
-    cp "${ROOT}/crates/atomic-exec/src/lib.rs" "${repo}/crates/atomic-exec/src/"
+    cp "${ROOT}/crates/atomic-exec/src/lib.rs" "${ROOT}/crates/atomic-exec/src/process.rs" \
+        "${repo}/crates/atomic-exec/src/"
     git -C "${repo}" init -q
     git -C "${repo}" -c user.name=test -c user.email=test@example.invalid add -A
     git -C "${repo}" -c user.name=test -c user.email=test@example.invalid -c commit.gpgSign=false \
@@ -88,7 +90,7 @@ untouched() {
 repo="$(fresh)"
 run honest
 [ "${code}" -eq 0 ] || fail "honest: exit ${code}: ${out}"
-[ "$(grep -c '^ok ' <<<"${out}")" -eq 7 ] || fail "honest: not seven controls ok: ${out}"
+[ "$(grep -c '^ok ' <<<"${out}")" -eq 16 ] || fail "honest: not sixteen controls ok: ${out}"
 untouched || fail "honest: the source is left modified"
 [ ! -e "${repo}/target/controls-check" ] || fail "honest: the saved copies are left behind"
 

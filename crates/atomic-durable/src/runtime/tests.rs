@@ -20,6 +20,11 @@
 //!   nothing to take times out;
 //! - a control transaction outside any workflow commits its writes, or
 //!   nothing.
+//!
+//! Two of these take [`Durare`] itself rather than the trait, since they
+//! resume a run after its panic through Durare's own resume:
+//! `a_step_runs_once_and_is_replayed_after_a_crash` and
+//! `a_message_is_received_once_and_replayed_after_a_crash`.
 
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -542,7 +547,19 @@ async fn runs_sharing_a_millisecond_are_each_paged_once(mut rt: Durare) {
     rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
 }
 
-async fn the_loser_of_a_checkpoint_race_takes_the_winners_outcome<R: DurableRuntime>(mut rt: R) {
+async fn the_loser_of_a_checkpoint_race_takes_the_winners_outcome<R: DurableRuntime>(rt: R) {
+    checkpoint_race(rt, false).await;
+}
+
+/// As above, with workflow code that turns the lost step's conflict into a
+/// failure of its own: the execution's outcome is still the conflict.
+async fn a_conflict_made_into_a_failure_still_takes_the_winners_outcome<R: DurableRuntime>(rt: R) {
+    checkpoint_race(rt, true).await;
+}
+
+/// Two executions of one run race to record the same step; with `swallow`,
+/// workflow code turns the loser's conflict into a failure.
+async fn checkpoint_race<R: DurableRuntime>(mut rt: R, swallow: bool) {
     let entered = Arc::new(AtomicUsize::new(0));
     let meet = Arc::new(tokio::sync::Barrier::new(2));
     let lost = Arc::new(AtomicUsize::new(0));
@@ -574,7 +591,11 @@ async fn the_loser_of_a_checkpoint_race_takes_the_winners_outcome<R: DurableRunt
             if matches!(&contested, Err(DurableError::Conflict(_))) {
                 lost.fetch_add(1, Ordering::SeqCst);
             }
-            let met = contested?;
+            let met = if swallow {
+                contested.map_err(|e| DurableError::Failed(format!("made a failure of: {e}")))?
+            } else {
+                contested?
+            };
             // The winner goes on only once the test has seen what the loser
             // did with its loss.
             ctx.step("after", move |_| {
@@ -643,6 +664,33 @@ async fn the_loser_of_a_checkpoint_race_takes_the_winners_outcome<R: DurableRunt
     rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
 }
 
+/// Workflow code that makes up a conflict, with no step having lost a race,
+/// fails its run: it does not wait for a winner that does not exist.
+async fn a_conflict_no_step_reported_fails_its_run<R: DurableRuntime>(mut rt: R) {
+    rt.register("made-up", |ctx: R::Context, (): ()| async move {
+        ctx.step("fine", |_| async { Ok(1_i64) }).await?;
+        Err::<(), _>(DurableError::Conflict("nobody".into()))
+    });
+    rt.launch().await.expect("launch");
+    let id = unique("made-up");
+    rt.start("made-up", &id, ()).await.expect("start");
+    let until = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        let status = rt.status(&id).await.expect("status");
+        if matches!(status, Some(RunStatus::Succeeded | RunStatus::Failed(_)))
+            || Instant::now() > until
+        {
+            break status;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(
+        matches!(&status, Some(RunStatus::Failed(m)) if m.contains("no step reported")),
+        "{status:?}"
+    );
+    rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+}
+
 async fn a_body_that_returns_a_conflict_fails_its_run<R: DurableRuntime>(mut rt: R) {
     rt.register("step-conflict", |ctx: R::Context, (): ()| async move {
         ctx.step("made up", |_| async {
@@ -705,6 +753,8 @@ on_backend!(
     an_interrupted_execution_records_nothing_and_stays_pending,
     a_failure_is_recorded_as_the_outcome,
     the_loser_of_a_checkpoint_race_takes_the_winners_outcome,
+    a_conflict_made_into_a_failure_still_takes_the_winners_outcome,
+    a_conflict_no_step_reported_fails_its_run,
     a_body_that_returns_a_conflict_fails_its_run,
     steps_are_siblings_in_order_and_cannot_nest,
     a_workflow_id_started_twice_runs_once,
@@ -724,6 +774,8 @@ on_backend!(
     an_interrupted_execution_records_nothing_and_stays_pending,
     a_failure_is_recorded_as_the_outcome,
     the_loser_of_a_checkpoint_race_takes_the_winners_outcome,
+    a_conflict_made_into_a_failure_still_takes_the_winners_outcome,
+    a_conflict_no_step_reported_fails_its_run,
     a_body_that_returns_a_conflict_fails_its_run,
     steps_are_siblings_in_order_and_cannot_nest,
     a_workflow_id_started_twice_runs_once,
