@@ -18,6 +18,7 @@ mod evals;
 mod failure;
 mod gates;
 mod init;
+mod parks;
 mod prompt;
 mod runs;
 mod settings;
@@ -88,6 +89,10 @@ enum Command {
     /// Enroll your operator credential, list gates and decide them.
     #[command(subcommand)]
     Gates(gates::GatesCommand),
+    /// List the runs parked on a budget cap, and release one, raising its
+    /// cap, with your operator credential.
+    #[command(subcommand)]
+    Parks(parks::ParksCommand),
     /// Model access: sign in with ChatGPT so Codex atoms run on your plan.
     #[command(subcommand)]
     Model(ModelCommand),
@@ -405,6 +410,7 @@ async fn run(cli: Cli, paths: CodexPaths, state: ProjectState) -> anyhow::Result
     let turns = turn_backend(cli.command.as_ref(), &state);
     match cli.command {
         Some(Command::Gates(command)) => gates::run(command, &state).await,
+        Some(Command::Parks(command)) => parks::run(command, &state).await,
         Some(Command::Model(_)) => unreachable!("`atomic model` runs without a state directory"),
         Some(Command::Check { path }) => {
             tokio::task::spawn_blocking(move || check(path, json)).await?
