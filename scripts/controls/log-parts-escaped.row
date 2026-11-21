@@ -1,0 +1,1 @@
+log-parts-escaped|crates/atomic-core/src/redact.rs|        crate::terminal::block(&cut(&self.text, MAX_TEXT))|        cut(&self.text, MAX_TEXT).into_owned() /*CONTROL_OFF*/|-p atomic-agentic-core --lib redact::tests::a_log_line_is_redacted_then_escaped
