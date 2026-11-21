@@ -49,6 +49,9 @@ def read_other_db():
 def read_credential():
     with open(credential) as f:
         f.read()
+def read_signin():
+    with open(os.environ['TARGET_SIGNIN']) as f:
+        f.read()
 def read_home_secret():
     with open(os.environ['HOME_SECRET']) as f:
         f.read()
@@ -69,7 +72,7 @@ def write_home():
     with open(os.path.join(os.environ['HOME'], 'mine'), 'w') as f:
         f.write('x')
 json.dump({name: attempt(f) for name, f in [('read_db', read_db), ('write_gate', write_gate),
-    ('read_credential', read_credential), ('read_home_secret', read_home_secret), ('read_other_db', read_other_db), ('read_project', read_project), ('write_home', write_home), ('unix_socket', unix_socket), ('tcp_socket', tcp_socket)]}
+    ('read_credential', read_credential), ('read_signin', read_signin), ('read_home_secret', read_home_secret), ('read_other_db', read_other_db), ('read_project', read_project), ('write_home', write_home), ('unix_socket', unix_socket), ('tcp_socket', tcp_socket)]}
     | {'env': ' '.join(sorted(n for n in os.environ if n != 'LC_CTYPE'))},
     sys.stdout)
 "#;
@@ -113,8 +116,8 @@ fn exec_atom(project: &Path, env: &[(&str, String)]) {
         project.join("atoms/probe.output.schema.yaml"),
         format!(
             "type: object\nadditionalProperties: false\n\
-             required: [read_db, write_gate, read_credential, read_home_secret, read_other_db, read_project, write_home, unix_socket, tcp_socket, env]\n\
-             properties:\n  read_db: {field}\n  write_gate: {field}\n  read_credential: {field}\n  read_home_secret: {field}\n  read_other_db: {field}\n\
+             required: [read_db, write_gate, read_credential, read_signin, read_home_secret, read_other_db, read_project, write_home, unix_socket, tcp_socket, env]\n\
+             properties:\n  read_db: {field}\n  write_gate: {field}\n  read_credential: {field}\n  read_signin: {field}\n  read_home_secret: {field}\n  read_other_db: {field}\n\
              \x20 read_project: {field}\n  write_home: {field}\n  unix_socket: {field}\n  tcp_socket: {field}\n  env: {field}\n"
         ),
     )
@@ -178,6 +181,14 @@ fn an_exec_atom_cannot_reach_atomics_private_state() {
         std::fs::create_dir_all(&credentials).expect("credentials");
         let credential = credentials.join("local-dev");
         std::fs::write(&credential, "the operator's secret").expect("credential");
+        // A ChatGPT sign-in in the file store.
+        let signin = credentials.join("codex-auth/auth.json");
+        std::fs::create_dir_all(signin.parent().expect("codex-auth")).expect("codex-auth");
+        std::fs::write(
+            &signin,
+            r#"{"tokens": {"access_token": "a sign-in's token"}}"#,
+        )
+        .expect("sign-in");
 
         // Another project's state under the same atomic home.
         let other_db = dir.join("home/private/other/atomic.db");
@@ -214,6 +225,7 @@ fn an_exec_atom_cannot_reach_atomics_private_state() {
             &[
                 ("TARGET_DB", text(&db)),
                 ("TARGET_CREDENTIAL", text(&credential)),
+                ("TARGET_SIGNIN", text(&signin)),
                 ("HOME_SECRET", text(&home_secret)),
                 ("OTHER_DB", text(&other_db)),
                 ("TARGET_SOCKET", text(&socket)),
@@ -261,7 +273,7 @@ fn an_exec_atom_cannot_reach_atomics_private_state() {
             assert_eq!(
                 out["env"],
                 "ATOMIC_EFFECT_KEY ATOMIC_RUN_ID ATOMIC_STEP_ID HOME HOME_SECRET OTHER_DB \
-                 TARGET_CREDENTIAL TARGET_DB TARGET_PORT TARGET_SOCKET TMPDIR",
+                 TARGET_CREDENTIAL TARGET_DB TARGET_PORT TARGET_SIGNIN TARGET_SOCKET TMPDIR",
                 "{what}"
             );
             let denied = |path: &Path| {
@@ -276,6 +288,7 @@ fn an_exec_atom_cannot_reach_atomics_private_state() {
                 "{what}"
             );
             assert_eq!(out["read_credential"], denied(&credential), "{what}");
+            assert_eq!(out["read_signin"], denied(&signin), "{what}");
             assert_eq!(out["read_home_secret"], denied(&home_secret), "{what}");
             assert_eq!(out["read_other_db"], denied(&other_db), "{what}");
             // No network and no sockets, until atoms can declare what they

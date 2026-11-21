@@ -161,6 +161,7 @@ async fn sandboxed_with(
             base_url: model.base_url(),
             model: "synthetic".into(),
             api_key_env: None,
+            sign_in: None,
         },
         defaults: Default::default(),
         artifacts: Artifacts::none(),
