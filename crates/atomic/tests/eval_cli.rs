@@ -906,3 +906,138 @@ fn selection_sampling_reports_and_junit_cover_every_atom() {
         let _ = std::fs::remove_dir_all(&dir);
     });
 }
+
+/// What a model answered reaches no terminal raw through `eval --json`,
+/// and reads back as the same text.
+#[test]
+fn an_evals_hostile_answer_reaches_no_terminal_raw() {
+    on_codex_runtime(async {
+        let dir = scratch("hostile-eval");
+        let project = project(&dir, None);
+        let ticket = "BUG\u{1b}[2J\u{7f}\u{9b}\u{202e}\u{E0041}";
+        let model =
+            FakeModel::respond(move |_| Reply::Text(json!({ "ticket": ticket }).to_string()))
+                .await
+                .expect("fake model");
+        let url = model.base_url();
+        let out = eval_async(&dir, &project, &url, &["note", "--live", "--json"]).await;
+        let raw = String::from_utf8_lossy(&out.stdout).into_owned();
+        for c in ['\u{1b}', '\u{7f}', '\u{9b}', '\u{202e}', '\u{E0041}'] {
+            assert!(
+                !raw.contains(c),
+                "U+{:04X} reached the terminal",
+                u32::from(c)
+            );
+        }
+        let report: Value = serde_json::from_str(&raw).expect("one JSON report");
+        assert!(report.to_string().contains("BUG"), "{report}");
+        assert_eq!(
+            report["reports"][0]["cases"][0]["output"]["ticket"], ticket,
+            "the answer read back whole"
+        );
+    });
+}
+
+#[test]
+fn a_plain_evals_hostile_answer_reaches_no_terminal_raw() {
+    on_codex_runtime(async {
+        let dir = scratch("hostile-plain-eval");
+        let project = project(&dir, None);
+        // An assertion that gives the answer itself back fails, and its
+        // failure quotes what the model wrote.
+        std::fs::write(
+            project.join("evals").join("note").join("cases.jsonl"),
+            json!({"input": {"text": "Export crashes"}, "expect": ["output.ticket"]}).to_string()
+                + "\n",
+        )
+        .expect("cases");
+        let ticket = "BUG\u{1b}[2J\u{7f}\u{9b}\u{202e}\u{E0041}";
+        let model =
+            FakeModel::respond(move |_| Reply::Text(json!({ "ticket": ticket }).to_string()))
+                .await
+                .expect("fake model");
+        let url = model.base_url();
+        let out = eval_async(&dir, &project, &url, &["note", "--live"]).await;
+        let raw = String::from_utf8_lossy(&out.stdout).into_owned()
+            + &String::from_utf8_lossy(&out.stderr);
+        for c in ['\u{1b}', '\u{7f}', '\u{9b}', '\u{202e}', '\u{E0041}'] {
+            assert!(
+                !raw.contains(c),
+                "U+{:04X} reached the terminal",
+                u32::from(c)
+            );
+        }
+        assert!(raw.contains("failed"), "the case failed: {raw:?}");
+        assert!(
+            raw.contains("\\u{007f}") && raw.contains("\\u{202e}"),
+            "the answer shown escaped: {raw:?}"
+        );
+    });
+}
+
+#[test]
+fn a_team_atom_refuses_a_case_of_the_default_origin_before_any_call() {
+    on_codex_runtime(async {
+        let dir = scratch("case-origin");
+        let project = project(&dir, None);
+        // An atom that takes only team input, and a case that does not say
+        // where its input came from: external, by default.
+        add_atom(
+            &project,
+            "reviewed",
+            "trust: 'team'",
+            &[("Export crashes", "output.ticket.size() > 0")],
+        );
+        let model = FakeModel::respond(answer).await.expect("fake model");
+        let out = eval_async(
+            &dir,
+            &project,
+            &model.base_url(),
+            &["reviewed", "--no-cassettes"],
+        )
+        .await;
+        assert!(!out.status.success(), "{}", text(&out));
+        let said = text(&out);
+        for part in [
+            "cases.jsonl:1",
+            "is external data",
+            "atom `reviewed` accepts team input at most",
+        ] {
+            assert!(said.contains(part), "{part}: {said}");
+        }
+        assert_eq!(model.calls(), 0, "a model was called");
+    });
+}
+
+#[test]
+fn naming_several_atoms_refuses_an_untrusted_case_before_any_atom_runs() {
+    on_codex_runtime(async {
+        let dir = scratch("case-origin-several");
+        let project = project(&dir, None);
+        // `note` comes first and would run live; `reviewed` takes only team
+        // input and has a case of the default origin.
+        add_atom(
+            &project,
+            "reviewed",
+            "trust: 'team'",
+            &[("Export crashes", "output.ticket.size() > 0")],
+        );
+        let model = FakeModel::respond(answer).await.expect("fake model");
+        let out = eval_async(
+            &dir,
+            &project,
+            &model.base_url(),
+            &["note", "reviewed", "--live"],
+        )
+        .await;
+        assert!(!out.status.success(), "{}", text(&out));
+        assert!(
+            text(&out).contains("atom `reviewed` accepts team input at most"),
+            "{}",
+            text(&out)
+        );
+        // Refused before `note` ran: no call, and nothing recorded for it.
+        assert_eq!(model.calls(), 0, "an atom ran before the refusal");
+        assert!(!project.join("evals/note/cassettes").exists());
+    });
+}

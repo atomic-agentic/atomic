@@ -45,8 +45,9 @@ the step's `base` and record atomic's commit in `steps.<id>.metadata.commit`.
 A run keeps the definitions it started with. An atom step's `review` is built
 for one reviewer atom with a typed verdict: a request for changes gives the
 author repair rounds, and any other verdict but an approval, or a request for
-changes with no rounds left, goes to a person at a gate. Several reviewers, `require: majority`, `ai-then-human` gate policy
-and calibrated decision atoms are not built yet.
+changes with no rounds left, goes to a person at a gate. Several reviewers,
+`require: majority`, `ai-then-human` gate policy and calibrated decision atoms
+are not built yet.
 
 `atomic init`, `atomic run`, `atomic runs resume`, `atomic runs show`,
 `atomic config --explain` and a local foreground `atomic serve` are built.
@@ -74,11 +75,18 @@ Lite atoms need a model endpoint and say so.
 
 A project's artifact store takes a lock in its private state while it is
 written or swept. A run that finds it held by another process, such as a sweep,
-says so once, waits and tries again for a bounded time (about 7.4 minutes with
-the store's 30-second wait: 11 tries and the pauses between them), then stops
-and is run again. Each stop spends one
-of durare's recoveries of the run, and once they run out the run waits for
-`atomic runs resume`.
+as it pins its definitions or gives an exec atom's command the artifacts its
+input references, says so (a pin once a run, an exec step once each time it
+waits), waits and tries again for a bounded time (about 7.4 minutes with the
+store's 30-second wait: 11 tries and the pauses between them), then stops,
+recording nothing and running nothing, and is run again. A process that is
+stopping waits out no more pauses between tries, though a try already
+waiting on the store's lock runs to the end of that lock's wait. Such stops never count toward dead-lettering the
+run, however many there are; each spends one of durare's recoveries of the
+run, and once they run out the run waits for `atomic runs resume`. The files
+a command hands over are stored after it has run: a store held then is
+waited out a few times, and past that the step's outcome is unknown, as
+after a crash there.
 
 `atomic serve` also runs on PostgreSQL (`ATOMIC_DATABASE_URL`) when the process
 has an executor identity (`ATOMIC_EXECUTOR_ID`). `atomic runner` and
@@ -91,7 +99,15 @@ rendered, which runs the atom's helpers, it opens a workspace there before any
 model call or command, and closes it however the run ends, including a panic or
 a cancelled run, and only once a command running in it has ended. A backend
 with no room for a workspace makes the run wait, recording nothing and saying
-on stderr that it waits, and the run goes on once there is room. The local backend is the only one with a Codex shell, and
+on stderr that it waits, and the run goes on once there is room. With the
+`backend_wait` setting (`--backend-wait <seconds>`, `ATOMIC_BACKEND_WAIT`) it
+waits at most that long: `atomic run` and
+`atomic runs resume` then stop with exit code 75, the run unfinished and nothing
+recorded, for `atomic runs resume` to continue, and `atomic serve` sets the
+step aside and keeps trying, at most 30 seconds apart, so the run goes on once
+there is room. A signal ends a wait at once, and a workspace that opens as the
+process stops is closed again before anything runs in it. The
+local backend is the only one with a Codex shell, and
 it states that its workspaces are durable. A backend that states anything else,
 or a value atomic does not recognize, is treated as ephemeral, and a workflow
 with a `worktree: true` step is refused on it before anything runs.
@@ -108,12 +124,13 @@ sandbox keeps its registry of the mount points it makes in a directory every
 turn of the project shares, which no turn's command may write.) Tools found
 through `HOME` are therefore not found: cargo's registry and tools, pyenv, nvm,
 Maven's `~/.m2` and the like. Every Codex turn's `CARGO_HOME` is `.cargo` in the
-attempt's own home. A worktree step's turn is also pointed at its run's own
-build caches, removed when the run ends, finished or failed, with a Cargo target
-directory for each worktree, and at your rustup toolchains, read-only (see
-[worktree steps](workflow-files.md#atom-steps)). Otherwise a codex or exec
-atom names what it needs in its `env`, as in `env: { RUSTUP_HOME:
-'/home/me/.rustup' }`. An
+attempt's own home. A worktree step's turn, and an exec atom's command in a run, is also pointed at
+its run's own build caches, removed when the run ends, finished or failed, with
+a Cargo target directory for each worktree and each exec step, and at your rustup
+toolchains, read-only, through `RUSTUP_HOME` (see
+[worktree steps](workflow-files.md#atom-steps)). Otherwise, as for a Codex atom
+outside a worktree or an exec atom in an eval, an atom names what it needs in
+its `env`, as in `env: { RUSTUP_HOME: '/home/me/.rustup' }`. An
 exec atom's command gets its own scratch directory as `HOME` and `TMPDIR`.
 Scratch directories live in the project's state directory, where no sandboxed
 turn may write; atomic refuses to run when that would be under `/tmp`,
@@ -135,23 +152,25 @@ configuration directory; the places in your home directory where credentials,
 shell startup files and history are kept (under both `$HOME` and the home
 directory the system records for your user, and wherever the variables that
 move them, such as `XDG_CONFIG_HOME`, `GNUPGHOME`, `CARGO_HOME` or
-`KUBECONFIG`, put them), and the file or directory of yours that a link
-among them points at, up to four directory levels inside a denied directory;
+`KUBECONFIG`, put them), and what a link among them points at, up to four
+directory levels inside a denied directory (except a device, anything under
+the system's program, library and device directories, and, for a link found
+inside a credential place, a program or a directory someone else owns);
 the kernel keyrings; the network, unless an exec atom declares the hosts it
 reaches, and then all but those, which it reaches through atomic's proxy; and
 sockets. Cargo's own configuration is
 not among them, so a registry token kept there rather than in
-`credentials.toml` is not protected. A link to something outside your own
-files, such as a history file linked to `/dev/null`, is left alone, and a
-command does not start when a denial would cover its working directory or a
-directory it may write, or a linked secret lies inside one. Other projects'
+`credentials.toml` is not protected. A command does not start when a denial
+would cover its working directory or a directory it may write, or when a
+denied place or a linked secret lies two or more levels inside a directory it
+may write. Other projects'
 Codex records are not denied yet. atomic makes the list when a
 turn or an exec step starts: a place on it that appears while a command runs
 is denied only to the commands that start after it, and a link made after
 the list is not followed until the next turn or step. Credentials kept
 anywhere else are not covered. An
-exec atom's command may write only its scratch directory and the project's
-caches, and only read the artifacts it is given there; `--runner process` confines it the same way. It runs in a process
+exec atom's command may write only its scratch directory and its run's own
+build caches, which no other run's command may write, though one can still read them by their path, and which go when the run ends, and only read the artifacts it is given there; `--runner process` confines it the same way. It runs in a process
 namespace of its own, so it can neither see nor signal atomic, its runner or
 any other process outside, and in a session of its own, with no controlling
 terminal and a `/dev` and `/proc` of its own, so it cannot type into, read or
@@ -160,9 +179,10 @@ terminal's path in `/dev/pts` or another process's descriptors. A step that runs
 needs bubblewrap and unprivileged user namespaces there: where the sandbox
 cannot start, `atomic run` and `atomic runs resume` stop, saying what it needs,
 before the step runs and without recording an outcome, and the run continues
-when resumed where the sandbox can start. `atomic serve` instead leaves that run
-unfinished, says so, and goes on serving the others; the run continues when a
-later process recovers it. A sandbox that fails in a way that may pass, such as
+when resumed where the sandbox can start. `atomic serve` instead sets that run
+aside, unfinished, says so, and goes on serving the others; it tries the
+sandbox again, first after a few seconds and then at most a minute apart, and
+the run goes on once the sandbox starts. A sandbox that fails in a way that may pass, such as
 on a full disk, makes the step wait, as a backend with no room does. Atoms that run no commands run as usual. When atomic
 stops with commands still running, on Linux it ends every process they
 started, inside their sandboxes too, before it exits and frees the project's

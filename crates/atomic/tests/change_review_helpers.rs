@@ -204,11 +204,11 @@ fn runtimes(dir: &Path, base_url: &str) -> Arc<Runtimes> {
             defaults: AtomConfig::default(),
             artifacts: Artifacts::none(),
             meter: atomic_core::usage::Metering::none(),
-            backend: Default::default(),
             caches: None,
         },
         lite: LiteRuntime::new(endpoint, AtomConfig::default()),
-        exec: Default::default(),
+        backend: Default::default(),
+        exec_meter: Default::default(),
         clock: None,
     })
 }
@@ -255,6 +255,7 @@ fn the_workflow_runs_and_a_helper_validator_asks_for_one_repair() {
                 store,
                 deployment,
                 worktrees: None,
+                caches: None,
                 budgets: Arc::default(),
                 context: None,
             },

@@ -40,6 +40,8 @@ test command_environment
 test entry_point
 test examples
 test exec_private_state
+test second_mounts
+test exec_caches
 test exec_network
 test failpoints
 test fixture_cli
@@ -56,6 +58,8 @@ test turn_workspace
 test worktree_step
 test golden
 test git_safety
+test cancelled_open
+test stopping_open
 test worktrees
 test dbos_schema
 test executor_identity

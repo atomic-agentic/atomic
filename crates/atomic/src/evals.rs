@@ -26,6 +26,7 @@
 
 use crate::engine::EngineArgs;
 use crate::failure::Failure;
+use crate::shown;
 use crate::target;
 use anyhow::Context;
 use atomic_app::metering::{BudgetPlan, RunBudget};
@@ -183,6 +184,7 @@ impl Meter for Replayed {
                     time: None,
                 },
                 bounded_by: None,
+                release: atomic_core::usage::Release::default(),
             })
         })
     }
@@ -311,6 +313,13 @@ pub async fn run(
     // sign-in only for a live eval, since a replay reads no credential.
     let live = source != Source::Recorded && needs_model;
     let resolved = crate::engine::settings(&state, &args.engine, live)?;
+    // A case waits for the execution backend no longer than a run would.
+    atomic_core::runtime::limit_backend_wait(
+        resolved
+            .settings
+            .backend_wait()
+            .map(std::time::Duration::from_secs),
+    );
     // A recording answers only the request it was made for, endpoint and
     // model included, so replaying needs them configured as they were; it
     // needs no key, so none is read. A live eval calls the endpoint as a
@@ -370,6 +379,8 @@ pub async fn run(
                 &budgets,
                 &Budget::default(),
                 &[(atom.name.as_str(), &atom.budget, model.as_str())],
+                // An eval meters its model calls only.
+                &[],
             )
             .map_err(|(_, e)| {
                 Failure::new(
@@ -390,11 +401,19 @@ pub async fn run(
         std::process::id()
     );
 
+    // Every chosen atom's cases, loaded before the first atom runs: a case
+    // the load refuses, such as one its atom does not trust, stops the eval
+    // before any call, command or spend.
+    let loaded = chosen
+        .atoms
+        .iter()
+        .map(|(atom, settings, _)| eval::load_cases(atom, settings))
+        .collect::<Result<Vec<_>, _>>()?;
+
     let mut reports = Vec::new();
     let mut tallies = Vec::new();
     let mut spent = Vec::new();
-    for (atom, settings, select) in &chosen.atoms {
-        let cases = eval::load_cases(atom, settings)?;
+    for ((atom, settings, select), cases) in chosen.atoms.iter().zip(loaded) {
         let cassette = match (calls_model(atom), source) {
             (false, _) | (true, Source::Live) => None,
             (true, recorded) => Some(
@@ -540,7 +559,9 @@ pub async fn run(
                 "reason": "atomic eval has no judge to call, so scorers are not run",
             })).collect::<Vec<_>>(),
         });
-        println!("{}", serde_json::to_string_pretty(&out)?);
+        // Cases' outputs are what models wrote: escaped for the terminal,
+        // and still the same JSON.
+        println!("{}", shown::pretty(&out)?);
     } else {
         print(&reports, &tallies, &skipped, source);
         for r in &refused {
@@ -551,22 +572,22 @@ pub async fn run(
                 } else {
                     "REFUSED"
                 },
-                r["atom"].as_str().unwrap_or_default(),
-                r["reason"].as_str().unwrap_or_default(),
-                r["hint"].as_str().unwrap_or_default()
+                shown::line(r["atom"].as_str().unwrap_or_default()),
+                shown::line(r["reason"].as_str().unwrap_or_default()),
+                shown::line(r["hint"].as_str().unwrap_or_default())
             );
         }
         if !chosen.empty.is_empty() {
-            println!("no eval cases: {}", chosen.empty.join(", "));
+            println!("no eval cases: {}", shown::line(&chosen.empty.join(", ")));
         }
         for s in &spent {
             println!(
                 "metered {}: {} model call(s), {} token(s), in the usage ledger as {} (a ledger \
                  scope, not a run `atomic runs` shows)",
-                s["atom"].as_str().unwrap_or_default(),
+                shown::line(s["atom"].as_str().unwrap_or_default()),
                 s["calls"],
                 s["tokens"],
-                s["run"].as_str().unwrap_or_default()
+                shown::line(s["run"].as_str().unwrap_or_default())
             );
         }
     }
@@ -735,10 +756,7 @@ fn runtimes(
     if let Some(cassette) = cassette {
         sent.base_url = cassette.base_url(&endpoint.base_url);
     }
-    let lite = LiteRuntime {
-        backend: exec.clone(),
-        ..lite_runtime(endpoint, sent.clone())
-    };
+    let lite = lite_runtime(endpoint, sent.clone());
     Ok(Runtimes {
         codex: CodexRuntime {
             paths: paths.clone(),
@@ -749,11 +767,11 @@ fn runtimes(
             artifacts: Artifacts::new(store.clone()),
             meter: atomic_core::usage::Metering::none(),
             guard: atomic_core::codex::StateGuard::for_project(state)?,
-            backend: exec.clone(),
             caches: None,
         },
         lite,
-        exec: exec.clone(),
+        backend: exec.clone(),
+        exec_meter: Default::default(),
         clock: None,
     })
 }
@@ -792,22 +810,27 @@ fn print(
         println!(
             "{} {}: {passed} of {} cases passed, pass rate {rate}, threshold {threshold}",
             if report.passed { "PASS" } else { "FAIL" },
-            report.atom,
+            shown::line(&report.atom),
             report.cases.len(),
         );
         for case in report.cases.iter().filter(|c| !c.passed) {
-            println!("  failed {}: {}", case.id, case.failures.join("; "));
+            // A failure can quote what the model answered.
+            println!(
+                "  failed {}: {}",
+                shown::line(&case.id),
+                shown::line(&case.failures.join("; "))
+            );
         }
         for scorer in &report.scorers {
             println!(
                 "  scorer {}: mean {} (minimum {:.3}){}",
-                scorer.name,
+                shown::line(&scorer.name),
                 scorer.mean.map_or("none".to_owned(), |m| format!("{m:.3}")),
                 scorer.min_mean,
                 scorer
                     .reason
                     .as_deref()
-                    .map(|r| format!(": {r}"))
+                    .map(|r| format!(": {}", shown::line(r)))
                     .unwrap_or_default()
             );
         }
@@ -832,7 +855,7 @@ fn print(
             );
         }
         for failure in &report.failures {
-            println!("  {failure}");
+            println!("  {}", shown::line(failure));
         }
     }
 }

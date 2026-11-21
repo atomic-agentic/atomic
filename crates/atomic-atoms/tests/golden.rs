@@ -72,7 +72,7 @@ async fn run_on<A: Atom>(
     let result = match atom.kind() {
         AtomKind::Lite => {
             let rt = LiteRuntime::new(endpoint(&model), AtomConfig::default());
-            run_lite_atom(atom, input, &rt).await
+            run_lite_atom(atom, input, &rt, &Default::default()).await
         }
         AtomKind::Codex => {
             let dir = scratch(A::NAME);
@@ -85,10 +85,9 @@ async fn run_on<A: Atom>(
                 defaults: AtomConfig::default(),
                 artifacts: atomic_core::runtime::Artifacts::none(),
                 meter: atomic_core::usage::Metering::none(),
-                backend: Default::default(),
                 caches: None,
             };
-            run_codex_atom(atom, input, &rt).await
+            run_codex_atom(atom, input, &rt, &Default::default()).await
         }
         AtomKind::Exec => panic!("{} calls no model", A::NAME),
     };

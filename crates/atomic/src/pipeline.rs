@@ -99,7 +99,7 @@ pub const PIPELINE: &str = "atomic.pipeline";
 /// record, through an approved and a rejected gate, with the shape of each
 /// checkpoint, and the run's own shape. They fail when the layout no longer
 /// matches this version's, whose file is never rewritten.
-pub const LAYOUT_VERSION: &str = "atomic.pipeline.5";
+pub const LAYOUT_VERSION: &str = "atomic.pipeline.6";
 
 /// How many times one process recovers one run of `run_pipeline` at the
 /// same step before it fails the run as dead-lettered: enough for a crash
@@ -138,7 +138,9 @@ fn reached(id: &str, position: usize) -> Result<()> {
             *top = position;
             *entries = 0;
         }
-        if position == *top {
+        // A step that stopped for an artifact store held elsewhere, as a pin
+        // does, takes nothing toward dead-lettering, nor does it get further.
+        if position == *top && !atomic_core::runtime::take_held_stop(id) {
             *entries += 1;
         }
         *entries
@@ -177,13 +179,15 @@ static STOPPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::
 /// its checkpoint while nothing new begins. Call it when a stop begins.
 pub fn stop_starting_steps() {
     STOPPING.store(true, std::sync::atomic::Ordering::SeqCst);
+    // A step waiting for room on the execution backend gives up its wait.
+    atomic_core::runtime::stop_waiting_for_backend();
 }
 
 /// Before a run's next piece of work: go on counted as working, or wait for
 /// good if this process is stopping.
-async fn keep_working(working: &mut Option<Running>) {
+async fn keep_working(working: &mut Option<Running>, run: &str) {
     match working {
-        None => *working = Some(begin_work().await),
+        None => *working = Some(begin_work(run).await),
         Some(_) if STOPPING.load(std::sync::atomic::Ordering::SeqCst) => {
             *working = None;
             std::future::pending::<()>().await;
@@ -195,8 +199,8 @@ async fn keep_working(working: &mut Option<Running>) {
 /// Count this run as working in [`steps_running`], then wait for good if
 /// this process is stopping. Counted first, so a stop that finds nothing
 /// running has seen every run that could still begin work.
-async fn begin_work() -> Running {
-    let running = Running::start();
+async fn begin_work(run: &str) -> Running {
+    let running = Running::start(run);
     if STOPPING.load(std::sync::atomic::Ordering::SeqCst) {
         drop(running);
         return std::future::pending::<Running>().await;
@@ -205,14 +209,20 @@ async fn begin_work() -> Running {
 }
 
 /// How many atom steps this process is running now.
-static RUNNING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// The runs working now, each as many times as it counts.
+static RUNNING: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 /// How many atom steps this process is running now: a stopping process
-/// waits for them to reach their checkpoints.
+/// waits for them to reach their checkpoints. A run whose step is set aside,
+/// waiting past its limit for room ([`atomic_core::runtime`]), is not one;
+/// a set-aside step of a run not counted here takes nothing off.
 pub fn steps_running() -> usize {
-    RUNNING
-        .load(std::sync::atomic::Ordering::SeqCst)
-        .saturating_sub(SET_ASIDE.load(std::sync::atomic::Ordering::SeqCst))
+    let aside = atomic_core::runtime::runs_set_aside_for_room();
+    let counted = RUNNING
+        .lock()
+        .map(|runs| runs.iter().filter(|run| !aside.contains(*run)).count())
+        .unwrap_or_default();
+    counted.saturating_sub(SET_ASIDE.load(std::sync::atomic::Ordering::SeqCst))
 }
 
 /// How many of the [`RUNNING`] runs wait for good, set aside by
@@ -224,19 +234,25 @@ pub(crate) fn set_aside() {
     SET_ASIDE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 }
 
-/// Counts one running atom step in [`steps_running`] while it lives.
-struct Running;
+/// Counts one run's work in [`steps_running`] while it lives.
+struct Running(String);
 
 impl Running {
-    fn start() -> Self {
-        RUNNING.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Self
+    fn start(run: &str) -> Self {
+        if let Ok(mut runs) = RUNNING.lock() {
+            runs.push(run.to_owned());
+        }
+        Self(run.to_owned())
     }
 }
 
 impl Drop for Running {
     fn drop(&mut self) {
-        RUNNING.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        if let Ok(mut runs) = RUNNING.lock()
+            && let Some(at) = runs.iter().position(|run| *run == self.0)
+        {
+            runs.swap_remove(at);
+        }
     }
 }
 
@@ -709,9 +725,10 @@ fn failed(message: String) -> DurableError {
 /// run again: each try waits as long as the store waits for its lock, and
 /// the wait between tries doubles up to that long. With the store's 30 s,
 /// an execution waits about 7.4 minutes (11 tries of 30 s, and 111 s
-/// between them) before it spends one of durare's recoveries.
-const LOCKED_RETRIES: u32 = 10;
-const LOCKED_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
+/// between them) before it spends one of durare's recoveries. An exec
+/// step giving its command its inputs waits the same.
+const LOCKED_RETRIES: u32 = atomic_core::runtime::STORE_HELD_RETRIES;
+const LOCKED_BACKOFF: std::time::Duration = atomic_core::runtime::STORE_HELD_BACKOFF;
 
 /// How many times this process has found the artifact store held elsewhere
 /// for each run, try by try.
@@ -742,7 +759,7 @@ fn put_waiting_out_the_lock(
     let mut retries = 0;
     loop {
         match store.put(&mut &content[..], provenance.clone()) {
-            Err(ArtifactError::Locked { .. }) if retries < LOCKED_RETRIES => {
+            Err(e @ ArtifactError::Locked { .. }) if retries < LOCKED_RETRIES => {
                 let waits = {
                     let mut all = STORE_WAITS.lock().unwrap_or_else(|e| e.into_inner());
                     let n = all.entry(id.to_owned()).or_insert(0);
@@ -756,7 +773,11 @@ fn put_waiting_out_the_lock(
                     );
                 }
                 retries += 1;
-                std::thread::sleep(backoff);
+                // A stopping process waits no longer: the run stops as it
+                // does once the tries run out.
+                if atomic_core::runtime::sleep_unless_stopping(backoff) {
+                    return Err(e);
+                }
                 backoff = (backoff * 2).min(cap);
             }
             stored => return stored,
@@ -823,7 +844,13 @@ fn plan_budgets(
         .iter()
         .map(|(name, budget, model)| (*name, *budget, model.as_str()))
         .collect();
-    BudgetPlan::resolve(settings, &pipeline.budget, &atoms).map_err(|(atom, e)| match atom {
+    let exec: Vec<(&str, &Budget)> = pipeline
+        .atoms
+        .iter()
+        .filter(|(_, atom)| atom.kind == "exec")
+        .map(|(name, atom)| (name.as_str(), &atom.budget))
+        .collect();
+    BudgetPlan::resolve(settings, &pipeline.budget, &atoms, &exec).map_err(|(atom, e)| match atom {
         None => format!("workflow {}: budget: {e}", pipeline.name),
         Some(name) => format!("atom {name}: budget: {e}"),
     })
@@ -838,10 +865,11 @@ async fn run_pipeline<C: WorkflowContext>(
     services: Arc<Services>,
     ledger: Ledger,
     replay: Option<Arc<Replay>>,
+    why: atomic_core::usage::Why,
 ) -> Result<Value> {
     let id = ctx.workflow_id().to_owned();
     let mut caches = None;
-    let result = run_pipeline_in(ctx, run, services, ledger, replay, &mut caches).await;
+    let result = run_pipeline_in(ctx, run, services, ledger, replay, &why, &mut caches).await;
     if let Some(caches) = caches {
         settle_caches(&id, caches, &result).await;
     }
@@ -878,14 +906,16 @@ async fn remove_caches(id: &str, caches: atomic_core::worktree::Caches) {
     }
 }
 
-/// [`run_pipeline`]'s work, leaving in `caches` the run's build caches once
-/// a worktree step has used them.
+/// [`run_pipeline`]'s work, leaving in `run_caches` the run's build caches,
+/// named before its first step, for [`run_pipeline`] to settle when the run
+/// ends.
 async fn run_pipeline_in<C: WorkflowContext>(
     ctx: C,
     run: PipelineRun,
     services: Arc<Services>,
     ledger: Ledger,
     replay: Option<Arc<Replay>>,
+    why: &atomic_core::usage::Why,
     run_caches: &mut Option<atomic_core::worktree::Caches>,
 ) -> Result<Value> {
     let PipelineRun { pipeline, input } = run;
@@ -905,11 +935,14 @@ async fn run_pipeline_in<C: WorkflowContext>(
     }
     // Working from here to its end, but for waits at gates: a stopping
     // process gives it its grace, and begins none of its steps.
-    let mut working = Some(begin_work().await);
+    let mut working = Some(begin_work(&id).await);
     reached(&id, 0)?;
     let store = services.store.clone();
     fits("the workflow's input", &pipeline.input, &input)?;
-    plan(&pipeline, services.runtimes.codex.backend.statement())?;
+    check_reviews(&pipeline)?;
+    plan(&pipeline, services.runtimes.backend.statement())?;
+    // Every step is held to its atom's trust before the run does anything.
+    trusted(&pipeline).map_err(failed)?;
     // The budgets the run keeps: pinned before it started, or resolved now,
     // once, and recorded with its definitions.
     let planned = match &pipeline.budgets {
@@ -924,8 +957,15 @@ async fn run_pipeline_in<C: WorkflowContext>(
                 .filter(|(_, atom)| model_of(atom, &services.runtimes).is_some())
                 .map(|(name, _)| name.as_str())
                 .collect();
+            // And every exec atom its caps, which its command is held to.
+            let exec_atoms: Vec<&str> = pipeline
+                .atoms
+                .iter()
+                .filter(|(_, atom)| atom.kind == "exec")
+                .map(|(name, _)| name.as_str())
+                .collect();
             plan.validate()
-                .and_then(|()| plan.covers(&model_atoms))
+                .and_then(|()| plan.covers(&model_atoms, &exec_atoms))
                 .map(|()| plan.clone())
                 .map_err(|e| format!("workflow {}: its pinned budget: {e}", pipeline.name))
         }
@@ -1005,7 +1045,7 @@ async fn run_pipeline_in<C: WorkflowContext>(
         .await?;
     let plan = pinned.budgets.clone();
     let budget = RunBudget::pinned(ledger, &plan);
-    let (caps, models) = (plan.atoms, plan.models);
+    let (caps, models, exec_caps) = (plan.atoms, plan.models, plan.exec);
     let mut steps = Map::new();
     // What each finished step's output is typed by, for CEL.
     let mut shapes = BTreeMap::new();
@@ -1027,27 +1067,31 @@ async fn run_pipeline_in<C: WorkflowContext>(
     } else {
         None
     };
-    // The run's build caches, named once for all its worktree steps from
-    // what its first step recorded, with the person's rustup toolchains
-    // found once; named before any step, so a run that ends before its
-    // first worktree step still removes what an earlier execution left.
-    if pipeline
-        .steps
-        .iter()
-        .any(|s| matches!(s, Step::Atom(step) if step.worktree))
-        && let Some(worktrees) = &run_worktrees
-    {
-        let rustup = atomic_core::worktree::rustup_home(&|n| std::env::var(n).ok());
-        *run_caches = Some(
-            worktrees
-                .caches(ctx.workflow_id(), pinned.caches.as_deref(), rustup)
-                .map_err(|e| failed(format!("the run's build caches: {e}")))?,
-        );
+    // The run's build caches, named once for all its worktree and exec
+    // steps from what its first step recorded, with the person's rustup
+    // toolchains found once; named before any step, so a run that ends
+    // before the first step that uses them still removes what an earlier
+    // execution left. Made only when a step uses them.
+    let rustup = || atomic_core::worktree::rustup_home(&|n| std::env::var(n).ok());
+    let named = match (&services.caches, &run_worktrees) {
+        (Some(root), _) => Some(atomic_core::worktree::Caches::for_run(
+            root,
+            ctx.workflow_id(),
+            pinned.caches.as_deref(),
+            rustup(),
+        )),
+        (None, Some(worktrees)) => {
+            Some(worktrees.caches(ctx.workflow_id(), pinned.caches.as_deref(), rustup()))
+        }
+        (None, None) => None,
+    };
+    if let Some(named) = named {
+        *run_caches = Some(named.map_err(|e| failed(format!("the run's build caches: {e}")))?);
     }
     let mut accepted = Vec::new();
     for (position, step) in pipeline.steps.iter().enumerate() {
         // Before its attempt is recorded: a stopping process begins nothing.
-        keep_working(&mut working).await;
+        keep_working(&mut working, &id).await;
         reached(&id, position + 1)?;
         let scope = json!(steps);
         let steps_shape = Shape::Fields(shapes.clone());
@@ -1071,6 +1115,7 @@ async fn run_pipeline_in<C: WorkflowContext>(
                 );
                 let decision = crate::telemetry::traced(
                     crate::telemetry::gate_span(&g.id, ctx.workflow_id()),
+                    why.clone(),
                     decision,
                 )
                 .await?;
@@ -1095,12 +1140,14 @@ async fn run_pipeline_in<C: WorkflowContext>(
             services: &services,
             budget: &budget,
             caps: &caps,
+            exec_caps: &exec_caps,
             models: &models,
             replay: &replay,
             pinned: &pinned,
             worktrees: run_worktrees.as_ref(),
             accepted: &accepted,
             caches: run_caches.as_ref(),
+            why,
         };
         used_worktrees |= step.worktree;
         let (candidate, told) = turn(
@@ -1192,7 +1239,7 @@ async fn run_pipeline_in<C: WorkflowContext>(
             ]),
         );
     }
-    keep_working(&mut working).await;
+    keep_working(&mut working, &id).await;
     let scope = json!(steps);
     let steps_shape = Shape::Fields(shapes);
     let result = atomic_schema::expr::evaluate(
@@ -1234,6 +1281,8 @@ struct RunScope<'a> {
     services: &'a Arc<Services>,
     budget: &'a RunBudget,
     caps: &'a BTreeMap<String, atomic_core::budget::Resolved>,
+    /// Each exec atom's caps, which its command's active time is charged to.
+    exec_caps: &'a BTreeMap<String, atomic_core::budget::Resolved>,
     models: &'a BTreeMap<String, String>,
     replay: &'a Option<Arc<Replay>>,
     pinned: &'a Pinned,
@@ -1241,8 +1290,12 @@ struct RunScope<'a> {
     worktrees: Option<&'a Arc<Worktrees>>,
     /// The commits its earlier worktree steps made.
     accepted: &'a [String],
-    /// The run's build caches, once a worktree step needs them.
+    /// The run's build caches, shared by its worktree and exec turns,
+    /// repairs and reviews included.
     caches: Option<&'a atomic_core::worktree::Caches>,
+    /// What this run's spans say of a step that failed (see
+    /// [`atomic_core::usage::Why`]).
+    why: &'a atomic_core::usage::Why,
 }
 
 /// One turn of an atom: a step's author, a reviewer, or the author's repair
@@ -1285,6 +1338,7 @@ async fn turn<C: WorkflowContext>(
         models,
         replay,
         pinned,
+        why,
         ..
     } = *run;
     // A fixture is its own repository (see `in_worktree`).
@@ -1295,6 +1349,10 @@ async fn turn<C: WorkflowContext>(
         .cloned()
         .ok_or_else(|| failed(format!("step `{}`: no atom `{}`", t.name, t.atom)))?;
     let mut runtimes = (*services.runtimes).clone();
+    // What this run's spans say of a failure. Each run of this step notes on a
+    // handle of its own, which the run takes up only when that step failed
+    // (see [`atomic_core::usage::Why`] and [`crate::telemetry::traced_step`]).
+    let run_why = (*why).clone();
     // An atom with captured helpers gets its step's logical time and seed
     // from a step of its own, recorded once and read back on every retry,
     // so its helpers render the same prompt and reach the same validator
@@ -1347,7 +1405,14 @@ async fn turn<C: WorkflowContext>(
         &serde_json::to_vec(&atom_input)
             .map_err(|e| failed(format!("step `{}`: encode its input: {e}", t.name)))?,
     );
-    let (budget, atom_caps) = (budget.clone(), caps.get(&t.atom).cloned());
+    // A model atom's caps, or an exec atom's, which its command's active
+    // time is charged to.
+    let (budget, atom_caps) = (
+        budget.clone(),
+        caps.get(&t.atom)
+            .or_else(|| run.exec_caps.get(&t.atom))
+            .cloned(),
+    );
     // A model atom runs on the model its budget was resolved for, and
     // only with caps: never unmetered, never at another model's price.
     if let Some(model) = model_of(&atom, &runtimes) {
@@ -1371,6 +1436,13 @@ async fn turn<C: WorkflowContext>(
                 t.name, atom.name
             )));
         }
+    }
+    // An exec atom's command runs only with caps, never unmetered.
+    if atom.kind == "exec" && atom_caps.is_none() {
+        return Err(failed(format!(
+            "step `{}`: `{}` runs a command, and the run's budget has no caps for it",
+            t.name, atom.name
+        )));
     }
     let tree = if t.worktree {
         let worktrees = run.worktrees.cloned().ok_or_else(|| {
@@ -1430,15 +1502,35 @@ async fn turn<C: WorkflowContext>(
             run_id: run_id.clone(),
             step_id: t.name.clone(),
         };
-        let (opening, who, backend) = (atom.clone(), identity.clone(), runtimes.exec.shared());
+        let (opening, who, backend) = (atom.clone(), identity.clone(), runtimes.backend.shared());
+        let (giving, artifacts) = (atom_input.clone(), runtimes.codex.artifacts.clone());
+        // The run's own build caches, with a Cargo target of the turn's own.
+        let exec_caches = run.caches.map(|c| c.for_exec(&t.name));
         let place = format!("run {run_id}, step {}", t.name);
         let attempt_step = format!("{}.attempt", t.name);
         let (begun, opened) = if replay.is_some() {
             (attempt::begin(ctx, &attempt_step).await?, None)
         } else {
             attempt::begin_with(ctx, &attempt_step, move || async move {
-                let opened =
-                    atomic_core::runtime::open_exec_workspace(&opening, &who, backend).await;
+                let mut opened = atomic_core::runtime::open_exec_workspace(
+                    &opening,
+                    &who,
+                    backend,
+                    exec_caches.as_ref(),
+                )
+                .await;
+                // Its inputs are given here, before the attempt is recorded:
+                // a store held too long then stops the step with nothing
+                // run and nothing recorded, and the run is run again.
+                if let (Ok(workspace), Ok(compiled)) =
+                    (&opened, compile::compile(&opening, &Registry::new()))
+                    && let Err(e) = atomic_core::runtime::give_exec_inputs(
+                        &opening, &compiled, &giving, &who, workspace, &artifacts,
+                    )
+                    .await
+                {
+                    opened = Err(e);
+                }
                 crate::workflows::settled(opened, &place, true).await
             })
             .await?
@@ -1457,10 +1549,21 @@ async fn turn<C: WorkflowContext>(
     let serving = replay.clone();
     let repair = t.repair.clone();
     let charge = t.charge;
-    execute_candidate_told(ctx, &format!("{}.turn", t.name), move |position| {
+    let step_caches = run.caches.map(|c| c.for_exec(&t.name));
+    // What an exec step's command hands over is held until the turn has
+    // recorded the output that references it, then let go; and let go too
+    // when the turn is dropped or panics before that.
+    let release = guard
+        .as_ref()
+        .map(|(_, _, _, identity)| runtimes.codex.artifacts.releasing(identity.clone()));
+    let turn = execute_candidate_told(ctx, &format!("{}.turn", t.name), move |position| {
         // The turn runs again after a park is released, so each run
         // takes its own copies.
         let mut runtimes = runtimes.clone();
+        // What this run of this step's model calls say of a failure of their
+        // own, which its span says in turn.
+        let why = atomic_core::usage::Why::for_step();
+        let step_caches = step_caches.clone();
         let (atom, atom_input, origins) = (atom.clone(), atom_input.clone(), origins.clone());
         let repair = repair.clone();
         let (id, ran, run_id) = (id.clone(), ran.clone(), run_id.clone());
@@ -1472,19 +1575,21 @@ async fn turn<C: WorkflowContext>(
         // live.
         let served = serving.as_ref().map(|r| r.serve(&id, &input_sha256));
         let input_sha256 = input_sha256.clone();
-        // An exec atom calls no model and has no caps to meter.
+        // A model atom's calls, or an exec atom's command.
         if let Some(atom_caps) = &atom_caps {
             let meter = match charge {
                 Some(allowance) => budget.meter_charged(&position, allowance, atom_caps),
                 None => budget.meter(&position, atom_caps),
             };
             runtimes.codex.meter = meter.clone();
-            runtimes.lite.meter = meter;
+            runtimes.lite.meter = meter.clone();
+            runtimes.exec_meter = meter;
         }
         // Made here, in the step's body, so a step that replays from
         // its checkpoint makes none.
         let span = crate::telemetry::step_span(&atom.name, &id, &run_id);
         let caller = (run_id.clone(), id.clone());
+        let (ledgered, metered, at) = (budget.clone(), atom_caps.is_some(), position.clone());
         let work = async move {
             if let Some(served) = served {
                 return served;
@@ -1507,25 +1612,48 @@ async fn turn<C: WorkflowContext>(
                     )));
                 }
             }
-            if let Some((begun, declared, _, _)) = &guard
-                && begun.interrupted()
-                && !declared
-            {
+            // The command may have run before when an earlier execution's
+            // attempt replays as interrupted, or when, in this process, an
+            // earlier run of the body took the workspace this attempt
+            // opened. Either way it may never have started: a cap refused it
+            // and the step parked. For a metered step the ledger says which:
+            // only a command admitted may have run. An unmetered one is
+            // taken to have run.
+            let (replayed, taken) = match &guard {
+                Some((begun, false, opened, _)) => {
+                    let replayed = begun.interrupted();
+                    // A replayed attempt opened no workspace here.
+                    (
+                        replayed,
+                        !replayed && opened.lock().map_or(true, |o| o.is_none()),
+                    )
+                }
+                _ => (false, false),
+            };
+            let admitted = if (replayed || taken) && metered {
+                ledgered
+                    .command_admitted(&at)
+                    .await
+                    .map_err(|e| failed(format!("step `{id}`: read its command's attempts: {e}")))?
+            } else {
+                true
+            };
+            if let Some(why) = ran_before(&atom.name, replayed && admitted, taken && admitted) {
                 return Err(failed(format!(
-                    "step `{id}`: outcome_unknown: an earlier attempt of `{}` was interrupted \
-                         before its result was saved, so whether its command's effects happened \
-                         is unknown. The step is parked and its command does not run again. If \
-                         repeating it is safe, declare `effects: {{ external: 'idempotent' }}` \
-                         (or `'read-only'` if it only reads)",
-                    atom.name
+                    "step `{id}`: outcome_unknown: {why}, so whether its command's effects \
+                     happened is unknown. The step is parked and its command does not run \
+                     again. If repeating it is safe, declare `effects: {{ external: \
+                     'idempotent' }}` (or `'read-only'` if it only reads)"
                 )));
             }
             let proposal = match (tree, guard) {
                 (_, Some((_, _, opened, identity))) => {
                     let clock = runtimes.clock.clone();
-                    let backend = runtimes.exec.shared();
+                    let backend = runtimes.backend.shared();
+                    let exec_caches = step_caches.clone();
                     // The store the model runtimes check references against.
                     let artifacts = runtimes.codex.artifacts.clone();
+                    let meter = runtimes.exec_meter.clone();
                     propose_at(&place, true, async move {
                         let compiled = compile::compile(&atom, &Registry::new())
                             .map_err(|e| AtomError::Runtime(e.to_string()))?;
@@ -1535,8 +1663,13 @@ async fn turn<C: WorkflowContext>(
                         let opened = match first {
                             Some(opened) => opened,
                             None => {
-                                atomic_core::runtime::open_exec_workspace(&atom, &identity, backend)
-                                    .await?
+                                atomic_core::runtime::open_exec_workspace(
+                                    &atom,
+                                    &identity,
+                                    backend,
+                                    exec_caches.as_ref(),
+                                )
+                                .await?
                             }
                         };
                         atomic_core::runtime::run_exec_opened(
@@ -1547,6 +1680,7 @@ async fn turn<C: WorkflowContext>(
                             opened,
                             clock.as_ref(),
                             &artifacts,
+                            &meter,
                         )
                         .await
                     })
@@ -1589,10 +1723,19 @@ async fn turn<C: WorkflowContext>(
             failpoint(&ran);
             Ok(proposal)
         };
-        // Model calls name the run and step on their spans.
-        crate::telemetry::traced(span, atomic_core::usage::for_step(caller.0, caller.1, work))
+        // Model calls name the run and step on their spans, and say why they
+        // failed here and, if this step is what failed the run, on its span
+        // too (see `mark_failed`).
+        crate::telemetry::traced_step(
+            span,
+            why.clone(),
+            &run_why,
+            atomic_core::usage::for_step(caller.0, caller.1, why, work),
+        )
     })
-    .await
+    .await;
+    drop(release);
+    turn
 }
 
 /// Review `candidate`, the author's turn of `step` on `input`: the reviewer
@@ -1621,35 +1764,6 @@ async fn reviewed<C: WorkflowContext>(
     input: Value,
     (mut candidate, author_turn): (Candidate, i32),
 ) -> Result<(Candidate, Acceptance)> {
-    // As the loader refuses them, for a run whose pipeline came from
-    // anywhere else.
-    if step.id.contains('.') {
-        return Err(failed(format!(
-            "step `{}` has a dot in its name, which its review's durable names would share",
-            step.id
-        )));
-    }
-    let kind = |name: &str| run.pipeline.atoms.get(name).map(|a| a.kind.as_str());
-    if kind(&step.atom) == Some("exec") {
-        return Err(failed(format!(
-            "step `{}`: an exec atom's output cannot be reviewed",
-            step.id
-        )));
-    }
-    if !matches!(kind(&review.reviewer), Some("lite" | "codex")) {
-        return Err(failed(format!(
-            "step `{}`: its reviewer `{}` is not a lite or codex atom of the run",
-            step.id, review.reviewer
-        )));
-    }
-    if review.rounds > atomic_core::workflow::MAX_REVIEW_ROUNDS {
-        return Err(failed(format!(
-            "step `{}`: its review gives {} repair rounds, more than the {} atomic allows",
-            step.id,
-            review.rounds,
-            atomic_core::workflow::MAX_REVIEW_ROUNDS
-        )));
-    }
     let author = run
         .pipeline
         .atoms
@@ -1678,7 +1792,7 @@ async fn reviewed<C: WorkflowContext>(
             mapped.insert(field.clone(), value);
         }
         let name = format!("{}.review.{round}", step.id);
-        keep_working(working).await;
+        keep_working(working, ctx.workflow_id()).await;
         let (verdict, told) = turn(
             ctx,
             run,
@@ -1724,7 +1838,7 @@ async fn reviewed<C: WorkflowContext>(
             }
             atomic_core::workflow::Verdict::Changes if round < review.rounds => {
                 round += 1;
-                keep_working(working).await;
+                keep_working(working, ctx.workflow_id()).await;
                 (candidate, _) = turn(
                     ctx,
                     run,
@@ -1786,11 +1900,12 @@ async fn reviewed<C: WorkflowContext>(
     *working = None;
     let resolution = crate::telemetry::traced(
         crate::telemetry::gate_span(&id, ctx.workflow_id()),
+        (*run.why).clone(),
         gate::gate(ctx, &id, spec),
     )
     .await?;
     failpoint(&format!("pipeline:after:{id}"));
-    keep_working(working).await;
+    keep_working(working, ctx.workflow_id()).await;
     match resolution {
         Resolution::Decided(d) if d.verdict == gate::Verdict::Approve => {
             let acceptance = Acceptance {
@@ -1811,6 +1926,47 @@ async fn reviewed<C: WorkflowContext>(
             }
         ))),
     }
+}
+
+/// Refuse, before anything of the run is paid for, a reviewed step the
+/// workflow loader would have refused, for a run whose pipeline came from
+/// anywhere else: a dotted name, an exec author, a reviewer that is not a
+/// model atom of the run, or more rounds than atomic allows.
+fn check_reviews(pipeline: &Pipeline) -> Result<()> {
+    for step in &pipeline.steps {
+        let Step::Atom(step) = step else { continue };
+        let Some(review) = &step.review else { continue };
+        // As the loader refuses them, for a run whose pipeline came from
+        // anywhere else.
+        if step.id.contains('.') {
+            return Err(failed(format!(
+                "step `{}` has a dot in its name, which its review's durable names would share",
+                step.id
+            )));
+        }
+        let kind = |name: &str| pipeline.atoms.get(name).map(|a| a.kind.as_str());
+        if kind(&step.atom) == Some("exec") {
+            return Err(failed(format!(
+                "step `{}`: an exec atom's output cannot be reviewed",
+                step.id
+            )));
+        }
+        if !matches!(kind(&review.reviewer), Some("lite" | "codex")) {
+            return Err(failed(format!(
+                "step `{}`: its reviewer `{}` is not a lite or codex atom of the run",
+                step.id, review.reviewer
+            )));
+        }
+        if review.rounds > atomic_core::workflow::MAX_REVIEW_ROUNDS {
+            return Err(failed(format!(
+                "step `{}`: its review gives {} repair rounds, more than the {} atomic allows",
+                step.id,
+                review.rounds,
+                atomic_core::workflow::MAX_REVIEW_ROUNDS
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Refuse, before anything runs, a step the execution backend's statement
@@ -2078,6 +2234,11 @@ pub struct Services {
     /// The project repository's worktrees, for `worktree: true` steps, or
     /// `None` when the project is not in a git repository.
     pub worktrees: Option<Arc<Worktrees>>,
+    /// Where each run's build caches go, the state directory's `cache/`:
+    /// a directory of the run's own there, which its worktree and exec
+    /// steps may write and which goes when the run ends. `None` puts them
+    /// beside the run's worktrees, and a run with neither gets none.
+    pub caches: Option<PathBuf>,
     /// The budget settings every run's model calls are metered under.
     pub budgets: Arc<BudgetSettings>,
     /// The public context settings a step whose atom declares a context is
@@ -2094,32 +2255,136 @@ pub fn register_pipeline<R: DurableRuntime>(rt: &mut R, services: Services) {
     rt.register(PIPELINE, move |ctx: R::Context, run: PipelineRun| {
         let span = crate::telemetry::workflow_span(&run.pipeline.name, ctx.workflow_id());
         let id = ctx.workflow_id().to_owned();
-        crate::panics::caught(
-            id,
-            crate::telemetry::traced(
-                span,
-                run_pipeline(ctx, run, services.clone(), ledger.clone(), None),
-            ),
-        )
+        // One for this execution of the run, which its steps note when a
+        // model call of theirs fails (see [`atomic_core::usage::Why`]).
+        let why = atomic_core::usage::Why::default();
+        let traced = crate::telemetry::traced(
+            span,
+            why.clone(),
+            run_pipeline(ctx, run, services.clone(), ledger.clone(), None, why),
+        );
+        crate::panics::caught(id, traced)
     });
     rt.register(REPLAY, move |ctx: R::Context, replay: ReplayRun| {
         let ReplayRun { of, run, recorded } = replay;
         let span = crate::telemetry::workflow_span(&run.pipeline.name, ctx.workflow_id());
         let id = ctx.workflow_id().to_owned();
-        crate::panics::caught(
-            id,
-            crate::telemetry::traced(
-                span,
-                run_pipeline(
-                    ctx,
-                    run,
-                    replaying.clone(),
-                    replay_ledger.clone(),
-                    Some(Arc::new(Replay { of, recorded })),
-                ),
+        let why = atomic_core::usage::Why::default();
+        let traced = crate::telemetry::traced(
+            span,
+            why.clone(),
+            run_pipeline(
+                ctx,
+                run,
+                replaying.clone(),
+                replay_ledger.clone(),
+                Some(Arc::new(Replay { of, recorded })),
+                why,
             ),
-        )
+        );
+        crate::panics::caught(id, traced)
     });
+}
+
+/// Hold every atom step's bindings to its atom's trust, and its review's to
+/// the reviewer's, as the loader does, from the pipeline alone: before a run
+/// does anything, so no step's effect lands before a later step is refused.
+/// Each binding's origin is the lower of what the run recorded for it
+/// (external, when it recorded nothing) and what its expression reads,
+/// recomputed from the steps before it, so a pipeline built some other way,
+/// or a run recorded before a check existed, cannot raise one. An atom whose
+/// `trust` is none of the three accepts nothing. A resumed or served run is
+/// checked on the pipeline it recorded.
+fn trusted(pipeline: &Pipeline) -> std::result::Result<(), String> {
+    use atomic_core::workflow::{
+        accepted_trust, review_origin, trusted_sources, unknown_trust, unknown_trust_advice,
+        untrusted_binding,
+    };
+    let atom_of = |id: &str, name: &str| {
+        let atom = pipeline
+            .atoms
+            .get(name)
+            .ok_or_else(|| format!("step `{id}`: no atom `{name}`"))?;
+        let accepts = accepted_trust(atom).map_err(|_| {
+            format!(
+                "step `{id}`: {}; {}",
+                unknown_trust(atom).unwrap_or_default(),
+                unknown_trust_advice(atom)
+            )
+        })?;
+        Ok::<_, String>((atom, accepts))
+    };
+    // A binding's origin at run time: the lower of what the run recorded
+    // (external, when it recorded nothing) and what its expression reads;
+    // and, when the run's `origins` entry is what lowered it, the advice to
+    // remove that entry.
+    let origin = |recorded: Option<&String>, read: &'static str| match recorded.map(String::as_str)
+    {
+        Some(entry) if rank(entry) < rank(read) => (
+            entry.to_owned(),
+            format!(", remove the `origins` entry that marks it {entry}"),
+        ),
+        None if rank("external") < rank(read) => ("external".to_owned(), String::new()),
+        _ => (read.to_owned(), String::new()),
+    };
+    let mut kinds = BTreeMap::new();
+    for step in &pipeline.steps {
+        let step = match step {
+            Step::Gate(gate) => {
+                kinds.insert(gate.id.clone(), "gate".to_owned());
+                continue;
+            }
+            Step::Atom(step) => step,
+        };
+        let (atom, accepts) = atom_of(&step.id, &step.atom)?;
+        for (field, source) in &step.with {
+            let read = origin_of(source, &kinds).unwrap_or("external");
+            let (origin, entry) = origin(step.origins.get(field), read);
+            if let Some(refused) = untrusted_binding(atom, source, &origin) {
+                return Err(format!(
+                    "step `{}`: `with.{field}`: {refused}; bind it to {} instead{entry}, or \
+                     declare a lower `trust` on the atom if it is built for {origin} input",
+                    step.id,
+                    trusted_sources(accepts),
+                ));
+            }
+        }
+        if let Some(review) = &step.review {
+            let (reviewer, reviewer_accepts) = atom_of(&step.id, &review.reviewer)?;
+            // What the reviewer's findings carry: a model's output on what
+            // it read.
+            let mut findings = "agent".to_owned();
+            for (field, source) in &review.with {
+                let read = review_origin(source, &kinds).unwrap_or("external");
+                let (origin, entry) = origin(review.origins.get(field), read);
+                if let Some(refused) = untrusted_binding(reviewer, source, &origin) {
+                    return Err(format!(
+                        "step `{}`: `review.with.{field}`: {refused}; a candidate under review \
+                         is external data; bind it to {} instead{entry}, or declare a lower \
+                         `trust` on the reviewer if it is built for {origin} input",
+                        step.id,
+                        trusted_sources(reviewer_accepts),
+                    ));
+                }
+                if rank(&origin) < rank(&findings) {
+                    findings = origin;
+                }
+            }
+            // A repair round hands the author the reviewer's findings: no
+            // more trusted than what the reviewer read.
+            if review.rounds > 0 && rank(&findings) < rank(accepts) {
+                return Err(format!(
+                    "step `{}`: `review.rounds`: a repair round hands `{}` the reviewer's \
+                     findings, which are {findings} data, and it accepts {accepts} input at \
+                     most (`trust: '{accepts}'`); set `rounds: 0`, so a person decides on a \
+                     rejection, or review it with what it can take",
+                    step.id, step.atom,
+                ));
+            }
+        }
+        kinds.insert(step.id.clone(), atom.kind.clone());
+    }
+    Ok(())
 }
 
 /// The name a replay of a recorded run is registered under.
@@ -2251,9 +2516,40 @@ fn recorded_results(
     Ok(recorded)
 }
 
+/// Why the command of exec atom `atom`, about to run in its step's body,
+/// may have run already, so that running it again could repeat its
+/// effects; `None` when this is its first run. Either an earlier execution
+/// was `interrupted` after the step's attempt began, or, in this process,
+/// an earlier run of the step's body took the workspace its attempt opened
+/// (`workspace_taken`), and so ran its command or began to.
+fn ran_before(atom: &str, interrupted: bool, workspace_taken: bool) -> Option<String> {
+    if interrupted {
+        Some(format!(
+            "an earlier attempt of `{atom}` was interrupted before its result was saved"
+        ))
+    } else if workspace_taken {
+        Some(format!(
+            "this step already ran `{atom}`'s command, or began to, in this process"
+        ))
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A command runs again only through the effects rule: after an
+    /// interrupted attempt, and after an earlier run of the step's body in
+    /// this process took its attempt's workspace.
+    #[test]
+    fn an_exec_command_that_may_have_run_is_not_run_again_unchecked() {
+        assert_eq!(ran_before("x", false, false), None, "its first run");
+        assert!(ran_before("x", true, true).is_some_and(|why| why.contains("interrupted")));
+        assert!(ran_before("x", true, false).is_some_and(|why| why.contains("interrupted")));
+        assert!(ran_before("x", false, true).is_some_and(|why| why.contains("in this process")));
+    }
 
     /// Only a recorded outcome, finished or failed, removes a run's caches:
     /// an execution that lost a race, or whose outcome went unrecorded,

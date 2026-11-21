@@ -26,6 +26,7 @@ pub mod git;
 pub mod helper_runtime;
 pub mod http_tools;
 pub mod lite;
+pub mod mounts;
 pub mod names;
 pub mod network;
 pub mod project;
@@ -35,6 +36,7 @@ pub mod runtime;
 pub mod signin;
 pub mod spans;
 pub mod state;
+pub mod terminal;
 #[cfg(any(test, feature = "fake-model"))]
 pub mod testing;
 pub mod typed;

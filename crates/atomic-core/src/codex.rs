@@ -22,7 +22,6 @@ use codex_core_api::AuthKeyringBackendKind;
 use codex_core_api::AuthManager;
 use codex_core_api::AutoCompactTokenLimitScope;
 use codex_core_api::CodexAppsToolsCache;
-use codex_core_api::CodexHomeUserInstructionsProvider;
 use codex_core_api::CodexThread;
 use codex_core_api::Config;
 use codex_core_api::ConfigLayerStack;
@@ -38,6 +37,8 @@ use codex_core_api::Feature;
 use codex_core_api::Features;
 use codex_core_api::GhostSnapshotConfig;
 use codex_core_api::History;
+use codex_core_api::LoadInstructionsFuture;
+use codex_core_api::LoadedUserInstructions;
 use codex_core_api::MemoriesConfig;
 use codex_core_api::ModelAvailabilityNuxConfig;
 use codex_core_api::ModelCatalogSettings;
@@ -70,6 +71,7 @@ use codex_core_api::TuiPetAnchor;
 use codex_core_api::TurnInputRequest;
 use codex_core_api::UriBasedFileOpener;
 use codex_core_api::UserInput;
+use codex_core_api::UserInstructionsProvider;
 use codex_core_api::WebSearchMode;
 use codex_core_api::arg0_dispatch_or_else;
 use codex_core_api::bootstrap_auth_config;
@@ -80,6 +82,8 @@ use codex_core_api::local_agent_graph_store_from_state_db;
 use codex_core_api::passthrough_image_store;
 use codex_core_api::resolve_bootstrap_respect_system_proxy;
 use codex_core_api::resolve_installation_id;
+use codex_extension_api::SkillInvocationContributor;
+use codex_protocol::config_types::TrustLevel;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::future::Future;
@@ -118,10 +122,11 @@ pub struct TurnSpec {
     /// The sandbox the thread runs in. The network is always restricted.
     pub sandbox: crate::typed::Sandbox,
     /// Environment variables set for every command the thread runs, such as
-    /// the project's shared caches (see [`crate::worktree::Caches`]).
+    /// those that point build tools at its run's caches (see
+    /// [`crate::worktree::Caches`]).
     pub env: BTreeMap<String, String>,
     /// Directories a `workspace-write` thread may write besides its working
-    /// directory, such as the project's shared caches. Absolute paths.
+    /// directory, such as its run's build caches. Absolute paths.
     pub writable_roots: Vec<PathBuf>,
 }
 
@@ -389,8 +394,10 @@ const LINK_DEPTH: usize = 4;
 /// past this nothing runs.
 const MAX_LINK_TARGETS: usize = 512;
 
-/// Where the system keeps what every command needs: a link into one of
-/// these is never followed to deny its target.
+/// Where the system keeps the programs and libraries every command needs,
+/// and its devices: a link into one of these is never followed to deny its
+/// target. Secrets kept elsewhere by the system, under `/run`, `/etc` or
+/// `/opt`, are denied when a credential place links to them.
 const SYSTEM_PREFIXES: &[&str] = &[
     "/usr",
     "/bin",
@@ -399,14 +406,32 @@ const SYSTEM_PREFIXES: &[&str] = &[
     "/lib32",
     "/lib64",
     "/libx32",
-    "/etc",
-    "/opt",
     "/nix/store",
     "/dev",
     "/proc",
     "/sys",
-    "/run",
 ];
+
+/// Why a deny list could not be made: nothing runs. Not the model's doing.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct DenyRefused(pub String);
+
+/// Whether `meta` is a character or block device, such as `/dev/null`:
+/// never denied, since every command may need it.
+fn device(meta: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        let kind = meta.file_type();
+        kind.is_char_device() || kind.is_block_device()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        false
+    }
+}
 
 /// The links up to [`LINK_DEPTH`] directory levels inside `dir`. Links to
 /// directories are not walked into.
@@ -426,29 +451,71 @@ fn links_in(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// What a link or a variable resolved to, if it should be denied: only a
-/// regular file or a directory, the person's own, outside the system's
-/// directories. A history file linked to `/dev/null`, or a tool linked to
-/// the system's `python3`, is left alone, since denying it would break
-/// every command.
-fn deniable(target: &Path) -> bool {
+/// Directories a credential place that is a link may point at and still not
+/// be denied, since every command needs them: the root and the system's
+/// top-level directories, each exactly.
+const NEVER_DENIED: &[&str] = &[
+    "/", "/bin", "/boot", "/dev", "/etc", "/home", "/lib", "/lib32", "/lib64", "/libx32", "/media",
+    "/mnt", "/nix", "/opt", "/proc", "/root", "/run", "/sbin", "/srv", "/sys", "/tmp", "/usr",
+    "/var",
+];
+
+/// What a link resolved to, if it should be denied.
+///
+/// Never a device, nor anything under the system's program, library and
+/// device directories ([`SYSTEM_PREFIXES`]). A credential place that is
+/// itself a link (`listed`), such as `~/.netrc` kept with a person's
+/// dotfiles, is otherwise denied as what it points at, whoever owns it and
+/// whatever its mode, but for the system's top-level directories
+/// ([`NEVER_DENIED`]). A link found inside a credential place is also left
+/// alone when it leads to a program (a file with an execute bit that starts
+/// as one does) or to a directory someone else owns: a virtual
+/// environment's `python` linked to a toolchain's keeps working. A key
+/// linked to one a secrets manager keeps under `/run`, or a cluster's
+/// credentials under `/etc`, are denied whoever owns them.
+fn deniable(target: &Path, listed: bool) -> bool {
     let Ok(meta) = std::fs::metadata(target) else {
         return false;
     };
-    if !(meta.is_file() || meta.is_dir()) {
+    if device(&meta) || SYSTEM_PREFIXES.iter().any(|p| target.starts_with(p)) {
         return false;
     }
-    if SYSTEM_PREFIXES.iter().any(|p| target.starts_with(p)) {
-        return false;
+    if listed {
+        return !NEVER_DENIED.iter().any(|p| target == Path::new(p));
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt;
-        if meta.uid() != crate::state::effective_uid() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if meta.is_file() && meta.permissions().mode() & 0o111 != 0 && program(target) {
+            return false;
+        }
+        if meta.is_dir() && meta.uid() != crate::state::effective_uid() {
             return false;
         }
     }
     true
+}
+
+/// Whether the file at `path` starts as a program does: an ELF or Mach-O
+/// binary, or a script with `#!`.
+fn program(path: &Path) -> bool {
+    use std::io::Read;
+    let mut start = [0u8; 4];
+    let Ok(read) = std::fs::File::open(path).and_then(|mut f| f.read(&mut start)) else {
+        return false;
+    };
+    let start = &start[..read];
+    start.starts_with(b"#!")
+        || start.starts_with(b"\x7fELF")
+        || [
+            [0xfe, 0xed, 0xfa, 0xce],
+            [0xfe, 0xed, 0xfa, 0xcf],
+            [0xce, 0xfa, 0xed, 0xfe],
+            [0xcf, 0xfa, 0xed, 0xfe],
+            [0xca, 0xfe, 0xba, 0xbe],
+        ]
+        .iter()
+        .any(|magic| start == magic)
 }
 
 /// Every path a profile denies under `guard`, for a thread whose Codex home
@@ -471,6 +538,12 @@ fn deniable(target: &Path) -> bool {
 /// a directory the thread may write, where a command could rename it out
 /// from under its denial.
 ///
+/// Each is denied too wherever else the mount table shows it, such as a
+/// home bound at a second path (see [`crate::mounts`]); nothing runs when
+/// the table cannot be read, or when such a place would cover what the
+/// thread needs or lies two or more levels inside a directory it may
+/// write.
+///
 /// The list is made when a thread starts. A path that does not exist then
 /// is denied only once it does, when a later command starts: one made while
 /// a command runs can be read by that command.
@@ -481,16 +554,48 @@ fn denied_paths(
     writable: &[PathBuf],
 ) -> anyhow::Result<(Vec<PathBuf>, Vec<String>)> {
     let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_owned());
-    let writable: Vec<PathBuf> = writable.iter().map(|p| real(p)).collect();
+    let roots: Vec<PathBuf> = writable.iter().map(|p| real(p)).collect();
     // atomic's state holds what the thread may write (its worktrees,
     // scratch and temporary directories): no denied link may point there.
-    let mut writable = writable;
+    let mut writable = roots.clone();
     writable.push(real(&private.state_dir));
     let mut needed = writable.clone();
     needed.extend(cwd.map(real));
     needed.push(real(codex_home));
     needed.extend(std::env::current_exe().ok().map(|p| real(&p)));
     let covers = |denied: &Path| needed.iter().find(|n| n.starts_with(denied)).cloned();
+    let refuse = |why: String| anyhow::Error::new(DenyRefused(why));
+    let holds = |path: &Path, needed: &Path| {
+        refuse(format!(
+            "{} holds {}, which atoms' commands need, so atomic cannot deny it; keep the \
+             project and atomic's state outside the places that hold credentials, and point \
+             any variable that names such a place (HISTFILE, CODEX_HOME and the like) elsewhere",
+            path.display(),
+            needed.display()
+        ))
+    };
+    // A denied place two or more levels inside a directory the thread may
+    // write could be moved out from under its denial by a command renaming
+    // a directory above it; one directly inside cannot, since the sandbox's
+    // mount on it is busy.
+    let movable = |path: &Path, real_path: &Path, within: &[PathBuf]| {
+        within
+            .iter()
+            .find(|w| {
+                real_path
+                    .strip_prefix(w)
+                    .is_ok_and(|rest| rest.components().count() >= 2)
+            })
+            .map(|root| {
+                refuse(format!(
+                    "{} is inside {}, which atoms' commands may write, so a command could move \
+                     it out from under its denial; run with a working directory that does not \
+                     hold it",
+                    path.display(),
+                    root.display()
+                ))
+            })
+    };
     // Every project's private state, by one entry, however many projects
     // the home holds.
     let mut denied = vec![private.private.clone()];
@@ -499,25 +604,40 @@ fn denied_paths(
     // such as a variable naming the root.
     for path in &denied {
         if let Some(needed) = covers(&real(path)).or_else(|| covers(path)) {
-            bail!(
-                "{} holds {}, which atoms' commands need, so atomic cannot deny it; check \
-                 the variables that name credential places, such as HISTFILE or CODEX_HOME",
-                path.display(),
-                needed.display()
-            );
+            return Err(holds(path, &needed));
         }
     }
+    // The places themselves, resolved, which what is found inside them
+    // needs no denial of its own beside: a place as it is, or what a place
+    // that is a link points at, when that is denied.
+    let base = denied.len();
+    let places: Vec<PathBuf> = denied
+        .iter()
+        .filter_map(|p| {
+            let meta = std::fs::symlink_metadata(p).ok()?;
+            let target = real(p);
+            (!meta.file_type().is_symlink() || deniable(&target, true)).then_some(target)
+        })
+        .collect();
     let mut links = Vec::new();
     for dir in &private.also {
         links_in(dir, LINK_DEPTH, &mut links);
     }
+    // Only the links that lead somewhere a denial is needed count against
+    // the cap.
+    links.retain(|link| {
+        std::fs::canonicalize(link)
+            .is_ok_and(|t| deniable(&t, false) && !places.iter().any(|p| t.starts_with(p)))
+    });
     if links.len() > MAX_LINK_TARGETS {
-        bail!(
-            "the places denied to atoms' commands hold {} links, more than the {MAX_LINK_TARGETS} \
-             atomic follows; remove some, or keep the files they point at inside those places",
+        return Err(refuse(format!(
+            "the places denied to atoms' commands hold {} links to files elsewhere, more than \
+             the {MAX_LINK_TARGETS} atomic follows; remove some, or keep the files they point at \
+             inside those places",
             links.len()
-        );
+        )));
     }
+    let link_count = links.len();
     denied.extend(links);
     let children = |dir: &Path, keep: &str| -> Vec<PathBuf> {
         std::fs::read_dir(dir)
@@ -548,58 +668,96 @@ fn denied_paths(
             all.push(entry);
         }
     }
-    for path in denied {
+    for (i, path) in denied.into_iter().enumerate() {
+        let found = i >= base;
         let Ok(meta) = std::fs::symlink_metadata(&path) else {
             // Nothing there yet: denied once it is.
             all.push(path);
             continue;
         };
-        let target = std::fs::canonicalize(&path).ok();
-        if meta.file_type().is_symlink() || target.as_ref().is_some_and(|t| *t != path) {
-            // A link, or a path through one: what it resolves to, if that
-            // is a file or directory of the person's, and never what the
-            // thread needs or may write.
-            let Some(target) = target.filter(|t| deniable(t)) else {
+        if meta.file_type().is_symlink() {
+            // A link: the sandbox cannot mount on one, so what it resolves
+            // to, if that should be denied, and never what the thread
+            // needs or may write. A target inside another denied place is
+            // denied with it.
+            let Some(target) = std::fs::canonicalize(&path)
+                .ok()
+                .filter(|t| deniable(t, !found))
+            else {
                 continue;
             };
+            if found && places.iter().any(|p| target.starts_with(p)) {
+                continue;
+            }
             if let Some(needed) = covers(&target) {
-                bail!(
+                return Err(refuse(format!(
                     "{} resolves to {}, which holds {}, which atoms' commands need; atomic \
                      cannot deny it",
                     path.display(),
                     target.display(),
                     needed.display()
-                );
+                )));
             }
-            if let Some(root) = writable.iter().find(|w| target.starts_with(w)) {
-                bail!(
-                    "{} resolves to {}, inside {}, which atoms' commands may write, so a command \
-                     could move it out from under its denial; keep it elsewhere",
-                    path.display(),
-                    target.display(),
-                    root.display()
-                );
+            if let Some(refused) = movable(&path, &target, &writable) {
+                return Err(refused);
             }
-            all.push(target.clone());
-            if !meta.file_type().is_symlink() {
-                all.push(path);
-            }
+            all.push(target);
             continue;
         }
-        if !(meta.is_file() || meta.is_dir()) {
-            // A device or socket, such as a variable naming /dev/null.
+        // A place as it is named, under both spellings when a directory
+        // above it is a link; only a device, such as a variable naming
+        // /dev/null, is left out. A pipe or socket is denied like a file.
+        if device(&meta) {
             continue;
         }
-        if let Some(needed) = covers(&path) {
-            bail!(
-                "{} holds {}, which atoms' commands need, so atomic cannot deny it; check \
-                 the variables that name credential places, such as HISTFILE or CODEX_HOME",
-                path.display(),
-                needed.display()
-            );
+        let real_path = real(&path);
+        if let Some(needed) = covers(&real_path) {
+            return Err(holds(&path, &needed));
+        }
+        if let Some(refused) = movable(&path, &real_path, &roots) {
+            return Err(refused);
+        }
+        if real_path != path {
+            all.push(real_path);
         }
         all.push(path);
     }
+    // The same places wherever else they are mounted, such as a home bound
+    // at a second path or the host's files under /run/host: denied there
+    // too, or nothing runs (see `crate::mounts`).
+    // And Codex's home, whose databases a pattern denies (see below).
+    let home = [codex_home.to_owned()];
+    let found =
+        crate::mounts::second_mounts(&[&all, &home]).map_err(|e| refuse(format!("{e:#}")))?;
+    let (aliases, home_aliases) = (&found[0], &found[1]);
+    // One cap for both, as both go to the sandbox helper in one argument.
+    let second = aliases.len() + home_aliases.len();
+    if link_count + second > MAX_LINK_TARGETS {
+        return Err(refuse(format!(
+            "the places denied to atoms' commands hold {link_count} links to files elsewhere and \
+             are mounted at {second} other places, more than the {MAX_LINK_TARGETS} atomic \
+             denies besides the places themselves"
+        )));
+    }
+    for alias in aliases.iter().chain(home_aliases) {
+        if let Some(needed) = covers(alias) {
+            return Err(refuse(format!(
+                "{} is a second mount of a place denied to atoms' commands, and holds {}, which \
+                 they need, so atomic cannot deny it there",
+                alias.display(),
+                needed.display()
+            )));
+        }
+        if two_deep(alias, &writable) {
+            return Err(refuse(format!(
+                "{} is a second mount of a place denied to atoms' commands, two or more levels \
+                 inside a directory they may write, so a command could move it out from under \
+                 its denial; mount it elsewhere",
+                alias.display()
+            )));
+        }
+    }
+    all.extend(aliases.iter().cloned());
     // A path inside another denied path is denied with it, and the sandbox
     // cannot mount a denial inside one: such as the credential store inside
     // the person's own configuration directory.
@@ -610,8 +768,21 @@ fn denied_paths(
     // Codex creates its state database when the first thread starts, after
     // the list above is made: a pattern, expanded when each command starts,
     // covers it.
-    let globs = vec![format!("{}/*.sqlite*", codex_home.display())];
+    // And so at each second mount of Codex's home.
+    let mut globs = vec![format!("{}/*.sqlite*", codex_home.display())];
+    for alias in home_aliases {
+        globs.push(format!("{}/*.sqlite*", alias.display()));
+    }
     Ok((all, globs))
+}
+
+/// Whether `path` lies two or more levels inside a directory of `within`,
+/// where a command that may write it could rename a directory above `path`.
+fn two_deep(path: &Path, within: &[PathBuf]) -> bool {
+    within.iter().any(|w| {
+        path.strip_prefix(w)
+            .is_ok_and(|rest| rest.components().count() >= 2)
+    })
 }
 
 /// What Codex reads from its home at start: `.env` sets variables in
@@ -858,6 +1029,17 @@ fn harden() {
     }
 }
 
+/// Harden `atomic runner` as [`dispatch`] hardens atomic: the commands it
+/// runs arrive on its stdin with their environments, and a confined one's
+/// with its proxy token, so no process of the same user may read its memory
+/// or the /proc files that show it, such as `environ` and `mem`, unless it
+/// has `CAP_SYS_PTRACE` over the runner's user namespace; its `cmdline` and
+/// `stat` stay readable. Call it first, before the request is read.
+pub fn harden_runner() {
+    // The runner holds commands' environments, proxy tokens among them.
+    codex_process_hardening::pre_main_hardening();
+}
+
 /// The process entry point.
 ///
 /// The same executable re-runs itself as Codex's helpers (the Linux sandbox,
@@ -1009,7 +1191,16 @@ fn an_option(arg: &std::ffi::OsString) -> bool {
 
 /// When this process is Codex's Linux sandbox helper, keep the command it
 /// runs off the kernel keyrings, or exit: with them in reach the command
-/// could read what they hold, or plant a key.
+/// could read what they hold, or plant a key. The outer stage, which stays
+/// outside the sandbox while the command runs and was started with the
+/// command's proxy token in its environment, is also made non-dumpable, so
+/// that from then on no process of the same user without `CAP_SYS_PTRACE`
+/// over its user namespace can read that environment through /proc; between
+/// its exec and this prologue, a few milliseconds, one can. Exec resets
+/// it: where the outer stage has no mounts of its own to manage it execs
+/// bubblewrap itself, by which time Codex's helper has taken the token out
+/// of its environment, and the bridges it forked first keep the token,
+/// non-dumpable.
 fn keep_sandbox_off_keyrings() {
     #[cfg(target_os = "linux")]
     if invoked_as_linux_sandbox() {
@@ -1026,7 +1217,28 @@ fn keep_sandbox_off_keyrings() {
             );
             std::process::exit(1);
         }
+        if !inner && let Err(e) = not_dumpable() {
+            crate::log_line!(
+                "atomic: cannot make the sandbox helper, which holds the command's proxy \
+                 token, non-dumpable: {e}"
+            );
+            std::process::exit(1);
+        }
     }
+}
+
+/// Make this process non-dumpable: its memory and the /proc files that show
+/// it, its environment among them, become unreadable to other processes of
+/// its user without `CAP_SYS_PTRACE` over its user namespace; its `cmdline`
+/// and `stat` stay readable.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn not_dumpable() -> std::io::Result<()> {
+    // SAFETY: PR_SET_DUMPABLE takes an integer and touches no memory.
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Confines an exec atom's command under Codex's Linux sandbox helper, as a
@@ -1034,16 +1246,43 @@ fn keep_sandbox_off_keyrings() {
 /// atomic's private state, which is denied as it is to turns (see
 /// [`denied_paths`]), and the private state of every other project under
 /// the same atomic home; only the command's own writable directories, such
-/// as its scratch directory, and the project's caches writable; no network
+/// as its scratch directory and its run's build caches, writable; no network
 /// and no sockets, unless its atom declares hosts, and then only those,
 /// through a proxy of atomic's own (see [`crate::network`]).
 /// The command still runs with exactly its environment, in its directory.
+#[cfg_attr(
+    not(feature = "exec-loopback-tests"),
+    doc = r#"
+Only a build with the `exec-loopback-tests` feature, for the sandbox suites,
+can let a command reach this machine's loopback interface. (rustdoc does not
+check the error code of a `compile_fail` test; the twin below, which runs
+with the feature, pins that this fails for want of the method.)
+
+```compile_fail,E0599
+fn widen(sandbox: atomic_core::codex::ExecSandbox) -> atomic_core::codex::ExecSandbox {
+    sandbox.reaching_loopback_for_tests(vec!["127.0.0.1".into()])
+}
+```
+"#
+)]
+#[cfg_attr(
+    feature = "exec-loopback-tests",
+    doc = r#"
+With the `exec-loopback-tests` feature, for the sandbox suites, a command
+may reach this machine's loopback interface:
+
+```
+fn widen(sandbox: atomic_core::codex::ExecSandbox) -> atomic_core::codex::ExecSandbox {
+    sandbox.reaching_loopback_for_tests(vec!["127.0.0.1".into()])
+}
+```
+"#
+)]
 #[derive(Clone, Debug)]
 pub struct ExecSandbox {
     helper: PathBuf,
     guard: StateGuard,
     codex_home: PathBuf,
-    also_writable: Vec<PathBuf>,
     /// The proxies that limit commands declaring network access to their
     /// hosts, shared by every command this sandbox confines.
     proxies: crate::network::Proxies,
@@ -1064,15 +1303,16 @@ impl ExecSandbox {
             helper,
             guard,
             codex_home,
-            also_writable: Vec::new(),
             proxies: crate::network::Proxies::default(),
             loopback_for_tests: Vec::new(),
         })
     }
 
     /// The same confinement, letting a command name `addrs`, loopback
-    /// addresses that atomic's policy refuses, as hosts. For tests that
-    /// serve on this machine; atomic never calls it.
+    /// addresses that atomic's policy refuses, as hosts, on any port. For
+    /// tests that serve on this machine; atomic never calls it, and only a
+    /// build with the `exec-loopback-tests` feature has it.
+    #[cfg(feature = "exec-loopback-tests")]
     #[doc(hidden)]
     pub fn reaching_loopback_for_tests(mut self, addrs: Vec<String>) -> Self {
         self.loopback_for_tests = addrs
@@ -1085,34 +1325,26 @@ impl ExecSandbox {
         self
     }
 
-    /// The same confinement, letting every command also write `dirs`, such
-    /// as the project's build and package caches.
-    pub fn also_writing(mut self, dirs: Vec<PathBuf>) -> Self {
-        self.also_writable = dirs;
-        self
-    }
-
-    /// The profile for a command that may write `writable`, except the
-    /// directories in `read_only` inside them.
+    /// The profile for a command run in `cwd` that may write `writable`,
+    /// except the directories in `read_only` inside them.
     fn profile(
         &self,
+        cwd: &Path,
         writable: &[PathBuf],
         read_only: &[PathBuf],
     ) -> anyhow::Result<PermissionProfile> {
         use codex_protocol::permissions::{
             FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry,
         };
-        let mut writes = writable.to_vec();
-        writes.extend(self.also_writable.iter().cloned());
         let base = permission_profile(
             crate::typed::Sandbox::ReadOnly,
             &self.guard,
             &self.codex_home,
-            None,
-            &writes,
+            Some(cwd),
+            writable,
         )?;
         let mut policy = base.file_system_sandbox_policy();
-        for dir in writable.iter().chain(&self.also_writable) {
+        for dir in writable {
             let dir = AbsolutePathBuf::from_absolute_path(dir)
                 .with_context(|| format!("resolve the writable directory {}", dir.display()))?;
             policy.entries.push(FileSystemSandboxEntry::new(
@@ -1140,13 +1372,23 @@ impl ExecSandbox {
 
 impl atomic_exec::Confine for ExecSandbox {
     /// As [`confine_held`](atomic_exec::Confine::confine_held), for a
-    /// command that declares no network: one that does needs its proxy
-    /// held while it runs, which this drops.
+    /// command that declares no network. One that does needs its proxy
+    /// held while it runs, which this would drop before the command
+    /// started, so it is refused.
     fn confine(
         &self,
         command: &atomic_exec::Command,
         tmp: &Path,
     ) -> Result<atomic_exec::Command, atomic_exec::ExecError> {
+        let declares_hosts = !command.network.is_empty();
+        if declares_hosts {
+            return Err(atomic_exec::ExecError::Start {
+                program: command.program.clone(),
+                message: "it declares hosts, so its proxy must be held while it runs; \
+                          confine it with confine_held"
+                    .into(),
+            });
+        }
         self.confine_held(command, tmp).map(|(command, _)| command)
     }
 
@@ -1176,7 +1418,7 @@ impl atomic_exec::Confine for ExecSandbox {
             )));
         }
         let profile = self
-            .profile(&command.writable, &command.read_only)
+            .profile(&command.cwd, &command.writable, &command.read_only)
             .and_then(|p| serde_json::to_string(&p).context("encode the sandbox profile"))
             .map_err(|e| fail(format!("{e:#}")))?;
         let cwd = text(&command.cwd)?;
@@ -1235,6 +1477,10 @@ impl atomic_exec::Confine for ExecSandbox {
                 .filter(|(k, v)| !command.env.iter().any(|(ck, cv)| ck == k && cv == v))
                 .collect();
             added.sort();
+            // The helper's outer stage already drops the proxy token from
+            // its environment before it starts the sandbox, so the command
+            // never inherits it (the sandbox suite's token test checks
+            // that); unsetting it here too keeps it out should that change.
             clear = [
                 "TMPDIR",
                 "PATH",
@@ -1672,6 +1918,43 @@ where
     .await
 }
 
+/// The instructions a Codex host declares for itself: none, and read from
+/// nowhere.
+///
+/// At the pinned rev Codex's own host provider reads `AGENTS.override.md` and
+/// then `AGENTS.md` straight out of the Codex home and sends them to every
+/// thread as global user instructions. atomic's Codex home is the project's
+/// state directory (see [`crate::state`]), so those files are not a
+/// checkout's; they are still input no atom declared, no pin recorded and
+/// nothing checked. An atom's inputs are what its file declares, so the host
+/// declares none: this answers "nothing" and opens no file doing it.
+struct NoHostInstructions;
+
+impl UserInstructionsProvider for NoHostInstructions {
+    fn load_user_instructions(&self) -> LoadInstructionsFuture<'_> {
+        Box::pin(std::future::ready(LoadedUserInstructions::default()))
+    }
+}
+
+/// Whether atomic needs a snapshot of the skills Codex finds in the host. It
+/// has no skill catalog of its own, so it needs none.
+///
+/// That answer is what `Feature::SkipHostSkillDiscovery` (`new_config`) acts
+/// on: Codex asks its installed skill contributors, and a registry with no
+/// contributor at all is taken for the old behavior of searching anyway
+/// (`ext/extension-api/src/registry.rs`). Answering here is the only way the
+/// feature reaches an atom's thread; with nothing discovered, a `$name` in a
+/// turn's text names no skill, so no `SKILL.md` of the checkout is loaded.
+const ATOMIC_NEEDS_HOST_SKILLS: bool = false;
+
+struct NoSkillCatalog;
+
+impl SkillInvocationContributor for NoSkillCatalog {
+    fn requires_host_skill_discovery(&self) -> bool {
+        ATOMIC_NEEDS_HOST_SKILLS
+    }
+}
+
 /// Conversation with asynchronous checks between turns. Each turn is
 /// admitted by `meter` before it is submitted and settled once after it.
 #[allow(clippy::too_many_arguments)] // each is one thing every thread needs
@@ -1797,11 +2080,16 @@ where
     let thread_store = ThreadStoreBuilder::from_config(&config, state_db.clone()).build();
     let environment_manager = Arc::new(local_environment(local_runtime_paths).await?);
     let installation_id = resolve_installation_id(&config.codex_home).await?;
-    let user_instructions_provider = Arc::new(CodexHomeUserInstructionsProvider::new(
-        config.codex_home.clone(),
-    ));
-    // No extensions: an atom's tools are the ones its file declares.
-    let extensions = ExtensionRegistryBuilder::<Config>::new();
+    // The host declares no instructions of its own, so it reads none from
+    // the Codex home (see [`NoHostInstructions`]).
+    let user_instructions_provider: Arc<dyn UserInstructionsProvider> =
+        Arc::new(NoHostInstructions);
+    // No extension gives a thread tools or context: an atom's tools are the
+    // ones its file declares. The one entry answers the question Codex asks
+    // before it searches the checkout for `.agents/skills` (see
+    // [`ATOMIC_NEEDS_HOST_SKILLS`]).
+    let mut extensions = ExtensionRegistryBuilder::<Config>::new();
+    extensions.skill_invocation_contributor(Arc::new(NoSkillCatalog));
     let startup = codex_core_api::build_startup_models(
         &config,
         Arc::clone(&auth_manager),
@@ -1847,6 +2135,7 @@ where
                 model: endpoint.model.clone(),
                 input_bound: None,
                 turn: true,
+                work: false,
             })
             .await
         {
@@ -1869,12 +2158,16 @@ where
             seen,
             recorded: seen,
             records: 0,
-            warned: false,
+            warnings: 0,
+            said: None,
         };
         let (turn, progress) = span
             .run(run_turn(&thread, &current, limit.time, &mut recorder))
             .await;
         if let (Err(e), Some(span)) = (&turn, span.span()) {
+            // What this turn says of itself, for this step's span and its
+            // run's, which never hear this error (see [`crate::usage::Why`]).
+            crate::usage::note_step_failure(e);
             crate::usage::record_error(&span, e);
         }
         let totals = progress.totals(seen);
@@ -1942,6 +2235,26 @@ where
     let outcome = outcome?;
     shutdown_result.context("shut down Codex thread")?;
     Ok(outcome)
+}
+
+/// Codex finds repository instructions on its own: it walks up from a
+/// thread's working directory to the project root and, in each directory on
+/// the way, reads the first file it finds named `AGENTS.override.md` or
+/// `AGENTS.md` (a configured fallback name next, and atomic configures
+/// none), sending their text to the model as user instructions. An
+/// atom's inputs are what its file declares, so no thread atomic starts gets
+/// any of that text: a checkout's or worktree's instruction files are
+/// untrusted input that nothing has pinned or recorded the provenance of. At
+/// the pinned rev Codex stops discovery on either of the two values below
+/// (`core/src/agents_md.rs`), so both are set: a zero-byte project-doc budget,
+/// and the project explicitly untrusted. Repository skills and the Codex
+/// home's own instruction file come to Codex by other routes and are switched
+/// off there: `new_config` sets `Feature::SkipHostSkillDiscovery`, which acts
+/// on the answer in [`ATOMIC_NEEDS_HOST_SKILLS`], and [`NoHostInstructions`]
+/// replaces Codex's host provider. With nothing read, a step's repair and
+/// resume turns see the same instructions as its first.
+fn no_repository_instructions() -> (usize, Option<TrustLevel>) {
+    (0, Some(TrustLevel::Untrusted))
 }
 
 async fn new_config(
@@ -2027,6 +2340,10 @@ async fn new_config(
         }
     };
     model_providers.insert(model_provider_id.clone(), model_provider.clone());
+
+    // Codex finds a checkout's or worktree's own instruction files unless
+    // both these say otherwise (see [`no_repository_instructions`]).
+    let (project_doc_max_bytes, project_trust) = no_repository_instructions();
 
     let mut config = Config {
         application_network_policy: Default::default(),
@@ -2125,7 +2442,7 @@ async fn new_config(
         mcp_oauth_callback_url: None,
         mcp_optional_startup_grace: std::time::Duration::from_secs(1),
         model_providers,
-        project_doc_max_bytes: 32 * 1024,
+        project_doc_max_bytes,
         project_doc_fallback_filenames: Vec::new(),
         tool_output_token_limit: None,
         agents_enabled: true,
@@ -2197,7 +2514,9 @@ async fn new_config(
 
         runtime_feature_defaults: Default::default(),
         suppress_unstable_features_warning: false,
-        active_project: ProjectConfig { trust_level: None },
+        active_project: ProjectConfig {
+            trust_level: project_trust,
+        },
         notices: Notice::default(),
         check_for_update_on_startup: false,
         disable_paste_burst: false,
@@ -2226,6 +2545,18 @@ async fn new_config(
             .set_enabled(*feature, false)
             .with_context(|| format!("turn off Codex feature {feature:?}"))?;
     }
+    // Codex would otherwise search every directory from the project root down
+    // to the thread's working directory for a `.agents/skills/` folder and
+    // load each skill it finds there, with neither the project's trust level
+    // nor the instruction budget in the way (`ext/skills/src/host_roots.rs`).
+    // A `$name` in a turn's text then sends that skill's `SKILL.md` to the
+    // model. The feature stops that search once Codex has asked whether
+    // anything needs the host's skills, which is what the one contributor
+    // registered in `converse_async` answers (see [`ATOMIC_NEEDS_HOST_SKILLS`]).
+    config
+        .features
+        .set_enabled(Feature::SkipHostSkillDiscovery, true)
+        .context("skip the checkout's skills")?;
     // AuthManager and MCP both derive their credential backend from Config.
     config.features.set_enabled(
         Feature::SecretAuthStorage,
@@ -2429,6 +2760,11 @@ impl Progress {
     }
 }
 
+/// Where a running turn sends a line it has to say: production gives the
+/// recorder none, and the line goes to the log; a test gives it one and
+/// reads the line back.
+type Said = Arc<dyn Fn(&str) + Send + Sync>;
+
 /// Where a running turn's reported usage is recorded as it grows, so that a
 /// turn whose process is stopped or killed before it settles stays charged
 /// at least what it reported (see [`crate::usage::Meter::progress`]).
@@ -2441,8 +2777,12 @@ struct ProgressLog<'a> {
     recorded: (i64, i64),
     /// How many times it recorded.
     records: u32,
-    /// Whether a record failed, and was said to.
-    warned: bool,
+    /// How many times a failed record was said to, which is at most once a
+    /// turn. Counted rather than flagged, so that a second one trying to
+    /// follow the first is visible to a test instead of merely unseen.
+    warnings: u32,
+    /// Where what it says goes (see [`Said`]).
+    said: Option<Said>,
 }
 
 /// How long a turn waits on one record of its progress before it goes on
@@ -2489,29 +2829,51 @@ impl ProgressLog<'_> {
                     ));
                 }
             }
-            failed if !self.warned => {
-                self.warned = true;
+            failed if self.warnings == 0 => {
+                self.warnings += 1;
                 let why = match failed {
                     Ok(Err(e)) => e.to_string(),
                     _ => format!("the store did not answer within {PROGRESS_PATIENCE:?}"),
                 };
-                // The meter's request id is `<run>:<step>:<call>`.
                 let (run, request) = match self.ticket {
-                    Some(t) => (
-                        t.request.rsplitn(3, ':').nth(2).unwrap_or(&t.request),
-                        t.request.as_str(),
-                    ),
+                    Some(t) => (run_of_request(&t.request), t.request.as_str()),
                     None => ("?", "?"),
                 };
-                crate::log_line!(
-                    "run {run}: a Codex turn's usage so far was not recorded for request \
-                     {request} ({why}); until it is, a stop before the turn settles leaves it \
-                     charged at its last record"
-                );
+                let line = progress_warning(run, request, &why, self.records > 0);
+                match &self.said {
+                    Some(said) => said(&line),
+                    None => crate::log_line!("{line}"),
+                }
             }
             _ => {}
         }
     }
+}
+
+/// The run a meter's request id names. The ledger meter in the `atomic`
+/// binary makes each one as `<run>:<step>:<call>`, so the run is what is
+/// left after two fields are cut off the end: a run's id may itself hold
+/// colons. An id of any other shape names no run and is said as it is.
+fn run_of_request(request: &str) -> &str {
+    request.rsplitn(3, ':').nth(2).unwrap_or(request)
+}
+
+/// What a turn says when a record of its progress fails. `recorded` is
+/// whether any record of it was ever written: with none, a stop before the
+/// turn settles leaves it charged what its admission reserved, and only
+/// with one is there a last record to be charged at (see
+/// [`ProgressLog::note`]).
+fn progress_warning(run: &str, request: &str, why: &str, recorded: bool) -> String {
+    let charged = if recorded {
+        "charged at its last record"
+    } else {
+        "charged at the whole bound its request reserved"
+    };
+    format!(
+        "run {run}: a Codex turn's usage so far was not recorded for request \
+         {request} ({why}); until it is, a stop before the turn settles leaves \
+         it {charged}"
+    )
 }
 
 /// Run one turn, cut off after `time` if one is given, recording its
@@ -2780,6 +3142,94 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_second_mount_that_cannot_be_denied_refuses_the_list() {
+        let dir = scratch("second-mounts");
+        let codex = dir.join("codex");
+        for d in [&codex, &dir.join("home/.aws")] {
+            std::fs::create_dir_all(d).expect("dir");
+        }
+        let private = PrivateState {
+            state_dir: dir.join("state"),
+            private: dir.join("private"),
+            also: vec![dir.join("home/.aws")],
+        };
+        let real = std::fs::canonicalize(&dir).expect("real");
+        let rel = real.strip_prefix("/").expect("absolute");
+        // The whole filesystem bound again at `at`.
+        let bound = |at: &str| {
+            format!("1 0 8:1 / / rw - ext4 /dev/sda1 rw\n2 1 8:1 / {at} rw - ext4 /dev/sda1 rw\n")
+        };
+        let refused = |table: String, cwd: Option<&Path>, writable: &[PathBuf]| {
+            let _table = crate::mounts::with_table(table.as_bytes());
+            denied_paths(&private, &codex, cwd, writable)
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default()
+        };
+        // Bound where nothing needs it: denied there too, with Codex's
+        // databases.
+        {
+            let _table = crate::mounts::with_table(bound("/again").as_bytes());
+            let (denied, globs) = denied_paths(&private, &codex, None, &[]).expect("denied");
+            assert!(
+                denied.contains(&Path::new("/again").join(rel).join("home/.aws")),
+                "{denied:?}"
+            );
+            assert!(
+                globs.contains(&format!("/again/{}/codex/*.sqlite*", rel.display())),
+                "{globs:?}"
+            );
+        }
+        // Where its second mount would cover the thread's directory.
+        let cwd = Path::new("/again").join(rel).join("home/.aws/work");
+        let message = refused(bound("/again"), Some(&cwd), &[]);
+        assert!(
+            message.contains("is a second mount") && message.contains("which they need"),
+            "{message}"
+        );
+        // Where it lies two levels inside a directory the thread may write.
+        let message = refused(bound("/w/a"), None, &[PathBuf::from("/w")]);
+        assert!(
+            message.contains("is a second mount") && message.contains("two or more levels"),
+            "{message}"
+        );
+        // Codex's home bound two levels inside a writable directory: its
+        // databases' pattern there is held to the same checks.
+        let codex_real = std::fs::canonicalize(&codex).expect("real");
+        let message = refused(
+            format!(
+                "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n2 1 8:1 {} /w/a/b rw - ext4 /dev/sda1 rw\n",
+                codex_real.display()
+            ),
+            None,
+            &[PathBuf::from("/w")],
+        );
+        assert!(
+            message.contains("/w/a/b is a second mount") && message.contains("two or more levels"),
+            "{message}"
+        );
+        // Too many second mounts of Codex's home alone: they count too.
+        let mut many = String::from("1 0 8:1 / / rw - ext4 /dev/sda1 rw\n");
+        for i in 0..=MAX_LINK_TARGETS {
+            many.push_str(&format!(
+                "{} 1 8:1 {} /h{i} rw - ext4 /dev/sda1 rw\n",
+                i + 2,
+                codex_real.display()
+            ));
+        }
+        let message = refused(many, None, &[]);
+        assert!(message.contains("other places, more than"), "{message}");
+        // Too many second mounts to deny.
+        let mut many = String::from("1 0 8:1 / / rw - ext4 /dev/sda1 rw\n");
+        for i in 0..=MAX_LINK_TARGETS {
+            many.push_str(&format!("{} 1 8:1 / /m{i} rw - ext4 /dev/sda1 rw\n", i + 2));
+        }
+        let message = refused(many, None, &[]);
+        assert!(message.contains("other places, more than"), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn nothing_runs_when_a_denial_would_cover_what_commands_need_or_may_write() {
         let dir = scratch("covering");
         let home = dir.join("home");
@@ -2805,11 +3255,20 @@ mod tests {
         let project = home.join("project");
         assert!(refused(vec![home.clone()], Some(&project), &[]).contains("need"));
         assert!(refused(vec![dir.clone()], None, &[]).contains("need"));
-        // A secret linked into a directory the thread may write.
-        std::fs::write(work.join("creds"), "x").expect("creds");
-        link(&work.join("creds"), &home.join(".aws/credentials"));
+        // A secret linked two levels into a directory the thread may write,
+        // where a command could rename the directory above it; directly
+        // inside, the sandbox's mount on it cannot be moved.
+        std::fs::create_dir_all(work.join("deep")).expect("deep");
+        std::fs::write(work.join("deep/creds"), "x").expect("creds");
+        link(&work.join("deep/creds"), &home.join(".aws/credentials"));
         let message = refused(vec![home.join(".aws")], None, std::slice::from_ref(&work));
         assert!(message.contains("may write"), "{message}");
+        std::fs::write(work.join("creds"), "x").expect("creds");
+        link(&work.join("creds"), &home.join(".aws/credentials"));
+        assert_eq!(
+            refused(vec![home.join(".aws")], None, std::slice::from_ref(&work)),
+            ""
+        );
         // Too many links to follow.
         std::fs::remove_file(home.join(".aws/credentials")).expect("unlink");
         let many = home.join(".kube");
@@ -2818,9 +3277,132 @@ mod tests {
         for i in 0..=MAX_LINK_TARGETS {
             link(&dir.join("one"), &many.join(format!("l{i}")));
         }
-        assert!(refused(vec![many], None, &[]).contains("links"));
+        assert!(refused(vec![many.clone()], None, &[]).contains("links"));
+        // Links inside the place they are in count for nothing.
+        std::fs::remove_dir_all(&many).expect("unlink");
+        std::fs::create_dir_all(&many).expect("kube");
+        std::fs::write(many.join("one"), "x").expect("one");
+        for i in 0..=MAX_LINK_TARGETS {
+            link(&many.join("one"), &many.join(format!("l{i}")));
+        }
+        assert_eq!(refused(vec![many.clone()], None, &[]), "");
+        // A place inside a directory the thread may write could be moved
+        // away from its denial; a link inside a place, to the place, is
+        // no reason to refuse.
+        link(&home.join(".aws"), &home.join(".aws/current"));
+        let message = refused(vec![home.join(".aws")], None, std::slice::from_ref(&dir));
+        assert!(message.contains("may write"), "{message}");
+        // With the home itself the working directory a turn may write, as a
+        // project at the home's top is, its places directly inside stay.
+        assert_eq!(
+            refused(vec![home.join(".aws")], None, std::slice::from_ref(&home)),
+            ""
+        );
+        std::fs::remove_file(home.join(".aws/current")).expect("unlink");
         // And the same places, safely, run.
         assert_eq!(refused(vec![home.join(".aws")], Some(&project), &[]), "");
+        // A refusal is the machine's, not the model's.
+        let private = PrivateState {
+            state_dir: dir.join("state"),
+            private: dir.join("private"),
+            also: vec!["/".into()],
+        };
+        let refusal = denied_paths(&private, &codex, None, &[]).expect_err("refused");
+        assert!(refusal.downcast_ref::<DenyRefused>().is_some(), "{refusal}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pipe_is_denied_and_only_programs_devices_and_others_directories_are_left() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("pipes");
+        let home = dir.join("home");
+        std::fs::create_dir_all(home.join(".ssh")).expect("ssh");
+        std::fs::create_dir_all(dir.join("codex")).expect("codex home");
+        let fifo = home.join(".netrc");
+        let _ = std::fs::remove_file(&fifo);
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo");
+        assert!(made.success());
+        // A program of the person's, a key and a directory elsewhere.
+        std::fs::create_dir_all(dir.join("tools")).expect("tools");
+        std::fs::write(dir.join("tools/python3"), "#!/bin/sh\n").expect("program");
+        std::fs::set_permissions(
+            dir.join("tools/python3"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("mode");
+        std::fs::write(dir.join("key"), "x").expect("key");
+        link(&dir.join("tools/python3"), &home.join(".ssh/bin/python3"));
+        link(&dir.join("key"), &home.join(".ssh/id"));
+        // Files with an execute bit that are no programs, as on a file
+        // system that marks everything executable: one found by the walk,
+        // and one a credential place itself links to.
+        for name in ["marked-key", "marked-pgpass"] {
+            std::fs::write(dir.join(name), "machine example.com password x\n").expect("file");
+            std::fs::set_permissions(dir.join(name), std::fs::Permissions::from_mode(0o777))
+                .expect("mode");
+        }
+        link(&dir.join("marked-key"), &home.join(".ssh/marked"));
+        link(&dir.join("marked-pgpass"), &home.join(".pgpass"));
+        // A credential place that links to a program is still denied.
+        link(&dir.join("tools/python3"), &home.join(".vault-token"));
+        let private = PrivateState {
+            state_dir: dir.join("state"),
+            private: dir.join("private"),
+            also: vec![
+                fifo.clone(),
+                home.join(".ssh"),
+                home.join(".pgpass"),
+                home.join(".vault-token"),
+            ],
+        };
+        let (denied, _) = denied_paths(&private, &dir.join("codex"), None, &[]).expect("denied");
+        assert!(denied.contains(&fifo), "{denied:?}");
+        let real = |p: &Path| std::fs::canonicalize(p).expect("real");
+        assert!(denied.contains(&real(&dir.join("key"))), "{denied:?}");
+        for marked in ["marked-key", "marked-pgpass"] {
+            assert!(
+                denied.contains(&real(&dir.join(marked))),
+                "{marked}: {denied:?}"
+            );
+        }
+        // Found by the walk, the program is left; linked to by a credential
+        // place, it is denied.
+        assert!(
+            denied.contains(&real(&dir.join("tools/python3"))),
+            "{denied:?}"
+        );
+        assert!(!deniable(&real(&dir.join("tools/python3")), false));
+        // Whoever owns them: what the system keeps outside its program and
+        // device directories, such as a cluster's credentials under /etc.
+        assert!(
+            Path::new("/etc/hostname").is_file(),
+            "a file the system keeps"
+        );
+        assert!(deniable(Path::new("/etc/hostname"), false));
+        assert!(!deniable(Path::new("/usr/bin/env"), false));
+        assert!(!deniable(Path::new("/dev/null"), true));
+        // A directory someone else owns, found by the walk, stays; one a
+        // credential place links to is denied, but for the system's own.
+        if crate::state::effective_uid() != 0 {
+            assert!(
+                !deniable(Path::new("/etc"), false),
+                "root's, found by the walk"
+            );
+        }
+        assert!(!deniable(Path::new("/etc"), true), "the system's own");
+        // A directory under them that a credential place links to, such as
+        // a cluster's, is denied whoever owns it.
+        if Path::new("/etc/ssl").is_dir() {
+            let ssl = std::fs::canonicalize("/etc/ssl").expect("real");
+            if !SYSTEM_PREFIXES.iter().any(|p| ssl.starts_with(p)) {
+                assert!(deniable(&ssl, true), "{ssl:?}");
+            }
+        }
+        assert!(!deniable(Path::new("/"), true), "the root");
     }
 
     #[cfg(unix)]
@@ -3000,6 +3582,24 @@ mod tests {
         d
     }
 
+    /// A scratch directory this call alone has: named by a counter and the
+    /// clock as well as the pid, and made with `create_dir`, so a second run
+    /// says so instead of planting its canaries where the first left them.
+    fn scratch_once(tag: &str) -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let d = std::env::temp_dir().join(format!(
+            "atomic-codex-{tag}-{}-{n}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&d).expect("this test's own scratch directory");
+        d
+    }
+
     /// Codex runs on threads with large stacks, as its entry point sets up.
     fn on_codex_runtime<F: std::future::Future<Output = ()> + Send + 'static>(f: F) {
         const STACK: usize = 16 * 1024 * 1024;
@@ -3049,6 +3649,233 @@ mod tests {
         });
     }
 
+    /// The configuration every Codex thread is started with leaves Codex's
+    /// own repository-instruction discovery switched off, on both of the
+    /// settings Codex gates it on.
+    #[test]
+    fn no_threads_configuration_discovers_repository_instructions() {
+        on_codex_runtime(async {
+            let home = scratch("home-docs");
+            let endpoint = ModelEndpoint {
+                base_url: "http://127.0.0.1:9/unused".into(),
+                model: "synthetic".into(),
+                api_key_env: None,
+                sign_in: None,
+            };
+            let config = new_config(&endpoint, &home, &home, Arg0DispatchPaths::default())
+                .await
+                .expect("config");
+            assert_eq!(config.project_doc_max_bytes, 0);
+            assert_eq!(
+                config.active_project.trust_level,
+                Some(TrustLevel::Untrusted),
+                "an unset trust level still lets Codex read the project's docs"
+            );
+            assert!(
+                config.features.enabled(Feature::SkipHostSkillDiscovery),
+                "without it Codex searches the checkout for `.agents/skills`"
+            );
+        });
+    }
+
+    /// A turn whose working directory is inside a checkout sees none of the
+    /// instruction files lying about it: not the `AGENTS.md` at the project
+    /// root Codex walks up to, nor the `AGENTS.override.md` in the turn's own
+    /// directory, which is the one Codex would read there. Both are there to
+    /// be seen: the turn runs twice, as a step's repair and resume turns do,
+    /// and neither request holds either.
+    #[test]
+    fn a_turn_is_sent_no_instruction_file_of_the_checkout_it_runs_in() {
+        on_codex_runtime(async {
+            let dir = scratch_once("ambient-docs");
+            let (root, nested) = (dir.join("repo"), dir.join("repo/sub"));
+            for d in [&root, &nested] {
+                std::fs::create_dir_all(d).expect("directory");
+            }
+            // A project root, so Codex walks up from the turn's directory to
+            // it, as it does in a checkout or a worktree.
+            std::fs::create_dir(root.join(".git")).expect("the project root's marker");
+            std::fs::write(root.join("AGENTS.md"), "AMBIENT-CANARY-ROOT").expect("root doc");
+            // In one directory Codex reads the first of these two names, so
+            // this is the file its own directory would contribute.
+            std::fs::write(nested.join("AGENTS.override.md"), "AMBIENT-CANARY-OVERRIDE")
+                .expect("the local override");
+            let model = FakeModel::start(vec![Reply::Text("pong".into()); 2])
+                .await
+                .expect("fake model");
+            let home = dir.join("codex");
+            std::fs::create_dir_all(&home).expect("codex home");
+            let endpoint = ModelEndpoint {
+                base_url: model.base_url(),
+                model: "synthetic".into(),
+                api_key_env: None,
+                sign_in: None,
+            };
+            let first = TurnSpec {
+                prompt: "ping".into(),
+                ..TurnSpec::default()
+            };
+            let mut turns = 0;
+            let (last, report) = converse(
+                &CodexPaths::without_helpers(),
+                &home,
+                &nested,
+                &endpoint,
+                &StateGuard::NoProjectState,
+                &first,
+                |answer| {
+                    assert_eq!(answer, "pong");
+                    turns += 1;
+                    (turns < 2).then(|| TurnSpec {
+                        prompt: "again".into(),
+                        ..TurnSpec::default()
+                    })
+                },
+            )
+            .await
+            .expect("both turns");
+            assert_eq!(last, "pong");
+            assert_eq!(report.turns, 2, "the thread ran both turns");
+            let requests = model.requests();
+            assert_eq!(requests.len(), 2, "requests: {requests:#?}");
+            for (i, request) in requests.iter().enumerate() {
+                let sent = request.to_string();
+                // Each request is there to read: its own prompt is in it.
+                assert!(
+                    sent.contains(if i == 0 { "ping" } else { "again" }),
+                    "turn {i}: {sent}"
+                );
+                for canary in ["AMBIENT-CANARY-ROOT", "AMBIENT-CANARY-OVERRIDE"] {
+                    assert!(
+                        !sent.contains(canary),
+                        "turn {i} was sent repository instructions: {canary} is in {sent}"
+                    );
+                }
+            }
+        });
+    }
+
+    /// Nor any skill of that checkout. Pinned Codex loads
+    /// `<dir>/.agents/skills/*/SKILL.md` from every directory between the
+    /// project root and the thread's working directory, gated by neither the
+    /// project's trust level nor the instruction budget, and a `$name` in a
+    /// turn's text then sends that skill's `SKILL.md` to the model. The
+    /// mention is in the prompt, so the request would show the skill's text
+    /// beside it; it shows none.
+    #[test]
+    fn a_turn_is_sent_no_skill_of_the_checkout_it_runs_in() {
+        on_codex_runtime(async {
+            let dir = scratch_once("ambient-skills");
+            let (root, cwd) = (dir.join("repo"), dir.join("repo/sub"));
+            for d in [&root, &cwd] {
+                std::fs::create_dir_all(d).expect("directory");
+            }
+            std::fs::create_dir(root.join(".git")).expect("the project root's marker");
+            let skill = root.join(".agents/skills/canary-skill");
+            std::fs::create_dir_all(&skill).expect("skill directory");
+            std::fs::write(
+                skill.join("SKILL.md"),
+                "---\nname: canary-skill\ndescription: Say hello, once.\n---\n\n\
+                 AMBIENT-SKILL-CANARY say hello and nothing else\n",
+            )
+            .expect("SKILL.md");
+            let model = FakeModel::start(vec![Reply::Text("pong".into())])
+                .await
+                .expect("fake model");
+            let home = dir.join("codex");
+            std::fs::create_dir_all(&home).expect("codex home");
+            let endpoint = ModelEndpoint {
+                base_url: model.base_url(),
+                model: "synthetic".into(),
+                api_key_env: None,
+                sign_in: None,
+            };
+            let (answer, report) = converse(
+                &CodexPaths::without_helpers(),
+                &home,
+                &cwd,
+                &endpoint,
+                &StateGuard::NoProjectState,
+                &TurnSpec {
+                    prompt: "run $canary-skill for ping".into(),
+                    ..TurnSpec::default()
+                },
+                |_| None,
+            )
+            .await
+            .expect("one turn");
+            assert_eq!(answer, "pong");
+            assert_eq!(report.turns, 1, "the thread ran its one turn");
+            let requests = model.requests();
+            assert_eq!(requests.len(), 1, "requests: {requests:#?}");
+            let sent = requests[0].to_string();
+            // The request is there to read, and so is the mention in it.
+            assert!(sent.contains("$canary-skill"), "{sent}");
+            assert!(
+                !sent.contains("AMBIENT-SKILL-CANARY"),
+                "the turn was sent a repository skill: AMBIENT-SKILL-CANARY is in {sent}"
+            );
+        });
+    }
+
+    /// Nor the Codex home's own instruction file. The home is atomic's
+    /// per-project state directory, so it is not a checkout's path, but
+    /// pinned Codex reads `AGENTS.override.md` and `AGENTS.md` there as global
+    /// instructions for every thread it starts, and an atom's inputs are only
+    /// what its file declares. The host declares none: it reads nothing, so a
+    /// file planted in the home reaches no model.
+    #[test]
+    fn a_turn_is_sent_no_instruction_file_of_the_codex_home() {
+        on_codex_runtime(async {
+            let dir = scratch_once("home-instructions");
+            let (home, cwd) = (dir.join("codex"), dir.join("work"));
+            std::fs::create_dir_all(&home).expect("codex home");
+            std::fs::create_dir_all(&cwd).expect("working directory");
+            std::fs::write(
+                home.join("AGENTS.override.md"),
+                "AMBIENT-HOME-CANARY-OVERRIDE",
+            )
+            .expect("the override Codex reads first");
+            std::fs::write(home.join("AGENTS.md"), "AMBIENT-HOME-CANARY").expect("AGENTS.md");
+            let model = FakeModel::start(vec![Reply::Text("pong".into())])
+                .await
+                .expect("fake model");
+            let endpoint = ModelEndpoint {
+                base_url: model.base_url(),
+                model: "synthetic".into(),
+                api_key_env: None,
+                sign_in: None,
+            };
+            let (answer, report) = converse(
+                &CodexPaths::without_helpers(),
+                &home,
+                &cwd,
+                &endpoint,
+                &StateGuard::NoProjectState,
+                &TurnSpec {
+                    prompt: "ping".into(),
+                    ..TurnSpec::default()
+                },
+                |_| None,
+            )
+            .await
+            .expect("one turn");
+            assert_eq!(answer, "pong");
+            assert_eq!(report.turns, 1, "the thread ran its one turn");
+            let requests = model.requests();
+            assert_eq!(requests.len(), 1, "requests: {requests:#?}");
+            let sent = requests[0].to_string();
+            // The request is there to read: its prompt is in it.
+            assert!(sent.contains("ping"), "{sent}");
+            for canary in ["AMBIENT-HOME-CANARY-OVERRIDE", "AMBIENT-HOME-CANARY"] {
+                assert!(
+                    !sent.contains(canary),
+                    "the turn was sent the Codex home's instructions: {canary} is in {sent}"
+                );
+            }
+        });
+    }
+
     /// Codex sends TurnComplete before it marks the thread idle; a follow-up
     /// submitted in that window must wait, not fail as NotIdle.
     #[test]
@@ -3095,7 +3922,7 @@ mod tests {
     /// An exec command, confined, is the sandbox helper running `env -i`
     /// with exactly the command's environment, then the command: its
     /// profile denies atomic's private state and lets it write only its own
-    /// directories and the project's caches.
+    /// directories and those it is given, such as its run's caches.
     #[test]
     fn an_exec_command_is_confined_under_the_sandbox_helper() {
         use atomic_exec::Confine;
@@ -3111,9 +3938,7 @@ mod tests {
             private: state.join("private"),
             also: vec![state.join("keys")],
         });
-        let sandbox = ExecSandbox::new(&paths, guard, state.join("codex"))
-            .expect("a helper")
-            .also_writing(vec![state.join("cache")]);
+        let sandbox = ExecSandbox::new(&paths, guard, state.join("codex")).expect("a helper");
         let tmp = state.join("scratch/.tmp");
         let confined = sandbox
             .confine(
@@ -3122,7 +3947,7 @@ mod tests {
                     args: vec!["-c".into(), "true".into()],
                     cwd: state.clone(),
                     env: vec![("HOME".into(), scratch_dir.display().to_string())],
-                    writable: vec![scratch_dir.clone()],
+                    writable: vec![scratch_dir.clone(), state.join("cache/run-1")],
                     ..Default::default()
                 },
                 &tmp,
@@ -3156,13 +3981,47 @@ mod tests {
                 "{denied:?}: {text}"
             );
         }
-        for writable in [&scratch_dir, &state.join("cache")] {
+        // Its scratch and its run's caches, as the command names them.
+        for writable in [&scratch_dir, &state.join("cache/run-1")] {
             assert!(
                 text.contains(&writable.display().to_string()),
                 "{writable:?}: {text}"
             );
         }
         assert!(text.contains("restricted"), "no network: {text}");
+    }
+
+    /// A command that declares hosts is confined only with its proxy held:
+    /// `confine`, which would drop the proxy before the command starts,
+    /// refuses it, and `confine_held` routes it to the proxy and hands back
+    /// the hold.
+    #[test]
+    fn a_command_with_hosts_is_confined_only_with_its_proxy_held() {
+        use atomic_exec::Confine;
+        let state = scratch("exec-held");
+        let paths = CodexPaths::with_helpers(
+            PathBuf::from("/opt/atomic"),
+            PathBuf::from("/opt/bin/codex-linux-sandbox"),
+        );
+        let sandbox = ExecSandbox::new(&paths, StateGuard::NoProjectState, state.join("codex"))
+            .expect("a helper");
+        let command = atomic_exec::Command {
+            program: "sh".into(),
+            cwd: state.clone(),
+            network: vec!["allowed.invalid".into()],
+            ..Default::default()
+        };
+        let error = sandbox
+            .confine(&command, &state)
+            .expect_err("its proxy would stop before it starts");
+        assert!(error.to_string().contains("confine_held"), "{error}");
+        let (confined, held) = sandbox.confine_held(&command, &state).expect("confined");
+        assert!(held.is_some(), "the proxy is held");
+        assert!(
+            confined.args.iter().any(|a| a == "--managed-network"),
+            "{:?}",
+            confined.args
+        );
     }
 
     /// However many projects the atomic home holds, their private state is
@@ -3670,6 +4529,7 @@ mod tests {
                     admitted: std::time::Instant::now(),
                     limit: self.limit,
                     bounded_by: None,
+                    release: crate::usage::Release::default(),
                 })
             })
         }
@@ -3724,7 +4584,20 @@ mod tests {
             admitted: std::time::Instant::now(),
             limit: Limit::default(),
             bounded_by: None,
+            release: crate::usage::Release::default(),
         }
+    }
+
+    /// A sink for a [`ProgressLog`] to say its warnings into, and the lines
+    /// it keeps: a test hands the sink to a recorder as `said` and reads
+    /// back what it wrote, instead of what reached the log.
+    fn warning_sink() -> (Said, Arc<std::sync::Mutex<Vec<String>>>) {
+        let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = {
+            let lines = lines.clone();
+            move |line: &str| lines.lock().expect("said").push(line.to_owned())
+        };
+        (Arc::new(sink), lines)
     }
 
     #[tokio::test]
@@ -3736,13 +4609,15 @@ mod tests {
         });
         let metering = Metering::new(meter.clone());
         let ticket = progress_ticket();
+        let (sink, said) = warning_sink();
         let mut log = ProgressLog {
             meter: &metering,
             ticket: Some(&ticket),
             seen: (0, 0),
             recorded: (0, 0),
             records: 0,
-            warned: false,
+            warnings: 0,
+            said: Some(sink),
         };
         let grown = Progress {
             usage: Some((3, 2, 5)),
@@ -3751,15 +4626,72 @@ mod tests {
         // A failed record does not advance, so the next token event, though
         // it reports nothing new, tries it again; the failure is said once.
         log.note(&grown).await;
-        assert_eq!((log.recorded, log.records, log.warned), ((0, 0), 0, true));
+        assert_eq!((log.recorded, log.records, log.warnings), ((0, 0), 0, 1));
         log.note(&grown).await;
         assert_eq!(meter.records.load(SeqCst), 2);
-        assert_eq!((log.recorded, log.records), ((0, 0), 0));
+        assert_eq!((log.recorded, log.records, log.warnings), ((0, 0), 0, 1));
+        // What was written, not what was meant: two failures asked for, one
+        // line said. Drop the guard that says it once and this is two.
+        let lines = said.lock().expect("said").clone();
+        assert_eq!(lines.len(), 1, "said once, of two failures: {lines:?}");
+        // Nothing was recorded, so a stop would charge the reservation, and
+        // the line names it instead of a record that does not exist.
+        assert!(lines[0].contains("reserved"), "{lines:?}");
+        assert!(!lines[0].contains("last record"), "{lines:?}");
+        // The run it names is the run the request id belongs to.
+        assert!(lines[0].starts_with("run run-1: "), "{lines:?}");
         // Written, it advances; with nothing new, nothing is asked again.
         log.note(&grown).await;
         assert_eq!((log.recorded, log.records), ((3, 2), 1));
         log.note(&grown).await;
         assert_eq!(meter.records.load(SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn a_progress_warning_of_a_turn_that_had_recorded_names_its_last_record() {
+        let meter = Arc::new(Flaky {
+            failing: 1.into(),
+            ..Flaky::default()
+        });
+        let metering = Metering::new(meter.clone());
+        let ticket = progress_ticket();
+        let (sink, said) = warning_sink();
+        let mut log = ProgressLog {
+            meter: &metering,
+            ticket: Some(&ticket),
+            seen: (0, 0),
+            recorded: (3, 2),
+            records: 1,
+            warnings: 0,
+            said: Some(sink),
+        };
+        // One record is kept, the turn reports more, and the store refuses
+        // it: what a stop would charge is that last record, not a bound a
+        // record was meant to replace.
+        log.note(&Progress {
+            usage: Some((5, 4, 9)),
+            ..Progress::default()
+        })
+        .await;
+        let lines = said.lock().expect("said").clone();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("last record"), "{lines:?}");
+        assert!(!lines[0].contains("reserved"), "{lines:?}");
+        assert_eq!((log.recorded, log.records), ((3, 2), 1));
+    }
+
+    #[test]
+    fn the_run_a_request_id_names_keeps_the_colons_it_has() {
+        // The ledger meter makes every request id `<run>:<step>:<call>`, so
+        // only the last two fields are cut off (see `metering` in the
+        // `atomic` binary).
+        assert_eq!(run_of_request("run-1:2:0"), "run-1");
+        assert_eq!(run_of_request("wf:7:ab:2:0"), "wf:7:ab");
+        // An id of any other shape names no run and is said as it is, as
+        // the ids of a meter that keeps nothing between admit and settle.
+        assert_eq!(run_of_request("r:0"), "r:0");
+        assert_eq!(run_of_request("0"), "0");
+        assert_eq!(run_of_request(""), "");
     }
 
     #[tokio::test]
@@ -3776,7 +4708,8 @@ mod tests {
             seen: (0, 0),
             recorded: (0, 0),
             records: 0,
-            warned: false,
+            warnings: 0,
+            said: None,
         };
         let started = std::time::Instant::now();
         log.note(&Progress {
@@ -3789,7 +4722,7 @@ mod tests {
             waited >= PROGRESS_PATIENCE && waited < PROGRESS_PATIENCE * 3,
             "{waited:?}"
         );
-        assert_eq!((log.records, log.warned), (0, true));
+        assert_eq!((log.records, log.warnings), (0, 1));
     }
 
     async fn metered_conversation(

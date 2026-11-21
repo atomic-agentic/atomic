@@ -6,7 +6,12 @@
 //! different YAML versions read differently, is refused at load with the file,
 //! line and column. The loader uses the YAML 1.2 core schema and rejects:
 //!
-//! - duplicate keys, and keys that are not strings (`1:`, `true:`, `null:`);
+//! - duplicate keys, and keys that are neither a string nor a canonical
+//!   decimal integer (`true:`, `null:`, `1.5:`, and equally `+2:`, `007:`,
+//!   `0x1F:` and `0o17:`, which would be renamed to the number they read as).
+//!   A canonical integer key is read as its own text, so `200:` and `"200":`
+//!   are one key and both in one map are a duplicate; OpenAPI specs write
+//!   status codes unquoted;
 //! - explicit tags (`!!str`, `!custom`), anchors (`&a`) and aliases (`*a`);
 //! - more than one document in a file;
 //! - plain (unquoted) `yes`, `no`, `on` and `off` in any letter case, which
@@ -244,13 +249,30 @@ impl<'a> Loader<'a> {
             Event::Scalar(text, style, anchor, tag) => {
                 self.reject_extras(at, anchor, &tag)?;
                 if style == ScalarStyle::Plain {
-                    // A plain key must read as a string under the core schema.
+                    // A plain key must read as a string under the core schema,
+                    // or as a canonical decimal integer, which is then read as
+                    // its own text: OpenAPI specs write status codes unquoted,
+                    // so `200:` is the key `"200"`, and the mapping's duplicate
+                    // check sees the two spellings as one key.
                     match self.scalar(at, &text, style)? {
                         Value::String(s) => Ok((s, at)),
+                        // Only when the number's string form is the source
+                        // text, which leaves `0` and `-?[1-9][0-9]*`, read the
+                        // same by YAML 1.1 and 1.2. Any other spelling that
+                        // core_int takes for an integer, such as `+2`, `0200`,
+                        // `007`, `0x1F`, `0o17` or `-0`, would be renamed to
+                        // the value it reads as, so `007:` and `"007":` would
+                        // be two different keys; it is refused below.
+                        Value::Number(n)
+                            if (n.is_i64() || n.is_u64()) && n.to_string() == *text =>
+                        {
+                            Ok((text.into_owned(), at))
+                        }
                         other => Err(self.error(
                             at,
                             format!(
-                                "keys must be strings, and this one reads as {other}; quote it"
+                                "keys must be a string or a plain decimal integer, \
+                                 and this one reads as {other}; quote it"
                             ),
                         )),
                     }
@@ -259,7 +281,11 @@ impl<'a> Loader<'a> {
                 }
             }
             Event::Alias(_) => Err(self.error(at, "aliases (*name) are not allowed")),
-            _ => Err(self.error(at, "keys must be strings, not mappings or sequences")),
+            _ => Err(self.error(
+                at,
+                "keys must be a string or a plain decimal integer, \
+                 not a mapping or a sequence; quote it",
+            )),
         }
     }
 

@@ -110,6 +110,22 @@ pub enum AtomError {
     /// attempt: its attempt guard decides whether the command may run again.
     #[error("outcome unknown: {0}")]
     OutcomeUnknown(String),
+    /// The execution backend had no room for the step's workspace for as
+    /// long as this process waits; nothing ran. Not a failure of the atom: a
+    /// durable run stops without recording anything, to continue once there
+    /// is room.
+    #[error("{0}")]
+    NoRoom(String),
+    /// The artifact store was held elsewhere, such as by a sweep, for as
+    /// long as the step waits to give its command its inputs; nothing ran.
+    /// Not a failure of the atom: a durable run stops without recording
+    /// anything, and is run again.
+    #[error("{0}")]
+    StoreHeld(String),
+    /// This process is stopping, so a step that waited for its workspace
+    /// gave up the wait; nothing ran, and nothing is recorded.
+    #[error("this process is stopping")]
+    Stopping,
     /// Anything else in running the atom.
     #[error("{0}")]
     Runtime(String),

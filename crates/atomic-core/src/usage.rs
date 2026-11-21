@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Metering model calls.
+//! Metering model calls, and an exec atom's command.
 //!
 //! Every model call an atom makes, the first turn and any repair turn alike,
-//! passes through a [`Meter`]: [`Meter::admit`] before the call is
+//! and every exec atom's command (a [`Call`] that is [`Call::work`]), passes
+//! through a [`Meter`]: [`Meter::admit`] before the call is
 //! dispatched, and [`Meter::settle`] once, after it, with what the provider
 //! reported. A meter that refuses admission stops the atom before the call
 //! goes out, with [`Exhausted`]; the atom's run fails with
@@ -18,7 +19,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Tokens one model call used, as the provider reported them.
@@ -53,7 +54,14 @@ pub struct Call {
     /// several provider requests and run tools between them: it reserves
     /// the atom's remaining active time, not one request's.
     pub turn: bool,
+    /// Whether it is not a model call but other active work, such as an exec
+    /// atom's command: it uses no tokens and costs nothing, and, like a
+    /// turn, reserves the active time left and is cut off when it runs out.
+    pub work: bool,
 }
+
+/// The model name active work that is not a model call is accounted under.
+pub const WORK_MODEL: &str = "(command)";
 
 /// What an admitted call may use: the runtime holds the call to it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -88,6 +96,60 @@ pub struct Ticket {
     /// For a turn, the allowance whose time left set its time limit, such
     /// as `atom:<run>:<step>`.
     pub bounded_by: Option<String>,
+    /// What the meter does if the ticket is dropped unsettled, as when the
+    /// task that holds it panics or is cancelled.
+    pub release: Release,
+}
+
+/// What a meter does for a ticket dropped unsettled, such as stopping its
+/// call's heartbeat: run once, when the last clone of the ticket is dropped.
+/// Settling the ticket drops it too, so the meter's settlement does the
+/// same first, and running it again then changes nothing.
+#[derive(Clone, Default)]
+pub struct Release(Option<Arc<OnDrop>>);
+
+/// The action a [`Release`] runs when its last clone is dropped.
+struct OnDrop(std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>);
+
+impl Drop for OnDrop {
+    fn drop(&mut self) {
+        let release = match self.0.get_mut() {
+            Ok(release) => release.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        if let Some(release) = release {
+            release();
+        }
+    }
+}
+
+impl Release {
+    /// Run `release` when the ticket is dropped.
+    pub fn new(release: impl FnOnce() + Send + 'static) -> Self {
+        Self(Some(Arc::new(OnDrop(std::sync::Mutex::new(Some(
+            Box::new(release),
+        ))))))
+    }
+}
+
+/// Every release is alike to a ticket's equality: what it runs is not part
+/// of the call.
+impl PartialEq for Release {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for Release {}
+
+impl std::fmt::Debug for Release {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "Release(..)"
+        } else {
+            "Release(none)"
+        })
+    }
 }
 
 /// An admission: the ticket to settle, if the call is metered, and the
@@ -242,15 +304,18 @@ pub(crate) fn meter_failure(e: &anyhow::Error) -> Option<&MeterError> {
     e.chain().find_map(|c| c.downcast_ref::<MeterError>())
 }
 
-/// The run and step a model call is made for, which its span names. Set by
-/// the workflow code that runs a step, around the step's work; see
-/// [`for_step`].
+/// The run and step a model call is made for, which its span names, and where
+/// a call that failed says so. Set by the workflow code that runs a step,
+/// around the step's work; see [`for_step`].
 #[derive(Clone, Debug)]
 pub struct Caller {
     /// The run's workflow ID.
     pub run: String,
     /// The step's ID.
     pub step: String,
+    /// What this step's spans say of a call of its own that failed, and what
+    /// its run's say once the step failed (see [`Why`]).
+    pub why: Why,
 }
 
 tokio::task_local! {
@@ -258,15 +323,20 @@ tokio::task_local! {
 }
 
 /// Run `work` as step `step` of run `run`: model calls it makes name them on
-/// their spans.
+/// their spans, and one that fails notes on `why` what its own span says, for
+/// this step's span and its run's to say in turn. Give each step a handle of
+/// its own (see [`Why::for_step`]), and hand it to the run only when the step
+/// itself failed (see [`Why::note_step`]).
 pub async fn for_step<F: std::future::Future>(
     run: impl Into<String>,
     step: impl Into<String>,
+    why: Why,
     work: F,
 ) -> F::Output {
     let caller = Caller {
         run: run.into(),
         step: step.into(),
+        why,
     };
     CALLER.scope(caller, work).await
 }
@@ -284,6 +354,16 @@ pub(crate) async fn with_caller<F: std::future::Future>(
     match caller {
         Some(caller) => CALLER.scope(caller, work).await,
         None => work.await,
+    }
+}
+
+/// Note on the step the current task runs that one of its model calls failed,
+/// as that call's own span says it (see [`Why`]): the step's span and its
+/// run's cannot hear the call's error. A call made outside a step notes
+/// nothing, since no span outlives it to repeat this.
+pub(crate) fn note_step_failure(error: &anyhow::Error) {
+    if let Some(caller) = caller() {
+        caller.why.note_call(error);
     }
 }
 
@@ -335,7 +415,7 @@ pub(crate) fn record_usage(span: &tracing::Span, usage: &Usage) {
 
 /// The most characters of a failed call's error a span carries, with the
 /// `…` that ends one that was cut. The run's stored error keeps the whole.
-pub(crate) const MAX_SPAN_ERROR: usize = 200;
+pub const MAX_SPAN_ERROR: usize = 200;
 
 /// What a call's span says of why it failed, redacted and at most
 /// [`MAX_SPAN_ERROR`] characters: for an error a provider answered with,
@@ -357,7 +437,71 @@ pub(crate) fn span_error(error: &anyhow::Error) -> (String, Option<u16>) {
     }
 }
 
-/// Record on `span` why a call failed (see [`span_error`]).
+/// What a span may say about why the thing it covers failed, kept between the
+/// model call that knows and the spans that outlive it.
+///
+/// A durable step's failure travels as text: the engine records the text and
+/// hands workflow code new text of its own, so what a step's failure was
+/// *caused* by — a provider's answer, with its status and the type of error it
+/// named — cannot reach the step's own span, still less its run's, which only
+/// ever sees the run's error. So a call that failed notes here what its own
+/// span says; the step's span says that, and when the step fails the run takes
+/// the note and says the same. The whole failure is never noted: it stays in
+/// the run's stored error, where a person reads it.
+///
+/// A handle says for one thing: [`Why::for_step`] gives a step one, which
+/// reaches its model calls as the run and step do (see [`for_step`]), and the
+/// run's own is what its workflow passes to its spans. A note lives in this
+/// process only: a run resumed after a restart has nothing noted, and its
+/// spans say what the failure it recorded says, cut short.
+#[derive(Clone, Debug, Default)]
+pub struct Why(Arc<Mutex<Option<String>>>);
+
+impl Why {
+    /// A note of one step's own, for [`for_step`] and [`Why::note_step`].
+    pub fn for_step() -> Self {
+        Self::default()
+    }
+
+    /// Note that a call this covers failed with `error`, as a span may say it
+    /// (see [`span_error`]). The first note is the one kept: it came from the
+    /// call that failed first, which is what failed the step.
+    pub fn note_call(&self, error: &anyhow::Error) {
+        let (message, _) = span_error(error);
+        self.note(message);
+    }
+
+    /// Note on this what one of its steps noted on a handle of its own, so
+    /// that the run's span says what that step's said. Call it when that step
+    /// itself failed; a step that succeeded or parked is left to say nothing.
+    pub fn note_step(&self, step: &Why) {
+        if let Some(message) = step.noted() {
+            self.note(message);
+        }
+    }
+
+    /// Keep the first message noted, and no other. A note is never worth
+    /// stopping over: a poisoned lock loses it, and the spans then say what
+    /// the run's own error says, cut short.
+    fn note(&self, message: String) {
+        if let Ok(mut why) = self.0.lock()
+            && why.is_none()
+        {
+            *why = Some(message);
+        }
+    }
+
+    /// What was noted, or `None` when nothing here failed near a call or a
+    /// step.
+    pub fn noted(&self) -> Option<String> {
+        self.0.lock().ok().and_then(|why| why.clone())
+    }
+}
+
+/// Record on `span` why a call failed (see [`span_error`]). A call that fails
+/// inside a step notes the same text for the step's span and its run's, which
+/// cannot hear this error; the call's site does that, as both runtimes do (see
+/// [`Why`]).
 pub(crate) fn record_error(span: &tracing::Span, error: &anyhow::Error) {
     span.record("otel.status_code", "ERROR");
     span.record(
@@ -372,5 +516,30 @@ pub(crate) fn record_error(span: &tracing::Span, error: &anyhow::Error) {
     span.record("error.message", message.as_str());
     if let Some(status) = status {
         span.record("http.response.status_code", i64::from(status));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A call's time is its own limit, or its default when that is shorter
+    /// or it has none.
+    #[test]
+    fn a_limits_time_is_the_shorter_of_its_own_and_the_default() {
+        let five = Duration::from_secs(300);
+        let limit = |time: Option<Duration>| Limit {
+            output_tokens: None,
+            time,
+        };
+        assert_eq!(limit(None).time_within(five), five);
+        assert_eq!(
+            limit(Some(Duration::from_millis(700))).time_within(five),
+            Duration::from_millis(700)
+        );
+        assert_eq!(
+            limit(Some(Duration::from_secs(3600))).time_within(five),
+            five
+        );
     }
 }

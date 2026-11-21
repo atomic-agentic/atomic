@@ -74,6 +74,9 @@ jobs:
       - run: scripts/test-shards-test.sh
       # release-package.sh refuses a binary with failpoints compiled in.
       - run: scripts/release-package-test.sh
+      # The catalog checker reads only a lockfile the project holds, whichever
+      # of its three settings names it. Tested on inert fixtures.
+      - run: python3 tools/deno_exec_test.py
 
   # The Astro interpreter's own tests, and a rebuild of the bundled compiler
   # from its sources: the committed assets must be exactly what the sources
@@ -210,6 +213,10 @@ jobs:
           target-cache: test
           backends: "true"
       - name: Test shard ${{ matrix.shard }} (with Postgres and the sandbox)
+        # The runner's /tmp belongs to this job alone, so a test may create
+        # and remove entries there (turn_workspace.rs).
+        env:
+          ATOMIC_TEST_PRIVATE_TMP: "1"
         run: scripts/test-shards.py run ${{ matrix.shard }}
 
   # The crash suite: every failpoint, triggered in turn, against real
@@ -257,9 +264,21 @@ jobs:
       # Each milestone's acceptance clauses, the tests that show each listed in
       # scripts/acceptance/; a listed test that fails, is ignored or no longer
       # runs fails the step.
+      - name: M42a acceptance
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: python3 scripts/acceptance.py m42a
       - name: M12 acceptance
         if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: python3 scripts/acceptance.py m12
+      - name: M35a acceptance
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: python3 scripts/acceptance.py m35a
+      - name: M39a acceptance
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: python3 scripts/acceptance.py m39a
+      - name: M45 acceptance
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: python3 scripts/acceptance.py m45
       # A suite that cannot reach its backend fails; it never skips. The
       # Postgres and sandbox suites run once more with their backend missing,
       # and every one of their tests must fail, naming it. The sandbox half
@@ -297,6 +316,14 @@ jobs:
       - name: Build
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: cargo build --workspace --locked
+      # A compile-fail doctest checks that a test-only method is absent
+      # without its feature, which the test shards' features turn on; it runs
+      # only here, without them. The whole workspace is selected, as the
+      # shards select it, so dependencies resolve the same features and the
+      # cached builds serve (selecting one package rebuilds V8 differently).
+      - name: Doctests without the test features
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: cargo test --workspace --locked --doc
       # The graph still resolves from scratch onto the libsqlite3-sys Codex
       # locks, which both Codex and the durare fork link.
       - name: Lockfile resolves from scratch
