@@ -846,3 +846,39 @@ fn a_sweep_racing_a_slow_gather_keeps_the_gathered_files() {
     drop(held);
     assert_eq!(sweeping.sweep().removed.len(), 2);
 }
+
+/// Two commands, each in a workspace of its own, that hand over the same
+/// bytes leave one stored copy, referenced by both.
+#[test]
+fn two_commands_handing_over_the_same_bytes_leave_one_copy() {
+    let f = fixture("same-bytes");
+    let other = f.dir.join("other-scratch");
+    std::fs::create_dir_all(&other).expect("scratch");
+    let second = Exchange::new(Box::new(
+        atomic_exec::exchange::LocalExchange::create(&other).expect("exchange"),
+    ));
+    let bytes = b"--- a\n+++ b\n+the same\n";
+    f.write("change.diff", bytes);
+    std::fs::write(second.outputs().join("mine.diff"), bytes).expect("write");
+    let mut first_output = json!({"patch": {"$file": "change.diff", "mediaType": "text/x-diff"}});
+    let mut second_output = json!({"patch": {"$file": "mine.diff", "mediaType": "text/x-diff"}});
+    f.gather(&mut first_output).expect("first");
+    second
+        .gather(
+            &f.store,
+            &f.store,
+            &mut second_output,
+            &contract(),
+            &validate,
+            &Provenance {
+                step: Some("again".into()),
+                ..provenance()
+            },
+            Limits::default(),
+        )
+        .expect("second");
+    assert_eq!(first_output["patch"], second_output["patch"]);
+    assert_eq!(first_output["patch"], json!(reference_of(bytes)));
+    assert_eq!(f.blobs(), 1, "the same bytes were stored twice");
+    assert_eq!(f.staged(), 0);
+}
