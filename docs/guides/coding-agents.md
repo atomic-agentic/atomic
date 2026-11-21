@@ -18,20 +18,36 @@ beside atomic's are left as they are.
 
 The skill's own directory belongs to atomic, and the agent reads everything in
 it, so setup checks that directory before it writes anything, hidden files and
-subdirectories included: it must hold exactly the files atomic installs there,
-each with the content atomic installs, and every directory leading to it must
-be a plain directory. A file or directory atomic does not write, a symbolic
-link, and a file holding other content are each named in a refusal, and while
-any of them remains nothing is installed and no instruction points the agent at
-the directory. Delete what the refusal names, or the whole directory, and run
-setup again.
+subdirectories included. It may hold only what atomic wrote there. Setup records
+the files it writes, with a hash of each, in `.atomic-pack.json` beside them, and
+a later setup writes over only what that record still vouches for. A file or
+directory atomic did not write, a file atomic wrote that someone has since
+edited, and a symbolic link are each named in a refusal, and while any of them
+remains nothing is installed and no instruction points the agent at the
+directory. Remove what the refusal names and run setup again. Nothing of yours is
+deleted; a file an older release wrote that this one no longer ships does come
+out, once the record confirms nothing has touched it.
 
-So replacing an old skill is a deliberate step: the files an older atomic wrote
-hold content this one does not, and setup says so instead of installing beside
-them. Delete `.claude/skills/atomic-create-atom`, or its `.agents/skills/`
-counterpart, and run setup again to get the skill that matches the new binary.
-Where nothing has changed, running setup again writes the same files and adds
-nothing to the instructions file.
+The way to that directory matters as much as what is in it: it must run through
+plain directories from the repository root. A `.claude` or `.agents` that is
+really a symbolic link somewhere else is refused where the link stands, because
+atomic does not write through links: remove the link, not your directory. The
+instructions file may be a link only to the other agent's instructions file,
+which is how one file can serve both agents.
+
+An upgrade needs no clean-up. The references are generated from the binary that
+installs them, so their bytes change between releases, and setup writes the new
+ones over the old precisely because its record says those bytes are its own and
+untouched. That is why a refusal says an older version of atomic may be the cause:
+what atomic cannot account for is refused rather than installed beside.
+
+One case is still a deliberate step. A directory written by a version of atomic
+that kept no record cannot be checked, so setup accepts it only while it holds
+exactly the current pack's files with the current pack's bytes. Upgrading from
+such a version, delete `.claude/skills/atomic-create-atom`, or its
+`.agents/skills/` counterpart, and run setup again; from then on an upgrade takes
+nothing away. Where nothing has changed, running setup again writes the same files
+and adds nothing to the instructions file.
 
 Then describe the task in a sentence, for example "write an atom that pulls the
 action items, with their owners, out of meeting notes".

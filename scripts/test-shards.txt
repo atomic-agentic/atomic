@@ -52,6 +52,7 @@ test log_lines
 test retention
 test sandboxed_commit
 test self_approval
+test setup_cli
 test shell_env
 test turn_workspace
 test worktree_step

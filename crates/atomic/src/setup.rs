@@ -7,17 +7,25 @@
 //! section between marker lines in the agent's instructions file (`AGENTS.md`
 //! or `CLAUDE.md`) points the agent at the skill.
 //!
-//! The skill's own directory belongs to atomic, and the agent reads whatever
-//! it finds there, so setup first requires that directory to hold exactly the
-//! pack's files, each with the pack's content, reached down plain directories,
-//! and refuses anything else in it by name. Once it does, setup rewrites the
-//! pack's files and the instructions section, and touches nothing else: skills
-//! installed beside atomic's, and the rest of the instructions file, stay as
-//! they were.
+//! The skill's own directory belongs to atomic, and the agent reads whatever it
+//! finds there, so setup first requires that directory to hold only what atomic
+//! wrote there, each file still holding the bytes atomic wrote, reached down
+//! plain directories. What atomic wrote is what its last run recorded in the
+//! directory's own manifest, `.atomic-pack.json`. A directory written by a
+//! setup that wrote no manifest counts too, but only while it holds exactly
+//! this pack's files with this pack's bytes, since nothing can have been added
+//! to it or edited in it without showing. Setup refuses anything else, naming
+//! what it refuses, or the first of them and how many more there were when one
+//! message cannot hold them all. Once the directory passes, setup rewrites the
+//! pack's files and the instructions section, records what it wrote in the
+//! manifest, and touches nothing else: skills installed beside atomic's, and the
+//! rest of the instructions file, stay as they were.
 
+use crate::shown::line;
 use crate::skills;
 use anyhow::{Context, bail, ensure};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
 /// A coding agent atomic can set up.
@@ -72,6 +80,21 @@ const END: &str = "<!-- END atomic -->";
 /// How a section written by any version of atomic starts.
 const BEGIN_PREFIX: &str = "<!-- BEGIN atomic";
 
+/// The record setup leaves in each skill directory it owns: every file it wrote
+/// there, and the sha256 of what it wrote. It is how a later setup tells its own
+/// files from what someone else put there, so a directory an older atomic wrote
+/// can be upgraded, and one someone added to cannot.
+const MANIFEST: &str = ".atomic-pack.json";
+/// The manifest format this atomic reads and writes.
+const MANIFEST_FORMAT: u64 = 1;
+/// How big a manifest may be. One is a line per file of the pack, so anything
+/// much larger is not a manifest atomic wrote, and reading it would be the
+/// point.
+const MANIFEST_BYTES_MAX: u64 = 16 * 1024;
+/// How much of a refusal's list of names is written before the rest is counted
+/// instead. The remedy that follows is never cut for it.
+const NAMED_BYTES_MAX: usize = 2048;
+
 /// The section added to the agent's instructions file.
 fn section() -> String {
     format!(
@@ -106,9 +129,11 @@ pub fn run(args: SetupArgs) -> anyhow::Result<()> {
 /// files written, relative to `root`.
 ///
 /// Nothing is written until every skill directory atomic owns holds only what
-/// this binary's pack writes there and is reached without a link, so a refusal
-/// installs nothing and points no agent at a directory holding instructions
-/// atomic never wrote.
+/// atomic wrote there and is reached without a link, so a refusal installs
+/// nothing and points no agent at a directory holding instructions atomic never
+/// wrote. What passes may be rewritten; the only thing removed is a file the
+/// manifest says atomic wrote, still holding what it recorded, that this pack
+/// no longer ships. The manifest goes down after the files it records.
 pub fn install(agent: Agent, root: &Path) -> anyhow::Result<Vec<PathBuf>> {
     let root =
         std::fs::canonicalize(root).with_context(|| format!("cannot open {}", root.display()))?;
@@ -124,26 +149,71 @@ pub fn install(agent: Agent, root: &Path) -> anyhow::Result<Vec<PathBuf>> {
             );
         }
     }
-    // The agent reads everything in the skill's directory, so nothing outside
-    // the pack may sit in it and nothing may lead into it through a link.
+    // The agent reads everything in the skill's directory, so nothing atomic
+    // did not write may sit in it and nothing may lead into it through a link.
     let skills_dir = Path::new(agent.skills_dir());
-    for dir in owned_dirs(&pack)? {
-        OwnedDir::new(&root, skills_dir, &dir, &pack).check()?;
-    }
-    let mut written = Vec::new();
-    for file in pack {
-        let relative = skills_dir.join(&file.path);
-        write_inside(&root, &relative, file.contents.as_bytes())?;
-        written.push(relative);
+    // Checked first, all of them, before anything is written or removed: a
+    // refusal leaves every directory as it was found. Each check comes back
+    // with the files its manifest says are atomic's, still unmodified, that
+    // this pack no longer ships.
+    let skills = owned_dirs(&pack)?;
+    let mut owned = Vec::new();
+    for skill in &skills {
+        let dir = OwnedDir::new(&root, skills_dir, skill, &pack);
+        let stale = dir.check()?;
+        owned.push((dir, stale));
     }
     let instructions = Path::new(agent.instructions_file());
+    // The instructions file is the one path atomic writes that no skill
+    // directory's check covers, so its own link is refused here: before anything
+    // is written, and before it is read, since a link is not something atomic
+    // reads through either. A link atomic may not write through leaves the skill
+    // not installed at all, rather than installed and unreferenced. The only
+    // other file a link standing there may lead to is the other agent's
+    // instructions file, which is how one file serves both agents. A link that
+    // leads into a skill would write the instructions over one of its files, so
+    // it is refused like any other.
+    let mut instructions_files: Vec<PathBuf> = Vec::new();
+    for other in [Agent::Claude, Agent::Codex] {
+        instructions_files.push(PathBuf::from(other.instructions_file()));
+    }
+    link_to_own_file(
+        &root,
+        instructions,
+        &root.join(instructions),
+        &instructions_files,
+    )?;
+    // What the instructions file is to hold, read and put together before
+    // anything is written: an instructions file atomic cannot read, or one whose
+    // atomic section is broken, is refused here, so a refusal leaves the skill
+    // not partly installed for an agent to find.
     let current = match std::fs::read_to_string(root.join(instructions)) {
         Ok(text) => Some(text),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) if e.kind() == ErrorKind::NotFound => None,
         Err(e) => return Err(e).with_context(|| format!("read {}", instructions.display())),
     };
     let updated = with_section(current.as_deref(), &section())
         .with_context(|| format!("update {}", instructions.display()))?;
+    for (dir, stale) in &owned {
+        for gone in stale {
+            std::fs::remove_file(dir.path.join(gone))
+                .with_context(|| format!("remove {}", dir.shown(gone)))?;
+        }
+    }
+    let mut written = Vec::new();
+    for file in &pack {
+        let relative = skills_dir.join(&file.path);
+        write_inside(&root, &relative, file.contents.as_bytes())?;
+        written.push(relative);
+    }
+    // After the files, so a setup that stopped halfway leaves the manifest of
+    // the run before it, which then refuses the directory rather than vouching
+    // for bytes it never saw.
+    for (dir, _) in &owned {
+        let relative = skills_dir.join(dir.skill).join(MANIFEST);
+        write_inside(&root, &relative, dir.manifest().as_bytes())?;
+        written.push(relative);
+    }
     if current.as_deref() != Some(updated.as_str()) {
         write_inside(&root, instructions, updated.as_bytes())?;
         written.push(instructions.to_owned());
@@ -165,44 +235,164 @@ fn owned_dirs(pack: &[skills::SkillFile]) -> anyhow::Result<Vec<String>> {
         ensure!(
             !dir.is_empty(),
             "the pack writes {}, loose in the skills directory, not inside a skill",
-            file.path
+            line(&file.path)
         );
         dirs.insert(dir);
     }
     Ok(dirs.into_iter().map(str::to_owned).collect())
 }
 
-/// What a skill directory holds that the pack does not write there, as the
-/// clauses of one refusal: a pack file holding other content first, then what
-/// atomic does not write, then links.
+/// What one skill directory holds that atomic may not write over, as the
+/// clauses of one refusal, in this order: a file the manifest says atomic wrote
+/// that no longer holds those bytes, then a pack path holding other content,
+/// then what atomic does not write at all, then links.
 #[derive(Default)]
-struct Foreign {
-    /// Pack paths holding something other than the pack's contents.
+struct Report {
+    /// Listed paths no longer holding the bytes the manifest records, which is
+    /// what it looks like when a person edits a file atomic wrote.
+    edited: Vec<String>,
+    /// Pack paths holding something other than the pack's contents, or
+    /// something that is not a plain file. Only a directory with no manifest
+    /// leaves a pack path in this clause; with one, the manifest says who wrote
+    /// it, and the `edited` clause or the `extra` one takes it.
     changed: Vec<String>,
     /// Paths atomic does not write, directories included.
     extra: Vec<String>,
     /// Paths that are symbolic links, which are never followed.
     links: Vec<String>,
+    /// Listed paths found holding the bytes they are recorded with. These are
+    /// atomic's to write over, and to remove when this pack no longer ships
+    /// them.
+    unmodified: BTreeSet<String>,
 }
 
-impl Foreign {
+impl Report {
     fn is_empty(&self) -> bool {
-        self.changed.is_empty() && self.extra.is_empty() && self.links.is_empty()
+        self.edited.is_empty()
+            && self.changed.is_empty()
+            && self.extra.is_empty()
+            && self.links.is_empty()
     }
 
     /// The refusal's clauses, in order.
     fn clauses(&self) -> impl Iterator<Item = &str> {
-        self.changed
+        self.edited
             .iter()
+            .chain(self.changed.iter())
             .chain(self.extra.iter())
             .chain(self.links.iter())
             .map(String::as_str)
     }
 }
 
-/// One skill's directory below the repository root, and what the pack writes
-/// in it. The directory is atomic's to install into, so [`OwnedDir::check`]
-/// requires it to hold nothing else and to be reached without a link.
+/// What setup wrote in one skill directory: every file it made there, by its
+/// path below that directory, with the sha256 of the bytes it wrote. A later
+/// setup reads it before it writes, so that it may replace its own work and
+/// refuse what anyone else left there.
+#[derive(serde::Deserialize, serde::Serialize)]
+struct Manifest {
+    /// The manifest's format version. A file written to a format this atomic
+    /// does not know is refused, not guessed at.
+    format: u64,
+    /// The files atomic wrote, by path below the skill directory, each with the
+    /// hex sha256 of what it wrote there.
+    files: BTreeMap<String, String>,
+}
+
+impl Manifest {
+    /// A manifest for what `pack` writes inside one skill.
+    fn for_pack(pack: &[skills::SkillFile], skill: &str) -> Self {
+        let prefix = format!("{skill}/");
+        Self {
+            format: MANIFEST_FORMAT,
+            files: pack
+                .iter()
+                .filter(|file| file.path.starts_with(prefix.as_str()))
+                .map(|file| (file.path[prefix.len()..].to_owned(), sha256(&file.contents)))
+                .collect(),
+        }
+    }
+
+    /// The bytes to write the manifest as.
+    fn text(&self) -> String {
+        // From a structure this crate owns, so serializing it cannot fail.
+        let body = serde_json::to_string_pretty(self).expect("a manifest is JSON");
+        format!("{body}\n")
+    }
+
+    /// The manifest in `text`, or the reason it is not one atomic wrote. Every
+    /// part of it is checked, because a path listed here is one atomic may
+    /// write to or remove, and a hash listed here is what a file is trusted
+    /// against.
+    fn read(at: &str, text: &str) -> anyhow::Result<Self> {
+        let here = line(at);
+        let read: Self = serde_json::from_str(text).map_err(|e| {
+            anyhow::anyhow!(
+                "{here} is not a manifest atomic can read: {}",
+                line(&e.to_string())
+            )
+        })?;
+        ensure!(
+            read.format == MANIFEST_FORMAT,
+            "{here} is manifest format {}, which this atomic cannot read; it was written by \
+             a different version of atomic",
+            read.format
+        );
+        for (path, hash) in &read.files {
+            ensure!(
+                is_plain_relative(path)
+                    && hash.len() == 64
+                    && hash.bytes().all(|b| b.is_ascii_hexdigit()),
+                "{here} lists {path} as {hash}, which is not how atomic records a file"
+            );
+        }
+        Ok(read)
+    }
+
+    /// Whether the file at `relative` holds the bytes this manifest recorded
+    /// for it. A path that is not listed proves nothing about its contents, so
+    /// it is never `unmodified` in this structure's sense.
+    fn holds(&self, relative: &str, bytes: &[u8]) -> bool {
+        self.files
+            .get(relative)
+            .is_some_and(|recorded| *recorded == sha256(bytes))
+    }
+}
+
+/// The hex sha256 of `bytes`, which is how a manifest records a file.
+fn sha256(bytes: impl AsRef<[u8]>) -> String {
+    use sha2::Digest as _;
+    let mut hash = sha2::Sha256::new();
+    hash.update(bytes.as_ref());
+    hash.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Whether `manifest` is a manifest atomic wrote that records exactly these
+/// bytes at `relative`. This is the whole of what makes a listed file atomic's to
+/// write over: a manifest that vouches for other bytes was written before someone
+/// edited the file, and their work is not atomic's to throw away. It is one call
+/// so that the control of it has one site, which
+/// `scripts/controls/skill-dir-manifest-hash.row` switches off.
+fn manifest_vouches_for(manifest: Option<&Manifest>, relative: &str, bytes: &[u8]) -> bool {
+    manifest.is_some_and(|m| m.holds(relative, bytes))
+}
+
+/// Whether `path` is a plain relative path of the kind atomic writes below a
+/// skill directory: `/`-separated, with no leading `/` and no piece that is
+/// empty, `.` or `..`. A manifest listing anything else names somewhere atomic
+/// would write outside the directory it records, so it is refused.
+fn is_plain_relative(path: &str) -> bool {
+    !path.is_empty()
+        && !path.starts_with('/')
+        && path
+            .split('/')
+            .all(|piece| !piece.is_empty() && piece != "." && piece != "..")
+}
+
+/// One skill's directory below the repository root, and what the pack writes in
+/// it. The directory is atomic's to install into, so [`OwnedDir::check`]
+/// requires it to hold only what atomic wrote there, as its manifest says, and
+/// to be reached without a link.
 struct OwnedDir<'a> {
     /// The repository being set up.
     root: &'a Path,
@@ -210,14 +400,17 @@ struct OwnedDir<'a> {
     path: PathBuf,
     /// Where it sits below `root`, which is how a problem in it is named.
     at: PathBuf,
+    /// The skill's name, which is this directory's own last component.
+    skill: &'a str,
     /// `{skill}/`, which every pack path of this skill starts with.
     prefix: String,
-    /// The pack's paths below the skill directory, which are the files allowed
-    /// there.
+    /// The pack's paths below the skill directory, which are the files this
+    /// version of atomic writes there.
     files: BTreeSet<&'a str>,
     /// The directories those paths pass through, below the skill directory.
     dirs: BTreeSet<&'a str>,
-    /// The pack, for the content each allowed file must hold.
+    /// The pack, for the content each allowed file must hold where no manifest
+    /// says who wrote it.
     pack: &'a [skills::SkillFile],
 }
 
@@ -248,6 +441,7 @@ impl<'a> OwnedDir<'a> {
             root,
             path: root.join(&at),
             at,
+            skill,
             prefix,
             files,
             dirs,
@@ -255,33 +449,121 @@ impl<'a> OwnedDir<'a> {
         }
     }
 
-    /// Refuse, naming each, whatever this directory holds that the pack does
-    /// not write there, and whatever link stands between the repository root
-    /// and it. An absent directory is what a first install meets.
-    fn check(&self) -> anyhow::Result<()> {
-        let mut foreign = Foreign::default();
+    /// Refuse, naming each of them, whatever this directory holds that atomic
+    /// did not write, and whatever link stands between the repository root and
+    /// it. An absent directory is what a first install meets.
+    ///
+    /// What the directory's manifest lists is what atomic wrote there. A listed
+    /// file still holding the bytes it records may be written over, and comes
+    /// back from here for removal when this pack no longer ships it; a listed
+    /// file holding other bytes was edited since and is refused. With no
+    /// manifest to go by, only a directory holding exactly this pack's files,
+    /// with this pack's bytes, passes.
+    fn check(&self) -> anyhow::Result<Vec<String>> {
+        let mut report = Report::default();
         if let Some(link) = self.chain_link() {
             // Read through an alias, so this is not the directory atomic was
             // asked to install into, however plain what it leads to looks.
-            foreign
-                .links
-                .push(format!("{} is a symbolic link", link.display()));
+            report.links.push(link_named(&link));
         } else if is_link(&self.path) {
             // The whole directory atomic owns is an alias for elsewhere.
-            foreign
-                .links
-                .push(format!("{} is a symbolic link", self.shown("")));
+            report.links.push(link_named(&self.shown("")));
         } else if self.path.exists() {
-            self.inspect("", &mut foreign)?;
+            let manifest = self.read_manifest()?;
+            self.inspect("", manifest.as_ref(), &mut report)?;
+            if report.is_empty() {
+                return Ok(self.leftovers(&manifest, &report));
+            }
+            bail!("{}", self.refusal(&report));
         }
-        if foreign.is_empty() {
-            return Ok(());
+        ensure!(report.is_empty(), "{}", self.refusal(&report));
+        Ok(Vec::new())
+    }
+
+    /// The manifest this directory carries, if it has one: what the last setup
+    /// wrote here. A file that is not a manifest atomic wrote is refused here,
+    /// rather than read as no manifest at all, because that would let whatever
+    /// is in the directory through on the strength of a file someone else left.
+    fn read_manifest(&self) -> anyhow::Result<Option<Manifest>> {
+        let shown = self.shown(MANIFEST);
+        let at = self.path.join(MANIFEST);
+        // Plain file or nothing, before it is opened: what is asked of this
+        // path is one small read, and a fifo or a device would wait or stream.
+        let meta = match std::fs::symlink_metadata(&at) {
+            Ok(meta) if meta.is_file() => meta,
+            Ok(_) => {
+                bail!("{shown} is not a plain file, and atomic writes a plain file there")
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).with_context(|| format!("cannot inspect {shown}")),
+        };
+        if meta.len() > MANIFEST_BYTES_MAX {
+            bail!(
+                "{shown} is {}, which is larger than any manifest atomic writes; replace it \
+                 and run `atomic setup` again",
+                meta.len()
+            );
         }
-        bail!(
-            "{} holds what atomic did not write: {}; remove what is listed, or the whole \
-             directory, and run `atomic setup` again",
+        let text = std::fs::read(&at)
+            .with_context(|| format!("cannot read {shown}"))
+            .and_then(|bytes| {
+                String::from_utf8(bytes)
+                    .map_err(|_| anyhow::anyhow!("{shown} is not a manifest atomic can read"))
+            })?;
+        Ok(Some(Manifest::read(&shown, &text)?))
+    }
+
+    /// What the manifest lists that this pack no longer writes, each one
+    /// confirmed by the walk to still hold the bytes it records. Only these may
+    /// be removed, and only these are: a file atomic did not write, or one
+    /// someone changed, stays where it is, and it was refused above anyway.
+    fn leftovers(&self, manifest: &Option<Manifest>, report: &Report) -> Vec<String> {
+        let Some(manifest) = manifest else {
+            return Vec::new();
+        };
+        manifest
+            .files
+            .keys()
+            .filter(|path| !self.files.contains(path.as_str()))
+            .filter(|path| report.unmodified.contains(path.as_str()))
+            .cloned()
+            .collect()
+    }
+
+    /// The refusal for what the walk found: the directory, what is wrong in it,
+    /// and what to do about it. When there is too much to name, the list is cut
+    /// and counted; the remedy is never cut, and no name is cut in half.
+    fn refusal(&self, report: &Report) -> String {
+        let clauses: Vec<&str> = report.clauses().collect();
+        // At least one clause is always named, however long it is: a name cut
+        // in half is worse advice than a long line, and the line is bounded
+        // where atomic writes it.
+        let mut named = String::new();
+        let mut cut = 0;
+        for clause in &clauses {
+            if !named.is_empty() && named.len() + 2 + clause.len() > NAMED_BYTES_MAX {
+                break;
+            }
+            if !named.is_empty() {
+                named.push_str("; ");
+            }
+            named.push_str(clause);
+            cut += 1;
+        }
+        if cut < clauses.len() {
+            named.push_str(&format!("; and {} more", clauses.len() - cut));
+        }
+        let older = if report.links.len() == clauses.len() {
+            // Nothing but links: atomic wrote none of them, and no version of
+            // atomic writes a link, so that is not what is being suggested.
+            ""
+        } else {
+            " (an older version of atomic may be the cause)"
+        };
+        format!(
+            "{} holds what atomic did not write{older}: {named}; remove what is named and run \
+             `atomic setup` again",
             self.shown(""),
-            foreign.clauses().collect::<Vec<_>>().join("; "),
         )
     }
 
@@ -289,40 +571,50 @@ impl<'a> OwnedDir<'a> {
     /// named as it sits below the root, if any: one there points what follows
     /// at another place, so the directory is only inspected once the whole
     /// chain is plain directories.
-    fn chain_link(&self) -> Option<PathBuf> {
+    fn chain_link(&self) -> Option<String> {
         let mut dir = self.root.to_owned();
-        let mut shown = PathBuf::new();
+        let mut shown = String::new();
         for part in self.at.parent()?.components() {
             dir.push(part);
-            shown.push(part.as_os_str());
+            if !shown.is_empty() {
+                shown.push(std::path::MAIN_SEPARATOR);
+            }
+            shown.push_str(&part.as_os_str().to_string_lossy());
             if is_link(&dir) {
-                return Some(shown);
+                return Some(line(&shown));
             }
         }
         None
     }
 
     /// How this directory, or a path below it, is named in a refusal: as it
-    /// sits below the repository root.
+    /// sits below the repository root, and safe for a terminal. Only what is
+    /// below it is escaped, so the part atomic itself chose stays as it is.
     fn shown(&self, relative: &str) -> String {
-        let path = if relative.is_empty() {
-            self.at.clone()
+        let at = self.at.display().to_string();
+        if relative.is_empty() {
+            at
         } else {
-            self.at.join(relative)
-        };
-        match path.to_str() {
-            Some(text) => text.to_owned(),
-            None => self.at.display().to_string(),
+            format!("{at}/{}", line(relative))
         }
     }
 
-    /// Add what the directory `at` below this one holds that the pack does not
-    /// write, where `at` is empty for this directory itself. Entries are taken
-    /// in name order, so a refusal does not depend on the order a filesystem
-    /// happens to give. A directory is walked into only when the pack writes a
-    /// file under it, so what atomic never writes is refused with the directory
-    /// that holds it and nothing here descends past the pack's own nesting.
-    fn inspect(&self, at: &str, foreign: &mut Foreign) -> anyhow::Result<()> {
+    /// Add to `report` what the directory `at` below this one holds that atomic
+    /// may not write over, where `at` is empty for this directory itself, and
+    /// record there what `manifest` vouches for. With no manifest, the only
+    /// content atomic accepts at one of its paths is this pack's own.
+    ///
+    /// Entries are taken in name order, so a refusal does not depend on the
+    /// order a filesystem happens to give. A directory is walked into only when
+    /// the pack writes a file under it or the manifest lists one there, so what
+    /// atomic never wrote is refused with the directory holding it and nothing
+    /// here descends past what atomic itself nested.
+    fn inspect(
+        &self,
+        at: &str,
+        manifest: Option<&Manifest>,
+        report: &mut Report,
+    ) -> anyhow::Result<()> {
         let shown_at = self.shown(at);
         let read = std::fs::read_dir(self.path.join(at))
             .with_context(|| format!("cannot inspect {shown_at}"))?;
@@ -347,55 +639,103 @@ impl<'a> OwnedDir<'a> {
                 .with_context(|| format!("cannot inspect {shown}"))?;
             let kind = meta.file_type();
             if kind.is_symlink() {
-                foreign.links.push(format!("{shown} is a symbolic link"));
+                report.links.push(link_named(&shown));
                 continue;
             }
+            // The manifest, which atomic writes last and reads first, is as
+            // much atomic's own as any file it lists.
+            if relative == MANIFEST {
+                continue;
+            }
+            let listed = manifest.is_some_and(|m| m.files.contains_key(relative.as_str()));
             if kind.is_dir() {
-                if !self.dirs.contains(relative.as_str()) {
-                    foreign
+                let holds_one = manifest.is_some_and(|m| {
+                    let under = format!("{relative}/");
+                    m.files.keys().any(|p| p.starts_with(under.as_str()))
+                });
+                if !holds_one && !self.dirs.contains(relative.as_str()) {
+                    report
                         .extra
                         .push(format!("{shown} is not a directory atomic writes"));
                     continue;
                 }
-                self.inspect(&relative, foreign)?;
+                self.inspect(&relative, manifest, report)?;
                 continue;
             }
-            if !self.files.contains(relative.as_str()) {
-                foreign
+            if !listed && !self.files.contains(relative.as_str()) {
+                report
                     .extra
                     .push(format!("{shown} is not a file atomic writes"));
                 continue;
             }
-            // The pack has this path, so its own bytes belong here: a leftover
-            // from another version, an edited file or anything not a plain
-            // file at all is refused rather than taken in.
+            // Past this point the path is atomic's to write, so only a plain
+            // file may stand at it: a device, a fifo or a socket is refused,
+            // not read from.
+            if !meta.is_file() {
+                report.changed.push(format!(
+                    "{shown} is not a plain file, and atomic writes a plain file there"
+                ));
+                continue;
+            }
+            if listed {
+                // The manifest says atomic wrote these bytes here. If they are
+                // still here, the file is atomic's to replace; if not, someone
+                // edited it, and their work is not atomic's to throw away.
+                let bytes = self.bytes(&relative, &shown)?;
+                let holds = manifest_vouches_for(manifest, &relative, &bytes);
+                if holds {
+                    report.unmodified.insert(relative);
+                } else {
+                    report
+                        .edited
+                        .push(format!("{shown} no longer holds what atomic wrote there"));
+                }
+                continue;
+            }
+            // No manifest vouches for this path, so nothing but what this very
+            // pack would write there counts as atomic's: a leftover from
+            // another version, or an edit, is refused instead of taken in.
             let file = self
                 .pack
                 .iter()
                 .find(|f| f.path == self.pack_path(&relative))
                 .expect("the pack has its own path");
             // Sizes first, so a large leftover costs no reading.
-            if meta.len() != file.contents.len() as u64 {
-                foreign
-                    .changed
-                    .push(format!("{shown} does not hold what atomic writes there"));
-                continue;
-            }
-            let on_disk = std::fs::read(self.path.join(&relative))
-                .with_context(|| format!("cannot read {shown}"))?;
-            if on_disk != file.contents.as_bytes() {
-                foreign
-                    .changed
-                    .push(format!("{shown} does not hold what atomic writes there"));
+            let other = meta.len() != file.contents.len() as u64
+                || self.bytes(&relative, &shown)? != file.contents.as_bytes();
+            if other {
+                report.changed.push(format!(
+                    "{shown} holds other content than the pack's, which atomic wrote there and \
+                     can replace"
+                ));
             }
         }
         Ok(())
+    }
+
+    /// The bytes of the plain file at `relative`, which the walk has seen to be
+    /// one.
+    fn bytes(&self, relative: &str, shown: &str) -> anyhow::Result<Vec<u8>> {
+        std::fs::read(self.path.join(relative)).with_context(|| format!("cannot read {shown}"))
     }
 
     /// The pack path of a file at `relative` below this directory.
     fn pack_path(&self, relative: &str) -> String {
         format!("{}{relative}", self.prefix)
     }
+
+    /// The manifest to write here now: every file of the pack that belongs to
+    /// this skill, with the bytes this atomic writes for it.
+    fn manifest(&self) -> String {
+        Manifest::for_pack(self.pack, self.skill).text()
+    }
+}
+
+/// How a link is named in a refusal: where it is, what it is, and that writing
+/// through it is not something atomic does. The link is what to remove, not the
+/// directory it stands in.
+fn link_named(at: &str) -> String {
+    format!("{at} is a symbolic link, and atomic never writes through one")
 }
 
 /// Whether `path` is itself a symbolic link.
@@ -429,8 +769,13 @@ fn with_section(text: Option<&str>, section: &str) -> anyhow::Result<String> {
     }
 }
 
-/// Write `relative` under `root`, creating directories, and refuse any path
-/// that leaves `root` through `..` or a symbolic link.
+/// Write `relative` under `root`, creating directories, and refuse any path that
+/// leaves `root` through `..` or a symbolic link.
+///
+/// The caller has refused what stands at the path itself: see
+/// [`link_to_own_file`], which `install` asks of the one path below the
+/// repository root that no skill directory's check covers, before it writes
+/// anything.
 fn write_inside(root: &Path, relative: &Path, contents: &[u8]) -> anyhow::Result<()> {
     ensure!(
         relative
@@ -466,24 +811,56 @@ fn write_inside(root: &Path, relative: &Path, contents: &[u8]) -> anyhow::Result
         }
     }
     let file = dir.join(relative.file_name().context("a file has a name")?);
-    if let Ok(meta) = std::fs::symlink_metadata(&file)
-        && meta.file_type().is_symlink()
-    {
-        let resolved = std::fs::canonicalize(&file)
-            .with_context(|| format!("{} is a broken symbolic link", relative.display()))?;
-        ensure!(
-            resolved.starts_with(root),
-            "{} is a symbolic link outside {}",
-            relative.display(),
-            root.display()
-        );
-    }
     std::fs::write(&file, contents).with_context(|| format!("write {}", relative.display()))
+}
+
+/// Refuse to write `file`, which stands at `relative` below `root`, when it is a
+/// symbolic link atomic may not write through: one that is broken, leads out of
+/// the repository, or leads to something other than another of the files named
+/// in `may_lead_to`. A link inside the repository is not enough on its own: what
+/// it leads to may be the person's own work, or one of a skill's files, which
+/// hold the pack rather than the instructions. Where two agents share one
+/// instructions file the link leads to the other's, and that one is followed.
+fn link_to_own_file(
+    root: &Path,
+    relative: &Path,
+    file: &Path,
+    may_lead_to: &[PathBuf],
+) -> anyhow::Result<()> {
+    if !is_link(file) {
+        return Ok(());
+    }
+    let resolved = std::fs::canonicalize(file)
+        .with_context(|| format!("{} is a broken symbolic link", relative.display()))?;
+    ensure!(
+        resolved.starts_with(root),
+        "{} is a symbolic link outside {}",
+        relative.display(),
+        root.display()
+    );
+    // The path being written is not its own target; only another of the files
+    // named is, and that is read plain rather than through a link of its own,
+    // which would be the same question one step on.
+    let leads_to = |path: &Path| {
+        path != relative
+            && std::fs::canonicalize(root.join(path)).is_ok_and(|target| target == resolved)
+    };
+    ensure!(
+        may_lead_to.iter().any(|path| leads_to(path)),
+        "{} is a symbolic link to {}, which is not a file atomic may write through from here; \
+         atomic writes this path plain, or through a link to the other agent's instructions file",
+        relative.display(),
+        resolved.display()
+    );
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The one skill of the pack, which every test here names.
+    const SKILL: &str = skills::CREATE_ATOM;
 
     fn scratch(name: &str) -> PathBuf {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -492,8 +869,21 @@ mod tests {
             std::process::id(),
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("scratch directory");
         dir
+    }
+
+    /// Where `agent` installs the skill, below `root`.
+    fn skill_dir(root: &Path, agent: Agent) -> PathBuf {
+        root.join(agent.skills_dir()).join(SKILL)
+    }
+
+    /// The manifest an installed skill directory carries.
+    fn manifest_of(root: &Path, agent: Agent) -> Manifest {
+        let at = skill_dir(root, agent).join(MANIFEST);
+        let text = std::fs::read_to_string(&at).expect("the manifest setup wrote");
+        Manifest::read(&at.display().to_string(), &text).expect("a manifest atomic wrote")
     }
 
     #[test]
@@ -532,8 +922,42 @@ mod tests {
         }
     }
 
-    /// Re-running setup is what an up-to-date install meets, and the check
-    /// must not stand in its way: the same pack installs again.
+    /// What the manifest is for: a later setup reads it to tell its own files
+    /// from anyone else's, so it must list exactly the files this setup wrote,
+    /// with the bytes it wrote, and nothing else.
+    #[test]
+    fn setup_records_in_the_skill_directory_what_it_wrote_there() {
+        let root = scratch("manifest");
+        let written = install(Agent::Codex, &root).expect("installs");
+        let at = Path::new(Agent::Codex.skills_dir())
+            .join(SKILL)
+            .join(MANIFEST);
+        assert!(written.contains(&at), "{written:?}");
+        let manifest = manifest_of(&root, Agent::Codex);
+        assert_eq!(manifest.format, MANIFEST_FORMAT);
+        let under = format!("{SKILL}/");
+        let want: BTreeMap<String, String> = skills::pack()
+            .expect("pack")
+            .iter()
+            .filter(|file| file.path.starts_with(under.as_str()))
+            .map(|file| (file.path[under.len()..].to_owned(), sha256(&file.contents)))
+            .collect();
+        assert_eq!(manifest.files, want);
+        // Every file it lists really does hold what it says, which is what lets
+        // a later setup write over it.
+        for (path, recorded) in &manifest.files {
+            let bytes = std::fs::read(skill_dir(&root, Agent::Codex).join(path)).expect("file");
+            assert_eq!(sha256(&bytes), *recorded, "{path}");
+        }
+        // And it is the same bytes again next time, so re-running setup leaves a
+        // directory that reads as it did.
+        let once = std::fs::read_to_string(root.join(&at)).expect("read");
+        install(Agent::Codex, &root).expect("again");
+        assert_eq!(std::fs::read_to_string(root.join(&at)).expect("read"), once);
+    }
+
+    /// Re-running setup is what an up-to-date install meets, and the check must
+    /// not stand in its way: the same pack installs again.
     #[test]
     fn reinstalling_the_same_pack_needs_no_clean_up() {
         let root = scratch("again");
@@ -553,6 +977,181 @@ mod tests {
         }
     }
 
+    /// What an upgrade meets: a directory an earlier setup wrote whose pack this
+    /// one no longer matches. The manifest says those bytes are atomic's own and
+    /// still unmodified, so setup writes its pack over them and drops what it no
+    /// longer ships. That is what the record is for.
+    #[test]
+    fn an_upgrade_replaces_the_pack_an_earlier_setup_wrote() {
+        let root = scratch("upgrade");
+        install(Agent::Codex, &root).expect("installed");
+        let skill = skill_dir(&root, Agent::Codex);
+        // The state a release before this one leaves: its own bytes, and a
+        // manifest recording exactly those.
+        let mut manifest = manifest_of(&root, Agent::Codex);
+        let older_skill = "---\nname: atomic-create-atom\n---\nan older release\n";
+        let gone = "<!-- a reference this release no longer ships -->\n";
+        std::fs::write(skill.join("SKILL.md"), older_skill).expect("write");
+        std::fs::write(skill.join("references/gone.md"), gone).expect("write");
+        manifest
+            .files
+            .insert("SKILL.md".to_owned(), sha256(older_skill));
+        manifest
+            .files
+            .insert("references/gone.md".to_owned(), sha256(gone));
+        std::fs::write(skill.join(MANIFEST), manifest.text()).expect("write");
+        install(Agent::Codex, &root).expect("the upgrade installs");
+        for file in skills::pack().expect("pack") {
+            let installed = std::fs::read_to_string(root.join(".agents/skills").join(&file.path))
+                .expect("installed file");
+            assert_eq!(installed, file.contents, "{}", file.path);
+        }
+        assert!(
+            !skill.join("references/gone.md").exists(),
+            "the file an older pack shipped, unmodified, stayed"
+        );
+        let now = manifest_of(&root, Agent::Codex);
+        assert!(
+            !now.files.contains_key("references/gone.md"),
+            "the new record still lists the file it removed"
+        );
+        assert_eq!(
+            now.files.get("SKILL.md"),
+            Some(&sha256(&skills::pack().expect("pack")[0].contents)),
+            "the new record does not describe what it wrote"
+        );
+    }
+
+    /// What a version of atomic that wrote no manifest leaves behind is refused
+    /// rather than taken in: with nothing to say who wrote a file, only the
+    /// pack's own bytes count as atomic's, and clearing the old skill is the
+    /// person's one deliberate step.
+    #[test]
+    fn a_pack_file_holding_other_content_is_refused_when_no_manifest_vouches_for_it() {
+        let root = scratch("changed");
+        std::fs::create_dir_all(root.join(".agents/skills/atomic-create-atom/references"))
+            .expect("references");
+        let skill = root.join(".agents/skills/atomic-create-atom/SKILL.md");
+        std::fs::write(&skill, "---\nname: atomic-create-atom\n---\nmine\n").expect("write");
+        let error = install(Agent::Codex, &root).expect_err("refused");
+        assert_eq!(
+            format!("{error:#}"),
+            ".agents/skills/atomic-create-atom holds what atomic did not write (an older \
+             version of atomic may be the cause): .agents/skills/atomic-create-atom/SKILL.md \
+             holds other content than the pack's, which atomic wrote there and can replace; \
+             remove what is named and run `atomic setup` again"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&skill).expect("unchanged"),
+            "---\nname: atomic-create-atom\n---\nmine\n"
+        );
+        assert!(!root.join("AGENTS.md").exists());
+    }
+
+    /// A file atomic wrote, listed in its own manifest, that someone has since
+    /// changed is theirs, not atomic's to throw away.
+    #[test]
+    fn an_edited_pack_file_is_refused_and_left_as_it_is() {
+        let root = scratch("edited");
+        install(Agent::Codex, &root).expect("installed");
+        let skill = skill_dir(&root, Agent::Codex);
+        let theirs = "the person's own instructions, added to the skill\n";
+        std::fs::write(skill.join("SKILL.md"), theirs).expect("write");
+        let error = install(Agent::Codex, &root).expect_err("refused");
+        assert_eq!(
+            format!("{error:#}"),
+            ".agents/skills/atomic-create-atom holds what atomic did not write (an older \
+             version of atomic may be the cause): .agents/skills/atomic-create-atom/SKILL.md \
+             no longer holds what atomic wrote there; remove what is named and run `atomic \
+             setup` again"
+        );
+        assert_eq!(
+            std::fs::read_to_string(skill.join("SKILL.md")).expect("theirs"),
+            theirs
+        );
+        // The record still describes what the last setup wrote, not what is on
+        // disk now: nothing was written over the refusal.
+        assert_eq!(
+            manifest_of(&root, Agent::Codex).files.get("SKILL.md"),
+            Some(&sha256(&skills::pack().expect("pack")[0].contents)),
+            "the record was rewritten over the refusal"
+        );
+    }
+
+    /// The manifest decides whose a file is, so a directory that has one cannot
+    /// smuggle anything in by holding the pack's bytes.
+    #[test]
+    fn a_file_the_manifest_does_not_list_is_refused_even_holding_the_packs_content() {
+        let root = scratch("unlisted");
+        install(Agent::Codex, &root).expect("installed");
+        let skill = skill_dir(&root, Agent::Codex);
+        std::fs::write(
+            skill.join("SKILL.md.bak"),
+            std::fs::read(skill.join("SKILL.md")).expect("read"),
+        )
+        .expect("write");
+        let error = install(Agent::Codex, &root).expect_err("refused");
+        assert_eq!(
+            format!("{error:#}"),
+            ".agents/skills/atomic-create-atom holds what atomic did not write (an older \
+             version of atomic may be the cause): \
+             .agents/skills/atomic-create-atom/SKILL.md.bak is not a file atomic writes; \
+             remove what is named and run `atomic setup` again"
+        );
+    }
+
+    /// A manifest is the whole basis for what a later setup may overwrite, so one
+    /// that is not atomic's own is refused where it stands: reading it as no
+    /// manifest at all would let anyone's file list vouch for the directory.
+    #[test]
+    fn a_manifest_atomic_did_not_write_is_refused() {
+        let zeros = "0".repeat(64);
+        let outside = format!("{{\"format\":1,\"files\":{{\"../elsewhere.md\":\"{zeros}\"}}}}");
+        let bad_hash = "{\"format\":1,\"files\":{\"SKILL.md\":\"not a hash\"}}".to_owned();
+        for (what, text, says) in [
+            (
+                "not-json",
+                b"not a manifest at all\n".to_vec(),
+                "is not a manifest atomic can read",
+            ),
+            (
+                "not-text",
+                vec![0xff, 0xfe, 0x00, 0x01],
+                "is not a manifest atomic can read",
+            ),
+            (
+                "another-format",
+                b"{\"format\":2,\"files\":{}}".to_vec(),
+                "is manifest format 2, which this atomic cannot read",
+            ),
+            (
+                "foreign-path",
+                outside.into_bytes(),
+                "lists ../elsewhere.md as",
+            ),
+            (
+                "foreign-hash",
+                bad_hash.into_bytes(),
+                "lists SKILL.md as not a hash",
+            ),
+        ] {
+            let root = scratch("manifest");
+            install(Agent::Codex, &root).expect("installed");
+            std::fs::write(skill_dir(&root, Agent::Codex).join(MANIFEST), &text)
+                .expect("write the impostor");
+            let error = format!("{:#}", install(Agent::Codex, &root).unwrap_err());
+            assert!(
+                error.contains(&format!("{MANIFEST} {says}")),
+                "{what}: {error}"
+            );
+            assert_eq!(
+                std::fs::read(skill_dir(&root, Agent::Codex).join(MANIFEST)).expect("read"),
+                text,
+                "{what}: the impostor was written over, so the directory was taken in"
+            );
+        }
+    }
+
     /// What an augmented directory costs: the refusal's exact wording, and no
     /// install at all.
     #[test]
@@ -564,9 +1163,10 @@ mod tests {
         let error = install(Agent::Codex, &root).expect_err("refused");
         assert_eq!(
             format!("{error:#}"),
-            ".agents/skills/atomic-create-atom holds what atomic did not write: \
+            ".agents/skills/atomic-create-atom holds what atomic did not write (an older \
+             version of atomic may be the cause): \
              .agents/skills/atomic-create-atom/scripts is not a directory atomic writes; \
-             remove what is listed, or the whole directory, and run `atomic setup` again"
+             remove what is named and run `atomic setup` again"
         );
         assert!(
             !root
@@ -584,8 +1184,8 @@ mod tests {
         );
     }
 
-    /// The extra thing can be a plain file beside the pack's own, which is
-    /// what a leftover from an older atomic or a hand-written note looks like.
+    /// The extra thing can be a plain file beside the pack's own, which is what
+    /// a leftover from an older atomic or a hand-written note looks like.
     #[test]
     fn a_plain_extra_file_in_the_skill_directory_is_refused() {
         let root = scratch("extra-file");
@@ -599,9 +1199,10 @@ mod tests {
         let error = install(Agent::Claude, &root).expect_err("refused");
         assert_eq!(
             format!("{error:#}"),
-            ".claude/skills/atomic-create-atom holds what atomic did not write: \
-             .claude/skills/atomic-create-atom/extra.md is not a file atomic writes; \
-             remove what is listed, or the whole directory, and run `atomic setup` again"
+            ".claude/skills/atomic-create-atom holds what atomic did not write (an older \
+             version of atomic may be the cause): \
+             .claude/skills/atomic-create-atom/extra.md is not a file atomic writes; remove \
+             what is named and run `atomic setup` again"
         );
         assert!(!root.join("CLAUDE.md").exists());
     }
@@ -620,34 +1221,94 @@ mod tests {
         let error = install(Agent::Codex, &root).expect_err("refused");
         assert_eq!(
             format!("{error:#}"),
-            ".agents/skills/atomic-create-atom holds what atomic did not write: \
-             .agents/skills/atomic-create-atom/.alias is not a file atomic writes; \
-             remove what is listed, or the whole directory, and run `atomic setup` again"
+            ".agents/skills/atomic-create-atom holds what atomic did not write (an older \
+             version of atomic may be the cause): \
+             .agents/skills/atomic-create-atom/.alias is not a file atomic writes; remove \
+             what is named and run `atomic setup` again"
         );
         assert!(!root.join("AGENTS.md").exists());
     }
 
-    /// What a version of atomic that wrote other content, or an edited
-    /// installed file, leaves behind is refused rather than taken in.
+    /// A refusal is written where a person reads it, so a name cannot forge the
+    /// lines around it: what is refused is named on one line, escaped.
+    #[cfg(unix)]
     #[test]
-    fn a_pack_file_holding_other_content_is_refused() {
-        let root = scratch("changed");
-        std::fs::create_dir_all(root.join(".agents/skills/atomic-create-atom/references"))
-            .expect("references");
-        let skill = root.join(".agents/skills/atomic-create-atom/SKILL.md");
-        std::fs::write(&skill, "---\nname: atomic-create-atom\n---\nmine\n").expect("write");
-        let error = install(Agent::Codex, &root).expect_err("refused");
-        assert_eq!(
-            format!("{error:#}"),
-            ".agents/skills/atomic-create-atom holds what atomic did not write: \
-             .agents/skills/atomic-create-atom/SKILL.md does not hold what atomic writes there; \
-             remove what is listed, or the whole directory, and run `atomic setup` again"
+    fn a_refusal_escapes_a_name_a_person_gave_a_file() {
+        let root = scratch("escaping");
+        std::fs::create_dir_all(skill_dir(&root, Agent::Codex)).expect("skill directory");
+        std::os::unix::fs::symlink(
+            "/etc/hosts",
+            skill_dir(&root, Agent::Codex).join("evil\nrm -rf ~"),
+        )
+        .expect("link");
+        let error = format!("{:#}", install(Agent::Codex, &root).unwrap_err());
+        assert!(
+            error.contains(".agents/skills/atomic-create-atom/evil\\nrm -rf ~ is a symbolic link"),
+            "{error}"
         );
         assert_eq!(
-            std::fs::read_to_string(&skill).expect("unchanged"),
-            "---\nname: atomic-create-atom\n---\nmine\n"
+            error.lines().count(),
+            1,
+            "a name split the refusal: {error}"
         );
         assert!(!root.join("AGENTS.md").exists());
+    }
+
+    /// Too much to name is counted, not squeezed: what is named stops, what is
+    /// left is tallied, and the advice a person has to follow stays whole.
+    #[test]
+    fn a_long_list_of_names_is_cut_and_counted_and_the_advice_stays() {
+        let root = scratch("many");
+        std::fs::create_dir_all(skill_dir(&root, Agent::Codex)).expect("skill directory");
+        for i in 0..60 {
+            std::fs::write(
+                skill_dir(&root, Agent::Codex).join(format!("extra-file-number-{i:02}.md")),
+                "mine",
+            )
+            .expect("write");
+        }
+        let error = format!("{:#}", install(Agent::Codex, &root).unwrap_err());
+        assert!(
+            error.ends_with("remove what is named and run `atomic setup` again"),
+            "the advice was cut: {error}"
+        );
+        // The list's own limit leaves room for far fewer than these 60, so the
+        // rest is counted, and the name after the last one written is absent.
+        assert!(error.contains("and 37 more"), "not counted: {error}");
+        assert_eq!(
+            error.matches("is not a file atomic writes").count(),
+            23,
+            "not the number the list's limit allows: {error}"
+        );
+        assert!(
+            !error.contains("extra-file-number-23.md"),
+            "named past the list's own limit"
+        );
+        assert_eq!(error.lines().count(), 1, "split over lines: {error}");
+    }
+
+    /// What an entry that is not a file at all looks like where a pack file
+    /// belongs: refused as what it is, and never opened. A fifo would wait for a
+    /// writer, or stream for ever, so being told it is not a plain file is not
+    /// only clearer than reading it, it is what lets setup finish.
+    #[test]
+    #[cfg(unix)]
+    fn a_pipe_where_a_pack_file_belongs_is_refused_as_not_a_plain_file() {
+        let root = scratch("fifo");
+        std::fs::create_dir_all(skill_dir(&root, Agent::Codex)).expect("skill directory");
+        let path = skill_dir(&root, Agent::Codex).join("SKILL.md");
+        let fifo = std::ffi::CString::new(path.into_os_string().into_encoded_bytes())
+            .expect("a path with no inner NUL");
+        // SAFETY: mkfifo reads a NUL-terminated path and makes a pipe there.
+        #[allow(unsafe_code)]
+        let made = unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) };
+        assert_eq!(made, 0, "mkfifo: {}", std::io::Error::last_os_error());
+        let error = format!("{:#}", install(Agent::Codex, &root).unwrap_err());
+        assert!(
+            error.contains(".agents/skills/atomic-create-atom/SKILL.md is not a plain file"),
+            "{error}"
+        );
+        assert!(!root.join("AGENTS.md").exists(), "installed anyway");
     }
 
     #[cfg(unix)]
@@ -667,8 +1328,9 @@ mod tests {
         assert_eq!(
             format!("{error:#}"),
             ".agents/skills/atomic-create-atom holds what atomic did not write: \
-             .agents/skills/atomic-create-atom/references/fields.md is a symbolic link; \
-             remove what is listed, or the whole directory, and run `atomic setup` again"
+             .agents/skills/atomic-create-atom/references/fields.md is a symbolic link, and \
+             atomic never writes through one; remove what is named and run `atomic setup` \
+             again"
         );
         assert_eq!(
             std::fs::read_to_string(outside.join("someone-elses.md")).expect("read"),
@@ -677,8 +1339,8 @@ mod tests {
         assert!(!root.join("AGENTS.md").exists());
     }
 
-    /// The directory behind the alias looks like a skill of its own, right
-    /// down to the `name` its directory goes by, and stays exactly as it was.
+    /// The directory behind the alias looks like a skill of its own, right down
+    /// to the `name` its directory goes by, and stays exactly as it was.
     #[cfg(unix)]
     #[test]
     fn a_skill_directory_that_is_a_link_is_refused() {
@@ -694,8 +1356,8 @@ mod tests {
         assert_eq!(
             format!("{error:#}"),
             ".agents/skills/atomic-create-atom holds what atomic did not write: \
-             .agents/skills/atomic-create-atom is a symbolic link; \
-             remove what is listed, or the whole directory, and run `atomic setup` again"
+             .agents/skills/atomic-create-atom is a symbolic link, and atomic never writes \
+             through one; remove what is named and run `atomic setup` again"
         );
         assert_eq!(
             std::fs::read_to_string(other.join("SKILL.md")).expect("theirs"),
@@ -722,14 +1384,14 @@ mod tests {
         assert_eq!(
             format!("{error:#}"),
             ".agents/skills/atomic-create-atom holds what atomic did not write: \
-             .agents/skills/atomic-create-atom/SKILL.md is a symbolic link; \
-             remove what is listed, or the whole directory, and run `atomic setup` again"
+             .agents/skills/atomic-create-atom/SKILL.md is a symbolic link, and atomic never \
+             writes through one; remove what is named and run `atomic setup` again"
         );
         assert!(!root.join("AGENTS.md").exists());
     }
 
-    /// Refusing is about the directory atomic owns. A skill installed beside
-    /// it stays, and so does anything else in the shared skills directory.
+    /// Refusing is about the directory atomic owns. A skill installed beside it
+    /// stays, and so does anything else in the shared skills directory.
     #[test]
     fn a_skill_installed_beside_atomic_is_left_alone() {
         let root = scratch("neighbour");
@@ -788,9 +1450,10 @@ mod tests {
         assert!(format!("{error:#}").contains("marker"), "{error:#}");
     }
 
-    /// A skill directory is installed only down a chain of plain directories.
-    /// A link partway down leads the agent, and atomic's own writes, somewhere
-    /// else, so it is refused where it is, and what it leads to is left out.
+    /// A skill directory is installed only down a chain of plain directories. A
+    /// link partway down leads the agent, and atomic's own writes, somewhere
+    /// else, so it is refused where it is, and what it leads to is left out. The
+    /// advice is about the link: the directory it stands in is the person's own.
     #[cfg(unix)]
     #[test]
     fn a_skill_directory_reached_through_a_link_is_refused() {
@@ -802,9 +1465,13 @@ mod tests {
         let error = install(Agent::Claude, &root).expect_err("refused");
         assert_eq!(
             format!("{error:#}"),
-            ".claude/skills/atomic-create-atom holds what atomic did not write: \
-             .claude is a symbolic link; remove what is listed, or the whole directory, \
-             and run `atomic setup` again"
+            ".claude/skills/atomic-create-atom holds what atomic did not write: .claude is a \
+             symbolic link, and atomic never writes through one; remove what is named and run \
+             `atomic setup` again"
+        );
+        assert!(
+            !format!("{error:#}").contains("whole directory"),
+            "the advice named the wrong thing to remove"
         );
         assert!(!root.join("CLAUDE.md").exists());
         assert_eq!(
@@ -822,25 +1489,98 @@ mod tests {
         let error = install(Agent::Codex, &root).expect_err("refused");
         assert_eq!(
             format!("{error:#}"),
-            ".agents/skills/atomic-create-atom holds what atomic did not write: \
-             .agents is a symbolic link; remove what is listed, or the whole directory, \
-             and run `atomic setup` again"
+            ".agents/skills/atomic-create-atom holds what atomic did not write: .agents is a \
+             symbolic link, and atomic never writes through one; remove what is named and run \
+             `atomic setup` again"
         );
         assert!(
             std::fs::read_dir(&outside)
                 .expect("outside")
                 .next()
-                .is_none()
+                .is_none(),
+            "something was written where the link leads"
         );
 
         let root = scratch("link-file");
         std::fs::write(outside.join("notes.md"), "theirs").expect("write");
         std::os::unix::fs::symlink(outside.join("notes.md"), root.join("CLAUDE.md")).expect("link");
         let error = install(Agent::Claude, &root).expect_err("refused");
-        assert!(format!("{error:#}").contains("symbolic link"), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("CLAUDE.md is a symbolic link outside"),
+            "{error:#}"
+        );
         assert_eq!(
             std::fs::read_to_string(outside.join("notes.md")).expect("read"),
             "theirs"
+        );
+    }
+
+    /// A link standing where the instructions file belongs is followed only when
+    /// it leads to the other agent's instructions file. One that reaches a file of
+    /// the person's own is refused wherever in the repository it sits, so
+    /// `CLAUDE.md` cannot be an alias for a note beside the skill.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_to_a_file_atomic_does_not_write_is_refused_even_inside_the_repository() {
+        let root = scratch("inside-escape");
+        std::fs::create_dir_all(root.join(".claude")).expect("claude directory");
+        std::fs::write(root.join(".claude/notes.md"), "the person's own note\n").expect("write");
+        std::os::unix::fs::symlink(".claude/notes.md", root.join("CLAUDE.md")).expect("link");
+        let error = install(Agent::Claude, &root).expect_err("refused");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("CLAUDE.md is a symbolic link to")
+                && text.contains("which is not a file atomic may write through from here"),
+            "{text}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(".claude/notes.md")).expect("theirs"),
+            "the person's own note\n"
+        );
+        assert!(
+            std::fs::symlink_metadata(root.join("CLAUDE.md"))
+                .expect("meta")
+                .file_type()
+                .is_symlink(),
+            "the link was replaced"
+        );
+        assert!(
+            !skill_dir(&root, Agent::Claude).join("SKILL.md").is_file(),
+            "the skill was installed despite the refusal"
+        );
+    }
+
+    /// A link at the instructions file that leads into a skill is refused as
+    /// well: writing there would put atomic's instructions over one of the pack's
+    /// own files, which is no more atomic's to do than overwriting a note of the
+    /// person's.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_from_the_instructions_file_into_the_skill_is_refused() {
+        let root = scratch("into-skill");
+        install(Agent::Codex, &root).expect("the skill is installed");
+        let pack_file = skill_dir(&root, Agent::Codex).join("SKILL.md");
+        std::os::unix::fs::symlink(
+            Path::new(".agents/skills")
+                .join(SKILL)
+                .join("SKILL.md")
+                .to_string_lossy()
+                .as_ref(),
+            root.join("CLAUDE.md"),
+        )
+        .expect("link");
+        let before = std::fs::read(&pack_file).expect("read");
+        let error = install(Agent::Claude, &root).expect_err("refused");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("CLAUDE.md is a symbolic link to")
+                && text.contains("which is not a file atomic may write through from here"),
+            "{text}"
+        );
+        assert_eq!(
+            std::fs::read(&pack_file).expect("read"),
+            before,
+            "the instructions were written into the skill"
         );
     }
 

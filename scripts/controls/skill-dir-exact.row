@@ -1,0 +1,1 @@
+skill-dir-exact|crates/atomic/src/setup.rs|        let stale = dir.check()?;|        let stale = Vec::<String>::new(); let _ = &dir; // CONTROL_OFF|-p atomic-agentic --bin atomic -- a_file_atomic_did_not_write_in_the_skill_directory_is_refused a_pack_file_holding_other_content_is_refused_when_no_manifest_vouches_for_it symbolic_links_out_of_the_repository_are_refused
