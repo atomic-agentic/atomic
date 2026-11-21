@@ -165,18 +165,26 @@ fn a_sign_in_that_cannot_be_used_refuses_a_run_and_nothing_takes_its_place() {
         assert!(!out.status.success(), "{t}");
         t
     };
-    // The sign-in's directory, and a keyring that cannot be reached.
-    std::fs::create_dir_all(f.credentials().join("codex-auth")).unwrap();
-    let t = refused(&[("ATOMIC_CREDENTIAL_STORE", "keyring")]);
+    // Kept outside every checkout, where it is accepted: the sign-in's
+    // directory, and a keyring that cannot be reached.
+    let away = f.outside.join("keyring-home");
+    std::fs::create_dir_all(away.join("credentials/codex-auth")).unwrap();
+    let away_home = away.to_str().unwrap().to_owned();
+    let t = refused(&[
+        ("ATOMIC_HOME", away_home.as_str()),
+        ("ATOMIC_CREDENTIAL_STORE", "keyring"),
+    ]);
     assert!(t.contains("the ChatGPT sign-in cannot be used"), "{t}");
+    assert!(!t.contains("inside the checkout"), "{t}");
     assert!(t.contains("from outside the project"), "{t}");
-    std::fs::remove_dir_all(f.credentials().join("codex-auth")).unwrap();
     // A sign-in's directory that is a link to itself, which no lookup gets
     // to the end of: refused, never taken for absent.
-    std::os::unix::fs::symlink("codex-auth", f.credentials().join("codex-auth")).unwrap();
-    let t = refused(&[]);
+    let looped = f.outside.join("loop-home");
+    std::fs::create_dir_all(looped.join("credentials")).unwrap();
+    std::os::unix::fs::symlink("codex-auth", looped.join("credentials/codex-auth")).unwrap();
+    let looped_home = looped.to_str().unwrap().to_owned();
+    let t = refused(&[("ATOMIC_HOME", looped_home.as_str())]);
     assert!(t.contains("the ChatGPT sign-in cannot be used"), "{t}");
-    std::fs::remove_file(f.credentials().join("codex-auth")).unwrap();
     // Kept inside the checkout holding the project: refused there. With no
     // sign-in's directory there, nothing is refused for one, and the run
     // goes to the detected endpoint; with one, it is refused for the
@@ -193,7 +201,7 @@ fn a_sign_in_that_cannot_be_used_refuses_a_run_and_nothing_takes_its_place() {
     std::fs::remove_dir_all(f.dir.join(".git")).unwrap();
     // A sign-in's directory under one this user cannot look in, accepted
     // where it is kept or refused there: never taken for absent.
-    let closed = f.dir.join("closed-home");
+    let closed = f.outside.join("closed-home");
     std::fs::create_dir_all(closed.join("credentials/codex-auth")).unwrap();
     let mode = |m: u32| {
         std::fs::set_permissions(
