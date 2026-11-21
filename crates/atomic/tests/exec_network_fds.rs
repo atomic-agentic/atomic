@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! A confined command that opens many connections through its proxy cannot
-//! take atomic past its share of file descriptors. With atomic's limit on
-//! open files held at 1024, soft and hard, a command opens 300 tunnels through the proxy to a
-//! server on this machine that keeps every one open. Its sandbox's bridge
+//! A confined command that holds many tunnels through its proxy to a server
+//! that answers stays within its share of atomic's file descriptors: the
+//! admission budget holds for an upstream that behaves (a command that
+//! abandons connections to one that never answers can pass it; that is not
+//! enforced). With atomic's limit on open files held at 1024, soft and hard,
+//! a command opens 300 tunnels through the proxy to a server on this
+//! machine that keeps every one open. Its sandbox's bridge
 //! lets at most 128 through at once, each costing atomic two descriptors,
 //! so the proxy holds no more than its per-command allowance, and that is
 //! within half of the limit. While it runs, a second command that declares
@@ -79,7 +82,7 @@ fn limit_open_files(soft: u64) {
 }
 
 #[test]
-fn a_command_opening_many_connections_stays_within_its_share_of_descriptors() {
+fn a_command_holding_many_tunnels_to_a_live_server_stays_within_its_budget() {
     support::require_sandbox();
     const LIMIT: u64 = 1024;
     limit_open_files(LIMIT);
@@ -186,7 +189,12 @@ fn a_command_opening_many_connections_stays_within_its_share_of_descriptors() {
         let second = local.run(&command(&other_done));
         std::fs::write(&done, "").expect("done");
         let error = second.expect_err("a second command started past the share");
-        assert!(error.to_string().contains("open files"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("commands that declare hosts are running, and atomic's limit of 1024"),
+            "{error}"
+        );
 
         let first = first.join().expect("the first command").expect("it runs");
         assert!(

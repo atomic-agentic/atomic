@@ -185,13 +185,21 @@ command's sandbox and that the command itself never sees, so no sandboxed
 process and no other user's process can use the proxy. A process of your own
 user that runs outside any sandbox can still read the token from the sandbox
 helper's environment while the command runs.
-A command's sandbox opens at most 128 connections to its proxy at once, each
-costing atomic two open files, and the commands that declare hosts may take
-no more than half of atomic's limit on open files between them. When they
-need more room, atomic first raises its own limit as far as the hard limit
-allows, up to 65536, and the commands it starts afterwards inherit that; a
-command that would still pass it does not start, and says so. Raise the hard
-limit (`ulimit -Hn`) to run more of them at once.
+Each command that declares hosts is admitted against a budget of open files:
+its sandbox keeps at most 128 connections to the proxy open at once, each
+costing atomic two, and the commands that declare hosts may reserve no more
+than half of atomic's limit on open files between them. When they need more
+room, atomic first raises its own limit as far as the hard limit allows, up
+to 65536, and the commands it starts afterwards inherit that; a command that
+would still pass it does not start, and says so, and its step fails rather
+than waits. Start atomic with a higher limit (`ulimit -n`) to run more of
+them at once. The budget holds while the hosts a command reaches answer and
+close as they should; it is not a limit the proxy enforces. The proxy
+answers an HTTPS `CONNECT` before it dials, with no time limit on the dial,
+keeps a connection's files for a while after the command has dropped it,
+and keeps a tunnel open until the host closes it, so a command that keeps
+opening and abandoning connections to a host that never answers can take
+more than its share, and can leave atomic short of open files.
 
 What an atom may list is atomic's policy, checked when the atom loads and again
 before its command runs: public DNS names only. An IP address in any spelling

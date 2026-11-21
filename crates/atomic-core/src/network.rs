@@ -33,12 +33,19 @@
 //! from the helper's environment. A command's token admits no new connection
 //! once the command ends, and the proxy stops once no command needs it.
 //!
-//! A command's bridge opens at most 128 connections to its proxy at once,
-//! and each costs atomic two file descriptors, so a command may hold
-//! [`DESCRIPTORS_PER_COMMAND`] of them. Together, the commands that declare
-//! hosts may hold no more than half of atomic's limit on open files, which
-//! atomic raises toward its hard limit when they need room: a
-//! command that would pass it does not start ([`Budget`]).
+//! Each command that declares hosts is admitted against a budget of file
+//! descriptors ([`Budget`]): it reserves [`DESCRIPTORS_PER_COMMAND`], two for
+//! each of the 128 connections its sandbox's bridge keeps open to the proxy
+//! at once, and together the commands may reserve no more than half of
+//! atomic's limit on open files, which atomic first raises toward its hard
+//! limit. A command that would pass it does not start. The budget holds
+//! while upstreams answer and close as they should; it is not a limit the
+//! proxy enforces. Codex's proxy answers `CONNECT` before it dials, with no
+//! dial timeout, may dial more than once for one connection, keeps a
+//! connection's descriptors for a while after the bridge has dropped it, and
+//! keeps a tunnel open until the upstream closes it, so a command that keeps
+//! opening and abandoning connections to a host that never answers can hold
+//! more than its share.
 
 use anyhow::Context as _;
 use codex_network_proxy::{
@@ -375,8 +382,9 @@ impl Budget {
             anyhow::bail!(
                 "{} commands that declare hosts are running, and atomic's limit of {limit} open \
                  files leaves room for {} at once: their proxy connections may take half of it, \
-                 {DESCRIPTORS_PER_COMMAND} for each; raise the limit (`ulimit -n`) to run more \
-                 at once",
+                 {DESCRIPTORS_PER_COMMAND} for each. atomic raises its own limit only as far as \
+                 its hard limit and at most to {RAISED_LIMIT}; start it with a higher limit \
+                 (`ulimit -n`) to run more at once",
                 *reserved / DESCRIPTORS_PER_COMMAND,
                 share / DESCRIPTORS_PER_COMMAND,
             );
@@ -405,14 +413,14 @@ fn descriptor_limits() -> anyhow::Result<libc::rlimit> {
     Ok(limit)
 }
 
-/// Room for one more command's connections in [`BUDGET`]. Where there is
+/// Room for one more command's connections in `budget`. Where there is
 /// none under this process's soft limit on open files, the limit is first
 /// raised as far as the hard one allows, up to [`RAISED_LIMIT`]; the
 /// commands atomic starts afterwards inherit it.
 #[allow(unsafe_code, clippy::unnecessary_cast)]
-fn reserve_room() -> anyhow::Result<Reservation> {
+fn reserve_room(budget: &'static Budget) -> anyhow::Result<Reservation> {
     let mut limit = descriptor_limits()?;
-    let refused = match BUDGET.reserve(limit.rlim_cur as u64) {
+    let refused = match budget.reserve(limit.rlim_cur as u64) {
         Ok(room) => return Ok(room),
         Err(why) => why,
     };
@@ -426,7 +434,7 @@ fn reserve_room() -> anyhow::Result<Reservation> {
     if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
         return Err(refused);
     }
-    BUDGET.reserve(raised)
+    budget.reserve(raised)
 }
 
 /// What a command holds while it runs: its proxy runs until no command
@@ -453,13 +461,33 @@ fn token() -> anyhow::Result<String> {
 
 /// The proxies a confining backend runs, one for each distinct list of
 /// hosts, each kept while a command that declared it runs.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct Proxies {
     running: Arc<Mutex<HashMap<Vec<String>, Weak<Running>>>>,
+    /// The descriptor budget its commands reserve room in: the process's,
+    /// or, in a unit test, one of the test's own.
+    budget: &'static Budget,
     /// This machine's addresses as a test says they are, in place of its
     /// interfaces'.
     #[cfg(test)]
     own_for_tests: Arc<Mutex<Option<BTreeSet<IpAddr>>>>,
+}
+
+impl Default for Proxies {
+    fn default() -> Self {
+        // Each unit test's proxies count against a budget of their own, so
+        // tests running at once do not share one.
+        #[cfg(test)]
+        let budget: &'static Budget = Box::leak(Box::new(Budget(Mutex::new(0))));
+        #[cfg(not(test))]
+        let budget = &BUDGET;
+        Self {
+            running: Arc::default(),
+            budget,
+            #[cfg(test)]
+            own_for_tests: Arc::default(),
+        }
+    }
 }
 
 impl std::fmt::Debug for Proxies {
@@ -518,7 +546,7 @@ impl Proxies {
         // A proxy started before this machine's addresses changed would
         // reach a new one: start another.
         let own = self.own()?;
-        let room = reserve_room()?;
+        let room = reserve_room(self.budget)?;
         let running = {
             let mut proxies = self
                 .running
@@ -1131,7 +1159,7 @@ mod tests {
         let Err(why) = OURS.reserve(limit) else {
             panic!("room for a third");
         };
-        assert!(why.to_string().contains("open files"), "{why}");
+        assert!(why.to_string().contains("commands that declare hosts are running"), "{why}");
         drop(first);
         let third = OURS.reserve(limit).expect("room again");
         drop((second, third));
