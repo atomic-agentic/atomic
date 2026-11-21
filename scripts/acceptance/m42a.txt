@@ -1,0 +1,26 @@
+# M42a, the first authoring skill and atomic setup: each acceptance clause of
+# docs/design/milestones.md § M42a, word for word, and the tests that show them,
+# as `<binary> <test path>`.
+# Run by scripts/acceptance.py m42a; see that script for the format.
+
+## In a new repository, Claude Code and Codex each build a working atom from a one-sentence task, with `atomic check` and `atomic eval` passing and nothing edited by hand.
+# CI cannot run signed-in Claude Code and Codex or make model calls, so it
+# cannot watch the two agents turn a one-sentence task into an atom, nor run
+# `atomic eval` against a model. What it checks instead: `atomic setup` puts the
+# pack where each agent looks in a fresh repository (so both could use it), the
+# pack installed is the one this binary builds, and the worked example the skill
+# teaches is a working atom that passes `atomic check` and renders, with eval
+# cases that are well-formed and hold against the example. By hand, with both
+# agents signed in, each is given a one-sentence task in a fresh repository and
+# `atomic check` and `atomic eval` are run on what it wrote, unedited.
+atomic setup::tests::claude_gets_its_own_skills_directory_and_claude_md
+atomic setup::tests::codex_gets_the_cross_tool_skills_directory_and_agents_md
+atomic skills::tests::checked_in_pack_matches_the_binary
+atomic skills::tests::the_worked_example_checks_renders_and_its_cases_hold
+pending: needs signed-in Claude Code and Codex making model calls, and `atomic eval` run against a model; CI has no provider and no network
+
+## The skill passes Agent Skills validation.
+# The pack's SKILL.md files pass the specification check, and the check refuses
+# what the specification refuses, so the passing means something.
+atomic skills::tests::the_pack_validates_against_the_agent_skills_specification
+atomic skills::tests::the_specification_check_refuses_what_the_specification_refuses
