@@ -4,6 +4,7 @@ use super::*;
 use crate::artifact::LocalStore;
 use serde_json::json;
 use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 
 /// A store and a command's scratch directory, removed when the test ends.
 struct Fixture {
@@ -15,7 +16,7 @@ struct Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = std::fs::set_permissions(
-            &self.exchange.inputs,
+            self.exchange.inputs(),
             std::fs::Permissions::from_mode(0o700),
         );
         let _ = std::fs::remove_dir_all(&self.dir);
@@ -33,7 +34,9 @@ fn fixture(tag: &str) -> Fixture {
     ));
     std::fs::create_dir_all(dir.join("scratch")).expect("scratch");
     let store = LocalStore::open(dir.join("store")).expect("store");
-    let exchange = Exchange::create(&dir.join("scratch")).expect("exchange");
+    let exchange = Exchange::new(Box::new(
+        atomic_exec::exchange::LocalExchange::create(&dir.join("scratch")).expect("exchange"),
+    ));
     Fixture {
         dir,
         store,
@@ -84,7 +87,7 @@ fn validate(value: &Value) -> Result<(), String> {
 
 impl Fixture {
     fn write(&self, name: &str, bytes: &[u8]) {
-        std::fs::write(self.exchange.outputs.join(name), bytes).expect("write");
+        std::fs::write(self.exchange.outputs().join(name), bytes).expect("write");
     }
 
     fn gather(&self, output: &mut Value) -> Result<Vec<Hold>, ArtifactError> {
@@ -213,12 +216,12 @@ fn links_fifos_directories_and_hard_links_are_refused() {
     // it tests: the link's target has one link, the hard link's two.
     let linked = f.dir.join("linked.txt");
     std::fs::write(&linked, b"not the command's").expect("outside");
-    std::os::unix::fs::symlink(&linked, f.exchange.outputs.join("link")).expect("link");
+    std::os::unix::fs::symlink(&linked, f.exchange.outputs().join("link")).expect("link");
     let outside = f.dir.join("outside.txt");
     std::fs::write(&outside, b"not the command's either").expect("outside");
-    std::fs::hard_link(&outside, f.exchange.outputs.join("hard")).expect("hard link");
-    std::fs::create_dir(f.exchange.outputs.join("dir")).expect("dir");
-    let fifo = std::ffi::CString::new(f.exchange.outputs.join("fifo").to_str().expect("UTF-8"))
+    std::fs::hard_link(&outside, f.exchange.outputs().join("hard")).expect("hard link");
+    std::fs::create_dir(f.exchange.outputs().join("dir")).expect("dir");
+    let fifo = std::ffi::CString::new(f.exchange.outputs().join("fifo").to_str().expect("UTF-8"))
         .expect("path");
     // SAFETY: a NUL-terminated path, for one call.
     #[allow(unsafe_code)]
@@ -240,8 +243,8 @@ fn a_swapped_outputs_directory_leads_nowhere() {
     let elsewhere = f.dir.join("elsewhere");
     std::fs::create_dir(&elsewhere).expect("elsewhere");
     std::fs::write(elsewhere.join("change.diff"), b"from elsewhere").expect("decoy");
-    std::fs::rename(&f.exchange.outputs, f.dir.join("moved")).expect("move");
-    std::os::unix::fs::symlink(&elsewhere, &f.exchange.outputs).expect("swap");
+    std::fs::rename(f.exchange.outputs(), f.dir.join("moved")).expect("move");
+    std::os::unix::fs::symlink(&elsewhere, f.exchange.outputs()).expect("swap");
     let mut output = json!({"patch": {"$file": "change.diff", "mediaType": "text/x-diff"}});
     let e = f.gather(&mut output).expect_err("the decoy is not read");
     assert!(matches!(e, ArtifactError::Refused(_)), "{e}");
@@ -296,7 +299,7 @@ fn a_file_or_a_step_past_its_limit_is_refused() {
     )
     .expect("one file, named twice");
     // Sparse: the size is what counts, not the blocks it takes.
-    let sparse = std::fs::File::create(f.exchange.outputs.join("sparse")).expect("sparse");
+    let sparse = std::fs::File::create(f.exchange.outputs().join("sparse")).expect("sparse");
     sparse.set_len(1 << 40).expect("a terabyte, sparse");
     let mut output = json!({"patch": {"$file": "sparse", "mediaType": "text/x-diff"}});
     let e = f.gather(&mut output).expect_err("a sparse terabyte");
@@ -322,12 +325,12 @@ fn inputs_are_copies_of_what_the_contract_references_read_only() {
     let given = referenced(&contract(), &input, &f.store);
     assert_eq!(given, vec![patch.clone()], "only the typed reference");
     f.exchange.mount(&f.store, &given).expect("mounted");
-    let copy = f.exchange.inputs.join(patch.digest());
+    let copy = f.exchange.inputs().join(patch.digest());
     assert_eq!(std::fs::read(&copy).expect("copy"), b"the patch");
-    assert!(!f.exchange.inputs.join(other.digest()).exists());
+    assert!(!f.exchange.inputs().join(other.digest()).exists());
     let mode = |p: &Path| std::fs::metadata(p).expect("meta").permissions().mode() & 0o777;
     assert_eq!(mode(&copy), 0o444);
-    assert_eq!(mode(&f.exchange.inputs), 0o555);
+    assert_eq!(mode(f.exchange.inputs()), 0o555);
     // A copy is the command's own: writing it, were it allowed, leaves the
     // store as it was.
     assert_ne!(
@@ -359,7 +362,7 @@ fn a_damaged_blob_is_not_given_to_a_command() {
         .mount(&f.store, std::slice::from_ref(&patch))
         .expect_err("refused");
     assert!(matches!(e, ArtifactError::Corrupt(_)), "{e}");
-    assert!(!f.exchange.inputs.join(patch.digest()).exists());
+    assert!(!f.exchange.inputs().join(patch.digest()).exists());
 }
 
 /// A store that changes a file as it is about to read the `at`-th, counting
@@ -516,7 +519,7 @@ fn a_file_that_changes_while_it_is_read_hands_over_only_what_it_had() {
     f.write("change.diff", b"0123456789");
     let shrinking = Tampering {
         inner: &f.store,
-        path: f.exchange.outputs.join("change.diff"),
+        path: f.exchange.outputs().join("change.diff"),
         change: |path| {
             std::fs::OpenOptions::new()
                 .write(true)
@@ -544,7 +547,7 @@ fn a_file_that_changes_while_it_is_read_hands_over_only_what_it_had() {
     f.write("grow.diff", b"0123456789");
     let growing = Tampering {
         inner: &f.store,
-        path: f.exchange.outputs.join("grow.diff"),
+        path: f.exchange.outputs().join("grow.diff"),
         change: |path| {
             use std::io::Write;
             std::fs::OpenOptions::new()
@@ -567,7 +570,8 @@ fn a_refusal_of_any_file_stores_none() {
     let f = fixture("any");
     f.write("a.diff", b"first");
     f.write("big.diff", &[b'b'; 200]);
-    std::os::unix::fs::symlink(f.dir.join("store"), f.exchange.outputs.join("link")).expect("link");
+    std::os::unix::fs::symlink(f.dir.join("store"), f.exchange.outputs().join("link"))
+        .expect("link");
     for (second, limits) in [
         ("link", Limits::default()),
         ("missing", Limits::default()),
