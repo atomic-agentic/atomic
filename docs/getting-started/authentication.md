@@ -72,7 +72,8 @@ supplied it. That includes the default location when your home directory is
 itself a git checkout (a `~/.git`) holding the project: set `ATOMIC_HOME` to a
 directory outside it. A link on the way that leads nowhere is refused too, and
 so is a checkout whose `.git` file or `commondir` is not a small regular file,
-as git writes them: that refuses your own configuration as well. A login that
+as git writes them (one another user owns still counts as a checkout, but is
+not read): that refuses your own configuration as well. A login that
 makes the sign-in directory first forgets whatever the store still holds for
 it, which outlived an earlier directory and is no sign-in. It is forgotten, not
 revoked, and a later logout can no longer revoke it. Under

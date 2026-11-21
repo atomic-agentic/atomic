@@ -662,16 +662,45 @@ pub fn as_it_really_is(path: &Path) -> PathBuf {
 /// project supplies both, and a pipe or a device there would hang or fill
 /// memory.
 pub fn checkouts_holding(dir: &Path) -> Result<Vec<PathBuf>, String> {
+    #[cfg(unix)]
+    let me = Some(effective_uid());
+    #[cfg(not(unix))]
+    let me = None;
+    checkouts_holding_as(dir, me)
+}
+
+/// [`checkouts_holding`], for the user `me` (`None` where files have no
+/// owner to compare). A `.git` another user owns, such as one planted in
+/// `/tmp` above every project there, still makes its directory a checkout
+/// that holds the project, but its link is neither followed nor refused:
+/// what it says is that user's, and no project under it should fail for it.
+fn checkouts_holding_as(dir: &Path, me: Option<u32>) -> Result<Vec<PathBuf>, String> {
     let mut found = Vec::new();
     for checkout in dir.ancestors().filter(|d| d.join(".git").exists()) {
         found.push(checkout.to_owned());
-        if let Some(main) = main_checkout(&checkout.join(".git"))?
+        let git = checkout.join(".git");
+        if !owned_by(&git, me) {
+            continue;
+        }
+        if let Some(main) = main_checkout(&git)?
             && !found.contains(&main)
         {
             found.push(main);
         }
     }
     Ok(found)
+}
+
+/// Whether `path` itself, not what a link there leads to, is owned by `me`;
+/// with no owner to compare, it counts as owned.
+fn owned_by(path: &Path, me: Option<u32>) -> bool {
+    #[cfg(unix)]
+    if let Some(me) = me {
+        use std::os::unix::fs::MetadataExt;
+        return std::fs::symlink_metadata(path).is_ok_and(|m| m.uid() == me);
+    }
+    let _ = (path, me);
+    true
 }
 
 /// The most a `.git` file or a `commondir` is read for: a path or two.
@@ -1193,6 +1222,25 @@ fn project_id(root: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `.git` another user owns above a project counts its directory as
+    /// a checkout, but what it links to is neither followed nor refused,
+    /// however it is made: the same file, owned by this user, is refused.
+    #[cfg(unix)]
+    #[test]
+    fn another_users_git_above_a_project_is_a_checkout_and_is_not_read() {
+        let dir = std::env::temp_dir().join(format!("atomic-foreign-git-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("project")).expect("project");
+        std::os::unix::fs::symlink("/dev/zero", dir.join(".git")).expect(".git");
+        let project = dir.join("project");
+        let me = effective_uid();
+        let held = checkouts_holding_as(&project, Some(me.wrapping_add(1))).expect("not read");
+        assert!(held.contains(&dir), "{held:?}");
+        let refused = checkouts_holding_as(&project, Some(me)).expect_err("read, and refused");
+        assert!(refused.contains("is not a regular file"), "{refused}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A worktree's `.git` or its repository's `commondir` that is a device,
     /// or larger than git writes, is refused without being read to its end,
