@@ -1546,6 +1546,13 @@ impl ExecutionBackend for Recording {
         self.calls.lock().expect("calls").push(call);
         closed
     }
+
+    fn exchange(
+        &self,
+        workspace: &Workspace,
+    ) -> Result<Option<Box<dyn atomic_exec::exchange::Exchange>>, atomic_exec::ExecError> {
+        atomic_exec::LocalBackend::default().exchange(workspace)
+    }
 }
 
 const CLASSIFIED: &str = r#"{"category": "bug", "summary": "Export crashes.", "line": null}"#;
@@ -3089,6 +3096,13 @@ impl ExecutionBackend for HeldOpen {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         atomic_exec::LocalBackend::default().close(workspace)
     }
+
+    fn exchange(
+        &self,
+        workspace: &Workspace,
+    ) -> Result<Option<Box<dyn atomic_exec::exchange::Exchange>>, atomic_exec::ExecError> {
+        atomic_exec::LocalBackend::default().exchange(workspace)
+    }
 }
 
 /// A run cancelled while its workspace is still opening leaves nothing
@@ -3282,4 +3296,330 @@ fn a_runtime_dropped_under_a_running_command_or_a_held_workspace_shuts_down() {
         assert!(!opened.opened().is_empty(), "the workspace never opened");
     });
     assert!(returned, "the runtime's drop hung under a held workspace");
+}
+
+/// A backend elsewhere: its workspace's paths are its runner's, which this
+/// machine does not have, and its exchange keeps their files in memory,
+/// where its "command" reads what it was given and writes what it hands
+/// over.
+#[derive(Clone, Default)]
+struct Remote {
+    files: Arc<std::sync::Mutex<RemoteFiles>>,
+    /// Whether it hands no files over, giving no exchange.
+    none: bool,
+    /// What its command writes, in place of a patch made from its input.
+    stdout: Option<Value>,
+}
+
+/// What a [`Remote`] backend's exchange holds.
+#[derive(Default)]
+struct RemoteFiles {
+    inputs: std::collections::BTreeMap<String, Vec<u8>>,
+    sealed: bool,
+    outputs: std::collections::BTreeMap<String, Vec<u8>>,
+}
+
+/// The root a [`Remote`] backend's workspace names, which is not here.
+const REMOTE_ROOT: &str = "/atomic-remote-runner";
+
+impl ExecutionBackend for Remote {
+    fn connect(&self) -> Result<atomic_exec::Statement, atomic_exec::ExecError> {
+        Ok(atomic_exec::Statement::default())
+    }
+
+    fn open(&self, request: &atomic_exec::Open) -> Result<Workspace, atomic_exec::ExecError> {
+        Ok(Workspace {
+            label: request.label.clone(),
+            root: Some(PathBuf::from(REMOTE_ROOT).join("work")),
+            scratch: Some(PathBuf::from(REMOTE_ROOT).join("scratch")),
+            ..Default::default()
+        })
+    }
+
+    /// Reads the patch it was given, by the digest its input names, and
+    /// hands over that patch with a line added.
+    fn run(
+        &self,
+        command: &atomic_exec::Command,
+    ) -> Result<atomic_exec::Completed, atomic_exec::ExecError> {
+        if let Some(stdout) = &self.stdout {
+            return Ok(atomic_exec::Completed {
+                code: Some(0),
+                stdout: serde_json::to_vec(stdout).expect("output"),
+                stderr: Vec::new(),
+            });
+        }
+        let env: std::collections::BTreeMap<_, _> = command.env.iter().cloned().collect();
+        assert_eq!(
+            env.get("ATOMIC_INPUTS").map(String::as_str),
+            Some("/atomic-remote-runner/scratch/inputs")
+        );
+        let input: Value = serde_json::from_slice(&command.stdin).expect("input");
+        let digest = input["patch"]
+            .as_str()
+            .and_then(|r| r.strip_prefix("artifact://sha256/"))
+            .expect("a reference")
+            .to_owned();
+        let mut files = self.files.lock().expect("files");
+        assert!(files.sealed, "run before its inputs were sealed");
+        let mut patch = files.inputs.get(&digest).expect("given").clone();
+        patch.extend_from_slice(b"+one more\n");
+        files.outputs.insert("out.diff".into(), patch);
+        Ok(atomic_exec::Completed {
+            code: Some(0),
+            stdout: serde_json::to_vec(
+                &json!({"total": 1, "patch": {"$file": "out.diff", "mediaType": "text/x-diff"}}),
+            )
+            .expect("output"),
+            stderr: Vec::new(),
+        })
+    }
+
+    fn close(&self, _: &Workspace) -> Result<(), atomic_exec::ExecError> {
+        Ok(())
+    }
+
+    fn exchange(
+        &self,
+        workspace: &Workspace,
+    ) -> Result<Option<Box<dyn atomic_exec::exchange::Exchange>>, atomic_exec::ExecError> {
+        if self.none {
+            return Ok(None);
+        }
+        let scratch = workspace.require_scratch()?;
+        Ok(Some(Box::new(RemoteExchange {
+            outputs: scratch.join("outputs"),
+            inputs: scratch.join("inputs"),
+            files: self.files.clone(),
+        })))
+    }
+}
+
+struct RemoteExchange {
+    outputs: PathBuf,
+    inputs: PathBuf,
+    files: Arc<std::sync::Mutex<RemoteFiles>>,
+}
+
+impl atomic_exec::exchange::Exchange for RemoteExchange {
+    fn outputs(&self) -> &std::path::Path {
+        &self.outputs
+    }
+    fn inputs(&self) -> &std::path::Path {
+        &self.inputs
+    }
+    fn give(&self, name: &str, content: &mut dyn std::io::Read) -> std::io::Result<()> {
+        let mut bytes = Vec::new();
+        content.read_to_end(&mut bytes)?;
+        self.files
+            .lock()
+            .expect("files")
+            .inputs
+            .insert(name.into(), bytes);
+        Ok(())
+    }
+    fn seal(&self) -> std::io::Result<()> {
+        self.files.lock().expect("files").sealed = true;
+        Ok(())
+    }
+    fn take(
+        &self,
+        name: &str,
+    ) -> Result<atomic_exec::exchange::Taken, atomic_exec::exchange::TakeError> {
+        let files = self.files.lock().expect("files");
+        let bytes = files
+            .outputs
+            .get(name)
+            .ok_or(atomic_exec::exchange::TakeError::Missing)?
+            .clone();
+        Ok(atomic_exec::exchange::Taken {
+            size: bytes.len() as u64,
+            content: Box::new(std::io::Cursor::new(bytes)),
+        })
+    }
+}
+
+/// An exec atom on a backend whose runner is elsewhere is given its input
+/// artifact and hands a file over, all through the backend's exchange:
+/// atomic touches no file of the workspace, whose paths this machine does
+/// not have.
+#[cfg(unix)]
+#[test]
+fn a_remote_backend_gives_inputs_and_hands_a_file_over() {
+    use crate::artifact::{ArtifactStore, LocalStore, Provenance};
+    use crate::{atom, compile};
+    use std::io::Read as _;
+    on_codex_runtime(async {
+        assert!(!std::path::Path::new(REMOTE_ROOT).exists());
+        let store = LocalStore::open(scratch("exec-remote-store")).expect("store");
+        let given = store
+            .put(
+                &mut &b"--- a\n+++ b\n"[..],
+                Provenance {
+                    media_type: "text/x-diff".into(),
+                    ..Default::default()
+                },
+            )
+            .expect("put")
+            .artifact;
+        let (dir, _, _) = exec_project("exec-remote", "", "");
+        std::fs::write(
+            dir.join("atoms/total.input.schema.yaml"),
+            "type: object\nadditionalProperties: false\nrequired: [cents, patch]\nproperties:\n  cents: {type: array, items: {type: integer}}\n  patch: {$ref: 'atomic:artifact', mediaType: text/x-diff}\n",
+        )
+        .expect("input");
+        std::fs::write(
+            dir.join("atoms/total.output.schema.yaml"),
+            "type: object\nadditionalProperties: false\nrequired: [total, patch]\nproperties:\n  total: {type: integer}\n  patch: {$ref: 'atomic:artifact', mediaType: text/x-diff}\n",
+        )
+        .expect("output");
+        let mut registry = Registry::new();
+        let a = atom::load(&dir.join("atoms/total.atom.astro"), &mut registry).expect("loads");
+        let compiled = compile::compile(&a, &registry).expect("compiles");
+        let artifacts = Artifacts::store(store.clone(), Default::default());
+        let remote = Remote::default();
+        let (out, _) = run_exec(
+            &a,
+            &compiled,
+            &json!({"cents": [1], "patch": given.uri()}),
+            &EffectIdentity {
+                run_id: "run-1".into(),
+                step_id: "total".into(),
+            },
+            Arc::new(remote.clone()),
+            None,
+            &artifacts,
+            &crate::usage::Metering::none(),
+        )
+        .await
+        .expect("runs");
+        let handed: crate::artifact::ArtifactRef = out["patch"]
+            .as_str()
+            .expect("a reference")
+            .parse()
+            .expect("parses");
+        let mut stored = Vec::new();
+        store
+            .open(&handed)
+            .expect("stored")
+            .read_to_end(&mut stored)
+            .expect("read");
+        assert_eq!(stored, b"--- a\n+++ b\n+one more\n");
+        let files = remote.files.lock().expect("files");
+        assert_eq!(
+            files.inputs.keys().collect::<Vec<_>>(),
+            vec![given.digest()]
+        );
+        assert!(!std::path::Path::new(REMOTE_ROOT).exists());
+    });
+}
+
+/// An exec atom whose input contract has an artifact where `patch` is, if
+/// `given`, and whose output contract has one there and an object of its
+/// own where `meta` is; with a store, as `atomic run` has.
+fn remote_atom(
+    tag: &str,
+    given: bool,
+) -> (crate::atom::Atom, Compiled, crate::artifact::LocalStore) {
+    use crate::{atom, compile};
+    let store = crate::artifact::LocalStore::open(scratch(&format!("{tag}-store"))).expect("store");
+    let (dir, _, _) = exec_project(tag, "", "");
+    if given {
+        std::fs::write(
+            dir.join("atoms/total.input.schema.yaml"),
+            "type: object\nadditionalProperties: false\nrequired: [cents, patch]\nproperties:\n  cents: {type: array, items: {type: integer}}\n  patch: {$ref: 'atomic:artifact', mediaType: text/x-diff}\n",
+        )
+        .expect("input");
+    }
+    std::fs::write(
+        dir.join("atoms/total.output.schema.yaml"),
+        "type: object\nadditionalProperties: false\nrequired: [total]\nproperties:\n  total: {type: integer}\n  patch: {$ref: 'atomic:artifact', mediaType: text/x-diff}\n  meta: {type: object}\n",
+    )
+    .expect("output");
+    let mut registry = Registry::new();
+    let a = atom::load(&dir.join("atoms/total.atom.astro"), &mut registry).expect("loads");
+    let compiled = compile::compile(&a, &registry).expect("compiles");
+    (a, compiled, store)
+}
+
+/// On a backend that hands no files over, an exec atom whose input
+/// references an artifact is refused before its command runs, and so is an
+/// output that names a file where its contract expects a reference; a
+/// `$file` object anywhere else is the output's own, and stays.
+#[cfg(unix)]
+#[test]
+fn a_backend_with_no_exchange_refuses_what_it_cannot_hand_over() {
+    use crate::artifact::{ArtifactStore, Provenance};
+    on_codex_runtime(async {
+        let identity = EffectIdentity {
+            run_id: "run-1".into(),
+            step_id: "total".into(),
+        };
+        let meter = crate::usage::Metering::none();
+        // An input that references an artifact.
+        let (a, compiled, store) = remote_atom("no-exchange-input", true);
+        let given = store
+            .put(
+                &mut &b"--- a\n+++ b\n"[..],
+                Provenance {
+                    media_type: "text/x-diff".into(),
+                    ..Default::default()
+                },
+            )
+            .expect("put")
+            .artifact;
+        let remote = Remote {
+            none: true,
+            stdout: Some(json!({"total": 1})),
+            ..Default::default()
+        };
+        let artifacts = Artifacts::store(store, Default::default());
+        let r = run_exec(
+            &a,
+            &compiled,
+            &json!({"cents": [1], "patch": given.uri()}),
+            &identity,
+            Arc::new(remote),
+            None,
+            &artifacts,
+            &meter,
+        )
+        .await;
+        assert!(
+            matches!(&r, Err(AtomError::Runtime(m)) if m.contains("gives commands no files")),
+            "{r:?}"
+        );
+        // An output that names a file where a reference goes, and one that
+        // has a `$file` object of its own.
+        let (a, compiled, store) = remote_atom("no-exchange-output", false);
+        let artifacts = Artifacts::store(store, Default::default());
+        let input = json!({"cents": [1]});
+        let run = |stdout: Value| {
+            let remote = Remote {
+                none: true,
+                stdout: Some(stdout),
+                ..Default::default()
+            };
+            run_exec(
+                &a,
+                &compiled,
+                &input,
+                &identity,
+                Arc::new(remote),
+                None,
+                &artifacts,
+                &meter,
+            )
+        };
+        let r =
+            run(json!({"total": 1, "patch": {"$file": "out.diff", "mediaType": "text/x-diff"}}))
+                .await;
+        assert!(
+            matches!(&r, Err(AtomError::Schema { message, .. }) if message.contains("hands no files over")),
+            "{r:?}"
+        );
+        let own = json!({"total": 1, "meta": {"$file": "notes.txt"}});
+        let (out, _) = run(own.clone()).await.expect("its own object");
+        assert_eq!(out, own);
+    });
 }
