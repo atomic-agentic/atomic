@@ -855,6 +855,26 @@ fn deny_also(profile: PermissionProfile, denied: &[PathBuf]) -> anyhow::Result<P
     ))
 }
 
+/// Where Codex keeps what it records of a thread under `guard`, its state
+/// databases and its logs, made if missing: the project's own directory in
+/// the atomic home's `private/` (`<home>/private/<id>/codex`), which every
+/// project's commands are denied whole, by one entry, so no command reads
+/// another project's records, nor its own. Its Codex home keeps only what a
+/// turn's shell needs. `None` under [`StateGuard::NoProjectState`]: the
+/// records stay in the Codex home.
+fn codex_records(guard: &StateGuard) -> anyhow::Result<Option<PathBuf>> {
+    let StateGuard::Deny(private) = guard else {
+        return Ok(None);
+    };
+    let id = private
+        .state_dir
+        .file_name()
+        .context("the state directory has no name to keep its Codex records by")?;
+    let records = private.private.join(id).join("codex");
+    crate::state::private_dir(&records).with_context(|| format!("create {}", records.display()))?;
+    Ok(Some(records))
+}
+
 /// Refuse a thread whose commands must be kept out of `denied` when `paths`
 /// has no Linux sandbox helper, except on macOS (`macos`), whose own sandbox
 /// denies paths itself. On Linux, Codex's sandbox reads a profile that
@@ -1939,6 +1959,16 @@ where
         endpoint.model = m.clone();
     }
     let mut config = new_config(&endpoint, codex_home, cwd, paths.0.clone()).await?;
+    // What Codex records of its threads goes with the project's private
+    // state, which every project's commands are denied by one entry.
+    if let Some(records) = codex_records(guard)? {
+        config.sqlite = SqliteConfig::from_sqlite_home_with_nfs_enforcement(
+            AbsolutePathBuf::from_absolute_path(&records)
+                .context("resolve the Codex records' directory")?,
+            /*enforce_delete_on_nfs*/ false,
+        );
+        config.log_dir = records.join("log");
+    }
     config.developer_instructions = spec.developer_instructions.clone();
     config.permissions = Permissions::from_approval_and_profile(
         Constrained::allow_any(AskForApproval::Never),

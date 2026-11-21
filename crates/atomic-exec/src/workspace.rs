@@ -115,9 +115,8 @@ pub struct Workspace {
     /// Directories of the backend's own that the workspace's commands may
     /// neither read nor write, `scratch` excepted: the scratch directories of
     /// every other attempt, live or not, its backend's and those of the
-    /// project's other backends it was told to deny, so no turn of the
-    /// project reads another's `HOME` or `TMPDIR`. Other projects' scratch
-    /// directories are not among them.
+    /// other backends it was told to deny, such as every project's in the
+    /// atomic home, so no turn reads another's `HOME` or `TMPDIR`.
     pub denied: Vec<PathBuf>,
 }
 
@@ -202,6 +201,19 @@ pub(crate) fn check_not_within(denied: &Path, roots: &[PathBuf]) -> Result<(), S
         }
     }
     Ok(())
+}
+
+/// The directories of `denied` that lie inside no other of them: the ones a
+/// sandbox denies. Codex's Linux sandbox cannot open a writable directory
+/// again inside a denied one that lies inside another, so a backend's own
+/// scratch root inside a directory it is also told to deny, such as the
+/// atomic home's `scratch/`, is left to that one.
+fn outermost(denied: &[PathBuf]) -> Vec<PathBuf> {
+    denied
+        .iter()
+        .filter(|d| !denied.iter().any(|o| o != *d && d.starts_with(o)))
+        .cloned()
+        .collect()
 }
 
 /// Make each of `dirs`, other backends' scratch roots a workspace's commands
@@ -318,7 +330,7 @@ pub(crate) fn open_local(
             label: request.label.clone(),
             sandbox: request.sandbox,
             env: request.env.clone(),
-            denied,
+            denied: outermost(&denied),
             ..Workspace::default()
         });
     };
@@ -384,7 +396,7 @@ pub(crate) fn open_local(
         sandbox: request.sandbox,
         writable_roots: request.writable_roots.clone(),
         env: request.env.clone(),
-        denied,
+        denied: outermost(&denied),
     })
 }
 

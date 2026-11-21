@@ -116,14 +116,14 @@ turn, gets the platform's core variables and what the atom declares, never
 atomic's own environment or its credentials. A turn's commands run with no
 login shell; their `HOME` (and `ZDOTDIR`) is a private scratch directory of the
 attempt's own, and their `TMPDIR` a directory inside it, so no shell startup
-file runs and no other turn of the project can see, add, change or remove what
-a turn keeps in its `HOME` or temporary directory: every scratch directory of
-the project, those of `atomic run`, `atomic serve` and `atomic eval` and those
-of `atomic debug codex-prompt` and `atomic debug probe`, is denied to a turn's commands, apart from a
-`workspace-write` turn's own. A `read-only` turn, which may not write its own,
-cannot reach it at all, not even to list it. Other projects' scratch
-directories are not denied yet: a turn can read another project's live
-attempts by their path. Apart from macOS, whose own sandbox denies them, only
+file runs and no other turn, of the project or another, can see, add, change
+or remove what a turn keeps in its `HOME` or temporary directory: every
+project's scratch directories, those of `atomic run`, `atomic serve` and
+`atomic eval` and those of `atomic debug codex-prompt` and `atomic debug
+probe`, are kept in the atomic home's `scratch/`, which is denied to a turn's
+commands whole, apart from a `workspace-write` turn's own directory. A
+`read-only` turn, which may not write its own, cannot reach it at all, not
+even to list it. Apart from macOS, whose own sandbox denies them, only
 Codex's Linux sandbox helper, which the `atomic` binary provides, can deny
 them, so a process without it refuses the turn instead of running it. On
 macOS none of this is verified. An exec atom's
@@ -141,9 +141,11 @@ toolchains, read-only, through `RUSTUP_HOME` (see
 outside a worktree or an exec atom in an eval, an atom names what it needs in
 its `env`, as in `env: { RUSTUP_HOME: '/home/me/.rustup' }`. An
 exec atom's command gets its own scratch directory as `HOME` and `TMPDIR`.
-Scratch directories live in the project's state directory, where no sandboxed
-turn may write; atomic refuses to run when that would be under `/tmp`,
-`$TMPDIR` or the project. A turn's shell always runs on the machine its backend
+Scratch directories live in the atomic home's `scratch/`, one directory per
+project, where no sandboxed turn may write; atomic refuses to run when that
+would be under `/tmp`, `$TMPDIR` or the project. Scratch directories an older
+atomic left in a project's state directory are no longer used, and can be
+removed. A turn's shell always runs on the machine its backend
 names; `CODEX_EXEC_SERVER_URL` and an `environments.toml` in Codex's home have
 no effect.
 
@@ -174,8 +176,12 @@ would cover its working directory or a directory it may write, apart from its
 own scratch directory, which a denied scratch root covers and which is opened
 to it again, or when a
 denied place or a linked secret lies two or more levels inside a directory it
-may write. Other projects'
-Codex records are not denied yet. atomic makes the list when a
+may write. What Codex records of a project's threads, its state databases and
+its logs, is kept with the project's private state, in the atomic home's
+`private/`, which every project's commands are denied; its Codex home keeps
+only the helper links a turn's shell runs. Records an older atomic left in a
+project's Codex home move there when atomic next starts in that project, so
+until then another project's commands can still read them. atomic makes the list when a
 turn or an exec step starts: a place on it that appears while a command runs
 is denied only to the commands that start after it, and a link made after
 the list is not followed until the next turn or step. Credentials kept
