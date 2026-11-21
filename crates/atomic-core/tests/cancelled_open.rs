@@ -73,6 +73,7 @@ fn a_workspace_that_opens_after_its_run_was_cancelled_is_closed() {
                 base_url: "http://127.0.0.1:9/v1".into(),
                 model: "unused".into(),
                 api_key_env: None,
+                sign_in: None,
             },
             defaults: AtomConfig::default(),
             artifacts: Artifacts::none(),

@@ -92,6 +92,7 @@ async fn opens_as_it_stops() -> (Option<Result<String, AtomError>>, usize) {
             base_url: "http://127.0.0.1:9/v1".into(),
             model: "unused".into(),
             api_key_env: None,
+            sign_in: None,
         },
         defaults: AtomConfig::default(),
         artifacts: Artifacts::none(),
