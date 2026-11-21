@@ -58,7 +58,9 @@ project could have supplied it; point `XDG_CONFIG_HOME`, or `HOME`, outside it.
 That includes the default `~/.config/atomic` when your home directory is itself
 a git checkout (a `~/.git`) holding the project. A checkout whose `.git` file or
 `commondir` is not a small regular file, as git writes them, refuses your own
-configuration, and the sign-in, until it is fixed. It holds the same
+configuration, and the sign-in, until it is fixed. A `.git` another user owns,
+such as one left in `/tmp`, still counts its directory as a checkout holding the
+project, but what it links to is not read. It holds the same
 settings as `atomic.yaml`, and the project's files override it.
 
 Selecting a configuration profile is planned. The loader reads
