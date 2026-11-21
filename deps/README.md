@@ -86,7 +86,12 @@ describes how builds read them.
 ## durare
 
 atomic uses a fork of durare, ported to sqlx 0.9 so that it shares Codex's
-sqlx and `libsqlite3-sys` versions. The fork's changes live on its `atomic`
+sqlx and `libsqlite3-sys` versions. On SQLite, the fork also begins a
+transactional step that may write `IMMEDIATE`, through the provider and
+through a data source, so that another connection's commit cannot make the
+step's body run again; fails a step whose body returns a lock conflict ten
+times in a row, as a body waiting on its own step's lock does; and logs its
+conflict retries. The fork's changes live on its `atomic`
 branch and are kept small enough to rebase on upstream. A durare dependency
 only resolves inside a workspace whose `[patch.crates-io]` patches
 `sqlx-core`, `sqlx-sqlite` and `sqlx-postgres` to the same sqlx fork revision,

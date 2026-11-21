@@ -105,29 +105,27 @@ async fn engine(dir: &Path) -> Durare {
             Ok(json!([one, two, three.output]))
         }
     });
-    // A transaction another connection writes beside while its body runs:
-    // the body reads, then the other connection writes. The step holds the
-    // store's writer lock while its body runs, so the other write waits for
-    // the step to commit, and the body runs once.
+    // A transaction another connection tries to write beside while its body
+    // runs: the step holds the store's writer lock while its body runs, so a
+    // write that will not wait is refused as busy, and the body runs once.
     let at = dir.to_owned();
-    rt.register("retried", move |ctx: DurareContext, (): ()| {
+    rt.register("beside", move |ctx: DurareContext, (): ()| {
         let dir = at.clone();
         async move {
             let n: i64 = ctx
-                .transaction("race", move |mut tx| {
+                .transaction("beside", move |mut tx| {
                     let dir = dir.clone();
                     Box::pin(async move {
                         let row = tx
                             .query_one("SELECT COUNT(*) AS n FROM atomic_parks", &[])
                             .await?;
-                        note(&dir, "race");
-                        let first = !dir.join("raced").exists();
-                        if first {
-                            std::fs::write(dir.join("raced"), "").expect("marker");
-                            // Not awaited: it waits on this step's lock.
-                            tokio::spawn(write_beside(dir.join("atomic.db")));
-                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                        }
+                        note(&dir, "beside");
+                        let busy = write_beside(&dir.join("atomic.db")).await.is_err_and(|e| {
+                            e.as_database_error()
+                                .and_then(|d| d.code())
+                                .is_some_and(|c| c == "5")
+                        });
+                        note(&dir, if busy { "busy" } else { "written" });
                         row.int("n")
                     })
                 })
@@ -174,20 +172,23 @@ async fn engine(dir: &Path) -> Durare {
     rt
 }
 
-/// Write to the store from a connection of its own.
-async fn write_beside(db: PathBuf) {
-    let db = db.as_path();
-    use sqlx::Connection;
-    let mut other = sqlx::SqliteConnection::connect(&format!("sqlite://{}", db.display()))
-        .await
-        .expect("a second connection");
+/// Write to the store from a connection of its own that does not wait for a
+/// lock: SQLITE_BUSY while another connection holds the writer lock.
+async fn write_beside(db: &Path) -> Result<(), sqlx::Error> {
+    use sqlx::ConnectOptions;
+    use std::str::FromStr;
+    let mut other =
+        sqlx::sqlite::SqliteConnectOptions::from_str(&format!("sqlite://{}", db.display()))?
+            .busy_timeout(std::time::Duration::ZERO)
+            .connect()
+            .await?;
     sqlx::query(
         "INSERT INTO atomic_parks (park_id, run, step, reason, parked_at) \
          VALUES ('beside', 'beside', 'beside', 'beside', 0)",
     )
     .execute(&mut other)
-    .await
-    .expect("the write beside");
+    .await?;
+    Ok(())
 }
 
 /// Not a test on its own: the parent runs it in a child process, which
@@ -209,8 +210,8 @@ fn failpoints_child() {
             let rt = engine(&dir).await;
             if role == "start" {
                 rt.start("probe", RUN, ()).await.expect("start");
-            } else if role == "retried" {
-                rt.start("retried", RUN, ()).await.expect("start");
+            } else if role == "beside" {
+                rt.start("beside", RUN, ()).await.expect("start");
             } else if role == "gated" {
                 rt.start("gated", RUN, ()).await.expect("start");
             } else if role == "twice" {
@@ -449,19 +450,172 @@ fn every_failpoint_in_the_source_is_in_the_inventory_and_back() {
 }
 
 #[test]
-fn a_transaction_another_connection_writes_beside_runs_once_and_reaches_its_failpoints_once() {
-    let dir = scratch("retried");
-    let (status, stderr) = child(&dir, "retried", None, "first.log");
+fn a_writing_transaction_holds_the_lock_while_its_body_runs_and_reaches_its_failpoints_once() {
+    let dir = scratch("beside");
+    let (status, stderr) = child(&dir, "beside", None, "first.log");
     assert!(status.success(), "the run finished: {status}\n{stderr}");
-    // The other connection wrote while the body ran, and the body still ran
-    // once: the step held the writer lock, so the write waited for it.
-    assert_eq!(lines(&dir.join("ran.log")), ["race"], "the body ran again");
-    // One durable operation, whose writes and checkpoint committed once: its
-    // failpoints are reached once each.
+    // While the body ran, a write from another connection that would not
+    // wait was refused as busy: the step held the store's writer lock. The
+    // body ran once.
+    assert_eq!(lines(&dir.join("ran.log")), ["beside", "busy"]);
+    // One durable operation, whose writes and checkpoint committed once.
     assert_eq!(
         lines(&dir.join("first.log")),
-        ["checkpoint:before:race", "checkpoint:after:race"]
+        ["checkpoint:before:beside", "checkpoint:after:beside"]
     );
+    // Once the step committed, the same write goes through.
+    let db = dir.join("atomic.db");
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(async {
+            write_beside(&db).await.expect("the write after the step");
+            use sqlx::Connection;
+            let mut c = sqlx::SqliteConnection::connect(&format!("sqlite://{}", db.display()))
+                .await
+                .expect("connect");
+            let (n,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM atomic_parks")
+                .fetch_one(&mut c)
+                .await
+                .expect("count");
+            assert_eq!(n, 1);
+        });
+}
+
+/// The schema and URL a Postgres child runs on (see
+/// [`a_transaction_whose_commit_fails_runs_again_and_reaches_its_failpoints_once_on_postgres`]).
+#[cfg(feature = "postgres-tests")]
+const ENV_PG_URL: &str = "ATOMIC_FAILPOINTS_PG_URL";
+#[cfg(feature = "postgres-tests")]
+const ENV_PG_SCHEMA: &str = "ATOMIC_FAILPOINTS_PG_SCHEMA";
+
+/// Not a test on its own: the Postgres failpoint test runs it in a child
+/// process, on the schema it names.
+#[cfg(feature = "postgres-tests")]
+#[test]
+#[ignore = "run by the failpoint tests in a child process"]
+fn failpoints_postgres_child() {
+    let (Ok(dir), Ok(url), Ok(schema)) = (
+        std::env::var(ENV_DIR),
+        std::env::var(ENV_PG_URL),
+        std::env::var(ENV_PG_SCHEMA),
+    ) else {
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(async {
+            let mut rt = Durare::postgres(&url, &schema).await.expect("engine");
+            let (at, table) = (dir.clone(), format!("\"{schema}\".once_t"));
+            rt.register("commit-retried", move |ctx: DurareContext, (): ()| {
+                let (dir, table) = (at.clone(), table.clone());
+                async move {
+                    let n: i64 = ctx
+                        .transaction("commit-retried", move |mut tx| {
+                            let (dir, table) = (dir.clone(), table.clone());
+                            Box::pin(async move {
+                                note(&dir, "commit-retried");
+                                tx.execute(&format!("INSERT INTO {table} (v) VALUES (1)"), &[])
+                                    .await?;
+                                Ok(1)
+                            })
+                        })
+                        .await?;
+                    Ok(json!(n))
+                }
+            });
+            rt.launch().await.expect("launch");
+            rt.start("commit-retried", RUN, ()).await.expect("start");
+            let out: Value = rt.result(RUN).await.expect("finishes");
+            std::fs::write(dir.join("result.json"), out.to_string()).expect("result");
+            rt.shutdown(std::time::Duration::from_secs(5))
+                .await
+                .expect("shutdown");
+        });
+}
+
+/// A transaction whose body succeeded but whose commit then failed with a
+/// serialization failure runs its body again on a fresh transaction. That
+/// is still one durable operation: its failpoints are reached once each, so a
+/// crash test counting them does not take the retry for a second run. The
+/// body inserts into a table whose deferred constraint trigger raises 40001
+/// the first time it fires, at the first commit.
+#[cfg(feature = "postgres-tests")]
+#[test]
+fn a_transaction_whose_commit_fails_runs_again_and_reaches_its_failpoints_once_on_postgres() {
+    let dir = scratch("commit-retried");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let guard = runtime.block_on(atomic_durable::testing::schema("failpoints"));
+    let schema = guard.name().to_owned();
+    runtime.block_on(async {
+        let pool = sqlx::PgPool::connect(guard.url()).await.expect("connect");
+        for statement in [
+            format!("CREATE SCHEMA IF NOT EXISTS \"{schema}\""),
+            format!("CREATE SEQUENCE \"{schema}\".once_seq"),
+            format!("CREATE TABLE \"{schema}\".once_t (v INTEGER NOT NULL)"),
+            format!(
+                "CREATE FUNCTION \"{schema}\".fail_once() RETURNS trigger LANGUAGE plpgsql AS $$ \
+                 BEGIN IF nextval('\"{schema}\".once_seq') = 1 THEN \
+                 RAISE EXCEPTION 'the first commit fails' USING ERRCODE = '40001'; END IF; \
+                 RETURN NULL; END $$"
+            ),
+            format!(
+                "CREATE CONSTRAINT TRIGGER fail_once AFTER INSERT ON \"{schema}\".once_t \
+                 DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION \"{schema}\".fail_once()"
+            ),
+        ] {
+            sqlx::raw_sql(sqlx::AssertSqlSafe(statement))
+                .execute(&pool)
+                .await
+                .expect("set up the failing commit");
+        }
+    });
+    let stderr = dir.join("first.log.stderr");
+    let status = Command::new(std::env::current_exe().expect("this test binary"))
+        .args([
+            "--exact",
+            "failpoints_postgres_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(ENV_DIR, &dir)
+        .env(ENV_PG_URL, guard.url())
+        .env(ENV_PG_SCHEMA, &schema)
+        .env("ATOMIC_FAILPOINT_LOG", dir.join("first.log"))
+        .env_remove("ATOMIC_FAILPOINT")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&stderr).expect("stderr"))
+        .status()
+        .expect("run the child");
+    assert!(
+        status.success(),
+        "the run finished: {status}\n{}",
+        std::fs::read_to_string(&stderr).unwrap_or_default()
+    );
+    assert_eq!(result(&dir), json!(1));
+    // The body ran twice: its first commit failed.
+    assert_eq!(
+        lines(&dir.join("ran.log")),
+        ["commit-retried", "commit-retried"]
+    );
+    // One durable operation all the same.
+    assert_eq!(
+        lines(&dir.join("first.log")),
+        [
+            "checkpoint:before:commit-retried",
+            "checkpoint:after:commit-retried"
+        ]
+    );
+    drop(guard);
 }
 
 /// The wake-ups queued for `run`, read or not: the engine keeps a message
