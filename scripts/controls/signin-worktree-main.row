@@ -1,0 +1,1 @@
+signin-worktree-main|crates/atomic-core/src/state.rs|            main_checkout(&git, true)?|            Ok::<_, String>(None::<PathBuf>)? /*CONTROL_OFF*/|-p atomic-agentic-core --lib signin::tests::a_linked_worktrees_main_checkout_holds_its_project

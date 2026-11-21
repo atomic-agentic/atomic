@@ -1,0 +1,1 @@
+signin-unusable-refuses|crates/atomic/src/engine.rs|    if required && let Some(why) = &resolved.sign_in_unreadable {|    if false /*CONTROL_OFF*/ && let Some(why) = &resolved.sign_in_unreadable {|-p atomic-agentic --test model_auth a_sign_in_that_cannot_be_used_refuses_a_run_and_nothing_takes_its_place

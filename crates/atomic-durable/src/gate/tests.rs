@@ -75,10 +75,12 @@ async fn me<R: DurableRuntime>(rt: &R) -> HumanCredential {
 
 const EVIDENCE: &str = "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
 
-/// The input of the test workflow: what its gate shows and how long it waits.
+/// The input of the test workflow: what its gate shows, the evidence it
+/// lists, and how long it waits.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Gated {
     show: Value,
+    evidence: Vec<String>,
     timeout_ms: Option<u64>,
 }
 
@@ -87,7 +89,7 @@ fn spec(input: &Gated) -> GateSpec {
         workflow: "gated".into(),
         title: "Accept the reviewed summary".into(),
         show: input.show.clone(),
-        evidence: vec![EVIDENCE.into()],
+        evidence: input.evidence.clone(),
         approvers: resolve(
             "accept",
             None,
@@ -112,6 +114,7 @@ fn register<R: DurableRuntime>(rt: &mut R) {
 fn input(timeout_ms: Option<u64>) -> Gated {
     Gated {
         show: json!({"draft": "Two units cost 2.50.", "review": "approve"}),
+        evidence: vec![EVIDENCE.into()],
         timeout_ms,
     }
 }
@@ -693,6 +696,7 @@ async fn changed_content_cannot_reuse_an_approval<R: DurableRuntime>(mut rt: R) 
 
     let changed = Gated {
         show: json!({"draft": "Two units cost 2.75.", "review": "approve"}),
+        evidence: vec![EVIDENCE.into()],
         timeout_ms: None,
     };
     let (second_run, second) = start_gated(&rt, changed).await;
@@ -747,6 +751,67 @@ async fn changed_content_cannot_reuse_an_approval<R: DurableRuntime>(mut rt: R) 
     assert!(
         matches!(&refused, Err(DurableError::Failed(m)) if m.contains("changed content needs a new gate")),
         "{refused:?}"
+    );
+    rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+}
+
+/// The same title and the same shown content, with only an evidence digest
+/// changed: a new proposal, and the approval made on the old evidence does
+/// not carry over to it, while a new approval carrying the new proposal is
+/// decided.
+async fn changed_evidence_cannot_reuse_an_approval<R: DurableRuntime>(mut rt: R) {
+    register(&mut rt);
+    rt.launch().await.expect("launch");
+    let (first_run, first) = start_gated(&rt, input(None)).await;
+    decide(&rt, &me(&rt).await, command(&first, "e1", Verdict::Approve))
+        .await
+        .expect("decided");
+    assert!(outcome(&rt, &first_run).await.expect("finishes").approved());
+
+    let other = "sha256:60303ae22b998861bce3b28f33eec1be758a213c86c93c076dbe9f558c11c752";
+    let changed = Gated {
+        evidence: vec![other.into()],
+        ..input(None)
+    };
+    let (second_run, second) = start_gated(&rt, changed).await;
+    assert_eq!((&second.title, &second.show), (&first.title, &first.show));
+    assert_ne!(
+        second.proposal, first.proposal,
+        "new evidence, new proposal"
+    );
+    let mut reuse = command(&first, "e9", Verdict::Approve);
+    reuse.gate = second.id.clone();
+    assert_eq!(
+        decide(&rt, &me(&rt).await, reuse).await,
+        Err(DecideError::ProposalChanged {
+            gate: second.id.clone(),
+            shown: first.proposal.clone(),
+            current: second.proposal.clone(),
+        })
+    );
+    assert_eq!(
+        find(&rt, &second.id)
+            .await
+            .expect("find")
+            .expect("stored")
+            .resolution,
+        None
+    );
+    // The refusal was the old approval, not the new evidence: a command that
+    // carries the second gate's own proposal decides it. And the run
+    // finishes, so the shutdown below has nothing left to wait for.
+    decide(
+        &rt,
+        &me(&rt).await,
+        command(&second, &unique("e"), Verdict::Approve),
+    )
+    .await
+    .expect("decided");
+    assert!(
+        outcome(&rt, &second_run)
+            .await
+            .expect("finishes")
+            .approved()
     );
     rt.shutdown(Duration::from_secs(5)).await.expect("shutdown");
 }
@@ -949,6 +1014,7 @@ on_backend!(
     a_passed_deadline_expires_the_gate_and_a_later_decision_conflicts,
     a_decision_after_the_deadline_records_the_expiry,
     changed_content_cannot_reuse_an_approval,
+    changed_evidence_cannot_reuse_an_approval,
     redelivery_wakes_a_run_whose_decider_stopped_early,
     a_forked_run_does_not_reuse_the_original_approval,
     an_imported_run_does_not_reuse_an_exported_approval,
@@ -971,6 +1037,7 @@ on_backend!(
     a_passed_deadline_expires_the_gate_and_a_later_decision_conflicts,
     a_decision_after_the_deadline_records_the_expiry,
     changed_content_cannot_reuse_an_approval,
+    changed_evidence_cannot_reuse_an_approval,
     redelivery_wakes_a_run_whose_decider_stopped_early,
     a_forked_run_does_not_reuse_the_original_approval,
     an_imported_run_does_not_reuse_an_exported_approval,

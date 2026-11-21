@@ -17,6 +17,9 @@
 //!   configure instead;
 //! - a configured endpoint comes before the sign-in, and the sign-in before
 //!   detection, as `atomic config --explain` says;
+//! - a sign-in that is there and cannot be used, unreadable, refused where
+//!   it is kept, or under a directory this user cannot look in, refuses a
+//!   run that calls a model, and nothing detected takes its place;
 //! - a running atomic cannot be read through /proc by its own user.
 //!
 //! A Codex atom running on the sign-in, with no API key set, is tested in
@@ -32,6 +35,7 @@
 mod fixture;
 
 use fixture::{Fixture, text};
+use std::path::Path;
 
 #[test]
 fn login_status_says_who_is_signed_in_and_logout_forgets_it() {
@@ -113,6 +117,182 @@ fn logout_forgets_the_file_copy_whichever_store_is_chosen() {
             json["keyring"].is_boolean() || json["keyring_error"].is_string(),
             "{store}: {json}"
         );
+    }
+}
+
+/// A stand-in for a local Ollama on loopback: it lists `synthetic` to every
+/// request, so a run that took it as its endpoint would reach no further
+/// than here, and it keeps the first line of each request it was sent.
+fn ollama_on_loopback() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut request = [0u8; 4096];
+            let n = std::io::Read::read(&mut stream, &mut request).unwrap_or(0);
+            let line = String::from_utf8_lossy(&request[..n])
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_owned();
+            log.lock().unwrap().push(line);
+            let body = r#"{"models":[{"name":"synthetic"}]}"#;
+            let _ = std::io::Write::write_all(
+                &mut stream,
+                format!(
+                    "HTTP/1.0 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+        }
+    });
+    (addr, seen)
+}
+
+/// A sign-in that is there and cannot be used, unreadable, refused where it
+/// is kept, or under a directory this user cannot look in, refuses a run
+/// that calls a model: a detected endpoint, here a local Ollama on loopback,
+/// is not used in its place. With no sign-in there, nothing is refused for
+/// one, and the detected endpoint serves.
+#[test]
+fn a_sign_in_that_cannot_be_used_refuses_a_run_and_nothing_takes_its_place() {
+    let f = Fixture::new("unusable");
+    let (ollama, seen) = ollama_on_loopback();
+    // What the stand-in was sent beyond the probe that detects it.
+    let calls = || {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|l| !l.starts_with("GET /api/tags"))
+            .count()
+    };
+    let run = ["run", "tidy-codex", "--data", r#"{"text": "a note"}"#];
+    let refused = |env: &[(&str, &str)]| {
+        let mut all = vec![
+            ("ATOMIC_MODEL", "synthetic"),
+            ("ATOMIC_DETECT_OLLAMA_ADDR", ollama.as_str()),
+        ];
+        all.extend_from_slice(env);
+        let out = f.atomic_within(&run, &all, 60).expect("the run stopped");
+        let t = text(&out);
+        assert!(!out.status.success(), "{t}");
+        t
+    };
+    // Kept outside every checkout, where it is accepted: the sign-in's
+    // directory, and a keyring that cannot be reached.
+    let away = f.outside.join("keyring-home");
+    std::fs::create_dir_all(away.join("credentials/codex-auth")).unwrap();
+    let away_home = away.to_str().unwrap().to_owned();
+    let t = refused(&[
+        ("ATOMIC_HOME", away_home.as_str()),
+        ("ATOMIC_CREDENTIAL_STORE", "keyring"),
+    ]);
+    assert!(t.contains("the ChatGPT sign-in cannot be used"), "{t}");
+    assert!(!t.contains("inside the checkout"), "{t}");
+    assert!(t.contains("from outside the project"), "{t}");
+    // A sign-in's directory that is a link to itself, which no lookup gets
+    // to the end of: refused, never taken for absent.
+    let looped = f.outside.join("loop-home");
+    std::fs::create_dir_all(looped.join("credentials")).unwrap();
+    std::os::unix::fs::symlink("codex-auth", looped.join("credentials/codex-auth")).unwrap();
+    let looped_home = looped.to_str().unwrap().to_owned();
+    let t = refused(&[("ATOMIC_HOME", looped_home.as_str())]);
+    assert!(t.contains("the ChatGPT sign-in cannot be used"), "{t}");
+    // Kept inside the checkout holding the project: refused there. With no
+    // sign-in's directory there, nothing is refused for one, and the run
+    // goes to the detected endpoint; with one, it is refused for the
+    // sign-in, and the detected endpoint is not used.
+    std::fs::create_dir_all(f.dir.join(".git")).unwrap();
+    let inside = f.dir.join("atomic-home");
+    let home = inside.to_str().unwrap().to_owned();
+    assert_eq!(calls(), 0, "a refused run reached the detected endpoint");
+    let t = refused(&[("ATOMIC_HOME", home.as_str())]);
+    assert!(!t.contains("cannot be used"), "{t}");
+    assert!(
+        calls() > 0,
+        "the detected endpoint did not take the run: {t}"
+    );
+    let before = calls();
+    std::fs::create_dir_all(inside.join("credentials/codex-auth")).unwrap();
+    let t = refused(&[("ATOMIC_HOME", home.as_str())]);
+    assert!(t.contains("the ChatGPT sign-in cannot be used"), "{t}");
+    assert!(t.contains("inside the checkout holding the project"), "{t}");
+    assert_eq!(
+        calls(),
+        before,
+        "a refused run reached the detected endpoint"
+    );
+    // With an endpoint configured, the sign-in is not looked for: the run
+    // goes to the endpoint, and `atomic config --explain` says the sign-in
+    // is not used, not that a run is refused.
+    let base = format!("http://{ollama}/v1");
+    let configured = [
+        ("ATOMIC_HOME", home.as_str()),
+        ("ATOMIC_MODEL_BASE_URL", base.as_str()),
+    ];
+    let t = refused(&configured);
+    assert!(!t.contains("cannot be used"), "{t}");
+    assert!(
+        calls() > before,
+        "the configured endpoint did not take the run: {t}"
+    );
+    let out = f.atomic(&["config", "--explain"], &configured);
+    let t = text(&out);
+    assert!(out.status.success(), "{t}");
+    assert!(t.contains("not used: a model endpoint is"), "{t}");
+    assert!(!t.contains("a run that calls a model is refused"), "{t}");
+    std::fs::remove_dir_all(f.dir.join(".git")).unwrap();
+    // A sign-in's directory under one this user cannot look in, accepted
+    // where it is kept or refused there: never taken for absent.
+    let closed = f.outside.join("closed-home");
+    std::fs::create_dir_all(closed.join("credentials/codex-auth")).unwrap();
+    let inside_closed = f.dir.join("closed-inside");
+    std::fs::create_dir_all(inside_closed.join("credentials/codex-auth")).unwrap();
+    // Opened again however the test ends, so nothing it leaves is stuck.
+    let _reopened = Reopened(vec![
+        closed.join("credentials"),
+        inside_closed.join("credentials"),
+    ]);
+    let mode = |m: u32| {
+        std::fs::set_permissions(
+            closed.join("credentials"),
+            std::os::unix::fs::PermissionsExt::from_mode(m),
+        )
+        .unwrap()
+    };
+    mode(0o000);
+    assert!(
+        std::fs::read_dir(closed.join("credentials")).is_err(),
+        "mode 000 did not keep this user out (root?): run the test as a user"
+    );
+    let closed_home = closed.to_str().unwrap().to_owned();
+    let t = refused(&[("ATOMIC_HOME", closed_home.as_str())]);
+    assert!(t.contains("the ChatGPT sign-in cannot be used"), "{t}");
+    assert!(t.contains("denied (os error 13)"), "{t}");
+    std::fs::create_dir_all(f.dir.join(".git")).unwrap();
+    std::fs::set_permissions(
+        inside_closed.join("credentials"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o000),
+    )
+    .unwrap();
+    let inside_home = inside_closed.to_str().unwrap().to_owned();
+    let t = refused(&[("ATOMIC_HOME", inside_home.as_str())]);
+    assert!(t.contains("the ChatGPT sign-in cannot be used"), "{t}");
+    assert!(t.contains("inside the checkout holding the project"), "{t}");
+}
+
+/// Directories made readable again by their owner when dropped.
+struct Reopened(Vec<std::path::PathBuf>);
+
+impl Drop for Reopened {
+    fn drop(&mut self) {
+        for dir in &self.0 {
+            let _ =
+                std::fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o700));
+        }
     }
 }
 
@@ -253,12 +433,133 @@ fn a_sign_in_inside_the_checkout_holding_the_project_is_refused_and_explain_says
     let t = text(&out);
     assert!(!out.status.success(), "{t}");
     assert!(t.contains("inside the checkout holding the project"), "{t}");
-    // `atomic config` still shows the settings, and says why.
+    // `atomic config` still shows the settings. With no sign-in's directory
+    // there, it has nothing to say of one; with one, it says why it cannot
+    // be used, and that a run would be refused.
+    let out = f.atomic(&["config", "--explain"], &home);
+    let t = text(&out);
+    assert!(out.status.success(), "{t}");
+    assert!(!t.contains("could not be read"), "{t}");
+    std::fs::create_dir_all(inside.join("credentials/codex-auth")).unwrap();
     let out = f.atomic(&["config", "--explain"], &home);
     let t = text(&out);
     assert!(out.status.success(), "{t}");
     assert!(t.contains("the ChatGPT sign-in could not be read"), "{t}");
     assert!(t.contains("inside the checkout holding the project"), "{t}");
+    assert!(t.contains("a run that calls a model is refused"), "{t}");
+    std::fs::remove_dir_all(inside.join("credentials")).unwrap();
+    // The project in a checkout of its own inside that one, as a submodule
+    // or a worktree is: the outer checkout still holds it.
+    std::fs::create_dir_all(f.dir.join("project/.git")).unwrap();
+    let out = f.atomic(&["model", "status"], &home);
+    let t = text(&out);
+    assert!(!out.status.success(), "{t}");
+    assert!(t.contains("inside the checkout holding the project"), "{t}");
+    // Reached through a link from outside, as a linked home is: the
+    // sign-in is placed where the link leads, and refused there, before
+    // anything is made, not even the credential directory around it.
+    let target = f.dir.join("linked-target");
+    std::fs::create_dir_all(&target).unwrap();
+    let link = f.outside.join("linked-home");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let login = |home: &Path| {
+        let env = [
+            ("ATOMIC_HOME", home.to_str().unwrap()),
+            ("ATOMIC_TEST_LOGIN_ISSUER", "http://127.0.0.1:9"),
+        ];
+        let out = f
+            .atomic_within(&["model", "login"], &env, 60)
+            .expect("login stopped");
+        assert!(!out.status.success(), "{}", text(&out));
+        text(&out)
+    };
+    let t = login(&link);
+    assert!(t.contains("inside the checkout holding the project"), "{t}");
+    assert!(
+        !target.join("credentials").exists(),
+        "the credential directory was made inside the checkout"
+    );
+    // A link that leads nowhere yet: refused, saying so, and nothing made
+    // where it leads.
+    let dangling = f.outside.join("dangling-home");
+    std::os::unix::fs::symlink(f.dir.join("not-yet"), &dangling).unwrap();
+    let t = login(&dangling);
+    assert!(t.contains("which does not exist"), "{t}");
+    assert!(
+        !f.dir.join("not-yet").exists(),
+        "the link's target was made"
+    );
+}
+
+#[test]
+fn a_login_that_fails_and_a_logout_leave_no_sign_in_directory() {
+    let f = Fixture::new("tidy");
+    let auth = f.credentials().join("codex-auth");
+    // The keyring store, with no Secret Service here: the login is refused.
+    let keyring = [("ATOMIC_CREDENTIAL_STORE", "keyring")];
+    let out = f.atomic(&["model", "login"], &keyring);
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(!auth.exists(), "a failed login left {}", auth.display());
+    // So no later run is told a sign-in could not be read.
+    let out = f.atomic(&["config", "--explain"], &keyring);
+    assert!(!text(&out).contains("could not be read"), "{}", text(&out));
+    // One that was there is kept: with the keyring store a live sign-in's
+    // directory holds only Codex's lock files.
+    std::fs::create_dir_all(&auth).unwrap();
+    for lock in ["auth.lock", "auth.json.lock"] {
+        std::fs::write(auth.join(lock), "").unwrap();
+    }
+    let env = [
+        ("ATOMIC_CREDENTIAL_STORE", "keyring"),
+        ("ATOMIC_TEST_LOGIN_ISSUER", "http://127.0.0.1:9"),
+    ];
+    let out = f
+        .atomic_within(&["model", "login", "--device-auth"], &env, 60)
+        .expect("login stopped");
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(
+        auth.join("auth.lock").exists() && auth.join("auth.json.lock").exists(),
+        "a failed login removed a sign-in's directory it did not make"
+    );
+    std::fs::remove_dir_all(&auth).unwrap();
+    // Nor does a logout with no one signed in, whichever store: the
+    // directory it made is its own to remove, whatever lock files its own
+    // forgetting left in it, even with a keyring that cannot be checked.
+    for store in [&[][..], &keyring[..]] {
+        let out = f.atomic(&["--json", "model", "logout"], store);
+        assert!(out.status.success(), "{}", text(&out));
+        assert!(
+            !auth.exists(),
+            "a logout left {} ({store:?})",
+            auth.display()
+        );
+    }
+    // Signed in, a logout leaves the directory only when the keyring could
+    // not be checked, which may still keep the sign-in: the directory is
+    // what says so.
+    f.sign_in_unrevocable();
+    let out = f.atomic(&["--json", "model", "logout"], &[]);
+    assert!(out.status.success(), "{}", text(&out));
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(
+        auth.exists(),
+        json["keyring_error"].is_string(),
+        "{json}: {:?}",
+        std::fs::read_dir(&auth).map(|d| d.flatten().map(|e| e.file_name()).collect::<Vec<_>>())
+    );
+}
+
+#[test]
+fn a_keyring_entry_without_its_directory_is_no_sign_in() {
+    let f = Fixture::new("no-dir");
+    // No sign-in directory: the keyring is not read, so where it cannot be
+    // reached nothing says so, and no one is signed in.
+    let keyring = [("ATOMIC_CREDENTIAL_STORE", "keyring")];
+    let out = f.atomic(&["model", "status"], &keyring);
+    let t = text(&out);
+    assert!(!out.status.success(), "{t}");
+    assert!(t.contains("no one is signed in"), "{t}");
+    assert!(!t.contains("keyring"), "the keyring was read: {t}");
 }
 
 /// Start `atomic args`, wait for a stderr line containing `ready`, then
@@ -318,11 +619,13 @@ fn a_running_atomic_cannot_be_read_through_proc_by_its_own_user() {
         "serving until stopped",
     );
     // One that does not, and holds a sign-in while it runs: the login,
-    // waiting for the browser (which opens nothing here).
+    // waiting for the browser. Its issuer is the discard port, on a port
+    // the system picks, never Codex's fixed one, so no other login is
+    // cancelled and nothing is opened.
     read_while_running(
         &f,
         &["model", "login"],
-        &[("BROWSER", "true")],
+        &[("ATOMIC_TEST_LOGIN_ISSUER", "http://127.0.0.1:9")],
         "Sign in in your browser",
     );
 }

@@ -1,0 +1,1 @@
+skill-dir-read-one-name|crates/atomic/src/setup.rs|            std::os::unix::fs::MetadataExt::nlink(&meta) == 1,|            std::os::unix::fs::MetadataExt::nlink(&meta) >= 1,|-p atomic-agentic --bin atomic -- an_instructions_file_with_other_names_is_refused

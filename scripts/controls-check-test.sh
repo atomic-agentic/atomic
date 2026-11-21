@@ -31,10 +31,19 @@ fail() {
 mkdir -p "${WORK}/bin"
 cat >"${WORK}/bin/cargo" <<'SH'
 #!/usr/bin/env bash
-# A control is off while any file the script edits differs from the copy's
-# commit.
+# A control is off while the file it switches differs from the copy's commit.
+# CONTROL_FILES, which the test passes down, is every file a row names, so this
+# asks about a control's own file wherever that lives -- crates/ or tools/ --
+# and takes nothing a case of the test does to a row file, or to scripts/, for a
+# control switched off.
 off() {
-    ! git diff --quiet -- crates
+    local f
+    # shellcheck disable=SC2086
+    for f in ${CONTROL_FILES}; do
+        [ -e "${f}" ] || continue
+        git diff --quiet -- "${f}" || return 0
+    done
+    return 1
 }
 # What the script keeps for a file, and the file the git.rs control edits.
 state_copy() { echo "target/controls-check/$(tr / % <<<"$1")"; }
@@ -199,18 +208,23 @@ fresh() {
 
 # run MODE ARGS...: run the script in the copy; sets `code` and `out`.
 # RUN_PATH, when set, is a directory put before the stand-in cargo's, for a
-# mode that wants a different cp.
+# mode that wants a different cp. CONTROL_FILES goes to the stand-in so that it
+# knows which files a control may switch off, whichever directory they live in.
 run() {
     local mode="$1"
     shift
-    out="$(cd "${repo}" && FAKE_CARGO="${mode}" \
+    out="$(cd "${repo}" && FAKE_CARGO="${mode}" CONTROL_FILES="${CONTROL_FILES[*]}" \
         PATH="${RUN_PATH:+${RUN_PATH}:}${WORK}/bin:${PATH}" \
         scripts/controls-check.sh "$@" 2>&1)"
     code=$?
 }
 
+# Whether none of the files the rows name is left modified, which is what the
+# script edits. The rows' own files are no control's file, and several cases
+# below change or remove them on purpose.
 untouched() {
-    [ -z "$(git -C "${repo}" status --porcelain -- crates)" ]
+    [ "${#CONTROL_FILES[@]}" -eq 0 ] ||
+        [ -z "$(git -C "${repo}" status --porcelain -- "${CONTROL_FILES[@]}")" ]
 }
 
 # Every control fails its test when off and passes when on; nothing is left.
@@ -333,6 +347,24 @@ run honest git-hardening
     grep -q "scripts/controls/git-hardening.row holds 2 rows, not the one it must" <<<"${out}" ||
     fail "a row file with two rows: exit ${code}: ${out}"
 [ ! -e "${repo}/cargo-args" ] || fail "a row file with two rows: cargo ran"
+
+repo="$(fresh)"
+printf '%s\n' 'git-hardening|crates/atomic-core/src/git.rs|a || b|c|args' \
+    >"${repo}/scripts/controls/git-hardening.row"
+run honest git-hardening
+[ "${code}" -eq 1 ] &&
+    grep -q "scripts/controls/git-hardening.row has 6 '|' separators, not the 4 between its five fields" <<<"${out}" ||
+    fail "a row whose field holds a '|': exit ${code}: ${out}"
+[ ! -e "${repo}/cargo-args" ] || fail "a row whose field holds a '|': cargo ran"
+
+repo="$(fresh)"
+printf '%s\n' 'git-hardening|crates/atomic-core/src/git.rs|a|args' \
+    >"${repo}/scripts/controls/git-hardening.row"
+run honest git-hardening
+[ "${code}" -eq 1 ] &&
+    grep -q "scripts/controls/git-hardening.row has 3 '|' separators, not the 4 between its five fields" <<<"${out}" ||
+    fail "a row missing a field: exit ${code}: ${out}"
+[ ! -e "${repo}/cargo-args" ] || fail "a row missing a field: cargo ran"
 
 repo="$(fresh)"
 : >"${repo}/scripts/controls/git-hardening.row"

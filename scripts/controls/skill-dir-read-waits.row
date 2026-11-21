@@ -1,0 +1,1 @@
+skill-dir-read-waits|crates/atomic/src/setup.rs|    const READ_WITHOUT_WAITING: libc::c_int = libc::O_NONBLOCK;|    const READ_WITHOUT_WAITING: libc::c_int = 0;|-p atomic-agentic --bin atomic -- a_fifo_for_the_instructions_file_is_refused_without_waiting a_fifo_for_a_skill_file_is_refused_without_waiting

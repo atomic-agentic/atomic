@@ -112,6 +112,13 @@ pub struct Workspace {
     /// The environment every command in the workspace gets beside the
     /// platform's core variables.
     pub env: BTreeMap<String, String>,
+    /// Directories of the backend's own that the workspace's commands may
+    /// neither read nor write, `scratch` excepted: the scratch directories of
+    /// every other attempt, live or not, its backend's and those of the
+    /// project's other backends it was told to deny, so no turn of the
+    /// project reads another's `HOME` or `TMPDIR`. Other projects' scratch
+    /// directories are not among them.
+    pub denied: Vec<PathBuf>,
 }
 
 impl Workspace {
@@ -175,6 +182,42 @@ pub(crate) fn check_outside(scratch_root: &Path, roots: &[PathBuf]) -> Result<()
                 other.display()
             ));
         }
+    }
+    Ok(())
+}
+
+/// Refuse a writable root at or inside `denied`, a directory a workspace's
+/// commands are denied: Codex's Linux sandbox reopens a writable directory
+/// inside a denied one, so the root would be reachable after all.
+pub(crate) fn check_not_within(denied: &Path, roots: &[PathBuf]) -> Result<(), String> {
+    let denied_real = resolved(denied);
+    for root in roots {
+        if resolved(root).starts_with(&denied_real) {
+            return Err(format!(
+                "{} lies inside {}, which a workspace's commands are denied, and cannot be \
+                 one of its writable directories",
+                root.display(),
+                denied.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Make each of `dirs`, other backends' scratch roots a workspace's commands
+/// are denied, if missing: one that appeared later, while a command ran,
+/// would not be denied to it.
+fn make_denied(
+    dirs: &[PathBuf],
+    failed: &dyn Fn(&str, std::io::Error) -> ExecError,
+) -> Result<(), ExecError> {
+    for dir in dirs {
+        private_dir(dir).map_err(|e| {
+            failed(
+                &format!("create {}, which its commands are denied", dir.display()),
+                e,
+            )
+        })?;
     }
     Ok(())
 }
@@ -244,27 +287,13 @@ fn started(pid: u32) -> Option<u64> {
 pub(crate) fn open_local(
     scratch_root: &Path,
     tmp: &Path,
+    denying: &[PathBuf],
     request: &Open,
 ) -> Result<Workspace, ExecError> {
     let fail = |message: String| ExecError::Workspace {
         label: request.label.clone(),
         message,
     };
-    let Some(source) = &request.source else {
-        return Ok(Workspace {
-            label: request.label.clone(),
-            sandbox: request.sandbox,
-            env: request.env.clone(),
-            ..Workspace::default()
-        });
-    };
-    if !source.is_dir() {
-        return Err(fail(format!("{} is not a directory", source.display())));
-    }
-    let writable: Vec<PathBuf> = std::iter::once(source.clone())
-        .chain(request.writable_roots.iter().cloned())
-        .collect();
-    check_outside(scratch_root, &writable).map_err(fail)?;
     let failed = |what: &str, e: std::io::Error| {
         let message = format!("{what}: {e}");
         if transient(&e) {
@@ -276,6 +305,36 @@ pub(crate) fn open_local(
             fail(message)
         }
     };
+    // Its own scratch root, then the others it is told to deny.
+    let mut denied = vec![scratch_root.to_owned()];
+    for dir in denying {
+        if !denied.contains(dir) {
+            denied.push(dir.clone());
+        }
+    }
+    let Some(source) = &request.source else {
+        make_denied(&denied[1..], &failed)?;
+        return Ok(Workspace {
+            label: request.label.clone(),
+            sandbox: request.sandbox,
+            env: request.env.clone(),
+            denied,
+            ..Workspace::default()
+        });
+    };
+    if !source.is_dir() {
+        return Err(fail(format!("{} is not a directory", source.display())));
+    }
+    let writable: Vec<PathBuf> = std::iter::once(source.clone())
+        .chain(request.writable_roots.iter().cloned())
+        .collect();
+    // No denied root may lie in a writable root, which would cover it, nor a
+    // writable root in a denied one, where Codex's sandbox would reopen it.
+    for root in &denied {
+        check_outside(root, &writable).map_err(fail)?;
+        check_not_within(root, &writable).map_err(fail)?;
+    }
+    make_denied(&denied[1..], &failed)?;
     private_dir(scratch_root).map_err(|e| failed("create the scratch directories' parent", e))?;
     let tmp = tmp.to_owned();
     private_dir(&tmp).map_err(|e| failed("create the shared temporary directory", e))?;
@@ -325,6 +384,7 @@ pub(crate) fn open_local(
         sandbox: request.sandbox,
         writable_roots: request.writable_roots.clone(),
         env: request.env.clone(),
+        denied,
     })
 }
 

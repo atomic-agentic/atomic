@@ -145,6 +145,90 @@ pub struct Command {
     /// confines it; with none, it has no network at all. A backend that does
     /// not confine its commands ignores it.
     pub network: Vec<String>,
+    /// Variables it gets on a socket instead of in its environment, which
+    /// another process of the same user can read through /proc until the
+    /// program has made itself non-dumpable: see [`SecretEnv`]. Only a
+    /// program that reads the socket, such as atomic's sandbox helper, gets
+    /// them. Unlike a pipe, a socket cannot be reopened through
+    /// `/proc/<pid>/fd`, so in that window another process can take them
+    /// only by attaching to the program (ptrace, `pidfd_getfd`), which Yama's
+    /// `ptrace_scope` of 1 or more refuses to a process that is not its
+    /// ancestor; at `ptrace_scope` 0 one can attach in that window and keep
+    /// its access after, so the window is narrowed, not closed. A process
+    /// runner forwards them to its runner the same way.
+    pub secret_env: SecretEnv,
+}
+
+/// The variable that names the descriptor a command reads its
+/// [`SecretEnv`] from.
+pub const SECRET_ENV_FD: &str = "ATOMIC_SECRET_ENV_FD";
+
+/// Variables handed to a command on a Unix socket rather than in its exec
+/// environment: the command finds the socket's descriptor in
+/// [`SECRET_ENV_FD`] and reads `KEY=VALUE` entries, each ended by a NUL
+/// byte, until the other end closes. Its `Debug` form shows the names only.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct SecretEnv(pub Vec<(String, String)>);
+
+impl std::fmt::Debug for SecretEnv {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(self.0.iter().map(|(k, _)| format!("{k}=<hidden>")))
+            .finish()
+    }
+}
+
+impl SecretEnv {
+    /// Whether it holds no variable.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Its entries as they cross the socket, or why one cannot: a name that
+    /// is empty or holds `=` or NUL, or a value that holds NUL.
+    pub fn encode(&self) -> Result<Vec<u8>, String> {
+        let mut bytes = Vec::new();
+        for (key, value) in &self.0 {
+            if key.is_empty() || key.contains(['=', '\0']) {
+                return Err(format!("{key:?} cannot name a secret variable"));
+            }
+            if value.contains('\0') {
+                return Err(format!("the secret variable {key} holds a NUL byte"));
+            }
+            bytes.extend_from_slice(key.as_bytes());
+            bytes.push(b'=');
+            bytes.extend_from_slice(value.as_bytes());
+            bytes.push(0);
+        }
+        Ok(bytes)
+    }
+
+    /// The entries in `bytes`, as [`encode`](Self::encode) wrote them, each
+    /// ended by its NUL, the last too.
+    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+        let Some(entries) = bytes.strip_suffix(&[0]) else {
+            return if bytes.is_empty() {
+                Ok(Self::default())
+            } else {
+                Err("the secret variables end before their last NUL".to_owned())
+            };
+        };
+        entries
+            .split(|b| *b == 0)
+            .map(|entry| {
+                let entry = std::str::from_utf8(entry)
+                    .map_err(|_| "a secret variable is not UTF-8".to_owned())?;
+                let (key, value) = entry
+                    .split_once('=')
+                    .ok_or_else(|| "a secret variable has no `=`".to_owned())?;
+                if key.is_empty() {
+                    return Err("a secret variable has no name".to_owned());
+                }
+                Ok((key.to_owned(), value.to_owned()))
+            })
+            .collect::<Result<_, _>>()
+            .map(Self)
+    }
 }
 
 /// Puts a command under a sandbox before a backend runs it: what it may
@@ -436,6 +520,10 @@ pub struct LocalBackend {
     scratch_root: PathBuf,
     tmp: PathBuf,
     confine: Option<Arc<dyn Confine>>,
+    /// Directories its workspaces' commands are kept out of besides its own
+    /// scratch root, such as another backend's scratch root in the same
+    /// project.
+    denying: Vec<PathBuf>,
     /// Set once its confinement has been seen to work here; a check that
     /// fails is made again the next time.
     checked: Arc<std::sync::OnceLock<()>>,
@@ -447,6 +535,7 @@ impl std::fmt::Debug for LocalBackend {
             .field("scratch_root", &self.scratch_root)
             .field("tmp", &self.tmp)
             .field("confined", &self.confine.is_some())
+            .field("denying", &self.denying)
             .finish()
     }
 }
@@ -479,8 +568,19 @@ impl LocalBackend {
             tmp: scratch_root.join(".tmp"),
             scratch_root,
             confine: None,
+            denying: Vec::new(),
             checked: Arc::default(),
         }
+    }
+
+    /// The same backend, keeping its workspaces' commands out of `dirs` as
+    /// well as its own scratch root: the scratch roots of the project's other
+    /// backends, so no command of one reads another's attempts. Each is
+    /// created, if missing, when a workspace opens, so it cannot appear
+    /// undenied while a command runs.
+    pub fn denying(mut self, dirs: impl IntoIterator<Item = PathBuf>) -> Self {
+        self.denying.extend(dirs);
+        self
     }
 
     /// The same backend, running every command under `confine`.
@@ -502,6 +602,27 @@ impl LocalBackend {
     /// Where it keeps its scratch directories.
     pub fn scratch_root(&self) -> &std::path::Path {
         &self.scratch_root
+    }
+
+    /// The temporary directory every turn on this backend shares, created
+    /// private to this user if it is not there: the `TMPDIR` of Codex's
+    /// sandbox helper outside the sandbox, where it keeps its registry of
+    /// the mount points it makes in a turn's writable roots.
+    pub fn shared_tmp(&self) -> std::io::Result<&std::path::Path> {
+        workspace::ensure_private(&self.tmp)?;
+        Ok(&self.tmp)
+    }
+
+    /// Refuse a scratch root inside the system's temporary directories,
+    /// which sandboxed turns may write, as
+    /// [`connect`](ExecutionBackend::connect) does.
+    pub fn check_scratch_root(&self) -> Result<(), ExecError> {
+        workspace::check_outside(&self.scratch_root, &workspace::temporary_roots()).map_err(
+            |message| ExecError::Workspace {
+                label: "connect".into(),
+                message,
+            },
+        )
     }
 }
 
@@ -531,6 +652,7 @@ impl Default for LocalBackend {
             )),
             tmp: base.join(".tmp"),
             confine: None,
+            denying: Vec::new(),
             checked: Arc::default(),
         }
     }
@@ -543,12 +665,7 @@ impl ExecutionBackend for LocalBackend {
     /// there. Each workspace it opens is also checked against the turn's own
     /// writable directories.
     fn connect(&self) -> Result<Statement, ExecError> {
-        workspace::check_outside(&self.scratch_root, &workspace::temporary_roots()).map_err(
-            |message| ExecError::Workspace {
-                label: "connect".into(),
-                message,
-            },
-        )?;
+        self.check_scratch_root()?;
         workspace::sweep_local(&self.scratch_root);
         // No turn of this backend runs yet: what earlier turns left in the
         // shared temporary directory goes.
@@ -585,7 +702,7 @@ impl ExecutionBackend for LocalBackend {
             confine.check(&self.tmp)?;
             let _ = self.checked.set(());
         }
-        workspace::open_local(&self.scratch_root, &self.tmp, request)
+        workspace::open_local(&self.scratch_root, &self.tmp, &self.denying, request)
     }
 
     fn close(&self, workspace: &Workspace) -> Result<(), ExecError> {
@@ -628,12 +745,13 @@ impl LocalBackend {
             program: command.program.clone(),
             message,
         })?;
-        process::run_in(
+        process::run_in_with_secret(
             group,
             &program,
             &command.args,
             Some(&command.cwd),
             &command.env,
+            &command.secret_env,
             &command.stdin,
             process::Limits {
                 time: command.time_limit,

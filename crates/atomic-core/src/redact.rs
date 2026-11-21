@@ -540,6 +540,10 @@ fn step(n: usize) {
     let _ = n;
 }
 
+/// ESC as atomic's terminal escaping and Rust's `{:?}` write it, so text
+/// escaped before it is redacted hides no token either.
+const BRACED_ESC: &[&str] = &["\\u{1b}", "\\u{001b}", "\\u{1B}", "\\u{001B}"];
+
 /// How long the terminal escape sequence starting `rest` is, if one does: a
 /// control sequence (`ESC[1;33m`, `ESC[38:5:196m`, `ESC[1 q`), the
 /// introducer of a title, link or clipboard write (`ESC]`), or a character
@@ -551,6 +555,7 @@ fn escape_sequence_len(rest: &str) -> Option<usize> {
         "\x1b", "\\u001b", "\\u001B", "\\x1b", "\\x1B", "\\e", "\\033",
     ]
     .iter()
+    .chain(BRACED_ESC)
     .find(|i| rest.starts_with(**i))?;
     let body = &rest[introducer.len()..];
     let bytes = body.as_bytes();
@@ -1386,7 +1391,7 @@ fn redact_held(strength: Strength, value: &mut Value, nested: usize) {
         Value::String(string) if is_secret_value(strength, string) => {
             *string = REDACTED.into();
         }
-        Value::String(string) => redact_string(string, nested),
+        Value::String(string) => redact_held_string(strength, string, nested, true),
         Value::Number(_) if strength == Strength::Strong => *value = Value::String(REDACTED.into()),
         Value::Array(items) => {
             redact_flag_values(items);
@@ -1405,8 +1410,8 @@ fn redact_held(strength: Strength, value: &mut Value, nested: usize) {
                 let name = renamed
                     .get(key)
                     .map_or_else(|| base_name(key), |r| base_name(&r.original));
-                if HEADERS.iter().any(|h| name.eq_ignore_ascii_case(h))
-                    && field.as_str().is_some_and(|v| is_header_secret(name, v))
+                if let Some(header) = header_named(name)
+                    && field.as_str().is_some_and(|v| is_header_secret(header, v))
                 {
                     *field = Value::String(REDACTED.into());
                     continue;
@@ -1418,10 +1423,126 @@ fn redact_held(strength: Strength, value: &mut Value, nested: usize) {
                     strength
                 };
                 redact_held(held, field, nested);
+                hide_header_secret(name, field);
             }
         }
         Value::Number(_) | Value::Null | Value::Bool(_) => {}
     }
+}
+
+/// Hide `field`, under `name`, if it is a header's secret as redacted: what
+/// redaction made of it, rewritten JSON say, can read as one where it did
+/// not before, and a second pass would hide it.
+fn hide_header_secret(name: &str, field: &mut Value) {
+    if !as_main()
+        && let Some(header) = header_named(name)
+        && field.as_str().is_some_and(|v| is_header_secret(header, v))
+    {
+        *field = Value::String(REDACTED.into());
+    }
+}
+
+/// A string held under a name of this strength, which does not read as its
+/// secret whole: redacted as any string is, and JSON in it, under a hint,
+/// opened and redacted as held (see [`open_held_json`]). One that is
+/// rewritten is read again as a second pass would read it (`settle`), and
+/// hidden whole if that would change it, so redacting again changes
+/// nothing.
+fn redact_held_string(strength: Strength, string: &mut String, nested: usize, settle: bool) {
+    if is_secret_value(strength, string) {
+        *string = REDACTED.into();
+        return;
+    }
+    let rewritten = strength == Strength::Weak && open_held_json(string, nested);
+    redact_string(string, nested);
+    if rewritten && settle {
+        let mut again = string.clone();
+        redact_held_string(strength, &mut again, nested, false);
+        if again != *string {
+            *string = REDACTED.into();
+        }
+    }
+}
+
+/// JSON held in a string under a hint, such as `{"key": "{\"note\": …}"}`:
+/// redacted as text, then opened and redacted as any JSON in a string is
+/// and then as held, so a value that looks like a credential inside is
+/// hidden as it would be in a real object under that name. It is written
+/// back only when the opened JSON hid something, pretty if it came so, so a
+/// string with nothing more to hide is left to be redacted as any string
+/// is; one that text redaction grows past [`MAX_TEXT`] is hidden whole.
+/// Whether it was rewritten.
+fn open_held_json(string: &mut String, nested: usize) -> bool {
+    if as_main()
+        || nested >= MAX_NESTED_JSON
+        || string.len() > MAX_TEXT
+        || !string.trim_start().starts_with(['{', '['])
+    {
+        return false;
+    }
+    // Redacted as text first, as it is unopened: what that finds in the
+    // string as written, an escaped `\/` before a token say, stays hidden
+    // once the JSON is written back without the escape. Text that no
+    // longer reads as JSON is left to be redacted as any string is.
+    let texted = text(string);
+    let Ok(mut inner) = serde_json::from_str::<Value>(&texted) else {
+        return false;
+    };
+    // Grown past the bound, a second pass would cut it: hidden whole now.
+    if texted.len() > MAX_TEXT {
+        *string = REDACTED.to_owned();
+        return true;
+    }
+    let before = inner.clone();
+    // As any JSON in a string is, which reads names and pairs as they are
+    // written, and then as held, so it is never read less closely than it
+    // would be unopened.
+    redact_nested(&mut inner, nested + 1);
+    redact_held(Strength::Weak, &mut inner, nested + 1);
+    if inner == before {
+        return false;
+    }
+    // Written as it came, pretty or compact. What would read as a
+    // credential whole, as compact JSON can, or grow past the bound, a
+    // second pass would hide: [`redact_held_string`] hides it now.
+    *string = if string.contains('\n') {
+        serde_json::to_string_pretty(&inner).unwrap_or_default()
+    } else {
+        inner.to_string()
+    };
+    true
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// Whether this thread redacts as atomic did before held JSON was
+    /// opened and dotted header names read, for tests that compare the two.
+    static AS_MAIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether this thread redacts as before (see `AS_MAIN`); never outside
+/// tests.
+#[cfg(test)]
+fn as_main() -> bool {
+    AS_MAIN.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+const fn as_main() -> bool {
+    false
+}
+
+/// The header `name` names, if any: the name itself, or its last dotted
+/// segment, as in `http.request.header.authorization`.
+fn header_named(name: &str) -> Option<&str> {
+    let last = if as_main() {
+        name
+    } else {
+        name.rsplit('.').next().unwrap_or(name)
+    };
+    [name, last]
+        .into_iter()
+        .find(|n| HEADERS.iter().any(|h| n.eq_ignore_ascii_case(h)))
 }
 
 /// A key [`rename_keys`] renamed: what it was, and its new name before any
@@ -1629,8 +1750,15 @@ fn pair_holds_secret(name: &str, secret: &Value, explicit: bool) -> bool {
     let Some(secret) = secret.as_str() else {
         return false;
     };
-    if HEADERS.iter().any(|h| name.eq_ignore_ascii_case(h)) {
-        return is_header_secret(name, secret);
+    if let Some(header) = header_named(name) {
+        if is_header_secret(header, secret) {
+            return true;
+        }
+        // A header by its own name is judged as a header alone; one only
+        // by its last dotted segment is read by its name too.
+        if header.len() == name.len() {
+            return false;
+        }
     }
     match strength(name) {
         Strength::Strong if explicit => is_secret_value(Strength::Strong, secret),
@@ -1701,8 +1829,8 @@ fn redact_nested(value: &mut Value, nested: usize) {
                     .get(key)
                     .map_or_else(|| base_name(key), |r| r.original.as_str());
                 // A header's value, such as `"Authorization": "Bearer …"`.
-                if HEADERS.iter().any(|h| name.eq_ignore_ascii_case(h))
-                    && field.as_str().is_some_and(|v| is_header_secret(name, v))
+                if let Some(header) = header_named(name)
+                    && field.as_str().is_some_and(|v| is_header_secret(header, v))
                 {
                     *field = Value::String(REDACTED.into());
                     continue;
@@ -1711,6 +1839,7 @@ fn redact_nested(value: &mut Value, nested: usize) {
                     Strength::None => redact_nested(field, nested),
                     held => redact_held(held, field, nested),
                 }
+                hide_header_secret(name, field);
             }
         }
         Value::Null | Value::Bool(_) | Value::Number(_) => {}
@@ -1722,8 +1851,37 @@ pub fn value(value: &mut Value) {
     redact_nested(value, 0);
 }
 
-/// Write one log line to stderr, redacted, bounded to [`MAX_TEXT`]
-/// characters and then made safe for a terminal. atomic's own log lines go
+/// Tell the person where to sign in: Codex's authorize address for
+/// `atomic model login`, written as it is. It holds no secret (a client id,
+/// where to come back to, and a random state and PKCE challenge, which are
+/// public), but a random value can look like a token, and redacting one
+/// would break the login. Anything but such an address, on loopback or over
+/// HTTPS with no user or password in it, is redacted as any line is. Either
+/// is then made safe for a terminal, as every log line is.
+pub fn log_sign_in_address(address: &str) {
+    eprintln!("{}", sign_in_line(address));
+}
+
+/// What [`log_sign_in_address`] writes for `address`.
+pub(crate) fn sign_in_line(address: &str) -> String {
+    let authorize = url::Url::parse(address).is_ok_and(|u| {
+        let local = matches!(u.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"));
+        (u.scheme() == "https" || (u.scheme() == "http" && local))
+            && u.username().is_empty()
+            && u.password().is_none()
+            && u.path() == "/oauth/authorize"
+    });
+    let line = format!("Sign in in your browser. If it did not open, go to:\n\n  {address}\n");
+    let line = if authorize && line.chars().count() <= MAX_TEXT {
+        line
+    } else {
+        bounded(&line, MAX_TEXT)
+    };
+    crate::terminal::block(&line)
+}
+
+/// Write one log line to stderr, redacted and bounded to [`MAX_TEXT`]
+/// characters, and then made safe for a terminal, which can lengthen it. atomic's own log lines go
 /// through this, never straight to `eprintln!`: what they name, a run's id
 /// or a principal, and what they quote can come from a caller or a model.
 pub fn log(line: impl AsRef<str>) {
@@ -1768,13 +1926,14 @@ impl Line {
         self
     }
 
-    /// What it writes: its text, bounded to [`MAX_TEXT`] characters and
-    /// safe for a terminal, whatever a part of it missed.
+    /// What it writes: its text, bounded to [`MAX_TEXT`] characters, then
+    /// made safe for a terminal, whatever a part of it missed, which can
+    /// lengthen it.
     fn written(&self) -> String {
         crate::terminal::block(&cut(&self.text, MAX_TEXT))
     }
 
-    /// Write it to stderr, bounded to [`MAX_TEXT`] characters.
+    /// Write it to stderr, as [`Line::written`] gives it.
     pub fn log(self) {
         eprintln!("{}", self.written());
     }

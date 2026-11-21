@@ -1,0 +1,1 @@
+skill-dir-write-still-absent|crates/atomic/src/setup.rs|                anyhow::ensure!(now.is_none(), "a file was put there since it was read");|                anyhow::ensure!(true, "a file was put there since it was read");|-p atomic-agentic --bin atomic -- the_instructions_file_must_still_be_the_one_read

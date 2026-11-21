@@ -1,0 +1,1 @@
+plan-keeps-dollars|crates/atomic/src/metering.rs|                    Some(cap) if cap > limit => {|                    Some(cap) if std::hint::black_box(false) && cap > limit => {|-p atomic-agentic --test pipeline -- --exact a_budget_plan_above_its_minutes_or_dollar_ceilings_is_refused

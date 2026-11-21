@@ -1,0 +1,1 @@
+decision-principal-escaped|crates/atomic/src/gates.rs|        shown::line(decision.by.as_str()),|        decision.by.as_str(), /*CONTROL_OFF*/|-p atomic-agentic --test gates_cli a_hostile_principal_and_command_are_shown_escaped
