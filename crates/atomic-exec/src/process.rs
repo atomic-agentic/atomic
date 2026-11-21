@@ -262,12 +262,13 @@ mod descendants {
     /// Every process now running whose parents lead to this one, each
     /// started no earlier than its parent, as far as `/proc` can be read by
     /// `deadline`: processes that keep starting others cannot hold one look
-    /// past it. Reports those that cannot be read.
+    /// past it. Says whether the look was complete; reports those that
+    /// cannot be read.
     fn found(
         report: &mut dyn FnMut(&str),
         unreadable: &mut HashSet<libc::pid_t>,
         deadline: Instant,
-    ) -> Vec<(Process, libc::pid_t)> {
+    ) -> (Vec<(Process, libc::pid_t)>, bool) {
         let me = libc::pid_t::try_from(std::process::id()).unwrap_or(0);
         let mut children: HashMap<libc::pid_t, Vec<(Process, libc::pid_t)>> = HashMap::new();
         let mut own_start = 0;
@@ -277,11 +278,13 @@ mod descendants {
                 report(&format!(
                     "cannot list /proc, so the processes this one started cannot be found: {e}"
                 ));
-                return Vec::new();
+                return (Vec::new(), false);
             }
         };
+        let mut complete = true;
         for entry in entries.flatten() {
             if Instant::now() >= deadline {
+                complete = false;
                 break;
             }
             let Some(pid) = entry
@@ -326,7 +329,7 @@ mod descendants {
                 out.push((child, parent));
             }
         }
-        out
+        (out, complete)
     }
 
     /// The processes of atomic's own tools, and every process they started.
@@ -392,29 +395,29 @@ mod descendants {
     /// starting others cannot hold the stop. Returns what was stopped, and
     /// whether nothing new appeared before the limit.
     fn stop_phase<P: Copy + Eq + std::hash::Hash>(
-        find: &mut dyn FnMut(Instant) -> Vec<P>,
+        find: &mut dyn FnMut(Instant) -> (Vec<P>, bool),
         stop: &mut dyn FnMut(&P),
         limit: Duration,
     ) -> (HashSet<P>, bool) {
         let deadline = Instant::now() + limit;
-        let mut stopped = HashSet::new();
+        let mut found = HashSet::new();
         loop {
-            let new: Vec<P> = find(deadline)
-                .into_iter()
-                .filter(|p| !stopped.contains(p))
-                .collect();
-            if new.is_empty() {
-                return (stopped, Instant::now() < deadline);
-            }
+            let (looked, complete) = find(deadline);
+            let new: Vec<P> = looked.into_iter().filter(|p| !found.contains(p)).collect();
+            let none = new.is_empty();
+            // Everything a look found is kept, to be killed, even past the
+            // deadline, which ends only the stopping and the looking.
             for process in new {
-                if Instant::now() >= deadline {
-                    return (stopped, false);
+                if Instant::now() < deadline {
+                    stop(&process);
                 }
-                stop(&process);
-                stopped.insert(process);
+                found.insert(process);
+            }
+            if none && complete {
+                return (found, Instant::now() < deadline);
             }
             if Instant::now() >= deadline {
-                return (stopped, false);
+                return (found, false);
             }
         }
     }
@@ -441,16 +444,28 @@ mod descendants {
             }
             return;
         }
+        // From here a process whose parent dies comes to this one, rather
+        // than to the system's first process, so it is still found: the
+        // first process of a sandbox's process namespace, say, once the
+        // group kill below has ended what started it.
+        // SAFETY: prctl with these arguments only sets a flag of this
+        // process.
+        #[allow(unsafe_code)]
+        unsafe {
+            libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
+        }
         let mut unreadable = HashSet::new();
         let begun = Instant::now();
         let (mut watched, settled) = stop_phase(
             &mut |deadline| {
-                let all = found(report, &mut unreadable, deadline);
+                let (all, complete) = found(report, &mut unreadable, deadline);
                 let own = own(&all, &tools);
-                all.into_iter()
+                let others = all
+                    .into_iter()
                     .map(|(p, _)| p)
                     .filter(|p| !own.contains(p))
-                    .collect()
+                    .collect();
+                (others, complete)
             },
             &mut |process| signal(process, libc::SIGSTOP),
             STOP_PHASE,
@@ -473,7 +488,7 @@ mod descendants {
         // this one runs.
         let mut next = FIRST_REPORT;
         loop {
-            let all = found(report, &mut unreadable, Instant::now() + STOP_PHASE);
+            let (all, complete) = found(report, &mut unreadable, Instant::now() + STOP_PHASE);
             let own = own(&all, &tools);
             for (process, _) in all.iter().filter(|(p, _)| !own.contains(p)) {
                 if watched.insert(*process) {
@@ -486,7 +501,8 @@ mod descendants {
                 .filter(|p| alive(p))
                 .map(|p| p.pid)
                 .collect();
-            if left.is_empty() {
+            // Only a look that saw all of /proc can show that nothing runs.
+            if left.is_empty() && complete {
                 return;
             }
             if begun.elapsed() >= next {
@@ -504,11 +520,13 @@ mod descendants {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
 
         /// Run `stop_phase` with `find` and `stop`, on a thread, giving it
         /// `within`.
         fn bounded(
-            mut find: impl FnMut(Instant) -> Vec<u32> + Send + 'static,
+            mut find: impl FnMut(Instant) -> (Vec<u32>, bool) + Send + 'static,
             mut stop: impl FnMut(&u32) + Send + 'static,
             limit: Duration,
             within: Duration,
@@ -524,29 +542,30 @@ mod descendants {
 
         /// Processes that never stop starting others hold the stop no
         /// longer than its limit: whether each look finds another, a look
-        /// itself never ends, or stopping each one is slow. Ones that
-        /// settle are all stopped.
+        /// itself never ends, or stopping each one is slow. Whatever a look
+        /// found is kept, to be killed, even what there was no time left to
+        /// stop. Ones that settle are all stopped.
         #[test]
-        fn the_stop_phase_is_bounded() {
+        fn the_stop_phase_is_bounded_and_keeps_what_it_found() {
             let limit = Duration::from_millis(200);
             let within = Duration::from_secs(5);
             let mut next = 0u32;
-            let (stopped, settled) = bounded(
+            let (found, settled) = bounded(
                 move |_| {
                     next += 1;
-                    vec![next]
+                    (vec![next], true)
                 },
                 |_| {},
                 limit,
                 within,
             );
-            assert!(stopped.len() > 1);
+            assert!(found.len() > 1);
             assert!(!settled, "it gave up looking");
 
             // A look that would chase new processes for good, but for its
-            // deadline.
+            // deadline: what it found by then is kept.
             let mut next = 0u32;
-            let (_, settled) = bounded(
+            let (found, settled) = bounded(
                 move |deadline| {
                     let mut out = Vec::new();
                     while Instant::now() < deadline {
@@ -554,39 +573,65 @@ mod descendants {
                         out.push(next);
                         std::thread::sleep(Duration::from_millis(1));
                     }
-                    out
+                    (out, false)
                 },
                 |_| {},
                 limit,
                 within,
             );
+            assert!(!found.is_empty(), "the cut look's finds were kept");
             assert!(!settled);
 
-            // Many found at once, each slow to stop.
-            let (stopped, settled) = bounded(
-                |_| (0..10_000).collect(),
-                |_| std::thread::sleep(Duration::from_millis(5)),
+            // Many found at once, each slow to stop: all kept, few stopped.
+            let stops = Arc::new(AtomicUsize::new(0));
+            let counted = stops.clone();
+            let (found, settled) = bounded(
+                |_| ((0..10_000).collect(), true),
+                move |_| {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(5));
+                },
                 limit,
                 within,
             );
-            assert!(stopped.len() < 10_000, "{}", stopped.len());
+            assert_eq!(found.len(), 10_000, "every one found is kept, to be killed");
+            assert!(stops.load(Ordering::SeqCst) < 10_000);
             assert!(!settled);
 
+            // A look cut short that found nothing new is no proof that
+            // nothing runs: it looks again.
             let mut rounds = 0;
-            let (stopped, settled) = bounded(
+            let (found, settled) = bounded(
                 move |_| {
                     rounds += 1;
-                    if rounds < 3 {
-                        vec![1, 2, rounds + 10]
-                    } else {
-                        vec![1, 2]
+                    match rounds {
+                        1 => (vec![1], true),
+                        2 => (vec![1], false),
+                        _ => (vec![1, 2], true),
                     }
                 },
                 |_| {},
                 Duration::from_secs(60),
                 within,
             );
-            assert_eq!(stopped, HashSet::from([1, 2, 11, 12]));
+            assert!(found.contains(&2), "{found:?}");
+            assert!(!settled || found.len() == 2);
+
+            let mut rounds = 0;
+            let (found, settled) = bounded(
+                move |_| {
+                    rounds += 1;
+                    if rounds < 3 {
+                        (vec![1, 2, rounds + 10], true)
+                    } else {
+                        (vec![1, 2], true)
+                    }
+                },
+                |_| {},
+                Duration::from_secs(60),
+                within,
+            );
+            assert_eq!(found, HashSet::from([1, 2, 11, 12]));
             assert!(settled);
         }
     }

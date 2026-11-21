@@ -82,6 +82,16 @@ pub(crate) async fn settled<T>(
     place: &str,
     counted: bool,
 ) -> Result<T> {
+    // This process is stopping, and may have killed what the atom ran, its
+    // commands, a model turn's, a compiler or a helper: how the atom ended
+    // is not its result. Like a stopped command's step, it records
+    // nothing, and waits for the exit.
+    if atomic_exec::process::stopping() {
+        if counted {
+            crate::pipeline::set_aside();
+        }
+        return std::future::pending().await;
+    }
     match result {
         Err(AtomError::Unconfinable(why)) if SERVING.load(std::sync::atomic::Ordering::SeqCst) => {
             atomic_core::log_line!("atomic serve: {place}: {why}");

@@ -1651,12 +1651,6 @@ where
     let shutdown_result = thread.shutdown_and_wait().await;
     let _ = thread_manager.remove_thread(&thread_id).await;
 
-    // A turn whose commands this process may have killed as it stops says
-    // nothing of how it went: it waits for the exit, so no step records an
-    // answer the kill may have shaped, as a stopped command's step does.
-    if atomic_exec::process::stopping() {
-        std::future::pending::<()>().await;
-    }
     let outcome = outcome?;
     shutdown_result.context("shut down Codex thread")?;
     Ok(outcome)

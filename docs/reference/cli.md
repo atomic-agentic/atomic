@@ -219,8 +219,9 @@ started, also under `--runner process`, and the process exits without recording
 how the command ended. On Linux it exits, freeing the project's execution lock,
 only once every process it started has ended, one in another process group or
 session, such as a sandboxed command, included; atomic's own git is let finish,
-within its ten-minute time limit, rather than killed. A model turn whose
-commands were killed reports nothing, so its step stays unfinished too. It names any process still running after ten seconds, and
+within its ten-minute time limit, rather than killed. A step whose atom ends
+while atomic stops records nothing, whatever ended it, a killed command, a
+model turn's or a compiler's included, so it stays unfinished too. It names any process still running after ten seconds, and
 again every thirty, and goes on waiting: only SIGKILL ends that wait, as it
 ends atomic at once. The same holds however the command ends, by an error
 included, though not when atomic itself panics. A process that left atomic's
