@@ -1139,7 +1139,31 @@ impl Durare {
         version: &str,
         project: &str,
     ) -> Result<Self> {
+        if project.trim().is_empty() {
+            return Err(DurableError::Engine(
+                "a store is opened for a project, and this one names none".into(),
+            ));
+        }
         let mut rt = Self::open_for_none(database, executor, version).await?;
+        // A SQLite store is one project's own: a park recorded before parks
+        // had a project is its.
+        if matches!(database, Database::Sqlite(_)) {
+            let project = project.to_owned();
+            rt.control_transaction(move |mut tx| {
+                let project = project.clone();
+                Box::pin(async move {
+                    tx.execute(
+                        "INSERT INTO atomic_park_projects (park_id, project) \
+                         SELECT p.park_id, ? FROM atomic_parks p WHERE NOT EXISTS \
+                         (SELECT 1 FROM atomic_park_projects pp WHERE pp.park_id = p.park_id)",
+                        &[Param::Text(project)],
+                    )
+                    .await
+                    .map(|_| ())
+                })
+            })
+            .await?;
+        }
         rt.project = Some(project.into());
         Ok(rt)
     }

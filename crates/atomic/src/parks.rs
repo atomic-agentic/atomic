@@ -76,7 +76,7 @@ pub async fn run(command: ParksCommand, state: &ProjectState) -> anyhow::Result<
         &database,
         None,
         atomic_app::pipeline::LAYOUT_VERSION,
-        &state.id(),
+        &crate::engine::store_project(state),
     )
     .await
     .with_context(|| format!("open the store at {}", crate::engine::describe(&database)))?;

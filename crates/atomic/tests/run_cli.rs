@@ -749,16 +749,16 @@ fn state_dir(dir: &Path, project: &Path) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(&out.stdout).trim())
 }
 
-/// The store of the project whose state directory is `state`, opened as
-/// atomic opens it, for that project: what it lists of parks is the
-/// project's.
+/// The store of the `notes` project whose state directory is `state`,
+/// opened as atomic opens it, for that project, by its manifest's name and
+/// its state id: what it lists of parks is the project's.
 async fn project_store(state: &Path) -> Durare {
     let id = state.file_name().expect("a project id").to_string_lossy();
     Durare::open(
         &atomic_durable::Database::Sqlite(database(state)),
         None,
         atomic_app::pipeline::LAYOUT_VERSION,
-        &id,
+        &format!("notes/{id}"),
     )
     .await
     .expect("store")

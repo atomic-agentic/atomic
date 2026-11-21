@@ -689,6 +689,12 @@ async fn a_project_sees_and_releases_only_its_own_parks(database: Database) {
                 .expect("engine")
         }
     };
+    assert!(
+        Durare::open(&database, None, DEFAULT_VERSION, " ")
+            .await
+            .is_err(),
+        "a store opened for no project"
+    );
     let mut mine = open("project-a").await;
     let theirs = open("project-b").await;
     // A run of project A parks, as runs park.
@@ -710,15 +716,36 @@ async fn a_project_sees_and_releases_only_its_own_parks(database: Database) {
     let run = unique("projects");
     allowance(&mine, &format!("run:{run}"), 100).await;
     mine.start("parks", &run, ()).await.expect("start");
-    let started = Instant::now();
-    let park = loop {
-        if let Some(park) = waiting(&mine)
+    // The park as recorded, whoever's it is, and the project recorded with
+    // it.
+    let recorded = |run: String| {
+        let rt = &mine;
+        async move {
+            rt.control_transaction(move |mut tx| {
+                let run = run.clone();
+                Box::pin(async move {
+                    match tx
+                        .query_opt(
+                            "SELECT p.park_id AS park_id, pp.project AS project \
+                             FROM atomic_parks p LEFT JOIN atomic_park_projects pp \
+                             ON pp.park_id = p.park_id WHERE p.run = ?",
+                            &[Param::Text(run)],
+                        )
+                        .await?
+                    {
+                        Some(r) => Ok(Some((r.text("park_id")?, r.text_opt("project")?))),
+                        None => Ok(None),
+                    }
+                })
+            })
             .await
-            .expect("waiting")
-            .into_iter()
-            .find(|p| p.run == run)
-        {
-            break park;
+            .expect("the park")
+        }
+    };
+    let started = Instant::now();
+    let (id, project) = loop {
+        if let Some(found) = recorded(run.clone()).await {
+            break found;
         }
         assert!(
             started.elapsed() < Duration::from_secs(30),
@@ -726,7 +753,13 @@ async fn a_project_sees_and_releases_only_its_own_parks(database: Database) {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
-    assert_eq!(park.project.as_deref(), Some("project-a"));
+    assert_eq!(project.as_deref(), Some("project-a"), "the park's project");
+    let park = waiting(&mine)
+        .await
+        .expect("waiting")
+        .into_iter()
+        .find(|p| p.id == id)
+        .expect("project A lists its park");
     // A park recorded for no project, as one recorded before parks had one.
     let none = match &database {
         Database::Sqlite(path) => Durare::sqlite(path).await.expect("engine"),
@@ -781,9 +814,48 @@ async fn a_project_sees_and_releases_only_its_own_parks(database: Database) {
         .await
         .expect("released");
     assert!(is_released(&mine, &park.id).await.expect("released?"));
+    assert!(
+        !is_released(&theirs, &park.id).await.expect("released?"),
+        "project B saw another project's release"
+    );
+    // A replay of A's command by B is no replay of B's: it releases nothing
+    // and says the park is not there.
+    let replayed = release_park(&theirs, &operator, command(&park.id, "a-release", None))
+        .await
+        .expect_err("another project's command");
+    assert!(
+        matches!(&replayed, ReleaseError::NoSuchPark(id) if *id == park.id),
+        "{replayed}"
+    );
+    // The released park's run still runs: only A redelivers its wake-up.
+    assert_eq!(redeliver(&theirs).await.expect("redeliver"), 0);
+    assert_eq!(redeliver(&mine).await.expect("redeliver"), 1);
     mine.shutdown(Duration::from_secs(5))
         .await
         .expect("shutdown");
+}
+
+/// A SQLite store is one project's own: a park recorded there before parks
+/// had a project becomes the project's when the store is opened for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_private_store_adopts_its_parks_without_a_project() {
+    let path = std::env::temp_dir().join(format!("{}.db", unique("atomic_release_adopt")));
+    let before = Durare::sqlite(&path).await.expect("engine");
+    let park = bare_park(&before, &unique("before"), 100).await;
+    let mine = Durare::open(&Database::Sqlite(path), None, DEFAULT_VERSION, "project-a")
+        .await
+        .expect("engine");
+    let ids: Vec<String> = waiting(&mine)
+        .await
+        .expect("waiting")
+        .into_iter()
+        .map(|p| p.id)
+        .collect();
+    assert_eq!(ids, vec![park]);
+    assert!(
+        waiting(&before).await.expect("waiting").is_empty(),
+        "still no project's"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -766,8 +766,17 @@ fn an_atom_cannot_release_a_park_or_raise_a_cap_through_its_shell() {
 
         // A park, and the allowance that parked it, as a run leaves them;
         // and the operator's credential, enrolled, in the file store.
-        let rt = Durare::sqlite(&private.join("atomic.db")).await.unwrap();
-        let of = id.clone();
+        // The project's key, as atomic opens its store: the directory's name,
+        // with no manifest, and the state id.
+        let of = format!("project/{id}");
+        let rt = Durare::open(
+            &atomic_durable::Database::Sqlite(private.join("atomic.db")),
+            None,
+            atomic_app::pipeline::LAYOUT_VERSION,
+            &of,
+        )
+        .await
+        .unwrap();
         rt.control_transaction(move |mut tx| {
             let of = of.clone();
             Box::pin(async move {

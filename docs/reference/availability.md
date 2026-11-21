@@ -269,12 +269,20 @@ their enrolled credential, raise a cap and release a park, recorded with who did
 it. Each park is recorded with the project whose run parked, and on a
 PostgreSQL store several projects share, both commands see only the current
 project's parks: releasing another project's park is refused as a park that
-does not exist. A project is told apart by its id, which comes from its path, so
-the same project checked out at another path is another project there, and a
-park recorded before atomic kept parks' projects is no project's and is listed
-and released by none. No atomic command can release such a park: its run stays
-parked, with its record kept in the store, and the work goes on only as a new
-run, started again with `atomic run`.
+does not exist. A project is told apart there by its manifest's name (its
+directory's name, with no manifest) together with an id that comes from its
+path. Two projects are the same project only when both match, so a project
+renamed, or checked out at another path, is another project, whose parks the
+old one's commands no longer list or release. Two different projects that
+share both a name and a path, such as the same `/app` in two containers, are
+one project there: give them different names. A local SQLite store is the
+project's own, and a park recorded there before atomic kept parks' projects
+becomes the project's when atomic opens the store. On a shared PostgreSQL store
+such a park is no project's: no atomic command lists or releases it, its run
+stays parked with its record kept in the store, and the work goes on only as a
+new run, started again with `atomic run`. Stop every atomic process that uses a
+shared store before upgrading it, so that none goes on recording parks without
+their project.
 The commands that show budgets and spend come with run inspection.
 
 ## Observability stages

@@ -296,8 +296,12 @@ pub async fn release_park<R: DurableRuntime>(
                     Verified::NotEnrolled => return Ok(Err(ReleaseError::NotEnrolled(by))),
                     Verified::Mismatch => return Ok(Err(ReleaseError::BadCredential(by))),
                 }
-                // A replay returns what the command did.
+                // A replay returns what the command did, but only for a park
+                // of the runtime's own project: another's is no park of its.
                 if let Some(found) = journaled(&mut tx, &cmd.command_id, &request).await? {
+                    if read_park(&mut tx, &cmd.park, &project).await?.is_none() {
+                        return Ok(Err(ReleaseError::NoSuchPark(cmd.park.clone())));
+                    }
                     return Ok(found.map(|r| (r, false)));
                 }
                 #[cfg(test)]
@@ -521,7 +525,8 @@ pub async fn redeliver<R: DurableRuntime>(rt: &R) -> crate::runtime::Result<usiz
     Ok(waiting.len())
 }
 
-/// Every release recorded, oldest first.
+/// Every release recorded, oldest first, of every project that shares the
+/// store: the journal is the store's, not one project's.
 pub async fn releases<R: DurableRuntime>(rt: &R) -> crate::runtime::Result<Vec<Released>> {
     rt.control_transaction(|mut tx| {
         Box::pin(async move {
@@ -562,16 +567,21 @@ pub async fn waiting<R: DurableRuntime>(rt: &R) -> crate::runtime::Result<Vec<Pa
     .await
 }
 
-/// Whether park `id` is released.
+/// Whether park `id` of `rt`'s project is released: another project's is
+/// never released, as far as this one can tell.
 pub async fn is_released<R: DurableRuntime>(rt: &R, id: &str) -> crate::runtime::Result<bool> {
-    let id = id.to_owned();
+    let (id, project) = (id.to_owned(), project_param(rt.project()));
     rt.control_transaction(move |mut tx| {
-        let id = id.clone();
+        let (id, project) = (id.clone(), project.clone());
         Box::pin(async move {
             Ok(tx
                 .query_opt(
-                    "SELECT park_id FROM atomic_park_releases WHERE park_id = ?",
-                    &[Param::Text(id)],
+                    &format!(
+                        "SELECT r.park_id FROM atomic_park_releases r \
+                         LEFT JOIN atomic_park_projects pp ON pp.park_id = r.park_id \
+                         WHERE r.park_id = ? AND {FOR_PROJECT}"
+                    ),
+                    &[Param::Text(id), project],
                 )
                 .await?
                 .is_some())
