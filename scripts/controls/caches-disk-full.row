@@ -1,0 +1,1 @@
+caches-disk-full|crates/atomic-core/src/worktree.rs|        if e.disk_full() {|        if std::hint::black_box(false) && e.disk_full() {|-p atomic-agentic-core --lib --features fake-model -- only_atomics_own_writes_on_a_full_disk_wait an_exec_steps_caches_wait_for_room_and_fail_only_for_good

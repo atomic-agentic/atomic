@@ -1,0 +1,1 @@
+sandbox-mounts-stale-remote|crates/atomic-core/src/mounts.rs|            same_file(&shows, &alias)?;|            let _ = (&shows, &alias); // CONTROL_OFF|-p atomic-agentic-core --lib --features fake-model a_stale_remote_root_is_refused_where_the_place_is_there

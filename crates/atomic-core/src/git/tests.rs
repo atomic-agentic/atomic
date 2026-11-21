@@ -145,7 +145,7 @@ fn printable_error_text_has_no_control_characters() {
 }
 
 /// A scratch directory of the test's own.
-fn scratch(tag: &str) -> PathBuf {
+pub(crate) fn scratch(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("atomic-git-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("scratch");
@@ -153,7 +153,7 @@ fn scratch(tag: &str) -> PathBuf {
 }
 
 /// git as a person runs it, with no configuration of theirs, in `dir`.
-fn plain(dir: &Path, args: &[&str]) -> String {
+pub(crate) fn plain(dir: &Path, args: &[&str]) -> String {
     let git = Git::find().expect("git");
     let out = std::process::Command::new(git.program())
         .args(["-c", "user.name=dev", "-c", "user.email=dev@example.com"])
@@ -175,7 +175,7 @@ fn plain(dir: &Path, args: &[&str]) -> String {
 
 /// A repository with two commits, the second holding `a.txt` and
 /// `-dir/.gitattributes`; returns the repository and both commits.
-fn history(dir: &Path) -> (PathBuf, String, String) {
+pub(crate) fn history(dir: &Path) -> (PathBuf, String, String) {
     let repo = dir.join("repo");
     std::fs::create_dir_all(repo.join("-dir")).expect("repo");
     plain(&repo, &["init", "-q"]);

@@ -1,0 +1,1 @@
+log-order|crates/atomic-core/src/redact.rs|    crate::terminal::block(&bounded(line, MAX_TEXT))|    bounded(&crate::terminal::block(line), MAX_TEXT) /*CONTROL_OFF*/|-p atomic-agentic-core --lib redact::tests::a_log_line_is_redacted_then_escaped

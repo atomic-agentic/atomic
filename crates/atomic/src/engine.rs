@@ -66,10 +66,13 @@ pub struct EngineArgs {
     /// `ATOMIC_EXECUTOR_ID`).
     #[arg(long)]
     pub executor_id: Option<String>,
-    /// How many seconds a step waits for the execution backend to have room
-    /// for its workspace before the run stops, unfinished and with nothing
-    /// recorded, for `atomic runs resume`. Without it, a step waits for as
-    /// long as it takes (`backend_wait`, `ATOMIC_BACKEND_WAIT`).
+    /// How many seconds a step waits for room, on the execution backend for
+    /// its workspace or on the disk for atomic's own writes (its run's build
+    /// caches and its worktree's directory), before the run stops,
+    /// unfinished and with nothing recorded, for `atomic runs resume`. Each
+    /// of those waits has its own clock. A checkout git cannot finish fails
+    /// the step instead. Without it, a step waits for as long as it takes
+    /// (`backend_wait`, `ATOMIC_BACKEND_WAIT`).
     #[arg(long, value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(1..))]
     pub backend_wait: Option<u64>,
 }
@@ -112,9 +115,27 @@ pub fn runner_of(resolved: &settings::Resolved) -> anyhow::Result<RunnerKind> {
     }
 }
 
+/// The backend on this machine that `atomic run`, `atomic serve` and the
+/// evals run turns and exec atoms' commands on, unconfined and unconnected
+/// (see [`ProjectState::run_backend`]): scratch outside every directory a
+/// sandboxed turn may write, and the project's other backends' denied to
+/// its commands.
+pub fn local_backend(state: &ProjectState) -> atomic_exec::LocalBackend {
+    state.run_backend()
+}
+
+/// The backend `atomic debug codex-prompt` and `atomic debug probe` run
+/// their turn on (see [`ProjectState::debug_backend`]): one of its own
+/// beside [`local_backend`], since these commands take no execution lock,
+/// and connecting empties a backend's shared temporary directory, which a
+/// run's turns may be using.
+pub fn debug_backend(state: &ProjectState) -> atomic_exec::LocalBackend {
+    state.debug_backend()
+}
+
 /// The backend exec atoms' commands run on with `runner`: scratch in the
-/// project's state, confined like turns' commands where that is verified,
-/// connected once.
+/// atomic home's `scratch/`, confined like turns' commands where that is
+/// verified, connected once.
 pub fn exec_backend(
     state: &ProjectState,
     paths: &CodexPaths,
@@ -125,7 +146,7 @@ pub fn exec_backend(
     // write. Connected once: what the
     // backend states here is what runs plan on, and connecting reclaims
     // what attempts of dead processes left.
-    let local = state.run_backend();
+    let local = local_backend(state);
     // Exec atoms' commands run under the same sandbox helper as turns'
     // commands, denied atomic's private state. Elsewhere than Linux this is
     // not verified, and they run unconfined (see the availability notes).

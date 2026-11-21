@@ -505,6 +505,15 @@ pub fn b64url(bytes: &[u8]) -> String {
     out
 }
 
+/// A provider's answer that is not a success, as a lite call makes one of a
+/// status and a body, for a test that wants the error a provider's failure
+/// becomes — with its excerpt of the body — without a server to answer. What
+/// a span says of it is the status and the type of error the body names, if
+/// it names one; what no span carries is the body's own text.
+pub fn provider_failure(url: &str, status: u16, body: &str) -> anyhow::Error {
+    crate::lite::provider_failure(url, status, body)
+}
+
 /// An unsigned ChatGPT id token, as a test issuer would hand out, for
 /// `email` on a Plus plan in workspace `account`.
 pub fn fake_id_token(email: &str, account: &str) -> String {
