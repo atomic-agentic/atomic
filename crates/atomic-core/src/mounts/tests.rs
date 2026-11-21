@@ -92,12 +92,7 @@ fn a_real_table_parses_and_finds_what_it_should() {
     assert_eq!(mounts.len(), 19);
     assert!(mounts.iter().any(|m| m.kind == "nsfs" && m.root.is_none()));
     // A FUSE mount under the user's runtime directory is found where it is.
-    let gvfs = mount_of(
-        &mounts,
-        &ids(&mounts),
-        Path::new("/run/user/1000/gvfs/share"),
-    )
-    .expect("a mount");
+    let gvfs = mount_of(&mounts, Path::new("/run/user/1000/gvfs/share")).expect("a mount");
     assert_eq!(
         (gvfs.kind.as_str(), gvfs.at.as_path()),
         ("fuse.gvfsd-fuse", Path::new("/run/user/1000/gvfs"))
@@ -180,7 +175,7 @@ fn the_mount_at_a_path_is_the_top_of_its_stack() {
 6 1 8:2 / /mnt/b rw - ext4 /dev/sdb1 rw
 ";
     let mounts = parse(stacked).expect("parses");
-    let home = mount_of(&mounts, &ids(&mounts), Path::new("/home/u")).expect("a mount");
+    let home = mount_of(&mounts, Path::new("/home/u")).expect("a mount");
     assert_eq!(home.id, 5);
     // Through the mount on top, sdb1, not the one it covers.
     assert_eq!(found(&mounts, "/home/u"), [PathBuf::from("/mnt/b/u")]);
@@ -228,6 +223,21 @@ fn a_root_that_is_its_own_parent_is_the_root() {
     assert_eq!(
         found(&mounts, "/home/u"),
         [PathBuf::from("/mnt/again/home/u")]
+    );
+}
+
+/// A mount on a root that is its own parent, at `/`, is above it: the root
+/// a process sees, as the kernel shows it.
+#[test]
+fn a_mount_at_the_root_over_one_that_is_its_own_parent_is_on_top() {
+    let stacked = b"\
+1 1 0:2 / / rw - rootfs rootfs rw
+2 1 8:1 / / rw - ext4 /dev/sda1 rw
+";
+    let mounts = parse(stacked).expect("parses");
+    assert_eq!(
+        mount_of(&mounts, Path::new("/home/u")).expect("a mount").id,
+        2
     );
 }
 

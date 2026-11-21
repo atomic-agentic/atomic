@@ -239,8 +239,15 @@ impl<'a> Index<'a> {
         let mut by_device: std::collections::HashMap<&str, Vec<&Mount>> =
             std::collections::HashMap::new();
         for m in mounts {
-            // Two on one place on one mount: the later is on top (`top`
-            // takes the first found, which is the earlier, then climbs).
+            // A root that is its own parent, as an initramfs's is, is on
+            // nothing: what is mounted on it at `/` is above it, as the
+            // kernel shows it to a process. Two on one place on one mount:
+            // the first listed is the one on it, and `top` climbs from it to
+            // the other, mounted on it in turn.
+            if m.parent == m.id {
+                by_device.entry(m.device.as_str()).or_default().push(m);
+                continue;
+            }
             on.entry((m.parent, m.at.as_path())).or_insert(m);
             by_device.entry(m.device.as_str()).or_default().push(m);
         }
@@ -291,11 +298,7 @@ impl<'a> Index<'a> {
 /// The mount `path` is in, as this process sees it: from the root mount,
 /// down the mounts on each directory of the path, each the top of its stack.
 #[cfg(test)]
-fn mount_of<'a>(
-    mounts: &'a [Mount],
-    _listed: &std::collections::HashSet<u64>,
-    path: &Path,
-) -> Option<&'a Mount> {
+fn mount_of<'a>(mounts: &'a [Mount], path: &Path) -> Option<&'a Mount> {
     Index::new(mounts).mount_of(path)
 }
 
