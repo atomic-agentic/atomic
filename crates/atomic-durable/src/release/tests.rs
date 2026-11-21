@@ -237,10 +237,17 @@ async fn only_the_enrolled_credential_releases_and_raises<R: DurableRuntime>(mut
         .await
         .expect("replay");
     assert_eq!(again.released, released);
-    assert!(matches!(
-        release_park(&rt, &mine, command(&park.id, "c2", None)).await,
-        Err(ReleaseError::AlreadyReleased { by, .. }) if by == operator()
-    ));
+    let again = release_park(&rt, &mine, command(&park.id, "c2", None))
+        .await
+        .expect_err("already released");
+    assert!(
+        matches!(&again, ReleaseError::AlreadyReleased { by, wake_failed: None, .. } if *by == operator()),
+        "{again}"
+    );
+    assert!(
+        again.to_string().contains("its run was woken again"),
+        "{again}"
+    );
     assert!(matches!(
         release_park(&rt, &mine, command(&park.id, "c1", None)).await,
         Err(ReleaseError::CommandReused(_))
@@ -318,4 +325,254 @@ async fn only_the_enrolled_credential_releases_and_raises_on_postgres() {
     // The schema outlives the engine.
     let (rt, _schema) = postgres().await;
     only_the_enrolled_credential_releases_and_raises(rt).await
+}
+
+// ---------------------------------------------------------------------------
+// Hooks the release transaction calls in tests.
+
+/// Pauses at `before_marking`, by park: the release tells the first notify
+/// it has reached the point, then waits on the second.
+type Pause = Arc<(tokio::sync::Notify, tokio::sync::Notify)>;
+static PAUSES: std::sync::LazyLock<Mutex<std::collections::HashMap<String, Pause>>> =
+    std::sync::LazyLock::new(Mutex::default);
+/// How many wake-ups each park's run was sent.
+static WAKES: std::sync::LazyLock<Mutex<std::collections::HashMap<String, usize>>> =
+    std::sync::LazyLock::new(Mutex::default);
+
+/// Hold the next release of `park` after it raised its cap, before it marks
+/// the park released, until the returned pause's second notify fires.
+fn pause_before_marking(park: &str) -> Pause {
+    let pause: Pause = Arc::default();
+    PAUSES
+        .lock()
+        .expect("pauses")
+        .insert(park.to_owned(), pause.clone());
+    pause
+}
+
+/// Called by the release transaction after its savepoint and raise.
+pub(super) async fn before_marking(park: &str) {
+    let pause = PAUSES.lock().ok().and_then(|mut p| p.remove(park));
+    if let Some(pause) = pause {
+        pause.0.notify_one();
+        pause.1.notified().await;
+    }
+}
+
+/// Called for every wake-up sent to a released park's run.
+pub(super) fn woken(park: &str) {
+    *WAKES
+        .lock()
+        .expect("wakes")
+        .entry(park.to_owned())
+        .or_default() += 1;
+}
+
+fn wakes(park: &str) -> usize {
+    WAKES.lock().expect("wakes").get(park).copied().unwrap_or(0)
+}
+
+/// A park of run `run`, with nothing waiting on it, and its run's allowance.
+async fn bare_park<R: DurableRuntime>(rt: &R, run: &str, tokens: i64) -> String {
+    let park = format!("{run}:1");
+    let (id, r) = (park.clone(), run.to_owned());
+    rt.control_transaction(move |mut tx| {
+        let (id, r) = (id.clone(), r.clone());
+        Box::pin(async move {
+            tx.execute(
+                "INSERT INTO atomic_parks (park_id, run, step, reason, parked_at) \
+                 VALUES (?, ?, 'plan.park', 'no room', 1)",
+                &[Param::Text(id), Param::Text(r)],
+            )
+            .await
+            .map(|_| ())
+        })
+    })
+    .await
+    .expect("a park");
+    allowance(rt, &format!("run:{run}"), tokens).await;
+    park
+}
+
+fn raising(run: &str, tokens: i64) -> Option<Raise> {
+    Some(Raise {
+        scope: format!("run:{run}"),
+        caps: Caps {
+            tokens,
+            millis: 0,
+            micro_usd: None,
+        },
+    })
+}
+
+/// A release already made sends its run's wake-up again, and says whether
+/// that worked: here the park's run is not one the engine has, so it says
+/// waking failed and who will deliver it. (Where it works, the run's own
+/// test sees it said so.)
+async fn a_release_already_made_wakes_its_run_again<R: DurableRuntime>(rt: R) {
+    let mine = HumanCredential::new(operator(), "the operator's secret");
+    crate::gate::enroll(&rt, &mine).await.expect("enroll");
+    let run = unique("again");
+    let park = bare_park(&rt, &run, 100).await;
+    let first = release_park(&rt, &mine, command(&park, "first", None))
+        .await
+        .expect("released");
+    assert!(first.wake_failed.is_some(), "no run to wake");
+    assert_eq!(wakes(&park), 1);
+    let again = release_park(&rt, &mine, command(&park, "second", None))
+        .await
+        .expect_err("already released");
+    assert_eq!(wakes(&park), 2, "the wake-up was not sent again");
+    let said = again.to_string();
+    assert!(said.contains("was already released by local:dev"), "{said}");
+    assert!(said.contains("waking its run again failed"), "{said}");
+    assert!(said.contains("atomic runs resume"), "{said}");
+    assert!(!said.contains("woken again"), "{said}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_release_already_made_wakes_its_run_again_on_sqlite() {
+    a_release_already_made_wakes_its_run_again(sqlite().await).await
+}
+
+#[cfg(feature = "postgres-tests")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_release_already_made_wakes_its_run_again_on_postgres() {
+    let (rt, _schema) = postgres().await;
+    a_release_already_made_wakes_its_run_again(rt).await
+}
+
+/// Two releases interleaved as only PostgreSQL lets them (SQLite runs one
+/// write at a time): the first has raised its cap when the second marks the
+/// park released and commits. The first then finds the park taken, undoes
+/// its raise, and says the park was already released; the cap is raised by
+/// the winner alone.
+#[cfg(feature = "postgres-tests")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_release_that_loses_the_park_undoes_its_raise_on_postgres() {
+    let (rt, _schema) = postgres().await;
+    let rt = Arc::new(rt);
+    let mine = HumanCredential::new(operator(), "the operator's secret");
+    crate::gate::enroll(&*rt, &mine).await.expect("enroll");
+    let run = unique("lost");
+    let park = bare_park(&*rt, &run, 100).await;
+    // The run's atom allowance, under its own, for the winner to raise.
+    let atom = format!("atom:{run}:1");
+    let (scope, parent) = (atom.clone(), format!("run:{run}"));
+    rt.control_transaction(move |mut tx| {
+        let (scope, parent) = (scope.clone(), parent.clone());
+        Box::pin(async move {
+            tx.execute(
+                "INSERT INTO atomic_usage_allowances (scope, parent, tokens_cap, millis_cap, \
+                 micro_usd_cap, tokens_charged, millis_charged, micro_usd_charged) \
+                 VALUES (?, ?, 50, 60000, CAST(? AS BIGINT), 0, 0, 0)",
+                &[Param::Text(scope), Param::Text(parent), Param::Null],
+            )
+            .await
+            .map(|_| ())
+        })
+    })
+    .await
+    .expect("an atom allowance");
+    let pause = pause_before_marking(&park);
+    let (first_rt, first_cred, first_park) = (rt.clone(), mine.clone(), park.clone());
+    let first = tokio::spawn(async move {
+        release_park(
+            &*first_rt,
+            &first_cred,
+            command(&first_park, "first", raising(&run_of(&first_park), 1_000)),
+        )
+        .await
+    });
+    // The first has raised the run's cap and holds before marking the park.
+    pause.0.notified().await;
+    let won = release_park(
+        &*rt,
+        &mine,
+        command(
+            &park,
+            "second",
+            Some(Raise {
+                scope: atom.clone(),
+                caps: Caps {
+                    tokens: 500,
+                    millis: 0,
+                    micro_usd: None,
+                },
+            }),
+        ),
+    )
+    .await
+    .expect("the second release wins");
+    assert_eq!(won.released.command, "second");
+    pause.1.notify_one();
+    let lost = first
+        .await
+        .expect("the first release")
+        .expect_err("lost the park");
+    assert!(
+        matches!(lost, ReleaseError::AlreadyReleased { .. }),
+        "{lost}"
+    );
+    assert_eq!(
+        caps_of(&*rt, &format!("run:{}", run_of(&park))).await,
+        100,
+        "the loser's raise stayed"
+    );
+    assert_eq!(caps_of(&*rt, &atom).await, 500);
+}
+
+/// Two releases interleaved on one command id, for different parks: the
+/// first has marked its park when the second records the command. The first
+/// then finds the id taken, undoes its release and raise, and says the id
+/// was used for another command.
+#[cfg(feature = "postgres-tests")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_release_that_loses_its_command_id_undoes_itself_on_postgres() {
+    let (rt, _schema) = postgres().await;
+    let rt = Arc::new(rt);
+    let mine = HumanCredential::new(operator(), "the operator's secret");
+    crate::gate::enroll(&*rt, &mine).await.expect("enroll");
+    let (one, two) = (unique("one"), unique("two"));
+    let (first_park, second_park) = (
+        bare_park(&*rt, &one, 100).await,
+        bare_park(&*rt, &two, 100).await,
+    );
+    let pause = pause_before_marking(&first_park);
+    let (first_rt, first_cred, park) = (rt.clone(), mine.clone(), first_park.clone());
+    let one_run = one.clone();
+    let first = tokio::spawn(async move {
+        release_park(
+            &*first_rt,
+            &first_cred,
+            command(&park, "shared", raising(&one_run, 1_000)),
+        )
+        .await
+    });
+    pause.0.notified().await;
+    release_park(&*rt, &mine, command(&second_park, "shared", None))
+        .await
+        .expect("the second records the command");
+    pause.1.notify_one();
+    let lost = first
+        .await
+        .expect("the first release")
+        .expect_err("lost the id");
+    assert!(matches!(lost, ReleaseError::CommandReused(_)), "{lost}");
+    assert!(
+        !is_released(&*rt, &first_park).await.expect("released?"),
+        "the loser's park stayed released"
+    );
+    assert_eq!(
+        caps_of(&*rt, &format!("run:{one}")).await,
+        100,
+        "the loser's raise stayed"
+    );
+}
+
+/// The run of park `park` (`<run>:<n>`).
+fn run_of(park: &str) -> String {
+    park.rsplit_once(':')
+        .map(|(r, _)| r.to_owned())
+        .unwrap_or_default()
 }

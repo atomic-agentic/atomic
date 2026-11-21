@@ -70,7 +70,7 @@ fn whole(value: f64, flag: &str) -> anyhow::Result<i64> {
 }
 
 pub async fn run(command: ParksCommand, state: &ProjectState) -> anyhow::Result<()> {
-    let database = crate::engine::database(state);
+    let database = crate::engine::database(state)?;
     let rt = Durare::open(&database, None, atomic_app::pipeline::LAYOUT_VERSION)
         .await
         .with_context(|| format!("open the store at {}", crate::engine::describe(&database)))?;
@@ -90,6 +90,9 @@ pub async fn run(command: ParksCommand, state: &ProjectState) -> anyhow::Result<
                      --minutes or --cost-usd"
                 );
             }
+            if args.tokens.is_some_and(|t| t < 0) {
+                anyhow::bail!("--tokens must be a whole number, zero or more");
+            }
             let caps = Caps {
                 tokens: args.tokens.unwrap_or(0),
                 millis: match args.minutes {
@@ -104,9 +107,14 @@ pub async fn run(command: ParksCommand, state: &ProjectState) -> anyhow::Result<
             let credential = operator_credential(state)?;
             // The park as recorded, released or not, so a repeat of the
             // command raises what the first one did.
-            let park = release::park(&rt, &args.park).await?;
+            let Some(park) = release::park(&rt, &args.park).await? else {
+                anyhow::bail!(
+                    "no park {}; `atomic parks list` lists the runs parked and not yet released",
+                    args.park
+                );
+            };
             let raise = if raising {
-                let scope = match (&args.scope, park.as_ref().and_then(|p| p.scope())) {
+                let scope = match (&args.scope, park.scope()) {
                     (Some(scope), _) => scope.clone(),
                     (None, Some(scope)) => scope.to_owned(),
                     (None, None) => anyhow::bail!(

@@ -79,14 +79,27 @@ pub enum ReleaseError {
     /// There is no such allowance to raise.
     #[error("no allowance {0} to raise")]
     NoSuchAllowance(String),
-    /// The park was already released, by another command; its run was
-    /// woken again.
-    #[error("park {} was already released by {by}; its run was woken again", park.id)]
+    /// The park was already released, by another command; its run's
+    /// wake-up was sent again, in case it was lost.
+    #[error(
+        "park {} was already released by {by}; {}",
+        park.id,
+        match wake_failed {
+            None => "its run was woken again, in case its wake-up was lost".to_owned(),
+            Some(why) => format!(
+                "waking its run again failed ({why}); atomic serve or atomic runs resume {} \
+                 delivers it",
+                park.run
+            ),
+        }
+    )]
     AlreadyReleased {
         /// The park.
         park: Box<Park>,
         /// Who released it.
         by: Principal,
+        /// Why waking its run again failed, if it did.
+        wake_failed: Option<String>,
     },
     /// The park's run has finished: there is nothing to release.
     #[error("park {park}'s run {run} has finished; there is nothing to release")]
@@ -288,6 +301,7 @@ pub async fn release_park<R: DurableRuntime>(
                     return Ok(Err(ReleaseError::AlreadyReleased {
                         park: Box::new(park.clone()),
                         by: Principal::stored(row.text("released_by")?),
+                        wake_failed: None,
                     }));
                 }
                 if finished(&mut tx, &park.run).await? {
@@ -308,6 +322,8 @@ pub async fn release_park<R: DurableRuntime>(
                 // after this one raised the cap: keep its writes reversible
                 // until both are admitted.
                 tx.execute("SAVEPOINT atomic_park_release", &[]).await?;
+                #[cfg(test)]
+                let pausing = park.id.clone();
                 let (raised, unchanged) = match &cmd.raise {
                     None => (None, false),
                     Some(raise) => {
@@ -323,6 +339,8 @@ pub async fn release_park<R: DurableRuntime>(
                         }
                     }
                 };
+                #[cfg(test)]
+                tests::before_marking(&pausing).await;
                 let now = now_ms();
                 let released = Released {
                     park: park.clone(),
@@ -382,6 +400,7 @@ pub async fn release_park<R: DurableRuntime>(
                 Ok(Err(ReleaseError::AlreadyReleased {
                     park: Box::new(park.clone()),
                     by: Principal::stored(row.text("released_by")?),
+                    wake_failed: None,
                 }))
             })
         })
@@ -397,10 +416,15 @@ pub async fn release_park<R: DurableRuntime>(
                 raised_nothing,
             })
         }
-        Err(ReleaseError::AlreadyReleased { park, by }) => {
-            // Its wake may have been lost: send it again, harmlessly.
-            let _ = wake(rt, &park).await;
-            Err(ReleaseError::AlreadyReleased { park, by })
+        Err(ReleaseError::AlreadyReleased { park, by, .. }) => {
+            // Its wake may have been lost: send it again, harmlessly, and
+            // say whether that worked.
+            let wake_failed = wake(rt, &park).await.err().map(|e| e.to_string());
+            Err(ReleaseError::AlreadyReleased {
+                park,
+                by,
+                wake_failed,
+            })
         }
         Err(e) => Err(e),
     }
@@ -430,6 +454,8 @@ async fn journaled(
 }
 
 async fn wake<R: DurableRuntime>(rt: &R, park: &Park) -> crate::runtime::Result<()> {
+    #[cfg(test)]
+    tests::woken(&park.id);
     crate::failpoint("release:before-wake");
     crate::publication::release(rt, park).await
 }
@@ -440,6 +466,7 @@ async fn wake<R: DurableRuntime>(rt: &R, park: &Park) -> crate::runtime::Result<
 /// [`crate::gate::redeliver`]. Returns how many it woke; waking a run that
 /// already woke changes nothing.
 pub async fn redeliver<R: DurableRuntime>(rt: &R) -> crate::runtime::Result<usize> {
+    crate::failpoint("release:redeliver");
     let waiting: Vec<Park> = rt
         .control_transaction(|mut tx| {
             Box::pin(async move {

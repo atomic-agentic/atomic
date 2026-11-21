@@ -142,6 +142,11 @@ pub const COMMAND_SITES: &[Site] = &[
         name: "release:before-wake",
         what: "a park's release is committed and its run has not been woken",
     },
+    Site {
+        name: "release:redeliver",
+        what: "a process is about to wake the runs of released parks whose wake-up may have \
+               been lost",
+    },
 ];
 
 /// The site `name` comes from, if it is one of [`SITES`] or

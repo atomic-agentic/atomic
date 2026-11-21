@@ -5042,3 +5042,115 @@ fn the_debug_prompt_says_its_turn_is_not_metered() {
         assert_eq!(model.calls(), 1);
     });
 }
+
+/// Released parks whose wake-up was lost are redelivered wherever gate
+/// decisions are: when a run is resumed, after a gate decision, when
+/// `atomic serve` starts and every few seconds while it serves. Each
+/// reaches `release:redeliver`, which the failpoint log records.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[test]
+fn every_place_that_redelivers_gate_decisions_redelivers_park_releases() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
+    on_codex_runtime(async {
+        let model = FakeModel::start(vec![Reply::Text(RANK.into()), Reply::Text(SUMMARY.into())])
+            .await
+            .expect("fake model");
+        let dir = scratch("redelivered");
+        let project = project(&dir);
+        let mut env = model_env(&model.base_url()).to_vec();
+        env.push(("ATOMIC_CREDENTIAL_STORE", "file".into()));
+        let redelivered = |log: &Path| {
+            std::fs::read_to_string(log)
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| *l == "release:redeliver")
+                .count()
+        };
+        // A run waiting at its gate, then stopped where it waits.
+        let mut run = spawn(
+            &dir,
+            &project,
+            &["run", "gated", "--run-id", "redelivered", "--data", NOTE],
+            &with(&env, &[]),
+            &dir.join("run.log"),
+        );
+        wait_until("the run to wait at its gate", || {
+            std::fs::read_to_string(dir.join("run.log"))
+                .is_ok_and(|l| l.contains("decide it from a terminal"))
+        });
+        let _ = run.kill();
+        let _ = run.wait();
+        // Resumed.
+        let resumed_log = dir.join("resume.failpoints");
+        let resumed_at = resumed_log.to_string_lossy().into_owned();
+        let mut resumed = spawn(
+            &dir,
+            &project,
+            &["runs", "resume", "redelivered"],
+            &with(&env, &[("ATOMIC_FAILPOINT_LOG", &resumed_at)]),
+            &dir.join("resume.log"),
+        );
+        wait_until("the resume to redeliver", || redelivered(&resumed_log) >= 1);
+        let _ = resumed.kill();
+        let _ = resumed.wait();
+        // A gate decided from the command line.
+        let (d, p, e) = (dir.clone(), project.clone(), env.clone());
+        let enrolled = tokio::task::spawn_blocking(move || {
+            let mut script = command_as(Path::new("/usr/bin/script"), &d, &p, &[], &with(&e, &[]));
+            script
+                .args(["-qec", &format!("{ATOMIC} gates enroll"), "/dev/null"])
+                .output()
+                .expect("script")
+        })
+        .await
+        .expect("child");
+        assert!(enrolled.status.success(), "{}", text(&enrolled));
+        let decided_log = dir.join("approve.failpoints");
+        let decided_at = decided_log.to_string_lossy().into_owned();
+        let (d, p, e) = (dir.clone(), project.clone(), env.clone());
+        let approved = tokio::task::spawn_blocking(move || {
+            atomic(
+                &d,
+                &p,
+                &["gates", "approve", "redelivered:check"],
+                &with(&e, &[("ATOMIC_FAILPOINT_LOG", &decided_at)]),
+                "",
+            )
+        })
+        .await
+        .expect("child");
+        assert!(approved.status.success(), "{}", text(&approved));
+        assert!(
+            redelivered(&decided_log) >= 1,
+            "the gate decision redelivered nothing"
+        );
+        // Served: at start, and again a few seconds later.
+        let served_log = dir.join("serve.failpoints");
+        let served_at = served_log.to_string_lossy().into_owned();
+        let mut serve = spawn(
+            &dir,
+            &project,
+            &["serve"],
+            &with(&env, &[("ATOMIC_FAILPOINT_LOG", &served_at)]),
+            &dir.join("serve.log"),
+        );
+        // Once at start, before it says it serves.
+        wait_until("serve to say it serves", || {
+            std::fs::read_to_string(dir.join("serve.log"))
+                .is_ok_and(|l| l.contains("serving until stopped"))
+        });
+        assert!(
+            redelivered(&served_log) >= 1,
+            "serve redelivered nothing at start"
+        );
+        // And again while it serves.
+        let at_start = redelivered(&served_log);
+        wait_until("serve to redeliver while serving", || {
+            redelivered(&served_log) > at_start
+        });
+        terminate(&serve);
+        let _ = wait_child(&mut serve, "serve");
+    });
+}
