@@ -332,9 +332,9 @@ fn count_log(dir: &Path) -> usize {
     ran(dir, "count-note")
 }
 
-/// [`ran_in`] summed over the stores of every atomic home in `dir`.
-fn ran(dir: &Path, atom: &str) -> usize {
-    let atom = atom.to_owned();
+/// The stores of every atomic home in `dir`, with each project's state
+/// directory.
+fn stores(dir: &Path) -> Vec<(PathBuf, PathBuf)> {
     let mut stores = Vec::new();
     for home in std::fs::read_dir(dir).into_iter().flatten().flatten() {
         for project in std::fs::read_dir(home.path().join("private"))
@@ -348,6 +348,35 @@ fn ran(dir: &Path, atom: &str) -> usize {
             }
         }
     }
+    stores
+}
+
+/// What run `id` returned, once it has finished, in any store in `dir`.
+fn finished_output(dir: &Path, id: &str) -> Option<Value> {
+    let (stores, id) = (stores(dir), id.to_owned());
+    // A runtime of its own, so it may be asked from inside the tests' own.
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime")
+            .block_on(async move {
+                for (db, _) in stores {
+                    let rt = Durare::sqlite(&db).await.expect("store");
+                    if rt.status(&id).await.expect("status") == Some(RunStatus::Succeeded) {
+                        return rt.result::<Value>(&id).await.ok();
+                    }
+                }
+                None
+            })
+    })
+    .join()
+    .expect("result")
+}
+
+/// [`ran_in`] summed over the stores of every atomic home in `dir`.
+fn ran(dir: &Path, atom: &str) -> usize {
+    let (atom, stores) = (atom.to_owned(), stores(dir));
     // A runtime of its own, so it may be asked from inside the tests' own.
     std::thread::spawn(move || {
         tokio::runtime::Builder::new_current_thread()
@@ -578,6 +607,7 @@ fn command_as(
         "ATOMIC_MODEL",
         "ATOMIC_MODEL_API_KEY_ENV",
         "ATOMIC_RUNNER",
+        "ATOMIC_BACKEND_WAIT",
         "OPENAI_API_KEY",
         "DATABASE_URL",
     ] {
@@ -777,10 +807,12 @@ fn wait_child(child: &mut Child, what: &str) -> std::process::ExitStatus {
         if let Some(status) = child.try_wait().expect("wait") {
             return status;
         }
-        assert!(
-            started.elapsed() < Duration::from_secs(120),
-            "{what} did not exit"
-        );
+        if started.elapsed() >= Duration::from_secs(120) {
+            // Not left running after the test.
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("{what} did not exit");
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
 }
@@ -1605,8 +1637,11 @@ fn a_run_stopped_mid_call_charges_the_call_only_the_time_it_ran() {
         // the time is what it ran, not the 10 minutes it reserved.
         let rt = Durare::sqlite(&database(&state)).await.expect("store");
         let attempts = rt.ledger().attempts("stopped-1").await.expect("attempts");
-        assert_eq!(attempts.len(), 1, "{attempts:?}");
-        let call = &attempts[0];
+        // The exec step before rank finished, and its command is settled.
+        let (work, calls): (Vec<_>, Vec<_>) = attempts.iter().partition(|a| a.model == "(command)");
+        assert!(work.iter().all(|a| a.state == "settled"), "{attempts:?}");
+        assert_eq!(calls.len(), 1, "{attempts:?}");
+        let call = calls[0];
         assert_eq!(call.state, "reserved");
         assert_eq!(call.reserved.millis, 600_000);
         assert!(call.charged.millis < 60_000, "{call:?}");
@@ -2959,6 +2994,327 @@ fn a_sandbox_trial_failing_for_want_of_room_makes_the_run_wait_then_finish() {
     assert!(status.success(), "{text}");
     assert!(text.contains("can open its workspace again"), "{text}");
     assert_eq!(count_log(&dir), 2, "its command ran once");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// With `--backend-wait`, a run whose step finds no room on the execution
+/// backend for that long stops, unfinished and with nothing recorded, with
+/// the exit code for a failure to try again; `atomic runs resume` continues
+/// it once there is room, and its command runs once.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[test]
+fn a_run_that_waits_too_long_for_room_stops_unfinished_and_resumes() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
+    let dir = scratch("backend-wait");
+    let project = project(&dir);
+    let path = bwrap_in_front(&dir);
+    let env = [("PATH", path.as_str())];
+    let out = atomic(
+        &dir,
+        &project,
+        &["run", "count-only", "--data", NOTE],
+        &env,
+        "",
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(count_log(&dir), 1);
+
+    let full = dir.join("bwrap-full");
+    std::fs::write(&full, "").expect("the disk fills");
+    let log = dir.join("wait.log");
+    let started = Instant::now();
+    let mut run = spawn(
+        &dir,
+        &project,
+        &[
+            "run",
+            "count-only",
+            "--run-id",
+            "room-1",
+            "--backend-wait",
+            "2",
+            "--data",
+            NOTE,
+        ],
+        &env,
+        &log,
+    );
+    let status = wait_child(&mut run, "the waiting run");
+    let waited = started.elapsed();
+    let text_log = std::fs::read_to_string(&log).unwrap_or_default();
+    assert_eq!(
+        status.code(),
+        Some(atomic_app::workflows::NO_ROOM_EXIT),
+        "{text_log}"
+    );
+    assert!(
+        waited >= Duration::from_secs(2),
+        "it waited its limit: {waited:?}"
+    );
+    assert!(
+        waited < Duration::from_secs(30),
+        "and no longer: {waited:?}"
+    );
+    assert!(
+        text_log.contains("the most this process waits"),
+        "{text_log}"
+    );
+    assert!(text_log.contains("atomic runs resume"), "{text_log}");
+    assert_eq!(count_log(&dir), 1, "nothing ran");
+
+    std::fs::remove_file(&full).expect("room again");
+    let out = atomic(
+        &dir,
+        &project,
+        &["runs", "resume", "room-1"],
+        &with_unused(&env),
+        "",
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(count_log(&dir), 2, "its command ran once");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A signal stops a run waiting for room on the execution backend at once,
+/// not after the time a running step has to reach its checkpoint: the
+/// waiting step gives up its wait, records nothing, and `atomic runs
+/// resume` continues it.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[test]
+fn a_signal_ends_a_wait_for_room_at_once() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
+    let dir = scratch("wait-stop");
+    let project = project(&dir);
+    let path = bwrap_in_front(&dir);
+    let env = [("PATH", path.as_str())];
+    let out = atomic(
+        &dir,
+        &project,
+        &["run", "count-only", "--data", NOTE],
+        &env,
+        "",
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    let full = dir.join("bwrap-full");
+    std::fs::write(&full, "").expect("the disk fills");
+    let log = dir.join("wait.log");
+    let mut run = spawn(
+        &dir,
+        &project,
+        &["run", "count-only", "--run-id", "room-2", "--data", NOTE],
+        &env,
+        &log,
+    );
+    wait_until("the run to wait", || {
+        std::fs::read_to_string(&log)
+            .is_ok_and(|l| l.contains("is waiting for the execution backend"))
+    });
+    // Into its pauses, which grow towards half a minute.
+    std::thread::sleep(Duration::from_secs(4));
+    let stopping = Instant::now();
+    signal(&run, "TERM");
+    let status = wait_child(&mut run, "the stopped run");
+    let took = stopping.elapsed();
+    let text_log = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        took < Duration::from_secs(3),
+        "it stopped in {took:?}: {text_log}"
+    );
+    assert!(!status.success(), "{text_log}");
+    assert_eq!(count_log(&dir), 1, "nothing ran");
+
+    std::fs::remove_file(&full).expect("room again");
+    let out = atomic(
+        &dir,
+        &project,
+        &["runs", "resume", "room-2"],
+        &with_unused(&env),
+        "",
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(count_log(&dir), 2, "its command ran once");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Under `atomic serve`, a step that found no room within the wait is set
+/// aside, not given up: serve says so, keeps trying at most half a minute
+/// apart and says so each time, stops at once when asked meanwhile, and runs
+/// the step once there is room. The wait comes from `ATOMIC_BACKEND_WAIT`.
+// needs_sandbox
+#[cfg(any(not(target_os = "linux"), feature = "sandbox-tests"))]
+#[test]
+fn serve_keeps_trying_a_step_that_found_no_room_in_time() {
+    #[cfg(target_os = "linux")]
+    support::require_sandbox();
+    let dir = scratch("serve-room");
+    let project = project(&dir);
+    write_two_steps(&project, &dir);
+    let path = bwrap_in_front(&dir);
+    // A run stopped after its first command, with a second to run.
+    let out = atomic(
+        &dir,
+        &project,
+        &["run", "two-steps", "--run-id", "two-1", "--data", NOTE],
+        &[
+            ("PATH", path.as_str()),
+            ("ATOMIC_FAILPOINT", "pipeline:after:first"),
+        ],
+        "",
+    );
+    assert!(!out.status.success(), "{}", text(&out));
+    let full = dir.join("bwrap-full");
+    std::fs::write(&full, "").expect("the disk fills");
+    let env = with_unused(&[("PATH", path.as_str()), ("ATOMIC_BACKEND_WAIT", "1")]);
+    let log = dir.join("serve.log");
+    let mut serve = spawn(&dir, &project, &["serve"], &env, &log);
+    wait_until("serve to set the step aside", || {
+        std::fs::read_to_string(&log).is_ok_and(|l| l.contains("is set aside"))
+    });
+    // A stop while a step is set aside does not wait for it.
+    let stopping = Instant::now();
+    terminate(&serve);
+    let status = wait_child(&mut serve, "serve");
+    let text_log = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(status.success(), "{text_log}");
+    assert!(
+        stopping.elapsed() < Duration::from_secs(5),
+        "a set-aside step is not one a stop waits for: {text_log}"
+    );
+    assert_eq!(
+        steps_log(&dir),
+        ["first start", "first end"],
+        "second has not run"
+    );
+
+    // Started again, serve sets the step aside again, keeps trying, and
+    // runs it, once, when there is room: the run's output carries the log
+    // its caches kept, which go with it.
+    let log = dir.join("serve-again.log");
+    let mut serve = spawn(&dir, &project, &["serve"], &env, &log);
+    wait_until("serve to try again", || {
+        std::fs::read_to_string(&log)
+            .is_ok_and(|l| l.contains("is set aside") && l.contains("still no room"))
+    });
+    assert!(serve.try_wait().expect("wait").is_none(), "serve goes on");
+    std::fs::remove_file(&full).expect("room again");
+    wait_until("serve to finish the run", || {
+        finished_output(&dir, "two-1").is_some()
+    });
+    terminate(&serve);
+    let status = wait_child(&mut serve, "serve");
+    let text_log = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(status.success(), "{text_log}");
+    assert_eq!(
+        finished_output(&dir, "two-1").expect("finished")["steps"],
+        json!(["first start", "first end", "second"])
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `--backend-wait` is a whole number of seconds, at least 1, and so is
+/// the `backend_wait` setting's variable, `ATOMIC_BACKEND_WAIT`, whose empty
+/// value means none was given. Each is checked before anything runs; with no sandbox here the empty case may
+/// stop for that, never for the wait.
+#[test]
+fn the_backend_wait_is_at_least_a_second() {
+    let dir = scratch("backend-wait-zero");
+    let project = project(&dir);
+    let out = atomic(
+        &dir,
+        &project,
+        &["run", "no-such-atom", "--backend-wait", "0", "--data", "{}"],
+        &[],
+        "",
+    );
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+    assert!(text(&out).contains("--backend-wait"), "{}", text(&out));
+    let out = atomic(
+        &dir,
+        &project,
+        &["--json", "run", "count-only", "--data", NOTE],
+        &[("ATOMIC_BACKEND_WAIT", "")],
+        "",
+    );
+    assert_ne!(
+        out.status.code(),
+        Some(2),
+        "an empty value is no value: {}",
+        text(&out)
+    );
+    // Run or stopped for want of a sandbox, but not refused: no
+    // configuration error, and nothing said of the wait.
+    assert!(
+        !text(&out).contains("config.invalid")
+            && !text(&out).contains("backend_wait")
+            && !text(&out).contains("ATOMIC_BACKEND_WAIT"),
+        "an empty value is no value: {}",
+        text(&out)
+    );
+    let out = atomic(
+        &dir,
+        &project,
+        &["--json", "run", "count-only", "--data", NOTE],
+        &[("ATOMIC_BACKEND_WAIT", "0")],
+        "",
+    );
+    assert_eq!(
+        stdout_json(&out)["error"]["kind"],
+        "config.invalid",
+        "{}",
+        text(&out)
+    );
+    assert!(
+        stdout_json(&out)["error"]["description"]
+            .as_str()
+            .is_some_and(
+                |d| d.contains("backend_wait, from environment variable ATOMIC_BACKEND_WAIT")
+            ),
+        "{}",
+        text(&out)
+    );
+    // Written in the manifest, the wait is read like any setting: the
+    // project loads, a run runs, and `config --explain` says where it came
+    // from.
+    let manifest = project.join("atomic.yaml");
+    let written = std::fs::read_to_string(&manifest).expect("manifest");
+    std::fs::write(&manifest, format!("{written}backend_wait: 300\n")).expect("manifest");
+    let out = atomic(
+        &dir,
+        &project,
+        &["--json", "run", "count-only", "--data", NOTE],
+        &[],
+        "",
+    );
+    assert!(
+        !text(&out).contains("project.invalid")
+            && !text(&out).contains("config.invalid")
+            && !text(&out).contains("unknown manifest key"),
+        "{}",
+        text(&out)
+    );
+    let out = atomic(&dir, &project, &["config", "--explain"], &[], "");
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        text(&out)
+            .lines()
+            .any(|l| l.contains("backend_wait") && l.contains("300") && l.contains("atomic.yaml")),
+        "{}",
+        text(&out)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `env` with an unused model endpoint, as `atomic runs resume` needs one.
+fn with_unused<'a>(env: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
+    UNUSED_MODEL
+        .iter()
+        .copied()
+        .chain(env.iter().copied())
+        .collect()
 }
 
 /// Under `atomic serve`, a run whose commands cannot be confined is set

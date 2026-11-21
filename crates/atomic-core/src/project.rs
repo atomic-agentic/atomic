@@ -194,7 +194,7 @@ pub fn load(path: &Path) -> Result<Project, ProjectError> {
             "atomic" | "name" | "collections" | "ignore" | "generated" | "workspace" => {}
             // Settings, which share the file: the configuration layers read
             // and check them (see `config`).
-            "model" | "database" | "runner" | "executor_id" | "budget" => {}
+            "model" | "database" | "runner" | "executor_id" | "backend_wait" | "budget" => {}
             "packages" | "exports" | "package" | "models" => {
                 return Err(invalid(
                     &pointer,

@@ -1837,6 +1837,7 @@ where
                 model: endpoint.model.clone(),
                 input_bound: None,
                 turn: true,
+                work: false,
             })
             .await
         {

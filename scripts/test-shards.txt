@@ -57,6 +57,8 @@ test turn_workspace
 test worktree_step
 test golden
 test git_safety
+test cancelled_open
+test stopping_open
 test worktrees
 test dbos_schema
 test executor_identity
