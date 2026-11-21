@@ -2160,6 +2160,10 @@ fn a_flag_value_in_escaped_quotes_is_hidden() {
             "case {case}: the value showed"
         );
     }
+    // A word in escaped quotes after a hint is read without them, as one
+    // in plain quotes is, and stays.
+    let kept = "run --token \\\"readOnlyScope\\\" now";
+    assert_eq!(text(kept), kept, "a word after a hint was hidden");
     // In JSON held in a string, one level deep and two.
     let inner = json!({"cmd": "deploy --password \"hunter2\""}).to_string();
     for (depth, doc) in [
