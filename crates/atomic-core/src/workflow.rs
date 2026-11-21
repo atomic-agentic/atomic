@@ -1011,14 +1011,7 @@ fn check_review(
             ));
         }
     };
-    let accepts = |atom: &Atom| {
-        atom.frontmatter
-            .get("trust")
-            .and_then(Value::as_str)
-            .unwrap_or("external")
-            .to_owned()
-    };
-    let reviewer_accepts = accepts(reviewer);
+    let reviewer_accepts = accepted_trust(reviewer);
     // What the reviewer's findings carry: a model's output on what it read.
     let mut findings = "agent";
     for (field, e) in &with {
@@ -1060,7 +1053,7 @@ fn check_review(
             }
         }
         let origin = review_origin(source, kinds).map_err(|m| fail(&wp, m))?;
-        if trust_rank(origin) < trust_rank(&reviewer_accepts) {
+        if trust_rank(origin) < trust_rank(reviewer_accepts) {
             return Err(fail(
                 &wp,
                 format!(
@@ -1092,8 +1085,8 @@ fn check_review(
     }
     // A repair round hands the author the reviewer's findings: no more
     // trusted than what the reviewer read.
-    let author_accepts = accepts(reviewed.atom);
-    if rounds > 0 && trust_rank(findings) < trust_rank(&author_accepts) {
+    let author_accepts = accepted_trust(reviewed.atom);
+    if rounds > 0 && trust_rank(findings) < trust_rank(author_accepts) {
         return Err(fail(
             &format!("{rp}/rounds"),
             format!(

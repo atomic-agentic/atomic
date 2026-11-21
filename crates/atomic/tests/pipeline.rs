@@ -4996,3 +4996,58 @@ fn a_worktree_steps_reviewer_sees_its_commit_and_the_gate_shows_the_one_publishe
             .expect("shutdown");
     });
 }
+
+#[test]
+fn a_hand_built_review_the_loader_would_refuse_is_refused_before_any_call() {
+    on_codex_runtime(async {
+        let dir = scratch("review-hand-built");
+        let project = project(&dir);
+        let model = FakeModel::start(vec![Reply::Text(READ.into())])
+            .await
+            .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        for (n, (change, said)) in [
+            (
+                (|s: &mut atomic_app::pipeline::AtomStep| {
+                    s.review.as_mut().expect("a review").rounds = 9
+                }) as fn(&mut atomic_app::pipeline::AtomStep),
+                "more than the 5 atomic allows",
+            ),
+            (
+                (|s: &mut atomic_app::pipeline::AtomStep| s.id = "read.review".into()),
+                "has a dot in its name",
+            ),
+            (
+                (|s: &mut atomic_app::pipeline::AtomStep| {
+                    s.review.as_mut().expect("a review").reviewer = "no-such-atom".into()
+                }),
+                "is not a lite or codex atom of the run",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut pipeline = reviewed(&project, 1);
+            let Step::Atom(step) = &mut pipeline.steps[0] else {
+                panic!("an atom step");
+            };
+            change(step);
+            let id = format!("hand-built-{n}");
+            let run = PipelineRun {
+                pipeline,
+                input: json!({ "text": NOTE }),
+            };
+            rt.start(PIPELINE, &id, run).await.expect("start");
+            let error = rt
+                .result::<Value>(&id)
+                .await
+                .expect_err("refused")
+                .to_string();
+            assert!(error.contains(said), "{error}");
+        }
+        assert_eq!(model.calls(), 0, "a refused run was paid for");
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
