@@ -32,10 +32,33 @@ class UniqueKeysLoader(yaml.SafeLoader):
     pass
 
 
+def mapping_key(loader, key_node, deep):
+    """One mapping key, read the way atomic's loader reads it.
+
+    The loader takes a plain key that is a canonical decimal integer -- `0` or
+    `-?[1-9][0-9]*` -- as its own text, so an OpenAPI spec's `200:` is the
+    property name "200" and one key with `"200":`. PyYAML follows YAML 1.1,
+    which reads `200:` as the integer 200 and `0200:` as the octal 128, so a
+    plain integer key is taken only while it is its own text; any other
+    spelling is refused, as the loader refuses it, and quoting is the fix.
+    """
+    key = loader.construct_object(key_node, deep=deep)
+    if not isinstance(key, int) or isinstance(key, bool):
+        return key
+    line = key_node.start_mark.line + 1
+    spelling = key_node.value
+    require(
+        key_node.style is None and str(key) == spelling,
+        f"{spelling!r} key at line {line} is not a plain decimal integer as atomic reads it; "
+        f"quote it (\"{spelling}\")",
+    )
+    return str(key)
+
+
 def unique_mapping(loader, node, deep=False):
     result = {}
     for key_node, value_node in node.value:
-        key = loader.construct_object(key_node, deep=deep)
+        key = mapping_key(loader, key_node, deep)
         if key in result:
             raise ValueError(f"duplicate YAML key {key!r} at line {key_node.start_mark.line + 1}")
         result[key] = loader.construct_object(value_node, deep=deep)
@@ -69,7 +92,11 @@ SchemaLoader.add_constructor("tag:yaml.org,2002:bool", strict_bool)
 
 
 def json_model(value, path):
-    """Fails on anything a JSON document could not hold."""
+    """Fails on anything a JSON document could not hold.
+
+    An integer key is a string by the time it gets here: mapping_key has read
+    it the way atomic's loader does, and refused any other spelling.
+    """
     if isinstance(value, dict):
         for key, child in value.items():
             require(isinstance(key, str), f"{path}: non-string key {key!r}")
@@ -453,6 +480,54 @@ def check_project(top):
     return atom_count, fixture_count, exec_count, workflow_count, diagram_count
 
 
+def check_yaml_loader_mirror():
+    """The loader's key rules, checked on text rather than on the catalog.
+
+    No catalog file needs an integer key, so the mirror of atomic's integer
+    keys would never run without this. Each case says what it must be read as
+    or how it must be refused, so a mirror that stops refusing reads as a
+    failure and not as a smaller count.
+    """
+    checks = 0
+
+    def refused(text, why):
+        try:
+            read_yaml(text)
+        except ValueError as exc:
+            require(why in str(exc), f"{text!r}: refused for {exc}, which does not say {why!r}")
+            return 1
+        raise ValueError(f"{text!r} was read as a key; it must be refused as {why}")
+
+    # A plain canonical integer key is read as its own text, so a schema's
+    # property name is a string and the two spellings are one key.
+    require(read_yaml("200: ok\n") == {"200": "ok"}, "an unquoted integer key is not its own text")
+    require(
+        read_yaml("responses:\n  200: ok\n") == read_yaml("responses:\n  \"200\": ok\n"),
+        "an unquoted integer key and its quoted form are not one key",
+    )
+    checks += 2
+    for text, why in [
+        ("200: a\n\"200\": b\n", "duplicate YAML key '200'"),
+        ("0200: a\n", "quote it"),
+        ("007: a\n", "quote it"),
+        ("+2: a\n", "quote it"),
+        ("-0: a\n", "quote it"),
+        ("0x1F: a\n", "quote it"),
+        ("0o17: a\n", "quote it"),
+    ]:
+        checks += refused(text, why)
+    # Anything else YAML reads as other than a string is no key in JSON.
+    for text in ("true: a\n", "1.5: a\n", "null: a\n"):
+        try:
+            json_model(read_yaml(text), "sidecar.schema.yaml")
+        except ValueError as exc:
+            require("non-string key" in str(exc), f"{text!r}: {exc}")
+        else:
+            raise ValueError(f"{text!r} reached JSON as a key; it must be refused")
+        checks += 1
+    return checks
+
+
 def check_exec_edges():
     project = EXAMPLES / "03-order-report"
     def run(script, data):
@@ -547,6 +622,7 @@ def check_decision_dates():
 def main():
     # Atom declarations come from this mirror, so it must agree with atomic's.
     print(f"PASS TypeScript projection mirror: {astro_atoms.check_projection()} cases match atomic's generator")
+    print(f"PASS YAML mirror: {check_yaml_loader_mirror()} key rules match atomic's loader")
     total = [0, 0, 0, 0, 0]
     projects = sorted(path for path in EXAMPLES.iterdir() if path.is_dir())
     for project in projects:
