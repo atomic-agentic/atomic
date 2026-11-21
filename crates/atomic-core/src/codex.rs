@@ -2124,7 +2124,7 @@ impl ProgressLog<'_> {
     /// what it reported, and one request in flight, since it may be making
     /// one. A record that fails, or takes longer than [`PROGRESS_PATIENCE`],
     /// leaves the turn charged as it was, at its reservation or its last
-    /// record, is tried again at the next growth, and is said once a turn.
+    /// record, is retried at the next token event, and is said once a turn.
     async fn note(&mut self, progress: &Progress) {
         let Some((input, output, _)) = progress.totals(self.seen) else {
             return;
@@ -2165,9 +2165,18 @@ impl ProgressLog<'_> {
                     Ok(Err(e)) => e.to_string(),
                     _ => format!("the store did not answer within {PROGRESS_PATIENCE:?}"),
                 };
+                // The meter's request id is `<run>:<step>:<call>`.
+                let (run, request) = match self.ticket {
+                    Some(t) => (
+                        t.request.rsplitn(3, ':').nth(2).unwrap_or(&t.request),
+                        t.request.as_str(),
+                    ),
+                    None => ("?", "?"),
+                };
                 crate::log_line!(
-                    "a Codex turn's usage so far was not recorded ({why}); until it is, a stop \
-                     before the turn settles leaves it charged at its last record"
+                    "run {run}: a Codex turn's usage so far was not recorded for request \
+                     {request} ({why}); until it is, a stop before the turn settles leaves it \
+                     charged at its last record"
                 );
             }
             _ => {}
@@ -3272,6 +3281,116 @@ mod tests {
                 Ok(())
             })
         }
+    }
+
+    /// A meter whose progress records fail `failing` times, or never
+    /// answer, counting each record it is asked for.
+    #[derive(Default)]
+    struct Flaky {
+        failing: std::sync::atomic::AtomicUsize,
+        hangs: bool,
+        records: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Meter for Flaky {
+        fn admit(&self, _: Call) -> MeterFuture<'_, Ticket> {
+            Box::pin(async { Err(MeterError::Store("not used".into())) })
+        }
+
+        fn settle(&self, _: Ticket, _: Outcome) -> MeterFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn progress<'a>(&'a self, _: &'a Ticket, _: Outcome) -> MeterFuture<'a, ()> {
+            use std::sync::atomic::Ordering::SeqCst;
+            Box::pin(async move {
+                self.records.fetch_add(1, SeqCst);
+                if self.hangs {
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                }
+                if self.failing.load(SeqCst) > 0 {
+                    self.failing.fetch_sub(1, SeqCst);
+                    return Err(MeterError::Store("the store is down".into()));
+                }
+                Ok(())
+            })
+        }
+    }
+
+    fn progress_ticket() -> Ticket {
+        Ticket {
+            request: "run-1:2:0".into(),
+            attempt: 1,
+            model: "synthetic".into(),
+            admitted: std::time::Instant::now(),
+            limit: Limit::default(),
+            bounded_by: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_progress_record_advances_only_once_written_and_a_failure_is_said_once() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let meter = Arc::new(Flaky {
+            failing: 2.into(),
+            ..Flaky::default()
+        });
+        let metering = Metering::new(meter.clone());
+        let ticket = progress_ticket();
+        let mut log = ProgressLog {
+            meter: &metering,
+            ticket: Some(&ticket),
+            seen: (0, 0),
+            recorded: (0, 0),
+            records: 0,
+            warned: false,
+        };
+        let grown = Progress {
+            usage: Some((3, 2, 5)),
+            ..Progress::default()
+        };
+        // A failed record does not advance, so the next token event, though
+        // it reports nothing new, tries it again; the failure is said once.
+        log.note(&grown).await;
+        assert_eq!((log.recorded, log.records, log.warned), ((0, 0), 0, true));
+        log.note(&grown).await;
+        assert_eq!(meter.records.load(SeqCst), 2);
+        assert_eq!((log.recorded, log.records), ((0, 0), 0));
+        // Written, it advances; with nothing new, nothing is asked again.
+        log.note(&grown).await;
+        assert_eq!((log.recorded, log.records), ((3, 2), 1));
+        log.note(&grown).await;
+        assert_eq!(meter.records.load(SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn a_progress_record_the_store_does_not_answer_is_given_up_after_its_patience() {
+        let meter = Arc::new(Flaky {
+            hangs: true,
+            ..Flaky::default()
+        });
+        let metering = Metering::new(meter.clone());
+        let ticket = progress_ticket();
+        let mut log = ProgressLog {
+            meter: &metering,
+            ticket: Some(&ticket),
+            seen: (0, 0),
+            recorded: (0, 0),
+            records: 0,
+            warned: false,
+        };
+        let started = std::time::Instant::now();
+        log.note(&Progress {
+            usage: Some((3, 2, 5)),
+            ..Progress::default()
+        })
+        .await;
+        let waited = started.elapsed();
+        assert!(
+            waited >= PROGRESS_PATIENCE && waited < PROGRESS_PATIENCE * 3,
+            "{waited:?}"
+        );
+        assert_eq!((log.records, log.warned), (0, true));
     }
 
     async fn metered_conversation(
