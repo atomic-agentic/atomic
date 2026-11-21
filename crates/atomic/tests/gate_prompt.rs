@@ -250,6 +250,20 @@ impl Project {
             )
             .unwrap();
         }
+        // A gate that shows two keys a model chose, each the start of a
+        // private key, so both redact to the same text.
+        std::fs::write(
+            root.join("workflows/collide.workflow.yaml"),
+            workflow(
+                "collide",
+                &format!(
+                    "      title: \"'Look at both'\"\n      show: \"{{'{KEY_START}1': 'harmless', \
+                     '{KEY_START}2': 'rm -rf /'}}\"\n"
+                ),
+                "steps.first.output.line",
+            ),
+        )
+        .unwrap();
         Self { dir, root }
     }
 
@@ -739,8 +753,10 @@ fn the_start_of_a_private_key_in_a_gate_hides_nothing_else_it_shows() {
         "the show was cut: {t}"
     );
     assert!(t.contains("`atomic gates list` shows it in full"), "{t}");
-    let errors = String::from_utf8_lossy(&out.stderr);
-    assert!(!errors.contains(KEY_START), "{errors}");
+    // atomic writes the gate to the terminal, which the driver reads and
+    // prints; the run's result, after it, is the person's own data.
+    let prompt = t.split("approved by").next().unwrap_or_default();
+    assert!(!prompt.contains(KEY_START), "{t}");
     // atomic's own words and the names in them are not redacted.
     assert!(
         t.contains("gate rotate-secret:pick is waiting for you"),
@@ -888,4 +904,22 @@ fn without_standard_error_on_the_terminal_or_in_the_background_it_does_not_promp
     }
     let said = std::fs::read_to_string(&errors).unwrap();
     assert!(said.contains("decide it from a terminal"), "{said}");
+}
+
+/// Two keys in what a gate shows that redact to the same text are both
+/// shown, each with its own value: neither hides the other's.
+#[test]
+fn keys_that_redact_alike_in_what_a_gate_shows_are_both_shown() {
+    support::require_sandbox();
+    let p = Project::new("collide");
+    p.enroll();
+    let data = json!({ "text": "a note" }).to_string();
+    let out = p.at_terminal(&["run", "collide", "--data", &data], &["a"]);
+    let t = text(&out);
+    assert!(out.status.success(), "{t}");
+    assert!(t.contains("\"harmless\""), "a value was lost: {t}");
+    assert!(t.contains("\"rm -rf /\""), "a value was lost: {t}");
+    assert!(t.contains("[REDACTED] (2)"), "{t}");
+    let prompt = t.split("approved by").next().unwrap_or_default();
+    assert!(!prompt.contains(KEY_START), "{t}");
 }
