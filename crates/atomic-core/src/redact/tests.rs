@@ -1798,11 +1798,18 @@ fn text_redacted_again_changes_nothing() {
         "--password Authorization: Cookie: Cookie: =12",
         "=secret: Cookie: x-api-key: '&",
         "123456x-api-key: Cookie: Authorization: Basic [REDACTED]",
+        "Authorization: Bearer x \\ab \\cd \\ef \\gh \\ij",
+        "Authorization: Bearer x \\ab \\cd \\ef \\gh \\ij:Authorization: Cookie: sid=s3cr3tvalue",
+        "Proxy-Authorization: --token \\x-api-key: api.telegram.org/bot[",
     ]
     .into_iter()
     .enumerate()
     {
         let once = text(input).into_owned();
+        assert_ne!(
+            once, REDACTED,
+            "case {case}: it did not settle within the bound"
+        );
         assert_eq!(text(&once), once, "case {case}: a second pass changed it");
     }
     // Generated: names, separators, headers and values strung together.
@@ -1841,6 +1848,12 @@ fn text_redacted_again_changes_nothing() {
         "-12",
         "=12",
         "Basic ",
+        "\\",
+        "\\ab ",
+        " c\\ab",
+        "Proxy-Authorization: ",
+        "--token ",
+        "\\x-api-key: ",
     ];
     let mut seed: u64 = 77;
     let mut next = move |n: u64| {
@@ -1861,4 +1874,104 @@ fn text_redacted_again_changes_nothing() {
         }
     }
     assert_eq!(unstable, 0, "a second pass changed generated text");
+}
+
+/// A backslash after a marker ends the value the marker stands for, so a
+/// run of backslashed chunks after a header settles at once rather than a
+/// chunk a reading, and a credential at its end is hidden.
+#[test]
+fn a_marker_before_a_backslash_ends_its_value() {
+    let chunks: String = (0..1000).map(|i| format!(" \\c{i}")).collect();
+    let input = format!("Authorization: Bearer x{chunks} password=s3cr3tvalue");
+    let once = text(&input).into_owned();
+    assert!(!once.contains("s3cr3tvalue"), "the credential showed");
+    assert!(
+        once.ends_with("\\c999 password=[REDACTED]"),
+        "it did not settle within the bound"
+    );
+    assert_eq!(text(&once), once, "a second pass changed it");
+}
+
+/// Text still changing when the readings run out is hidden whole.
+#[test]
+fn text_still_changing_at_the_bound_is_hidden_whole() {
+    let input = "api_key=Authorization: Cookie: =12";
+    PASSES.with(|p| p.set(1));
+    let capped = text(input).into_owned();
+    PASSES.with(|p| p.set(TEXT_PASSES));
+    assert_eq!(capped, REDACTED);
+    assert_ne!(text(input), REDACTED, "settled within the bound, it is not");
+}
+
+/// A key's value is held as surely as any reading of its name says: one
+/// that a single reading would hide is hidden when text is read until it
+/// settles.
+#[test]
+fn a_key_is_judged_by_every_reading_of_its_name() {
+    for (case, doc) in [
+        json!({"key Proxy-Authorization: -p password": "hunter2"}),
+        json!({"token": {"key Proxy-Authorization: -p password x-api-key: v.file": "hunter2"}}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut out = doc;
+        value(&mut out);
+        assert!(
+            !out.to_string().contains("hunter2"),
+            "case {case}: the value showed"
+        );
+    }
+    // Generated keys: nothing a single reading hides shows when the
+    // readings repeat.
+    const PARTS: &[&str] = &[
+        "key ",
+        "Proxy-Authorization: ",
+        "-p ",
+        "password",
+        " x-api-key: ",
+        "v.file",
+        "token=",
+        "Cookie: ",
+        "--password ",
+        "secret",
+        "=",
+        " ",
+        "\\ab",
+        "api_key=",
+        "Bearer ",
+    ];
+    let mut seed: u64 = 4242;
+    let mut next = move |n: u64| {
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (seed >> 33) % n
+    };
+    let mut shown = 0;
+    for _ in 0..20_000 {
+        let mut key = String::new();
+        for _ in 0..=next(6) {
+            key.push_str(PARTS[next(PARTS.len() as u64) as usize]);
+        }
+        let doc = if next(2) == 0 {
+            json!({ key: "hunter2" })
+        } else {
+            json!({"token": { key: "hunter2" }})
+        };
+        let run = |passes: usize| {
+            PASSES.with(|p| p.set(passes));
+            let mut out = doc.clone();
+            value(&mut out);
+            PASSES.with(|p| p.set(TEXT_PASSES));
+            out.to_string().contains("hunter2")
+        };
+        if run(TEXT_PASSES) && !run(1) {
+            shown += 1;
+        }
+    }
+    assert_eq!(
+        shown, 0,
+        "a value one reading hides shows when the readings repeat"
+    );
 }

@@ -860,6 +860,15 @@ fn bare_value_len(rest: &str) -> usize {
                 end = i;
                 break;
             }
+            // A marker another rule wrote ends the value when a backslash
+            // follows it, so a later reading does not read the marker and
+            // what follows as one value, a chunk a reading.
+            b'[' if rest[i..].starts_with(REDACTED)
+                && bytes.get(i + REDACTED.len()) == Some(&b'\\') =>
+            {
+                end = i + REDACTED.len();
+                break;
+            }
             b',' | b';' | b'&' if i + 1 == bytes.len() || starts_assignment(&rest[i + 1..]) => {
                 end = i;
                 break;
@@ -1121,28 +1130,72 @@ fn redact_userinfo(captures: &Captures<'_>) -> String {
     format!("{}{REDACTED}{}", &captures[1], &captures[3])
 }
 
-/// How many times [`text`] reads text again at most: each reading can
-/// leave what another rule reads as a secret only once a first rule has
-/// redacted around it, as a header after an assignment's marker.
+/// How many readings [`text`] takes at most: a reading can leave what
+/// another rule reads as a secret only once a first rule has redacted
+/// around it, as a header after an assignment's marker. Text seen to need
+/// three; text still changing at the last is hidden whole.
 const TEXT_PASSES: usize = 4;
 
 /// Replaces secrets in text, read again until a reading changes nothing,
-/// so redacting the result again changes nothing. Linear in the length of
-/// `input`; callers with text of unknown length bound it first (see
-/// [`excerpt`]).
+/// so redacting the result again changes nothing; text still changing
+/// after [`TEXT_PASSES`] readings is hidden whole, since what a further
+/// reading would hide cannot be told. Linear in the length of `input`;
+/// callers with text of unknown length bound it first (see [`excerpt`]).
 pub fn text(input: &str) -> Cow<'_, str> {
-    let mut output = text_once(input);
-    for _ in 1..TEXT_PASSES {
-        let again = match text_once(&output) {
-            Cow::Borrowed(_) => None,
-            Cow::Owned(again) => Some(again),
-        };
-        match again {
-            Some(again) => output = Cow::Owned(again),
-            None => break,
+    let mut output = match text_once(input) {
+        Cow::Owned(once) if once != input => once,
+        _ => return Cow::Borrowed(input),
+    };
+    for _ in 1..text_passes() {
+        let again = text_once(&output).into_owned();
+        if again == output {
+            return Cow::Owned(output);
         }
+        output = again;
     }
-    output
+    if text_once(&output) == output.as_str() {
+        Cow::Owned(output)
+    } else {
+        Cow::Owned(REDACTED.to_owned())
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// How many readings [`text`] takes at most on this thread, for tests
+    /// that try a lower bound.
+    static PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(TEXT_PASSES) };
+}
+
+#[cfg(test)]
+fn text_passes() -> usize {
+    PASSES.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+const fn text_passes() -> usize {
+    TEXT_PASSES
+}
+
+/// How surely `name` names a secret in every reading [`text`] makes of it,
+/// and as written too when `written`, the surest taken: a later reading
+/// can hide what made an earlier one name a secret.
+fn read_strength(name: &str, written: bool) -> Strength {
+    let mut surest = if written {
+        name_strength(name)
+    } else {
+        Strength::None
+    };
+    let mut reading = name.to_owned();
+    for _ in 0..=text_passes() {
+        let next = text_once(&reading).into_owned();
+        if next == reading {
+            break;
+        }
+        surest = surer(surest, name_strength(&next));
+        reading = next;
+    }
+    surest
 }
 
 /// One reading of `input` by every text rule (see [`text`]).
@@ -1500,18 +1553,19 @@ fn base_name(key: &str) -> &str {
 
 /// How surely the field at `key` holds a secret: what its name says (see
 /// [`name_strength`]), number and all, so a second pass reads it as this
-/// one does; for a key renamed, the surer of that and what its new name
-/// said before it was numbered, and, under a secret's name (`held`), what
-/// its original key said and what it said redacted as text too, so a
-/// secret's name redacted, or hidden whole, is still one there.
+/// one does; for a key renamed, the surest of that, of what its new name
+/// said before it was numbered, and of every reading text redaction makes
+/// of its original key (see [`read_strength`]), so a later reading cannot
+/// weaken what an earlier one said; and, under a secret's name (`held`),
+/// of the original key as written too, so a secret's name redacted, or
+/// hidden whole, is still one there.
 fn judged(key: &str, renamed: &std::collections::HashMap<String, Renamed>, held: bool) -> Strength {
     let whole = name_strength(key);
     match renamed.get(key) {
-        Some(r) if held => surer(
-            surer(whole, name_strength(&text(&r.original))),
-            surer(name_strength(&r.original), name_strength(&r.name)),
+        Some(r) => surer(
+            surer(whole, read_strength(&r.original, held)),
+            name_strength(&r.name),
         ),
-        Some(r) => surer(whole, name_strength(&r.name)),
         None => whole,
     }
 }

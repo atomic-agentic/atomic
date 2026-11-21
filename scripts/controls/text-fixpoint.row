@@ -1,1 +1,1 @@
-text-fixpoint|crates/atomic-core/src/redact.rs|    for _ in 1..TEXT_PASSES {|    for _ in 1..1 /*CONTROL_OFF*/ {|-p atomic-agentic-core --lib redact::tests::text_redacted_again_changes_nothing
+text-fixpoint|crates/atomic-core/src/redact.rs|    for _ in 1..text_passes() {|    for _ in 1..1 /*CONTROL_OFF*/ {|-p atomic-agentic-core --lib redact::tests::text_redacted_again_changes_nothing
