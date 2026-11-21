@@ -52,9 +52,11 @@ On Linux the command runs under the same sandbox as a Codex atom's commands. It
 can read the project and the rest of the filesystem except atomic's private
 state (every project's database and gate store under the atomic home's
 `private/`, the current project's Codex records, the credential and key
-directories) and the places in your home directory where credentials are
+directories), the places in your home directory where credentials are
 kept, the same ones a Codex atom's commands cannot read (see
-[configuration](#configuration)). It can write only its own scratch directory (its `HOME`
+[configuration](#configuration)), and the scratch directories of the
+project's other attempts, live or not, whether a turn's, another exec
+step's or `atomic debug prompt`'s. It can write only its own scratch directory (its `HOME`
 and `TMPDIR`) and, in a workflow, its run's own build caches; a command that writes anywhere
 else fails. It has no network and cannot use sockets unless the atom declares
 the hosts it reaches (see [Network access](#network-access)). It also:

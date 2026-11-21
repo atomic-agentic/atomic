@@ -43,6 +43,7 @@ test exec_private_state
 test second_mounts
 test exec_caches
 test exec_network
+test exec_scratch
 test failpoints
 test fixture_cli
 test gate_prompt

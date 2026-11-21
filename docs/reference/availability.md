@@ -117,9 +117,23 @@ turn, gets the platform's core variables and what the atom declares, never
 atomic's own environment or its credentials. A turn's commands run with no
 login shell; their `HOME` (and `ZDOTDIR`) is a private scratch directory of the
 attempt's own, and their `TMPDIR` a directory inside it, so no shell startup
-file runs and no other turn can add, change or remove what a turn keeps in its
-temporary directory. Another turn of the project can still read it, by its path
-under the project's scratch directory: do not rely on it for secrets. (Codex's
+file runs and no other turn of the project can see, add, change or remove what
+a turn keeps in its `HOME` or temporary directory: every scratch directory of
+the project, those of `atomic run`, `atomic serve` and `atomic eval` and those
+of `atomic debug prompt`, is denied to a turn's commands, apart from a
+`workspace-write` turn's own. A `read-only` turn, which may not write its own,
+cannot reach it at all, not even to list it. Other projects' scratch
+directories are not denied yet: a turn can read another project's live
+attempts by their path. Apart from macOS, whose own sandbox denies them, only
+Codex's Linux sandbox helper, which the `atomic` binary provides, can deny
+them, so a process without it refuses the turn instead of running it. On
+macOS none of this is verified: Codex's sandbox there has nothing like the
+Linux sandbox's reopening of a writable directory inside a denied one, so it
+may keep a turn from reading its own scratch directory too, and stop the
+turn. An exec atom's
+command, which has a scratch directory of its own too, is kept out of the
+project's other ones in the same way, its own apart, wherever its command is
+confined, on Linux; where exec atoms' commands run unconfined, it is not. (Codex's
 sandbox keeps its registry of the mount points it makes in a directory every
 turn of the project shares, which no turn's command may write.) Tools found
 through `HOME` are therefore not found: cargo's registry and tools, pyenv, nvm,
@@ -161,7 +175,9 @@ reaches, and then all but those, which it reaches through atomic's proxy; and
 sockets. Cargo's own configuration is
 not among them, so a registry token kept there rather than in
 `credentials.toml` is not protected. A command does not start when a denial
-would cover its working directory or a directory it may write, or when a
+would cover its working directory or a directory it may write, apart from its
+own scratch directory, which a denied scratch root covers and which is opened
+to it again, or when a
 denied place or a linked secret lies two or more levels inside a directory it
 may write. Other projects'
 Codex records are not denied yet. atomic makes the list when a

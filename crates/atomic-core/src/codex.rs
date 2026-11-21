@@ -124,6 +124,14 @@ pub struct TurnSpec {
     /// Directories a `workspace-write` thread may write besides its working
     /// directory, such as its run's build caches. Absolute paths.
     pub writable_roots: Vec<PathBuf>,
+    /// Directories the thread's commands may neither read nor write, apart
+    /// from those inside them it may write: the scratch roots of the
+    /// project's backends, a `workspace-write` thread's own directory
+    /// excepted. Absolute paths. Codex's Linux sandbox reopens only writable
+    /// directories inside a denied one, so a `read-only` thread's own scratch
+    /// directory, which it may not write, is out of its reach too: it cannot
+    /// even list it.
+    pub denied: Vec<PathBuf>,
 }
 
 /// What a thread's commands are kept out of. It has no default: every
@@ -878,6 +886,58 @@ pub(crate) fn permission_profile(
     ))
 }
 
+/// `profile` with `denied` denied as well: the backend's scratch
+/// directories. What the thread may write inside a denied directory, such as
+/// its own scratch directory, stays writable, as a writable root of its own.
+fn deny_also(profile: PermissionProfile, denied: &[PathBuf]) -> anyhow::Result<PermissionProfile> {
+    use codex_protocol::permissions::{
+        FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry,
+    };
+    if denied.is_empty() {
+        return Ok(profile);
+    }
+    let mut policy = profile.file_system_sandbox_policy();
+    for dir in denied {
+        let dir = AbsolutePathBuf::from_absolute_path(dir)
+            .with_context(|| format!("resolve the sandbox path {}", dir.display()))?;
+        policy.entries.push(FileSystemSandboxEntry::new(
+            FileSystemPath::from(dir),
+            FileSystemAccessMode::Deny,
+        ));
+    }
+    Ok(PermissionProfile::from_runtime_permissions(
+        &policy,
+        SANDBOX_NETWORK,
+    ))
+}
+
+/// Refuse a thread whose commands must be kept out of `denied` when `paths`
+/// has no Linux sandbox helper, except on macOS (`macos`), whose own sandbox
+/// denies paths itself. On Linux, Codex's sandbox reads a profile that
+/// denies paths only through that helper, and nowhere else has atomic seen a
+/// denial hold, so without one the thread could not be kept out of other
+/// attempts' scratch directories; atomic refuses it before the thread starts
+/// rather than run it with less denied. On macOS the denial is not verified:
+/// Seatbelt has no counterpart to the Linux sandbox reopening a writable
+/// directory inside a denied one, so it may keep a turn from reading its own
+/// scratch directory as well.
+fn refuse_denied_without_helper(
+    paths: &CodexPaths,
+    denied: &[PathBuf],
+    macos: bool,
+) -> anyhow::Result<()> {
+    if !macos && !denied.is_empty() && paths.linux_sandbox().is_none() {
+        let denied: Vec<_> = denied.iter().map(|d| d.display().to_string()).collect();
+        bail!(
+            "this turn's commands must be kept out of {}, and apart from macOS only \
+             Codex's Linux sandbox helper can do that, which this process does not have; \
+             run atomic itself, which provides one",
+            denied.join(", ")
+        );
+    }
+    Ok(())
+}
+
 /// Refuse a workspace-write thread under [`StateGuard::NoProjectState`]
 /// whose writable roots cover atomic's state or user-wide private
 /// directories, or lie inside them: nothing would deny them.
@@ -1241,7 +1301,8 @@ fn not_dumpable() -> std::io::Result<()> {
 /// turn's commands are confined: the whole filesystem readable except
 /// atomic's private state, which is denied as it is to turns (see
 /// [`denied_paths`]), and the private state of every other project under
-/// the same atomic home; only the command's own writable directories, such
+/// the same atomic home, and every other attempt's scratch directory (see
+/// [`atomic_exec::Command::denied`]); only the command's own writable directories, such
 /// as its scratch directory and its run's build caches, writable; no network
 /// and no sockets, unless its atom declares hosts, and then only those,
 /// through a proxy of atomic's own (see [`crate::network`]).
@@ -1322,12 +1383,15 @@ impl ExecSandbox {
     }
 
     /// The profile for a command run in `cwd` that may write `writable`,
-    /// except the directories in `read_only` inside them.
+    /// except the directories in `read_only` inside them, and may neither
+    /// read nor write `denied`, apart from the writable directories inside
+    /// them.
     fn profile(
         &self,
         cwd: &Path,
         writable: &[PathBuf],
         read_only: &[PathBuf],
+        denied: &[PathBuf],
     ) -> anyhow::Result<PermissionProfile> {
         use codex_protocol::permissions::{
             FileSystemAccessMode, FileSystemPath, FileSystemSandboxEntry,
@@ -1355,6 +1419,16 @@ impl ExecSandbox {
             policy.entries.push(FileSystemSandboxEntry::new(
                 FileSystemPath::from(dir),
                 FileSystemAccessMode::Read,
+            ));
+        }
+        // Codex's Linux sandbox reopens the writable directories inside a
+        // denied one, such as the command's own scratch directory.
+        for dir in denied {
+            let dir = AbsolutePathBuf::from_absolute_path(dir)
+                .with_context(|| format!("resolve the denied directory {}", dir.display()))?;
+            policy.entries.push(FileSystemSandboxEntry::new(
+                FileSystemPath::from(dir),
+                FileSystemAccessMode::Deny,
             ));
         }
         // No network of its own: a command whose atom declares hosts reaches
@@ -1414,7 +1488,12 @@ impl atomic_exec::Confine for ExecSandbox {
             )));
         }
         let profile = self
-            .profile(&command.cwd, &command.writable, &command.read_only)
+            .profile(
+                &command.cwd,
+                &command.writable,
+                &command.read_only,
+                &command.denied,
+            )
             .and_then(|p| serde_json::to_string(&p).context("encode the sandbox profile"))
             .map_err(|e| fail(format!("{e:#}")))?;
         let cwd = text(&command.cwd)?;
@@ -1500,6 +1579,7 @@ impl atomic_exec::Confine for ExecSandbox {
                 writable: Vec::new(),
                 read_only: Vec::new(),
                 network: Vec::new(),
+                denied: Vec::new(),
                 ..command.clone()
             },
             held,
@@ -1932,6 +2012,7 @@ where
     Fut: std::future::Future<Output = Option<TurnSpec>>,
 {
     let spec = first;
+    refuse_denied_without_helper(paths, &spec.denied, cfg!(target_os = "macos"))?;
     let mut endpoint = endpoint.clone();
     if let Some(m) = &spec.model {
         endpoint.model = m.clone();
@@ -1940,19 +2021,22 @@ where
     config.developer_instructions = spec.developer_instructions.clone();
     config.permissions = Permissions::from_approval_and_profile(
         Constrained::allow_any(AskForApproval::Never),
-        Constrained::allow_any(permission_profile(
-            spec.sandbox,
-            guard,
-            codex_home,
-            Some(cwd),
-            &match spec.sandbox {
-                crate::typed::Sandbox::ReadOnly => Vec::new(),
-                crate::typed::Sandbox::WorkspaceWrite => {
-                    let mut roots = spec.writable_roots.clone();
-                    roots.push(cwd.to_owned());
-                    roots
-                }
-            },
+        Constrained::allow_any(deny_also(
+            permission_profile(
+                spec.sandbox,
+                guard,
+                codex_home,
+                Some(cwd),
+                &match spec.sandbox {
+                    crate::typed::Sandbox::ReadOnly => Vec::new(),
+                    crate::typed::Sandbox::WorkspaceWrite => {
+                        let mut roots = spec.writable_roots.clone();
+                        roots.push(cwd.to_owned());
+                        roots
+                    }
+                },
+            )?,
+            &spec.denied,
         )?),
     )?;
     let mut writable_roots = spec.writable_roots.clone();
@@ -3541,6 +3625,61 @@ mod tests {
             assert_eq!(model.calls(), 1, "requests: {:#?}", model.requests());
             // The prompt reached the model.
             assert!(model.requests()[0].to_string().contains("ping"));
+        });
+    }
+
+    /// Only Codex's Linux sandbox helper keeps a thread's commands out of
+    /// the paths its profile denies, apart from macOS's own sandbox, so
+    /// anywhere but macOS a thread with something to deny and no helper is
+    /// refused before any model call, and is never run with less denied.
+    #[test]
+    fn a_thread_with_paths_to_deny_and_no_sandbox_helper_is_refused_except_on_macos() {
+        let denied = [PathBuf::from("/scratch/root")];
+        let helperless = CodexPaths::without_helpers();
+        let why = refuse_denied_without_helper(&helperless, &denied, false)
+            .expect_err("no helper to deny with")
+            .to_string();
+        assert!(
+            why.contains("/scratch/root") && why.contains("sandbox helper"),
+            "{why}"
+        );
+        refuse_denied_without_helper(&helperless, &[], false).expect("nothing to deny");
+        refuse_denied_without_helper(&helperless, &denied, true).expect("macOS denies itself");
+        let with =
+            CodexPaths::with_helpers("/bin/atomic".into(), "/bin/codex-linux-sandbox".into());
+        refuse_denied_without_helper(&with, &denied, false).expect("a helper denies");
+
+        if cfg!(target_os = "macos") {
+            return;
+        }
+        on_codex_runtime(async move {
+            let model = FakeModel::start(vec![Reply::Text("pong".into())])
+                .await
+                .expect("fake model");
+            let (home, cwd) = (scratch("deny-home"), scratch("deny-cwd"));
+            let endpoint = ModelEndpoint {
+                base_url: model.base_url(),
+                model: "synthetic".into(),
+                api_key_env: None,
+                sign_in: None,
+            };
+            let spec = TurnSpec {
+                prompt: "ping".into(),
+                denied: denied.to_vec(),
+                ..TurnSpec::default()
+            };
+            let err = run(
+                &CodexPaths::without_helpers(),
+                &home,
+                &cwd,
+                &endpoint,
+                &StateGuard::NoProjectState,
+                &spec,
+            )
+            .await
+            .expect_err("refused without a helper");
+            assert!(err.to_string().contains("sandbox helper"), "{err:#}");
+            assert_eq!(model.calls(), 0, "refused before any model call");
         });
     }
 
