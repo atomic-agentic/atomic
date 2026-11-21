@@ -54,7 +54,9 @@ Layer 2 is the operator's own file: the person who runs the command, not the
 project. No project supplies it, and atomic refuses to read one that lies inside
 the project or inside the checkout that holds it, since the project could have
 supplied it; point `XDG_CONFIG_HOME`, or `HOME`, outside it. It holds the same
-settings as `atomic.yaml`, and the project's files override it.
+settings as `atomic.yaml`, and the project's files override it — except the
+`budget` caps and prices, which are ceilings a project can only tighten, as
+[Budgets](budgets.md#your-own-caps-are-ceilings) describes.
 
 The directory is found as the operating system gives it, the same way for the
 denial of it to every atom's commands and the refusal of a state directory
@@ -149,6 +151,8 @@ waits for as long as it takes.
 The budget settings are the `budget` section: `budget.atom.*`,
 `budget.workflow.*`, `budget.call.*` and the `budget.pricing` table.
 [Budgets](budgets.md) gives the complete section and what each limit covers.
+Written in your own configuration file, a cap or a price there is a ceiling on
+every layer above it; written in a project's file, it is the project's own ask.
 
 ## What limits a setting
 
@@ -157,7 +161,10 @@ Three separate things constrain a setting. Only the first two are built.
 ### Precedence
 
 A higher layer wins over a lower one, layer by layer, as the table above orders
-them. That decides *which value* atomic uses, and nothing else.
+them. That decides *which value* atomic uses, and nothing else. The one exception
+runs the other way: the `budget` caps and prices in your own configuration cap
+what any layer above may ask for, so the number that binds is the smaller of the
+two.
 
 ### Settings only the operator may set
 
@@ -182,11 +189,16 @@ other override.
 
 ### Managed ceilings
 
-Planned. Nothing today limits what a layer may *ask for*: no policy file and no
-managed configuration narrows the choice a layer can express. The committed
-`atomic.policy.lock` is planned for v1.0, as [availability](availability.md)
-records it. Two things are true today and do not depend on it: detection grants
-nothing, and the settings above cannot come from a project.
+Partly built. The `budget` caps and prices in your own configuration narrow what
+every layer above may ask for: a project's file, an `ATOMIC_*` variable and a
+written `budget` block can bring a cap down to yours, never above it, and a price
+you wrote holds where a project's table would replace it
+([Budgets](budgets.md#your-own-caps-are-ceilings)). Nothing else limits what a
+layer may ask for: no policy file and no managed configuration narrows the choice
+a layer can express. The committed `atomic.policy.lock` is planned for v1.0, as
+[availability](availability.md) records it. Two things are true today and do not
+depend on it: detection grants nothing, and the settings above cannot come from a
+project.
 
 ## Models: one endpoint today
 
