@@ -534,6 +534,10 @@ fn step(n: usize) {
     let _ = n;
 }
 
+/// ESC as atomic's terminal escaping and Rust's `{:?}` write it, so text
+/// escaped before it is redacted hides no token either.
+const BRACED_ESC: &[&str] = &["\\u{1b}", "\\u{001b}", "\\u{1B}", "\\u{001B}"];
+
 /// How long the terminal escape sequence starting `rest` is, if one does: a
 /// control sequence (`ESC[1;33m`, `ESC[38:5:196m`, `ESC[1 q`), the
 /// introducer of a title, link or clipboard write (`ESC]`), or a character
@@ -545,6 +549,7 @@ fn escape_sequence_len(rest: &str) -> Option<usize> {
         "\x1b", "\\u001b", "\\u001B", "\\x1b", "\\x1B", "\\e", "\\033",
     ]
     .iter()
+    .chain(BRACED_ESC)
     .find(|i| rest.starts_with(**i))?;
     let body = &rest[introducer.len()..];
     let bytes = body.as_bytes();
@@ -1536,8 +1541,8 @@ pub fn value(value: &mut Value) {
     redact_nested(value, 0);
 }
 
-/// Write one log line to stderr, redacted, bounded to [`MAX_TEXT`]
-/// characters and then made safe for a terminal. atomic's own log lines go
+/// Write one log line to stderr, redacted and bounded to [`MAX_TEXT`]
+/// characters, and then made safe for a terminal, which can lengthen it. atomic's own log lines go
 /// through this, never straight to `eprintln!`: what they name, a run's id
 /// or a principal, and what they quote can come from a caller or a model.
 pub fn log(line: impl AsRef<str>) {
@@ -1582,13 +1587,14 @@ impl Line {
         self
     }
 
-    /// What it writes: its text, bounded to [`MAX_TEXT`] characters and
-    /// safe for a terminal, whatever a part of it missed.
+    /// What it writes: its text, bounded to [`MAX_TEXT`] characters, then
+    /// made safe for a terminal, whatever a part of it missed, which can
+    /// lengthen it.
     fn written(&self) -> String {
         crate::terminal::block(&cut(&self.text, MAX_TEXT))
     }
 
-    /// Write it to stderr, bounded to [`MAX_TEXT`] characters.
+    /// Write it to stderr, as [`Line::written`] gives it.
     pub fn log(self) {
         eprintln!("{}", self.written());
     }

@@ -1329,6 +1329,28 @@ fn a_log_line_is_redacted_then_escaped() {
     );
     let line = Line::new().plain("run ").shown("a\u{1b}]0;owned\u{7}");
     assert_eq!(line.written(), "run a\\u{001b}]0;owned\\u{0007}");
+    // Bounded as written, before escaping lengthens it: a line within the
+    // bound keeps its end.
+    let long = super::logged(&format!("{}end", "\u{1b}".repeat(MAX_TEXT - 3)));
+    assert!(long.ends_with("\\u{001b}end"), "the end was cut");
+}
+
+/// A token coloured in the form atomic's own escaping writes ESC in, or
+/// Rust's `{:?}` does, is found as one coloured with ESC itself.
+#[test]
+fn a_token_coloured_in_atomics_escaped_form_is_found() {
+    for (case, esc) in ["\\u{1b}", "\\u{001b}", "\\u{1B}", "\\u{001B}"]
+        .into_iter()
+        .enumerate()
+    {
+        let line = format!("said {esc}[1;33m{SAMPLE}{esc}[0m");
+        let out = text(&line);
+        assert!(!out.contains(&SAMPLE[4..]), "case {case}: the token showed");
+        assert!(
+            out.contains("[REDACTED]"),
+            "case {case}: nothing was redacted"
+        );
+    }
 }
 
 /// Many keys that redact alike are numbered in linear time: each name keeps

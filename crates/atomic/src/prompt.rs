@@ -195,12 +195,13 @@ fn reply(g: &Gate, line: &str) -> Result<Reply, String> {
     // Read as `atomic gates answer` reads it.
     let answer = shown::answer(question, line);
     // Refused here for a quicker retry; the gate store checks it again.
+    // Raw: the line it is logged as is redacted, then escaped.
     question.check(&answer).map_err(|why| {
-        format!(
-            "{} is not an answer to this question: {}",
-            shown::value(&answer),
-            shown::line(&why)
-        )
+        let typed = match &answer {
+            serde_json::Value::String(text) => text.clone(),
+            other => other.to_string(),
+        };
+        format!("{typed} is not an answer to this question: {why}")
     })?;
     Ok(Reply {
         verdict: Verdict::Approve,

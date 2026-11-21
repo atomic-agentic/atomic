@@ -175,18 +175,13 @@ async fn list(rt: &Durare, all: bool, json: bool) -> anyhow::Result<()> {
             Some(gate::Resolution::Defaulted { answer, .. }) => {
                 format!("silence selected {}", shown::value(answer))
             }
-            Some(gate::Resolution::Decided(d)) => match &d.answer {
-                Some(a) => format!(
-                    "answered {} by {}",
-                    shown::value(a),
-                    shown::line(d.by.as_str())
-                ),
-                None => format!(
-                    "{} by {}",
-                    format!("{:?}", d.verdict).to_lowercase(),
-                    shown::line(d.by.as_str())
-                ),
-            },
+            Some(gate::Resolution::Decided(d)) => {
+                let by = shown::line(d.by.as_str());
+                match &d.answer {
+                    Some(a) => format!("answered {} by {by}", shown::value(a)),
+                    None => format!("{} by {by}", format!("{:?}", d.verdict).to_lowercase()),
+                }
+            }
         };
         println!(
             "{}  {}  [{state}]",
@@ -285,7 +280,8 @@ async fn decide(
 ) -> anyhow::Result<()> {
     let found = gate::find(rt, gate_id)
         .await?
-        .with_context(|| format!("no gate {}", shown::line(gate_id)))?;
+        // Raw: an error is redacted, then escaped, where it is reported.
+        .with_context(|| format!("no gate {gate_id}"))?;
     // Read as the prompt reads it.
     let answer = answer.map(|text| match &found.question {
         Some(q) => shown::answer(q, &text),
@@ -310,7 +306,7 @@ async fn decide(
         "{} {what} by {} ({})",
         shown::line(&found.id),
         shown::line(decision.by.as_str()),
-        decision.command
+        shown::line(&decision.command)
     );
     Ok(())
 }
