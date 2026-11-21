@@ -400,6 +400,32 @@ paths:
       operationId: lookup
       responses:
         "404": { description: no such thing, content: { application/json: { schema: { type: object } } } }
+  /anything:
+    get:
+      operationId: anything
+      responses:
+        "200": { description: any media type, content: { "*/*": { schema: { type: object, required: [never_checked] } } } }
+  /open:
+    get:
+      operationId: open
+      responses:
+        "200": { description: json, content: { application/json: {} } }
+  /text:
+    get:
+      operationId: text
+      responses:
+        "200": { description: text, content: { text/plain: { schema: { type: string } } } }
+  /nullable:
+    get:
+      operationId: nullable
+      responses:
+        "200": { description: a body that may be null, content: { application/json: { schema: { type: [object, "null"] } } } }
+  /falls-back:
+    get:
+      operationId: fallback
+      responses:
+        "200": { description: done, content: { application/json: { schema: { type: object, required: [result], properties: { result: { type: string } } } } } }
+        default: { description: error }
 "##;
 
 fn jobs(host: &str) -> HttpToolset {
@@ -483,18 +509,26 @@ async fn each_success_is_checked_against_the_response_its_status_declares() {
 // server wrote after them. The check covers a 204 all the same; the refusals
 // below run on statuses whose body does arrive.
 #[tokio::test]
-async fn a_success_declared_with_no_content_must_carry_no_body() {
-    let (host, _) = server(vec![
-        (204, ""),                   // exactly what the spec declares
-        (200, r#"{"alive": true}"#), // a 200 declared with no content
-        (200, "deleted"),            // and a body that is not JSON at all
-        (200, r#"{"matters": 1}"#),  // the same, selected by the `2XX` range
-        (200, "  \n"),               // whitespace is an empty body
-        // A status declared with a JSON body is still checked against it.
-        (200, r#"{"result": "ok"}"#),
-        (200, r#"{"ticket": 7}"#),
-    ])
-    .await;
+async fn a_body_on_a_response_that_declares_no_content_is_refused() {
+    // The three replies that carry a body on a response declaring no
+    // content, each with the operation that receives it and the response its
+    // status selects. The size the message reports is the body's own length,
+    // and the body is never echoed: its marker has to be absent from what
+    // the caller reads.
+    let refused = [
+        ("health", "200", r#"{"alive": true}"#, "alive"),
+        ("health", "200", "deleted", "deleted"),
+        ("thing", "2XX", r#"{"matters": 1}"#, "matters"),
+    ];
+    let mut script = vec![(204u16, "")]; // exactly what the spec declares
+    for body in refused.iter().map(|(_, _, body, _)| *body) {
+        script.push((200, body));
+    }
+    script.push((200, "  \n")); // whitespace is an empty body
+    // A status declared with a JSON body is still checked against it.
+    script.push((200, r#"{"result": "ok"}"#));
+    script.push((200, r#"{"ticket": 7}"#));
+    let (host, _) = server(script).await;
     let tools = jobs(&host);
     let args = json!({});
     assert_eq!(
@@ -502,7 +536,7 @@ async fn a_success_declared_with_no_content_must_carry_no_body() {
         Value::Null,
         "an empty body is no result"
     );
-    for (operation, key) in [("health", "200"), ("health", "200"), ("thing", "2XX")] {
+    for (operation, key, body, marker) in refused {
         let error = tools
             .call(operation, &args)
             .await
@@ -516,6 +550,12 @@ async fn a_success_declared_with_no_content_must_carry_no_body() {
         let said = format!("returned 200, which does not fit its response `{key}`");
         assert!(error.to_string().contains(&said), "{error}");
         assert!(error.to_string().contains("no body"), "{error}");
+        let count = format!("and {} bytes were returned", body.len());
+        assert!(error.to_string().contains(&count), "{operation}: {error}");
+        assert!(
+            !error.to_string().contains(marker),
+            "{operation}: the refused body was echoed: {error}"
+        );
     }
     assert_eq!(
         tools
@@ -541,5 +581,113 @@ async fn a_success_declared_with_no_content_must_carry_no_body() {
     assert!(
         matches!(&error, CallError::Response { status: 200, response, .. } if response == "200"),
         "{error}"
+    );
+}
+
+// Three responses declare content atomic takes no JSON schema from: a media
+// type it does not read, a JSON media type that names no schema, and
+// text/plain. Each declares a body whose shape nothing in the spec
+// describes, so what comes back is the caller's, unchecked. A refusal here
+// would be a claim that no body was declared, which is not what these say.
+#[tokio::test]
+async fn a_body_on_content_atomic_gives_no_schema_is_passed_through() {
+    let (host, _) = server(vec![
+        (200, r#"{"alive": true}"#),
+        (200, r#"{"open": 1}"#),
+        (200, r#"{"plain": "yes"}"#),
+    ])
+    .await;
+    let tools = jobs(&host);
+    let args = json!({});
+    // `*/*` names a schema the reply would fail were it atomic's to check.
+    assert_eq!(
+        tools
+            .call("anything", &args)
+            .await
+            .expect("`*/*` declares content"),
+        json!({ "alive": true })
+    );
+    assert_eq!(
+        tools
+            .call("open", &args)
+            .await
+            .expect("a JSON media type with no schema"),
+        json!({ "open": 1 })
+    );
+    assert_eq!(
+        tools.call("text", &args).await.expect("text/plain"),
+        json!({ "plain": "yes" })
+    );
+}
+
+// A blank body is lenient only where nothing was declared. Where a response
+// declares a JSON body it is read as JSON, and JSON whitespace is not a
+// value — so a whitespace body is a transport failure even where `null`
+// would have fitted the schema, as it always was. Form feed is not JSON
+// whitespace at all: it is a body whether or not a content was declared.
+#[tokio::test]
+async fn a_blank_body_is_lenient_only_where_no_content_is_declared() {
+    let (host, _) = server(vec![(200, "\n"), (200, "\u{0C}"), (200, "\u{0C}")]).await;
+    let tools = jobs(&host);
+    let args = json!({});
+    // `nullable` declares `{ type: [object, "null"] }`: null fits it, and
+    // still the whitespace reply is no value.
+    for (what, operation) in [("a line feed", "nullable"), ("a form feed", "nullable")] {
+        let error = tools
+            .call(operation, &args)
+            .await
+            .expect_err(&format!("{what} is not a value"));
+        assert!(
+            matches!(&error, CallError::Transport { .. }),
+            "{what}: {error}"
+        );
+        assert!(error.to_string().contains("not JSON"), "{what}: {error}");
+    }
+    // Where nothing was declared, JSON whitespace counts as no body and a
+    // form feed does not: it is a body, and a body on a response that
+    // declares none is the refusal.
+    let error = tools
+        .call("health", &args)
+        .await
+        .expect_err("a form feed is a body");
+    assert!(
+        matches!(&error, CallError::Response { status: 200, response, .. } if response == "200"),
+        "{error}"
+    );
+    assert!(error.to_string().contains("no body"), "{error}");
+}
+
+// `default` is a response like any other, and every success no code or range
+// declares selects it. A contentless `default` therefore refuses an
+// undeclared success that comes back with a body, which is the restrictive
+// reading and is kept on purpose: the selected response said there would be
+// no body.
+#[tokio::test]
+async fn a_contentless_default_refuses_a_body_on_an_undeclared_success() {
+    let (host, _) = server(vec![(201, r#"{"result": "ok"}"#), (203, "  ")]).await;
+    let tools = jobs(&host);
+    let args = json!({});
+    let error = tools
+        .call("fallback", &args)
+        .await
+        .expect_err("201 falls back to a contentless default");
+    assert!(
+        matches!(&error, CallError::Response { status: 201, response, .. } if response == "default"),
+        "{error}"
+    );
+    let said = "returned 201, which does not fit its response `default`";
+    assert!(error.to_string().contains(said), "{error}");
+    assert!(
+        error.to_string().contains("and 16 bytes were returned"),
+        "{error}"
+    );
+    assert!(!error.to_string().contains("result"), "{error}");
+    // The same fallback with a body that carries nothing is still no result.
+    assert_eq!(
+        tools
+            .call("fallback", &args)
+            .await
+            .expect("a blank body is no body"),
+        Value::Null
     );
 }

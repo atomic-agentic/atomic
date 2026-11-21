@@ -176,7 +176,11 @@ fn an_operation_becomes_one_input_object_with_its_parameters_and_body() {
             assert!(!validator.is_valid(&json!({ "latitude": 98, "longitude": -9.1 })));
             assert!(!validator.is_valid(&json!({ "latitude": 1, "longitude": 1, "extra": 1 })));
         }
-        for schema in op.output.iter().chain(op.responses.values().flatten()) {
+        for schema in op
+            .output
+            .iter()
+            .chain(op.responses.values().filter_map(ResponseBody::schema))
+        {
             registry.validator_for(schema).expect("response schema");
         }
     }
@@ -299,17 +303,18 @@ components:
         op.responses.keys().map(String::as_str).collect::<Vec<_>>(),
         ["200", "202", "204", "2xx", "404", "default"]
     );
-    let picked = |status: u16| {
-        op.response(status)
-            .map(|(key, schema)| (key, schema.clone()))
-    };
+    let picked = |status: u16| op.response(status).map(|(key, body)| (key, body.clone()));
     assert_eq!(
-        picked(200).map(|(k, s)| (k, s.map(|s| s["required"].clone()))),
+        picked(200).map(|(k, b)| (k, b.schema().map(|s| s["required"].clone()))),
         Some(("200", Some(json!(["result"]))))
     );
-    assert_eq!(picked(204), Some(("204", None)), "no content");
     assert_eq!(
-        picked(201).map(|(k, s)| (k, s.map(|s| s["type"].clone()))),
+        picked(204),
+        Some(("204", ResponseBody::NoBody)),
+        "no content at all"
+    );
+    assert_eq!(
+        picked(201).map(|(k, b)| (k, b.schema().map(|s| s["type"].clone()))),
         Some(("2xx", Some(json!("string")))),
         "a range, in either case"
     );
@@ -335,7 +340,7 @@ paths:
     // component schema through $defs that the response carries.
     let (key, queued) = op.response(202).expect("202");
     assert_eq!(key, "202");
-    let queued = queued.as_ref().expect("a schema");
+    let queued = queued.schema().expect("a schema");
     assert!(queued.get("$defs").is_some(), "{queued}");
     let validator = Registry::new().validator_for(queued).expect("compiles");
     assert!(validator.is_valid(&json!({ "ticket": 7 })));
@@ -345,4 +350,63 @@ paths:
         op.output.as_ref().map(|s| s["required"].clone()),
         Some(json!(["result"]))
     );
+}
+
+// What a response declares about its body comes in three kinds, and they
+// are not the same claim. Only a response with no `content` key says there
+// is no body to read; one whose content names no JSON media type, or names
+// one with no schema, declares a body whose shape nothing describes. The
+// two are kept apart because only the first lets atomic refuse a body.
+#[test]
+fn a_response_says_whether_it_declares_no_body_no_schema_or_a_schema() {
+    let ops = operations(&yaml(
+        r##"openapi: 3.1.0
+info: { title: Kinds, version: "1" }
+paths:
+  /kinds:
+    get:
+      operationId: kinds
+      responses:
+        "200": { description: no content key at all }
+        "201": { description: any media type, content: { "*/*": { schema: { type: object } } } }
+        "202": { description: plain text, content: { text/plain: { schema: { type: string } } } }
+        "203": { description: bytes, content: { application/octet-stream: { schema: { type: string } } } }
+        "204": { description: json with no schema, content: { application/json: {} } }
+        "206": { description: a json schema, content: { application/json: { schema: { type: object } } } }
+"##,
+    ))
+    .expect("spec");
+    let op = &ops[0];
+    let declared = |code: &str| op.responses.get(code).expect("declared");
+    assert_eq!(*declared("200"), ResponseBody::NoBody);
+    assert_eq!(
+        *declared("201"),
+        ResponseBody::NoJsonSchema,
+        "`*/*` is not a JSON media type"
+    );
+    assert_eq!(
+        *declared("202"),
+        ResponseBody::NoJsonSchema,
+        "text/plain is not JSON"
+    );
+    assert_eq!(
+        *declared("203"),
+        ResponseBody::NoJsonSchema,
+        "octet-stream is not JSON"
+    );
+    assert_eq!(
+        *declared("204"),
+        ResponseBody::NoJsonSchema,
+        "a JSON media type with no `schema`"
+    );
+    assert_eq!(
+        declared("206").schema(),
+        Some(&json!({ "type": "object" })),
+        "only a JSON media type with a schema gives one"
+    );
+    // Selection by status is the test above; what it hands over is one of
+    // these three. The tool's output is still the first success's
+    // declaration, and that one declares no content, so the tool describes
+    // no output.
+    assert_eq!(op.output, None);
 }
