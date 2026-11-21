@@ -56,10 +56,16 @@ The same pipeline runs for every model-backed atom:
    sandbox, network policy and only its listed tools. In v0.1 Codex atoms run
    through Codex's `ThreadManager`; from v0.5 they run on the embedded
    app-server so the CLI can attach (see
-   [people in the loop](human-in-the-loop.md)). Codex reads no instruction file
-   of its own for them: an `AGENTS.md` or `AGENTS.override.md` in the checkout
-   or worktree a thread runs in never reaches the model, because an atom's
-   inputs are only what its file declares.
+   [people in the loop](human-in-the-loop.md)). A Codex thread is given no
+   instructions Codex finds on its own, because an atom's inputs are only what
+   its file declares. Three things are switched off for it: repository
+   instruction discovery, so no `AGENTS.md` or `AGENTS.override.md` from the
+   project root down to the directory the thread runs in; repository skill
+   discovery, so no `SKILL.md` from a `.agents/skills` folder in those
+   directories, which a `$name` in a turn would otherwise pull in; and the
+   host's own instructions, so nothing read from the thread's Codex home,
+   which is the project's state directory. A lite atom builds its own request,
+   so it has no such file to read.
 4. **Turn.** The lowered schema constrains the final answer.
 5. **Normalize and check.** Remove each `null` that lowering introduced, then
    validate against the full contract, then run the atom's validators. On
