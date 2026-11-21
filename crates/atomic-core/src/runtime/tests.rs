@@ -2518,6 +2518,16 @@ impl HeldOpen {
     }
 }
 
+/// Lets a [`HeldOpen`] go when dropped, as when a test fails while the
+/// open is held, so the test fails rather than hangs.
+struct LetOpenGo(HeldOpen);
+
+impl Drop for LetOpenGo {
+    fn drop(&mut self) {
+        self.0.let_go();
+    }
+}
+
 impl ExecutionBackend for HeldOpen {
     fn connect(&self) -> Result<atomic_exec::Statement, atomic_exec::ExecError> {
         Ok(atomic_exec::LocalBackend::STATEMENT)
@@ -2559,6 +2569,7 @@ fn a_workspace_that_opens_after_its_run_was_cancelled_is_closed() {
         let dir = scratch("cancelled-open");
         std::fs::create_dir_all(&dir).expect("source");
         let backend = HeldOpen::default();
+        let _let_go = LetOpenGo(backend.clone());
         let shared: Arc<dyn ExecutionBackend> = Arc::new(backend.clone());
         let request = atomic_exec::Open {
             label: "held".into(),
@@ -2604,4 +2615,140 @@ fn a_workspace_that_opens_after_its_run_was_cancelled_is_closed() {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert_eq!(backend.closes(), 1, "closed more than once");
     });
+}
+
+/// Run `body` on a runtime of its own on a thread of its own, then drop the
+/// runtime: whether the drop returned within `within`, and did not hang.
+fn runtime_drop_returns(
+    within: std::time::Duration,
+    body: impl FnOnce(&tokio::runtime::Runtime) + Send + 'static,
+) -> bool {
+    let (done, dropped) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        body(&rt);
+        drop(rt);
+        let _ = done.send(());
+    });
+    dropped.recv_timeout(within).is_ok()
+}
+
+/// A runtime dropped while a workspace is still opening shuts down: the
+/// open finishes as the blocking pool winds down, and the workspace it
+/// made is left for the backend to reclaim rather than closed from there.
+#[test]
+fn a_runtime_dropped_while_a_workspace_opens_shuts_down() {
+    let backend = HeldOpen::default();
+    let _let_go = LetOpenGo(backend.clone());
+    let held = backend.clone();
+    let returned = runtime_drop_returns(std::time::Duration::from_secs(30), move |rt| {
+        let dir = scratch("dropped-open");
+        std::fs::create_dir_all(&dir).expect("source");
+        let shared: Arc<dyn ExecutionBackend> = Arc::new(held.clone());
+        rt.spawn(open_workspace(
+            shared,
+            atomic_exec::Open {
+                label: "held".into(),
+                run: "run-1".into(),
+                step: "held".into(),
+                attempt: "attempt-1".into(),
+                source: Some(dir),
+                ..atomic_exec::Open::default()
+            },
+        ));
+        for _ in 0..500 {
+            if held.begun() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(held.begun(), "the open never began");
+        // Let go once the runtime is shutting down.
+        let late = held.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            late.let_go();
+        });
+    });
+    assert!(returned, "the runtime's drop hung");
+}
+
+/// A runtime dropped while a command runs in its workspace, or while a task
+/// holds an open workspace, shuts down.
+#[test]
+fn a_runtime_dropped_under_a_running_command_or_a_held_workspace_shuts_down() {
+    // A command that holds its workspace open until it ends.
+    let (_, a, compiled) = exec_project(
+        "dropped-command",
+        "import json, sys, time\njson.load(sys.stdin)\ntime.sleep(1)\njson.dump({'total': 1}, sys.stdout)\n",
+        "",
+    );
+    let recorded = Recording::default();
+    let calls = recorded.clone();
+    let returned = runtime_drop_returns(std::time::Duration::from_secs(30), move |rt| {
+        let backend: Arc<dyn ExecutionBackend> = Arc::new(calls.clone());
+        rt.spawn(async move {
+            let _ = run_exec(
+                &a,
+                &compiled,
+                &json!({"cents": [1]}),
+                &EffectIdentity {
+                    run_id: "run-1".into(),
+                    step_id: "total".into(),
+                },
+                backend,
+                None,
+                &Artifacts::none(),
+            )
+            .await;
+        });
+        for _ in 0..500 {
+            if calls.calls().iter().any(|c| c.starts_with("run ")) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            calls.calls().iter().any(|c| c.starts_with("run ")),
+            "{:?}",
+            calls.calls()
+        );
+    });
+    assert!(returned, "the runtime's drop hung under a running command");
+    // A task that holds an open workspace and never lets go of it.
+    let holding = Recording::default();
+    let opened = holding.clone();
+    let returned = runtime_drop_returns(std::time::Duration::from_secs(30), move |rt| {
+        let dir = scratch("dropped-guard");
+        std::fs::create_dir_all(&dir).expect("source");
+        let backend: Arc<dyn ExecutionBackend> = Arc::new(opened.clone());
+        rt.spawn(async move {
+            let guard = open_workspace(
+                backend,
+                atomic_exec::Open {
+                    label: "kept".into(),
+                    run: "run-1".into(),
+                    step: "kept".into(),
+                    attempt: "attempt-1".into(),
+                    source: Some(dir),
+                    ..atomic_exec::Open::default()
+                },
+            )
+            .await;
+            std::future::pending::<()>().await;
+            drop(guard);
+        });
+        for _ in 0..500 {
+            if !opened.opened().is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!opened.opened().is_empty(), "the workspace never opened");
+    });
+    assert!(returned, "the runtime's drop hung under a held workspace");
 }
