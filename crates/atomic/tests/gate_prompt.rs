@@ -14,6 +14,9 @@
 //!   which the store records and the feedback log remembers;
 //! - replies typed ahead, or before anything is shown, decide no gate, and
 //!   an exec command cannot type into the prompt (it has no terminal);
+//! - a gate store that stops answering while a gate is shown is told about
+//!   once, not on every pass of the read that looks for a decision made
+//!   elsewhere;
 //! - a hostile title reaches the terminal escaped, in `atomic gates list`
 //!   and at the prompt.
 //!
@@ -47,15 +50,24 @@ const ATOMIC: &str = env!("CARGO_BIN_EXE_atomic");
 /// When it stops: a test says what it waits for with `DRIVER_STOP_AFTER`
 /// (that many prompts answered) or `DRIVER_STOP_MARKER` (that written), and
 /// the driver stops once it has happened and the terminal has written
-/// nothing for `DRIVER_QUIET` seconds, so the run's answer to it has been
-/// written and read too. A test that waits for a run to *stay* waiting is
-/// then bounded by what the run does, not by a deadline a busy machine
+/// nothing for `DRIVER_QUIET` seconds (one by default, so a stop is never
+/// taken at the instant its condition is met), so the run's answer to it has
+/// been written and read too. A test that waits for a run to *stay* waiting
+/// is then bounded by what the run does, not by a deadline a busy machine
 /// could miss. With neither, it stops when the command ends.
+/// `DRIVER_SEEN_MARKER` and `DRIVER_SEEN_FILE`, named together, do something
+/// else: when that marker has been written, the driver creates that file, so
+/// that a test which has to act while the run sits waiting can see when to.
 /// `DRIVER_DEADLINE` seconds (90 by default) is the backstop that catches a
-/// run which never gets that far.
+/// run which never gets that far. A driver that ends there has not seen what
+/// its test waited for, and [`Project::at_terminal_with`] fails the test.
 const DRIVER: &str = r#"
 import json, os, pty, select, subprocess, sys, time
 answers = json.loads(sys.argv[1])
+# Before anything is started: a half-set handshake would leave a test
+# waiting for a file no one is going to write.
+if bool(os.environ.get("DRIVER_SEEN_MARKER")) != bool(os.environ.get("DRIVER_SEEN_FILE")):
+    sys.exit("DRIVER_SEEN_MARKER and DRIVER_SEEN_FILE are set together or not at all")
 master, slave = pty.openpty()
 def own_terminal():
     os.setsid()
@@ -92,12 +104,20 @@ deadline = time.time() + float(os.environ.get("DRIVER_DEADLINE", "90"))
 # or this written. 0 / empty waits for the command to end instead.
 stop_after = int(os.environ.get("DRIVER_STOP_AFTER", "0"))
 stop_marker = os.environ.get("DRIVER_STOP_MARKER", "").encode()
+# What the test waits to have happened, for a test that acts from outside
+# while the run waits rather than one that stops: when this has been written,
+# create that file, once. It does not say when to stop.
+seen_marker = os.environ.get("DRIVER_SEEN_MARKER", "").encode()
+seen_file = os.environ.get("DRIVER_SEEN_FILE", "")
 # Stop once that has happened and the terminal has written nothing for this
 # many seconds: whatever the run was going to write in answer has been
 # written, and read, so a test that waits for the run to still be waiting
-# waits for the thing, not for the clock.
-quiet = float(os.environ.get("DRIVER_QUIET", "0"))
+# waits for the thing, not for the clock. One second by default, so a stop is
+# never taken at the instant its condition is met; a test waiting for
+# something slower says so.
+quiet = float(os.environ.get("DRIVER_QUIET", "1"))
 last = time.time()
+told = False
 markers = (b"comment if you like > ", b"(/reject to refuse) > ")
 # Each prompt counts once, by its count of markers so far.
 while True:
@@ -111,6 +131,9 @@ while True:
             break
         out += data
         last = time.time()
+        if seen_marker and not told and seen_marker in out:
+            open(seen_file, "w").close()
+            told = True
         prompts = sum(out.count(m) for m in markers)
         while seen < prompts and seen < len(answers):
             os.write(master, answers[seen].encode() + b"\n")
@@ -340,7 +363,11 @@ impl Project {
         self.at_terminal_with(args, answers, &[])
     }
 
-    /// [`Self::at_terminal`], with the driver's settings in `env`.
+    /// [`Self::at_terminal`], with the driver's settings in `env`. Fails the
+    /// test if the driver ran out its backstop deadline instead of getting
+    /// what the test waited for: a test that waits for a run to *stay*
+    /// waiting must be bounded by what the run does, and a deadline a busy
+    /// machine misses is not that.
     fn at_terminal_with(&self, args: &[&str], answers: &[&str], env: &[(&str, &str)]) -> Output {
         let mut c = self.command("python3");
         c.arg(self.dir.join("driver.py"))
@@ -350,7 +377,13 @@ impl Project {
         for (k, v) in env {
             c.env(k, v);
         }
-        c.output().unwrap()
+        let out = c.output().unwrap();
+        let t = text(&out);
+        assert!(
+            !t.contains("[driver: deadline]"),
+            "the driver waited out its backstop without seeing what this test waits for: {t}"
+        );
+        out
     }
 
     /// `atomic args` with no terminal, killed if the test fails first.
@@ -720,13 +753,13 @@ fn replies_typed_ahead_decide_no_gate_they_were_not_typed_at() {
             r#"{"text": "v7"}"#,
         ],
         &[],
-        // The line typed ahead is the one reply the prompt is answered with,
-        // so the driver stops once that is answered and the terminal has
-        // been quiet long enough for it to decide the gate, were it going
-        // to.
+        // Nothing is typed at this prompt: what was typed before the run
+        // started was thrown away before the gate was shown. So the driver
+        // stops once the prompt has shown and the terminal has been quiet
+        // long enough for that line to decide the gate, were it going to.
         &[
             ("DRIVER_EARLY", "a"),
-            ("DRIVER_STOP_AFTER", "1"),
+            ("DRIVER_STOP_MARKER", "is waiting for you"),
             ("DRIVER_QUIET", "3"),
             ("DRIVER_DEADLINE", "60"),
         ],
@@ -766,6 +799,114 @@ fn an_exec_command_cannot_type_into_the_prompt() {
     );
     assert!(!t.contains("approved by"), "{t}");
     assert_eq!(p.gate("typed-in:deploy").resolution, None, "the gate waits");
+}
+
+/// Make the gate store stop answering the prompt's read of gate `id`, and
+/// keep failing the same way every pass: its state becomes one the store
+/// cannot read back. `shown` says the prompt has been written; nothing else
+/// reads a gate while its run waits at it, so the run goes on waiting and
+/// only the prompt's own read fails.
+fn stop_the_store_answering(store: &Path, id: &str, shown: &Path) {
+    let (store, id, shown) = (store.to_path_buf(), id.to_owned(), shown.to_path_buf());
+    on_codex_runtime(async move {
+        let until = Instant::now() + Duration::from_secs(60);
+        while !shown.exists() {
+            assert!(Instant::now() < until, "the prompt never showed");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        use sqlx::Connection;
+        let url = format!("sqlite://{}", store.display());
+        let mut db = sqlx::SqliteConnection::connect(&url)
+            .await
+            .expect("the gate store");
+        // The run's engine writes between its reads, so a write that finds
+        // the store busy is worth trying again for a while.
+        let till = Instant::now() + Duration::from_secs(10);
+        let changed = loop {
+            let tried =
+                sqlx::query("UPDATE atomic_gates SET state = 'unreadable' WHERE gate_id = ?")
+                    .bind(id.clone())
+                    .execute(&mut db)
+                    .await;
+            match tried {
+                Ok(r) => break r.rows_affected(),
+                Err(e) => {
+                    assert!(Instant::now() < till, "cannot reach the gate store: {e}");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        };
+        db.close().await.expect("the store closes");
+        assert_eq!(changed, 1, "gate {id} is not in the store to break");
+    });
+}
+
+/// A gate store that stops answering while a gate is shown is told about
+/// once, not on every pass of the read the prompt makes to see whether the
+/// gate was decided elsewhere.
+#[test]
+fn a_gate_store_that_stops_answering_while_a_gate_is_shown_is_told_once() {
+    support::require_sandbox();
+    let p = Project::new("store");
+    p.enroll();
+    let shown = p.dir.join("prompt-shown");
+    let (shown_file, store) = (shown.display().to_string(), p.store());
+    let out = std::thread::scope(|scope| {
+        let running = scope.spawn(|| {
+            p.at_terminal_with(
+                &[
+                    "run",
+                    "approval",
+                    "--run-id",
+                    "failing",
+                    "--data",
+                    r#"{"text":"v9"}"#,
+                ],
+                &[],
+                // The driver tells the test when the prompt has shown, so
+                // that it can break the store while the run sits waiting, and
+                // stops once the fault has been told and the terminal has
+                // gone quiet for three seconds. A prompt told on every pass
+                // never goes quiet, and ends on the deadline instead.
+                &[
+                    ("DRIVER_SEEN_MARKER", "is waiting for you"),
+                    ("DRIVER_SEEN_FILE", shown_file.as_str()),
+                    ("DRIVER_STOP_MARKER", "the gate store"),
+                    ("DRIVER_QUIET", "3"),
+                    ("DRIVER_DEADLINE", "60"),
+                ],
+            )
+        });
+        stop_the_store_answering(&store, "failing:pick", &shown);
+        running.join().unwrap()
+    });
+    let t = text(&out);
+    assert!(
+        t.contains("gate failing:pick is waiting for you"),
+        "the prompt did not show: {t}"
+    );
+    // The fault, named by the reason the store gives for it, which is the
+    // same on every pass.
+    let told: Vec<&str> = t
+        .lines()
+        .filter(|l| l.contains("unknown gate state"))
+        .collect();
+    assert_eq!(
+        told.len(),
+        1,
+        "a store that failed on every pass was told {} times: {t}",
+        told.len()
+    );
+    assert!(
+        told[0].contains("the gate store:"),
+        "not the prompt's own fault line: {:?}",
+        told[0]
+    );
+    assert!(
+        !t.contains("cannot read the gate store"),
+        "the read that looks for a newly opened gate faulted too, so this says \
+         nothing about the prompt's own tell: {t}"
+    );
 }
 
 /// What starts a private key block, which a model can put in a gate's
