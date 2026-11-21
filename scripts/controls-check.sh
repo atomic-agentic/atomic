@@ -54,6 +54,9 @@ CONTROLS=(
     "exec-network-allowlist|crates/atomic-core/src/network.rs|        } else if !declared(&self.0, &req.host) {|        } else if /*CONTROL_OFF*/ false {|--workspace --features ${FEATURES} --test run_cli an_exec_atom_reaches_only_the_hosts_it_declares"
     "exec-network-ports|crates/atomic-core/src/network.rs|        } else if !PORTS.contains(&req.port) {|        } else if /*CONTROL_OFF*/ false {|--workspace --features ${FEATURES} --test run_cli an_exec_atom_reaches_only_the_hosts_it_declares"
     "exec-network-upstream|crates/atomic-core/src/network.rs|        allow_upstream_proxy: false,|        allow_upstream_proxy: /*CONTROL_OFF*/ true,|-p atomic-agentic-core --lib --features fake-model network::tests::a_proxy_uses_no_upstream_proxy_and_no_socks"
+    "exec-network-confine-held|crates/atomic-core/src/codex.rs|        if declares_hosts {|        if /*CONTROL_OFF*/ false {|-p atomic-agentic-core --lib --features fake-model a_command_with_hosts_is_confined_only_with_its_proxy_held"
+    "exec-network-loopback-feature|crates/atomic-core/src/codex.rs|    #[cfg(feature = \"exec-loopback-tests\")]|    #[cfg(all())]|-p atomic-agentic-core --doc --features fake-model codex::ExecSandbox"
+    "exec-network-helper-undumpable|crates/atomic-core/src/codex.rs|            leave_session_keyring().and(not_dumpable())|            leave_session_keyring()|--workspace --features ${FEATURES} --test exec_network a_confined_command_never_holds_its_proxy_token"
     "exec-network-recheck|crates/atomic-core/src/codex.rs|            let hosts = crate::network::check_hosts(&hosts)|            let hosts = /*CONTROL_OFF*/ Ok::<Vec<String>, String>(hosts)|--workspace --features ${FEATURES} --test exec_network a_confined_command_reaches_only_the_hosts_it_is_given"
     "exec-network-policy|crates/atomic-core/src/atom.rs|            if let Err(why) = crate::network::check_hosts(&hosts) {|            if let Err(why) = /*CONTROL_OFF*/ Ok::<(), String>(()) { let _ = &hosts;|-p atomic-agentic-core --lib --features fake-model exec_declarations_are_checked_at_load"
     "stop-subreaper|crates/atomic-exec/src/process.rs|            libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);|            let _ = libc::PR_SET_CHILD_SUBREAPER; // CONTROL_OFF|-p atomic-agentic-exec --test stop_all stopping_ends_every_process_a_command_started_before_it_returns"
@@ -263,7 +266,8 @@ for row in "${selected[@]}"; do
     unfailed=""
     while read -r test; do
         # The name as it is, not as a pattern: a failed test's path holds it.
-        grep -E '^test [^ ]+ \.\.\. FAILED$' "${LOG}" | cut -d' ' -f2 | grep -qF -- "${test}" ||
+        grep -E '^test .+ \.\.\. FAILED$' "${LOG}" | sed -E 's/^test (.+) \.\.\. FAILED$/\1/' |
+            grep -qF -- "${test}" ||
             unfailed="${unfailed} ${test}"
     done < <(named_tests "${args}")
     if [ -n "${unfailed}" ]; then

@@ -24,10 +24,13 @@
 //! the same hosts. The sandbox helper's bridge opens each connection with a
 //! token atomic made for its command alone (Codex's attribution frame), and
 //! the proxy refuses every request on a connection without a token it issued,
-//! so a sandboxed process or another user's process reaches nothing through
-//! it. A process of the same user outside any sandbox can still read a token
-//! from the helper's environment. A command's token admits no new connection
-//! once the command ends, and the proxy stops once no command needs it.
+//! so no other process on this machine reaches anything through it. The
+//! token is in no environment but that of the sandbox helper's outer stage
+//! and its bridges, outside the sandbox, which atomic makes non-dumpable: a
+//! process of the same user can neither read their environment through
+//! /proc nor attach to them, and only one with `CAP_SYS_PTRACE`, such as
+//! root's, can. A command's token admits no new connection once the command
+//! ends, and the proxy stops once no command needs it.
 
 use codex_network_proxy::{
     NetworkDecision, NetworkPolicyDecider, NetworkPolicyDeciderFuture, NetworkPolicyRequest,
@@ -572,9 +575,14 @@ mod tests {
             .prepare(&hosts, &[], HashMap::new())
             .expect("starts");
         // Another command keeps the proxy running after the first ends.
-        let (_, other) = proxies
+        let (other_env, other) = proxies
             .prepare(&hosts, &[], HashMap::new())
             .expect("reused");
+        let other_token =
+            other_env.env[codex_network_proxy::PROXY_ATTRIBUTION_TOKEN_ENV_KEY].clone();
+        // A connection dropped at the frame: the proxy accepted it and
+        // answered nothing.
+        let dropped = |got: &str| matches!(got, "none" | "ConnectionReset" | "BrokenPipe");
         let addr = prepared.env["HTTP_PROXY"]
             .trim_start_matches("http://")
             .trim_end_matches('/')
@@ -583,18 +591,17 @@ mod tests {
 
         assert_eq!(fetch(&addr, None), format!("403 {UNATTRIBUTED_REFUSED}"));
         let forged = fetch(&addr, Some(&"0".repeat(64)));
-        assert!(
-            !forged.starts_with("403") && !forged.starts_with("200"),
-            "{forged}"
-        );
+        assert!(dropped(&forged), "{forged}");
         assert_eq!(fetch(&addr, Some(&token)), "403 not_allowed_local");
 
         drop(lease);
         assert_eq!(proxies.running(), 1, "the other command holds it");
         let ended = fetch(&addr, Some(&token));
-        assert!(
-            !ended.starts_with("403") && !ended.starts_with("200"),
-            "{ended}"
+        assert!(dropped(&ended), "{ended}");
+        assert_eq!(
+            fetch(&addr, Some(&other_token)),
+            "403 not_allowed_local",
+            "the other command's token still works"
         );
         drop(other);
     }

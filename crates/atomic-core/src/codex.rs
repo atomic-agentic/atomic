@@ -1009,7 +1009,11 @@ fn an_option(arg: &std::ffi::OsString) -> bool {
 
 /// When this process is Codex's Linux sandbox helper, keep the command it
 /// runs off the kernel keyrings, or exit: with them in reach the command
-/// could read what they hold, or plant a key.
+/// could read what they hold, or plant a key. The outer stage, which stays
+/// outside the sandbox while the command runs and was started with the
+/// command's proxy token in its environment, is also made non-dumpable, so
+/// no process of the same user can read that environment through /proc.
+/// (Exec resets it, so bubblewrap and the command are unaffected.)
 fn keep_sandbox_off_keyrings() {
     #[cfg(target_os = "linux")]
     if invoked_as_linux_sandbox() {
@@ -1018,7 +1022,7 @@ fn keep_sandbox_off_keyrings() {
             // Inside the sandbox, just before the command runs.
             deny_keyrings()
         } else {
-            leave_session_keyring()
+            leave_session_keyring().and(not_dumpable())
         };
         if let Err(e) = kept_off {
             crate::log_line!(
@@ -1027,6 +1031,18 @@ fn keep_sandbox_off_keyrings() {
             std::process::exit(1);
         }
     }
+}
+
+/// Make this process non-dumpable: its memory and its /proc files, its
+/// environment among them, become unreadable to other processes of its user.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn not_dumpable() -> std::io::Result<()> {
+    // SAFETY: PR_SET_DUMPABLE takes an integer and touches no memory.
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Confines an exec atom's command under Codex's Linux sandbox helper, as a
@@ -1038,6 +1054,19 @@ fn keep_sandbox_off_keyrings() {
 /// and no sockets, unless its atom declares hosts, and then only those,
 /// through a proxy of atomic's own (see [`crate::network`]).
 /// The command still runs with exactly its environment, in its directory.
+#[cfg_attr(
+    not(feature = "exec-loopback-tests"),
+    doc = r#"
+Only a build with the `exec-loopback-tests` feature, for the sandbox suites,
+can let a command reach this machine's loopback interface:
+
+```compile_fail
+fn widen(sandbox: atomic_core::codex::ExecSandbox) -> atomic_core::codex::ExecSandbox {
+    sandbox.reaching_loopback_for_tests(vec!["127.0.0.1".into()])
+}
+```
+"#
+)]
 #[derive(Clone, Debug)]
 pub struct ExecSandbox {
     helper: PathBuf,
@@ -1071,8 +1100,10 @@ impl ExecSandbox {
     }
 
     /// The same confinement, letting a command name `addrs`, loopback
-    /// addresses that atomic's policy refuses, as hosts. For tests that
-    /// serve on this machine; atomic never calls it.
+    /// addresses that atomic's policy refuses, as hosts, on any port. For
+    /// tests that serve on this machine; atomic never calls it, and only a
+    /// build with the `exec-loopback-tests` feature has it.
+    #[cfg(feature = "exec-loopback-tests")]
     #[doc(hidden)]
     pub fn reaching_loopback_for_tests(mut self, addrs: Vec<String>) -> Self {
         self.loopback_for_tests = addrs
@@ -1140,13 +1171,23 @@ impl ExecSandbox {
 
 impl atomic_exec::Confine for ExecSandbox {
     /// As [`confine_held`](atomic_exec::Confine::confine_held), for a
-    /// command that declares no network: one that does needs its proxy
-    /// held while it runs, which this drops.
+    /// command that declares no network. One that does needs its proxy
+    /// held while it runs, which this would drop before the command
+    /// started, so it is refused.
     fn confine(
         &self,
         command: &atomic_exec::Command,
         tmp: &Path,
     ) -> Result<atomic_exec::Command, atomic_exec::ExecError> {
+        let declares_hosts = !command.network.is_empty();
+        if declares_hosts {
+            return Err(atomic_exec::ExecError::Start {
+                program: command.program.clone(),
+                message: "it declares hosts, so its proxy must be held while it runs; \
+                          confine it with confine_held"
+                    .into(),
+            });
+        }
         self.confine_held(command, tmp).map(|(command, _)| command)
     }
 
@@ -1235,6 +1276,10 @@ impl atomic_exec::Confine for ExecSandbox {
                 .filter(|(k, v)| !command.env.iter().any(|(ck, cv)| ck == k && cv == v))
                 .collect();
             added.sort();
+            // The helper's outer stage already drops the proxy token from
+            // its environment before it starts the sandbox, so the command
+            // never inherits it (the sandbox suite's token test checks
+            // that); unsetting it here too keeps it out should that change.
             clear = [
                 "TMPDIR",
                 "PATH",
@@ -3164,6 +3209,39 @@ mod tests {
             );
         }
         assert!(text.contains("restricted"), "no network: {text}");
+    }
+
+    /// A command that declares hosts is confined only with its proxy held:
+    /// `confine`, which would drop the proxy before the command starts,
+    /// refuses it, and `confine_held` routes it to the proxy and hands back
+    /// the hold.
+    #[test]
+    fn a_command_with_hosts_is_confined_only_with_its_proxy_held() {
+        use atomic_exec::Confine;
+        let state = scratch("exec-held");
+        let paths = CodexPaths::with_helpers(
+            PathBuf::from("/opt/atomic"),
+            PathBuf::from("/opt/bin/codex-linux-sandbox"),
+        );
+        let sandbox = ExecSandbox::new(&paths, StateGuard::NoProjectState, state.join("codex"))
+            .expect("a helper");
+        let command = atomic_exec::Command {
+            program: "sh".into(),
+            cwd: state.clone(),
+            network: vec!["allowed.invalid".into()],
+            ..Default::default()
+        };
+        let error = sandbox
+            .confine(&command, &state)
+            .expect_err("its proxy would stop before it starts");
+        assert!(error.to_string().contains("confine_held"), "{error}");
+        let (confined, held) = sandbox.confine_held(&command, &state).expect("confined");
+        assert!(held.is_some(), "the proxy is held");
+        assert!(
+            confined.args.iter().any(|a| a == "--managed-network"),
+            "{:?}",
+            confined.args
+        );
     }
 
     /// However many projects the atomic home holds, their private state is

@@ -2651,6 +2651,10 @@ fn an_exec_atom_reaches_only_the_hosts_it_declares() {
             );
         }
     }
+    // Offline this cannot fail: every request above is refused before the
+    // proxy dials anything, through an upstream proxy or not. The control
+    // for the upstream proxy is the unit test that reads the proxy's
+    // configuration, network::tests::a_proxy_uses_no_upstream_proxy_and_no_socks.
     assert!(
         upstream.accept().is_err(),
         "a request went through the proxy in atomic's environment"

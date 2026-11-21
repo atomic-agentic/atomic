@@ -180,10 +180,11 @@ them reaches nothing. An atom's `env` cannot set any of them. It can open no
 other connection, to this machine or anywhere else, and no Unix socket. The
 proxy never goes through another proxy, even when atomic's own environment
 names one. Each connection must open with a token that atomic gives the
-command's sandbox and that the command itself never sees, so no sandboxed
-process and no other user's process can use the proxy. A process of your own
-user that runs outside any sandbox can still read the token from the sandbox
-helper's environment while the command runs.
+command's sandbox and that the command itself never sees, so no other
+process on the machine can use the proxy: the sandbox helper that holds the
+token outside the sandbox cannot be read or attached to by another process,
+even one of your own user, unless it runs as root. Once the command ends,
+its token admits no new connection.
 
 What an atom may list is atomic's policy, checked when the atom loads and again
 before its command runs: public DNS names only. An IP address in any spelling
