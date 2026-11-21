@@ -1,0 +1,1 @@
+exec-network-suffix-rule-parent|crates/atomic-core/src/network.rs|    is_suffix(&format!("atomic-probe.{name}"))|    false|-p atomic-agentic-core --lib --features fake-model network::tests::a_wildcard_over_a_public_suffix_is_refused

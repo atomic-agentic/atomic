@@ -1,0 +1,1 @@
+pair-dotted-by-name|crates/atomic-core/src/redact.rs|        if header.len() == name.len() {|        if true /*CONTROL_OFF*/ {|-p atomic-agentic-core --lib redact::tests::a_dotted_header_in_a_pair_is_read_by_its_name_too

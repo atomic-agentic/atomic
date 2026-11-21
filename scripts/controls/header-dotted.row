@@ -1,0 +1,1 @@
+header-dotted|crates/atomic-core/src/redact.rs|        name.rsplit('.').next().unwrap_or(name)|        name /*CONTROL_OFF*/|-p atomic-agentic-core --lib redact::tests::a_dotted_header_name_holds_its_header_secret
