@@ -495,13 +495,16 @@ fn out_of_reach(path: &Path) -> bool {
 
 /// Whether this user may map `uid` into a user namespace of its own: it is
 /// in one of the user's ranges in `/etc/subuid`, named by the user's name
-/// or uid. A file there that cannot be read or is not one such counts every
-/// uid as mappable; with none, the user maps only itself.
+/// or uid, or by any name when the user has none in the password database.
+/// A file there that cannot be read or is not one such counts every uid as
+/// mappable; with none, the user maps only itself, unless the system takes
+/// subordinate uids from elsewhere ([`subids_elsewhere`]).
 #[cfg(unix)]
 fn mappable(uid: u32) -> bool {
     let text = match subuid_file() {
         Ok(text) => text,
-        Err(std::io::ErrorKind::NotFound) => return false,
+        // With no file, ranges may still come from a directory service.
+        Err(std::io::ErrorKind::NotFound) => return subids_elsewhere(),
         Err(_) => return true,
     };
     let me = this_uid();
@@ -523,9 +526,51 @@ fn mappable(uid: u32) -> bool {
         return true;
     };
     ranges.iter().any(|(who, start, count)| {
-        let mine = *who == me.to_string() || name.as_deref() == Some(who.as_str());
+        let named = match &name {
+            Some(name) => who == name,
+            // No name to match by: any name may be the user's.
+            None => who.parse::<u32>().is_err(),
+        };
+        let mine = *who == me.to_string() || named;
         mine && (*start..start.saturating_add(*count)).contains(&u64::from(uid))
     })
+}
+
+/// Whether the system takes subordinate uids from somewhere but files, as
+/// with `subid: sss` in `/etc/nsswitch.conf` (SSSD, FreeIPA): then what
+/// this user may map is not known here, and every uid counts as mappable.
+/// A file that cannot be read counts so too; with none, or no such line,
+/// only `/etc/subuid` is read.
+#[cfg(unix)]
+fn subids_elsewhere() -> bool {
+    let text = match nsswitch_file() {
+        Ok(text) => text,
+        Err(std::io::ErrorKind::NotFound) => return false,
+        Err(_) => return true,
+    };
+    text.lines()
+        .map(|l| l.split('#').next().unwrap_or_default().trim())
+        .filter_map(|l| l.strip_prefix("subid:"))
+        .flat_map(str::split_whitespace)
+        .any(not_files)
+}
+
+/// Whether an `nsswitch.conf` source is other than `files`; an action in
+/// brackets is none.
+#[cfg(unix)]
+fn not_files(source: &str) -> bool {
+    !source.starts_with('[') && source != "files"
+}
+
+/// What `/etc/nsswitch.conf` holds, or, in a test, what [`with_nsswitch`]
+/// stands in.
+#[cfg(unix)]
+fn nsswitch_file() -> Result<String, std::io::ErrorKind> {
+    #[cfg(test)]
+    if let Some(given) = NSSWITCH.with(|s| s.borrow().clone()) {
+        return given;
+    }
+    std::fs::read_to_string("/etc/nsswitch.conf").map_err(|e| e.kind())
 }
 
 /// What `/etc/subuid` holds, or, in a test, what [`with_subuid`] stands in.
@@ -573,6 +618,28 @@ thread_local! {
     static UID: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
     static SUBUID: std::cell::RefCell<Option<Result<String, std::io::ErrorKind>>> =
         const { std::cell::RefCell::new(None) };
+    static NSSWITCH: std::cell::RefCell<Option<Result<String, std::io::ErrorKind>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Have [`nsswitch_file`] answer `given` on this thread until what it
+/// returns is dropped.
+#[cfg(test)]
+pub(crate) fn with_nsswitch(given: Result<&str, std::io::ErrorKind>) -> NsswitchGuard {
+    NsswitchGuard(NSSWITCH.with(|s| s.replace(Some(given.map(str::to_owned)))))
+}
+
+/// Puts back what [`nsswitch_file`] answered before [`with_nsswitch`] when
+/// dropped.
+#[cfg(test)]
+#[must_use]
+pub(crate) struct NsswitchGuard(Option<Result<String, std::io::ErrorKind>>);
+
+#[cfg(test)]
+impl Drop for NsswitchGuard {
+    fn drop(&mut self) {
+        NSSWITCH.with(|s| *s.borrow_mut() = self.0.take());
+    }
 }
 
 /// Have [`this_uid`] answer `uid` on this thread until what it returns is

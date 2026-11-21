@@ -537,6 +537,9 @@ fn locked(dir: &Path) -> Unlocked {
 /// from a user namespace of its own, so the list is refused.
 #[test]
 fn what_hides_behind_the_users_own_locked_directory_is_refused() {
+    // Whatever the host's own subordinate uids are.
+    let _no_subuid = with_subuid(Err(std::io::ErrorKind::NotFound));
+    let _no_nsswitch = with_nsswitch(Err(std::io::ErrorKind::NotFound));
     let dir = scratch("locked-own");
     let place = dir.0.join("home/.ssh");
     std::fs::create_dir_all(&place).expect("dir");
@@ -573,7 +576,6 @@ fn what_hides_behind_the_users_own_locked_directory_is_refused() {
     // elsewhere cannot be checked.
     let me = crate::state::effective_uid();
     let _other = with_uid(me + 1);
-    let _none = with_subuid(Err(std::io::ErrorKind::NotFound));
     let behind = parse(table(&dir.0.join("locked/m")).as_bytes()).expect("parses");
     assert_eq!(
         aliases(&behind, std::slice::from_ref(&place)).expect("out of reach"),
@@ -607,6 +609,7 @@ fn a_directory_of_a_uid_the_user_may_map_is_the_users_own() {
     let owner = crate::state::effective_uid();
     let user = owner + 1;
     let _other = with_uid(user);
+    let _no_nsswitch = with_nsswitch(Err(std::io::ErrorKind::NotFound));
     let refused = |given: Result<&str, std::io::ErrorKind>| {
         let _subuid = with_subuid(given);
         aliases(&mounts, std::slice::from_ref(&place)).is_err_and(|e| {
@@ -629,4 +632,20 @@ fn a_directory_of_a_uid_the_user_may_map_is_the_users_own() {
     // A file that cannot be read, or is not one: refused.
     assert!(refused(Err(std::io::ErrorKind::PermissionDenied)));
     assert!(refused(Ok("not a subordinate uid file\n")));
+    // The stand-in user has no name in the password database: a range by
+    // any name may be its own.
+    assert!(refused(Ok(&format!("someone:{owner}:1\n"))));
+    // No file, but subordinate uids from a directory service: refused; from
+    // files only, or with no such line: passed over.
+    let nss = |given: Result<&str, std::io::ErrorKind>| {
+        let _nsswitch = with_nsswitch(given);
+        refused(Err(std::io::ErrorKind::NotFound))
+    };
+    assert!(nss(Ok("passwd: files\nsubid: sss\n")));
+    assert!(nss(Ok(
+        "subid: files [NOTFOUND=return] sss # and the rest\n"
+    )));
+    assert!(!nss(Ok("subid: files [NOTFOUND=return]\n")));
+    assert!(!nss(Ok("passwd: files sss\n# subid: sss\n")));
+    assert!(nss(Err(std::io::ErrorKind::PermissionDenied)));
 }
