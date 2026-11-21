@@ -2316,3 +2316,38 @@ fn a_held_string_that_redacts_to_a_credential_settles_in_one_pass() {
     value(&mut twice);
     assert_eq!(twice, once, "a second pass changed it");
 }
+
+/// A name and value pair whose value redaction rewrites into the pair's
+/// secret is read again once its value is redacted, so a second pass
+/// changes nothing: `pwd="a b"` redacted to `pwd="[REDACTED]"`, or a
+/// cookie's JSON written back with `\u003d` as the `=` that makes it one,
+/// as a value on its own and held under a hint.
+#[test]
+fn a_pair_whose_value_redacts_to_its_secret_settles_in_one_pass() {
+    let secret = "pwd=\"a b\"";
+    let token = concat!("Zx81", "kQ0pL2mN4bV6");
+    let cookie = format!("{{\"t\\u006fken\": \"{token}\", \"a\": \"a b\\u003dc\"}}");
+    for (case, doc) in [
+        json!(["token", secret]),
+        json!({"name": "--token", "value": secret}),
+        json!({"key": ["x/MAX_TOKEN", secret]}),
+        json!({"password": {"name": "--token", "value": secret}}),
+        json!(["Cookie", cookie]),
+        json!({"key": ["Cookie", cookie]}),
+        json!({"key": {"name": "Cookie", "value": cookie}}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut once = doc;
+        value(&mut once);
+        let shown = once.to_string();
+        assert!(
+            !shown.contains("a b") && !shown.contains(&token[4..]),
+            "case {case}: a secret showed"
+        );
+        let mut twice = once.clone();
+        value(&mut twice);
+        assert_eq!(twice, once, "case {case}: a second pass changed it");
+    }
+}
