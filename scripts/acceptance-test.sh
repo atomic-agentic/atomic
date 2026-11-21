@@ -276,6 +276,21 @@ for marker in '**Acceptance, beyond the full M4 test**:' '**Acceptance, beyond t
         "${marker}" >"${WORK}/near.md"
     list_check_against 1 "not an Acceptance block marker" "${WORK}/near.md" "${WORK}/m4b.txt" m4b
 done
+# The same for a line shaped like the marker in any other shape: no wrapper,
+# the word misspelt or plural, a wrapper that is not bold, a bullet before it.
+# Only a line beginning `**Acceptance` opens a block, so what sits under any of
+# these is read as nothing, and outside a block such a line was skipped in
+# silence.
+for marker in 'Acceptance:' 'Acceptance, files and data:' 'acceptance:' \
+    '__Acceptance:__' '**Acceptence:**' '**Acceptances:**' '- **Acceptance:**' \
+    '- **Acceptance, beyond the full M4 test:**'; do
+    printf '## M4: Split\n\n**Acceptance:**\n\n- A cap parks the run.\n- A scorer fails CI.\n\n### M4b\n\n**v1.0.** Finishes M4.\n\n%s\n\n- Restarting twice costs nothing.\n' \
+            "${marker}" >"${WORK}/shaped.md"
+    out="$(python3 "${CHECK}" m4b --milestones "${WORK}/shaped.md" --list "${WORK}/m4b.txt" --check 2>&1)"
+    if [ $? -ne 1 ] || ! grep -qF "not an Acceptance block marker" <<<"${out}"; then
+        fail "a line shaped like a marker, '${marker}', was not refused: ${out}"
+    fi
+done
 # The same line before a block that does read: open block or not, it is the
 # line that is refused, and named with its number.
 printf '## M0: A milestone\n\n**Acceptance, files and data**:\n\n- A thing that is not a clause.\n\n**Acceptance:**\n\n- A cap parks the run.\n- Cases in JSONL run the same, written over two lines.\n- A scorer fails CI.\n' >"${WORK}/near-open.md"
@@ -283,6 +298,13 @@ out="$(python3 "${CHECK}" m0 --milestones "${WORK}/near-open.md" --list "${WORK}
 if [ $? -ne 1 ] || ! grep -qF "near-open.md:3: not an Acceptance block marker" <<<"${out}"; then
     fail "a near-miss marker before an open block was not refused with its line: ${out}"
 fi
+printf '## M0: A milestone\n\nAcceptance, files and data:\n\n- A thing that is not a clause.\n\n**Acceptance:**\n\n- A cap parks the run.\n- Cases in JSONL run the same, written over two lines.\n- A scorer fails CI.\n' >"${WORK}/shaped-open.md"
+out="$(python3 "${CHECK}" m0 --milestones "${WORK}/shaped-open.md" --list "${WORK}/list.txt" --check 2>&1)"
+if [ $? -ne 1 ] || ! grep -qF "shaped-open.md:3: not an Acceptance block marker" <<<"${out}"; then
+    fail "a marker-shaped line outside a block was not refused with its line: ${out}"
+fi
+grep -qF "M0's clause is not listed" <<<"${out}" &&
+    fail "a block after a marker-shaped line stopped reading: ${out}"
 # A milestone that states no clause says so, rather than passing with nothing
 # asked of it: a "b" part inherits its parent's, so this is where the check that
 # nothing was read has its say.
@@ -312,26 +334,23 @@ done
 
 # And every milestone heading in the repository's own milestones document reads:
 # an Acceptance block in a shape the check cannot read fails here, whether or
-# not that milestone has a list yet. An empty list is enough to ask, so what the
-# check says of a milestone whose blocks read is exactly its list's own problem
-# and nothing else; a milestone that states no clause is said so. sweep_ok says
-# whether that is all it said, so anything else - a block it could not read, or
-# the check itself failing - fails the sweep.
+# not that milestone has a list yet. An empty list is enough to ask, so the
+# whole of what the check says of a milestone whose blocks read is that list's
+# own problem: `no clauses`, and nothing else. sweep_ok takes only that answer,
+# so everything else fails the sweep - a block it could not read, a milestone
+# that states no clause at all, or the check itself failing.
 MILESTONES="${ROOT}/docs/design/milestones.md"
 printf '# Nothing is listed.\n' >"${WORK}/sweep.txt"
 # sweep_ok <milestone> <milestones document> <empty list>: leaves what the check
-# said in `said`, and says whether that was the sweep's answer and only it.
+# said in `said`, and says whether that was exactly the sweep's answer.
 sweep_ok() {
-    local id="$1" doc="$2" list="$3" title want none
+    local id="$1" doc="$2" list="$3" title want
     title="$(tr '[:lower:]' '[:upper:]' <<<"${id}")"
     said="$(python3 "${CHECK}" "${id}" --milestones "${doc}" --list "${list}" --check 2>&1)"
     [ $? -eq 1 ] || return 1
     want="${list}: no clauses"$'\n\n'
     want+="${title} acceptance: FAILED: the list cannot be checked"
-    none="${list}: no clauses"$'\n'
-    none+="${doc}: ${title} states no Acceptance clause"$'\n\n'
-    none+="${title} acceptance: FAILED: the list cannot be checked"
-    [ "${said}" = "${want}" ] || [ "${said}" = "${none}" ]
+    [ "${said}" = "${want}" ]
 }
 swept=0
 while read -r milestone; do
@@ -341,21 +360,35 @@ while read -r milestone; do
 done < <(grep -oE '^#+[[:space:]]+M[0-9]+[a-z]?' "${MILESTONES}" | grep -oE 'M[0-9]+[a-z]?')
 [ "${swept}" -gt 50 ] || fail "the sweep read only ${swept} milestone headings in ${MILESTONES}"
 # Only that answer passes, so a marker the check cannot read fails the sweep even
-# in a document no list asks about.
-sed 's/^\*\*Acceptance, beyond the full M36 test:\*\*$/**Acceptance, beyond the full M36 test**:/' \
-    "${MILESTONES}" >"${WORK}/near-doc.md"
-sweep_ok m36b "${WORK}/near-doc.md" "${WORK}/sweep.txt" &&
+# in a document no list asks about. A document of its own, written here, so that
+# no retitle of the real one can leave this asking about nothing.
+printf '## M4: Split\n\n**Acceptance:**\n\n- A cap parks the run.\n\n### M4b\n\n**Acceptance, beyond the full M4 test**:\n\n- Restarting twice costs nothing.\n' >"${WORK}/near-doc.md"
+sweep_ok m4b "${WORK}/near-doc.md" "${WORK}/sweep.txt" &&
     fail "the sweep passed a marker it cannot read: ${said}"
+grep -qF "not an Acceptance block marker" <<<"${said}" ||
+    fail "the sweep did not name the marker it cannot read: ${said}"
 # Nor a run of the check that failed outright, whose traceback names no file.
 sweep_ok m12 "${MILESTONES}" "${WORK}/no-such-list.txt" &&
     fail "the sweep passed a check that failed outright: ${said}"
-# And a milestone that states no clause at all is named, so the sweep cannot pass
-# a document whose milestone states none.
+# Nor a milestone that states no clause at all: it is named, so the sweep cannot
+# pass a document whose milestone states none.
 printf '## M0: A milestone\n\n**Delivers:** a thing.\n' >"${WORK}/no-clause-doc.md"
-sweep_ok m0 "${WORK}/no-clause-doc.md" "${WORK}/sweep.txt" ||
-    fail "a milestone stating no clause is not the answer the sweep takes: ${said}"
+sweep_ok m0 "${WORK}/no-clause-doc.md" "${WORK}/sweep.txt" &&
+    fail "a milestone stating no clause passed as the answer the sweep takes: ${said}"
 grep -qF "M0 states no Acceptance clause" <<<"${said}" ||
     fail "a milestone stating no Acceptance clause is not named: ${said}"
+# Which is what a milestone whose only marker is mangled comes to: its clauses
+# sit under a line that opens no block, so none of them is read. Each shape
+# below must fail the sweep, naming the milestone whose clauses went unread.
+for marker in 'Acceptance:' '__Acceptance:__' '**Acceptence:**' \
+    '**Acceptances:**' '- **Acceptance:**'; do
+    printf '## M0: A milestone\n\n**Delivers:** a thing.\n\n%s\n\n- A cap parks the run.\n- A scorer fails CI.\n' \
+            "${marker}" >"${WORK}/mangled-doc.md"
+    sweep_ok m0 "${WORK}/mangled-doc.md" "${WORK}/sweep.txt" &&
+        fail "the sweep passed a milestone whose only marker was '${marker}': ${said}"
+    grep -qF "M0 states no Acceptance clause" <<<"${said}" ||
+        fail "a milestone whose only marker was '${marker}' is not named: ${said}"
+done
 
 # The features it runs with are those CI builds the tests with, so nothing
 # rebuilds.

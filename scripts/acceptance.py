@@ -25,10 +25,12 @@ In the milestones document, an Acceptance block starts at a line that begins
 `**Acceptance` and ends `:**`, with or without a title after the word, and
 holds a bullet per clause: a milestone's clauses are those of all its blocks,
 in order. A line that only looks like that marker is refused with its line
-number, not skipped, so a block in such a shape cannot go unread. A split
-milestone's parts are sections under it. An "a" part states its own acceptance;
-a "b" part finishes its parent's work, so its clauses are its parent's, with any
-of its own blocks after them.
+number, not skipped, so a block in such a shape cannot go unread: outside a
+block, any line that leads with a spelling of `accept` and ends in a colon is
+refused as one, however it is wrapped. A split milestone's parts are sections
+under it. An "a" part states its own acceptance; a "b" part finishes its
+parent's work, so its clauses are its parent's, with any of its own blocks
+after them.
 
 Every listed test is run in one `cargo test` over the workspace, with CI's
 test features (FEATURES, which must match CI's test build, and which
@@ -68,6 +70,13 @@ ACCEPTANCE = re.compile(r"^\*\*Acceptance\b.*:\*\*$")
 # outside the bold. Refused wherever it sits, open block or not: the clauses
 # under it would be skipped in silence.
 NEAR_MARKER = re.compile(r"^\*\*Acceptance\b", re.IGNORECASE)
+# Any line shaped like that marker, whatever wrapper it is in and however the
+# word is spelt: `Acceptance:`, `__Acceptance:__`, `**Acceptence:**`,
+# `- **Acceptance, files and data:**`. The wrapper holds markdown punctuation
+# only, so a line whose first word is not a spelling of `accept` stays prose.
+# Outside a block such a line is refused too, since only a line beginning
+# `**Acceptance` opens one.
+MARKERISH = re.compile(r"^[-_*~>#\s]*accept\w*\b.*:[-_*~>#\s]*$", re.IGNORECASE)
 # A bullet: `- `, `* ` or `+ `, or a number, at the start of the line or
 # indented. Only a `- ` at the start of a line is read as a clause.
 BULLET = re.compile(r"^\s*(?:[-*+][ \t]|\d+[.)]\s)")
@@ -186,10 +195,11 @@ def own(lines, milestone, start, level, path):
     The section's own text ends where one of its parts' sections starts. Under
     any other deeper heading a bullet is refused, because which block it
     belongs to would be a guess; a block marker ends that, as it starts a block
-    of its own. A line that only looks like a block marker is refused too, open
-    block or not: what sits under it is read as nothing, and a "b" part, which
-    is asked for its parent's clauses as well as its own, is never then asked
-    for a clause it states itself."""
+    of its own. A line that only looks like a block marker is refused too: open
+    block or not, one that begins `**Acceptance`, and outside a block any line
+    shaped like the marker at all. What sits under such a line is read as
+    nothing, and a "b" part, which is asked for its parent's clauses as well as
+    its own, is never then asked for a clause it states itself."""
     clauses, problems = [], []
     inside, deeper = False, None
     parent = PART.match(milestone)
@@ -212,7 +222,7 @@ def own(lines, milestone, start, level, path):
             continue
         if not text:
             continue
-        if NEAR_MARKER.match(text):
+        if NEAR_MARKER.match(text) or not inside and MARKERISH.match(text):
             problems.append(
                 f"{path}:{n}: not an Acceptance block marker, so everything "
                 "under it would be skipped: a block starts at a line "
