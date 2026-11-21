@@ -87,7 +87,10 @@ async fn run_on<A: Atom>(
                 meter: atomic_core::usage::Metering::none(),
                 caches: None,
             };
-            run_codex_atom(atom, input, &rt, &Default::default()).await
+            // Its turns run without Codex's sandbox helper, so nothing may be
+            // denied to them: see `denying_nothing`.
+            let backend = atomic_core::testing::denying_nothing(Default::default());
+            run_codex_atom(atom, input, &rt, &backend).await
         }
         AtomKind::Exec => panic!("{} calls no model", A::NAME),
     };
