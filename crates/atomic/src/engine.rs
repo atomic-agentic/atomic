@@ -438,7 +438,7 @@ pub async fn open(
     // Never the developer's checkout: a run's worktree steps use the
     // snapshot of the fixture it is bound to (see `atomic_core::fixture`).
     let worktrees: Option<Arc<Worktrees>> = None;
-    let mut rt = Durare::open(&database, executor.as_deref(), LAYOUT_VERSION)
+    let mut rt = Durare::open(&database, executor.as_deref(), LAYOUT_VERSION, &state.id())
         .await
         .with_context(|| format!("open the durable store at {}", describe(&database)))?;
     register_pipeline(

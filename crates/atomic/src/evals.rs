@@ -349,7 +349,7 @@ pub async fn run(
     let ledger = if source != Source::Recorded && needs_model {
         let database = crate::engine::store_of(&state, &resolved.settings);
         let executor = atomic_durable::executor_identity(resolved.settings.executor_id.as_deref())?;
-        let rt = Durare::open(&database, executor.as_deref(), LAYOUT_VERSION)
+        let rt = Durare::open(&database, executor.as_deref(), LAYOUT_VERSION, &state.id())
             .await
             .map_err(|e| {
                 Failure::new(

@@ -13,7 +13,7 @@
 
 use super::*;
 use crate::publication::{Proposal, Published, run_atom_at};
-use crate::runtime::{DurableError, Durare, RunStatus};
+use crate::runtime::{DEFAULT_VERSION, Database, DurableError, Durare, DurareContext, RunStatus};
 use crate::usage::Caps;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -673,4 +673,108 @@ fn a_repeated_release_says_whether_its_run_was_woken_again() {
         "{said}"
     );
     assert!(said.contains("atomic runs resume run-1"), "{said}");
+}
+
+/// Two projects sharing one store, each on a runtime of its own, and a
+/// runtime for no project: each lists, reads and releases only its own
+/// project's parks, and a release of another project's park is refused as a
+/// park it has not got, releasing nothing.
+async fn a_project_sees_and_releases_only_its_own_parks(database: Database) {
+    let open = |project: &'static str| {
+        let database = database.clone();
+        async move {
+            Durare::open(&database, None, DEFAULT_VERSION, project)
+                .await
+                .expect("engine")
+        }
+    };
+    let mut mine = open("project-a").await;
+    let theirs = open("project-b").await;
+    // A run of project A parks, as runs park.
+    mine.register("parks", move |ctx: DurareContext, (): ()| async move {
+        run_atom_at(
+            &ctx,
+            "plan",
+            move |info| async move {
+                Err::<Proposal, _>(DurableError::Parked {
+                    reason: "no room".into(),
+                    scope: Some(format!("run:{}", info.workflow_id)),
+                })
+            },
+            Vec::new(),
+        )
+        .await
+    });
+    mine.launch().await.expect("launch");
+    let run = unique("projects");
+    allowance(&mine, &format!("run:{run}"), 100).await;
+    mine.start("parks", &run, ()).await.expect("start");
+    let started = Instant::now();
+    let park = loop {
+        if let Some(park) = waiting(&mine).await.expect("waiting").into_iter().find(|p| p.run == run) {
+            break park;
+        }
+        assert!(started.elapsed() < Duration::from_secs(30), "the run never parked");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(park.project.as_deref(), Some("project-a"));
+    // A park recorded for no project, as one recorded before parks had one.
+    let none = match &database {
+        Database::Sqlite(path) => Durare::sqlite(path).await.expect("engine"),
+        Database::Postgres { url, schema } => {
+            Durare::postgres(url, schema).await.expect("engine")
+        }
+    };
+    let unowned = bare_park(&none, &unique("unowned"), 100).await;
+
+    let ids = |parks: Vec<Park>| parks.into_iter().map(|p| p.id).collect::<Vec<_>>();
+    assert!(
+        ids(waiting(&mine).await.expect("waiting")).contains(&park.id)
+            && !ids(waiting(&mine).await.expect("waiting")).contains(&unowned)
+    );
+    assert!(ids(waiting(&theirs).await.expect("waiting")).is_empty());
+    assert_eq!(ids(waiting(&none).await.expect("waiting")), vec![unowned.clone()]);
+    assert!(super::park(&theirs, &park.id).await.expect("park").is_none());
+    assert!(crate::publication::parks(&theirs, &run).await.expect("parks").is_empty());
+
+    // Project B's operator cannot release it, and nothing is recorded.
+    let operator = HumanCredential::new(operator(), "the operator's secret");
+    crate::gate::enroll(&theirs, &operator).await.expect("enroll");
+    let refused = release_park(&theirs, &operator, command(&park.id, "b-release", None))
+        .await
+        .expect_err("another project's park");
+    assert!(
+        matches!(&refused, ReleaseError::NoSuchPark(id) if *id == park.id),
+        "{refused}"
+    );
+    assert!(!is_released(&mine, &park.id).await.expect("released?"));
+    assert!(
+        release_park(&mine, &operator, command(&unowned, "a-unowned", None))
+            .await
+            .is_err_and(|e| matches!(e, ReleaseError::NoSuchPark(_))),
+        "a park for no project is no project's"
+    );
+    // Project A's can.
+    release_park(&mine, &operator, command(&park.id, "a-release", None))
+        .await
+        .expect("released");
+    assert!(is_released(&mine, &park.id).await.expect("released?"));
+    mine.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_project_sees_and_releases_only_its_own_parks_on_sqlite() {
+    let path = std::env::temp_dir().join(format!("{}.db", unique("atomic_release_projects")));
+    a_project_sees_and_releases_only_its_own_parks(Database::Sqlite(path)).await
+}
+
+#[cfg(feature = "postgres-tests")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_project_sees_and_releases_only_its_own_parks_on_postgres() {
+    let schema = crate::testing::schema("release_projects").await;
+    a_project_sees_and_releases_only_its_own_parks(Database::Postgres {
+        url: schema.url().to_owned(),
+        schema: schema.name().to_owned(),
+    })
+    .await
 }

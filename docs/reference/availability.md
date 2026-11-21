@@ -248,7 +248,13 @@ each model call before it is dispatched, settles it once, and parks a run that
 reaches a cap. A released park admits the call again against the caps as stored.
 `atomic parks list` and `atomic parks release` let the local operator, with
 their enrolled credential, raise a cap and release a park, recorded with who did
-it.
+it. Each park is recorded with the project whose run parked, and on a
+PostgreSQL store several projects share, both commands see only the current
+project's parks: releasing another project's park is refused as a park that
+does not exist. A project is told apart by its id, which comes from its path, so
+the same project checked out at another path is another project there, and a
+park recorded before atomic kept parks' projects is no project's and is listed
+and released by none.
 The commands that show budgets and spend come with run inspection.
 
 ## Observability stages

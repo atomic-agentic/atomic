@@ -272,7 +272,7 @@ pub async fn show(
 ) -> anyhow::Result<()> {
     let state = crate::runs::state(project)?;
     let database = engine::database(&state)?;
-    let rt = Durare::open(&database, None, LAYOUT_VERSION)
+    let rt = Durare::open(&database, None, LAYOUT_VERSION, &state.id())
         .await
         .with_context(|| format!("open the store at {}", engine::describe(&database)))?;
     let Some(doc) = gather(&rt, &args.run_id).await? else {

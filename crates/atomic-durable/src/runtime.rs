@@ -488,6 +488,10 @@ pub trait WorkflowContext: Clone + Send + Sync + 'static {
     /// The workflow's id.
     fn workflow_id(&self) -> &str;
 
+    /// The project the workflow runs for, as its runtime was opened with
+    /// (see [`DurableRuntime::project`]).
+    fn project(&self) -> Option<&str>;
+
     /// Run `body` as a durable step: its output is recorded, and on replay
     /// it is returned without running `body` again. The body runs at least
     /// once: a crash after it returns and before its checkpoint commits runs
@@ -536,6 +540,13 @@ pub trait WorkflowContext: Clone + Send + Sync + 'static {
 pub trait DurableRuntime: Send + Sync + Sized {
     /// The context workflow code receives.
     type Context: WorkflowContext;
+
+    /// The project this runtime serves, which several may share a store
+    /// with: what it records, such as a park, is the project's, and what it
+    /// lists or acts on is only the project's. `None` for a runtime opened
+    /// for no project, such as a test's, which sees only what was recorded
+    /// for none.
+    fn project(&self) -> Option<&str>;
 
     /// Register workflow `name`. Registration happens before
     /// [`launch`](Self::launch), in the same way in every process that may
@@ -740,6 +751,8 @@ impl Checkpoint {
 pub struct DurareContext {
     engine: durare::DurableContext,
     reads: Reads,
+    /// The project its runtime serves.
+    project: Option<Arc<str>>,
     /// A workflow conflict any operation of this execution returned: once
     /// the execution has lost a race to record a step, its outcome is the
     /// conflict, whatever its workflow code goes on to return.
@@ -770,6 +783,10 @@ impl Lost {
 impl WorkflowContext for DurareContext {
     fn workflow_id(&self) -> &str {
         self.engine.workflow_id()
+    }
+
+    fn project(&self) -> Option<&str> {
+        self.project.as_deref()
     }
 
     fn step<T, F, Fut>(&self, name: &str, body: F) -> impl Future<Output = Result<T>> + Send
@@ -1074,6 +1091,8 @@ pub struct Durare {
     /// The resume queues this engine takes runs from (see
     /// [`Durare::take_resumed_runs`]).
     resume_queues: std::collections::BTreeSet<String>,
+    /// The project it serves (see [`DurableRuntime::project`]).
+    project: Option<Arc<str>>,
 }
 
 impl Durare {
@@ -1109,7 +1128,27 @@ impl Durare {
     /// steps the registered workflows record, changed exactly when a run
     /// started under the old layout could not replay under the new one, so
     /// any build of the same layout continues the same runs.
-    pub async fn open(database: &Database, executor: Option<&str>, version: &str) -> Result<Self> {
+    ///
+    /// It serves `project`, the id of the project's state (see
+    /// [`DurableRuntime::project`]): on a store several projects share, it
+    /// records its parks as the project's and lists and releases no other
+    /// project's.
+    pub async fn open(
+        database: &Database,
+        executor: Option<&str>,
+        version: &str,
+        project: &str,
+    ) -> Result<Self> {
+        let mut rt = Self::open_for_none(database, executor, version).await?;
+        rt.project = Some(project.into());
+        Ok(rt)
+    }
+
+    async fn open_for_none(
+        database: &Database,
+        executor: Option<&str>,
+        version: &str,
+    ) -> Result<Self> {
         let executor =
             executor_identity(executor).map_err(|e| DurableError::Engine(e.to_string()))?;
         match database {
@@ -1402,6 +1441,7 @@ impl Durare {
             reads,
             started: std::sync::Mutex::default(),
             resume_queues: Default::default(),
+            project: None,
         })
     }
 
@@ -1453,6 +1493,10 @@ impl Durare {
 impl DurableRuntime for Durare {
     type Context = DurareContext;
 
+    fn project(&self) -> Option<&str> {
+        self.project.as_deref()
+    }
+
     fn register<I, O, F, Fut>(&mut self, name: &str, workflow: F)
     where
         I: DeserializeOwned + Send + 'static,
@@ -1460,7 +1504,7 @@ impl DurableRuntime for Durare {
         F: Fn(Self::Context, I) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<O>> + Send + 'static,
     {
-        let reads = self.reads.clone();
+        let (reads, project) = (self.reads.clone(), self.project.clone());
         self.engine
             .register(name, move |ctx: durare::DurableContext, input: I| {
                 let lost = Lost::default();
@@ -1468,6 +1512,7 @@ impl DurableRuntime for Durare {
                     DurareContext {
                         engine: ctx,
                         reads: reads.clone(),
+                        project: project.clone(),
                         lost: lost.clone(),
                     },
                     input,
