@@ -1474,27 +1474,54 @@ fn redact_nested(value: &mut Value, nested: usize) {
                 .for_each(|item| redact_nested(item, nested));
         }
         Value::Object(fields) => {
-            let renamed: Vec<(String, String)> = fields
+            // In the order of the keys themselves, so the same object
+            // numbers its entries the same however it was built.
+            let mut renamed: Vec<(String, String)> = fields
                 .keys()
                 .filter_map(|key| match text(key) {
                     Cow::Owned(new_key) => Some((key.clone(), new_key)),
                     Cow::Borrowed(_) => None,
                 })
                 .collect();
+            renamed.sort();
+            // Each numbered key's name as redacted, before its number, which
+            // is what says whether its value is a secret.
+            let mut named: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            // The next number for each name, so numbering stays linear.
+            let mut next: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
             for (old_key, new_key) in renamed {
                 if let Some(field) = fields.remove(&old_key) {
-                    fields.insert(new_key, field);
+                    // Two keys can redact to the same text, as two that
+                    // start private key blocks do: each keeps its entry,
+                    // the later ones numbered, so neither hides the other.
+                    let mut key = new_key.clone();
+                    if fields.contains_key(&key) {
+                        let n = next.entry(new_key.clone()).or_insert(2);
+                        loop {
+                            step(1);
+                            key = format!("{new_key} ({n})");
+                            *n += 1;
+                            if !fields.contains_key(&key) {
+                                break;
+                            }
+                        }
+                        named.insert(key.clone(), new_key);
+                    }
+                    fields.insert(key, field);
                 }
             }
             for (key, field) in fields.iter_mut() {
+                let name = named.get(key).map_or(key.as_str(), String::as_str);
                 // A header's value, such as `"Authorization": "Bearer …"`.
-                if HEADERS.iter().any(|h| key.eq_ignore_ascii_case(h))
-                    && field.as_str().is_some_and(|v| is_header_secret(key, v))
+                if HEADERS.iter().any(|h| name.eq_ignore_ascii_case(h))
+                    && field.as_str().is_some_and(|v| is_header_secret(name, v))
                 {
                     *field = Value::String(REDACTED.into());
                     continue;
                 }
-                match strength(key) {
+                match strength(name) {
                     Strength::None => redact_nested(field, nested),
                     held => redact_held(held, field, nested),
                 }
@@ -1516,16 +1543,15 @@ pub fn log(line: impl AsRef<str>) {
     eprintln!("{}", bounded(line.as_ref(), MAX_TEXT));
 }
 
-/// One log line put together from atomic's own text and values that may
-/// carry a secret, each value redacted on its own: a value's text, such as
-/// an unterminated private key, never reaches the text around it, and
-/// atomic's own words and names are written as they are, never mistaken
-/// for a secret. Each line is written by itself, so nothing one line holds
+/// One log line put together from atomic's own words, names and text made
+/// safe already, written as they are: none of it is redacted again, so
+/// atomic's words and the names in them are never mistaken for a secret,
+/// and nothing one part holds, such as the start of a private key, reaches
+/// the others. Each line is written by itself, so nothing one line holds
 /// changes what later lines show.
 #[derive(Debug, Default)]
 pub struct Line {
     text: String,
-    redacted: bool,
 }
 
 impl Line {
@@ -1534,31 +1560,29 @@ impl Line {
         Self::default()
     }
 
-    /// Text that carries no secret: atomic's own words, a name the person
-    /// or the workflow chose (a run's id, a gate's), or a value redacted
-    /// already.
-    pub fn plain(mut self, text: &str) -> Self {
+    /// atomic's own words. Only text written into atomic itself is
+    /// `'static`, so no value read at run time comes in here.
+    pub fn plain(mut self, words: &'static str) -> Self {
+        self.text.push_str(words);
+        self
+    }
+
+    /// Text that is safe to show as it is: a name a person or a workflow
+    /// chose (a run's id, a gate's), escaped for the terminal, or a value
+    /// redacted already, such as by [`value`] or [`bounded`].
+    pub fn shown(mut self, text: &str) -> Self {
         self.text.push_str(text);
         self
     }
 
-    /// A value that may carry a secret, such as a gate's title: redacted
-    /// and bounded on its own.
-    pub fn value(mut self, text: &str) -> Self {
-        let shown = bounded(text, MAX_TEXT);
-        self.redacted |= shown != text;
-        self.text.push_str(&shown);
-        self
-    }
-
-    /// Whether a value in it was redacted or cut short.
-    pub fn redacted(&self) -> bool {
-        self.redacted
+    /// What it writes: its text, bounded to [`MAX_TEXT`] characters.
+    fn written(&self) -> Cow<'_, str> {
+        cut(&self.text, MAX_TEXT)
     }
 
     /// Write it to stderr, bounded to [`MAX_TEXT`] characters.
     pub fn log(self) {
-        eprintln!("{}", cut(&self.text, MAX_TEXT));
+        eprintln!("{}", self.written());
     }
 
     /// Write it to stderr with no line end, flushed, as a prompt for a
@@ -1566,7 +1590,7 @@ impl Line {
     pub fn prompt(self) {
         use std::io::Write;
         let mut e = std::io::stderr().lock();
-        let _ = write!(e, "{}", cut(&self.text, MAX_TEXT));
+        let _ = write!(e, "{}", self.written());
         let _ = e.flush();
     }
 }

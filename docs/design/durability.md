@@ -207,7 +207,7 @@ outputs and telemetry (M12).
   keeps the reservation charged at its full bound, or, for a Codex turn that
   recorded its progress, at what it last recorded having reported and one
   request in flight, if that is more; only a person entering the real usage
-  can later correct it. A fresh retry gets a new reservation; if the
+  through the ledger can later correct it, and no command does that yet. A fresh retry gets a new reservation; if the
   allowance is gone, the run parks. Allowance goes back into the pool in two
   cases only: the request provably never left, or reconciliation showed it
   unused.

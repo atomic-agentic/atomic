@@ -885,7 +885,7 @@ fn pipeline_child() {
     };
     on_codex_runtime(async move {
         let dir = PathBuf::from(dir);
-        let rt = engine(&dir, &url).await;
+        let rt = Arc::new(engine(&dir, &url).await);
         if role == "replay" {
             // A replay of the recorded run `recorded`, noting a panic where
             // the parent looks.
@@ -920,12 +920,47 @@ fn pipeline_child() {
                     pipeline: load(&project, "gated.workflow.yaml", &gated()),
                     input: json!({"text": "Exporting a file named café.txt crashes the app."}),
                 },
+                "start-reviewed" => PipelineRun {
+                    pipeline: reviewed(&project, 1),
+                    input: json!({ "text": NOTE }),
+                },
+                "start-reviewed-once" | "start-reviewed-counting" => PipelineRun {
+                    pipeline: reviewed(&project, 0),
+                    input: json!({ "text": NOTE }),
+                },
+                "start-reviewed-stopping" => PipelineRun {
+                    pipeline: reviewed(&project, 1),
+                    input: json!({ "text": NOTE }),
+                },
                 _ => PipelineRun {
                     pipeline: load(&project, "fix.workflow.yaml", FIX),
                     input: json!({"title": "Export crashes on accents", "base": plain_git(&project, &["rev-parse", "HEAD"])}),
                 },
             };
             let id = std::env::var(ENV_RUN).expect("run id");
+            // The process stops starting steps once the parent says so.
+            if role == "start-reviewed-stopping" {
+                let dir = dir.clone();
+                tokio::spawn(async move {
+                    while !dir.join("stop").exists() {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                    atomic_app::pipeline::stop_starting_steps();
+                    std::fs::write(dir.join("stopped"), "").expect("stopped");
+                });
+            }
+            // What the process counts as running while its run waits at
+            // the review's gate.
+            if role == "start-reviewed-counting" {
+                let (dir, rt, id) = (dir.clone(), rt.clone(), id.clone());
+                tokio::spawn(async move {
+                    let _ = open_gate(&rt, &id).await;
+                    // Long enough for the run to be waiting, not deciding.
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    let running = atomic_app::pipeline::steps_running();
+                    std::fs::write(dir.join("running"), running.to_string()).expect("running");
+                });
+            }
             rt.start(PIPELINE, &id, run).await.expect("start");
         } else {
             rt.recover().await.expect("recover");
@@ -3806,9 +3841,38 @@ fn the_durable_layout_is_the_one_its_version_names() {
         );
         decide(&rt, &g, Verdict::Approve, "fine").await;
         let _: Value = rt.result("layout-3").await.expect("the replay finishes");
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+        // And a reviewed step: a request for changes, a repair round and an
+        // approval.
+        let reviewer = FakeModel::start(vec![
+            Reply::Text(WRONG.into()),
+            Reply::Text(REJECT.into()),
+            Reply::Text(READ.into()),
+            Reply::Text(APPROVE.into()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = engine(&dir, &reviewer.base_url()).await;
+        let reviewed_run = PipelineRun {
+            pipeline: reviewed(&project, 1),
+            input: json!({ "text": NOTE }),
+        };
+        let mut reviewed_shape = shape(&serde_json::to_value(&reviewed_run).expect("encode"));
+        if let Some(atoms) = reviewed_shape["pipeline"]["atoms"].as_object().cloned() {
+            reviewed_shape["pipeline"]["atoms"] = json!({"<name>": atoms["read-note"].clone()});
+        }
+        rt.start(PIPELINE, "layout-4", reviewed_run)
+            .await
+            .expect("start");
+        let _: Value = rt
+            .result("layout-4")
+            .await
+            .expect("the reviewed run finishes");
         // Each recorded step's name, and the shape of its checkpoint.
         let mut steps = BTreeMap::new();
-        for run in ["layout-1", "layout-2", "layout-3"] {
+        for run in ["layout-1", "layout-2", "layout-3", "layout-4"] {
             let recorded: Vec<Value> = rt
                 .steps(run)
                 .await
@@ -3827,7 +3891,12 @@ fn the_durable_layout_is_the_one_its_version_names() {
         rt.shutdown(std::time::Duration::from_secs(5))
             .await
             .expect("shutdown");
-        let recorded = json!({"steps": steps, "run": run_shape, "replay": replay_shape});
+        let recorded = json!({
+            "steps": steps,
+            "run": run_shape,
+            "replay": replay_shape,
+            "reviewed": reviewed_shape,
+        });
         let file = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/layout")
             .join(format!("{}.json", atomic_app::pipeline::LAYOUT_VERSION));
@@ -4096,6 +4165,602 @@ fn a_replay_takes_no_lock_on_the_store() {
     });
 }
 
+/// A reviewer atom, `check-title`, whose output is a typed verdict, and a
+/// workflow whose `read` step it reviews, with `rounds` repair rounds.
+fn reviewed(project: &Path, rounds: u64) -> Pipeline {
+    write_atom(
+        project,
+        "check-title",
+        "Find what is wrong with this title for the note. Approve it only if it is right.\n\
+         Note: {input.text}\nTitle: {input.title}",
+        object(json!({"text": {"type": "string"}, "title": {"type": "string"}})),
+        // The catalog's verdict: `verdict`, and findings with a file, a
+        // severity and a message.
+        object(json!({
+            "verdict": {"type": "string", "enum": ["approve", "request_changes", "reject"]},
+            "findings": {"type": "array", "items": object(json!({
+                "file": {"type": "string"},
+                "severity": {"type": "string", "enum": ["blocker", "major", "minor", "nit"]},
+                "message": {"type": "string"},
+            }))},
+        })),
+    );
+    load(
+        project,
+        "reviewed.workflow.yaml",
+        &format!(
+            "atomic: 1
+name: reviewed-note
+input: {{ $ref: ../atoms/read-note.input.schema.json }}
+output: {{ $ref: ../atoms/read-note.output.schema.json }}
+steps:
+  read:
+    atom: read-note
+    with: {{ text: input.text }}
+    review:
+      reviewer: check-title
+      with: {{ text: input.text, title: candidate.output.title }}
+      rounds: {rounds}
+returns: steps.read.output
+"
+        ),
+    )
+}
+
+/// The title a seeded bug gives the note: it says the opposite of the note.
+const WRONG: &str = r#"{"title": "Export works with accents", "words": 7}"#;
+const REJECT: &str = r#"{"verdict": "request_changes", "findings": [{"file": "title", "severity": "major", "message": "The note says the export crashes; the title says it works."}]}"#;
+const APPROVE: &str = r#"{"verdict": "approve", "findings": []}"#;
+const NOTE: &str = "Exporting a file named café.txt crashes the app.";
+
+#[test]
+fn a_reviewer_catches_a_seeded_bug_and_escalates_after_its_repair_rounds() {
+    on_codex_runtime(async {
+        let dir = scratch("review-escalates");
+        let project = project(&dir);
+        let pipeline = reviewed(&project, 2);
+        // The author keeps the bug through both repair rounds; the reviewer
+        // rejects every candidate.
+        let model = FakeModel::start(vec![
+            Reply::Text(WRONG.into()),
+            Reply::Text(REJECT.into()),
+            Reply::Text(WRONG.into()),
+            Reply::Text(REJECT.into()),
+            Reply::Text(WRONG.into()),
+            Reply::Text(REJECT.into()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        let run = PipelineRun {
+            pipeline,
+            input: json!({ "text": NOTE }),
+        };
+        rt.start(PIPELINE, "review-1", run).await.expect("start");
+
+        // A person is asked, with the candidate and the verdict.
+        let g = open_gate(&rt, "review-1").await;
+        assert_eq!(g.id, "review-1:read.review");
+        assert!(
+            g.title
+                .contains("reviewer check-title asked for changes after 2 repair round(s)"),
+            "{}",
+            g.title
+        );
+        assert_eq!(g.show["output"]["title"], "Export works with accents");
+        assert_eq!(g.show["verdict"]["verdict"], "request_changes");
+        assert_eq!(g.show["verdict"]["findings"][0]["file"], "title");
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            model.calls(),
+            6,
+            "the author three times, the reviewer three times, and nothing more"
+        );
+        // Each repair round was given the findings, as data.
+        let requests = model.requests();
+        for (i, request) in requests.iter().enumerate() {
+            let said = request.to_string();
+            let repair = said.contains("A reviewer rejected your previous output");
+            assert_eq!(repair, i == 2 || i == 4, "request {i}: {said}");
+            if repair {
+                assert!(said.contains("the title says it works"), "{said}");
+            }
+        }
+        // Every call its own request, and the rounds charged to two atom
+        // allowances: the author's first turn's and the first verdict's.
+        let attempts = rt.ledger().attempts("review-1").await.expect("attempts");
+        let positions: std::collections::BTreeSet<String> = attempts
+            .iter()
+            .filter_map(|a| a.request.split(':').nth(1).map(str::to_owned))
+            .collect();
+        assert_eq!(positions.len(), 6, "{attempts:?}");
+        let mut allowances = 0;
+        for position in &positions {
+            let scope = format!("atom:review-1:{position}");
+            if rt
+                .ledger()
+                .allowance(&scope)
+                .await
+                .expect("allowance")
+                .is_some()
+            {
+                allowances += 1;
+            }
+        }
+        assert_eq!(allowances, 2, "each round took an allowance of its own");
+        // Nothing was published while the review ran.
+        let published = rt
+            .recorded_candidates("review-1")
+            .await
+            .expect("candidates");
+        assert!(!published.contains_key("read"), "{published:?}");
+
+        decide(&rt, &g, Verdict::Reject, "the title is wrong").await;
+        let error = rt
+            .result::<Value>("review-1")
+            .await
+            .expect_err("rejected")
+            .to_string();
+        assert!(
+            error.contains("its review went to gate `read.review`"),
+            "{error}"
+        );
+        assert!(error.contains("not published"), "{error}");
+        assert_eq!(model.calls(), 6);
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[test]
+fn a_repair_the_reviewer_approves_is_published_with_no_gate() {
+    on_codex_runtime(async {
+        let dir = scratch("review-approves");
+        let project = project(&dir);
+        let pipeline = reviewed(&project, 2);
+        let model = FakeModel::start(vec![
+            Reply::Text(WRONG.into()),
+            Reply::Text(REJECT.into()),
+            Reply::Text(READ.into()),
+            Reply::Text(APPROVE.into()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        let run = PipelineRun {
+            pipeline,
+            input: json!({ "text": NOTE }),
+        };
+        rt.start(PIPELINE, "review-2", run).await.expect("start");
+        let out: Value = rt.result("review-2").await.expect("finishes");
+        assert_eq!(out, serde_json::from_str::<Value>(READ).expect("json"));
+        assert_eq!(model.calls(), 4);
+        let open = gate::gates(&rt, GateFilter::default())
+            .await
+            .expect("gates");
+        assert!(open.is_empty(), "a gate opened: {open:?}");
+        // The record names the repaired candidate as the step's.
+        let published = rt
+            .recorded_candidates("review-2")
+            .await
+            .expect("candidates");
+        assert_eq!(
+            published["read"].proposal.output["title"],
+            "Export crashes on accents"
+        );
+        assert_eq!(
+            published["read.review.1"].proposal.output["verdict"],
+            "approve"
+        );
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[test]
+fn a_reviewer_that_rejects_asks_a_person_at_once() {
+    on_codex_runtime(async {
+        let dir = scratch("review-escalate");
+        let project = project(&dir);
+        let pipeline = reviewed(&project, 2);
+        let model = FakeModel::start(vec![
+            Reply::Text(READ.into()),
+            Reply::Text(
+                r#"{"verdict": "reject", "findings": [{"file": "note", "severity": "minor", "message": "Is a crash on export urgent here?"}]}"#
+                    .into(),
+            ),
+        ])
+        .await
+        .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        let run = PipelineRun {
+            pipeline,
+            input: json!({ "text": NOTE }),
+        };
+        rt.start(PIPELINE, "review-3", run).await.expect("start");
+        let g = open_gate(&rt, "review-3").await;
+        assert!(
+            g.title.contains("reviewer check-title rejected it"),
+            "{}",
+            g.title
+        );
+        assert_eq!(model.calls(), 2, "no repair round on a rejection");
+        decide(&rt, &g, Verdict::Approve, "fine as it is").await;
+        let out: Value = rt.result("review-3").await.expect("finishes");
+        assert_eq!(out, serde_json::from_str::<Value>(READ).expect("json"));
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[test]
+fn a_review_its_author_cannot_be_given_is_refused_when_loaded() {
+    let dir = scratch("review-refused");
+    let project = project(&dir);
+    write_send_note(&dir, None);
+    let _ = reviewed(&project, 1);
+    let workflow = |review: &str| {
+        format!(
+            "atomic: 1
+name: refused
+input: {{ $ref: ../atoms/read-note.input.schema.json }}
+output: {{ $ref: ../atoms/read-note.output.schema.json }}
+steps:
+  read:
+    atom: read-note
+    with: {{ text: input.text }}
+    review: {review}
+returns: steps.read.output
+"
+        )
+    };
+    for (review, said) in [
+        (
+            "{ reviewer: read-note, with: { text: input.text } }",
+            "would review its own output",
+        ),
+        (
+            "{ reviewer: rank-note, with: { title: candidate.output.title, words: 1 } }",
+            "is not a verdict",
+        ),
+        (
+            "{ reviewer: check-title, with: { text: input.text, title: candidate.output.title }, rounds: 9 }",
+            "`rounds` is a whole number from 0 to 5",
+        ),
+        (
+            "{ reviewer: check-title, with: { text: input.text } }",
+            "requires input field `title`",
+        ),
+        (
+            "{ reviewer: check-title, with: { text: input.text, title: candidate.output.nope } }",
+            "nope",
+        ),
+        (
+            "{ reviewer: check-title, with: { text: input.text, title: candidate.output.words } }",
+            "cannot fit",
+        ),
+        (
+            "{ reviewer: send-note, with: { text: input.text } }",
+            "a reviewer is a lite or codex atom",
+        ),
+    ] {
+        let refused =
+            try_load(&project, "refused.workflow.yaml", &workflow(review)).expect_err("refused");
+        assert!(refused.contains(said), "{review}: {refused}");
+    }
+    let refused = |text: &str, said: &str| {
+        let refused = try_load(&project, "refused.workflow.yaml", text).expect_err("refused");
+        assert!(refused.contains(said), "{text}: {refused}");
+    };
+    let review =
+        "{ reviewer: check-title, with: { text: input.text, title: candidate.output.title } }";
+    // An exec atom's output cannot be repaired by a review.
+    refused(
+        &workflow(review).replace("atom: read-note", "atom: send-note"),
+        "is an exec atom",
+    );
+    // A gate is decided by a person, never reviewed.
+    refused(
+        &workflow(review).replace(
+            "    atom: read-note\n    with: { text: input.text }\n",
+            "    gate: { title: \"'Ship it?'\" }\n",
+        ),
+        "`review` belongs to an atom step",
+    );
+    // A step id with a dot would share its durable names with another's.
+    refused(
+        &workflow(review)
+            .replace("  read:\n", "  read.review:\n")
+            .replace("steps.read.", "steps.read.review."),
+        "has a dot in its name",
+    );
+    // A reviewer that accepts only team input, fed the candidate (and a
+    // literal, which is team data).
+    trusted(&project, "check-title", "team");
+    refused(
+        &workflow(
+            "{ reviewer: check-title, with: { text: \"'a note'\", title: candidate.output.title } }",
+        ),
+        "`candidate.output.title` is external data",
+    );
+    trusted(&project, "check-title", "external");
+    // An author that accepts only team input, given a review of external
+    // data in a repair round.
+    trusted(&project, "read-note", "team");
+    let literal = |review: &str| {
+        workflow(review).replace(
+            "    with: { text: input.text }\n",
+            "    with: { text: \"'Exports crash.'\" }\n",
+        )
+    };
+    refused(&literal(review), "a repair round hands");
+    // With no repair rounds, the review is only shown to a person.
+    let none = "{ reviewer: check-title, with: { text: input.text, title: candidate.output.title }, rounds: 0 }";
+    try_load(&project, "refused.workflow.yaml", &literal(none))
+        .expect("no rounds, no review handed to the author");
+    trusted(&project, "read-note", "external");
+}
+
+/// Rewrite atom `name`'s config to accept at most `trust` input.
+fn trusted(project: &Path, name: &str, trust: &str) {
+    let file = project.join("atoms").join(format!("{name}.atom.astro"));
+    let source = std::fs::read_to_string(&file).expect("atom");
+    let start = source.find("{ description: ").expect("config");
+    let end = source[start..].find(" };").expect("config end") + start + 3;
+    std::fs::write(
+        &file,
+        format!(
+            "{}{{ description: '{name}', trust: '{trust}' }};{}",
+            &source[..start],
+            &source[end..]
+        ),
+    )
+    .expect("atom");
+}
+
+#[test]
+fn a_process_killed_during_review_repeats_no_finished_turn() {
+    // Killed once the reviewer's rejection is published, and once the
+    // repair round's candidate is checkpointed: either way a new process
+    // goes on from there.
+    for (point, before) in [
+        ("checkpoint:after:read.review.0.publish", 2),
+        ("checkpoint:after:read.repair.1.turn", 3),
+    ] {
+        on_codex_runtime(async move {
+            let model = FakeModel::start(vec![
+                Reply::Text(WRONG.into()),
+                Reply::Text(REJECT.into()),
+                Reply::Text(READ.into()),
+                Reply::Text(APPROVE.into()),
+            ])
+            .await
+            .expect("fake model");
+            let dir = scratch(&format!("review-killed-{before}"));
+            project(&dir);
+            let url = model.base_url();
+            let (d, u) = (dir.clone(), url.clone());
+            let status = tokio::task::spawn_blocking(move || {
+                child(&d, &u, "start-reviewed", "review-killed", Some(point))
+            })
+            .await
+            .expect("child");
+            assert!(
+                !status.success(),
+                "{point}: the first process was killed: {status}"
+            );
+            assert_eq!(model.calls(), before, "{point}");
+            let (d, u) = (dir.clone(), url.clone());
+            let status = tokio::task::spawn_blocking(move || {
+                child(&d, &u, "recover", "review-killed", None)
+            })
+            .await
+            .expect("child");
+            assert!(
+                status.success(),
+                "{point}: the second process finished: {status}"
+            );
+            assert_eq!(model.calls(), 4, "{point}: no finished turn ran again");
+            let out: Value = serde_json::from_str(
+                &std::fs::read_to_string(dir.join("result.json")).expect("result"),
+            )
+            .expect("decode");
+            assert_eq!(
+                out,
+                serde_json::from_str::<Value>(READ).expect("json"),
+                "{point}"
+            );
+        });
+    }
+}
+
+#[test]
+fn the_candidate_reaches_the_reviewer_as_external_data() {
+    let dir = scratch("review-origin");
+    let project = project(&dir);
+    let pipeline = reviewed(&project, 1);
+    let Step::Atom(read) = &pipeline.steps[0] else {
+        panic!("{:?}", pipeline.steps[0]);
+    };
+    let review = read.review.as_ref().expect("a review");
+    assert_eq!(review.origins["title"], "external", "{review:?}");
+    assert_eq!(review.origins["text"], "external", "{review:?}");
+}
+
+#[test]
+fn a_replay_of_a_reviewed_run_reviews_nothing_again() {
+    on_codex_runtime(async {
+        let dir = scratch("review-replay");
+        let project = project(&dir);
+        let pipeline = reviewed(&project, 1);
+        let model = FakeModel::start(vec![
+            Reply::Text(WRONG.into()),
+            Reply::Text(REJECT.into()),
+            Reply::Text(READ.into()),
+            Reply::Text(APPROVE.into()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        let run = PipelineRun {
+            pipeline,
+            input: json!({ "text": NOTE }),
+        };
+        rt.start(PIPELINE, "reviewed-1", run).await.expect("start");
+        let out: Value = rt.result("reviewed-1").await.expect("finishes");
+        assert_eq!(model.calls(), 4);
+        let replay = replay_of(&rt, "reviewed-1").await.expect("a replay");
+        rt.start(REPLAY, "reviewed-2", replay).await.expect("start");
+        let replayed: Value = rt.result("reviewed-2").await.expect("the replay finishes");
+        assert_eq!(replayed, out, "the replay serves what review accepted");
+        assert_eq!(model.calls(), 4, "the replay called no model");
+        let steps = rt.steps("reviewed-2").await.expect("steps");
+        assert!(
+            !steps
+                .iter()
+                .any(|s| s.name.contains(".review.") || s.name.contains(".repair.")),
+            "{:?}",
+            steps.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+#[test]
+fn a_process_killed_at_the_review_gate_or_after_its_approval_publishes_once() {
+    // Killed once the review's gate is open, and approved while no process
+    // runs; then killed after the approval, before the output is published.
+    for (point, approve_while_running) in [
+        ("gate:after-open", false),
+        ("checkpoint:before:read.publish", true),
+    ] {
+        on_codex_runtime(async move {
+            let model =
+                FakeModel::start(vec![Reply::Text(WRONG.into()), Reply::Text(REJECT.into())])
+                    .await
+                    .expect("fake model");
+            let dir = scratch(&format!("review-gate-killed-{approve_while_running}"));
+            project(&dir);
+            let url = model.base_url();
+            let (d, u) = (dir.clone(), url.clone());
+            let first = tokio::task::spawn_blocking(move || {
+                child(&d, &u, "start-reviewed-once", "gate-killed", Some(point))
+            });
+            let rt = engine(&dir, &url).await;
+            if approve_while_running {
+                let g = open_gate(&rt, "gate-killed").await;
+                decide(&rt, &g, Verdict::Approve, "as it stands").await;
+            }
+            let status = first.await.expect("child");
+            assert!(
+                !status.success(),
+                "{point}: the first process was killed: {status}"
+            );
+            if !approve_while_running {
+                let g = open_gate(&rt, "gate-killed").await;
+                assert_eq!(g.id, "gate-killed:read.review");
+                decide(&rt, &g, Verdict::Approve, "as it stands").await;
+            }
+            rt.shutdown(std::time::Duration::from_secs(5))
+                .await
+                .expect("shutdown");
+            assert_eq!(model.calls(), 2, "{point}");
+            let (d, u) = (dir.clone(), url.clone());
+            let status =
+                tokio::task::spawn_blocking(move || child(&d, &u, "recover", "gate-killed", None))
+                    .await
+                    .expect("child");
+            assert!(
+                status.success(),
+                "{point}: the second process finished: {status}"
+            );
+            assert_eq!(model.calls(), 2, "{point}: no turn ran again");
+            let out: Value = serde_json::from_str(
+                &std::fs::read_to_string(dir.join("result.json")).expect("result"),
+            )
+            .expect("decode");
+            assert_eq!(
+                out,
+                serde_json::from_str::<Value>(WRONG).expect("json"),
+                "{point}"
+            );
+            let rt = engine(&dir, &url).await;
+            let published = rt
+                .recorded_candidates("gate-killed")
+                .await
+                .expect("candidates");
+            assert_eq!(
+                published["read"].proposal.output["title"],
+                "Export works with accents"
+            );
+            rt.shutdown(std::time::Duration::from_secs(5))
+                .await
+                .expect("shutdown");
+        });
+    }
+}
+
+/// The review the workflow-files reference shows, over the atoms of the
+/// first-workflow guide: `review-summary`'s verdict is `approve` or
+/// `revise`, with a reason.
+#[test]
+fn the_documented_review_loads() {
+    let dir = scratch("review-docs");
+    let project = dir.join("docs-project");
+    std::fs::create_dir_all(project.join("atoms")).expect("atoms");
+    std::fs::create_dir_all(project.join("workflows")).expect("workflows");
+    std::fs::write(project.join("atomic.yaml"), "atomic: 1\nname: note-tools\n").expect("manifest");
+    write_atom(
+        &project,
+        "summarize-note",
+        "Summarize the note.\nNote: {input.text}",
+        object(json!({"text": {"type": "string"}})),
+        object(json!({"summary": {"type": "string"}})),
+    );
+    write_atom(
+        &project,
+        "review-summary",
+        "Check the draft against the note.\nOriginal: {input.source}\nDraft: {input.draft}",
+        object(
+            json!({"source": {"type": "string", "minLength": 1}, "draft": {"type": "string", "minLength": 1}}),
+        ),
+        object(json!({
+            "verdict": {"type": "string", "enum": ["approve", "revise"]},
+            "reason": {"type": "string", "minLength": 1, "maxLength": 300},
+        })),
+    );
+    let pipeline = load(
+        &project,
+        "documented.workflow.yaml",
+        "atomic: 1
+name: documented
+input: { $ref: ../atoms/summarize-note.input.schema.json }
+output: { $ref: ../atoms/summarize-note.output.schema.json }
+steps:
+  summarize:
+    atom: summarize-note
+    with:
+      text: input.text
+    review:
+      reviewer: review-summary
+      with:
+        source: input.text
+        draft: candidate.output.summary
+      rounds: 2
+returns: steps.summarize.output
+",
+    );
+    let Step::Atom(step) = &pipeline.steps[0] else {
+        panic!("{:?}", pipeline.steps[0]);
+    };
+    assert_eq!(step.review.as_ref().map(|r| r.rounds), Some(2));
+}
+
 /// A replay whose workflow code panics has its panic noted, as a run's is.
 #[test]
 fn a_replay_whose_workflow_code_panics_is_noted() {
@@ -4212,6 +4877,162 @@ fn a_replayed_run_reuses_its_checkpoints_and_spends_nothing() {
             "the replay charged the run it replays"
         );
         assert_eq!(model.calls(), 3, "the replay made no model call");
+        rt.shutdown(std::time::Duration::from_secs(5))
+            .await
+            .expect("shutdown");
+    });
+}
+
+/// [`child`], started and left running: the parent kills it.
+fn spawned_child(dir: &Path, url: &str, role: &str, run: &str) -> std::process::Child {
+    std::process::Command::new(std::env::current_exe().expect("this test binary"))
+        .env("TZ", "UTC")
+        .env_remove("ATOMIC_TEST_HELPER_RUNTIME")
+        .args(["--exact", "pipeline_child", "--ignored", "--nocapture"])
+        .env(ENV_ROLE, role)
+        .env(ENV_RUN, run)
+        .env(ENV_DIR, dir)
+        .env(ENV_URL, url)
+        .env("ATOMIC_DETECT_OLLAMA_ADDR", "127.0.0.1:9")
+        .env_remove("OPENAI_API_KEY")
+        .env("XDG_CONFIG_HOME", dir.join("config"))
+        .env_remove("ATOMIC_FAILPOINT")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn the child")
+}
+
+/// Wait up to a minute for `what` to hold.
+async fn until(what: &str, holds: impl Fn() -> bool) {
+    for _ in 0..1200 {
+        if holds() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("{what} never happened");
+}
+
+#[test]
+fn a_stopping_process_starts_no_repair_round_and_a_review_gate_is_not_work() {
+    on_codex_runtime(async {
+        // Stopping: the reviewer's request for changes arrives once the
+        // process has begun to stop, and the repair round never starts.
+        let dir = scratch("review-stopping");
+        project(&dir);
+        let model = FakeModel::start(vec![
+            Reply::Text(WRONG.into()),
+            Reply::Gated {
+                file: dir.join("release"),
+                reply: Box::new(Reply::Text(REJECT.into())),
+            },
+            Reply::Text(READ.into()),
+            Reply::Text(APPROVE.into()),
+        ])
+        .await
+        .expect("fake model");
+        let mut child = spawned_child(
+            &dir,
+            &model.base_url(),
+            "start-reviewed-stopping",
+            "stopping",
+        );
+        until("the reviewer is asked", || model.calls() == 2).await;
+        std::fs::write(dir.join("stop"), "").expect("stop");
+        until("the process stops starting steps", || {
+            dir.join("stopped").exists()
+        })
+        .await;
+        std::fs::write(dir.join("release"), "").expect("release");
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(model.calls(), 2, "a repair round began after the stop");
+
+        // Waiting at the review's gate: the process counts nothing as
+        // running, so a stop does not wait out its grace for it.
+        let dir = scratch("review-counting");
+        project(&dir);
+        let model = FakeModel::start(vec![Reply::Text(WRONG.into()), Reply::Text(REJECT.into())])
+            .await
+            .expect("fake model");
+        let mut child = spawned_child(
+            &dir,
+            &model.base_url(),
+            "start-reviewed-counting",
+            "counting",
+        );
+        until("the waiting run is counted", || {
+            dir.join("running").exists()
+        })
+        .await;
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("running")).expect("running"),
+            "0",
+            "a run waiting at its review's gate was counted as running"
+        );
+    });
+}
+
+#[test]
+fn a_worktree_steps_reviewer_sees_its_commit_and_the_gate_shows_the_one_published() {
+    on_codex_runtime(async {
+        let dir = scratch("review-worktree");
+        let (project, base) = repository_project(&dir);
+        write_atom(
+            &project,
+            "check-commit",
+            "Review commit {input.commit}.",
+            object(json!({"commit": {"type": "string"}})),
+            object(json!({"verdict": {"type": "string", "enum": ["approve", "reject"]}})),
+        );
+        let pipeline = load(
+            &project,
+            "reviewed-fix.workflow.yaml",
+            &FIX.replace("name: fix-and-check", "name: reviewed-fix").replace(
+                "    worktree: true\n  check:",
+                "    worktree: true\n    review:\n      reviewer: check-commit\n      with: { commit: candidate.metadata.commit }\n      rounds: 0\n  check:",
+            ),
+        );
+        let model = FakeModel::start(vec![
+            Reply::Text(r#"{"done": true}"#.into()),
+            Reply::Text(r#"{"verdict": "reject"}"#.into()),
+            Reply::Text(r#"{"ok": true}"#.into()),
+        ])
+        .await
+        .expect("fake model");
+        let rt = engine(&dir, &model.base_url()).await;
+        let run = PipelineRun {
+            pipeline,
+            input: json!({"title": "Export crashes on accents", "base": base}),
+        };
+        rt.start(PIPELINE, "reviewed-fix-1", run)
+            .await
+            .expect("start");
+        let g = open_gate(&rt, "reviewed-fix-1").await;
+        let commit = g.show["commit"]
+            .as_str()
+            .expect("the gate shows a commit")
+            .to_owned();
+        // The reviewer was given that commit.
+        assert!(model.requests()[1].to_string().contains(&commit));
+        decide(&rt, &g, Verdict::Approve, "as it stands").await;
+        let out: Value = rt.result("reviewed-fix-1").await.expect("finishes");
+        assert_eq!(out, json!({"ok": true}));
+        // What the gate showed is what the step published.
+        let published = rt
+            .recorded_candidates("reviewed-fix-1")
+            .await
+            .expect("candidates");
+        assert_eq!(published["fix"].proposal.metadata["commit"], json!(commit));
+        assert_eq!(
+            plain_git(&project, &["rev-parse", &format!("{commit}^")]),
+            base
+        );
         rt.shutdown(std::time::Duration::from_secs(5))
             .await
             .expect("shutdown");
