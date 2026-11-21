@@ -142,16 +142,87 @@ list_check malformed.txt "expected \`<binary> <test path>\`"
 printf '## A cap parks the run.\npending:\nbudgets a_cap_parks\n' >"${WORK}/no-reason.txt"
 list_check no-reason.txt "\`pending:\` needs a reason"
 
+# A pending clause whose test failed fails, pending or not.
+sed 's/^test eval::tests::scorer \.\.\. ok$/test eval::tests::scorer ... FAILED/' "${WORK}/ok.log" >"${WORK}/pending-failed.log"
+check 1 "atomic_core eval::tests::scorer: FAILED" --log "${WORK}/pending-failed.log"
+
+# A test seen to fail stays failed, whatever a later line says of it.
+{
+    log FAILED
+    echo "     Running unittests src/lib.rs (target/debug/deps/atomic_core-0123456789abcdef)"
+    echo "test budget::tests::unpriced ... ok"
+} >"${WORK}/twice.log"
+check 1 "budget::tests::unpriced: FAILED" --log "${WORK}/twice.log"
+
+# A downloaded log may start with a byte-order mark.
+{ printf '\xef\xbb\xbf'; cat "${WORK}/ok.log"; } >"${WORK}/bom.log"
+check 0 "M0 acceptance: passed, 1 clause pending" --log "${WORK}/bom.log"
+
+# A clause of several parts lists each, in its words, with a test of its own.
+printf '## M2: Parts\n\n**Acceptance:**\n\n- A cap parks the run; a child cannot spend twice.\n' >"${WORK}/parts.md"
+parts() { printf '## A cap parks the run; a child cannot spend twice.\n%s' "$1" >"${WORK}/parts.txt"; }
+parts_check() {
+    local code="$1" text="$2" out
+    out="$(python3 "${CHECK}" m2 --milestones "${WORK}/parts.md" --list "${WORK}/parts.txt" --log "${WORK}/ok.log" 2>&1)"
+    if [ $? -ne "${code}" ] || ! grep -qF -- "${text}" <<<"${out}"; then
+        fail "parts: expected exit ${code} and '${text}': ${out}"
+    fi
+}
+parts $'### A cap parks the run\nbudgets a_cap_parks\n### a child cannot spend twice\natomic_core budget::tests::unpriced\n'
+parts_check 0 "M2 acceptance: passed"
+parts $'### A cap parks the run\nbudgets a_cap_parks\n'
+parts_check 1 "not listed: a child cannot spend twice"
+parts $'### A cap parks the run\nbudgets a_cap_parks\n### a child cannot spend twice\n'
+parts_check 1 "no test listed for: a child cannot spend twice"
+parts $'### A cap parks the run\nbudgets a_cap_parks\n### a child cannot spend at all\natomic_core budget::tests::unpriced\n'
+parts_check 1 "not a part of"
+parts $'budgets a_cap_parks\n### A cap parks the run\nbudgets a_cap_parks\n### a child cannot spend twice\natomic_core budget::tests::unpriced\n'
+parts_check 1 "lists tests outside its parts"
+
+# A list that says a thing twice is refused.
+{ cat "${WORK}/list.txt"; printf 'pending: again\n'; } >"${WORK}/two-pending.txt"
+list_check two-pending.txt "has a \`pending:\` line already"
+{ cat "${WORK}/list.txt"; printf '## A cap parks the run.\nbudgets a_cap_parks\n'; } >"${WORK}/twice.txt"
+list_check twice.txt "the clause is listed twice"
+
+# Anything in the milestone's Acceptance block that is not a clause, or a
+# clause's two-space continuation, is refused rather than skipped.
+for odd in '* Another clause.' '1. Another clause.' ' - Another clause.' $'-\tAnother clause.' \
+    'An unindented continuation.' '  - A nested bullet.'; do
+    printf '## M0: A milestone\n\n**Acceptance:**\n\n- A cap parks the run.\n%s\n' "${odd}" >"${WORK}/odd.md"
+    out="$(python3 "${CHECK}" m0 --milestones "${WORK}/odd.md" --list "${WORK}/list.txt" --check 2>&1)"
+    if [ $? -ne 1 ] || ! grep -qF "not a clause or its continuation" <<<"${out}"; then
+        fail "a line '${odd}' in the Acceptance block was not refused: ${out}"
+    fi
+done
+printf '## M0: A milestone\n\n**Acceptance:**\n\n- A cap parks the run.\n\n### More\n\n**Acceptance:**\n\n- Another.\n' >"${WORK}/two-blocks.md"
+out="$(python3 "${CHECK}" m0 --milestones "${WORK}/two-blocks.md" --list "${WORK}/list.txt" --check 2>&1)"
+if [ $? -ne 1 ] || ! grep -qF "2 Acceptance blocks" <<<"${out}"; then
+    fail "a second Acceptance block was not refused: ${out}"
+fi
+# A milestone under a `###` heading is found, and ends at the next heading
+# of its level.
+printf '## Phase\n\n### M3a: Small\n\n**Acceptance:**\n\n- A cap parks the run.\n\n### M3b: Next\n\n**Acceptance:**\n\n- Other.\n' >"${WORK}/nested.md"
+printf '## A cap parks the run.\nbudgets a_cap_parks\n' >"${WORK}/nested.txt"
+out="$(python3 "${CHECK}" m3a --milestones "${WORK}/nested.md" --list "${WORK}/nested.txt" --check 2>&1)" ||
+    fail "a ### milestone was not read: ${out}"
+
+# A list that cannot be checked still says so in the job summary.
+GITHUB_STEP_SUMMARY="${WORK}/bad-summary.md" list_check twice.txt "listed twice"
+grep -qF "the list cannot be checked" "${WORK}/bad-summary.md" 2>/dev/null ||
+    fail "a list that cannot be checked wrote no job summary"
+
 # The repository's own lists state their milestones' clauses.
 for list in "${ROOT}"/scripts/acceptance/*.txt; do
     milestone="$(basename "${list}" .txt)"
     out="$(python3 "${CHECK}" "${milestone}" --check 2>&1)" || fail "${list}: ${out}"
 done
 
-# The features it runs with are CI's test step's, so nothing rebuilds.
+# The features it runs with are those CI builds the tests with, so nothing
+# rebuilds.
 ci="$(grep -o 'cargo test --workspace --locked --no-fail-fast --features [^ ]*' "${ROOT}/.github/workflows/ci.yml" | head -1 | awk '{print $NF}')"
 ours="$(python3 -c "import sys; sys.path.insert(0, '${ROOT}/scripts'); import acceptance; print(acceptance.FEATURES)")"
-[ -n "${ci}" ] && [ "${ci}" = "${ours}" ] || fail "acceptance.py's features (${ours}) are not CI's test step's (${ci})"
+[ -n "${ci}" ] && [ "${ci}" = "${ours}" ] || fail "acceptance.py's features (${ours}) are not CI's test build's (${ci})"
 
 # A job summary goes where GITHUB_STEP_SUMMARY says, and holds the report.
 GITHUB_STEP_SUMMARY="${WORK}/summary.md" check 0 "passed" --log "${WORK}/ok.log"
@@ -175,6 +246,10 @@ if [ "$(cat "${WORK}/args" 2>/dev/null)" != "${want}" ]; then
     fail "cargo was run as '$(cat "${WORK}/args" 2>/dev/null)', not '${want}'"
 fi
 PATH="${WORK}/bin:${PATH}" FAKE_CARGO_EXIT=101 check 1 "cargo test failed, exiting 101"
+# In a run, cargo's exit says whether it failed: a line a test printed that
+# reads like cargo's error does not fail a run that passed.
+echo "error: a test's own output" >>"${WORK}/ok.log"
+PATH="${WORK}/bin:${PATH}" check 0 "M0 acceptance: passed"
 
 if [ "${failures}" -ne 0 ]; then
     echo "${failures} acceptance.py test(s) failed" >&2

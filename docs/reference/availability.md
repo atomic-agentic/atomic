@@ -58,8 +58,10 @@ from a snapshot of that commit in the state directory, never from your
 checkout. One process at a time executes a project's runs. Errors carry a
 description and an action, separately in `--json` output. `atomic gates enroll`,
 `list`, `approve` and `reject` decide gates from a second terminal; a gate
-decision counts only with the credential its person enrolled. The terminal
-prompt for gates in `atomic run` is not wired up yet.
+decision counts only with the credential its person enrolled. `atomic run` and
+`atomic runs resume` prompt at the terminal for each gate their run reaches, and
+question gates (`ask` with a typed `answer`, `remember`, and a default when time
+runs out) are built; `atomic gates answer` answers one from another terminal.
 
 A project's artifact store takes a lock in its private state while it is
 written or swept. A run that finds it held by another process, such as a sweep,
@@ -103,9 +105,14 @@ temporary directory. Another turn of the project can still read it, by its path
 under the project's scratch directory: do not rely on it for secrets. (Codex's
 sandbox keeps its registry of the mount points it makes in a directory every
 turn of the project shares, which no turn's command may write.) Tools found
-through `HOME` are therefore not found: rustup, cargo, pyenv, nvm, Maven's `~/.m2` and the like.
-A codex or exec atom names them in its `env`, as in
-`env: { RUSTUP_HOME: '/home/me/.rustup', CARGO_HOME: '/home/me/.cargo' }`. An
+through `HOME` are therefore not found: cargo's registry and tools, pyenv, nvm,
+Maven's `~/.m2` and the like. Every Codex turn's `CARGO_HOME` is `.cargo` in the
+attempt's own home. A worktree step's turn is also pointed at its run's own
+build caches, removed when the run ends, finished or failed, with a Cargo target
+directory for each worktree, and at your rustup toolchains, read-only (see
+[worktree steps](workflow-files.md#atom-steps)). Otherwise a codex or exec
+atom names what it needs in its `env`, as in `env: { RUSTUP_HOME:
+'/home/me/.rustup' }`. An
 exec atom's command gets its own scratch directory as `HOME` and `TMPDIR`.
 Scratch directories live in the project's state directory, where no sandboxed
 turn may write; atomic refuses to run when that would be under `/tmp`,

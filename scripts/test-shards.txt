@@ -1,0 +1,69 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Which CI job runs which of the workspace's test targets. scripts/test-shards.py
+# reads this; each `[name]` starts a shard, and each line under it is one unit:
+#
+#   lib            every library's unit tests (cargo test --lib)
+#   bins           every binary's unit tests (cargo test --bins)
+#   doc            every library's doctests (cargo test --doc)
+#   examples       every example builds (cargo build --examples), as a plain
+#                  cargo test checks
+#   test <name>    one integration test, tests/<name>.rs (cargo test --test <name>)
+#
+# Every unit belongs to exactly one shard, and a test target in no shard fails
+# CI: give a new tests/*.rs a line here. The shards are balanced by how long
+# their tests take on a CI runner (about seven minutes each); the crash suite
+# has a job of its own.
+
+[1]
+test run_cli
+test telemetry
+
+[2]
+test pipeline
+test eval_cli
+test kill_spike
+test telemetry_sandbox
+
+[3]
+lib
+bins
+doc
+examples
+test astro_cli
+test budgets
+test change_request
+test change_request_example
+test change_review_helpers
+test coding_tasks
+test command_environment
+test entry_point
+test examples
+test exec_private_state
+test failpoints
+test fixture_cli
+test gate_prompt
+test gates_cli
+test helper_dispatch
+test large_results
+test log_lines
+test retention
+test sandboxed_commit
+test self_approval
+test shell_env
+test turn_workspace
+test worktree_step
+test golden
+test git_safety
+test cancelled_open
+test stopping_open
+test worktrees
+test dbos_schema
+test executor_identity
+test gates
+test nested_steps
+test step_positions
+test test_database
+
+[crash]
+test crash

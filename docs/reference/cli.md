@@ -36,7 +36,9 @@ for gate deadlines, budgets and recovery limits.
 workflow, status, input and output; each attempt, which is each time the run
 executed, from its start or from its checkpoints; each recorded step with the
 attempt that ran it, so after a kill and a resume it shows which steps the
-resume found checkpointed and which it ran again; its model calls and tokens;
+resume found checkpointed and which it ran again; its model calls and tokens,
+counting what a Codex turn still running, or stopped before it settled, last
+recorded having reported;
 its gates; and the Codex threads that hold its transcripts. `--json` gives the
 same as one document, with each step's output. It reads the store alone, and
 runs nothing: it needs no model, does not take the project's execution lock,
@@ -147,6 +149,8 @@ takes the same pair when it is built.
 | `atomic gates list` | Inspect durable gates | v0.1 local |
 | `atomic gates approve <gate-id>` | Approve a recorded proposal as the local operator | v0.1 local |
 | `atomic gates reject <gate-id>` | Reject a recorded proposal as the local operator | v0.1 local |
+| `atomic gates answer <gate-id> <answer>` | Answer a question gate as the local operator | v0.1 local |
+| The prompt in `atomic run` and `atomic runs resume` | Decide or answer each gate the run reaches, at the terminal | v0.1 local |
 | `atomic workflows show <name>` | Inspect a workflow definition and its steps | v0.5 |
 | `atomic graph` | Inspect work items, status and blocking dependencies | v0.5 |
 | Live thread controls | Answer, steer, stop and take over work | v0.5 CLI |
@@ -271,9 +275,14 @@ ignores the stop signals a command in its group might send it.
 
 One process recovers a run at most five times at the same step before it fails
 it as dead-lettered (a run that gets further counts afresh), so a step whose process keeps dying stops soon; restarting
-`atomic serve` does not count against a run. A run the engine parks after many
-restarts (`MAX_RECOVERY_ATTEMPTS_EXCEEDED`) is named by `atomic serve` and goes
-on with `atomic runs resume`.
+`atomic serve` does not count against a run. The engine parks a run
+(`MAX_RECOVERY_ATTEMPTS_EXCEEDED`) when it stops without finishing more times than
+the engine allows, and at once when atomic's own workflow code panics: a panic is
+a bug in atomic, and would likely happen again. `atomic run`, `atomic runs resume`
+and `atomic serve` (when it happens while serving, and when it starts) name the
+cause, with the panic's message redacted; the message is kept in the project's
+private state. A parked run goes on with `atomic runs resume`, once the cause is
+fixed.
 
 A resumed run goes on a queue of the resuming executor's own: only
 `atomic runs resume` and `atomic serve` of that executor run it, and

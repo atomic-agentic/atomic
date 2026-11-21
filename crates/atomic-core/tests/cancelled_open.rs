@@ -77,6 +77,7 @@ fn a_workspace_that_opens_after_its_run_was_cancelled_is_closed() {
             defaults: AtomConfig::default(),
             artifacts: Artifacts::none(),
             meter: Metering::none(),
+            caches: None,
             backend,
         };
         let turn = tokio::spawn(async move { run_turn(&runtime, &TurnSpec::default()).await });

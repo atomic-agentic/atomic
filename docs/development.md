@@ -193,19 +193,23 @@ fails until it is updated.
 
 A milestone's acceptance clauses, from [the milestones](design/milestones.md),
 are listed in `scripts/acceptance/<milestone>.txt`, each with the tests that show
-it, and `scripts/acceptance.py` runs them as one check. CI runs it after the
-test step, with the same features, so nothing rebuilds:
+it, and `scripts/acceptance.py` runs them as one check. CI runs it in the
+"Acceptance and backends" job, after building the tests with the same
+features, so nothing rebuilds:
 
 ```bash
 ATOMIC_DEV_SANDBOX=on scripts/dev.sh scripts/acceptance.py m12
 ```
 
-Each clause is written as the milestones state it, and the check fails when
-the list's clauses and the milestone's differ, when a listed test fails, is
-ignored or does not run (renamed, removed, or built out by a feature), when a
-clause lists no test, or when cargo fails. A clause its tests do not yet show in
-full is marked `pending:` with the reason, and the verdict names it. The
-Postgres and sandbox tests it lists need their backends, as in the test step,
+Each clause is written as the milestones state it, and a clause of several
+parts, separated by semicolons, can list each part on a `### ` line with tests
+of its own. The check fails when the list's clauses and the milestone's differ,
+when anything in the milestone's Acceptance block cannot be read as a clause,
+when a listed test fails, is ignored or does not run (renamed, removed, or
+built out by a feature), when a clause or part lists no test, or when cargo
+fails. A clause its tests do not yet show in full is marked `pending:` with the
+reason, and the verdict names it. The
+Postgres and sandbox tests it lists need their backends, as in the test jobs,
 hence `ATOMIC_DEV_SANDBOX=on`. `scripts/acceptance-test.sh` (in CI) tests the
 check itself.
 
@@ -214,10 +218,12 @@ check itself.
 atomic's crash tests kill the process at named failpoints. A failpoint is
 compiled in only with the `failpoints` features of `atomic-agentic-durable` and
 `atomic-agentic-core`, which the `atomic-agentic` package's tests turn on; a
-release build has none. Two variables drive them:
+release build has none. Three variables drive them:
 
 - `ATOMIC_FAILPOINT=<name>` kills the process (SIGKILL, so no core is dumped)
   at the first failpoint of that name;
+- `ATOMIC_FAILPOINT_PANIC=<name>` makes the code that reaches the first
+  failpoint of that name panic, as a bug in atomic would;
 - `ATOMIC_FAILPOINT_LOG=<file>` appends the name of every failpoint the process
   reaches to `<file>`.
 
@@ -247,7 +253,69 @@ ATOMIC_DEV_SANDBOX=on ATOMIC_TEST_CRASH_ONLY=pipeline:after-commit scripts/dev.s
   cargo test -p atomic-agentic --locked --features sandbox-tests --test crash
 ```
 
-CI runs it on Linux, in a step of its own.
+CI runs it on Linux, in a job of its own ("Crash suite").
+
+## Continuous integration
+
+CI (`.github/workflows/ci.yml`) runs on every push to main and every pull
+request, on Linux. The checks that need no Rust build run in small jobs of
+their own. The Rust checks run in parallel jobs, so a pull request waits for
+the slowest one rather than for all of them in turn:
+
+| Job | What it runs |
+| --- | --- |
+| Clippy | `cargo fmt --check`, and clippy with and without the test features |
+| Test (1/3), Test (2/3), Test (3/3) | The workspace's tests, with Postgres and the sandbox, one shard each |
+| Crash suite | `crates/atomic/tests/crash.rs`, the shard `crash` |
+| Acceptance and backends | Builds every test, checks that the shards run each test exactly once, runs the M12 acceptance check, and runs the Postgres and sandbox suites without their backends |
+| Build, lockfile and SBOM | `cargo build`, `scripts/lock-resolves.sh`, `scripts/lock-check.sh v8-built` and `scripts/sbom.sh` |
+| Rust (ubuntu-24.04) | Passes only when every job above passes |
+
+A manual run with the `macos` input adds "Rust (macos-15)", which builds and
+tests on macOS in one job. CodeQL runs in a workflow of its own, on pull
+requests too, and nothing in CI waits for it.
+
+### Test shards
+
+`scripts/test-shards.txt` assigns each test target to a shard: each
+integration test (`tests/<name>.rs`) by name, and the libraries' unit tests,
+the binaries', the doctests and the examples' build as one unit each. The
+shards are balanced by how long their tests take on a CI runner. Every shard
+runs over the whole workspace with the test features, so all of them build the
+same dependencies:
+
+```bash
+ATOMIC_DEV_SANDBOX=on scripts/dev.sh scripts/test-shards.py run 2
+```
+
+`scripts/test-shards.py run` first checks the table against `cargo metadata`,
+so a test file in no shard, or in two, fails every shard until the table
+places it. `scripts/test-shards.py check`, in the "Acceptance and backends"
+job, lists the tests (`cargo test -- --list`) of one unsplit
+`cargo test --workspace` and of each shard, and fails unless each test is in
+exactly one shard. `scripts/test-shards-test.sh` (in CI) tests both checks,
+and that the workflow runs every shard of the table: a shard added to the
+table needs a matrix entry in the test job as well.
+
+### Build caches
+
+The Rust jobs restore two caches, through `.github/actions/rust-setup`:
+cargo's downloads (the registry and the git sources, rusty_v8's Chromium
+submodules among them), keyed on the toolchain and `Cargo.lock`, and
+`target/`, keyed on those and the manifests, one for the test features'
+build and one for clippy's. A checkout gives every source file a new time, so
+the workspace's own crates rebuild in every job; the cached `target/` holds
+only the dependencies, trimmed by `scripts/cache-trim.py`, which keeps it near
+1.5 GB compressed beside about 3 GB of downloads, inside the repository's
+10 GB of cache. The trim deletes everything else in `target/`, so it runs only
+in CI, or with `--force`.
+
+Only pushes to main save the caches: Clippy saves the downloads and clippy's
+build once both clippy passes have passed, and "Acceptance and backends" saves
+the test build. `scripts/test-shards-test.sh` fails if any other step saves a
+cache. Pull requests restore main's, so they never push main's caches out. A
+miss falls back to the newest cache of the same kind, or builds everything,
+which takes a few minutes longer.
 
 ## Coding tasks
 

@@ -96,6 +96,7 @@ async fn opens_as_it_stops() -> (Option<Result<String, AtomError>>, usize) {
         defaults: AtomConfig::default(),
         artifacts: Artifacts::none(),
         meter: Metering::none(),
+        caches: None,
         backend,
     };
     let turn = tokio::spawn(async move { run_turn(&runtime, &TurnSpec::default()).await });
