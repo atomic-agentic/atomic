@@ -265,12 +265,14 @@ async fn run_once(
         .remove(0)
 }
 
-/// The value of `name=` that a command printed on a line of its own.
+/// The value of `name=` that a command printed on a line of its own. A
+/// command that printed no such line fails the test, saying so, rather than
+/// reading as an empty value.
 fn printed_value(output: &str, name: &str) -> String {
     output
         .lines()
         .find_map(|l| l.strip_prefix(&format!("{name}=")))
-        .unwrap_or_default()
+        .unwrap_or_else(|| panic!("no line {name}=… in: {output}"))
         .to_owned()
 }
 
@@ -305,17 +307,21 @@ fn a_turn_writes_a_home_of_its_own_and_still_reads_nothing_of_the_persons() {
         let project = dir.join("project");
         write_project(&project);
         let base = git(&project);
+        // What the command says on stderr arrives beside its stdout in no
+        // set order, and can land inside a line this test reads, so every
+        // part that may fail sends its stderr nowhere: what is asserted is
+        // on stdout.
         let command = format!(
-            "ls -A \"$HOME\"; echo listed; find \"$HOME\" -type l; echo linked; \
+            "ls -A \"$HOME\"; echo listed; find \"$HOME\" -type l 2>/dev/null; echo linked; \
              for d in {PROTECTED}; do ls -A \"$HOME/$d\" 2>/dev/null; done; echo protected; \
-             mkdir -p \"$HOME/.cache\" && echo cached > \"$HOME/.cache/x\" && cat \"$HOME/.cache/x\"; \
-             cat {0}/.ssh/id_ed25519 {0}/.profile; echo \"home=$HOME\"; \
+             (mkdir -p \"$HOME/.cache\" && echo cached > \"$HOME/.cache/x\" && cat \"$HOME/.cache/x\") 2>/dev/null; \
+             cat {0}/.ssh/id_ed25519 {0}/.profile 2>/dev/null; echo \"home=$HOME\"; \
              echo \"cargo=$CARGO_HOME\"; echo \"rustup=$RUSTUP_HOME\"; echo \"gomod=$GOMODCACHE\"; \
              echo \"target=$CARGO_TARGET_DIR\"; \
-             mkdir -p \"$XDG_CACHE_HOME\" && touch \"$XDG_CACHE_HOME/w\" && echo cache-written; \
+             (mkdir -p \"$XDG_CACHE_HOME\" && touch \"$XDG_CACHE_HOME/w\" && echo cache-written) 2>/dev/null; \
              touch \"$RUSTUP_HOME/w\" 2>/dev/null && echo rustup-written; \
-             mkdir -p \"$GOMODCACHE/m@v1\" && touch \"$GOMODCACHE/m@v1/go.mod\" && \
-             chmod 0500 \"$GOMODCACHE/m@v1\" \"$GOMODCACHE\"; \
+             (mkdir -p \"$GOMODCACHE/m@v1\" && touch \"$GOMODCACHE/m@v1/go.mod\" && \
+             chmod 0500 \"$GOMODCACHE/m@v1\" \"$GOMODCACHE\") 2>/dev/null; \
              echo looked",
             home.display(),
             PROTECTED = PROTECTED.join(" ")
