@@ -1335,6 +1335,34 @@ impl Durare {
         self.run_record(id).await
     }
 
+    /// Whether `id` is taken in the store by another project than this
+    /// runtime's: by a run of theirs, or by the record of one they began.
+    pub async fn run_id_taken_elsewhere(&self, id: &str) -> Result<bool> {
+        let (run, project) = (
+            id.to_owned(),
+            self.project.as_deref().unwrap_or_default().to_owned(),
+        );
+        let recorded: Option<String> = self
+            .reads
+            .read(move |mut tx| {
+                let run = run.clone();
+                Box::pin(async move {
+                    tx.query_opt(
+                        "SELECT project FROM atomic_run_projects WHERE run_id = ?",
+                        &[Param::Text(run)],
+                    )
+                    .await?
+                    .map(|row| row.text("project"))
+                    .transpose()
+                })
+            })
+            .await?;
+        Ok(match recorded {
+            Some(owner) => owner != project,
+            None => self.run_record(id).await?.is_some() && !project.is_empty(),
+        })
+    }
+
     /// Run `id`'s status, owner and version, or `None` if there is no such
     /// run, whichever project's it is: what a new run's id must not reuse.
     pub async fn run_record(&self, id: &str) -> Result<Option<RunRecord>> {
@@ -1665,10 +1693,27 @@ impl DurableRuntime for Durare {
                         tx.execute(
                             "INSERT INTO atomic_run_projects (run_id, project) VALUES (?, ?) \
                              ON CONFLICT (run_id) DO NOTHING",
-                            &[Param::Text(run), Param::Text(project)],
+                            &[Param::Text(run.clone()), Param::Text(project.clone())],
                         )
-                        .await
-                        .map(|_| ())
+                        .await?;
+                        // Whoever recorded it first: a row another project
+                        // left, even with no run behind it, keeps the id
+                        // theirs.
+                        let recorded = tx
+                            .query_one(
+                                "SELECT project FROM atomic_run_projects WHERE run_id = ?",
+                                &[Param::Text(run.clone())],
+                            )
+                            .await?
+                            .text("project")?;
+                        if recorded == project {
+                            Ok(())
+                        } else {
+                            Err(DurableError::Failed(format!(
+                                "the run id {run} is taken in this store by another project; \
+                                 give another id"
+                            )))
+                        }
                     })
                 })
                 .await?;

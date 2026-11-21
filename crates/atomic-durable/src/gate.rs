@@ -934,18 +934,16 @@ pub async fn decide<R: DurableRuntime>(
                         return Ok((Err(DecideError::BadCredential(by)), None));
                     }
                 }
-                if let Some(found) = journaled(&mut tx, &cmd.command_id, &request).await? {
-                    // A replay: wake the run again, in case the first time
-                    // stopped before it did.
-                    let run = read_own_gate(&mut tx, &cmd.gate, &project)
-                        .await?
-                        .map(|g| g.run);
-                    return Ok((found, run));
-                }
-                // Another project's gate is, to this one, no gate at all.
+                // Another project's gate is, to this one, no gate at all:
+                // checked before anything is read back of a decision on it.
                 let Some(gate) = read_own_gate(&mut tx, &cmd.gate, &project).await? else {
                     return Ok((Err(DecideError::NoSuchGate(cmd.gate.clone())), None));
                 };
+                if let Some(found) = journaled(&mut tx, &cmd.command_id, &request).await? {
+                    // A replay: wake the run again, in case the first time
+                    // stopped before it did.
+                    return Ok((found, Some(gate.run)));
+                }
                 if !gate.approvers.contains(&by) {
                     return Ok((
                         Err(DecideError::NotAnApprover {

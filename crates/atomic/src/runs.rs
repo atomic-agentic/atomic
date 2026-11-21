@@ -371,6 +371,17 @@ pub async fn run(
     // The engine treats a run id as an idempotency key: starting one that
     // exists would wait for that run, whatever it runs, instead of this one.
     // Checked under the lock, so no other local process starts it meanwhile.
+    // Taken by another project on a shared store: said with nothing of
+    // their run, which this project can neither read nor resume.
+    if engine.rt.run_id_taken_elsewhere(&run_id).await? {
+        let _ = engine.rt.shutdown(SHUTDOWN).await;
+        return Err(Failure::new(
+            "run.exists",
+            format!("the run id {run_id} is taken in this store by another project"),
+            "give a new id, or leave out --run-id for one",
+        )
+        .into());
+    }
     if let Some(existing) = engine.rt.run_record(&run_id).await? {
         let _ = engine.rt.shutdown(SHUTDOWN).await;
         let state = match existing.status {
@@ -746,8 +757,13 @@ pub async fn serve(
     engine.launch().await?;
     // The engine parks a run whose workflow code panicked, and one it has
     // recovered too often, instead of recovering it once more: name each,
-    // with its cause.
-    let now = parked(engine.rt.runs_in(PARKED).await?);
+    // with its cause. Only this project's: another's run is not named.
+    let mut now = Vec::new();
+    for id in parked(engine.rt.runs_in(PARKED).await?) {
+        if engine.rt.own_run_record(&id).await?.is_some() {
+            now.push(id);
+        }
+    }
     for id in &now {
         match atomic_app::panics::of(id) {
             // Whenever it panicked, in this process's recovery or an
