@@ -428,11 +428,45 @@ any execute bit that starts as a binary or a `#!` script does) or to a
 directory someone else owns, so a virtual environment's `python` linked to
 a toolchain's keeps working; what it leads to stays readable. A key linked
 to one a secrets manager keeps under `/run` is denied. A pipe or socket in a
-credential place is denied like a file. A turn does not start when a denial
-would cover its working directory or a directory it may write, or when a
-denied place, or a linked secret, lies two or more levels inside a directory
-it may write, where a command could move the directory above it away from
-its denial. The model chooses the
+credential place is denied like a file. Each is denied too wherever else
+the same directory is mounted, as it is with your home bound at a second
+path, inside toolbox or distrobox (the host's files under `/run/host`), or
+with a btrfs top-level subvolume mounted elsewhere, and so is each
+filesystem mounted inside a denied directory wherever else it is mounted.
+atomic reads the mount table for this when it makes the list, and nothing
+runs when it cannot read it, or when the table has no root mount (as under
+a chroot whose root is not a mount point) or lists a mount on one it does
+not list; when a denied place is on NFS or SMB and that filesystem is
+mounted more than once, since the table cannot be trusted to say which
+directory each such mount shows (NFS gives every mount `/`); when it is on
+any filesystem but a local one (ext2/3/4, XFS, btrfs, F2FS, tmpfs, ramfs,
+overlay) mounted more than once whose root the kernel shows as lost, as
+when a FUSE server is away or another Ceph client renamed the directory;
+or when, on such a filesystem, the place is there and its second place is
+missing or another file or directory. Otherwise FUSE (`fuse.*`), 9p,
+virtiofs and other mounts are followed as local ones are. The
+links followed and the second mounts found together come to at most 512;
+past that, nothing runs. Not covered: the same remote directory, or one
+inside another, mounted twice as two filesystems, each with a device of its
+own, such as with 9p, NFS with `nosharecache` or with mount options that
+differ (each gets a superblock of its own), Ceph (one per server path), two
+SMB sessions or two FUSE daemons, neither of which is denied for the other;
+a stale root, off a local filesystem, for a place that is not there yet,
+and one, on any filesystem, that makes a second mount look unrelated to a
+denied place, such as a bound overlay directory whose lower directory was
+renamed beneath it;
+a snapshot, which holds a copy, not the place itself; an overlay or FUSE
+filesystem built over a denied directory, such as an overlay whose upper or
+lower directory is inside one, which shows its files as its own; and a
+mount made after the list, or a root that goes stale after it, such as a
+mount an automount makes when a path is
+first used, even from inside the sandbox, which sees the host's new mounts
+until the next turn. A turn does
+not start when a denial would cover its working directory or a directory it
+may write, or when a denied place, a linked secret or a second mount of a
+denied place lies two or more levels inside a directory it may write, where
+a command could move the directory above it away from its denial. The model
+chooses the
 commands, so none of these reach it through them. atomic makes the list
 when the turn starts: a place on it that appears while a command runs is
 denied only to later commands, and a link made after the list is not
