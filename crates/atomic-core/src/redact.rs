@@ -1379,12 +1379,7 @@ fn redact_held(strength: Strength, value: &mut Value, nested: usize) {
         Value::String(string) if is_secret_value(strength, string) => {
             *string = REDACTED.into();
         }
-        Value::String(string) => {
-            if strength == Strength::Weak {
-                open_held_json(string, nested);
-            }
-            redact_string(string, nested);
-        }
+        Value::String(string) => redact_held_string(strength, string, nested, true),
         Value::Number(_) if strength == Strength::Strong => *value = Value::String(REDACTED.into()),
         Value::Array(items) => {
             redact_flag_values(items);
@@ -1416,54 +1411,101 @@ fn redact_held(strength: Strength, value: &mut Value, nested: usize) {
                     strength
                 };
                 redact_held(held, field, nested);
+                hide_header_secret(name, field);
             }
         }
         Value::Number(_) | Value::Null | Value::Bool(_) => {}
     }
 }
 
+/// Hide `field`, under `name`, if it is a header's secret as redacted: what
+/// redaction made of it, rewritten JSON say, can read as one where it did
+/// not before, and a second pass would hide it.
+fn hide_header_secret(name: &str, field: &mut Value) {
+    if !as_main()
+        && let Some(header) = header_named(name)
+        && field.as_str().is_some_and(|v| is_header_secret(header, v))
+    {
+        *field = Value::String(REDACTED.into());
+    }
+}
+
+/// A string held under a name of this strength, which does not read as its
+/// secret whole: redacted as any string is, and JSON in it, under a hint,
+/// opened and redacted as held (see [`open_held_json`]). One that is
+/// rewritten is read again as a second pass would read it (`settle`), and
+/// hidden whole if that would change it, so redacting again changes
+/// nothing.
+fn redact_held_string(strength: Strength, string: &mut String, nested: usize, settle: bool) {
+    if is_secret_value(strength, string) {
+        *string = REDACTED.into();
+        return;
+    }
+    let rewritten = strength == Strength::Weak && open_held_json(string, nested);
+    redact_string(string, nested);
+    if rewritten && settle {
+        let mut again = string.clone();
+        redact_held_string(strength, &mut again, nested, false);
+        if again != *string {
+            *string = REDACTED.into();
+        }
+    }
+}
+
 /// JSON held in a string under a hint, such as `{"key": "{\"note\": …}"}`:
-/// opened and redacted as held, before text redaction reads it, so a value
-/// that looks like a credential inside is hidden as it would be in a real
-/// object under that name. It is written back only when that hid
-/// something, pretty if it came so, so a string with nothing to hide stays
-/// as it was; one that would grow past [`MAX_TEXT`], or read whole as a
-/// credential, is hidden whole, as a second pass would hide it. Text
-/// redaction still runs over what it becomes.
-fn open_held_json(string: &mut String, nested: usize) {
+/// redacted as text, then opened and redacted as any JSON in a string is
+/// and then as held, so a value that looks like a credential inside is
+/// hidden as it would be in a real object under that name. It is written
+/// back only when the opened JSON hid something, pretty if it came so, so a
+/// string with nothing more to hide is left to be redacted as any string
+/// is; one that text redaction grows past [`MAX_TEXT`] is hidden whole.
+/// Whether it was rewritten.
+fn open_held_json(string: &mut String, nested: usize) -> bool {
     if as_main()
         || nested >= MAX_NESTED_JSON
         || string.len() > MAX_TEXT
         || !string.trim_start().starts_with(['{', '['])
     {
-        return;
+        return false;
     }
-    let Ok(mut inner) = serde_json::from_str::<Value>(string) else {
-        return;
+    // Redacted as text first, as it is unopened: what that finds in the
+    // string as written, an escaped `\/` before a token say, stays hidden
+    // once the JSON is written back without the escape. Text that no
+    // longer reads as JSON is left to be redacted as any string is.
+    let texted = text(string);
+    let Ok(mut inner) = serde_json::from_str::<Value>(&texted) else {
+        return false;
     };
-    let before = inner.clone();
-    // As held, and then as any JSON in a string is, so it is never read
-    // less closely than it would be unopened.
-    redact_held(Strength::Weak, &mut inner, nested + 1);
-    redact_nested(&mut inner, nested + 1);
-    if inner == before {
-        return;
+    // Grown past the bound, a second pass would cut it: hidden whole now.
+    if texted.len() > MAX_TEXT {
+        *string = REDACTED.to_owned();
+        return true;
     }
-    // Written as it came, pretty or compact; what would read as a
-    // credential whole on a second pass, as compact JSON can, or grow past
-    // the bound, is hidden whole now.
-    let opened = if string.contains('\n') {
+    let before = inner.clone();
+    // As any JSON in a string is, which reads names and pairs as they are
+    // written, and then as held, so it is never read less closely than it
+    // would be unopened.
+    let passes: [fn(&mut Value, usize); 2] = [redact_nested, held_as_hinted];
+    for pass in passes {
+        pass(&mut inner, nested + 1);
+    }
+    if inner == before {
+        return false;
+    }
+    // Written as it came, pretty or compact. What would read as a
+    // credential whole, as compact JSON can, or grow past the bound, a
+    // second pass would hide: [`redact_held_string`] hides it now.
+    *string = if string.contains('\n') {
         serde_json::to_string_pretty(&inner).unwrap_or_default()
     } else {
         inner.to_string()
     };
-    let too_long = opened.len() > MAX_TEXT;
-    let whole = is_secret_value(Strength::Weak, &opened);
-    *string = if !too_long && !whole {
-        opened
-    } else {
-        REDACTED.to_owned()
-    };
+    true
+}
+
+/// [`redact_held`] under a hint, as [`open_held_json`] passes it.
+fn held_as_hinted(value: &mut Value, nested: usize) {
+    redact_held(Strength::Weak, value, nested);
 }
 
 #[cfg(test)]
@@ -1496,6 +1538,8 @@ fn header_named(name: &str) -> Option<&str> {
     [name, last]
         .into_iter()
         .find(|n| HEADERS.iter().any(|h| n.eq_ignore_ascii_case(h)))
+}
+
 /// A key [`rename_keys`] renamed: what it was, and its new name before any
 /// number.
 struct Renamed {
@@ -1702,7 +1746,14 @@ fn pair_holds_secret(name: &str, secret: &Value, explicit: bool) -> bool {
         return false;
     };
     if let Some(header) = header_named(name) {
-        return is_header_secret(header, secret);
+        if is_header_secret(header, secret) {
+            return true;
+        }
+        // A header by its own name is judged as a header alone; one only
+        // by its last dotted segment is read by its name too.
+        if header.len() == name.len() {
+            return false;
+        }
     }
     match strength(name) {
         Strength::Strong if explicit => is_secret_value(Strength::Strong, secret),
@@ -1783,6 +1834,7 @@ fn redact_nested(value: &mut Value, nested: usize) {
                     Strength::None => redact_nested(field, nested),
                     held => redact_held(held, field, nested),
                 }
+                hide_header_secret(name, field);
             }
         }
         Value::Null | Value::Bool(_) | Value::Number(_) => {}

@@ -1919,7 +1919,7 @@ fn opening_held_json_never_shows_what_redaction_hid_before() {
         "x-api-key",
         "args",
     ];
-    let (mut shown_more, mut hidden_more) = (0, 0);
+    let (mut shown_more, mut hidden_more, mut unstable) = (0, 0, 0);
     for _ in 0..3000 {
         let mut planted: Vec<String> = Vec::new();
         let doc = generate(&mut next, &mut planted, 0);
@@ -1930,6 +1930,17 @@ fn opening_held_json_never_shows_what_redaction_hid_before() {
         AS_MAIN.with(|m| m.set(true));
         value(&mut before);
         AS_MAIN.with(|m| m.set(false));
+        // As stable as before: where a second pass changed nothing before,
+        // it changes nothing now.
+        let mut now_again = now.clone();
+        value(&mut now_again);
+        let mut before_again = before.clone();
+        AS_MAIN.with(|m| m.set(true));
+        value(&mut before_again);
+        AS_MAIN.with(|m| m.set(false));
+        if before_again == before && now_again != now {
+            unstable += 1;
+        }
         let (now, before) = (now.to_string(), before.to_string());
         shown_more += planted
             .iter()
@@ -1941,6 +1952,10 @@ fn opening_held_json_never_shows_what_redaction_hid_before() {
             .count();
     }
     assert_eq!(shown_more, 0, "a secret hidden before is shown now");
+    assert_eq!(
+        unstable, 0,
+        "a second pass changes what it did not change before"
+    );
     // The comparison compares something: some are hidden only now.
     assert!(hidden_more > 0, "nothing is hidden that was shown before");
 
@@ -1963,6 +1978,14 @@ fn opening_held_json_never_shows_what_redaction_hid_before() {
             1 => json!(format!("session={}", secret(next, planted))),
             2 => json!(format!("Bearer {}", secret(next, planted))),
             3 => json!(format!("password={}", secret(next, planted))),
+            4 if next(2) == 0 => {
+                json!([{"name": "DB_PASSWORD", "value": format!("{} x", secret(next, planted))}])
+            }
+            4 if next(2) == 0 => json!([
+                "run",
+                "--DB_PASSWORD",
+                format!("{} x", secret(next, planted))
+            ]),
             4 => json!("ship it"),
             5 | 6 => {
                 let mut fields = serde_json::Map::new();
@@ -1986,5 +2009,78 @@ fn opening_held_json_never_shows_what_redaction_hid_before() {
                 }
             }
         }
+    }
+}
+
+/// What redacts in JSON held in a string as written, a secret's name and
+/// value pair or flag, or a token after an escaped `/`, still redacts once
+/// the string is opened, as it does unopened.
+#[test]
+fn held_json_hides_what_unopened_json_hides() {
+    let credential = concat!("Zx81", "kQ0pL2mN4bV6");
+    let pretty = |v: Value| serde_json::to_string_pretty(&v).expect("JSON");
+    for (case, doc) in [
+        json!({"credentials": pretty(json!([{"name": "DB_PASSWORD", "value": "correct horse"}]))}),
+        json!({"key": pretty(json!(["run", "--DB_PASSWORD", "correct horse"]))}),
+        json!({"credentials": {"env": [{"name": "DB_PASSWORD", "value": "correct horse"}]}}),
+        json!({"key": format!("{{\"a\": \"{credential}\", \"url\": \"see https:\\/\\/h\\/t\\/{SAMPLE} ok\"}}")}),
+        json!({"key": format!("{{\"a\": \"{credential}\", \"url\": \"see x\\u002b{SAMPLE} ok\"}}")}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut out = doc;
+        value(&mut out);
+        let shown = out.to_string();
+        assert!(!shown.contains("correct horse"), "case {case}: a secret showed");
+        assert!(!shown.contains(&SAMPLE[4..]), "case {case}: a token showed");
+        assert!(!shown.contains(&credential[4..]), "case {case}: a credential showed");
+    }
+}
+
+/// A header named by its last dotted segment in a name and value pair is
+/// read by its name too, as it was before dotted names were headers.
+#[test]
+fn a_dotted_header_in_a_pair_is_read_by_its_name_too() {
+    let credential = concat!("Zx81", "kQ0pL2mN4bV6");
+    for (case, doc) in [
+        json!([["http.cookie", credential]]),
+        json!({"name": "http.response.header.set-cookie", "value": "opaque session"}),
+        json!({"key": "http.request.header.proxy-authorization", "value": "hunter2"}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut out = doc;
+        value(&mut out);
+        let shown = out.to_string();
+        for secret in [&credential[4..], "opaque session", "hunter2"] {
+            assert!(!shown.contains(secret), "case {case}: a secret showed");
+        }
+    }
+}
+
+/// Held JSON that is rewritten settles in one pass, under a header's name
+/// and where text redaction reads the rewritten form.
+#[test]
+fn rewritten_held_json_settles_in_one_pass() {
+    let credential = concat!("Zx81", "kQ0pL2mN4bV6");
+    for (case, doc) in [
+        json!({"authorization": format!("{{\"id\": \"a b\", \"k\": \"{credential}\"}}")}),
+        json!({"key": format!("{{\"x/MAX_TOKEN\": \"a b\", \"k\": \"{credential}\"}}")}),
+        json!({"cookie": format!("{{\"note\": \"a b\", \"k\": \"{credential}\"}}")}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut once = doc;
+        value(&mut once);
+        assert!(
+            !once.to_string().contains(&credential[4..]),
+            "case {case}: a credential showed"
+        );
+        let mut twice = once.clone();
+        value(&mut twice);
+        assert_eq!(twice, once, "case {case}: a second pass changed it");
     }
 }
