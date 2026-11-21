@@ -2869,6 +2869,43 @@ fn a_cancelled_run_is_not_resumed_and_a_parked_one_is() {
     });
 }
 
+/// When Codex cannot make its links to atomic under its helpers' names, as
+/// when another atomic process sweeping the same Codex home takes their
+/// directory away, it runs atomic itself as its Linux sandbox helper: an
+/// exec atom's confined command still runs, rather than its run waiting for
+/// a sandbox that never starts.
+#[cfg(target_os = "linux")]
+// needs_sandbox
+#[cfg(feature = "sandbox-tests")]
+#[test]
+fn an_exec_atom_runs_when_codex_cannot_link_its_helpers() {
+    support::require_sandbox();
+    let dir = scratch("no-helper-links");
+    let project = project(&dir);
+    let state = state_dir(&dir, &project);
+    // Where Codex makes its links, made unusable: a file where their
+    // directory goes.
+    let links = state.join("codex/tmp/arg0-linux");
+    let _ = std::fs::remove_dir_all(&links);
+    std::fs::create_dir_all(links.parent().expect("parent")).expect("dir");
+    std::fs::write(&links, "not a directory").expect("file");
+    let out = atomic(
+        &dir,
+        &project,
+        &["run", "count-only", "--data", NOTE],
+        // A sandbox that never starts fails the run soon, not after minutes.
+        &[("ATOMIC_BACKEND_WAIT", "5")],
+        "",
+    );
+    let said = text(&out);
+    assert!(
+        said.contains("could not create PATH aliases"),
+        "Codex made its links after all: {said}"
+    );
+    assert!(out.status.success(), "{said}");
+    assert_eq!(count_log(&dir), 1, "the command ran once");
+}
+
 /// `atomic run` confines an exec atom's command: through the engine as it
 /// is wired, the command cannot read the project's database or the
 /// credential store, write a gate decision, or open a socket, and can still
