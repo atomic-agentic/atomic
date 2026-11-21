@@ -110,11 +110,14 @@ atomic's own environment or its credentials. A turn's commands run with no
 login shell; their `HOME` (and `ZDOTDIR`) is a private scratch directory of the
 attempt's own, and their `TMPDIR` a directory inside it, so no shell startup
 file runs and no other turn can see, add, change or remove what a turn keeps in
-its `HOME` or temporary directory: every scratch directory of the project is
-denied to a turn's commands, apart from a `workspace-write` turn's own. A
-`read-only` turn, which may not write its own, sees it empty. On Linux only
-Codex's sandbox helper, which the `atomic` binary provides, can deny them, so
-a process without it refuses the turn instead of running it. An exec atom's
+its `HOME` or temporary directory: every scratch directory of the project,
+those of `atomic run`, `atomic serve` and `atomic eval` and those of
+`atomic debug prompt`,
+is denied to a turn's commands, apart from a `workspace-write` turn's own. A
+`read-only` turn, which may not write its own, cannot reach it at all, not
+even to list it. Apart from macOS, whose own sandbox denies them, only
+Codex's Linux sandbox helper, which the `atomic` binary provides, can deny
+them, so a process without it refuses the turn instead of running it. An exec atom's
 command, which has a scratch directory of its own too, is not yet kept from
 the others' in the same way. (Codex's
 sandbox keeps its registry of the mount points it makes in a directory every

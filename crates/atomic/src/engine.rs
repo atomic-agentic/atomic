@@ -124,7 +124,7 @@ pub fn exec_backend(
     // every directory a sandboxed turn may write. Connected once: what the
     // backend states here is what runs plan on, and connecting reclaims
     // what attempts of dead processes left.
-    let local = atomic_exec::LocalBackend::in_dir(state.dir().join("scratch"));
+    let local = state.run_backend();
     // Exec atoms' commands run under the same sandbox helper as turns'
     // commands, denied atomic's private state. Elsewhere than Linux this is
     // not verified, and they run unconfined (see the availability notes).

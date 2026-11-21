@@ -114,8 +114,9 @@ pub struct Workspace {
     pub env: BTreeMap<String, String>,
     /// Directories of the backend's own that the workspace's commands may
     /// neither read nor write, `scratch` excepted: the scratch directories of
-    /// every other attempt, live or not, so no turn reads another's `HOME`
-    /// or `TMPDIR`.
+    /// every other attempt, live or not, its backend's and those of the
+    /// project's other backends it was told to deny, so no turn reads
+    /// another's `HOME` or `TMPDIR`.
     pub denied: Vec<PathBuf>,
 }
 
@@ -249,17 +250,34 @@ fn started(pid: u32) -> Option<u64> {
 pub(crate) fn open_local(
     scratch_root: &Path,
     tmp: &Path,
+    denying: &[PathBuf],
     request: &Open,
 ) -> Result<Workspace, ExecError> {
     let fail = |message: String| ExecError::Workspace {
         label: request.label.clone(),
         message,
     };
+    // Its own scratch root, then the others it is told to deny, each made
+    // now if missing: a directory that appeared later, while a command ran,
+    // would not be denied to it.
+    let mut denied = vec![scratch_root.to_owned()];
+    for dir in denying {
+        if !denied.contains(dir) {
+            private_dir(dir).map_err(|e| {
+                fail(format!(
+                    "create {}, which its commands are denied: {e}",
+                    dir.display()
+                ))
+            })?;
+            denied.push(dir.clone());
+        }
+    }
     let Some(source) = &request.source else {
         return Ok(Workspace {
             label: request.label.clone(),
             sandbox: request.sandbox,
             env: request.env.clone(),
+            denied,
             ..Workspace::default()
         });
     };
@@ -330,7 +348,7 @@ pub(crate) fn open_local(
         sandbox: request.sandbox,
         writable_roots: request.writable_roots.clone(),
         env: request.env.clone(),
-        denied: vec![scratch_root.to_owned()],
+        denied,
     })
 }
 
