@@ -35,6 +35,7 @@ pub mod runtime;
 pub mod signin;
 pub mod spans;
 pub mod state;
+pub mod terminal;
 #[cfg(any(test, feature = "fake-model"))]
 pub mod testing;
 pub mod typed;

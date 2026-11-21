@@ -3,7 +3,9 @@ interface SummarizeReportInput { key: string }
 
 
 
-const MAX_BYTES = 200_000;
+// The most report text this step will hold. Exported so that its tests name
+// the same number the code enforces.
+export const MAX_BYTES = 200_000;
 
 // A standalone workflow step fetches this report before the model call.
 // The workflow checkpoints its output; script code creates no nested steps.
@@ -22,11 +24,54 @@ export async function fetchReport(input: SummarizeReportInput) {
         Key: input.key,
       }),
     );
-    const bytes = await object.Body!.transformToByteArray();
-    if (bytes.length > MAX_BYTES) {
-      throw new Error(`${input.key} is larger than ${MAX_BYTES} bytes`);
+    // The body is taken up as one web stream whether it gets read or dropped:
+    // giving up on that stream is what ends the transfer. Under Deno the SDK's
+    // body is Node's IncomingMessage, and cancelling this web view of it is
+    // what makes the server stop sending.
+    const body = object.Body!.transformToWebStream();
+    // When S3 declares the length, an object that is already too big is
+    // refused before its body is read, and the transfer is given up on rather
+    // than left to arrive on its own. A refusal that only threw would leave
+    // the server sending: see test/fetch_report_test.ts.
+    const length = object.ContentLength;
+    if (length !== undefined && length > MAX_BYTES) {
+      try {
+        await body.cancel();
+      } finally {
+        throw new Error(`${input.key} is larger than ${MAX_BYTES} bytes`);
+      }
     }
-    const hash = await crypto.subtle.digest("SHA-256", new Uint8Array(bytes));
+    // Counts the body as it arrives, so an object whose length was not
+    // declared is refused partway through instead of after all of it.
+    const chunks: Uint8Array[] = [];
+    const reader = body.getReader();
+    let total = 0;
+    try {
+      for (;;) {
+        const chunk = await reader.read();
+        if (chunk.done) {
+          break;
+        }
+        total += chunk.value.length;
+        if (total > MAX_BYTES) {
+          // Stops here, and cancelling the stream ends the transfer with it;
+          // what was read is dropped with this call frame.
+          await reader.cancel();
+          throw new Error(`${input.key} is larger than ${MAX_BYTES} bytes`);
+        }
+        chunks.push(chunk.value);
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    // One copy, bounded by MAX_BYTES however the body was cut up.
+    const bytes = new Uint8Array(total);
+    let at = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, at);
+      at += chunk.length;
+    }
+    const hash = await crypto.subtle.digest("SHA-256", bytes);
     const report = {
       text: new TextDecoder("utf-8", { fatal: true }).decode(bytes),
       bytes: bytes.length,
